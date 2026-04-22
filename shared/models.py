@@ -10,7 +10,10 @@ from shared.constants import (
     CompileTrigger,
     DocClass,
     DocType,
+    EdgeType,
     EntityType,
+    IngestionEventType,
+    NodeLabel,
     Permission,
     PrincipalType,
     RefType,
@@ -172,3 +175,97 @@ class BootstrapConfig(BaseModel):
     r2_bucket_name: str
     api_key: str
     oauth_urls: dict[SourceSystem, str]
+
+
+# ---------------------------------------------------------------------------
+# Connector contract — shared output schema.
+#
+# Every connector (Slack, GitHub, Linear, ...) returns a NormalizationResult
+# from its .normalize() method. The normalizer/worker persists these to the
+# canonical tables (documents, chunks, graph_nodes, graph_edges, acl_snapshots)
+# regardless of source system.
+#
+# To add a new connector, subclass Connector (in services/ingestion/handlers/base.py),
+# return one of these result shapes, and register with @register_connector.
+# ---------------------------------------------------------------------------
+
+
+class GraphNodeSpec(BaseModel):
+    """One graph node to upsert. Resolved to a node_id by graph_writer."""
+
+    label: NodeLabel
+    canonical_id: str
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+
+class GraphEdgeSpec(BaseModel):
+    """One graph edge to upsert. Endpoints reference (label, canonical_id) pairs
+    and are resolved to node_ids after their GraphNodeSpec peers are upserted."""
+
+    edge_type: EdgeType
+    from_label: NodeLabel
+    from_canonical_id: str
+    to_label: NodeLabel
+    to_canonical_id: str
+    properties: dict[str, Any] = Field(default_factory=dict)
+    valid_from: datetime | None = None
+    valid_to: datetime | None = None
+
+
+class ACLSnapshotRow(BaseModel):
+    """One row for acl_snapshots. Separate from ACLPrincipal (embedded in Document.acl)
+    because the temporal ACL table is a wider row shape."""
+
+    source_system: SourceSystem
+    principal_type: PrincipalType
+    principal_id: str
+    resource_type: str
+    resource_id: str
+    permission: Permission
+    valid_from: datetime
+    valid_to: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class NormalizationResult(BaseModel):
+    """Uniform output shape produced by every connector's .normalize().
+
+    The normalizer persists each field into its canonical table. Empty lists
+    are fine — a connector that never touches the graph just returns `graph_nodes=[]`.
+    """
+
+    documents: list[Document] = Field(default_factory=list)
+    graph_nodes: list[GraphNodeSpec] = Field(default_factory=list)
+    graph_edges: list[GraphEdgeSpec] = Field(default_factory=list)
+    acl_snapshots: list[ACLSnapshotRow] = Field(default_factory=list)
+    # Non-fatal reason this event produced no documents (e.g. "slack edit of deleted msg").
+    skipped_reason: str | None = None
+
+    @property
+    def is_empty(self) -> bool:
+        return not (
+            self.documents or self.graph_nodes or self.graph_edges or self.acl_snapshots
+        )
+
+
+class WebhookParseResult(BaseModel):
+    """What parse_webhook_event() returns. None means: ignore this webhook."""
+
+    source_event_id: str
+    received_at: datetime
+    event_kind: IngestionEventType = IngestionEventType.WEBHOOK
+    # Connector-specific hint the normalizer can pass through to fetch_supplementary
+    # without re-parsing the payload.
+    parse_hint: dict[str, Any] = Field(default_factory=dict)
+
+
+class IntegrationToken(BaseModel):
+    """Decrypted OAuth credentials passed into fetch_supplementary / backfill."""
+
+    customer_id: str
+    source_system: SourceSystem
+    access_token: str
+    refresh_token: str | None = None
+    expires_at: datetime | None = None
+    scope: str | None = None
+    webhook_secret: str | None = None

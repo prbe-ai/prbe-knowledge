@@ -16,7 +16,8 @@ Storage:
 - Neon Postgres 16 + pgvector (chunks, documents, graph, ACL snapshots, queue)
 - Cloudflare R2 bucket-per-tenant (raw webhook payloads)
 
-Full design: [`docs/phase0-design.md`](docs/phase0-design.md)
+- Full design: [`docs/phase0-design.md`](docs/phase0-design.md)
+- Build roadmap (Phase 0 tiers + Phase 1-4+): [`docs/roadmap.md`](docs/roadmap.md)
 
 ---
 

@@ -1,0 +1,11 @@
+"""Importing this package triggers @register_connector decorators for every
+source module listed below. The ingestion service + worker both import this
+at boot, so the registry is fully populated before any webhook is served.
+
+Adding a new connector: create `handlers/<source>.py`, decorate the class with
+`@register_connector`, and append its module import here.
+"""
+
+from services.ingestion.handlers import slack  # noqa: F401
+
+__all__: list[str] = []
