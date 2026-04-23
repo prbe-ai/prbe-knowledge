@@ -36,3 +36,9 @@ logs/
 
 fly.toml.local
 .fly/
+
+# Claude Code per-session scratch — never commit worktree contents or local
+# settings overrides. `.claude/settings.json` (project-shared config) and
+# `.claude/skills/` are still tracked intentionally.
+.claude/worktrees/
+.claude/settings.local.json
