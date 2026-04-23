@@ -415,6 +415,7 @@ class SlackConnector(Connector):
         scopes = ",".join(
             [
                 "channels:history",
+                "channels:join",
                 "channels:read",
                 "groups:history",
                 "groups:read",
@@ -536,7 +537,13 @@ class SlackConnector(Connector):
 
         state = _decode_slack_cursor(cursor)
 
-        # 1. Enumerate channels once if we don't have them yet.
+        # 1. On first run, auto-join every public channel so both backfill and
+        # live webhooks see them. No-op if the token lacks channels:join scope.
+        # Private channels still require a manual `/invite @bot`.
+        if cursor is None:
+            await _join_all_public_channels(self.http, token, customer_id)
+
+        # 2. Enumerate channels once if we don't have them yet.
         if not state["channels_remaining"] and state["current_channel"] is None:
             state["channels_remaining"] = await _list_channels(self.http, token.access_token)
 
@@ -624,6 +631,96 @@ class SlackConnector(Connector):
 
 
 # ---- helpers ---------------------------------------------------------------
+
+
+_AUTO_JOIN_SCOPE = "channels:join"
+
+
+async def _join_all_public_channels(
+    http,
+    token: IntegrationToken,
+    customer_id: str,
+) -> None:
+    """Call conversations.join on every non-archived public channel the token can see.
+
+    No-op if the token lacks channels:join scope. conversations.join is idempotent
+    (already_in_channel is not an error). Respects 429 Retry-After; other
+    per-channel failures are logged and the sweep continues.
+    """
+    import asyncio as _asyncio
+
+    if not token.scope or _AUTO_JOIN_SCOPE not in token.scope:
+        log.info("slack.auto_join.skipped_no_scope", customer=customer_id)
+        return
+
+    discovered = joined = already = errors = 0
+    cursor: str | None = None
+    while True:
+        params: dict[str, Any] = {
+            "types": "public_channel",
+            "exclude_archived": "true",
+            "limit": 1000,
+        }
+        if cursor:
+            params["cursor"] = cursor
+        resp = await http.get(
+            f"{_SLACK_API}/conversations.list",
+            params=params,
+            headers={"Authorization": f"Bearer {token.access_token}"},
+        )
+        if resp.status_code == 429:
+            await _asyncio.sleep(int(resp.headers.get("retry-after", "5")))
+            continue
+        if resp.status_code != 200:
+            log.warning("slack.auto_join.list_failed", status=resp.status_code)
+            break
+        body = resp.json()
+        if not body.get("ok"):
+            log.warning("slack.auto_join.list_failed", error=body.get("error"))
+            break
+
+        for ch in body.get("channels", []):
+            discovered += 1
+            channel_id = ch.get("id")
+            if not channel_id:
+                continue
+            if ch.get("is_member"):
+                already += 1
+                continue
+            # Retry on 429; a single non-429 failure ends this channel's attempt.
+            while True:
+                jr = await http.post(
+                    f"{_SLACK_API}/conversations.join",
+                    data={"channel": channel_id},
+                    headers={"Authorization": f"Bearer {token.access_token}"},
+                )
+                if jr.status_code == 429:
+                    await _asyncio.sleep(int(jr.headers.get("retry-after", "5")))
+                    continue
+                break
+            jbody = jr.json() if jr.status_code == 200 else {}
+            if jr.status_code == 200 and jbody.get("ok"):
+                joined += 1
+            else:
+                errors += 1
+                log.warning(
+                    "slack.auto_join.channel_failed",
+                    channel=channel_id,
+                    error=jbody.get("error") if jbody else f"http_{jr.status_code}",
+                )
+
+        cursor = (body.get("response_metadata") or {}).get("next_cursor") or None
+        if not cursor:
+            break
+
+    log.info(
+        "slack.auto_join.done",
+        customer=customer_id,
+        discovered=discovered,
+        joined=joined,
+        already_member=already,
+        errors=errors,
+    )
 
 
 async def _list_channels(http, token: str) -> list[str]:
