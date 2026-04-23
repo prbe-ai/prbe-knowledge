@@ -9,8 +9,8 @@ Covers:
   containing its stacktrace + tags). Subsequent events for the same issue
   land at the same deterministic (doc_id, content_hash), which the normalizer
   content-hash dedup collapses into a no-op. Live, up-to-the-second event
-  data (counts, fresh stacks, per-release breakdowns) is served by the
-  live-Sentry tool in prbe-mcp-internal, not by this index.
+  data (counts, fresh stacks, per-release breakdowns) is served directly
+  from Sentry's API by a separate tool surface, not by this index.
 
   Rationale: Sentry's event firehose is volume-heavy and retrieval-value-
   thin — the 2,000,000th occurrence of an issue looks identical to the 100th
@@ -462,8 +462,8 @@ class SentryConnector(Connector):
         # produces these exact two strings. The normalizer's content-hash
         # dedup (services/ingestion/normalizer.py:_upsert_document) then
         # no-ops every subsequent event, so we never re-embed or bump versions
-        # for the firehose. Fresh event details come from the live Sentry
-        # lookup tool in prbe-mcp-internal.
+        # for the firehose. Fresh event details come from Sentry's API directly
+        # via a separate tool surface.
         doc_id = f"sentry:issue:{group_id}:sample"
         content_hash = _sha256(f"{doc_id}|representative_sample")
 
