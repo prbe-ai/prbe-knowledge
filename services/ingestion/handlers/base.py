@@ -50,6 +50,7 @@ from shared.config import Settings, get_settings
 from shared.constants import SourceSystem
 from shared.exceptions import NotSupportedByConnector
 from shared.models import (
+    ExternalWorkspaceRef,
     IntegrationToken,
     NormalizationResult,
     WebhookEvent,
@@ -201,6 +202,37 @@ class Connector(ABC):
         raise NotSupportedByConnector(
             f"{self.source_system.value} connector does not implement OAuth exchange"
         )
+
+    # ---- 7. workspace identification (webhook → customer routing) ----------
+
+    async def identify_workspaces(
+        self, token: IntegrationToken
+    ) -> list[ExternalWorkspaceRef]:
+        """Return source-side workspace/team/org ids tied to this token.
+
+        Called once at OAuth-callback time. Each returned ref is written
+        to `customer_source_mapping` so future webhooks can resolve
+        customer_id from the payload alone.
+
+        Default returns []. Connectors that support webhooks MUST override —
+        otherwise their webhooks will 400 unless X-Prbe-Customer is set manually.
+        """
+        return []
+
+    def extract_external_id_from_payload(
+        self,
+        headers: Mapping[str, str],
+        raw_payload: Mapping[str, Any],
+    ) -> str | None:
+        """Pull the workspace/team/org id out of an incoming webhook payload.
+
+        Paired with `identify_workspaces`: the id this returns must match one
+        of the ids `identify_workspaces` recorded at install time. The webhook
+        handler uses this to look up the owning customer.
+
+        Default returns None. Connectors that support webhooks MUST override.
+        """
+        return None
 
     # ---- housekeeping ------------------------------------------------------
 

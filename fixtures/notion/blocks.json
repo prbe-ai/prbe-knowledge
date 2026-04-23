@@ -1,0 +1,70 @@
+{
+  "object": "list",
+  "results": [
+    {
+      "object": "block",
+      "id": "blk_1",
+      "type": "heading_2",
+      "heading_2": {
+        "rich_text": [
+          {"type": "text", "plain_text": "Incident runbook"}
+        ]
+      }
+    },
+    {
+      "object": "block",
+      "id": "blk_2",
+      "type": "paragraph",
+      "paragraph": {
+        "rich_text": [
+          {"type": "text", "plain_text": "When payments 500s, page "},
+          {
+            "type": "mention",
+            "mention": {"type": "user", "user": {"id": "user_bob"}},
+            "plain_text": "@Bob"
+          },
+          {"type": "text", "plain_text": " immediately."}
+        ]
+      }
+    },
+    {
+      "object": "block",
+      "id": "blk_3",
+      "type": "bulleted_list_item",
+      "bulleted_list_item": {
+        "rich_text": [
+          {"type": "text", "plain_text": "Check Stripe dashboard"}
+        ]
+      }
+    },
+    {
+      "object": "block",
+      "id": "blk_4",
+      "type": "bulleted_list_item",
+      "bulleted_list_item": {
+        "rich_text": [
+          {"type": "text", "plain_text": "Roll back last deploy"}
+        ]
+      }
+    },
+    {
+      "object": "block",
+      "id": "blk_5",
+      "type": "code",
+      "code": {
+        "language": "bash",
+        "rich_text": [
+          {"type": "text", "plain_text": "fly deploy --image prev"}
+        ]
+      }
+    },
+    {
+      "object": "block",
+      "id": "blk_6",
+      "type": "image",
+      "image": {"type": "external", "external": {"url": "https://ex.com/x.png"}}
+    }
+  ],
+  "next_cursor": null,
+  "has_more": false
+}

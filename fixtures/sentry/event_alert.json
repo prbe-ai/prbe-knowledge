@@ -1,0 +1,70 @@
+{
+  "action": "triggered",
+  "installation": {
+    "uuid": "inst-xyz-0001"
+  },
+  "data": {
+    "event": {
+      "event_id": "abcdef0123456789abcdef0123456789",
+      "groupID": "1234567890",
+      "project": 999,
+      "title": "TypeError: 'NoneType' object is not subscriptable",
+      "culprit": "payments.charges.handle_webhook",
+      "platform": "python",
+      "environment": "production",
+      "release": "payments-api@2026.04.22-1",
+      "timestamp": "2026-04-22T14:10:02.000Z",
+      "url": "https://sentry.io/organizations/acme/issues/1234567890/events/abcdef0123456789abcdef0123456789/",
+      "web_url": "https://sentry.io/organizations/acme/issues/1234567890/events/abcdef0123456789abcdef0123456789/",
+      "tags": [
+        ["environment", "production"],
+        ["level", "error"],
+        ["release", "payments-api@2026.04.22-1"]
+      ],
+      "exception": {
+        "values": [
+          {
+            "type": "TypeError",
+            "value": "'NoneType' object is not subscriptable",
+            "stacktrace": {
+              "frames": [
+                {
+                  "filename": "payments/charges.py",
+                  "function": "handle_webhook",
+                  "lineno": 142,
+                  "context_line": "    amount = payload['amount']"
+                },
+                {
+                  "filename": "payments/router.py",
+                  "function": "dispatch",
+                  "lineno": 57,
+                  "context_line": "    return handler(payload)"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "triggered_rule": "High error rate"
+  },
+  "actor": {
+    "type": "application",
+    "id": "sentry",
+    "name": "Sentry"
+  },
+  "organization": {
+    "slug": "acme",
+    "name": "Acme Inc"
+  },
+  "project": {
+    "id": "999",
+    "slug": "payments-api",
+    "name": "Payments API",
+    "platform": "python",
+    "team": {
+      "id": "t-1",
+      "slug": "billing-platform"
+    }
+  }
+}

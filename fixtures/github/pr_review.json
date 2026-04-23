@@ -1,0 +1,39 @@
+{
+  "action": "submitted",
+  "review": {
+    "id": 3003,
+    "user": {
+      "login": "bob",
+      "id": 502
+    },
+    "body": "Looks good, but please add a regression test for the retry counter.",
+    "state": "changes_requested",
+    "html_url": "https://github.com/prbe/payments/pull/42#pullrequestreview-3003",
+    "submitted_at": "2026-04-22T12:00:00Z"
+  },
+  "pull_request": {
+    "id": 1001,
+    "number": 42,
+    "title": "Fix payments retry loop",
+    "html_url": "https://github.com/prbe/payments/pull/42",
+    "user": {
+      "login": "alice",
+      "id": 501
+    }
+  },
+  "repository": {
+    "id": 9001,
+    "name": "payments",
+    "full_name": "prbe/payments",
+    "private": false,
+    "html_url": "https://github.com/prbe/payments",
+    "owner": {
+      "login": "prbe",
+      "id": 1
+    }
+  },
+  "sender": {
+    "login": "bob",
+    "id": 502
+  }
+}

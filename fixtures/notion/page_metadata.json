@@ -1,0 +1,44 @@
+{
+  "object": "page",
+  "id": "page_abc123",
+  "created_time": "2026-04-20T09:00:00.000Z",
+  "last_edited_time": "2026-04-22T12:00:00.000Z",
+  "created_by": {"object": "user", "id": "user_alice"},
+  "last_edited_by": {"object": "user", "id": "user_alice"},
+  "archived": false,
+  "url": "https://www.notion.so/Payments-runbook-abc123",
+  "parent": {
+    "type": "page_id",
+    "page_id": "page_parent_999"
+  },
+  "properties": {
+    "title": {
+      "id": "title",
+      "type": "title",
+      "title": [
+        {
+          "type": "text",
+          "text": {"content": "Payments runbook", "link": null},
+          "plain_text": "Payments runbook"
+        }
+      ]
+    },
+    "Status": {
+      "id": "status",
+      "type": "select",
+      "select": {"id": "s1", "name": "Active", "color": "green"}
+    }
+  },
+  "permissions": [
+    {
+      "type": "user_permissions",
+      "user_id": "user_alice",
+      "role": "editor"
+    },
+    {
+      "type": "group_permissions",
+      "group_id": "group_eng",
+      "role": "reader"
+    }
+  ]
+}

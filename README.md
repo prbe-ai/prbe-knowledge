@@ -160,6 +160,39 @@ security delete-generic-password -a "<branch>" -s "neon-prbe-knowledge"
 
 ---
 
+## Syncing secrets to Fly
+
+Local `.env` values live on your laptop; Fly apps need each secret set per app. Use `scripts/fly-secrets-sync.sh` to push everything from `.env` to all three Fly apps in one shot.
+
+```bash
+# Sync all three apps from .env
+scripts/fly-secrets-sync.sh
+
+# Sync a single app only
+scripts/fly-secrets-sync.sh ingestion      # or: retrieval | worker
+
+# Use a different env file (e.g. staging)
+scripts/fly-secrets-sync.sh -f .env.staging
+```
+
+Under the hood it runs `flyctl secrets import -a <app> < <env-file>` on each of:
+
+- `prbe-knowledge-ingestion`
+- `prbe-knowledge-retrieval`
+- `prbe-knowledge-worker`
+
+Preflight checks bail early if `flyctl` is missing, you're not logged in, or the env file is empty. The underlying `flyctl secrets import` is idempotent — safe to re-run any time you rotate a key.
+
+Verify after a run:
+
+```bash
+flyctl secrets list -a prbe-knowledge-ingestion
+```
+
+Secret names are shown, values are not. Re-run the script whenever a secret rotates.
+
+---
+
 ## Repo layout
 
 ```
@@ -172,9 +205,10 @@ prbe-knowledge/
 │   ├── schema.sql      canonical Postgres schema (source of truth)
 │   └── migrations/     Alembic migrations (execute schema.sql)
 ├── scripts/
-│   ├── neon-store.sh   store a branch connection string in Keychain
-│   ├── neon-psql.sh    open psql to a branch
-│   └── neon-migrate.sh run alembic upgrade head against a branch
+│   ├── neon-store.sh          store a branch connection string in Keychain
+│   ├── neon-psql.sh           open psql to a branch
+│   ├── neon-migrate.sh        run alembic upgrade head against a branch
+│   └── fly-secrets-sync.sh    push .env to Fly secrets on all three apps
 ├── fixtures/           real sample webhook payloads per source
 ├── tests/
 ├── docker-compose.yml  local Postgres + MinIO

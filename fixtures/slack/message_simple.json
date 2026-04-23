@@ -1,0 +1,17 @@
+{
+  "token": "verification",
+  "team_id": "T_TEST",
+  "api_app_id": "A_TEST",
+  "event": {
+    "type": "message",
+    "channel": "C_PAYMENTS",
+    "user": "U_ALICE",
+    "text": "the payments service is returning 500s after the latest deploy — rolling back now. see https://example.com/run/42 for logs",
+    "ts": "1713628800.000100",
+    "client_msg_id": "abc-123",
+    "team": "T_TEST"
+  },
+  "type": "event_callback",
+  "event_id": "Ev_TEST",
+  "event_time": 1713628800
+}

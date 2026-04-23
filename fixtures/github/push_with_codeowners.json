@@ -1,0 +1,54 @@
+{
+  "ref": "refs/heads/main",
+  "before": "0000000000000000000000000000000000000000",
+  "after": "deadbeefcafe1234567890abcdef1234567890aa",
+  "head_commit": {
+    "id": "deadbeefcafe1234567890abcdef1234567890aa",
+    "message": "chore: update CODEOWNERS for payments team\n\nAssigns the new payments squad.",
+    "timestamp": "2026-04-22T11:30:00Z",
+    "url": "https://github.com/prbe/payments/commit/deadbeefcafe1234567890abcdef1234567890aa",
+    "author": {
+      "name": "Alice Dev",
+      "email": "alice@example.com",
+      "username": "alice"
+    },
+    "added": [],
+    "removed": [],
+    "modified": [".github/CODEOWNERS"]
+  },
+  "commits": [
+    {
+      "id": "deadbeefcafe1234567890abcdef1234567890aa",
+      "message": "chore: update CODEOWNERS for payments team\n\nAssigns the new payments squad.",
+      "timestamp": "2026-04-22T11:30:00Z",
+      "url": "https://github.com/prbe/payments/commit/deadbeefcafe1234567890abcdef1234567890aa",
+      "author": {
+        "name": "Alice Dev",
+        "email": "alice@example.com",
+        "username": "alice"
+      },
+      "added": [],
+      "removed": [],
+      "modified": [".github/CODEOWNERS"]
+    }
+  ],
+  "repository": {
+    "id": 9001,
+    "name": "payments",
+    "full_name": "prbe/payments",
+    "private": true,
+    "html_url": "https://github.com/prbe/payments",
+    "owner": {
+      "login": "prbe",
+      "id": 1
+    }
+  },
+  "pusher": {
+    "name": "alice",
+    "email": "alice@example.com"
+  },
+  "sender": {
+    "login": "alice",
+    "id": 501
+  }
+}

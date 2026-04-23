@@ -124,6 +124,7 @@ class IngestionEventType(StrEnum):
 
 class BackfillStatus(StrEnum):
     IDLE = "idle"
+    PENDING = "pending"
     RUNNING = "running"
     COMPLETE = "complete"
     FAILED = "failed"

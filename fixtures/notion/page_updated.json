@@ -1,0 +1,18 @@
+{
+  "id": "evt_01HXYZ",
+  "type": "page.updated",
+  "timestamp": "2026-04-22T12:00:00.000Z",
+  "workspace_id": "ws_TEST",
+  "workspace_name": "PRBE",
+  "entity": {
+    "type": "page",
+    "id": "page_abc123"
+  },
+  "data": {
+    "last_edited_time": "2026-04-22T12:00:00.000Z",
+    "last_edited_by": {
+      "id": "user_alice"
+    },
+    "updated_properties": ["title", "Status"]
+  }
+}

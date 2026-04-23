@@ -123,32 +123,80 @@ class SlackConnector(Connector):
         # Ignore ephemeral noise.
         if event_type in {"user_typing", "desktop_notification", "hello"}:
             return None
-        if subtype in {"message_changed", "message_deleted"}:
-            # We care, but they need special handling — Phase 0 ignores edits/deletes.
-            return None
         if event_type != "message":
             return None
+
+        channel = event.get("channel")
+        if not channel:
+            raise InvalidWebhookPayload("slack message missing channel")
+
+        team_id = raw_payload.get("team_id")
+
+        # Edits arrive as subtype=message_changed with the new body under
+        # event.message and the prior under event.previous_message. The
+        # stable message identity is the inner message's `ts`; event_ts is
+        # the edit's own event timestamp, which we fold into source_event_id
+        # so repeated edits of the same message don't collide on the UNIQUE
+        # (customer_id, source_system, source_event_id) constraint.
+        if subtype == "message_changed":
+            inner = event.get("message") or {}
+            msg_ts = inner.get("ts")
+            event_ts = event.get("event_ts") or inner.get("edited", {}).get("ts")
+            if not msg_ts or not event_ts:
+                raise InvalidWebhookPayload("slack message_changed missing ts/event_ts")
+            return WebhookParseResult(
+                source_event_id=f"{channel}:{msg_ts}:edit:{event_ts}",
+                received_at=_ts_to_datetime(event_ts),
+                event_kind=IngestionEventType.WEBHOOK,
+                parse_hint={
+                    "subtype": "message_changed",
+                    "channel": channel,
+                    "ts": msg_ts,
+                    "thread_ts": inner.get("thread_ts"),
+                    "team_id": team_id,
+                },
+            )
+
+        # Deletes arrive as subtype=message_deleted with the original ts under
+        # event.deleted_ts (and the full prior message under event.previous_message).
+        if subtype == "message_deleted":
+            deleted_ts = event.get("deleted_ts") or (
+                event.get("previous_message") or {}
+            ).get("ts")
+            event_ts = event.get("event_ts") or deleted_ts
+            if not deleted_ts or not event_ts:
+                raise InvalidWebhookPayload("slack message_deleted missing deleted_ts")
+            return WebhookParseResult(
+                source_event_id=f"{channel}:{deleted_ts}:delete:{event_ts}",
+                received_at=_ts_to_datetime(event_ts),
+                event_kind=IngestionEventType.WEBHOOK,
+                parse_hint={
+                    "subtype": "message_deleted",
+                    "channel": channel,
+                    "ts": deleted_ts,
+                    "team_id": team_id,
+                },
+            )
+
+        # Bot messages without text are noise (e.g. blocks-only interactive messages).
         if event.get("bot_id") and not event.get("text"):
             return None
 
         ts = event.get("ts")
-        channel = event.get("channel")
-        if not ts or not channel:
-            raise InvalidWebhookPayload("slack message missing ts/channel")
+        if not ts:
+            raise InvalidWebhookPayload("slack message missing ts")
 
         # ts is monotonic per channel → globally unique with channel prefix.
-        source_event_id = f"{channel}:{ts}"
-        received_at = _ts_to_datetime(ts)
-
         return WebhookParseResult(
-            source_event_id=source_event_id,
-            received_at=received_at,
+            source_event_id=f"{channel}:{ts}",
+            received_at=_ts_to_datetime(ts),
             event_kind=IngestionEventType.WEBHOOK,
             parse_hint={
+                "subtype": subtype,
                 "channel": channel,
                 "ts": ts,
                 "thread_ts": event.get("thread_ts"),
-                "team_id": raw_payload.get("team_id"),
+                "team_id": team_id,
             },
         )
 
@@ -197,10 +245,25 @@ class SlackConnector(Connector):
         event: WebhookEvent,
         hydrated: Mapping[str, Any],
     ) -> NormalizationResult:
-        msg = event.raw_payload.get("event", {})
-        channel = msg.get("channel")
-        ts = msg.get("ts")
+        outer = event.raw_payload.get("event", {})
+        subtype = outer.get("subtype")
         team_id = event.raw_payload.get("team_id", "")
+        channel = outer.get("channel")
+
+        # For edits, the authoritative message is under `message`. For deletes,
+        # `previous_message` is what we had before. For plain messages, the
+        # event itself is the message.
+        if subtype == "message_changed":
+            msg = outer.get("message") or {}
+        elif subtype == "message_deleted":
+            msg = outer.get("previous_message") or {}
+        else:
+            msg = outer
+
+        ts = msg.get("ts") or outer.get("ts") or outer.get("deleted_ts")
+        if subtype == "message_deleted" and not ts:
+            ts = outer.get("deleted_ts")
+
         user = msg.get("user") or msg.get("bot_id") or "unknown"
         text = msg.get("text") or ""
         thread_ts = msg.get("thread_ts")
@@ -212,9 +275,18 @@ class SlackConnector(Connector):
         source_url = self._permalink(team_id, channel, ts)
         created = _ts_to_datetime(ts)
 
-        content_hash = _sha256(
-            f"{doc_id}|{text}|{','.join(sorted(_attachment_urls(msg)))}"
-        )
+        # For deletes, body is empty and deleted_at marks the tombstone.
+        # The content_hash MUST differ from the prior live version so the
+        # normalizer writes a new version and marks old chunks stale via diff.
+        deleted_at: datetime | None = None
+        if subtype == "message_deleted":
+            text = ""
+            deleted_at = event.received_at
+            content_hash = _sha256(f"{doc_id}|__deleted__|{event.received_at.isoformat()}")
+        else:
+            content_hash = _sha256(
+                f"{doc_id}|{text}|{','.join(sorted(_attachment_urls(msg)))}"
+            )
 
         acl_principals = [
             ACLPrincipal(
@@ -242,8 +314,9 @@ class SlackConnector(Connector):
             body_token_count=count_tokens(text),
             author_id=user,
             created_at=created,
-            updated_at=created,
-            valid_from=created,
+            updated_at=event.received_at,
+            valid_from=event.received_at,
+            deleted_at=deleted_at,
             ingested_at=datetime.now(UTC),
             parent_doc_id=(
                 f"slack:{team_id}:{channel}:{thread_ts}"
@@ -319,7 +392,7 @@ class SlackConnector(Connector):
         )
 
     # ------------------------------------------------------------------
-    # 5. OAuth install (for completeness — real redirect wired in Tier 7)
+    # 5. OAuth install + exchange
     # ------------------------------------------------------------------
 
     def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
@@ -344,10 +417,257 @@ class SlackConnector(Connector):
             f"&state={customer_id}"
         )
 
+    async def exchange_oauth_code(
+        self,
+        code: str,
+        redirect_uri: str,
+    ) -> IntegrationToken:
+        cid = self.settings.slack_client_id
+        secret = self.settings.slack_client_secret
+        if not cid or secret is None:
+            from shared.exceptions import MissingSecret
+
+            raise MissingSecret("SLACK_CLIENT_ID / SLACK_CLIENT_SECRET not configured")
+
+        resp = await self.http.post(
+            f"{_SLACK_API}/oauth.v2.access",
+            data={
+                "client_id": cid,
+                "client_secret": secret.get_secret_value(),
+                "redirect_uri": redirect_uri,
+                "code": code,
+            },
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if not body.get("ok"):
+            from shared.exceptions import PermanentSourceError
+
+            raise PermanentSourceError(f"slack oauth failed: {body.get('error')}")
+
+        return IntegrationToken(
+            customer_id="",
+            source_system=SourceSystem.SLACK,
+            access_token=body["access_token"],
+            scope=body.get("scope"),
+            webhook_secret=None,
+        )
+
+    # ------------------------------------------------------------------
+    # 7. workspace identification
+    # ------------------------------------------------------------------
+
+    async def identify_workspaces(self, token: IntegrationToken):  # type: ignore[override]
+        """Use Slack's `auth.test` to resolve team_id + team_name from the token.
+
+        This is one API call per install; result is cached forever in
+        customer_source_mapping (unless the customer re-installs under a
+        different workspace).
+        """
+        try:
+            resp = await self.http.post(
+                f"{_SLACK_API}/auth.test",
+                headers={"Authorization": f"Bearer {token.access_token}"},
+            )
+        except Exception as exc:
+            log.warning("slack.auth_test_failed", error=str(exc))
+            return []
+        if resp.status_code != 200:
+            return []
+        body = resp.json()
+        if not body.get("ok"):
+            return []
+        team_id = body.get("team_id")
+        if not team_id:
+            return []
+        from shared.models import ExternalWorkspaceRef
+
+        return [
+            ExternalWorkspaceRef(
+                external_id=team_id,
+                external_name=body.get("team"),
+                metadata={"url": body.get("url")},
+            )
+        ]
+
+    def extract_external_id_from_payload(self, headers, raw_payload):
+        team_id = raw_payload.get("team_id")
+        if not team_id and isinstance(raw_payload.get("team"), dict):
+            team_id = raw_payload["team"].get("id")
+        return str(team_id) if team_id else None
+
+    # ------------------------------------------------------------------
+    # 5. backfill
+    # ------------------------------------------------------------------
+
+    async def backfill(
+        self,
+        customer_id: str,
+        token: IntegrationToken,
+        cursor: str | None = None,
+    ):
+        """Historical Slack backfill — paginated channel + message walk.
+
+        Resumable via the `cursor` arg: an opaque JSON blob encoding which
+        channel we're in and where in that channel's history we stopped.
+        Yields synthetic WebhookEvents shaped exactly like live `message`
+        events so the normalizer has one code path.
+
+        Rate limits: Slack tier 3 (~20 req/min on conversations.history).
+        We rely on httpx + source-returned Retry-After on 429 to back off;
+        Slack's docs promise graceful degradation, not throttling kills.
+        """
+        import json as _json
+
+        import httpx
+
+        from shared.models import WebhookEvent
+
+        state = _decode_slack_cursor(cursor)
+
+        # 1. Enumerate channels once if we don't have them yet.
+        if not state["channels_remaining"] and state["current_channel"] is None:
+            state["channels_remaining"] = await _list_channels(self.http, token.access_token)
+
+        team_id = await _auth_team_id(self.http, token.access_token) or "UNKNOWN"
+
+        while state["current_channel"] or state["channels_remaining"]:
+            if state["current_channel"] is None:
+                state["current_channel"] = state["channels_remaining"].pop(0)
+                state["history_cursor"] = None
+
+            channel = state["current_channel"]
+
+            try:
+                params = {"channel": channel, "limit": 200}
+                if state["history_cursor"]:
+                    params["cursor"] = state["history_cursor"]
+                resp = await self.http.get(
+                    f"{_SLACK_API}/conversations.history",
+                    params=params,
+                    headers={"Authorization": f"Bearer {token.access_token}"},
+                )
+            except httpx.HTTPError as exc:
+                log.warning("slack.backfill_http_error", channel=channel, error=str(exc))
+                # Move on to next channel rather than stalling the whole backfill.
+                state["current_channel"] = None
+                state["history_cursor"] = None
+                continue
+
+            if resp.status_code == 429:
+                # Respect Retry-After (seconds). httpx won't sleep for us here.
+                import asyncio as _asyncio
+
+                retry_after = int(resp.headers.get("retry-after", "5"))
+                await _asyncio.sleep(retry_after)
+                continue
+
+            if resp.status_code != 200:
+                state["current_channel"] = None
+                state["history_cursor"] = None
+                continue
+
+            body = resp.json()
+            if not body.get("ok"):
+                state["current_channel"] = None
+                state["history_cursor"] = None
+                continue
+
+            for msg in body.get("messages", []):
+                if msg.get("type") != "message":
+                    continue
+                # Skip messages without text (ephemeral, bot blocks-only).
+                if not msg.get("text") and not msg.get("files"):
+                    continue
+                payload = {
+                    "team_id": team_id,
+                    "type": "event_callback",
+                    "event": {
+                        **msg,
+                        "type": "message",
+                        "channel": channel,
+                    },
+                    # Runner reads this to persist the cursor:
+                    "_cursor": _json.dumps(state),
+                }
+                ts = msg.get("ts", "")
+                yield WebhookEvent(
+                    customer_id=customer_id,
+                    source_system=SourceSystem.SLACK,
+                    source_event_id=f"{channel}:{ts}",
+                    received_at=_ts_to_datetime(ts) if ts else datetime.now(UTC),
+                    payload_s3_key="",  # runner fills this in
+                    raw_payload=payload,
+                    headers={},
+                )
+
+            next_cursor = (body.get("response_metadata") or {}).get("next_cursor")
+            if next_cursor:
+                state["history_cursor"] = next_cursor
+            else:
+                # Channel exhausted — move on.
+                state["current_channel"] = None
+                state["history_cursor"] = None
+
     # ------------------------------------------------------------------
 
 
 # ---- helpers ---------------------------------------------------------------
+
+
+async def _list_channels(http, token: str) -> list[str]:
+    """Enumerate all channels the bot can see. Paginated."""
+    channels: list[str] = []
+    cursor: str | None = None
+    while True:
+        params = {"types": "public_channel,private_channel", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        resp = await http.get(
+            f"{_SLACK_API}/conversations.list",
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        if resp.status_code != 200:
+            break
+        body = resp.json()
+        if not body.get("ok"):
+            break
+        for ch in body.get("channels", []):
+            if ch.get("id") and ch.get("is_member", True):
+                channels.append(ch["id"])
+        cursor = (body.get("response_metadata") or {}).get("next_cursor") or None
+        if not cursor:
+            break
+    return channels
+
+
+async def _auth_team_id(http, token: str) -> str | None:
+    resp = await http.post(
+        f"{_SLACK_API}/auth.test",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if resp.status_code != 200:
+        return None
+    body = resp.json()
+    if not body.get("ok"):
+        return None
+    return body.get("team_id")
+
+
+def _decode_slack_cursor(cursor: str | None) -> dict:
+    import json as _json
+
+    if not cursor:
+        return {"channels_remaining": [], "current_channel": None, "history_cursor": None}
+    try:
+        return _json.loads(cursor)
+    except _json.JSONDecodeError:
+        # Corrupt cursor — start over.
+        return {"channels_remaining": [], "current_channel": None, "history_cursor": None}
+
+
+
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:

@@ -1,0 +1,57 @@
+{
+  "action": "created",
+  "installation": {
+    "uuid": "inst-xyz-0001"
+  },
+  "data": {
+    "issue": {
+      "id": "1234567890",
+      "shortId": "PRBE-42",
+      "title": "TypeError: 'NoneType' object is not subscriptable",
+      "culprit": "payments.charges.handle_webhook",
+      "level": "error",
+      "status": "unresolved",
+      "platform": "python",
+      "firstSeen": "2026-04-21T18:22:10.000Z",
+      "lastSeen": "2026-04-22T14:10:02.000Z",
+      "url": "https://sentry.io/organizations/acme/issues/1234567890/",
+      "permalink": "https://sentry.io/organizations/acme/issues/1234567890/",
+      "assignedTo": {
+        "type": "user",
+        "id": "55",
+        "username": "alice",
+        "email": "alice@example.com"
+      },
+      "project": {
+        "id": "999",
+        "slug": "payments-api",
+        "name": "Payments API"
+      },
+      "metadata": {
+        "value": "'NoneType' object is not subscriptable",
+        "type": "TypeError",
+        "filename": "payments/charges.py",
+        "function": "handle_webhook"
+      }
+    }
+  },
+  "actor": {
+    "type": "user",
+    "id": "55",
+    "name": "alice"
+  },
+  "organization": {
+    "slug": "acme",
+    "name": "Acme Inc"
+  },
+  "project": {
+    "id": "999",
+    "slug": "payments-api",
+    "name": "Payments API",
+    "platform": "python",
+    "team": {
+      "id": "t-1",
+      "slug": "billing-platform"
+    }
+  }
+}

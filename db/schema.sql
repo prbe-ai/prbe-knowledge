@@ -1,5 +1,5 @@
 -- prbe-knowledge Phase 0 schema.
--- Canonical reference. Alembic's initial migration is generated from this.
+-- Canonical reference. Alembic's initial migration executes this file verbatim.
 
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -22,7 +22,30 @@ CREATE TABLE customers (
 );
 
 -- ---------------------------------------------------------------------------
--- documents: canonical normalized form, one row per version
+-- customer_source_mapping: resolve an incoming webhook's source-side
+-- workspace/team/org id to the owning customer.
+-- Populated at OAuth install time via Connector.identify_workspaces().
+-- ---------------------------------------------------------------------------
+CREATE TABLE customer_source_mapping (
+    source_system   TEXT NOT NULL,
+    external_id     TEXT NOT NULL,
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    external_name   TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (source_system, external_id)
+);
+CREATE INDEX idx_customer_source_mapping_customer
+    ON customer_source_mapping (customer_id, source_system);
+
+-- ---------------------------------------------------------------------------
+-- documents: canonical normalized form, one row per version.
+-- Temporal columns:
+--   valid_from         — when this version became the live version
+--   valid_to           — when it stopped being live (NULL = still live)
+--   supersedes_doc_id  — chain pointer to the version that replaced it
+--   deleted_at         — source-side deletion tombstone (no chunks should be live)
 -- Full body content lives in chunks.content (inline). No documents.body column.
 -- ---------------------------------------------------------------------------
 CREATE TABLE documents (
@@ -76,22 +99,33 @@ CREATE TABLE documents (
 CREATE INDEX idx_documents_customer_source ON documents (customer_id, source_system, source_id);
 CREATE INDEX idx_documents_customer_updated ON documents (customer_id, updated_at DESC);
 CREATE INDEX idx_documents_customer_class ON documents (customer_id, doc_class, doc_type);
+-- Fast "latest version" lookup per (customer_id, doc_id).
+CREATE INDEX idx_documents_live ON documents (customer_id, doc_id) WHERE valid_to IS NULL;
 CREATE INDEX idx_documents_fts_title_preview ON documents
     USING GIN (to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body_preview,'')));
 CREATE INDEX idx_documents_entities ON documents USING GIN (entities jsonb_path_ops);
 CREATE INDEX idx_documents_metadata ON documents USING GIN (metadata jsonb_path_ops);
 
 -- ---------------------------------------------------------------------------
--- chunks: retrieval-sized pieces of a document version
+-- chunks: content-addressable retrieval units.
+-- Identity is (doc_id, content_hash) — a chunk with the same content across
+-- doc versions is ONE row with its temporal validity extended, not N rows.
+-- That keeps embedding cost bounded on doc edits (only added content is re-embedded).
+--
+-- Temporal columns:
+--   valid_from          — when this chunk first appeared in any version of the doc
+--   valid_to            — when it stopped being in the live version (NULL = still live)
+--   first_seen_version  — document version that first introduced this chunk
+--   last_seen_version   — most recent document version that still contained it
 -- ---------------------------------------------------------------------------
 CREATE TABLE chunks (
     chunk_id             TEXT PRIMARY KEY,
     doc_id               TEXT NOT NULL,
-    doc_version          INT  NOT NULL,
     customer_id          TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
 
     chunk_index          INT  NOT NULL,
     content              TEXT NOT NULL,
+    content_hash         TEXT NOT NULL,
     token_count          INT  NOT NULL,
 
     embedding            halfvec(3072) NOT NULL,
@@ -99,17 +133,29 @@ CREATE TABLE chunks (
     embedding_dim        INT  NOT NULL DEFAULT 3072,
     chunker_version      TEXT NOT NULL DEFAULT 'naive-v1',
 
+    first_seen_version   INT  NOT NULL,
+    last_seen_version    INT  NOT NULL,
+    valid_from           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    valid_to             TIMESTAMPTZ,
+
     metadata             JSONB NOT NULL DEFAULT '{}',
 
-    FOREIGN KEY (doc_id, doc_version) REFERENCES documents(doc_id, version) ON DELETE CASCADE
+    UNIQUE (doc_id, content_hash)
+    -- No FK to documents(doc_id, version). A chunk can span multiple versions
+    -- (first_seen_version..last_seen_version), so pinning the FK to a specific
+    -- version would cascade-delete live chunks if an old doc version ever
+    -- gets hand-deleted by a retention job. The customer_id CASCADE above
+    -- handles the tenant-delete path, which is the only real delete in
+    -- normal operation.
 );
 
--- halfvec_cosine_ops because the column type is halfvec, not vector.
--- pgvector HNSW indexes halfvec up to 4000 dims (vs 2000 for full-precision vector).
+-- halfvec_cosine_ops: pgvector HNSW indexes halfvec up to 4000 dims.
 CREATE INDEX idx_chunks_embedding_hnsw ON chunks USING hnsw (embedding halfvec_cosine_ops);
-CREATE INDEX idx_chunks_customer ON chunks (customer_id);
-CREATE INDEX idx_chunks_doc_version ON chunks (doc_id, doc_version);
-CREATE INDEX idx_chunks_fts_content ON chunks USING GIN (to_tsvector('english', content));
+CREATE INDEX idx_chunks_customer       ON chunks (customer_id);
+CREATE INDEX idx_chunks_doc            ON chunks (doc_id);
+CREATE INDEX idx_chunks_doc_live       ON chunks (doc_id) WHERE valid_to IS NULL;
+CREATE INDEX idx_chunks_doc_hash       ON chunks (doc_id, content_hash);
+CREATE INDEX idx_chunks_fts_content    ON chunks USING GIN (to_tsvector('english', content));
 
 -- ---------------------------------------------------------------------------
 -- acl_snapshots: temporal ACL truth.
@@ -138,9 +184,7 @@ CREATE INDEX idx_acl_resource ON acl_snapshots (customer_id, resource_type, reso
 
 -- ---------------------------------------------------------------------------
 -- ingestion_queue: backpressure buffer between webhook handler and worker.
--- Fast path inserts here and returns 200.
--- Worker drains with SELECT ... FOR UPDATE SKIP LOCKED.
--- Heartbeat-based stuck-row reclaim.
+-- Fast path inserts here and returns 200. Worker drains with SKIP LOCKED.
 -- ---------------------------------------------------------------------------
 CREATE TABLE ingestion_queue (
     queue_id             BIGSERIAL PRIMARY KEY,
@@ -170,15 +214,20 @@ CREATE TABLE backfill_state (
     last_cursor          TEXT,
     status               TEXT NOT NULL DEFAULT 'idle',
     last_error           TEXT,
+    events_enqueued      INT  NOT NULL DEFAULT 0,
     started_at           TIMESTAMPTZ,
+    heartbeat_at         TIMESTAMPTZ,
     last_progress_at     TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
     PRIMARY KEY (customer_id, source_system)
 );
+CREATE INDEX idx_backfill_state_pending ON backfill_state (status, started_at)
+    WHERE status = 'pending';
+CREATE INDEX idx_backfill_state_running ON backfill_state (status, heartbeat_at)
+    WHERE status = 'running';
 
 -- ---------------------------------------------------------------------------
 -- integration_tokens: per-customer per-source OAuth credentials.
--- Token refresh cron updates last_refresh_error on failure (Grafana alert).
 -- ---------------------------------------------------------------------------
 CREATE TABLE integration_tokens (
     customer_id              TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
@@ -199,7 +248,7 @@ CREATE INDEX idx_tokens_refresh_errors ON integration_tokens (status, last_refre
     WHERE last_refresh_error IS NOT NULL;
 
 -- ---------------------------------------------------------------------------
--- failed_chunks: audit of embedding batch rejects (recursive half-split isolator).
+-- failed_chunks: audit of embedding batch rejects.
 -- ---------------------------------------------------------------------------
 CREATE TABLE failed_chunks (
     failed_chunk_id      BIGSERIAL PRIMARY KEY,
@@ -286,8 +335,11 @@ CREATE INDEX idx_graph_edges_to ON graph_edges (customer_id, to_node_id, edge_ty
 
 -- RLS: tenant isolation enforced at the DB level.
 -- Application sets `SET app.current_customer_id = '<id>'` at the start of each tx.
+-- FORCE is required so the policy applies to the table owner too.
 ALTER TABLE graph_nodes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_nodes FORCE ROW LEVEL SECURITY;
 ALTER TABLE graph_edges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_edges FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_isolation ON graph_nodes
     USING (customer_id = current_setting('app.current_customer_id', true));
@@ -295,8 +347,9 @@ CREATE POLICY tenant_isolation ON graph_nodes
 CREATE POLICY tenant_isolation ON graph_edges
     USING (customer_id = current_setting('app.current_customer_id', true));
 
--- query_cache: router (Haiku) output cache keyed by query hash.
--- 1-hour TTL, cleaned by a cron.
+-- ---------------------------------------------------------------------------
+-- query_cache: router (Haiku) output cache keyed by query hash. 1-hour TTL.
+-- ---------------------------------------------------------------------------
 CREATE TABLE query_cache (
     cache_key            TEXT PRIMARY KEY,
     customer_id          TEXT NOT NULL,

@@ -126,6 +126,28 @@ Required before any real customer can connect sources. Webhooks work without it 
 - [ ] Measure `/query` p95 on warm + cold Haiku cache with real corpus
 - [ ] Document any schema drift → fix in-place
 
+### Tier 13 — Onboarding completion (close Phase 0 gap vs design)
+
+Onboarding scaffolding landed in Tiers 6-7, but the historical-fetch step is a stub on every connector and the OAuth callback does not trigger backfill as the design specifies (`docs/phase0-design.md:1162`). Close these gaps before any Phase 1 pilot lands.
+
+**Current state today:**
+- `scripts/bootstrap_customer.py` provisions customer row + R2 bucket + prints 5 OAuth install URLs. Works.
+- `services/ingestion/oauth/routes.py` handles `/oauth/{source}/install` and `/oauth/{source}/callback`, persists encrypted tokens. Works, but does NOT trigger backfill — just returns an HTML "Connected" page.
+- `scripts/backfill.py` drains a connector's `backfill()` generator into R2 + `ingestion_queue`, then the normal worker loop picks up the queue rows through the same normalize → chunk → embed → upsert path as live webhooks. Works — but every handler still inherits `base.py`'s default `NotSupportedByConnector` raise, so the script short-circuits on every source.
+
+**Gap-closing work:**
+
+- [ ] **OAuth callback auto-triggers backfill.** `oauth/routes.py:90` after `save_token(token)`: enqueue a `backfill_state` row with `status=PENDING` on successful exchange; a worker drains it. Do NOT fire-and-forget via `asyncio.create_task` — Fly restarts drop in-flight tasks.
+- [ ] **Per-source `backfill()` implementations.** `handlers/base.py:164-179` defines the generator contract; every handler currently inherits the default raise. Implement in priority order: Slack (`conversations.history`, cursor = `oldest` ts) → GitHub (REST pagination, `since=` param) → Linear (GraphQL cursor) → Notion (search + pagination) → Sentry (issues list, cursor).
+- [ ] **Rate-limit handling in backfill generators.** Per-source 429 backoff — not in shared plumbing today. Add `shared/http.py` retry wrapper with exponential backoff respecting `Retry-After`, reused by all handlers' backfill paths.
+- [ ] **HNSW tuning during bulk ingest.** `SET LOCAL hnsw.ef_construction = 200` in the worker's per-transaction session when the queue row is tagged `event_type='backfill'`. Defaults degrade index quality at scale (design doc line 763).
+- [ ] **Sign OAuth `state` param.** `oauth/routes.py:13` acknowledges plain `customer_id` is a Phase 0 shortcut. HMAC-sign with a new `OAUTH_STATE_SECRET` Fly secret before Phase 1 — prevents CSRF on the callback.
+- [ ] **Multi-source parallel driver.** `scripts/backfill_all.py --customer <id>` wrapping 5 parallel subprocesses over `scripts/backfill.py`. Defer per-customer parallelism until ≥10 tenants.
+- [ ] **Operator progress surface.** `GET /admin/backfill_state?customer_id=X` returning `[{source, status, started_at, last_progress_at, events_processed}, ...]`. Unblocks "is the onboarding stuck?" without grepping structlog.
+- [ ] **Fix `bootstrap_customer.py` API-key footgun.** Current `ON CONFLICT DO UPDATE` silently rotates the API key on re-run. Either error out with "customer exists — use `--rotate-key` to overwrite" or only upsert `display_name`.
+
+**Gate:** all 5 handlers implement `backfill()`, OAuth callback wires into the queue, and one end-to-end test (bootstrap → OAuth click-through stub → ≥100 historical events processed → `/query` returns chunks from backfilled data) passes. Without this, Phase 1 pilot onboarding regresses to "operator babysits the CLI for an hour."
+
 ### Phase 0 Success Criteria
 
 Copy of the design doc's criteria. Phase 0 shippable when all hold:

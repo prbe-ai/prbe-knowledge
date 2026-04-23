@@ -6,6 +6,12 @@ Adding a new connector: create `handlers/<source>.py`, decorate the class with
 `@register_connector`, and append its module import here.
 """
 
-from services.ingestion.handlers import slack  # noqa: F401
+from services.ingestion.handlers import (
+    github,  # noqa: F401
+    linear,  # noqa: F401
+    notion,  # noqa: F401
+    sentry,  # noqa: F401
+    slack,  # noqa: F401
+)
 
 __all__: list[str] = []

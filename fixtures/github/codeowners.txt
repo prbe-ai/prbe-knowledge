@@ -1,0 +1,16 @@
+# Global fallback — payments squad owns everything by default
+*       @prbe/payments-squad
+
+# Docs are owned by the tech-writers team plus an individual reviewer
+docs/   @prbe/tech-writers @alice
+
+# Python services map to the backend team
+services/*.py   @prbe/backend-team
+
+# Comment-only line below; skip it
+# nothing-here
+    # indented comment
+
+# A blank line follows this comment
+
+/infra/terraform/   @ops-lead

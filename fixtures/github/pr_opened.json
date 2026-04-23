@@ -1,0 +1,45 @@
+{
+  "action": "opened",
+  "number": 42,
+  "pull_request": {
+    "id": 1001,
+    "number": 42,
+    "state": "open",
+    "title": "Fix payments retry loop",
+    "body": "Resolves the infinite retry loop in the payments service. Fixes #17 and relates to prbe/other#8.",
+    "html_url": "https://github.com/prbe/payments/pull/42",
+    "created_at": "2026-04-22T10:00:00Z",
+    "updated_at": "2026-04-22T10:00:00Z",
+    "user": {
+      "login": "alice",
+      "id": 501
+    },
+    "base": {
+      "ref": "main",
+      "sha": "aaaaaaa"
+    },
+    "head": {
+      "ref": "fix/payments-retry",
+      "sha": "bbbbbbb"
+    },
+    "changed_files": 3,
+    "additions": 42,
+    "deletions": 7,
+    "merged": false
+  },
+  "repository": {
+    "id": 9001,
+    "name": "payments",
+    "full_name": "prbe/payments",
+    "private": false,
+    "html_url": "https://github.com/prbe/payments",
+    "owner": {
+      "login": "prbe",
+      "id": 1
+    }
+  },
+  "sender": {
+    "login": "alice",
+    "id": 501
+  }
+}

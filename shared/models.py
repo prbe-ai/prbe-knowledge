@@ -1,9 +1,10 @@
 """Canonical Pydantic schemas. The contract every handler produces."""
 
 from datetime import datetime
-from typing import Any
+from enum import StrEnum
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from shared.constants import (
     AttachmentKind,
@@ -112,17 +113,29 @@ class Document(BaseModel):
 
 
 class Chunk(BaseModel):
+    """Content-addressable chunk row.
+
+    Identity is (doc_id, content_hash). When a doc edits and a chunk with the
+    same content still exists, the existing row's `last_seen_version` is bumped
+    instead of writing a new row — so embedding cost is proportional to what
+    actually changed, not to total chunk count.
+    """
+
     chunk_id: str
     doc_id: str
-    doc_version: int
     customer_id: str
     chunk_index: int
     content: str
+    content_hash: str
     token_count: int
     embedding: list[float]
     embedding_model: str
     embedding_dim: int
     chunker_version: str
+    first_seen_version: int
+    last_seen_version: int
+    valid_from: datetime
+    valid_to: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -138,6 +151,53 @@ class WebhookEvent(BaseModel):
     headers: dict[str, str] = Field(default_factory=dict)
 
 
+class TemporalMode(StrEnum):
+    """How retrieval should interpret document/chunk versions.
+
+    latest          — only chunks from each doc's live version (valid_to IS NULL).
+                      Default for agent queries about current state.
+    as_of           — snapshot of what was live at a point in time.
+                      Set TemporalSpec.as_of.
+    changed_between — docs whose latest version landed in [since, until).
+                      Useful for "what moved during the incident" queries.
+    all             — no temporal filter. Returns every version ever ingested.
+                      Escape hatch; not a common default.
+    """
+
+    LATEST = "latest"
+    AS_OF = "as_of"
+    CHANGED_BETWEEN = "changed_between"
+    ALL = "all"
+
+
+class TemporalSpec(BaseModel):
+    """Temporal predicate bundle passed to retrievers.
+
+    `time_basis` controls whether time-bounded modes use the source-side clock
+    (`updated_at` — "what changed in Linear") or our ingest-side clock
+    (`ingested_at` — "what our pipeline learned about"). Source is the default
+    because agents almost always want source time when asking about an incident.
+    """
+
+    mode: TemporalMode = TemporalMode.LATEST
+    as_of: datetime | None = None
+    since: datetime | None = None
+    until: datetime | None = None
+    time_basis: Literal["source", "ingest"] = "source"
+
+    @model_validator(mode="after")
+    def _check_fields_match_mode(self) -> "TemporalSpec":
+        if self.mode == TemporalMode.AS_OF and self.as_of is None:
+            raise ValueError("as_of mode requires `as_of` timestamp")
+        if self.mode == TemporalMode.CHANGED_BETWEEN and (
+            self.since is None or self.until is None
+        ):
+            raise ValueError("changed_between mode requires `since` and `until`")
+        if self.mode == TemporalMode.CHANGED_BETWEEN and self.until <= self.since:
+            raise ValueError("changed_between requires `until` > `since`")
+        return self
+
+
 class QueryRequest(BaseModel):
     query: str
     customer_id: str
@@ -145,11 +205,15 @@ class QueryRequest(BaseModel):
     sources: list[SourceSystem] | None = None
     requesting_user_id: str | None = None
     trace_id: str | None = None
+    temporal: TemporalSpec = Field(default_factory=TemporalSpec)
 
 
 class QueryChunk(BaseModel):
     chunk_id: str
     doc_id: str
+    # Which document version this chunk's content came from when first seen.
+    # Under content-addressable chunks the same chunk can span many versions;
+    # the `first_seen_version` is the stable provenance value we return.
     doc_version: int
     source_system: SourceSystem
     source_url: str
@@ -269,3 +333,16 @@ class IntegrationToken(BaseModel):
     expires_at: datetime | None = None
     scope: str | None = None
     webhook_secret: str | None = None
+
+
+class ExternalWorkspaceRef(BaseModel):
+    """A source-side workspace/team/org identifier linked to a PRBE customer.
+
+    Returned by `Connector.identify_workspaces` after OAuth token exchange.
+    Stored in `customer_source_mapping` so incoming webhooks can resolve
+    their owning customer from the payload alone (no X-Prbe-Customer header).
+    """
+
+    external_id: str
+    external_name: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)

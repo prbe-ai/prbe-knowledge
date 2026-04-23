@@ -16,7 +16,6 @@ webhook from the source.
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -24,15 +23,19 @@ from datetime import UTC, datetime
 import orjson
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
+from services.ingestion.backfill_routes import router as backfill_router
 from services.ingestion.handlers.base import make_default_context
 from services.ingestion.handlers.registry import (
     build_connector,
     get_connector_class,
     list_registered,
 )
+from services.ingestion.oauth import router as oauth_router
 from shared.config import get_settings
 from shared.constants import SourceSystem
+from shared.customer_mapping import resolve_customer, single_customer_fallback
 from shared.db import get_pool, health_check, init_pool
 from shared.exceptions import (
     HandlerNotFound,
@@ -68,6 +71,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="prbe-knowledge ingestion", lifespan=lifespan)
+# Trust X-Forwarded-Proto / X-Forwarded-For from Fly's upstream so
+# `request.url.scheme` is `https` and OAuth redirect_uri matches what we registered.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+app.include_router(oauth_router)
+app.include_router(backfill_router)
 
 
 @app.get("/health")
@@ -102,13 +110,6 @@ async def webhook(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     raw_body = await request.body()
-
-    # customer_id arrives as a header today. Future: resolve from OAuth state
-    # or install-level signing key. Phase 0 is operator-provisioned.
-    customer_id = request.headers.get("x-prbe-customer")
-    if not customer_id:
-        raise HTTPException(status_code=400, detail="missing X-Prbe-Customer header")
-
     connector = build_connector(source_enum, request.app.state.ctx)
 
     if not connector.verify_signature(dict(request.headers), raw_body):
@@ -118,6 +119,25 @@ async def webhook(
         payload = orjson.loads(raw_body) if raw_body else {}
     except orjson.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"invalid json: {exc}") from exc
+
+    # Resolve customer_id in this priority order:
+    #   1. X-Prbe-Customer header (internal callers / tests / manual routing)
+    #   2. Payload's external_id → customer_source_mapping lookup
+    #   3. single_customer_fallback (dev / solo-tenant convenience)
+    customer_id = request.headers.get("x-prbe-customer")
+    if not customer_id:
+        external_id = connector.extract_external_id_from_payload(
+            dict(request.headers), payload
+        )
+        if external_id:
+            customer_id = await resolve_customer(source_enum, external_id)
+        if not customer_id:
+            customer_id = await single_customer_fallback()
+    if not customer_id:
+        raise HTTPException(
+            status_code=400,
+            detail="could not resolve customer (no X-Prbe-Customer header, no mapping, multiple tenants exist)",
+        )
 
     try:
         parsed = connector.parse_webhook_event(
@@ -216,7 +236,3 @@ if __name__ == "__main__":  # pragma: no cover
         port=8080,
         reload=False,
     )
-
-
-# Keep asyncio import used in reload flows / background tasks.
-_ = asyncio

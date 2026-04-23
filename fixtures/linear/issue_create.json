@@ -1,0 +1,41 @@
+{
+  "action": "create",
+  "type": "Issue",
+  "createdAt": "2026-04-22T10:15:00.000Z",
+  "organizationId": "org_test",
+  "webhookId": "wh_test",
+  "url": "https://linear.app/prbe/issue/ENG-123",
+  "data": {
+    "id": "11111111-2222-3333-4444-555555555555",
+    "identifier": "ENG-123",
+    "title": "Payments service returns 500 after latest deploy",
+    "description": "The payments service is erroring for checkout flows — see [OPS-42] for related runbook and https://example.com/run/42 for logs.",
+    "priority": 1,
+    "url": "https://linear.app/prbe/issue/ENG-123",
+    "teamId": "team_eng",
+    "team": {
+      "id": "team_eng",
+      "key": "ENG",
+      "name": "Engineering"
+    },
+    "creatorId": "user_alice",
+    "creator": {
+      "id": "user_alice",
+      "name": "Alice",
+      "email": "alice@example.com"
+    },
+    "assigneeId": "user_bob",
+    "assignee": {
+      "id": "user_bob",
+      "name": "Bob",
+      "email": "bob@example.com"
+    },
+    "state": {
+      "id": "state_inprogress",
+      "name": "In Progress",
+      "type": "started"
+    },
+    "createdAt": "2026-04-22T10:15:00.000Z",
+    "updatedAt": "2026-04-22T10:15:00.000Z"
+  }
+}

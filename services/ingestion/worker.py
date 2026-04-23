@@ -91,6 +91,7 @@ class Worker:
         customer_id = row["customer_id"]
         source = SourceSystem(row["source_system"])
         event_id = row["source_event_id"]
+        payload_s3_key = row["payload_s3_key"]
         attempts = row["attempts"] + 1
 
         bind_trace(f"queue-{queue_id}")
@@ -101,15 +102,21 @@ class Worker:
                 customer_id=customer_id,
                 source_system=source,
                 source_event_id=event_id,
-                payload_s3_key=row["payload_s3_key"],
+                payload_s3_key=payload_s3_key,
             )
-            await self._mark_done(queue_id, customer_id, source, event_id, outcome)
+            await self._mark_done(
+                queue_id, customer_id, source, event_id, payload_s3_key, outcome
+            )
         except DuplicateEventIgnored as exc:
             log.info("worker.skipped", queue_id=queue_id, reason=str(exc))
-            await self._mark_skipped(queue_id, customer_id, source, event_id, str(exc))
+            await self._mark_skipped(
+                queue_id, customer_id, source, event_id, payload_s3_key, str(exc)
+            )
         except UnsupportedEventType as exc:
             log.info("worker.unsupported", queue_id=queue_id, reason=str(exc))
-            await self._mark_skipped(queue_id, customer_id, source, event_id, str(exc))
+            await self._mark_skipped(
+                queue_id, customer_id, source, event_id, payload_s3_key, str(exc)
+            )
         except PrbeError as exc:
             transient = getattr(exc, "transient", False)
             await self._on_error(queue_id, attempts, str(exc), transient=transient)
@@ -136,35 +143,34 @@ class Worker:
         customer_id: str,
         source: SourceSystem,
         event_id: str,
+        payload_s3_key: str,
         outcome,
     ) -> None:
         async with get_pool().acquire() as conn, conn.transaction():
             await conn.execute(
                 """
-                    UPDATE ingestion_queue
-                    SET status = $1, completed_at = NOW(), error = NULL
-                    WHERE queue_id = $2
-                    """,
+                UPDATE ingestion_queue
+                SET status = $1, completed_at = NOW(), error = NULL
+                WHERE queue_id = $2
+                """,
                 QueueStatus.DONE.value,
                 queue_id,
             )
             await conn.execute(
                 """
-                    INSERT INTO ingestion_events (
-                        customer_id, source_system, event_type, source_event_id,
-                        payload_s3_key, status, doc_ids_produced, processed_at,
-                        normalizer_version
-                    ) VALUES ($1, $2, 'webhook', $3,
-                              (SELECT payload_s3_key FROM ingestion_queue WHERE queue_id=$4),
-                              $5, $6, NOW(), 'v1')
-                    ON CONFLICT (customer_id, source_system, source_event_id)
-                    DO UPDATE SET status = EXCLUDED.status, processed_at = NOW(),
-                                  doc_ids_produced = EXCLUDED.doc_ids_produced
-                    """,
+                INSERT INTO ingestion_events (
+                    customer_id, source_system, event_type, source_event_id,
+                    payload_s3_key, status, doc_ids_produced, processed_at,
+                    normalizer_version
+                ) VALUES ($1, $2, 'webhook', $3, $4, $5, $6, NOW(), 'v1')
+                ON CONFLICT (customer_id, source_system, source_event_id)
+                DO UPDATE SET status = EXCLUDED.status, processed_at = NOW(),
+                              doc_ids_produced = EXCLUDED.doc_ids_produced
+                """,
                 customer_id,
                 source.value,
                 event_id,
-                queue_id,
+                payload_s3_key,
                 IngestionEventStatus.PROCESSED.value,
                 outcome.doc_ids,
             )
@@ -175,6 +181,7 @@ class Worker:
         customer_id: str,
         source: SourceSystem,
         event_id: str,
+        payload_s3_key: str,
         reason: str,
     ) -> None:
         async with get_pool().acquire() as conn:
@@ -193,9 +200,7 @@ class Worker:
                 INSERT INTO ingestion_events (
                     customer_id, source_system, event_type, source_event_id,
                     payload_s3_key, status, error, processed_at, normalizer_version
-                ) VALUES ($1, $2, 'webhook', $3,
-                          (SELECT payload_s3_key FROM ingestion_queue WHERE queue_id=$4),
-                          $5, $6, NOW(), 'v1')
+                ) VALUES ($1, $2, 'webhook', $3, $4, $5, $6, NOW(), 'v1')
                 ON CONFLICT (customer_id, source_system, source_event_id)
                 DO UPDATE SET status = EXCLUDED.status, error = EXCLUDED.error,
                               processed_at = NOW()
@@ -203,7 +208,7 @@ class Worker:
                 customer_id,
                 source.value,
                 event_id,
-                queue_id,
+                payload_s3_key,
                 IngestionEventStatus.SKIPPED.value,
                 reason,
             )
@@ -245,8 +250,59 @@ class Worker:
                 )
 
 
+class BackfillWorker:
+    """Drains backfill_state rows with status='pending'.
+
+    Runs alongside the ingestion Worker in the same process. Each claimed row
+    is handed to run_backfill which paginates the source and enqueues events
+    into ingestion_queue — where the ingestion Worker picks them up like any
+    other webhook. The two workers are independent; backfill progress does
+    not block webhook processing.
+    """
+
+    def __init__(self, ctx: ConnectorContext, poll_interval: float = 5.0) -> None:
+        self._ctx = ctx
+        self._poll_interval = poll_interval
+        self._shutdown = asyncio.Event()
+
+    async def run(self) -> None:
+        from services.ingestion.backfill_runner import (
+            claim_pending_backfill,
+            run_backfill,
+        )
+
+        log.info("backfill_worker.start")
+        while not self._shutdown.is_set():
+            claimed = await claim_pending_backfill()
+            if claimed is None:
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._shutdown.wait(), timeout=self._poll_interval
+                    )
+                continue
+
+            customer_id, source = claimed
+            bind_trace(f"backfill-{customer_id}-{source.value}")
+            try:
+                await run_backfill(self._ctx, customer_id, source)
+            except Exception:
+                log.exception(
+                    "backfill_worker.run_failed",
+                    customer=customer_id,
+                    source=source.value,
+                )
+        log.info("backfill_worker.stop")
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+
+
 async def run_worker_forever() -> None:
-    """Entry point for `python -m services.ingestion.worker`."""
+    """Entry point for `python -m services.ingestion.worker`.
+
+    Runs the ingestion drain and backfill drain concurrently. Both share the
+    same ConnectorContext + asyncpg pool.
+    """
     from shared.config import get_settings
     from shared.logging import configure_logging
 
@@ -257,14 +313,18 @@ async def run_worker_forever() -> None:
     import services.ingestion.handlers  # noqa: F401
 
     ctx = make_default_context()
-    worker = Worker(ctx, max_attempts=settings.worker_max_attempts)
+    ingestion_worker = Worker(ctx, max_attempts=settings.worker_max_attempts)
+    backfill_worker = BackfillWorker(ctx)
     log.info(
         "worker.boot",
         environment=settings.environment,
         timestamp=datetime.now(UTC).isoformat(),
     )
     try:
-        await worker.run(poll_interval=settings.worker_poll_interval_seconds)
+        await asyncio.gather(
+            ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
+            backfill_worker.run(),
+        )
     finally:
         await ctx.http.aclose()
 

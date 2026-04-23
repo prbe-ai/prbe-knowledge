@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import time
+from datetime import UTC
 
 import httpx
 import pytest
@@ -112,7 +113,7 @@ async def test_normalize_produces_document_and_graph() -> None:
     ctx = _make_ctx()
     slack = build_connector(SourceSystem.SLACK, ctx)
 
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from shared.models import WebhookEvent
 
@@ -120,7 +121,7 @@ async def test_normalize_produces_document_and_graph() -> None:
         customer_id="cust-1",
         source_system=SourceSystem.SLACK,
         source_event_id="C456:1713628800.000100",
-        received_at=datetime.now(timezone.utc),
+        received_at=datetime.now(UTC),
         payload_s3_key="raw/slack/cust-1/2026/04/22/test.json",
         raw_payload=SAMPLE_EVENT,
         headers={},
