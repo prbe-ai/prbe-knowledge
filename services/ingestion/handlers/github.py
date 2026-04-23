@@ -354,6 +354,187 @@ class GitHubConnector(Connector):
         return str(iid) if iid is not None else None
 
     # ------------------------------------------------------------------
+    # 5. backfill
+    # ------------------------------------------------------------------
+
+    async def backfill(
+        self,
+        customer_id: str,
+        token: IntegrationToken,
+        cursor: str | None = None,
+    ):
+        """Historical GitHub backfill — walks installation repos, PRs, and issues.
+
+        Assumes `token.access_token` is a valid GitHub App installation token
+        (bearer). We do not mint it here; the caller is responsible.
+
+        Resumable via the `cursor` arg: an opaque JSON blob capturing which
+        repos remain, the current repo + phase (pulls/issues), and the next
+        page URL. Yields synthetic WebhookEvents shaped like live webhook
+        deliveries so the normalizer has one code path.
+        """
+        import asyncio as _asyncio
+        import json as _json
+
+        import httpx
+
+        from shared.models import WebhookEvent
+
+        state = _decode_github_cursor(cursor)
+        auth_headers = {
+            "Authorization": f"Bearer {token.access_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+
+        if not state["repos_remaining"] and state["current_repo"] is None:
+            state["repos_remaining"] = await _list_installation_repos(
+                self.http, auth_headers
+            )
+
+        repo_objs: dict[str, Mapping[str, Any]] = state.get("repo_objs") or {}
+
+        while state["current_repo"] or state["repos_remaining"]:
+            if state["current_repo"] is None:
+                next_repo = state["repos_remaining"].pop(0)
+                if isinstance(next_repo, dict):
+                    full_name = next_repo.get("full_name")
+                    if not full_name:
+                        continue
+                    repo_objs[full_name] = next_repo
+                    state["current_repo"] = full_name
+                else:
+                    state["current_repo"] = next_repo
+                state["current_phase"] = "pulls"
+                state["next_url"] = (
+                    f"{_GITHUB_API}/repos/{state['current_repo']}/pulls"
+                    "?state=all&sort=updated&direction=desc&per_page=100"
+                )
+                state["repo_objs"] = repo_objs
+
+            full_name = state["current_repo"]
+            repo = repo_objs.get(full_name) or {"full_name": full_name}
+
+            url = state["next_url"]
+            if not url:
+                if state["current_phase"] == "pulls":
+                    state["current_phase"] = "issues"
+                    state["next_url"] = (
+                        f"{_GITHUB_API}/repos/{full_name}/issues"
+                        "?state=all&sort=updated&direction=desc&per_page=100"
+                    )
+                    continue
+                state["current_repo"] = None
+                state["current_phase"] = "pulls"
+                state["next_url"] = None
+                repo_objs.pop(full_name, None)
+                state["repo_objs"] = repo_objs
+                continue
+
+            try:
+                resp = await self.http.get(url, headers=auth_headers)
+            except httpx.HTTPError as exc:
+                log.warning(
+                    "github.backfill_http_error",
+                    repo=full_name,
+                    phase=state["current_phase"],
+                    error=str(exc),
+                )
+                state["next_url"] = None
+                continue
+
+            if resp.status_code == 429 or (
+                resp.status_code == 403
+                and resp.headers.get("x-ratelimit-remaining") == "0"
+            ):
+                # Respect GitHub's rate-limit backoff: honor retry-after if
+                # present, else compute delta from x-ratelimit-reset (unix ts).
+                retry_after = resp.headers.get("retry-after")
+                if retry_after is not None:
+                    try:
+                        delay = int(retry_after)
+                    except ValueError:
+                        delay = 5
+                else:
+                    reset = resp.headers.get("x-ratelimit-reset")
+                    try:
+                        delay = max(
+                            int(float(reset)) - int(datetime.now(UTC).timestamp()), 1
+                        ) if reset else 5
+                    except ValueError:
+                        delay = 5
+                await _asyncio.sleep(max(delay, 1))
+                continue
+
+            if resp.status_code != 200:
+                log.warning(
+                    "github.backfill_non_200",
+                    repo=full_name,
+                    phase=state["current_phase"],
+                    status=resp.status_code,
+                )
+                state["next_url"] = None
+                continue
+
+            rows = resp.json()
+            if not isinstance(rows, list):
+                state["next_url"] = None
+                continue
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if state["current_phase"] == "pulls":
+                    number = row.get("number")
+                    updated_at = row.get("updated_at")
+                    if number is None or not updated_at:
+                        continue
+                    raw_payload = {
+                        "action": "opened",
+                        "repository": repo,
+                        "pull_request": row,
+                        "_cursor": _json.dumps(state),
+                    }
+                    source_event_id = f"pr:{full_name}:{number}:opened:{updated_at}"
+                    yield WebhookEvent(
+                        customer_id=customer_id,
+                        source_system=SourceSystem.GITHUB,
+                        source_event_id=source_event_id,
+                        received_at=_parse_iso8601(updated_at),
+                        payload_s3_key="",
+                        raw_payload=raw_payload,
+                        headers={"X-GitHub-Event": _EVENT_PULL_REQUEST},
+                    )
+                else:
+                    # GitHub's /issues endpoint returns PRs as issues (with a
+                    # `pull_request` field). Skip those — they're covered in
+                    # the pulls phase above.
+                    if row.get("pull_request") is not None:
+                        continue
+                    number = row.get("number")
+                    updated_at = row.get("updated_at")
+                    if number is None or not updated_at:
+                        continue
+                    raw_payload = {
+                        "action": "opened",
+                        "repository": repo,
+                        "issue": row,
+                        "_cursor": _json.dumps(state),
+                    }
+                    source_event_id = f"issue:{full_name}:{number}:opened:{updated_at}"
+                    yield WebhookEvent(
+                        customer_id=customer_id,
+                        source_system=SourceSystem.GITHUB,
+                        source_event_id=source_event_id,
+                        received_at=_parse_iso8601(updated_at),
+                        payload_s3_key="",
+                        raw_payload=raw_payload,
+                        headers={"X-GitHub-Event": _EVENT_ISSUES},
+                    )
+
+            state["next_url"] = _next_link(resp)
+
+    # ------------------------------------------------------------------
     # 4. normalization
     # ------------------------------------------------------------------
 
@@ -794,6 +975,67 @@ class GitHubConnector(Connector):
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+
+
+async def _list_installation_repos(http, headers: dict[str, str]) -> list[dict]:
+    """Enumerate repositories the installation can access. Paginated."""
+    repos: list[dict] = []
+    url: str | None = (
+        f"{_GITHUB_API}/installation/repositories?per_page=100"
+    )
+    while url:
+        try:
+            resp = await http.get(url, headers=headers)
+        except Exception as exc:
+            log.warning("github.list_repos_error", error=str(exc))
+            return repos
+        if resp.status_code != 200:
+            return repos
+        body = resp.json()
+        page_repos = body.get("repositories") if isinstance(body, dict) else None
+        if isinstance(page_repos, list):
+            for r in page_repos:
+                if isinstance(r, dict) and r.get("full_name"):
+                    repos.append(r)
+        url = _next_link(resp)
+    return repos
+
+
+def _next_link(resp) -> str | None:
+    """Parse a GitHub Link header for the `rel="next"` URL."""
+    link_header = resp.headers.get("link") or resp.headers.get("Link")
+    if not link_header:
+        return None
+    for part in link_header.split(","):
+        part = part.strip()
+        if 'rel="next"' not in part:
+            continue
+        if part.startswith("<") and ">" in part:
+            return part.split(">", 1)[0][1:]
+    return None
+
+
+def _decode_github_cursor(cursor: str | None) -> dict:
+    import json as _json
+
+    default = {
+        "repos_remaining": [],
+        "current_repo": None,
+        "current_phase": "pulls",
+        "next_url": None,
+        "repo_objs": {},
+    }
+    if not cursor:
+        return default
+    try:
+        parsed = _json.loads(cursor)
+    except _json.JSONDecodeError:
+        return default
+    if not isinstance(parsed, dict):
+        return default
+    for key, value in default.items():
+        parsed.setdefault(key, value)
+    return parsed
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:

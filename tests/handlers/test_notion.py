@@ -293,12 +293,6 @@ def test_verify_signature_dev_bypass() -> None:
     assert notion.verify_signature({}, b"{}") is True
 
 
-def test_verify_signature_synthetic_poll_accepted_with_customer_header() -> None:
-    ctx = _make_ctx(env="main")
-    notion = build_connector(SourceSystem.NOTION, ctx)
-    assert notion.verify_signature({"X-Prbe-Customer": "cust-1"}, b"{}") is True
-
-
 def test_verify_signature_prod_rejects_unsigned_unknown_caller() -> None:
     ctx = _make_ctx(env="main")
     notion = build_connector(SourceSystem.NOTION, ctx)

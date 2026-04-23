@@ -370,6 +370,105 @@ async def test_sentry_backfill_paginates_issues() -> None:
     }
 
 
+# -------------------------------- github -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_github_backfill_paginates_repos_pulls_and_issues() -> None:
+    """GitHub: list installation repos, then pulls + issues per repo. Issue-shaped PRs filtered."""
+
+    def installation_repos(req):
+        return httpx.Response(
+            200,
+            json={
+                "repositories": [
+                    {
+                        "full_name": "acme/api",
+                        "name": "api",
+                        "owner": {"login": "acme"},
+                        "private": True,
+                    },
+                    {
+                        "full_name": "acme/web",
+                        "name": "web",
+                        "owner": {"login": "acme"},
+                        "private": False,
+                    },
+                ]
+            },
+        )
+
+    def api_pulls(req):
+        return httpx.Response(
+            200,
+            json=[
+                {"number": 1, "updated_at": "2026-04-01T00:00:00Z", "title": "pr1"},
+                {"number": 2, "updated_at": "2026-04-02T00:00:00Z", "title": "pr2"},
+            ],
+        )
+
+    def api_issues(req):
+        return httpx.Response(
+            200,
+            json=[
+                {"number": 10, "updated_at": "2026-04-03T00:00:00Z", "title": "issue"},
+                # Issue-shaped PR — must be filtered out by the backfill.
+                {
+                    "number": 11,
+                    "updated_at": "2026-04-04T00:00:00Z",
+                    "title": "pr-as-issue",
+                    "pull_request": {"url": "..."},
+                },
+            ],
+        )
+
+    def web_pulls(req):
+        return httpx.Response(
+            200,
+            json=[
+                {"number": 3, "updated_at": "2026-04-05T00:00:00Z", "title": "pr3"},
+            ],
+        )
+
+    def web_issues(req):
+        return httpx.Response(200, json=[])
+
+    transport = _mock_transport(
+        {
+            ("GET", "/installation/repositories"): installation_repos,
+            ("GET", "/repos/acme/api/pulls"): api_pulls,
+            ("GET", "/repos/acme/api/issues"): api_issues,
+            ("GET", "/repos/acme/web/pulls"): web_pulls,
+            ("GET", "/repos/acme/web/issues"): web_issues,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.GITHUB, access_token="x"
+    )
+
+    events = [e async for e in gh.backfill("cust", token)]
+
+    # 3 PRs + 1 issue = 4 events; the issue-shaped PR was filtered.
+    assert len(events) == 4
+
+    pr_events = [e for e in events if e.headers.get("X-GitHub-Event") == "pull_request"]
+    issue_events = [e for e in events if e.headers.get("X-GitHub-Event") == "issues"]
+    assert len(pr_events) == 3
+    assert len(issue_events) == 1
+
+    # Confirm the issue-shaped PR (number=11) was filtered.
+    issue_numbers = {e.raw_payload["issue"]["number"] for e in issue_events}
+    assert issue_numbers == {10}
+
+    pr_numbers = {e.raw_payload["pull_request"]["number"] for e in pr_events}
+    assert pr_numbers == {1, 2, 3}
+
+
 # --------------------- backfill status endpoint -----------------------------
 
 

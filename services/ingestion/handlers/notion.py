@@ -250,17 +250,11 @@ class NotionConnector(Connector):
         if self.settings.is_local:
             return True
 
-        secret = self.settings.notion_client_secret
         sig = _header(headers, "x-notion-signature")
-
-        # Synthetic poll path: trusted internal caller, no signature.
-        # The ingestion service is responsible for authenticating the caller
-        # (validating X-Prbe-Customer against an internal shared secret)
-        # before we ever reach this connector; we accept here when the
-        # request lacks a Notion signature AND there's a customer header.
         if sig is None:
-            return _header(headers, "x-prbe-customer") is not None
+            return False
 
+        secret = self.settings.notion_client_secret
         if secret is None:
             return False
 
