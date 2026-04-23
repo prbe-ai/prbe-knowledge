@@ -139,9 +139,12 @@ class SlackConnector(Connector):
         # so repeated edits of the same message don't collide on the UNIQUE
         # (customer_id, source_system, source_event_id) constraint.
         if subtype == "message_changed":
-            inner = event.get("message") or {}
+            inner = event.get("message")
+            if not isinstance(inner, dict):
+                raise InvalidWebhookPayload("message_changed missing 'message'")
             msg_ts = inner.get("ts")
-            event_ts = event.get("event_ts") or inner.get("edited", {}).get("ts")
+            edited = inner.get("edited") or {}
+            event_ts = event.get("event_ts") or edited.get("ts") or msg_ts
             if not msg_ts or not event_ts:
                 raise InvalidWebhookPayload("slack message_changed missing ts/event_ts")
             return WebhookParseResult(
@@ -160,9 +163,8 @@ class SlackConnector(Connector):
         # Deletes arrive as subtype=message_deleted with the original ts under
         # event.deleted_ts (and the full prior message under event.previous_message).
         if subtype == "message_deleted":
-            deleted_ts = event.get("deleted_ts") or (
-                event.get("previous_message") or {}
-            ).get("ts")
+            previous = event.get("previous_message") or {}
+            deleted_ts = event.get("deleted_ts") or previous.get("ts")
             event_ts = event.get("event_ts") or deleted_ts
             if not deleted_ts or not event_ts:
                 raise InvalidWebhookPayload("slack message_deleted missing deleted_ts")
@@ -174,6 +176,7 @@ class SlackConnector(Connector):
                     "subtype": "message_deleted",
                     "channel": channel,
                     "ts": deleted_ts,
+                    "thread_ts": previous.get("thread_ts"),
                     "team_id": team_id,
                 },
             )
@@ -247,25 +250,30 @@ class SlackConnector(Connector):
     ) -> NormalizationResult:
         outer = event.raw_payload.get("event", {})
         subtype = outer.get("subtype")
+        is_edit = subtype == "message_changed"
+        is_delete = subtype == "message_deleted"
         team_id = event.raw_payload.get("team_id", "")
         channel = outer.get("channel")
 
         # For edits, the authoritative message is under `message`. For deletes,
         # `previous_message` is what we had before. For plain messages, the
         # event itself is the message.
-        if subtype == "message_changed":
+        if is_edit:
             msg = outer.get("message") or {}
-        elif subtype == "message_deleted":
+        elif is_delete:
             msg = outer.get("previous_message") or {}
         else:
             msg = outer
 
+        if not channel:
+            channel = msg.get("channel")
+
         ts = msg.get("ts") or outer.get("ts") or outer.get("deleted_ts")
-        if subtype == "message_deleted" and not ts:
+        if is_delete and not ts:
             ts = outer.get("deleted_ts")
 
         user = msg.get("user") or msg.get("bot_id") or "unknown"
-        text = msg.get("text") or ""
+        text = "" if is_delete else (msg.get("text") or "")
         thread_ts = msg.get("thread_ts")
 
         if not channel or not ts:
@@ -274,14 +282,16 @@ class SlackConnector(Connector):
         doc_id = f"slack:{team_id}:{channel}:{ts}"
         source_url = self._permalink(team_id, channel, ts)
         created = _ts_to_datetime(ts)
+        # Edits/deletes come in after the original — use the event's received_at
+        # as the mutation clock so valid_from on the new version is monotonic.
+        updated = event.received_at if (is_edit or is_delete) else created
+        valid_from = updated
 
-        # For deletes, body is empty and deleted_at marks the tombstone.
-        # The content_hash MUST differ from the prior live version so the
-        # normalizer writes a new version and marks old chunks stale via diff.
-        deleted_at: datetime | None = None
-        if subtype == "message_deleted":
-            text = ""
-            deleted_at = event.received_at
+        if is_delete:
+            # For deletes, body is empty (text already cleared above) and
+            # deleted_at marks the tombstone. The content_hash MUST differ
+            # from the prior live version's hash — otherwise the content-hash
+            # no-op guard in _upsert_document would wrongly skip the delete.
             content_hash = _sha256(f"{doc_id}|__deleted__|{event.received_at.isoformat()}")
         else:
             content_hash = _sha256(
@@ -314,9 +324,9 @@ class SlackConnector(Connector):
             body_token_count=count_tokens(text),
             author_id=user,
             created_at=created,
-            updated_at=event.received_at,
-            valid_from=event.received_at,
-            deleted_at=deleted_at,
+            updated_at=updated,
+            valid_from=valid_from,
+            deleted_at=event.received_at if is_delete else None,
             ingested_at=datetime.now(UTC),
             parent_doc_id=(
                 f"slack:{team_id}:{channel}:{thread_ts}"
@@ -329,7 +339,8 @@ class SlackConnector(Connector):
                 "team_id": team_id,
                 "channel_id": channel,
                 "thread_ts": thread_ts,
-                "edited": bool(msg.get("edited")),
+                "edited": bool(msg.get("edited")) or is_edit,
+                "deleted": is_delete,
                 "reactions": msg.get("reactions", []),
             },
             doc_references=_references_from_text(text),

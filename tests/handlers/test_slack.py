@@ -54,6 +54,65 @@ def test_parse_webhook_event_valid_message() -> None:
     assert result.source_event_id == "C456:1713628800.000100"
     assert result.parse_hint["channel"] == "C456"
     assert result.parse_hint["team_id"] == "T123"
+    # Plain messages carry subtype=None in the hint so the normalizer can
+    # distinguish them from edits/deletes without re-parsing.
+    assert result.parse_hint["subtype"] is None
+
+
+def test_parse_webhook_event_message_changed_produces_edit_id() -> None:
+    ctx = _make_ctx()
+    slack = build_connector(SourceSystem.SLACK, ctx)
+
+    edit = {
+        "team_id": "T123",
+        "type": "event_callback",
+        "event": {
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "C456",
+            "event_ts": "1713629000.000400",
+            "message": {
+                "type": "message",
+                "channel": "C456",
+                "user": "U789",
+                "text": "edited body",
+                "ts": "1713628800.000100",
+                "edited": {"user": "U789", "ts": "1713629000.000300"},
+            },
+        },
+    }
+    result = slack.parse_webhook_event("cust-1", {}, edit)
+    assert result is not None
+    assert result.source_event_id == "C456:1713628800.000100:edit:1713629000.000400"
+    assert result.parse_hint["subtype"] == "message_changed"
+    assert result.parse_hint["ts"] == "1713628800.000100"
+
+
+def test_parse_webhook_event_message_deleted_produces_delete_id() -> None:
+    ctx = _make_ctx()
+    slack = build_connector(SourceSystem.SLACK, ctx)
+
+    delete = {
+        "team_id": "T123",
+        "type": "event_callback",
+        "event": {
+            "type": "message",
+            "subtype": "message_deleted",
+            "channel": "C456",
+            "event_ts": "1713629500.000100",
+            "deleted_ts": "1713628800.000100",
+            "previous_message": {
+                "type": "message",
+                "user": "U789",
+                "text": "will be gone",
+                "ts": "1713628800.000100",
+            },
+        },
+    }
+    result = slack.parse_webhook_event("cust-1", {}, delete)
+    assert result is not None
+    assert result.source_event_id == "C456:1713628800.000100:delete:1713629500.000100"
+    assert result.parse_hint["subtype"] == "message_deleted"
 
 
 def test_parse_webhook_event_ignores_noise() -> None:

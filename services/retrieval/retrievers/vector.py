@@ -33,7 +33,9 @@ async def vector_search(
     """Embed `query_text`, ANN-search against chunks, return top_k hits.
 
     Score is cosine similarity (1 - cosine distance) so higher is better.
-    Default temporal mode is `latest` (live doc + live chunk only).
+
+    `temporal` controls which versions of each doc are considered. Defaults
+    to TemporalSpec() = latest-live.
     """
     embedder = get_embedder()
     query_vec = await embedder.embed_query(query_text)

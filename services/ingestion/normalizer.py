@@ -3,35 +3,34 @@
 Generic across all connectors. Pulls the raw payload from R2, asks the
 right Connector to parse/hydrate/normalize, then persists everything.
 
-Persistence semantics:
+Called from the worker per queue row. Idempotent: running the same payload
+twice produces the same database state.
 
-- Docs are versioned. A new version bump closes out the prior version
-  (sets `valid_to = NOW()`, `supersedes_doc_id = $doc_id`).
-- Chunks are content-addressable. Identity is (doc_id, content_hash).
-  On re-ingest of an edited doc, chunks are reconciled as a three-way diff:
-    • reused (content still present) → bump `last_seen_version`, no embed call
-    • added  (new content)           → insert row, embed
-    • removed (no longer present)    → mark `valid_to = NOW()` (stale)
-- Tombstone path: when a doc arrives with `deleted_at` set, skip chunking;
-  the diff naturally marks every live chunk stale (empty-new-set).
+Persistence is content-addressable + bitemporal:
 
-Idempotency:
-- Same `content_hash` on the doc → no-op (no version bump).
-- Same chunk `content_hash` across versions → existing chunk row is reused.
-- The UNIQUE constraint on `ingestion_queue` dedupes webhook redelivery.
+- Documents use `valid_to` to close out the prior live version on edit.
+  `_upsert_document` detects no-op (content_hash match, not a delete)
+  and returns False without bumping version.
+- Chunks live at identity `(doc_id, content_hash)`. On re-ingest we diff
+  (live chunks ⟵ new chunks) — reused chunks just have `last_seen_version`
+  bumped (no embedding call), new chunks are embedded + inserted,
+  removed chunks get `valid_to = NOW()`.
+
+That's the bit that keeps embedding cost proportional to actual content
+change rather than the size of the document.
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 import asyncpg
 import orjson
 
-from services.ingestion.chunker import chunk_text
+from services.ingestion.chunker import ChunkPiece, chunk_text
 from services.ingestion.graph_writer import upsert_edges, upsert_nodes
 from services.ingestion.handlers.base import Connector, ConnectorContext
 from services.ingestion.handlers.registry import build_connector
@@ -66,11 +65,13 @@ log = get_logger(__name__)
 @dataclass(slots=True)
 class NormalizeOutcome:
     doc_ids: list[str]
-    chunk_count: int          # chunks that are live (added + reused)
-    added_chunk_count: int    # newly-embedded this run
-    reused_chunk_count: int   # matched an existing row, no embed call
-    removed_chunk_count: int  # marked stale this run
+    # Live chunks after the diff (added + reused). Not a version-count.
+    chunk_count: int
     failed_chunk_count: int
+    added_chunk_count: int = 0
+    reused_chunk_count: int = 0
+    removed_chunk_count: int = 0
+    stale_doc_ids: list[str] = field(default_factory=list)
 
 
 class Normalizer:
@@ -148,7 +149,7 @@ class Normalizer:
         self, customer_id: str, result: NormalizationResult
     ) -> NormalizeOutcome:
         doc_ids: list[str] = []
-        total_live = 0
+        total_live_chunks = 0
         total_added = 0
         total_reused = 0
         total_removed = 0
@@ -163,92 +164,77 @@ class Normalizer:
             for doc in result.documents:
                 persisted = await _upsert_document(conn, doc)
                 if not persisted:
-                    continue  # content_hash match → no new version, no chunk work
+                    continue  # content_hash match on live version → no-op
                 doc_ids.append(doc.doc_id)
 
-                # Deleted doc → no chunks in the new set. The diff below will
-                # mark every previously-live chunk as removed.
-                new_chunks = [] if doc.deleted_at else chunk_text(_stringify_body(doc))
-
-                diff = await self._sync_chunks(conn, doc, new_chunks)
-                total_live += diff.live_count
-                total_added += diff.added_count
-                total_reused += diff.reused_count
-                total_removed += diff.removed_count
-                total_failed += diff.failed_count
+                sync_outcome = await self._sync_chunks(conn, doc)
+                total_live_chunks += sync_outcome.live
+                total_added += sync_outcome.added
+                total_reused += sync_outcome.reused
+                total_removed += sync_outcome.removed
+                total_failed += sync_outcome.failed
 
         log.info(
             "normalizer.done",
             customer=customer_id,
             docs=len(doc_ids),
-            chunks_live=total_live,
-            chunks_added=total_added,
-            chunks_reused=total_reused,
-            chunks_removed=total_removed,
-            chunks_failed=total_failed,
+            live_chunks=total_live_chunks,
+            added=total_added,
+            reused=total_reused,
+            removed=total_removed,
+            failed_chunks=total_failed,
         )
         return NormalizeOutcome(
             doc_ids=doc_ids,
-            chunk_count=total_live,
+            chunk_count=total_live_chunks,
+            failed_chunk_count=total_failed,
             added_chunk_count=total_added,
             reused_chunk_count=total_reused,
             removed_chunk_count=total_removed,
-            failed_chunk_count=total_failed,
         )
 
     async def _sync_chunks(
-        self,
-        conn: asyncpg.Connection,
-        doc: Document,
-        new_chunks: list,
-    ) -> _ChunkDiffOutcome:
-        """Three-way diff on chunks for a doc version bump.
+        self, conn: asyncpg.Connection, doc: Document
+    ) -> _ChunkSyncOutcome:
+        """Diff live chunks against freshly-chunked content.
 
-        Matches new chunks to live rows by (doc_id, content_hash).
-        Only unmatched chunks get embedded; stale rows are marked valid_to.
+        The whole point: don't re-embed what hasn't changed.
         """
-        new_by_hash: dict[str, Any] = {}
-        for piece in new_chunks:
-            h = _chunk_hash(piece.content)
-            # First occurrence wins in case the chunker produced duplicates.
-            new_by_hash.setdefault(h, piece)
+        # Deleted docs: no body → chunks is empty → every live chunk gets closed out.
+        if doc.deleted_at is not None:
+            new_pieces: list[ChunkPiece] = []
+        else:
+            new_pieces = chunk_text(_stringify_body(doc))
 
-        # Pull currently-live chunks for this doc. If the chunker version
-        # changed since the last write, we can't trust the hashes — force
-        # a full re-embed by treating nothing as reused.
+        new_hashes: list[str] = [_chunk_hash(p.content) for p in new_pieces]
+        new_by_hash: dict[str, ChunkPiece] = {h: p for h, p in zip(new_hashes, new_pieces, strict=True)}
+
         live_rows = await conn.fetch(
             """
-            SELECT chunk_id, content_hash, chunker_version
+            SELECT content_hash, chunker_version, chunk_index
             FROM chunks
-            WHERE doc_id = $1 AND customer_id = $2 AND valid_to IS NULL
+            WHERE doc_id = $1 AND valid_to IS NULL
             """,
             doc.doc_id,
-            doc.customer_id,
         )
-        live_by_hash: dict[str, asyncpg.Record] = {}
-        stale_mismatched_chunker: list[str] = []
-        for r in live_rows:
-            if r["chunker_version"] != CHUNKER_VERSION:
-                stale_mismatched_chunker.append(r["chunk_id"])
-                continue
-            live_by_hash[r["content_hash"]] = r
 
-        # Mark chunks that were produced by a different chunker version as stale.
-        # They can't be reliably diffed — the new chunker may have sliced content
-        # differently so hashes aren't comparable across versions.
-        if stale_mismatched_chunker:
-            await conn.execute(
-                "UPDATE chunks SET valid_to = NOW() WHERE chunk_id = ANY($1::text[])",
-                stale_mismatched_chunker,
-            )
+        # A chunk produced by an older chunker version is never "reused" — its
+        # hash space isn't comparable to naive-v1's, so we mark it stale up front
+        # and let the diff treat it as removed.
+        live_hashes: set[str] = set()
+        stale_hashes: set[str] = set()
+        for row in live_rows:
+            if row["chunker_version"] == CHUNKER_VERSION:
+                live_hashes.add(row["content_hash"])
+            else:
+                stale_hashes.add(row["content_hash"])
 
-        new_hashes = set(new_by_hash)
-        live_hashes = set(live_by_hash)
-        reused_hashes = new_hashes & live_hashes
-        added_hashes = new_hashes - live_hashes
-        removed_hashes = live_hashes - new_hashes
+        new_hashes_set = set(new_hashes)
+        reused_hashes = live_hashes & new_hashes_set
+        added_hashes = new_hashes_set - live_hashes
+        removed_hashes = (live_hashes - new_hashes_set) | stale_hashes
 
-        # Bump last_seen_version on reused chunks — cheap, no embed call.
+        # 1) Reuse: just bump last_seen_version. No embed call.
         if reused_hashes:
             await conn.execute(
                 """
@@ -261,7 +247,28 @@ class Normalizer:
                 list(reused_hashes),
             )
 
-        # Mark removed chunks stale.
+        # 2) Added: embed + insert. Position inputs by their order in `added`
+        # and pair back via the embedder's `chunk_index` which equals input index.
+        added_pieces: list[ChunkPiece] = [new_by_hash[h] for h in new_hashes if h in added_hashes]
+
+        failed = 0
+        if added_pieces:
+            embeds = await self._embedder.embed_many([p.content for p in added_pieces])
+            for match in embeds.embedded:
+                if match.chunk_index < 0 or match.chunk_index >= len(added_pieces):
+                    continue
+                piece = added_pieces[match.chunk_index]
+                await _insert_chunk(conn, doc, piece, match.embedding)
+            for fail in embeds.failed:
+                # Map back to the originating piece to record chunk_index on failure.
+                if 0 <= fail.chunk_index < len(added_pieces):
+                    piece = added_pieces[fail.chunk_index]
+                else:
+                    piece = None
+                await _insert_failed_chunk(conn, doc, fail, piece)
+                failed += 1
+
+        # 3) Removed: mark stale at NOW().
         if removed_hashes:
             await conn.execute(
                 """
@@ -273,49 +280,12 @@ class Normalizer:
                 list(removed_hashes),
             )
 
-        # Embed and insert only the added chunks. The embedder indexes by
-        # position in the input list (not by the chunker's chunk_index), so
-        # we pair added_pieces with embed results positionally.
-        added_pieces = [new_by_hash[h] for h in added_hashes]
-        added_count = 0
-        failed_count = 0
-
-        if added_pieces:
-            embeds = await self._embedder.embed_many(
-                [p.content for p in added_pieces]
-            )
-            embed_by_input_idx = {e.chunk_index: e for e in embeds.embedded}
-            failed_input_idxs = {f.chunk_index for f in embeds.failed}
-            for input_idx, piece in enumerate(added_pieces):
-                if input_idx in failed_input_idxs:
-                    continue
-                match = embed_by_input_idx.get(input_idx)
-                if match is None:
-                    continue
-                await _insert_chunk(conn, doc, piece, match.embedding)
-                added_count += 1
-            for failed in embeds.failed:
-                # failed.chunk_index is the input-list index into added_pieces;
-                # translate back to the chunker's chunk_index for the audit row.
-                if 0 <= failed.chunk_index < len(added_pieces):
-                    orig = added_pieces[failed.chunk_index]
-                    audit = type(failed)(
-                        chunk_index=orig.chunk_index,
-                        content_preview=failed.content_preview,
-                        error=failed.error,
-                    )
-                    await _insert_failed_chunk(conn, doc, audit)
-                else:
-                    await _insert_failed_chunk(conn, doc, failed)
-                failed_count += 1
-
-        live_count = len(reused_hashes) + added_count
-        return _ChunkDiffOutcome(
-            live_count=live_count,
-            added_count=added_count,
-            reused_count=len(reused_hashes),
-            removed_count=len(removed_hashes) + len(stale_mismatched_chunker),
-            failed_count=failed_count,
+        return _ChunkSyncOutcome(
+            added=len(added_pieces) - failed,
+            reused=len(reused_hashes),
+            removed=len(removed_hashes),
+            failed=failed,
+            live=len(reused_hashes) + (len(added_pieces) - failed),
         )
 
     # ---- helpers ------------------------------------------------------------
@@ -352,59 +322,44 @@ class Normalizer:
 
 
 @dataclass(slots=True)
-class _ChunkDiffOutcome:
-    live_count: int
-    added_count: int
-    reused_count: int
-    removed_count: int
-    failed_count: int
+class _ChunkSyncOutcome:
+    added: int
+    reused: int
+    removed: int
+    failed: int
+    live: int
 
 
 # ---- SQL helpers (module-level so tests can unit-test them) ---------------
 
 
 async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
-    """Insert a new document version if content_hash changed.
+    """Insert a new document version if content changed.
 
-    Side effects when a new version is written:
-    - Prior live version (if any) has `valid_to = NOW()` and
-      `supersedes_doc_id = doc.doc_id` set in the same transaction.
-    - `doc.version` is mutated in place to the version number actually written.
+    Returns True if a new (doc_id, version) row was written (and the prior
+    live version was closed out), False if this payload matches the current
+    live version's content_hash and isn't a delete (i.e. no-op).
 
-    Returns True iff a new (doc_id, version) was written.
+    Mutates `doc.version` to the newly-written version so callers can use it
+    when writing chunks.
     """
     existing = await conn.fetchrow(
         """
-        SELECT version, content_hash FROM documents
+        SELECT version, content_hash
+        FROM documents
         WHERE doc_id = $1 AND customer_id = $2 AND valid_to IS NULL
-        ORDER BY version DESC
         LIMIT 1
         """,
         doc.doc_id,
         doc.customer_id,
     )
 
-    if existing and existing["content_hash"] == doc.content_hash and not doc.deleted_at:
+    if existing and existing["content_hash"] == doc.content_hash and doc.deleted_at is None:
+        # Same content, not a delete → idempotent no-op.
         return False
 
-    # There may be a prior version row with valid_to already set (from a
-    # chain-of-edits history); we need the latest version number to bump.
-    last_version = await conn.fetchval(
-        """
-        SELECT MAX(version) FROM documents
-        WHERE doc_id = $1 AND customer_id = $2
-        """,
-        doc.doc_id,
-        doc.customer_id,
-    )
-    next_version = (last_version or 0) + 1
-
-    # Close out the prior live version in the same transaction. We only touch
-    # valid_to here — supersedes_doc_id is reserved for chain-breaking scenarios
-    # (source deletes item X, recreates with new source_id) where the connector
-    # sets it explicitly. Within-doc_id version bumps don't need it because the
-    # (doc_id, version) primary key already links the chain.
-    if existing:
+    if existing is not None:
+        # Close out the prior live version in the same transaction.
         await conn.execute(
             """
             UPDATE documents
@@ -414,6 +369,23 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
             doc.doc_id,
             existing["version"],
         )
+        next_version = existing["version"] + 1
+        # Link the new version to the one it supersedes, if not already.
+        if doc.supersedes_doc_id is None:
+            doc.supersedes_doc_id = doc.doc_id
+    else:
+        # Take the MAX in case there are pre-existing non-live versions (e.g.
+        # from a previously tombstoned doc that's being re-created).
+        max_version = await conn.fetchval(
+            """
+            SELECT COALESCE(MAX(version), 0)
+            FROM documents
+            WHERE doc_id = $1 AND customer_id = $2
+            """,
+            doc.doc_id,
+            doc.customer_id,
+        )
+        next_version = int(max_version or 0) + 1
 
     await conn.execute(
         """
@@ -479,16 +451,9 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
 async def _insert_chunk(
     conn: asyncpg.Connection,
     doc: Document,
-    piece: Any,
+    piece: ChunkPiece,
     embedding: list[float],
 ) -> None:
-    """Insert a chunk row. Identity is (doc_id, content_hash).
-
-    Under normal operation the UNIQUE (doc_id, content_hash) shouldn't fire —
-    the diff algorithm only routes to this function for chunks that aren't
-    in the live set. ON CONFLICT handles the race where two workers ingest
-    overlapping doc versions concurrently.
-    """
     content_hash = _chunk_hash(piece.content)
     chunk_id = f"{doc.doc_id}:c_{content_hash[:16]}"
     await conn.execute(
@@ -525,8 +490,9 @@ async def _insert_chunk(
 
 
 async def _insert_failed_chunk(
-    conn: asyncpg.Connection, doc: Document, failed: Any
+    conn: asyncpg.Connection, doc: Document, failed: Any, piece: ChunkPiece | None = None
 ) -> None:
+    chunk_index = piece.chunk_index if piece is not None else failed.chunk_index
     await conn.execute(
         """
         INSERT INTO failed_chunks
@@ -536,7 +502,7 @@ async def _insert_failed_chunk(
         doc.customer_id,
         doc.doc_id,
         doc.version,
-        failed.chunk_index,
+        chunk_index,
         failed.content_preview,
         failed.error,
     )
@@ -573,10 +539,6 @@ async def _insert_acl_snapshots(
 # ---- formatting helpers --------------------------------------------------
 
 
-def _chunk_hash(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
-
-
 def _json(obj: Any) -> str:
     return orjson.dumps(obj, default=_json_default).decode("utf-8")
 
@@ -597,6 +559,11 @@ def _pg_vector(vec: list[float]) -> str:
     halfvec accepts the same text input — the cast in the INSERT handles it.
     """
     return "[" + ",".join(f"{x:.7f}" for x in vec) + "]"
+
+
+def _chunk_hash(content: str) -> str:
+    """Stable content-hash used as the identity of a chunk within a doc."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def _stringify_body(doc: Document) -> str:

@@ -36,8 +36,13 @@ _TEST_ENV = {
 for _k, _v in _TEST_ENV.items():
     os.environ[_k] = _v
 
+from shared import db as db_module  # noqa: E402
 from shared.config import Settings, get_settings  # noqa: E402
-from shared.db import close_pool, init_pool, raw_conn  # noqa: E402
+
+
+@pytest.fixture(scope="session")
+def anyio_backend() -> str:  # pragma: no cover — pytest-asyncio auto-mode
+    return "asyncio"
 
 
 @pytest.fixture(scope="session")
@@ -46,20 +51,37 @@ def settings() -> Settings:
     return Settings()
 
 
+TRUNCATE_SQL = """
+    TRUNCATE TABLE
+        query_cache,
+        graph_edges,
+        graph_nodes,
+        audit_log,
+        ingestion_events,
+        failed_chunks,
+        integration_tokens,
+        backfill_state,
+        ingestion_queue,
+        acl_snapshots,
+        chunks,
+        documents,
+        customer_source_mapping,
+        customers
+    RESTART IDENTITY CASCADE;
+"""
+
+
 @pytest_asyncio.fixture
 async def live_db(settings: Settings) -> AsyncIterator[None]:
-    """Spins the async pool up, truncates tenant-scoped tables, yields, tears down."""
-    await init_pool(settings)
-    async with raw_conn() as conn:
-        await conn.execute(
-            """
-            TRUNCATE
-                chunks, documents, ingestion_queue, ingestion_events,
-                failed_chunks, acl_snapshots, graph_edges, graph_nodes,
-                integration_tokens, backfill_state, query_cache, audit_log,
-                customers
-            RESTART IDENTITY CASCADE
-            """
-        )
-    yield
-    await close_pool()
+    """Initialize a fresh pool on the current event loop, truncate, yield, close."""
+    # Tear down any pool left over from a prior test bound to a dead loop.
+    await db_module.close_pool()
+    await db_module.init_pool(settings)
+    async with db_module.raw_conn() as conn:
+        await conn.execute(TRUNCATE_SQL)
+    try:
+        yield None
+    finally:
+        async with db_module.raw_conn() as conn:
+            await conn.execute(TRUNCATE_SQL)
+        await db_module.close_pool()

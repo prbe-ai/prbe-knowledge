@@ -193,7 +193,12 @@ class TemporalSpec(BaseModel):
             self.since is None or self.until is None
         ):
             raise ValueError("changed_between mode requires `since` and `until`")
-        if self.mode == TemporalMode.CHANGED_BETWEEN and self.until <= self.since:
+        if (
+            self.mode == TemporalMode.CHANGED_BETWEEN
+            and self.until is not None
+            and self.since is not None
+            and self.until <= self.since
+        ):
             raise ValueError("changed_between requires `until` > `since`")
         return self
 

@@ -1,0 +1,11 @@
+{
+    "team_id": "T123",
+    "type": "event_callback",
+    "event": {
+        "type": "message",
+        "channel": "C456",
+        "user": "U789",
+        "text": "deploying the payments service now",
+        "ts": "1713628800.000100"
+    }
+}
