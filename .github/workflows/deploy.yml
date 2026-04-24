@@ -1,10 +1,8 @@
 name: deploy
 
-# Disabled: deploys are handled by Fly's native GitHub integration
-# (each app attached to this repo with its own fly.<service>.toml).
-# Flip the trigger back to `push: branches: [main]` if you want
-# GitHub Actions to own deploys instead.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
