@@ -10,24 +10,74 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  changes:
     runs-on: ubuntu-latest
-
+    outputs:
+      ingestion: ${{ steps.filter.outputs.ingestion == 'true' || github.event_name == 'workflow_dispatch' }}
+      retrieval: ${{ steps.filter.outputs.retrieval == 'true' || github.event_name == 'workflow_dispatch' }}
+      worker:    ${{ steps.filter.outputs.worker    == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            ingestion:
+              - 'services/ingestion/**'
+              - 'shared/**'
+              - 'db/migrations/**'
+              - 'alembic.ini'
+              - 'fly.ingestion.toml'
+              - 'pyproject.toml'
+            retrieval:
+              - 'services/retrieval/**'
+              - 'shared/**'
+              - 'fly.retrieval.toml'
+              - 'pyproject.toml'
+            worker:
+              - 'services/ingestion/**'
+              - 'services/worker/**'
+              - 'shared/**'
+              - 'fly.worker.toml'
+              - 'pyproject.toml'
 
+  deploy-ingestion:
+    needs: changes
+    if: needs.changes.outputs.ingestion == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-
       - name: Deploy ingestion
         run: flyctl deploy --remote-only -c fly.ingestion.toml
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
+  deploy-retrieval:
+    needs: [changes, deploy-ingestion]
+    if: |
+      always() &&
+      needs.changes.outputs.retrieval == 'true' &&
+      (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy retrieval
         run: flyctl deploy --remote-only -c fly.retrieval.toml
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
+  deploy-worker:
+    needs: [changes, deploy-ingestion]
+    if: |
+      always() &&
+      needs.changes.outputs.worker == 'true' &&
+      (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy worker
         run: flyctl deploy --remote-only -c fly.worker.toml
         env:
