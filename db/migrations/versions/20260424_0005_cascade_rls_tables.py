@@ -29,23 +29,42 @@ _CUSTOMER_FK_TABLES = ("audit_log", "query_cache")
 
 
 def upgrade() -> None:
+    # Idempotent. Fresh installs run schema.sql (via 0001) which already
+    # creates these constraints with the same names, so 0005 is a no-op
+    # there. Upgrading an existing DB from 0004 actually adds them.
     for table in _CUSTOMER_FK_TABLES:
         op.execute(
             f"""
-            ALTER TABLE {table}
-            ADD CONSTRAINT {table}_customer_id_fkey
-            FOREIGN KEY (customer_id)
-            REFERENCES customers(customer_id)
-            ON DELETE CASCADE
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = '{table}_customer_id_fkey'
+                ) THEN
+                    ALTER TABLE {table}
+                    ADD CONSTRAINT {table}_customer_id_fkey
+                    FOREIGN KEY (customer_id)
+                    REFERENCES customers(customer_id)
+                    ON DELETE CASCADE;
+                END IF;
+            END $$;
             """
         )
     op.execute(
         """
-        ALTER TABLE documents
-        ADD CONSTRAINT documents_ingestion_event_id_fkey
-        FOREIGN KEY (ingestion_event_id)
-        REFERENCES ingestion_events(event_id)
-        ON DELETE SET NULL
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'documents_ingestion_event_id_fkey'
+            ) THEN
+                ALTER TABLE documents
+                ADD CONSTRAINT documents_ingestion_event_id_fkey
+                FOREIGN KEY (ingestion_event_id)
+                REFERENCES ingestion_events(event_id)
+                ON DELETE SET NULL;
+            END IF;
+        END $$;
         """
     )
 
