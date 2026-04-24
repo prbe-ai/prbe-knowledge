@@ -82,14 +82,36 @@ case "$TARGET" in
     worker)     APPS=("prbe-knowledge-worker") ;;
 esac
 
+# -- parse -------------------------------------------------------------------
+# Build a KEY=VALUE arg list, decoding dotenv-style escapes in double-quoted
+# values so multiline secrets (e.g. PEM private keys stored as "...\n..." in
+# .env) land in Fly with real newlines. `flyctl secrets import` can't handle
+# multiline values; `flyctl secrets set` via argv can, because shell quoting
+# preserves embedded newlines.
+
+SECRET_ARGS=()
+while IFS= read -r line || [ -n "$line" ]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    val="${BASH_REMATCH[2]}"
+    # Strip surrounding double quotes and decode \n, \t, \", \\ escapes.
+    if [[ "$val" == \"*\" ]]; then
+        val="${val#\"}"
+        val="${val%\"}"
+        val="$(printf '%b' "$val")"
+    fi
+    SECRET_ARGS+=("$key=$val")
+done < "$ENV_FILE"
+
 # -- sync -------------------------------------------------------------------
 
-echo "Syncing $SECRET_COUNT secret(s) from $ENV_FILE to: ${APPS[*]}"
+echo "Syncing ${#SECRET_ARGS[@]} secret(s) from $ENV_FILE to: ${APPS[*]}"
 echo
 
 for app in "${APPS[@]}"; do
     echo "→ $app"
-    if ! flyctl secrets import -a "$app" < "$ENV_FILE"; then
+    if ! flyctl secrets set -a "$app" "${SECRET_ARGS[@]}"; then
         echo "  failed on $app — fix and re-run (sync is idempotent)" >&2
         exit 1
     fi

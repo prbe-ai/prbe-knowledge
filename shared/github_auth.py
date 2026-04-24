@@ -117,7 +117,7 @@ async def mint_installation_token(
             )
             raise GitHubAuthError(f"http error minting installation token: {exc}") from exc
 
-        if resp.status_code != 200:
+        if resp.status_code not in (200, 201):
             body = resp.text
             log.warning(
                 "github_auth.mint_failed",

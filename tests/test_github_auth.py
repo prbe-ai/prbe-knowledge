@@ -93,6 +93,26 @@ async def test_mint_builds_rs256_jwt_and_caches() -> None:
 
 
 @pytest.mark.asyncio
+async def test_mint_accepts_201_response() -> None:
+    """GitHub's POST /app/installations/{id}/access_tokens returns 201 Created,
+    not 200. We must accept both."""
+    app_id = "12345"
+    pem = _fresh_private_key_pem()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={"token": "ghs_from_201", "expires_at": "2026-12-31T00:00:00Z"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        token, _expires = await mint_installation_token(http, app_id, pem, "55")
+
+    assert token == "ghs_from_201"
+
+
+@pytest.mark.asyncio
 async def test_mint_raises_github_auth_error_on_401() -> None:
     app_id = "12345"
     pem = _fresh_private_key_pem()
