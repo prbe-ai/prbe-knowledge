@@ -290,7 +290,7 @@ CREATE INDEX idx_events_customer_received ON ingestion_events (customer_id, rece
 -- ---------------------------------------------------------------------------
 CREATE TABLE audit_log (
     audit_id             BIGSERIAL PRIMARY KEY,
-    customer_id          TEXT NOT NULL,
+    customer_id          TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     actor_id             TEXT NOT NULL,
     action               TEXT NOT NULL,
     resource_type        TEXT,
@@ -352,7 +352,7 @@ CREATE POLICY tenant_isolation ON graph_edges
 -- ---------------------------------------------------------------------------
 CREATE TABLE query_cache (
     cache_key            TEXT PRIMARY KEY,
-    customer_id          TEXT NOT NULL,
+    customer_id          TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     query_text_hash      TEXT NOT NULL,
     entities             JSONB NOT NULL,
     expansions           JSONB NOT NULL,

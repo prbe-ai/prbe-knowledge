@@ -212,6 +212,68 @@ async def test_rotate_key_404_for_missing_customer(live_db, settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_delete_customer_removes_row_and_cascades(live_db, settings) -> None:
+    create = await _admin_request(
+        "POST",
+        "/admin/customers",
+        headers=_auth(),
+        json={
+            "customer_id": "del",
+            "display_name": "Delete Me",
+            "redirect_uri_base": "https://api.example.com",
+        },
+    )
+    assert create.status_code == 200, create.text
+
+    # Seed a child row in a cascading table and a non-cascading RLS table
+    # to prove both get nuked.
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO integration_tokens
+                (customer_id, source_system, access_token_encrypted, status)
+            VALUES ('del', 'slack', 'encrypted', 'active')
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO query_cache
+                (cache_key, customer_id, query_text_hash,
+                 entities, expansions, expires_at)
+            VALUES ('del-key', 'del', 'hash',
+                    '{}'::jsonb, '{}'::jsonb,
+                    NOW() + INTERVAL '1 hour')
+            """
+        )
+
+    delete = await _admin_request(
+        "DELETE", "/admin/customers/del", headers=_auth()
+    )
+    await init_pool(settings)
+    assert delete.status_code == 204, delete.text
+
+    async with raw_conn() as conn:
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM customers WHERE customer_id='del'"
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM integration_tokens WHERE customer_id='del'"
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT COUNT(*) FROM query_cache WHERE customer_id='del'"
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_delete_customer_404_for_missing(live_db, settings) -> None:
+    resp = await _admin_request(
+        "DELETE", "/admin/customers/ghost", headers=_auth()
+    )
+    await init_pool(settings)
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
 async def test_list_customers(live_db, settings) -> None:
     for cid in ("one", "two"):
         await _admin_request(

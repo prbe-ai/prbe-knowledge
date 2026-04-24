@@ -29,6 +29,7 @@ from shared.provisioning import (
     CustomerAlreadyExists,
     CustomerNotFound,
     create_customer,
+    delete_customer,
     ensure_bucket_for,
     rotate_customer_key,
 )
@@ -149,6 +150,18 @@ async def rotate_key_route(customer_id: str) -> RotateKeyResponse:
     except CustomerNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return RotateKeyResponse(api_key=api_key)
+
+
+@router.delete(
+    "/customers/{customer_id}",
+    status_code=204,
+    dependencies=[Depends(verify_admin_key)],
+)
+async def delete_customer_route(customer_id: str) -> None:
+    try:
+        await delete_customer(customer_id)
+    except CustomerNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @router.get("/customers", dependencies=[Depends(verify_admin_key)])

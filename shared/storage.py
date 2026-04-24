@@ -114,6 +114,36 @@ class ObjectStore:
 
         return await asyncio.to_thread(_head)
 
+    async def delete_bucket_recursive(self, bucket: str) -> None:
+        """Delete every object in a bucket, then delete the bucket.
+
+        Missing buckets are swallowed silently. Used by customer delete.
+        """
+        def _delete() -> None:
+            try:
+                paginator = self._client.get_paginator("list_objects_v2")
+                for page in paginator.paginate(Bucket=bucket):
+                    contents = page.get("Contents") or []
+                    if not contents:
+                        continue
+                    self._client.delete_objects(
+                        Bucket=bucket,
+                        Delete={"Objects": [{"Key": c["Key"]} for c in contents]},
+                    )
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code not in {"NoSuchBucket", "404", "NotFound"}:
+                    raise StorageUnavailable(f"list/delete_objects failed: {exc}") from exc
+                return
+            try:
+                self._client.delete_bucket(Bucket=bucket)
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code not in {"NoSuchBucket", "404", "NotFound"}:
+                    raise StorageUnavailable(f"delete_bucket failed: {exc}") from exc
+
+        await asyncio.to_thread(_delete)
+
 
 _store: ObjectStore | None = None
 

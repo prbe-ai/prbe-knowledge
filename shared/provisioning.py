@@ -92,3 +92,32 @@ async def ensure_bucket_for(customer_id: str) -> str:
     bucket = store.bucket_for(customer_id)
     await store.ensure_bucket(bucket)
     return bucket
+
+
+async def delete_customer(customer_id: str) -> None:
+    """Hard-delete a customer and all their data.
+
+    Every child table FKs to customers with ON DELETE CASCADE, so one
+    DELETE nukes the whole tenant. Bucket cleanup is best-effort — a
+    failed bucket delete leaves an orphan we can clean up manually, but
+    a failed DB delete would leave a much worse state.
+    """
+    async with raw_conn() as conn:
+        result = await conn.execute(
+            "DELETE FROM customers WHERE customer_id = $1", customer_id
+        )
+    if result.rsplit(" ", 1)[-1] == "0":
+        raise CustomerNotFound("customer not found", customer_id=customer_id)
+
+    store = get_store()
+    bucket = store.bucket_for(customer_id)
+    try:
+        await store.delete_bucket_recursive(bucket)
+    except Exception as exc:
+        log.warning(
+            "provisioning.bucket_delete_failed",
+            customer=customer_id,
+            bucket=bucket,
+            error=str(exc),
+        )
+    log.info("provisioning.customer_deleted", customer=customer_id)
