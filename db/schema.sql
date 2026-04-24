@@ -85,7 +85,7 @@ CREATE TABLE documents (
     attachments          JSONB NOT NULL DEFAULT '[]',
     doc_references       JSONB NOT NULL DEFAULT '[]',
 
-    ingestion_event_id   BIGINT,
+    ingestion_event_id   BIGINT,  -- FK added at bottom (ingestion_events is defined later)
     normalizer_version   TEXT NOT NULL DEFAULT 'v1',
 
     compiled_from_doc_ids TEXT[] DEFAULT NULL,
@@ -361,3 +361,12 @@ CREATE TABLE query_cache (
 );
 CREATE INDEX idx_query_cache_expiry ON query_cache (expires_at);
 CREATE INDEX idx_query_cache_customer ON query_cache (customer_id, query_text_hash);
+
+-- ---------------------------------------------------------------------------
+-- Late-bound FKs: targets defined later in this file than their source tables.
+-- ---------------------------------------------------------------------------
+ALTER TABLE documents
+    ADD CONSTRAINT documents_ingestion_event_id_fkey
+    FOREIGN KEY (ingestion_event_id)
+    REFERENCES ingestion_events(event_id)
+    ON DELETE SET NULL;

@@ -1,14 +1,18 @@
-"""cascade FK on audit_log + query_cache
+"""backfill missing foreign keys
 
 Revision ID: 0005_cascade_rls_tables
 Revises: 0004_backfill_progress
 Create Date: 2026-04-24
 
-audit_log and query_cache carried a customer_id column but no FK to
-customers — relying on RLS only. That made customer delete awkward
-(had to issue extra DELETEs before DELETE FROM customers succeeded).
-Adding the FK with ON DELETE CASCADE means a single DELETE FROM
-customers now cascades to every child row in the DB.
+Closes three FK gaps:
+  - audit_log.customer_id and query_cache.customer_id were RLS-only,
+    no FK. DELETE FROM customers had to issue extra DELETEs first.
+  - documents.ingestion_event_id was declared but never constrained,
+    so there was no way to assert docs point at real events.
+
+Cascades on customer_id are ON DELETE CASCADE (tenant delete nukes
+everything). documents → ingestion_events is ON DELETE SET NULL so
+periodic retention sweeps on the event log don't take docs with them.
 """
 
 from __future__ import annotations
@@ -21,11 +25,11 @@ branch_labels = None
 depends_on = None
 
 
-_TABLES = ("audit_log", "query_cache")
+_CUSTOMER_FK_TABLES = ("audit_log", "query_cache")
 
 
 def upgrade() -> None:
-    for table in _TABLES:
+    for table in _CUSTOMER_FK_TABLES:
         op.execute(
             f"""
             ALTER TABLE {table}
@@ -35,10 +39,22 @@ def upgrade() -> None:
             ON DELETE CASCADE
             """
         )
+    op.execute(
+        """
+        ALTER TABLE documents
+        ADD CONSTRAINT documents_ingestion_event_id_fkey
+        FOREIGN KEY (ingestion_event_id)
+        REFERENCES ingestion_events(event_id)
+        ON DELETE SET NULL
+        """
+    )
 
 
 def downgrade() -> None:
-    for table in _TABLES:
+    op.execute(
+        "ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_ingestion_event_id_fkey"
+    )
+    for table in _CUSTOMER_FK_TABLES:
         op.execute(
             f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_customer_id_fkey"
         )
