@@ -93,14 +93,20 @@ async def oauth_callback(
     # "Redirect on update" fires (repo added/removed). Fall back to existing
     # (source, external_id) → customer_id mapping so those flows don't 422.
     customer_id = state
+    resolved_from_mapping = False
     if customer_id is None:
         customer_id = await _resolve_customer_from_callback(source_enum, extra_params)
+        resolved_from_mapping = customer_id is not None
 
-    # "Redirect on update" fires on every repo add/remove. Installation id is
-    # unchanged and tokens are minted on-demand, so nothing needs re-saving —
-    # just log and land the user back on the dashboard.
+    # Post-install "Redirect on update" fires on every repo add/remove for an
+    # already-connected installation. Recognize it by: state absent (GitHub
+    # drops it on update), mapping already on file, no `code`. Skip the full
+    # save path — installation id is unchanged, tokens are minted on demand.
+    # When `state` IS present we're in a first-time connect flow even if
+    # GitHub happens to stamp setup_action=update (e.g. the app was installed
+    # at the account level before this customer linked it).
     setup_action = extra_params.get("setup_action")
-    if customer_id and setup_action == "update" and not code:
+    if resolved_from_mapping and setup_action == "update" and not code:
         log.info("oauth.post_install_update", customer=customer_id, source=source)
         if dashboard_base:
             return _landed_redirect(

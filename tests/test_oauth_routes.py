@@ -164,6 +164,99 @@ async def test_oauth_callback_github_path(live_db, settings, monkeypatch) -> Non
 
 
 @pytest.mark.asyncio
+async def test_oauth_callback_github_state_with_update_action_still_saves(
+    live_db, settings, monkeypatch
+) -> None:
+    """GitHub stamps setup_action=update when the App was already installed
+    at the account level before this customer linked it. `state` is present,
+    so this is still a first-time connect — must run the full save path,
+    not short-circuit."""
+    pem = _fresh_private_key_pem()
+    monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", pem)
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "http://dash.local")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO customers (customer_id, display_name, api_key_hash)
+            VALUES ($1, 'update-action-test', 'dummy')
+            ON CONFLICT DO NOTHING
+            """,
+            CUSTOMER_ID,
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == f"/app/installations/{INSTALLATION_ID}/access_tokens":
+            return httpx.Response(
+                200,
+                json={"token": "ghs_abc", "expires_at": "2026-12-31T00:00:00Z"},
+            )
+        if path == f"/app/installations/{INSTALLATION_ID}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": int(INSTALLATION_ID),
+                    "account": {"login": "prbe", "type": "Organization"},
+                    "target_type": "Organization",
+                },
+            )
+        return httpx.Response(404, json={"message": f"unexpected path {path}"})
+
+    from services.ingestion.main import app as ingestion_app
+
+    await close_pool()
+    transport = ASGITransport(app=ingestion_app)
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        ingestion_app.router.lifespan_context(ingestion_app),
+    ):
+        mock_http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        original_ctx = ingestion_app.state.ctx
+        ingestion_app.state.ctx = ConnectorContext(
+            settings=Settings(
+                environment="local",
+                github_app_id="12345",
+                github_app_slug="prbe-knowledge-dev",
+                github_app_private_key=SecretStr(pem),
+            ),
+            http=mock_http,
+        )
+        try:
+            resp = await client.get(
+                "/oauth/github/callback",
+                params={
+                    "installation_id": INSTALLATION_ID,
+                    "setup_action": "update",
+                    "state": CUSTOMER_ID,
+                },
+            )
+        finally:
+            ingestion_app.state.ctx = original_ctx
+            await mock_http.aclose()
+
+    assert resp.status_code == 302, resp.text
+
+    await init_pool(settings)
+    async with raw_conn() as conn:
+        token_row = await conn.fetchrow(
+            """
+            SELECT scope, status
+            FROM integration_tokens
+            WHERE customer_id = $1 AND source_system = $2
+            """,
+            CUSTOMER_ID,
+            SourceSystem.GITHUB.value,
+        )
+    assert token_row is not None, (
+        "setup_action=update with state present must still save the token "
+        "(this is a first-time connect, not a post-install repo update)"
+    )
+    assert token_row["status"] == "active"
+
+
+@pytest.mark.asyncio
 async def test_oauth_callback_github_update_without_state(
     live_db, settings, monkeypatch
 ) -> None:
