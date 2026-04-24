@@ -53,7 +53,9 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
-ignore = ["E501"]
+# E501: line length (enforced via line-length above); B008: FastAPI's
+# canonical Depends() / Query() etc. in argument defaults.
+ignore = ["E501", "B008"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

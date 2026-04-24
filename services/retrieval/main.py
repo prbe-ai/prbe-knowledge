@@ -63,7 +63,7 @@ _UNAUTHORIZED_HEADERS = {"WWW-Authenticate": "Bearer"}
 
 
 class _AuthResult:
-    __slots__ = ("customer_id", "auth_present")
+    __slots__ = ("auth_present", "customer_id")
 
     def __init__(self, customer_id: str | None, auth_present: bool) -> None:
         self.customer_id = customer_id
