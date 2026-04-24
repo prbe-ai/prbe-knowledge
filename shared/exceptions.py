@@ -54,6 +54,12 @@ class TokenRefreshFailed(AuthError):
     transient = True
 
 
+class GitHubAuthError(AuthError):
+    """Raised when a GitHub App installation-token mint fails."""
+
+    transient = True
+
+
 # --- Storage ----------------------------------------------------------------
 
 class StorageError(PrbeError): ...
@@ -195,6 +201,7 @@ __all__ = [
     "EmbeddingContextLengthExceeded",
     "EmbeddingError",
     "EmbeddingRateLimited",
+    "GitHubAuthError",
     "GraphError",
     "GraphNodeConflict",
     "HandlerNotFound",

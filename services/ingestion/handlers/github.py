@@ -31,6 +31,7 @@ from services.ingestion.chunker import count_tokens
 from services.ingestion.handlers.base import Connector
 from services.ingestion.handlers.registry import register_connector
 from shared.constants import (
+    GITHUB_INSTALLATION_SCOPE_PREFIX,
     DocClass,
     DocType,
     EdgeType,
@@ -41,7 +42,8 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
+from shared.exceptions import GitHubAuthError, InvalidWebhookPayload
+from shared.github_auth import mint_installation_token
 from shared.logging import get_logger
 from shared.models import (
     ACLPrincipal,
@@ -280,6 +282,33 @@ class GitHubConnector(Connector):
     # 3. hydration — fetch CODEOWNERS file contents for push events
     # ------------------------------------------------------------------
 
+    async def _resolve_installation_bearer(self, token: IntegrationToken) -> str:
+        """Return the bearer to use for GitHub API calls.
+
+        If token.scope starts with 'installation:', mint a fresh installation
+        token via `shared.github_auth`. Otherwise return token.access_token
+        as-is (legacy path — assumes caller already provided a valid token).
+        """
+        scope = token.scope or ""
+        if not scope.startswith(GITHUB_INSTALLATION_SCOPE_PREFIX):
+            return token.access_token
+
+        app_id = self.settings.github_app_id
+        private_key = self.settings.github_app_private_key
+        if app_id is None or private_key is None:
+            raise GitHubAuthError(
+                "installation scope requires GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY"
+            )
+
+        installation_id = scope.split(":", 1)[1]
+        bearer, _expires = await mint_installation_token(
+            self.http,
+            app_id,
+            private_key.get_secret_value(),
+            installation_id,
+        )
+        return bearer
+
     async def fetch_supplementary(
         self,
         event: WebhookEvent,
@@ -300,23 +329,25 @@ class GitHubConnector(Connector):
             # No installation token — defer to the fallback path in normalize().
             return {}
 
+        bearer = await self._resolve_installation_bearer(token)
+
         # Try each canonical CODEOWNERS path in order. GitHub accepts all three.
         for path in _CODEOWNERS_PATHS:
-            content = await self._fetch_codeowners_content(full_name, path, token)
+            content = await self._fetch_codeowners_content(full_name, path, bearer)
             if content is not None:
                 return {"codeowners_content": content, "codeowners_path": path}
 
         return {}
 
     async def _fetch_codeowners_content(
-        self, full_name: str, path: str, token: IntegrationToken
+        self, full_name: str, path: str, bearer: str
     ) -> str | None:
         url = f"{_GITHUB_API}/repos/{full_name}/contents/{path}"
         try:
             resp = await self.http.get(
                 url,
                 headers={
-                    "Authorization": f"Bearer {token.access_token}",
+                    "Authorization": f"Bearer {bearer}",
                     "Accept": "application/vnd.github.raw",
                 },
             )
@@ -365,8 +396,9 @@ class GitHubConnector(Connector):
     ):
         """Historical GitHub backfill — walks installation repos, PRs, and issues.
 
-        Assumes `token.access_token` is a valid GitHub App installation token
-        (bearer). We do not mint it here; the caller is responsible.
+        When `token.scope` starts with `installation:` we mint a fresh App
+        installation bearer via `shared.github_auth`. Otherwise we use
+        `token.access_token` verbatim (legacy / test path).
 
         Resumable via the `cursor` arg: an opaque JSON blob capturing which
         repos remain, the current repo + phase (pulls/issues), and the next
@@ -381,8 +413,9 @@ class GitHubConnector(Connector):
         from shared.models import WebhookEvent
 
         state = _decode_github_cursor(cursor)
+        bearer = await self._resolve_installation_bearer(token)
         auth_headers = {
-            "Authorization": f"Bearer {token.access_token}",
+            "Authorization": f"Bearer {bearer}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }

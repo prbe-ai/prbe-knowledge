@@ -46,6 +46,9 @@ Create `.env.local` in the repo root. The services auto-load it on boot.
 ```bash
 # Generate a Fernet key for OAuth token encryption:
 .venv/bin/python -c "from shared.encryption import generate_key; print(generate_key())"
+
+# Generate an admin API key (for the internal provisioning dashboard):
+.venv/bin/python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
 ```ini
@@ -59,6 +62,7 @@ R2_ACCESS_KEY_ID=minioadmin
 R2_SECRET_ACCESS_KEY=minioadmin
 
 TOKEN_ENCRYPTION_KEY=<paste the Fernet key you just generated>
+ADMIN_API_KEY=<paste the admin API key you just generated>
 
 OPENAI_API_KEY=sk-...                       # embeddings
 ANTHROPIC_API_KEY=sk-ant-...                # router (optional for Phase 0 smoke)
@@ -119,6 +123,21 @@ and (where applicable) `signing_secret` for each, pasted into `.env.local`.
 5. Generate a **private key** (PEM file) → paste contents into `GITHUB_APP_PRIVATE_KEY`
 6. **App ID** → `GITHUB_APP_ID`
 7. Install the app on your org.
+
+After installing the App, grab the `installation_id` from the post-install
+redirect URL — e.g. `.../settings/installations/87654321` → `87654321`. Then
+seed PRBE so it can mint installation tokens on demand:
+
+```bash
+.venv/bin/python -m scripts.github_seed_token \
+  --customer prbe-internal \
+  --installation-id 87654321
+```
+
+Backfill and CODEOWNERS hydration mint fresh installation tokens via the
+App private key whenever they need to call GitHub — there's no refresh cron
+for GitHub because installation tokens are ~1h-lived and always reissued
+from the App JWT.
 
 ### Linear (10 min)
 
@@ -303,6 +322,7 @@ for app in prbe-knowledge-ingestion prbe-knowledge-retrieval prbe-knowledge-work
     OPENAI_API_KEY="$OPENAI_API_KEY" \
     ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
     TOKEN_ENCRYPTION_KEY="$TOKEN_ENCRYPTION_KEY" \
+    ADMIN_API_KEY="$ADMIN_API_KEY" \
     R2_ENDPOINT_URL="$R2_ENDPOINT_URL" \
     R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
     R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \

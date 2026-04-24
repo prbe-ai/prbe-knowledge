@@ -92,8 +92,12 @@ route doesn't pass this through to `identify_workspaces` today.
 and pass it to a GitHub-specific identify method, OR have `identify_workspaces`
 call `GET /user/installations` with the user token to list installs.
 
-**Workaround today:** first GitHub webhook drops to `single_customer_fallback`.
-Fine for solo dogfood, breaks for multi-tenant.
+**Workaround today:** workaround documented — see `scripts/github_seed_token.py`.
+Operator grabs `installation_id` from the install redirect URL and seeds the
+token row manually. `customer_source_mapping` is written at the same time so
+live webhooks route correctly without relying on `single_customer_fallback`.
+The real fix (auto-capturing `installation_id` in the OAuth callback) is
+still unstarted.
 
 ### Sentry `identify_workspaces`
 **Where:** `services/ingestion/handlers/sentry.py`

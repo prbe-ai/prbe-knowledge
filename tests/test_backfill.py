@@ -469,6 +469,86 @@ async def test_github_backfill_paginates_repos_pulls_and_issues() -> None:
     assert pr_numbers == {1, 2, 3}
 
 
+@pytest.mark.asyncio
+async def test_github_backfill_with_installation_scope_mints_token(monkeypatch) -> None:
+    """A token with scope='installation:<id>' mints a fresh bearer via github_auth."""
+    from datetime import UTC, datetime
+
+    observed_auth: list[str] = []
+
+    def installation_repos(req):
+        observed_auth.append(req.headers["authorization"])
+        return httpx.Response(
+            200,
+            json={
+                "repositories": [
+                    {
+                        "full_name": "acme/api",
+                        "name": "api",
+                        "owner": {"login": "acme"},
+                        "private": True,
+                    }
+                ]
+            },
+        )
+
+    def api_pulls(req):
+        observed_auth.append(req.headers["authorization"])
+        return httpx.Response(
+            200,
+            json=[{"number": 1, "updated_at": "2026-04-01T00:00:00Z", "title": "pr"}],
+        )
+
+    def api_issues(req):
+        observed_auth.append(req.headers["authorization"])
+        return httpx.Response(200, json=[])
+
+    transport = _mock_transport(
+        {
+            ("GET", "/installation/repositories"): installation_repos,
+            ("GET", "/repos/acme/api/pulls"): api_pulls,
+            ("GET", "/repos/acme/api/issues"): api_issues,
+        }
+    )
+
+    minted_for: list[str] = []
+
+    async def fake_mint(http, app_id, private_key_pem, installation_id):
+        minted_for.append(installation_id)
+        return "ghs_fresh_bearer", datetime(2026, 12, 31, tzinfo=UTC)
+
+    monkeypatch.setattr(
+        "services.ingestion.handlers.github.mint_installation_token", fake_mint
+    )
+
+    from services.ingestion.handlers.base import ConnectorContext
+    from services.ingestion.handlers.registry import build_connector
+    from shared.config import Settings as _S
+    from shared.models import IntegrationToken
+
+    ctx = ConnectorContext(
+        settings=_S(
+            github_app_id="1",
+            github_app_private_key="dummy-key",  # type: ignore[arg-type]
+        ),
+        http=httpx.AsyncClient(transport=transport),
+    )
+    gh = build_connector(SourceSystem.GITHUB, ctx)
+    token = IntegrationToken(
+        customer_id="cust",
+        source_system=SourceSystem.GITHUB,
+        access_token="placeholder-never-used",
+        scope="installation:99",
+    )
+
+    events = [e async for e in gh.backfill("cust", token)]
+    assert len(events) == 1
+    assert minted_for == ["99"]
+    assert observed_auth, "mock transport should have captured requests"
+    for auth in observed_auth:
+        assert auth == "Bearer ghs_fresh_bearer"
+
+
 # --------------------- backfill status endpoint -----------------------------
 
 

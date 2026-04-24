@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     # --- Token encryption (Fernet key, 32 url-safe base64 bytes) -----------
     token_encryption_key: SecretStr = SecretStr("")
 
+    # --- Admin API (gates /admin/* routes on the ingestion service) ---------
+    # Unset → /admin/* returns 503. Set to a high-entropy token; compared with
+    # hmac.compare_digest to avoid timing-based token recovery.
+    admin_api_key: SecretStr | None = None
+
     # --- Per-source OAuth / signing secrets (all optional in dev) ---------
     slack_client_id: str | None = None
     slack_client_secret: SecretStr | None = None

@@ -195,3 +195,8 @@ TOP_K_BM25 = 50
 TOP_K_GRAPH = 20
 RRF_K = 60
 DEDUP_COSINE_THRESHOLD = 0.95
+
+# Prefix used in `integration_tokens.scope` to signal the row represents a
+# GitHub App installation rather than an OAuth access_token. The installation
+# id follows the colon; tokens are minted on demand from the App private key.
+GITHUB_INSTALLATION_SCOPE_PREFIX = "installation:"

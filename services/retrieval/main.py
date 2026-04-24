@@ -11,12 +11,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from services.retrieval.acl import filter_by_acl
@@ -28,7 +29,7 @@ from services.retrieval.retrievers.vector import vector_search
 from services.retrieval.router import route_query
 from shared.config import get_settings
 from shared.constants import SourceSystem
-from shared.db import health_check, init_pool, with_tenant
+from shared.db import health_check, init_pool, raw_conn, with_tenant
 from shared.logging import configure_logging, get_logger
 from shared.models import QueryChunk, QueryRequest, QueryResponse
 
@@ -58,8 +59,88 @@ async def health() -> JSONResponse:
     return JSONResponse(body, status_code=200 if db_ok else 503)
 
 
+_UNAUTHORIZED_HEADERS = {"WWW-Authenticate": "Bearer"}
+
+
+class _AuthResult:
+    __slots__ = ("customer_id", "auth_present")
+
+    def __init__(self, customer_id: str | None, auth_present: bool) -> None:
+        self.customer_id = customer_id
+        self.auth_present = auth_present
+
+
+async def _resolve_customer_from_bearer(token: str) -> str:
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT customer_id FROM customers WHERE api_key_hash = $1",
+            token_hash,
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=401,
+            detail="invalid api key",
+            headers=_UNAUTHORIZED_HEADERS,
+        )
+    return row["customer_id"]
+
+
+async def authenticate_query(request: Request) -> _AuthResult:
+    """Derive customer_id from Authorization: Bearer <api_key>.
+
+    Dev-only bypass: environment=local + missing header lets the handler
+    fall back to a customer_id in the request body (for smoke tests and
+    local curl). Production environments always require the header.
+    """
+    authorization = request.headers.get("authorization")
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token.strip():
+            raise HTTPException(
+                status_code=401,
+                detail="invalid authorization scheme",
+                headers=_UNAUTHORIZED_HEADERS,
+            )
+        resolved = await _resolve_customer_from_bearer(token.strip())
+        return _AuthResult(customer_id=resolved, auth_present=True)
+
+    if get_settings().is_local:
+        return _AuthResult(customer_id=None, auth_present=False)
+
+    raise HTTPException(
+        status_code=401,
+        detail="missing bearer token",
+        headers=_UNAUTHORIZED_HEADERS,
+    )
+
+
 @app.post("/query", response_model=QueryResponse)
-async def query(req: QueryRequest) -> QueryResponse:
+async def query(
+    req: QueryRequest,
+    auth: _AuthResult = Depends(authenticate_query),
+) -> QueryResponse:
+    if auth.auth_present:
+        # Header is authoritative; a mismatching body value is almost certainly
+        # a caller bug (or a cross-tenant probe) — refuse rather than silently
+        # shadowing the header.
+        if req.customer_id and req.customer_id != auth.customer_id:
+            raise HTTPException(
+                status_code=400,
+                detail="customer_id in body does not match authenticated tenant",
+            )
+        customer_id = auth.customer_id
+    else:
+        # Local dev bypass path.
+        customer_id = req.customer_id
+        if not customer_id:
+            raise HTTPException(
+                status_code=401,
+                detail="missing bearer token",
+                headers=_UNAUTHORIZED_HEADERS,
+            )
+    assert customer_id is not None  # for type-checker, guaranteed above
+    req = req.model_copy(update={"customer_id": customer_id})
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="empty query")
 

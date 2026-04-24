@@ -16,14 +16,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import hashlib
-import secrets
 
 from shared.config import get_settings
 from shared.constants import SourceSystem
-from shared.db import close_pool, init_pool, raw_conn
+from shared.db import close_pool, init_pool
 from shared.logging import configure_logging, get_logger
-from shared.storage import get_store
+from shared.provisioning import (
+    CustomerAlreadyExists,
+    create_customer,
+    ensure_bucket_for,
+)
 
 log = get_logger(__name__)
 
@@ -37,30 +39,16 @@ async def bootstrap(
     configure_logging(settings.log_level)
     await init_pool(settings)
 
-    # 1. API key — 32 url-safe bytes. Store sha256 hash.
-    api_key = secrets.token_urlsafe(32)
-    api_key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+    try:
+        api_key = await create_customer(customer_id, display_name)
+    except CustomerAlreadyExists:
+        print(f"Customer '{customer_id}' already exists. Use the admin API to rotate the key.")
+        await close_pool()
+        return
 
-    async with raw_conn() as conn:
-        await conn.execute(
-            """
-            INSERT INTO customers (customer_id, display_name, api_key_hash)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (customer_id)
-            DO UPDATE SET display_name = EXCLUDED.display_name,
-                          api_key_hash = EXCLUDED.api_key_hash
-            """,
-            customer_id,
-            display_name,
-            api_key_hash,
-        )
+    bucket = await ensure_bucket_for(customer_id)
 
-    # 2. R2 bucket
-    store = get_store()
-    bucket = store.bucket_for(customer_id)
-    await store.ensure_bucket(bucket)
-
-    # 3. OAuth install URLs (best-effort — connectors without registered OAuth skip)
+    # Best-effort OAuth install URLs — connectors without registered OAuth skip.
     from services.ingestion.handlers.base import make_default_context
     from services.ingestion.handlers.registry import build_connector, list_registered
 
