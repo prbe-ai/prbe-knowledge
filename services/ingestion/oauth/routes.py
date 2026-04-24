@@ -15,14 +15,17 @@ Flow:
 
 from __future__ import annotations
 
+from urllib.parse import urlencode
+
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from services.ingestion.backfill_runner import enqueue_backfill
 from services.ingestion.handlers.registry import (
     build_connector,
     get_connector_class,
 )
+from shared.config import get_settings
 from shared.constants import SourceSystem
 from shared.customer_mapping import record_mapping
 from shared.exceptions import (
@@ -68,8 +71,13 @@ async def oauth_callback(
     code: str | None = Query(default=None),
     state: str = Query(..., description="customer_id passed through from install"),
     error: str | None = Query(default=None),
-) -> HTMLResponse:
+) -> Response:
+    dashboard_base = (get_settings().dashboard_base_url or "").rstrip("/")
     if error:
+        if dashboard_base:
+            return _landed_redirect(
+                dashboard_base, source=source, customer_id=state, ok=False, error=error
+            )
         raise HTTPException(status_code=400, detail=f"OAuth provider error: {error}")
 
     source_enum = _source(source)
@@ -156,6 +164,14 @@ async def oauth_callback(
         source=source,
         workspaces=[r.external_id for r in refs],
     )
+    if dashboard_base:
+        return _landed_redirect(
+            dashboard_base,
+            source=source,
+            customer_id=state,
+            ok=True,
+            workspaces=[r.external_name or r.external_id for r in refs],
+        )
     return HTMLResponse(
         f"<!doctype html><html><body><h2>Connected: {source}</h2>"
         f"<p>Integration active for customer <code>{state}</code>.</p>"
@@ -168,3 +184,25 @@ def _source(s: str) -> SourceSystem:
         return SourceSystem(s)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=f"unknown source '{s}'") from exc
+
+
+def _landed_redirect(
+    dashboard_base: str,
+    *,
+    source: str,
+    customer_id: str,
+    ok: bool,
+    error: str | None = None,
+    workspaces: list[str] | None = None,
+) -> RedirectResponse:
+    params: dict[str, str] = {
+        "source": source,
+        "customer_id": customer_id,
+        "ok": "1" if ok else "0",
+    }
+    if error:
+        params["error"] = error[:200]
+    if workspaces:
+        params["workspaces"] = ",".join(workspaces)[:200]
+    url = f"{dashboard_base}/oauth-landed?{urlencode(params)}"
+    return RedirectResponse(url=url, status_code=302)

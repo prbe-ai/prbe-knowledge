@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     # hmac.compare_digest to avoid timing-based token recovery.
     admin_api_key: SecretStr | None = None
 
+    # --- Dashboard redirect (optional) --------------------------------------
+    # When set, OAuth callbacks 302 to <url>/oauth-landed?source=...&customer_id=...
+    # instead of rendering the backend's own HTML success page, so users land
+    # back on the dashboard after connecting an integration.
+    dashboard_base_url: str | None = None
+
     # --- Per-source OAuth / signing secrets (all optional in dev) ---------
     slack_client_id: str | None = None
     slack_client_secret: SecretStr | None = None
