@@ -370,7 +370,7 @@ Or let the `deploy.yml` workflow handle it on merges to `main`.
 ### After deploy
 
 Update every webhook / callback URL in §3 from your local tunnel to the Fly
-hostname (`https://prbe-knowledge-ingestion.fly.dev`). OAuth tokens don't need
+hostname (`https://ingest.prbe.ai`). OAuth tokens don't need
 to be reissued — they're the same across environments (we use shared Neon).
 
 ---

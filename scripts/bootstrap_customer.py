@@ -81,7 +81,7 @@ def main() -> None:
     ap.add_argument("--display-name", required=True)
     ap.add_argument(
         "--redirect-uri",
-        default="https://api.prbe.ai/oauth/callback",
+        default="https://ingest.prbe.ai/oauth/callback",
         help="OAuth redirect URI used in install URLs",
     )
     args = ap.parse_args()
