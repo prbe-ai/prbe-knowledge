@@ -93,7 +93,10 @@ async def test_admin_requires_key_header(live_db, settings) -> None:
 
 @pytest.mark.asyncio
 async def test_admin_503_when_key_unset(live_db, settings, monkeypatch) -> None:
-    monkeypatch.delenv("ADMIN_API_KEY", raising=False)
+    # Setenv to "" — delenv alone leaks through any .env file the developer
+    # has on disk (pydantic-settings falls back to those when the env var is
+    # absent). verify_admin_key treats empty SecretStr as "not set".
+    monkeypatch.setenv("ADMIN_API_KEY", "")
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
     for method, path in [

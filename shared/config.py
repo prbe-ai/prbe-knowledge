@@ -59,6 +59,7 @@ class Settings(BaseSettings):
 
     github_app_id: str | None = None
     github_app_private_key: SecretStr | None = None
+    github_app_slug: str | None = None
     github_webhook_secret: SecretStr | None = None
 
     linear_client_id: str | None = None

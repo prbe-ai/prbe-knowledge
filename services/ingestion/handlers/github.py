@@ -42,7 +42,11 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
-from shared.exceptions import GitHubAuthError, InvalidWebhookPayload
+from shared.exceptions import (
+    GitHubAuthError,
+    InvalidWebhookPayload,
+    NotSupportedByConnector,
+)
 from shared.github_auth import mint_installation_token
 from shared.logging import get_logger
 from shared.models import (
@@ -51,6 +55,7 @@ from shared.models import (
     ACLSnapshotRow,
     DocRef,
     Document,
+    ExternalWorkspaceRef,
     GraphEdgeSpec,
     GraphNodeSpec,
     IntegrationToken,
@@ -360,24 +365,145 @@ class GitHubConnector(Connector):
         return resp.text
 
     # ------------------------------------------------------------------
+    # 6. OAuth install + exchange
+    # ------------------------------------------------------------------
+
+    def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
+        slug = self.settings.github_app_slug
+        if not slug:
+            raise NotSupportedByConnector("GITHUB_APP_SLUG not configured")
+        # GitHub Apps don't accept redirect_uri on the install URL — the
+        # post-install redirect is controlled in the App's settings. We still
+        # accept the arg for API compatibility; state carries the customer_id
+        # through the round-trip.
+        from urllib.parse import urlencode
+
+        params = urlencode({"state": customer_id})
+        return f"https://github.com/apps/{slug}/installations/new?{params}"
+
+    async def exchange_oauth_code(
+        self,
+        code: str | None,
+        redirect_uri: str,
+        extra_params: dict[str, str] | None = None,
+    ) -> IntegrationToken:
+        extra = extra_params or {}
+        installation_id = extra.get("installation_id")
+        if not installation_id:
+            raise InvalidWebhookPayload(
+                "github OAuth callback missing installation_id — was the app installed?"
+            )
+
+        app_id = self.settings.github_app_id
+        pk = self.settings.github_app_private_key
+        if not app_id or pk is None:
+            raise NotSupportedByConnector(
+                "github OAuth callback requires GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY"
+            )
+
+        # Validate the installation exists + credentials are live by minting once.
+        await mint_installation_token(
+            self.http, app_id, pk.get_secret_value(), installation_id
+        )
+
+        return IntegrationToken(
+            customer_id="",  # caller fills in — connector does not know the tenant
+            source_system=SourceSystem.GITHUB,
+            # access_token column is NOT NULL. GitHub installation tokens are
+            # re-minted on-demand via the App private key so the stored value
+            # is never read by the connector.
+            access_token="installation-minted-on-demand",
+            scope=f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}",
+        )
+
+    # ------------------------------------------------------------------
     # 7. workspace identification
     # ------------------------------------------------------------------
 
     async def identify_workspaces(self, token):  # type: ignore[override]
-        """GitHub Apps don't fit OAuth's standard code→token flow cleanly.
+        """Resolve the GitHub installation's owning account for customer_source_mapping.
 
-        The install URL delivers `installation_id` as a query param on the
-        post-install redirect, separately from the OAuth `code`. For Phase 0
-        we return [] here — webhooks use `extract_external_id_from_payload`
-        (reading `installation.id` from every webhook payload) which is
-        sufficient for the mapping once the first webhook lands and the
-        single_customer_fallback kicks in.
-
-        Phase 1 TODO: extend the OAuth callback to also pass `installation_id`
-        into identify_workspaces so we can write the mapping at install time
-        instead of relying on the fallback for the first webhook.
+        `token.scope` carries `installation:<id>` from `exchange_oauth_code`.
+        We mint an installation token (cached) and call `GET /app/installations/<id>`
+        with the App JWT to fetch the account login without a second mint step.
+        On HTTP failure we return [] — the OAuth callback already downgrades
+        `identify_workspaces_failed` to a warning and the base webhook path
+        resolves the customer via `extract_external_id_from_payload` on the
+        first live webhook.
         """
-        return []
+        scope = token.scope or ""
+        if not scope.startswith(GITHUB_INSTALLATION_SCOPE_PREFIX):
+            return []
+        installation_id = scope.split(":", 1)[1]
+        if not installation_id:
+            return []
+
+        app_id = self.settings.github_app_id
+        pk = self.settings.github_app_private_key
+        if not app_id or pk is None:
+            return []
+
+        # Minting populates the cache (idempotent if already present) and
+        # proves the installation is still live before we look it up.
+        try:
+            await mint_installation_token(
+                self.http, app_id, pk.get_secret_value(), installation_id
+            )
+        except GitHubAuthError as exc:
+            log.warning(
+                "github.identify_workspaces_mint_failed",
+                installation=installation_id,
+                error=str(exc),
+            )
+            return []
+
+        # Fetch the installation's account via the App JWT. We rebuild a JWT
+        # here (cheap) rather than extend shared.github_auth's surface area.
+        from shared.github_auth import _build_app_jwt
+
+        jwt = _build_app_jwt(app_id, pk.get_secret_value())
+        try:
+            resp = await self.http.get(
+                f"{_GITHUB_API}/app/installations/{installation_id}",
+                headers={
+                    "Authorization": f"Bearer {jwt}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+            )
+        except (OSError, ValueError) as exc:
+            log.warning(
+                "github.identify_workspaces_http_error",
+                installation=installation_id,
+                error=str(exc),
+            )
+            return []
+
+        if resp.status_code != 200:
+            log.warning(
+                "github.identify_workspaces_non_200",
+                installation=installation_id,
+                status=resp.status_code,
+            )
+            return []
+
+        body = resp.json() if resp.content else {}
+        account = body.get("account") or {}
+        account_login = account.get("login") if isinstance(account, dict) else None
+        account_type = account.get("type") if isinstance(account, dict) else None
+        target_type = body.get("target_type")
+
+        return [
+            ExternalWorkspaceRef(
+                external_id=installation_id,
+                external_name=account_login,
+                metadata={
+                    "installation_id": installation_id,
+                    "account_type": account_type,
+                    "target_type": target_type,
+                },
+            )
+        ]
 
     def extract_external_id_from_payload(self, headers, raw_payload):
         install = raw_payload.get("installation") or {}

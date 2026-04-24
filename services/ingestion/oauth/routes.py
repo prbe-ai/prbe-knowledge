@@ -65,7 +65,7 @@ async def oauth_install(
 async def oauth_callback(
     source: str,
     request: Request,
-    code: str = Query(...),
+    code: str | None = Query(default=None),
     state: str = Query(..., description="customer_id passed through from install"),
     error: str | None = Query(default=None),
 ) -> HTMLResponse:
@@ -77,9 +77,12 @@ async def oauth_callback(
 
     # Redirect URI must match exactly what was sent in the install step.
     redirect_uri = str(request.url).split("?", 1)[0]
+    extra_params = dict(request.query_params)
 
     try:
-        token = await connector.exchange_oauth_code(code, redirect_uri)
+        token = await connector.exchange_oauth_code(
+            code=code, redirect_uri=redirect_uri, extra_params=extra_params
+        )
     except NotSupportedByConnector as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except PrbeError as exc:

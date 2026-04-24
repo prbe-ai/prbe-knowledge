@@ -47,7 +47,9 @@ async def verify_admin_key(
     x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
 ) -> None:
     expected_secret = get_settings().admin_api_key
-    if expected_secret is None:
+    # Treat an empty SecretStr as "unset" — otherwise a blank .env value
+    # would silently allow the header check to pass against "" == "".
+    if expected_secret is None or not expected_secret.get_secret_value():
         raise HTTPException(
             status_code=503, detail="admin disabled — set ADMIN_API_KEY"
         )

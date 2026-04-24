@@ -74,6 +74,7 @@ SLACK_SIGNING_SECRET=
 
 GITHUB_APP_ID=
 GITHUB_APP_PRIVATE_KEY=                     # full PEM, use """ quoting if needed
+GITHUB_APP_SLUG=                            # the last path component of github.com/apps/<slug>
 GITHUB_WEBHOOK_SECRET=
 
 LINEAR_CLIENT_ID=
@@ -122,11 +123,21 @@ and (where applicable) `signing_secret` for each, pasted into `.env.local`.
 4. **Subscribe to events**: `push`, `pull_request`, `issues`, `pull_request_review`
 5. Generate a **private key** (PEM file) → paste contents into `GITHUB_APP_PRIVATE_KEY`
 6. **App ID** → `GITHUB_APP_ID`
-7. Install the app on your org.
+7. On the App's **Basic Information** page, copy the slug (the last path
+   component of `github.com/apps/<slug>`) → `GITHUB_APP_SLUG`. This is what
+   the dashboard's Connect flow uses to build the install URL.
+8. Install the app on your org via the dashboard's **Connect** button. The
+   post-install redirect hits `/oauth/github/callback` which writes the
+   integration token and customer_source_mapping row automatically.
 
-After installing the App, grab the `installation_id` from the post-install
-redirect URL — e.g. `.../settings/installations/87654321` → `87654321`. Then
-seed PRBE so it can mint installation tokens on demand:
+Backfill and CODEOWNERS hydration mint fresh installation tokens via the
+App private key whenever they need to call GitHub — there's no refresh cron
+for GitHub because installation tokens are ~1h-lived and always reissued
+from the App JWT.
+
+Emergency / debug fallback only: if you need to seed an installation id
+without going through the dashboard Connect flow (e.g. a broken redirect),
+you can insert the mapping manually:
 
 ```bash
 .venv/bin/python -m scripts.github_seed_token \
@@ -134,10 +145,7 @@ seed PRBE so it can mint installation tokens on demand:
   --installation-id 87654321
 ```
 
-Backfill and CODEOWNERS hydration mint fresh installation tokens via the
-App private key whenever they need to call GitHub — there's no refresh cron
-for GitHub because installation tokens are ~1h-lived and always reissued
-from the App JWT.
+The primary path is the dashboard Connect button.
 
 ### Linear (10 min)
 

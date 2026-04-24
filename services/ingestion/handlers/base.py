@@ -192,10 +192,17 @@ class Connector(ABC):
 
     async def exchange_oauth_code(
         self,
-        code: str,
+        code: str | None,
         redirect_uri: str,
+        extra_params: dict[str, str] | None = None,
     ) -> IntegrationToken:
         """Exchange an OAuth authorization code for an access token.
+
+        `extra_params` carries the full callback query string so providers
+        that don't fit the standard `code` → token dance (e.g. GitHub Apps,
+        which redirect with `installation_id` + `setup_action` instead of
+        `code`) can reach the rest of the query. Standard OAuth2 connectors
+        can ignore it.
 
         Default raises; subclasses override if the source uses OAuth.
         """

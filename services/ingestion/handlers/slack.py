@@ -431,8 +431,9 @@ class SlackConnector(Connector):
 
     async def exchange_oauth_code(
         self,
-        code: str,
+        code: str | None,
         redirect_uri: str,
+        extra_params: dict[str, str] | None = None,
     ) -> IntegrationToken:
         cid = self.settings.slack_client_id
         secret = self.settings.slack_client_secret

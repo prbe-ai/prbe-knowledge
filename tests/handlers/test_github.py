@@ -15,6 +15,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import SecretStr
 
 from services.ingestion.handlers.base import ConnectorContext
@@ -25,6 +27,7 @@ from services.ingestion.handlers.github import (
 from services.ingestion.handlers.registry import build_connector
 from shared.config import Settings
 from shared.constants import (
+    GITHUB_INSTALLATION_SCOPE_PREFIX,
     DocType,
     EdgeType,
     NodeLabel,
@@ -32,8 +35,9 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
-from shared.models import WebhookEvent
+from shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
+from shared.github_auth import _reset_cache_for_tests
+from shared.models import IntegrationToken, WebhookEvent
 
 FIXTURES = Path(__file__).resolve().parents[1].parent / "fixtures" / "github"
 
@@ -352,3 +356,153 @@ def test_parse_codeowners_last_match_wins_on_duplicate_pattern() -> None:
     text = "*.py @alice\n*.py @bob @carol\n"
     result = parse_codeowners(text)
     assert result["*.py"] == ["@bob", "@carol"]
+
+
+# ---------------------------------------------------------------------------
+# oauth_install_url / exchange_oauth_code / identify_workspaces
+# ---------------------------------------------------------------------------
+
+
+def _fresh_private_key_pem() -> str:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return pem.decode("ascii")
+
+
+def _make_github_ctx(
+    *,
+    app_slug: str | None = None,
+    app_id: str | None = None,
+    private_key_pem: str | None = None,
+    http: httpx.AsyncClient | None = None,
+) -> ConnectorContext:
+    settings = Settings(
+        environment="local",
+        github_app_slug=app_slug,
+        github_app_id=app_id,
+        github_app_private_key=SecretStr(private_key_pem) if private_key_pem else None,
+    )
+    return ConnectorContext(
+        settings=settings,
+        http=http if http is not None else httpx.AsyncClient(),
+    )
+
+
+def test_oauth_install_url_uses_app_slug() -> None:
+    ctx = _make_github_ctx(app_slug="prbe-knowledge-dev")
+    connector = build_connector(SourceSystem.GITHUB, ctx)
+    url = connector.oauth_install_url(
+        "cust-1", "https://api.example.com/oauth/github/callback"
+    )
+    assert "/apps/prbe-knowledge-dev/installations/new" in url
+    assert "state=cust-1" in url
+
+
+def test_oauth_install_url_raises_without_slug() -> None:
+    ctx = _make_github_ctx(app_slug=None)
+    connector = build_connector(SourceSystem.GITHUB, ctx)
+    with pytest.raises(NotSupportedByConnector):
+        connector.oauth_install_url(
+            "cust-1", "https://api.example.com/oauth/github/callback"
+        )
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_without_installation_id_raises() -> None:
+    pem = _fresh_private_key_pem()
+    ctx = _make_github_ctx(app_id="12345", private_key_pem=pem)
+    connector = build_connector(SourceSystem.GITHUB, ctx)
+    with pytest.raises(InvalidWebhookPayload):
+        await connector.exchange_oauth_code(
+            code=None,
+            redirect_uri="https://api.example.com/oauth/github/callback",
+            extra_params={},
+        )
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_with_installation_id_returns_token_scoped_to_installation() -> None:
+    _reset_cache_for_tests()
+    pem = _fresh_private_key_pem()
+    installation_id = "99"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == f"/app/installations/{installation_id}/access_tokens"
+        return httpx.Response(
+            200,
+            json={"token": "ghs_abc", "expires_at": "2026-12-31T00:00:00Z"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(transport=transport)
+    ctx = _make_github_ctx(app_id="12345", private_key_pem=pem, http=http)
+    connector = build_connector(SourceSystem.GITHUB, ctx)
+
+    try:
+        token = await connector.exchange_oauth_code(
+            code=None,
+            redirect_uri="https://api.example.com/oauth/github/callback",
+            extra_params={"installation_id": installation_id, "setup_action": "install"},
+        )
+    finally:
+        await http.aclose()
+        _reset_cache_for_tests()
+
+    assert token.source_system is SourceSystem.GITHUB
+    assert token.scope == f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}"
+    assert token.access_token  # non-empty placeholder
+
+
+@pytest.mark.asyncio
+async def test_identify_workspaces_returns_installation_account() -> None:
+    _reset_cache_for_tests()
+    pem = _fresh_private_key_pem()
+    installation_id = "99"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == f"/app/installations/{installation_id}/access_tokens":
+            return httpx.Response(
+                200,
+                json={"token": "ghs_abc", "expires_at": "2026-12-31T00:00:00Z"},
+            )
+        if path == f"/app/installations/{installation_id}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": int(installation_id),
+                    "account": {"login": "prbe", "type": "Organization"},
+                    "target_type": "Organization",
+                },
+            )
+        return httpx.Response(404, json={"message": f"unexpected path {path}"})
+
+    transport = httpx.MockTransport(handler)
+    http = httpx.AsyncClient(transport=transport)
+    ctx = _make_github_ctx(app_id="12345", private_key_pem=pem, http=http)
+    connector = build_connector(SourceSystem.GITHUB, ctx)
+
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        access_token="installation-minted-on-demand",
+        scope=f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}",
+    )
+    try:
+        refs = await connector.identify_workspaces(token)
+    finally:
+        await http.aclose()
+        _reset_cache_for_tests()
+
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref.external_id == installation_id
+    assert ref.external_name == "prbe"
+    assert ref.metadata["installation_id"] == installation_id
+    assert ref.metadata["account_type"] == "Organization"
+    assert ref.metadata["target_type"] == "Organization"
