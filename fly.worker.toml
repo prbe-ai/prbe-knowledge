@@ -7,12 +7,40 @@ kill_timeout = "30s"
   dockerfile = "services/worker/Dockerfile"
 
 [env]
-  ENVIRONMENT  = "main"
-  LOG_LEVEL    = "INFO"
-  SERVICE_NAME = "prbe-knowledge-worker"
+  ENVIRONMENT         = "main"
+  LOG_LEVEL           = "INFO"
+  SERVICE_NAME        = "prbe-knowledge-worker"
+  WORKER_HEALTH_PORT  = "8082"
 
 [processes]
   worker = "python -m services.ingestion.worker"
+
+# Fly should always try to bring the worker back. No HTTP traffic drives
+# this process — a single transient DB reconnect during a deploy is enough
+# to exit non-zero, and without an explicit policy Fly leaves the machine
+# stopped until human intervention.
+[[restart]]
+  policy      = "always"
+  max_retries = 10
+
+# Pin liveness to the worker's own /health endpoint + guarantee 1 running
+# machine at all times. auto_stop=false because there's no inbound traffic
+# to "idle" on; min_machines_running=1 keeps one up even when the health
+# check briefly fails during rolling deploys.
+[http_service]
+  internal_port        = 8082
+  force_https          = true
+  auto_stop_machines   = false
+  auto_start_machines  = true
+  min_machines_running = 1
+  processes            = ["worker"]
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval     = "15s"
+    method       = "GET"
+    timeout      = "5s"
+    path         = "/health"
 
 [[vm]]
   size   = "shared-cpu-1x"

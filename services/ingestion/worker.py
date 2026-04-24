@@ -297,12 +297,43 @@ class BackfillWorker:
         self._shutdown.set()
 
 
+def _build_health_app():
+    """FastAPI app exposing `/health` so Fly can probe liveness.
+
+    Deliberately separate from the full ingestion app — this one runs
+    alongside the drain loop in the worker process so Fly's health
+    check has something to hit.
+    """
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    from shared.db import health_check
+
+    app = FastAPI(title="prbe-knowledge worker health", docs_url=None, redoc_url=None)
+
+    @app.get("/health")
+    async def health() -> JSONResponse:
+        db_ok = await health_check()
+        body = {
+            "status": "ok" if db_ok else "degraded",
+            "db": db_ok,
+            "time": datetime.now(UTC).isoformat(),
+        }
+        return JSONResponse(body, status_code=200 if db_ok else 503)
+
+    return app
+
+
 async def run_worker_forever() -> None:
     """Entry point for `python -m services.ingestion.worker`.
 
-    Runs the ingestion drain and backfill drain concurrently. Both share the
-    same ConnectorContext + asyncpg pool.
+    Runs the ingestion drain, the backfill drain, and a tiny health
+    HTTP server concurrently. They share the same asyncpg pool.
     """
+    import os
+
+    import uvicorn
+
     from shared.config import get_settings
     from shared.logging import configure_logging
 
@@ -315,15 +346,29 @@ async def run_worker_forever() -> None:
     ctx = make_default_context()
     ingestion_worker = Worker(ctx, max_attempts=settings.worker_max_attempts)
     backfill_worker = BackfillWorker(ctx)
+
+    health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
+    health_config = uvicorn.Config(
+        _build_health_app(),
+        host="0.0.0.0",
+        port=health_port,
+        log_config=None,
+        lifespan="off",
+        access_log=False,
+    )
+    health_server = uvicorn.Server(health_config)
+
     log.info(
         "worker.boot",
         environment=settings.environment,
+        health_port=health_port,
         timestamp=datetime.now(UTC).isoformat(),
     )
     try:
         await asyncio.gather(
             ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
             backfill_worker.run(),
+            health_server.serve(),
         )
     finally:
         await ctx.http.aclose()
