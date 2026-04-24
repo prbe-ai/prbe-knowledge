@@ -122,6 +122,18 @@ async def webhook(
     except orjson.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"invalid json: {exc}") from exc
 
+    # Slack URL verification handshake: echo back the challenge before any
+    # customer-routing or pipeline work runs. Slack accepts {"challenge": ...}.
+    if (
+        source_enum is SourceSystem.SLACK
+        and isinstance(payload, dict)
+        and payload.get("type") == "url_verification"
+    ):
+        challenge = payload.get("challenge")
+        if not isinstance(challenge, str):
+            raise HTTPException(status_code=400, detail="missing challenge")
+        return JSONResponse({"challenge": challenge})
+
     # Resolve customer_id in this priority order:
     #   1. X-Prbe-Customer header (internal callers / tests / manual routing)
     #   2. Payload's external_id → customer_source_mapping lookup
