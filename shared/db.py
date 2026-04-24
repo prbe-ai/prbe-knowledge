@@ -46,6 +46,17 @@ async def close_pool() -> None:
         _pool = None
 
 
+def reset_pool() -> None:
+    """Drop the module reference without gracefully closing.
+
+    Used only by tests that reuse module state across event loops — a
+    graceful close would touch the pool's creation loop, which may
+    already be closed and raises `RuntimeError: Event loop is closed`.
+    """
+    global _pool
+    _pool = None
+
+
 def get_pool() -> asyncpg.Pool:
     if _pool is None:
         raise DatabaseUnavailable("pool not initialized — call init_pool() first")

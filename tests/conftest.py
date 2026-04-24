@@ -74,8 +74,9 @@ TRUNCATE_SQL = """
 @pytest_asyncio.fixture
 async def live_db(settings: Settings) -> AsyncIterator[None]:
     """Initialize a fresh pool on the current event loop, truncate, yield, close."""
-    # Tear down any pool left over from a prior test bound to a dead loop.
-    await db_module.close_pool()
+    # Drop any pool left over from a prior test — its loop is already closed,
+    # so a graceful close() would crash. Reset the reference, then init fresh.
+    db_module.reset_pool()
     await db_module.init_pool(settings)
     async with db_module.raw_conn() as conn:
         await conn.execute(TRUNCATE_SQL)
