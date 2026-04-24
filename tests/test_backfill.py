@@ -148,6 +148,144 @@ async def test_slack_backfill_paginates_channels_and_history() -> None:
     assert calls == ["history:C1", "history:C2"]
 
 
+@pytest.mark.asyncio
+async def test_slack_backfill_auto_joins_public_channels_when_scope_present() -> None:
+    """With channels:join scope, backfill joins every non-member public channel."""
+    joined: list[str] = []
+    list_calls: list[str] = []
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        types = req.url.params.get("types", "")
+        list_calls.append(types)
+        if types == "public_channel":
+            # Auto-join sweep: C1 already member, C2 needs to be joined.
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "channels": [
+                        {"id": "C1", "is_member": True},
+                        {"id": "C2", "is_member": False},
+                    ],
+                    "response_metadata": {"next_cursor": ""},
+                },
+            )
+        # Backfill's own enumeration (public + private): both now members.
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [
+                    {"id": "C1", "is_member": True},
+                    {"id": "C2", "is_member": True},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def join_channel(req):
+        channel = dict(x.split("=", 1) for x in req.content.decode().split("&")).get("channel")
+        joined.append(channel or "")
+        return httpx.Response(200, json={"ok": True, "channel": {"id": channel}})
+
+    def history(req):
+        channel = req.url.params["channel"]
+        base = 1713628800 if channel == "C1" else 1713628900
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [
+                    {"type": "message", "channel": channel, "ts": f"{base}.000100", "text": "hi", "user": "U1"},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("POST", "/api/conversations.join"): join_channel,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust",
+        source_system=SourceSystem.SLACK,
+        access_token="x",
+        scope="channels:history,channels:join,channels:read",
+    )
+
+    events = [e async for e in slack.backfill("cust", token)]
+    assert joined == ["C2"], "should join only the non-member channel"
+    assert list_calls[0] == "public_channel", "auto-join must list public channels first"
+    assert len(events) == 2  # 2 channels, 1 message each
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_skips_auto_join_without_scope() -> None:
+    """Without channels:join scope, backfill skips the auto-join sweep entirely."""
+    join_calls: list[str] = []
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        assert req.url.params.get("types") != "public_channel", (
+            "auto-join list call should not fire without scope"
+        )
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [{"id": "C1", "is_member": True}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def join_channel(req):
+        join_calls.append("called")
+        return httpx.Response(200, json={"ok": True})
+
+    def history(req):
+        return httpx.Response(
+            200,
+            json={"ok": True, "messages": [], "response_metadata": {"next_cursor": ""}},
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("POST", "/api/conversations.join"): join_channel,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust",
+        source_system=SourceSystem.SLACK,
+        access_token="x",
+        scope="channels:history,channels:read",  # no channels:join
+    )
+
+    [e async for e in slack.backfill("cust", token)]
+    assert join_calls == [], "conversations.join must not be called without scope"
+
+
 # -------------------------------- linear ------------------------------------
 
 
