@@ -61,6 +61,7 @@ def _patch_settings(monkeypatch, settings: Settings) -> None:
 async def test_oauth_callback_github_path(live_db, settings, monkeypatch) -> None:
     pem = _fresh_private_key_pem()
     monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", pem)
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "http://dash.local")
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
     # Customer row required by integration_tokens.customer_id FK.
@@ -126,7 +127,11 @@ async def test_oauth_callback_github_path(live_db, settings, monkeypatch) -> Non
             ingestion_app.state.ctx = original_ctx
             await mock_http.aclose()
 
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 302, resp.text
+    location = resp.headers["location"]
+    assert location.startswith("http://dash.local/oauth-landed?")
+    assert f"customer_id={CUSTOMER_ID}" in location
+    assert "ok=1" in location
 
     await init_pool(settings)
     async with raw_conn() as conn:
@@ -156,3 +161,143 @@ async def test_oauth_callback_github_path(live_db, settings, monkeypatch) -> Non
     assert mapping_row is not None, "customer_source_mapping row was not written"
     assert mapping_row["customer_id"] == CUSTOMER_ID
     assert mapping_row["external_name"] == "prbe"
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_github_update_without_state(
+    live_db, settings, monkeypatch
+) -> None:
+    """GitHub 'Redirect on update' fires with installation_id + setup_action=update
+    but no `state` or `code`. We must resolve customer_id via existing mapping,
+    skip token re-exchange, and land the user on the dashboard."""
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "http://dash.local")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    update_customer = "cust-update"
+    update_install = "100"
+
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO customers (customer_id, display_name, api_key_hash)
+            VALUES ($1, 'update-test', 'dummy')
+            ON CONFLICT DO NOTHING
+            """,
+            update_customer,
+        )
+        await conn.execute(
+            """
+            INSERT INTO customer_source_mapping
+                (source_system, external_id, customer_id, external_name, metadata)
+            VALUES ($1, $2, $3, 'prbe', '{}'::jsonb)
+            """,
+            SourceSystem.GITHUB.value,
+            update_install,
+            update_customer,
+        )
+
+    http_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        http_calls.append(request.url.path)
+        return httpx.Response(500, json={"message": "should not be called"})
+
+    from services.ingestion.main import app as ingestion_app
+
+    await close_pool()
+    transport = ASGITransport(app=ingestion_app)
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        ingestion_app.router.lifespan_context(ingestion_app),
+    ):
+        mock_http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        original_ctx = ingestion_app.state.ctx
+        ingestion_app.state.ctx = ConnectorContext(
+            settings=Settings(environment="local"),
+            http=mock_http,
+        )
+        try:
+            resp = await client.get(
+                "/oauth/github/callback",
+                params={
+                    "installation_id": update_install,
+                    "setup_action": "update",
+                },
+            )
+        finally:
+            ingestion_app.state.ctx = original_ctx
+            await mock_http.aclose()
+
+    assert resp.status_code == 302, resp.text
+    location = resp.headers["location"]
+    assert location.startswith("http://dash.local/oauth-landed?")
+    assert "source=github" in location
+    assert f"customer_id={update_customer}" in location
+    assert "ok=1" in location
+    assert http_calls == [], f"update path should not hit GitHub API, got {http_calls}"
+
+    await init_pool(settings)
+    async with raw_conn() as conn:
+        token_row = await conn.fetchrow(
+            """
+            SELECT 1
+            FROM integration_tokens
+            WHERE customer_id = $1 AND source_system = $2
+            """,
+            update_customer,
+            SourceSystem.GITHUB.value,
+        )
+    assert token_row is None, "update flow must not write an integration_tokens row"
+
+
+@pytest.mark.asyncio
+async def test_oauth_callback_github_install_without_state_no_mapping(
+    live_db, monkeypatch
+) -> None:
+    """A marketplace install (or any direct install from github.com/apps/<slug>)
+    reaches the Setup URL with only installation_id — no `state`, no existing
+    mapping. We can't bind this to a tenant, so redirect to the dashboard
+    with a recoverable error instead of 422'ing."""
+    monkeypatch.setenv("DASHBOARD_BASE_URL", "http://dash.local")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    unknown_install = "200"
+
+    http_calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        http_calls.append(request.url.path)
+        return httpx.Response(500, json={"message": "should not be called"})
+
+    from services.ingestion.main import app as ingestion_app
+
+    await close_pool()
+    transport = ASGITransport(app=ingestion_app)
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        ingestion_app.router.lifespan_context(ingestion_app),
+    ):
+        mock_http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        original_ctx = ingestion_app.state.ctx
+        ingestion_app.state.ctx = ConnectorContext(
+            settings=Settings(environment="local"),
+            http=mock_http,
+        )
+        try:
+            resp = await client.get(
+                "/oauth/github/callback",
+                params={
+                    "installation_id": unknown_install,
+                    "setup_action": "install",
+                },
+            )
+        finally:
+            ingestion_app.state.ctx = original_ctx
+            await mock_http.aclose()
+
+    assert resp.status_code == 302, resp.text
+    location = resp.headers["location"]
+    assert location.startswith("http://dash.local/oauth-landed?")
+    assert "ok=0" in location
+    assert "error=install_without_state" in location
+    assert http_calls == [], "no-mapping path should not hit GitHub API"

@@ -27,7 +27,7 @@ from services.ingestion.handlers.registry import (
 )
 from shared.config import get_settings
 from shared.constants import SourceSystem
-from shared.customer_mapping import record_mapping
+from shared.customer_mapping import record_mapping, resolve_customer
 from shared.exceptions import (
     HandlerNotFound,
     NotSupportedByConnector,
@@ -69,23 +69,69 @@ async def oauth_callback(
     source: str,
     request: Request,
     code: str | None = Query(default=None),
-    state: str = Query(..., description="customer_id passed through from install"),
+    state: str | None = Query(
+        default=None, description="customer_id passed through from install"
+    ),
     error: str | None = Query(default=None),
 ) -> Response:
     dashboard_base = (get_settings().dashboard_base_url or "").rstrip("/")
+    source_enum = _source(source)
+    extra_params = dict(request.query_params)
+
     if error:
         if dashboard_base:
             return _landed_redirect(
-                dashboard_base, source=source, customer_id=state, ok=False, error=error
+                dashboard_base,
+                source=source,
+                customer_id=state or "",
+                ok=False,
+                error=error,
             )
         raise HTTPException(status_code=400, detail=f"OAuth provider error: {error}")
 
-    source_enum = _source(source)
+    # `state` is absent for GitHub marketplace installs and for post-install
+    # "Redirect on update" fires (repo added/removed). Fall back to existing
+    # (source, external_id) → customer_id mapping so those flows don't 422.
+    customer_id = state
+    if customer_id is None:
+        customer_id = await _resolve_customer_from_callback(source_enum, extra_params)
+
+    # "Redirect on update" fires on every repo add/remove. Installation id is
+    # unchanged and tokens are minted on-demand, so nothing needs re-saving —
+    # just log and land the user back on the dashboard.
+    setup_action = extra_params.get("setup_action")
+    if customer_id and setup_action == "update" and not code:
+        log.info("oauth.post_install_update", customer=customer_id, source=source)
+        if dashboard_base:
+            return _landed_redirect(
+                dashboard_base, source=source, customer_id=customer_id, ok=True
+            )
+        return HTMLResponse(
+            f"<!doctype html><html><body><h2>Updated: {source}</h2>"
+            f"<p>Installation updated for customer <code>{customer_id}</code>.</p>"
+            f"</body></html>"
+        )
+
+    # No state and no existing mapping: direct marketplace install without
+    # a dashboard-initiated flow. We can't bind this to a tenant.
+    if customer_id is None:
+        if dashboard_base:
+            return _landed_redirect(
+                dashboard_base,
+                source=source,
+                customer_id="",
+                ok=False,
+                error="install_without_state",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth callback missing tenant context. Install via the dashboard.",
+        )
+
     connector = build_connector(source_enum, request.app.state.ctx)
 
     # Redirect URI must match exactly what was sent in the install step.
     redirect_uri = str(request.url).split("?", 1)[0]
-    extra_params = dict(request.query_params)
 
     try:
         token = await connector.exchange_oauth_code(
@@ -99,7 +145,7 @@ async def oauth_callback(
 
     # Ensure customer_id is bound before persisting. Connector impls may leave
     # it empty because they don't know the tenant; we take it from `state`.
-    token = token.model_copy(update={"customer_id": state})
+    token = token.model_copy(update={"customer_id": customer_id})
     await save_token(token)
 
     # Identify the source-side workspace(s) this token grants access to so
@@ -111,13 +157,13 @@ async def oauth_callback(
         log.warning(
             "oauth.identify_workspaces_failed",
             source=source,
-            customer=state,
+            customer=customer_id,
             error=str(exc),
         )
         refs = []
     for ref in refs:
         await record_mapping(
-            customer_id=state,
+            customer_id=customer_id,
             source_system=source_enum,
             external_id=ref.external_id,
             external_name=ref.external_name,
@@ -141,15 +187,15 @@ async def oauth_callback(
     # asynchronously; webhooks arrive in parallel and are deduped by the
     # UNIQUE (customer, source, source_event_id) constraint.
     try:
-        await enqueue_backfill(customer_id=state, source=source_enum)
+        await enqueue_backfill(customer_id=customer_id, source=source_enum)
         backfill_msg = (
             "<p><small>Historical backfill queued. Check "
-            f"<code>/backfill/status?customer_id={state}</code> for progress.</small></p>"
+            f"<code>/backfill/status?customer_id={customer_id}</code> for progress.</small></p>"
         )
     except Exception as exc:
         log.warning(
             "oauth.backfill_enqueue_failed",
-            customer=state,
+            customer=customer_id,
             source=source,
             error=str(exc),
         )
@@ -160,7 +206,7 @@ async def oauth_callback(
 
     log.info(
         "oauth.connected",
-        customer=state,
+        customer=customer_id,
         source=source,
         workspaces=[r.external_id for r in refs],
     )
@@ -168,15 +214,32 @@ async def oauth_callback(
         return _landed_redirect(
             dashboard_base,
             source=source,
-            customer_id=state,
+            customer_id=customer_id,
             ok=True,
             workspaces=[r.external_name or r.external_id for r in refs],
         )
     return HTMLResponse(
         f"<!doctype html><html><body><h2>Connected: {source}</h2>"
-        f"<p>Integration active for customer <code>{state}</code>.</p>"
+        f"<p>Integration active for customer <code>{customer_id}</code>.</p>"
         f"{workspaces_msg}{backfill_msg}</body></html>"
     )
+
+
+async def _resolve_customer_from_callback(
+    source: SourceSystem, extra_params: dict[str, str]
+) -> str | None:
+    """Derive customer_id when `state` was lost (marketplace install, update fire).
+
+    Uses the connector-native workspace id already recorded in
+    `customer_source_mapping` at first install. Returns None if no mapping
+    exists yet — that case must be surfaced as a 'please install via the
+    dashboard' flow, not a silent bind.
+    """
+    if source == SourceSystem.GITHUB:
+        installation_id = extra_params.get("installation_id")
+        if installation_id:
+            return await resolve_customer(source, installation_id)
+    return None
 
 
 def _source(s: str) -> SourceSystem:
