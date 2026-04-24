@@ -1,5 +1,5 @@
 app = "prbe-knowledge-worker"
-primary_region = "iad"
+primary_region = "sjc"
 kill_signal = "SIGINT"
 kill_timeout = "30s"
 

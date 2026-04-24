@@ -1,5 +1,5 @@
 app = "prbe-knowledge-ingestion"
-primary_region = "iad"
+primary_region = "sjc"
 kill_signal = "SIGINT"
 kill_timeout = "5s"
 
@@ -36,5 +36,5 @@ kill_timeout = "5s"
     path         = "/health"
 
 [[vm]]
-  size   = "shared-cpu-1x"
-  memory = "512mb"
+  size   = "shared-cpu-4x"
+  memory = "2gb"
