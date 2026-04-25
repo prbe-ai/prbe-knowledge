@@ -318,3 +318,47 @@ def test_verify_signature_valid_hmac() -> None:
     assert (
         notion.verify_signature({"X-Notion-Signature": f"sha256={digest}"}, body) is True
     )
+
+
+# ---------------------------------------------------------------------------
+# OAuth install URL
+# ---------------------------------------------------------------------------
+
+
+def _make_oauth_ctx(*, client_id: str | None = "ntn_test_client") -> ConnectorContext:
+    settings = Settings(
+        environment="local",
+        notion_client_id=client_id,
+    )
+    return ConnectorContext(settings=settings, http=httpx.AsyncClient())
+
+
+def test_oauth_install_url_shape() -> None:
+    ctx = _make_oauth_ctx()
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    url = notion.oauth_install_url(
+        "cust-1",
+        "https://example.com/oauth/notion/callback",
+        "signed-state-token",
+    )
+
+    assert url.startswith("https://api.notion.com/v1/oauth/authorize?")
+    assert "client_id=ntn_test_client" in url
+    assert (
+        "redirect_uri=https%3A%2F%2Fexample.com%2Foauth%2Fnotion%2Fcallback"
+        in url
+    )
+    assert "response_type=code" in url
+    assert "owner=user" in url
+    assert "state=signed-state-token" in url
+
+
+def test_oauth_install_url_missing_client_id_raises() -> None:
+    from shared.exceptions import MissingSecret
+
+    ctx = _make_oauth_ctx(client_id=None)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    with pytest.raises(MissingSecret):
+        notion.oauth_install_url("cust-1", "https://x/cb", "state")

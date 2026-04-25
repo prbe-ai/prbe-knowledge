@@ -88,6 +88,9 @@ _DELETE_EVENT_TYPES: frozenset[str] = frozenset(
 
 _DEFAULT_WORKSPACE_PRINCIPAL = "notion-default"
 
+_NOTION_OAUTH_AUTHORIZE = "https://api.notion.com/v1/oauth/authorize"
+_NOTION_OAUTH_TOKEN = "https://api.notion.com/v1/oauth/token"
+
 
 # ---- source-shape discriminators -------------------------------------------
 
@@ -637,6 +640,31 @@ class NotionConnector(Connector):
             graph_edges=edges,
             acl_snapshots=acl_rows,
         )
+
+    # ------------------------------------------------------------------
+    # 6. OAuth install + exchange
+    # ------------------------------------------------------------------
+
+    def oauth_install_url(
+        self, customer_id: str, redirect_uri: str, state: str
+    ) -> str:
+        cid = self.settings.notion_client_id
+        if not cid:
+            from shared.exceptions import MissingSecret
+
+            raise MissingSecret("NOTION_CLIENT_ID not configured")
+        from urllib.parse import urlencode
+
+        params = urlencode(
+            {
+                "client_id": cid,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "owner": "user",
+                "state": state,
+            }
+        )
+        return f"{_NOTION_OAUTH_AUTHORIZE}?{params}"
 
     # ------------------------------------------------------------------
     # 7. workspace identification
