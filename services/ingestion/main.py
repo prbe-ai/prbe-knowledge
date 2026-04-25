@@ -36,7 +36,7 @@ from services.ingestion.handlers.registry import (
 from services.ingestion.oauth import router as oauth_router
 from shared.config import get_settings
 from shared.constants import SourceSystem
-from shared.customer_mapping import resolve_customer, single_customer_fallback
+from shared.customer_mapping import resolve_customer
 from shared.db import get_pool, health_check, init_pool
 from shared.exceptions import (
     HandlerNotFound,
@@ -134,43 +134,48 @@ async def webhook(
             raise HTTPException(status_code=400, detail="missing challenge")
         return JSONResponse({"challenge": challenge})
 
-    # Resolve customer_id in this priority order:
+    # Resolve customer_id strictly:
     #   1. X-Prbe-Customer header (internal callers / tests / manual routing)
     #   2. Payload's external_id → customer_source_mapping lookup
-    #   3. single_customer_fallback (only when there's NO external_id at all,
-    #      e.g. early Sentry installation events that lack org info)
     #
-    # If we DID extract an external_id but it doesn't map to a known customer,
-    # that's an unknown workspace — reject the webhook. Otherwise solo-tenant
-    # tenants silently absorb traffic from any other workspace where the bot
-    # happens to be installed (cross-tenant leak).
-    customer_id = request.headers.get("x-prbe-customer")
+    # No fallback. Every real webhook payload from every source we support
+    # carries a stable workspace/org id (Slack team_id, GitHub installation.id,
+    # Linear organizationId, Notion workspace_id, Sentry organization.slug).
+    # If we can't tie an event to a customer, drop it. The previous
+    # single_customer_fallback path silently absorbed cross-tenant traffic
+    # whenever the bot was installed in workspaces we never deliberately
+    # connected.
+    customer_id: str | None = request.headers.get("x-prbe-customer")
     if not customer_id:
         external_id = connector.extract_external_id_from_payload(
             dict(request.headers), payload
         )
-        if external_id:
-            customer_id = await resolve_customer(source_enum, external_id)
-            if not customer_id:
-                log.warning(
-                    "ingestion.unknown_workspace",
-                    source=source,
-                    external_id=external_id,
-                )
-                raise HTTPException(
-                    status_code=401,
-                    detail=(
-                        f"unknown {source_enum.value} workspace: {external_id}. "
-                        "Connect this workspace via the dashboard to receive its events."
-                    ),
-                )
-        else:
-            customer_id = await single_customer_fallback()
-    if not customer_id:
-        raise HTTPException(
-            status_code=400,
-            detail="could not resolve customer (no X-Prbe-Customer header, no mapping, multiple tenants exist)",
-        )
+        if not external_id:
+            log.warning(
+                "ingestion.payload_missing_workspace_id",
+                source=source,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"{source_enum.value} payload has no workspace identifier. "
+                    "Cannot route to a customer."
+                ),
+            )
+        customer_id = await resolve_customer(source_enum, external_id)
+        if not customer_id:
+            log.warning(
+                "ingestion.unknown_workspace",
+                source=source,
+                external_id=external_id,
+            )
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    f"unknown {source_enum.value} workspace: {external_id}. "
+                    "Connect this workspace via the dashboard to receive its events."
+                ),
+            )
 
     try:
         parsed = connector.parse_webhook_event(
