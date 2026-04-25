@@ -127,9 +127,12 @@ async def synthesize(
     )
 
     parsed = _parse_response(raw)
-    citations = _extract_citations(parsed["answer"], chunks)
+    answer = normalize_citations_in_answer(parsed["answer"])
+    declared = parsed.get("citations_used") or parsed.get("citations") or None
+    declared_list = declared if isinstance(declared, list) else None
+    citations = _extract_citations(answer, chunks, declared=declared_list)
     return SynthesisResult(
-        answer=parsed["answer"],
+        answer=answer,
         citations=citations,
         insufficient_context=bool(parsed.get("insufficient_context", False)),
         model=model,
@@ -306,23 +309,45 @@ def _parse_response(raw: str) -> dict[str, Any]:
     }
 
 
-_CITATION_RE = re.compile(r"\[chunk:(\d+)\]")
+# Match [chunk:N] (preferred) and bare chunk:N. Gemini in particular tends to
+# drop the brackets despite the prompt; we accept both and normalize on render.
+_CITATION_RE = re.compile(r"\[?chunk:(\d+)\]?")
+
+
+def normalize_citations_in_answer(answer: str) -> str:
+    """Wrap bare `chunk:N` into `[chunk:N]` so downstream renderers (and the
+    dashboard's markdown-link conversion) see a single canonical format.
+    """
+    def _repl(m: re.Match[str]) -> str:
+        return f"[chunk:{m.group(1)}]"
+
+    return _CITATION_RE.sub(_repl, answer)
 
 
 def _extract_citations(
-    answer: str, chunks: list[SynthesisChunk]
+    answer: str,
+    chunks: list[SynthesisChunk],
+    declared: list[int] | None = None,
 ) -> list[dict[str, object]]:
-    """Pull [chunk:N] tags from the answer, dedupe, map to chunk_id.
-
-    Out-of-range or duplicate indices are dropped silently — the dashboard
-    can render the [chunk:N] tags inline without worrying about validity.
+    """Pull citations from the answer text plus any explicit `citations_used`
+    list the model returned. Dedupe, drop out-of-range indices, map to
+    chunk_id.
     """
     seen: set[int] = set()
     out: list[dict[str, object]] = []
-    for match in _CITATION_RE.finditer(answer):
-        idx = int(match.group(1))
+
+    def _add(idx: int) -> None:
         if idx < 1 or idx > len(chunks) or idx in seen:
-            continue
+            return
         seen.add(idx)
         out.append({"index": idx, "chunk_id": chunks[idx - 1].chunk_id})
+
+    for match in _CITATION_RE.finditer(answer):
+        _add(int(match.group(1)))
+    if declared:
+        for idx in declared:
+            try:
+                _add(int(idx))
+            except (TypeError, ValueError):
+                continue
     return out

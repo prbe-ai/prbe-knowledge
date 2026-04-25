@@ -10,6 +10,7 @@ from services.retrieval.synthesis import (
     _extract_citations,
     _format_user_prompt,
     _parse_response,
+    normalize_citations_in_answer,
     synthesize,
 )
 
@@ -100,6 +101,38 @@ def test_extract_citations_dedupes_and_drops_out_of_range() -> None:
 def test_extract_citations_empty_when_no_tags() -> None:
     chunks = [_chunk(1)]
     assert _extract_citations("plain prose with no citations", chunks) == []
+
+
+def test_extract_citations_accepts_bare_chunk_n() -> None:
+    """Gemini ignores the [bracket] format sometimes — extractor must
+    still recognize bare `chunk:1`."""
+    chunks = [_chunk(1), _chunk(2)]
+    answer = "Granola was added chunk:1. Backfill via poller chunk:2."
+    out = _extract_citations(answer, chunks)
+    assert {c["index"] for c in out} == {1, 2}
+
+
+def test_extract_citations_uses_declared_list() -> None:
+    """When the model also returns `citations_used: [...]`, indices in that
+    list are added even if no inline tag references them."""
+    chunks = [_chunk(1), _chunk(2), _chunk(3)]
+    out = _extract_citations(
+        "answer text with [chunk:1].", chunks, declared=[1, 2, 3]
+    )
+    assert {c["index"] for c in out} == {1, 2, 3}
+
+
+def test_normalize_citations_brackets_bare_tags() -> None:
+    text = "Granola integration chunk:1 and the poller chunk:2."
+    assert (
+        normalize_citations_in_answer(text)
+        == "Granola integration [chunk:1] and the poller [chunk:2]."
+    )
+
+
+def test_normalize_citations_idempotent_on_already_bracketed() -> None:
+    text = "Already done [chunk:1]."
+    assert normalize_citations_in_answer(text) == "Already done [chunk:1]."
 
 
 @pytest.mark.asyncio
