@@ -362,3 +362,163 @@ def test_oauth_install_url_missing_client_id_raises() -> None:
 
     with pytest.raises(MissingSecret):
         notion.oauth_install_url("cust-1", "https://x/cb", "state")
+
+
+# ---------------------------------------------------------------------------
+# OAuth code exchange
+# ---------------------------------------------------------------------------
+
+
+def _oauth_ctx_with_secret(
+    *,
+    handler,
+    client_id: str | None = "ntn_test_client",
+    client_secret: str | None = "ntn_test_secret",
+) -> ConnectorContext:
+    from pydantic import SecretStr
+
+    settings = Settings(
+        environment="local",
+        notion_client_id=client_id,
+        notion_client_secret=SecretStr(client_secret) if client_secret else None,
+    )
+    return ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_happy() -> None:
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/oauth/token"
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "ntn_access_xyz",
+                "token_type": "bearer",
+                "refresh_token": "ntn_refresh_abc",
+                "bot_id": "bot_42",
+                "workspace_id": "ws_alpha",
+                "workspace_name": "Acme Eng",
+                "workspace_icon": "https://example.com/icon.png",
+                "owner": {"user": {"id": "user_alice"}},
+                "duplicated_template_id": None,
+                "request_id": "req_1",
+            },
+        )
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    token = await notion.exchange_oauth_code(
+        code="ntn-code-123",
+        redirect_uri="https://example.com/oauth/notion/callback",
+    )
+
+    # httpx.BasicAuth puts client_id:client_secret as base64.
+    assert seen["auth"].startswith("Basic ")
+    assert seen["body"] == {
+        "grant_type": "authorization_code",
+        "code": "ntn-code-123",
+        "redirect_uri": "https://example.com/oauth/notion/callback",
+    }
+
+    assert token.access_token == "ntn_access_xyz"
+    assert token.refresh_token == "ntn_refresh_abc"
+    assert token.source_system == SourceSystem.NOTION
+    # connector returns customer_id="" — the route fills it in.
+    assert token.customer_id == ""
+    # Notion uses capability checkboxes, not OAuth scope strings.
+    assert token.scope is None
+
+    # install_metadata carries workspace info into identify_workspaces.
+    assert token.install_metadata == {
+        "workspace_id": "ws_alpha",
+        "workspace_name": "Acme Eng",
+        "workspace_icon": "https://example.com/icon.png",
+        "bot_id": "bot_42",
+        "owner": {"user": {"id": "user_alice"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_4xx_raises_permanent() -> None:
+    from shared.exceptions import PermanentSourceError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    with pytest.raises(PermanentSourceError):
+        await notion.exchange_oauth_code(
+            code="bad", redirect_uri="https://x/cb"
+        )
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_missing_code_raises() -> None:
+    from shared.exceptions import InvalidWebhookPayload
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("HTTP should not be called when code is None")
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    with pytest.raises(InvalidWebhookPayload):
+        await notion.exchange_oauth_code(
+            code=None, redirect_uri="https://x/cb"
+        )
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_missing_secret_raises() -> None:
+    from shared.exceptions import MissingSecret
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("HTTP should not be called when secret is missing")
+
+    ctx = _oauth_ctx_with_secret(handler=handler, client_secret=None)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    with pytest.raises(MissingSecret):
+        await notion.exchange_oauth_code(
+            code="x", redirect_uri="https://x/cb"
+        )
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_no_refresh_token() -> None:
+    """Notion's docs say refresh_token is nullable — connector must not
+    crash when it's absent (older public integrations)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "ntn_access_xyz",
+                "token_type": "bearer",
+                "bot_id": "bot_42",
+                "workspace_id": "ws_alpha",
+                "workspace_name": "Acme Eng",
+                "owner": {"user": {"id": "user_alice"}},
+                # no refresh_token / workspace_icon
+            },
+        )
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = await notion.exchange_oauth_code(
+        code="x", redirect_uri="https://x/cb"
+    )
+    assert token.access_token == "ntn_access_xyz"
+    assert token.refresh_token is None
+    assert token.install_metadata["workspace_id"] == "ws_alpha"
+    assert token.install_metadata["workspace_icon"] is None

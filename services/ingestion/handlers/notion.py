@@ -666,6 +666,57 @@ class NotionConnector(Connector):
         )
         return f"{_NOTION_OAUTH_AUTHORIZE}?{params}"
 
+    async def exchange_oauth_code(
+        self,
+        code: str | None,
+        redirect_uri: str,
+        extra_params: dict[str, str] | None = None,
+    ) -> IntegrationToken:
+        from shared.exceptions import (
+            InvalidWebhookPayload,
+            MissingSecret,
+            PermanentSourceError,
+        )
+
+        cid = self.settings.notion_client_id
+        secret = self.settings.notion_client_secret
+        if not cid or secret is None:
+            raise MissingSecret(
+                "NOTION_CLIENT_ID / NOTION_CLIENT_SECRET not configured"
+            )
+        if not code:
+            raise InvalidWebhookPayload("notion oauth callback missing code")
+
+        resp = await self.http.post(
+            _NOTION_OAUTH_TOKEN,
+            auth=(cid, secret.get_secret_value()),  # httpx handles Basic encoding
+            headers={"Notion-Version": _NOTION_VERSION},
+            json={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        if resp.status_code != 200:
+            raise PermanentSourceError(
+                f"notion oauth failed: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        body = resp.json()
+        return IntegrationToken(
+            customer_id="",  # filled in by oauth/routes.py:callback
+            source_system=SourceSystem.NOTION,
+            access_token=body["access_token"],
+            refresh_token=body.get("refresh_token"),
+            scope=None,  # Notion uses per-integration capability checkboxes
+            install_metadata={
+                "workspace_id": body["workspace_id"],
+                "workspace_name": body.get("workspace_name"),
+                "workspace_icon": body.get("workspace_icon"),
+                "bot_id": body.get("bot_id"),
+                "owner": body.get("owner"),
+            },
+        )
+
     # ------------------------------------------------------------------
     # 7. workspace identification
     # ------------------------------------------------------------------
