@@ -188,17 +188,24 @@ async def _call_anthropic(system: str, user: str, model: str, max_tokens: int) -
         raise SynthesisError("ANTHROPIC_API_KEY not configured")
     client = AsyncAnthropic(api_key=api_key, timeout=SYNTHESIS_TIMEOUT_SECONDS)
     try:
+        # Prefill the assistant turn with `{` to bias toward JSON. Claude
+        # respects this prefix; the response continues from there. Re-prepend
+        # the `{` to the returned text since the SDK strips it.
         resp = await client.messages.create(
             model=model,
             max_tokens=max_tokens,
             system=system,
-            messages=[{"role": "user", "content": user}],
+            messages=[
+                {"role": "user", "content": user},
+                {"role": "assistant", "content": "{"},
+            ],
         )
     except APIError as exc:
         raise SynthesisError(f"anthropic api error: {exc}") from exc
-    return "".join(
+    body = "".join(
         block.text for block in resp.content if getattr(block, "type", "") == "text"
     )
+    return "{" + body
 
 
 async def _call_openai(system: str, user: str, model: str, max_tokens: int) -> str:
@@ -257,20 +264,53 @@ async def _call_google(system: str, user: str, model: str, max_tokens: int) -> s
 # ---------------------------------------------------------------------------
 
 
+_INSUFFICIENT_MARKERS = (
+    "insufficient context",
+    "cannot answer",
+    "can't answer",
+    "not enough information",
+    "no relevant information",
+    "no information",
+    "do not have",
+    "don't have",
+    "unable to answer",
+)
+
+
 def _parse_response(raw: str) -> dict[str, Any]:
+    """Best-effort: prefer JSON when the model obeys the schema, fall back
+    to treating the raw output as plain prose. Models occasionally answer
+    in prose despite the prompt — that's still a useful answer, no reason
+    to 502 the caller over it.
+    """
     text = raw.strip()
     # Tolerate markdown-fenced JSON.
     if text.startswith("```"):
-        text = text.strip("`").strip()
-        if text.lower().startswith("json"):
-            text = text[4:].strip()
+        stripped = text.strip("`").strip()
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:].strip()
+        text = stripped
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise SynthesisError(f"synthesizer returned non-JSON: {raw[:200]}") from exc
-    if not isinstance(parsed, dict) or "answer" not in parsed:
-        raise SynthesisError(f"synthesizer JSON missing 'answer': {raw[:200]}")
-    return parsed
+        if isinstance(parsed, dict) and "answer" in parsed:
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: treat the raw text as the answer body. Citation extraction
+    # downstream still works on [chunk:N] tags inside prose. Infer
+    # insufficient_context heuristically from common refusal phrasing.
+    lower = raw.lower()
+    insufficient = any(marker in lower for marker in _INSUFFICIENT_MARKERS)
+    log.info(
+        "synthesis.fallback_parse",
+        raw_len=len(raw),
+        insufficient=insufficient,
+    )
+    return {
+        "answer": raw.strip(),
+        "insufficient_context": insufficient,
+    }
 
 
 _CITATION_RE = re.compile(r"\[chunk:(\d+)\]")

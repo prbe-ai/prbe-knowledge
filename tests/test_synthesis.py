@@ -56,14 +56,35 @@ def test_parse_response_strips_markdown_fence() -> None:
     assert parsed["answer"] == "ok [chunk:1]"
 
 
-def test_parse_response_raises_on_garbage() -> None:
-    with pytest.raises(SynthesisError):
-        _parse_response("not json at all")
+def test_parse_response_falls_back_for_non_json() -> None:
+    """When the model returns prose despite the prompt, we render the prose
+    rather than 502 the caller. Citation extraction still works on
+    [chunk:N] tags inside the text downstream.
+    """
+    parsed = _parse_response("Klavis shipped Tuesday [chunk:1].")
+    assert parsed["answer"] == "Klavis shipped Tuesday [chunk:1]."
+    assert parsed["insufficient_context"] is False
 
 
-def test_parse_response_raises_when_answer_missing() -> None:
-    with pytest.raises(SynthesisError):
-        _parse_response('{"foo": "bar"}')
+def test_parse_response_falls_back_when_answer_key_missing() -> None:
+    parsed = _parse_response('{"foo": "bar"}')
+    assert parsed["answer"] == '{"foo": "bar"}'
+    assert parsed["insufficient_context"] is False
+
+
+def test_parse_response_infers_insufficient_context_from_prose() -> None:
+    parsed = _parse_response(
+        "I cannot answer this question from the provided chunks."
+    )
+    assert parsed["insufficient_context"] is True
+
+
+def test_parse_response_strips_anthropic_prefill_double_brace_safely() -> None:
+    """When prefill `{` succeeds and Claude returns valid JSON we still parse
+    the JSON path. The `{` prefix doesn't break us.
+    """
+    parsed = _parse_response('{"answer": "ok [chunk:1]", "insufficient_context": false}')
+    assert parsed["answer"] == "ok [chunk:1]"
 
 
 def test_extract_citations_dedupes_and_drops_out_of_range() -> None:
