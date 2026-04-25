@@ -104,3 +104,11 @@ jobs:
         run: flyctl deploy --remote-only -c fly.poller.toml
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      # min_machines_running = 1 in fly.poller.toml is a floor, not a cap —
+      # Fly will happily run more if it decides to. The poller MUST stay at 1
+      # until a distributed lock + rate limiter exist (see fly.poller.toml).
+      # Re-asserting count=1 every deploy is idempotent and cheap insurance.
+      - name: Pin poller to exactly 1 machine
+        run: flyctl scale count poller=1 -a prbe-knowledge-poller --yes
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

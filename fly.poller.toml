@@ -21,23 +21,21 @@ kill_timeout = "30s"
   max_retries = 10
 
 # ---------------------------------------------------------------------------
-# SHARP EDGE — DO NOT SET count > 1 WITHOUT INTRODUCING A DISTRIBUTED LOCK.
+# SHARP EDGE — POLLER MUST STAY AT 1 MACHINE.
 #
-# This process re-enqueues Granola backfills on a 5-min cadence. With a
-# single instance, in-process scheduling is correct. With N instances, every
-# tick produces N pg_notify events for every customer — backfill rows still
-# de-dup at the SQL level (re_enqueue_for_polling no-ops on pending/running),
-# so correctness is preserved BUT each manual refresh produces N notifies
-# and each tick produces N redundant SQL queries against integration_tokens.
+# `min_machines_running = 1` below is a FLOOR not a CAP — Fly will run more
+# if it decides to (e.g. autoscaler, deploy quirks). The deploy workflow
+# re-asserts `flyctl scale count poller=1` after every deploy as enforcement.
+# If you ever bump it manually, you're asking for trouble:
+#   - Each tick produces N pg_notify events per customer (de-dup at SQL level
+#     keeps correctness, but it's wasteful).
+#   - The in-process rate limiter inside connector.backfill() lets each
+#     instance spend its own 4 rps budget — total spend would exceed Granola's
+#     5 rps limit and we'd start eating 429s.
 #
-# Worse, if we ever add real polling logic that calls Granola here directly,
-# the in-process aiolimiter would let each instance spend its own 4 rps
-# budget — total spend would exceed the 5 rps Granola limit and we'd start
-# eating 429s.
-#
-# Before scaling out: introduce Postgres advisory locks
-# (`pg_try_advisory_lock(hashtext('granola_poller_tick'))`) or move the
-# rate budget into a shared store (Redis token bucket).
+# Before scaling out: introduce a Postgres advisory lock around the tick
+# (`pg_try_advisory_lock(hashtext('granola_poller_tick'))`) AND move the
+# Granola rate budget into a shared store (Redis token bucket).
 # ---------------------------------------------------------------------------
 [http_service]
   internal_port        = 8083
