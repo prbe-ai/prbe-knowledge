@@ -80,6 +80,20 @@ class Settings(BaseSettings):
     sentry_client_secret: SecretStr | None = None
     sentry_webhook_secret: SecretStr | None = None
 
+    # --- Neon Auth (dashboard service) -------------------------------------
+    # Base URL of the Neon Auth service for this branch (e.g.
+    # https://ep-xxx.neonauth.us-east-1.aws.neon.tech/neondb/auth). The
+    # dashboard backend resolves the JWKS URL by appending
+    # /.well-known/jwks.json.
+    neon_auth_base_url: str | None = None
+    # Shared secret between the Neon API and our webhook receiver — only
+    # used during webhook configuration (the actual signature is EdDSA).
+    neon_api_key: SecretStr | None = None
+
+    # --- Resend (invite email delivery) ------------------------------------
+    resend_api_key: SecretStr | None = None
+    resend_from_address: str = "invites@prbe.ai"
+
     # --- Worker tuning ------------------------------------------------------
     worker_poll_interval_seconds: float = 1.0
     worker_max_concurrent: int = 4
