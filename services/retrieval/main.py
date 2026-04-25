@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from services.retrieval.acl import filter_by_acl
@@ -43,6 +44,7 @@ from shared.models import (
     QueryChunk,
     QueryRequest,
     QueryResponse,
+    SourceResponse,
     TemporalMode,
     TemporalSpec,
 )
@@ -142,6 +144,127 @@ async def retrieve(
     or human-readable answers go to /query.
     """
     return await _run_retrieval(req, auth)
+
+
+@app.get("/sources/{doc_id:path}", response_model=SourceResponse)
+async def get_source(
+    doc_id: str,
+    auth: _AuthResult = Depends(authenticate_query),
+    version: int | None = Query(
+        default=None,
+        description="Specific document version. Defaults to the live version.",
+    ),
+) -> SourceResponse:
+    """Full source content for one document, reassembled from its chunks.
+
+    Use case: agent has a chunk back from /retrieve or /query, wants to
+    read the whole document around it without leaving PRBE. We rebuild
+    the source text from the same chunks that powered retrieval — same
+    content we ingested, no external API call, no rate limits.
+
+    `doc_id` is the colon-delimited identifier emitted by each connector
+    (e.g. `slack:T123:C456:1234567890.123456` or `github:owner/repo:pr:42`).
+    Path uses `:path` so colons aren't URL-decoded out from under us.
+    """
+    customer_id = _resolve_customer_id(auth)
+
+    async with with_tenant(customer_id) as conn:
+        if version is not None:
+            doc = await conn.fetchrow(
+                """
+                SELECT doc_id, version, source_system, source_id, source_url,
+                       title, body_size_bytes, author_id, metadata, entities,
+                       created_at, updated_at, ingested_at, deleted_at
+                FROM documents
+                WHERE customer_id = $1 AND doc_id = $2 AND version = $3
+                """,
+                customer_id,
+                doc_id,
+                version,
+            )
+        else:
+            doc = await conn.fetchrow(
+                """
+                SELECT doc_id, version, source_system, source_id, source_url,
+                       title, body_size_bytes, author_id, metadata, entities,
+                       created_at, updated_at, ingested_at, deleted_at
+                FROM documents
+                WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                customer_id,
+                doc_id,
+            )
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"document not found: {doc_id}")
+
+        # Reassemble content from the chunks tagged to this version. Chunks are
+        # content-addressable across versions, so we filter by the version range
+        # they cover (first_seen_version .. last_seen_version).
+        chunk_rows = await conn.fetch(
+            """
+            SELECT content, chunk_index
+            FROM chunks
+            WHERE customer_id = $1
+              AND doc_id = $2
+              AND valid_to IS NULL
+              AND $3 BETWEEN first_seen_version AND last_seen_version
+            ORDER BY chunk_index
+            """,
+            customer_id,
+            doc_id,
+            doc["version"],
+        )
+
+    full_content = "\n\n".join(c["content"] for c in chunk_rows)
+    metadata = doc["metadata"] if isinstance(doc["metadata"], dict) else {}
+    entities = doc["entities"] if isinstance(doc["entities"], list) else []
+    if isinstance(doc["metadata"], str):
+        try:
+            metadata = json.loads(doc["metadata"])
+        except (TypeError, ValueError):
+            metadata = {}
+    if isinstance(doc["entities"], str):
+        try:
+            entities = json.loads(doc["entities"])
+        except (TypeError, ValueError):
+            entities = []
+
+    return SourceResponse(
+        doc_id=doc["doc_id"],
+        doc_version=doc["version"],
+        source_system=SourceSystem(doc["source_system"]),
+        source_id=doc["source_id"],
+        source_url=doc["source_url"],
+        title=doc["title"],
+        content=full_content,
+        author_id=doc["author_id"],
+        chunk_count=len(chunk_rows),
+        body_size_bytes=doc["body_size_bytes"] or 0,
+        metadata=metadata,
+        entities=entities,
+        created_at=doc["created_at"],
+        updated_at=doc["updated_at"],
+        ingested_at=doc["ingested_at"],
+        deleted_at=doc["deleted_at"],
+    )
+
+
+def _resolve_customer_id(auth: _AuthResult) -> str:
+    """Bearer-only resolution for endpoints with no body fallback.
+
+    /sources has no body where customer_id could come from (it's a GET),
+    so the local-dev bypass that /retrieve and /query support doesn't
+    apply here. Require a bearer token always.
+    """
+    if not auth.customer_id:
+        raise HTTPException(
+            status_code=401,
+            detail="missing bearer token",
+            headers=_UNAUTHORIZED_HEADERS,
+        )
+    return auth.customer_id
 
 
 async def _run_retrieval(

@@ -316,6 +316,33 @@ class AnswerResponse(BaseModel):
     trace_id: str
 
 
+class SourceResponse(BaseModel):
+    """Full source content for a document, reassembled from its chunks.
+
+    Agents drilling down from a retrieved chunk into broader context
+    fetch this. The same chunks that powered retrieval get concatenated
+    in `chunk_index` order, so the result is the exact text we ingested
+    — no live API calls, no rate limits, no stale-vs-live divergence.
+    """
+
+    doc_id: str
+    doc_version: int
+    source_system: SourceSystem
+    source_id: str
+    source_url: str
+    title: str | None
+    content: str
+    author_id: str | None = None
+    chunk_count: int
+    body_size_bytes: int
+    metadata: dict[str, object] = Field(default_factory=dict)
+    entities: list[dict[str, object]] = Field(default_factory=list)
+    created_at: datetime
+    updated_at: datetime
+    ingested_at: datetime
+    deleted_at: datetime | None = None
+
+
 class BootstrapConfig(BaseModel):
     customer_id: str
     display_name: str
