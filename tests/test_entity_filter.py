@@ -114,3 +114,57 @@ def test_filter_dedupes_needles_when_canonical_equals_display() -> None:
     )
     assert info["needles"] == ["klavis"]  # single needle, not duplicated
     assert out == []
+
+
+def test_filter_passes_chunks_by_source_system_for_platform_needles() -> None:
+    """'what happened in slack recently?' should keep Slack messages even
+    though their text doesn't contain the word 'slack'."""
+    slack_msg = FakeFused(
+        chunk_id="slack-1",
+        content="hey team, deploying at 3pm",
+        source_system="slack",
+    )
+    github_pr = FakeFused(
+        chunk_id="gh-1",
+        content="fix slack integration retry logic",
+        source_system="github",
+    )
+    notion_page = FakeFused(
+        chunk_id="notion-1",
+        content="Q1 planning notes",
+        source_system="notion",
+    )
+    out, info = _apply_entity_filter(
+        [slack_msg, github_pr, notion_page],
+        [
+            RouterEntity(
+                entity_type="channel",
+                canonical_id="slack",
+                display_name="Slack",
+                confidence=0.85,
+            )
+        ],
+        threshold=0.7,
+    )
+    # Slack message passes via source_system; GitHub PR passes via text match;
+    # Notion page is dropped (no text or source match).
+    kept = {h.chunk_id for h in out}
+    assert kept == {"slack-1", "gh-1"}
+    assert "slack" in info["source_needles"]
+
+
+def test_filter_source_match_only_for_known_platforms() -> None:
+    """A needle that happens to match a chunk's source_system value but
+    isn't one of our known sources doesn't trigger the source-match branch.
+    """
+    chunk = FakeFused(
+        chunk_id="x", content="totally unrelated", source_system="custom"
+    )
+    out, _ = _apply_entity_filter(
+        [chunk],
+        [_entity("custom", "Custom", conf=0.9)],
+        threshold=0.7,
+    )
+    # "custom" is not a known SourceSystem, so source_system match doesn't
+    # rescue this chunk; text doesn't contain "custom" either → dropped.
+    assert out == []

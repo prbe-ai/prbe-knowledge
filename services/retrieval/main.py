@@ -410,16 +410,25 @@ async def query(
     )
 
 
+_KNOWN_SOURCES: frozenset[str] = frozenset(s.value for s in SourceSystem)
+
+
 def _apply_entity_filter(
     fused: list, entities: list, threshold: float
 ) -> tuple[list, dict[str, object]]:
     """Drop fused chunks whose content/title doesn't textually contain any
     extracted entity meeting the confidence threshold.
 
-    Pure function on top of the fused list. Returns (filtered_hits, info).
-    `info` reports which entity strings were used as needles + a `skipped`
-    flag if no qualifying entities were available (the filter is a no-op
-    in that case so callers can surface that to the user).
+    Special case: when a needle is a known source platform name (slack,
+    github, linear, notion, sentry, granola), a chunk also passes if its
+    `source_system` matches. Slack messages themselves rarely contain the
+    word "slack" in their content — they're conversation. Without this
+    branch, "what happened in slack recently?" filters out every actual
+    Slack chunk and returns only GitHub PRs that mention slack, which is
+    the opposite of what the user wanted.
+
+    Returns (filtered_hits, info). `info["needles"]` lists every needle;
+    `info["source_needles"]` lists the subset that's a known platform.
     """
     qualifying = [e for e in entities if e.confidence >= threshold]
     info: dict[str, object] = {"enabled": True, "threshold": threshold}
@@ -428,6 +437,7 @@ def _apply_entity_filter(
             f"no entities with confidence >= {threshold:.2f} extracted"
         )
         info["needles"] = []
+        info["source_needles"] = []
         return fused, info
 
     needles: list[str] = []
@@ -440,12 +450,17 @@ def _apply_entity_filter(
             if tok and tok not in seen:
                 seen.add(tok)
                 needles.append(tok)
+    source_needles: set[str] = {n for n in needles if n in _KNOWN_SOURCES}
     info["needles"] = needles
+    info["source_needles"] = sorted(source_needles)
 
     matched: list = []
     for hit in fused:
         haystack = ((hit.content or "") + " " + (hit.title or "")).lower()
         if any(n in haystack for n in needles):
+            matched.append(hit)
+            continue
+        if source_needles and (hit.source_system or "").lower() in source_needles:
             matched.append(hit)
     return matched, info
 
