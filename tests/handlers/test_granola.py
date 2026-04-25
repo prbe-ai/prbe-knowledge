@@ -21,7 +21,7 @@ import httpx
 import pytest
 
 from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.granola import (  # noqa: F401 — registers
+from services.ingestion.handlers.granola import (
     GranolaConnector,
 )
 from services.ingestion.handlers.registry import build_connector
@@ -37,7 +37,6 @@ from shared.constants import (
 )
 from shared.exceptions import PermanentSourceError, RateLimited, TransientSourceError
 from shared.models import IntegrationToken, WebhookEvent
-
 
 # ---------------------------------------------------------------------------
 # helpers
