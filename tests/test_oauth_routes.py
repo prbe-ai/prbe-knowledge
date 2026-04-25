@@ -115,12 +115,14 @@ async def test_oauth_callback_github_path(live_db, settings, monkeypatch) -> Non
             http=mock_http,
         )
         try:
+            from shared.state_signing import sign_state
+
             resp = await client.get(
                 "/oauth/github/callback",
                 params={
                     "installation_id": INSTALLATION_ID,
                     "setup_action": "install",
-                    "state": CUSTOMER_ID,
+                    "state": sign_state(CUSTOMER_ID, "github"),
                 },
             )
         finally:
@@ -224,12 +226,14 @@ async def test_oauth_callback_github_state_with_update_action_still_saves(
             http=mock_http,
         )
         try:
+            from shared.state_signing import sign_state
+
             resp = await client.get(
                 "/oauth/github/callback",
                 params={
                     "installation_id": INSTALLATION_ID,
                     "setup_action": "update",
-                    "state": CUSTOMER_ID,
+                    "state": sign_state(CUSTOMER_ID, "github"),
                 },
             )
         finally:
@@ -394,3 +398,106 @@ async def test_oauth_callback_github_install_without_state_no_mapping(
     assert "ok=0" in location
     assert "error=install_without_state" in location
     assert http_calls == [], "no-mapping path should not hit GitHub API"
+
+
+# ---------------------------------------------------------------------------
+# State-signing rejection paths — generic across all OAuth sources
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_install_redirect_carries_signed_state(live_db) -> None:
+    """install must sign customer_id into state — never substitute the
+    raw value, since that's the token-attachment CSRF the spec fixes.
+
+    Needs live_db because the ingestion app's lifespan initializes the
+    DB pool. The /oauth/slack/install route never touches the DB itself,
+    but the lifespan's init_pool() does — same pattern the existing
+    GitHub callback tests use.
+    """
+    from services.ingestion.main import app as ingestion_app
+
+    transport = ASGITransport(app=ingestion_app)
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        ingestion_app.router.lifespan_context(ingestion_app),
+    ):
+        # Swap ctx to a Settings with slack_client_id populated. Matches the
+        # pattern used by test_oauth_callback_github_path — the lifespan-built
+        # ctx may not see test-injected env vars at the right moment.
+        original_ctx = ingestion_app.state.ctx
+        ingestion_app.state.ctx = ConnectorContext(
+            settings=Settings(
+                environment="local",
+                slack_client_id="slack-id-test",
+            ),
+            http=httpx.AsyncClient(),
+        )
+        try:
+            resp = await client.get(
+                "/oauth/slack/install",
+                params={
+                    "customer_id": "cust-1",
+                    "redirect_uri": "http://t/oauth/slack/callback",
+                },
+                follow_redirects=False,
+            )
+        finally:
+            ingestion_app.state.ctx = original_ctx
+
+    assert resp.status_code == 302, resp.text
+    location = resp.headers["location"]
+    # state must NOT be the raw customer_id.
+    assert "state=cust-1" not in location
+    # state must look like an itsdangerous signed blob (body.signature).
+    from urllib.parse import parse_qs, urlparse
+
+    qs = parse_qs(urlparse(location).query)
+    state = qs["state"][0]
+    assert "." in state, f"state should be signed body.sig, got: {state!r}"
+
+    # And it should round-trip through verify_state.
+    from shared.state_signing import verify_state
+
+    assert verify_state(state, "slack") == "cust-1"
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_unsigned_state(live_db) -> None:
+    """A request that puts the raw customer_id in state must 400."""
+    from services.ingestion.main import app as ingestion_app
+
+    transport = ASGITransport(app=ingestion_app)
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        ingestion_app.router.lifespan_context(ingestion_app),
+    ):
+        resp = await client.get(
+            "/oauth/slack/callback",
+            params={"code": "abc", "state": "cust-1"},
+            follow_redirects=False,
+        )
+
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_state_for_wrong_source(live_db) -> None:
+    """State signed for slack must not be accepted by the notion callback."""
+    from services.ingestion.main import app as ingestion_app
+    from shared.state_signing import sign_state
+
+    slack_state = sign_state("cust-1", "slack")
+
+    transport = ASGITransport(app=ingestion_app)
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        ingestion_app.router.lifespan_context(ingestion_app),
+    ):
+        resp = await client.get(
+            "/oauth/notion/callback",
+            params={"code": "abc", "state": slack_state},
+            follow_redirects=False,
+        )
+
+    assert resp.status_code == 400

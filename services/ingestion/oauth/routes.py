@@ -48,19 +48,27 @@ async def oauth_install(
     customer_id: str = Query(...),
     redirect_uri: str = Query(...),
 ) -> RedirectResponse:
+    from shared.state_signing import sign_state
+
     source_enum = _source(source)
     try:
         get_connector_class(source_enum)
     except HandlerNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+    state = sign_state(customer_id, source)
     connector = build_connector(source_enum, request.app.state.ctx)
     try:
-        url = connector.oauth_install_url(customer_id, redirect_uri)
+        url = connector.oauth_install_url(customer_id, redirect_uri, state)
     except NotSupportedByConnector as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    log.info("oauth.install_redirect", customer=customer_id, source=source)
+    log.info(
+        "oauth.install_redirect",
+        customer=customer_id,
+        source=source,
+        state_ttl_seconds=600,
+    )
     return RedirectResponse(url=url, status_code=302)
 
 
@@ -92,11 +100,28 @@ async def oauth_callback(
     # `state` is absent for GitHub marketplace installs and for post-install
     # "Redirect on update" fires (repo added/removed). Fall back to existing
     # (source, external_id) → customer_id mapping so those flows don't 422.
-    customer_id = state
+    # Otherwise: state must be a valid HMAC-signed token bound to this source.
+    from shared.state_signing import verify_state
+
+    customer_id: str | None
     resolved_from_mapping = False
-    if customer_id is None:
+    if state is None:
         customer_id = await _resolve_customer_from_callback(source_enum, extra_params)
         resolved_from_mapping = customer_id is not None
+    else:
+        customer_id = verify_state(state, source)
+        if customer_id is None:
+            log.warning(
+                "oauth.state_verification_failed",
+                source=source,
+                state_prefix=state[:8],
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "OAuth state invalid or expired — please retry from the dashboard."
+                ),
+            )
 
     # Post-install "Redirect on update" fires on every repo add/remove for an
     # already-connected installation. Recognize it by: state absent (GitHub
