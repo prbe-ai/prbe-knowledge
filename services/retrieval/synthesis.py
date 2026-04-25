@@ -311,6 +311,24 @@ async def _call_openai(
     return _fallback_parse_text(content)
 
 
+def _strip_keys_recursive(
+    schema: Any, keys_to_strip: tuple[str, ...]
+) -> Any:
+    """Return a deep copy of `schema` with the named keys removed at every
+    object level. Used to sanitize a JSON-Schema dict for providers whose
+    schema dialect rejects keys others require.
+    """
+    if isinstance(schema, dict):
+        return {
+            k: _strip_keys_recursive(v, keys_to_strip)
+            for k, v in schema.items()
+            if k not in keys_to_strip
+        }
+    if isinstance(schema, list):
+        return [_strip_keys_recursive(v, keys_to_strip) for v in schema]
+    return schema
+
+
 async def _call_google(
     system: str, user: str, model: str, max_tokens: int
 ) -> dict[str, Any]:
@@ -327,6 +345,10 @@ async def _call_google(
     client = genai.Client(api_key=api_key)
     # Google has no separate system slot; prepend the system message.
     contents = f"{system}\n\n---\n\n{user}"
+    # Google's response_schema is a strict JSON-Schema subset that rejects
+    # `additionalProperties` outright (OpenAI strict mode REQUIRES it). Strip
+    # the key for the Google call only; the schema is otherwise identical.
+    google_schema = _strip_keys_recursive(ANSWER_SCHEMA, ("additionalProperties",))
     try:
         resp = await client.aio.models.generate_content(
             model=model,
@@ -334,7 +356,7 @@ async def _call_google(
             config={
                 "max_output_tokens": max_tokens,
                 "response_mime_type": "application/json",
-                "response_schema": ANSWER_SCHEMA,
+                "response_schema": google_schema,
             },
         )
     except Exception as exc:

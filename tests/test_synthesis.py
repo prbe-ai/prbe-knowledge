@@ -11,6 +11,7 @@ from services.retrieval.synthesis import (
     _extract_citations,
     _fallback_parse_text,
     _format_user_prompt,
+    _strip_keys_recursive,
     normalize_citations_in_answer,
     synthesize,
 )
@@ -41,6 +42,40 @@ def test_answer_schema_has_strict_shape() -> None:
     props = set(ANSWER_SCHEMA["properties"].keys())
     required = set(ANSWER_SCHEMA["required"])
     assert props == required == {"answer", "citations_used", "insufficient_context"}
+
+
+def test_strip_keys_recursive_removes_at_every_level() -> None:
+    """Google's response_schema rejects `additionalProperties`. The Google
+    adapter strips it before the call; verify the helper handles nesting.
+    """
+    nested = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "x": {"type": "string", "additionalProperties": False},
+            "y": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "z": {"type": "array", "items": {"type": "object", "additionalProperties": False}},
+                },
+            },
+        },
+    }
+    out = _strip_keys_recursive(nested, ("additionalProperties",))
+    # No additionalProperties anywhere in the resulting tree.
+    def _walk(node: object) -> None:
+        if isinstance(node, dict):
+            assert "additionalProperties" not in node
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+
+    _walk(out)
+    # Original schema unchanged (deep-copy-style).
+    assert "additionalProperties" in nested
 
 
 # ---------------------------------------------------------------------------
