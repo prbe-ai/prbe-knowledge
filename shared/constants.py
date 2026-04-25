@@ -10,6 +10,7 @@ class SourceSystem(StrEnum):
     NOTION = "notion"
     SENTRY = "sentry"
     GRANOLA = "granola"
+    CLAUDE_CODE = "claude_code"
 
 
 class DocClass(StrEnum):
@@ -34,6 +35,11 @@ class DocType(StrEnum):
     SENTRY_ISSUE = "sentry.issue"
     SENTRY_EVENT = "sentry.event"
     GRANOLA_MEETING = "granola.meeting"
+    CLAUDE_CODE_SESSION     = "claude_code.session"
+    CLAUDE_CODE_QA          = "claude_code.qa"
+    CLAUDE_CODE_CODE_CHANGE = "claude_code.code_change"
+    CLAUDE_CODE_DECISION    = "claude_code.decision"
+    CLAUDE_CODE_FILE_REF    = "claude_code.file_ref"
     WIKI_SERVICE_CARD = "wiki.service_card"
     WIKI_DECISION = "wiki.decision"
     WIKI_FEATURE = "wiki.feature"
