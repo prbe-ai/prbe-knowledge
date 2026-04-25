@@ -352,3 +352,20 @@ Conflict flags: none — Lane 1 (backend repo) and Lane 2 (frontend repo) are ph
 - [ ] Super-admin role for break-glass tenant ops
 
 ---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | 6 issues, 0 critical gaps, 0 unresolved |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+**OUTSIDE VOICE:** Claude subagent ran (codex unavailable on this machine). 11 critiques returned; 7 folded into the plan as additions, 2 surfaced as cross-model tensions and resolved by the user (single-team semantics → multi-team-ready data model with UNIQUE constraint; existing tenants → kill X-Admin-Key control plane), 1 push-back retained (separate `services/dashboard/` over router-in-ingestion), 1 adjusted (BackgroundTasks durability mitigated via `notified_at` + manual resend, auto-retry deferred).
+
+**UNRESOLVED:** 0
+
+**VERDICT:** ENG CLEARED — ready to implement once Phase 0 (Neon Auth pre-flight verification via `/neon-postgres`) confirms the auth substrate. CEO review optional given user has already made the strategic call.
+
