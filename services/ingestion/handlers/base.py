@@ -181,8 +181,14 @@ class Connector(ABC):
 
     # ---- 6. OAuth install (optional) ---------------------------------------
 
-    def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
+    def oauth_install_url(
+        self, customer_id: str, redirect_uri: str, state: str
+    ) -> str:
         """Build the user-facing OAuth install URL for this source.
+
+        `state` is a signed, opaque token built by `shared.state_signing.sign_state`
+        binding `customer_id` to this source. Connectors must put it on the
+        provider's authorize URL verbatim — never substitute or re-derive it.
 
         Default raises; subclasses override if the source uses OAuth.
         """

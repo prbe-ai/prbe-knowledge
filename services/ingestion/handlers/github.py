@@ -368,17 +368,19 @@ class GitHubConnector(Connector):
     # 6. OAuth install + exchange
     # ------------------------------------------------------------------
 
-    def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
+    def oauth_install_url(
+        self, customer_id: str, redirect_uri: str, state: str
+    ) -> str:
         slug = self.settings.github_app_slug
         if not slug:
             raise NotSupportedByConnector("GITHUB_APP_SLUG not configured")
         # GitHub Apps don't accept redirect_uri on the install URL — the
         # post-install redirect is controlled in the App's settings. We still
-        # accept the arg for API compatibility; state carries the customer_id
-        # through the round-trip.
+        # accept the arg for API compatibility; state is the signed token
+        # that round-trips through to the callback.
         from urllib.parse import urlencode
 
-        params = urlencode({"state": customer_id})
+        params = urlencode({"state": state})
         return f"https://github.com/apps/{slug}/installations/new?{params}"
 
     async def exchange_oauth_code(

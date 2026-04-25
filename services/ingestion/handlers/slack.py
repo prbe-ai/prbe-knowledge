@@ -406,7 +406,9 @@ class SlackConnector(Connector):
     # 5. OAuth install + exchange
     # ------------------------------------------------------------------
 
-    def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
+    def oauth_install_url(
+        self, customer_id: str, redirect_uri: str, state: str
+    ) -> str:
         cid = self.settings.slack_client_id
         if not cid:
             from shared.exceptions import MissingSecret
@@ -426,7 +428,7 @@ class SlackConnector(Connector):
         return (
             "https://slack.com/oauth/v2/authorize"
             f"?client_id={cid}&scope={scopes}&redirect_uri={redirect_uri}"
-            f"&state={customer_id}"
+            f"&state={state}"
         )
 
     async def exchange_oauth_code(

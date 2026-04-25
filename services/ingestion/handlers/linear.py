@@ -593,7 +593,9 @@ class LinearConnector(Connector):
     # 5. OAuth install (for completeness — real redirect wired in Tier 7)
     # ------------------------------------------------------------------
 
-    def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
+    def oauth_install_url(
+        self, customer_id: str, redirect_uri: str, state: str
+    ) -> str:
         cid = self.settings.linear_client_id
         if not cid:
             from shared.exceptions import MissingSecret
@@ -603,7 +605,7 @@ class LinearConnector(Connector):
         return (
             f"{_LINEAR_OAUTH_AUTHORIZE}"
             f"?client_id={cid}&redirect_uri={redirect_uri}"
-            f"&response_type=code&scope={scopes}&state={customer_id}"
+            f"&response_type=code&scope={scopes}&state={state}"
         )
 
     async def exchange_oauth_code(

@@ -396,10 +396,15 @@ def test_oauth_install_url_uses_app_slug() -> None:
     ctx = _make_github_ctx(app_slug="prbe-knowledge-dev")
     connector = build_connector(SourceSystem.GITHUB, ctx)
     url = connector.oauth_install_url(
-        "cust-1", "https://api.example.com/oauth/github/callback"
+        "cust-1",
+        "https://api.example.com/oauth/github/callback",
+        "signed-state-token",
     )
     assert "/apps/prbe-knowledge-dev/installations/new" in url
-    assert "state=cust-1" in url
+    # state must be the signed token the route layer passed in — never the
+    # raw customer_id (that was the token-attachment CSRF P1).
+    assert "state=signed-state-token" in url
+    assert "state=cust-1" not in url
 
 
 def test_oauth_install_url_raises_without_slug() -> None:
@@ -407,7 +412,9 @@ def test_oauth_install_url_raises_without_slug() -> None:
     connector = build_connector(SourceSystem.GITHUB, ctx)
     with pytest.raises(NotSupportedByConnector):
         connector.oauth_install_url(
-            "cust-1", "https://api.example.com/oauth/github/callback"
+            "cust-1",
+            "https://api.example.com/oauth/github/callback",
+            "signed-state-token",
         )
 
 
