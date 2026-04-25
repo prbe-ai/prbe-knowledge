@@ -1,4 +1,4 @@
-"""Bearer auth on POST /query (retrieval service).
+"""Bearer auth on POST /retrieve (retrieval service).
 
 Covers:
   - 401 when Authorization header is missing in non-local env
@@ -66,7 +66,7 @@ async def _post_query(
         retrieval_app.router.lifespan_context(retrieval_app),
     ):
         resp = await client.post(
-            "/query",
+            "/retrieve",
             json=body or {"query": "anything", "top_k": 1},
             headers=headers or {},
         )

@@ -277,6 +277,45 @@ class QueryResponse(BaseModel):
     trace_id: str
 
 
+class AnswerRequest(QueryRequest):
+    """Same retrieval knobs as QueryRequest, plus synthesis configuration.
+
+    Inherits everything (top_k, temporal, sort, entity_must_match, etc.) so
+    callers can use the same body shape and just toggle the endpoint.
+    """
+
+    model: str | None = Field(
+        default=None,
+        description=(
+            "Synthesis model in '<provider>/<model>' form. Defaults to "
+            "anthropic/claude-sonnet-4-6. See shared.constants.SYNTHESIS_MODELS "
+            "for the full allowed list."
+        ),
+    )
+    max_tokens: int = Field(
+        default=600,
+        ge=64,
+        le=4096,
+        description="Cap on synthesis output length.",
+    )
+
+
+class AnswerResponse(BaseModel):
+    query: str
+    answer: str
+    citations: list[dict[str, object]] = Field(default_factory=list)
+    insufficient_context: bool = False
+    model: str
+    chunks: list[QueryChunk]
+    total_candidates: int
+    applied_temporal: dict[str, object] | None = None
+    applied_sort: dict[str, object] | None = None
+    applied_entity_filter: dict[str, object] | None = None
+    extracted_entities: list[dict[str, object]] = Field(default_factory=list)
+    timing_ms: dict[str, float] = Field(default_factory=dict)
+    trace_id: str
+
+
 class BootstrapConfig(BaseModel):
     customer_id: str
     display_name: str

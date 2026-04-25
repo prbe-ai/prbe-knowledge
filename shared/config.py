@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     # --- External model providers -------------------------------------------
     openai_api_key: SecretStr = SecretStr("")
     anthropic_api_key: SecretStr = SecretStr("")
+    google_api_key: SecretStr = SecretStr("")
 
     # --- Token encryption (Fernet key, 32 url-safe base64 bytes) -----------
     token_encryption_key: SecretStr = SecretStr("")

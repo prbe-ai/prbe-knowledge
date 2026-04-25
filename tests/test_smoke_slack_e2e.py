@@ -173,7 +173,7 @@ async def test_slack_webhook_to_query(live_db, settings: Settings) -> None:
         retrieval_app.router.lifespan_context(retrieval_app),
     ):
         qresp = await client.post(
-            "/query",
+            "/retrieve",
             json={
                 "query": "payments 500s deploy",
                 "customer_id": CUSTOMER_ID,
@@ -205,7 +205,7 @@ async def test_slack_webhook_to_query(live_db, settings: Settings) -> None:
         retrieval_app.router.lifespan_context(retrieval_app),
     ):
         qresp2 = await client.post(
-            "/query",
+            "/retrieve",
             json={
                 "query": "payments 500s deploy",
                 "customer_id": CUSTOMER_ID,

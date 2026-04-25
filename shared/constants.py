@@ -188,6 +188,21 @@ NORMALIZER_VERSION = "v1"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SONNET_MODEL = "claude-sonnet-4-6"
 
+# Models supported by the /query synthesis layer. Keys are the
+# "<provider>/<model>" identifier callers pass; values are provider names
+# the synthesis dispatcher uses to pick a client.
+SYNTHESIS_MODELS: dict[str, str] = {
+    "anthropic/claude-haiku-4-5-20251001": "anthropic",
+    "anthropic/claude-sonnet-4-6":          "anthropic",
+    "anthropic/claude-opus-4-7":            "anthropic",
+    "openai/gpt-4o":                        "openai",
+    "openai/gpt-4o-mini":                   "openai",
+    "openai/gpt-5":                         "openai",
+    "google/gemini-2.5-flash":              "google",
+    "google/gemini-2.5-pro":                "google",
+}
+DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-6"
+
 MAX_WEBHOOK_ATTEMPTS = 5
 QUEUE_HEARTBEAT_INTERVAL_SECONDS = 30
 QUEUE_RECLAIM_THRESHOLD_SECONDS = 300

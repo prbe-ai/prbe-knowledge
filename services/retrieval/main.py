@@ -27,12 +27,19 @@ from services.retrieval.retrievers.bm25 import bm25_search
 from services.retrieval.retrievers.graph import graph_search
 from services.retrieval.retrievers.vector import vector_search
 from services.retrieval.router import route_query
+from services.retrieval.synthesis import (
+    SynthesisChunk,
+    SynthesisError,
+    synthesize,
+)
 from services.retrieval.temporal import resolve_temporal
 from shared.config import get_settings
-from shared.constants import SourceSystem
+from shared.constants import DEFAULT_SYNTHESIS_MODEL, SourceSystem
 from shared.db import health_check, init_pool, raw_conn, with_tenant
 from shared.logging import configure_logging, get_logger
 from shared.models import (
+    AnswerRequest,
+    AnswerResponse,
     QueryChunk,
     QueryRequest,
     QueryResponse,
@@ -122,10 +129,24 @@ async def authenticate_query(request: Request) -> _AuthResult:
     )
 
 
-@app.post("/query", response_model=QueryResponse)
-async def query(
+@app.post("/retrieve", response_model=QueryResponse)
+async def retrieve(
     req: QueryRequest,
     auth: _AuthResult = Depends(authenticate_query),
+) -> QueryResponse:
+    """Raw-chunks retrieval. Vector + BM25 + graph fusion, returns ranked
+    chunks with metadata. No LLM synthesis — that's /query's job.
+
+    Agents and tools wanting full fidelity (code generation, verification
+    queries, iterative re-retrieval) call this. Linear-style enrichment
+    or human-readable answers go to /query.
+    """
+    return await _run_retrieval(req, auth)
+
+
+async def _run_retrieval(
+    req: QueryRequest,
+    auth: _AuthResult,
 ) -> QueryResponse:
     if auth.auth_present:
         # Header is authoritative; a mismatching body value is almost certainly
@@ -330,6 +351,62 @@ async def query(
         extracted_entities=extracted_entities,
         timing_ms=timing,
         trace_id=trace_id,
+    )
+
+
+@app.post("/query", response_model=AnswerResponse)
+async def query(
+    req: AnswerRequest,
+    auth: _AuthResult = Depends(authenticate_query),
+) -> AnswerResponse:
+    """Retrieve + synthesize. Calls /retrieve internally, then runs an LLM
+    over the resulting chunks to produce a cited answer.
+
+    Pick the model via `model: "<provider>/<model>"`. Defaults to
+    anthropic/claude-sonnet-4-6. Allowed models live in
+    shared.constants.SYNTHESIS_MODELS — Anthropic, OpenAI, Google.
+    """
+    base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
+    rresp = await _run_retrieval(base_req, auth)
+
+    model = req.model or DEFAULT_SYNTHESIS_MODEL
+    syn_chunks = [
+        SynthesisChunk(
+            chunk_id=c.chunk_id,
+            title=c.title,
+            content=c.content,
+            source_system=c.source_system.value,
+            source_url=c.source_url,
+            updated_at=c.updated_at.isoformat(),
+        )
+        for c in rresp.chunks
+    ]
+
+    t_syn = time.perf_counter()
+    try:
+        result = await synthesize(
+            req.query, syn_chunks, model=model, max_tokens=req.max_tokens
+        )
+    except SynthesisError as exc:
+        log.warning("query.synthesis_failed", model=model, error=str(exc))
+        raise HTTPException(status_code=502, detail=f"synthesis failed: {exc}") from exc
+    timing = dict(rresp.timing_ms)
+    timing["synthesis_ms"] = (time.perf_counter() - t_syn) * 1000
+
+    return AnswerResponse(
+        query=req.query,
+        answer=result.answer,
+        citations=result.citations,
+        insufficient_context=result.insufficient_context,
+        model=result.model,
+        chunks=rresp.chunks,
+        total_candidates=rresp.total_candidates,
+        applied_temporal=rresp.applied_temporal,
+        applied_sort=rresp.applied_sort,
+        applied_entity_filter=rresp.applied_entity_filter,
+        extracted_entities=rresp.extracted_entities,
+        timing_ms=timing,
+        trace_id=rresp.trace_id,
     )
 
 
