@@ -416,6 +416,11 @@ class IntegrationToken(BaseModel):
     expires_at: datetime | None = None
     scope: str | None = None
     webhook_secret: str | None = None
+    # Transient: populated during exchange_oauth_code by connectors that
+    # capture workspace info from the token-exchange response (e.g. Notion).
+    # Pydantic exclude=True keeps it out of model_dump(), so save_token()
+    # never persists it. Cleared on every load_token() trip through the DB.
+    install_metadata: dict[str, Any] | None = Field(default=None, exclude=True)
 
 
 class ExternalWorkspaceRef(BaseModel):
