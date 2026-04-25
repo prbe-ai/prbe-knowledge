@@ -11,15 +11,37 @@ CREATE EXTENSION IF NOT EXISTS btree_gin;
 
 -- ---------------------------------------------------------------------------
 -- customers: tenant registry (parent of all customer-scoped tables)
+--
+-- Bridges to Neon Auth (Better Auth) Organization plugin via organization_id:
+--   * Each team-managed tenant maps 1:1 to a neon_auth.organization row
+--   * NULL organization_id is permitted for legacy admin-key-managed tenants
+--     pre-Phase-9 migration; new tenants always have one
+--   * ON DELETE RESTRICT — the dashboard soft-deletes via status='deleted'
+--     and an offline reaper handles hard-delete; Better Auth's
+--     organization.delete is blocked while a customer references the org
+-- status:
+--   'active'   — normal operation
+--   'deleted'  — soft-deleted; service layer filters all reads/writes
 -- ---------------------------------------------------------------------------
 CREATE TABLE customers (
     customer_id          TEXT PRIMARY KEY,
     display_name         TEXT NOT NULL,
     api_key_hash         TEXT NOT NULL,
     status               TEXT NOT NULL DEFAULT 'active',
+    organization_id      UUID REFERENCES neon_auth.organization(id) ON DELETE RESTRICT,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     metadata             JSONB NOT NULL DEFAULT '{}'
 );
+
+-- One customer per organization (where the link is set).
+CREATE UNIQUE INDEX customers_organization_id_unique
+    ON customers (organization_id)
+    WHERE organization_id IS NOT NULL;
+
+-- Hot path filter: dashboard + retrieval skip soft-deleted tenants.
+CREATE INDEX idx_customers_active
+    ON customers (customer_id)
+    WHERE status = 'active';
 
 -- ---------------------------------------------------------------------------
 -- customer_source_mapping: resolve an incoming webhook's source-side
