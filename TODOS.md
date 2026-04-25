@@ -33,16 +33,6 @@ with real customers.
 **Fix:** Bearer API key auth. Hash, look up `customers.api_key_hash`, derive
 `customer_id` from the row. Remove `customer_id` from `QueryRequest`. ~30 lines.
 
-### OAuth `state` parameter unsigned
-**Where:** `services/ingestion/oauth/routes.py:67, 89`
-
-`state` carries `customer_id` as plaintext. Attacker with their own Slack workspace
-can craft a callback with `state=<victim_customer>` and attach their token to
-the victim's tenant.
-
-**Fix:** HMAC-sign `state` with `TOKEN_ENCRYPTION_KEY` at install, verify at
-callback. ~20 lines.
-
 ### `_upsert_document` check-then-act race
 **Where:** `services/ingestion/normalizer.py:216-264`
 
@@ -180,3 +170,43 @@ overhead. Add a per-process LRU when query volume justifies it:
 - `ProxyHeadersMiddleware` so OAuth redirect_uri resolves to `https://` behind Fly
 - Fly + CI/CD configs ready (three Dockerfiles, three fly.tomls, three GH Actions)
 - `/review` ran; dead imports + worker subquery + test-fixture import caching fixed
+- Notion OAuth install path (`oauth_install_url` + `exchange_oauth_code`) +
+  generic HMAC-signed state across all OAuth sources
+
+---
+
+## P4 — follow-ups from the Notion OAuth + state-signing branch
+
+### Tuple return from `Connector.exchange_oauth_code`
+**Where:** `services/ingestion/handlers/base.py:193` and all six connector subclasses
+
+Today connectors that capture workspace info during exchange (Notion, and
+any future provider that gives back the workspace id directly) plumb it
+through `IntegrationToken.install_metadata` — a Pydantic transient field
+that exists only in memory between `exchange_oauth_code` and
+`identify_workspaces`. Works, but pollutes the shared model with one inert
+attribute and creates a request-scoped lifetime that's awkward to reason
+about.
+
+**Fix:** change `exchange_oauth_code` to return
+`tuple[IntegrationToken, list[ExternalWorkspaceRef]]`. Drop the
+`install_metadata` field. Slack/GitHub/Linear/Granola/Sentry return
+`(token, [])` and keep their `identify_workspaces` methods; Notion drops
+`identify_workspaces` entirely. ~50 lines across all connectors.
+
+Defer until the next connector lands that needs install-time metadata.
+
+### Notion refresh-token rotation
+**Where:** `services/ingestion/handlers/notion.py:exchange_oauth_code` + new helper
+
+Notion is rolling out refresh-token rotation. Today's access tokens don't
+expire; older public integrations get long-lived static tokens. Newer ones
+may get tokens with a finite lifetime + a refresh_token. We persist the
+refresh_token already (column was always there); we just don't refresh.
+
+**Fix:** when a Notion API call returns 401 with a token-expired error,
+exchange the refresh_token for a new access_token via
+`POST /v1/oauth/token` with `grant_type=refresh_token`. Update both columns
+on `integration_tokens` and retry the original call once.
+
+Trigger to do this work: first observed 401 from Notion in production logs.
