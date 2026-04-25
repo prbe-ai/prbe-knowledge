@@ -59,26 +59,38 @@ class Settings(BaseSettings):
     # back on the dashboard after connecting an integration.
     dashboard_base_url: str | None = None
 
-    # --- Per-source OAuth / signing secrets (all optional in dev) ---------
+    # --- Per-source OAuth + webhook secrets ----
+    # After the gateway migration, ACTIVE code in this service only uses
+    # client_secrets (token exchange in /api/oauth/{source}/exchange). The
+    # webhook signing secrets and OAuth client_ids no longer have an active
+    # caller — they're owned by the gateway (prbe-backend) which verifies
+    # signatures before forwarding and builds authorize URLs.
+    #
+    # The remaining fields below are kept as None-defaults because the
+    # connector classes still expose `verify_signature` and `oauth_install_url`
+    # methods that reference them. Those methods are dead in production
+    # but still exercised by unit tests in tests/handlers/. Removing the
+    # fields would force a surgery across all connectors; keeping them
+    # None-default costs nothing.
     slack_client_id: str | None = None
     slack_client_secret: SecretStr | None = None
-    slack_signing_secret: SecretStr | None = None
+    slack_signing_secret: SecretStr | None = None  # unused in prod (gateway verifies)
 
     github_app_id: str | None = None
     github_app_private_key: SecretStr | None = None
-    github_app_slug: str | None = None
-    github_webhook_secret: SecretStr | None = None
+    github_app_slug: str | None = None  # unused in prod (gateway builds install URL)
+    github_webhook_secret: SecretStr | None = None  # unused in prod
 
     linear_client_id: str | None = None
     linear_client_secret: SecretStr | None = None
-    linear_webhook_secret: SecretStr | None = None
+    linear_webhook_secret: SecretStr | None = None  # unused in prod
 
     notion_client_id: str | None = None
     notion_client_secret: SecretStr | None = None
 
     sentry_client_id: str | None = None
     sentry_client_secret: SecretStr | None = None
-    sentry_webhook_secret: SecretStr | None = None
+    sentry_webhook_secret: SecretStr | None = None  # unused in prod
 
     # --- Worker tuning ------------------------------------------------------
     worker_poll_interval_seconds: float = 1.0
