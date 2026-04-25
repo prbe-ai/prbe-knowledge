@@ -11,6 +11,9 @@ Route layout:
     GET    /api/customers                           — list tenants
     GET    /api/customers/{id}/integrations         — per-source status
     GET    /api/customers/{id}/ingestion_stats      — per-source counters
+    POST   /api/oauth/{source}/exchange             — token exchange
+                                                       (callback handled by
+                                                       prbe-backend gateway)
 """
 
 from __future__ import annotations
@@ -27,6 +30,10 @@ from services.ingestion.backfill_runner import (
     enqueue_backfill,
     re_enqueue_for_polling,
 )
+from services.ingestion.handlers.registry import (
+    build_connector,
+    get_connector_class,
+)
 from shared.config import get_settings
 from shared.constants import (
     GRANOLA_REFRESH_CHANNEL,
@@ -36,8 +43,14 @@ from shared.constants import (
     IntegrationStatus,
     SourceSystem,
 )
+from shared.customer_mapping import record_mapping
 from shared.db import get_pool, raw_conn, with_tenant
 from shared.encryption import encrypt_token
+from shared.exceptions import (
+    HandlerNotFound,
+    NotSupportedByConnector,
+    PrbeError,
+)
 from shared.logging import get_logger
 from shared.provisioning import (
     CustomerAlreadyExists,
@@ -47,6 +60,7 @@ from shared.provisioning import (
     ensure_bucket_for,
     rotate_customer_key,
 )
+from shared.tokens import save_token
 
 # Sources that do NOT use OAuth — admin endpoints handle their connect flow
 # explicitly (paste-an-API-key, etc.) and the OAuth install URL is omitted
@@ -672,4 +686,133 @@ async def refresh_granola_route(customer_id: str) -> GranolaRefreshResponse:
     return GranolaRefreshResponse(
         customer_id=customer_id,
         triggered=triggered,
+    )
+
+
+# ---------------------------------------------------------------------------
+# OAuth code-for-token exchange (gateway pattern).
+#
+# prbe-backend handles the public-facing OAuth callback at
+# /oauth/{source}/callback. After verifying the HMAC-signed state and
+# resolving customer_id, it POSTs here with {customer_id, code,
+# redirect_uri, extra_params}. We run the per-source token exchange,
+# persist the encrypted token, identify workspaces, and queue backfill —
+# the same logic as the legacy /oauth/{source}/callback under
+# services/ingestion/oauth/routes.py, just split off the public surface.
+# ---------------------------------------------------------------------------
+
+
+class OAuthExchangeRequest(BaseModel):
+    customer_id: str = Field(min_length=1, max_length=64)
+    code: str = Field(min_length=1, max_length=4096)
+    redirect_uri: str = Field(min_length=1)
+    extra_params: dict[str, str] = Field(default_factory=dict)
+
+
+class OAuthExchangeResponse(BaseModel):
+    customer_id: str
+    source: str
+    workspaces: list[dict[str, Any]] = Field(default_factory=list)
+    backfill_queued: bool = False
+
+
+def _source_or_404(source: str) -> SourceSystem:
+    try:
+        return SourceSystem(source)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"unknown source: {source}"
+        ) from exc
+
+
+@router.post(
+    "/oauth/{source}/exchange",
+    response_model=OAuthExchangeResponse,
+    dependencies=[Depends(verify_admin_key)],
+)
+async def oauth_exchange(
+    source: str,
+    body: OAuthExchangeRequest,
+    request: Request,
+) -> OAuthExchangeResponse:
+    source_enum = _source_or_404(source)
+    try:
+        get_connector_class(source_enum)
+    except HandlerNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    connector = build_connector(source_enum, request.app.state.ctx)
+
+    try:
+        token = await connector.exchange_oauth_code(
+            code=body.code,
+            redirect_uri=body.redirect_uri,
+            extra_params=body.extra_params,
+        )
+    except NotSupportedByConnector as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except PrbeError as exc:
+        log.error(
+            "oauth.exchange_failed",
+            source=source,
+            customer=body.customer_id,
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # Connectors don't know the tenant; bind it from the request.
+    token = token.model_copy(update={"customer_id": body.customer_id})
+    await save_token(token)
+
+    # Identify workspaces this token grants access to so incoming webhooks
+    # can resolve customer_id from payload alone.
+    workspaces: list[dict[str, Any]] = []
+    try:
+        refs = await connector.identify_workspaces(token)
+    except Exception as exc:
+        log.warning(
+            "oauth.identify_workspaces_failed",
+            source=source,
+            customer=body.customer_id,
+            error=str(exc),
+        )
+        refs = []
+    for ref in refs:
+        await record_mapping(
+            customer_id=body.customer_id,
+            source_system=source_enum,
+            external_id=ref.external_id,
+            external_name=ref.external_name,
+            metadata=ref.metadata,
+        )
+        workspaces.append(
+            {
+                "external_id": ref.external_id,
+                "external_name": ref.external_name,
+            }
+        )
+
+    backfill_queued = False
+    try:
+        await enqueue_backfill(customer_id=body.customer_id, source=source_enum)
+        backfill_queued = True
+    except Exception as exc:
+        log.warning(
+            "oauth.backfill_enqueue_failed",
+            customer=body.customer_id,
+            source=source,
+            error=str(exc),
+        )
+
+    log.info(
+        "oauth.exchanged",
+        customer=body.customer_id,
+        source=source,
+        workspaces=[r.external_id for r in refs],
+    )
+    return OAuthExchangeResponse(
+        customer_id=body.customer_id,
+        source=source,
+        workspaces=workspaces,
+        backfill_queued=backfill_queued,
     )
