@@ -9,15 +9,7 @@ Covers:
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
-import time
-from pathlib import Path
-
-import httpx
 import pytest
-from httpx import ASGITransport
 
 from shared.config import Settings, get_settings
 from shared.constants import SourceSystem
@@ -26,7 +18,7 @@ from shared.customer_mapping import (
     resolve_customer,
     single_customer_fallback,
 )
-from shared.db import close_pool, init_pool, raw_conn
+from shared.db import raw_conn
 from shared.embeddings import reset_embedder
 from shared.storage import reset_store
 
