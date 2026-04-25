@@ -44,6 +44,7 @@ def fuse(
     k: int = RRF_K,
     recency_half_life_days: float | None = None,
     now: datetime | None = None,
+    sort: dict[str, str] | None = None,
 ) -> list[FusedHit]:
     """Combine ranked lists from multiple retrievers.
 
@@ -56,8 +57,12 @@ def fuse(
     reference (defaults to datetime.now(UTC)). Future timestamps (clock
     skew) skip the decay so they're not penalized.
 
-    Returns up to top_k fused hits, sorted by combined score desc, then by
-    updated_at desc as tie-breaker, then chunk_id asc for determinism.
+    `sort` is optional. When set, replaces the default relevance sort with a
+    deterministic time sort: `{"field": "created_at"|"updated_at",
+    "direction": "asc"|"desc"}`. RRF score still drives which chunks make
+    the candidate pool; sort only reorders the surviving hits.
+
+    Returns up to top_k fused hits.
     """
     per_chunk_score: dict[str, float] = defaultdict(float)
     per_chunk_breakdown: dict[str, dict[str, float]] = defaultdict(dict)
@@ -112,6 +117,17 @@ def fuse(
             )
         )
 
-    # Sort: highest score first, then most recent updated_at, then chunk_id asc.
-    fused.sort(key=lambda h: (-h.score, -h.updated_at.timestamp(), h.chunk_id))
+    if sort:
+        # Caller asked for a deterministic time sort. Score still gated which
+        # chunks made it here; this just orders the survivors.
+        field_name = sort.get("field", "updated_at")
+        direction = sort.get("direction", "desc")
+        sign = -1 if direction == "desc" else 1
+        if field_name == "created_at":
+            fused.sort(key=lambda h: (sign * h.created_at.timestamp(), h.chunk_id))
+        else:
+            fused.sort(key=lambda h: (sign * h.updated_at.timestamp(), h.chunk_id))
+    else:
+        # Default: highest score, then most recent updated_at as tie-breaker.
+        fused.sort(key=lambda h: (-h.score, -h.updated_at.timestamp(), h.chunk_id))
     return fused[:top_k]

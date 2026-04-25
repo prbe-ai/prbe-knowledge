@@ -62,6 +62,11 @@ Return strict JSON:
     "basis": "source",
     "raw_phrase": "in the last month",
     "unresolvable_anchor": null | "the auth refactor"
+  }} | null,
+  "sort": {{
+    "field": "created_at" | "updated_at",
+    "direction": "asc" | "desc",
+    "trigger_phrase": "oldest"
   }} | null
 }}
 
@@ -87,12 +92,27 @@ Temporal rules:
   since/until null. Never set both.
 - If the query has no time scoping at all, set "temporal": null.
 
+Sort rules:
+- "oldest", "earliest", "first", "first ever" → {{"field":"created_at","direction":"asc","trigger_phrase":"oldest"}}
+- "newest", "latest", "most recent", "last", "the last X" → {{"field":"updated_at","direction":"desc","trigger_phrase":"newest"}}
+- "recently edited", "last touched", "most recently updated" → {{"field":"updated_at","direction":"desc","trigger_phrase":"recently edited"}}
+- If the query asks for state-of-the-world without explicit sort intent
+  ("what does the auth middleware do"), set "sort": null and let semantic
+  relevance rank.
+- A time filter and a sort can coexist: "the oldest fly.io change since
+  April 15th" filters with `temporal` AND sorts with `sort`.
+
 Examples (assume today is {today_iso}):
 - "what shipped this week" → temporal:{{"since":{{"kind":"rel","offset_days":-7}},"until":{{"kind":"rel","offset_days":0}},"basis":"source","raw_phrase":"this week","unresolvable_anchor":null}}
 - "yesterday" → temporal:{{"since":{{"kind":"rel","offset_days":-1}},"until":{{"kind":"rel","offset_days":0}},"basis":"source","raw_phrase":"yesterday","unresolvable_anchor":null}}
 - "since April 15th" with bare month/day → resolve to the most recent April 15 at or before {today_iso}, output "abs" iso with that year.
 - "since the auth refactor" → temporal:{{"since":null,"until":null,"basis":"source","raw_phrase":"since the auth refactor","unresolvable_anchor":"the auth refactor"}}
 - "middleware bugs" → temporal: null
+- "what was the oldest fly.io change since April 15th" →
+    temporal: {{since: April 15th of the most recent year ≤ {today_iso}, ...}},
+    sort: {{"field":"created_at","direction":"asc","trigger_phrase":"oldest"}}
+- "the latest changes to billing" → sort:{{"field":"updated_at","direction":"desc","trigger_phrase":"latest"}}
+- "what is the auth middleware" → temporal: null, sort: null
 """
 
 
@@ -109,6 +129,7 @@ class RouterOutput:
     entities: list[RouterEntity] = field(default_factory=list)
     expansions: list[str] = field(default_factory=list)
     temporal: dict[str, Any] | None = None
+    sort: dict[str, Any] | None = None
 
 
 async def route_query(customer_id: str, query: str) -> RouterOutput:
@@ -131,6 +152,7 @@ async def route_query(customer_id: str, query: str) -> RouterOutput:
         entities=[RouterEntity(**e) for e in parsed.get("entities", [])],
         expansions=parsed.get("expansions", []),
         temporal=parsed.get("temporal"),
+        sort=parsed.get("sort"),
     )
 
 
@@ -142,7 +164,7 @@ async def _call_haiku(query: str) -> dict:
     api_key = settings.anthropic_api_key.get_secret_value()
     if not api_key:
         # No Anthropic key configured — router returns empty (graceful no-op).
-        return {"entities": [], "expansions": [], "temporal": None}
+        return {"entities": [], "expansions": [], "temporal": None, "sort": None}
 
     system_prompt = _build_system_prompt(datetime.now(UTC))
     client = AsyncAnthropic(api_key=api_key, timeout=ROUTER_TIMEOUT_SECONDS)

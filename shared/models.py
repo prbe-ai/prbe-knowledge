@@ -248,6 +248,7 @@ class QueryResponse(BaseModel):
     total_candidates: int
     router_hit_cache: bool
     applied_temporal: dict[str, object] | None = None
+    applied_sort: dict[str, object] | None = None
     timing_ms: dict[str, float] = Field(default_factory=dict)
     trace_id: str
 

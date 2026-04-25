@@ -184,6 +184,11 @@ async def query(
         spec = TemporalSpec()
         temporal_source = "default"
 
+    # When sort intent ("oldest", "newest", "first") fires, fetch a wider net
+    # so the truly oldest/newest matches don't get dropped by relevance ranking
+    # before sort runs.
+    pool_multiplier = 5 if routed.sort else 2
+
     # Run retrievers in parallel. Each retriever runs the raw query; BM25 also
     # runs each router expansion (disjoint score space under RRF so it's fine).
     queries = [req.query, *routed.expansions]
@@ -192,7 +197,7 @@ async def query(
         return await vector_search(
             req.customer_id,
             req.query,
-            top_k=req.top_k * 2,
+            top_k=req.top_k * pool_multiplier,
             sources=sources,
             temporal=spec,
         )
@@ -203,7 +208,7 @@ async def query(
             for hit in await bm25_search(
                 req.customer_id,
                 q,
-                top_k=req.top_k * 2,
+                top_k=req.top_k * pool_multiplier,
                 sources=sources,
                 temporal=spec,
             ):
@@ -230,9 +235,10 @@ async def query(
     t_fuse = time.perf_counter()
     fused = fuse(
         {"vector": vec_hits, "bm25": bm25_hits, "graph": graph_hits},
-        top_k=req.top_k * 2,
+        top_k=req.top_k * pool_multiplier,
         recency_half_life_days=req.recency_half_life_days,
         now=now,
+        sort=routed.sort,
     )
     timing["fusion_ms"] = (time.perf_counter() - t_fuse) * 1000
 
@@ -281,12 +287,22 @@ async def query(
         applied_temporal["as_of"] = spec.as_of.isoformat() if spec.as_of else None
     # LATEST + ALL omit since/until/basis — they don't apply to those modes.
 
+    applied_sort: dict[str, object] | None = None
+    if routed.sort:
+        applied_sort = {
+            "field": routed.sort.get("field"),
+            "direction": routed.sort.get("direction"),
+            "trigger_phrase": routed.sort.get("trigger_phrase"),
+            "source": "inferred",
+        }
+
     return QueryResponse(
         query=req.query,
         chunks=chunks,
         total_candidates=len(fused),
         router_hit_cache=False,
         applied_temporal=applied_temporal,
+        applied_sort=applied_sort,
         timing_ms=timing,
         trace_id=trace_id,
     )

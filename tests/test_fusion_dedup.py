@@ -154,3 +154,75 @@ def test_fusion_tertiary_tie_breaks_on_chunk_id_asc() -> None:
     )
     assert fused[0].chunk_id == "aaa"
     assert fused[1].chunk_id == "bbb"
+
+
+# ---------------------------------------------------------------------------
+# Sort intent
+# ---------------------------------------------------------------------------
+
+
+def test_fusion_sort_oldest_by_created_at() -> None:
+    """sort=created_at asc: oldest doc first regardless of relevance score."""
+    old = FakeHit(
+        chunk_id="old",
+        doc_id="d-old",
+        created_at=_NOW - timedelta(days=90),
+        updated_at=_NOW - timedelta(days=1),
+        score=0.1,
+    )
+    new = FakeHit(
+        chunk_id="new",
+        doc_id="d-new",
+        created_at=_NOW - timedelta(days=2),
+        updated_at=_NOW - timedelta(days=2),
+        score=0.99,  # highest relevance
+    )
+    fused = fuse(
+        {"vector": [new, old]},  # new ranks 1 in retriever, old ranks 2
+        top_k=10,
+        sort={"field": "created_at", "direction": "asc"},
+    )
+    # Despite higher score, "new" loses because it's not oldest.
+    assert fused[0].chunk_id == "old"
+    assert fused[1].chunk_id == "new"
+
+
+def test_fusion_sort_newest_by_updated_at() -> None:
+    """sort=updated_at desc: most recently touched first."""
+    stale = FakeHit(
+        chunk_id="stale", doc_id="d-stale", updated_at=_NOW - timedelta(days=30)
+    )
+    fresh = FakeHit(chunk_id="fresh", doc_id="d-fresh", updated_at=_NOW)
+    fused = fuse(
+        {"vector": [stale], "bm25": [fresh]},
+        top_k=10,
+        sort={"field": "updated_at", "direction": "desc"},
+    )
+    assert fused[0].chunk_id == "fresh"
+    assert fused[1].chunk_id == "stale"
+
+
+def test_fusion_sort_overrides_relevance_completely() -> None:
+    """Even when one chunk has 10x the RRF score, sort wins."""
+    relevant = FakeHit(
+        chunk_id="r", doc_id="d-r", created_at=_NOW, score=1.0
+    )
+    older_irrelevant = FakeHit(
+        chunk_id="o", doc_id="d-o", created_at=_NOW - timedelta(days=180), score=0.01
+    )
+    # Both rank 1 in different retrievers → identical RRF
+    fused = fuse(
+        {"vector": [relevant], "bm25": [relevant], "graph": [older_irrelevant]},
+        top_k=10,
+        sort={"field": "created_at", "direction": "asc"},
+    )
+    assert fused[0].chunk_id == "o"  # oldest wins regardless
+
+
+def test_fusion_no_sort_kwarg_keeps_relevance_order() -> None:
+    """sort=None: existing relevance + tie-break behavior unchanged."""
+    a = FakeHit(chunk_id="aaa", doc_id="d-a", updated_at=_NOW)
+    b = FakeHit(chunk_id="bbb", doc_id="d-b", updated_at=_NOW - timedelta(days=10))
+    fused = fuse({"vector": [a, b]}, top_k=10)
+    # Standard score-desc; "a" ranks 1 in retriever → higher RRF.
+    assert fused[0].chunk_id == "aaa"
