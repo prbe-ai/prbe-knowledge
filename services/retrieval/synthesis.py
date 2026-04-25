@@ -188,24 +188,17 @@ async def _call_anthropic(system: str, user: str, model: str, max_tokens: int) -
         raise SynthesisError("ANTHROPIC_API_KEY not configured")
     client = AsyncAnthropic(api_key=api_key, timeout=SYNTHESIS_TIMEOUT_SECONDS)
     try:
-        # Prefill the assistant turn with `{` to bias toward JSON. Claude
-        # respects this prefix; the response continues from there. Re-prepend
-        # the `{` to the returned text since the SDK strips it.
         resp = await client.messages.create(
             model=model,
             max_tokens=max_tokens,
             system=system,
-            messages=[
-                {"role": "user", "content": user},
-                {"role": "assistant", "content": "{"},
-            ],
+            messages=[{"role": "user", "content": user}],
         )
     except APIError as exc:
         raise SynthesisError(f"anthropic api error: {exc}") from exc
-    body = "".join(
+    return "".join(
         block.text for block in resp.content if getattr(block, "type", "") == "text"
     )
-    return "{" + body
 
 
 async def _call_openai(system: str, user: str, model: str, max_tokens: int) -> str:
