@@ -1,9 +1,9 @@
 """Admin API for the internal provisioning dashboard.
 
-Gated by a shared X-Admin-Key header. All routes live under /admin and
-are unavailable when `ADMIN_API_KEY` is unset (503). The dashboard uses
-these to bootstrap tenants, read integration status, and surface ingestion
-stats — never to serve end-user traffic.
+Gated by a shared X-Internal-Knowledge-Key header. All routes live under /admin
+and are unavailable when `INTERNAL_KNOWLEDGE_API_KEY` is unset (503). The
+dashboard uses these to bootstrap tenants, read integration status, and surface
+ingestion stats — never to serve end-user traffic.
 
 Route layout:
     POST   /admin/customers                           — create tenant
@@ -63,21 +63,26 @@ router = APIRouter(prefix="/admin", tags=["admin"])
 # ---------------------------------------------------------------------------
 
 
-async def verify_admin_key(
-    x_admin_key: str | None = Header(default=None, alias="X-Admin-Key"),
+async def verify_internal_knowledge_key(
+    x_internal_knowledge_key: str | None = Header(
+        default=None, alias="X-Internal-Knowledge-Key"
+    ),
 ) -> None:
-    expected_secret = get_settings().admin_api_key
+    expected_secret = get_settings().internal_knowledge_api_key
     # Treat an empty SecretStr as "unset" — otherwise a blank .env value
     # would silently allow the header check to pass against "" == "".
     if expected_secret is None or not expected_secret.get_secret_value():
         raise HTTPException(
-            status_code=503, detail="admin disabled — set ADMIN_API_KEY"
+            status_code=503,
+            detail="internal API disabled — set INTERNAL_KNOWLEDGE_API_KEY",
         )
-    if x_admin_key is None:
-        raise HTTPException(status_code=401, detail="missing X-Admin-Key")
+    if x_internal_knowledge_key is None:
+        raise HTTPException(status_code=401, detail="missing X-Internal-Knowledge-Key")
     # compare_digest avoids timing-based token recovery.
-    if not hmac.compare_digest(x_admin_key, expected_secret.get_secret_value()):
-        raise HTTPException(status_code=401, detail="invalid X-Admin-Key")
+    if not hmac.compare_digest(
+        x_internal_knowledge_key, expected_secret.get_secret_value()
+    ):
+        raise HTTPException(status_code=401, detail="invalid X-Internal-Knowledge-Key")
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +146,7 @@ def _iso(ts: Any) -> str | None:
 @router.post(
     "/customers",
     response_model=CreateCustomerResponse,
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(verify_internal_knowledge_key)],
 )
 async def create_customer_route(body: CreateCustomerRequest) -> CreateCustomerResponse:
     try:
@@ -162,7 +167,7 @@ async def create_customer_route(body: CreateCustomerRequest) -> CreateCustomerRe
 @router.post(
     "/customers/{customer_id}/rotate_key",
     response_model=RotateKeyResponse,
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(verify_internal_knowledge_key)],
 )
 async def rotate_key_route(customer_id: str) -> RotateKeyResponse:
     try:
@@ -175,7 +180,7 @@ async def rotate_key_route(customer_id: str) -> RotateKeyResponse:
 @router.delete(
     "/customers/{customer_id}",
     status_code=204,
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(verify_internal_knowledge_key)],
 )
 async def delete_customer_route(customer_id: str) -> None:
     try:
@@ -184,7 +189,7 @@ async def delete_customer_route(customer_id: str) -> None:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/customers", dependencies=[Depends(verify_admin_key)])
+@router.get("/customers", dependencies=[Depends(verify_internal_knowledge_key)])
 async def list_customers_route() -> dict[str, Any]:
     async with raw_conn() as conn:
         rows = await conn.fetch(
@@ -208,7 +213,7 @@ async def list_customers_route() -> dict[str, Any]:
 
 @router.get(
     "/customers/{customer_id}/integrations",
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(verify_internal_knowledge_key)],
 )
 async def get_integrations_route(
     customer_id: str,
@@ -330,7 +335,7 @@ async def get_integrations_route(
 
 @router.get(
     "/customers/{customer_id}/ingestion_stats",
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(verify_internal_knowledge_key)],
 )
 async def get_ingestion_stats_route(customer_id: str) -> dict[str, Any]:
     if not await _customer_exists(customer_id):
@@ -515,7 +520,7 @@ async def _validate_granola_key(api_key: str) -> None:
 @router.post(
     "/customers/{customer_id}/integrations/granola",
     response_model=GranolaConnectResponse,
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(verify_internal_knowledge_key)],
 )
 async def connect_granola_route(
     customer_id: str, body: GranolaConnectRequest
@@ -573,7 +578,7 @@ async def connect_granola_route(
 @router.delete(
     "/customers/{customer_id}/integrations/granola",
     status_code=204,
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(verify_internal_knowledge_key)],
 )
 async def disconnect_granola_route(customer_id: str) -> None:
     if not await _customer_exists(customer_id):
@@ -596,7 +601,7 @@ async def disconnect_granola_route(customer_id: str) -> None:
 @router.post(
     "/customers/{customer_id}/integrations/granola/refresh",
     response_model=GranolaRefreshResponse,
-    dependencies=[Depends(verify_admin_key)],
+    dependencies=[Depends(verify_internal_knowledge_key)],
 )
 async def refresh_granola_route(customer_id: str) -> GranolaRefreshResponse:
     """Manually re-enqueue a Granola backfill, preserving the cursor.

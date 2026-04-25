@@ -62,7 +62,7 @@ R2_ACCESS_KEY_ID=minioadmin
 R2_SECRET_ACCESS_KEY=minioadmin
 
 TOKEN_ENCRYPTION_KEY=<paste the Fernet key you just generated>
-ADMIN_API_KEY=<paste the admin API key you just generated>
+INTERNAL_KNOWLEDGE_API_KEY=<paste the internal-knowledge API key you just generated>
 
 OPENAI_API_KEY=sk-...                       # embeddings
 ANTHROPIC_API_KEY=sk-ant-...                # router (optional for Phase 0 smoke)
@@ -330,7 +330,7 @@ for app in prbe-knowledge-ingestion prbe-knowledge-retrieval prbe-knowledge-work
     OPENAI_API_KEY="$OPENAI_API_KEY" \
     ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
     TOKEN_ENCRYPTION_KEY="$TOKEN_ENCRYPTION_KEY" \
-    ADMIN_API_KEY="$ADMIN_API_KEY" \
+    INTERNAL_KNOWLEDGE_API_KEY="$INTERNAL_KNOWLEDGE_API_KEY" \
     R2_ENDPOINT_URL="$R2_ENDPOINT_URL" \
     R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
     R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \

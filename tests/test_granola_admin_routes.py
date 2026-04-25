@@ -54,7 +54,7 @@ def _patch_settings(monkeypatch, settings: Settings) -> None:
         "TOKEN_ENCRYPTION_KEY", settings.token_encryption_key.get_secret_value()
     )
     monkeypatch.setenv("ENVIRONMENT", "local")
-    monkeypatch.setenv("ADMIN_API_KEY", ADMIN_KEY)
+    monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", ADMIN_KEY)
     reset_embedder()
     reset_store()
     get_settings.cache_clear()  # type: ignore[attr-defined]
@@ -75,7 +75,7 @@ async def _admin_request(
         ingestion_app.router.lifespan_context(ingestion_app),
     ):
         resp = await client.request(
-            method, path, headers={"X-Admin-Key": ADMIN_KEY}, json=json
+            method, path, headers={"X-Internal-Knowledge-Key": ADMIN_KEY}, json=json
         )
     return resp
 

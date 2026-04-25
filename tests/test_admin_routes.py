@@ -1,7 +1,7 @@
-"""Admin API gated by X-Admin-Key.
+"""Admin API gated by X-Internal-Knowledge-Key.
 
 Covers:
-  - 503 when ADMIN_API_KEY is unset
+  - 503 when INTERNAL_KNOWLEDGE_API_KEY is unset
   - 401 when header missing / wrong
   - create_customer → plaintext key + install URLs
   - 409 on duplicate
@@ -35,7 +35,7 @@ def _patch_settings(monkeypatch, settings: Settings) -> None:
         "TOKEN_ENCRYPTION_KEY", settings.token_encryption_key.get_secret_value()
     )
     monkeypatch.setenv("ENVIRONMENT", "local")
-    monkeypatch.setenv("ADMIN_API_KEY", ADMIN_KEY)
+    monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", ADMIN_KEY)
     reset_embedder()
     reset_store()
     get_settings.cache_clear()  # type: ignore[attr-defined]
@@ -67,7 +67,7 @@ async def _admin_request(
 
 
 def _auth(extra: dict[str, str] | None = None) -> dict[str, str]:
-    h = {"X-Admin-Key": ADMIN_KEY}
+    h = {"X-Internal-Knowledge-Key": ADMIN_KEY}
     if extra:
         h.update(extra)
     return h
@@ -85,7 +85,7 @@ async def test_admin_requires_key_header(live_db, settings) -> None:
     assert resp.status_code == 401, resp.text
 
     resp = await _admin_request(
-        "GET", "/admin/customers", headers={"X-Admin-Key": "wrong"}
+        "GET", "/admin/customers", headers={"X-Internal-Knowledge-Key": "wrong"}
     )
     await init_pool(settings)
     assert resp.status_code == 401, resp.text
@@ -95,8 +95,8 @@ async def test_admin_requires_key_header(live_db, settings) -> None:
 async def test_admin_503_when_key_unset(live_db, settings, monkeypatch) -> None:
     # Setenv to "" — delenv alone leaks through any .env file the developer
     # has on disk (pydantic-settings falls back to those when the env var is
-    # absent). verify_admin_key treats empty SecretStr as "not set".
-    monkeypatch.setenv("ADMIN_API_KEY", "")
+    # absent). verify_internal_knowledge_key treats empty SecretStr as "not set".
+    monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", "")
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
     for method, path in [
@@ -107,7 +107,7 @@ async def test_admin_503_when_key_unset(live_db, settings, monkeypatch) -> None:
         ("GET", "/admin/customers/foo/ingestion_stats"),
     ]:
         body = {"customer_id": "x", "display_name": "y", "redirect_uri_base": "z"} if method == "POST" and path == "/admin/customers" else None
-        resp = await _admin_request(method, path, headers={"X-Admin-Key": "anything"}, json=body)
+        resp = await _admin_request(method, path, headers={"X-Internal-Knowledge-Key": "anything"}, json=body)
         assert resp.status_code == 503, f"{method} {path}: {resp.status_code} {resp.text}"
 
     await init_pool(settings)
