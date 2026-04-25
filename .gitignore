@@ -42,3 +42,7 @@ fly.toml.local
 # `.claude/skills/` are still tracked intentionally.
 .claude/worktrees/
 .claude/settings.local.json
+
+# Brainstorming + planning artifacts kept in the worktree for reference but
+# not part of the repo's tracked surface.
+docs/superpowers/
