@@ -5,11 +5,12 @@ from __future__ import annotations
 import pytest
 
 from services.retrieval.synthesis import (
+    ANSWER_SCHEMA,
     SynthesisChunk,
     SynthesisError,
     _extract_citations,
+    _fallback_parse_text,
     _format_user_prompt,
-    _parse_response,
     normalize_citations_in_answer,
     synthesize,
 )
@@ -26,6 +27,25 @@ def _chunk(idx: int, content: str = "x", title: str | None = None) -> SynthesisC
         source_url=f"https://example.com/{idx}",
         updated_at=_NOW_ISO,
     )
+
+
+# ---------------------------------------------------------------------------
+# Schema sanity
+# ---------------------------------------------------------------------------
+
+
+def test_answer_schema_has_strict_shape() -> None:
+    """OpenAI strict json_schema mode requires additionalProperties:false
+    and every property in the required list."""
+    assert ANSWER_SCHEMA["additionalProperties"] is False
+    props = set(ANSWER_SCHEMA["properties"].keys())
+    required = set(ANSWER_SCHEMA["required"])
+    assert props == required == {"answer", "citations_used", "insufficient_context"}
+
+
+# ---------------------------------------------------------------------------
+# Prompt formatting
+# ---------------------------------------------------------------------------
 
 
 def test_format_user_prompt_indexes_chunks() -> None:
@@ -45,47 +65,54 @@ def test_format_user_prompt_truncates_long_chunks() -> None:
     assert len(out) < 4000  # well under raw chunk size
 
 
-def test_parse_response_handles_plain_json() -> None:
-    parsed = _parse_response('{"answer": "hi [chunk:1]", "insufficient_context": false}')
+# ---------------------------------------------------------------------------
+# Fallback parser (when a provider returns free-form text)
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_parse_handles_plain_json_text() -> None:
+    parsed = _fallback_parse_text(
+        '{"answer": "hi [chunk:1]", "insufficient_context": false}'
+    )
     assert parsed["answer"] == "hi [chunk:1]"
     assert parsed["insufficient_context"] is False
 
 
-def test_parse_response_strips_markdown_fence() -> None:
+def test_fallback_parse_strips_markdown_fence() -> None:
     raw = '```json\n{"answer": "ok [chunk:1]", "insufficient_context": false}\n```'
-    parsed = _parse_response(raw)
+    parsed = _fallback_parse_text(raw)
     assert parsed["answer"] == "ok [chunk:1]"
 
 
-def test_parse_response_falls_back_for_non_json() -> None:
-    """When the model returns prose despite the prompt, we render the prose
-    rather than 502 the caller. Citation extraction still works on
-    [chunk:N] tags inside the text downstream.
-    """
-    parsed = _parse_response("Klavis shipped Tuesday [chunk:1].")
+def test_fallback_parse_wraps_prose_as_answer() -> None:
+    parsed = _fallback_parse_text("Klavis shipped Tuesday [chunk:1].")
     assert parsed["answer"] == "Klavis shipped Tuesday [chunk:1]."
     assert parsed["insufficient_context"] is False
+    assert parsed["citations_used"] == []
 
 
-def test_parse_response_falls_back_when_answer_key_missing() -> None:
-    parsed = _parse_response('{"foo": "bar"}')
+def test_fallback_parse_wraps_unrelated_json_as_answer() -> None:
+    parsed = _fallback_parse_text('{"foo": "bar"}')
+    # No "answer" key in the parsed json → fall through to wrap-as-text path.
     assert parsed["answer"] == '{"foo": "bar"}'
-    assert parsed["insufficient_context"] is False
 
 
-def test_parse_response_infers_insufficient_context_from_prose() -> None:
-    parsed = _parse_response(
+def test_fallback_parse_infers_insufficient_context() -> None:
+    parsed = _fallback_parse_text(
         "I cannot answer this question from the provided chunks."
     )
     assert parsed["insufficient_context"] is True
 
 
-def test_parse_response_strips_anthropic_prefill_double_brace_safely() -> None:
-    """When prefill `{` succeeds and Claude returns valid JSON we still parse
-    the JSON path. The `{` prefix doesn't break us.
-    """
-    parsed = _parse_response('{"answer": "ok [chunk:1]", "insufficient_context": false}')
-    assert parsed["answer"] == "ok [chunk:1]"
+def test_fallback_parse_handles_empty() -> None:
+    parsed = _fallback_parse_text("")
+    assert parsed["insufficient_context"] is True
+    assert "no content" in parsed["answer"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Citation extraction + normalization
+# ---------------------------------------------------------------------------
 
 
 def test_extract_citations_dedupes_and_drops_out_of_range() -> None:
@@ -104,8 +131,6 @@ def test_extract_citations_empty_when_no_tags() -> None:
 
 
 def test_extract_citations_accepts_bare_chunk_n() -> None:
-    """Gemini ignores the [bracket] format sometimes — extractor must
-    still recognize bare `chunk:1`."""
     chunks = [_chunk(1), _chunk(2)]
     answer = "Granola was added chunk:1. Backfill via poller chunk:2."
     out = _extract_citations(answer, chunks)
@@ -113,8 +138,6 @@ def test_extract_citations_accepts_bare_chunk_n() -> None:
 
 
 def test_extract_citations_uses_declared_list() -> None:
-    """When the model also returns `citations_used: [...]`, indices in that
-    list are added even if no inline tag references them."""
     chunks = [_chunk(1), _chunk(2), _chunk(3)]
     out = _extract_citations(
         "answer text with [chunk:1].", chunks, declared=[1, 2, 3]
@@ -135,6 +158,11 @@ def test_normalize_citations_idempotent_on_already_bracketed() -> None:
     assert normalize_citations_in_answer(text) == "Already done [chunk:1]."
 
 
+# ---------------------------------------------------------------------------
+# Synthesize end-to-end with mocked _dispatch (returns dict now, not str)
+# ---------------------------------------------------------------------------
+
+
 @pytest.mark.asyncio
 async def test_synthesize_short_circuits_on_empty_chunks() -> None:
     result = await synthesize(
@@ -148,16 +176,14 @@ async def test_synthesize_short_circuits_on_empty_chunks() -> None:
 @pytest.mark.asyncio
 async def test_synthesize_rejects_unknown_model() -> None:
     with pytest.raises(SynthesisError) as exc_info:
-        await synthesize(
-            "q", [_chunk(1)], model="bogus/model-name"
-        )
+        await synthesize("q", [_chunk(1)], model="bogus/model-name")
     assert "unsupported synthesis model" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_synthesize_anthropic_path(monkeypatch) -> None:
-    """End-to-end via mocked Anthropic dispatch — verifies prompt + citation
-    extraction against a realistic JSON response.
+    """Mocked dispatch returns a structured dict (the new contract).
+    Verifies prompt content + citation extraction.
     """
     captured: dict = {}
 
@@ -166,10 +192,11 @@ async def test_synthesize_anthropic_path(monkeypatch) -> None:
         captured["model"] = model
         captured["max_tokens"] = max_tokens
         captured["user"] = user
-        return (
-            '{"answer": "Klavis shipped on Tuesday [chunk:1]. '
-            'It uses MCP [chunk:2].", "insufficient_context": false}'
-        )
+        return {
+            "answer": "Klavis shipped on Tuesday [chunk:1]. It uses MCP [chunk:2].",
+            "citations_used": [1, 2],
+            "insufficient_context": False,
+        }
 
     monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
     chunks = [
@@ -198,12 +225,14 @@ async def test_synthesize_routes_openai(monkeypatch) -> None:
     async def fake_call(provider_name, *, system, user, model, max_tokens):
         captured["provider"] = provider_name
         captured["model"] = model
-        return '{"answer": "x [chunk:1]", "insufficient_context": false}'
+        return {
+            "answer": "x [chunk:1]",
+            "citations_used": [1],
+            "insufficient_context": False,
+        }
 
     monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
-    await synthesize(
-        "q", [_chunk(1)], model="openai/gpt-4o-mini",
-    )
+    await synthesize("q", [_chunk(1)], model="openai/gpt-4o-mini")
     assert captured["provider"] == "openai"
     assert captured["model"] == "gpt-4o-mini"
 
@@ -215,12 +244,14 @@ async def test_synthesize_routes_google(monkeypatch) -> None:
     async def fake_call(provider_name, *, system, user, model, max_tokens):
         captured["provider"] = provider_name
         captured["model"] = model
-        return '{"answer": "x [chunk:1]", "insufficient_context": false}'
+        return {
+            "answer": "x [chunk:1]",
+            "citations_used": [1],
+            "insufficient_context": False,
+        }
 
     monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
-    await synthesize(
-        "q", [_chunk(1)], model="google/gemini-2.5-flash",
-    )
+    await synthesize("q", [_chunk(1)], model="google/gemini-2.5-flash")
     assert captured["provider"] == "google"
     assert captured["model"] == "gemini-2.5-flash"
 
@@ -228,10 +259,11 @@ async def test_synthesize_routes_google(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_synthesize_propagates_insufficient_context(monkeypatch) -> None:
     async def fake_call(provider_name, *, system, user, model, max_tokens):
-        return (
-            '{"answer": "I cannot answer this from the available chunks.", '
-            '"insufficient_context": true}'
-        )
+        return {
+            "answer": "I cannot answer this from the available chunks.",
+            "citations_used": [],
+            "insufficient_context": True,
+        }
 
     monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
     result = await synthesize(
@@ -240,3 +272,26 @@ async def test_synthesize_propagates_insufficient_context(monkeypatch) -> None:
         model="anthropic/claude-sonnet-4-6",
     )
     assert result.insufficient_context is True
+
+
+@pytest.mark.asyncio
+async def test_synthesize_normalizes_bare_citations(monkeypatch) -> None:
+    """Provider returned bare `chunk:1` (Gemini-style). synthesize() should
+    canonicalize to [chunk:1] before returning."""
+    async def fake_call(provider_name, *, system, user, model, max_tokens):
+        return {
+            "answer": "Klavis shipped chunk:1 and uses MCP chunk:2.",
+            "citations_used": [1, 2],
+            "insufficient_context": False,
+        }
+
+    monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
+    chunks = [_chunk(1), _chunk(2)]
+    result = await synthesize(
+        "what is klavis?",
+        chunks,
+        model="google/gemini-2.5-flash",
+    )
+    assert "[chunk:1]" in result.answer
+    assert "[chunk:2]" in result.answer
+    assert "chunk:1." not in result.answer  # bare form was rewritten

@@ -4,15 +4,20 @@ Three providers (Anthropic, OpenAI, Google) behind one async function:
 
     result = await synthesize(query, chunks, model, max_tokens)
 
-The model selector is a "<provider>/<model>" string. Provider keys are
-defined in shared.constants.SYNTHESIS_MODELS — adding a new model is
-one line there if it shares a provider, or a new branch in `_dispatch`
-for a fresh provider.
+Each provider uses its native structured-output mechanism so the wrapper
+shape is enforced at the API level, not by asking the model nicely:
 
-Output contract is identical across providers: every claim in `answer`
-ends with one or more `[chunk:N]` citations (1-indexed against the
-input chunk list). When chunks don't support a confident answer, the
-LLM returns `insufficient_context: true` instead of hallucinating.
+    Anthropic — tool use with a forced `render_answer` tool call
+    OpenAI    — response_format = json_schema strict mode
+    Google    — config.response_schema
+
+This avoids the "did the model wrap in JSON or return prose?" guessing
+game that the old prompt-only approach hit on every provider.
+
+Citation format inside the answer string is still free-form. Models
+sometimes drop the [bracket] formatting; normalize_citations_in_answer()
+canonicalizes bare `chunk:N` to `[chunk:N]` so downstream rendering
+works regardless.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any
 
 from shared.config import get_settings
 from shared.constants import SYNTHESIS_MODELS
@@ -56,40 +61,70 @@ class SynthesisResult:
     citations: list[dict[str, object]]  # [{"index": 1, "chunk_id": "..."}]
     insufficient_context: bool
     model: str
-    raw_provider_response: str  # untouched body from the provider for debugging
+    raw_provider_response: str  # debugging / observability only
 
 
-class _Provider(Protocol):
-    async def call(self, system: str, user: str, model: str, max_tokens: int) -> str: ...
+# ---------------------------------------------------------------------------
+# Schema (one definition, three providers)
+# ---------------------------------------------------------------------------
+
+
+# additionalProperties: False is required by OpenAI's strict json_schema mode
+# and harmless on Anthropic + Google. All three properties live in `required`
+# for the same reason.
+ANSWER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "answer": {
+            "type": "string",
+            "description": (
+                "Cited prose answer. 1-3 short paragraphs. Every factual claim "
+                "ends with one or more inline citations of the form [chunk:N], "
+                "where N is the 1-indexed chunk number. Use ONLY information "
+                "present in the chunks. Do not invent dates, names, PR numbers, "
+                "decisions, or relationships. Do not restate the question. No "
+                "preamble. Use markdown for emphasis when helpful."
+            ),
+        },
+        "citations_used": {
+            "type": "array",
+            "items": {"type": "integer", "minimum": 1},
+            "description": (
+                "Every chunk index referenced in the answer text. Used as a "
+                "self-check by the renderer."
+            ),
+        },
+        "insufficient_context": {
+            "type": "boolean",
+            "description": (
+                "True iff the chunks don't contain enough information to "
+                "confidently answer. When true, `answer` should be a one-line "
+                "explanation of what's missing rather than a fabricated answer."
+            ),
+        },
+    },
+    "required": ["answer", "citations_used", "insufficient_context"],
+}
+
+
+_SYSTEM_PROMPT = """You are a careful retrieval-augmented assistant. You answer the user's
+question using ONLY the chunks you've been given. The runtime enforces a
+structured output schema; just produce the values it asks for.
+
+Hard rules:
+- Use ONLY information present in the chunks. Do not invent facts.
+- Every sentence that makes a claim must end with at least one [chunk:N].
+- If the chunks don't support a confident answer, set insufficient_context
+  to true and write a one-line explanation in `answer` instead of guessing.
+- Be concise. 1-3 short paragraphs. No preamble.
+- Markdown formatting (bold, italic, code) is fine when it helps clarity.
+"""
 
 
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
-
-
-_SYSTEM_PROMPT = """You are a careful retrieval-augmented assistant. You answer the user's question
-using ONLY the chunks you've been given. Every factual claim in your answer must
-end with one or more inline citations of the form [chunk:N], where N is the
-1-indexed chunk number.
-
-Rules:
-- Use ONLY information present in the chunks. Do not invent dates, names,
-  PR numbers, decisions, or relationships.
-- Every sentence that makes a claim must end with at least one [chunk:N].
-- If the chunks do not contain enough information to confidently answer,
-  set "insufficient_context": true and write `answer` as a one-sentence
-  explanation of what's missing.
-- Be concise. 1-3 short paragraphs. Don't restate the question. No preamble.
-- No bullet lists unless the user explicitly asks for a list.
-
-Return ONLY this JSON, nothing else:
-{
-  "answer": "string with inline [chunk:N] citations",
-  "citations_used": [1, 2, 5],
-  "insufficient_context": false
-}
-"""
 
 
 async def synthesize(
@@ -100,9 +135,10 @@ async def synthesize(
 ) -> SynthesisResult:
     """Run an LLM over `chunks` to synthesize an answer to `query`.
 
-    Raises SynthesisError on provider failure or unparseable output.
-    Empty `chunks` short-circuits to an explicit "no context" result so
-    we don't waste a model call on nothing.
+    Empty `chunks` short-circuits to insufficient_context — no model call.
+    Provider failures raise SynthesisError; the route handler converts to 502.
+    Model output that doesn't match the schema falls back to plain-text
+    handling so the user always gets *something* renderable.
     """
     if not chunks:
         return SynthesisResult(
@@ -121,13 +157,15 @@ async def synthesize(
     model_id = model.split("/", 1)[1]
 
     user_prompt = _format_user_prompt(query, chunks)
-    raw = await _dispatch(
-        provider_name, system=_SYSTEM_PROMPT, user=user_prompt,
-        model=model_id, max_tokens=max_tokens,
+    parsed = await _dispatch(
+        provider_name,
+        system=_SYSTEM_PROMPT,
+        user=user_prompt,
+        model=model_id,
+        max_tokens=max_tokens,
     )
 
-    parsed = _parse_response(raw)
-    answer = normalize_citations_in_answer(parsed["answer"])
+    answer = normalize_citations_in_answer(str(parsed.get("answer", "")))
     declared = parsed.get("citations_used") or parsed.get("citations") or None
     declared_list = declared if isinstance(declared, list) else None
     citations = _extract_citations(answer, chunks, declared=declared_list)
@@ -136,7 +174,7 @@ async def synthesize(
         citations=citations,
         insufficient_context=bool(parsed.get("insufficient_context", False)),
         model=model,
-        raw_provider_response=raw,
+        raw_provider_response=json.dumps(parsed, default=str)[:4000],
     )
 
 
@@ -150,7 +188,6 @@ def _format_user_prompt(query: str, chunks: list[SynthesisChunk]) -> str:
     for i, c in enumerate(chunks, start=1):
         title = f" — {c.title}" if c.title else ""
         body = (c.content or "").strip()
-        # Truncate very long chunks so we don't blow the context window.
         if len(body) > 1500:
             body = body[:1500] + "…"
         blocks.append(
@@ -163,17 +200,22 @@ def _format_user_prompt(query: str, chunks: list[SynthesisChunk]) -> str:
 Chunks:
 {chunk_block}
 
-Now answer using only these chunks. Cite every claim with [chunk:N]."""
+Answer using only these chunks. Cite every claim with [chunk:N]."""
 
 
 # ---------------------------------------------------------------------------
-# Provider dispatch
+# Provider dispatch — each adapter returns the parsed structured dict
 # ---------------------------------------------------------------------------
 
 
 async def _dispatch(
-    provider_name: str, *, system: str, user: str, model: str, max_tokens: int
-) -> str:
+    provider_name: str,
+    *,
+    system: str,
+    user: str,
+    model: str,
+    max_tokens: int,
+) -> dict[str, Any]:
     if provider_name == "anthropic":
         return await _call_anthropic(system, user, model, max_tokens)
     if provider_name == "openai":
@@ -183,7 +225,9 @@ async def _dispatch(
     raise SynthesisError(f"unknown provider: {provider_name}")
 
 
-async def _call_anthropic(system: str, user: str, model: str, max_tokens: int) -> str:
+async def _call_anthropic(
+    system: str, user: str, model: str, max_tokens: int
+) -> dict[str, Any]:
     from anthropic import APIError, AsyncAnthropic
 
     api_key = get_settings().anthropic_api_key.get_secret_value()
@@ -196,15 +240,39 @@ async def _call_anthropic(system: str, user: str, model: str, max_tokens: int) -
             max_tokens=max_tokens,
             system=system,
             messages=[{"role": "user", "content": user}],
+            tools=[
+                {
+                    "name": "render_answer",
+                    "description": (
+                        "Output the answer in the required structured format. "
+                        "Always invoke this tool — never reply in plain text."
+                    ),
+                    "input_schema": ANSWER_SCHEMA,
+                }
+            ],
+            tool_choice={"type": "tool", "name": "render_answer"},
         )
     except APIError as exc:
         raise SynthesisError(f"anthropic api error: {exc}") from exc
-    return "".join(
-        block.text for block in resp.content if getattr(block, "type", "") == "text"
+
+    for block in resp.content:
+        if (
+            getattr(block, "type", "") == "tool_use"
+            and getattr(block, "name", "") == "render_answer"
+        ):
+            payload = getattr(block, "input", None)
+            if isinstance(payload, dict):
+                return payload
+    # Model declined to call the tool — best-effort fall back to text content.
+    text = "".join(
+        getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text"
     )
+    return _fallback_parse_text(text)
 
 
-async def _call_openai(system: str, user: str, model: str, max_tokens: int) -> str:
+async def _call_openai(
+    system: str, user: str, model: str, max_tokens: int
+) -> dict[str, Any]:
     from openai import APIError, AsyncOpenAI
 
     api_key = get_settings().openai_api_key.get_secret_value()
@@ -219,15 +287,33 @@ async def _call_openai(system: str, user: str, model: str, max_tokens: int) -> s
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            response_format={"type": "json_object"},
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": ANSWER_SCHEMA,
+                    "strict": True,
+                },
+            },
         )
     except APIError as exc:
         raise SynthesisError(f"openai api error: {exc}") from exc
-    choice = resp.choices[0]
-    return choice.message.content or ""
+
+    content = resp.choices[0].message.content or ""
+    if not content:
+        return _fallback_parse_text("")
+    try:
+        parsed = json.loads(content)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    return _fallback_parse_text(content)
 
 
-async def _call_google(system: str, user: str, model: str, max_tokens: int) -> str:
+async def _call_google(
+    system: str, user: str, model: str, max_tokens: int
+) -> dict[str, Any]:
     try:
         from google import genai
     except ImportError as exc:
@@ -239,7 +325,7 @@ async def _call_google(system: str, user: str, model: str, max_tokens: int) -> s
     if not api_key:
         raise SynthesisError("GOOGLE_API_KEY not configured")
     client = genai.Client(api_key=api_key)
-    # Google doesn't have a separate system slot; prepend system to the user msg.
+    # Google has no separate system slot; prepend the system message.
     contents = f"{system}\n\n---\n\n{user}"
     try:
         resp = await client.aio.models.generate_content(
@@ -248,15 +334,27 @@ async def _call_google(system: str, user: str, model: str, max_tokens: int) -> s
             config={
                 "max_output_tokens": max_tokens,
                 "response_mime_type": "application/json",
+                "response_schema": ANSWER_SCHEMA,
             },
         )
     except Exception as exc:
         raise SynthesisError(f"google api error: {exc}") from exc
-    return getattr(resp, "text", None) or ""
+
+    text = getattr(resp, "text", None) or ""
+    if not text:
+        return _fallback_parse_text("")
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    return _fallback_parse_text(text)
 
 
 # ---------------------------------------------------------------------------
-# Output parsing + citation extraction
+# Fallback — when a provider returns free-form text instead of structured
+# output (model declined the tool, schema enforcement glitched, etc.).
 # ---------------------------------------------------------------------------
 
 
@@ -273,51 +371,60 @@ _INSUFFICIENT_MARKERS = (
 )
 
 
-def _parse_response(raw: str) -> dict[str, Any]:
-    """Best-effort: prefer JSON when the model obeys the schema, fall back
-    to treating the raw output as plain prose. Models occasionally answer
-    in prose despite the prompt — that's still a useful answer, no reason
-    to 502 the caller over it.
+def _fallback_parse_text(text: str) -> dict[str, Any]:
+    """Wrap a raw text body into the structured shape with best-effort
+    insufficient_context inference. Used only when the provider's structured
+    output mode fails or returns nothing.
     """
-    text = raw.strip()
+    body = text.strip()
     # Tolerate markdown-fenced JSON.
-    if text.startswith("```"):
-        stripped = text.strip("`").strip()
+    if body.startswith("```"):
+        stripped = body.strip("`").strip()
         if stripped.lower().startswith("json"):
             stripped = stripped[4:].strip()
-        text = stripped
+        body = stripped
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(body)
         if isinstance(parsed, dict) and "answer" in parsed:
             return parsed
     except json.JSONDecodeError:
         pass
 
-    # Fallback: treat the raw text as the answer body. Citation extraction
-    # downstream still works on [chunk:N] tags inside prose. Infer
-    # insufficient_context heuristically from common refusal phrasing.
-    lower = raw.lower()
+    if not body:
+        return {
+            "answer": "Provider returned no content.",
+            "insufficient_context": True,
+            "citations_used": [],
+        }
+    lower = body.lower()
     insufficient = any(marker in lower for marker in _INSUFFICIENT_MARKERS)
     log.info(
         "synthesis.fallback_parse",
-        raw_len=len(raw),
+        raw_len=len(text),
         insufficient=insufficient,
     )
     return {
-        "answer": raw.strip(),
+        "answer": body,
         "insufficient_context": insufficient,
+        "citations_used": [],
     }
 
 
-# Match [chunk:N] (preferred) and bare chunk:N. Gemini in particular tends to
+# ---------------------------------------------------------------------------
+# Citation handling
+# ---------------------------------------------------------------------------
+
+
+# Match [chunk:N] (preferred) and bare chunk:N. Models in particular tend to
 # drop the brackets despite the prompt; we accept both and normalize on render.
 _CITATION_RE = re.compile(r"\[?chunk:(\d+)\]?")
 
 
 def normalize_citations_in_answer(answer: str) -> str:
-    """Wrap bare `chunk:N` into `[chunk:N]` so downstream renderers (and the
-    dashboard's markdown-link conversion) see a single canonical format.
+    """Wrap bare `chunk:N` into `[chunk:N]` so downstream renderers see a
+    single canonical format.
     """
+
     def _repl(m: re.Match[str]) -> str:
         return f"[chunk:{m.group(1)}]"
 
@@ -329,9 +436,8 @@ def _extract_citations(
     chunks: list[SynthesisChunk],
     declared: list[int] | None = None,
 ) -> list[dict[str, object]]:
-    """Pull citations from the answer text plus any explicit `citations_used`
-    list the model returned. Dedupe, drop out-of-range indices, map to
-    chunk_id.
+    """Pull citations from the answer text plus any `citations_used` list
+    the model declared. Dedupe, drop out-of-range, map index → chunk_id.
     """
     seen: set[int] = set()
     out: list[dict[str, object]] = []
