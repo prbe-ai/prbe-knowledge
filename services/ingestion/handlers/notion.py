@@ -702,14 +702,24 @@ class NotionConnector(Connector):
                 f"notion oauth failed: HTTP {resp.status_code} {resp.text[:200]}"
             )
         body = resp.json()
+        # access_token + workspace_id are documented non-null on a 200 response,
+        # but guard explicitly so a malformed body becomes a 502 (PermanentSourceError)
+        # rather than an unhandled KeyError → 500.
+        try:
+            access_token = body["access_token"]
+            workspace_id = body["workspace_id"]
+        except (KeyError, TypeError) as exc:
+            raise PermanentSourceError(
+                f"notion oauth response missing required fields: {exc}"
+            ) from exc
         return IntegrationToken(
             customer_id="",  # filled in by oauth/routes.py:callback
             source_system=SourceSystem.NOTION,
-            access_token=body["access_token"],
+            access_token=access_token,
             refresh_token=body.get("refresh_token"),
             scope=None,  # Notion uses per-integration capability checkboxes
             install_metadata={
-                "workspace_id": body["workspace_id"],
+                "workspace_id": workspace_id,
                 "workspace_name": body.get("workspace_name"),
                 "workspace_icon": body.get("workspace_icon"),
                 "bot_id": body.get("bot_id"),

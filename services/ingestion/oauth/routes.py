@@ -1,16 +1,20 @@
 """OAuth install + callback routes.
 
 Generic across all connectors. Each connector that supports OAuth implements
-`oauth_install_url(customer_id, redirect_uri)` and `exchange_oauth_code(code,
-redirect_uri)`. This module wires those into FastAPI routes.
+`oauth_install_url(customer_id, redirect_uri, state)` and
+`exchange_oauth_code(code, redirect_uri)`. This module wires those into
+FastAPI routes.
 
 Flow:
     GET  /oauth/{source}/install?customer_id=...&redirect_uri=...
-         → 302 redirect to the source's authorize URL
-    GET  /oauth/{source}/callback?code=...&state=<customer_id>
+         → sign state via shared.state_signing.sign_state
+         → 302 redirect to the source's authorize URL with signed state
+    GET  /oauth/{source}/callback?code=...&state=<signed>
+         → verify_state(state, source) — 400 on forged / expired / wrong source
          → exchange code → encrypt + persist token → return success page
 
-`state` carries the customer_id (signed would be safer; Phase 0 accepts plain).
+State is HMAC-SHA256 signed (TTL 600s) so an attacker can't attach their own
+token to a victim tenant by crafting `state=<victim_customer>`.
 """
 
 from __future__ import annotations
@@ -78,20 +82,28 @@ async def oauth_callback(
     request: Request,
     code: str | None = Query(default=None),
     state: str | None = Query(
-        default=None, description="customer_id passed through from install"
+        default=None,
+        description=(
+            "HMAC-signed state from /oauth/{source}/install — opaque to clients."
+        ),
     ),
     error: str | None = Query(default=None),
 ) -> Response:
+    from shared.state_signing import verify_state
+
     dashboard_base = (get_settings().dashboard_base_url or "").rstrip("/")
     source_enum = _source(source)
     extra_params = dict(request.query_params)
 
     if error:
+        # state may be a signed blob — must verify before exposing to the
+        # dashboard URL. Forged or absent state → empty customer_id.
+        verified_cust = verify_state(state, source) if state else None
         if dashboard_base:
             return _landed_redirect(
                 dashboard_base,
                 source=source,
-                customer_id=state or "",
+                customer_id=verified_cust or "",
                 ok=False,
                 error=error,
             )
@@ -101,8 +113,6 @@ async def oauth_callback(
     # "Redirect on update" fires (repo added/removed). Fall back to existing
     # (source, external_id) → customer_id mapping so those flows don't 422.
     # Otherwise: state must be a valid HMAC-signed token bound to this source.
-    from shared.state_signing import verify_state
-
     customer_id: str | None
     resolved_from_mapping = False
     if state is None:
