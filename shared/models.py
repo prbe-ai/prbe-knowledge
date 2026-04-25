@@ -222,6 +222,28 @@ class QueryRequest(BaseModel):
             "Off by default."
         ),
     )
+    entity_must_match: bool = Field(
+        default=False,
+        description=(
+            "If true and the router extracts at least one high-confidence "
+            "entity, drop fused candidates whose content/title doesn't "
+            "textually contain the entity's canonical_id or display_name. "
+            "Filters obvious vector-similarity false positives (queries like "
+            "'whats going on with klavis' otherwise match generic Slack "
+            "greetings on conversational shape)."
+        ),
+    )
+    entity_match_threshold: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Confidence threshold for entities to qualify as filter needles "
+            "when `entity_must_match` is true. Entities below this confidence "
+            "are ignored by the filter. Lower (e.g. 0.5) is more aggressive; "
+            "higher (e.g. 0.9) only filters on dead-certain entities."
+        ),
+    )
 
 
 class QueryChunk(BaseModel):
@@ -249,6 +271,8 @@ class QueryResponse(BaseModel):
     router_hit_cache: bool
     applied_temporal: dict[str, object] | None = None
     applied_sort: dict[str, object] | None = None
+    applied_entity_filter: dict[str, object] | None = None
+    extracted_entities: list[dict[str, object]] = Field(default_factory=list)
     timing_ms: dict[str, float] = Field(default_factory=dict)
     trace_id: str
 

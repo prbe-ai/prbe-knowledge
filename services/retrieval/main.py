@@ -242,6 +242,19 @@ async def query(
     )
     timing["fusion_ms"] = (time.perf_counter() - t_fuse) * 1000
 
+    # Optional entity filter — kills vector-similarity false positives on
+    # entity-anchored queries ("whats going on with klavis" otherwise matches
+    # any "whats going on" Slack message). Only fires when the toggle is on
+    # AND the router extracted at least one high-confidence entity.
+    applied_entity_filter: dict[str, object] | None = None
+    if req.entity_must_match:
+        pre_count = len(fused)
+        fused, applied_entity_filter = _apply_entity_filter(
+            fused, routed.entities, threshold=req.entity_match_threshold
+        )
+        applied_entity_filter["candidates_before"] = pre_count
+        applied_entity_filter["candidates_after"] = len(fused)
+
     # Dedup uses the vector hits' embeddings where available (the only retriever
     # that carries them). BM25/graph-only hits fall through the dedup filter.
     t_dedup = time.perf_counter()
@@ -296,6 +309,16 @@ async def query(
             "source": "inferred",
         }
 
+    extracted_entities = [
+        {
+            "entity_type": e.entity_type,
+            "canonical_id": e.canonical_id,
+            "display_name": e.display_name,
+            "confidence": e.confidence,
+        }
+        for e in routed.entities
+    ]
+
     return QueryResponse(
         query=req.query,
         chunks=chunks,
@@ -303,9 +326,51 @@ async def query(
         router_hit_cache=False,
         applied_temporal=applied_temporal,
         applied_sort=applied_sort,
+        applied_entity_filter=applied_entity_filter,
+        extracted_entities=extracted_entities,
         timing_ms=timing,
         trace_id=trace_id,
     )
+
+
+def _apply_entity_filter(
+    fused: list, entities: list, threshold: float
+) -> tuple[list, dict[str, object]]:
+    """Drop fused chunks whose content/title doesn't textually contain any
+    extracted entity meeting the confidence threshold.
+
+    Pure function on top of the fused list. Returns (filtered_hits, info).
+    `info` reports which entity strings were used as needles + a `skipped`
+    flag if no qualifying entities were available (the filter is a no-op
+    in that case so callers can surface that to the user).
+    """
+    qualifying = [e for e in entities if e.confidence >= threshold]
+    info: dict[str, object] = {"enabled": True, "threshold": threshold}
+    if not qualifying:
+        info["skipped"] = (
+            f"no entities with confidence >= {threshold:.2f} extracted"
+        )
+        info["needles"] = []
+        return fused, info
+
+    needles: list[str] = []
+    seen: set[str] = set()
+    for e in qualifying:
+        for token in (e.canonical_id, e.display_name):
+            if not token:
+                continue
+            tok = token.lower().strip()
+            if tok and tok not in seen:
+                seen.add(tok)
+                needles.append(tok)
+    info["needles"] = needles
+
+    matched: list = []
+    for hit in fused:
+        haystack = ((hit.content or "") + " " + (hit.title or "")).lower()
+        if any(n in haystack for n in needles):
+            matched.append(hit)
+    return matched, info
 
 
 async def _embeddings_for_chunks(
