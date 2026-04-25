@@ -449,6 +449,11 @@ class IntegrationToken(BaseModel):
     # never persists it. Cleared on every load_token() trip through the DB.
     install_metadata: dict[str, Any] | None = Field(default=None, exclude=True)
 
+    # Device-scoped credentials (Phase 1 use: claude_code per-laptop tokens).
+    # Non-device sources leave these as None.
+    device_id: str | None = Field(default=None)
+    device_metadata: dict[str, Any] | None = Field(default=None)
+
 
 class ExternalWorkspaceRef(BaseModel):
     """A source-side workspace/team/org identifier linked to a PRBE customer.
