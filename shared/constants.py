@@ -9,6 +9,7 @@ class SourceSystem(StrEnum):
     GITHUB = "github"
     NOTION = "notion"
     SENTRY = "sentry"
+    GRANOLA = "granola"
 
 
 class DocClass(StrEnum):
@@ -32,6 +33,7 @@ class DocType(StrEnum):
     NOTION_DATABASE = "notion.database"
     SENTRY_ISSUE = "sentry.issue"
     SENTRY_EVENT = "sentry.event"
+    GRANOLA_MEETING = "granola.meeting"
     WIKI_SERVICE_CARD = "wiki.service_card"
     WIKI_DECISION = "wiki.decision"
     WIKI_FEATURE = "wiki.feature"
@@ -200,3 +202,26 @@ DEDUP_COSINE_THRESHOLD = 0.95
 # GitHub App installation rather than an OAuth access_token. The installation
 # id follows the colon; tokens are minted on demand from the App private key.
 GITHUB_INSTALLATION_SCOPE_PREFIX = "installation:"
+
+# Granola: API tier prefix in integration_tokens.scope. Personal keys see only
+# the issuing user's notes + shared. Enterprise keys see the whole workspace.
+GRANOLA_SCOPE_PERSONAL = "tier:personal"
+GRANOLA_SCOPE_ENTERPRISE = "tier:enterprise"
+
+# pg_notify channel the worker LISTENs on for sub-second manual-refresh wake.
+# The /admin/.../granola/refresh endpoint NOTIFYs after enqueuing so
+# BackfillWorker doesn't wait for its 5s poll cycle.
+GRANOLA_REFRESH_CHANNEL = "granola_refresh"
+
+# Steady-state polling cadence: re-enqueue Granola backfills this often once
+# the initial sync is complete. Read by services/ingestion/poller.
+GRANOLA_POLL_INTERVAL_SECONDS = 300
+
+# Per-customer rate-budget for outbound calls to the Granola API.
+# Granola docs: 5 rps / 25 in 5s burst. We sleep this long between calls inside
+# the connector's backfill loop, leaving 20% headroom under the documented limit.
+GRANOLA_REQUEST_INTERVAL_SECONDS = 0.25
+
+# Manual-refresh debounce. Repeated /refresh hits within this window collapse
+# into a single enqueue + notify; the second hit returns 429 with Retry-After.
+GRANOLA_REFRESH_DEBOUNCE_SECONDS = 30

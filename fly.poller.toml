@@ -1,0 +1,60 @@
+app = "prbe-knowledge-poller"
+primary_region = "sjc"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+# Reuses the worker Dockerfile — same code, different CMD via [processes].
+[build]
+  dockerfile = "services/worker/Dockerfile"
+
+[env]
+  ENVIRONMENT          = "main"
+  LOG_LEVEL            = "INFO"
+  SERVICE_NAME         = "prbe-knowledge-poller"
+  POLLER_HEALTH_PORT   = "8083"
+
+[processes]
+  poller = "python -m services.ingestion.poller"
+
+[[restart]]
+  policy      = "always"
+  max_retries = 10
+
+# ---------------------------------------------------------------------------
+# SHARP EDGE — DO NOT SET count > 1 WITHOUT INTRODUCING A DISTRIBUTED LOCK.
+#
+# This process re-enqueues Granola backfills on a 5-min cadence. With a
+# single instance, in-process scheduling is correct. With N instances, every
+# tick produces N pg_notify events for every customer — backfill rows still
+# de-dup at the SQL level (re_enqueue_for_polling no-ops on pending/running),
+# so correctness is preserved BUT each manual refresh produces N notifies
+# and each tick produces N redundant SQL queries against integration_tokens.
+#
+# Worse, if we ever add real polling logic that calls Granola here directly,
+# the in-process aiolimiter would let each instance spend its own 4 rps
+# budget — total spend would exceed the 5 rps Granola limit and we'd start
+# eating 429s.
+#
+# Before scaling out: introduce Postgres advisory locks
+# (`pg_try_advisory_lock(hashtext('granola_poller_tick'))`) or move the
+# rate budget into a shared store (Redis token bucket).
+# ---------------------------------------------------------------------------
+[http_service]
+  internal_port        = 8083
+  force_https          = true
+  auto_stop_machines   = false
+  auto_start_machines  = true
+  min_machines_running = 1
+  processes            = ["poller"]
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval     = "15s"
+    method       = "GET"
+    timeout      = "5s"
+    path         = "/health"
+
+[[vm]]
+  size      = "shared-cpu-1x"
+  memory    = "256mb"
+  processes = ["poller"]

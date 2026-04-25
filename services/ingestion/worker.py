@@ -16,6 +16,7 @@ import asyncpg
 from services.ingestion.handlers.base import ConnectorContext, make_default_context
 from services.ingestion.normalizer import Normalizer
 from shared.constants import (
+    GRANOLA_REFRESH_CHANNEL,
     QUEUE_HEARTBEAT_INTERVAL_SECONDS,
     IngestionEventStatus,
     QueueStatus,
@@ -258,12 +259,25 @@ class BackfillWorker:
     into ingestion_queue — where the ingestion Worker picks them up like any
     other webhook. The two workers are independent; backfill progress does
     not block webhook processing.
+
+    Wake semantics:
+      - Normal cycle: sleep `poll_interval` between claim attempts.
+      - On `wake_event` set (via pg_notify from /admin/.../granola/refresh
+        or from prbe-knowledge-poller's tick), break sleep early and re-poll.
+      - The wake_event is informational — the row was already enqueued by
+        the caller; we just want to start work sub-second instead of waiting.
     """
 
-    def __init__(self, ctx: ConnectorContext, poll_interval: float = 5.0) -> None:
+    def __init__(
+        self,
+        ctx: ConnectorContext,
+        poll_interval: float = 5.0,
+        wake_event: asyncio.Event | None = None,
+    ) -> None:
         self._ctx = ctx
         self._poll_interval = poll_interval
         self._shutdown = asyncio.Event()
+        self._wake = wake_event or asyncio.Event()
 
     async def run(self) -> None:
         from services.ingestion.backfill_runner import (
@@ -275,10 +289,7 @@ class BackfillWorker:
         while not self._shutdown.is_set():
             claimed = await claim_pending_backfill()
             if claimed is None:
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self._shutdown.wait(), timeout=self._poll_interval
-                    )
+                await self._sleep_or_wake()
                 continue
 
             customer_id, source = claimed
@@ -292,6 +303,91 @@ class BackfillWorker:
                     source=source.value,
                 )
         log.info("backfill_worker.stop")
+
+    async def _sleep_or_wake(self) -> None:
+        """Wait until shutdown, wake, or poll_interval timeout — whichever first."""
+        shutdown_task = asyncio.create_task(self._shutdown.wait())
+        wake_task = asyncio.create_task(self._wake.wait())
+        try:
+            _done, pending = await asyncio.wait(
+                {shutdown_task, wake_task},
+                timeout=self._poll_interval,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+        finally:
+            if self._wake.is_set():
+                self._wake.clear()
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+
+
+class GranolaNotifyListener:
+    """LISTEN granola_refresh on a dedicated asyncpg connection.
+
+    Sets `wake_event` whenever a NOTIFY arrives, which the BackfillWorker uses
+    to break its poll-interval sleep early. Reconnects on connection drop with
+    exponential backoff (1s → 60s).
+
+    Belt-and-suspenders: the BackfillWorker still polls every `poll_interval`
+    seconds even if no notify ever arrives. A missed notify (during reconnect)
+    just means up to one poll_interval extra latency.
+    """
+
+    def __init__(self, dsn: str, wake_event: asyncio.Event) -> None:
+        self._dsn = dsn
+        self._wake = wake_event
+        self._shutdown = asyncio.Event()
+
+    async def run(self) -> None:
+        log.info("granola_listener.start", channel=GRANOLA_REFRESH_CHANNEL)
+        backoff = 1.0
+        while not self._shutdown.is_set():
+            try:
+                conn = await asyncpg.connect(self._dsn)
+            except (asyncpg.PostgresError, OSError) as exc:
+                log.warning(
+                    "granola_listener.connect_failed",
+                    error=str(exc),
+                    backoff_seconds=backoff,
+                )
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._shutdown.wait(), timeout=backoff)
+                backoff = min(backoff * 2, 60.0)
+                continue
+
+            backoff = 1.0
+            try:
+                def _on_notify(_conn, _pid, _channel, payload) -> None:
+                    log.info(
+                        "granola_listener.notified",
+                        payload=payload,
+                    )
+                    self._wake.set()
+
+                await conn.add_listener(GRANOLA_REFRESH_CHANNEL, _on_notify)
+                log.info("granola_listener.ready")
+                # Keep the connection alive. Periodic SELECT 1 detects half-open
+                # connections (e.g., after a network partition) faster than waiting
+                # for a packet to time out.
+                while not self._shutdown.is_set():
+                    try:
+                        await asyncio.wait_for(self._shutdown.wait(), timeout=30.0)
+                    except TimeoutError:
+                        try:
+                            await conn.fetchval("SELECT 1")
+                        except (asyncpg.PostgresError, OSError) as exc:
+                            log.warning("granola_listener.lost", error=str(exc))
+                            break
+            finally:
+                with contextlib.suppress(Exception):
+                    await conn.close()
+
+        log.info("granola_listener.stop")
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -344,8 +440,13 @@ async def run_worker_forever() -> None:
     import services.ingestion.handlers  # noqa: F401
 
     ctx = make_default_context()
+    # Shared wake event: NotifyListener sets it on pg_notify, BackfillWorker
+    # reads it to break its poll sleep early. Single asyncio.Event because
+    # both live in the same process.
+    wake_event = asyncio.Event()
     ingestion_worker = Worker(ctx, max_attempts=settings.worker_max_attempts)
-    backfill_worker = BackfillWorker(ctx)
+    backfill_worker = BackfillWorker(ctx, wake_event=wake_event)
+    granola_listener = GranolaNotifyListener(settings.database_url, wake_event)
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
     health_config = uvicorn.Config(
@@ -368,6 +469,7 @@ async def run_worker_forever() -> None:
         await asyncio.gather(
             ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
             backfill_worker.run(),
+            granola_listener.run(),
             health_server.serve(),
         )
     finally:

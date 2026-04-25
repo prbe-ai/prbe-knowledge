@@ -138,7 +138,11 @@ async def test_create_customer_returns_api_key_and_install_urls(live_db, setting
     assert body["api_key"]  # plaintext key returned once
     assert body["bucket"]
     urls = body["install_urls"]
-    assert set(urls.keys()) == {s.value for s in SourceSystem}
+    # No-OAuth sources (Granola — paste-an-API-key flow) are excluded from
+    # install_urls. The dashboard renders a custom modal for them instead.
+    assert set(urls.keys()) == {
+        s.value for s in SourceSystem if s != SourceSystem.GRANOLA
+    }
     assert (
         urls["slack"]
         == "https://api.example.com/oauth/slack/install"

@@ -141,7 +141,12 @@ async def run_backfill(
 
 
 async def enqueue_backfill(customer_id: str, source: SourceSystem) -> None:
-    """Insert a `pending` backfill_state row so a worker picks it up."""
+    """Insert a `pending` backfill_state row so a worker picks it up.
+
+    Resets cursor to NULL — use for INITIAL syncs only. For incremental
+    re-polls of already-synced integrations (Granola steady-state), use
+    `re_enqueue_for_polling` to preserve the cursor watermark.
+    """
     async with raw_conn() as conn:
         await conn.execute(
             """
@@ -161,6 +166,38 @@ async def enqueue_backfill(customer_id: str, source: SourceSystem) -> None:
             source.value,
             BackfillStatus.PENDING.value,
         )
+
+
+async def re_enqueue_for_polling(customer_id: str, source: SourceSystem) -> bool:
+    """Mark a backfill_state row pending again WITHOUT clearing the cursor.
+
+    Used for incremental polling on connectors with no webhooks (Granola).
+    Preserves last_cursor so the connector resumes from its watermark.
+
+    No-ops if the row is already pending or running (don't restart in-flight
+    work). Returns True if a re-enqueue actually happened, False if it was
+    a no-op or no row existed.
+    """
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE backfill_state
+            SET status = $1,
+                last_error = NULL,
+                started_at = NULL,
+                heartbeat_at = NULL,
+                completed_at = NULL
+            WHERE customer_id = $2 AND source_system = $3
+              AND status NOT IN ($4, $5)
+            RETURNING customer_id
+            """,
+            BackfillStatus.PENDING.value,
+            customer_id,
+            source.value,
+            BackfillStatus.PENDING.value,
+            BackfillStatus.RUNNING.value,
+        )
+    return row is not None
 
 
 async def _mark_running(customer_id: str, source: SourceSystem) -> None:
