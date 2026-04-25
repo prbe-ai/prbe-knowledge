@@ -32,6 +32,7 @@ dependencies = [
     "notion-client>=2.2.0",
 
     "cryptography>=43.0.0",
+    "itsdangerous>=2.2.0",
     "python-jose[cryptography]>=3.3.0",
     "orjson>=3.10.0",
     "tiktoken>=0.8.0",
