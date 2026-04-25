@@ -260,6 +260,23 @@ async def get_integrations_route(
             """,
             customer_id,
         )
+        # last_event_at: most recent webhook/poll arrival per source. The
+        # signal users actually want when asking "is data flowing in?" —
+        # different from `last_refresh_at` (OAuth token rotation only).
+        # Also surface a 24h count so the card can flag silent integrations.
+        event_rows = await conn.fetch(
+            """
+            SELECT source_system,
+                   MAX(received_at) AS last_received_at,
+                   COUNT(*) FILTER (
+                     WHERE received_at > NOW() - INTERVAL '24 hours'
+                   ) AS events_24h
+            FROM ingestion_events
+            WHERE customer_id = $1
+            GROUP BY source_system
+            """,
+            customer_id,
+        )
 
     token_by_source: dict[str, Any] = {r["source_system"]: r for r in token_rows}
     backfill_by_source: dict[str, Any] = {
@@ -267,6 +284,13 @@ async def get_integrations_route(
     }
     failed_by_source: dict[str, int] = {
         r["source_system"]: int(r["n"]) for r in failed_rows
+    }
+    events_by_source: dict[str, dict[str, Any]] = {
+        r["source_system"]: {
+            "last_received_at": r["last_received_at"],
+            "events_24h": int(r["events_24h"]),
+        }
+        for r in event_rows
     }
     mappings_by_source: dict[str, list[dict[str, Any]]] = {}
     for r in mapping_rows:
@@ -278,6 +302,7 @@ async def get_integrations_route(
     for src in SourceSystem:
         tok = token_by_source.get(src.value)
         bf = backfill_by_source.get(src.value)
+        ev = events_by_source.get(src.value)
         connected = bool(tok and tok["status"] == IntegrationStatus.ACTIVE.value)
         integrations.append(
             {
@@ -286,6 +311,8 @@ async def get_integrations_route(
                 "workspaces": mappings_by_source.get(src.value, []),
                 "last_refresh_at": _iso(tok["last_refresh_at"]) if tok else None,
                 "last_refresh_error": tok["last_refresh_error"] if tok else None,
+                "last_event_at": _iso(ev["last_received_at"]) if ev else None,
+                "events_24h": ev["events_24h"] if ev else 0,
                 "install_url": install_urls.get(src.value),
                 "scope": tok["scope"] if tok else None,
                 "backfill_status": bf["status"] if bf else None,
