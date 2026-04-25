@@ -5,10 +5,7 @@ on ingestion_queue + content_hash dedup in documents combine to guarantee this.
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
-import time
 from pathlib import Path
 
 import httpx
@@ -26,20 +23,22 @@ SECRET = "test-secret"
 
 
 def _signed(body: bytes) -> dict[str, str]:
-    ts = str(int(time.time()))
-    sig = "v0=" + hmac.new(SECRET.encode(), f"v0:{ts}:".encode() + body, hashlib.sha256).hexdigest()
+    """Internal-only headers — gateway is the sole sig verifier in prod, so
+    this service trusts X-Internal-Knowledge-Key + X-Prbe-Customer."""
     return {
         "content-type": "application/json",
+        "x-internal-knowledge-key": INTERNAL_KEY,
         "x-prbe-customer": CUSTOMER,
-        "x-slack-request-timestamp": ts,
-        "x-slack-signature": sig,
     }
+
+
+INTERNAL_KEY = "test-internal-key-32bytes-padding-padding"
 
 
 @pytest.fixture(autouse=True)
 def _patch(monkeypatch, settings: Settings):
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", settings.token_encryption_key.get_secret_value())
-    monkeypatch.setenv("SLACK_SIGNING_SECRET", SECRET)
+    monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", INTERNAL_KEY)
     monkeypatch.setenv("ENVIRONMENT", "local")
     get_settings.cache_clear()  # type: ignore[attr-defined]
     reset_embedder()

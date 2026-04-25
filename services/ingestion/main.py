@@ -1,21 +1,28 @@
-"""Ingestion service: webhook fast path.
+"""Ingestion service — internal worker behind the prbe-backend gateway.
+
+Public webhooks land at api.prbe.ai/webhooks/{source}. prbe-backend
+verifies signatures, resolves the tenant via customer_source_mapping,
+then POSTs to this service's `/webhooks/{source}` with X-Internal-Knowledge-Key
++ X-Prbe-Customer headers. We trust those headers and skip signature
+re-verification — the gateway is the single signing-secret holder.
 
 Per request:
-    1. Look up customer_id from subdomain / header / path param.
-    2. Dispatch to the right Connector via the registry.
-    3. verify_signature → 401 on miss.
-    4. parse_webhook_event → None means ignore (200 no-op).
-    5. Put raw payload in R2.
-    6. Insert ingestion_queue row (UNIQUE dedupes redeliveries).
-    7. Return 200.
+  1. Validate X-Internal-Knowledge-Key.
+  2. Read X-Prbe-Customer (no fallback).
+  3. Dispatch to the right Connector.
+  4. parse_webhook_event → None means ignore.
+  5. Persist raw payload to R2.
+  6. Insert ingestion_queue row (UNIQUE dedupes redeliveries).
+  7. Return 200.
 
-Kept thin on purpose. Anything beyond "accept + persist + enqueue" happens
-in the worker, so transient failures in downstream systems never reject a
-webhook from the source.
+OAuth callbacks also land at the gateway. After verifying state, the
+gateway POSTs to /api/oauth/{source}/exchange (admin-key gated) and we
+do the per-source token exchange + storage. See admin_routes.py.
 """
 
 from __future__ import annotations
 
+import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -33,10 +40,8 @@ from services.ingestion.handlers.registry import (
     get_connector_class,
     list_registered,
 )
-from services.ingestion.oauth import router as oauth_router
 from shared.config import get_settings
 from shared.constants import SourceSystem
-from shared.customer_mapping import resolve_customer
 from shared.db import get_pool, health_check, init_pool
 from shared.exceptions import (
     HandlerNotFound,
@@ -72,10 +77,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="prbe-knowledge ingestion", lifespan=lifespan)
-# Trust X-Forwarded-Proto / X-Forwarded-For from Fly's upstream so
-# `request.url.scheme` is `https` and OAuth redirect_uri matches what we registered.
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
-app.include_router(oauth_router)
 app.include_router(backfill_router)
 app.include_router(admin_router)
 
@@ -92,13 +94,39 @@ async def health() -> JSONResponse:
     return JSONResponse(body, status_code=200 if db_ok else 503)
 
 
+def _verify_internal_key(request: Request) -> None:
+    expected = get_settings().internal_knowledge_api_key
+    if expected is None or not expected.get_secret_value():
+        raise HTTPException(
+            status_code=503,
+            detail="INTERNAL_KNOWLEDGE_API_KEY not configured",
+        )
+    presented = request.headers.get("x-internal-knowledge-key")
+    if not presented or not hmac.compare_digest(
+        presented, expected.get_secret_value()
+    ):
+        raise HTTPException(
+            status_code=401, detail="missing or invalid X-Internal-Knowledge-Key"
+        )
+
+
 @app.post("/webhooks/{source}")
 async def webhook(
     source: str,
     request: Request,
     x_trace_id: str | None = Header(default=None),
+    x_prbe_customer: str | None = Header(default=None),
 ) -> JSONResponse:
-    trace_id = x_trace_id or f"wh-{int(datetime.now().timestamp()*1000)}"
+    """Internal-only webhook endpoint. Called by prbe-backend gateway.
+
+    Trusts X-Internal-Knowledge-Key + X-Prbe-Customer; does NOT verify the source
+    platform's signature (gateway already did).
+    """
+    _verify_internal_key(request)
+    if not x_prbe_customer:
+        raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
+
+    trace_id = x_trace_id or f"wh-{int(datetime.now().timestamp() * 1000)}"
     bind_trace(trace_id)
 
     try:
@@ -114,69 +142,12 @@ async def webhook(
     raw_body = await request.body()
     connector = build_connector(source_enum, request.app.state.ctx)
 
-    if not connector.verify_signature(dict(request.headers), raw_body):
-        raise HTTPException(status_code=401, detail="signature verification failed")
-
     try:
         payload = orjson.loads(raw_body) if raw_body else {}
     except orjson.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"invalid json: {exc}") from exc
 
-    # Slack URL verification handshake: echo back the challenge before any
-    # customer-routing or pipeline work runs. Slack accepts {"challenge": ...}.
-    if (
-        source_enum is SourceSystem.SLACK
-        and isinstance(payload, dict)
-        and payload.get("type") == "url_verification"
-    ):
-        challenge = payload.get("challenge")
-        if not isinstance(challenge, str):
-            raise HTTPException(status_code=400, detail="missing challenge")
-        return JSONResponse({"challenge": challenge})
-
-    # Resolve customer_id strictly:
-    #   1. X-Prbe-Customer header (internal callers / tests / manual routing)
-    #   2. Payload's external_id → customer_source_mapping lookup
-    #
-    # No fallback. Every real webhook payload from every source we support
-    # carries a stable workspace/org id (Slack team_id, GitHub installation.id,
-    # Linear organizationId, Notion workspace_id, Sentry organization.slug).
-    # If we can't tie an event to a customer, drop it. The previous
-    # single_customer_fallback path silently absorbed cross-tenant traffic
-    # whenever the bot was installed in workspaces we never deliberately
-    # connected.
-    customer_id: str | None = request.headers.get("x-prbe-customer")
-    if not customer_id:
-        external_id = connector.extract_external_id_from_payload(
-            dict(request.headers), payload
-        )
-        if not external_id:
-            log.warning(
-                "ingestion.payload_missing_workspace_id",
-                source=source,
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"{source_enum.value} payload has no workspace identifier. "
-                    "Cannot route to a customer."
-                ),
-            )
-        customer_id = await resolve_customer(source_enum, external_id)
-        if not customer_id:
-            log.warning(
-                "ingestion.unknown_workspace",
-                source=source,
-                external_id=external_id,
-            )
-            raise HTTPException(
-                status_code=401,
-                detail=(
-                    f"unknown {source_enum.value} workspace: {external_id}. "
-                    "Connect this workspace via the dashboard to receive its events."
-                ),
-            )
-
+    customer_id = x_prbe_customer
     try:
         parsed = connector.parse_webhook_event(
             customer_id, dict(request.headers), payload
@@ -187,7 +158,6 @@ async def webhook(
     if parsed is None:
         return JSONResponse({"status": "ignored", "trace_id": trace_id})
 
-    # Persist raw payload + headers for full replayability.
     envelope = orjson.dumps(
         {
             "_headers": {k: v for k, v in request.headers.items()},

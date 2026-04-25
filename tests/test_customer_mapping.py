@@ -9,15 +9,7 @@ Covers:
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import json
-import time
-from pathlib import Path
-
-import httpx
 import pytest
-from httpx import ASGITransport
 
 from shared.config import Settings, get_settings
 from shared.constants import SourceSystem
@@ -26,7 +18,7 @@ from shared.customer_mapping import (
     resolve_customer,
     single_customer_fallback,
 )
-from shared.db import close_pool, init_pool, raw_conn
+from shared.db import raw_conn
 from shared.embeddings import reset_embedder
 from shared.storage import reset_store
 
@@ -145,69 +137,3 @@ def test_sentry_extract_external_id() -> None:
     )
 
 
-@pytest.mark.asyncio
-async def test_webhook_resolves_via_mapping_without_header(
-    live_db, settings: Settings
-) -> None:
-    """Webhook with no X-Prbe-Customer resolves via customer_source_mapping."""
-    async with raw_conn() as conn:
-        await conn.execute(
-            "INSERT INTO customers (customer_id, display_name, api_key_hash) VALUES ($1,'x','y') ON CONFLICT DO NOTHING",
-            "cust-map",
-        )
-        await conn.execute(
-            "INSERT INTO customers (customer_id, display_name, api_key_hash) VALUES ($1,'z','y') ON CONFLICT DO NOTHING",
-            "cust-other",
-        )
-
-    # Register Slack team T_TEST against cust-map.
-    await record_mapping(
-        customer_id="cust-map",
-        source_system=SourceSystem.SLACK,
-        external_id="T_TEST",
-        external_name="Test Workspace",
-    )
-
-    from shared.storage import get_store
-
-    store = get_store()
-    await store.ensure_bucket(store.bucket_for("cust-map"))
-
-    fixture = json.loads(
-        (Path(__file__).parent.parent / "fixtures" / "slack" / "message_simple.json").read_text()
-    )
-    body = json.dumps(fixture).encode()
-
-    ts = str(int(time.time()))
-    sig = (
-        "v0="
-        + hmac.new(
-            b"test-secret", f"v0:{ts}:".encode() + body, hashlib.sha256
-        ).hexdigest()
-    )
-    # No X-Prbe-Customer header — the resolver should use team_id from the payload.
-    headers = {
-        "content-type": "application/json",
-        "x-slack-request-timestamp": ts,
-        "x-slack-signature": sig,
-    }
-
-    from services.ingestion.main import app as ingestion_app
-
-    await close_pool()
-    transport = ASGITransport(app=ingestion_app)
-    async with (
-        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
-        ingestion_app.router.lifespan_context(ingestion_app),
-    ):
-        resp = await client.post("/webhooks/slack", content=body, headers=headers)
-    await init_pool(settings)
-
-    assert resp.status_code == 200, resp.text
-    # The queue row should be attributed to cust-map, not cust-other.
-    async with raw_conn() as conn:
-        row = await conn.fetchrow(
-            "SELECT customer_id FROM ingestion_queue WHERE source_system='slack'"
-        )
-    assert row is not None
-    assert row["customer_id"] == "cust-map"
