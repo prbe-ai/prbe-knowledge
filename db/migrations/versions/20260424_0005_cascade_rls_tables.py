@@ -32,11 +32,19 @@ def upgrade() -> None:
     # Idempotent. Fresh installs run schema.sql (via 0001) which already
     # creates these constraints with the same names, so 0005 is a no-op
     # there. Upgrading an existing DB from 0004 actually adds them.
+    # query_cache may already be dropped (via migration 0006 on a fresh
+    # install where schema.sql doesn't include it) — skip if missing.
     for table in _CUSTOMER_FK_TABLES:
         op.execute(
             f"""
             DO $$
             BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_class
+                    WHERE relname = '{table}' AND relkind = 'r'
+                ) THEN
+                    RETURN;
+                END IF;
                 IF NOT EXISTS (
                     SELECT 1 FROM pg_constraint
                     WHERE conname = '{table}_customer_id_fkey'
