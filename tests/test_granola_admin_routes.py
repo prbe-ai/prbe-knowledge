@@ -102,7 +102,7 @@ async def _seed_customer(customer_id: str = "cust-1") -> None:
 async def test_connect_404_when_customer_missing(live_db) -> None:
     resp = await _admin_request(
         "POST",
-        "/admin/customers/nope/integrations/granola",
+        "/api/customers/nope/integrations/granola",
         json={"api_key": "grn_test123", "tier": "enterprise"},
     )
     assert resp.status_code == 404
@@ -113,7 +113,7 @@ async def test_connect_400_on_invalid_tier(live_db) -> None:
     await _seed_customer()
     resp = await _admin_request(
         "POST",
-        "/admin/customers/cust-1/integrations/granola",
+        "/api/customers/cust-1/integrations/granola",
         json={"api_key": "grn_test123", "tier": "freebie"},
     )
     assert resp.status_code == 400
@@ -129,7 +129,7 @@ async def test_connect_400_when_granola_rejects_key(live_db) -> None:
     )
     resp = await _admin_request(
         "POST",
-        "/admin/customers/cust-1/integrations/granola",
+        "/api/customers/cust-1/integrations/granola",
         json={"api_key": "grn_test123", "tier": "enterprise"},
     )
     assert resp.status_code == 400
@@ -145,7 +145,7 @@ async def test_connect_stores_encrypted_token_and_enqueues_backfill(live_db) -> 
     )
     resp = await _admin_request(
         "POST",
-        "/admin/customers/cust-1/integrations/granola",
+        "/api/customers/cust-1/integrations/granola",
         json={"api_key": "grn_secret_001", "tier": "enterprise"},
     )
     assert resp.status_code == 200
@@ -188,13 +188,13 @@ async def test_connect_overwrites_existing_token_on_reconnect(live_db) -> None:
     # First connect (personal tier).
     await _admin_request(
         "POST",
-        "/admin/customers/cust-1/integrations/granola",
+        "/api/customers/cust-1/integrations/granola",
         json={"api_key": "grn_first", "tier": "personal"},
     )
     # Reconnect with enterprise tier and a new key.
     await _admin_request(
         "POST",
-        "/admin/customers/cust-1/integrations/granola",
+        "/api/customers/cust-1/integrations/granola",
         json={"api_key": "grn_second", "tier": "enterprise"},
     )
 
@@ -223,11 +223,11 @@ async def test_disconnect_marks_revoked(live_db) -> None:
     )
     await _admin_request(
         "POST",
-        "/admin/customers/cust-1/integrations/granola",
+        "/api/customers/cust-1/integrations/granola",
         json={"api_key": "grn_test123", "tier": "enterprise"},
     )
 
-    resp = await _admin_request("DELETE", "/admin/customers/cust-1/integrations/granola")
+    resp = await _admin_request("DELETE", "/api/customers/cust-1/integrations/granola")
     assert resp.status_code == 204
 
     async with raw_conn() as conn:
@@ -249,7 +249,7 @@ async def test_disconnect_marks_revoked(live_db) -> None:
 async def test_refresh_404_when_not_configured(live_db) -> None:
     await _seed_customer()
     resp = await _admin_request(
-        "POST", "/admin/customers/cust-1/integrations/granola/refresh"
+        "POST", "/api/customers/cust-1/integrations/granola/refresh"
     )
     assert resp.status_code == 404
 
@@ -263,13 +263,13 @@ async def test_refresh_409_when_revoked(live_db) -> None:
     )
     await _admin_request(
         "POST",
-        "/admin/customers/cust-1/integrations/granola",
+        "/api/customers/cust-1/integrations/granola",
         json={"api_key": "grn_test123", "tier": "enterprise"},
     )
-    await _admin_request("DELETE", "/admin/customers/cust-1/integrations/granola")
+    await _admin_request("DELETE", "/api/customers/cust-1/integrations/granola")
 
     resp = await _admin_request(
-        "POST", "/admin/customers/cust-1/integrations/granola/refresh"
+        "POST", "/api/customers/cust-1/integrations/granola/refresh"
     )
     assert resp.status_code == 409
 
@@ -283,7 +283,7 @@ async def test_refresh_debounces_within_30s(live_db, monkeypatch) -> None:
     )
     await _admin_request(
         "POST",
-        "/admin/customers/cust-1/integrations/granola",
+        "/api/customers/cust-1/integrations/granola",
         json={"api_key": "grn_test123", "tier": "enterprise"},
     )
 
@@ -300,14 +300,14 @@ async def test_refresh_debounces_within_30s(live_db, monkeypatch) -> None:
         )
 
     first = await _admin_request(
-        "POST", "/admin/customers/cust-1/integrations/granola/refresh"
+        "POST", "/api/customers/cust-1/integrations/granola/refresh"
     )
     assert first.status_code == 200
     assert first.json()["triggered"] is True
 
     # Immediate second call: 429 with Retry-After.
     second = await _admin_request(
-        "POST", "/admin/customers/cust-1/integrations/granola/refresh"
+        "POST", "/api/customers/cust-1/integrations/granola/refresh"
     )
     assert second.status_code == 429
     assert "Retry-After" in second.headers
@@ -437,7 +437,7 @@ async def test_refresh_fires_pg_notify(live_db, settings) -> None:
     )
     await _admin_request(
         "POST",
-        "/admin/customers/cust-1/integrations/granola",
+        "/api/customers/cust-1/integrations/granola",
         json={"api_key": "grn_test123", "tier": "enterprise"},
     )
     async with raw_conn() as conn:
@@ -461,7 +461,7 @@ async def test_refresh_fires_pg_notify(live_db, settings) -> None:
         await listen_conn.add_listener(GRANOLA_REFRESH_CHANNEL, _on_notify)
 
         resp = await _admin_request(
-            "POST", "/admin/customers/cust-1/integrations/granola/refresh"
+            "POST", "/api/customers/cust-1/integrations/granola/refresh"
         )
         assert resp.status_code == 200
 

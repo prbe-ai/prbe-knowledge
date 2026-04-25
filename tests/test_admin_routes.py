@@ -80,12 +80,12 @@ def _auth(extra: dict[str, str] | None = None) -> dict[str, str]:
 
 @pytest.mark.asyncio
 async def test_admin_requires_key_header(live_db, settings) -> None:
-    resp = await _admin_request("GET", "/admin/customers")
+    resp = await _admin_request("GET", "/api/customers")
     await init_pool(settings)
     assert resp.status_code == 401, resp.text
 
     resp = await _admin_request(
-        "GET", "/admin/customers", headers={"X-Admin-Key": "wrong"}
+        "GET", "/api/customers", headers={"X-Admin-Key": "wrong"}
     )
     await init_pool(settings)
     assert resp.status_code == 401, resp.text
@@ -100,13 +100,13 @@ async def test_admin_503_when_key_unset(live_db, settings, monkeypatch) -> None:
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
     for method, path in [
-        ("GET", "/admin/customers"),
-        ("POST", "/admin/customers"),
-        ("POST", "/admin/customers/foo/rotate_key"),
-        ("GET", "/admin/customers/foo/integrations"),
-        ("GET", "/admin/customers/foo/ingestion_stats"),
+        ("GET", "/api/customers"),
+        ("POST", "/api/customers"),
+        ("POST", "/api/customers/foo/rotate_key"),
+        ("GET", "/api/customers/foo/integrations"),
+        ("GET", "/api/customers/foo/ingestion_stats"),
     ]:
-        body = {"customer_id": "x", "display_name": "y", "redirect_uri_base": "z"} if method == "POST" and path == "/admin/customers" else None
+        body = {"customer_id": "x", "display_name": "y", "redirect_uri_base": "z"} if method == "POST" and path == "/api/customers" else None
         resp = await _admin_request(method, path, headers={"X-Admin-Key": "anything"}, json=body)
         assert resp.status_code == 503, f"{method} {path}: {resp.status_code} {resp.text}"
 
@@ -122,7 +122,7 @@ async def test_admin_503_when_key_unset(live_db, settings, monkeypatch) -> None:
 async def test_create_customer_returns_api_key_and_install_urls(live_db, settings) -> None:
     resp = await _admin_request(
         "POST",
-        "/admin/customers",
+        "/api/customers",
         headers=_auth(),
         json={
             "customer_id": "acme",
@@ -167,9 +167,9 @@ async def test_create_customer_409_on_duplicate(live_db, settings) -> None:
         "display_name": "Dupe",
         "redirect_uri_base": "https://api.example.com",
     }
-    r1 = await _admin_request("POST", "/admin/customers", headers=_auth(), json=payload)
+    r1 = await _admin_request("POST", "/api/customers", headers=_auth(), json=payload)
     assert r1.status_code == 200, r1.text
-    r2 = await _admin_request("POST", "/admin/customers", headers=_auth(), json=payload)
+    r2 = await _admin_request("POST", "/api/customers", headers=_auth(), json=payload)
     await init_pool(settings)
     assert r2.status_code == 409, r2.text
 
@@ -178,7 +178,7 @@ async def test_create_customer_409_on_duplicate(live_db, settings) -> None:
 async def test_rotate_key_returns_new_key_and_invalidates_old(live_db, settings) -> None:
     create = await _admin_request(
         "POST",
-        "/admin/customers",
+        "/api/customers",
         headers=_auth(),
         json={
             "customer_id": "rot",
@@ -191,7 +191,7 @@ async def test_rotate_key_returns_new_key_and_invalidates_old(live_db, settings)
     old_hash = hashlib.sha256(old_key.encode()).hexdigest()
 
     rot = await _admin_request(
-        "POST", "/admin/customers/rot/rotate_key", headers=_auth()
+        "POST", "/api/customers/rot/rotate_key", headers=_auth()
     )
     await init_pool(settings)
     assert rot.status_code == 200, rot.text
@@ -209,7 +209,7 @@ async def test_rotate_key_returns_new_key_and_invalidates_old(live_db, settings)
 @pytest.mark.asyncio
 async def test_rotate_key_404_for_missing_customer(live_db, settings) -> None:
     resp = await _admin_request(
-        "POST", "/admin/customers/ghost/rotate_key", headers=_auth()
+        "POST", "/api/customers/ghost/rotate_key", headers=_auth()
     )
     await init_pool(settings)
     assert resp.status_code == 404, resp.text
@@ -219,7 +219,7 @@ async def test_rotate_key_404_for_missing_customer(live_db, settings) -> None:
 async def test_delete_customer_removes_row_and_cascades(live_db, settings) -> None:
     create = await _admin_request(
         "POST",
-        "/admin/customers",
+        "/api/customers",
         headers=_auth(),
         json={
             "customer_id": "del",
@@ -248,7 +248,7 @@ async def test_delete_customer_removes_row_and_cascades(live_db, settings) -> No
         )
 
     delete = await _admin_request(
-        "DELETE", "/admin/customers/del", headers=_auth()
+        "DELETE", "/api/customers/del", headers=_auth()
     )
     await init_pool(settings)
     assert delete.status_code == 204, delete.text
@@ -268,7 +268,7 @@ async def test_delete_customer_removes_row_and_cascades(live_db, settings) -> No
 @pytest.mark.asyncio
 async def test_delete_customer_404_for_missing(live_db, settings) -> None:
     resp = await _admin_request(
-        "DELETE", "/admin/customers/ghost", headers=_auth()
+        "DELETE", "/api/customers/ghost", headers=_auth()
     )
     await init_pool(settings)
     assert resp.status_code == 404, resp.text
@@ -279,7 +279,7 @@ async def test_list_customers(live_db, settings) -> None:
     for cid in ("one", "two"):
         await _admin_request(
             "POST",
-            "/admin/customers",
+            "/api/customers",
             headers=_auth(),
             json={
                 "customer_id": cid,
@@ -288,7 +288,7 @@ async def test_list_customers(live_db, settings) -> None:
             },
         )
 
-    resp = await _admin_request("GET", "/admin/customers", headers=_auth())
+    resp = await _admin_request("GET", "/api/customers", headers=_auth())
     await init_pool(settings)
     assert resp.status_code == 200, resp.text
     ids = [c["customer_id"] for c in resp.json()["customers"]]
@@ -334,7 +334,7 @@ async def test_get_integrations_for_customer(live_db, settings) -> None:
 
     resp = await _admin_request(
         "GET",
-        "/admin/customers/intg/integrations?redirect_uri_base=https://api.example.com",
+        "/api/customers/intg/integrations?redirect_uri_base=https://api.example.com",
         headers=_auth(),
     )
     await init_pool(settings)
@@ -355,7 +355,7 @@ async def test_get_integrations_for_customer(live_db, settings) -> None:
 @pytest.mark.asyncio
 async def test_get_integrations_404_for_missing_customer(live_db, settings) -> None:
     resp = await _admin_request(
-        "GET", "/admin/customers/nope/integrations", headers=_auth()
+        "GET", "/api/customers/nope/integrations", headers=_auth()
     )
     await init_pool(settings)
     assert resp.status_code == 404, resp.text
@@ -409,7 +409,7 @@ async def test_get_ingestion_stats(live_db, settings) -> None:
         )
 
     resp = await _admin_request(
-        "GET", "/admin/customers/stats/ingestion_stats", headers=_auth()
+        "GET", "/api/customers/stats/ingestion_stats", headers=_auth()
     )
     await init_pool(settings)
     assert resp.status_code == 200, resp.text
@@ -435,7 +435,7 @@ async def test_get_ingestion_stats(live_db, settings) -> None:
 @pytest.mark.asyncio
 async def test_get_ingestion_stats_404_for_missing_customer(live_db, settings) -> None:
     resp = await _admin_request(
-        "GET", "/admin/customers/ghost/ingestion_stats", headers=_auth()
+        "GET", "/api/customers/ghost/ingestion_stats", headers=_auth()
     )
     await init_pool(settings)
     assert resp.status_code == 404, resp.text

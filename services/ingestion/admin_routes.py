@@ -1,16 +1,16 @@
-"""Admin API for the internal provisioning dashboard.
+"""Internal API for the dashboard BFF (prbe-backend) to manage tenants.
 
-Gated by a shared X-Admin-Key header. All routes live under /admin and
-are unavailable when `ADMIN_API_KEY` is unset (503). The dashboard uses
-these to bootstrap tenants, read integration status, and surface ingestion
-stats — never to serve end-user traffic.
+Gated by a shared X-Admin-Key header. All routes live under /api and
+are unavailable when `ADMIN_API_KEY` is unset (503). prbe-backend
+calls these to bootstrap tenants, read integration status, and surface
+ingestion stats — never served directly to end users.
 
 Route layout:
-    POST   /admin/customers                           — create tenant
-    POST   /admin/customers/{id}/rotate_key           — issue new API key
-    GET    /admin/customers                           — list tenants
-    GET    /admin/customers/{id}/integrations         — per-source status
-    GET    /admin/customers/{id}/ingestion_stats      — per-source counters
+    POST   /api/customers                           — create tenant
+    POST   /api/customers/{id}/rotate_key           — issue new API key
+    GET    /api/customers                           — list tenants
+    GET    /api/customers/{id}/integrations         — per-source status
+    GET    /api/customers/{id}/ingestion_stats      — per-source counters
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ _NO_OAUTH_SOURCES: frozenset[SourceSystem] = frozenset({SourceSystem.GRANOLA})
 
 log = get_logger(__name__)
 
-router = APIRouter(prefix="/admin", tags=["admin"])
+router = APIRouter(prefix="/api", tags=["internal-api"])
 
 
 # ---------------------------------------------------------------------------
