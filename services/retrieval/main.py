@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import time
 from collections.abc import AsyncIterator
@@ -103,12 +104,45 @@ async def _resolve_customer_from_bearer(token: str) -> str:
 
 
 async def authenticate_query(request: Request) -> _AuthResult:
-    """Derive customer_id from Authorization: Bearer <api_key>.
+    """Derive customer_id from one of the supported auth shapes.
 
-    Dev-only bypass: environment=local + missing header lets the handler
+    Accepts either:
+      1. `Authorization: Bearer <api_key>` — customer-issued key, looked up
+         in `customers.api_key_hash`. Used by external callers (dashboard,
+         agents holding a per-tenant key).
+      2. `X-Internal-Knowledge-Key: <secret>` + `X-Prbe-Customer: <id>` —
+         service-to-service trust. Used by prbe-orchestrator and
+         prbe-knowledge-mcp. The internal key gates access; the customer
+         header sets scope. We trust the caller to have resolved the
+         customer correctly upstream.
+
+    Dev-only bypass: environment=local + missing headers lets the handler
     fall back to a customer_id in the request body (for smoke tests and
-    local curl). Production environments always require the header.
+    local curl). Production environments always require auth.
     """
+    settings = get_settings()
+
+    internal_key = request.headers.get("x-internal-knowledge-key")
+    if internal_key:
+        expected = settings.internal_knowledge_api_key
+        if expected is None or not expected.get_secret_value():
+            raise HTTPException(
+                status_code=503,
+                detail="internal API disabled — set INTERNAL_KNOWLEDGE_API_KEY",
+            )
+        if not hmac.compare_digest(internal_key, expected.get_secret_value()):
+            raise HTTPException(
+                status_code=401,
+                detail="invalid X-Internal-Knowledge-Key",
+            )
+        customer = request.headers.get("x-prbe-customer")
+        if not customer:
+            raise HTTPException(
+                status_code=400,
+                detail="X-Internal-Knowledge-Key requires X-Prbe-Customer",
+            )
+        return _AuthResult(customer_id=customer, auth_present=True)
+
     authorization = request.headers.get("authorization")
     if authorization:
         scheme, _, token = authorization.partition(" ")
@@ -121,12 +155,12 @@ async def authenticate_query(request: Request) -> _AuthResult:
         resolved = await _resolve_customer_from_bearer(token.strip())
         return _AuthResult(customer_id=resolved, auth_present=True)
 
-    if get_settings().is_local:
+    if settings.is_local:
         return _AuthResult(customer_id=None, auth_present=False)
 
     raise HTTPException(
         status_code=401,
-        detail="missing bearer token",
+        detail="missing bearer token or X-Internal-Knowledge-Key",
         headers=_UNAUTHORIZED_HEADERS,
     )
 
