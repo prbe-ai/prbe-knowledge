@@ -16,6 +16,7 @@ jobs:
       ingestion: ${{ steps.filter.outputs.ingestion == 'true' || github.event_name == 'workflow_dispatch' }}
       retrieval: ${{ steps.filter.outputs.retrieval == 'true' || github.event_name == 'workflow_dispatch' }}
       worker:    ${{ steps.filter.outputs.worker    == 'true' || github.event_name == 'workflow_dispatch' }}
+      poller:    ${{ steps.filter.outputs.poller    == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -39,6 +40,12 @@ jobs:
               - 'services/worker/**'
               - 'shared/**'
               - 'fly.worker.toml'
+              - 'pyproject.toml'
+            poller:
+              - 'services/ingestion/**'
+              - 'services/worker/**'
+              - 'shared/**'
+              - 'fly.poller.toml'
               - 'pyproject.toml'
 
   deploy-ingestion:
@@ -80,5 +87,20 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy worker
         run: flyctl deploy --remote-only -c fly.worker.toml
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-poller:
+    needs: [changes, deploy-ingestion]
+    if: |
+      always() &&
+      needs.changes.outputs.poller == 'true' &&
+      (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy poller
+        run: flyctl deploy --remote-only -c fly.poller.toml
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
