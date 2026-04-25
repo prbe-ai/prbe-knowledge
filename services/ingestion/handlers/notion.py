@@ -722,43 +722,43 @@ class NotionConnector(Connector):
     # ------------------------------------------------------------------
 
     async def identify_workspaces(self, token):  # type: ignore[override]
-        """Notion's OAuth response includes workspace_id + workspace_name
-        directly. Since we don't currently capture those during
-        `exchange_oauth_code`, fall back to `/v1/users/me` which returns
-        the bot's workspace affiliation via `bot.workspace_name` on
-        recent API versions.
+        """Read workspace info captured during `exchange_oauth_code`.
+
+        The Notion token-exchange response gives us `workspace_id` +
+        `workspace_name` + `bot_id` directly, so we stash that in
+        `token.install_metadata` and read it here — no second API call,
+        no fallback cascade needed.
+
+        Returns [] when `install_metadata` is None (e.g., a token loaded
+        from DB; the field is Pydantic-transient). The OAuth callback
+        already handles that case by skipping `record_mapping` and
+        logging a warning.
         """
         from shared.logging import get_logger
         from shared.models import ExternalWorkspaceRef
 
         lg = get_logger(__name__)
-        try:
-            resp = await self.http.get(
-                "https://api.notion.com/v1/users/me",
-                headers={
-                    "Authorization": f"Bearer {token.access_token}",
-                    "Notion-Version": "2022-06-28",
-                },
-            )
-        except Exception as exc:
-            lg.warning("notion.identify_workspaces_failed", error=str(exc))
-            return []
-        if resp.status_code != 200:
-            return []
-        body = resp.json()
-        bot = body.get("bot") or {}
-        ws_id = (
-            bot.get("workspace_id")
-            or bot.get("workspace")
-            or body.get("workspace_id")
-        )
+        meta = token.install_metadata or {}
+        ws_id = meta.get("workspace_id")
         if not ws_id:
+            lg.warning(
+                "notion.identify_workspaces_no_install_metadata",
+                customer=token.customer_id,
+            )
             return []
+
+        owner_user_id = (
+            ((meta.get("owner") or {}).get("user") or {}).get("id")
+        )
         return [
             ExternalWorkspaceRef(
                 external_id=str(ws_id),
-                external_name=bot.get("workspace_name"),
-                metadata={"owner_user_id": (bot.get("owner") or {}).get("user", {}).get("id")},
+                external_name=meta.get("workspace_name"),
+                metadata={
+                    "bot_id": meta.get("bot_id"),
+                    "owner_user_id": owner_user_id,
+                    "workspace_icon": meta.get("workspace_icon"),
+                },
             )
         ]
 

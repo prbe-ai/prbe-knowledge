@@ -522,3 +522,77 @@ async def test_exchange_oauth_code_no_refresh_token() -> None:
     assert token.refresh_token is None
     assert token.install_metadata["workspace_id"] == "ws_alpha"
     assert token.install_metadata["workspace_icon"] is None
+
+
+# ---------------------------------------------------------------------------
+# identify_workspaces — reads install_metadata, no network
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_identify_workspaces_from_install_metadata() -> None:
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(
+            "identify_workspaces must NOT make HTTP calls — workspace info "
+            "should come from token.install_metadata, populated by "
+            "exchange_oauth_code"
+        )
+
+    settings = Settings(environment="local")
+    ctx = ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.NOTION,
+        access_token="ntn_access_xyz",
+        install_metadata={
+            "workspace_id": "ws_alpha",
+            "workspace_name": "Acme Eng",
+            "workspace_icon": "https://example.com/icon.png",
+            "bot_id": "bot_42",
+            "owner": {"user": {"id": "user_alice"}},
+        },
+    )
+
+    refs = await notion.identify_workspaces(token)
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref.external_id == "ws_alpha"
+    assert ref.external_name == "Acme Eng"
+    assert ref.metadata == {
+        "bot_id": "bot_42",
+        "owner_user_id": "user_alice",
+        "workspace_icon": "https://example.com/icon.png",
+    }
+
+
+@pytest.mark.asyncio
+async def test_identify_workspaces_returns_empty_when_metadata_missing() -> None:
+    """A token loaded from DB doesn't have install_metadata (it's transient).
+    Connector must return [] instead of crashing — the OAuth callback already
+    swallows that case (logs a warning, no mapping recorded)."""
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("identify_workspaces must not hit the network on missing metadata")
+
+    settings = Settings(environment="local")
+    ctx = ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.NOTION,
+        access_token="ntn_access_xyz",
+        install_metadata=None,
+    )
+    assert await notion.identify_workspaces(token) == []
