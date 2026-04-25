@@ -12,6 +12,8 @@ for whichever query shape a retriever happens to use.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from shared.models import TemporalMode, TemporalSpec
 
@@ -81,3 +83,81 @@ def build_predicate(
         )
 
     raise ValueError(f"unhandled TemporalMode: {spec.mode}")
+
+
+# ---------------------------------------------------------------------------
+# Symbolic-temporal resolution: turn Haiku's symbolic output into a TemporalSpec
+# relative to a fresh `now`. Pure function, no LLM dependency.
+# ---------------------------------------------------------------------------
+
+
+def resolve_temporal(
+    symbolic: dict[str, Any] | None, now: datetime
+) -> tuple[TemporalSpec | None, str | None]:
+    """Convert the Haiku router's symbolic temporal block into a TemporalSpec.
+
+    Returns (spec, error). If `symbolic` is None or empty, returns
+    (None, None) so the caller falls back to default LATEST. If
+    `unresolvable_anchor` is set, returns (None, "<descriptive error>") so
+    the caller can surface that the agent referenced an event the router
+    couldn't pin to a date.
+    """
+    if symbolic is None:
+        return None, None
+
+    anchor = symbolic.get("unresolvable_anchor")
+    if anchor:
+        return None, f"could not resolve event anchor: '{anchor}'"
+
+    since = _resolve_endpoint(symbolic.get("since"), now)
+    until = _resolve_endpoint(symbolic.get("until"), now)
+
+    if since is None and until is None:
+        return None, None
+
+    if since is None:
+        since = datetime(1970, 1, 1, tzinfo=UTC)
+    if until is None:
+        until = now
+    if until <= since:
+        return None, "until is not after since"
+
+    basis = symbolic.get("basis") or "source"
+    if basis not in ("source", "ingest"):
+        basis = "source"
+
+    spec = TemporalSpec(
+        mode=TemporalMode.CHANGED_BETWEEN,
+        since=since,
+        until=until,
+        time_basis=basis,
+    )
+    return spec, None
+
+
+def _resolve_endpoint(
+    endpoint: dict[str, Any] | None, now: datetime
+) -> datetime | None:
+    if endpoint is None:
+        return None
+    kind = endpoint.get("kind")
+    if kind == "rel":
+        offset = endpoint.get("offset_days")
+        if offset is None:
+            return None
+        try:
+            return now + timedelta(days=float(offset))
+        except (TypeError, ValueError):
+            return None
+    if kind == "abs":
+        iso = endpoint.get("iso")
+        if not iso:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed
+    return None

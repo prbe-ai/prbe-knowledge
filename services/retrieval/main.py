@@ -27,11 +27,18 @@ from services.retrieval.retrievers.bm25 import bm25_search
 from services.retrieval.retrievers.graph import graph_search
 from services.retrieval.retrievers.vector import vector_search
 from services.retrieval.router import route_query
+from services.retrieval.temporal import resolve_temporal
 from shared.config import get_settings
 from shared.constants import SourceSystem
 from shared.db import health_check, init_pool, raw_conn, with_tenant
 from shared.logging import configure_logging, get_logger
-from shared.models import QueryChunk, QueryRequest, QueryResponse
+from shared.models import (
+    QueryChunk,
+    QueryRequest,
+    QueryResponse,
+    TemporalMode,
+    TemporalSpec,
+)
 
 log = get_logger(__name__)
 
@@ -152,6 +159,31 @@ async def query(
     routed = await route_query(req.customer_id, req.query)
     timing["router_ms"] = (time.perf_counter() - t_router) * 1000
 
+    # Resolve temporal: caller's explicit (non-default) TemporalSpec wins.
+    # Otherwise use Haiku-extracted symbolic temporal. Otherwise fall back
+    # to the default LATEST. extraction_failed surfaces unresolvable
+    # event anchors ("since the auth refactor") — agent decides what to do.
+    now = datetime.now(UTC)
+    inferred_spec, extraction_error = resolve_temporal(routed.temporal, now=now)
+    caller_explicit = (
+        req.temporal.mode != TemporalMode.LATEST
+        or req.temporal.since is not None
+        or req.temporal.until is not None
+        or req.temporal.as_of is not None
+    )
+    if caller_explicit:
+        spec = req.temporal
+        temporal_source = "caller"
+    elif inferred_spec is not None:
+        spec = inferred_spec
+        temporal_source = "inferred"
+    elif extraction_error is not None:
+        spec = TemporalSpec()  # default LATEST
+        temporal_source = "extraction_failed"
+    else:
+        spec = TemporalSpec()
+        temporal_source = "default"
+
     # Run retrievers in parallel. Each retriever runs the raw query; BM25 also
     # runs each router expansion (disjoint score space under RRF so it's fine).
     queries = [req.query, *routed.expansions]
@@ -162,7 +194,7 @@ async def query(
             req.query,
             top_k=req.top_k * 2,
             sources=sources,
-            temporal=req.temporal,
+            temporal=spec,
         )
 
     async def _bm25_runner() -> list:
@@ -173,7 +205,7 @@ async def query(
                 q,
                 top_k=req.top_k * 2,
                 sources=sources,
-                temporal=req.temporal,
+                temporal=spec,
             ):
                 prior = hits_by_chunk.get(hit.chunk_id)
                 if prior is None or hit.score > prior.score:
@@ -186,7 +218,7 @@ async def query(
         return await graph_search(
             req.customer_id,
             [(e.entity_type, e.canonical_id) for e in routed.entities],
-            temporal=req.temporal,
+            temporal=spec,
         )
 
     t_retrieve = time.perf_counter()
@@ -199,6 +231,8 @@ async def query(
     fused = fuse(
         {"vector": vec_hits, "bm25": bm25_hits, "graph": graph_hits},
         top_k=req.top_k * 2,
+        recency_half_life_days=req.recency_half_life_days,
+        now=now,
     )
     timing["fusion_ms"] = (time.perf_counter() - t_fuse) * 1000
 
@@ -223,6 +257,8 @@ async def query(
             source_url=h.source_url,
             title=h.title,
             content=h.content,
+            created_at=h.created_at,
+            updated_at=h.updated_at,
             score=h.score,
             rank=i + 1,
             retriever_scores=h.retriever_scores,
@@ -230,11 +266,27 @@ async def query(
         for i, h in enumerate(top)
     ]
 
+    raw_phrase = (routed.temporal or {}).get("raw_phrase") if routed.temporal else None
+    applied_temporal: dict[str, object] = {
+        "mode": spec.mode.value,
+        "source": temporal_source,
+        "raw_phrase": raw_phrase,
+        "error": extraction_error,
+    }
+    if spec.mode == TemporalMode.CHANGED_BETWEEN:
+        applied_temporal["since"] = spec.since.isoformat() if spec.since else None
+        applied_temporal["until"] = spec.until.isoformat() if spec.until else None
+        applied_temporal["basis"] = spec.time_basis
+    elif spec.mode == TemporalMode.AS_OF:
+        applied_temporal["as_of"] = spec.as_of.isoformat() if spec.as_of else None
+    # LATEST + ALL omit since/until/basis — they don't apply to those modes.
+
     return QueryResponse(
         query=req.query,
         chunks=chunks,
         total_candidates=len(fused),
-        router_hit_cache=routed.hit_cache,
+        router_hit_cache=False,
+        applied_temporal=applied_temporal,
         timing_ms=timing,
         trace_id=trace_id,
     )

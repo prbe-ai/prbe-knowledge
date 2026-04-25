@@ -181,9 +181,42 @@ async def test_slack_webhook_to_query(live_db, settings: Settings) -> None:
             },
         )
     assert qresp.status_code == 200, qresp.text
-    chunks = qresp.json()["chunks"]
+    body_json = qresp.json()
+    chunks = body_json["chunks"]
     assert chunks, "retrieval returned no chunks"
     assert any("payments" in c["content"].lower() for c in chunks)
+    # Each chunk now carries source-side timestamps for agent freshness reasoning.
+    for c in chunks:
+        assert c.get("created_at")
+        assert c.get("updated_at")
+    # applied_temporal surfaces what filter was actually used + where it came from.
+    assert "applied_temporal" in body_json
+    at = body_json["applied_temporal"]
+    assert at is not None
+    # No caller temporal + no Anthropic key in tests → router returns empty → default LATEST.
+    assert at["mode"] == "latest"
+    assert at["source"] == "default"
+
+    # Caller-explicit override: ALL mode wins regardless of router output.
+    rtransport2 = ASGITransport(app=retrieval_app)
+    await close_pool()
+    async with (
+        httpx.AsyncClient(transport=rtransport2, base_url="http://t") as client,
+        retrieval_app.router.lifespan_context(retrieval_app),
+    ):
+        qresp2 = await client.post(
+            "/query",
+            json={
+                "query": "payments 500s deploy",
+                "customer_id": CUSTOMER_ID,
+                "top_k": 5,
+                "temporal": {"mode": "all"},
+            },
+        )
+    assert qresp2.status_code == 200, qresp2.text
+    body2 = qresp2.json()
+    assert body2["applied_temporal"]["source"] == "caller"
+    assert body2["applied_temporal"]["mode"] == "all"
     await init_pool(settings)
 
 

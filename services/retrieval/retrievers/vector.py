@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_VECTOR
@@ -20,6 +21,8 @@ class VectorHit:
     source_url: str
     title: str | None
     content: str
+    created_at: datetime
+    updated_at: datetime
     score: float
 
 
@@ -64,6 +67,8 @@ async def vector_search(
                    d.source_url,
                    d.title,
                    c.content,
+                   d.created_at,
+                   d.updated_at,
                    1 - (c.embedding <=> $2::halfvec) AS score
             FROM chunks c
             JOIN documents d
@@ -89,6 +94,8 @@ async def vector_search(
             source_url=r["source_url"],
             title=r["title"],
             content=r["content"],
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
             score=float(r["score"]),
         )
         for r in rows

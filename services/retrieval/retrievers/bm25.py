@@ -9,6 +9,7 @@ or a real BM25 lib if ranking quality matters enough.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_BM25
@@ -25,6 +26,8 @@ class BM25Hit:
     source_url: str
     title: str | None
     content: str
+    created_at: datetime
+    updated_at: datetime
     score: float
 
 
@@ -58,6 +61,8 @@ async def bm25_search(
                    d.source_url,
                    d.title,
                    c.content,
+                   d.created_at,
+                   d.updated_at,
                    ts_rank_cd(to_tsvector('english', c.content),
                               plainto_tsquery('english', $2)) AS score
             FROM chunks c
@@ -85,6 +90,8 @@ async def bm25_search(
             source_url=r["source_url"],
             title=r["title"],
             content=r["content"],
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
             score=float(r["score"]),
         )
         for r in rows

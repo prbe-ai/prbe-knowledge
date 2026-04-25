@@ -127,6 +127,48 @@ Items the design doc explicitly defers to Phase 1:
 
 ---
 
+## P5 — Phase 1 retrieval
+
+### Event-anchor index
+
+Agents asking "since the auth refactor" or "after we shipped v2" hit a wall:
+the Haiku temporal extractor returns `unresolvable_anchor` and we fall back
+to LATEST with `applied_temporal.source = "extraction_failed"`. The agent
+sees the error and can decide what to do. No automatic resolution today.
+
+**Fix:** define first-class "event" entities ingested into `graph_nodes`:
+- GitHub releases (`/releases`) → `Release` entity with `published_at`
+- Linear milestone-tagged issues → `Release` entity with `completed_at`
+- Notion "Decision" DB pages → `Decision` entity with frontmatter date
+- Slack `#releases` posts → `Release` entity
+
+Each gets a `graph_nodes` row with `label IN ('Release','Decision','Migration')`
+and `properties.date`. Anchor resolution becomes a single SQL hit on
+`graph_nodes` keyed by canonical_id or property text match. Resolution
+plugs into `services/retrieval/temporal.py:resolve_temporal()` as a new
+branch when `unresolvable_anchor` is set.
+
+**Scope:** ~400 LOC across all 5 connectors + dashboard tagging UX.
+Pays back in: temporal resolution accuracy, Phase 2 verification ("did
+this PR conflict with anything since release v2"), and "show me the
+decision history" queries.
+
+Discussed: 2026-04-24. Skipped from current PR because event extraction
+needs per-connector ontology work + customer-specific tagging conventions.
+
+### In-memory router cache (LRU)
+
+We dropped the Postgres-backed `query_cache` in migration 0006 because at
+single-tenant scale the hit rate didn't pay back the schema + cron sweep
+overhead. Add a per-process LRU when query volume justifies it:
+- Scope: `functools.lru_cache(maxsize=512)` or a TTL dict in
+  `services/retrieval/router.py` keyed by `(customer_id, query, prompt_version)`.
+- Triggers when `/query` p95 starts pressing the 2s SLO with Haiku as the
+  dominant chunk OR monthly Anthropic spend on the router crosses ~$50/customer.
+- ~30 LOC. No DB schema work.
+
+---
+
 ## Done recently (clear periodically)
 
 - Tier 3 end-to-end smoke test passes against local Postgres + MinIO
