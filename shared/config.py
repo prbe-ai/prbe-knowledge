@@ -42,8 +42,12 @@ class Settings(BaseSettings):
 
     # --- External model providers -------------------------------------------
     openai_api_key: SecretStr = SecretStr("")
-    anthropic_api_key: SecretStr = SecretStr("")
+    anthropic_api_key: SecretStr = Field(
+        default=SecretStr("dev-only"),
+        description="Used for claude_code unit extraction.",
+    )
     google_api_key: SecretStr = SecretStr("")
+    claude_code_extraction_model: str = Field(default="claude-sonnet-4-6")
 
     # --- Token encryption (Fernet key, 32 url-safe base64 bytes) -----------
     token_encryption_key: SecretStr = SecretStr("")
