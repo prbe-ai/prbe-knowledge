@@ -7,6 +7,7 @@ Adding a new connector: create `handlers/<source>.py`, decorate the class with
 """
 
 from services.ingestion.handlers import (
+    claude_code,  # noqa: F401
     github,  # noqa: F401
     granola,  # noqa: F401
     linear,  # noqa: F401
