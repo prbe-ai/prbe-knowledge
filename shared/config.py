@@ -103,6 +103,9 @@ class Settings(BaseSettings):
     # --- Embeddings batching ------------------------------------------------
     embedding_batch_size: int = Field(default=96, ge=1, le=2048)
 
+    # --- Claude Code session completer --------------------------------------
+    claude_code_session_idle_minutes: int = Field(default=5, ge=1)
+
     @property
     def is_local(self) -> bool:
         return self.environment == "local"
