@@ -144,6 +144,27 @@ class ObjectStore:
 
         await asyncio.to_thread(_delete)
 
+    async def list_keys(self, bucket: str, prefix: str) -> list[str]:
+        """Return all keys in `bucket` starting with `prefix`. Paginated.
+
+        Used by Claude Code's fetch_supplementary to assemble per-session batches.
+        """
+        def _list() -> list[str]:
+            keys: list[str] = []
+            paginator = self._client.get_paginator("list_objects_v2")
+            try:
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    for obj in page.get("Contents", []) or []:
+                        keys.append(obj["Key"])
+            except (BotoCoreError, ClientError) as exc:
+                code = exc.response.get("Error", {}).get("Code", "") if isinstance(exc, ClientError) else ""
+                if code in {"NoSuchBucket", "404", "NotFound"}:
+                    return []
+                raise StorageUnavailable(f"list_objects_v2 failed: {exc}") from exc
+            return keys
+
+        return await asyncio.to_thread(_list)
+
 
 _store: ObjectStore | None = None
 
