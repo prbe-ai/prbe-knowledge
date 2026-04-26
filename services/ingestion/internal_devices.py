@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import orjson
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -165,6 +166,7 @@ async def verify_device_token(
             WHERE webhook_secret = $1
               AND source_system = $2
               AND device_id IS NOT NULL
+            LIMIT 1
             """,
             body.token_hash,
             SourceSystem.CLAUDE_CODE.value,
@@ -178,7 +180,6 @@ async def verify_device_token(
 
     metadata = row["device_metadata"] or {}
     if isinstance(metadata, (str, bytes, bytearray)):
-        import orjson
         metadata = orjson.loads(metadata)
     employee_id = metadata.get("employee_id") if isinstance(metadata, dict) else None
     if not employee_id:
