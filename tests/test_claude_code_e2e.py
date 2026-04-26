@@ -87,7 +87,7 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
             "batch_seq": 0,
             "cwd": "/tmp/e2e",
             "employee_id": EMPLOYEE,
-            "events": [{"line_no": 0, "raw": {"type": "user_prompt", "content": "hi"}}],
+            "events": [{"line_no": 0, "raw": {"type": "user_prompt", "content": "hi from e2e"}}],
         }
         wh = await client.post(
             "/webhooks/claude_code",
@@ -126,13 +126,26 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
 
     assert outcome.doc_ids, "normalizer produced no doc_ids"
 
-    # 4. Confirm a claude_code.session Document was persisted.
+    # 4. Confirm a claude_code.session Document was persisted AND the live
+    # webhook event content actually flowed end-to-end (not just a stub doc).
     async with raw_conn() as conn:
         rows = await conn.fetch(
-            "SELECT doc_id, doc_type FROM documents WHERE customer_id = $1 ORDER BY doc_id",
+            "SELECT doc_id, doc_type, metadata::text AS metadata, body_size_bytes "
+            "FROM documents WHERE customer_id = $1 AND doc_type = 'claude_code.session'",
             CUSTOMER,
         )
-    types = {r["doc_type"] for r in rows}
-    assert "claude_code.session" in types, (
-        f"expected claude_code.session doc; found: {types}"
+    assert rows, "expected a claude_code.session document"
+    session_row = rows[0]
+    import orjson as _orjson
+
+    meta = _orjson.loads(session_row["metadata"])
+    assert meta["event_count"] >= 1, (
+        f"session doc was emitted with no events — fetch_supplementary likely "
+        f"never picked up the gateway-forwarded body. metadata={meta}"
+    )
+    assert meta.get("body"), (
+        "session doc has no metadata['body'] — chunker won't see the transcript"
+    )
+    assert "hi from e2e" in meta["body"], (
+        f"event content should land in metadata['body']; got: {meta['body']!r}"
     )

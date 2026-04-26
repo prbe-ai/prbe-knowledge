@@ -142,13 +142,38 @@ class ClaudeCodeConnector(Connector):
             raise ValueError(
                 f"fetch_supplementary: cannot determine session_id from event {event.source_event_id!r}"
             )
+
+        merged_events: list[dict[str, Any]] = []
+        seen_line_nos: set[int] = set()
+
+        def _ingest(obj: dict[str, Any]) -> None:
+            """Append `obj` to merged_events, deduplicating by line_no when present."""
+            line_no = obj.get("line_no")
+            # Only deduplicate events with explicit line_no values. Events that
+            # lack line_no must always be included — otherwise the first None
+            # poisons the dedup set and silently drops every subsequent
+            # line_no-less event.
+            if line_no is not None:
+                if line_no in seen_line_nos:
+                    return
+                seen_line_nos.add(line_no)
+            merged_events.append(obj)
+
+        # 1. Events from the gateway-forwarded webhook body (the live path).
+        #    services/ingestion/main.py persists the envelope to a
+        #    date-partitioned R2 key, NOT under raw/claude_code/<session>/,
+        #    so we read the events out of the in-memory raw_payload here.
+        for obj in event.raw_payload.get("events") or []:
+            if isinstance(obj, dict):
+                _ingest(obj)
+
+        # 2. Merge any per-session R2 batches that exist (session-completer
+        #    cron path, or any future writer that pre-stages JSONL there).
         prefix = f"raw/claude_code/{event.customer_id}/{session_id}/"
         store = get_store()
         bucket = store.bucket_for(event.customer_id)
 
-        keys = await store.list_keys(bucket, prefix)
         # batch_seq encoded in filename; sort numerically
-
         def _batch_seq(k: str) -> int:
             stem = k.rsplit("/", 1)[-1].split(".", 1)[0]
             try:
@@ -156,14 +181,11 @@ class ClaudeCodeConnector(Connector):
             except ValueError:
                 return 10**9  # non-numeric keys (e.g. "finalize") sort last
 
+        keys = await store.list_keys(bucket, prefix)
         keys.sort(key=_batch_seq)
-
-        merged_events: list[dict[str, Any]] = []
-        seen_line_nos: set[int] = set()
         for key in keys:
             # Skip non-batch keys (e.g. finalize.marker written by the
             # session-completer cron — see services/ingestion/session_completer.py).
-            # _batch_seq returns 10**9 for non-numeric stems.
             if _batch_seq(key) == 10**9:
                 continue
             body = await store.get(bucket, key)
@@ -171,16 +193,9 @@ class ClaudeCodeConnector(Connector):
                 if not line.strip():
                     continue
                 obj = orjson.loads(line)
-                line_no = obj.get("line_no")
-                # Only deduplicate events with explicit line_no values. Events that
-                # lack line_no must always be included — otherwise the first None
-                # poisons the dedup set and silently drops every subsequent
-                # line_no-less event.
-                if line_no is not None:
-                    if line_no in seen_line_nos:
-                        continue
-                    seen_line_nos.add(line_no)
-                merged_events.append(obj)
+                if isinstance(obj, dict):
+                    _ingest(obj)
+
         merged_events.sort(key=lambda e: (e.get("line_no") is None, e.get("line_no") or 0))
 
         # Heuristic: a session is "complete" if any merged event is the
@@ -457,6 +472,11 @@ class ClaudeCodeConnector(Connector):
                 "device_id": event.raw_payload.get("device_id"),
                 "session_complete": complete,
                 "event_count": len(events),
+                # `body` drives Normalizer._stringify_body → chunker.
+                # Surface a human-readable rendering of the merged events so
+                # full-session retrieval works (every other connector follows
+                # the same metadata["body"] convention).
+                "body": _events_to_text(events),
             },
             acl=self._acl(employee_id),
         )
@@ -498,7 +518,10 @@ class ClaudeCodeConnector(Connector):
             valid_from=now,
             ingested_at=now,
             parent_doc_id=parent.doc_id,
-            metadata=metadata,
+            # `body` drives Normalizer._stringify_body → chunker. Without it,
+            # only the 200-char preview gets indexed and the unit's full
+            # content (Q+A, code change, decision text, file ref) is lost.
+            metadata={**metadata, "body": body},
             acl=parent.acl,
         )
 
@@ -511,6 +534,29 @@ class ClaudeCodeConnector(Connector):
         raise NotSupportedByConnector(
             "claude_code backfill happens client-side via the agent-tap daemon"
         )
+
+
+def _events_to_text(events: list[dict[str, Any]]) -> str:
+    """Render merged Claude Code events into a chunkable text body.
+
+    Each event becomes one block: `<type>: <content>` for events that have
+    string content, or a JSON dump for everything else. Ordering matches the
+    line_no-sorted merged stream, so a chunker walking sequentially sees the
+    session in transcript order.
+    """
+    blocks: list[str] = []
+    for ev in events:
+        raw = ev.get("raw") if isinstance(ev, dict) else None
+        if not isinstance(raw, dict):
+            blocks.append(orjson.dumps(ev).decode("utf-8"))
+            continue
+        ev_type = raw.get("type")
+        content = raw.get("content")
+        if isinstance(content, str) and content:
+            blocks.append(f"{ev_type or 'event'}: {content}")
+        else:
+            blocks.append(orjson.dumps(raw).decode("utf-8"))
+    return "\n\n".join(blocks)
 
     def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
         raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
