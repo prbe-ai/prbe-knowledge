@@ -34,13 +34,13 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from services.ingestion.admin_routes import router as admin_router
 from services.ingestion.backfill_routes import router as backfill_router
-from services.ingestion.internal_devices import router as devices_router
 from services.ingestion.handlers.base import make_default_context
 from services.ingestion.handlers.registry import (
     build_connector,
     get_connector_class,
     list_registered,
 )
+from services.ingestion.internal_devices import router as devices_router
 from shared.config import get_settings
 from shared.constants import SourceSystem
 from shared.db import get_pool, health_check, init_pool
