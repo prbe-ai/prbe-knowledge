@@ -59,7 +59,11 @@ class Worker:
     # ---- queue ops ----------------------------------------------------------
 
     async def _claim_one(self) -> asyncpg.Record | None:
-        """Atomically mark one pending row as processing and return it."""
+        """Atomically mark one pending row as processing and return it.
+
+        Gates on next_retry_at so the exponential-backoff added in
+        migration 0011 actually slows down hot-loops on transient outages.
+        """
         async with get_pool().acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
@@ -67,6 +71,7 @@ class Worker:
                            payload_s3_key, attempts
                     FROM ingestion_queue
                     WHERE status = $1
+                      AND (next_retry_at IS NULL OR next_retry_at <= NOW())
                     ORDER BY enqueued_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -239,15 +244,21 @@ class Worker:
                     queue_id,
                 )
             else:
+                # Transient → back to pending with exponential backoff gate.
+                # min(30min, 30s * 2^(attempts-1)) — matches the helper used
+                # in prbe-orchestrator/app/services/backoff.py.
+                backoff_s = min(1800, 30 * (2 ** max(attempts - 1, 0)))
                 await conn.execute(
                     """
                     UPDATE ingestion_queue
-                    SET status = $1, error = $2, heartbeat_at = NULL, started_at = NULL
+                    SET status = $1, error = $2, heartbeat_at = NULL, started_at = NULL,
+                        next_retry_at = NOW() + ($4 || ' seconds')::interval
                     WHERE queue_id = $3
                     """,
                     QueueStatus.PENDING.value,
                     error,
                     queue_id,
+                    str(backoff_s),
                 )
 
 
