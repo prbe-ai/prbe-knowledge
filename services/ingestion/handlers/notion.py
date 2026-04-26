@@ -88,6 +88,12 @@ _DELETE_EVENT_TYPES: frozenset[str] = frozenset(
 
 _DEFAULT_WORKSPACE_PRINCIPAL = "notion-default"
 
+# Token-exchange endpoint. The public-facing /oauth/notion/install +
+# /oauth/notion/callback live in prbe-backend's gateway; this endpoint
+# is what the gateway POSTs to (via /api/oauth/notion/exchange) once it
+# has a verified-state callback in hand.
+_NOTION_OAUTH_TOKEN = "https://api.notion.com/v1/oauth/token"
+
 
 # ---- source-shape discriminators -------------------------------------------
 
@@ -639,47 +645,117 @@ class NotionConnector(Connector):
         )
 
     # ------------------------------------------------------------------
+    # 6. OAuth code-for-token exchange
+    # ------------------------------------------------------------------
+    # Public-facing /oauth/notion/install + /oauth/notion/callback live in
+    # prbe-backend's gateway (api.prbe.ai). After backend verifies the
+    # signed state, it POSTs (customer_id, code, redirect_uri, extra_params)
+    # to /api/oauth/notion/exchange (admin_routes.py), which calls into
+    # this method.
+
+    async def exchange_oauth_code(
+        self,
+        code: str | None,
+        redirect_uri: str,
+        extra_params: dict[str, str] | None = None,
+    ) -> IntegrationToken:
+        from shared.exceptions import (
+            InvalidWebhookPayload,
+            MissingSecret,
+            PermanentSourceError,
+        )
+
+        cid = self.settings.notion_client_id
+        secret = self.settings.notion_client_secret
+        if not cid or secret is None:
+            raise MissingSecret(
+                "NOTION_CLIENT_ID / NOTION_CLIENT_SECRET not configured"
+            )
+        if not code:
+            raise InvalidWebhookPayload("notion oauth callback missing code")
+
+        resp = await self.http.post(
+            _NOTION_OAUTH_TOKEN,
+            auth=(cid, secret.get_secret_value()),  # httpx handles Basic encoding
+            headers={"Notion-Version": _NOTION_VERSION},
+            json={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        if resp.status_code != 200:
+            raise PermanentSourceError(
+                f"notion oauth failed: HTTP {resp.status_code} {resp.text[:200]}"
+            )
+        body = resp.json()
+        # access_token + workspace_id are documented non-null on a 200 response,
+        # but guard explicitly so a malformed body becomes a 502 (PermanentSourceError)
+        # rather than an unhandled KeyError → 500.
+        try:
+            access_token = body["access_token"]
+            workspace_id = body["workspace_id"]
+        except (KeyError, TypeError) as exc:
+            raise PermanentSourceError(
+                f"notion oauth response missing required fields: {exc}"
+            ) from exc
+        return IntegrationToken(
+            customer_id="",  # filled in by /api/oauth/notion/exchange caller
+            source_system=SourceSystem.NOTION,
+            access_token=access_token,
+            refresh_token=body.get("refresh_token"),
+            scope=None,  # Notion uses per-integration capability checkboxes
+            install_metadata={
+                "workspace_id": workspace_id,
+                "workspace_name": body.get("workspace_name"),
+                "workspace_icon": body.get("workspace_icon"),
+                "bot_id": body.get("bot_id"),
+                "owner": body.get("owner"),
+            },
+        )
+
+    # ------------------------------------------------------------------
     # 7. workspace identification
     # ------------------------------------------------------------------
 
     async def identify_workspaces(self, token):  # type: ignore[override]
-        """Notion's OAuth response includes workspace_id + workspace_name
-        directly. Since we don't currently capture those during
-        `exchange_oauth_code`, fall back to `/v1/users/me` which returns
-        the bot's workspace affiliation via `bot.workspace_name` on
-        recent API versions.
+        """Read workspace info captured during `exchange_oauth_code`.
+
+        The Notion token-exchange response gives us `workspace_id` +
+        `workspace_name` + `bot_id` directly, so we stash that in
+        `token.install_metadata` and read it here — no second API call,
+        no fallback cascade needed.
+
+        Returns [] when `install_metadata` is None (e.g., a token loaded
+        from DB; the field is Pydantic-transient). The exchange caller
+        already handles that case by skipping `record_mapping` and
+        logging a warning.
         """
         from shared.logging import get_logger
         from shared.models import ExternalWorkspaceRef
 
         lg = get_logger(__name__)
-        try:
-            resp = await self.http.get(
-                "https://api.notion.com/v1/users/me",
-                headers={
-                    "Authorization": f"Bearer {token.access_token}",
-                    "Notion-Version": "2022-06-28",
-                },
-            )
-        except Exception as exc:
-            lg.warning("notion.identify_workspaces_failed", error=str(exc))
-            return []
-        if resp.status_code != 200:
-            return []
-        body = resp.json()
-        bot = body.get("bot") or {}
-        ws_id = (
-            bot.get("workspace_id")
-            or bot.get("workspace")
-            or body.get("workspace_id")
-        )
+        meta = token.install_metadata or {}
+        ws_id = meta.get("workspace_id")
         if not ws_id:
+            lg.warning(
+                "notion.identify_workspaces_no_install_metadata",
+                customer=token.customer_id,
+            )
             return []
+
+        owner_user_id = (
+            ((meta.get("owner") or {}).get("user") or {}).get("id")
+        )
         return [
             ExternalWorkspaceRef(
                 external_id=str(ws_id),
-                external_name=bot.get("workspace_name"),
-                metadata={"owner_user_id": (bot.get("owner") or {}).get("user", {}).get("id")},
+                external_name=meta.get("workspace_name"),
+                metadata={
+                    "bot_id": meta.get("bot_id"),
+                    "owner_user_id": owner_user_id,
+                    "workspace_icon": meta.get("workspace_icon"),
+                },
             )
         ]
 
