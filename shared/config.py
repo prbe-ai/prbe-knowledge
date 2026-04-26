@@ -55,12 +55,6 @@ class Settings(BaseSettings):
     # retrieval + /internal/ingest. Compared with hmac.compare_digest.
     internal_knowledge_api_key: SecretStr | None = None
 
-    # --- Dashboard redirect (optional) --------------------------------------
-    # When set, OAuth callbacks 302 to <url>/oauth-landed?source=...&customer_id=...
-    # instead of rendering the backend's own HTML success page, so users land
-    # back on the dashboard after connecting an integration.
-    dashboard_base_url: str | None = None
-
     # --- Per-source OAuth + webhook secrets ----
     # After the gateway migration, ACTIVE code in this service only uses
     # client_secrets (token exchange in /api/oauth/{source}/exchange). The
