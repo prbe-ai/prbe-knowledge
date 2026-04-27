@@ -100,7 +100,7 @@ async def seed(customer_id: str, installation_id: str) -> None:
                     (customer_id, source_system, access_token_encrypted,
                      refresh_token_encrypted, expires_at, scope, status)
                 VALUES ($1, 'github', $2, NULL, NULL, $3, $4)
-                ON CONFLICT (customer_id, source_system) DO UPDATE SET
+                ON CONFLICT (customer_id, source_system) WHERE device_id IS NULL DO UPDATE SET
                     scope      = EXCLUDED.scope,
                     status     = 'active',
                     updated_at = NOW()

@@ -42,8 +42,12 @@ class Settings(BaseSettings):
 
     # --- External model providers -------------------------------------------
     openai_api_key: SecretStr = SecretStr("")
-    anthropic_api_key: SecretStr = SecretStr("")
+    anthropic_api_key: SecretStr = Field(
+        default=SecretStr("dev-only"),
+        description="Used for claude_code unit extraction.",
+    )
     google_api_key: SecretStr = SecretStr("")
+    claude_code_extraction_model: str = Field(default="claude-sonnet-4-6")
 
     # --- Token encryption (Fernet key, 32 url-safe base64 bytes) -----------
     token_encryption_key: SecretStr = SecretStr("")
@@ -98,6 +102,9 @@ class Settings(BaseSettings):
 
     # --- Embeddings batching ------------------------------------------------
     embedding_batch_size: int = Field(default=96, ge=1, le=2048)
+
+    # --- Claude Code session completer --------------------------------------
+    claude_code_session_idle_minutes: int = Field(default=5, ge=1)
 
     @property
     def is_local(self) -> bool:

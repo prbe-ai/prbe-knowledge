@@ -249,9 +249,15 @@ CREATE INDEX idx_backfill_state_running ON backfill_state (status, heartbeat_at)
     WHERE status = 'running';
 
 -- ---------------------------------------------------------------------------
--- integration_tokens: per-customer per-source OAuth credentials.
+-- integration_tokens: per-customer per-source credentials.
+--
+-- For non-device sources (slack/linear/github/notion/granola), one row per
+-- (customer, source) — enforced by the partial unique index where device_id
+-- IS NULL. Device-scoped sources (claude_code) can have many rows per
+-- (customer, source), keyed by device_id.
 -- ---------------------------------------------------------------------------
 CREATE TABLE integration_tokens (
+    token_id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     customer_id              TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     source_system            TEXT NOT NULL,
     access_token_encrypted   TEXT NOT NULL,
@@ -262,10 +268,17 @@ CREATE TABLE integration_tokens (
     status                   TEXT NOT NULL DEFAULT 'active',
     last_refresh_at          TIMESTAMPTZ,
     last_refresh_error       TEXT,
+    device_id                TEXT,
+    device_metadata          JSONB,
     created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (customer_id, source_system)
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX integration_tokens_unique_per_source
+    ON integration_tokens (customer_id, source_system)
+    WHERE device_id IS NULL;
+CREATE UNIQUE INDEX integration_tokens_unique_per_device
+    ON integration_tokens (customer_id, source_system, device_id)
+    WHERE device_id IS NOT NULL;
 CREATE INDEX idx_tokens_refresh_errors ON integration_tokens (status, last_refresh_error)
     WHERE last_refresh_error IS NOT NULL;
 

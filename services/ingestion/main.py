@@ -40,6 +40,7 @@ from services.ingestion.handlers.registry import (
     get_connector_class,
     list_registered,
 )
+from services.ingestion.internal_devices import router as devices_router
 from shared.config import get_settings
 from shared.constants import SourceSystem
 from shared.db import get_pool, health_check, init_pool
@@ -80,6 +81,7 @@ app = FastAPI(title="prbe-knowledge ingestion", lifespan=lifespan)
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 app.include_router(backfill_router)
 app.include_router(admin_router)
+app.include_router(devices_router)
 
 
 @app.get("/health")
@@ -158,9 +160,18 @@ async def webhook(
     if parsed is None:
         return JSONResponse({"status": "ignored", "trace_id": trace_id})
 
+    # Headers are persisted with the raw payload for replayability. Strip
+    # bearer/cookie/api-key headers before write — even though the gateway
+    # is supposed to filter, a single misconfigured caller could land a
+    # plaintext device-token in long-term R2 storage. Defense in depth.
+    safe_headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in _SENSITIVE_HEADERS
+    }
     envelope = orjson.dumps(
         {
-            "_headers": {k: v for k, v in request.headers.items()},
+            "_headers": safe_headers,
             "payload": payload,
             "received_at": parsed.received_at.isoformat(),
             "trace_id": trace_id,
@@ -200,6 +211,18 @@ async def webhook(
 
 
 # ---- helpers ----------------------------------------------------------------
+
+
+# Headers we never want to land in R2 alongside the raw payload. Lower-case;
+# matched against the lower-cased header name in the envelope-build step.
+_SENSITIVE_HEADERS: frozenset[str] = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "x-api-key",
+        "x-internal-knowledge-key",
+    }
+)
 
 
 def _payload_key(source: SourceSystem, customer_id: str, event_id: str) -> str:
