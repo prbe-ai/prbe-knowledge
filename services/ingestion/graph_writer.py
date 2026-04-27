@@ -15,8 +15,14 @@ async def upsert_nodes(
     conn: asyncpg.Connection,
     customer_id: str,
     nodes: list[GraphNodeSpec],
+    source_system: str,
 ) -> dict[tuple[str, str], int]:
-    """Upsert nodes. Returns map (label, canonical_id) → node_id."""
+    """Upsert nodes. Returns map (label, canonical_id) → node_id.
+
+    Also records provenance: which source_system asserted this node, so
+    disconnect-integration can correctly handle nodes touched by multiple
+    connectors (delete only when the last source disconnects).
+    """
     if not nodes:
         return {}
 
@@ -37,7 +43,21 @@ async def upsert_nodes(
             node.canonical_id,
             orjson.dumps(node.properties).decode("utf-8"),
         )
-        results[(node.label.value, node.canonical_id)] = row["node_id"]
+        node_id = row["node_id"]
+        results[(node.label.value, node.canonical_id)] = node_id
+
+        await conn.execute(
+            """
+            INSERT INTO graph_node_provenance
+                (node_id, customer_id, source_system, first_seen_at, last_seen_at)
+            VALUES ($1, $2, $3, NOW(), NOW())
+            ON CONFLICT (node_id, source_system) DO UPDATE
+                SET last_seen_at = NOW()
+            """,
+            node_id,
+            customer_id,
+            source_system,
+        )
     return results
 
 
@@ -46,12 +66,16 @@ async def upsert_edges(
     customer_id: str,
     edges: list[GraphEdgeSpec],
     node_ids: dict[tuple[str, str], int],
+    source_system: str,
 ) -> int:
     """Upsert edges. Returns count upserted.
 
     Edges whose endpoints aren't in `node_ids` are silently skipped — the
     normalizer is responsible for including the full node set in the same
     NormalizationResult.
+
+    `source_system` is recorded on initial insert and preserved on conflict
+    (first asserting source wins; edges are not multi-sourced today).
     """
     if not edges:
         return 0
@@ -67,9 +91,9 @@ async def upsert_edges(
             """
             INSERT INTO graph_edges (
                 customer_id, edge_type, from_node_id, to_node_id,
-                properties, valid_from, valid_to
+                properties, valid_from, valid_to, source_system
             )
-            VALUES ($1, $2, $3, $4, $5::jsonb, COALESCE($6, NOW()), $7)
+            VALUES ($1, $2, $3, $4, $5::jsonb, COALESCE($6, NOW()), $7, $8)
             ON CONFLICT (customer_id, edge_type, from_node_id, to_node_id)
             DO UPDATE SET
                 properties = graph_edges.properties || EXCLUDED.properties,
@@ -83,6 +107,7 @@ async def upsert_edges(
             orjson.dumps(edge.properties).decode("utf-8"),
             edge.valid_from,
             edge.valid_to,
+            source_system,
         )
         inserted += 1
     return inserted

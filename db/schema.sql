@@ -348,12 +348,28 @@ CREATE TABLE graph_edges (
     properties    JSONB NOT NULL DEFAULT '{}',
     valid_from    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     valid_to      TIMESTAMPTZ,
+    source_system TEXT,
     UNIQUE (customer_id, edge_type, from_node_id, to_node_id)
 );
 
 CREATE INDEX idx_graph_edges_customer_type ON graph_edges (customer_id, edge_type);
 CREATE INDEX idx_graph_edges_from ON graph_edges (customer_id, from_node_id, edge_type);
 CREATE INDEX idx_graph_edges_to ON graph_edges (customer_id, to_node_id, edge_type);
+
+-- Per-node provenance: which source system(s) asserted this node. A node
+-- touched by multiple connectors must survive disconnection of any single
+-- one; this table is the join target for that cleanup logic.
+CREATE TABLE graph_node_provenance (
+    node_id        BIGINT NOT NULL REFERENCES graph_nodes(node_id) ON DELETE CASCADE,
+    customer_id    TEXT   NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    source_system  TEXT   NOT NULL,
+    first_seen_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (node_id, source_system)
+);
+
+CREATE INDEX idx_provenance_customer_source
+    ON graph_node_provenance (customer_id, source_system);
 
 -- RLS: tenant isolation enforced at the DB level.
 -- Application sets `SET app.current_customer_id = '<id>'` at the start of each tx.

@@ -141,12 +141,15 @@ class Normalizer:
                 raise DuplicateEventIgnored(result.skipped_reason)
             raise NormalizationError("connector produced no documents and no reason")
 
-        return await self._persist(customer_id, result)
+        return await self._persist(customer_id, source_system, result)
 
     # ---- persistence --------------------------------------------------------
 
     async def _persist(
-        self, customer_id: str, result: NormalizationResult
+        self,
+        customer_id: str,
+        source_system: SourceSystem,
+        result: NormalizationResult,
     ) -> NormalizeOutcome:
         doc_ids: list[str] = []
         total_live_chunks = 0
@@ -157,8 +160,12 @@ class Normalizer:
 
         async with with_tenant(customer_id) as conn:
             # Nodes first, then edges — edges look up node_ids.
-            node_ids = await upsert_nodes(conn, customer_id, result.graph_nodes)
-            await upsert_edges(conn, customer_id, result.graph_edges, node_ids)
+            node_ids = await upsert_nodes(
+                conn, customer_id, result.graph_nodes, source_system.value
+            )
+            await upsert_edges(
+                conn, customer_id, result.graph_edges, node_ids, source_system.value
+            )
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
 
             for doc in result.documents:
