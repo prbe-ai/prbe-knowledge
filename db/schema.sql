@@ -115,7 +115,10 @@ CREATE TABLE documents (
     compiled_at          TIMESTAMPTZ DEFAULT NULL,
     compile_trigger      TEXT DEFAULT NULL,
 
-    PRIMARY KEY (doc_id, version)
+    -- PK includes customer_id so tenants ingesting the same source identity
+    -- (e.g. the same Slack workspace replayed under a different customer)
+    -- don't collide on doc_id and silently drop writes via ON CONFLICT.
+    PRIMARY KEY (customer_id, doc_id, version)
 );
 
 CREATE INDEX idx_documents_customer_source ON documents (customer_id, source_system, source_id);
@@ -141,7 +144,7 @@ CREATE INDEX idx_documents_metadata ON documents USING GIN (metadata jsonb_path_
 --   last_seen_version   — most recent document version that still contained it
 -- ---------------------------------------------------------------------------
 CREATE TABLE chunks (
-    chunk_id             TEXT PRIMARY KEY,
+    chunk_id             TEXT NOT NULL,
     doc_id               TEXT NOT NULL,
     customer_id          TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
 
@@ -162,6 +165,9 @@ CREATE TABLE chunks (
 
     metadata             JSONB NOT NULL DEFAULT '{}',
 
+    -- PK includes customer_id so tenants ingesting overlapping source content
+    -- can't collide on chunk_id (which is derived from doc_id + content_hash).
+    PRIMARY KEY (customer_id, chunk_id),
     UNIQUE (doc_id, content_hash)
     -- No FK to documents(doc_id, version). A chunk can span multiple versions
     -- (first_seen_version..last_seen_version), so pinning the FK to a specific

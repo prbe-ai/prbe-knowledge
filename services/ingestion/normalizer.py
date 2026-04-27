@@ -220,8 +220,9 @@ class Normalizer:
             """
             SELECT content_hash, chunker_version, chunk_index
             FROM chunks
-            WHERE doc_id = $1 AND valid_to IS NULL
+            WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
             """,
+            doc.customer_id,
             doc.doc_id,
         )
 
@@ -247,9 +248,11 @@ class Normalizer:
                 """
                 UPDATE chunks
                 SET last_seen_version = $1
-                WHERE doc_id = $2 AND content_hash = ANY($3::text[]) AND valid_to IS NULL
+                WHERE customer_id = $2 AND doc_id = $3
+                  AND content_hash = ANY($4::text[]) AND valid_to IS NULL
                 """,
                 doc.version,
+                doc.customer_id,
                 doc.doc_id,
                 list(reused_hashes),
             )
@@ -281,8 +284,10 @@ class Normalizer:
                 """
                 UPDATE chunks
                 SET valid_to = NOW()
-                WHERE doc_id = $1 AND content_hash = ANY($2::text[]) AND valid_to IS NULL
+                WHERE customer_id = $1 AND doc_id = $2
+                  AND content_hash = ANY($3::text[]) AND valid_to IS NULL
                 """,
+                doc.customer_id,
                 doc.doc_id,
                 list(removed_hashes),
             )
@@ -394,7 +399,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
         )
         next_version = int(max_version or 0) + 1
 
-    await conn.execute(
+    inserted = await conn.fetchval(
         """
         INSERT INTO documents (
             doc_id, version, customer_id,
@@ -418,7 +423,8 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
             $25::jsonb, $26::jsonb, $27::jsonb, $28::jsonb, $29::jsonb,
             $30
         )
-        ON CONFLICT (doc_id, version) DO NOTHING
+        ON CONFLICT (customer_id, doc_id, version) DO NOTHING
+        RETURNING 1
         """,
         doc.doc_id,
         next_version,
@@ -451,6 +457,21 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
         _json([r.model_dump() for r in doc.doc_references]),
         NORMALIZER_VERSION,
     )
+    if inserted is None:
+        # ON CONFLICT swallowed the write. We already proved above that no
+        # live version exists for (customer_id, doc_id), so a conflict here
+        # means a stale row at this exact (customer_id, doc_id, version) is
+        # blocking us — typically a prior run that closed out without
+        # bumping. Surfacing it loudly beats the previous silent-drop bug
+        # (where customer-B's writes vanished into customer-A's tenancy
+        # because the PK was global).
+        log.warning(
+            "upsert_document.silent_conflict",
+            customer=doc.customer_id,
+            doc_id=doc.doc_id,
+            version=next_version,
+        )
+        return False
     doc.version = next_version
     return True
 
