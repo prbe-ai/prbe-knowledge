@@ -1,8 +1,8 @@
 """enrichment_runs + ingestion_queue retry columns
 
-Revision ID: 0011_enrichment_retry_columns
-Revises: 0010_own_organization_tables
-Create Date: 2026-04-26
+Revision ID: 0014_enrichment_retry_columns
+Revises: 0013_merge_heads
+Create Date: 2026-04-27
 
 Adds the columns required for the heartbeat + backoff + DLQ pattern in
 both queue tables. enrichment_runs is owned by prbe-orchestrator's worker;
@@ -14,16 +14,18 @@ review (see prbe-orchestrator/docs/enrichment-retry-reconciler.md). A
 single migration prevents schema drift between the two structurally
 identical queue tables.
 
-Numbered 0011 because 0010_own_organization_tables landed on
-feature/coding-agent-ingestion-v2 first (also dated 2026-04-26).
+Renumbered 0011 → 0014 to chain after 0013_merge_heads (which
+collapsed 0011_graph_source_system / 0011_integration_tokens_devices /
+0012_per_tenant_pk into a single linear head). Originally drafted as
+0011 before those siblings landed on main.
 """
 
 from __future__ import annotations
 
 from alembic import op
 
-revision = "0011_enrichment_retry_columns"
-down_revision = "0010_own_organization_tables"
+revision = "0014_enrichment_retry_columns"
+down_revision = "0013_merge_heads"
 branch_labels = None
 depends_on = None
 
