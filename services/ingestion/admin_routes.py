@@ -80,7 +80,11 @@ async def verify_internal_knowledge_key(
 
 class OAuthExchangeRequest(BaseModel):
     customer_id: str = Field(min_length=1, max_length=64)
-    code: str = Field(min_length=1, max_length=4096)
+    # Empty string allowed — GitHub Apps installs authenticate via
+    # installation_id from extra_params, no user-grant code required.
+    # Slack/Linear/Notion connectors reject an empty code downstream when
+    # they try to use it against the OAuth provider.
+    code: str = Field(default="", max_length=4096)
     redirect_uri: str = Field(min_length=1)
     extra_params: dict[str, str] = Field(default_factory=dict)
 
