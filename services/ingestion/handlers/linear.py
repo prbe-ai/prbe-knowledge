@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -158,8 +159,17 @@ class LinearConnector(Connector):
             raise InvalidWebhookPayload(
                 "linear payload missing createdAt/updatedAt — cannot compute stable source_event_id"
             )
+        # Linear's createdAt/updatedAt is per-second, so two distinct edits
+        # within the same second by the same user produce identical clocks
+        # and the second event is silently dropped by the queue's UNIQUE
+        # constraint. A deterministic hash of the data dict disambiguates
+        # them while staying stable across webhook retries (same payload
+        # bytes => same hash => dedup still works).
+        payload_fp = hashlib.sha256(
+            json.dumps(data, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
         source_event_id = (
-            f"{type_.lower()}:{resource_id}:{action}:{stable_clock}"
+            f"{type_.lower()}:{resource_id}:{action}:{stable_clock}:{payload_fp}"
         )
 
         return WebhookParseResult(

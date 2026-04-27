@@ -8,11 +8,13 @@ live in this service.
 
 Route layout:
     POST   /api/oauth/{source}/exchange — token exchange + persist
+    POST   /api/queue/replay-dlq        — re-enqueue DLQ rows
 """
 
 from __future__ import annotations
 
 import hmac
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -24,8 +26,9 @@ from services.ingestion.handlers.registry import (
     get_connector_class,
 )
 from shared.config import get_settings
-from shared.constants import SourceSystem
+from shared.constants import QueueStatus, SourceSystem
 from shared.customer_mapping import record_mapping
+from shared.db import raw_conn
 from shared.exceptions import (
     HandlerNotFound,
     NotSupportedByConnector,
@@ -193,3 +196,102 @@ async def oauth_exchange(
         workspaces=workspaces,
         backfill_queued=backfill_queued,
     )
+
+
+# ---------------------------------------------------------------------------
+# Queue admin: re-enqueue DLQ rows.
+#
+# Source-platform redeliveries cannot rescue a DLQ'd row because the
+# UNIQUE (customer_id, source_system, source_event_id) constraint on
+# ingestion_queue makes the redelivery a silent "duplicate" 200. So once
+# something lands in DLQ, the only way to retry it is to flip status back
+# to 'pending'. This route is the supported path; manual SQL is the
+# unsupported one.
+# ---------------------------------------------------------------------------
+
+
+class ReplayDLQRequest(BaseModel):
+    customer_id: str | None = Field(
+        default=None,
+        description="If set, only replay this customer's DLQ rows.",
+    )
+    source_system: str | None = Field(
+        default=None,
+        description="If set, only replay rows for this source.",
+    )
+    since: datetime | None = Field(
+        default=None,
+        description="If set, only replay rows whose enqueued_at >= this timestamp.",
+    )
+    queue_ids: list[int] | None = Field(
+        default=None,
+        description="If set, only replay these specific queue_ids (overrides other filters).",
+    )
+    limit: int = Field(
+        default=1000,
+        ge=1,
+        le=100_000,
+        description="Maximum rows to replay in this call.",
+    )
+
+
+class ReplayDLQResponse(BaseModel):
+    requeued: int
+    queue_ids: list[int]
+
+
+@router.post(
+    "/queue/replay-dlq",
+    response_model=ReplayDLQResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def replay_dlq(body: ReplayDLQRequest) -> ReplayDLQResponse:
+    if body.source_system is not None:
+        try:
+            SourceSystem(body.source_system)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"unknown source: {body.source_system}"
+            ) from exc
+
+    sql = """
+        UPDATE ingestion_queue
+        SET status       = $1,
+            attempts     = 0,
+            error        = NULL,
+            started_at   = NULL,
+            heartbeat_at = NULL,
+            completed_at = NULL
+        WHERE queue_id IN (
+            SELECT queue_id FROM ingestion_queue
+            WHERE status = $2
+              AND ($3::text IS NULL OR customer_id   = $3)
+              AND ($4::text IS NULL OR source_system = $4)
+              AND ($5::timestamptz IS NULL OR enqueued_at >= $5)
+              AND ($6::bigint[] IS NULL OR queue_id = ANY($6))
+            ORDER BY enqueued_at
+            LIMIT $7
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING queue_id
+    """
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            sql,
+            QueueStatus.PENDING.value,
+            QueueStatus.DLQ.value,
+            body.customer_id,
+            body.source_system,
+            body.since,
+            body.queue_ids,
+            body.limit,
+        )
+
+    queue_ids = [r["queue_id"] for r in rows]
+    log.info(
+        "queue.replay_dlq",
+        requeued=len(queue_ids),
+        customer=body.customer_id,
+        source=body.source_system,
+    )
+    return ReplayDLQResponse(requeued=len(queue_ids), queue_ids=queue_ids)

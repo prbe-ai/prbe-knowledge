@@ -47,6 +47,7 @@ from shared.encryption import decrypt_token
 from shared.exceptions import (
     DuplicateEventIgnored,
     NormalizationError,
+    PrbeError,
     TenantIsolationError,
     UnsupportedEventType,
 )
@@ -71,7 +72,7 @@ class NormalizeOutcome:
     added_chunk_count: int = 0
     reused_chunk_count: int = 0
     removed_chunk_count: int = 0
-    stale_doc_ids: list[str] = field(default_factory=list)
+    quarantined_doc_ids: list[str] = field(default_factory=list)
 
 
 class Normalizer:
@@ -152,6 +153,7 @@ class Normalizer:
         result: NormalizationResult,
     ) -> NormalizeOutcome:
         doc_ids: list[str] = []
+        quarantined: list[str] = []
         total_live_chunks = 0
         total_added = 0
         total_reused = 0
@@ -168,23 +170,43 @@ class Normalizer:
             )
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
 
-            for doc in result.documents:
-                persisted = await _upsert_document(conn, doc)
-                if not persisted:
-                    continue  # content_hash match on live version → no-op
-                doc_ids.append(doc.doc_id)
-
-                sync_outcome = await self._sync_chunks(conn, doc)
-                total_live_chunks += sync_outcome.live
-                total_added += sync_outcome.added
-                total_reused += sync_outcome.reused
-                total_removed += sync_outcome.removed
-                total_failed += sync_outcome.failed
+            for idx, doc in enumerate(result.documents):
+                # Per-doc SAVEPOINT: a deterministic-permanent error on one doc
+                # (e.g. a malformed body) must not roll back already-good
+                # siblings, otherwise the queue row stays poisoned forever.
+                # Transient errors still bubble out so the worker retries the
+                # whole row.
+                sp = f"doc_{idx}"
+                await conn.execute(f"SAVEPOINT {sp}")
+                try:
+                    persisted = await _upsert_document(conn, doc)
+                    if persisted:
+                        doc_ids.append(doc.doc_id)
+                        sync_outcome = await self._sync_chunks(conn, doc)
+                        total_live_chunks += sync_outcome.live
+                        total_added += sync_outcome.added
+                        total_reused += sync_outcome.reused
+                        total_removed += sync_outcome.removed
+                        total_failed += sync_outcome.failed
+                except PrbeError as exc:
+                    if getattr(exc, "transient", False):
+                        raise
+                    await conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    quarantined.append(doc.doc_id)
+                    log.warning(
+                        "normalizer.doc_quarantined",
+                        customer=customer_id,
+                        doc_id=doc.doc_id,
+                        error=str(exc),
+                        error_class=type(exc).__name__,
+                    )
+                await conn.execute(f"RELEASE SAVEPOINT {sp}")
 
         log.info(
             "normalizer.done",
             customer=customer_id,
             docs=len(doc_ids),
+            quarantined=len(quarantined),
             live_chunks=total_live_chunks,
             added=total_added,
             reused=total_reused,
@@ -198,6 +220,7 @@ class Normalizer:
             added_chunk_count=total_added,
             reused_chunk_count=total_reused,
             removed_chunk_count=total_removed,
+            quarantined_doc_ids=quarantined,
         )
 
     async def _sync_chunks(
@@ -550,6 +573,7 @@ async def _insert_acl_snapshots(
                 customer_id, source_system, principal_type, principal_id,
                 resource_type, resource_id, permission, valid_from, valid_to, metadata
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+            ON CONFLICT ON CONSTRAINT acl_snapshots_assertion_unique DO NOTHING
             """,
             customer_id,
             r.source_system.value,

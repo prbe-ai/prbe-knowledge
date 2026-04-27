@@ -210,7 +210,14 @@ CREATE TABLE acl_snapshots (
     permission           TEXT NOT NULL,
     valid_from           TIMESTAMPTZ NOT NULL,
     valid_to             TIMESTAMPTZ,
-    metadata             JSONB NOT NULL DEFAULT '{}'
+    metadata             JSONB NOT NULL DEFAULT '{}',
+
+    CONSTRAINT acl_snapshots_assertion_unique UNIQUE (
+        customer_id, source_system,
+        principal_type, principal_id,
+        resource_type, resource_id,
+        permission, valid_from
+    )
 );
 
 CREATE INDEX idx_acl_principal ON acl_snapshots (customer_id, principal_id, valid_from DESC);
