@@ -392,6 +392,60 @@ async def test_empty_entity_filter_behaves_as_no_filter(live_db) -> None:
 # ---- EXPLAIN test (planner uses indexes) ---------------------------------
 
 
+async def test_entity_filter_excludes_soft_closed_edges(live_db) -> None:
+    """REGRESSION — when a graph_edge is soft-closed (valid_to IS NOT NULL),
+    the entity filter must NOT include it. Today no code path closes edges,
+    but this guards against silent inclusion of stale relationships when a
+    future feature ('user left channel') starts soft-deleting."""
+    cust = "cust-soft-close"
+    await _seed_customer(cust)
+    await _seed_doc_with_repo_link(
+        cust,
+        doc_id="d1",
+        full_name="prbe-ai/prbe-backend",
+        repo_short_name="prbe-backend",
+        title="commit",
+        updated_at=datetime(2026, 4, 28, tzinfo=UTC),
+    )
+
+    # Filter sees the doc — baseline.
+    before = await sql_list(
+        cust,
+        top_k=10,
+        graph_entity_filters=[GraphEntityFilter(label="Repo", values=["prbe-backend"])],
+    )
+    assert len(before) == 1
+
+    # Soft-close the Document → Repo edge.
+    async with raw_conn() as conn:
+        await conn.execute(
+            "SELECT set_config('app.current_customer_id', $1, false)", cust
+        )
+        await conn.execute(
+            """
+            UPDATE graph_edges SET valid_to = NOW()
+            WHERE customer_id = $1
+              AND from_node_id IN (
+                SELECT node_id FROM graph_nodes
+                WHERE customer_id = $1 AND label = 'Document'
+              )
+              AND to_node_id IN (
+                SELECT node_id FROM graph_nodes
+                WHERE customer_id = $1 AND label = 'Repo'
+              )
+            """,
+            cust,
+        )
+
+    # Filter must NOT find the doc anymore — the only edge is closed.
+    after = await sql_list(
+        cust,
+        top_k=10,
+        graph_entity_filters=[GraphEntityFilter(label="Repo", values=["prbe-backend"])],
+    )
+    assert after == []
+
+
 async def test_explain_uses_index_when_seqscan_off(live_db) -> None:
     """With `enable_seqscan = OFF`, the planner can only execute the
     query if it has a usable index path on the equality arms of the
