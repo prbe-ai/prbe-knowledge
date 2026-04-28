@@ -24,5 +24,10 @@ EXPOSE 8080
 # Run alembic upgrade head first, then start uvicorn.
 # `release_command` in fly.toml runs migrations separately; keeping this
 # fallback here so `fly deploy --local-only` also migrates.
+#
+# `::` binds the IPv6 wildcard, which on Linux is dual-stack and accepts
+# both IPv4 and IPv6. Required for app-to-app calls via Fly's 6PN
+# private network (`<app>.internal` DNS), which is IPv6-only — bare
+# `0.0.0.0` would silently fail on .internal traffic.
 CMD alembic upgrade head && \
-    uvicorn services.ingestion.main:app --host 0.0.0.0 --port 8080 --workers 2
+    uvicorn services.ingestion.main:app --host :: --port 8080 --workers 2
