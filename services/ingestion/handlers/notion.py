@@ -30,7 +30,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
@@ -129,77 +129,131 @@ def _rich_text_to_plain(rich_text: list[dict[str, Any]] | None) -> str:
 
 
 def _extract_mentioned_user_ids(blocks: list[dict[str, Any]]) -> list[str]:
-    """Walk block rich_text spans, collect Notion user ids from @mentions."""
+    """Walk block rich_text spans, collect Notion user ids from @mentions.
+
+    Recurses into `_children` attached by `_fetch_all_blocks` so mentions
+    nested inside toggles / columns / sub-bullets still surface.
+    """
     user_ids: list[str] = []
-    for block in blocks:
-        btype = block.get("type")
-        payload = block.get(btype) if btype else None
-        if not isinstance(payload, dict):
-            continue
-        rich = payload.get("rich_text") or []
-        for span in rich:
-            if span.get("type") != "mention":
-                continue
-            mention = span.get("mention") or {}
-            if mention.get("type") == "user":
-                uid = (mention.get("user") or {}).get("id")
-                if uid and uid not in user_ids:
-                    user_ids.append(uid)
+
+    def _walk(items: list[dict[str, Any]]) -> None:
+        for block in items:
+            btype = block.get("type")
+            payload = block.get(btype) if btype else None
+            if isinstance(payload, dict):
+                rich = payload.get("rich_text") or []
+                for span in rich:
+                    if span.get("type") != "mention":
+                        continue
+                    mention = span.get("mention") or {}
+                    if mention.get("type") == "user":
+                        uid = (mention.get("user") or {}).get("id")
+                        if uid and uid not in user_ids:
+                            user_ids.append(uid)
+            children = block.get("_children")
+            if isinstance(children, list):
+                _walk(children)
+
+    _walk(blocks)
     return user_ids
 
 
-def blocks_to_markdown(blocks: list[dict[str, Any]]) -> str:
-    """Convert a flat list of Notion blocks to a markdown-ish plain-text body.
+# Block types whose content lives entirely in `_children` (no own rich_text
+# worth rendering). Used by `blocks_to_markdown` to suppress placeholder noise.
+_CONTAINER_BLOCK_TYPES: frozenset[str] = frozenset(
+    {"column_list", "column", "synced_block"}
+)
+
+
+def blocks_to_markdown(
+    blocks: list[dict[str, Any]],
+    *,
+    _depth: int = 0,
+) -> str:
+    """Convert Notion blocks (with optional `_children`) to markdown-ish text.
 
     Handles: paragraph, heading_1/2/3, bulleted_list_item, numbered_list_item,
-    to_do, code, quote. Unknown block types emit `[block:<type>]` so the
-    downstream chunker still sees a stable placeholder.
+    to_do, code, quote, toggle, callout, child_page, child_database. Container
+    blocks (column_list / column / synced_block) emit nothing themselves but
+    descend into `_children`. Unknown leaf block types emit `[block:<type>]`
+    so the downstream chunker still sees a stable placeholder.
+
+    `_children` is populated by `_fetch_all_blocks` for any block whose Notion
+    `has_children` flag is true. Without that recursion, content inside a
+    toggle or column was silently dropped — that's the bulk of the "missing
+    docs" the user reported on Notion ingestion.
     """
+    indent = "  " * _depth
     lines: list[str] = []
     numbered_counter = 0
     for block in blocks:
         btype = block.get("type") or ""
         payload = block.get(btype)
         if not isinstance(payload, dict):
-            lines.append(f"[block:{btype or 'unknown'}]")
-            numbered_counter = 0
-            continue
-
-        text = _rich_text_to_plain(payload.get("rich_text"))
-
-        if btype == "paragraph":
-            lines.append(text)
-            numbered_counter = 0
-        elif btype == "heading_1":
-            lines.append(f"# {text}")
-            numbered_counter = 0
-        elif btype == "heading_2":
-            lines.append(f"## {text}")
-            numbered_counter = 0
-        elif btype == "heading_3":
-            lines.append(f"### {text}")
-            numbered_counter = 0
-        elif btype == "bulleted_list_item":
-            lines.append(f"- {text}")
-            numbered_counter = 0
-        elif btype == "numbered_list_item":
-            numbered_counter += 1
-            lines.append(f"{numbered_counter}. {text}")
-        elif btype == "to_do":
-            checked = payload.get("checked", False)
-            box = "[x]" if checked else "[ ]"
-            lines.append(f"- {box} {text}")
-            numbered_counter = 0
-        elif btype == "code":
-            lang = payload.get("language") or ""
-            lines.append(f"```{lang}\n{text}\n```")
-            numbered_counter = 0
-        elif btype == "quote":
-            lines.append(f"> {text}")
+            lines.append(f"{indent}[block:{btype or 'unknown'}]")
             numbered_counter = 0
         else:
-            lines.append(f"[block:{btype}]")
-            numbered_counter = 0
+            text = _rich_text_to_plain(payload.get("rich_text"))
+
+            if btype == "paragraph":
+                lines.append(f"{indent}{text}")
+                numbered_counter = 0
+            elif btype == "heading_1":
+                lines.append(f"{indent}# {text}")
+                numbered_counter = 0
+            elif btype == "heading_2":
+                lines.append(f"{indent}## {text}")
+                numbered_counter = 0
+            elif btype == "heading_3":
+                lines.append(f"{indent}### {text}")
+                numbered_counter = 0
+            elif btype == "bulleted_list_item":
+                lines.append(f"{indent}- {text}")
+                numbered_counter = 0
+            elif btype == "numbered_list_item":
+                numbered_counter += 1
+                lines.append(f"{indent}{numbered_counter}. {text}")
+            elif btype == "to_do":
+                checked = payload.get("checked", False)
+                box = "[x]" if checked else "[ ]"
+                lines.append(f"{indent}- {box} {text}")
+                numbered_counter = 0
+            elif btype == "code":
+                lang = payload.get("language") or ""
+                lines.append(f"{indent}```{lang}\n{indent}{text}\n{indent}```")
+                numbered_counter = 0
+            elif btype == "quote":
+                lines.append(f"{indent}> {text}")
+                numbered_counter = 0
+            elif btype == "toggle":
+                lines.append(f"{indent}> {text}" if text else f"{indent}> ▼")
+                numbered_counter = 0
+            elif btype == "callout":
+                lines.append(f"{indent}> {text}")
+                numbered_counter = 0
+            elif btype == "child_page":
+                title = payload.get("title") or ""
+                lines.append(f"{indent}[child_page: {title}]")
+                numbered_counter = 0
+            elif btype == "child_database":
+                title = payload.get("title") or ""
+                lines.append(f"{indent}[child_database: {title}]")
+                numbered_counter = 0
+            elif btype in _CONTAINER_BLOCK_TYPES:
+                # No own line — children render inline at same depth.
+                numbered_counter = 0
+            else:
+                lines.append(f"{indent}[block:{btype}]")
+                numbered_counter = 0
+
+        children = block.get("_children")
+        if isinstance(children, list) and children:
+            # Containers keep children at the same depth so multi-column /
+            # synced content reads as flat prose; everything else nests.
+            child_depth = _depth if btype in _CONTAINER_BLOCK_TYPES else _depth + 1
+            child_md = blocks_to_markdown(children, _depth=child_depth)
+            if child_md:
+                lines.append(child_md)
 
     return "\n".join(line for line in lines if line is not None)
 
@@ -443,11 +497,38 @@ class NotionConnector(Connector):
         self,
         page_id: str,
         token: IntegrationToken,
+        *,
+        _depth: int = 0,
+        _budget: list[int] | None = None,
     ) -> list[dict[str, Any]]:
+        """Fetch a page's blocks, recursing into nested children.
+
+        Notion's `/blocks/{id}/children` only returns DIRECT children. Anything
+        inside a toggle, column, callout, synced_block, or list item with
+        sub-bullets is hidden behind `has_children=true` and a separate fetch.
+        Skipping that recursion is the main reason the chunker was seeing
+        "some chunks but not everything" — entire collapsed sections vanished.
+
+        `child_page` / `child_database` blocks are deliberately *not* descended
+        into here: they're independent ingestion roots that surface through
+        their own events from `/search` (and database row enumeration during
+        backfill). Recursing would duplicate documents.
+
+        Two safety nets keep a pathological page from DoS'ing the worker:
+          - `_depth` cap (Notion technically permits arbitrary nesting; >25
+            levels in real workspaces is essentially nonexistent).
+          - shared `_budget` block-count cap so a single page can't fan out
+            into millions of nested blocks.
+        """
+        if _budget is None:
+            _budget = [50_000]
+        if _depth > 25:
+            log.warning("notion.fetch_blocks_depth_cap", id=page_id)
+            return []
+
         results: list[dict[str, Any]] = []
         cursor: str | None = None
-        # Cap pages defensively — Phase 0 doesn't page arbitrarily large docs.
-        for _ in range(20):
+        while _budget[0] > 0:
             params: dict[str, Any] = {"page_size": 100}
             if cursor:
                 params["start_cursor"] = cursor
@@ -464,7 +545,27 @@ class NotionConnector(Connector):
                 break
             body = resp.json()
             page = body.get("results") or []
-            results.extend(page)
+            for block in page:
+                _budget[0] -= 1
+                if _budget[0] < 0:
+                    log.warning("notion.fetch_blocks_budget_exhausted", id=page_id)
+                    break
+                btype = block.get("type")
+                if (
+                    block.get("has_children")
+                    and btype not in {"child_page", "child_database"}
+                ):
+                    child_id = block.get("id")
+                    if child_id:
+                        block["_children"] = await self._fetch_all_blocks(
+                            child_id,
+                            token,
+                            _depth=_depth + 1,
+                            _budget=_budget,
+                        )
+                results.append(block)
+            if _budget[0] < 0:
+                break
             if not body.get("has_more"):
                 break
             cursor = body.get("next_cursor")
@@ -785,12 +886,18 @@ class NotionConnector(Connector):
         token,
         cursor: str | None = None,
     ):
-        """Paginated `/search` → synthetic page.updated events.
+        """Paginated `/search` → synthetic page.updated / database.updated events.
 
         Emits events shaped like real Notion webhooks. The normalizer's
         `fetch_supplementary` path will hit Notion again for full block
         content, so we don't need to fully hydrate here — just enqueue
         the entity reference.
+
+        For each database we encounter, we additionally page through
+        `databases/{id}/query` and yield a `page.updated` event per row.
+        Rows in Notion are pages with their own block trees; they're not
+        returned by `/search` unless individually shared with the integration,
+        so without this enumeration every database's contents are invisible.
         """
         from shared.models import WebhookEvent
 
@@ -821,20 +928,20 @@ class NotionConnector(Connector):
                 entity_type = result.get("object")  # "page" | "database"
                 if entity_type not in {"page", "database"}:
                     continue
+                eid = result.get("id") or ""
+                last_edited = result.get("last_edited_time") or ""
                 payload = {
                     "type": f"{entity_type}.updated",
                     "entity": {
                         "type": entity_type,
-                        "id": result.get("id"),
-                        "last_edited_time": result.get("last_edited_time"),
+                        "id": eid,
+                        "last_edited_time": last_edited,
                         "workspace_id": workspace_id,
                     },
                     "data": result,
                     "workspace_id": workspace_id,
                     "_cursor": next_cursor,
                 }
-                eid = result.get("id") or ""
-                last_edited = result.get("last_edited_time") or ""
                 yield WebhookEvent(
                     customer_id=customer_id,
                     source_system=SourceSystem.NOTION,
@@ -844,6 +951,81 @@ class NotionConnector(Connector):
                     raw_payload=payload,
                     headers={},
                 )
+
+                if entity_type == "database" and eid:
+                    async for row in self._iter_database_rows(eid, headers):
+                        row_id = row.get("id") or ""
+                        if not row_id:
+                            continue
+                        row_last_edited = row.get("last_edited_time") or ""
+                        row_payload = {
+                            "type": "page.updated",
+                            "entity": {
+                                "type": "page",
+                                "id": row_id,
+                                "last_edited_time": row_last_edited,
+                                "workspace_id": workspace_id,
+                            },
+                            "data": row,
+                            "workspace_id": workspace_id,
+                            "_parent_database_id": eid,
+                        }
+                        yield WebhookEvent(
+                            customer_id=customer_id,
+                            source_system=SourceSystem.NOTION,
+                            source_event_id=f"page:{row_id}:{row_last_edited}",
+                            received_at=_parse_iso(row_last_edited) or datetime.now(UTC),
+                            payload_s3_key="",
+                            raw_payload=row_payload,
+                            headers={},
+                        )
+
+            if not body.get("has_more"):
+                return
+            next_cursor = body.get("next_cursor")
+            if not next_cursor:
+                return
+
+    async def _iter_database_rows(
+        self,
+        database_id: str,
+        headers: Mapping[str, str],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield every page row in a database, paginating `databases/{id}/query`.
+
+        Read-only POST with no filter/sort body returns all rows the integration
+        can see. Rate-limit / 4xx responses end the iteration cleanly so a single
+        bad database doesn't abort the entire backfill.
+        """
+        next_cursor: str | None = None
+        while True:
+            body_json: dict[str, Any] = {"page_size": 100}
+            if next_cursor:
+                body_json["start_cursor"] = next_cursor
+            try:
+                resp = await self.http.post(
+                    f"{_NOTION_API}/databases/{database_id}/query",
+                    headers=dict(headers),
+                    json=body_json,
+                )
+            except Exception as exc:
+                log.warning(
+                    "notion.query_database_http_error",
+                    error=str(exc),
+                    id=database_id,
+                )
+                return
+            if resp.status_code != 200:
+                log.warning(
+                    "notion.query_database_non_200",
+                    status=resp.status_code,
+                    id=database_id,
+                )
+                return
+            body = resp.json()
+            for row in body.get("results") or []:
+                if row.get("object") == "page":
+                    yield row
             if not body.get("has_more"):
                 return
             next_cursor = body.get("next_cursor")
