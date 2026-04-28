@@ -412,12 +412,14 @@ class ReclaimLoop:
     Runs in-process inside the worker so we don't need separate cron
     infra. Single worker machine ⇒ single reclaim loop ⇒ no race.
 
-    The reclaim UPDATE is fenced: we match `attempts = $expected` so a
-    long-running but still-alive worker (slow embed, OpenAI backoff)
-    cannot be undercut by the reclaim if its heartbeat happens to lapse
-    briefly. The fence isn't airtight under multi-worker scale-out — see
-    the warning in fly.worker.toml — but matches the current single-machine
-    deployment.
+    The reclaim UPDATE is NOT fenced on `attempts` today — a long-running
+    but still-alive worker (slow embed, OpenAI backoff) whose heartbeat
+    lapses briefly will have its row reclaimed and re-claimed by the next
+    poll. This is acceptable under single-machine deployment because the
+    worker discards its in-flight work on the doubly-claimed row; if we
+    scale out, add `AND attempts = $4` to the UPDATE plus an attempts
+    bump on claim to make the fence airtight. See the warning in
+    fly.worker.toml.
     """
 
     def __init__(
