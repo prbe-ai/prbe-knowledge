@@ -762,8 +762,22 @@ class LinearConnector(Connector):
                 return
 
             if resp.status_code != 200:
+                log.warning(
+                    "linear.backfill_non_200",
+                    status=resp.status_code,
+                    body=resp.text[:500],
+                )
                 return
             body = resp.json()
+            if body.get("errors"):
+                # Linear returns 200 with a non-empty `errors` array on
+                # GraphQL validation failures (e.g. unknown field). Without
+                # this branch the loop would silently see no `data.issues`
+                # and the runner would mark the backfill complete with 0
+                # events enqueued — exactly the failure mode that masked
+                # this handler's bad query for two installs.
+                log.warning("linear.backfill_graphql_errors", errors=body["errors"])
+                return
             issues = ((body.get("data") or {}).get("issues") or {})
             for node in issues.get("nodes", []):
                 # Yield the issue itself as an Issue webhook-shaped event.
@@ -833,7 +847,6 @@ query Backfill($first: Int!, $after: String) {
       state { name type }
       priority
       team { id key name }
-      teamId
       creator { id name email }
       assignee { id name email }
       comments(first: 50) {
