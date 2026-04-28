@@ -27,12 +27,13 @@ from services.ingestion.handlers.registry import (
 )
 from shared.config import get_settings
 from shared.constants import QueueStatus, SourceSystem
-from shared.customer_mapping import record_mapping
+from shared.customer_mapping import record_mapping, resolve_customer
 from shared.db import raw_conn
 from shared.exceptions import (
     HandlerNotFound,
     NotSupportedByConnector,
     PrbeError,
+    SourceAlreadyConnectedError,
 )
 from shared.logging import get_logger
 from shared.tokens import save_token
@@ -144,9 +145,12 @@ async def oauth_exchange(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     token = token.model_copy(update={"customer_id": body.customer_id})
-    await save_token(token)
 
-    workspaces: list[dict[str, Any]] = []
+    # Identify workspaces BEFORE persisting the token so we can refuse the
+    # install if any workspace is already connected to a different customer.
+    # `identify_workspaces` only needs the in-memory token; nothing in the DB
+    # yet. If we saved the token first and then discovered a conflict, we'd
+    # leave a half-installed integration_tokens row behind.
     try:
         refs = await connector.identify_workspaces(token)
     except Exception as exc:
@@ -157,14 +161,63 @@ async def oauth_exchange(
             error=str(exc),
         )
         refs = []
+
     for ref in refs:
-        await record_mapping(
-            customer_id=body.customer_id,
-            source_system=source_enum,
-            external_id=ref.external_id,
-            external_name=ref.external_name,
-            metadata=ref.metadata,
-        )
+        existing = await resolve_customer(source_enum, ref.external_id)
+        if existing is not None and existing != body.customer_id:
+            log.warning(
+                "oauth.workspace_already_connected",
+                source=source,
+                external_id=ref.external_id,
+                external_name=ref.external_name,
+                existing_customer=existing,
+                attempted_customer=body.customer_id,
+            )
+            # Friendly message for the dashboard. Intentionally does not
+            # name the existing customer — that would leak tenant identity
+            # to an unrelated user attempting an install.
+            label = ref.external_name or ref.external_id
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"This {source} workspace ({label}) is already connected "
+                    f"to another Probe account. Ask an admin of that account "
+                    f"to disconnect it before connecting it here."
+                ),
+            )
+
+    await save_token(token)
+
+    workspaces: list[dict[str, Any]] = []
+    for ref in refs:
+        try:
+            await record_mapping(
+                customer_id=body.customer_id,
+                source_system=source_enum,
+                external_id=ref.external_id,
+                external_name=ref.external_name,
+                metadata=ref.metadata,
+            )
+        except SourceAlreadyConnectedError as exc:
+            # Defense in depth: should be unreachable because of the
+            # pre-check above. If it fires, a parallel install raced us
+            # between the pre-check and now.
+            log.warning(
+                "oauth.workspace_already_connected_race",
+                source=source,
+                external_id=exc.external_id,
+                external_name=exc.external_name,
+                existing_customer=exc.existing_customer_id,
+                attempted_customer=exc.attempted_customer_id,
+            )
+            label = exc.external_name or exc.external_id
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"This {source} workspace ({label}) was just connected "
+                    f"to another Probe account. Try again or contact support."
+                ),
+            ) from exc
         workspaces.append(
             {
                 "external_id": ref.external_id,

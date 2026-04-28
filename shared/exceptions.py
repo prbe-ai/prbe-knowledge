@@ -122,6 +122,39 @@ class PermanentSourceError(IngestionError):
     """4xx from source that no retry can fix (bad scopes, deleted resource)."""
 
 
+class SourceAlreadyConnectedError(IngestionError):
+    """Tried to connect a (source, external_id) already owned by another customer.
+
+    Raised by `record_mapping` (and the OAuth exchange route) when an install
+    would overwrite an existing customer→workspace mapping with a different
+    customer_id. Holds enough context for the caller to render a useful 409
+    without leaking the existing customer_id externally.
+    """
+
+    def __init__(
+        self,
+        *,
+        source_system: str,
+        external_id: str,
+        existing_customer_id: str,
+        attempted_customer_id: str,
+        external_name: str | None = None,
+    ) -> None:
+        super().__init__(
+            f"{source_system} workspace {external_id!r} is already connected to a different customer",
+            source_system=source_system,
+            external_id=external_id,
+            existing_customer_id=existing_customer_id,
+            attempted_customer_id=attempted_customer_id,
+            external_name=external_name,
+        )
+        self.source_system = source_system
+        self.external_id = external_id
+        self.existing_customer_id = existing_customer_id
+        self.attempted_customer_id = attempted_customer_id
+        self.external_name = external_name
+
+
 # --- Embeddings -------------------------------------------------------------
 
 class EmbeddingError(PrbeError): ...
