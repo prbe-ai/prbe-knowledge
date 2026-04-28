@@ -31,6 +31,41 @@ SERVICE="neon-prbe-knowledge"
 if [ "$BRANCH" = "local" ]; then
     URL="postgresql+psycopg://prbe:prbe@localhost:5432/prbe_knowledge"
     echo "Migrating local docker-compose Postgres..."
+
+    # Local + CI start from an empty DB and don't have Neon Auth provisioned.
+    # schema.sql references neon_auth.organization in customers' FK, and
+    # migration 0001 runs schema.sql verbatim — both fail without a shim.
+    # Provision a minimal stand-in so the FK target exists.
+    PGPASSWORD=prbe psql -h localhost -p 5432 -U prbe -d prbe_knowledge \
+        -v ON_ERROR_STOP=1 <<'SQL'
+        CREATE SCHEMA IF NOT EXISTS neon_auth;
+        CREATE TABLE IF NOT EXISTS neon_auth.organization (
+            id UUID PRIMARY KEY
+        );
+        CREATE TABLE IF NOT EXISTS neon_auth."user" (
+            id              UUID PRIMARY KEY,
+            organization_id UUID REFERENCES neon_auth.organization(id),
+            email           TEXT,
+            name            TEXT
+        );
+SQL
+
+    # On a fresh local DB, prefer applying schema.sql directly (canonical
+    # latest) + stamping head over running the migration chain. Migrations
+    # 0007+ duplicate state schema.sql already creates, which `alembic
+    # upgrade head` chokes on. See .github/workflows/tests.yml for the
+    # same explanation.
+    if ! PGPASSWORD=prbe psql -h localhost -p 5432 -U prbe -d prbe_knowledge \
+            -tAc "SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='alembic_version'" \
+            | grep -q 1; then
+        echo "Fresh local DB detected — applying schema.sql + stamping alembic head."
+        PGPASSWORD=prbe psql -h localhost -p 5432 -U prbe -d prbe_knowledge \
+            -v ON_ERROR_STOP=1 -f db/schema.sql
+        DATABASE_URL_SYNC="$URL" .venv/bin/alembic stamp head
+        echo "Done."
+        exit 0
+    fi
+    # Existing local DB: just run incremental migrations.
 else
     if ! RAW_URL=$(security find-generic-password -a "$BRANCH" -s "$SERVICE" -w 2>/dev/null); then
         echo "No Keychain entry for branch '$BRANCH'." >&2
