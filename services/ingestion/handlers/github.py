@@ -1251,9 +1251,16 @@ def _payload_fp(obj: Any) -> str:
     same payload bytes always hash to the same fingerprint, so true
     webhook retries still collide on the queue's UNIQUE constraint and
     dedupe correctly.
+
+    Strict JSON: we DON'T pass `default=str` because `str(datetime)` is
+    timezone-dependent and would let two equivalent timestamps fingerprint
+    differently. Callers always feed dicts/lists that came from JSON
+    deserialization of a webhook body, so non-JSON types are a bug; let
+    `TypeError` raise loudly rather than silently producing a non-stable
+    hash.
     """
     return hashlib.sha256(
-        json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+        json.dumps(obj, sort_keys=True).encode("utf-8")
     ).hexdigest()[:16]
 
 

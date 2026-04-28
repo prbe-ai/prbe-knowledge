@@ -25,6 +25,32 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Safety check + observability before the inline self-join DELETE.
+    #
+    # The dedupe is an 8-column self-join with no targeted index — fast
+    # at Phase-0 row counts but unbounded under "the bug ran for months
+    # in prod" scenarios. Log the size, and refuse to run inline if it's
+    # large enough that the DELETE + ALTER table-lock would visibly affect
+    # request latency. Operators hitting the abort run a chunked dedupe
+    # offline first, then re-apply.
+    op.execute(
+        """
+        DO $$
+        DECLARE
+            row_count BIGINT;
+        BEGIN
+            SELECT COUNT(*) INTO row_count FROM acl_snapshots;
+            RAISE NOTICE 'acl_snapshots row count before dedupe: %', row_count;
+            IF row_count > 1000000 THEN
+                RAISE EXCEPTION
+                    'acl_snapshots has % rows — refusing to run inline dedupe. '
+                    'Run a chunked DELETE-USING off-migration, then re-apply 0016.',
+                    row_count;
+            END IF;
+        END $$;
+        """
+    )
+
     # Drop any duplicates accumulated before this constraint existed.
     # Keep the lowest snapshot_id for each unique tuple.
     op.execute(
