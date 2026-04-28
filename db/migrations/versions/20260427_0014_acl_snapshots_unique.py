@@ -1,8 +1,8 @@
 """acl_snapshots: idempotency UNIQUE
 
-Revision ID: 0013_acl_snapshots_unique
-Revises: 0012_per_tenant_pk
-Create Date: 2026-04-26
+Revision ID: 0014_acl_snapshots_unique
+Revises: 0013_merge_heads
+Create Date: 2026-04-27
 
 Reclaim retries and webhook redeliveries that hit the normalizer re-run
 _insert_acl_snapshots, which was a naked INSERT loop. Without a UNIQUE
@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0013_acl_snapshots_unique"
-down_revision = "0012_per_tenant_pk"
+revision = "0014_acl_snapshots_unique"
+down_revision = "0013_merge_heads"
 branch_labels = None
 depends_on = None
 
