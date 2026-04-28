@@ -61,7 +61,12 @@ def test_parse_webhook_event_page_updated() -> None:
     result = notion.parse_webhook_event("cust-1", {}, payload)
 
     assert result is not None
-    assert result.source_event_id == "page:page_abc123:edit:2026-04-22T12:00:00.000Z"
+    # Trailing :<16-hex> is a stable payload fingerprint disambiguating rapid
+    # same-second edits (Notion last_edited_time is per-second).
+    assert result.source_event_id.startswith(
+        "page:page_abc123:edit:2026-04-22T12:00:00.000Z:"
+    )
+    assert len(result.source_event_id.rsplit(":", 1)[-1]) == 16
     assert result.event_kind == IngestionEventType.WEBHOOK
     assert result.parse_hint["resource_type"] == "page"
     assert result.parse_hint["resource_id"] == "page_abc123"

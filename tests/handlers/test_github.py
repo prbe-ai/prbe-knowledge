@@ -76,7 +76,12 @@ def test_parse_pull_request_opened() -> None:
         "cust-1", {"X-GitHub-Event": "pull_request"}, payload
     )
     assert result is not None
-    assert result.source_event_id == "pr:prbe/payments:42:opened:2026-04-22T10:00:00Z"
+    # Trailing :<16-hex> is a stable payload-fingerprint suffix that disambiguates
+    # rapid same-second updates (GitHub timestamps are per-second).
+    assert result.source_event_id.startswith(
+        "pr:prbe/payments:42:opened:2026-04-22T10:00:00Z:"
+    )
+    assert len(result.source_event_id.rsplit(":", 1)[-1]) == 16
     assert result.parse_hint["repo"] == "prbe/payments"
     assert result.parse_hint["number"] == 42
 
@@ -88,7 +93,10 @@ def test_parse_issue_opened() -> None:
         "cust-1", {"X-GitHub-Event": "issues"}, payload
     )
     assert result is not None
-    assert result.source_event_id == "issue:prbe/payments:17:opened:2026-04-22T09:00:00Z"
+    assert result.source_event_id.startswith(
+        "issue:prbe/payments:17:opened:2026-04-22T09:00:00Z:"
+    )
+    assert len(result.source_event_id.rsplit(":", 1)[-1]) == 16
     assert result.parse_hint["number"] == 17
 
 

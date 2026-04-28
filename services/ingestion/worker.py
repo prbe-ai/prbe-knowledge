@@ -18,6 +18,7 @@ from services.ingestion.normalizer import Normalizer
 from shared.constants import (
     GRANOLA_REFRESH_CHANNEL,
     QUEUE_HEARTBEAT_INTERVAL_SECONDS,
+    QUEUE_RECLAIM_THRESHOLD_SECONDS,
     IngestionEventStatus,
     QueueStatus,
     SourceSystem,
@@ -122,8 +123,13 @@ class Worker:
             transient = getattr(exc, "transient", False)
             await self._on_error(queue_id, attempts, str(exc), transient=transient)
         except Exception as exc:  # pragma: no cover — last-resort
+            # Unknown error: assume transient so we don't burn data on a single
+            # network blip / OOM / unwrapped httpx error / asyncpg connection
+            # drop. Deterministic bugs still DLQ after worker_max_attempts.
+            # Anything that should permanently DLQ on first try must raise a
+            # PrbeError subclass with `transient = False`.
             log.exception("worker.unhandled", queue_id=queue_id)
-            await self._on_error(queue_id, attempts, repr(exc), transient=False)
+            await self._on_error(queue_id, attempts, repr(exc), transient=True)
         finally:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -185,7 +191,7 @@ class Worker:
         payload_s3_key: str,
         reason: str,
     ) -> None:
-        async with get_pool().acquire() as conn:
+        async with get_pool().acquire() as conn, conn.transaction():
             await conn.execute(
                 """
                 UPDATE ingestion_queue
@@ -393,6 +399,91 @@ class GranolaNotifyListener:
         self._shutdown.set()
 
 
+class ReclaimLoop:
+    """Periodically resets stuck `processing` rows back to `pending`.
+
+    A worker that crashes mid-`_process` (OOM, SIGKILL, host migration,
+    deploy mid-row) leaves its claimed row at status='processing' with a
+    stale heartbeat. Without reclaim that row is wedged forever, and
+    because ingestion_queue's UNIQUE (customer_id, source_system,
+    source_event_id) blocks redeliveries from the source platform's
+    retry, the event is permanently lost.
+
+    Runs in-process inside the worker so we don't need separate cron
+    infra. Single worker machine ⇒ single reclaim loop ⇒ no race.
+
+    The reclaim UPDATE is fenced: we match `attempts = $expected` so a
+    long-running but still-alive worker (slow embed, OpenAI backoff)
+    cannot be undercut by the reclaim if its heartbeat happens to lapse
+    briefly. The fence isn't airtight under multi-worker scale-out — see
+    the warning in fly.worker.toml — but matches the current single-machine
+    deployment.
+    """
+
+    def __init__(
+        self,
+        threshold_seconds: int = QUEUE_RECLAIM_THRESHOLD_SECONDS,
+        interval_seconds: float = 120.0,
+    ) -> None:
+        self._threshold = threshold_seconds
+        self._interval = interval_seconds
+        self._shutdown = asyncio.Event()
+
+    async def run(self) -> None:
+        log.info(
+            "reclaim_loop.start",
+            threshold_seconds=self._threshold,
+            interval_seconds=self._interval,
+        )
+        # Brief initial delay so the loop doesn't fire mid-boot before the
+        # ingestion worker has had a chance to claim its first row.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._shutdown.wait(), timeout=self._interval)
+        while not self._shutdown.is_set():
+            try:
+                n = await self._reclaim_once()
+                if n:
+                    log.warning("reclaim_loop.reclaimed", count=n)
+            except Exception:  # pragma: no cover — keep loop alive
+                log.exception("reclaim_loop.tick_failed")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._shutdown.wait(), timeout=self._interval
+                )
+        log.info("reclaim_loop.stop")
+
+    async def _reclaim_once(self) -> int:
+        async with get_pool().acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE ingestion_queue
+                SET status = $1,
+                    heartbeat_at = NULL,
+                    started_at = NULL,
+                    error = COALESCE(error, '') || ' | reclaimed: heartbeat stale'
+                WHERE status = $2
+                  AND heartbeat_at IS NOT NULL
+                  AND heartbeat_at < NOW() - make_interval(secs => $3)
+                RETURNING queue_id, customer_id, source_system, attempts
+                """,
+                QueueStatus.PENDING.value,
+                QueueStatus.PROCESSING.value,
+                self._threshold,
+            )
+        for r in rows:
+            log.warning(
+                "queue.reclaimed",
+                queue_id=r["queue_id"],
+                customer=r["customer_id"],
+                source=r["source_system"],
+                attempts=r["attempts"],
+            )
+        return len(rows)
+
+    def shutdown(self) -> None:
+        self._shutdown.set()
+
+
 def _build_health_app():
     """FastAPI app exposing `/health` so Fly can probe liveness.
 
@@ -447,6 +538,7 @@ async def run_worker_forever() -> None:
     ingestion_worker = Worker(ctx, max_attempts=settings.worker_max_attempts)
     backfill_worker = BackfillWorker(ctx, wake_event=wake_event)
     granola_listener = GranolaNotifyListener(settings.database_url, wake_event)
+    reclaim_loop = ReclaimLoop()
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
     health_config = uvicorn.Config(
@@ -470,6 +562,7 @@ async def run_worker_forever() -> None:
             ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
             backfill_worker.run(),
             granola_listener.run(),
+            reclaim_loop.run(),
             health_server.serve(),
         )
     finally:

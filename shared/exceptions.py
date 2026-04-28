@@ -137,6 +137,15 @@ class EmbeddingRateLimited(EmbeddingError):
     transient = True
 
 
+class EmbeddingProviderUnavailable(EmbeddingError):
+    """OpenAI 5xx / connection errors. Distinct from EmbeddingBatchRejected
+    (which is per-batch input-shaped) so the worker retries the whole queue
+    row instead of silently routing chunks to failed_chunks during an outage.
+    """
+
+    transient = True
+
+
 # --- Retrieval --------------------------------------------------------------
 
 class RetrievalError(PrbeError): ...
@@ -200,6 +209,7 @@ __all__ = [
     "EmbeddingBatchRejected",
     "EmbeddingContextLengthExceeded",
     "EmbeddingError",
+    "EmbeddingProviderUnavailable",
     "EmbeddingRateLimited",
     "GitHubAuthError",
     "GraphError",

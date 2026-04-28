@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -181,7 +182,14 @@ class GitHubConnector(Connector):
         if number is None or not updated_at:
             raise InvalidWebhookPayload("pull_request missing number/updated_at")
 
-        source_event_id = f"pr:{full_name}:{number}:{action}:{updated_at}"
+        # GitHub's `updated_at` is per-second; two distinct rapid actions
+        # (bot synchronize + bot synchronize, label add + label add) within
+        # the same second collide on UNIQUE and the second is silently
+        # dropped. Append a payload fingerprint to disambiguate while
+        # staying stable across true webhook retries.
+        source_event_id = (
+            f"pr:{full_name}:{number}:{action}:{updated_at}:{_payload_fp(pr)}"
+        )
         return WebhookParseResult(
             source_event_id=source_event_id,
             received_at=_parse_iso8601(updated_at),
@@ -210,7 +218,9 @@ class GitHubConnector(Connector):
         if number is None or not updated_at:
             raise InvalidWebhookPayload("issue missing number/updated_at")
 
-        source_event_id = f"issue:{full_name}:{number}:{action}:{updated_at}"
+        source_event_id = (
+            f"issue:{full_name}:{number}:{action}:{updated_at}:{_payload_fp(issue)}"
+        )
         return WebhookParseResult(
             source_event_id=source_event_id,
             received_at=_parse_iso8601(updated_at),
@@ -238,7 +248,11 @@ class GitHubConnector(Connector):
         timestamp = head.get("timestamp") or datetime.now(UTC).isoformat()
         touches_codeowners = _push_touches_codeowners(raw_payload)
 
-        source_event_id = f"push:{full_name}:{head_id}"
+        # Force-push that resets back to a previous head_id would otherwise
+        # collide with the original push event. Include the timestamp +
+        # commits-array fingerprint so the revert lands as a distinct row.
+        commits_fp = _payload_fp(raw_payload.get("commits") or [])
+        source_event_id = f"push:{full_name}:{head_id}:{timestamp}:{commits_fp}"
         return WebhookParseResult(
             source_event_id=source_event_id,
             received_at=_parse_iso8601(timestamp),
@@ -654,7 +668,9 @@ class GitHubConnector(Connector):
                         "pull_request": row,
                         "_cursor": _json.dumps(state),
                     }
-                    source_event_id = f"pr:{full_name}:{number}:opened:{updated_at}"
+                    source_event_id = (
+                        f"pr:{full_name}:{number}:opened:{updated_at}:{_payload_fp(row)}"
+                    )
                     yield WebhookEvent(
                         customer_id=customer_id,
                         source_system=SourceSystem.GITHUB,
@@ -1225,6 +1241,20 @@ def _parse_iso8601(value: Any) -> datetime:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _payload_fp(obj: Any) -> str:
+    """Stable 16-char fingerprint of a JSON-serialisable webhook subobject.
+
+    Used to disambiguate two distinct logical events that share an
+    `updated_at` second (GitHub timestamps are second-resolution). The
+    same payload bytes always hash to the same fingerprint, so true
+    webhook retries still collide on the queue's UNIQUE constraint and
+    dedupe correctly.
+    """
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
 
 
 def _derive_title(text: str) -> str | None:

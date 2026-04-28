@@ -15,7 +15,7 @@ from shared.constants import CHUNKER_VERSION
 
 DEFAULT_CHUNK_TOKENS = 512
 DEFAULT_CHUNK_OVERLAP = 64
-MAX_INPUT_TOKENS = 8192  # OpenAI embedding-3-large hard ceiling
+MAX_INPUT_TOKENS = 8191  # OpenAI embedding-3-large hard ceiling (8192 is exclusive)
 
 
 @dataclass(slots=True)

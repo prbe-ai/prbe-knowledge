@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
@@ -321,8 +322,15 @@ class NotionConnector(Connector):
         is_delete = event_type in _DELETE_EVENT_TYPES
         # Deletes get their own source_event_id suffix so a create/update/delete
         # sequence on the same resource doesn't collide on the UNIQUE constraint.
+        # last_edited_time is per-second, so rapid block edits would collapse;
+        # add a payload fingerprint to disambiguate while keeping retries idempotent.
         tail = "delete" if is_delete else "edit"
-        source_event_id = f"{entity_type}:{entity_id}:{tail}:{last_edited_time}"
+        payload_fp = hashlib.sha256(
+            json.dumps(data, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+        source_event_id = (
+            f"{entity_type}:{entity_id}:{tail}:{last_edited_time}:{payload_fp}"
+        )
         received_at = _parse_iso8601(raw_payload.get("timestamp") or last_edited_time)
 
         return WebhookParseResult(

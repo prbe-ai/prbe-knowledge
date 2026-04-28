@@ -15,13 +15,21 @@ import hashlib
 import math
 from dataclasses import dataclass
 
-from openai import APIError, APITimeoutError, AsyncOpenAI, RateLimitError
+from openai import (
+    APIConnectionError,
+    APIError,
+    APIStatusError,
+    APITimeoutError,
+    AsyncOpenAI,
+    RateLimitError,
+)
 
 from shared.config import Settings, get_settings
 from shared.constants import EMBEDDING_DIM, EMBEDDING_MODEL
 from shared.exceptions import (
     EmbeddingBatchRejected,
     EmbeddingContextLengthExceeded,
+    EmbeddingProviderUnavailable,
     EmbeddingRateLimited,
 )
 from shared.logging import get_logger
@@ -155,13 +163,33 @@ class Embedder:
                     raise EmbeddingRateLimited(str(exc)) from exc
                 await asyncio.sleep(min(2**attempt, 30))
             except APITimeoutError as exc:
+                # Treat as provider-unavailable: timeouts are network/load-shaped,
+                # not input-shaped. Retrying the queue row at the worker layer is
+                # the right recovery, not silently sending chunks to failed_chunks.
                 if attempt >= 3:
-                    raise EmbeddingBatchRejected(f"timeout: {exc}") from exc
+                    raise EmbeddingProviderUnavailable(f"timeout: {exc}") from exc
+                await asyncio.sleep(1 * attempt)
+            except APIConnectionError as exc:
+                if attempt >= 3:
+                    raise EmbeddingProviderUnavailable(
+                        f"connection error: {exc}"
+                    ) from exc
                 await asyncio.sleep(1 * attempt)
             except APIError as exc:
                 msg = str(exc).lower()
                 if "maximum context length" in msg or ("token" in msg and "exceed" in msg):
                     raise EmbeddingContextLengthExceeded(str(exc)) from exc
+                # OpenAI 5xx => provider down; surface as transient so the worker
+                # retries the whole queue row rather than burying chunks in
+                # failed_chunks (which has no retry path today).
+                status = getattr(exc, "status_code", None)
+                if isinstance(exc, APIStatusError) and isinstance(status, int) and status >= 500:
+                    if attempt >= 2:
+                        raise EmbeddingProviderUnavailable(
+                            f"openai {status}: {exc}"
+                        ) from exc
+                    await asyncio.sleep(1 * attempt)
+                    continue
                 if attempt >= 2:
                     raise EmbeddingBatchRejected(str(exc)) from exc
                 await asyncio.sleep(1)
