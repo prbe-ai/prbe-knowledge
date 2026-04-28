@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import time
 
-from fastapi import HTTPException
-
 from services.retrieval.acl import filter_by_acl
 from services.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
 from services.retrieval.router import RouterOutput
@@ -63,6 +61,7 @@ def _author_ids_from_entities(routed: RouterOutput) -> list[str] | None:
 
 async def run_list(
     req: QueryRequest,
+    customer_id: str,
     routed: RouterOutput,
     spec: TemporalSpec,
     temporal_meta: dict[str, object],
@@ -72,9 +71,6 @@ async def run_list(
     trace_id: str,
     timing: dict[str, float],
 ) -> QueryResponse:
-    if req.customer_id is None:  # pragma: no cover — guaranteed by caller
-        raise HTTPException(status_code=500, detail="customer_id missing")
-
     sources = [s.value for s in req.sources] if req.sources else None
     author_ids = _author_ids_from_entities(routed)
     operation = (routed.operation or "list").lower()
@@ -89,7 +85,7 @@ async def run_list(
 
     if operation == "count":
         n = await sql_count(
-            req.customer_id,
+            customer_id,
             sources=sources,
             doc_types=doc_types,
             author_ids=author_ids,
@@ -103,7 +99,7 @@ async def run_list(
         if key not in ("source_system", "doc_type", "author_id"):
             key = "source_system"
         groups = await sql_group_by(
-            req.customer_id,
+            customer_id,
             key=key,  # type: ignore[arg-type]
             top_k=req.top_k,
             sources=sources,
@@ -117,7 +113,7 @@ async def run_list(
     else:  # operation == "list"
         sort_field, sort_dir = _pick_sort(routed)
         hits = await sql_list(
-            req.customer_id,
+            customer_id,
             top_k=req.top_k,
             sources=sources,
             doc_types=doc_types,
@@ -128,7 +124,7 @@ async def run_list(
         )
         # ACL still runs for shape consistency (no-op until ENFORCE_ACL flips).
         t_acl = time.perf_counter()
-        hits = await filter_by_acl(req.customer_id, req.requesting_user_id, hits)
+        hits = await filter_by_acl(customer_id, req.requesting_user_id, hits)
         timing["acl_ms"] = (time.perf_counter() - t_acl) * 1000
 
         total_candidates = len(hits)

@@ -1,11 +1,12 @@
-"""Bearer auth on POST /retrieve (retrieval service).
+"""Auth on POST /retrieve (retrieval service).
 
 Covers:
-  - 401 when Authorization header is missing in non-local env
-  - Local bypass: no header + body customer_id → 200
+  - 401 when no auth headers are present (in any environment)
   - Valid Bearer → 200 with customer_id derived from customers row
   - Invalid Bearer → 401
-  - Header tenant ≠ body tenant → 400
+  - X-Internal-Knowledge-Key + X-Prbe-Customer → 200 (service-to-service path,
+    works in local dev too)
+  - Body `customer_id` field is silently ignored — schema no longer accepts it
 """
 
 from __future__ import annotations
@@ -22,6 +23,10 @@ from shared.db import close_pool, init_pool, raw_conn
 from shared.embeddings import reset_embedder
 from shared.storage import reset_store
 
+# Test internal-knowledge key. Set via monkeypatch so each test gets a clean
+# settings instance (the autouse fixture clears the lru_cache).
+INTERNAL_KEY = "test-internal-knowledge-key"
+
 
 @pytest.fixture(autouse=True)
 def _patch_settings(monkeypatch, settings: Settings) -> None:
@@ -29,6 +34,7 @@ def _patch_settings(monkeypatch, settings: Settings) -> None:
         "TOKEN_ENCRYPTION_KEY", settings.token_encryption_key.get_secret_value()
     )
     monkeypatch.setenv("ENVIRONMENT", "local")
+    monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", INTERNAL_KEY)
     reset_embedder()
     reset_store()
     get_settings.cache_clear()  # type: ignore[attr-defined]
@@ -74,7 +80,7 @@ async def _post_query(
 
 
 @pytest.mark.asyncio
-async def test_query_requires_bearer_in_non_local(live_db, settings, monkeypatch) -> None:
+async def test_query_requires_auth_in_non_local(live_db, settings, monkeypatch) -> None:
     monkeypatch.setenv("ENVIRONMENT", "dev")
     get_settings.cache_clear()  # type: ignore[attr-defined]
     try:
@@ -83,6 +89,15 @@ async def test_query_requires_bearer_in_non_local(live_db, settings, monkeypatch
         assert resp.headers.get("www-authenticate", "").lower() == "bearer"
     finally:
         await init_pool(settings)
+
+
+@pytest.mark.asyncio
+async def test_query_requires_auth_in_local(live_db, settings) -> None:
+    """No body-fallback in local: missing headers → 401, same as prod."""
+    resp = await _post_query(body={"query": "hi", "top_k": 1})
+    await init_pool(settings)
+    assert resp.status_code == 401, resp.text
+    assert resp.headers.get("www-authenticate", "").lower() == "bearer"
 
 
 @pytest.mark.asyncio
@@ -109,22 +124,36 @@ async def test_query_rejects_invalid_bearer(live_db, settings) -> None:
 
 
 @pytest.mark.asyncio
-async def test_query_rejects_mismatched_body_customer_id(live_db, settings) -> None:
-    api_key_a = await _seed_customer("tenant-a")
-    await _seed_customer("tenant-b")
+async def test_query_accepts_internal_key_with_customer_header(live_db, settings) -> None:
+    """Service-to-service path: shared internal key + X-Prbe-Customer header.
+
+    Used by prbe-orchestrator and prbe-knowledge-mcp; also the way local-dev
+    callers authenticate now that the body bypass is gone.
+    """
+    await _seed_customer("cust-internal-ok")
     resp = await _post_query(
-        headers={"Authorization": f"Bearer {api_key_a}"},
-        body={"query": "hi", "customer_id": "tenant-b", "top_k": 1},
+        headers={
+            "X-Internal-Knowledge-Key": INTERNAL_KEY,
+            "X-Prbe-Customer": "cust-internal-ok",
+        },
+        body={"query": "hello world", "top_k": 1},
     )
     await init_pool(settings)
-    assert resp.status_code == 400, resp.text
+    assert resp.status_code == 200, resp.text
 
 
 @pytest.mark.asyncio
-async def test_query_local_bypass_works(live_db, settings) -> None:
-    await _seed_customer("cust-local-bypass")
+async def test_query_body_customer_id_is_silently_ignored(live_db, settings) -> None:
+    """`customer_id` is no longer part of the request schema. Pydantic's
+    default `extra=ignore` means callers passing it as a vestigial field
+    aren't rejected — but the value has no effect. Tenant comes from auth."""
+    api_key = await _seed_customer("cust-real-tenant")
+    await _seed_customer("cust-other-tenant")
     resp = await _post_query(
-        body={"query": "hi", "customer_id": "cust-local-bypass", "top_k": 1}
+        headers={"Authorization": f"Bearer {api_key}"},
+        # customer_id in the body would have routed to the wrong tenant under
+        # the old code path. Under the new code it's dropped on parse.
+        body={"query": "hi", "customer_id": "cust-other-tenant", "top_k": 1},
     )
     await init_pool(settings)
     assert resp.status_code == 200, resp.text

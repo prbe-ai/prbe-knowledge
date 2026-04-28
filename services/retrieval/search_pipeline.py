@@ -27,8 +27,6 @@ import asyncio
 import time
 from datetime import UTC, datetime
 
-from fastapi import HTTPException
-
 from services.retrieval.acl import filter_by_acl
 from services.retrieval.dedup import dedupe
 from services.retrieval.fusion import fuse
@@ -60,6 +58,7 @@ _SORT_INTENT_MIN_HALF_LIFE_DAYS = 7.0
 
 async def run_search(
     req: QueryRequest,
+    customer_id: str,
     routed: RouterOutput,
     spec: TemporalSpec,
     temporal_meta: dict[str, object],
@@ -71,9 +70,6 @@ async def run_search(
 ) -> QueryResponse:
     """Run the existing semantic pipeline. Caller has already authenticated,
     resolved customer_id, and called the router."""
-    if req.customer_id is None:  # pragma: no cover — guaranteed by caller
-        raise HTTPException(status_code=500, detail="customer_id missing")
-
     sources = [s.value for s in req.sources] if req.sources else None
     pool_multiplier = 2  # No widening even when sort intent fires; recency
     # boost handles "give me recent X about Y" without needing to widen.
@@ -86,7 +82,7 @@ async def run_search(
 
     async def _vec_runner() -> list:
         return await vector_search(
-            req.customer_id,
+            customer_id,
             req.query,
             top_k=req.top_k * pool_multiplier,
             sources=sources,
@@ -98,7 +94,7 @@ async def run_search(
         hits_by_chunk: dict = {}
         for q in queries:
             for hit in await bm25_search(
-                req.customer_id,
+                customer_id,
                 q,
                 top_k=req.top_k * pool_multiplier,
                 sources=sources,
@@ -114,7 +110,7 @@ async def run_search(
         if not routed.entities:
             return []
         return await graph_search(
-            req.customer_id,
+            customer_id,
             [(e.entity_type, e.canonical_id) for e in routed.entities],
             doc_types=retriever_doc_types,
             temporal=spec,
@@ -158,12 +154,12 @@ async def run_search(
         applied_entity_filter["candidates_after"] = len(fused)
 
     t_dedup = time.perf_counter()
-    embeddings = await embeddings_for_chunks(req.customer_id, [h.chunk_id for h in fused])
+    embeddings = await embeddings_for_chunks(customer_id, [h.chunk_id for h in fused])
     deduped = dedupe(fused, embeddings)
     timing["dedup_ms"] = (time.perf_counter() - t_dedup) * 1000
 
     t_acl = time.perf_counter()
-    filtered = await filter_by_acl(req.customer_id, req.requesting_user_id, deduped)
+    filtered = await filter_by_acl(customer_id, req.requesting_user_id, deduped)
     timing["acl_ms"] = (time.perf_counter() - t_acl) * 1000
 
     top = filtered[: req.top_k]

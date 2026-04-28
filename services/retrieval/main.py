@@ -23,11 +23,7 @@ from datetime import UTC, datetime
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from services.retrieval.auth import (
-    AuthResult,
-    authenticate_query,
-    resolve_customer_id_strict,
-)
+from services.retrieval.auth import authenticate_query
 from services.retrieval.pipeline import run_retrieval
 from services.retrieval.synthesis import (
     SynthesisChunk,
@@ -106,7 +102,7 @@ def _log_query_handled(
 @app.post("/retrieve", response_model=QueryResponse)
 async def retrieve(
     req: QueryRequest,
-    auth: AuthResult = Depends(authenticate_query),
+    customer_id: str = Depends(authenticate_query),
 ) -> QueryResponse:
     """Raw-chunks retrieval. Branches on Haiku-emitted mode:
     list → SQL window/aggregate; search → vector + BM25 + graph fusion.
@@ -116,7 +112,7 @@ async def retrieve(
     human-readable answers go to /query.
     """
     t_total = time.perf_counter()
-    resp = await run_retrieval(req, auth)
+    resp = await run_retrieval(req, customer_id)
     total_ms = (time.perf_counter() - t_total) * 1000
     _log_query_handled(
         endpoint="/retrieve",
@@ -131,7 +127,7 @@ async def retrieve(
 @app.post("/query", response_model=AnswerResponse)
 async def query(
     req: AnswerRequest,
-    auth: AuthResult = Depends(authenticate_query),
+    customer_id: str = Depends(authenticate_query),
 ) -> AnswerResponse:
     """Retrieve + synthesize. Calls retrieval internally, then runs an LLM
     over the resulting chunks to produce a cited answer.
@@ -142,7 +138,7 @@ async def query(
     """
     t_total = time.perf_counter()
     base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
-    rresp = await run_retrieval(base_req, auth)
+    rresp = await run_retrieval(base_req, customer_id)
 
     model = req.model or DEFAULT_SYNTHESIS_MODEL
     syn_chunks = [
@@ -199,7 +195,7 @@ async def query(
 @app.get("/sources/{doc_id:path}", response_model=SourceResponse)
 async def get_source(
     doc_id: str,
-    auth: AuthResult = Depends(authenticate_query),
+    customer_id: str = Depends(authenticate_query),
     version: int | None = Query(
         default=None,
         description="Specific document version. Defaults to the live version.",
@@ -211,8 +207,6 @@ async def get_source(
     (e.g. `slack:T123:C456:1234567890.123456` or `github:owner/repo:pr:42`).
     Path uses `:path` so colons aren't URL-decoded out from under us.
     """
-    customer_id = resolve_customer_id_strict(auth)
-
     async with with_tenant(customer_id) as conn:
         if version is not None:
             doc = await conn.fetchrow(
@@ -294,7 +288,6 @@ async def get_source(
 
 
 __all__ = [
-    "AuthResult",
     "app",
     "authenticate_query",
 ]

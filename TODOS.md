@@ -23,16 +23,6 @@ the synthetic path. ~5 lines.
 
 ## P1 — fix before onboarding a second tenant
 
-### `/query` is unauthenticated
-**Where:** `services/retrieval/main.py`
-
-Client sends `customer_id` in the request body, no validation. A curl with
-`customer_id: any-tenant` reads that tenant's data. Fine for solo dogfood, fatal
-with real customers.
-
-**Fix:** Bearer API key auth. Hash, look up `customers.api_key_hash`, derive
-`customer_id` from the row. Remove `customer_id` from `QueryRequest`. ~30 lines.
-
 ### `_upsert_document` check-then-act race
 **Where:** `services/ingestion/normalizer.py:216-264`
 

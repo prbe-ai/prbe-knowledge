@@ -20,7 +20,6 @@ from datetime import UTC, datetime
 
 from fastapi import HTTPException
 
-from services.retrieval.auth import AuthResult, resolve_customer_id_for_body
 from services.retrieval.doc_type_resolver import resolve_doc_type_token
 from services.retrieval.list_pipeline import run_list
 from services.retrieval.router import (
@@ -61,11 +60,9 @@ def _gate_verify_list(routed: RouterOutput, spec: TemporalSpec) -> bool:
     return not any(e.entity_type in TOPIC_ENTITY_TYPES for e in routed.entities)
 
 
-async def run_retrieval(req: QueryRequest, auth: AuthResult) -> QueryResponse:
+async def run_retrieval(req: QueryRequest, customer_id: str) -> QueryResponse:
     """Run the full retrieval pipeline. The single entry point for the
     /retrieve endpoint and (via /query) the synthesis layer."""
-    customer_id = resolve_customer_id_for_body(auth, req.customer_id)
-    req = req.model_copy(update={"customer_id": customer_id})
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="empty query")
 
@@ -157,6 +154,7 @@ async def run_retrieval(req: QueryRequest, auth: AuthResult) -> QueryResponse:
         )
         return await run_list(
             req=req,
+            customer_id=customer_id,
             routed=routed,
             spec=spec,
             temporal_meta=temporal_meta,
@@ -179,6 +177,7 @@ async def run_retrieval(req: QueryRequest, auth: AuthResult) -> QueryResponse:
     )
     return await run_search(
         req=req,
+        customer_id=customer_id,
         routed=routed,
         spec=spec,
         temporal_meta=temporal_meta,

@@ -203,9 +203,6 @@ class TemporalSpec(BaseModel):
 
 class QueryRequest(BaseModel):
     query: str
-    # Optional — /query derives customer_id from the Bearer token. Only the
-    # local-dev bypass and smoke tests pass customer_id in the body.
-    customer_id: str | None = None
     top_k: int = 20
     sources: list[SourceSystem] | None = None
     doc_types: list[str] | None = Field(
