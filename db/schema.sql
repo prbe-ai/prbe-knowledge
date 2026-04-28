@@ -378,6 +378,12 @@ CREATE TABLE graph_nodes (
 
 CREATE INDEX idx_graph_nodes_customer_label ON graph_nodes (customer_id, label);
 CREATE INDEX idx_graph_nodes_props ON graph_nodes USING GIN (properties jsonb_path_ops);
+-- Functional indexes for the list pipeline's loose-match entity filter.
+-- Equality arms (= canonical_id, = properties->>'name') hit these; the
+-- suffix-LIKE arm accepts seq-scan-of-subset (graph_nodes filtered by
+-- (customer_id, label) is small).
+CREATE INDEX idx_graph_nodes_lower_canonical ON graph_nodes (customer_id, label, LOWER(canonical_id));
+CREATE INDEX idx_graph_nodes_lower_props_name ON graph_nodes (customer_id, label, LOWER(properties ->> 'name'));
 
 CREATE TABLE graph_edges (
     edge_id       BIGSERIAL PRIMARY KEY,

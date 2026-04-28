@@ -59,6 +59,61 @@ def _author_ids_from_entities(routed: RouterOutput) -> list[str] | None:
     return ids or None
 
 
+# Narrowing-entity types that map to a graph_nodes label. `person` is
+# excluded — it has its own direct documents.author_id filter, no need
+# to round-trip through graph. `feature`/`decision`/`error_group` are
+# TOPIC entities and never reach the list path (gated out upstream).
+# `file_path` is intentionally omitted — file paths don't have a clean
+# graph_node representation, deferred to a follow-up.
+_NARROWING_TO_LABEL: dict[str, str] = {
+    "service": "Service",
+    "repo": "Repo",
+    "ticket": "Ticket",
+    "pr": "PR",
+    "channel": "Channel",
+}
+
+
+def _graph_entity_filters_from_routed(
+    routed: RouterOutput, min_confidence: float = 0.7
+) -> list:
+    """Build GraphEntityFilters from narrowing entities in the router's
+    output. Each entity becomes one filter (label, [canonical_id,
+    display_name]). The SQL helper applies loose case-insensitive matching
+    across canonical_id and properties->>'name' so both bare and full
+    forms match the same graph node.
+
+    Returns an empty list when there are no qualifying entities — caller
+    treats it as "no entity filter" (existing behavior preserved).
+    """
+    from services.retrieval.retrievers.sql import GraphEntityFilter
+
+    filters: list[GraphEntityFilter] = []
+    for e in routed.entities:
+        label = _NARROWING_TO_LABEL.get(e.entity_type)
+        if label is None:
+            continue
+        if e.confidence < min_confidence:
+            continue
+        # Both forms — canonical_id might be the full owner/repo while
+        # display_name is the bare name (or vice versa). Loose match in
+        # SQL handles whichever form lives in graph_nodes.
+        values = [v for v in (e.canonical_id, e.display_name) if v]
+        if not values:
+            continue
+        # Dedupe (case-insensitive) — both fields often hold the same
+        # string for non-repo entities.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for v in values:
+            key = v.lower()
+            if key not in seen:
+                seen.add(key)
+                deduped.append(v)
+        filters.append(GraphEntityFilter(label=label, values=deduped))
+    return filters
+
+
 async def run_list(
     req: QueryRequest,
     customer_id: str,
@@ -73,6 +128,7 @@ async def run_list(
 ) -> QueryResponse:
     sources = [s.value for s in req.sources] if req.sources else None
     author_ids = _author_ids_from_entities(routed)
+    graph_entity_filters = _graph_entity_filters_from_routed(routed)
     operation = (routed.operation or "list").lower()
     if operation not in ("list", "count", "group_by"):
         operation = "list"
@@ -89,6 +145,7 @@ async def run_list(
             sources=sources,
             doc_types=doc_types,
             author_ids=author_ids,
+            graph_entity_filters=graph_entity_filters or None,
             temporal=spec,
         )
         aggregation = {"count": n}
@@ -105,6 +162,7 @@ async def run_list(
             sources=sources,
             doc_types=doc_types,
             author_ids=author_ids,
+            graph_entity_filters=graph_entity_filters or None,
             temporal=spec,
         )
         aggregation = {"key": key, "groups": groups}
@@ -118,6 +176,7 @@ async def run_list(
             sources=sources,
             doc_types=doc_types,
             author_ids=author_ids,
+            graph_entity_filters=graph_entity_filters or None,
             sort_field=sort_field,  # type: ignore[arg-type]
             sort_direction=sort_dir,  # type: ignore[arg-type]
             temporal=spec,

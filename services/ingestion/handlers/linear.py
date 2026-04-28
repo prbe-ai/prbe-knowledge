@@ -360,7 +360,18 @@ class LinearConnector(Connector):
                 )
             )
 
-        edges: list[GraphEdgeSpec] = []
+        edges: list[GraphEdgeSpec] = [
+            # Document → Ticket so list-pipeline entity filter
+            # ("last ticket in PROJ-X") can find the doc.
+            GraphEdgeSpec(
+                edge_type=EdgeType.LINKED_FROM,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.TICKET,
+                to_canonical_id=issue_id,
+                valid_from=created,
+            ),
+        ]
         if author_id:
             edges.append(
                 GraphEdgeSpec(
@@ -544,6 +555,20 @@ class LinearConnector(Connector):
             )
 
         edges: list[GraphEdgeSpec] = []
+        if issue_id:
+            # Document → Ticket so a comment doc surfaces under "tickets in PROJ-X"
+            # filtering (the comment lives on a ticket; the entity filter walks
+            # to the parent ticket via this edge).
+            edges.append(
+                GraphEdgeSpec(
+                    edge_type=EdgeType.LINKED_FROM,
+                    from_label=NodeLabel.DOCUMENT,
+                    from_canonical_id=doc_id,
+                    to_label=NodeLabel.TICKET,
+                    to_canonical_id=issue_id,
+                    valid_from=created,
+                )
+            )
         if author_id:
             edges.append(
                 GraphEdgeSpec(

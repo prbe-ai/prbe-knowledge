@@ -381,6 +381,16 @@ class SlackConnector(Connector):
                 to_canonical_id=doc_id,
                 valid_from=created,
             ),
+            # Document → Channel so list-pipeline entity filter
+            # ("messages from #engineering") can find the doc.
+            GraphEdgeSpec(
+                edge_type=EdgeType.MEMBER_OF,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.CHANNEL,
+                to_canonical_id=channel,
+                valid_from=created,
+            ),
         ]
 
         acl_rows = [

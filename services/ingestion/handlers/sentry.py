@@ -345,6 +345,28 @@ class SentryConnector(Connector):
                 to_canonical_id=project_slug,
                 valid_from=first_seen,
             ),
+            # Document → ErrorGroup + Document → Service so the
+            # list-pipeline entity filter can find a Sentry doc under
+            # either "errors in service api" or "issues in error_group X".
+            GraphEdgeSpec(
+                edge_type=EdgeType.LINKED_FROM,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.ERROR_GROUP,
+                to_canonical_id=issue_id,
+                valid_from=first_seen,
+            ),
+            # LINKED_FROM (not FIRES_IN) — only the ERROR_GROUP→SERVICE
+            # edge represents "this error fires in this service" semantics.
+            # The doc just references the service.
+            GraphEdgeSpec(
+                edge_type=EdgeType.LINKED_FROM,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.SERVICE,
+                to_canonical_id=project_slug,
+                valid_from=first_seen,
+            ),
         ]
 
         if assignee:
@@ -544,6 +566,24 @@ class SentryConnector(Connector):
                 edge_type=EdgeType.FIRES_IN,
                 from_label=NodeLabel.ERROR_GROUP,
                 from_canonical_id=group_id,
+                to_label=NodeLabel.SERVICE,
+                to_canonical_id=project_slug,
+                valid_from=occurred_at,
+            ),
+            # Document → ErrorGroup + Document → Service for entity-filter
+            # reachability on the list path.
+            GraphEdgeSpec(
+                edge_type=EdgeType.LINKED_FROM,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.ERROR_GROUP,
+                to_canonical_id=group_id,
+                valid_from=occurred_at,
+            ),
+            GraphEdgeSpec(
+                edge_type=EdgeType.LINKED_FROM,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
                 to_label=NodeLabel.SERVICE,
                 to_canonical_id=project_slug,
                 valid_from=occurred_at,

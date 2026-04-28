@@ -23,13 +23,109 @@ Group-by is constrained to a small allowlist (`source_system`, `doc_type`,
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
 from services.retrieval.temporal import build_predicate
 from shared.db import with_tenant
 from shared.models import TemporalSpec
+
+
+@dataclass(slots=True)
+class GraphEntityFilter:
+    """One narrowing-entity-type filter, AND'd with other types.
+
+    `label` is the graph_nodes label (NodeLabel.value) — Repo, Channel,
+    Ticket, PR, Service. `values` is the set of acceptable matches; they
+    are OR'd within the filter (a doc passes if it links to ANY of them).
+    Across multiple GraphEntityFilters, the filters are AND'd (a doc must
+    link to entities from EACH type).
+
+    `values` accepts both the bare and full forms of an identifier
+    (e.g. ['prbe-backend', 'prbe-ai/prbe-backend', 'Probe Backend']) — the
+    SQL helper applies a loose match across canonical_id and
+    properties->>'name' so any of these forms matches the same graph node.
+    """
+
+    label: str
+    values: list[str] = field(default_factory=list)
+
+
+def _entity_match_clause(
+    label: str,
+    values: list[str],
+    next_param_index: int,
+) -> tuple[str, list[object]]:
+    """Build an EXISTS-clause SQL fragment + appended params for one
+    GraphEntityFilter.
+
+    Returns SQL like:
+
+      AND EXISTS (
+        SELECT 1 FROM graph_edges e
+        JOIN graph_nodes gn ON gn.node_id = e.from_node_id
+                            OR gn.node_id = e.to_node_id
+        WHERE e.customer_id = $1
+          AND gn.customer_id = $1
+          AND gn.label = $LABEL
+          AND (
+            <loose match against any value>
+          )
+          AND <doc node match>
+      )
+
+    Loose match per value:
+        LOWER(gn.canonical_id) = LOWER($X)
+        OR LOWER(gn.canonical_id) LIKE '%/' || LOWER($X)
+        OR LOWER(gn.properties->>'name') = LOWER($X)
+
+    NOTE: the suffix-LIKE arm has a leading wildcard so it can't use a
+    btree functional index; it falls back to a seq scan over rows
+    pre-narrowed by (customer_id, label). At our scale that's fine.
+    See migration 0019 for context.
+    """
+    if not values:
+        return "", []
+
+    params: list[object] = [label]
+    label_param = next_param_index
+
+    value_clauses: list[str] = []
+    for value in values:
+        next_param_index += 1
+        params.append(value)
+        i = next_param_index
+        value_clauses.append(
+            "(LOWER(gn.canonical_id) = LOWER($I) "
+            "OR LOWER(gn.canonical_id) LIKE '%/' || LOWER($I) "
+            "OR LOWER(gn.properties->>'name') = LOWER($I))".replace("$I", f"${i}")
+        )
+
+    # Anchor: the graph_nodes row representing the document itself.
+    # We need a graph_edges row connecting the doc node to a node matching
+    # the entity filter. Document nodes have label='Document' and
+    # canonical_id = doc_id.
+    sql = f"""
+        AND EXISTS (
+            SELECT 1
+            FROM graph_nodes doc_gn
+            JOIN graph_edges e
+              ON e.customer_id = $1
+             AND (e.from_node_id = doc_gn.node_id OR e.to_node_id = doc_gn.node_id)
+            JOIN graph_nodes gn
+              ON gn.customer_id = $1
+             AND gn.node_id = CASE
+                   WHEN e.from_node_id = doc_gn.node_id THEN e.to_node_id
+                   ELSE e.from_node_id END
+             AND gn.label = ${label_param}
+             AND ({" OR ".join(value_clauses)})
+            WHERE doc_gn.customer_id = $1
+              AND doc_gn.label = 'Document'
+              AND doc_gn.canonical_id = d.doc_id
+        )
+    """
+    return sql, params
 
 
 @dataclass(slots=True)
@@ -82,6 +178,7 @@ async def sql_list(
     sources: list[str] | None = None,
     doc_types: list[str] | None = None,
     author_ids: list[str] | None = None,
+    graph_entity_filters: list[GraphEntityFilter] | None = None,
     sort_field: SortField = "updated_at",
     sort_direction: SortDirection = "desc",
     temporal: TemporalSpec | None = None,
@@ -112,6 +209,18 @@ async def sql_list(
         params.append(author_ids)
         author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
 
+    # Build entity-filter EXISTS clauses; AND'd across types, OR'd
+    # within values for one type.
+    entity_clauses_sql = ""
+    if graph_entity_filters:
+        for ef in graph_entity_filters:
+            clause_sql, clause_params = _entity_match_clause(
+                ef.label, ef.values, next_param_index=len(params) + 1
+            )
+            if clause_sql:
+                params.extend(clause_params)
+                entity_clauses_sql += clause_sql
+
     pred = build_predicate(spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1)
     params.extend(pred.params)
 
@@ -127,6 +236,7 @@ async def sql_list(
                   {source_filter}
                   {doc_type_filter}
                   {author_filter}
+                  {entity_clauses_sql}
                 ORDER BY d.{field} {direction.upper()}, d.doc_id
                 LIMIT $2
             )
@@ -184,6 +294,7 @@ async def sql_count(
     sources: list[str] | None = None,
     doc_types: list[str] | None = None,
     author_ids: list[str] | None = None,
+    graph_entity_filters: list[GraphEntityFilter] | None = None,
     temporal: TemporalSpec | None = None,
 ) -> int:
     """Single SELECT COUNT(*) over documents matching the filter set."""
@@ -205,6 +316,16 @@ async def sql_count(
         params.append(author_ids)
         author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
 
+    entity_clauses_sql = ""
+    if graph_entity_filters:
+        for ef in graph_entity_filters:
+            clause_sql, clause_params = _entity_match_clause(
+                ef.label, ef.values, next_param_index=len(params) + 1
+            )
+            if clause_sql:
+                params.extend(clause_params)
+                entity_clauses_sql += clause_sql
+
     pred = build_predicate(spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1)
     params.extend(pred.params)
 
@@ -218,6 +339,7 @@ async def sql_count(
               {source_filter}
               {doc_type_filter}
               {author_filter}
+              {entity_clauses_sql}
             """,
             *params,
         )
@@ -231,6 +353,7 @@ async def sql_group_by(
     sources: list[str] | None = None,
     doc_types: list[str] | None = None,
     author_ids: list[str] | None = None,
+    graph_entity_filters: list[GraphEntityFilter] | None = None,
     temporal: TemporalSpec | None = None,
 ) -> list[dict[str, object]]:
     """SELECT <key>, COUNT(*) GROUP BY <key> ORDER BY count DESC LIMIT top_k.
@@ -258,6 +381,16 @@ async def sql_group_by(
         params.append(author_ids)
         author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
 
+    entity_clauses_sql = ""
+    if graph_entity_filters:
+        for ef in graph_entity_filters:
+            clause_sql, clause_params = _entity_match_clause(
+                ef.label, ef.values, next_param_index=len(params) + 1
+            )
+            if clause_sql:
+                params.extend(clause_params)
+                entity_clauses_sql += clause_sql
+
     pred = build_predicate(spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1)
     params.extend(pred.params)
 
@@ -271,6 +404,7 @@ async def sql_group_by(
               {source_filter}
               {doc_type_filter}
               {author_filter}
+              {entity_clauses_sql}
             GROUP BY d.{col}
             ORDER BY n DESC, d.{col}
             LIMIT $2
