@@ -234,7 +234,15 @@ class QueryRequest(BaseModel):
             "textually contain the entity's canonical_id or display_name. "
             "Filters obvious vector-similarity false positives (queries like "
             "'whats going on with klavis' otherwise match generic Slack "
-            "greetings on conversational shape)."
+            "greetings on conversational shape). When true, ALSO applies "
+            "hard entity filters in list mode: `author_id = ANY(...)` from "
+            "`person` entities and graph_nodes membership from narrowing "
+            "entities (`service`/`repo`/`ticket`/`pr`/`channel`). When false "
+            "(default), list mode skips entity-based narrowing entirely and "
+            "relies on sort + temporal + source + doc_type only — preferred "
+            "for broad-recall callers (e.g. the MCP) where a router-extracted "
+            "entity that has no matching graph_node would otherwise zero out "
+            "the SQL result."
         ),
     )
     entity_match_threshold: float = Field(

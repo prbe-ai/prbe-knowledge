@@ -127,8 +127,20 @@ async def run_list(
     timing: dict[str, float],
 ) -> QueryResponse:
     sources = [s.value for s in req.sources] if req.sources else None
-    author_ids = _author_ids_from_entities(routed)
-    graph_entity_filters = _graph_entity_filters_from_routed(routed)
+    # Entity-based hard filters (author_id from `person` entities,
+    # graph_nodes membership from narrowing entities) are gated on
+    # `req.entity_must_match` — same flag that gates the search path's
+    # post-fusion entity filter. When False (the MCP / default), the
+    # list path skips entity-based narrowing and relies on sort +
+    # temporal + source + doc_type only. This avoids zero-result SQL
+    # when the router extracts an entity that doesn't have a matching
+    # graph_nodes row or documents.author_id.
+    if req.entity_must_match:
+        author_ids = _author_ids_from_entities(routed)
+        graph_entity_filters = _graph_entity_filters_from_routed(routed)
+    else:
+        author_ids = None
+        graph_entity_filters = []
     operation = (routed.operation or "list").lower()
     if operation not in ("list", "count", "group_by"):
         operation = "list"
