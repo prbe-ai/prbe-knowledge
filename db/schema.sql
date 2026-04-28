@@ -384,6 +384,14 @@ CREATE INDEX idx_graph_nodes_props ON graph_nodes USING GIN (properties jsonb_pa
 -- (customer_id, label) is small).
 CREATE INDEX idx_graph_nodes_lower_canonical ON graph_nodes (customer_id, label, LOWER(canonical_id));
 CREATE INDEX idx_graph_nodes_lower_props_name ON graph_nodes (customer_id, label, LOWER(properties ->> 'name'));
+-- Alphanumeric-normalized variants for the regex_replace match arms in
+-- _entity_match_clause (PR #18). Strip non-[a-z0-9] before comparing so
+-- "external investigations" ↔ "external-investigations" hits the same
+-- index path as the LOWER() variants above.
+CREATE INDEX idx_graph_nodes_alnum_canonical
+    ON graph_nodes (customer_id, label, regexp_replace(LOWER(canonical_id), '[^a-z0-9]+', '', 'g'));
+CREATE INDEX idx_graph_nodes_alnum_props_name
+    ON graph_nodes (customer_id, label, regexp_replace(LOWER(properties ->> 'name'), '[^a-z0-9]+', '', 'g'));
 
 CREATE TABLE graph_edges (
     edge_id       BIGSERIAL PRIMARY KEY,

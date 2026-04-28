@@ -107,12 +107,14 @@ def _entity_match_clause(
     # (`investigation` vs `investigations`) and word-reorder also out
     # of scope; would need trigram/levenshtein with higher FP risk.
     #
-    # The regexp_replace arms break the (customer_id, label,
-    # LOWER(canonical_id)) functional index — the JOIN falls back to a
-    # seq scan over the (customer_id, label)-narrowed subset. Fine at
-    # current scale (graph_nodes per tenant is small). TODO: if any
-    # tenant exceeds ~100k graph_nodes, add a functional index on
-    # regexp_replace(LOWER(canonical_id), '[^a-z0-9]+', '', 'g').
+    # Each arm hits a functional index:
+    #   1. exact eq on canonical_id  →  idx_graph_nodes_lower_canonical
+    #   2. suffix-after-/ on canonical_id  →  seq scan of (customer_id,
+    #      label)-narrowed subset (leading wildcard, can't index)
+    #   3. exact eq on properties->>'name'  →  idx_graph_nodes_lower_props_name
+    #   4. alnum-normalized canonical_id  →  idx_graph_nodes_alnum_canonical
+    #   5. alnum-normalized properties->>'name'  →  idx_graph_nodes_alnum_props_name
+    # All built CONCURRENTLY in migrations 0019 + 0022.
     value_clauses: list[str] = []
     for value in values:
         next_param_index += 1

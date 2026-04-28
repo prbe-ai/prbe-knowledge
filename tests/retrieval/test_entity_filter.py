@@ -496,11 +496,12 @@ async def test_entity_filter_excludes_soft_closed_edges(live_db) -> None:
 
 async def test_explain_uses_index_when_seqscan_off(live_db) -> None:
     """With `enable_seqscan = OFF`, the planner can only execute the
-    query if it has a usable index path on the equality arms of the
-    loose match. If the functional indexes (idx_graph_nodes_lower_canonical
-    and idx_graph_nodes_lower_props_name) are missing, this would error
-    out. This is a tripwire: catches "the migration didn't ship the index"
-    regressions even though the test fixture is small.
+    query if it has a usable index path on each indexable arm of the
+    loose match. If any of the four functional indexes is missing
+    (lower_canonical / lower_props_name from migration 0019,
+    alnum_canonical / alnum_props_name from migration 0022), this
+    test errors out. Tripwire that catches "migration didn't ship"
+    regressions even on a small test fixture.
     """
     cust = "cust-explain"
     await _seed_customer(cust)
@@ -512,31 +513,59 @@ async def test_explain_uses_index_when_seqscan_off(live_db) -> None:
 
     # Forcing enable_seqscan = OFF; if Postgres can't find any index
     # path, the query fails. We don't assert a specific plan shape —
-    # we just assert it executes successfully.
+    # we just assert it executes successfully on each arm.
     async with raw_conn() as conn:
         # SET commands don't accept parameter binding; use SELECT
         # set_config to set the GUC parameterized.
         await conn.execute("SELECT set_config('app.current_customer_id', $1, false)", cust)
         await conn.execute("SET LOCAL enable_seqscan = OFF")
+
+        # Arm 1: LOWER(canonical_id) = LOWER($X)
         rows = await conn.fetch(
             """
-            SELECT 1
-            FROM graph_nodes
-            WHERE customer_id = $1
-              AND label = 'Repo'
+            SELECT 1 FROM graph_nodes
+            WHERE customer_id = $1 AND label = 'Repo'
               AND LOWER(canonical_id) = LOWER($2)
             LIMIT 1
             """,
             cust, "prbe-ai/prbe-backend",
         )
         assert len(rows) == 1
+
+        # Arm 3: LOWER(properties->>'name') = LOWER($X)
         rows = await conn.fetch(
             """
-            SELECT 1
-            FROM graph_nodes
-            WHERE customer_id = $1
-              AND label = 'Repo'
+            SELECT 1 FROM graph_nodes
+            WHERE customer_id = $1 AND label = 'Repo'
               AND LOWER(properties->>'name') = LOWER($2)
+            LIMIT 1
+            """,
+            cust, "prbe-backend",
+        )
+        assert len(rows) == 1
+
+        # Arm 4: regexp_replace(LOWER(canonical_id), ...) — needs
+        # idx_graph_nodes_alnum_canonical from migration 0022.
+        rows = await conn.fetch(
+            """
+            SELECT 1 FROM graph_nodes
+            WHERE customer_id = $1 AND label = 'Repo'
+              AND regexp_replace(LOWER(canonical_id), '[^a-z0-9]+', '', 'g')
+                = regexp_replace(LOWER($2), '[^a-z0-9]+', '', 'g')
+            LIMIT 1
+            """,
+            cust, "prbe-ai/prbe-backend",
+        )
+        assert len(rows) == 1
+
+        # Arm 5: regexp_replace(LOWER(properties->>'name'), ...) — needs
+        # idx_graph_nodes_alnum_props_name from migration 0022.
+        rows = await conn.fetch(
+            """
+            SELECT 1 FROM graph_nodes
+            WHERE customer_id = $1 AND label = 'Repo'
+              AND regexp_replace(LOWER(properties->>'name'), '[^a-z0-9]+', '', 'g')
+                = regexp_replace(LOWER($2), '[^a-z0-9]+', '', 'g')
             LIMIT 1
             """,
             cust, "prbe-backend",
