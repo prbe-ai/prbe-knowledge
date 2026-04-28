@@ -307,7 +307,19 @@ class NotionConnector(Connector):
         headers: Mapping[str, str],
         raw_body: bytes,
     ) -> bool:
-        # Local dev always accepts.
+        """HMAC-SHA256 the body with the subscription's verification token.
+
+        Per Notion's webhook docs, the signing key is the per-subscription
+        `verification_token` (received in the one-time `{"verification_token":
+        "..."}` handshake POST when the subscription is wired up), NOT the
+        OAuth client secret. The token is stored in
+        `notion_webhook_verification_token`.
+
+        Local dev accepts unsigned to keep tunnels working. Prod requires
+        a signed payload — return False (caller -> 401) when the token isn't
+        configured yet so a misconfigured environment can't silently accept
+        forged events.
+        """
         if self.settings.is_local:
             return True
 
@@ -315,12 +327,12 @@ class NotionConnector(Connector):
         if sig is None:
             return False
 
-        secret = self.settings.notion_client_secret
-        if secret is None:
+        token = self.settings.notion_webhook_verification_token
+        if token is None:
             return False
 
         expected = hmac.new(
-            secret.get_secret_value().encode(),
+            token.get_secret_value().encode(),
             raw_body,
             hashlib.sha256,
         ).hexdigest()

@@ -510,16 +510,23 @@ def test_verify_signature_prod_rejects_unsigned_unknown_caller() -> None:
 
 
 def test_verify_signature_valid_hmac() -> None:
+    """Signature key is the subscription's verification_token, not the OAuth
+    client secret. Notion's webhook docs (and the Sept 2025 upgrade) are
+    explicit on this — the verification_token returned during the one-time
+    handshake doubles as the HMAC signing secret."""
     import hashlib
     import hmac as hmac_mod
 
     from pydantic import SecretStr
 
-    secret = "notion-secret"
+    secret = "notion-verification-token"
     body = b'{"hello":"notion"}'
     digest = hmac_mod.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
-    settings = Settings(environment="main", notion_client_secret=SecretStr(secret))
+    settings = Settings(
+        environment="main",
+        notion_webhook_verification_token=SecretStr(secret),
+    )
     ctx = ConnectorContext(settings=settings, http=httpx.AsyncClient())
     notion = build_connector(SourceSystem.NOTION, ctx)
 
@@ -528,6 +535,49 @@ def test_verify_signature_valid_hmac() -> None:
     assert (
         notion.verify_signature({"X-Notion-Signature": f"sha256={digest}"}, body) is True
     )
+
+
+def test_verify_signature_prod_rejects_when_token_unset() -> None:
+    """A signed payload with no token configured should still 401 — defense
+    against a half-deployed env where the secret hasn't been set yet."""
+    import hashlib
+    import hmac as hmac_mod
+
+    body = b'{"hello":"notion"}'
+    digest = hmac_mod.new(b"any-secret", body, hashlib.sha256).hexdigest()
+
+    settings = Settings(environment="main")  # no token
+    ctx = ConnectorContext(settings=settings, http=httpx.AsyncClient())
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    assert notion.verify_signature({"X-Notion-Signature": digest}, body) is False
+
+
+def test_verify_signature_ignores_oauth_client_secret() -> None:
+    """Pre-fix bug: signature was being checked against `notion_client_secret`.
+    Make sure signing with the OAuth secret is now rejected when the
+    verification token is the configured signing key."""
+    import hashlib
+    import hmac as hmac_mod
+
+    from pydantic import SecretStr
+
+    body = b'{"hello":"notion"}'
+    oauth_secret = "oauth-client-secret"
+    real_token = "verification-token"
+
+    # Sign with the OAuth secret, not the verification token.
+    bad_digest = hmac_mod.new(oauth_secret.encode(), body, hashlib.sha256).hexdigest()
+
+    settings = Settings(
+        environment="main",
+        notion_client_secret=SecretStr(oauth_secret),
+        notion_webhook_verification_token=SecretStr(real_token),
+    )
+    ctx = ConnectorContext(settings=settings, http=httpx.AsyncClient())
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    assert notion.verify_signature({"X-Notion-Signature": bad_digest}, body) is False
 
 
 # ---------------------------------------------------------------------------

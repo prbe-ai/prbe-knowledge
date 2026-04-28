@@ -160,7 +160,18 @@ The primary path is the dashboard Connect button.
 2. **Type**: Public. **Capabilities**: Read content, Read user information.
 3. **Redirect URI**: `https://<tunnel>/oauth/notion/callback`
 4. Copy **OAuth client ID / client secret** → `NOTION_CLIENT_ID` / `NOTION_CLIENT_SECRET`
-5. **Webhooks**: enable, URL `https://<tunnel>/webhooks/notion` (Notion's official webhook support is beta — if unavailable, skip; the connector also accepts synthetic polls).
+5. **Webhooks** (one-time, integration-level — covers every workspace that installs Probe):
+   1. **Webhooks** tab → **+ Create a subscription** → URL `https://<tunnel>/webhooks/notion` (or `api.prbe.ai/webhooks/notion` in prod).
+   2. Notion POSTs `{"verification_token": "secret_..."}` to that URL once. The gateway logs it: `fly logs -a prbe-backend | grep webhooks.notion.verification_token` (or look at local stdout).
+   3. Paste the token into the **Verify** dialog in Notion's UI.
+   4. Set the same token as a Fly secret on **both** services so the gateway can verify HMAC and the connector can re-verify defense-in-depth:
+      ```
+      fly secrets set NOTION_WEBHOOK_VERIFICATION_TOKEN=secret_... -a prbe-backend
+      fly secrets set NOTION_WEBHOOK_VERIFICATION_TOKEN=secret_... -a prbe-knowledge-ingestion
+      ```
+   5. Subscribe to event types: `page.created`, `page.updated`, `page.deleted`, `database.created`, `database.updated`, `database.deleted`.
+
+   Until the secret is set, the gateway accepts unsigned webhooks in local dev only and rejects them in prod (defense against silent acceptance during partial deploys). Without a verified subscription, post-connect Notion edits will not flow into Probe.
 
 ### Sentry (10 min)
 
