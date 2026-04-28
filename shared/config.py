@@ -87,6 +87,12 @@ class Settings(BaseSettings):
 
     notion_client_id: str | None = None
     notion_client_secret: SecretStr | None = None
+    # Per-subscription token Notion sends in the verification handshake (paste
+    # it back into Notion's UI to verify, then set this secret). Once set,
+    # every Notion webhook is HMAC-SHA256 signed with this token in the
+    # `X-Notion-Signature` header. Unset => connector accepts unsigned in
+    # local dev only and rejects in prod (see verify_signature).
+    notion_webhook_verification_token: SecretStr | None = None
 
     sentry_client_id: str | None = None
     sentry_client_secret: SecretStr | None = None
