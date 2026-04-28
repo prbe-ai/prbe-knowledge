@@ -106,12 +106,19 @@ def _entity_match_clause(
     # We need a graph_edges row connecting the doc node to a node matching
     # the entity filter. Document nodes have label='Document' and
     # canonical_id = doc_id.
+    #
+    # `e.valid_to IS NULL` filters out soft-closed edges. No code path
+    # writes valid_to on edges today, so this is prophylactic — when a
+    # future feature ("user left channel" → close the Person→Channel
+    # edge) starts soft-deleting, the entity filter won't silently pull
+    # in stale relationships.
     sql = f"""
         AND EXISTS (
             SELECT 1
             FROM graph_nodes doc_gn
             JOIN graph_edges e
               ON e.customer_id = $1
+             AND e.valid_to IS NULL
              AND (e.from_node_id = doc_gn.node_id OR e.to_node_id = doc_gn.node_id)
             JOIN graph_nodes gn
               ON gn.customer_id = $1
