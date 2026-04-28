@@ -91,6 +91,28 @@ def _entity_match_clause(
     params: list[object] = [label]
     label_param = next_param_index
 
+    # Match arms (OR'd) for each value:
+    #   1. exact case-insensitive equality on canonical_id
+    #   2. suffix-after-slash on canonical_id (handles bare repo names
+    #      like "prbe-backend" matching canonical "prbe-ai/prbe-backend")
+    #   3. exact case-insensitive equality on properties->>'name'
+    #   4. alphanumeric-only normalization on canonical_id —
+    #      strips '[^a-z0-9]+' from both sides before comparing. Catches
+    #      hyphen ↔ space ↔ underscore ↔ casing mismatches like
+    #      "external investigations" ↔ "external-investigations".
+    #   5. same alphanumeric normalization on properties->>'name'
+    #
+    # Substring-contains is NOT in the list — would false-positive
+    # things like "backend" matching every "*-backend" repo. Plurals
+    # (`investigation` vs `investigations`) and word-reorder also out
+    # of scope; would need trigram/levenshtein with higher FP risk.
+    #
+    # The regexp_replace arms break the (customer_id, label,
+    # LOWER(canonical_id)) functional index — the JOIN falls back to a
+    # seq scan over the (customer_id, label)-narrowed subset. Fine at
+    # current scale (graph_nodes per tenant is small). TODO: if any
+    # tenant exceeds ~100k graph_nodes, add a functional index on
+    # regexp_replace(LOWER(canonical_id), '[^a-z0-9]+', '', 'g').
     value_clauses: list[str] = []
     for value in values:
         next_param_index += 1
@@ -99,7 +121,13 @@ def _entity_match_clause(
         value_clauses.append(
             "(LOWER(gn.canonical_id) = LOWER($I) "
             "OR LOWER(gn.canonical_id) LIKE '%/' || LOWER($I) "
-            "OR LOWER(gn.properties->>'name') = LOWER($I))".replace("$I", f"${i}")
+            "OR LOWER(gn.properties->>'name') = LOWER($I) "
+            "OR regexp_replace(LOWER(gn.canonical_id), '[^a-z0-9]+', '', 'g') "
+            "   = regexp_replace(LOWER($I), '[^a-z0-9]+', '', 'g') "
+            "OR regexp_replace(LOWER(gn.properties->>'name'), '[^a-z0-9]+', '', 'g') "
+            "   = regexp_replace(LOWER($I), '[^a-z0-9]+', '', 'g'))".replace(
+                "$I", f"${i}"
+            )
         )
 
     # Anchor: the graph_nodes row representing the document itself.
