@@ -27,6 +27,7 @@ jobs:
     env:
       DATABASE_URL_SYNC: postgresql+psycopg://prbe:prbe@localhost:5432/prbe_knowledge
       DATABASE_URL: postgresql://prbe:prbe@localhost:5432/prbe_knowledge
+      PGPASSWORD: prbe
 
     steps:
       - uses: actions/checkout@v4
@@ -55,8 +56,42 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -e ".[dev]"
 
-      - name: Migrate local DB
-        run: .venv/bin/alembic upgrade head
+      # Apply schema directly (canonical-latest) and stamp alembic head.
+      #
+      # Background: db/schema.sql is updated alongside every migration as the
+      # canonical Phase-0 reference, and migration 0001 runs schema.sql verbatim.
+      # This means migrations 0007+ duplicate state schema.sql already created
+      # (e.g. 0007 ADD COLUMN organization_id, but schema.sql line 31 already
+      # creates it) — `alembic upgrade head` against a fresh DB throws
+      # DuplicateColumn and DuplicateTable errors.
+      #
+      # Fix: skip the upgrade chain on a known-fresh DB and apply schema.sql
+      # directly, then stamp head so future incremental migrations work. This
+      # preserves the convention that schema.sql is canonical and PRs update
+      # both schema.sql + a migration file together.
+      #
+      # Prod (Neon) doesn't hit this — schema there evolved organically through
+      # `alembic upgrade head` over time, and Neon Auth provisions neon_auth
+      # for real. CI/local need the shim because they start from empty.
+      - name: Provision neon_auth shim
+        run: |
+          psql -h localhost -p 5432 -U prbe -d prbe_knowledge -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE SCHEMA IF NOT EXISTS neon_auth;
+            CREATE TABLE IF NOT EXISTS neon_auth.organization (
+              id UUID PRIMARY KEY
+            );
+            CREATE TABLE IF NOT EXISTS neon_auth."user" (
+              id              UUID PRIMARY KEY,
+              organization_id UUID REFERENCES neon_auth.organization(id),
+              email           TEXT,
+              name            TEXT
+            );
+          SQL
+
+      - name: Apply schema and stamp alembic
+        run: |
+          psql -h localhost -p 5432 -U prbe -d prbe_knowledge -v ON_ERROR_STOP=1 -f db/schema.sql
+          .venv/bin/alembic stamp head
 
       - name: Lint
         run: .venv/bin/ruff check .
