@@ -432,6 +432,43 @@ CREATE POLICY tenant_isolation ON graph_edges
     USING (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
+-- usage_events: per-tenant audit trail of /retrieve, /query, /sources calls.
+-- Written from a post-response BackgroundTask in services/retrieval/middleware.py;
+-- read by the dashboard's /query/usage page via /usage/feed, /usage/stats,
+-- /usage/search. RLS-isolated like graph_nodes / graph_edges.
+-- ---------------------------------------------------------------------------
+CREATE TABLE usage_events (
+    event_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    caller_kind     TEXT NOT NULL,
+    caller_subject  TEXT,
+    event_type      TEXT NOT NULL,
+    request_id      UUID,
+    endpoint        TEXT NOT NULL,
+    summary         TEXT,
+    status          TEXT NOT NULL,
+    error_class     TEXT,
+    latency_ms      INT,
+    result_count    INT,
+    metadata        JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX idx_usage_events_customer_time
+    ON usage_events (customer_id, occurred_at DESC);
+CREATE INDEX idx_usage_events_customer_type_time
+    ON usage_events (customer_id, event_type, occurred_at DESC);
+-- 'simple' (not 'english') so user search terms aren't stemmed/stop-worded.
+CREATE INDEX idx_usage_events_search
+    ON usage_events USING gin (to_tsvector('simple', summary));
+
+ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usage_events FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY usage_events_tenant_isolation ON usage_events
+    USING (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents

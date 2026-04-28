@@ -362,6 +362,57 @@ class BootstrapConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# usage_events: dashboard-facing audit trail of retrieval calls.
+# Written by services/retrieval/middleware.py, read by /usage/{feed,stats,search}.
+# ---------------------------------------------------------------------------
+
+
+class UsageEventOut(BaseModel):
+    """One usage_events row, as serialized to dashboard / SDK callers."""
+
+    event_id: str
+    occurred_at: datetime
+    caller_kind: str
+    caller_subject: str | None = None
+    event_type: str
+    request_id: str | None = None
+    endpoint: str
+    summary: str | None = None
+    status: str
+    error_class: str | None = None
+    latency_ms: int | None = None
+    result_count: int | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class UsageFeedResponse(BaseModel):
+    """Top-N most recent events within a window. Used by /usage/feed and
+    /usage/search (which is feed-shaped + FTS predicate)."""
+
+    events: list[UsageEventOut]
+    window: str
+    count: int
+
+
+class UsageStatsResponse(BaseModel):
+    """Aggregate counts + latency percentiles over a window.
+
+    Latency percentiles are computed only across status='ok' rows — error
+    rows have no meaningful latency (they may have errored before any
+    retrieval ran). `error_count` is reported separately so the dashboard
+    can show error rate without polluting the latency bars.
+    """
+
+    total: int
+    by_caller_kind: dict[str, int] = Field(default_factory=dict)
+    by_event_type: dict[str, int] = Field(default_factory=dict)
+    latency_p50_ms: int | None = None
+    latency_p95_ms: int | None = None
+    error_count: int
+    window: str
+
+
+# ---------------------------------------------------------------------------
 # Connector contract — shared output schema.
 #
 # Every connector (Slack, GitHub, Linear, ...) returns a NormalizationResult

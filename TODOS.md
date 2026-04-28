@@ -57,6 +57,18 @@ Complements R2 lifecycle — delete `ingestion_events` rows older than the R2
 retention window so the table stays bounded. Write `scripts/cron_events_retention.py`
 (pattern matches the other crons). Run hourly via Fly cron.
 
+### usage_events retention
+**Where:** new cron `scripts/cron_usage_retention.py` or pg_partman config
+
+**Why:** search needs history but the table grows unbounded. Search latency
+degrades past ~10M rows.
+
+**Trigger:** when a tenant crosses 1M rows OR /usage/search latency exceeds
+500ms.
+
+**Fix:** ~30 lines for cron sweep deleting >180d, OR pg_partman monthly
+partitions.
+
 ---
 
 ## P3 — connector completeness

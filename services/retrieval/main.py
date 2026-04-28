@@ -20,16 +20,18 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from services.retrieval.auth import authenticate_query
+from services.retrieval.middleware import UsageLoggingMiddleware
 from services.retrieval.pipeline import run_retrieval
 from services.retrieval.synthesis import (
     SynthesisChunk,
     SynthesisError,
     synthesize,
 )
+from services.retrieval.usage import usage_router
 from shared.config import get_settings
 from shared.constants import DEFAULT_SYNTHESIS_MODEL, SourceSystem
 from shared.db import health_check, init_pool, with_tenant
@@ -55,6 +57,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="prbe-knowledge retrieval", lifespan=lifespan)
+# UsageLoggingMiddleware records one row per /retrieve, /query, /sources
+# call into the usage_events table from a post-response BackgroundTask.
+# Skips /health and /usage/* by design — see middleware.py for rationale.
+app.add_middleware(UsageLoggingMiddleware)
 
 
 @app.get("/health")
@@ -102,6 +108,7 @@ def _log_query_handled(
 @app.post("/retrieve", response_model=QueryResponse)
 async def retrieve(
     req: QueryRequest,
+    request: Request,
     customer_id: str = Depends(authenticate_query),
 ) -> QueryResponse:
     """Raw-chunks retrieval. Branches on Haiku-emitted mode:
@@ -111,8 +118,14 @@ async def retrieve(
     iterative re-retrieval) call this. Linear-style enrichment or
     human-readable answers go to /query.
     """
+    # Stash for UsageLoggingMiddleware. customer_id scopes the usage row;
+    # usage_summary is the FTS-searchable text; result_count is set after
+    # retrieval runs so the middleware can record it.
+    request.state.customer_id = customer_id
+    request.state.usage_summary = req.query
     t_total = time.perf_counter()
     resp = await run_retrieval(req, customer_id)
+    request.state.result_count = len(resp.chunks)
     total_ms = (time.perf_counter() - t_total) * 1000
     _log_query_handled(
         endpoint="/retrieve",
@@ -127,6 +140,7 @@ async def retrieve(
 @app.post("/query", response_model=AnswerResponse)
 async def query(
     req: AnswerRequest,
+    request: Request,
     customer_id: str = Depends(authenticate_query),
 ) -> AnswerResponse:
     """Retrieve + synthesize. Calls retrieval internally, then runs an LLM
@@ -136,9 +150,13 @@ async def query(
     anthropic/claude-sonnet-4-6. Allowed models live in
     shared.constants.SYNTHESIS_MODELS — Anthropic, OpenAI, Google.
     """
+    # Stash for UsageLoggingMiddleware (see /retrieve for shape).
+    request.state.customer_id = customer_id
+    request.state.usage_summary = req.query
     t_total = time.perf_counter()
     base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
     rresp = await run_retrieval(base_req, customer_id)
+    request.state.result_count = len(rresp.chunks)
 
     model = req.model or DEFAULT_SYNTHESIS_MODEL
     syn_chunks = [
@@ -195,6 +213,7 @@ async def query(
 @app.get("/sources/{doc_id:path}", response_model=SourceResponse)
 async def get_source(
     doc_id: str,
+    request: Request,
     customer_id: str = Depends(authenticate_query),
     version: int | None = Query(
         default=None,
@@ -207,6 +226,11 @@ async def get_source(
     (e.g. `slack:T123:C456:1234567890.123456` or `github:owner/repo:pr:42`).
     Path uses `:path` so colons aren't URL-decoded out from under us.
     """
+    # Stash for UsageLoggingMiddleware. The summary for /sources is the
+    # doc_id itself — usable enough to FTS for "show me every time agent
+    # X pulled github:foo/bar:pr:42".
+    request.state.customer_id = customer_id
+    request.state.usage_summary = doc_id
     async with with_tenant(customer_id) as conn:
         if version is not None:
             doc = await conn.fetchrow(
@@ -267,6 +291,7 @@ async def get_source(
         except (TypeError, ValueError):
             entities = []
 
+    request.state.result_count = len(chunk_rows)
     return SourceResponse(
         doc_id=doc["doc_id"],
         doc_version=doc["version"],
@@ -285,6 +310,13 @@ async def get_source(
         ingested_at=doc["ingested_at"],
         deleted_at=doc["deleted_at"],
     )
+
+
+# Mount the usage_events read endpoints (/usage/feed, /usage/stats,
+# /usage/search). The router carries its own auth via authenticate_query
+# and is excluded from UsageLoggingMiddleware so reads don't recursively
+# log themselves.
+app.include_router(usage_router)
 
 
 __all__ = [
