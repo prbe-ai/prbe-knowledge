@@ -119,13 +119,6 @@ class GranolaScheduler:
         queue, no point re-enqueueing. NULL backfill_state row means the
         initial backfill never ran (shouldn't happen post-connect since
         connect_granola_route enqueues one) — also skip.
-
-        Persistent-auth-failure rows (last_error indicates 401/403 / token
-        revoked) are also skipped: re-enqueueing them every tick would
-        spam Granola with a known-bad token until the customer reconnects.
-        Once `integration_tokens.status` flips back to 'active' after a
-        re-auth, the join naturally re-includes the row and the next tick
-        will pick it up. The connector resets last_error on success.
         """
         async with raw_conn() as conn:
             rows = await conn.fetch(
@@ -141,16 +134,6 @@ class GranolaScheduler:
                   AND (
                     b.last_progress_at IS NULL
                     OR b.last_progress_at < NOW() - make_interval(secs => $5)
-                  )
-                  AND NOT (
-                    b.status = $4
-                    AND b.last_error IS NOT NULL
-                    AND (
-                      b.last_error ILIKE '%granola auth failure%'
-                      OR b.last_error ILIKE '%PermanentSourceError%'
-                      OR b.last_error ILIKE '%401%'
-                      OR b.last_error ILIKE '%403%'
-                    )
                   )
                 ORDER BY b.last_progress_at NULLS FIRST
                 """,
