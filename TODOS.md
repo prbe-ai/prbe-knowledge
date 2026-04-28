@@ -112,6 +112,9 @@ Items the design doc explicitly defers to Phase 1:
   before logs land in third-party storage
 - Secrets rotation machinery (Fernet key, OAuth tokens, webhook signing)
 - Prompt injection defense on the Haiku entity extractor
+  (Minimal `<query>...</query>` wrapping shipped in feature/router-list-mode.
+   Residual: input length cap, structured-input validation across all
+   extractors, detection-pattern logging, response-shape sanity checks.)
 - Webhook-reactive ACL updates (member_left_channel, user_deactivated)
 - Nightly ACL reconciliation sweep
 
@@ -145,6 +148,24 @@ decision history" queries.
 
 Discussed: 2026-04-24. Skipped from current PR because event extraction
 needs per-connector ontology work + customer-specific tagging conventions.
+
+### Multi-hop graph retrieval — measure + tune
+
+The graph retriever (`services/retrieval/retrievers/graph.py`) does
+single-hop traversal today: feed `(entity_type, canonical_id)`, get docs
+that have edges to that entity. Multi-hop reasoning ("did the PR that
+closes ABC-123 ship to prod yet?") relies on the graph retriever surfacing
+the related docs and the synthesis LLM connecting them. We've never
+measured precision/recall on this path.
+
+**Fix:** build a small eval set of ~10 multi-hop queries with hand-labeled
+expected docs. Measure precision@5 + recall@5 with the current fusion
+weights. If the graph retriever underweights when entity confidence is
+high, bump its RRF contribution conditionally (e.g., when any extracted
+entity has confidence ≥ 0.85, treat graph hits with a multiplied score in
+fusion). ~50 LOC + the eval set.
+
+Discussed: 2026-04-28 in plan-eng-review for feature/router-list-mode.
 
 ### In-memory router cache (LRU)
 
