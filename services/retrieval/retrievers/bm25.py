@@ -36,6 +36,7 @@ async def bm25_search(
     query_text: str,
     top_k: int = TOP_K_BM25,
     sources: list[str] | None = None,
+    doc_types: list[str] | None = None,
     temporal: TemporalSpec | None = None,
 ) -> list[BM25Hit]:
     spec = temporal or TemporalSpec()
@@ -46,6 +47,11 @@ async def bm25_search(
         if sources:
             params.append(sources)
             source_filter = f"AND d.source_system = ANY(${len(params)}::text[])"
+
+        doc_type_filter = ""
+        if doc_types:
+            params.append(doc_types)
+            doc_type_filter = f"AND d.doc_type = ANY(${len(params)}::text[])"
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -75,6 +81,7 @@ async def bm25_search(
               {pred.chunk_sql}
               {pred.doc_sql}
               {source_filter}
+              {doc_type_filter}
             ORDER BY score DESC
             LIMIT $3
             """,

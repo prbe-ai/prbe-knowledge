@@ -49,6 +49,7 @@ async def graph_search(
     customer_id: str,
     entities: list[tuple[str, str]],  # (entity_type, canonical_id)
     top_k: int = TOP_K_GRAPH,
+    doc_types: list[str] | None = None,
     temporal: TemporalSpec | None = None,
 ) -> list[GraphHit]:
     """Return chunks from documents within 1 hop of any matching entity node.
@@ -56,6 +57,8 @@ async def graph_search(
     Scoring is flat (1.0) — callers normalize. The value this retriever adds
     is recall for entity-qualified queries where vector/BM25 miss the
     less-obviously-relevant docs (sibling tickets, co-owned services, etc.).
+
+    `doc_types`, when set, hard-filters joined documents by `doc_type`.
     """
     if not entities:
         return []
@@ -74,6 +77,12 @@ async def graph_search(
         labels = [r[0] for r in resolved]
         cids = [r[1] for r in resolved]
         params: list = [customer_id, labels, cids, top_k]
+
+        doc_type_filter = ""
+        if doc_types:
+            params.append(doc_types)
+            doc_type_filter = f"AND d.doc_type = ANY(${len(params)}::text[])"
+
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
         )
@@ -119,6 +128,7 @@ async def graph_search(
             WHERE 1 = 1
               {pred.chunk_sql}
               {pred.doc_sql}
+              {doc_type_filter}
             GROUP BY c.chunk_id, c.doc_id, d.version,
                      d.source_system, d.source_url, d.title, c.content,
                      d.created_at, d.updated_at

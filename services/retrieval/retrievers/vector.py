@@ -31,6 +31,7 @@ async def vector_search(
     query_text: str,
     top_k: int = TOP_K_VECTOR,
     sources: list[str] | None = None,
+    doc_types: list[str] | None = None,
     temporal: TemporalSpec | None = None,
 ) -> list[VectorHit]:
     """Embed `query_text`, ANN-search against chunks, return top_k hits.
@@ -39,6 +40,11 @@ async def vector_search(
 
     `temporal` controls which versions of each doc are considered. Defaults
     to TemporalSpec() = latest-live.
+
+    `doc_types`, when set, hard-filters by `documents.doc_type` (dotted form,
+    e.g. ['github.commit', 'github.pull_request']). The search pipeline
+    passes None and uses doc_type as a soft RRF boost; the list pipeline
+    passes the resolved set as a hard filter — same retriever, two callers.
     """
     embedder = get_embedder()
     query_vec = await embedder.embed_query(query_text)
@@ -52,6 +58,11 @@ async def vector_search(
         if sources:
             params.append(sources)
             source_filter = f"AND d.source_system = ANY(${len(params)}::text[])"
+
+        doc_type_filter = ""
+        if doc_types:
+            params.append(doc_types)
+            doc_type_filter = f"AND d.doc_type = ANY(${len(params)}::text[])"
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -79,6 +90,7 @@ async def vector_search(
               {pred.chunk_sql}
               {pred.doc_sql}
               {source_filter}
+              {doc_type_filter}
             ORDER BY c.embedding <=> $2::halfvec
             LIMIT $3
             """,

@@ -1,0 +1,190 @@
+"""Retrieval dispatcher — splits semantic search vs deterministic listing.
+
+Flow:
+    /retrieve → authenticate → resolve customer_id → route_query (Haiku)
+              → resolve temporal + doc_type
+              → branch on routed.mode:
+                    "list"   → list_pipeline.run_list  (SQL window/aggregate)
+                    "search" → search_pipeline.run_search  (vec + bm25 + graph + RRF)
+                    None/unknown → fall back to search
+
+Defensive recheck: even when Haiku says `mode=list`, we re-verify the gate
+locally. If a topic entity slipped through (Haiku misclassification under
+the new schema), we route to search instead. Trust-but-verify the LLM.
+"""
+
+from __future__ import annotations
+
+import time
+from datetime import UTC, datetime
+
+from fastapi import HTTPException
+
+from services.retrieval.auth import AuthResult, resolve_customer_id_for_body
+from services.retrieval.doc_type_resolver import resolve_doc_type_token
+from services.retrieval.list_pipeline import run_list
+from services.retrieval.router import (
+    TOPIC_ENTITY_TYPES,
+    RouterOutput,
+    route_query,
+)
+from services.retrieval.search_pipeline import run_search
+from services.retrieval.temporal import resolve_temporal
+from shared.logging import get_logger
+from shared.models import (
+    QueryRequest,
+    QueryResponse,
+    TemporalMode,
+    TemporalSpec,
+)
+
+log = get_logger(__name__)
+
+
+def _gate_verify_list(routed: RouterOutput, spec: TemporalSpec) -> bool:
+    """Local recheck of the mode=list gate.
+
+    Returns True iff the Haiku output actually satisfies the gate:
+        (sort non-null OR temporal non-default) AND no topic entity.
+
+    A defense-in-depth: if Haiku misclassifies (e.g. emits mode=list with a
+    `feature` entity present), the dispatcher catches it and falls back to
+    search. The router prompt should already prevent this; we double-check
+    here so a bad Haiku snapshot can't silently route topic queries to SQL.
+    """
+    has_temporal = spec.mode != TemporalMode.LATEST or any(
+        v is not None for v in (spec.since, spec.until, spec.as_of)
+    )
+    has_sort = routed.sort is not None
+    if not (has_temporal or has_sort):
+        return False
+    return not any(e.entity_type in TOPIC_ENTITY_TYPES for e in routed.entities)
+
+
+async def run_retrieval(req: QueryRequest, auth: AuthResult) -> QueryResponse:
+    """Run the full retrieval pipeline. The single entry point for the
+    /retrieve endpoint and (via /query) the synthesis layer."""
+    customer_id = resolve_customer_id_for_body(auth, req.customer_id)
+    req = req.model_copy(update={"customer_id": customer_id})
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="empty query")
+
+    trace_id = req.trace_id or f"q-{int(datetime.now().timestamp() * 1000)}"
+    timing: dict[str, float] = {}
+
+    t_router = time.perf_counter()
+    routed = await route_query(customer_id, req.query)
+    timing["router_ms"] = (time.perf_counter() - t_router) * 1000
+
+    # Resolve temporal: caller's explicit (non-default) TemporalSpec wins.
+    # Otherwise use Haiku-extracted symbolic temporal. Otherwise fall back
+    # to the default LATEST. extraction_failed surfaces unresolvable
+    # event anchors ("since the auth refactor") — agent decides what to do.
+    now = datetime.now(UTC)
+    inferred_spec, extraction_error = resolve_temporal(routed.temporal, now=now)
+    caller_explicit = (
+        req.temporal.mode != TemporalMode.LATEST
+        or req.temporal.since is not None
+        or req.temporal.until is not None
+        or req.temporal.as_of is not None
+    )
+    if caller_explicit:
+        spec = req.temporal
+        temporal_source = "caller"
+    elif inferred_spec is not None:
+        spec = inferred_spec
+        temporal_source = "inferred"
+    elif extraction_error is not None:
+        spec = TemporalSpec()
+        temporal_source = "extraction_failed"
+    else:
+        spec = TemporalSpec()
+        temporal_source = "default"
+
+    raw_phrase = (routed.temporal or {}).get("raw_phrase") if routed.temporal else None
+    temporal_meta: dict[str, object] = {
+        "mode": spec.mode.value,
+        "source": temporal_source,
+        "raw_phrase": raw_phrase,
+        "error": extraction_error,
+    }
+    if spec.mode == TemporalMode.CHANGED_BETWEEN:
+        temporal_meta["since"] = spec.since.isoformat() if spec.since else None
+        temporal_meta["until"] = spec.until.isoformat() if spec.until else None
+        temporal_meta["basis"] = spec.time_basis
+    elif spec.mode == TemporalMode.AS_OF:
+        temporal_meta["as_of"] = spec.as_of.isoformat() if spec.as_of else None
+
+    sort_meta: dict[str, object] | None = None
+    if routed.sort:
+        sort_meta = {
+            "field": routed.sort.get("field"),
+            "direction": routed.sort.get("direction"),
+            "trigger_phrase": routed.sort.get("trigger_phrase"),
+            "source": "inferred",
+        }
+
+    extracted_entities = [
+        {
+            "entity_type": e.entity_type,
+            "canonical_id": e.canonical_id,
+            "display_name": e.display_name,
+            "confidence": e.confidence,
+        }
+        for e in routed.entities
+    ]
+
+    # Caller-provided doc_types always win. Otherwise resolve Haiku's token.
+    doc_types: list[str] | None
+    if req.doc_types:
+        doc_types = list(req.doc_types)
+    else:
+        doc_types = resolve_doc_type_token(routed.doc_type, sources=req.sources)
+
+    # Mode dispatch with defensive recheck.
+    routed_mode = (routed.mode or "search").lower()
+    if routed_mode == "list" and _gate_verify_list(routed, spec):
+        log.info(
+            "query.dispatch",
+            extra={
+                "trace_id": trace_id,
+                "mode": "list",
+                "doc_type": routed.doc_type,
+                "operation": routed.operation,
+                "router_mode": routed.mode,
+                "query_len": len(req.query),
+            },
+        )
+        return await run_list(
+            req=req,
+            routed=routed,
+            spec=spec,
+            temporal_meta=temporal_meta,
+            sort_meta=sort_meta,
+            extracted_entities=extracted_entities,
+            doc_types=doc_types,
+            trace_id=trace_id,
+            timing=timing,
+        )
+
+    log.info(
+        "query.dispatch",
+        extra={
+            "trace_id": trace_id,
+            "mode": "search",
+            "doc_type": routed.doc_type,
+            "router_mode": routed.mode,
+            "query_len": len(req.query),
+        },
+    )
+    return await run_search(
+        req=req,
+        routed=routed,
+        spec=spec,
+        temporal_meta=temporal_meta,
+        sort_meta=sort_meta,
+        extracted_entities=extracted_entities,
+        doc_types=doc_types,
+        trace_id=trace_id,
+        timing=timing,
+    )

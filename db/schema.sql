@@ -124,6 +124,12 @@ CREATE TABLE documents (
 CREATE INDEX idx_documents_customer_source ON documents (customer_id, source_system, source_id);
 CREATE INDEX idx_documents_customer_updated ON documents (customer_id, updated_at DESC);
 CREATE INDEX idx_documents_customer_class ON documents (customer_id, doc_class, doc_type);
+-- Composite + partial for the deterministic list pipeline (and aggregates).
+-- Matches: WHERE customer_id=? AND source_system=? AND doc_type=? AND valid_to IS NULL
+-- ORDER BY updated_at DESC.
+CREATE INDEX idx_documents_customer_source_doctype_updated
+    ON documents (customer_id, source_system, doc_type, updated_at DESC)
+    WHERE valid_to IS NULL;
 -- Fast "latest version" lookup per (customer_id, doc_id).
 CREATE INDEX idx_documents_live ON documents (customer_id, doc_id) WHERE valid_to IS NULL;
 CREATE INDEX idx_documents_fts_title_preview ON documents

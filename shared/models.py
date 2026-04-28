@@ -189,9 +189,7 @@ class TemporalSpec(BaseModel):
     def _check_fields_match_mode(self) -> "TemporalSpec":
         if self.mode == TemporalMode.AS_OF and self.as_of is None:
             raise ValueError("as_of mode requires `as_of` timestamp")
-        if self.mode == TemporalMode.CHANGED_BETWEEN and (
-            self.since is None or self.until is None
-        ):
+        if self.mode == TemporalMode.CHANGED_BETWEEN and (self.since is None or self.until is None):
             raise ValueError("changed_between mode requires `since` and `until`")
         if (
             self.mode == TemporalMode.CHANGED_BETWEEN
@@ -210,6 +208,15 @@ class QueryRequest(BaseModel):
     customer_id: str | None = None
     top_k: int = 20
     sources: list[SourceSystem] | None = None
+    doc_types: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional caller-provided doc_type filter. Values are dotted "
+            "DocType strings (e.g. 'github.commit'). When set, overrides "
+            "any doc_type the router would have inferred from the query. "
+            "Hard filter on list mode; soft RRF boost on search mode."
+        ),
+    )
     requesting_user_id: str | None = None
     trace_id: str | None = None
     temporal: TemporalSpec = Field(default_factory=TemporalSpec)
@@ -272,7 +279,10 @@ class QueryResponse(BaseModel):
     applied_temporal: dict[str, object] | None = None
     applied_sort: dict[str, object] | None = None
     applied_entity_filter: dict[str, object] | None = None
+    applied_mode: str | None = None
+    applied_doc_types: list[str] | None = None
     extracted_entities: list[dict[str, object]] = Field(default_factory=list)
+    aggregation: dict[str, object] | None = None
     timing_ms: dict[str, float] = Field(default_factory=dict)
     trace_id: str
 
@@ -311,7 +321,10 @@ class AnswerResponse(BaseModel):
     applied_temporal: dict[str, object] | None = None
     applied_sort: dict[str, object] | None = None
     applied_entity_filter: dict[str, object] | None = None
+    applied_mode: str | None = None
+    applied_doc_types: list[str] | None = None
     extracted_entities: list[dict[str, object]] = Field(default_factory=list)
+    aggregation: dict[str, object] | None = None
     timing_ms: dict[str, float] = Field(default_factory=dict)
     trace_id: str
 
@@ -417,9 +430,7 @@ class NormalizationResult(BaseModel):
 
     @property
     def is_empty(self) -> bool:
-        return not (
-            self.documents or self.graph_nodes or self.graph_edges or self.acl_snapshots
-        )
+        return not (self.documents or self.graph_nodes or self.graph_edges or self.acl_snapshots)
 
 
 class WebhookParseResult(BaseModel):

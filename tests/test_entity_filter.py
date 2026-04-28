@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from services.retrieval.main import _apply_entity_filter
+from services.retrieval.helpers import apply_entity_filter as _apply_entity_filter
 from services.retrieval.router import RouterEntity
 
 _NOW = datetime(2026, 4, 24, tzinfo=UTC)
@@ -55,17 +55,13 @@ def test_filter_matches_on_title_too() -> None:
             title="Migrate tool execution to MCP + add Klavis integrations",
         ),
     ]
-    out, _ = _apply_entity_filter(
-        hits, [_entity("klavis", "Klavis")], threshold=0.7
-    )
+    out, _ = _apply_entity_filter(hits, [_entity("klavis", "Klavis")], threshold=0.7)
     assert len(out) == 1
 
 
 def test_filter_case_insensitive() -> None:
     hits = [FakeFused(chunk_id="c", content="KLAVIS shipped today")]
-    out, _ = _apply_entity_filter(
-        hits, [_entity("klavis", "klavis")], threshold=0.7
-    )
+    out, _ = _apply_entity_filter(hits, [_entity("klavis", "klavis")], threshold=0.7)
     assert len(out) == 1
 
 
@@ -109,9 +105,7 @@ def test_filter_uses_both_canonical_id_and_display_name() -> None:
 
 
 def test_filter_dedupes_needles_when_canonical_equals_display() -> None:
-    out, info = _apply_entity_filter(
-        [], [_entity("klavis", "klavis", conf=0.9)], threshold=0.7
-    )
+    out, info = _apply_entity_filter([], [_entity("klavis", "klavis", conf=0.9)], threshold=0.7)
     assert info["needles"] == ["klavis"]  # single needle, not duplicated
     assert out == []
 
@@ -157,9 +151,7 @@ def test_filter_source_match_only_for_known_platforms() -> None:
     """A needle that happens to match a chunk's source_system value but
     isn't one of our known sources doesn't trigger the source-match branch.
     """
-    chunk = FakeFused(
-        chunk_id="x", content="totally unrelated", source_system="custom"
-    )
+    chunk = FakeFused(chunk_id="x", content="totally unrelated", source_system="custom")
     out, _ = _apply_entity_filter(
         [chunk],
         [_entity("custom", "Custom", conf=0.9)],
