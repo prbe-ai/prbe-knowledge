@@ -29,6 +29,7 @@ class BM25Hit:
     created_at: datetime
     updated_at: datetime
     score: float
+    kind: str = "content"
 
 
 async def bm25_search(
@@ -67,6 +68,7 @@ async def bm25_search(
                    d.source_url,
                    d.title,
                    c.content,
+                   c.kind,
                    d.created_at,
                    d.updated_at,
                    ts_rank_cd(to_tsvector('english', c.content),
@@ -100,6 +102,7 @@ async def bm25_search(
             created_at=r["created_at"],
             updated_at=r["updated_at"],
             score=float(r["score"]),
+            kind=r["kind"],
         )
         for r in rows
     ]

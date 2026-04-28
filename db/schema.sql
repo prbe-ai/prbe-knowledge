@@ -170,6 +170,12 @@ CREATE TABLE chunks (
     valid_to             TIMESTAMPTZ,
 
     metadata             JSONB NOT NULL DEFAULT '{}',
+    -- 'content' = body chunk (default for all rows pre-0018).
+    -- 'metadata' = synthetic per-document chunk holding title/repo/author/url
+    --   text, generated at ingestion. Embedded + FTS-indexed for the search
+    --   path to rank metadata-keyed queries; the list path's representative
+    --   chunk filters to kind='content' so list responses always show body.
+    kind                 TEXT NOT NULL DEFAULT 'content',
 
     -- PK includes customer_id so tenants ingesting overlapping source content
     -- can't collide on chunk_id (which is derived from doc_id + content_hash).
@@ -190,6 +196,8 @@ CREATE INDEX idx_chunks_doc            ON chunks (doc_id);
 CREATE INDEX idx_chunks_doc_live       ON chunks (doc_id) WHERE valid_to IS NULL;
 CREATE INDEX idx_chunks_doc_hash       ON chunks (doc_id, content_hash);
 CREATE INDEX idx_chunks_fts_content    ON chunks USING GIN (to_tsvector('english', content));
+-- One metadata chunk per doc; partial index serves backfill idempotency check.
+CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kind = 'metadata';
 
 -- ---------------------------------------------------------------------------
 -- acl_snapshots: temporal ACL truth.

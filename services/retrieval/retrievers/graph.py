@@ -29,6 +29,10 @@ class GraphHit:
     updated_at: datetime
     score: float
     via_entity: str  # canonical_id that anchored this hit
+    # Always 'content' for graph hits (graph_search filters synthetic
+    # metadata chunks out — graph anchoring is about entity proximity,
+    # not synthetic-text similarity).
+    kind: str = "content"
 
 
 _ENTITY_TO_LABEL = {
@@ -124,6 +128,7 @@ async def graph_search(
             JOIN chunks c
               ON c.doc_id = d.doc_id
              AND c.customer_id = $1
+             AND c.kind = 'content'
              AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
             WHERE 1 = 1
               {pred.chunk_sql}
