@@ -24,6 +24,11 @@ class VectorHit:
     created_at: datetime
     updated_at: datetime
     score: float
+    # 'content' (default for legacy rows) or 'metadata'. The fusion layer
+    # uses kind to combine per-doc scores (metadata signal boosts the doc's
+    # best content chunk's ranking) and to drop synthetic key:value text from
+    # the response.
+    kind: str = "content"
 
 
 async def vector_search(
@@ -78,6 +83,7 @@ async def vector_search(
                    d.source_url,
                    d.title,
                    c.content,
+                   c.kind,
                    d.created_at,
                    d.updated_at,
                    1 - (c.embedding <=> $2::halfvec) AS score
@@ -109,6 +115,7 @@ async def vector_search(
             created_at=r["created_at"],
             updated_at=r["updated_at"],
             score=float(r["score"]),
+            kind=r["kind"],
         )
         for r in rows
     ]

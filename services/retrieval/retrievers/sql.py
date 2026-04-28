@@ -147,6 +147,7 @@ async def sql_list(
                 WHERE customer_id = $1
                   AND doc_id = rd.doc_id
                   AND valid_to IS NULL
+                  AND kind = 'content'
                   AND rd.version BETWEEN first_seen_version AND last_seen_version
                 ORDER BY chunk_index
                 LIMIT 1

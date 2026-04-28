@@ -23,6 +23,7 @@ change rather than the size of the document.
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -108,9 +109,7 @@ class Normalizer:
             event_id=source_event_id,
         )
 
-        raw_bytes = await self._store.get(
-            self._store.bucket_for(customer_id), payload_s3_key
-        )
+        raw_bytes = await self._store.get(self._store.bucket_for(customer_id), payload_s3_key)
         raw_payload = orjson.loads(raw_bytes)
         headers = raw_payload.get("_headers", {})
         payload = raw_payload.get("payload", raw_payload)
@@ -165,9 +164,7 @@ class Normalizer:
             node_ids = await upsert_nodes(
                 conn, customer_id, result.graph_nodes, source_system.value
             )
-            await upsert_edges(
-                conn, customer_id, result.graph_edges, node_ids, source_system.value
-            )
+            await upsert_edges(conn, customer_id, result.graph_edges, node_ids, source_system.value)
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
 
             for idx, doc in enumerate(result.documents):
@@ -223,25 +220,36 @@ class Normalizer:
             quarantined_doc_ids=quarantined,
         )
 
-    async def _sync_chunks(
-        self, conn: asyncpg.Connection, doc: Document
-    ) -> _ChunkSyncOutcome:
+    async def _sync_chunks(self, conn: asyncpg.Connection, doc: Document) -> _ChunkSyncOutcome:
         """Diff live chunks against freshly-chunked content.
 
         The whole point: don't re-embed what hasn't changed.
         """
         # Deleted docs: no body → chunks is empty → every live chunk gets closed out.
+        # The metadata chunk also disappears for deleted docs (joins the removed
+        # set just like content chunks).
         if doc.deleted_at is not None:
             new_pieces: list[ChunkPiece] = []
+            metadata_piece: ChunkPiece | None = None
         else:
             new_pieces = chunk_text(_stringify_body(doc))
+            metadata_piece = _metadata_piece(doc)
 
         new_hashes: list[str] = [_chunk_hash(p.content) for p in new_pieces]
-        new_by_hash: dict[str, ChunkPiece] = {h: p for h, p in zip(new_hashes, new_pieces, strict=True)}
+        new_by_hash: dict[str, ChunkPiece] = {
+            h: p for h, p in zip(new_hashes, new_pieces, strict=True)
+        }
+
+        # The metadata chunk participates in the same hash-based reuse machinery
+        # as content chunks: same content_hash across versions → just bump
+        # last_seen_version, no re-embed. Its `kind='metadata'` is what
+        # distinguishes it at insert + read time. Tracked separately so we can
+        # filter live_rows by kind to avoid colliding with content hashes.
+        metadata_hash: str | None = _chunk_hash(metadata_piece.content) if metadata_piece else None
 
         live_rows = await conn.fetch(
             """
-            SELECT content_hash, chunker_version, chunk_index
+            SELECT content_hash, chunker_version, chunk_index, kind
             FROM chunks
             WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
             """,
@@ -249,24 +257,42 @@ class Normalizer:
             doc.doc_id,
         )
 
-        # A chunk produced by an older chunker version is never "reused" — its
-        # hash space isn't comparable to naive-v1's, so we mark it stale up front
-        # and let the diff treat it as removed.
-        live_hashes: set[str] = set()
+        # Diff content chunks and the (singular) metadata chunk against
+        # separate live-row partitions. Filtering by kind avoids the case
+        # where a content chunk and the metadata chunk happen to coincide
+        # by content_hash (highly unlikely under sha256 but cheap to defend).
+        live_content_hashes: set[str] = set()
+        live_metadata_hashes: set[str] = set()
         stale_hashes: set[str] = set()
         for row in live_rows:
-            if row["chunker_version"] == CHUNKER_VERSION:
-                live_hashes.add(row["content_hash"])
-            else:
+            if row["chunker_version"] != CHUNKER_VERSION:
                 stale_hashes.add(row["content_hash"])
+                continue
+            if row["kind"] == "metadata":
+                live_metadata_hashes.add(row["content_hash"])
+            else:
+                live_content_hashes.add(row["content_hash"])
 
         new_hashes_set = set(new_hashes)
-        reused_hashes = live_hashes & new_hashes_set
-        added_hashes = new_hashes_set - live_hashes
-        removed_hashes = (live_hashes - new_hashes_set) | stale_hashes
+        reused_hashes = live_content_hashes & new_hashes_set
+        added_hashes = new_hashes_set - live_content_hashes
+        removed_hashes = (live_content_hashes - new_hashes_set) | stale_hashes
+
+        # Metadata-chunk diff: separate set, separate flow.
+        metadata_reuse = metadata_hash is not None and metadata_hash in live_metadata_hashes
+        metadata_add = metadata_piece is not None and metadata_hash not in live_metadata_hashes
+        # Any live metadata-kind hash that doesn't match the new one (e.g.
+        # title changed across doc versions) is stale and gets closed out.
+        removed_metadata_hashes = {h for h in live_metadata_hashes if h != metadata_hash}
+        if removed_metadata_hashes:
+            removed_hashes |= removed_metadata_hashes
 
         # 1) Reuse: just bump last_seen_version. No embed call.
-        if reused_hashes:
+        # Combined: content reused + metadata reused (if any).
+        reused_for_bump = set(reused_hashes)
+        if metadata_reuse and metadata_hash is not None:
+            reused_for_bump.add(metadata_hash)
+        if reused_for_bump:
             await conn.execute(
                 """
                 UPDATE chunks
@@ -277,29 +303,48 @@ class Normalizer:
                 doc.version,
                 doc.customer_id,
                 doc.doc_id,
-                list(reused_hashes),
+                list(reused_for_bump),
             )
 
-        # 2) Added: embed + insert. Position inputs by their order in `added`
-        # and pair back via the embedder's `chunk_index` which equals input index.
-        added_pieces: list[ChunkPiece] = [new_by_hash[h] for h in new_hashes if h in added_hashes]
+        # 2) Added: embed + insert. Content pieces and the metadata piece (if
+        # added) go through ONE embed_many call so we don't pay an extra
+        # OpenAI round-trip per doc. The metadata piece is appended at the
+        # end of the input list; its index is tracked separately so we know
+        # which match belongs to it.
+        added_content_pieces: list[ChunkPiece] = [
+            new_by_hash[h] for h in new_hashes if h in added_hashes
+        ]
+        embed_inputs: list[ChunkPiece] = list(added_content_pieces)
+        metadata_input_index: int | None = None
+        if metadata_add and metadata_piece is not None:
+            metadata_input_index = len(embed_inputs)
+            embed_inputs.append(metadata_piece)
 
         failed = 0
-        if added_pieces:
-            embeds = await self._embedder.embed_many([p.content for p in added_pieces])
+        if embed_inputs:
+            embeds = await self._embedder.embed_many([p.content for p in embed_inputs])
             for match in embeds.embedded:
-                if match.chunk_index < 0 or match.chunk_index >= len(added_pieces):
+                if match.chunk_index < 0 or match.chunk_index >= len(embed_inputs):
                     continue
-                piece = added_pieces[match.chunk_index]
-                await _insert_chunk(conn, doc, piece, match.embedding)
+                piece = embed_inputs[match.chunk_index]
+                kind = (
+                    "metadata"
+                    if metadata_input_index is not None
+                    and match.chunk_index == metadata_input_index
+                    else "content"
+                )
+                await _insert_chunk(conn, doc, piece, match.embedding, kind=kind)
             for fail in embeds.failed:
                 # Map back to the originating piece to record chunk_index on failure.
-                if 0 <= fail.chunk_index < len(added_pieces):
-                    piece = added_pieces[fail.chunk_index]
+                if 0 <= fail.chunk_index < len(embed_inputs):
+                    piece = embed_inputs[fail.chunk_index]
                 else:
                     piece = None
                 await _insert_failed_chunk(conn, doc, fail, piece)
-                failed += 1
+                # Don't count metadata-chunk failures against `failed` — that
+                # counter feeds the chunk-sync outcome which is content-shaped.
+                if metadata_input_index is None or fail.chunk_index != metadata_input_index:
+                    failed += 1
 
         # 3) Removed: mark stale at NOW().
         if removed_hashes:
@@ -316,11 +361,11 @@ class Normalizer:
             )
 
         return _ChunkSyncOutcome(
-            added=len(added_pieces) - failed,
+            added=len(added_content_pieces) - failed,
             reused=len(reused_hashes),
             removed=len(removed_hashes),
             failed=failed,
-            live=len(reused_hashes) + (len(added_pieces) - failed),
+            live=len(reused_hashes) + (len(added_content_pieces) - failed),
         )
 
     # ---- helpers ------------------------------------------------------------
@@ -504,22 +549,27 @@ async def _insert_chunk(
     doc: Document,
     piece: ChunkPiece,
     embedding: list[float],
+    kind: str = "content",
 ) -> None:
     content_hash = _chunk_hash(piece.content)
-    chunk_id = f"{doc.doc_id}:c_{content_hash[:16]}"
+    # Distinct chunk_id prefix for metadata so a same-content_hash collision
+    # between content and metadata (theoretical) doesn't ON CONFLICT-update
+    # the wrong row.
+    prefix = "m_" if kind == "metadata" else "c_"
+    chunk_id = f"{doc.doc_id}:{prefix}{content_hash[:16]}"
     await conn.execute(
         """
         INSERT INTO chunks (
             chunk_id, doc_id, customer_id,
             chunk_index, content, content_hash, token_count,
             embedding, embedding_model, embedding_dim, chunker_version,
-            first_seen_version, last_seen_version
+            first_seen_version, last_seen_version, kind
         )
         VALUES (
             $1, $2, $3,
             $4, $5, $6, $7,
             $8::halfvec, $9, $10, $11,
-            $12, $12
+            $12, $12, $13
         )
         ON CONFLICT (doc_id, content_hash) DO UPDATE
             SET last_seen_version = EXCLUDED.last_seen_version,
@@ -537,6 +587,7 @@ async def _insert_chunk(
         EMBEDDING_DIM,
         CHUNKER_VERSION,
         doc.version,
+        kind,
     )
 
 
@@ -616,6 +667,71 @@ def _pg_vector(vec: list[float]) -> str:
 def _chunk_hash(content: str) -> str:
     """Stable content-hash used as the identity of a chunk within a doc."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+# Index of the metadata chunk within a doc. Sentinel value chosen so it
+# sorts before any content chunk's index — readers filter by `kind` to
+# skip it; this index just keeps the (content_hash unique within doc)
+# invariant from colliding with content chunks at index 0.
+METADATA_CHUNK_INDEX = -1
+
+
+# Strip opaque commit SHAs from github URLs before embedding — they
+# tokenize into garbage and waste vector capacity. Captures `/commit/`
+# followed by a 40-hex SHA, replaces with `/commit/`. Keeps the
+# human-readable repo path intact.
+_GITHUB_SHA_RE = re.compile(r"/commit/[0-9a-f]{40}")
+
+
+def _strip_opaque_ids(url: str) -> str:
+    """Remove SHAs and similar opaque IDs from a URL prior to embedding."""
+    if not url:
+        return url
+    return _GITHUB_SHA_RE.sub("/commit/", url)
+
+
+def _metadata_text(doc: Document) -> str:
+    """Structured key:value text for the synthetic metadata chunk.
+
+    Contains the human-readable doc fields that the search path needs to
+    rank metadata-keyed queries on ("what's going on with prbe-backend"
+    matches `repo:` line via embedding similarity / BM25).
+
+    Excludes opaque IDs (doc_id, content_hash, SHAs in URLs) — they
+    waste embedding capacity and never match real queries. Stable across
+    re-ingestion of the same document state, so the resulting chunk's
+    content_hash is idempotent under retries.
+    """
+    lines: list[str] = []
+    if doc.title:
+        lines.append(f"title: {doc.title}")
+    lines.append(f"source: {doc.source_system.value}")
+    if doc.author_id:
+        lines.append(f"author: {doc.author_id}")
+    if doc.source_url:
+        lines.append(f"url: {_strip_opaque_ids(doc.source_url)}")
+    if doc.body_preview:
+        # First line of the body gives ranking a content anchor without
+        # bloating the metadata chunk to full chunk size.
+        first_line = doc.body_preview.strip().splitlines()
+        if first_line:
+            lines.append(f"summary: {first_line[0][:200]}")
+    return "\n".join(lines)
+
+
+def _metadata_piece(doc: Document) -> ChunkPiece | None:
+    """Build a ChunkPiece for the doc's metadata text. None if there's
+    nothing useful to embed (e.g. no title and no body_preview)."""
+    text = _metadata_text(doc)
+    if not text.strip():
+        return None
+    from services.ingestion.chunker import count_tokens
+
+    return ChunkPiece(
+        chunk_index=METADATA_CHUNK_INDEX,
+        content=text,
+        token_count=count_tokens(text),
+    )
 
 
 def _stringify_body(doc: Document) -> str:
