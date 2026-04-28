@@ -299,6 +299,54 @@ async def test_loose_match_case_insensitive(live_db) -> None:
     assert len(hits) == 1
 
 
+@pytest.mark.parametrize(
+    ("query_value", "expect_match"),
+    [
+        # Same logical entity expressed every way Haiku might emit it.
+        # All should match a graph node whose canonical_id is
+        # 'external-investigations'.
+        ("external-investigations", True),  # exact
+        ("external investigations", True),  # space → hyphen
+        ("external_investigations", True),  # underscore → hyphen
+        ("External Investigations", True),  # title-case + space
+        ("EXTERNAL_INVESTIGATIONS", True),  # uppercase + underscore
+        ("ExternalInvestigations", True),  # camel-case, no separator
+        # NOT a match — different word entirely; alnum normalization
+        # doesn't introduce substring fuzziness.
+        ("investigations", False),
+        ("external", False),
+    ],
+)
+async def test_alphanumeric_normalization_arm(live_db, query_value, expect_match) -> None:
+    """The 4th + 5th match arms strip non-alphanumeric chars on both
+    sides so cosmetic-separator differences don't defeat the filter.
+    Catches the "external investigations" vs "external-investigations"
+    family of mismatches Haiku produces from natural-language queries."""
+    cust = f"cust-alnum-{abs(hash(query_value)) % 10_000}"
+    await _seed_customer(cust)
+    await _seed_doc_with_repo_link(
+        cust,
+        doc_id="d1",
+        full_name="external-investigations",
+        repo_short_name="external-investigations",
+        title="ticket",
+        updated_at=datetime(2026, 4, 28, tzinfo=UTC),
+        # `Repo` label is the seeder's default; the alnum normalization
+        # arm doesn't care about label semantics — it's purely a string
+        # comparison on canonical_id / properties.name.
+    )
+
+    hits = await sql_list(
+        cust,
+        top_k=10,
+        graph_entity_filters=[GraphEntityFilter(label="Repo", values=[query_value])],
+    )
+    if expect_match:
+        assert len(hits) == 1, f"{query_value!r} should match"
+    else:
+        assert hits == [], f"{query_value!r} should NOT match (would be substring fuzziness)"
+
+
 # ---- guardrail: substring DOESN'T match ----------------------------------
 
 

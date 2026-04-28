@@ -124,6 +124,37 @@ Items the design doc explicitly defers to Phase 1:
 
 ## P5 — Phase 1 retrieval
 
+### Functional index for relaxed entity-filter match
+**Where:** `services/retrieval/retrievers/sql.py::_entity_match_clause`
+
+The list-pipeline entity filter has 5 OR'd match arms. Three use
+`LOWER(...)` and hit the existing `idx_graph_nodes_lower_canonical` /
+`idx_graph_nodes_lower_props_name` functional indexes. Two new arms
+(alphanumeric normalization for "external investigations" ↔
+"external-investigations") use `regexp_replace(LOWER(...), '[^a-z0-9]+',
+'', 'g')` and CAN'T use those indexes — they fall back to a seq scan
+over the `(customer_id, label)`-narrowed subset.
+
+Acceptable today: graph_nodes per tenant is small enough (a few hundred)
+that the seq-scan-of-subset is microseconds. **Trigger to add the index:**
+any tenant accumulates > 100k `graph_nodes` rows OR EXPLAIN ANALYZE in
+the perf test starts showing `Seq Scan on graph_nodes` as the dominant
+cost.
+
+**Fix:** new alembic migration adding two CONCURRENTLY-built indexes:
+
+```sql
+CREATE INDEX CONCURRENTLY idx_graph_nodes_alnum_canonical
+  ON graph_nodes (customer_id, label,
+                  regexp_replace(LOWER(canonical_id), '[^a-z0-9]+', '', 'g'));
+CREATE INDEX CONCURRENTLY idx_graph_nodes_alnum_props_name
+  ON graph_nodes (customer_id, label,
+                  regexp_replace(LOWER(properties->>'name'),
+                                 '[^a-z0-9]+', '', 'g'));
+```
+
+~10 LOC migration. No application change required.
+
 ### Event-anchor index
 
 Agents asking "since the auth refactor" or "after we shipped v2" hit a wall:
