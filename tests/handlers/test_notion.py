@@ -173,6 +173,211 @@ def test_blocks_to_markdown_numbered_list_restarts() -> None:
     assert lines[3] == "1. one again"
 
 
+def test_blocks_to_markdown_recurses_into_children() -> None:
+    """Toggle / column / list-children content must surface, not vanish.
+
+    Previously: nested children were never fetched and rendered as
+    `[block:toggle]` placeholders, dropping the entire collapsed body.
+    """
+    blocks = [
+        {
+            "type": "toggle",
+            "toggle": {"rich_text": [{"plain_text": "How to deploy"}]},
+            "_children": [
+                {
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"plain_text": "Run fly deploy"}]},
+                },
+                {
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {
+                        "rich_text": [{"plain_text": "verify health"}]
+                    },
+                },
+            ],
+        },
+        {
+            "type": "column_list",
+            "column_list": {},
+            "_children": [
+                {
+                    "type": "column",
+                    "column": {},
+                    "_children": [
+                        {
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [{"plain_text": "left column"}]
+                            },
+                        }
+                    ],
+                },
+                {
+                    "type": "column",
+                    "column": {},
+                    "_children": [
+                        {
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [{"plain_text": "right column"}]
+                            },
+                        }
+                    ],
+                },
+            ],
+        },
+    ]
+    md = blocks_to_markdown(blocks)
+    assert "How to deploy" in md
+    assert "Run fly deploy" in md
+    assert "verify health" in md
+    # Container blocks render children at the same depth (no indent).
+    assert "left column" in md
+    assert "right column" in md
+    # Toggle children are indented one level under the toggle line.
+    toggle_line = next(line for line in md.splitlines() if "How to deploy" in line)
+    body_line = next(line for line in md.splitlines() if "Run fly deploy" in line)
+    assert toggle_line.lstrip(" >").startswith("How to deploy")
+    assert body_line.startswith("  ")
+
+
+def test_blocks_to_markdown_child_page_placeholder_no_recursion() -> None:
+    """child_page is a separate ingestion root — render as a placeholder
+    referencing the title, but do NOT inline its content (would duplicate)."""
+    blocks = [
+        {
+            "type": "child_page",
+            "child_page": {"title": "Subpage runbook"},
+        }
+    ]
+    md = blocks_to_markdown(blocks)
+    assert "[child_page: Subpage runbook]" in md
+
+
+def test_extract_mentioned_user_ids_descends_into_children() -> None:
+    """Mentions inside toggle/column children must still surface as PERSON
+    nodes — otherwise nested @mentions silently vanish from the graph."""
+    from services.ingestion.handlers.notion import _extract_mentioned_user_ids
+
+    blocks = [
+        {
+            "type": "toggle",
+            "toggle": {"rich_text": [{"plain_text": "Toggle title"}]},
+            "_children": [
+                {
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [
+                            {
+                                "type": "mention",
+                                "mention": {
+                                    "type": "user",
+                                    "user": {"id": "user_carol"},
+                                },
+                                "plain_text": "@Carol",
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+    ]
+    assert _extract_mentioned_user_ids(blocks) == ["user_carol"]
+
+
+# ---------------------------------------------------------------------------
+# _fetch_all_blocks recursion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_all_blocks_recurses_into_has_children() -> None:
+    """Nested blocks (has_children=true) must be fetched and attached as
+    `_children`. The original implementation only fetched direct children,
+    which is the bulk of the "missing docs" the user reported."""
+    from shared.models import IntegrationToken
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # /v1/blocks/{id}/children
+        path = request.url.path
+        calls.append(path)
+        if path == "/v1/blocks/page_root/children":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": "blk_toggle",
+                            "type": "toggle",
+                            "has_children": True,
+                            "toggle": {"rich_text": [{"plain_text": "T"}]},
+                        },
+                        {
+                            "id": "blk_para",
+                            "type": "paragraph",
+                            "has_children": False,
+                            "paragraph": {"rich_text": [{"plain_text": "flat"}]},
+                        },
+                        # child_page must NOT be recursed (separate ingestion root).
+                        {
+                            "id": "blk_subpage",
+                            "type": "child_page",
+                            "has_children": True,
+                            "child_page": {"title": "Subpage"},
+                        },
+                    ],
+                    "has_more": False,
+                    "next_cursor": None,
+                },
+            )
+        if path == "/v1/blocks/blk_toggle/children":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "id": "blk_inner",
+                            "type": "paragraph",
+                            "has_children": False,
+                            "paragraph": {"rich_text": [{"plain_text": "hidden"}]},
+                        }
+                    ],
+                    "has_more": False,
+                    "next_cursor": None,
+                },
+            )
+        return httpx.Response(404, json={"error": f"unmocked {path}"})
+
+    settings = Settings(environment="local")
+    ctx = ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = IntegrationToken(
+        customer_id="c", source_system=SourceSystem.NOTION, access_token="x"
+    )
+
+    blocks = await notion._fetch_all_blocks("page_root", token)
+
+    # Top-level: toggle + paragraph + child_page.
+    assert [b["type"] for b in blocks] == ["toggle", "paragraph", "child_page"]
+    # Toggle has children attached.
+    toggle = blocks[0]
+    assert toggle["_children"][0]["type"] == "paragraph"
+    assert (
+        toggle["_children"][0]["paragraph"]["rich_text"][0]["plain_text"] == "hidden"
+    )
+    # child_page was NOT recursed into — only toggle's children were fetched.
+    assert "/v1/blocks/blk_subpage/children" not in calls
+    # Markdown renders the nested content end-to-end.
+    md = blocks_to_markdown(blocks)
+    assert "hidden" in md
+    assert "[child_page: Subpage]" in md
+
+
 # ---------------------------------------------------------------------------
 # normalize
 # ---------------------------------------------------------------------------

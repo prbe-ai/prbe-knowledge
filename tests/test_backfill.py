@@ -447,6 +447,111 @@ async def test_notion_backfill_paginates_search() -> None:
     assert set(kinds) == {"page", "database"}
 
 
+@pytest.mark.asyncio
+async def test_notion_backfill_enumerates_database_rows() -> None:
+    """Each database discovered in /search must have its rows pulled via
+    databases/{id}/query and yielded as page.updated events.
+
+    Without this, every Notion database's contents are invisible: rows are
+    pages that /search does not list unless individually shared with the
+    integration.
+    """
+
+    def users_me(req):
+        return httpx.Response(200, json={"bot": {"workspace_id": "WS1"}})
+
+    def search(req):
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "object": "database",
+                        "id": "DB1",
+                        "last_edited_time": "2026-04-01T00:00:00.000Z",
+                    }
+                ],
+                "has_more": False,
+                "next_cursor": None,
+            },
+        )
+
+    query_calls: list[dict] = []
+    page_state = {"ix": 0}
+
+    def query(req):
+        body = req.read()
+        import json as _json
+
+        query_calls.append(_json.loads(body) if body else {})
+        if page_state["ix"] == 0:
+            page_state["ix"] = 1
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "object": "page",
+                            "id": "ROW1",
+                            "last_edited_time": "2026-04-01T01:00:00.000Z",
+                        },
+                        {
+                            "object": "page",
+                            "id": "ROW2",
+                            "last_edited_time": "2026-04-01T02:00:00.000Z",
+                        },
+                    ],
+                    "has_more": True,
+                    "next_cursor": "cur_q1",
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {
+                        "object": "page",
+                        "id": "ROW3",
+                        "last_edited_time": "2026-04-01T03:00:00.000Z",
+                    }
+                ],
+                "has_more": False,
+                "next_cursor": None,
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("GET", "/v1/users/me"): users_me,
+            ("POST", "/v1/search"): search,
+            ("POST", "/v1/databases/DB1/query"): query,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    notion = build_connector(SourceSystem.NOTION, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="c", source_system=SourceSystem.NOTION, access_token="x"
+    )
+    events = [e async for e in notion.backfill("c", token)]
+
+    # 1 database event + 3 row-as-page events.
+    assert len(events) == 4
+    kinds = [e.raw_payload["entity"]["type"] for e in events]
+    assert kinds == ["database", "page", "page", "page"]
+    row_ids = [e.raw_payload["entity"]["id"] for e in events[1:]]
+    assert row_ids == ["ROW1", "ROW2", "ROW3"]
+    # Pagination cursor was passed on the second query call.
+    assert query_calls[0] == {"page_size": 100}
+    assert query_calls[1] == {"page_size": 100, "start_cursor": "cur_q1"}
+    # Rows carry parent-database breadcrumb so downstream can attribute them.
+    assert all(
+        e.raw_payload.get("_parent_database_id") == "DB1" for e in events[1:]
+    )
+
+
 # -------------------------------- sentry ------------------------------------
 
 
