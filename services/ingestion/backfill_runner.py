@@ -25,7 +25,7 @@ from services.ingestion.handlers.registry import build_connector
 from shared.constants import BackfillStatus, QueueStatus, SourceSystem
 from shared.db import get_pool, raw_conn
 from shared.encryption import decrypt_token
-from shared.exceptions import NotSupportedByConnector
+from shared.exceptions import NotSupportedByConnector, PermanentSourceError
 from shared.logging import get_logger
 from shared.metrics import counter
 from shared.models import IntegrationToken
@@ -34,6 +34,10 @@ from shared.storage import get_store
 log = get_logger(__name__)
 
 PROGRESS_EVERY_N_EVENTS = 25
+# How often to re-check `integration_tokens.status='active'` mid-backfill.
+# A SELECT every event is wasteful; once per ~50 events bounds the disconnect-race
+# window to one Granola page (~250ms) without flooding the DB. See _token_still_active.
+TOKEN_RECHECK_EVERY_N_EVENTS = 50
 
 
 async def run_backfill(
@@ -71,11 +75,36 @@ async def run_backfill(
         try:
             events = connector.backfill(customer_id, token, cursor)
         except NotSupportedByConnector as exc:
-            await _mark_failed(customer_id, source, f"not supported: {exc}")
+            # Not auth-related; passing exc is harmless since _mark_failed
+            # only flips the token on PermanentSourceError with 401/403.
+            await _mark_failed(
+                customer_id, source, f"not supported: {exc}", exc=exc
+            )
             return 0
 
         latest_cursor = cursor
         async for event in events:
+            # Disconnect race: if the user disconnected mid-backfill, the
+            # integration_tokens row was deleted (or status flipped). Bail
+            # before writing more rows so we don't leave zombie R2 objects +
+            # ingestion_queue entries for a now-disconnected source.
+            #
+            # Checking once per N events rather than every event keeps the
+            # SELECT cost bounded (~250ms race window for Granola at ~50
+            # events/page).
+            if (
+                enqueued % TOKEN_RECHECK_EVERY_N_EVENTS == 0
+                and not await _token_still_active(customer_id, source)
+            ):
+                log.info(
+                    "backfill.aborted_disconnect",
+                    customer=customer_id,
+                    source=source.value,
+                    enqueued=enqueued,
+                )
+                # Do NOT call _mark_done — leave backfill_state for cleanup.
+                return enqueued
+
             envelope = json.dumps(
                 {
                     "_headers": event.headers,
@@ -129,7 +158,10 @@ async def run_backfill(
             "backfill.done", customer=customer_id, source=source.value, events=enqueued
         )
     except Exception as exc:
-        await _mark_failed(customer_id, source, str(exc))
+        # Pass exc so _mark_failed can detect PermanentSourceError(401/403)
+        # raised by a connector mid-backfill (e.g. Granola key revoked) and
+        # flip integration_tokens.status='auth_failed' atomically.
+        await _mark_failed(customer_id, source, str(exc), exc=exc)
         counter("backfill.failed", 1, source=source.value)
         log.exception("backfill.failed", customer=customer_id, source=source.value)
         raise
@@ -264,22 +296,82 @@ async def _mark_done(
 
 
 async def _mark_failed(
-    customer_id: str, source: SourceSystem, error: str
+    customer_id: str,
+    source: SourceSystem,
+    error: str,
+    *,
+    exc: Exception | None = None,
 ) -> None:
-    async with raw_conn() as conn:
+    """Mark a backfill_state row as failed.
+
+    When `exc` is a `PermanentSourceError` carrying a 401/403 status, ALSO flip
+    the active integration_tokens row to status='auth_failed'. This is what
+    surfaces "Reconnect" in the dashboard for revoked Granola keys without
+    flipping on Granola 503s (transient) or non-auth permanent errors.
+
+    The `WHERE status='active'` filter on the token UPDATE means a concurrent
+    disconnect (which deletes the row) leaves us with a 0-row UPDATE — silent,
+    no error.
+
+    Both updates run in a single transaction on the same connection so a crash
+    never leaves backfill_state='failed' but integration_tokens still 'active'.
+    """
+    # PermanentSourceError stores kwargs in `self.context`, not as attributes
+    # (see shared/exceptions.PrbeError). Granola raises with status=401/403.
+    is_auth_failure = False
+    if isinstance(exc, PermanentSourceError):
+        status_val = exc.context.get("status", 0) if exc.context else 0
+        is_auth_failure = status_val in {401, 403}
+
+    async with raw_conn() as conn, conn.transaction():
         await conn.execute(
             """
-            UPDATE backfill_state
-            SET status       = $1,
-                last_error   = $2,
-                heartbeat_at = NOW()
-            WHERE customer_id = $3 AND source_system = $4
-            """,
+                UPDATE backfill_state
+                SET status       = $1,
+                    last_error   = $2,
+                    heartbeat_at = NOW()
+                WHERE customer_id = $3 AND source_system = $4
+                """,
             BackfillStatus.FAILED.value,
             error[:1000],
             customer_id,
             source.value,
         )
+        if is_auth_failure:
+            # The status='active' filter means a concurrent disconnect
+            # (DELETE FROM integration_tokens) leaves this UPDATE matching
+            # 0 rows — safe no-op, no error raised.
+            await conn.execute(
+                """
+                    UPDATE integration_tokens
+                    SET status             = 'auth_failed',
+                        last_refresh_error = $1,
+                        updated_at         = NOW()
+                    WHERE customer_id   = $2
+                      AND source_system = $3
+                      AND status        = 'active'
+                    """,
+                error[:500],
+                customer_id,
+                source.value,
+            )
+
+
+async def _token_still_active(customer_id: str, source: SourceSystem) -> bool:
+    """Re-check integration_tokens.status='active' mid-backfill.
+
+    Used to bail out of `run_backfill` when a concurrent disconnect deletes
+    the token row (or flips status). Cheap one-row SELECT keyed on the unique
+    index (customer_id, source_system).
+    """
+    async with raw_conn() as conn:
+        status = await conn.fetchval(
+            "SELECT status FROM integration_tokens "
+            "WHERE customer_id=$1 AND source_system=$2",
+            customer_id,
+            source.value,
+        )
+    return status == "active"
 
 
 async def _load_cursor(customer_id: str, source: SourceSystem) -> str | None:
