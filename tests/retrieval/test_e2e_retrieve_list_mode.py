@@ -167,15 +167,12 @@ async def test_three_most_recent_commits_returns_only_commits_sorted(live_db) ->
         updated_at=base + timedelta(minutes=2),
     )
 
+    # Haiku for "3 most recent github commits" extracts sort + doc_type but
+    # no narrowing entity (github is a source-system mention, not a repo
+    # canonical_id). With no entity, the list path skips the graph entity
+    # filter and returns N most-recent commits.
     haiku_payload = {
-        "entities": [
-            {
-                "entity_type": "repo",
-                "canonical_id": "github",
-                "display_name": "GitHub",
-                "confidence": 0.9,
-            }
-        ],
+        "entities": [],
         "expansions": [],
         "temporal": None,
         "sort": {"field": "updated_at", "direction": "desc", "trigger_phrase": "most recent"},

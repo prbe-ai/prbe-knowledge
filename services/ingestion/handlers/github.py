@@ -851,6 +851,19 @@ class GitHubConnector(Connector):
                 to_canonical_id=full_name,
                 valid_from=created,
             ),
+            # Document → Repo: the list-pipeline entity filter walks
+            # graph_edges from the Document node looking for a matching
+            # entity. Without this edge, "last commit on prbe-backend"
+            # finds zero docs because the only Repo connection is via
+            # the PR/Issue/etc. node, not the Document itself.
+            GraphEdgeSpec(
+                edge_type=EdgeType.TOUCHES,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.REPO,
+                to_canonical_id=full_name,
+                valid_from=created,
+            ),
         ]
         edges.extend(
             _mention_edges(
@@ -970,6 +983,14 @@ class GitHubConnector(Connector):
                 from_canonical_id=author,
                 to_label=NodeLabel.ISSUE,
                 to_canonical_id=f"{full_name}#{number}",
+                valid_from=created,
+            ),
+            GraphEdgeSpec(
+                edge_type=EdgeType.TOUCHES,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.REPO,
+                to_canonical_id=full_name,
                 valid_from=created,
             ),
             GraphEdgeSpec(
@@ -1135,6 +1156,16 @@ class GitHubConnector(Connector):
                 from_canonical_id=author,
                 to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=doc_id,
+                valid_from=submitted_at,
+            ),
+            # Document → Repo so the list-pipeline entity filter
+            # ("PR reviews on prbe-backend") can reach the doc.
+            GraphEdgeSpec(
+                edge_type=EdgeType.TOUCHES,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.REPO,
+                to_canonical_id=full_name,
                 valid_from=submitted_at,
             ),
         ]
@@ -1531,6 +1562,17 @@ def _codeowners_artifacts(
             label=NodeLabel.DOCUMENT,
             canonical_id=doc_id,
             properties={"doc_type": DocType.GITHUB_CODEOWNERS.value},
+        )
+    )
+    # Document → Repo for entity-filter reachability.
+    edges.append(
+        GraphEdgeSpec(
+            edge_type=EdgeType.TOUCHES,
+            from_label=NodeLabel.DOCUMENT,
+            from_canonical_id=doc_id,
+            to_label=NodeLabel.REPO,
+            to_canonical_id=full_name,
+            valid_from=timestamp,
         )
     )
     return doc, nodes, edges
