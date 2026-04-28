@@ -20,6 +20,7 @@ from shared.customer_mapping import (
 )
 from shared.db import raw_conn
 from shared.embeddings import reset_embedder
+from shared.exceptions import SourceAlreadyConnectedError
 from shared.storage import reset_store
 
 
@@ -52,6 +53,76 @@ async def test_record_and_resolve(live_db) -> None:
 
     # Unknown external_id returns None.
     assert await resolve_customer(SourceSystem.SLACK, "T_UNKNOWN") is None
+
+
+@pytest.mark.asyncio
+async def test_record_mapping_same_customer_is_idempotent(live_db) -> None:
+    """Re-installing under the same customer_id refreshes name/metadata."""
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO customers (customer_id, display_name, api_key_hash) VALUES ($1,'A','x') ON CONFLICT DO NOTHING",
+            "cust-reinstall",
+        )
+
+    await record_mapping(
+        customer_id="cust-reinstall",
+        source_system=SourceSystem.LINEAR,
+        external_id="org-1",
+        external_name="Old Name",
+    )
+    # Same customer, different external_name — must succeed and update.
+    await record_mapping(
+        customer_id="cust-reinstall",
+        source_system=SourceSystem.LINEAR,
+        external_id="org-1",
+        external_name="New Name",
+    )
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT customer_id, external_name FROM customer_source_mapping WHERE source_system='linear' AND external_id='org-1'"
+        )
+    assert row["customer_id"] == "cust-reinstall"
+    assert row["external_name"] == "New Name"
+
+
+@pytest.mark.asyncio
+async def test_record_mapping_blocks_cross_customer_overwrite(live_db) -> None:
+    """A second customer trying to claim the same workspace must be refused.
+
+    Pre-fix, this overwrote `customer_id` and split chunks across tenants
+    (the Linear-org incident on 2026-04-28).
+    """
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO customers (customer_id, display_name, api_key_hash) VALUES ('cust-a','A','x') ON CONFLICT DO NOTHING"
+        )
+        await conn.execute(
+            "INSERT INTO customers (customer_id, display_name, api_key_hash) VALUES ('cust-b','B','x') ON CONFLICT DO NOTHING"
+        )
+
+    await record_mapping(
+        customer_id="cust-a",
+        source_system=SourceSystem.LINEAR,
+        external_id="shared-org",
+        external_name="Acme",
+    )
+
+    with pytest.raises(SourceAlreadyConnectedError) as excinfo:
+        await record_mapping(
+            customer_id="cust-b",
+            source_system=SourceSystem.LINEAR,
+            external_id="shared-org",
+            external_name="Acme",
+        )
+    err = excinfo.value
+    assert err.existing_customer_id == "cust-a"
+    assert err.attempted_customer_id == "cust-b"
+    assert err.source_system == "linear"
+    assert err.external_id == "shared-org"
+
+    # Mapping must still point at the original owner — refused write, not overwrite.
+    assert await resolve_customer(SourceSystem.LINEAR, "shared-org") == "cust-a"
 
 
 @pytest.mark.asyncio
