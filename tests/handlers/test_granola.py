@@ -235,7 +235,7 @@ def _granola_transport(handler) -> httpx.MockTransport:
 
 @pytest.mark.asyncio
 async def test_backfill_paginates_and_advances_watermark() -> None:
-    """Two pages; verify each note yields once and _cursor.watermark advances."""
+    """Two pages; per-note events carry input_watermark; final checkpoint carries new max."""
     page_1 = {
         "notes": [{"id": "not_a"}, {"id": "not_b"}],
         "hasMore": True,
@@ -290,10 +290,26 @@ async def test_backfill_paginates_and_advances_watermark() -> None:
             event async for event in granola.backfill("cust-1", _token(), cursor=None)
         ]
 
-    assert [e.source_event_id for e in events] == ["not_a", "not_b", "not_c"]
+    # Three note events + one checkpoint event.
+    assert [e.source_event_id for e in events] == [
+        "not_a",
+        "not_b",
+        "not_c",
+        "__cursor_checkpoint__",
+    ]
 
-    # Final event's _cursor should encode the highest watermark we saw.
-    final_cursor = json.loads(events[-1].raw_payload["_cursor"])
+    # Per-note events carry the INPUT watermark (None here). Watermark only
+    # advances at the final checkpoint event.
+    for ev in events[:3]:
+        per_note_cursor = json.loads(ev.raw_payload["_cursor"])
+        assert per_note_cursor["watermark"] is None
+        assert per_note_cursor["page_cursor"] is None
+        assert "_checkpoint" not in ev.raw_payload
+
+    # Final checkpoint event encodes the highest watermark seen.
+    checkpoint = events[-1]
+    assert checkpoint.raw_payload["_checkpoint"] is True
+    final_cursor = json.loads(checkpoint.raw_payload["_cursor"])
     assert final_cursor["watermark"] == "2026-04-24T00:00:00Z"
     assert final_cursor["page_cursor"] is None
 
@@ -395,3 +411,277 @@ async def test_backfill_skips_note_with_transient_hydration_failure() -> None:
             async for ev in granola.backfill("cust-1", _token(), cursor=None):
                 collected.append(ev.source_event_id)
         assert collected == ["good"]
+
+
+# ---------------------------------------------------------------------------
+# backfill — watermark-checkpoint correctness (regression for the bug where a
+# transient interruption would advance the persisted watermark past notes the
+# previous run never reached, permanently skipping them).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_no_checkpoint_on_transient_list_error() -> None:
+    """First page yields notes; second page list errors transiently (None).
+
+    Per-yield events must carry the INPUT watermark (not advanced) and the
+    connector must NOT emit a checkpoint event. The runner then leaves the
+    persisted watermark at the input value, so the next tick re-lists.
+    """
+    page_1 = {
+        "notes": [{"id": "not_a"}, {"id": "not_b"}],
+        "hasMore": True,
+        "cursor": "page2",
+    }
+    notes_by_id = {
+        "not_a": {
+            "id": "not_a",
+            "title": "A",
+            "summary": "first",
+            "owner": {"name": "x", "email": "x@e"},
+            "created_at": "2026-04-26T00:00:00Z",
+            "transcript": [],
+        },
+        "not_b": {
+            "id": "not_b",
+            "title": "B",
+            "summary": "second",
+            "owner": {"name": "x", "email": "x@e"},
+            "created_at": "2026-04-27T00:00:00Z",
+            "transcript": [],
+        },
+    }
+
+    list_calls: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v1/notes":
+            list_calls.append(req)
+            cursor = req.url.params.get("cursor")
+            if cursor == "page2":
+                # 418 is a non-{200,401,403,429,5xx} status → _granola_get
+                # returns None → backfill returns without checkpoint.
+                return httpx.Response(418, text="teapot")
+            return httpx.Response(200, json=page_1)
+        if req.url.path.startswith("/v1/notes/"):
+            note_id = req.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json=notes_by_id[note_id])
+        return httpx.Response(404)
+
+    input_cursor = json.dumps(
+        {"watermark": "2026-04-25T00:00:00Z", "page_cursor": None}
+    )
+    async with httpx.AsyncClient(transport=_granola_transport(handler)) as http:
+        granola = GranolaConnector(_make_ctx(http=http))
+        events = [
+            ev async for ev in granola.backfill("cust-1", _token(), cursor=input_cursor)
+        ]
+
+    # Both notes from page 1 yielded, no checkpoint after page 2's None.
+    assert [e.source_event_id for e in events] == ["not_a", "not_b"]
+    for ev in events:
+        per = json.loads(ev.raw_payload["_cursor"])
+        assert per["watermark"] == "2026-04-25T00:00:00Z"  # INPUT, not advanced
+        assert "_checkpoint" not in ev.raw_payload
+    # We attempted both list pages.
+    assert len(list_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_backfill_checkpoint_on_clean_run_advances_watermark() -> None:
+    """Single page, hasMore=false; final checkpoint encodes max created_at."""
+    page = {
+        "notes": [{"id": "A"}, {"id": "B"}, {"id": "C"}],
+        "hasMore": False,
+    }
+    notes_by_id = {
+        "A": {
+            "id": "A",
+            "summary": "a",
+            "owner": {"name": "x", "email": "x@e"},
+            "created_at": "2026-04-25T00:00:00Z",
+            "transcript": [],
+        },
+        "B": {
+            "id": "B",
+            "summary": "b",
+            "owner": {"name": "x", "email": "x@e"},
+            "created_at": "2026-04-26T00:00:00Z",
+            "transcript": [],
+        },
+        "C": {
+            "id": "C",
+            "summary": "c",
+            "owner": {"name": "x", "email": "x@e"},
+            "created_at": "2026-04-27T00:00:00Z",
+            "transcript": [],
+        },
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v1/notes":
+            return httpx.Response(200, json=page)
+        if req.url.path.startswith("/v1/notes/"):
+            return httpx.Response(200, json=notes_by_id[req.url.path.rsplit("/", 1)[-1]])
+        return httpx.Response(404)
+
+    input_watermark = "2026-04-24T00:00:00Z"
+    input_cursor = json.dumps({"watermark": input_watermark, "page_cursor": None})
+
+    async with httpx.AsyncClient(transport=_granola_transport(handler)) as http:
+        granola = GranolaConnector(_make_ctx(http=http))
+        events = [
+            ev async for ev in granola.backfill("cust-1", _token(), cursor=input_cursor)
+        ]
+
+    assert [e.source_event_id for e in events] == [
+        "A",
+        "B",
+        "C",
+        "__cursor_checkpoint__",
+    ]
+    for ev in events[:3]:
+        per = json.loads(ev.raw_payload["_cursor"])
+        assert per["watermark"] == input_watermark  # unchanged on per-note events
+        assert "_checkpoint" not in ev.raw_payload
+
+    checkpoint = events[-1]
+    assert checkpoint.raw_payload["_checkpoint"] is True
+    final = json.loads(checkpoint.raw_payload["_cursor"])
+    assert final["watermark"] == "2026-04-27T00:00:00Z"  # = C's created_at
+    assert final["page_cursor"] is None
+
+
+@pytest.mark.asyncio
+async def test_backfill_no_checkpoint_when_max_pages_hit(monkeypatch) -> None:
+    """If we hit _MAX_PAGES_PER_TICK with has_more still true, don't checkpoint —
+    next tick must keep the same created_after filter."""
+    import services.ingestion.handlers.granola as granola_mod
+
+    monkeypatch.setattr(granola_mod, "_MAX_PAGES_PER_TICK", 1)
+
+    page_1 = {
+        "notes": [{"id": "only"}],
+        "hasMore": True,
+        "cursor": "page2",  # but we'll never reach page 2 due to MAX=1
+    }
+    note = {
+        "id": "only",
+        "summary": "x",
+        "owner": {"name": "x", "email": "x@e"},
+        "created_at": "2026-04-27T00:00:00Z",
+        "transcript": [],
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v1/notes":
+            return httpx.Response(200, json=page_1)
+        if req.url.path.startswith("/v1/notes/"):
+            return httpx.Response(200, json=note)
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=_granola_transport(handler)) as http:
+        granola = GranolaConnector(_make_ctx(http=http))
+        events = [
+            ev async for ev in granola.backfill("cust-1", _token(), cursor=None)
+        ]
+
+    # Got the one note, but no checkpoint because the loop terminated via the
+    # MAX_PAGES guard while has_more=true.
+    assert [e.source_event_id for e in events] == ["only"]
+    assert all("_checkpoint" not in ev.raw_payload for ev in events)
+
+
+@pytest.mark.asyncio
+async def test_backfill_caps_watermark_at_skipped_note() -> None:
+    """A, B, C in one page. Hydrate succeeds for A and C, returns None for B.
+
+    The connector must cap the checkpoint watermark at B's created_at - 1ms,
+    NOT advance it to C's created_at — otherwise B would be permanently
+    skipped on the next tick (created_after=C filters B out).
+    """
+    page = {
+        "notes": [
+            {"id": "A", "created_at": "2026-04-25T00:00:00.000Z"},
+            {"id": "B", "created_at": "2026-04-26T00:00:00.000Z"},
+            {"id": "C", "created_at": "2026-04-27T00:00:00.000Z"},
+        ],
+        "hasMore": False,
+    }
+    notes_by_id = {
+        "A": {
+            "id": "A",
+            "summary": "a",
+            "owner": {"name": "x", "email": "x@e"},
+            "created_at": "2026-04-25T00:00:00.000Z",
+            "transcript": [],
+        },
+        "C": {
+            "id": "C",
+            "summary": "c",
+            "owner": {"name": "x", "email": "x@e"},
+            "created_at": "2026-04-27T00:00:00.000Z",
+            "transcript": [],
+        },
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v1/notes":
+            return httpx.Response(200, json=page)
+        if req.url.path.endswith("/A"):
+            return httpx.Response(200, json=notes_by_id["A"])
+        if req.url.path.endswith("/B"):
+            # 418 → _granola_get returns None → connector skips B and
+            # records min_skipped_created_at=B.created_at.
+            return httpx.Response(418, text="teapot")
+        if req.url.path.endswith("/C"):
+            return httpx.Response(200, json=notes_by_id["C"])
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=_granola_transport(handler)) as http:
+        granola = GranolaConnector(_make_ctx(http=http))
+        events = [
+            ev async for ev in granola.backfill("cust-1", _token(), cursor=None)
+        ]
+
+    # A and C yielded; B skipped. Final event is the checkpoint.
+    assert [e.source_event_id for e in events] == [
+        "A",
+        "C",
+        "__cursor_checkpoint__",
+    ]
+    checkpoint = events[-1]
+    assert checkpoint.raw_payload["_checkpoint"] is True
+    final = json.loads(checkpoint.raw_payload["_cursor"])
+    # Capped at B's created_at minus 1ms (NOT C's created_at).
+    assert final["watermark"] == "2026-04-25T23:59:59.999Z"
+
+
+@pytest.mark.asyncio
+async def test_backfill_no_checkpoint_when_nothing_seen() -> None:
+    """Empty page → connector yields nothing at all (no checkpoint either)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.url.path == "/v1/notes":
+            return httpx.Response(200, json={"notes": [], "hasMore": False})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=_granola_transport(handler)) as http:
+        granola = GranolaConnector(_make_ctx(http=http))
+        events = [
+            ev async for ev in granola.backfill("cust-1", _token(), cursor=None)
+        ]
+
+    assert events == []
+
+
+def test_watermark_step_back_1ms_helper() -> None:
+    """Helper produces ISO 1ms earlier; returns None on unparseable input."""
+    from services.ingestion.handlers.granola import _watermark_step_back_1ms
+
+    assert (
+        _watermark_step_back_1ms("2026-04-28T19:03:26.314Z")
+        == "2026-04-28T19:03:26.313Z"
+    )
+    assert _watermark_step_back_1ms("not-a-date") is None
+    assert _watermark_step_back_1ms("") is None

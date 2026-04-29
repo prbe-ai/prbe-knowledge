@@ -452,3 +452,124 @@ async def test_run_backfill_continues_when_token_active(live_db, monkeypatch) ->
     bf = await _backfill_state_row()
     assert bf is not None
     assert bf["status"] == BackfillStatus.COMPLETE.value
+
+
+# ---------------------------------------------------------------------------
+# run_backfill: cursor-only `_checkpoint` event (Granola end-of-pagination)
+# ---------------------------------------------------------------------------
+
+
+class _CheckpointConnector(Connector):
+    """Yields one normal event then one cursor-only `_checkpoint` event.
+
+    Mirrors the shape Granola's connector emits at the end of a clean run.
+    The runner must persist the checkpoint cursor without enqueueing it.
+    """
+
+    source_system = SOURCE
+
+    def __init__(
+        self,
+        ctx: ConnectorContext,
+        *,
+        normal_cursor: str,
+        checkpoint_cursor: str,
+    ) -> None:
+        super().__init__(ctx)
+        self._normal_cursor = normal_cursor
+        self._checkpoint_cursor = checkpoint_cursor
+
+    def verify_signature(self, headers, raw_body):  # pragma: no cover
+        return True
+
+    def parse_webhook_event(self, customer_id, headers, raw_payload):  # pragma: no cover
+        return None
+
+    async def normalize(self, event, hydrated):  # pragma: no cover
+        raise NotImplementedError
+
+    async def backfill(  # type: ignore[override]
+        self,
+        customer_id: str,
+        token: IntegrationToken,
+        cursor: str | None = None,
+    ) -> AsyncIterator[WebhookEvent]:
+        # Normal event with the input watermark.
+        yield WebhookEvent(
+            customer_id=customer_id,
+            source_system=SOURCE,
+            source_event_id="real-1",
+            received_at=datetime.now(UTC),
+            payload_s3_key="",
+            raw_payload={"note": {"id": "real-1"}, "_cursor": self._normal_cursor},
+            headers={},
+        )
+        # Cursor-only checkpoint event.
+        yield WebhookEvent(
+            customer_id=customer_id,
+            source_system=SOURCE,
+            source_event_id="__cursor_checkpoint__",
+            received_at=datetime.now(UTC),
+            payload_s3_key="",
+            raw_payload={
+                "_cursor": self._checkpoint_cursor,
+                "_checkpoint": True,
+            },
+            headers={},
+        )
+
+
+async def _backfill_state_cursor() -> str | None:
+    async with raw_conn() as conn:
+        return await conn.fetchval(
+            "SELECT last_cursor FROM backfill_state "
+            "WHERE customer_id=$1 AND source_system=$2",
+            CUSTOMER_ID,
+            SOURCE.value,
+        )
+
+
+@pytest.mark.asyncio
+async def test_runner_checkpoint_event_persists_cursor_without_enqueue(
+    live_db, monkeypatch
+) -> None:
+    """`_checkpoint` events update last_cursor but don't add a queue row.
+
+    Regression for the Granola watermark bug: the connector now defers the
+    watermark advance to a final `_checkpoint=True` event that the runner
+    must recognize as cursor-only (no R2 put, no ingestion_queue insert).
+    """
+    import json as _json
+
+    await _seed_customer()
+    await _seed_token(status="active")
+    await enqueue_backfill(CUSTOMER_ID, SOURCE)
+
+    normal_cursor = _json.dumps({"watermark": None, "page_cursor": None})
+    checkpoint_cursor = _json.dumps(
+        {"watermark": "2026-04-27T00:00:00Z", "page_cursor": None}
+    )
+
+    fake = _CheckpointConnector(
+        _ctx(),
+        normal_cursor=normal_cursor,
+        checkpoint_cursor=checkpoint_cursor,
+    )
+    monkeypatch.setattr(
+        "services.ingestion.backfill_runner.build_connector", lambda src, ctx: fake
+    )
+
+    enqueued = await run_backfill(_ctx(), CUSTOMER_ID, SOURCE)
+
+    # Only the normal event made it to ingestion_queue. The checkpoint did
+    # NOT get enqueued, but its cursor IS persisted.
+    assert enqueued == 1
+    queue_count = await _ingestion_queue_count()
+    assert queue_count == 1
+
+    persisted = await _backfill_state_cursor()
+    assert persisted == checkpoint_cursor
+
+    bf = await _backfill_state_row()
+    assert bf is not None
+    assert bf["status"] == BackfillStatus.COMPLETE.value

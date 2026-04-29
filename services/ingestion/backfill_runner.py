@@ -105,6 +105,21 @@ async def run_backfill(
                 # Do NOT call _mark_done — leave backfill_state for cleanup.
                 return enqueued
 
+            # Cursor-only checkpoint event (e.g. Granola end-of-pagination).
+            # The connector is telling us the watermark may safely advance now
+            # that pagination completed cleanly. Persist immediately; do NOT
+            # enqueue into ingestion_queue or R2. `payload.get(...)` is
+            # defensive against `raw_payload=None` or missing key.
+            payload = event.raw_payload or {}
+            if payload.get("_checkpoint"):
+                cursor_str = payload.get("_cursor")
+                if cursor_str is not None:
+                    latest_cursor = str(cursor_str)
+                    await _update_progress(
+                        customer_id, source, latest_cursor, enqueued
+                    )
+                continue
+
             envelope = json.dumps(
                 {
                     "_headers": event.headers,
@@ -137,9 +152,9 @@ async def run_backfill(
 
             # The runner can discover a new cursor via the event's parse_hint
             # or via the connector yielding a tuple — keep it simple for now:
-            # most connectors set a `parse_hint["cursor"]` on their synthesized
-            # events specifically so the runner can persist it.
-            possible_cursor = (event.raw_payload or {}).get("_cursor")
+            # most connectors set a `_cursor` on their synthesized events
+            # specifically so the runner can persist it.
+            possible_cursor = payload.get("_cursor")
             if possible_cursor is not None:
                 latest_cursor = str(possible_cursor)
 

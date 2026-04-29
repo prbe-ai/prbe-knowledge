@@ -51,7 +51,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 import httpx
@@ -292,13 +292,26 @@ class GranolaConnector(Connector):
           - cursor=None        → full backfill (created_after omitted)
           - cursor=<json>      → incremental (created_after=watermark)
 
-        Each yielded event carries `_cursor` in its raw_payload so the
-        backfill_runner persists progress. The watermark in `_cursor`
-        advances as we see notes with newer created_at, so the next
-        backfill resumes from where this one ended.
+        Watermark accounting:
+          Per-yield events carry the **input** watermark unchanged. We track
+          the new max separately and only commit it via a final
+          `_checkpoint=True` event after pagination completes cleanly. If the
+          run is interrupted (transient `_granola_get` returns None) we
+          return WITHOUT a checkpoint — the persisted watermark stays at the
+          input value and the next tick re-issues the same `created_after`
+          filter, picking up notes the previous run missed.
         """
         state = _decode_cursor(cursor)
-        watermark: str | None = state.get("watermark")
+        input_watermark: str | None = state.get("watermark")
+
+        # final_watermark = max created_at we've successfully hydrated.
+        # min_skipped_created_at = earliest created_at we couldn't hydrate
+        # (transient per-note error). On clean end we cap the persisted
+        # watermark at min_skipped - 1ms so a transient hydrate failure
+        # doesn't permanently skip the note — it gets re-listed next run.
+        final_watermark: str | None = input_watermark
+        min_skipped_created_at: str | None = None
+        saw_any = False
         page_cursor: str | None = None  # reset across ticks
 
         headers = {
@@ -310,8 +323,10 @@ class GranolaConnector(Connector):
         while pages < _MAX_PAGES_PER_TICK:
             pages += 1
             params: dict[str, Any] = {"limit": _PAGE_SIZE}
-            if watermark:
-                params["created_after"] = watermark
+            if input_watermark:
+                # Use INPUT watermark — don't advance per-note. The connector
+                # only commits a new watermark on the final checkpoint event.
+                params["created_after"] = input_watermark
             if page_cursor:
                 params["cursor"] = page_cursor
 
@@ -319,7 +334,11 @@ class GranolaConnector(Connector):
                 f"{_GRANOLA_API}/notes", params=params, headers=headers
             )
             if list_body is None:
-                return  # transient error — let next tick resume
+                # Transient error — return WITHOUT checkpoint so the persisted
+                # watermark stays at input_watermark. Next tick resumes with
+                # the same created_after filter and re-lists everything we
+                # haven't acknowledged yet.
+                return
 
             results = list_body.get("notes") or list_body.get("data") or []
             if not isinstance(results, list):
@@ -332,6 +351,13 @@ class GranolaConnector(Connector):
                 if not note_id:
                     continue
 
+                # Capture created_at from the LIST response so we know it
+                # even if the per-note hydrate fails. Used to cap the
+                # checkpoint watermark below.
+                list_created_at = (
+                    note_summary.get("created_at") or ""
+                ).strip() or None
+
                 # Hydrate: GET /notes/{id}?include=transcript per note.
                 # The list response doesn't include summary or transcript,
                 # so we always need the per-note fetch.
@@ -341,19 +367,37 @@ class GranolaConnector(Connector):
                     headers=headers,
                 )
                 if note is None:
-                    # Skip on transient — next tick will retry the cursor.
+                    # Transient hydrate failure. Record the earliest
+                    # created_at among skipped notes so we cap the
+                    # final watermark and re-list this note next run.
+                    if list_created_at and (
+                        min_skipped_created_at is None
+                        or list_created_at < min_skipped_created_at
+                    ):
+                        min_skipped_created_at = list_created_at
                     continue
 
-                created_at_str = note.get("created_at") or ""
+                created_at_str = (
+                    note.get("created_at") or list_created_at or ""
+                )
                 received_at = _parse_iso(created_at_str) or datetime.now(UTC)
 
-                # Advance watermark to the latest created_at we've seen.
+                # Track the highest successfully-hydrated created_at.
                 # Strict > so we don't get stuck re-polling notes with
                 # identical timestamps (Granola IDs are unique within a tick).
-                if created_at_str and (watermark is None or created_at_str > watermark):
-                    watermark = created_at_str
+                if created_at_str and (
+                    final_watermark is None or created_at_str > final_watermark
+                ):
+                    final_watermark = created_at_str
+                saw_any = True
 
-                next_state = {"watermark": watermark, "page_cursor": None}
+                # Per-event _cursor stays at INPUT watermark. The runner
+                # would otherwise persist this value via _update_progress
+                # and a subsequent run interruption would skip older notes.
+                next_state = {
+                    "watermark": input_watermark,
+                    "page_cursor": None,
+                }
                 payload = {
                     "note": note,
                     "_cursor": json.dumps(next_state),
@@ -372,8 +416,43 @@ class GranolaConnector(Connector):
             has_more = bool(list_body.get("hasMore") or list_body.get("has_more"))
             next_cursor = list_body.get("cursor") or list_body.get("next_cursor")
             if not has_more or not next_cursor:
-                return
+                break
             page_cursor = str(next_cursor)
+        else:
+            # while loop exited because pages >= _MAX_PAGES_PER_TICK. There
+            # may be more notes upstream we haven't seen. Don't checkpoint
+            # — next tick resumes with the same created_after filter.
+            return
+
+        # Clean end of pagination. Decide on a safe new watermark.
+        if not saw_any:
+            return  # nothing to checkpoint
+
+        safe_watermark = final_watermark
+        if min_skipped_created_at is not None:
+            # Cap so the skipped note will be re-listed next run.
+            capped = _watermark_step_back_1ms(min_skipped_created_at)
+            if capped is not None and (
+                safe_watermark is None or capped < safe_watermark
+            ):
+                safe_watermark = capped
+
+        if safe_watermark is None or safe_watermark == input_watermark:
+            return  # no movement — nothing to commit
+
+        checkpoint_state = {"watermark": safe_watermark, "page_cursor": None}
+        yield WebhookEvent(
+            customer_id=customer_id,
+            source_system=SourceSystem.GRANOLA,
+            source_event_id="__cursor_checkpoint__",
+            received_at=datetime.now(UTC),
+            payload_s3_key="",
+            raw_payload={
+                "_cursor": json.dumps(checkpoint_state),
+                "_checkpoint": True,
+            },
+            headers={},
+        )
 
     # ---- 7. workspace identification --------------------------------------
     #
@@ -469,6 +548,25 @@ def _parse_iso(value: Any) -> datetime | None:
     except ValueError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=UTC)
+
+
+def _watermark_step_back_1ms(value: str) -> str | None:
+    """Return an ISO timestamp 1ms earlier than `value`, or None if unparseable.
+
+    Used by the connector to cap the persisted watermark just BEFORE a note
+    we couldn't hydrate, so a transient hydration failure doesn't permanently
+    skip the note. ISO 8601 sorts lexicographically when zone-normalized, so
+    string comparison against the capped value still works.
+    """
+    dt = _parse_iso(value)
+    if dt is None:
+        return None
+    stepped = (dt - timedelta(milliseconds=1)).astimezone(UTC)
+    # Match Granola's wire format: ISO with 'Z' suffix, ms precision.
+    return (
+        stepped.strftime("%Y-%m-%dT%H:%M:%S.")
+        + f"{stepped.microsecond // 1000:03d}Z"
+    )
 
 
 def _sha256(text: str) -> str:
