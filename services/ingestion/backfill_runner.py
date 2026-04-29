@@ -139,8 +139,9 @@ async def run_backfill(
                 await conn.execute(
                     """
                     INSERT INTO ingestion_queue
-                        (customer_id, source_system, source_event_id, payload_s3_key, status)
-                    VALUES ($1, $2, $3, $4, $5)
+                        (customer_id, source_system, source_event_id,
+                         payload_s3_key, status, priority)
+                    VALUES ($1, $2, $3, $4, $5, 50)
                     ON CONFLICT DO NOTHING
                     """,
                     customer_id,

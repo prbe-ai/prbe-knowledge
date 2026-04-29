@@ -7,10 +7,14 @@ kill_timeout = "30s"
   dockerfile = "services/worker/Dockerfile"
 
 [env]
-  ENVIRONMENT         = "main"
-  LOG_LEVEL           = "INFO"
-  SERVICE_NAME        = "prbe-knowledge-worker"
-  WORKER_HEALTH_PORT  = "8082"
+  ENVIRONMENT           = "main"
+  LOG_LEVEL             = "INFO"
+  SERVICE_NAME          = "prbe-knowledge-worker"
+  WORKER_HEALTH_PORT    = "8082"
+  # Parallel claim loops per machine. Sized for OpenAI Tier 1 (1M TPM):
+  # 7 machines × 2 = 14 in-flight, safe headroom under the cap. Bump to
+  # 8 the day Tier 5 lands (10M TPM).
+  WORKER_MAX_CONCURRENT = "2"
 
 [processes]
   worker = "python -m services.ingestion.worker"

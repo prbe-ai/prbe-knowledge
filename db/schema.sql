@@ -244,13 +244,14 @@ CREATE TABLE ingestion_queue (
     status               TEXT NOT NULL DEFAULT 'pending',
     attempts             INT  NOT NULL DEFAULT 0,
     error                TEXT,
+    priority             SMALLINT NOT NULL DEFAULT 100,
     enqueued_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     started_at           TIMESTAMPTZ,
     heartbeat_at         TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
     UNIQUE (customer_id, source_system, source_event_id)
 );
-CREATE INDEX idx_queue_pending ON ingestion_queue (status, enqueued_at) WHERE status = 'pending';
+CREATE INDEX idx_queue_pending_priority ON ingestion_queue (priority DESC, enqueued_at) WHERE status = 'pending';
 CREATE INDEX idx_queue_processing ON ingestion_queue (status, heartbeat_at) WHERE status = 'processing';
 CREATE INDEX idx_queue_customer_status ON ingestion_queue (customer_id, status, enqueued_at);
 

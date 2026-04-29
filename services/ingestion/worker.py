@@ -35,14 +35,32 @@ log = get_logger(__name__)
 
 
 class Worker:
-    def __init__(self, ctx: ConnectorContext, max_attempts: int = 5) -> None:
+    def __init__(
+        self,
+        ctx: ConnectorContext,
+        max_attempts: int = 5,
+        concurrency: int = 1,
+    ) -> None:
         self._ctx = ctx
         self._normalizer = Normalizer(ctx)
         self._max_attempts = max_attempts
+        self._concurrency = max(1, concurrency)
         self._shutdown = asyncio.Event()
 
     async def run(self, poll_interval: float = 1.0) -> None:
-        log.info("worker.start", max_attempts=self._max_attempts)
+        log.info(
+            "worker.start",
+            max_attempts=self._max_attempts,
+            concurrency=self._concurrency,
+        )
+        # Each loop independently claims via FOR UPDATE SKIP LOCKED, so N
+        # parallel loops in the same process safely share the queue.
+        await asyncio.gather(
+            *(self._claim_loop(poll_interval) for _ in range(self._concurrency))
+        )
+        log.info("worker.stop")
+
+    async def _claim_loop(self, poll_interval: float) -> None:
         while not self._shutdown.is_set():
             claimed = await self._claim_one()
             if claimed is None:
@@ -52,7 +70,6 @@ class Worker:
                     )
                 continue
             await self._process(claimed)
-        log.info("worker.stop")
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -60,7 +77,12 @@ class Worker:
     # ---- queue ops ----------------------------------------------------------
 
     async def _claim_one(self) -> asyncpg.Record | None:
-        """Atomically mark one pending row as processing and return it."""
+        """Atomically mark one pending row as processing and return it.
+
+        Higher `priority` claims first; backfill rows are inserted at a
+        lower priority than webhook rows so a backfill burst can't head-of-
+        line block live traffic.
+        """
         async with get_pool().acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
@@ -68,7 +90,7 @@ class Worker:
                            payload_s3_key, attempts
                     FROM ingestion_queue
                     WHERE status = $1
-                    ORDER BY enqueued_at
+                    ORDER BY priority DESC, enqueued_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                     """,
@@ -537,7 +559,11 @@ async def run_worker_forever() -> None:
     # reads it to break its poll sleep early. Single asyncio.Event because
     # both live in the same process.
     wake_event = asyncio.Event()
-    ingestion_worker = Worker(ctx, max_attempts=settings.worker_max_attempts)
+    ingestion_worker = Worker(
+        ctx,
+        max_attempts=settings.worker_max_attempts,
+        concurrency=settings.worker_max_concurrent,
+    )
     backfill_worker = BackfillWorker(ctx, wake_event=wake_event)
     granola_listener = GranolaNotifyListener(settings.database_url, wake_event)
     reclaim_loop = ReclaimLoop()
