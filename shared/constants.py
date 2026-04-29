@@ -213,6 +213,28 @@ TOP_K_GRAPH = 20
 RRF_K = 60
 DEDUP_COSINE_THRESHOLD = 0.95
 
+# Per-source-system score multiplier applied AFTER RRF fusion. Values < 1.0
+# demote a source's docs so they rank below other sources at equal vector
+# relevance. Defaults to 1.0 (no change) for any source not listed.
+#
+# Rationale: claude_code transcripts are high-volume and lower-signal-density
+# than authored team artifacts (Slack threads, Linear tickets, PR descriptions),
+# so we down-weight them to keep authored content surfacing first.
+SOURCE_SCORE_MULTIPLIERS: dict[SourceSystem, float] = {
+    SourceSystem.CLAUDE_CODE: 0.5,
+}
+
+# Per-source-system half-life (days) for recency decay applied after the
+# multiplier. Smaller = faster decay. Sources not listed fall back to the
+# caller-supplied global half_life_days, or no decay if that's None.
+#
+# Rationale: a CC session is a point-in-time scratchpad — by week two it's
+# almost always stale or contradicted by something authored elsewhere.
+# Slack/Linear/PR docs stay relevant for months by design.
+SOURCE_HALF_LIFE_DAYS: dict[SourceSystem, float] = {
+    SourceSystem.CLAUDE_CODE: 7.0,
+}
+
 # Prefix used in `integration_tokens.scope` to signal the row represents a
 # GitHub App installation rather than an OAuth access_token. The installation
 # id follows the colon; tokens are minted on demand from the App private key.

@@ -40,7 +40,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from shared.constants import RRF_K
+from shared.constants import (
+    RRF_K,
+    SOURCE_HALF_LIFE_DAYS,
+    SOURCE_SCORE_MULTIPLIERS,
+)
 
 
 @dataclass(slots=True)
@@ -127,16 +131,30 @@ def fuse(
     for doc_id, content_score in content_score_for_doc.items():
         combined_for_doc[doc_id] = content_score + metadata_score_for_doc.get(doc_id, 0.0)
 
-    if recency_half_life_days is not None:
-        ref_now = now or datetime.now(UTC)
-        ln2 = math.log(2)
-        for doc_id, combined in list(combined_for_doc.items()):
-            chunk_id = best_content_for_doc[doc_id]
-            hit = per_chunk_meta[chunk_id]
+    # Per-source-system score multiplier (Change A) and per-source-system
+    # recency decay (Change C). Multiplier first so a brand-new claude_code
+    # doc still gets demoted; otherwise zero-decay at age=0 would bypass it.
+    # Per-source half-life beats the caller's global half-life when set, and
+    # applies even when the global is None — that's how claude_code decays
+    # in days without forcing other sources to.
+    ref_now = now or datetime.now(UTC)
+    ln2 = math.log(2)
+    for doc_id, combined in list(combined_for_doc.items()):
+        chunk_id = best_content_for_doc[doc_id]
+        hit = per_chunk_meta[chunk_id]
+        source_system = hit.source_system
+
+        multiplier = SOURCE_SCORE_MULTIPLIERS.get(source_system, 1.0)
+        if multiplier != 1.0:
+            combined *= multiplier
+
+        half_life = SOURCE_HALF_LIFE_DAYS.get(source_system, recency_half_life_days)
+        if half_life is not None:
             age_days = (ref_now - hit.updated_at).total_seconds() / 86400.0
-            if age_days < 0:
-                continue
-            combined_for_doc[doc_id] = combined * math.exp(-ln2 * age_days / recency_half_life_days)
+            if age_days >= 0:
+                combined *= math.exp(-ln2 * age_days / half_life)
+
+        combined_for_doc[doc_id] = combined
 
     fused: list[FusedHit] = []
     for doc_id, combined in combined_for_doc.items():
