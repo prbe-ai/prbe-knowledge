@@ -91,16 +91,27 @@ async def run_search(
         )
 
     async def _bm25_runner() -> list:
+        # Fan out the query + router expansions in parallel — each is an
+        # independent SELECT against the chunks GIN index, so wall time
+        # collapses to the slowest single call instead of summing N round
+        # trips. The per-chunk dedup keeps the highest-scoring hit when an
+        # expansion surfaces a chunk the original query already matched.
+        per_query_hits = await asyncio.gather(
+            *(
+                bm25_search(
+                    customer_id,
+                    q,
+                    top_k=req.top_k * pool_multiplier,
+                    sources=sources,
+                    doc_types=retriever_doc_types,
+                    temporal=spec,
+                )
+                for q in queries
+            )
+        )
         hits_by_chunk: dict = {}
-        for q in queries:
-            for hit in await bm25_search(
-                customer_id,
-                q,
-                top_k=req.top_k * pool_multiplier,
-                sources=sources,
-                doc_types=retriever_doc_types,
-                temporal=spec,
-            ):
+        for hits in per_query_hits:
+            for hit in hits:
                 prior = hits_by_chunk.get(hit.chunk_id)
                 if prior is None or hit.score > prior.score:
                     hits_by_chunk[hit.chunk_id] = hit
