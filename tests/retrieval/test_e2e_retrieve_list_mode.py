@@ -69,6 +69,7 @@ async def _seed_doc(
     doc_type: str,
     title: str,
     updated_at: datetime,
+    author_id: str | None = None,
 ) -> None:
     async with raw_conn() as conn:
         await conn.execute(
@@ -78,6 +79,7 @@ async def _seed_doc(
                 source_system, source_id, source_url,
                 doc_class, doc_type, content_type,
                 content_hash, title, body_size_bytes, body_token_count,
+                author_id,
                 created_at, updated_at, valid_from, ingested_at,
                 acl
             ) VALUES (
@@ -85,7 +87,8 @@ async def _seed_doc(
                 $3, $4, $5,
                 'raw_source', $6, 'text/plain',
                 $7, $8, 10, 0,
-                $9, $9, $9, $9,
+                $9,
+                $10, $10, $10, $10,
                 '{}'::jsonb
             )
             """,
@@ -97,6 +100,7 @@ async def _seed_doc(
             doc_type,
             f"hash-{doc_id}",
             title,
+            author_id,
             updated_at,
         )
         await conn.execute(
@@ -299,6 +303,109 @@ async def test_router_fallback_routes_to_search(live_db) -> None:
     # Semantic chunks list shape is the same as before the PR.
     assert isinstance(body["chunks"], list)
     assert body["aggregation"] is None
+
+
+async def test_author_id_surfaces_on_list_chunks(live_db) -> None:
+    """REGRESSION: a Mahit commit must self-identify on the wire.
+
+    Seeds two commits — one by Mahit, one by an anonymous "unknown" author.
+    The list-path response must carry `author_id` per chunk: "mahit" for
+    his row, null (not the literal "unknown") for the anonymous one.
+    """
+    api_key = await _seed_customer("cust-author-list")
+    base = datetime(2026, 4, 28, tzinfo=UTC)
+    await _seed_doc(
+        "cust-author-list",
+        "github:repo:commit:by-mahit",
+        source_system="github",
+        doc_type="github.commit",
+        title="mahit's commit",
+        updated_at=base,
+        author_id="mahit",
+    )
+    await _seed_doc(
+        "cust-author-list",
+        "github:repo:commit:no-author",
+        source_system="github",
+        doc_type="github.commit",
+        title="anonymous commit",
+        updated_at=base - timedelta(minutes=1),
+        author_id="unknown",
+    )
+
+    haiku_payload = {
+        "entities": [],
+        "expansions": [],
+        "temporal": None,
+        "sort": {"field": "updated_at", "direction": "desc", "trigger_phrase": "most recent"},
+        "mode": "list",
+        "doc_type": "commit",
+        "operation": "list",
+        "group_by_key": None,
+    }
+    with patch("services.retrieval.router.AsyncAnthropic") as mock_client_cls:
+        mock_client_cls.return_value.messages.create = AsyncMock(
+            return_value=_tool_use_resp(haiku_payload)
+        )
+        resp = await _post(
+            {"query": "recent commits", "top_k": 10},
+            {"Authorization": f"Bearer {api_key}"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    by_doc = {c["doc_id"]: c for c in body["chunks"]}
+    assert by_doc["github:repo:commit:by-mahit"]["author_id"] == "mahit"
+    assert by_doc["github:repo:commit:no-author"]["author_id"] is None
+
+
+async def test_author_id_surfaces_on_search_chunks(live_db) -> None:
+    """Search-path version of the regression: vector + BM25 + graph fusion
+    must all preserve author_id on the way to QueryChunk. If any retriever
+    forgets to SELECT d.author_id, the field will be None for chunks that
+    only that retriever surfaced — this catches that."""
+    api_key = await _seed_customer("cust-author-search")
+    base = datetime(2026, 4, 28, tzinfo=UTC)
+    await _seed_doc(
+        "cust-author-search",
+        "github:repo:commit:mahit-search",
+        source_system="github",
+        doc_type="github.commit",
+        title="mahit shipped the auth fix",
+        updated_at=base,
+        author_id="mahit",
+    )
+
+    # Empty router payload → search mode (vector + BM25 + graph + fusion).
+    haiku_payload = {
+        "entities": [],
+        "expansions": [],
+        "temporal": None,
+        "sort": None,
+        "mode": "search",
+        "doc_type": None,
+        "operation": None,
+        "group_by_key": None,
+    }
+    with patch("services.retrieval.router.AsyncAnthropic") as mock_client_cls:
+        mock_client_cls.return_value.messages.create = AsyncMock(
+            return_value=_tool_use_resp(haiku_payload)
+        )
+        resp = await _post(
+            {"query": "auth fix", "top_k": 5},
+            {"Authorization": f"Bearer {api_key}"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["applied_mode"] == "search"
+    assert len(body["chunks"]) >= 1
+    target = next(
+        (c for c in body["chunks"] if c["doc_id"] == "github:repo:commit:mahit-search"),
+        None,
+    )
+    assert target is not None, "seeded commit did not surface in search results"
+    assert target["author_id"] == "mahit"
 
 
 async def test_count_query_returns_aggregation(live_db) -> None:

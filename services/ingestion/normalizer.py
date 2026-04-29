@@ -708,6 +708,23 @@ def _metadata_text(doc: Document) -> str:
     lines.append(f"source: {doc.source_system.value}")
     if doc.author_id:
         lines.append(f"author: {doc.author_id}")
+    # Co-authors (currently github commits via Co-authored-by trailers) get
+    # one line per entry so they're indexed by BM25 and vector alongside the
+    # primary author. Without this, a commit Mahit only co-authored never
+    # surfaces for "Mahit's work" queries via the metadata-chunk path —
+    # only via the graph retriever's AUTHORED edge, which requires the
+    # router to extract a Person entity.
+    co_authors = doc.metadata.get("co_authors") if isinstance(doc.metadata, dict) else None
+    if isinstance(co_authors, list):
+        for c in co_authors:
+            if not isinstance(c, dict):
+                continue
+            email = c.get("email")
+            name = c.get("name")
+            if email and name:
+                lines.append(f"co_author: {email} ({name})")
+            elif email:
+                lines.append(f"co_author: {email}")
     if doc.source_url:
         lines.append(f"url: {_strip_opaque_ids(doc.source_url)}")
     if doc.body_preview:

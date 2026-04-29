@@ -98,6 +98,16 @@ _ACL_RESOURCE_REPO = "github.repository"
 _SAME_REPO_REF = re.compile(r"(?<![\w/])#(\d+)\b")
 _CROSS_REPO_REF = re.compile(r"\b([\w.-]+/[\w.-]+)#(\d+)\b")
 
+# Git "Co-authored-by:" trailer. Convention is one trailer per line in the
+# message footer; the email is the identity key. Match is case-insensitive
+# on the trailer key only — name and email retain their original casing for
+# display, then we lowercase the email for dedup since RFC 5321 treats the
+# local-part as case-sensitive but real-world SMTP routing doesn't.
+_COAUTHOR_TRAILER = re.compile(
+    r"^\s*co-authored-by:\s*(?P<name>[^<\n]+?)\s*<(?P<email>[^>\n]+)>\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 @register_connector(SourceSystem.GITHUB)
 class GitHubConnector(Connector):
@@ -1373,6 +1383,28 @@ def _push_touches_codeowners(payload: Mapping[str, Any]) -> bool:
     return False
 
 
+def _parse_co_authors(message: str) -> list[dict[str, str]]:
+    """Extract `Co-authored-by: Name <email>` trailers from a commit message.
+
+    Returns a list of `{"name": ..., "email": ...}` dicts in source order,
+    deduplicated by lowercased email. Email is the identity key because the
+    GitHub UI uses email (not name) to attribute commits in the contributor
+    graph for trailer-based co-authorship.
+    """
+    if not message:
+        return []
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    for match in _COAUTHOR_TRAILER.finditer(message):
+        name = match.group("name").strip()
+        email = match.group("email").strip().lower()
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        out.append({"name": name, "email": email})
+    return out
+
+
 def _commit_to_doc(
     *,
     event: WebhookEvent,
@@ -1389,11 +1421,29 @@ def _commit_to_doc(
     timestamp = _parse_iso8601(commit.get("timestamp"))
     author_info = commit.get("author") or {}
     author = author_info.get("username") or author_info.get("email") or "unknown"
+    primary_email = (author_info.get("email") or "").strip().lower()
     html_url = commit.get("url") or ""
+
+    co_authors = _parse_co_authors(message)
+    # Drop any co-author whose email matches the primary committer — git
+    # tooling sometimes adds a trailer for the primary author too.
+    co_authors = [c for c in co_authors if c["email"] != primary_email]
 
     doc_id = f"github:{full_name}:commit:{commit_id}"
     source_id = f"{full_name}@{commit_id}"
     content_hash = _sha256(f"{doc_id}|{message}")
+
+    metadata: dict[str, Any] = {
+        "body": message,
+        "repo_full_name": full_name,
+        "commit_id": commit_id,
+        "added": commit.get("added") or [],
+        "modified": commit.get("modified") or [],
+        "removed": commit.get("removed") or [],
+        "visibility": _repo_visibility(repo),
+    }
+    if co_authors:
+        metadata["co_authors"] = co_authors
 
     doc = Document(
         doc_id=doc_id,
@@ -1415,15 +1465,7 @@ def _commit_to_doc(
         valid_from=timestamp,
         ingested_at=datetime.now(UTC),
         acl=_repo_acl_snapshot(repo, event.received_at),
-        metadata={
-            "body": message,
-            "repo_full_name": full_name,
-            "commit_id": commit_id,
-            "added": commit.get("added") or [],
-            "modified": commit.get("modified") or [],
-            "removed": commit.get("removed") or [],
-            "visibility": _repo_visibility(repo),
-        },
+        metadata=metadata,
         doc_references=_references_from_text(message, full_name, html_url),
     )
 
@@ -1462,6 +1504,39 @@ def _commit_to_doc(
             valid_from=timestamp,
         ),
     ]
+
+    # Co-authors get their own Person node (keyed by email) and an AUTHORED
+    # edge to this commit. They are NOT placed in `documents.author_id` —
+    # that field is single-valued by design — so they're discoverable only
+    # via the graph (Person → AUTHORED → Document) and via the
+    # `metadata.co_authors` payload on get_source. Identity resolution
+    # across the email and the primary author's GitHub login form is
+    # deliberate scope; see TODOS.md.
+    for co in co_authors:
+        person_id = co["email"]
+        if person_id not in seen_people:
+            nodes.append(
+                GraphNodeSpec(
+                    label=NodeLabel.PERSON,
+                    canonical_id=person_id,
+                    properties={
+                        "source_system": SourceSystem.GITHUB.value,
+                        "name": co["name"],
+                    },
+                )
+            )
+            seen_people.add(person_id)
+        edges.append(
+            GraphEdgeSpec(
+                edge_type=EdgeType.AUTHORED,
+                from_label=NodeLabel.PERSON,
+                from_canonical_id=person_id,
+                to_label=NodeLabel.DOCUMENT,
+                to_canonical_id=doc_id,
+                valid_from=timestamp,
+            )
+        )
+
     edges.extend(
         _mention_edges(
             message,

@@ -258,6 +258,21 @@ class QueryRequest(BaseModel):
     )
 
 
+def normalize_author_id(value: str | None) -> str | None:
+    """Map ingestion-side sentinel `"unknown"` back to None at the response boundary.
+
+    Some handlers (github, notion) store the literal `"unknown"` when no
+    author resolved at ingestion time. Surfacing that string to agents would
+    look like a real identity. We strip it here, on the way out, so the field
+    is genuinely nullable without rewriting `documents.author_id` rows
+    (which would invalidate hashes and break callers passing
+    `author_ids=["unknown"]`).
+    """
+    if value == "unknown":
+        return None
+    return value
+
+
 class QueryChunk(BaseModel):
     chunk_id: str
     doc_id: str
@@ -269,6 +284,13 @@ class QueryChunk(BaseModel):
     source_url: str
     title: str | None
     content: str
+    # Raw author identifier from the source system: GitHub login (`mahit`),
+    # commit-author email when no GitHub login resolved (`mahit@prbe.ai`),
+    # Slack user id (`U07ABC123`), Linear user id (`user_a3f9`), etc.
+    # NOT canonicalized across sources — same human can appear under
+    # multiple values. Null when the source had no author or when the
+    # ingestion-time sentinel was `"unknown"`.
+    author_id: str | None = None
     created_at: datetime
     updated_at: datetime
     score: float

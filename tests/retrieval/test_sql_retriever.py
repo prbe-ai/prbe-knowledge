@@ -266,6 +266,62 @@ async def test_sql_list_filters_by_author(live_db) -> None:
     assert {h.title for h in hits} == {"alice's"}
 
 
+async def test_sql_list_returns_author_id_on_hit(live_db) -> None:
+    """Hit objects expose author_id so the response surfaces it on QueryChunk."""
+    cust = "cust-author-roundtrip"
+    await _seed_customer(cust)
+    now = datetime(2026, 4, 28, tzinfo=UTC)
+    await _seed_doc(
+        cust,
+        "doc:mahit",
+        source_system="github",
+        doc_type="github.commit",
+        title="mahit's commit",
+        content="x",
+        author_id="mahit",
+        updated_at=now,
+    )
+
+    hits = await sql_list(cust, top_k=10)
+    assert len(hits) == 1
+    assert hits[0].author_id == "mahit"
+
+
+async def test_sql_list_normalizes_unknown_author_to_none(live_db) -> None:
+    """The literal "unknown" sentinel from ingestion is mapped to None at
+    the response boundary so agents see absence-of-author, not a misleading
+    string identity."""
+    cust = "cust-author-unknown"
+    await _seed_customer(cust)
+    now = datetime(2026, 4, 28, tzinfo=UTC)
+    await _seed_doc(
+        cust,
+        "doc:unknown",
+        source_system="github",
+        doc_type="github.commit",
+        title="anonymous commit",
+        content="x",
+        author_id="unknown",
+        updated_at=now,
+    )
+    await _seed_doc(
+        cust,
+        "doc:null-author",
+        source_system="sentry",
+        doc_type="sentry.issue",
+        title="no-author event",
+        content="y",
+        author_id=None,
+        updated_at=now + timedelta(minutes=1),
+    )
+
+    hits = await sql_list(cust, top_k=10)
+    assert len(hits) == 2
+    by_doc = {h.doc_id: h for h in hits}
+    assert by_doc["doc:unknown"].author_id is None
+    assert by_doc["doc:null-author"].author_id is None
+
+
 async def test_sql_list_invalid_sort_raises() -> None:
     """Defense-in-depth — even if someone bypasses the dispatcher's
     validation, sql_list itself should reject SQL-injection vectors."""

@@ -22,6 +22,7 @@ from pydantic import SecretStr
 from services.ingestion.handlers.base import ConnectorContext
 from services.ingestion.handlers.github import (
     GitHubConnector,
+    _parse_co_authors,
     parse_codeowners,
 )
 from services.ingestion.handlers.registry import build_connector
@@ -328,6 +329,113 @@ async def test_normalize_push_without_token_skips_ownership() -> None:
     assert co_doc.metadata["ownership_map"] == {}
     owns_edges = [e for e in result.graph_edges if e.edge_type == EdgeType.OWNS]
     assert owns_edges == []
+
+
+# ---------------------------------------------------------------------------
+# Co-authored-by trailer parsing
+# ---------------------------------------------------------------------------
+
+
+def test_parse_co_authors_basic() -> None:
+    """Standard `Co-authored-by:` trailer with name and email."""
+    msg = (
+        "feat: ship the thing\n"
+        "\n"
+        "Co-authored-by: Mahit Singh <mahit@prbe.ai>\n"
+    )
+    assert _parse_co_authors(msg) == [{"name": "Mahit Singh", "email": "mahit@prbe.ai"}]
+
+
+def test_parse_co_authors_multiple_dedupes_by_email() -> None:
+    msg = (
+        "feat: ship the thing\n"
+        "\n"
+        "Co-authored-by: Mahit Singh <mahit@prbe.ai>\n"
+        "Co-authored-by: Bob Jones <bob@example.com>\n"
+        "Co-authored-by: M Singh <mahit@prbe.ai>\n"  # dup email, different name
+    )
+    out = _parse_co_authors(msg)
+    assert len(out) == 2
+    assert out[0]["email"] == "mahit@prbe.ai"
+    assert out[1]["email"] == "bob@example.com"
+
+
+def test_parse_co_authors_case_insensitive_trailer_key() -> None:
+    msg = "fix\n\nCO-AUTHORED-BY: Alice <alice@example.com>\n"
+    assert _parse_co_authors(msg) == [{"name": "Alice", "email": "alice@example.com"}]
+
+
+def test_parse_co_authors_lowercases_email_only() -> None:
+    msg = "fix\n\nCo-authored-by: Mahit Singh <Mahit@PRBE.AI>\n"
+    assert _parse_co_authors(msg) == [{"name": "Mahit Singh", "email": "mahit@prbe.ai"}]
+
+
+def test_parse_co_authors_ignores_non_trailer_text() -> None:
+    """An inline mention or prose mention of co-authored-by must not match."""
+    msg = "fix\n\nThis was originally co-authored-by alice but landed solo.\n"
+    assert _parse_co_authors(msg) == []
+
+
+def test_parse_co_authors_empty_message() -> None:
+    assert _parse_co_authors("") == []
+
+
+@pytest.mark.asyncio
+async def test_normalize_push_with_co_authored_by_emits_person_and_edges() -> None:
+    """A commit with `Co-authored-by:` trailers must:
+      1. Stash the parsed co-authors in `Document.metadata["co_authors"]`.
+      2. Emit a Person node per unique co-author email.
+      3. Emit an AUTHORED edge from each co-author Person to the commit doc.
+      4. NOT touch `Document.author_id` (that field stays single-valued
+         and equals the primary committer).
+    """
+    connector = _build()
+    payload = _load("push_with_codeowners.json")
+
+    # Inject Co-authored-by trailers into the head commit's message and the
+    # mirrored commits[0] entry. Mahit (distinct email) should produce a
+    # Person + edge; Alice (matching primary committer's email) should
+    # be skipped as a duplicate of the primary author.
+    extended_message = (
+        payload["head_commit"]["message"]
+        + "\n\n"
+        + "Co-authored-by: Mahit Singh <mahit@prbe.ai>\n"
+        + "Co-authored-by: Alice Dev <alice@example.com>\n"  # primary, dedup
+    )
+    payload["head_commit"]["message"] = extended_message
+    payload["commits"][0]["message"] = extended_message
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        source_event_id="push:prbe/payments:deadbeefcafe-coauth",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/github/cust-1/push.json",
+        raw_payload=payload,
+        headers={"X-GitHub-Event": "push"},
+    )
+
+    result = await connector.normalize(event, {})
+
+    commit_doc = next(d for d in result.documents if d.doc_type == DocType.GITHUB_COMMIT)
+    assert commit_doc.author_id == "alice"  # primary author unchanged
+    assert commit_doc.metadata["co_authors"] == [
+        {"name": "Mahit Singh", "email": "mahit@prbe.ai"}
+    ]
+
+    # Mahit's Person node exists (keyed by email).
+    person_ids = {n.canonical_id for n in result.graph_nodes if n.label == NodeLabel.PERSON}
+    assert "mahit@prbe.ai" in person_ids
+    assert "alice" in person_ids  # primary still there
+
+    # AUTHORED edges from BOTH alice AND mahit point to the commit doc.
+    authored_to_commit = [
+        e
+        for e in result.graph_edges
+        if e.edge_type == EdgeType.AUTHORED and e.to_canonical_id == commit_doc.doc_id
+    ]
+    authored_from = {e.from_canonical_id for e in authored_to_commit}
+    assert authored_from == {"alice", "mahit@prbe.ai"}
 
 
 # ---------------------------------------------------------------------------

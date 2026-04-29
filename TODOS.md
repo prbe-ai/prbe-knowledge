@@ -169,6 +169,47 @@ fusion). ~50 LOC + the eval set.
 
 Discussed: 2026-04-28 in plan-eng-review for feature/router-list-mode.
 
+### Cross-source author identity resolution
+
+`documents.author_id` and the `Person` graph node are populated with
+whatever raw identifier each connector saw, with no resolution between
+forms. The same human appears under multiple values:
+
+- GitHub PR/issue/review → GitHub login (`mahit`)
+- GitHub commit where the email didn't resolve to a login → email (`mahit@prbe.ai`)
+- GitHub commit `Co-authored-by:` trailers → email (always)
+- Slack → user id (`U07ABC123`)
+- Linear → user id (`user_a3f9`)
+- Notion / Granola / Sentry → varies
+
+Today, `search_knowledge` chunks expose `author_id` as the raw form. The
+`Co-authored-by:` work landed alongside this comment surfaces co-authors
+under their email — usually a *different* string from the same person's
+primary `author_id` on PRs. Agents filtering by `author_ids=["mahit"]`
+silently miss the email-form rows, and "who's been most active across
+sources" is impossible to answer without per-tenant manual mapping.
+
+**Fix:** introduce a canonical `person_id` per customer with a many-to-one
+mapping from raw forms. Two layers:
+
+1. **Storage:** add `person_aliases` table — `(customer_id, raw_id,
+   source_system, person_id)` — and a `persons` table — `(customer_id,
+   person_id, display_name, primary_email)`. Pre-populate via heuristic
+   (email match across sources, GitHub login → noreply email pattern,
+   Linear/Slack profile email if available via OAuth scope).
+2. **Surface:** retrieval returns `author_id` (raw, kept for back-compat)
+   AND `author` (resolved canonical `{person_id, display_name}`) on each
+   chunk. Filter API gains `person_ids=[...]` that joins through aliases.
+
+**Scope:** ~600 LOC across schema migration, alias-resolver in retrieval
+helpers, connector hooks for alias hints (Slack profile email, Linear
+user export), and dashboard UX for manual merges. Material work, deserves
+its own design doc.
+
+Discussed: 2026-04-28 in `/plan-eng-review` for the surface-author-id
+chunk shape change. Skipped in that PR — the visibility fix could ship
+without resolution; trying to do both would have ballooned scope.
+
 ### In-memory router cache (LRU)
 
 We dropped the Postgres-backed `query_cache` in migration 0006 because at

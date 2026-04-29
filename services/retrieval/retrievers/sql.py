@@ -29,7 +29,7 @@ from typing import Literal
 
 from services.retrieval.temporal import build_predicate
 from shared.db import with_tenant
-from shared.models import TemporalSpec
+from shared.models import TemporalSpec, normalize_author_id
 
 
 @dataclass(slots=True)
@@ -181,6 +181,7 @@ class SQLListHit:
     created_at: datetime
     updated_at: datetime
     score: float
+    author_id: str | None = None
 
 
 GroupByKey = Literal["source_system", "doc_type", "author_id"]
@@ -266,7 +267,7 @@ async def sql_list(
             f"""
             WITH ranked_docs AS (
                 SELECT d.doc_id, d.version, d.source_system, d.source_url,
-                       d.title, d.created_at, d.updated_at
+                       d.title, d.author_id, d.created_at, d.updated_at
                 FROM documents d
                 WHERE d.customer_id = $1
                   {pred.doc_sql}
@@ -283,6 +284,7 @@ async def sql_list(
                    rd.source_system,
                    rd.source_url,
                    rd.title,
+                   rd.author_id,
                    c.content,
                    rd.created_at,
                    rd.updated_at,
@@ -321,6 +323,7 @@ async def sql_list(
                 created_at=r["created_at"],
                 updated_at=r["updated_at"],
                 score=1.0 / (1 + i),
+                author_id=normalize_author_id(r["author_id"]),
             )
         )
     return hits
