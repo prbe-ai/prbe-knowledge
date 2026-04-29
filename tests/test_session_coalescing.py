@@ -306,6 +306,12 @@ async def test_full_session_body_has_events_from_all_batches(live_db, monkeypatc
             content=f"batch-{batch_seq}-marker",
         )
 
+    # claude_code.fetch_supplementary calls `get_store()` directly (not the
+    # injected normalizer store), so monkeypatch the global lookup so the
+    # connector's R2 reads land on our stub.
+    from services.ingestion.handlers import claude_code as _cc_mod
+    monkeypatch.setattr(_cc_mod, "get_store", lambda: store)
+
     settings = Settings(environment="local")
     ctx = ConnectorContext(settings=settings, http=httpx.AsyncClient())
     normalizer = Normalizer(ctx, store=store, embedder=_ZeroEmbedder())  # type: ignore[arg-type]

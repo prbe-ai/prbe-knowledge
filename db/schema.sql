@@ -240,11 +240,23 @@ CREATE TABLE ingestion_queue (
     customer_id          TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     source_system        TEXT NOT NULL,
     source_event_id      TEXT NOT NULL,
-    payload_s3_key       TEXT NOT NULL,
+    -- Legacy single-payload column. Kept dormant after migration 0026 so
+    -- old in-flight rows during the cutover deploy don't crash; new code
+    -- only reads payload_s3_keys. A follow-up PR drops payload_s3_key
+    -- once enough deploy cycles have passed.
+    payload_s3_key       TEXT,
+    -- Coalesced array of every R2 path written for this row. For most
+    -- connectors this is a single-element array; for claude_code, every
+    -- batch for the same session_id appends here via _enqueue's UPSERT.
+    payload_s3_keys      TEXT[] NOT NULL DEFAULT '{}',
     status               TEXT NOT NULL DEFAULT 'pending',
     attempts             INT  NOT NULL DEFAULT 0,
     error                TEXT,
     priority             SMALLINT NOT NULL DEFAULT 100,
+    -- Monotonic counter, bumped on every UPSERT into the row. Worker
+    -- captures it on claim and CAS-commits on it, so any batch landing
+    -- mid-Phase-A triggers a clean re-claim with the extended array.
+    version              INT NOT NULL DEFAULT 0,
     enqueued_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     started_at           TIMESTAMPTZ,
     heartbeat_at         TIMESTAMPTZ,

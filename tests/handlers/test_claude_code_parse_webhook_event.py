@@ -9,7 +9,13 @@ def _make() -> ClaudeCodeConnector:
     return ClaudeCodeConnector(make_default_context())
 
 
-def test_parse_webhook_event_returns_session_batch_id() -> None:
+def test_parse_webhook_event_returns_bare_session_id() -> None:
+    """Post-migration 0026: source_event_id is the bare session_id (no
+    :batch_seq suffix) so the queue UPSERT in main.py:_enqueue can
+    coalesce all batches for a session into one row. batch_seq is still
+    surfaced via parse_hint so the webhook handler can compose unique
+    R2 storage paths per delivery.
+    """
     c = _make()
     out = c.parse_webhook_event(
         customer_id="cust-1",
@@ -23,7 +29,8 @@ def test_parse_webhook_event_returns_session_batch_id() -> None:
         },
     )
     assert out is not None
-    assert out.source_event_id == "sess-abc:12"
+    assert out.source_event_id == "sess-abc"
+    assert out.parse_hint == {"session_id": "sess-abc", "batch_seq": 12}
 
 
 def test_parse_webhook_event_missing_session_raises() -> None:
