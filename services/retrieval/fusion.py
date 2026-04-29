@@ -55,6 +55,7 @@ class FusedHit:
     created_at: datetime
     updated_at: datetime
     score: float
+    author_id: str | None = None
     retriever_scores: dict[str, float] = field(default_factory=dict)
     # Always 'content' on FusedHit — fusion's contract is "synthetic
     # metadata text never escapes." Caller sees only body chunks.
@@ -74,7 +75,7 @@ def fuse(
     `ranked_lists` is `{"vector": [VectorHit, ...], "bm25": [...], "graph": [...]}`.
     Each hit object must expose: chunk_id, doc_id, doc_version,
     source_system, source_url, title, content, created_at, updated_at,
-    score, kind.
+    score, kind. `author_id` is optional and propagated when present.
 
     Returns up to top_k FusedHits, each one a CONTENT chunk (metadata
     chunks contribute scoring signal but never appear in the response).
@@ -156,6 +157,7 @@ def fuse(
                 created_at=hit.created_at,
                 updated_at=hit.updated_at,
                 score=combined,
+                author_id=getattr(hit, "author_id", None),
                 retriever_scores=retriever_scores,
                 kind="content",
             )

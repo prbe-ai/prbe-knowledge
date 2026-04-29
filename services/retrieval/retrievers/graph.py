@@ -13,7 +13,7 @@ from datetime import datetime
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_GRAPH
 from shared.db import with_tenant
-from shared.models import TemporalSpec
+from shared.models import TemporalSpec, normalize_author_id
 
 
 @dataclass(slots=True)
@@ -29,6 +29,7 @@ class GraphHit:
     updated_at: datetime
     score: float
     via_entity: str  # canonical_id that anchored this hit
+    author_id: str | None = None
     # Always 'content' for graph hits (graph_search filters synthetic
     # metadata chunks out — graph anchoring is about entity proximity,
     # not synthetic-text similarity).
@@ -117,8 +118,8 @@ async def graph_search(
                                 WHERE gn.node_id = anchors.node_id AND gn.label = 'Document')
             )
             SELECT c.chunk_id, c.doc_id, d.version AS doc_version,
-                   d.source_system, d.source_url, d.title, c.content,
-                   d.created_at, d.updated_at,
+                   d.source_system, d.source_url, d.title, d.author_id,
+                   c.content, d.created_at, d.updated_at,
                    MIN(n.via) AS via_entity
             FROM neighbors n
             JOIN graph_nodes gn ON gn.node_id = n.node_id
@@ -135,8 +136,8 @@ async def graph_search(
               {pred.doc_sql}
               {doc_type_filter}
             GROUP BY c.chunk_id, c.doc_id, d.version,
-                     d.source_system, d.source_url, d.title, c.content,
-                     d.created_at, d.updated_at
+                     d.source_system, d.source_url, d.title, d.author_id,
+                     c.content, d.created_at, d.updated_at
             LIMIT $4
             """,
             *params,
@@ -155,6 +156,7 @@ async def graph_search(
             updated_at=r["updated_at"],
             score=1.0,
             via_entity=r["via_entity"],
+            author_id=normalize_author_id(r["author_id"]),
         )
         for r in rows
     ]

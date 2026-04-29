@@ -183,6 +183,7 @@ async def run_search(
             source_url=h.source_url,
             title=h.title,
             content=h.content,
+            author_id=h.author_id,
             created_at=h.created_at,
             updated_at=h.updated_at,
             score=h.score,

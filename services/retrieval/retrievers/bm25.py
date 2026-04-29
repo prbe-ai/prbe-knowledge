@@ -14,7 +14,7 @@ from datetime import datetime
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_BM25
 from shared.db import with_tenant
-from shared.models import TemporalSpec
+from shared.models import TemporalSpec, normalize_author_id
 
 
 @dataclass(slots=True)
@@ -29,6 +29,7 @@ class BM25Hit:
     created_at: datetime
     updated_at: datetime
     score: float
+    author_id: str | None = None
     kind: str = "content"
 
 
@@ -67,6 +68,7 @@ async def bm25_search(
                    d.source_system,
                    d.source_url,
                    d.title,
+                   d.author_id,
                    c.content,
                    c.kind,
                    d.created_at,
@@ -102,6 +104,7 @@ async def bm25_search(
             created_at=r["created_at"],
             updated_at=r["updated_at"],
             score=float(r["score"]),
+            author_id=normalize_author_id(r["author_id"]),
             kind=r["kind"],
         )
         for r in rows

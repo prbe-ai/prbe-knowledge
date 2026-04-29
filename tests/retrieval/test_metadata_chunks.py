@@ -41,6 +41,7 @@ def _doc(
     source_url: str = "https://github.com/prbe-ai/prbe-backend/commit/abc1234567890abcdef1234567890abcdef12345",
     author_id: str | None = "alice",
     body_preview: str | None = "Three branding fixes on the OAuth consent page",
+    metadata: dict | None = None,
 ) -> Document:
     return Document(
         doc_id=doc_id,
@@ -55,6 +56,7 @@ def _doc(
         title=title,
         author_id=author_id,
         body_preview=body_preview,
+        metadata=metadata or {},
         created_at=_NOW,
         updated_at=_NOW,
         valid_from=_NOW,
@@ -125,6 +127,39 @@ def test_metadata_text_handles_missing_fields() -> None:
     assert "title:" not in text
     assert "author:" not in text
     assert "summary:" not in text
+
+
+def test_metadata_text_includes_co_authors_for_search() -> None:
+    """`Co-authored-by` trailers must reach the metadata chunk text so a
+    "what did Mahit ship" BM25 / vector query surfaces commits Mahit only
+    co-authored — not just the ones where he was the primary committer."""
+    doc = _doc(
+        metadata={
+            "co_authors": [
+                {"name": "Mahit Singh", "email": "mahit@prbe.ai"},
+                {"name": "Bob Jones", "email": "bob@example.com"},
+            ]
+        }
+    )
+    text = _metadata_text(doc)
+    assert "co_author: mahit@prbe.ai (Mahit Singh)" in text
+    assert "co_author: bob@example.com (Bob Jones)" in text
+
+
+def test_metadata_text_no_co_authors_line_when_absent() -> None:
+    text = _metadata_text(_doc())
+    assert "co_author:" not in text
+
+
+def test_metadata_text_handles_co_author_email_only() -> None:
+    """Defensive: a malformed co-author entry without a name still surfaces
+    the email so the chunk remains searchable."""
+    doc = _doc(
+        metadata={"co_authors": [{"email": "anon@example.com"}]}
+    )
+    text = _metadata_text(doc)
+    assert "co_author: anon@example.com" in text
+    assert "(" not in text.split("co_author:")[1].split("\n")[0]  # no name parens
 
 
 def test_metadata_text_summary_first_line_only_capped() -> None:
