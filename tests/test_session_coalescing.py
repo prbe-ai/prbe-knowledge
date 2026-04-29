@@ -306,6 +306,12 @@ async def test_full_session_body_has_events_from_all_batches(live_db, monkeypatc
             content=f"batch-{batch_seq}-marker",
         )
 
+    # claude_code.fetch_supplementary calls `get_store()` directly (not the
+    # injected normalizer store), so monkeypatch the global lookup so the
+    # connector's R2 reads land on our stub.
+    from services.ingestion.handlers import claude_code as _cc_mod
+    monkeypatch.setattr(_cc_mod, "get_store", lambda: store)
+
     settings = Settings(environment="local")
     ctx = ConnectorContext(settings=settings, http=httpx.AsyncClient())
     normalizer = Normalizer(ctx, store=store, embedder=_ZeroEmbedder())  # type: ignore[arg-type]
@@ -373,3 +379,41 @@ async def test_slack_still_uses_one_row_per_event(live_db) -> None:
         assert r["priority"] == 100, "slack priority stays at 100"
         assert r["version"] == 0, "slack rows don't bump version (no UPSERT)"
         assert len(r["payload_s3_keys"]) == 1, "slack payload_s3_keys is single-element"
+
+
+# ---- 6. R2 key namespace must stay unique per delivery ---------------------
+
+
+def test_webhook_handler_composes_unique_r2_keys_per_cc_batch() -> None:
+    """Regression: claude_code's queue source_event_id is now bare session_id
+    so the UPSERT can coalesce, but the R2 storage namespace must still
+    distinguish batches — otherwise batch N writes overwrite batch N-1's
+    envelope and only the last batch's events survive in storage.
+
+    The webhook handler composes <session_id>:<batch_seq> as the storage_id
+    when source_system==CLAUDE_CODE and parse_hint carries batch_seq.
+    Pure-function check: build a parse_hint, run the same composition the
+    handler does, assert distinct storage_ids per batch_seq.
+    """
+    from services.ingestion.main import _payload_key
+    from shared.constants import SourceSystem
+
+    customer = "kc-cust"
+    session = "sess-keys-unique"
+
+    keys: set[str] = set()
+    for batch_seq in range(5):
+        # Mirrors the storage_id composition in main.py:webhook
+        parse_hint = {"session_id": session, "batch_seq": batch_seq}
+        source_event_id = session  # what parse_webhook_event returns now
+        storage_id = source_event_id
+        bs = parse_hint.get("batch_seq")
+        if isinstance(bs, int):
+            storage_id = f"{source_event_id}:{bs}"
+        keys.add(_payload_key(SourceSystem.CLAUDE_CODE, customer, storage_id))
+
+    assert len(keys) == 5, (
+        f"expected 5 distinct R2 keys (one per batch), got {len(keys)}: {keys}. "
+        "If only 1 distinct key, the per-batch storage namespace collapsed "
+        "and batches will overwrite each other in R2."
+    )

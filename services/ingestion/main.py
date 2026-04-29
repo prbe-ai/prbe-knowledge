@@ -214,7 +214,18 @@ async def webhook(
     )
     store = request.app.state.store
     bucket = store.bucket_for(customer_id)
-    key = _payload_key(source_enum, customer_id, parsed.source_event_id)
+    # The R2 key namespace must stay UNIQUE per-delivery, even when the
+    # queue's source_event_id is intentionally non-unique (claude_code
+    # coalescing — every batch shares the same session_id). For CC we
+    # compose `<session_id>:<batch_seq>` as the storage_id so each batch
+    # writes a distinct R2 path; retries with the same batch_seq are
+    # idempotent (same R2 path, last-write-wins on identical content).
+    storage_id = parsed.source_event_id
+    if source_enum == SourceSystem.CLAUDE_CODE and isinstance(parsed.parse_hint, dict):
+        batch_seq = parsed.parse_hint.get("batch_seq")
+        if isinstance(batch_seq, int):
+            storage_id = f"{parsed.source_event_id}:{batch_seq}"
+    key = _payload_key(source_enum, customer_id, storage_id)
 
     try:
         await store.ensure_bucket(bucket)
