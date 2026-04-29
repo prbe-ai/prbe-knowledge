@@ -1,6 +1,8 @@
 """Query router — Haiku entity + temporal + mode extraction via tool-use.
 
-Always calls Haiku (no DB cache). The router output drives:
+Calls Haiku on every request, but the request uses Anthropic prompt
+caching (5-min ephemeral) on the tool schema + system prompt — only the
+per-query user message is uncached. The router output drives:
   - which retrievers fire (entity → graph weight, source → BM25/vector
     source filter)
   - how the dispatcher splits semantic vs deterministic ("list") work
@@ -366,9 +368,11 @@ class RouterOutput:
 async def route_query(customer_id: str, query: str) -> RouterOutput:
     """Return entities + expansions + temporal + mode for `query`.
 
-    No cache — Haiku is on the path for every call. Symbolic temporal
-    output stays query-stable, so callers can resolve it relative to a
-    fresh `now` on each request.
+    Haiku is on the path for every call, but the request uses Anthropic
+    prompt caching (5-min ephemeral) on the tool schema + system prompt —
+    the per-query user message stays uncached. Symbolic temporal output
+    stays query-stable, so callers can resolve it relative to a fresh
+    `now` on each request.
     """
     try:
         parsed = await _call_haiku(query)
@@ -417,10 +421,21 @@ async def _call_haiku(query: str) -> dict:
 
     client = AsyncAnthropic(api_key=api_key, timeout=ROUTER_TIMEOUT_SECONDS)
     try:
+        # Anthropic prompt caching: one breakpoint at the end of the system
+        # block caches everything before the per-query user message — the
+        # tool schema AND the system prompt. The system prompt has today's
+        # date baked in, so the cache turns over daily anyway; ephemeral
+        # (5-min TTL) is the right granularity.
         resp = await client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=512,
-            system=system_prompt,
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
             tools=[_ROUTE_QUERY_TOOL],
             tool_choice={"type": "tool", "name": "route_query"},
             messages=[{"role": "user", "content": user_message}],

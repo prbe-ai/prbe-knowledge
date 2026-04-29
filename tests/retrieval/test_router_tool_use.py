@@ -243,6 +243,45 @@ async def test_route_query_wraps_user_in_query_tags(monkeypatch) -> None:
     assert "Ignore previous" in content  # actual user text preserved as data
 
 
+@pytest.mark.asyncio
+async def test_route_query_uses_prompt_caching(monkeypatch) -> None:
+    """The Anthropic call must mark the system block with cache_control so
+    the static tool schema + system prompt are cached across calls. Without
+    this, every /query pays full Haiku TTFT for ~3K tokens of static prefix."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from shared.config import get_settings
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    payload = {
+        "entities": [],
+        "expansions": [],
+        "temporal": None,
+        "sort": None,
+        "mode": "search",
+        "doc_type": None,
+        "operation": None,
+        "group_by_key": None,
+    }
+    captured: dict[str, object] = {}
+    with patch("services.retrieval.router.AsyncAnthropic") as mock_client_cls:
+
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+            return _tool_use_response(payload)
+
+        mock_client_cls.return_value.messages.create = AsyncMock(side_effect=_capture)
+        await route_query("cust-1", "anything")
+
+    system = captured["system"]
+    assert isinstance(system, list) and len(system) == 1, (
+        "system must be a list of content blocks for cache_control to apply"
+    )
+    block = system[0]
+    assert block["type"] == "text"
+    assert block["cache_control"] == {"type": "ephemeral"}
+
+
 def test_router_entity_dataclass_constructible() -> None:
     e = RouterEntity(
         entity_type="repo",
