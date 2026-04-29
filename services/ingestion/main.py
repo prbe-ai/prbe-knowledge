@@ -41,6 +41,7 @@ from services.ingestion.handlers.registry import (
     list_registered,
 )
 from services.ingestion.internal_devices import router as devices_router
+from services.system_settings import get_ingestion_killswitch
 from shared.config import get_settings
 from shared.constants import SourceSystem
 from shared.db import get_pool, health_check, init_pool
@@ -112,6 +113,19 @@ def _verify_internal_key(request: Request) -> None:
         )
 
 
+@app.get("/api/internal/ingestion-status")
+async def ingestion_status(request: Request) -> JSONResponse:
+    """Read the global ingestion killswitch.
+
+    Called by prbe-backend's /agent-tap/ingestion-status proxy. Bypasses
+    the cache so admin polling sees flips immediately. Auth via the same
+    X-Internal-Knowledge-Key as the webhook endpoint.
+    """
+    _verify_internal_key(request)
+    ks = await get_ingestion_killswitch(force_refresh=True)
+    return JSONResponse({"enabled": ks.enabled, "reason": ks.reason})
+
+
 @app.post("/webhooks/{source}")
 async def webhook(
     source: str,
@@ -125,6 +139,23 @@ async def webhook(
     platform's signature (gateway already did).
     """
     _verify_internal_key(request)
+
+    # Global ingestion killswitch — short-circuit BEFORE doing any of the
+    # heavy work (R2 write, queue insert). If an operator has flipped the
+    # switch off (maintenance, runaway customer, panic stop), every plugin
+    # webhook gets a 503 with Retry-After so well-behaved clients back off.
+    # Cache lives in services/system_settings (30s TTL).
+    ks = await get_ingestion_killswitch()
+    if not ks.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": ks.reason or "ingestion paused",
+                "retry_after_s": 300,
+            },
+            headers={"Retry-After": "300"},
+        )
+
     if not x_prbe_customer:
         raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
 
