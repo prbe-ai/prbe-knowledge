@@ -159,6 +159,25 @@ class Normalizer:
         total_removed = 0
         total_failed = 0
 
+        # ---- Phase A: pre-compute chunk plans WITHOUT holding a write txn.
+        #
+        # Each plan does a tiny read txn for the live-chunks SELECT under
+        # tenant RLS, closes it, then calls `embed_many` outside any txn.
+        # Doing this inside Phase B's transaction (the historical bug) held
+        # row locks across the 60-120s OpenAI round trip, which caused
+        # concurrent workers' `graph_nodes` upserts to hit the 30s
+        # statement_timeout and DLQ. See incident 2026-04-29.
+        #
+        # Embedding-cost dedup against same-session work is enforced upstream
+        # in `Worker._claim_one` (NOT EXISTS on session_key) — without that,
+        # two batches of the same session would compute overlapping chunk
+        # sets here and pay OpenAI twice for identical content_hashes.
+        plans: list[_ChunkPlan] = []
+        for doc in result.documents:
+            plans.append(await self._plan_chunks(customer_id, doc))
+
+        # ---- Phase B: ONE short write transaction. No external I/O between
+        # BEGIN and COMMIT, so every lock held here is millisecond-scale.
         async with with_tenant(customer_id) as conn:
             # Nodes first, then edges — edges look up node_ids.
             node_ids = await upsert_nodes(
@@ -167,7 +186,7 @@ class Normalizer:
             await upsert_edges(conn, customer_id, result.graph_edges, node_ids, source_system.value)
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
 
-            for idx, doc in enumerate(result.documents):
+            for idx, (doc, plan) in enumerate(zip(result.documents, plans, strict=True)):
                 # Per-doc SAVEPOINT: a deterministic-permanent error on one doc
                 # (e.g. a malformed body) must not roll back already-good
                 # siblings, otherwise the queue row stays poisoned forever.
@@ -179,7 +198,7 @@ class Normalizer:
                     persisted = await _upsert_document(conn, doc)
                     if persisted:
                         doc_ids.append(doc.doc_id)
-                        sync_outcome = await self._sync_chunks(conn, doc)
+                        sync_outcome = await _apply_chunk_plan(conn, doc, plan)
                         total_live_chunks += sync_outcome.live
                         total_added += sync_outcome.added
                         total_reused += sync_outcome.reused
@@ -220,10 +239,17 @@ class Normalizer:
             quarantined_doc_ids=quarantined,
         )
 
-    async def _sync_chunks(self, conn: asyncpg.Connection, doc: Document) -> _ChunkSyncOutcome:
-        """Diff live chunks against freshly-chunked content.
+    async def _plan_chunks(self, customer_id: str, doc: Document) -> _ChunkPlan:
+        """Phase A: build a `_ChunkPlan` for one document — without holding
+        a write transaction across the embed_many call.
 
-        The whole point: don't re-embed what hasn't changed.
+        Reads live chunks under a short read txn (RLS needs the tenant GUC),
+        closes the txn, then calls the embedder for added pieces outside any
+        txn. The returned plan is applied later by `_apply_chunk_plan` inside
+        the shared write txn.
+
+        The whole point: don't re-embed what hasn't changed, AND don't hold
+        graph_nodes/chunks row locks during the long OpenAI round trip.
         """
         # Deleted docs: no body → chunks is empty → every live chunk gets closed out.
         # The metadata chunk also disappears for deleted docs (joins the removed
@@ -247,15 +273,19 @@ class Normalizer:
         # filter live_rows by kind to avoid colliding with content hashes.
         metadata_hash: str | None = _chunk_hash(metadata_piece.content) if metadata_piece else None
 
-        live_rows = await conn.fetch(
-            """
-            SELECT content_hash, chunker_version, chunk_index, kind
-            FROM chunks
-            WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
-            """,
-            doc.customer_id,
-            doc.doc_id,
-        )
+        # Read-only txn for the live-chunks lookup. RLS on `chunks` requires
+        # the tenant GUC, which `with_tenant` sets at txn start. Closing this
+        # txn before calling the embedder is the whole point of Phase A.
+        async with with_tenant(customer_id) as conn:
+            live_rows = await conn.fetch(
+                """
+                SELECT content_hash, chunker_version, chunk_index, kind
+                FROM chunks
+                WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+                """,
+                doc.customer_id,
+                doc.doc_id,
+            )
 
         # Diff content chunks and the (singular) metadata chunk against
         # separate live-row partitions. Filtering by kind avoids the case
@@ -287,30 +317,11 @@ class Normalizer:
         if removed_metadata_hashes:
             removed_hashes |= removed_metadata_hashes
 
-        # 1) Reuse: just bump last_seen_version. No embed call.
-        # Combined: content reused + metadata reused (if any).
-        reused_for_bump = set(reused_hashes)
-        if metadata_reuse and metadata_hash is not None:
-            reused_for_bump.add(metadata_hash)
-        if reused_for_bump:
-            await conn.execute(
-                """
-                UPDATE chunks
-                SET last_seen_version = $1
-                WHERE customer_id = $2 AND doc_id = $3
-                  AND content_hash = ANY($4::text[]) AND valid_to IS NULL
-                """,
-                doc.version,
-                doc.customer_id,
-                doc.doc_id,
-                list(reused_for_bump),
-            )
-
-        # 2) Added: embed + insert. Content pieces and the metadata piece (if
-        # added) go through ONE embed_many call so we don't pay an extra
-        # OpenAI round-trip per doc. The metadata piece is appended at the
-        # end of the input list; its index is tracked separately so we know
-        # which match belongs to it.
+        # Build embed inputs: content pieces being added + the metadata piece
+        # (if it's being added). Content pieces preserve their input order so
+        # the chunker_index in the resulting chunks row matches what the
+        # chunker emitted. The metadata piece is appended last with a
+        # sentinel chunk_index (METADATA_CHUNK_INDEX) baked in by `_metadata_piece`.
         added_content_pieces: list[ChunkPiece] = [
             new_by_hash[h] for h in new_hashes if h in added_hashes
         ]
@@ -320,7 +331,12 @@ class Normalizer:
             metadata_input_index = len(embed_inputs)
             embed_inputs.append(metadata_piece)
 
-        failed = 0
+        # Embed OUTSIDE any txn. This is the long I/O — 60-120s for big
+        # sessions. Holding a write txn across it caused the 2026-04-29
+        # incident.
+        added_pieces: list[tuple[ChunkPiece, list[float], str]] = []
+        failed_pieces: list[tuple[ChunkPiece | None, Any]] = []
+        failed_count = 0
         if embed_inputs:
             embeds = await self._embedder.embed_many([p.content for p in embed_inputs])
             for match in embeds.embedded:
@@ -333,39 +349,31 @@ class Normalizer:
                     and match.chunk_index == metadata_input_index
                     else "content"
                 )
-                await _insert_chunk(conn, doc, piece, match.embedding, kind=kind)
+                added_pieces.append((piece, match.embedding, kind))
             for fail in embeds.failed:
                 # Map back to the originating piece to record chunk_index on failure.
                 if 0 <= fail.chunk_index < len(embed_inputs):
-                    piece = embed_inputs[fail.chunk_index]
+                    fail_piece: ChunkPiece | None = embed_inputs[fail.chunk_index]
                 else:
-                    piece = None
-                await _insert_failed_chunk(conn, doc, fail, piece)
+                    fail_piece = None
+                failed_pieces.append((fail_piece, fail))
                 # Don't count metadata-chunk failures against `failed` — that
                 # counter feeds the chunk-sync outcome which is content-shaped.
                 if metadata_input_index is None or fail.chunk_index != metadata_input_index:
-                    failed += 1
+                    failed_count += 1
 
-        # 3) Removed: mark stale at NOW().
-        if removed_hashes:
-            await conn.execute(
-                """
-                UPDATE chunks
-                SET valid_to = NOW()
-                WHERE customer_id = $1 AND doc_id = $2
-                  AND content_hash = ANY($3::text[]) AND valid_to IS NULL
-                """,
-                doc.customer_id,
-                doc.doc_id,
-                list(removed_hashes),
-            )
-
-        return _ChunkSyncOutcome(
-            added=len(added_content_pieces) - failed,
-            reused=len(reused_hashes),
-            removed=len(removed_hashes),
-            failed=failed,
-            live=len(reused_hashes) + (len(added_content_pieces) - failed),
+        added_content_count = len(added_content_pieces) - failed_count
+        return _ChunkPlan(
+            reused_content_hashes=reused_hashes,
+            reused_metadata_hash=metadata_hash if metadata_reuse else None,
+            added_pieces=added_pieces,
+            failed_pieces=failed_pieces,
+            removed_hashes=removed_hashes,
+            added_count=added_content_count,
+            reused_count=len(reused_hashes),
+            removed_count=len(removed_hashes),
+            failed_count=failed_count,
+            live_count=len(reused_hashes) + added_content_count,
         )
 
     # ---- helpers ------------------------------------------------------------
@@ -408,6 +416,42 @@ class _ChunkSyncOutcome:
     removed: int
     failed: int
     live: int
+
+
+@dataclass(slots=True)
+class _ChunkPlan:
+    """Pre-computed chunk diff + embeddings for one document.
+
+    Phase A (`Normalizer._plan_chunks`) builds this without holding a write
+    transaction — it does the live-chunks SELECT under a short read txn,
+    closes the txn, then calls `embed_many` outside any txn. Phase B
+    (`_apply_chunk_plan`) takes the plan and runs the three writes inside
+    the single shared write txn that also covers nodes/edges/ACL/docs.
+
+    The split exists because `embed_many` is a 60-120s OpenAI round trip
+    for long sessions — holding row locks across it caused conflicting
+    `graph_nodes` upserts from concurrent workers to time out and DLQ.
+    See incident 2026-04-29.
+    """
+    # Content-chunk hashes that already exist live → just bump last_seen_version.
+    reused_content_hashes: set[str] = field(default_factory=set)
+    # Metadata chunk's hash if it already exists live (singleton). None if no
+    # metadata chunk in the plan or if it's being added/changed.
+    reused_metadata_hash: str | None = None
+    # (piece, embedding, kind) triples to insert. Kind is "content" or "metadata".
+    added_pieces: list[tuple[ChunkPiece, list[float], str]] = field(default_factory=list)
+    # (piece_or_None, failed_record) tuples from embedding failures. Goes to
+    # failed_chunks. Phase B writes these inside the per-doc savepoint.
+    failed_pieces: list[tuple[ChunkPiece | None, Any]] = field(default_factory=list)
+    # All hashes that should be marked valid_to=NOW() — content + metadata stale.
+    removed_hashes: set[str] = field(default_factory=set)
+    # Pre-computed counts for the outcome (computed in Phase A so Phase B's
+    # `_apply_chunk_plan` is purely SQL — no derived bookkeeping).
+    added_count: int = 0
+    reused_count: int = 0
+    removed_count: int = 0
+    failed_count: int = 0
+    live_count: int = 0
 
 
 # ---- SQL helpers (module-level so tests can unit-test them) ---------------
@@ -607,6 +651,65 @@ async def _insert_failed_chunk(
         chunk_index,
         failed.content_preview,
         failed.error,
+    )
+
+
+async def _apply_chunk_plan(
+    conn: asyncpg.Connection, doc: Document, plan: _ChunkPlan
+) -> _ChunkSyncOutcome:
+    """Phase B: apply a pre-computed `_ChunkPlan` inside the write txn.
+
+    No external I/O. Pure SQL: bump last_seen_version on reused, INSERT
+    new chunks (with embeddings already computed in Phase A), record
+    embedding failures, mark removed chunks stale.
+
+    Counts are pre-computed in Phase A and passed through verbatim — the
+    caller's outcome accumulators don't notice the split.
+    """
+    # 1) Reuse: bump last_seen_version. Combined: content reused + metadata reused.
+    reused_for_bump: set[str] = set(plan.reused_content_hashes)
+    if plan.reused_metadata_hash is not None:
+        reused_for_bump.add(plan.reused_metadata_hash)
+    if reused_for_bump:
+        await conn.execute(
+            """
+            UPDATE chunks
+            SET last_seen_version = $1
+            WHERE customer_id = $2 AND doc_id = $3
+              AND content_hash = ANY($4::text[]) AND valid_to IS NULL
+            """,
+            doc.version,
+            doc.customer_id,
+            doc.doc_id,
+            list(reused_for_bump),
+        )
+
+    # 2) Added: insert with pre-computed embeddings.
+    for piece, embedding, kind in plan.added_pieces:
+        await _insert_chunk(conn, doc, piece, embedding, kind=kind)
+    for piece, fail in plan.failed_pieces:
+        await _insert_failed_chunk(conn, doc, fail, piece)
+
+    # 3) Removed: mark stale at NOW().
+    if plan.removed_hashes:
+        await conn.execute(
+            """
+            UPDATE chunks
+            SET valid_to = NOW()
+            WHERE customer_id = $1 AND doc_id = $2
+              AND content_hash = ANY($3::text[]) AND valid_to IS NULL
+            """,
+            doc.customer_id,
+            doc.doc_id,
+            list(plan.removed_hashes),
+        )
+
+    return _ChunkSyncOutcome(
+        added=plan.added_count,
+        reused=plan.reused_count,
+        removed=plan.removed_count,
+        failed=plan.failed_count,
+        live=plan.live_count,
     )
 
 
