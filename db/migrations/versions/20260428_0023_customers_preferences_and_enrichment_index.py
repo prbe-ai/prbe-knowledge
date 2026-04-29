@@ -1,6 +1,6 @@
 """customers preferences + enrichment list index
 
-Revision ID: 0023_customers_preferences_and_enrichment_index
+Revision ID: 0023_customer_prefs
 Revises: 0022_graph_nodes_alnum_indexes
 Create Date: 2026-04-28
 
@@ -23,7 +23,7 @@ from __future__ import annotations
 from alembic import op
 
 
-revision = "0023_customers_preferences_and_enrichment_index"
+revision = "0023_customer_prefs"
 down_revision = "0022_graph_nodes_alnum_indexes"
 branch_labels = None
 depends_on = None
