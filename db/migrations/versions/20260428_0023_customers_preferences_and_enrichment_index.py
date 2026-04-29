@@ -22,7 +22,6 @@ from __future__ import annotations
 
 from alembic import op
 
-
 revision = "0023_customer_prefs"
 down_revision = "0022_graph_nodes_alnum_indexes"
 branch_labels = None
