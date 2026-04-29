@@ -119,7 +119,7 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
             customer_id=CUSTOMER,
             source_system=SourceSystem.CLAUDE_CODE,
             source_event_id=source_event_id,
-            payload_s3_key=row["payload_s3_key"],
+            payload_s3_keys=[row["payload_s3_key"]],
         )
     finally:
         await ctx.http.aclose()

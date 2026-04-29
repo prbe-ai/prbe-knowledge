@@ -207,6 +207,20 @@ MAX_WEBHOOK_ATTEMPTS = 5
 QUEUE_HEARTBEAT_INTERVAL_SECONDS = 30
 QUEUE_RECLAIM_THRESHOLD_SECONDS = 300
 
+# Per-source-system queue priority at enqueue time. Worker._claim_one
+# orders by priority DESC, so higher numbers claim first. Tiers:
+#
+#   100  — interactive webhooks: github, slack, notion, linear, granola, sentry
+#    75  — claude_code: bursty, deprioritized vs interactive (search-indexable,
+#          not user-blocking; one chatty CC user shouldn't block other connectors)
+#    50  — backfill rows (set in backfill_runner.py); never blocks live work
+#
+# Sources not in this map fall back to DEFAULT_INGESTION_PRIORITY.
+DEFAULT_INGESTION_PRIORITY = 100
+SOURCE_INGESTION_PRIORITY: dict[SourceSystem, int] = {
+    SourceSystem.CLAUDE_CODE: 75,
+}
+
 TOP_K_VECTOR = 50
 TOP_K_BM25 = 50
 TOP_K_GRAPH = 20

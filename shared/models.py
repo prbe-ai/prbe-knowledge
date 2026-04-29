@@ -140,13 +140,30 @@ class Chunk(BaseModel):
 
 
 class WebhookEvent(BaseModel):
-    """Uniform shape that every handler's parse_webhook_event produces."""
+    """Uniform shape that every handler's parse_webhook_event produces.
+
+    `payload_s3_keys` carries every R2 path coalesced into the queue row.
+    For non-CC connectors this is always a single-element list (one
+    payload per row). For claude_code it grows as batches arrive under
+    the same session_id. The connector decides how to consume the list
+    in its `fetch_supplementary` method.
+
+    `payload_s3_key` is a back-compat alias for `payload_s3_keys[0]`.
+    Older code paths that only know about a single payload (most connector
+    backfill generators) still set this; new code paths read the array.
+
+    `raw_payload` is the parsed contents of the *first* key in
+    `payload_s3_keys` (the most relevant single payload — e.g. for non-CC
+    it's literally THE payload). Connectors that need the full set
+    iterate `payload_s3_keys` themselves.
+    """
 
     customer_id: str
     source_system: SourceSystem
     source_event_id: str
     received_at: datetime
-    payload_s3_key: str
+    payload_s3_key: str = ""
+    payload_s3_keys: list[str] = Field(default_factory=list)
     raw_payload: dict[str, Any]
     headers: dict[str, str] = Field(default_factory=dict)
 

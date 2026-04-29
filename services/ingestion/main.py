@@ -43,7 +43,11 @@ from services.ingestion.handlers.registry import (
 from services.ingestion.internal_devices import router as devices_router
 from services.system_settings import get_ingestion_killswitch
 from shared.config import get_settings
-from shared.constants import SourceSystem
+from shared.constants import (
+    DEFAULT_INGESTION_PRIORITY,
+    SOURCE_INGESTION_PRIORITY,
+    SourceSystem,
+)
 from shared.db import get_pool, health_check, init_pool
 from shared.exceptions import (
     HandlerNotFound,
@@ -271,13 +275,78 @@ async def _enqueue(
     source_event_id: str,
     payload_s3_key: str,
 ) -> bool:
-    """Returns True if row was newly inserted, False if UNIQUE collision."""
+    """Persist a webhook batch to the ingestion queue.
+
+    Two paths:
+
+    1. **claude_code (coalescing)** — multiple batches for the same session
+       collapse into a single queue row. UPSERT keyed on
+       (customer_id, source_system, source_event_id=session_id) appends
+       the new R2 key to `payload_s3_keys` and bumps `version`. The worker
+       captures `version` at claim time and CAS-commits on it, so any
+       batch landing during Phase A causes a clean re-claim with the
+       extended array. See migration 0026 for column shape.
+
+    2. **other connectors** — INSERT each event as its own row with
+       `payload_s3_keys = ARRAY[key]`, `version = 0`. ON CONFLICT
+       DO NOTHING dedupes redeliveries from the source platform.
+
+    Returns True if a new row was created OR an existing CC session row
+    had its array extended; False only on the non-CC duplicate path
+    (ON CONFLICT swallowed the insert).
+
+    `payload_s3_key` is also written to the legacy column for back-compat
+    until a follow-up PR drops it. Both columns hold the same first key
+    on insert; CC UPSERTs leave the legacy column at whatever the
+    earliest batch wrote (fine, nothing reads it once the deploy lands).
+    """
+    priority = SOURCE_INGESTION_PRIORITY.get(source, DEFAULT_INGESTION_PRIORITY)
+
+    if source == SourceSystem.CLAUDE_CODE:
+        # Session-keyed UPSERT: append to array, bump version, refresh
+        # status to 'pending' so the worker picks it up even if the row
+        # was previously 'done' (session resumed after idle).
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO ingestion_queue
+                    (customer_id, source_system, source_event_id,
+                     payload_s3_key, payload_s3_keys, status, priority,
+                     version, enqueued_at)
+                VALUES ($1, $2, $3, $4, ARRAY[$4], 'pending', $5, 1, NOW())
+                ON CONFLICT (customer_id, source_system, source_event_id) DO UPDATE
+                    SET payload_s3_keys = ingestion_queue.payload_s3_keys
+                                          || EXCLUDED.payload_s3_keys,
+                        status = 'pending',
+                        version = ingestion_queue.version + 1,
+                        completed_at = NULL,
+                        error = NULL,
+                        -- Bump enqueued_at to reflect most-recent activity so
+                        -- session_completer's MAX(enqueued_at) tracks idle
+                        -- correctly. Side effect: chatty sessions get pushed
+                        -- to the back of the priority tier within CC, which
+                        -- is intentional — quieter sessions drain first.
+                        enqueued_at = NOW()
+                RETURNING queue_id
+                """,
+                customer_id,
+                source.value,
+                source_event_id,
+                payload_s3_key,
+                priority,
+            )
+        # UPSERT always returns a queue_id, so this is True for both
+        # first-batch (new row) and Nth-batch (extended array) cases.
+        # Callers just want to know "did we accept the payload?" — we did.
+        return row is not None
+
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO ingestion_queue
-                (customer_id, source_system, source_event_id, payload_s3_key)
-            VALUES ($1, $2, $3, $4)
+                (customer_id, source_system, source_event_id,
+                 payload_s3_key, payload_s3_keys, priority)
+            VALUES ($1, $2, $3, $4, ARRAY[$4], $5)
             ON CONFLICT (customer_id, source_system, source_event_id) DO NOTHING
             RETURNING queue_id
             """,
@@ -285,6 +354,7 @@ async def _enqueue(
             source.value,
             source_event_id,
             payload_s3_key,
+            priority,
         )
     return row is not None
 

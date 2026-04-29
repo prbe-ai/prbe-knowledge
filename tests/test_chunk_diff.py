@@ -90,7 +90,7 @@ async def _put_and_ingest(
         customer_id=customer_id,
         source_system=SourceSystem.SLACK,
         source_event_id=source_event_id,
-        payload_s3_key=key,
+        payload_s3_keys=[key],
     )
 
 

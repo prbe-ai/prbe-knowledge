@@ -18,6 +18,7 @@ Pairing/heartbeat/revoke are public lifecycle endpoints on prbe-backend
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
@@ -53,6 +54,13 @@ from shared.models import (
 )
 from shared.storage import get_store
 
+# Cap on simultaneous R2 GETs per fetch_supplementary call. With WORKER
+# concurrency=4 and a long session of ~100 batches, unbounded asyncio.gather
+# would peak at ~400 in-flight S3 GETs per machine and balloon memory. 16
+# is enough to drain a typical session in ~1.5s while keeping in-flight
+# envelopes bounded to a few MB.
+_FETCH_SUPP_R2_CONCURRENCY = 16
+
 
 @register_connector(SourceSystem.CLAUDE_CODE)
 class ClaudeCodeConnector(Connector):
@@ -77,15 +85,22 @@ class ClaudeCodeConnector(Connector):
         headers: Mapping[str, str],
         raw_payload: Mapping[str, Any],
     ) -> WebhookParseResult | None:
-        # Cron-injected finalize event. Has session_id but no real events;
-        # the worker dispatches it to fetch_supplementary which detects the
-        # :finalize suffix on source_event_id and forces session_complete=True.
+        # source_event_id is the bare session_id for both live batches AND
+        # finalize events. _enqueue (services/ingestion/main.py) UPSERTs on
+        # this key for claude_code, so every batch + the cron finalize all
+        # coalesce into one queue row per session. The worker detects
+        # finalize via the presence of a `finalize.marker` key in
+        # payload_s3_keys, not via a source_event_id suffix.
+        #
+        # Legacy `<session>:<batch>` and `<session>:finalize` source_event_ids
+        # may still exist on in-flight queue rows from before migration 0026;
+        # they continue to drain through the worker's old single-payload path.
         if raw_payload.get("finalize") is True:
             session_id = raw_payload.get("session_id")
             if not isinstance(session_id, str) or not session_id:
                 raise InvalidWebhookPayload("claude_code: finalize event missing session_id")
             return WebhookParseResult(
-                source_event_id=f"{session_id}:finalize",
+                source_event_id=session_id,
                 received_at=datetime.now(UTC),
                 parse_hint={"session_id": session_id, "finalize": True},
             )
@@ -104,7 +119,7 @@ class ClaudeCodeConnector(Connector):
             return None  # empty post, nothing to enqueue
 
         return WebhookParseResult(
-            source_event_id=f"{session_id}:{batch_seq}",
+            source_event_id=session_id,
             received_at=datetime.now(UTC),
             parse_hint={"session_id": session_id, "batch_seq": batch_seq},
         )
@@ -137,6 +152,28 @@ class ClaudeCodeConnector(Connector):
         event: WebhookEvent,
         token: IntegrationToken | None,
     ) -> dict[str, Any]:
+        """Merge events from every R2 payload coalesced into the queue row.
+
+        After migration 0026, all batches for a session land in one queue
+        row's `payload_s3_keys` array (services/ingestion/main.py:_enqueue
+        UPSERTs on session_id and appends each batch's key). This method
+        reads every key in parallel (semaphore-bounded), parses the
+        webhook envelope's `payload.events`, and merges them into a single
+        line_no-ordered event list.
+
+        Session-complete detection has two paths:
+        1. Live: any merged event with raw.type == 'session_end'.
+        2. Cron-finalize: any payload_s3_keys entry ending in
+           `finalize.marker` (written by session_completer.py when a
+           session goes idle past the threshold).
+
+        Legacy in-flight rows from before migration 0026 still flow
+        through here naturally: their `payload_s3_keys` was backfilled
+        to ARRAY[payload_s3_key], so the array is single-element. The
+        legacy `<session>:<batch>` and `<session>:finalize` source_event_ids
+        on those rows still trigger complete=True via the suffix check
+        below — they'll drain through one last time under old semantics.
+        """
         session_id = event.raw_payload.get("session_id") or event.source_event_id.split(":", 1)[0]
         if not session_id:
             raise ValueError(
@@ -159,54 +196,53 @@ class ClaudeCodeConnector(Connector):
                 seen_line_nos.add(line_no)
             merged_events.append(obj)
 
-        # 1. Events from the gateway-forwarded webhook body (the live path).
-        #    services/ingestion/main.py persists the envelope to a
-        #    date-partitioned R2 key, NOT under raw/claude_code/<session>/,
-        #    so we read the events out of the in-memory raw_payload here.
-        for obj in event.raw_payload.get("events") or []:
-            if isinstance(obj, dict):
-                _ingest(obj)
+        keys: list[str] = list(event.payload_s3_keys or [])
+        if not keys and event.payload_s3_key:
+            # Defensive: if the queue row was inserted before migration 0026
+            # and somehow the array backfill missed it, fall back to the
+            # single-key column.
+            keys = [event.payload_s3_key]
 
-        # 2. Merge any per-session R2 batches that exist (session-completer
-        #    cron path, or any future writer that pre-stages JSONL there).
-        prefix = f"raw/claude_code/{event.customer_id}/{session_id}/"
         store = get_store()
         bucket = store.bucket_for(event.customer_id)
+        sem = asyncio.Semaphore(_FETCH_SUPP_R2_CONCURRENCY)
 
-        # batch_seq encoded in filename; sort numerically
-        def _batch_seq(k: str) -> int:
-            stem = k.rsplit("/", 1)[-1].split(".", 1)[0]
+        async def _fetch(key: str) -> tuple[str, bytes]:
+            async with sem:
+                body = await store.get(bucket, key)
+            return key, body
+
+        # Parallel R2 fetches, semaphore-capped. Order doesn't matter
+        # for the merge — we re-sort by line_no after.
+        fetched: list[tuple[str, bytes]] = await asyncio.gather(*(_fetch(k) for k in keys))
+
+        finalize_marker_seen = False
+        for key, body in fetched:
+            if key.endswith("/finalize.marker"):
+                finalize_marker_seen = True
             try:
-                return int(stem)
-            except ValueError:
-                return 10**9  # non-numeric keys (e.g. "finalize") sort last
-
-        keys = await store.list_keys(bucket, prefix)
-        keys.sort(key=_batch_seq)
-        for key in keys:
-            # Skip non-batch keys (e.g. finalize.marker written by the
-            # session-completer cron — see services/ingestion/session_completer.py).
-            if _batch_seq(key) == 10**9:
+                envelope = orjson.loads(body)
+            except orjson.JSONDecodeError:
+                # Tolerate non-JSON or corrupted blobs — log and skip.
                 continue
-            body = await store.get(bucket, key)
-            for line in body.splitlines():
-                if not line.strip():
-                    continue
-                obj = orjson.loads(line)
+            payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else {}
+            if not isinstance(payload, dict):
+                continue
+            for obj in payload.get("events") or []:
                 if isinstance(obj, dict):
                     _ingest(obj)
 
         merged_events.sort(key=lambda e: (e.get("line_no") is None, e.get("line_no") or 0))
 
-        # Heuristic: a session is "complete" if any merged event is the
-        # SessionEnd record from Claude Code. Worker also re-runs on idle
-        # timeout (Task 17).
+        # Session-complete detection: live SessionEnd, cron-injected
+        # finalize.marker, or legacy `:finalize` source_event_id from
+        # in-flight pre-migration rows.
         complete = any(
             (e.get("raw") or {}).get("type") == "session_end"
             for e in merged_events
         )
-
-        # Cron-injected finalize marker → force complete flag (see Task 17).
+        if finalize_marker_seen:
+            complete = True
         if event.source_event_id.endswith(":finalize"):
             complete = True
 

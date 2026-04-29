@@ -125,7 +125,7 @@ async def test_embed_many_runs_with_no_db_connection_in_flight(live_db) -> None:
         customer_id=customer_id,
         source_system=SourceSystem.SLACK,
         source_event_id="evt-fence-1",
-        payload_s3_key=key,
+        payload_s3_keys=[key],
     )
 
     assert embedder.calls, (
