@@ -102,7 +102,11 @@ class Settings(BaseSettings):
 
     # --- Worker tuning ------------------------------------------------------
     worker_poll_interval_seconds: float = 1.0
-    worker_max_concurrent: int = 4
+    # Parallel claim loops per worker process. Embedding is I/O-bound, so
+    # one vCPU can fan out many concurrent OpenAI calls. Set in
+    # fly.worker.toml to size the fleet against the OpenAI tier's TPM cap:
+    # Tier 1 (1M TPM) → 2; Tier 5 (10M TPM) → 8.
+    worker_max_concurrent: int = 2
     worker_max_attempts: int = 5
 
     # --- HTTP / outbound ----------------------------------------------------
