@@ -100,7 +100,7 @@ async def test_replay_produces_one_doc(live_db, settings: Settings) -> None:
                 customer_id=CUSTOMER,
                 source_system=SourceSystem.SLACK,
                 source_event_id=row["source_event_id"],
-                payload_s3_key=row["payload_s3_key"],
+                payload_s3_keys=[row["payload_s3_key"]],
             )
     finally:
         await ctx.http.aclose()

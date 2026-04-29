@@ -99,17 +99,40 @@ class Normalizer:
         customer_id: str,
         source_system: SourceSystem,
         source_event_id: str,
-        payload_s3_key: str,
+        payload_s3_keys: list[str],
     ) -> NormalizeOutcome:
+        """Process one queue row.
+
+        For non-CC connectors, `payload_s3_keys` is single-element and the
+        flow is unchanged: read the single payload, parse, fetch, normalize.
+
+        For claude_code (after migration 0026), `payload_s3_keys` carries
+        every batch's R2 key coalesced into the row. We read the FIRST
+        key here for the parse_webhook_event metadata (any batch yields
+        the same session_id, so any key is fine for that purpose). The
+        connector's `fetch_supplementary` reads ALL keys from
+        `event.payload_s3_keys` and merges events from every batch.
+        """
         log.info(
             "normalizer.start",
             queue_id=queue_id,
             customer=customer_id,
             source=source_system.value,
             event_id=source_event_id,
+            payload_count=len(payload_s3_keys),
         )
 
-        raw_bytes = await self._store.get(self._store.bucket_for(customer_id), payload_s3_key)
+        if not payload_s3_keys:
+            raise UnsupportedEventType(
+                "queue row has no payload_s3_keys",
+                source=source_system.value,
+            )
+
+        # Read the first (oldest) payload for parse_webhook_event metadata.
+        # For non-CC connectors this is THE payload; for CC the connector
+        # reads the full set in fetch_supplementary.
+        first_key = payload_s3_keys[0]
+        raw_bytes = await self._store.get(self._store.bucket_for(customer_id), first_key)
         raw_payload = orjson.loads(raw_bytes)
         headers = raw_payload.get("_headers", {})
         payload = raw_payload.get("payload", raw_payload)
@@ -127,7 +150,8 @@ class Normalizer:
             source_system=source_system,
             source_event_id=parse_result.source_event_id,
             received_at=parse_result.received_at,
-            payload_s3_key=payload_s3_key,
+            payload_s3_key=first_key,  # legacy back-compat
+            payload_s3_keys=payload_s3_keys,
             raw_payload=payload,
             headers=headers,
         )

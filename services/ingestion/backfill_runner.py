@@ -136,12 +136,16 @@ async def run_backfill(
             await store.put(bucket, key, envelope)
 
             async with get_pool().acquire() as conn:
+                # Backfill rows always land at priority 50 (never block live).
+                # Both columns are populated for the migration window:
+                # `payload_s3_key` for back-compat readers, `payload_s3_keys`
+                # for the new array-based normalizer/worker path.
                 await conn.execute(
                     """
                     INSERT INTO ingestion_queue
                         (customer_id, source_system, source_event_id,
-                         payload_s3_key, status, priority)
-                    VALUES ($1, $2, $3, $4, $5, 50)
+                         payload_s3_key, payload_s3_keys, status, priority)
+                    VALUES ($1, $2, $3, $4, ARRAY[$4], $5, 50)
                     ON CONFLICT DO NOTHING
                     """,
                     customer_id,

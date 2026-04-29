@@ -263,32 +263,25 @@ about.
 
 Defer until the next connector lands that needs install-time metadata.
 
-### Same-session claim airtight serialization
-**Where:** `services/ingestion/worker.py:_claim_one`
+### Drop the legacy `payload_s3_key` column
 
-PR #33 added a `NOT EXISTS` clause that skips a pending row whose `session_key`
-(`split_part(source_event_id, ':', 1)`) matches an in-flight processing row.
-The subquery is evaluated at SELECT time, not under the row lock, so two
-concurrent claimers can both pass it in the same millisecond and each claim
-a different row from the same session. Observed once during the 2026-04-29
-DLQ resurrection (queues 493 + 495, session `521a687f`).
+**Where:** `db/migrations/versions/` + `shared/models.py` + ingestion paths
 
-**Cost when it fires:** Phase A in both workers re-merges all prior R2 batches
-and embeds the overlapping events. The chunks unique constraint silently
-discards the loser at insert. Wasted spend ~$0.003 per race. The Phase A txn
-split (also from #33) means the lock contention is now benign — this is a
-cost/efficiency issue, not a correctness one.
+Migration 0026 added `payload_s3_keys text[]` and backfilled every existing
+row with `ARRAY[payload_s3_key]`, but did NOT drop the legacy column —
+dropping in the same deploy as the code change would race with mid-deploy
+old workers reading a column the migration just dropped. After this
+deploy stabilizes, a follow-up PR can drop the column cleanly:
 
-**Fix:** inside `_claim_one`'s transaction, after `SELECT ... FOR UPDATE
-SKIP LOCKED` returns a candidate row, call
-`pg_try_advisory_xact_lock(hash(customer_id || source_system || session_key))`.
-If `false`, return None and let the next poll retry. If `true`, re-check the
-NOT EXISTS now that we hold the lock, then UPDATE to processing. The advisory
-lock releases on COMMIT (microseconds later). ~15 lines + one test.
+1. New migration: `ALTER TABLE ingestion_queue DROP COLUMN payload_s3_key`.
+2. Remove the legacy field from `WebhookEvent` (shared/models.py:142),
+   the connectors that synthesize `payload_s3_key=""` placeholders, and
+   the legacy fallback branches in worker.py:_process and
+   claude_code.py:fetch_supplementary.
+3. ~50 LOC, fully mechanical once no caller is reading the legacy field.
 
-**Trigger to do this work:** if `upsert_document.silent_conflict` warnings
-appear in worker logs, OR if cost monitoring shows duplicate embedding spend
-on claude_code sessions.
+**Trigger:** any time after migration 0026 has been live ~1 deploy cycle
+(say a week) with no rollback signals.
 
 ### Notion refresh-token rotation
 **Where:** `services/ingestion/handlers/notion.py:exchange_oauth_code` + new helper

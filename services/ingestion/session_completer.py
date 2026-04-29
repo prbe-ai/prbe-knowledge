@@ -1,17 +1,24 @@
 """Periodic finalizer for Claude Code sessions that go idle.
 
-For each (customer, session) where the most recent ingestion_queue row is
-older than `idle_minutes` and we haven't already enqueued a finalize event,
-write a placeholder R2 object and INSERT a synthetic '<session>:finalize'
-queue row that the worker will dispatch to ClaudeCodeConnector.normalize
-with session_complete=True (via the :finalize suffix detection in
-fetch_supplementary).
+For each (customer, session) where the most recent ingestion_queue activity is
+older than `idle_minutes`, write a finalize.marker placeholder to R2 and
+UPSERT it into the live session row's `payload_s3_keys` array. The worker,
+on next claim, sees the marker key and triggers `session_complete=True`
+extraction (qa, code_change, decision, file_ref unit docs).
+
+Post-migration 0026 the live session row is keyed on bare session_id (no
+`:batch_seq` suffix), and finalize is no longer a separate row — it
+coalesces into the same row as live batches via the same UPSERT path.
 """
 from __future__ import annotations
 
 import orjson
 
-from shared.constants import SourceSystem
+from shared.constants import (
+    DEFAULT_INGESTION_PRIORITY,
+    SOURCE_INGESTION_PRIORITY,
+    SourceSystem,
+)
 from shared.db import get_pool
 from shared.logging import get_logger
 from shared.storage import get_store
@@ -20,32 +27,64 @@ log = get_logger(__name__)
 
 
 async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
+    # Find sessions where the most recent activity (across both new-format
+    # rows with bare session_id and any in-flight legacy `:batch_seq`/
+    # `:finalize` rows) is older than the idle window. The split_part
+    # collapses both shapes onto the session_id key.
+    #
+    # We additionally filter out sessions whose live row already has a
+    # finalize.marker in payload_s3_keys — that's the post-coalescing
+    # signal that the cron has already finalized this session.
     find_sql = """
     WITH idle_sessions AS (
         SELECT customer_id,
                split_part(source_event_id, ':', 1) AS session_id,
-               max(enqueued_at) AS last_seen
+               MAX(enqueued_at) AS last_seen
           FROM ingestion_queue
          WHERE source_system = $1
-           AND source_event_id NOT LIKE '%:finalize'
          GROUP BY customer_id, session_id
-        HAVING max(enqueued_at) < NOW() - make_interval(mins => $2)
+        HAVING MAX(enqueued_at) < NOW() - make_interval(mins => $2)
     )
     SELECT i.customer_id, i.session_id
       FROM idle_sessions i
       LEFT JOIN ingestion_queue q
         ON q.customer_id = i.customer_id
        AND q.source_system = $1
-       AND q.source_event_id = i.session_id || ':finalize'
-     WHERE q.source_event_id IS NULL
-    """
-    insert_sql = """
-    INSERT INTO ingestion_queue
-        (customer_id, source_system, source_event_id, payload_s3_key, status, enqueued_at)
-    VALUES ($1, $2, $3, $4, 'pending', NOW())
-    ON CONFLICT (customer_id, source_system, source_event_id) DO NOTHING
+       AND q.source_event_id = i.session_id
+     WHERE q.queue_id IS NULL
+        OR NOT EXISTS (
+            SELECT 1 FROM unnest(q.payload_s3_keys) AS k
+            WHERE k LIKE '%/finalize.marker'
+        )
     """
 
+    # UPSERT the finalize.marker into the live session row. Same shape as
+    # services/ingestion/main.py:_enqueue's CC path: append marker key,
+    # bump version, refresh status, bump enqueued_at. If no live row
+    # exists for this session_id (cleanly archived sessions, or sessions
+    # that only ever had legacy `:batch_seq` rows that all completed),
+    # this INSERTs a fresh row whose payload_s3_keys contains only the
+    # marker — the worker will process it once and emit complete=True
+    # with an empty event list (no unit docs, no harm).
+    upsert_sql = """
+    INSERT INTO ingestion_queue
+        (customer_id, source_system, source_event_id,
+         payload_s3_key, payload_s3_keys, status, priority,
+         version, enqueued_at)
+    VALUES ($1, $2, $3, $4, ARRAY[$4], 'pending', $5, 1, NOW())
+    ON CONFLICT (customer_id, source_system, source_event_id) DO UPDATE
+        SET payload_s3_keys = ingestion_queue.payload_s3_keys
+                              || EXCLUDED.payload_s3_keys,
+            status = 'pending',
+            version = ingestion_queue.version + 1,
+            completed_at = NULL,
+            error = NULL,
+            enqueued_at = NOW()
+    """
+
+    cc_priority = SOURCE_INGESTION_PRIORITY.get(
+        SourceSystem.CLAUDE_CODE, DEFAULT_INGESTION_PRIORITY
+    )
     store = get_store()
     enqueued = 0
     async with get_pool().acquire() as conn:
@@ -68,16 +107,15 @@ async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
                 "finalize": True,
             })
             await store.put(bucket, placeholder_key, placeholder_body)
-            status = await conn.execute(
-                insert_sql,
+            await conn.execute(
+                upsert_sql,
                 customer_id,
                 SourceSystem.CLAUDE_CODE.value,
-                f"{session_id}:finalize",
+                session_id,  # bare session_id — coalescing key
                 placeholder_key,
+                cc_priority,
             )
-            # asyncpg returns 'INSERT 0 1' on success, 'INSERT 0 0' when ON CONFLICT fires.
-            if status.endswith(" 1"):
-                enqueued += 1
+            enqueued += 1
     log.info(
         "session_completer.run",
         extra={"idle_minutes": idle_minutes, "enqueued": enqueued, "candidates": len(rows)},

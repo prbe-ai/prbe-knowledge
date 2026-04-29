@@ -79,43 +79,36 @@ class Worker:
     async def _claim_one(self) -> asyncpg.Record | None:
         """Atomically mark one pending row as processing and return it.
 
-        Higher `priority` claims first; backfill rows are inserted at a
-        lower priority than webhook rows so a backfill burst can't head-of-
-        line block live traffic.
+        Returns: queue_id, customer_id, source_system, source_event_id,
+        payload_s3_key (legacy back-compat), payload_s3_keys (the array
+        of R2 paths coalesced into the row — for non-CC this is
+        single-element), version (monotonic counter for the CAS commit),
+        attempts.
 
-        Same-session serialization: the NOT EXISTS clause skips a pending
-        row whose session_id (the substring of source_event_id before the
-        first ':') matches an in-flight processing row for the same
-        customer + source. This stops two batches of the same Claude Code
-        session from both running normalization at once — they would
-        otherwise compute overlapping chunk sets, paying OpenAI twice for
-        identical content_hashes and racing on the unique-constraint
-        insert. Connectors whose source_event_id has no colon (github,
-        slack, notion, linear, granola, sentry) get split_part = the full
-        id, so each row is its own session_key and they never serialize
-        against each other. See incident 2026-04-29.
+        Higher `priority` claims first. Tier order at insert time
+        (shared/constants.py:SOURCE_INGESTION_PRIORITY): live(100) >
+        claude_code(75) > backfill(50). One chatty CC user can't block
+        github/slack/notion/linear/granola/sentry traffic.
+
+        Coalescing collapses N batches of the same Claude Code session
+        into one queue row (services/ingestion/main.py:_enqueue UPSERTs
+        on (customer_id, source_system, session_id) and bumps version).
+        So same-session serialization is structural — there's only ever
+        one row per session — and the explicit NOT EXISTS clause that
+        approximated this in PR #33 is now dead code, removed here.
         """
         async with get_pool().acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
                     SELECT queue_id, customer_id, source_system, source_event_id,
-                           payload_s3_key, attempts
-                    FROM ingestion_queue q
+                           payload_s3_key, payload_s3_keys, version, attempts
+                    FROM ingestion_queue
                     WHERE status = $1
-                      AND NOT EXISTS (
-                          SELECT 1 FROM ingestion_queue q2
-                          WHERE q2.status = $2
-                            AND q2.customer_id = q.customer_id
-                            AND q2.source_system = q.source_system
-                            AND split_part(q2.source_event_id, ':', 1)
-                                = split_part(q.source_event_id, ':', 1)
-                      )
                     ORDER BY priority DESC, enqueued_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                     """,
                 QueueStatus.PENDING.value,
-                QueueStatus.PROCESSING.value,
             )
             if row is None:
                 return None
@@ -136,7 +129,23 @@ class Worker:
         customer_id = row["customer_id"]
         source = SourceSystem(row["source_system"])
         event_id = row["source_event_id"]
-        payload_s3_key = row["payload_s3_key"]
+        # Coalesced rows have payload_s3_keys (array). Legacy rows from
+        # before migration 0026 have payload_s3_key (single string) and
+        # an empty array — the migration backfilled all existing rows so
+        # the array should always be non-empty in practice. Belt and
+        # suspenders: fall back to wrapping the single key.
+        payload_s3_keys: list[str] = list(row["payload_s3_keys"] or [])
+        if not payload_s3_keys and row["payload_s3_key"]:
+            payload_s3_keys = [row["payload_s3_key"]]
+        # The legacy single-key path is still used to populate
+        # ingestion_events.payload_s3_key for audit. Use the first
+        # (oldest) coalesced key — stable across re-claims.
+        payload_s3_key = payload_s3_keys[0] if payload_s3_keys else ""
+        # Captured version: the CAS guard for commit. If a new batch
+        # lands during Phase A (embeds) and bumps the row's version,
+        # _mark_done's WHERE version=$captured matches 0 rows and the
+        # row stays 'pending' to be re-claimed with the extended array.
+        captured_version: int = row["version"]
         attempts = row["attempts"] + 1
 
         bind_trace(f"queue-{queue_id}")
@@ -147,20 +156,23 @@ class Worker:
                 customer_id=customer_id,
                 source_system=source,
                 source_event_id=event_id,
-                payload_s3_key=payload_s3_key,
+                payload_s3_keys=payload_s3_keys,
             )
             await self._mark_done(
-                queue_id, customer_id, source, event_id, payload_s3_key, outcome
+                queue_id, customer_id, source, event_id, payload_s3_key,
+                outcome, captured_version,
             )
         except DuplicateEventIgnored as exc:
             log.info("worker.skipped", queue_id=queue_id, reason=str(exc))
             await self._mark_skipped(
-                queue_id, customer_id, source, event_id, payload_s3_key, str(exc)
+                queue_id, customer_id, source, event_id, payload_s3_key,
+                str(exc), captured_version,
             )
         except UnsupportedEventType as exc:
             log.info("worker.unsupported", queue_id=queue_id, reason=str(exc))
             await self._mark_skipped(
-                queue_id, customer_id, source, event_id, payload_s3_key, str(exc)
+                queue_id, customer_id, source, event_id, payload_s3_key,
+                str(exc), captured_version,
             )
         except PrbeError as exc:
             transient = getattr(exc, "transient", False)
@@ -195,17 +207,43 @@ class Worker:
         event_id: str,
         payload_s3_key: str,
         outcome,
+        captured_version: int,
     ) -> None:
+        """CAS-commit the row to status='done'.
+
+        The UPDATE has `WHERE version = $captured_version`. If a new batch
+        landed during Phase A (UPSERT in services/ingestion/main.py:_enqueue
+        bumps version), the row's version advanced and the WHERE matches
+        0 rows. We log `worker.cas_retry` and leave the row at 'processing'
+        — the heartbeat reclaim cron picks it up at the threshold and the
+        worker re-runs Phase A on the now-extended payload_s3_keys array.
+        Phase A is naturally idempotent: chunks dedupe by content_hash,
+        so re-running only re-embeds genuinely new content.
+        """
         async with get_pool().acquire() as conn, conn.transaction():
-            await conn.execute(
+            done_row = await conn.fetchrow(
                 """
                 UPDATE ingestion_queue
                 SET status = $1, completed_at = NOW(), error = NULL
-                WHERE queue_id = $2
+                WHERE queue_id = $2 AND version = $3
+                RETURNING queue_id
                 """,
                 QueueStatus.DONE.value,
                 queue_id,
+                captured_version,
             )
+            if done_row is None:
+                # New batch landed mid-Phase-A. Don't write ingestion_events
+                # yet (the next attempt will), don't mark done. Reclaim cron
+                # will pick this row up at heartbeat threshold and the worker
+                # re-runs against the extended payload_s3_keys array.
+                log.info(
+                    "worker.cas_retry",
+                    queue_id=queue_id,
+                    captured_version=captured_version,
+                    reason="new batch arrived during processing",
+                )
+                return
             await conn.execute(
                 """
                 INSERT INTO ingestion_events (
@@ -233,18 +271,34 @@ class Worker:
         event_id: str,
         payload_s3_key: str,
         reason: str,
+        captured_version: int,
     ) -> None:
+        """CAS-commit the row to status='done' with a skipped error reason.
+
+        Same CAS guard as _mark_done — if a new batch arrived during
+        processing, leave the row pending and let reclaim re-run.
+        """
         async with get_pool().acquire() as conn, conn.transaction():
-            await conn.execute(
+            done_row = await conn.fetchrow(
                 """
                 UPDATE ingestion_queue
                 SET status = $1, completed_at = NOW(), error = $2
-                WHERE queue_id = $3
+                WHERE queue_id = $3 AND version = $4
+                RETURNING queue_id
                 """,
                 QueueStatus.DONE.value,
                 reason,
                 queue_id,
+                captured_version,
             )
+            if done_row is None:
+                log.info(
+                    "worker.cas_retry",
+                    queue_id=queue_id,
+                    captured_version=captured_version,
+                    reason="new batch arrived during processing (skipped path)",
+                )
+                return
             await conn.execute(
                 """
                 INSERT INTO ingestion_events (
