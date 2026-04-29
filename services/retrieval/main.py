@@ -148,7 +148,7 @@ async def query(
 
     Pick the model via `model: "<provider>/<model>"`. Defaults to
     anthropic/claude-sonnet-4-6. Allowed models live in
-    shared.constants.SYNTHESIS_MODELS — Anthropic, OpenAI, Google.
+    shared.constants.SYNTHESIS_MODELS — Sonnet and Haiku only.
     """
     # Stash for UsageLoggingMiddleware (see /retrieve for shape).
     request.state.customer_id = customer_id

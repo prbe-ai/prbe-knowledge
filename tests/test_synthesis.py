@@ -254,7 +254,7 @@ async def test_synthesize_anthropic_path(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_synthesize_routes_openai(monkeypatch) -> None:
+async def test_synthesize_routes_haiku(monkeypatch) -> None:
     captured: dict = {}
 
     async def fake_call(provider_name, *, system, user, model, max_tokens):
@@ -267,28 +267,9 @@ async def test_synthesize_routes_openai(monkeypatch) -> None:
         }
 
     monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
-    await synthesize("q", [_chunk(1)], model="openai/gpt-4o-mini")
-    assert captured["provider"] == "openai"
-    assert captured["model"] == "gpt-4o-mini"
-
-
-@pytest.mark.asyncio
-async def test_synthesize_routes_google(monkeypatch) -> None:
-    captured: dict = {}
-
-    async def fake_call(provider_name, *, system, user, model, max_tokens):
-        captured["provider"] = provider_name
-        captured["model"] = model
-        return {
-            "answer": "x [chunk:1]",
-            "citations_used": [1],
-            "insufficient_context": False,
-        }
-
-    monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
-    await synthesize("q", [_chunk(1)], model="google/gemini-2.5-flash")
-    assert captured["provider"] == "google"
-    assert captured["model"] == "gemini-2.5-flash"
+    await synthesize("q", [_chunk(1)], model="anthropic/claude-haiku-4-5-20251001")
+    assert captured["provider"] == "anthropic"
+    assert captured["model"] == "claude-haiku-4-5-20251001"
 
 
 @pytest.mark.asyncio
@@ -311,8 +292,8 @@ async def test_synthesize_propagates_insufficient_context(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_synthesize_normalizes_bare_citations(monkeypatch) -> None:
-    """Provider returned bare `chunk:1` (Gemini-style). synthesize() should
-    canonicalize to [chunk:1] before returning."""
+    """Provider returned bare `chunk:1`. synthesize() should canonicalize
+    to [chunk:1] before returning."""
     async def fake_call(provider_name, *, system, user, model, max_tokens):
         return {
             "answer": "Klavis shipped chunk:1 and uses MCP chunk:2.",
@@ -325,7 +306,7 @@ async def test_synthesize_normalizes_bare_citations(monkeypatch) -> None:
     result = await synthesize(
         "what is klavis?",
         chunks,
-        model="google/gemini-2.5-flash",
+        model="anthropic/claude-haiku-4-5-20251001",
     )
     assert "[chunk:1]" in result.answer
     assert "[chunk:2]" in result.answer

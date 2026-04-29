@@ -200,12 +200,6 @@ SONNET_MODEL = "claude-sonnet-4-6"
 SYNTHESIS_MODELS: dict[str, str] = {
     "anthropic/claude-haiku-4-5-20251001": "anthropic",
     "anthropic/claude-sonnet-4-6":          "anthropic",
-    "anthropic/claude-opus-4-7":            "anthropic",
-    "openai/gpt-4o":                        "openai",
-    "openai/gpt-4o-mini":                   "openai",
-    "openai/gpt-5":                         "openai",
-    "google/gemini-2.5-flash":              "google",
-    "google/gemini-2.5-pro":                "google",
 }
 DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-6"
 
