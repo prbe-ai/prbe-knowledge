@@ -82,19 +82,40 @@ class Worker:
         Higher `priority` claims first; backfill rows are inserted at a
         lower priority than webhook rows so a backfill burst can't head-of-
         line block live traffic.
+
+        Same-session serialization: the NOT EXISTS clause skips a pending
+        row whose session_id (the substring of source_event_id before the
+        first ':') matches an in-flight processing row for the same
+        customer + source. This stops two batches of the same Claude Code
+        session from both running normalization at once — they would
+        otherwise compute overlapping chunk sets, paying OpenAI twice for
+        identical content_hashes and racing on the unique-constraint
+        insert. Connectors whose source_event_id has no colon (github,
+        slack, notion, linear, granola, sentry) get split_part = the full
+        id, so each row is its own session_key and they never serialize
+        against each other. See incident 2026-04-29.
         """
         async with get_pool().acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
                     SELECT queue_id, customer_id, source_system, source_event_id,
                            payload_s3_key, attempts
-                    FROM ingestion_queue
+                    FROM ingestion_queue q
                     WHERE status = $1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ingestion_queue q2
+                          WHERE q2.status = $2
+                            AND q2.customer_id = q.customer_id
+                            AND q2.source_system = q.source_system
+                            AND split_part(q2.source_event_id, ':', 1)
+                                = split_part(q.source_event_id, ':', 1)
+                      )
                     ORDER BY priority DESC, enqueued_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                     """,
                 QueueStatus.PENDING.value,
+                QueueStatus.PROCESSING.value,
             )
             if row is None:
                 return None

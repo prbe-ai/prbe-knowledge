@@ -48,5 +48,8 @@ kill_timeout = "30s"
 
 [[vm]]
   size   = "shared-cpu-2x"
-  memory = "1gb"
+  # 2gb because long Claude Code sessions hold the merged event list +
+  # chunked content + in-flight embedding payloads in memory; 1gb OOMed
+  # under WORKER_MAX_CONCURRENT=2. See incident 2026-04-29.
+  memory = "2gb"
   processes = ["worker"]
