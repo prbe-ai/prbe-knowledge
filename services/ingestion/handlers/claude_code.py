@@ -539,24 +539,129 @@ class ClaudeCodeConnector(Connector):
 def _events_to_text(events: list[dict[str, Any]]) -> str:
     """Render merged Claude Code events into a chunkable text body.
 
-    Each event becomes one block: `<type>: <content>` for events that have
-    string content, or a JSON dump for everything else. Ordering matches the
-    line_no-sorted merged stream, so a chunker walking sequentially sees the
-    session in transcript order.
+    Output is human-readable prose — what the chunker + embedder consume,
+    so it has to look like the conversation. NOT JSON dumps.
+
+    Each turn becomes a block separated by blank lines:
+
+        USER: how does auth work?
+
+        ASSISTANT (thinking): the flow uses JWT in cookie X.
+        ASSISTANT: we use JWT.
+
+        TOOL_USE: Bash — git status
+        TOOL_RESULT (toolu_xxx): ok
+
+        USER: refactor it.
+
+    Ordering matches the line_no-sorted merged stream so a chunker walking
+    sequentially sees the session in transcript order.
+
+    Events the plugin sanitizer already drops (file-history-snapshot,
+    last-prompt, ai-title, permission-mode, stop_hook_summary, turn_duration)
+    don't reach here. Anything else without a renderer is silently skipped
+    rather than dumped as JSON — JSON noise in the embedded text was the
+    original problem this rewrite solves.
     """
     blocks: list[str] = []
     for ev in events:
         raw = ev.get("raw") if isinstance(ev, dict) else None
         if not isinstance(raw, dict):
-            blocks.append(orjson.dumps(ev).decode("utf-8"))
             continue
-        ev_type = raw.get("type")
+        rendered = _render_event(raw)
+        if rendered:
+            blocks.append(rendered)
+    return "\n\n".join(blocks)
+
+
+def _render_event(raw: dict[str, Any]) -> str:
+    ev_type = raw.get("type")
+    if ev_type == "user":
+        return _render_user(raw)
+    if ev_type == "assistant":
+        return _render_assistant(raw)
+    if ev_type == "system":
+        sub = raw.get("subtype") or ""
         content = raw.get("content")
         if isinstance(content, str) and content:
-            blocks.append(f"{ev_type or 'event'}: {content}")
-        else:
-            blocks.append(orjson.dumps(raw).decode("utf-8"))
-    return "\n\n".join(blocks)
+            return f"SYSTEM ({sub}): {content}" if sub else f"SYSTEM: {content}"
+        # System event with no string content — note the subtype but skip
+        # dumping the rest. Keeps the conversation flow readable.
+        return f"SYSTEM ({sub})" if sub else ""
+
+    # Top-level string `content` for unknown event types — preserve
+    # forward-compat without leaking raw JSON into embeddings.
+    content = raw.get("content")
+    if isinstance(content, str) and content:
+        label = (ev_type or "EVENT").upper()
+        return f"{label}: {content}"
+    return ""
+
+
+def _render_user(raw: dict[str, Any]) -> str:
+    msg = raw.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str) and content:
+        return f"USER: {content}"
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if bt == "text":
+            text = b.get("text") or ""
+            if text:
+                parts.append(f"USER: {text}")
+        elif bt == "tool_result":
+            # Sanitizer already stripped the heavy `content` field; only
+            # tool_use_id (+ optional is_error) reach here. Surface
+            # success/failure as a one-liner so the conversation flow stays
+            # readable.
+            tool_id = b.get("tool_use_id") or ""
+            label = f"TOOL_RESULT ({tool_id})" if tool_id else "TOOL_RESULT"
+            parts.append(f"{label}: error" if b.get("is_error") else f"{label}: ok")
+    return "\n".join(parts)
+
+
+def _render_assistant(raw: dict[str, Any]) -> str:
+    msg = raw.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    content = msg.get("content")
+    if isinstance(content, str) and content:
+        return f"ASSISTANT: {content}"
+    if not isinstance(content, list):
+        return ""
+
+    parts: list[str] = []
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        bt = b.get("type")
+        if bt == "text":
+            text = b.get("text") or ""
+            if text:
+                parts.append(f"ASSISTANT: {text}")
+        elif bt == "thinking":
+            text = b.get("thinking") or ""
+            if text and text.strip():
+                parts.append(f"ASSISTANT (thinking): {text}")
+        elif bt == "tool_use":
+            name = b.get("name") or "tool"
+            summary = b.get("summary") or ""
+            parts.append(f"TOOL_USE: {name} — {summary}" if summary else f"TOOL_USE: {name}")
+
+    # Note non-default stop_reasons (max_tokens, refusal, …); end_turn is
+    # the boring case and noting it would just clutter every assistant turn.
+    stop_reason = msg.get("stop_reason")
+    if stop_reason and stop_reason not in ("end_turn", "tool_use") and parts:
+        parts.append(f"[stop: {stop_reason}]")
+    return "\n".join(parts)
 
     def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
         raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
