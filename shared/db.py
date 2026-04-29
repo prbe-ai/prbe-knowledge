@@ -8,6 +8,7 @@ Non-tenant operations (bootstrap, cron reclaim) use `raw_conn()`.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -15,6 +16,9 @@ import asyncpg
 
 from shared.config import Settings, get_settings
 from shared.exceptions import DatabaseUnavailable, TenantIsolationError
+from shared.logging import get_logger
+
+log = get_logger(__name__)
 
 _pool: asyncpg.Pool | None = None
 
@@ -26,17 +30,34 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
         return _pool
 
     settings = settings or get_settings()
-    try:
-        _pool = await asyncpg.create_pool(
-            dsn=settings.database_url,
-            min_size=settings.db_pool_min_size,
-            max_size=settings.db_pool_max_size,
-            command_timeout=settings.db_statement_timeout_ms / 1000,
-            statement_cache_size=0,  # pgbouncer-compatible
-        )
-    except (OSError, asyncpg.PostgresError) as exc:
-        raise DatabaseUnavailable(str(exc)) from exc
-    return _pool
+    attempts = max(1, settings.db_init_retry_attempts)
+    base = settings.db_init_retry_base_seconds
+    last_exc: BaseException | None = None
+    # Retry tolerates Neon cold-wake on first connect after scale-to-zero.
+    for attempt in range(1, attempts + 1):
+        try:
+            _pool = await asyncpg.create_pool(
+                dsn=settings.database_url,
+                min_size=settings.db_pool_min_size,
+                max_size=settings.db_pool_max_size,
+                command_timeout=settings.db_statement_timeout_ms / 1000,
+                statement_cache_size=0,  # pgbouncer-compatible
+            )
+            return _pool
+        except (OSError, asyncpg.PostgresError, TimeoutError) as exc:
+            last_exc = exc
+            if attempt >= attempts:
+                break
+            backoff = base * (2 ** (attempt - 1))
+            log.warning(
+                "db.init_pool.retry",
+                attempt=attempt,
+                attempts=attempts,
+                exc_type=type(exc).__name__,
+                backoff_seconds=backoff,
+            )
+            await asyncio.sleep(backoff)
+    raise DatabaseUnavailable(str(last_exc)) from last_exc
 
 
 async def close_pool() -> None:
