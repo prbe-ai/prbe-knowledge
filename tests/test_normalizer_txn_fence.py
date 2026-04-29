@@ -33,7 +33,7 @@ from services.ingestion.normalizer import Normalizer
 from shared import db as db_module
 from shared.config import Settings
 from shared.constants import SourceSystem
-from shared.embeddings import EmbeddedChunk, EmbedResult, FailedChunk
+from shared.embeddings import EmbeddedChunk, EmbedResult
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "slack" / "message_simple.json"
 
