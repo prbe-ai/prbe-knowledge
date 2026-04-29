@@ -273,3 +273,97 @@ async def test_normalize_comment_links_to_parent_issue() -> None:
     edge_kinds = {(e.edge_type, e.from_canonical_id, e.to_canonical_id) for e in result.graph_edges}
     assert (EdgeType.AUTHORED, "user_bob", doc.doc_id) in edge_kinds
     assert (EdgeType.MENTIONS, doc.doc_id, "ENG-99") in edge_kinds
+
+
+# ---------------------------------------------------------------------------
+# exchange_oauth_code — error mapping
+#
+# Linear's /oauth/token can return a non-2xx for many reasons (transient
+# 503 from CF edge, 400 invalid_grant for a spent code, 401 for revoked
+# credentials, etc.). Before this fix, `raise_for_status()` raised
+# `httpx.HTTPStatusError` which is NOT a `PrbeError`, so the admin route's
+# `except PrbeError` block missed it and FastAPI returned an opaque 500
+# with no body. Now: 5xx → TransientSourceError, 4xx → PermanentSourceError,
+# 200-without-access_token → PermanentSourceError. All three carry the
+# upstream response body in `.context["body"]` so the dashboard can render
+# something useful.
+# ---------------------------------------------------------------------------
+
+
+def _make_oauth_ctx(status_code: int, body: str | dict) -> ConnectorContext:
+    """Build a connector context whose http client returns a fixed Linear
+    /oauth/token response."""
+    from pydantic import SecretStr
+
+    settings = Settings(
+        environment="local",
+        linear_client_id="cid_test",
+        linear_client_secret=SecretStr("secret_test"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.linear.app/oauth/token"
+        if isinstance(body, str):
+            return httpx.Response(status_code, text=body)
+        return httpx.Response(status_code, json=body)
+
+    transport = httpx.MockTransport(handler)
+    return ConnectorContext(
+        settings=settings, http=httpx.AsyncClient(transport=transport)
+    )
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_5xx_raises_transient() -> None:
+    from shared.exceptions import TransientSourceError
+
+    ctx = _make_oauth_ctx(503, "upstream temporarily unavailable")
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+
+    with pytest.raises(TransientSourceError) as exc_info:
+        await linear.exchange_oauth_code(code="abc", redirect_uri="https://x/cb")
+
+    assert exc_info.value.context["status"] == 503
+    assert "upstream temporarily unavailable" in exc_info.value.context["body"]
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_4xx_raises_permanent() -> None:
+    from shared.exceptions import PermanentSourceError
+
+    ctx = _make_oauth_ctx(
+        400, {"error": "invalid_grant", "error_description": "code expired"}
+    )
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+
+    with pytest.raises(PermanentSourceError) as exc_info:
+        await linear.exchange_oauth_code(code="abc", redirect_uri="https://x/cb")
+
+    assert exc_info.value.context["status"] == 400
+    assert "invalid_grant" in exc_info.value.context["body"]
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_missing_access_token_raises_permanent() -> None:
+    from shared.exceptions import PermanentSourceError
+
+    ctx = _make_oauth_ctx(200, {"scope": "read,write"})  # no access_token
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+
+    with pytest.raises(PermanentSourceError) as exc_info:
+        await linear.exchange_oauth_code(code="abc", redirect_uri="https://x/cb")
+
+    assert "missing access_token" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_success() -> None:
+    ctx = _make_oauth_ctx(
+        200, {"access_token": "lin_oauth_xxx", "scope": "read,write"}
+    )
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+
+    token = await linear.exchange_oauth_code(code="abc", redirect_uri="https://x/cb")
+    assert token.access_token == "lin_oauth_xxx"
+    assert token.scope == "read,write"
+    assert token.source_system == SourceSystem.LINEAR

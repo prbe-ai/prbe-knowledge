@@ -36,7 +36,11 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
+from shared.exceptions import (
+    InvalidWebhookPayload,
+    PermanentSourceError,
+    TransientSourceError,
+)
 from shared.logging import get_logger
 from shared.models import (
     ACLPrincipal,
@@ -664,12 +668,33 @@ class LinearConnector(Connector):
                 "grant_type": "authorization_code",
             },
         )
-        resp.raise_for_status()
+        if resp.status_code >= 500:
+            # 5xx — Linear edge / app outage. Caller can retry.
+            raise TransientSourceError(
+                f"linear /oauth/token returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        if resp.status_code >= 400:
+            # 4xx — bad code, redirect_uri mismatch, revoked client, etc.
+            # No retry will help; surface the response so the caller can
+            # render a useful message in the dashboard.
+            raise PermanentSourceError(
+                f"linear /oauth/token returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
         body = resp.json()
+        access_token = body.get("access_token")
+        if not access_token:
+            raise PermanentSourceError(
+                "linear /oauth/token 200 but missing access_token",
+                body=str(body)[:500],
+            )
         return IntegrationToken(
             customer_id="",  # caller fills in — connector does not know the tenant
             source_system=SourceSystem.LINEAR,
-            access_token=body["access_token"],
+            access_token=access_token,
             scope=body.get("scope"),
         )
 
