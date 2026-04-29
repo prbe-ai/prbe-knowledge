@@ -32,7 +32,7 @@ from services.ingestion.handlers.slack import SlackConnector  # noqa: F401 — r
 from services.ingestion.normalizer import Normalizer
 from shared import db as db_module
 from shared.config import Settings
-from shared.constants import SourceSystem
+from shared.constants import EMBEDDING_DIM, SourceSystem
 from shared.embeddings import EmbeddedChunk, EmbedResult
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "slack" / "message_simple.json"
@@ -78,7 +78,7 @@ class _ConnectionFenceEmbedder:
     the OpenAI round trip — the exact bug from 2026-04-29.
     """
 
-    def __init__(self, dim: int = 1024) -> None:
+    def __init__(self, dim: int = EMBEDDING_DIM) -> None:
         self.calls: list[int] = []
         self._dim = dim
 
