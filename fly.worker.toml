@@ -59,8 +59,9 @@ kill_timeout = "30s"
   # pushing concurrency past 6.
   memory = "3gb"
   # 18 machines × concurrency 6 = 108 in-flight slots, ~540 batches/min
-  # ceiling at p50=12s/batch. Sized for ~500+ concurrent claude_code
-  # sessions at 1 batch/min/session. Bump count when sustained queue
-  # depth exceeds ~50 pending rows.
+  # ceiling at p50=12s/batch. Holds ~500 concurrent claude_code sessions
+  # at 1 batch/min/session — that's only ~7% headroom, so bump count
+  # before hitting that ceiling, not after. Sustained queue depth >50
+  # pending rows is the trigger.
   count     = 18
   processes = ["worker"]
