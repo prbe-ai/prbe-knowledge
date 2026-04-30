@@ -30,8 +30,8 @@ class Settings(BaseSettings):
     # --- Postgres ------------------------------------------------------------
     database_url: str = "postgresql://prbe:prbe@localhost:5432/prbe_knowledge"
     db_pool_min_size: int = 2
-    # >= machine_count × WORKER_MAX_CONCURRENT so claim loops never queue on
-    # the pool. 18 × 6 = 108 slots; 30 covers the steady-state working set
+    # >= machine_count * WORKER_MAX_CONCURRENT so claim loops never queue on
+    # the pool. 18 * 6 = 108 slots; 30 covers the steady-state working set
     # (claims hold a conn only briefly per heartbeat/commit).
     db_pool_max_size: int = 30
     db_statement_timeout_ms: int = 30_000
