@@ -30,7 +30,10 @@ class Settings(BaseSettings):
     # --- Postgres ------------------------------------------------------------
     database_url: str = "postgresql://prbe:prbe@localhost:5432/prbe_knowledge"
     db_pool_min_size: int = 2
-    db_pool_max_size: int = 10
+    # >= machine_count × WORKER_MAX_CONCURRENT so claim loops never queue on
+    # the pool. 18 × 6 = 108 slots; 30 covers the steady-state working set
+    # (claims hold a conn only briefly per heartbeat/commit).
+    db_pool_max_size: int = 30
     db_statement_timeout_ms: int = 30_000
     db_init_retry_attempts: int = 6
     db_init_retry_base_seconds: float = 1.0
@@ -105,7 +108,8 @@ class Settings(BaseSettings):
     # Parallel claim loops per worker process. Embedding is I/O-bound, so
     # one vCPU can fan out many concurrent OpenAI calls. Set in
     # fly.worker.toml to size the fleet against the OpenAI tier's TPM cap:
-    # Tier 1 (1M TPM) → 2; Tier 5 (10M TPM) → 8.
+    # Tier 1 (1M TPM) → 2; Tier 5 (10M TPM) → 6 today (OpenAI permits 8+;
+    # 3gb VM memory is the actual ceiling — resize before pushing higher).
     worker_max_concurrent: int = 2
     worker_max_attempts: int = 5
 
@@ -113,7 +117,7 @@ class Settings(BaseSettings):
     http_timeout_seconds: float = 30.0
 
     # --- Embeddings batching ------------------------------------------------
-    embedding_batch_size: int = Field(default=96, ge=1, le=2048)
+    embedding_batch_size: int = Field(default=256, ge=1, le=2048)
 
     # --- Claude Code session completer --------------------------------------
     claude_code_session_idle_minutes: int = Field(default=5, ge=1)

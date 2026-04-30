@@ -11,12 +11,13 @@ kill_timeout = "30s"
   LOG_LEVEL             = "INFO"
   SERVICE_NAME          = "prbe-knowledge-worker"
   WORKER_HEALTH_PORT    = "8082"
-  # Parallel claim loops per machine. 18 machines × 4 = 72 in-flight
-  # slots, sustained throughput ~360 batches/min at p50=12s/batch.
-  # Sized for OpenAI Tier 1 (1M TPM, 3000 RPM): each in-flight batch
-  # makes ≤1 embed_many call per cycle, so 72 RPM well under the cap.
-  # Bump concurrency to 6 once Tier 4+ lands.
-  WORKER_MAX_CONCURRENT = "4"
+  # Parallel claim loops per machine. 18 machines × 6 = 108 in-flight
+  # slots, sustained throughput ~540 batches/min at p50=12s/batch.
+  # Sized for OpenAI Tier 5 (10M TPM, 10k RPM): each in-flight batch
+  # makes ≤1 embed_many call per cycle, well under the cap.
+  # Memory is the binding constraint, not OpenAI — push to 8 only after
+  # bumping VM memory to 4gb.
+  WORKER_MAX_CONCURRENT = "6"
 
 [processes]
   worker = "python -m services.ingestion.worker"
@@ -52,12 +53,13 @@ kill_timeout = "30s"
   size   = "shared-cpu-2x"
   # 3gb because long Claude Code sessions hold the merged event list +
   # chunked content + in-flight embedding payloads in memory. At
-  # WORKER_MAX_CONCURRENT=4 worst case is ~4 × ~430 MB = ~1.7 GB peak;
-  # 3 GB gives headroom for GC + OS + a memory-bursty session. 2gb OOMed
-  # under concurrency=2 with very long sessions; see incident 2026-04-29.
+  # WORKER_MAX_CONCURRENT=6 worst case is ~6 × ~430 MB = ~2.6 GB peak;
+  # 3 GB gives a thin GC + OS margin. 2gb OOMed under concurrency=2 with
+  # very long sessions; see incident 2026-04-29. Resize to 4gb before
+  # pushing concurrency past 6.
   memory = "3gb"
-  # 18 machines × concurrency 4 = 72 in-flight slots, ~360 batches/min
-  # ceiling at p50=12s/batch. Sized for ~300+ concurrent claude_code
+  # 18 machines × concurrency 6 = 108 in-flight slots, ~540 batches/min
+  # ceiling at p50=12s/batch. Sized for ~500+ concurrent claude_code
   # sessions at 1 batch/min/session. Bump count when sustained queue
   # depth exceeds ~50 pending rows.
   count     = 18
