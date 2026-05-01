@@ -90,23 +90,30 @@ async def _seed_token(status: str = "active") -> None:
         )
 
 
-async def _seed_backfill_state(status: str = "running") -> None:
-    """Seed a backfill_state row in the desired starting state."""
+async def _seed_backfill_state(status: str = "running"):
+    """Seed a backfill_state row in the desired starting state.
+
+    Returns the started_at the row was claimed at — tests use this as the
+    claim ownership token when calling _mark_failed directly.
+    """
     async with raw_conn() as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             """
             INSERT INTO backfill_state
-                (customer_id, source_system, status, events_enqueued)
-            VALUES ($1, $2, $3, 0)
+                (customer_id, source_system, status, events_enqueued, started_at)
+            VALUES ($1, $2, $3, 0, NOW())
             ON CONFLICT (customer_id, source_system)
             DO UPDATE SET status = EXCLUDED.status,
                           events_enqueued = 0,
-                          last_error = NULL
+                          last_error = NULL,
+                          started_at = NOW()
+            RETURNING started_at
             """,
             CUSTOMER_ID,
             SOURCE.value,
             status,
         )
+    return row["started_at"]
 
 
 async def _backfill_state_row():
@@ -139,11 +146,11 @@ async def test_mark_failed_permanent_auth_flips_token(live_db) -> None:
     """PermanentSourceError with status=401 flips integration_tokens.status."""
     await _seed_customer()
     await _seed_token(status="active")
-    await _seed_backfill_state(status="running")
+    claim_token = await _seed_backfill_state(status="running")
 
     err = "granola auth failure: 401"
     exc = PermanentSourceError(err, url="https://api.granola.so/v1/notes", status=401)
-    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc)
+    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc, claim_token=claim_token)
 
     bf = await _backfill_state_row()
     assert bf is not None
@@ -161,10 +168,10 @@ async def test_mark_failed_permanent_403_flips_token(live_db) -> None:
     """403 is also an auth failure (Granola returns it for revoked keys)."""
     await _seed_customer()
     await _seed_token(status="active")
-    await _seed_backfill_state(status="running")
+    claim_token = await _seed_backfill_state(status="running")
 
     exc = PermanentSourceError("granola 403", status=403)
-    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc)
+    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc, claim_token=claim_token)
 
     tk = await _token_row()
     assert tk is not None
@@ -176,10 +183,10 @@ async def test_mark_failed_permanent_non_auth_no_flip(live_db) -> None:
     """PermanentSourceError with non-401/403 status flips backfill_state but not token."""
     await _seed_customer()
     await _seed_token(status="active")
-    await _seed_backfill_state(status="running")
+    claim_token = await _seed_backfill_state(status="running")
 
     exc = PermanentSourceError("granola 404 missing", status=404)
-    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc)
+    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc, claim_token=claim_token)
 
     bf = await _backfill_state_row()
     assert bf is not None
@@ -196,10 +203,10 @@ async def test_mark_failed_transient_no_flip(live_db) -> None:
     """TransientSourceError (e.g. Granola 503) must not flip the token."""
     await _seed_customer()
     await _seed_token(status="active")
-    await _seed_backfill_state(status="running")
+    claim_token = await _seed_backfill_state(status="running")
 
     exc = TransientSourceError("granola 5xx: 503", status=503)
-    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc)
+    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc, claim_token=claim_token)
 
     bf = await _backfill_state_row()
     assert bf is not None
@@ -215,9 +222,11 @@ async def test_mark_failed_no_exc_no_flip(live_db) -> None:
     """`exc=None` (e.g. the no-active-token branch) must not flip the token."""
     await _seed_customer()
     await _seed_token(status="active")
-    await _seed_backfill_state(status="running")
+    claim_token = await _seed_backfill_state(status="running")
 
-    await _mark_failed(CUSTOMER_ID, SOURCE, "some non-exception error string")
+    await _mark_failed(
+        CUSTOMER_ID, SOURCE, "some non-exception error string", claim_token=claim_token
+    )
 
     bf = await _backfill_state_row()
     assert bf is not None
@@ -234,11 +243,11 @@ async def test_mark_failed_no_token_row_silent(live_db) -> None:
     matches 0 rows and `_mark_failed` returns without raising."""
     await _seed_customer()
     # Intentionally NO token seeded.
-    await _seed_backfill_state(status="running")
+    claim_token = await _seed_backfill_state(status="running")
 
     exc = PermanentSourceError("granola 401", status=401)
     # Should not raise.
-    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc)
+    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc, claim_token=claim_token)
 
     bf = await _backfill_state_row()
     assert bf is not None
@@ -254,10 +263,10 @@ async def test_mark_failed_token_already_flipped(live_db) -> None:
     last_refresh_error stays whatever it was set to first."""
     await _seed_customer()
     await _seed_token(status="active")
-    await _seed_backfill_state(status="running")
+    claim_token = await _seed_backfill_state(status="running")
 
     exc = PermanentSourceError("first failure 401", status=401)
-    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc)
+    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc), exc=exc, claim_token=claim_token)
 
     tk_first = await _token_row()
     assert tk_first is not None
@@ -268,8 +277,10 @@ async def test_mark_failed_token_already_flipped(live_db) -> None:
     # Second permanent-auth failure with a different message — should NOT
     # double-flip and SHOULD NOT overwrite last_refresh_error (since the
     # WHERE status='active' filter excludes the row).
+    # Re-seed (gives a fresh claim) so the backfill_state UPDATE matches.
+    claim_token = await _seed_backfill_state(status="running")
     exc2 = PermanentSourceError("second failure 401", status=401)
-    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc2), exc=exc2)
+    await _mark_failed(CUSTOMER_ID, SOURCE, str(exc2), exc=exc2, claim_token=claim_token)
 
     tk_after = await _token_row()
     assert tk_after is not None

@@ -19,6 +19,7 @@ from shared.constants import (
     GRANOLA_REFRESH_CHANNEL,
     QUEUE_HEARTBEAT_INTERVAL_SECONDS,
     QUEUE_RECLAIM_THRESHOLD_SECONDS,
+    BackfillStatus,
     IngestionEventStatus,
     QueueStatus,
     SourceSystem,
@@ -395,11 +396,13 @@ class BackfillWorker:
         ctx: ConnectorContext,
         poll_interval: float = 5.0,
         wake_event: asyncio.Event | None = None,
+        heartbeat_interval_seconds: float = 30.0,
     ) -> None:
         self._ctx = ctx
         self._poll_interval = poll_interval
         self._shutdown = asyncio.Event()
         self._wake = wake_event or asyncio.Event()
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
 
     async def run(self) -> None:
         from services.ingestion.backfill_runner import (
@@ -417,7 +420,12 @@ class BackfillWorker:
             customer_id, source = claimed
             bind_trace(f"backfill-{customer_id}-{source.value}")
             try:
-                await run_backfill(self._ctx, customer_id, source)
+                await run_backfill(
+                    self._ctx,
+                    customer_id,
+                    source,
+                    heartbeat_interval_seconds=self._heartbeat_interval_seconds,
+                )
             except Exception:
                 log.exception(
                     "backfill_worker.run_failed",
@@ -542,9 +550,11 @@ class ReclaimLoop:
         self,
         threshold_seconds: int = QUEUE_RECLAIM_THRESHOLD_SECONDS,
         interval_seconds: float = 120.0,
+        backfill_threshold_seconds: int = QUEUE_RECLAIM_THRESHOLD_SECONDS,
     ) -> None:
         self._threshold = threshold_seconds
         self._interval = interval_seconds
+        self._backfill_threshold = backfill_threshold_seconds
         self._shutdown = asyncio.Event()
 
     async def run(self) -> None:
@@ -559,9 +569,13 @@ class ReclaimLoop:
             await asyncio.wait_for(self._shutdown.wait(), timeout=self._interval)
         while not self._shutdown.is_set():
             try:
-                n = await self._reclaim_once()
-                if n:
-                    log.warning("reclaim_loop.reclaimed", count=n)
+                queue_n, backfill_n = await self._reclaim_once()
+                if queue_n or backfill_n:
+                    log.warning(
+                        "reclaim_loop.reclaimed",
+                        queue_count=queue_n,
+                        backfill_count=backfill_n,
+                    )
             except Exception:  # pragma: no cover — keep loop alive
                 log.exception("reclaim_loop.tick_failed")
             with contextlib.suppress(TimeoutError):
@@ -570,7 +584,7 @@ class ReclaimLoop:
                 )
         log.info("reclaim_loop.stop")
 
-    async def _reclaim_once(self) -> int:
+    async def _reclaim_once(self) -> tuple[int, int]:
         async with get_pool().acquire() as conn:
             rows = await conn.fetch(
                 """
@@ -588,6 +602,24 @@ class ReclaimLoop:
                 QueueStatus.PROCESSING.value,
                 self._threshold,
             )
+            # last_cursor and events_enqueued are intentionally preserved so
+            # the next worker resumes exactly where the dead one stopped.
+            backfill_rows = await conn.fetch(
+                """
+                UPDATE backfill_state
+                   SET status = $1,
+                       started_at = NULL,
+                       heartbeat_at = NULL,
+                       last_error = COALESCE(last_error, '') || ' | reclaimed: heartbeat stale'
+                 WHERE status = $2
+                   AND heartbeat_at IS NOT NULL
+                   AND heartbeat_at < NOW() - make_interval(secs => $3)
+                RETURNING customer_id, source_system
+                """,
+                BackfillStatus.PENDING.value,
+                BackfillStatus.RUNNING.value,
+                self._backfill_threshold,
+            )
         for r in rows:
             log.warning(
                 "queue.reclaimed",
@@ -596,7 +628,14 @@ class ReclaimLoop:
                 source=r["source_system"],
                 attempts=r["attempts"],
             )
-        return len(rows)
+        for r in backfill_rows:
+            log.warning(
+                "backfill.reclaimed",
+                customer_id=r["customer_id"],
+                source_system=r["source_system"],
+                stale_seconds_threshold=self._backfill_threshold,
+            )
+        return len(rows), len(backfill_rows)
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -659,9 +698,15 @@ async def run_worker_forever() -> None:
         concurrency=settings.worker_max_concurrent,
         per_customer_max_inflight=settings.worker_per_customer_max_inflight,
     )
-    backfill_worker = BackfillWorker(ctx, wake_event=wake_event)
+    backfill_worker = BackfillWorker(
+        ctx,
+        wake_event=wake_event,
+        heartbeat_interval_seconds=settings.backfill_heartbeat_interval_seconds,
+    )
     granola_listener = GranolaNotifyListener(settings.database_url, wake_event)
-    reclaim_loop = ReclaimLoop()
+    reclaim_loop = ReclaimLoop(
+        backfill_threshold_seconds=settings.backfill_stale_heartbeat_seconds,
+    )
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
     health_config = uvicorn.Config(
