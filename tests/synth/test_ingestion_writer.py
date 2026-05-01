@@ -5,8 +5,10 @@ Integrate-mode tests are added in Task 14.
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import orjson
 import pytest
@@ -100,3 +102,104 @@ async def test_local_unsupported_source_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="Plan 2 doesn't support source"):
         await writer.write(doc)
+
+
+# ---------------------------------------------------------------------------
+# Task 14: integrate-mode tests
+# ---------------------------------------------------------------------------
+
+
+def _mock_bucket() -> AsyncMock:
+    bucket = AsyncMock()
+    bucket.bucket_for = MagicMock(return_value="prbe-synth-bucket")
+    bucket.put = AsyncMock(return_value=None)
+    return bucket
+
+
+def _mock_db() -> AsyncMock:
+    db = AsyncMock()
+    db.executemany = AsyncMock(return_value=None)
+    return db
+
+
+@pytest.mark.asyncio
+async def test_integrate_writes_local_and_bucket_and_queues_row(tmp_path: Path) -> None:
+    bucket = _mock_bucket()
+    db = _mock_db()
+    writer = IngestionWriter(
+        out_dir=tmp_path,
+        mode="integrate",
+        customer_id="cust-eval-test-01",
+        bucket=bucket,
+        db=db,
+    )
+    await writer.write(_slack_doc("doc-1"))
+    await writer.close()
+
+    # Local file written
+    assert (tmp_path / "raw" / "slack" / "doc-1.json").exists()
+    # R2 put called once with the customer-scoped key
+    assert bucket.put.await_count == 1
+    args = bucket.put.await_args.args
+    assert args[1] == "raw/slack/cust-eval-test-01/synth/doc-1.json"
+    # ingestion_queue insert flushed on close
+    assert db.executemany.await_count == 1
+    sql = db.executemany.await_args.args[0]
+    assert "INSERT INTO ingestion_queue" in sql
+    assert "ON CONFLICT" in sql
+
+
+@pytest.mark.asyncio
+async def test_integrate_batches_at_50_writes(tmp_path: Path) -> None:
+    bucket = _mock_bucket()
+    db = _mock_db()
+    writer = IngestionWriter(
+        out_dir=tmp_path,
+        mode="integrate",
+        customer_id="cust-eval-test-01",
+        bucket=bucket,
+        db=db,
+    )
+    for i in range(50):
+        await writer.write(_slack_doc(f"doc-{i}"))
+    # Flush should have triggered exactly once at the 50th write.
+    assert db.executemany.await_count == 1
+    await writer.close()
+    # close() with empty batch is a no-op.
+    assert db.executemany.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_integrate_close_flushes_residual_batch(tmp_path: Path) -> None:
+    bucket = _mock_bucket()
+    db = _mock_db()
+    writer = IngestionWriter(
+        out_dir=tmp_path,
+        mode="integrate",
+        customer_id="cust-eval-test-01",
+        bucket=bucket,
+        db=db,
+    )
+    for i in range(10):
+        await writer.write(_slack_doc(f"doc-{i}"))
+    assert db.executemany.await_count == 0  # under batch threshold
+    await writer.close()
+    assert db.executemany.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_integrate_requires_customer_id_bucket_db(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="integrate mode requires"):
+        IngestionWriter(out_dir=tmp_path, mode="integrate")
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not os.environ.get("PRBE_TEST_DB_URL"),
+    reason="PRBE_TEST_DB_URL env not set; skipping live integration test",
+)
+async def test_integrate_round_trip_against_test_db(tmp_path: Path) -> None:
+    """Live integration smoke. Requires PRBE_TEST_DB_URL pointing at a
+    disposable Postgres + a real ObjectStore. Skipped in standard CI.
+    """
+    pytest.skip("placeholder: implementer wires this against shared.db helpers")
