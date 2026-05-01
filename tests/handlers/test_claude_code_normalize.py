@@ -127,3 +127,138 @@ async def test_normalize_raises_on_missing_employee_id() -> None:
             ev,
             {"session_id": "s-x", "events": [], "session_complete": False, "cwd": None},
         )
+
+
+# ---- Person node properties: employee_name + employee_email ----------------
+#
+# Gateway (prbe-backend PR #67) injects employee_name/employee_email into the
+# webhook body alongside employee_id. The handler must merge them onto the
+# Person GraphNodeSpec.properties so the LOWER(properties->>'name') graph
+# index resolves name-keyed searches. Absence of the fields means "no value"
+# (NEVER null in the wire format) — empty string is treated the same.
+
+
+def _person_props(result) -> dict:
+    person_specs = [
+        n for n in result.graph_nodes if n.canonical_id == "emp-1"
+    ]
+    assert len(person_specs) == 1, f"expected one Person node, got {person_specs}"
+    return person_specs[0].properties
+
+
+@pytest.mark.asyncio
+async def test_normalize_writes_name_and_email_on_person_when_present() -> None:
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    ev.raw_payload["employee_name"] = "Richard Roe"
+    ev.raw_payload["employee_email"] = "richard@example.com"
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "s-1", "events": [], "session_complete": False, "cwd": None},
+    )
+    props = _person_props(result)
+    assert props == {
+        "employee_id": "emp-1",
+        "name": "Richard Roe",
+        "email": "richard@example.com",
+    }
+
+
+@pytest.mark.asyncio
+async def test_normalize_omits_name_when_payload_missing_name() -> None:
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    ev.raw_payload["employee_email"] = "richard@example.com"
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "s-1", "events": [], "session_complete": False, "cwd": None},
+    )
+    props = _person_props(result)
+    assert "name" not in props
+    assert props["email"] == "richard@example.com"
+    assert props["employee_id"] == "emp-1"
+
+
+@pytest.mark.asyncio
+async def test_normalize_omits_email_when_payload_missing_email() -> None:
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    ev.raw_payload["employee_name"] = "Richard Roe"
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "s-1", "events": [], "session_complete": False, "cwd": None},
+    )
+    props = _person_props(result)
+    assert "email" not in props
+    assert props["name"] == "Richard Roe"
+    assert props["employee_id"] == "emp-1"
+
+
+@pytest.mark.asyncio
+async def test_normalize_omits_both_when_payload_has_only_id() -> None:
+    """Regression: pre-Lane-A daemons / failed enrichment paths send only
+    employee_id. Person properties must remain exactly {"employee_id": ...}
+    so the existing wire contract keeps working."""
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    # _event() already sets only employee_id by default.
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "s-1", "events": [], "session_complete": False, "cwd": None},
+    )
+    props = _person_props(result)
+    assert props == {"employee_id": "emp-1"}
+
+
+@pytest.mark.asyncio
+async def test_normalize_pulls_name_from_merged_events_on_finalize() -> None:
+    """Finalize events have no per-event identity in event.raw_payload; the
+    fallback walks merged_events for the first record carrying the field.
+    Mirrors _employee_id_from_event's existing finalize behaviour."""
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    # Simulate finalize-event shape: raw_payload has session/finalize but no
+    # per-event identity fields beyond employee_id.
+    ev.raw_payload.pop("employee_name", None)
+    ev.raw_payload.pop("employee_email", None)
+    hydrated = {
+        "session_id": "s-1",
+        "events": [
+            {
+                "line_no": 0,
+                "raw": {},
+                "employee_name": "Richard Roe",
+                "employee_email": "richard@example.com",
+            }
+        ],
+        "session_complete": False,
+        "cwd": None,
+    }
+    result = await c.normalize(ev, hydrated)
+    props = _person_props(result)
+    assert props["name"] == "Richard Roe"
+    assert props["email"] == "richard@example.com"
+
+
+@pytest.mark.asyncio
+async def test_normalize_treats_empty_string_name_as_absent() -> None:
+    """Empty strings must not land in properties — the
+    LOWER(properties->>'name') index would otherwise hold a useless ''
+    entry per employee, defeating the index."""
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    ev.raw_payload["employee_name"] = ""
+    ev.raw_payload["employee_email"] = ""
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "s-1", "events": [], "session_complete": False, "cwd": None},
+    )
+    props = _person_props(result)
+    assert "name" not in props
+    assert "email" not in props
+    assert props == {"employee_id": "emp-1"}
