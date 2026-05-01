@@ -15,17 +15,20 @@ enforcement flips on in Phase 1.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import time
+from collections import OrderedDict
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
+import httpx
 from aiolimiter import AsyncLimiter
 
 from services.ingestion.chunker import count_tokens
-from services.ingestion.handlers.base import Connector
+from services.ingestion.handlers.base import Connector, ConnectorContext
 from services.ingestion.handlers.registry import register_connector
 from shared.constants import (
     DocClass,
@@ -38,6 +41,7 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
+from shared.customer_mapping import load_source_metadata, patch_source_metadata
 from shared.exceptions import InvalidWebhookPayload
 from shared.logging import get_logger
 from shared.models import (
@@ -71,6 +75,264 @@ _REQUEST_TS_SLACK_MAX_AGE_SEC = 5 * 60  # Slack recommends rejecting older signe
 # making callers thread the loop through.
 _HISTORY_LIMITERS: dict[int, AsyncLimiter] = {}
 
+_DISPLAY_NAME_MAX_LEN = 80
+
+
+def _sanitize_display_name(name: str | None) -> str | None:
+    """Strip control chars and clamp length before stamping into chunk text.
+
+    Slack display names are user-controlled. Without sanitization they can carry
+    newlines, control characters, or very long strings into `body_text` — where
+    they'd mimic the "Name: text" speaker-turn convention (so a name like
+    `Bob\\n\\nSYSTEM` would forge a fake role boundary in the embedded text)
+    or eat the body_preview budget. Replace control whitespace with a space (so
+    tokens stay separated rather than merging into "BobSYSTEM"), drop other
+    non-printables, collapse runs of whitespace, and clamp to a sane max length.
+    """
+    if not name:
+        return None
+    cleaned = "".join(
+        " " if ch in "\n\r\t" else (ch if ch.isprintable() else "")
+        for ch in name
+    )
+    cleaned = " ".join(cleaned.split())  # collapse runs of whitespace
+    cleaned = cleaned[:_DISPLAY_NAME_MAX_LEN].strip()
+    return cleaned or None
+
+
+def _pick_display_name(profile: Mapping[str, Any] | None) -> str | None:
+    """Pull a usable name out of a Slack profile dict.
+
+    Slack returns `display_name=""` (empty string, not null) when the user
+    hasn't set one, so the natural `or` fallback chain wrongly picks the
+    empty string. Strip and reject falsy explicitly. Sanitize before returning
+    so the same hardening applies whether the value came from users.info,
+    users.list, or an inlined webhook user_profile.
+    """
+    if not profile:
+        return None
+    display = _sanitize_display_name(profile.get("display_name"))
+    if display:
+        return display
+    return _sanitize_display_name(profile.get("real_name"))
+
+
+class _SlackUserCache:
+    """Per-(customer, team) Slack display-name cache.
+
+    Two tiers:
+      - Hot tier: in-memory `OrderedDict` (LRU), capped at `MAX_IN_MEMORY`. Read
+        on every normalize / backfill peek; written on resolve cache miss.
+      - Cold tier: `customer_source_mapping.metadata.user_names` JSONB on the
+        row keyed by (source=slack, external_id=team_id). Lazy-loaded on first
+        use; debounced flush ~30s after the most-recent in-memory write.
+
+    Lifecycle: instantiated lazily by `SlackConnector._get_cache(team_id)`; one
+    instance per Slack workspace per worker process. Auto-cleaned when the
+    customer disconnects (their `customer_source_mapping` row is deleted; the
+    JSONB goes with it). Worker crash drops up to `FLUSH_DEBOUNCE_S` seconds
+    of unflushed updates — acceptable since display names are regenerable from
+    `users.info`.
+
+    Why per-team (not per-customer): Slack `U_id`s are unique within a workspace
+    but a customer can connect multiple workspaces, where `U07ABC` could be two
+    different humans. Keying by team_id makes cross-workspace mixing impossible.
+    """
+
+    MAX_IN_MEMORY: ClassVar[int] = 500    # in-memory cap per (customer, team)
+    MAX_PERSIST: ClassVar[int] = 50       # top-N kept in JSONB
+    FLUSH_DEBOUNCE_S: ClassVar[float] = 30.0
+
+    def __init__(self, customer_id: str, team_id: str) -> None:
+        self.customer_id = customer_id
+        self.team_id = team_id
+        # OrderedDict: back = most-recently-touched, front = least-recent.
+        # Entry shape: {"name": str | None, "ts": iso8601 string}.
+        self._entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # Per-user singleflight locks: concurrent webhooks for the same new
+        # user share one users.info call. Bounded by MAX_IN_MEMORY because we
+        # prune locks alongside cache evictions.
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._loaded = False
+        self._dirty = False
+        self._flush_task: asyncio.Task[None] | None = None
+
+    async def ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        try:
+            metadata = await load_source_metadata(SourceSystem.SLACK, self.team_id)
+        except Exception as exc:
+            # DB unavailable — degrade to in-memory-only mode for this run;
+            # we'll attempt the load again on next instantiation.
+            log.warning(
+                "slack.user_cache_load_failed",
+                team=self.team_id,
+                error=type(exc).__name__,
+            )
+            self._loaded = True
+            return
+        for u_id, entry in (metadata.get("user_names") or {}).items():
+            if isinstance(entry, dict):
+                self._entries[u_id] = entry
+        self._loaded = True
+
+    def peek(self, user_id: str | None) -> str | None:
+        """Read with LRU bump but no API fetch on miss.
+
+        Used by backfill to stamp cached names onto yielded synthetic events
+        without paying a users.info round-trip per message.
+        """
+        if not user_id:
+            return None
+        entry = self._entries.get(user_id)
+        if entry is None:
+            return None
+        self._entries.move_to_end(user_id)  # in-memory recency only; no flush
+        return entry.get("name")
+
+    async def resolve(
+        self,
+        http: httpx.AsyncClient,
+        token: str,
+        user_id: str,
+    ) -> str | None:
+        """Cache-or-fetch via users.info with singleflight + transient-no-cache.
+
+        Caches authoritative results (`ok=true` positive/empty profile, `ok=false`
+        terminal failure). Does NOT cache transient failures (network error,
+        429, 5xx) — poisoning on a 429 storm would permanently suppress display
+        names for every user looked up during the storm.
+        """
+        if not user_id:
+            return None
+        await self.ensure_loaded()
+        if user_id in self._entries:
+            self._entries.move_to_end(user_id)
+            return self._entries[user_id].get("name")
+        lock = self._locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            if user_id in self._entries:
+                self._entries.move_to_end(user_id)
+                return self._entries[user_id].get("name")
+            try:
+                resp = await http.get(
+                    f"{_SLACK_API}/users.info",
+                    params={"user": user_id},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError as exc:
+                log.warning(
+                    "slack.users_info_transient",
+                    user=user_id,
+                    error=type(exc).__name__,
+                )
+                return None
+            if resp.status_code != 200:
+                log.warning(
+                    "slack.users_info_non_200",
+                    user=user_id,
+                    status=resp.status_code,
+                )
+                return None
+            body = resp.json()
+            if body.get("ok"):
+                name = _pick_display_name((body.get("user") or {}).get("profile"))
+                self._set(user_id, name)
+                return name
+            # Authoritative negative (e.g., user_not_found).
+            self._set(user_id, None)
+            return None
+
+    async def prime(self, http: httpx.AsyncClient, token: str) -> None:
+        """Bulk-fill from Slack users.list paginated. Best-effort.
+
+        Fills up to `MAX_IN_MEMORY` entries; the debounced flush captures the
+        top `MAX_PERSIST` for the cold tier. HTTP failures or `ok=false` log
+        and short-circuit — `resolve` will fall back to users.info on miss.
+        """
+        await self.ensure_loaded()
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                resp = await http.get(
+                    f"{_SLACK_API}/users.list",
+                    params=params,
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            except httpx.HTTPError as exc:
+                log.warning("slack.users_list_transient", error=type(exc).__name__)
+                return
+            if resp.status_code != 200:
+                log.warning("slack.users_list_non_200", status=resp.status_code)
+                return
+            body = resp.json()
+            if not body.get("ok"):
+                log.warning("slack.users_list_not_ok", error=body.get("error"))
+                return
+            for u in body.get("members", []):
+                uid = u.get("id")
+                if not uid:
+                    continue
+                self._set(uid, _pick_display_name(u.get("profile")))
+            cursor = (body.get("response_metadata") or {}).get("next_cursor") or None
+            if not cursor:
+                return
+
+    def _set(self, user_id: str, name: str | None) -> None:
+        self._entries[user_id] = {
+            "name": name,
+            "ts": datetime.now(UTC).isoformat(),
+        }
+        self._entries.move_to_end(user_id)
+        # Evict oldest until under the in-memory cap. Drop their locks too so
+        # _locks doesn't outgrow _entries.
+        while len(self._entries) > self.MAX_IN_MEMORY:
+            evicted_uid, _ = self._entries.popitem(last=False)
+            self._locks.pop(evicted_uid, None)
+        self._mark_dirty()
+
+    def _mark_dirty(self) -> None:
+        self._dirty = True
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._debounced_flush())
+
+    async def _debounced_flush(self) -> None:
+        await asyncio.sleep(self.FLUSH_DEBOUNCE_S)
+        if not self._dirty:
+            return
+        try:
+            await self._flush_to_db()
+            self._dirty = False
+        except Exception as exc:
+            # Best-effort; the next dirty mark will reschedule. Log so silent
+            # flush failures are visible in operations.
+            log.warning(
+                "slack.user_cache_flush_failed",
+                customer=self.customer_id,
+                team=self.team_id,
+                error=type(exc).__name__,
+            )
+
+    async def _flush_to_db(self) -> None:
+        """Persist top-`MAX_PERSIST` entries (most-recent end of the LRU)."""
+        items = list(self._entries.items())
+        keep = dict(items[-self.MAX_PERSIST :])
+        await patch_source_metadata(
+            SourceSystem.SLACK,
+            self.team_id,
+            patch={"user_names": keep},
+        )
+
+    async def flush_now(self) -> None:
+        """Synchronous flush bypass for tests and shutdown hooks."""
+        if self._dirty:
+            await self._flush_to_db()
+            self._dirty = False
+
 
 def _get_history_limiter() -> AsyncLimiter:
     import asyncio as _asyncio
@@ -87,6 +349,21 @@ def _get_history_limiter() -> AsyncLimiter:
 class SlackConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.SLACK
     display_name: ClassVar[str] = "Slack"
+
+    def __init__(self, ctx: ConnectorContext) -> None:
+        super().__init__(ctx)
+        # One cache per Slack workspace (keyed by team_id). Lives for the
+        # lifetime of this connector instance, which is itself one-per-process
+        # via Normalizer._connectors. Persists across requests; flushed to
+        # JSONB on customer_source_mapping.metadata.
+        self._caches: dict[str, _SlackUserCache] = {}
+
+    def _get_cache(self, customer_id: str, team_id: str) -> _SlackUserCache:
+        cache = self._caches.get(team_id)
+        if cache is None:
+            cache = _SlackUserCache(customer_id=customer_id, team_id=team_id)
+            self._caches[team_id] = cache
+        return cache
 
     # ------------------------------------------------------------------
     # 1. signature verification
@@ -240,11 +517,32 @@ class SlackConnector(Connector):
         if token is None:
             return {}
 
+        result: dict[str, Any] = {}
+
         msg = event.raw_payload.get("event", {})
+        # message_changed/message_deleted nest the actual message under .message
+        # / .previous_message. Pull the user from there when present so author
+        # resolution covers edits/deletes too.
+        inner = msg.get("message") if isinstance(msg.get("message"), dict) else None
+        if inner is None and isinstance(msg.get("previous_message"), dict):
+            inner = msg["previous_message"]
+        author_msg = inner or msg
+
+        # Resolve display name for the author when the webhook didn't inline a
+        # user_profile (Slack sometimes does, sometimes doesn't). Skip for bot
+        # messages — the resolver would just negative-cache the bot_id.
+        user_id = author_msg.get("user")
+        team_id = event.raw_payload.get("team_id") or msg.get("team")
+        if user_id and team_id and not author_msg.get("user_profile"):
+            cache = self._get_cache(event.customer_id, team_id)
+            name = await cache.resolve(self.http, token.access_token, user_id)
+            if name:
+                result["user_profile"] = {"display_name": name}
+
         thread_ts = msg.get("thread_ts")
         channel = msg.get("channel")
         if not thread_ts or not channel:
-            return {}
+            return result
 
         try:
             resp = await self.http.get(
@@ -254,14 +552,15 @@ class SlackConnector(Connector):
             )
         except Exception as exc:
             log.warning("slack.fetch_replies_failed", error=str(exc))
-            return {}
+            return result
 
         if resp.status_code != 200:
-            return {}
+            return result
         body = resp.json()
         if not body.get("ok"):
-            return {}
-        return {"replies": body.get("messages", [])}
+            return result
+        result["replies"] = body.get("messages", [])
+        return result
 
     # ------------------------------------------------------------------
     # 4. normalization
@@ -300,6 +599,17 @@ class SlackConnector(Connector):
         text = "" if is_delete else (msg.get("text") or "")
         thread_ts = msg.get("thread_ts")
 
+        # Display-name stamping: hydrated value (webhook fetch_supplementary)
+        # wins over msg-inline (some webhooks ship user_profile in-band) wins
+        # over nothing. Critical: when no name is known, prefix is empty —
+        # do NOT fall back to the raw U_ID (would pollute embeddings).
+        display_name = _pick_display_name(
+            hydrated.get("user_profile") or msg.get("user_profile")
+        )
+        body_text = "" if is_delete else (
+            f"{display_name}: {text}" if display_name else text
+        )
+
         if not channel or not ts:
             return NormalizationResult(skipped_reason="missing channel/ts after parse")
 
@@ -318,8 +628,14 @@ class SlackConnector(Connector):
             # no-op guard in _upsert_document would wrongly skip the delete.
             content_hash = _sha256(f"{doc_id}|__deleted__|{event.received_at.isoformat()}")
         else:
+            # Hash on `body_text` (post-prefix) so a late-arriving display name
+            # — webhook-only path that misses the cache on first sight then
+            # resolves on retry — produces a different hash and re-upserts the
+            # chunk with the name embedded. Without the prefix in the hash,
+            # name-stamped vs raw versions would collide and the no-op guard
+            # would drop the better one.
             content_hash = _sha256(
-                f"{doc_id}|{text}|{','.join(sorted(_attachment_urls(msg)))}"
+                f"{doc_id}|{body_text}|{','.join(sorted(_attachment_urls(msg)))}"
             )
 
         acl_principals = [
@@ -343,9 +659,9 @@ class SlackConnector(Connector):
             content_type="text/plain",
             content_hash=content_hash,
             title=_derive_title(text),
-            body_preview=text[:280],
-            body_size_bytes=len(text.encode("utf-8")),
-            body_token_count=count_tokens(text),
+            body_preview=body_text[:280],
+            body_size_bytes=len(body_text.encode("utf-8")),
+            body_token_count=count_tokens(body_text),
             author_id=user,
             created_at=created,
             updated_at=updated,
@@ -359,7 +675,7 @@ class SlackConnector(Connector):
             ),
             acl=ACLSnapshot(principals=acl_principals, captured_at=event.received_at),
             metadata={
-                "body": text,
+                "body": body_text,
                 "team_id": team_id,
                 "channel_id": channel,
                 "thread_ts": thread_ts,
@@ -370,6 +686,14 @@ class SlackConnector(Connector):
             doc_references=_references_from_text(text),
         )
 
+        # Person properties: only attach display_name when the canonical_id is a
+        # real Slack user ID (msg.user). When the canonical_id is a bot_id or
+        # the "unknown" sentinel, display_name belongs to a different identity
+        # and would be misleading on the node.
+        person_props: dict[str, Any] = {"source_system": SourceSystem.SLACK.value}
+        if msg.get("user") and display_name:
+            person_props["display_name"] = display_name
+
         nodes = [
             GraphNodeSpec(
                 label=NodeLabel.CHANNEL,
@@ -379,7 +703,7 @@ class SlackConnector(Connector):
             GraphNodeSpec(
                 label=NodeLabel.PERSON,
                 canonical_id=user,
-                properties={"source_system": SourceSystem.SLACK.value},
+                properties=person_props,
             ),
             GraphNodeSpec(
                 label=NodeLabel.DOCUMENT,
@@ -581,8 +905,6 @@ class SlackConnector(Connector):
         import asyncio as _asyncio
         import json as _json
 
-        import httpx
-
         from shared.models import WebhookEvent
 
         state = _decode_slack_cursor(cursor)
@@ -592,6 +914,19 @@ class SlackConnector(Connector):
         # channels still need a manual `/invite @bot`.
         if cursor is None:
             await _join_all_public_channels(self.http, token, customer_id)
+
+        # Resolve team_id first — needed both as the cache key AND stamped on
+        # every yielded WebhookEvent's payload.team_id so the normalizer can
+        # build canonical doc_ids without a second auth.test round-trip.
+        team_id = await _auth_team_id(self.http, token.access_token) or "UNKNOWN"
+
+        # Prime the per-workspace display-name cache once per backfill kickoff
+        # so per-message normalize() can stamp "<name>: " into chunk text
+        # without firing one users.info per message. On resume the JSONB cold
+        # tier rehydrates the top-N hot users; the prime tops it up with the
+        # full workspace member list.
+        cache = self._get_cache(customer_id, team_id)
+        await cache.prime(self.http, token.access_token)
 
         # Always enumerate channels - even on resume - so the round-robin
         # ranking has fresh num_members for every active channel. On a fresh
@@ -605,8 +940,6 @@ class SlackConnector(Connector):
                 "active": {ch_id: None for ch_id, _ in listed},
                 "done": [],
             }
-
-        team_id = await _auth_team_id(self.http, token.access_token) or "UNKNOWN"
 
         while state["active"]:
             # Sort once per round: hottest channels page first within the round
@@ -676,14 +1009,23 @@ class SlackConnector(Connector):
                         continue
                     if not msg.get("text") and not msg.get("files"):
                         continue
+                    # Stamp cached display name onto the synthetic event so
+                    # normalize() doesn't have to know whether this came from a
+                    # webhook (where Slack sometimes inlines user_profile) or
+                    # backfill (where it never does). Cache miss => no key
+                    # written, normalize falls back gracefully.
+                    cached_name = cache.peek(msg.get("user"))
+                    event_body: dict[str, Any] = {
+                        **msg,
+                        "type": "message",
+                        "channel": ch_id,
+                    }
+                    if cached_name:
+                        event_body["user_profile"] = {"display_name": cached_name}
                     payload = {
                         "team_id": team_id,
                         "type": "event_callback",
-                        "event": {
-                            **msg,
-                            "type": "message",
-                            "channel": ch_id,
-                        },
+                        "event": event_body,
                         # No `_cursor` here on purpose - see the cursor-bloat
                         # comment in the docstring. The runner advances cursor
                         # via the `_checkpoint` event yielded at end of round.

@@ -118,6 +118,60 @@ async def list_mappings_for_customer(
     return [(r["source_system"], r["external_id"], r["external_name"]) for r in rows]
 
 
+async def load_source_metadata(
+    source_system: SourceSystem, external_id: str
+) -> dict[str, Any]:
+    """Read the metadata JSONB for one (source_system, external_id) row.
+
+    Returns an empty dict when the row is missing or the column is NULL.
+    Used by connectors that persist per-workspace state alongside the mapping
+    (e.g. Slack stores its top-N display-name cache here).
+    """
+    async with get_pool().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT metadata FROM customer_source_mapping
+            WHERE source_system = $1 AND external_id = $2
+            """,
+            source_system.value,
+            external_id,
+        )
+    if row is None or row["metadata"] is None:
+        return {}
+    metadata = row["metadata"]
+    # asyncpg returns jsonb as str when no codec is registered; normalize.
+    if isinstance(metadata, str):
+        metadata = orjson.loads(metadata)
+    return metadata if isinstance(metadata, dict) else {}
+
+
+async def patch_source_metadata(
+    source_system: SourceSystem,
+    external_id: str,
+    patch: dict[str, Any],
+) -> None:
+    """Shallow-merge `patch` into the row's metadata JSONB column.
+
+    Uses Postgres `||` operator, so top-level keys in `patch` REPLACE existing
+    top-level keys. Missing rows are silently ignored (best-effort caching;
+    callers can't usefully recover from "row got deleted while flushing").
+    """
+    if not patch:
+        return
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE customer_source_mapping
+            SET metadata   = COALESCE(metadata, '{}'::jsonb) || $3::jsonb,
+                updated_at = NOW()
+            WHERE source_system = $1 AND external_id = $2
+            """,
+            source_system.value,
+            external_id,
+            orjson.dumps(patch).decode("utf-8"),
+        )
+
+
 async def single_customer_fallback() -> str | None:
     """Return the only customer_id if exactly one exists, else None.
 
