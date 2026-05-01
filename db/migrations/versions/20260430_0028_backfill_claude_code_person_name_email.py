@@ -1,8 +1,12 @@
 """backfill claude_code Person nodes with name + email from neon_auth.user
 
-Revision ID: 0028_backfill_cc_person_name_email
+Revision ID: 0028_backfill_cc_person_props
 Revises: 0027_mcp_oauth_sessions
 Create Date: 2026-04-30
+
+NOTE: revision id kept under 32 chars because alembic_version.version_num
+is varchar(32) by default; the original `0028_backfill_cc_person_name_email`
+(34 chars) overflowed and broke the deploy on first attempt.
 
 One-shot backfill that hydrates existing Claude Code Person graph nodes
 with `name` and `email` properties pulled from neon_auth."user".
@@ -52,7 +56,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0028_backfill_cc_person_name_email"
+revision = "0028_backfill_cc_person_props"
 down_revision = "0027_mcp_oauth_sessions"
 branch_labels = None
 depends_on = None

@@ -1,10 +1,11 @@
-"""Smoke test for migration 0028_backfill_cc_person_name_email.
+"""Smoke test for migration 0028_backfill_cc_person_props.
 
 We don't run the migration end-to-end here (Alembic + neon_auth fixtures
 are heavy). Instead we load the revision file by path and assert the
 upgrade SQL contains every load-bearing clause: provenance JOIN,
 claude_code filter, neon_auth user JOIN, jsonb merge, null-skip, UUID
-guard, and the idempotency check on existing properties keys.
+guard, the idempotency check on existing properties keys, and a check
+that the revision id fits in alembic_version.version_num (varchar 32).
 
 If any of these substrings drift (e.g. someone "simplifies" the WHERE
 clause and accidentally drops the UUID guard), this test catches it
@@ -39,8 +40,20 @@ def test_migration_file_exists() -> None:
 
 def test_revision_chain() -> None:
     m = _load_migration()
-    assert m.revision == "0028_backfill_cc_person_name_email"
+    assert m.revision == "0028_backfill_cc_person_props"
     assert m.down_revision == "0027_mcp_oauth_sessions"
+
+
+def test_revision_id_fits_alembic_version_column() -> None:
+    """alembic_version.version_num is varchar(32) by default. A revision id
+    over 32 chars makes the migration rollback at commit time
+    (StringDataRightTruncation), which we hit on first deploy attempt.
+    Lock in a guard so future revisions don't repeat that mistake."""
+    m = _load_migration()
+    assert len(m.revision) <= 32, (
+        f"revision id {m.revision!r} is {len(m.revision)} chars; "
+        "alembic_version.version_num is varchar(32)"
+    )
 
 
 def test_downgrade_is_noop() -> None:
