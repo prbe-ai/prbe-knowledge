@@ -172,19 +172,19 @@ def build_oncall_specs(
             text=notion_text,
             thread_parent_id=None,
             personas=(outgoing.canonical_id, incoming.canonical_id),
-            services_mentioned=tuple({
+            services_mentioned=tuple(sorted({
                 s
                 for cid in (outgoing.canonical_id, incoming.canonical_id)
                 for s in ownership.services_by_person.get(cid, ())
-            }),
+            })),
         )
 
         all_cast = (outgoing.canonical_id, incoming.canonical_id)
-        all_services = tuple({
+        all_services = tuple(sorted({
             s
             for cid in all_cast
             for s in ownership.services_by_person.get(cid, ())
-        })
+        }))
 
         spec = ScenarioSpec(
             id=scenario_id,
