@@ -396,11 +396,13 @@ class BackfillWorker:
         ctx: ConnectorContext,
         poll_interval: float = 5.0,
         wake_event: asyncio.Event | None = None,
+        heartbeat_interval_seconds: float = 30.0,
     ) -> None:
         self._ctx = ctx
         self._poll_interval = poll_interval
         self._shutdown = asyncio.Event()
         self._wake = wake_event or asyncio.Event()
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
 
     async def run(self) -> None:
         from services.ingestion.backfill_runner import (
@@ -418,7 +420,12 @@ class BackfillWorker:
             customer_id, source = claimed
             bind_trace(f"backfill-{customer_id}-{source.value}")
             try:
-                await run_backfill(self._ctx, customer_id, source)
+                await run_backfill(
+                    self._ctx,
+                    customer_id,
+                    source,
+                    heartbeat_interval_seconds=self._heartbeat_interval_seconds,
+                )
             except Exception:
                 log.exception(
                     "backfill_worker.run_failed",
@@ -691,7 +698,11 @@ async def run_worker_forever() -> None:
         concurrency=settings.worker_max_concurrent,
         per_customer_max_inflight=settings.worker_per_customer_max_inflight,
     )
-    backfill_worker = BackfillWorker(ctx, wake_event=wake_event)
+    backfill_worker = BackfillWorker(
+        ctx,
+        wake_event=wake_event,
+        heartbeat_interval_seconds=settings.backfill_heartbeat_interval_seconds,
+    )
     granola_listener = GranolaNotifyListener(settings.database_url, wake_event)
     reclaim_loop = ReclaimLoop(
         backfill_threshold_seconds=settings.backfill_stale_heartbeat_seconds,

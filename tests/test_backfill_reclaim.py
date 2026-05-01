@@ -5,12 +5,19 @@ its backfill_state row stranded with status='running' forever — claim only
 picks 'pending'. ReclaimLoop._reclaim_once flips stale 'running' rows back
 to 'pending', preserving last_cursor and events_enqueued so the next worker
 resumes exactly where the dead one stopped.
+
+Also covers the runner-side heartbeat loop: an unconditional ping decoupled
+from progress, so a healthy-but-paused runner is not falsely reclaimed.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import pytest
 
+from services.ingestion.backfill_runner import _heartbeat_loop
 from services.ingestion.worker import ReclaimLoop
 from shared.constants import BackfillStatus, SourceSystem
 from shared.db import raw_conn
@@ -186,3 +193,88 @@ async def test_reclaim_leaves_complete_alone(live_db) -> None:
     assert row["last_cursor"] == "final"
     assert row["events_enqueued"] == 5000
     assert row["last_error"] is None
+
+
+# ---- _heartbeat_loop: liveness decoupled from progress -------------------
+
+
+async def _heartbeat_at(customer_id: str):
+    async with raw_conn() as conn:
+        return await conn.fetchval(
+            "SELECT heartbeat_at FROM backfill_state WHERE customer_id = $1",
+            customer_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_advances_without_progress(live_db) -> None:
+    """Heartbeat ticks even when no events are being enqueued."""
+    await _insert_customer("cust-hb")
+    await _insert_backfill_state(
+        customer_id="cust-hb",
+        source=SourceSystem.SLACK,
+        status=BackfillStatus.RUNNING.value,
+        heartbeat_offset_seconds=600,  # stale on purpose
+        last_cursor="cur",
+        events_enqueued=100,
+    )
+    before = await _heartbeat_at("cust-hb")
+
+    task = asyncio.create_task(
+        _heartbeat_loop("cust-hb", SourceSystem.SLACK, interval_seconds=0.05)
+    )
+    try:
+        await asyncio.sleep(0.2)  # ~3-4 ticks
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    after = await _heartbeat_at("cust-hb")
+    assert after > before
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_skips_non_running_rows(live_db) -> None:
+    """A 'pending' row never has its heartbeat written by the liveness loop."""
+    await _insert_customer("cust-pending-hb")
+    await _insert_backfill_state(
+        customer_id="cust-pending-hb",
+        source=SourceSystem.SLACK,
+        status=BackfillStatus.PENDING.value,
+        heartbeat_offset_seconds=None,  # NULL
+    )
+
+    task = asyncio.create_task(
+        _heartbeat_loop(
+            "cust-pending-hb", SourceSystem.SLACK, interval_seconds=0.05
+        )
+    )
+    try:
+        await asyncio.sleep(0.2)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert await _heartbeat_at("cust-pending-hb") is None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loop_cancels_cleanly(live_db) -> None:
+    """Cancellation propagates as CancelledError, no stray exceptions."""
+    await _insert_customer("cust-cancel")
+    await _insert_backfill_state(
+        customer_id="cust-cancel",
+        source=SourceSystem.SLACK,
+        status=BackfillStatus.RUNNING.value,
+        heartbeat_offset_seconds=10,
+    )
+
+    task = asyncio.create_task(
+        _heartbeat_loop("cust-cancel", SourceSystem.SLACK, interval_seconds=10)
+    )
+    await asyncio.sleep(0.05)  # let the task start its sleep
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

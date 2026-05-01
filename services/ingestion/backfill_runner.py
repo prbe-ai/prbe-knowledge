@@ -17,6 +17,8 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from datetime import UTC, datetime
 
@@ -34,6 +36,7 @@ from shared.storage import get_store
 log = get_logger(__name__)
 
 PROGRESS_EVERY_N_EVENTS = 25
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
 # How often to re-check `integration_tokens.status='active'` mid-backfill.
 # A SELECT every event is wasteful; once per ~50 events bounds the disconnect-race
 # window to one Granola page (~250ms) without flooding the DB. See _token_still_active.
@@ -44,6 +47,7 @@ async def run_backfill(
     ctx: ConnectorContext,
     customer_id: str,
     source: SourceSystem,
+    heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
 ) -> int:
     """Execute a backfill for (customer, source). Returns events enqueued.
 
@@ -68,6 +72,13 @@ async def run_backfill(
         customer=customer_id,
         source=source.value,
         resume_cursor=bool(cursor),
+    )
+
+    # Liveness ping is decoupled from progress writes. The reaper looks at
+    # heartbeat_at; if we only updated it on enqueue (every 25 events), a
+    # healthy runner blocked on a slow Slack page would look dead.
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_loop(customer_id, source, heartbeat_interval_seconds)
     )
 
     enqueued = 0
@@ -185,8 +196,51 @@ async def run_backfill(
         counter("backfill.failed", 1, source=source.value)
         log.exception("backfill.failed", customer=customer_id, source=source.value)
         raise
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
 
     return enqueued
+
+
+async def _heartbeat_loop(
+    customer_id: str,
+    source: SourceSystem,
+    interval_seconds: float,
+) -> None:
+    """Unconditionally ping heartbeat_at every interval_seconds while running.
+
+    The WHERE clause filters on status='running' so a row that's been marked
+    done/failed/reclaimed mid-loop won't get a stale heartbeat written. DB
+    errors are logged and swallowed: a transient blip should not kill the
+    only liveness signal — if Postgres is truly down, the next reaper tick
+    will catch it via the stale heartbeat anyway.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            async with raw_conn() as conn:
+                await conn.execute(
+                    """
+                    UPDATE backfill_state
+                       SET heartbeat_at = NOW()
+                     WHERE customer_id = $1
+                       AND source_system = $2
+                       AND status = $3
+                    """,
+                    customer_id,
+                    source.value,
+                    BackfillStatus.RUNNING.value,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "backfill.heartbeat_loop.error",
+                customer=customer_id,
+                source=source.value,
+            )
 
 
 # ---- backfill_state writes -----------------------------------------------

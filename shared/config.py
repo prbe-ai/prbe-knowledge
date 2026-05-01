@@ -45,7 +45,13 @@ class Settings(BaseSettings):
     db_statement_timeout_ms: int = 300_000
     db_init_retry_attempts: int = 6
     db_init_retry_base_seconds: float = 1.0
-    backfill_stale_heartbeat_seconds: int = 300
+    # Heartbeat is liveness, NOT progress. The runner spawns a background task
+    # that pings heartbeat_at every N seconds regardless of whether events are
+    # being enqueued, so a healthy-but-paused runner (Slack rate limit, large
+    # channel mid-paginate) can't be reclaimed while it's still alive. The
+    # stale threshold is 6x the interval to absorb GC pauses + network blips.
+    backfill_heartbeat_interval_seconds: int = 30
+    backfill_stale_heartbeat_seconds: int = 180
 
     # --- Object storage (R2 in prod, MinIO locally) -------------------------
     r2_endpoint_url: str = "http://localhost:9000"
