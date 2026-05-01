@@ -7,7 +7,7 @@ writer, validator) consumes this as cached prompt context.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 
 
@@ -85,7 +85,7 @@ class SectionHint:
 
 @dataclass(frozen=True)
 class TimeAnchor:
-    label: str                      # "active period 2026-W12"
+    label: str                      # "active-2026-W12"
     start: datetime
     end: datetime
     activity_score: float
@@ -278,7 +278,8 @@ import math  # noqa: E402
 
 
 def _recency_decay(ts: datetime, now: datetime, half_life_days: float = 30.0) -> float:
-    delta_days = (now - ts).total_seconds() / 86400.0
+    """Future-dated timestamps clamp to delta_days=0 so weight ≤ 1.0."""
+    delta_days = max(0.0, (now - ts).total_seconds() / 86400.0)
     return 0.5 ** (delta_days / half_life_days)
 
 
@@ -296,7 +297,8 @@ def build_topic_pool(
     services: tuple[Service, ...],
     now: datetime,
 ) -> tuple[Topic, ...]:
-    service_names = {s.name for s in services} | {s.qualified for s in services}
+    # Sorted for deterministic Topic.mentioned_services tuple order.
+    service_names = sorted({s.name for s in services} | {s.qualified for s in services})
 
     topics: list[Topic] = []
     for sig in signals:
@@ -488,8 +490,7 @@ def compute_time_anchors(signals: list[RepoSignals]) -> tuple[TimeAnchor, ...]:
     for (year, week), count in sorted(week_counts.items()):
         # ISO week → start (Monday) of that week
         # date.fromisocalendar exists in 3.8+
-        from datetime import date as date_cls
-        start_date = date_cls.fromisocalendar(year, week, 1)
+        start_date = date.fromisocalendar(year, week, 1)
         start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=UTC)
         anchors.append(
             TimeAnchor(

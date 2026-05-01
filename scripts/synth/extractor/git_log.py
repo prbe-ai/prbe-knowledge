@@ -32,6 +32,7 @@ class Branch:
 
 # Custom delimiter — \x1f is ASCII unit separator, won't show up in git output.
 _FIELD = "\x1f"
+# Collision risk: a literal `\x1e` byte in commit body would split the record. Vanishingly rare in practice (no source code uses it).
 _RECORD = "\x1e"
 _FORMAT = (
     f"%H{_FIELD}%an{_FIELD}%ae{_FIELD}%aI{_FIELD}%s{_FIELD}%b{_RECORD}"

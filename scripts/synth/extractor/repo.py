@@ -75,6 +75,7 @@ class RepoExtractor:
         if self._cache is not None:
             hit = self._cache.get(cache_key)
             if hit is not None:
+                # NOTE: cached payload omits GH-only fields (issues/prs/contributors/workflows). `extract` re-fetches them after this returns.
                 return _signals_from_dict(hit)
 
         default_branch = subprocess.run(
@@ -198,9 +199,7 @@ def _signals_to_dict(s: RepoSignals) -> dict:
             return {k: encode(val) for k, val in v.items()}
         return v
 
-    out = encode(s)
-    # Mark gh-only fields explicitly None so loader knows they're absent vs empty.
-    return out
+    return encode(s)
 
 
 def _signals_from_dict(data: dict) -> RepoSignals:

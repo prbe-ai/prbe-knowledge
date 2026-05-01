@@ -315,15 +315,11 @@ def test_synthesize_sections_fixed_set_plus_per_service_runbooks() -> None:
 from scripts.synth.world_model import build_dep_graph  # noqa: E402
 
 
-def test_dep_edge_recorded_when_manifest_dep_matches_service() -> None:
+def test_dep_graph_records_edge_when_manifest_dep_matches_service() -> None:
     """A repo with manifest deps that name a Service produces a DepEdge
     from the manifest's owning service to the dependency service."""
     from scripts.synth.extractor.manifests import Manifest, ManifestKind
 
-    services = (
-        _svc("payments"),  # in repo A
-        _svc("billing"),   # in repo B
-    )
     services = (
         Service(name="payments", qualified="payments", repo_url="github.com/x/A",
                 kind=ServiceKind.API, description=None, owners=(), recent_activity=1.0,
@@ -360,7 +356,7 @@ def test_dep_edge_recorded_when_manifest_dep_matches_service() -> None:
     assert edges[0].source_repo == "github.com/x/A"
 
 
-def test_no_dep_edge_for_external_deps() -> None:
+def test_dep_graph_no_edge_for_external_deps() -> None:
     """Manifest deps that don't match any Service are ignored."""
     from scripts.synth.extractor.manifests import Manifest, ManifestKind
 

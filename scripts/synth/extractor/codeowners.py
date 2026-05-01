@@ -48,7 +48,10 @@ def parse_codeowners(text: str) -> tuple[CodeownerRule, ...]:
 
 
 def resolve_owners(path: str, rules: tuple[CodeownerRule, ...]) -> tuple[str, ...]:
-    """Return the owners of `path` per CODEOWNERS semantics: last matching rule wins."""
+    """Return the owners of `path` per CODEOWNERS semantics: last matching rule wins.
+
+    Path must be repo-root-relative with a leading '/' (e.g., '/services/payments/handler.py').
+    """
     matched: tuple[str, ...] = ()
     for rule in rules:
         if _matches(path, rule.pattern):

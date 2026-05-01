@@ -46,16 +46,24 @@ def _normalize_repo(entry: object) -> RepoSpec:
         if not url or not isinstance(url, str):
             raise ProfileError(f"repo entry missing 'url': {entry!r}")
         lp = entry.get("local_path")
+        branch = entry.get("branch")
+        if branch is not None and not isinstance(branch, str):
+            raise ProfileError(f"repo entry 'branch' must be a string, got {type(branch).__name__}: {branch!r}")
         return RepoSpec(
             url=url,
             local_path=Path(lp).expanduser() if lp else None,
-            branch=entry.get("branch"),
+            branch=branch,
         )
     raise ProfileError(f"repo entry must be a string or mapping, got {type(entry).__name__}")
 
 
 def load_profile(path: Path) -> Profile:
-    raw = yaml.safe_load(path.read_text())
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ProfileError(f"profile file not found: {path}") from exc
+    except yaml.YAMLError as exc:
+        raise ProfileError(f"profile YAML parse error: {exc}") from exc
     if not isinstance(raw, dict):
         raise ProfileError(f"profile must be a YAML mapping, got {type(raw).__name__}")
 
@@ -75,7 +83,13 @@ def load_profile(path: Path) -> Profile:
         raise ProfileError("repos must be a non-empty list")
     repos = tuple(_normalize_repo(r) for r in repos_raw)
 
+    preset = raw["preset"]
+    if not isinstance(preset, str) or not preset:
+        raise ProfileError(f"preset must be a non-empty string, got {preset!r}")
+
     seed = raw["seed"]
+    if isinstance(seed, bool):
+        raise ProfileError(f"seed must be an integer, not bool (YAML 'true'/'false' are booleans, not integers): {seed!r}")
     if not isinstance(seed, int):
         raise ProfileError(f"seed must be an integer, got {type(seed).__name__}")
 
@@ -85,7 +99,7 @@ def load_profile(path: Path) -> Profile:
     return Profile(
         customer_id=customer_id,
         repos=repos,
-        preset=raw["preset"],
+        preset=preset,
         seed=seed,
         company_context_path=cc_path,
         raw=raw,

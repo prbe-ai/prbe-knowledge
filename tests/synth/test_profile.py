@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from scripts.synth.profile import (
+    Profile,
     ProfileError,
     RepoSpec,
     load_profile,
@@ -26,6 +27,7 @@ seed: 42
 """.strip()
     )
     profile = load_profile(p)
+    assert isinstance(profile, Profile)
     assert profile.customer_id == "cust-eval-prbe-01"
     assert profile.preset == "flagship"
     assert profile.seed == 42
