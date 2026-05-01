@@ -67,10 +67,11 @@ class ClassListResponse(BaseModel):
 def _decode_jsonb(value: Any) -> Any:
     """Normalize asyncpg's JSONB return value to a Python object.
 
-    asyncpg returns JSONB as a ``str`` by default (no codec registered).
-    Some setups (e.g. when a codec is installed elsewhere in the same
-    process) return a ``dict`` directly. Handle both so this module
-    doesn't care which path the connection took.
+    asyncpg returns JSONB as either ``str``/``bytes`` or ``dict`` depending
+    on whether a JSONB codec is registered upstream — we've observed both
+    in this repo (``shared/tokens.py:_load_jsonb`` handles the str case;
+    the kg path here has seen dict). Handle both so this module doesn't
+    care which path the connection took.
     """
     if isinstance(value, (str, bytes, bytearray)):
         return json.loads(value)

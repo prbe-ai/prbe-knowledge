@@ -27,6 +27,7 @@ Self-cleans the kg_classes / customers rows it inserts (the parent
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
 from collections.abc import AsyncIterator
 
@@ -145,7 +146,7 @@ async def _seed_class(
             """,
             customer_id,
             class_id,
-            __import__("json").dumps(frontmatter),
+            json.dumps(frontmatter),
             body,
         )
 
