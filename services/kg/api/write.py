@@ -47,6 +47,7 @@ See spec §5.2 (envelope shape), §7.2 (single-writer + advisory lock),
 
 from __future__ import annotations
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 
@@ -57,6 +58,74 @@ from services.retrieval.auth import authenticate_query
 from shared.db import with_tenant
 
 router = APIRouter()
+
+
+async def upsert_class(
+    conn: asyncpg.Connection,
+    *,
+    customer_id: str,
+    class_id: str,
+    payload: BugClass,
+) -> int:
+    """Run kg_check + existence-check + upsert for one class. Return the
+    HTTP status code (201 on insert, 200 on update).
+
+    Extracted so both ``PUT /classes/{class_id}`` and the apply-template
+    handler in ``templates.py`` share one implementation. The caller is
+    responsible for opening the transaction (``with_tenant``) and
+    holding the per-tenant advisory lock (``tenant_xact_lock``) — the
+    helper assumes both are already in place. Path-id / payload-id
+    consistency is also the caller's job; this helper does not check it
+    because the apply handler doesn't have a "path id" distinct from the
+    template's frontmatter id.
+
+    Raises:
+        HTTPException(422): kg_check fails; detail is the KgCheckError msg.
+    """
+    # Universe = every existing class_id for this tenant, plus the path id
+    # of the class being upserted. Including the path id lets a brand-new
+    # class self-reference (e.g. as a regression marker) without hitting
+    # kg_check on the very first write.
+    universe_rows = await conn.fetch(
+        "SELECT class_id FROM kg_classes WHERE customer_id = $1",
+        customer_id,
+    )
+    universe: set[str] = {r["class_id"] for r in universe_rows} | {class_id}
+
+    try:
+        check_class(payload, universe=universe)
+    except KgCheckError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    existing = await conn.fetchrow(
+        """
+        SELECT 1
+          FROM kg_classes
+         WHERE customer_id = $1
+           AND class_id    = $2
+        """,
+        customer_id,
+        class_id,
+    )
+    status_code = 200 if existing is not None else 201
+
+    await conn.execute(
+        """
+        INSERT INTO kg_classes (customer_id, class_id, frontmatter, body)
+        VALUES ($1, $2, $3::jsonb, $4)
+        ON CONFLICT (customer_id, class_id) DO UPDATE
+          SET frontmatter = EXCLUDED.frontmatter,
+              body        = EXCLUDED.body,
+              -- DEFAULT NOW() only fires on INSERT; the conflict
+              -- branch must bump updated_at explicitly.
+              updated_at  = NOW()
+        """,
+        customer_id,
+        class_id,
+        payload.frontmatter.model_dump_json(),
+        payload.body,
+    )
+    return status_code
 
 
 @router.put("/classes/{class_id}")
@@ -72,10 +141,7 @@ async def put_class(
 
         with_tenant(customer_id):           # opens tx + sets RLS GUC
             tenant_xact_lock(customer_id):  # serialize writes per tenant
-                load class universe         # for kg_check
-                check_class(payload, ...)   # 422 on broken refs
-                check existence             # determines 200 vs 201
-                upsert                      # UPDATE bumps updated_at
+                upsert_class(...)           # kg_check + existence + upsert
     """
     # Cheap pre-check: bail before touching the DB if the path and payload
     # disagree. No point taking a tenant-wide lock for a malformed request.
@@ -91,48 +157,11 @@ async def put_class(
         with_tenant(customer_id) as conn,
         tenant_xact_lock(conn, customer_id=customer_id),
     ):
-        # Universe = every existing class_id for this tenant, plus the
-        # path id of the class being upserted. Including the path id
-        # lets a brand-new class self-reference (e.g. as a regression
-        # marker) without hitting kg_check on the very first write.
-        universe_rows = await conn.fetch(
-            "SELECT class_id FROM kg_classes WHERE customer_id = $1",
-            customer_id,
-        )
-        universe: set[str] = {r["class_id"] for r in universe_rows} | {class_id}
-
-        try:
-            check_class(payload, universe=universe)
-        except KgCheckError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-        existing = await conn.fetchrow(
-            """
-            SELECT 1
-              FROM kg_classes
-             WHERE customer_id = $1
-               AND class_id    = $2
-            """,
-            customer_id,
-            class_id,
-        )
-        status_code = 200 if existing is not None else 201
-
-        await conn.execute(
-            """
-            INSERT INTO kg_classes (customer_id, class_id, frontmatter, body)
-            VALUES ($1, $2, $3::jsonb, $4)
-            ON CONFLICT (customer_id, class_id) DO UPDATE
-              SET frontmatter = EXCLUDED.frontmatter,
-                  body        = EXCLUDED.body,
-                  -- DEFAULT NOW() only fires on INSERT; the conflict
-                  -- branch must bump updated_at explicitly.
-                  updated_at  = NOW()
-            """,
-            customer_id,
-            class_id,
-            payload.frontmatter.model_dump_json(),
-            payload.body,
+        status_code = await upsert_class(
+            conn,
+            customer_id=customer_id,
+            class_id=class_id,
+            payload=payload,
         )
 
     return JSONResponse(content={"status": "ok"}, status_code=status_code)

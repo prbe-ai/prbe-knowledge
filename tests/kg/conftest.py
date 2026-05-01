@@ -140,17 +140,23 @@ def _patch_settings(monkeypatch, settings: Settings) -> None:
 
 @pytest.fixture
 def kg_app() -> FastAPI:
-    """Tiny FastAPI app with the KG read + write routers mounted at /kg.
+    """Tiny FastAPI app with all KG routers mounted at /kg.
 
     Built per-test so the test-suite never carries app state between cases.
-    No lifespan: the live_db fixture handles pool init/close.
+    No lifespan: the live_db fixture handles pool init/close. Mounts the
+    read + write + templates + candidates routers so the API contract is
+    exercised end-to-end through one ASGI app.
     """
+    from services.kg.api.candidates import router as candidates_router
     from services.kg.api.read import router as read_router
+    from services.kg.api.templates import router as templates_router
     from services.kg.api.write import router as write_router
 
     app = FastAPI()
     app.include_router(read_router, prefix="/kg")
     app.include_router(write_router, prefix="/kg")
+    app.include_router(templates_router, prefix="/kg")
+    app.include_router(candidates_router, prefix="/kg")
     return app
 
 
