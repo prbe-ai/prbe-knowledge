@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "tls-cert-expiring",
+    "type": "bug-class",
+    "description": "A TLS certificate has fewer than 14 days remaining before expiry",
+    "signature": {
+      "must_match": ["cert_days_remaining < 14"],
+      "embedding_seed": "tls certificate expiring renewal acme letsencrypt"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "cert-details", "tool": "cert_inspect", "params": {"depth": "leaf-and-chain"}},
+      {"priority": 1, "name": "renewal-job-log", "tool": "log_search", "params": {"query_hint": "cert-manager OR acme", "window": "7d"}},
+      {"priority": 2, "name": "issuer-status", "tool": "provider_status_page", "params": {"provider_hint": "acme"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nA monitoring check has flagged a certificate with under two weeks of validity. Causes typically split between auto-renewal failing silently, manual certs that no one owns, and a DNS-01 challenge breaking after a domain change.\n\n## Playbook\n1. Run cert-details on the affected hostname to capture issuer, SANs, and exact expiry.\n2. Tail renewal-job-log to see whether the most recent renewal attempt failed and why.\n3. Confirm issuer-status is green before retrying renewal.\n"
+}

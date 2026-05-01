@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "rate-limit-tripped",
+    "type": "bug-class",
+    "description": "Caller is being throttled by an upstream rate limit (HTTP 429)",
+    "signature": {
+      "must_match": ["status_code == 429"],
+      "embedding_seed": "rate limit 429 throttle quota exceeded too many requests"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["upstream-5xx-spike"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "request-rate-by-key", "tool": "grafana_query", "params": {"window": "1h", "panel_hint": "requests_per_api_key"}},
+      {"priority": 1, "name": "upstream-quota", "tool": "file_read", "params": {"path_hint": "config/quotas"}},
+      {"priority": 2, "name": "recent-deploys-svc", "tool": "github_diff", "params": {"window": "24h"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nThe upstream is returning 429 because we exceeded our per-key, per-IP, or global quota. Common triggers: a new feature shipped that loops without backoff, a retry storm after an unrelated outage, or a quota tier change at the provider.\n\n## Playbook\n1. Check request-rate-by-key to see if a single caller dominates.\n2. Compare against upstream-quota for the configured budget.\n3. Read recent-deploys-svc for new code paths that increased call volume.\n"
+}

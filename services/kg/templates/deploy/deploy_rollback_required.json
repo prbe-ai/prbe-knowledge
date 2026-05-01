@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "deploy-rollback-required",
+    "type": "bug-class",
+    "description": "A deploy has failed health checks and rollback is required to restore service",
+    "signature": {
+      "must_match": ["deploy_state == failed"],
+      "embedding_seed": "deploy failed rollback bad release health check"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["deploy-version-mismatch"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "failed-deploy-log", "tool": "log_search", "params": {"query_hint": "deploy", "window": "1h"}},
+      {"priority": 1, "name": "diff-since-last-good", "tool": "github_diff", "params": {"window": "24h"}},
+      {"priority": 2, "name": "tickets-similar-rollbacks", "tool": "linear_search", "params": {"label": "rollback", "limit": 5}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nThe deploy pipeline reports a failed state — health checks did not pass, smoke tests broke, or the canary regressed.\n\n## Playbook\n1. Read failed-deploy-log to confirm the failure mode (boot crash vs. health check vs. canary regression).\n2. Pull diff-since-last-good to identify the smallest change set that could be reverted.\n3. Search tickets-similar-rollbacks for prior incidents with the same surface.\n\n## Common confusion\nThis is *not* [[deploy-version-mismatch]]: that fires when two services have drifted apart in compatible-version-land, not when a fresh deploy itself fails.\n"
+}

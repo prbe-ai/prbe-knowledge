@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "metrics-stopped-flowing",
+    "type": "bug-class",
+    "description": "A metric or whole metric pipeline has stopped reporting for longer than the alert window",
+    "signature": {
+      "must_match": ["metric_gap_s > 300"],
+      "embedding_seed": "metrics stopped flowing scraping gap absent timeseries"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "scrape-target-status", "tool": "metric_query", "params": {"window": "1h", "metric_hint": "up"}},
+      {"priority": 1, "name": "agent-pod-events", "tool": "k8s_events", "params": {"namespace_hint": "monitoring", "window": "1h"}},
+      {"priority": 2, "name": "recent-deploys-svc", "tool": "github_diff", "params": {"window": "24h"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nA metric the team relies on has been absent for more than 5 minutes. Causes split between the producer (label changed, scrape endpoint moved, exporter crashed) and the collector (agent down, pipeline backed up).\n\n## Playbook\n1. Read scrape-target-status to see whether the producer is reachable.\n2. Pull agent-pod-events for monitoring-namespace failures.\n3. Inspect recent-deploys-svc for label or path renames that broke the scrape.\n"
+}

@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "logs-volume-spike",
+    "type": "bug-class",
+    "description": "Log volume from a service has spiked far above its rolling baseline",
+    "signature": {
+      "must_match": ["log_volume_zscore > 3"],
+      "embedding_seed": "logs volume spike noisy logger flood retention"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "top-log-templates", "tool": "log_search", "params": {"window": "1h", "group_by": "template"}},
+      {"priority": 1, "name": "log-volume-trend", "tool": "metric_query", "params": {"window": "24h", "metric_hint": "log_bytes_total"}},
+      {"priority": 2, "name": "recent-deploys-svc", "tool": "github_diff", "params": {"window": "24h"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nA service is logging at more than 3 standard deviations above its baseline. Risk: log-pipeline back-pressure, shortened retention for everyone, and ballooning bills.\n\n## Playbook\n1. Run top-log-templates to identify the culprit log line.\n2. Compare against log-volume-trend to confirm whether this is a one-off burst or sustained.\n3. Read recent-deploys-svc for a newly added DEBUG-in-production logger.\n"
+}
