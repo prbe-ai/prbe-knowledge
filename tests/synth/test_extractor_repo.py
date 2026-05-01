@@ -7,6 +7,8 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from scripts.synth.extractor.repo import RepoExtractor, RepoSignals
 
 
@@ -57,3 +59,18 @@ def test_latest_sha_matches_git(tmp_repo: Path) -> None:
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     assert signals.latest_sha == expected
+
+
+@pytest.mark.asyncio
+async def test_extract_skips_github_when_fetch_github_false(tmp_repo: Path) -> None:
+    extractor = RepoExtractor(github_client=None)
+    signals = await extractor.extract(
+        url=f"file://{tmp_repo}",
+        clone_path=tmp_repo,
+        since=datetime(2026, 1, 1, tzinfo=UTC),
+        fetch_github=False,
+    )
+    assert signals.issues is None
+    assert signals.prs is None
+    assert signals.contributors is None
+    assert signals.workflows is None

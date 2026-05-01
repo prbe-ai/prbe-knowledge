@@ -10,7 +10,7 @@ Pass a `GithubClient` to enable; pass `None` to skip.
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -110,17 +110,8 @@ class RepoExtractor:
         workflows = await self._gh.fetch_workflows(owner, repo)
 
         # Reconstruct with the GH fields filled in.
-        return RepoSignals(
-            url=local.url,
-            clone_path=local.clone_path,
-            default_branch=local.default_branch,
-            latest_sha=local.latest_sha,
-            description=local.description,
-            manifests=local.manifests,
-            readmes=local.readmes,
-            codeowners=local.codeowners,
-            commits=local.commits,
-            branches=local.branches,
+        return replace(
+            local,
             issues=tuple(issues),
             prs=tuple(prs),
             contributors=tuple(contributors),
@@ -139,19 +130,33 @@ def _collect_readmes(clone_path: Path) -> tuple[Readme, ...]:
         if candidate.is_file():
             found.append(Readme(path=candidate, content=candidate.read_text(errors="replace")))
             break
-    for child in clone_path.iterdir():
+    try:
+        children = list(clone_path.iterdir())
+    except OSError:
+        return tuple(found)
+    for child in children:
         if not child.is_dir() or child.name.startswith("."):
             continue
         for candidate in (child / "README.md", child / "README.rst"):
             if candidate.is_file():
-                found.append(Readme(path=candidate, content=candidate.read_text(errors="replace")))
+                try:
+                    content = candidate.read_text(errors="replace")
+                except OSError:
+                    break
+                found.append(Readme(path=candidate, content=content))
                 break
     return tuple(found)
 
 
 def _top_level_description(manifests: list[Manifest], clone_path: Path) -> str | None:
-    """Pick the description from a top-level manifest, if any."""
+    """Pick description from a manifest at the repo root (relative-parts == 1)."""
     for m in manifests:
-        if m.description and len(m.path.relative_to(clone_path).parts) <= 1:  # repo root manifest
+        if not m.description:
+            continue
+        try:
+            rel = m.path.relative_to(clone_path)
+        except ValueError:
+            continue
+        if len(rel.parts) <= 1:
             return m.description
     return None
