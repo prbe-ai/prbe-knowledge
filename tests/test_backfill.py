@@ -143,9 +143,20 @@ async def test_slack_backfill_paginates_channels_and_history() -> None:
     )
 
     events = [e async for e in slack.backfill("cust", token)]
-    assert len(events) == 4  # 2 channels, 2 messages each
-    assert {e.raw_payload["event"]["channel"] for e in events} == {"C1", "C2"}
+    # Round-robin yields message events plus a synthetic _checkpoint event at
+    # end of each round (cursor lives on the checkpoint, not on every message,
+    # to avoid blowing up the R2 envelope size).
+    msg_events = [e for e in events if not e.raw_payload.get("_checkpoint")]
+    cp_events = [e for e in events if e.raw_payload.get("_checkpoint")]
+    assert len(msg_events) == 4  # 2 channels, 2 messages each
+    assert len(cp_events) == 1  # both channels exhaust in one round
+    assert {e.raw_payload["event"]["channel"] for e in msg_events} == {"C1", "C2"}
     assert calls == ["history:C1", "history:C2"]
+    # Checkpoint event MUST carry the full cursor so the runner can persist it.
+    import json as _json
+
+    final_state = _json.loads(cp_events[0].raw_payload["_cursor"])
+    assert final_state == {"active": {}, "done": ["C1", "C2"]}
 
 
 @pytest.mark.asyncio
@@ -228,7 +239,8 @@ async def test_slack_backfill_auto_joins_public_channels_when_scope_present() ->
     events = [e async for e in slack.backfill("cust", token)]
     assert joined == ["C2"], "should join only the non-member channel"
     assert list_calls[0] == "public_channel", "auto-join must list public channels first"
-    assert len(events) == 2  # 2 channels, 1 message each
+    msg_events = [e for e in events if not e.raw_payload.get("_checkpoint")]
+    assert len(msg_events) == 2  # 2 channels, 1 message each
 
 
 @pytest.mark.asyncio
@@ -284,6 +296,532 @@ async def test_slack_backfill_skips_auto_join_without_scope() -> None:
 
     [e async for e in slack.backfill("cust", token)]
     assert join_calls == [], "conversations.join must not be called without scope"
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_round_robin_interleaves_pages() -> None:
+    """Round-robin: page1(A), page1(B), checkpoint, page2(A), page2(B), checkpoint.
+
+    Critical property — the entire UX win of the rewrite. Sequential would yield
+    all of A's pages before any of B's; round-robin must interleave so the user
+    sees recent messages from every channel within ~1 round.
+    """
+    history_calls: list[tuple[str, str | None]] = []
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [
+                    {"id": "C1", "is_member": True, "num_members": 10},
+                    {"id": "C2", "is_member": True, "num_members": 10},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def history(req):
+        channel = req.url.params["channel"]
+        page_cursor = req.url.params.get("cursor")
+        history_calls.append((channel, page_cursor))
+        # Each channel has 2 pages. First call (no cursor) returns page 1
+        # with next_cursor="p2". Second call (cursor=p2) returns page 2 with
+        # no next_cursor (end).
+        if page_cursor == "p2":
+            base = 1713620000 if channel == "C1" else 1713620100
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "messages": [
+                        {"type": "message", "channel": channel, "ts": f"{base}.0", "text": "old", "user": "U1"},
+                    ],
+                    "response_metadata": {"next_cursor": ""},
+                },
+            )
+        # Page 1 — newest messages, more pages available.
+        base = 1713628800 if channel == "C1" else 1713628900
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [
+                    {"type": "message", "channel": channel, "ts": f"{base}.0", "text": "new", "user": "U1"},
+                ],
+                "response_metadata": {"next_cursor": "p2"},
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    events = [e async for e in slack.backfill("cust", token)]
+
+    # Round 1: C1 page1, C2 page1, checkpoint.
+    # Round 2: C1 page2, C2 page2, checkpoint.
+    assert history_calls == [
+        ("C1", None),
+        ("C2", None),
+        ("C1", "p2"),
+        ("C2", "p2"),
+    ], "must interleave channels within rounds, not exhaust each channel sequentially"
+
+    # Yield order: msg(C1.new), msg(C2.new), checkpoint, msg(C1.old), msg(C2.old), checkpoint.
+    msg_channels = [
+        e.raw_payload["event"]["channel"]
+        for e in events
+        if not e.raw_payload.get("_checkpoint")
+    ]
+    assert msg_channels == ["C1", "C2", "C1", "C2"], (
+        "messages must yield in interleaved order: page1(A), page1(B), page2(A), page2(B)"
+    )
+    cp_count = sum(1 for e in events if e.raw_payload.get("_checkpoint"))
+    assert cp_count == 2, "one checkpoint per round"
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_ranks_channels_by_num_members_desc() -> None:
+    """Hot channels page first within a round so #engineering's recent messages
+    land before 499 dead channels' first-page fetches."""
+    call_order: list[str] = []
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [
+                    {"id": "C_small", "is_member": True, "num_members": 3},
+                    {"id": "C_huge", "is_member": True, "num_members": 200},
+                    {"id": "C_med", "is_member": True, "num_members": 50},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def history(req):
+        ch = req.url.params["channel"]
+        call_order.append(ch)
+        return httpx.Response(
+            200,
+            json={"ok": True, "messages": [], "response_metadata": {"next_cursor": ""}},
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    [e async for e in slack.backfill("cust", token)]
+    assert call_order == ["C_huge", "C_med", "C_small"], (
+        "ranking must be num_members desc — hot channels first per round"
+    )
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_resumes_from_new_shape_cursor() -> None:
+    """Resume must respect each channel's per-page cursor and skip done channels."""
+    history_calls: list[tuple[str, str | None]] = []
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [
+                    {"id": "C1", "is_member": True, "num_members": 10},
+                    {"id": "C2", "is_member": True, "num_members": 5},
+                    {"id": "C3", "is_member": True, "num_members": 1},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def history(req):
+        ch = req.url.params["channel"]
+        page_cursor = req.url.params.get("cursor")
+        history_calls.append((ch, page_cursor))
+        return httpx.Response(
+            200,
+            json={"ok": True, "messages": [], "response_metadata": {"next_cursor": ""}},
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    # C1 mid-flight at page "p7", C2 fresh, C3 already done.
+    resume_cursor = (
+        '{"active": {"C1": "p7", "C2": null}, "done": ["C3"]}'
+    )
+    [e async for e in slack.backfill("cust", token, cursor=resume_cursor)]
+
+    # C1 must resume at p7, C2 must start fresh, C3 must NOT be re-fetched.
+    assert ("C1", "p7") in history_calls
+    assert ("C2", None) in history_calls
+    assert all(ch != "C3" for ch, _ in history_calls), "done channels must not be re-walked"
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_one_channel_500s_others_continue() -> None:
+    """Sticky-broken channel must be dropped to `done`; other channels keep walking."""
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [
+                    {"id": "C_ok", "is_member": True, "num_members": 5},
+                    {"id": "C_bad", "is_member": True, "num_members": 5},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def history(req):
+        ch = req.url.params["channel"]
+        if ch == "C_bad":
+            return httpx.Response(500, json={"error": "internal_error"})
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [
+                    {"type": "message", "channel": ch, "ts": "1713628800.0", "text": "hi", "user": "U1"},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    events = [e async for e in slack.backfill("cust", token)]
+    msg_events = [e for e in events if not e.raw_payload.get("_checkpoint")]
+    cp_events = [e for e in events if e.raw_payload.get("_checkpoint")]
+    assert {e.raw_payload["event"]["channel"] for e in msg_events} == {"C_ok"}, (
+        "good channel must still drain when sibling channel returns 500"
+    )
+
+    import json as _json
+
+    final_state = _json.loads(cp_events[-1].raw_payload["_cursor"])
+    assert "C_bad" in final_state["done"], "bad channel must land in done"
+    assert final_state["active"] == {}
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_drops_channel_on_ok_false() -> None:
+    """ok=false (e.g. channel_not_found from a since-archived channel) must
+    move the channel to `done` so the loop doesn't spin re-fetching it."""
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [
+                    {"id": "C_gone", "is_member": True, "num_members": 5},
+                    {"id": "C_ok", "is_member": True, "num_members": 5},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def history(req):
+        ch = req.url.params["channel"]
+        if ch == "C_gone":
+            return httpx.Response(200, json={"ok": False, "error": "channel_not_found"})
+        return httpx.Response(
+            200,
+            json={"ok": True, "messages": [], "response_metadata": {"next_cursor": ""}},
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    events = [e async for e in slack.backfill("cust", token)]
+    cp_events = [e for e in events if e.raw_payload.get("_checkpoint")]
+
+    import json as _json
+
+    final_state = _json.loads(cp_events[-1].raw_payload["_cursor"])
+    assert "C_gone" in final_state["done"]
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_429_pauses_and_breaks_round(monkeypatch) -> None:
+    """429 must trigger a sleep for retry-after seconds AND break the round
+    so we don't immediately fire another channel under the same penalty.
+
+    Sleep happens OUTSIDE the rate limiter (subagent finding #7) — the cap is
+    workspace-global, so backing off only one channel would hit 429 again."""
+    sleeps: list[int] = []
+    history_calls: list[str] = []
+
+    async def fake_sleep(s):
+        sleeps.append(int(s))
+
+    monkeypatch.setattr("asyncio.sleep", fake_sleep)
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [
+                    {"id": "C1", "is_member": True, "num_members": 10},
+                    {"id": "C2", "is_member": True, "num_members": 5},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    call_count = {"n": 0}
+
+    def history(req):
+        ch = req.url.params["channel"]
+        history_calls.append(ch)
+        call_count["n"] += 1
+        # First call (C1) returns 429 with Retry-After: 30. Second call onward
+        # (post-pause) returns 200 with one message and end-of-history.
+        if call_count["n"] == 1:
+            return httpx.Response(429, headers={"retry-after": "30"}, json={"error": "rate_limited"})
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [
+                    {"type": "message", "channel": ch, "ts": "1713628800.0", "text": "hi", "user": "U1"},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    [e async for e in slack.backfill("cust", token)]
+
+    # Slept exactly once for retry-after=30.
+    assert 30 in sleeps, f"expected 30s retry-after sleep, got {sleeps}"
+    # The 429 broke the round (didn't continue to C2 immediately under penalty).
+    # First two calls: C1 (429), then loop restarts -> C1 succeeds, then C2 succeeds.
+    assert history_calls[0] == "C1"
+    assert history_calls[1] == "C1", (
+        "round must break on 429 so next call retries the same channel after pause, "
+        "not fire C2 under the same global penalty"
+    )
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_skips_non_message_types() -> None:
+    """Channel-join, channel-name, and other non-message subtypes are noise
+    we don't want chunked into the graph."""
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [{"id": "C1", "is_member": True, "num_members": 5}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def history(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [
+                    {"type": "channel_join", "ts": "1713628800.0", "user": "U1"},
+                    {"type": "message", "channel": "C1", "ts": "1713628801.0", "text": "real msg", "user": "U1"},
+                    # Bot blocks-only message: type=message but no text and no files. Drop.
+                    {"type": "message", "channel": "C1", "ts": "1713628802.0", "bot_id": "B1"},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    events = [e async for e in slack.backfill("cust", token)]
+    msg_events = [e for e in events if not e.raw_payload.get("_checkpoint")]
+    assert len(msg_events) == 1, "only the type=message with text should yield"
+    assert msg_events[0].raw_payload["event"]["text"] == "real msg"
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_message_events_omit_cursor_field() -> None:
+    """Cursor bloat fix: real message events must NOT carry `_cursor` in their
+    raw_payload. Cursor only lives on the synthetic `_checkpoint` event yielded
+    at end of each round. With N active channels the cursor can be ~50 bytes
+    per channel; copying it onto every yielded message blows up R2 envelopes."""
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [{"id": "C1", "is_member": True, "num_members": 5}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def history(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [
+                    {"type": "message", "channel": "C1", "ts": "1713628800.0", "text": "a", "user": "U1"},
+                    {"type": "message", "channel": "C1", "ts": "1713628801.0", "text": "b", "user": "U1"},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    events = [e async for e in slack.backfill("cust", token)]
+    msg_events = [e for e in events if not e.raw_payload.get("_checkpoint")]
+    cp_events = [e for e in events if e.raw_payload.get("_checkpoint")]
+
+    for e in msg_events:
+        assert "_cursor" not in e.raw_payload, (
+            "message events must not carry _cursor — bloat fix"
+        )
+    assert all("_cursor" in e.raw_payload for e in cp_events)
 
 
 # -------------------------------- linear ------------------------------------

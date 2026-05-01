@@ -22,6 +22,8 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
+from aiolimiter import AsyncLimiter
+
 from services.ingestion.chunker import count_tokens
 from services.ingestion.handlers.base import Connector
 from services.ingestion.handlers.registry import register_connector
@@ -57,6 +59,28 @@ log = get_logger(__name__)
 _SLACK_API = "https://slack.com/api"
 _SIGNING_VERSION = "v0"
 _REQUEST_TS_SLACK_MAX_AGE_SEC = 5 * 60  # Slack recommends rejecting older signed requests
+
+# Slack capped conversations.history at ~1 req/sec per app per workspace in the
+# May 2025 platform tier change (the older "tier 3 ~20/min" docs are stale).
+# 1.1s leaves a 10% safety margin so we don't tip into 429s.
+#
+# Per-loop registry: aiolimiter caches the running loop on first use and warns
+# "undefined behaviour" if reused across loops. Production has one loop per
+# worker process, but pytest spins one loop per test and asyncio.run scripts
+# may too. Keying on the loop id keeps each loop's limiter isolated without
+# making callers thread the loop through.
+_HISTORY_LIMITERS: dict[int, AsyncLimiter] = {}
+
+
+def _get_history_limiter() -> AsyncLimiter:
+    import asyncio as _asyncio
+
+    loop = _asyncio.get_running_loop()
+    limiter = _HISTORY_LIMITERS.get(id(loop))
+    if limiter is None:
+        limiter = AsyncLimiter(1, 1.1)
+        _HISTORY_LIMITERS[id(loop)] = limiter
+    return limiter
 
 
 @register_connector(SourceSystem.SLACK)
@@ -529,17 +553,32 @@ class SlackConnector(Connector):
         token: IntegrationToken,
         cursor: str | None = None,
     ):
-        """Historical Slack backfill — paginated channel + message walk.
+        """Historical Slack backfill - round-robin walk across channels.
 
-        Resumable via the `cursor` arg: an opaque JSON blob encoding which
-        channel we're in and where in that channel's history we stopped.
-        Yields synthetic WebhookEvents shaped exactly like live `message`
-        events so the normalizer has one code path.
+        Each round fetches ONE page from each non-exhausted channel before
+        starting the next round. Because conversations.history returns messages
+        newest-first per page, after one round the user has the most recent
+        ~200 messages of every channel ingested - the "newest-first across the
+        workspace" UX win comes from the API contract, no separate phase needed.
 
-        Rate limits: Slack tier 3 (~20 req/min on conversations.history).
-        We rely on httpx + source-returned Retry-After on 429 to back off;
-        Slack's docs promise graceful degradation, not throttling kills.
+        Rate limit: Slack capped conversations.history at ~1 req/sec per app
+        per workspace (May 2025). Bottleneck is global, so a single shared
+        token bucket (`_HISTORY_LIMITER`) is correct - parallel walkers would
+        give zero throughput, only redistribute which channel gets the next
+        page.
+
+        Resumable: the cursor JSON encodes `{active: {ch_id: page_cursor}, done}`.
+        `_decode_slack_cursor` migrates pre-rewrite cursors transparently so
+        in-flight backfills survive deploy.
+
+        Cursor in the event stream: real message events DO NOT carry `_cursor`
+        (with N active channels the cursor can be ~50 bytes per channel; making
+        every yielded event copy that to R2 is pure waste). End-of-round
+        synthetic `_checkpoint` events carry the full cursor. Worst-case loss
+        on crash = 1 round of progress; ON CONFLICT in ingestion_queue dedups
+        on resume.
         """
+        import asyncio as _asyncio
         import json as _json
 
         import httpx
@@ -548,95 +587,141 @@ class SlackConnector(Connector):
 
         state = _decode_slack_cursor(cursor)
 
-        # 1. On first run, auto-join every public channel so both backfill and
-        # live webhooks see them. No-op if the token lacks channels:join scope.
-        # Private channels still require a manual `/invite @bot`.
+        # On first run, auto-join every public channel so both backfill and
+        # live webhooks see them. No-op without `channels:join` scope. Private
+        # channels still need a manual `/invite @bot`.
         if cursor is None:
             await _join_all_public_channels(self.http, token, customer_id)
 
-        # 2. Enumerate channels once if we don't have them yet.
-        if not state["channels_remaining"] and state["current_channel"] is None:
-            state["channels_remaining"] = await _list_channels(self.http, token.access_token)
+        # Always enumerate channels - even on resume - so the round-robin
+        # ranking has fresh num_members for every active channel. On a fresh
+        # start, also seed `state.active`. This costs one paginated
+        # conversations.list call per worker restart (~10-30s under the rate
+        # cap on a 1000-channel workspace). Worth it for stable ranking.
+        listed = await _list_channels(self.http, token.access_token)
+        members_map: dict[str, int] = {ch_id: n for ch_id, n in listed}
+        if cursor is None:
+            state = {
+                "active": {ch_id: None for ch_id, _ in listed},
+                "done": [],
+            }
 
         team_id = await _auth_team_id(self.http, token.access_token) or "UNKNOWN"
 
-        while state["current_channel"] or state["channels_remaining"]:
-            if state["current_channel"] is None:
-                state["current_channel"] = state["channels_remaining"].pop(0)
-                state["history_cursor"] = None
+        while state["active"]:
+            # Sort once per round: hottest channels page first within the round
+            # so #engineering's recent messages land before 499 dead channels'.
+            # Members map is computed once per backfill() invocation so the
+            # ordering is stable across rounds (channels with no entry default
+            # to 0 -> sort last; covers channels deleted/archived since the
+            # cursor was written).
+            ranked = sorted(
+                state["active"].keys(),
+                key=lambda ch: members_map.get(ch, 0),
+                reverse=True,
+            )
 
-            channel = state["current_channel"]
+            for ch_id in ranked:
+                page_cursor = state["active"].get(ch_id)
+                params: dict[str, Any] = {"channel": ch_id, "limit": 200}
+                if page_cursor:
+                    params["cursor"] = page_cursor
 
-            try:
-                params = {"channel": channel, "limit": 200}
-                if state["history_cursor"]:
-                    params["cursor"] = state["history_cursor"]
-                resp = await self.http.get(
-                    f"{_SLACK_API}/conversations.history",
-                    params=params,
-                    headers={"Authorization": f"Bearer {token.access_token}"},
-                )
-            except httpx.HTTPError as exc:
-                log.warning("slack.backfill_http_error", channel=channel, error=str(exc))
-                # Move on to next channel rather than stalling the whole backfill.
-                state["current_channel"] = None
-                state["history_cursor"] = None
-                continue
-
-            if resp.status_code == 429:
-                # Respect Retry-After (seconds). httpx won't sleep for us here.
-                import asyncio as _asyncio
-
-                retry_after = int(resp.headers.get("retry-after", "5"))
-                await _asyncio.sleep(retry_after)
-                continue
-
-            if resp.status_code != 200:
-                state["current_channel"] = None
-                state["history_cursor"] = None
-                continue
-
-            body = resp.json()
-            if not body.get("ok"):
-                state["current_channel"] = None
-                state["history_cursor"] = None
-                continue
-
-            for msg in body.get("messages", []):
-                if msg.get("type") != "message":
+                try:
+                    async with _get_history_limiter():
+                        resp = await self.http.get(
+                            f"{_SLACK_API}/conversations.history",
+                            params=params,
+                            headers={"Authorization": f"Bearer {token.access_token}"},
+                        )
+                except httpx.HTTPError as exc:
+                    log.warning(
+                        "slack.backfill_http_error", channel=ch_id, error=str(exc)
+                    )
+                    state["done"].append(ch_id)
+                    state["active"].pop(ch_id, None)
                     continue
-                # Skip messages without text (ephemeral, bot blocks-only).
-                if not msg.get("text") and not msg.get("files"):
+
+                if resp.status_code == 429:
+                    # Workspace-global cap: pause OUTSIDE the limiter so other
+                    # call sites also wait, then break the round so we don't
+                    # immediately re-fire on the next channel under penalty.
+                    retry_after = int(resp.headers.get("retry-after", "5"))
+                    log.info(
+                        "slack.backfill_429_pause",
+                        retry_after_s=retry_after,
+                        channel=ch_id,
+                    )
+                    await _asyncio.sleep(retry_after)
+                    break
+
+                if resp.status_code != 200:
+                    state["done"].append(ch_id)
+                    state["active"].pop(ch_id, None)
                     continue
-                payload = {
-                    "team_id": team_id,
-                    "type": "event_callback",
-                    "event": {
-                        **msg,
-                        "type": "message",
-                        "channel": channel,
-                    },
-                    # Runner reads this to persist the cursor:
+
+                body = resp.json()
+                if not body.get("ok"):
+                    log.info(
+                        "slack.backfill_channel_dropped",
+                        channel=ch_id,
+                        error=body.get("error"),
+                    )
+                    state["done"].append(ch_id)
+                    state["active"].pop(ch_id, None)
+                    continue
+
+                for msg in body.get("messages", []):
+                    if msg.get("type") != "message":
+                        continue
+                    if not msg.get("text") and not msg.get("files"):
+                        continue
+                    payload = {
+                        "team_id": team_id,
+                        "type": "event_callback",
+                        "event": {
+                            **msg,
+                            "type": "message",
+                            "channel": ch_id,
+                        },
+                        # No `_cursor` here on purpose - see the cursor-bloat
+                        # comment in the docstring. The runner advances cursor
+                        # via the `_checkpoint` event yielded at end of round.
+                    }
+                    ts = msg.get("ts", "")
+                    yield WebhookEvent(
+                        customer_id=customer_id,
+                        source_system=SourceSystem.SLACK,
+                        source_event_id=f"{ch_id}:{ts}",
+                        received_at=_ts_to_datetime(ts) if ts else datetime.now(UTC),
+                        payload_s3_key="",
+                        raw_payload=payload,
+                        headers={},
+                    )
+
+                next_cursor = (body.get("response_metadata") or {}).get("next_cursor")
+                if next_cursor:
+                    state["active"][ch_id] = next_cursor
+                else:
+                    state["done"].append(ch_id)
+                    state["active"].pop(ch_id, None)
+
+            # End of round - emit a synthetic checkpoint so the runner persists
+            # the cursor without us having to copy it onto every message event.
+            # The runner's `_checkpoint` branch (backfill_runner.py:114) skips
+            # the queue insert and just calls `_update_progress`.
+            yield WebhookEvent(
+                customer_id=customer_id,
+                source_system=SourceSystem.SLACK,
+                source_event_id=f"_checkpoint:{datetime.now(UTC).isoformat()}",
+                received_at=datetime.now(UTC),
+                payload_s3_key="",
+                raw_payload={
+                    "_checkpoint": True,
                     "_cursor": _json.dumps(state),
-                }
-                ts = msg.get("ts", "")
-                yield WebhookEvent(
-                    customer_id=customer_id,
-                    source_system=SourceSystem.SLACK,
-                    source_event_id=f"{channel}:{ts}",
-                    received_at=_ts_to_datetime(ts) if ts else datetime.now(UTC),
-                    payload_s3_key="",  # runner fills this in
-                    raw_payload=payload,
-                    headers={},
-                )
-
-            next_cursor = (body.get("response_metadata") or {}).get("next_cursor")
-            if next_cursor:
-                state["history_cursor"] = next_cursor
-            else:
-                # Channel exhausted — move on.
-                state["current_channel"] = None
-                state["history_cursor"] = None
+                },
+                headers={},
+            )
 
     # ------------------------------------------------------------------
 
@@ -734,9 +819,16 @@ async def _join_all_public_channels(
     )
 
 
-async def _list_channels(http, token: str) -> list[str]:
-    """Enumerate all channels the bot can see. Paginated."""
-    channels: list[str] = []
+async def _list_channels(http, token: str) -> list[tuple[str, int]]:
+    """Enumerate all channels the bot can see. Paginated.
+
+    Returns [(channel_id, num_members), ...]. num_members lets the round-robin
+    walker rank hot channels first so #engineering's recent messages don't sit
+    behind 499 dead channels' first-page fetches. num_members is in
+    conversations.list's default response shape per Slack docs (public AND
+    private channels). Channels missing the field default to 0 -> sort last.
+    """
+    channels: list[tuple[str, int]] = []
     cursor: str | None = None
     while True:
         params = {"types": "public_channel,private_channel", "limit": 1000}
@@ -754,7 +846,7 @@ async def _list_channels(http, token: str) -> list[str]:
             break
         for ch in body.get("channels", []):
             if ch.get("id") and ch.get("is_member", True):
-                channels.append(ch["id"])
+                channels.append((ch["id"], int(ch.get("num_members") or 0)))
         cursor = (body.get("response_metadata") or {}).get("next_cursor") or None
         if not cursor:
             break
@@ -774,16 +866,48 @@ async def _auth_team_id(http, token: str) -> str | None:
     return body.get("team_id")
 
 
-def _decode_slack_cursor(cursor: str | None) -> dict:
+def _decode_slack_cursor(cursor: str | None) -> dict[str, Any]:
+    """Decode the persisted backfill cursor into the round-robin state shape.
+
+    Shape: {"active": {channel_id: page_cursor_or_none, ...}, "done": [...]}.
+
+    Migrates the pre-rewrite shape transparently to keep in-flight backfills
+    moving on deploy without losing any channel: channels_remaining + the
+    current channel both fold into `active`, and current_channel's
+    history_cursor wins on collision so we never re-walk a channel from page 1.
+    """
     import json as _json
 
+    empty: dict[str, Any] = {"active": {}, "done": []}
     if not cursor:
-        return {"channels_remaining": [], "current_channel": None, "history_cursor": None}
+        return empty
     try:
-        return _json.loads(cursor)
+        data = _json.loads(cursor)
     except _json.JSONDecodeError:
-        # Corrupt cursor — start over.
-        return {"channels_remaining": [], "current_channel": None, "history_cursor": None}
+        return empty
+    if not isinstance(data, dict):
+        return empty
+
+    # New shape — passthrough with shallow copy + type coercion.
+    if isinstance(data.get("active"), dict):
+        return {
+            "active": dict(data["active"]),
+            "done": list(data.get("done", [])),
+        }
+
+    # Old shape — migrate. Order matters: seed channels_remaining first so the
+    # current_channel write below can overwrite a duplicate entry without
+    # losing its history_cursor.
+    if "channels_remaining" in data or "current_channel" in data:
+        active: dict[str, str | None] = {
+            ch: None for ch in (data.get("channels_remaining") or []) if ch
+        }
+        cur = data.get("current_channel")
+        if cur:
+            active[cur] = data.get("history_cursor")
+        return {"active": active, "done": []}
+
+    return empty
 
 
 
