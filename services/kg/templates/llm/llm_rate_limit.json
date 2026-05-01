@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "llm-rate-limit",
+    "type": "bug-class",
+    "description": "LLM provider is rate-limiting requests (HTTP 429 from the model API)",
+    "signature": {
+      "must_match": ["provider_status == 429"],
+      "embedding_seed": "llm provider rate limit 429 token quota model api"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "llm-call-volume", "tool": "metric_query", "params": {"window": "1h", "metric_hint": "llm_requests_total"}},
+      {"priority": 1, "name": "provider-status", "tool": "provider_status_page", "params": {"provider_hint": "llm"}},
+      {"priority": 2, "name": "recent-deploys-svc", "tool": "github_diff", "params": {"window": "24h"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nThe LLM provider is returning 429s. Causes: a feature shipped that loops over the model, an offline backfill running in foreground, or a tier change at the provider side.\n\n## Playbook\n1. Plot llm-call-volume by feature and route to find the dominant caller.\n2. Read provider-status for any in-flight provider incident affecting throughput.\n3. Check recent-deploys-svc for new code paths that increased token usage.\n"
+}

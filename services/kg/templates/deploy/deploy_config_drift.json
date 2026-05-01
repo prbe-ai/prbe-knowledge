@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "deploy-config-drift",
+    "type": "bug-class",
+    "description": "Runtime configuration has diverged from what is committed in the repo",
+    "signature": {
+      "must_match": ["config_diff_detected == true"],
+      "embedding_seed": "config drift runtime mismatch env vars stale"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["deploy-version-mismatch"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "live-config-snapshot", "tool": "file_read", "params": {"path_hint": "config/"}},
+      {"priority": 1, "name": "config-diff", "tool": "github_diff", "params": {"window": "7d", "path_hint": "config/"}},
+      {"priority": 2, "name": "secret-rotation-audit", "tool": "audit_log", "params": {"action": "secret_updated"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nThe live runtime config (env vars, feature flags, secrets) does not match the version in the repo. Common causes: a manual hotfix that bypassed CI, a stale environment that missed a deploy, or rotated secrets that diverged across regions.\n\n## Playbook\n1. Read live-config-snapshot to capture the current state.\n2. Compare against config-diff for what the repo expects.\n3. Cross-check secret-rotation-audit for any recent out-of-band changes.\n"
+}

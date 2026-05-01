@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "db-replica-lag",
+    "type": "bug-class",
+    "description": "Read replica is lagging primary by more than the operational threshold",
+    "signature": {
+      "must_match": ["replication_lag_s > 30"],
+      "embedding_seed": "replica lag streaming replication stale reads"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["db-connection-timeout"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "replica-lag-metric", "tool": "grafana_query", "params": {"window": "1h", "panel_hint": "pg_replication_lag_seconds"}},
+      {"priority": 1, "name": "primary-write-volume", "tool": "grafana_query", "params": {"window": "1h", "panel_hint": "pg_xact_commit"}},
+      {"priority": 2, "name": "recent-deploys-db", "tool": "github_diff", "params": {"window": "24h", "path_hint": "db/"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nReads against the replica return data older than the configured staleness budget. Common causes: a heavy write batch on the primary, a long-running query holding the replay slot, or a network bottleneck between primary and replica.\n\n## Playbook\n1. Check replica-lag-metric to see if the lag is climbing or steady.\n2. Cross-reference primary-write-volume to see whether the cause is upstream write pressure.\n3. Look at recent-deploys-db for any query or batch that could be flooding the WAL.\n\n## Common confusion\nThis is *not* [[db-connection-timeout]]: this fires on stale-but-successful reads, not on connection failures.\n"
+}

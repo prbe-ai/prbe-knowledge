@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "pod-oom-killed",
+    "type": "bug-class",
+    "description": "A container exited with reason OOMKilled — memory limit exceeded",
+    "signature": {
+      "must_match": ["exit_reason == OOMKilled"],
+      "embedding_seed": "pod oom killed memory limit exceeded container"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "pod-describe", "tool": "kube_describe", "params": {"resource_hint": "pod"}},
+      {"priority": 1, "name": "memory-trend", "tool": "grafana_query", "params": {"window": "6h", "panel_hint": "container_memory_working_set_bytes"}},
+      {"priority": 2, "name": "recent-deploys-svc", "tool": "github_diff", "params": {"window": "24h"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nThe Linux OOM killer terminated the container because RSS exceeded the configured memory limit. Common causes: a leak, a sudden batch with a larger working set, or a too-tight limit for the workload.\n\n## Playbook\n1. Run pod-describe to confirm OOMKilled and capture the limits.\n2. Plot memory-trend across recent restarts to see whether it is a leak (monotonic) or a spike (saw-tooth).\n3. Read recent-deploys-svc for changes that could have shifted the working set.\n"
+}

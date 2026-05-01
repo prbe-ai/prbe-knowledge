@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "embedding-model-mismatch",
+    "type": "bug-class",
+    "description": "Embedding stored with one model is being queried by another (dimension or distribution mismatch)",
+    "signature": {
+      "must_match": ["error_class == EmbeddingDimMismatch"],
+      "embedding_seed": "embedding dimension mismatch model version vector store"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "embedding-config", "tool": "file_read", "params": {"path_hint": "config/embeddings"}},
+      {"priority": 1, "name": "vector-index-meta", "tool": "db_query", "params": {"query_hint": "pgvector_index_columns"}},
+      {"priority": 2, "name": "recent-deploys-svc", "tool": "github_diff", "params": {"window": "30d", "path_hint": "embeddings"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nA query embedding has a different dimensionality (or a different model fingerprint) than the embeddings already stored in the index. Almost always caused by a model upgrade that wasn't followed by a backfill.\n\n## Playbook\n1. Read embedding-config to confirm the model name and dimension currently in use.\n2. Compare against vector-index-meta for what is actually persisted.\n3. Walk recent-deploys-svc to find when the model identifier changed.\n"
+}

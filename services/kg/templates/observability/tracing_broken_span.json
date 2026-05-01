@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "tracing-broken-span",
+    "type": "bug-class",
+    "description": "Distributed traces are arriving with orphan spans (parent_id missing in trace store)",
+    "signature": {
+      "must_match": ["span_orphan == true"],
+      "embedding_seed": "tracing broken span orphan parent context propagation"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "orphan-span-sample", "tool": "trace_query", "params": {"window": "1h", "filter_hint": "parent_missing"}},
+      {"priority": 1, "name": "instrumentation-config", "tool": "file_read", "params": {"path_hint": "config/otel"}},
+      {"priority": 2, "name": "recent-deploys-svc", "tool": "github_diff", "params": {"window": "24h"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nThe trace store is receiving spans whose parent_id does not resolve. Causes: a service in the middle isn't propagating headers, a sampler is dropping the parent, or context is lost at an async boundary.\n\n## Playbook\n1. Pull orphan-span-sample to identify which service emits the orphan.\n2. Read instrumentation-config to confirm propagation and sampler settings.\n3. Check recent-deploys-svc for changes to async/queue boundaries that could lose context.\n"
+}

@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "prompt-injection-detected",
+    "type": "bug-class",
+    "description": "Safety classifier flagged untrusted input as a prompt-injection attempt",
+    "signature": {
+      "must_match": ["safety_flag == prompt_injection"],
+      "embedding_seed": "prompt injection safety filter jailbreak untrusted input"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "flagged-payload", "tool": "log_search", "params": {"query_hint": "safety_flag", "window": "1h"}},
+      {"priority": 1, "name": "safety-policy-current", "tool": "file_read", "params": {"path_hint": "config/safety"}},
+      {"priority": 2, "name": "tickets-similar-injections", "tool": "linear_search", "params": {"label": "prompt-injection", "limit": 5}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nThe safety pipeline classified an inbound prompt as an injection attempt. The request was either rejected or routed through a quarantined model path.\n\n## Playbook\n1. Pull flagged-payload to capture the input the classifier rejected.\n2. Read safety-policy-current to confirm the classifier is on the correct version and threshold.\n3. Search tickets-similar-injections for the canonical response (block, sanitize, or escalate).\n"
+}
