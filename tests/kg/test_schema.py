@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 import pytest
+from pydantic import ValidationError
 
 from services.kg.schema import (
     BugClass,
@@ -46,17 +47,17 @@ def test_minimal_frontmatter_validates() -> None:
 
 
 def test_signature_rejects_empty_must_match_after_strip() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Signature(must_match=["   ", ""], embedding_seed="x" * 5)
 
 
 def test_signature_rejects_short_embedding_seed() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Signature(must_match=["status == 401"], embedding_seed="ab")
 
 
 def test_context_source_rejects_invalid_priority() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         ContextSource(priority=4, name="x", tool="y", params={})  # type: ignore[arg-type]
 
 
@@ -73,27 +74,27 @@ def test_id_slug_pattern_accepts_valid() -> None:
 
 
 def test_id_slug_rejects_uppercase() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _minimal_frontmatter(id="Auth-401")
 
 
 def test_id_slug_rejects_spaces() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _minimal_frontmatter(id="auth 401")
 
 
 def test_id_slug_rejects_starting_digit() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _minimal_frontmatter(id="401-auth")
 
 
 def test_id_slug_rejects_too_short() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         _minimal_frontmatter(id="ab")
 
 
 def test_extra_field_in_frontmatter_rejected() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         Frontmatter(
             id="auth-401",
             type="bug-class",

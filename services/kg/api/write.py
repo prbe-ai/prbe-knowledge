@@ -87,50 +87,52 @@ async def put_class(
             ),
         )
 
-    async with with_tenant(customer_id) as conn:
-        async with tenant_xact_lock(conn, customer_id=customer_id):
-            # Universe = every existing class_id for this tenant, plus the
-            # path id of the class being upserted. Including the path id
-            # lets a brand-new class self-reference (e.g. as a regression
-            # marker) without hitting kg_check on the very first write.
-            universe_rows = await conn.fetch(
-                "SELECT class_id FROM kg_classes WHERE customer_id = $1",
-                customer_id,
-            )
-            universe: set[str] = {r["class_id"] for r in universe_rows} | {class_id}
+    async with (
+        with_tenant(customer_id) as conn,
+        tenant_xact_lock(conn, customer_id=customer_id),
+    ):
+        # Universe = every existing class_id for this tenant, plus the
+        # path id of the class being upserted. Including the path id
+        # lets a brand-new class self-reference (e.g. as a regression
+        # marker) without hitting kg_check on the very first write.
+        universe_rows = await conn.fetch(
+            "SELECT class_id FROM kg_classes WHERE customer_id = $1",
+            customer_id,
+        )
+        universe: set[str] = {r["class_id"] for r in universe_rows} | {class_id}
 
-            try:
-                check_class(payload, universe=universe)
-            except KgCheckError as exc:
-                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            check_class(payload, universe=universe)
+        except KgCheckError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-            existing = await conn.fetchrow(
-                """
-                SELECT 1
-                  FROM kg_classes
-                 WHERE customer_id = $1
-                   AND class_id    = $2
-                """,
-                customer_id,
-                class_id,
-            )
-            status_code = 200 if existing is not None else 201
+        existing = await conn.fetchrow(
+            """
+            SELECT 1
+              FROM kg_classes
+             WHERE customer_id = $1
+               AND class_id    = $2
+            """,
+            customer_id,
+            class_id,
+        )
+        status_code = 200 if existing is not None else 201
 
-            await conn.execute(
-                """
-                INSERT INTO kg_classes (customer_id, class_id, frontmatter, body)
-                VALUES ($1, $2, $3::jsonb, $4)
-                ON CONFLICT (customer_id, class_id) DO UPDATE
-                  SET frontmatter = EXCLUDED.frontmatter,
-                      body        = EXCLUDED.body,
-                      -- DEFAULT NOW() only fires on INSERT; the conflict
-                      -- branch must bump updated_at explicitly.
-                      updated_at  = NOW()
-                """,
-                customer_id,
-                class_id,
-                payload.frontmatter.model_dump_json(),
-                payload.body,
-            )
+        await conn.execute(
+            """
+            INSERT INTO kg_classes (customer_id, class_id, frontmatter, body)
+            VALUES ($1, $2, $3::jsonb, $4)
+            ON CONFLICT (customer_id, class_id) DO UPDATE
+              SET frontmatter = EXCLUDED.frontmatter,
+                  body        = EXCLUDED.body,
+                  -- DEFAULT NOW() only fires on INSERT; the conflict
+                  -- branch must bump updated_at explicitly.
+                  updated_at  = NOW()
+            """,
+            customer_id,
+            class_id,
+            payload.frontmatter.model_dump_json(),
+            payload.body,
+        )
 
     return JSONResponse(content={"status": "ok"}, status_code=status_code)

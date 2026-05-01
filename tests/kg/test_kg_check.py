@@ -1,8 +1,7 @@
 import pytest
-from services.kg.schema import (
-    BugClass, Frontmatter, Signature, Related, Evidence
-)
-from services.kg.kg_check import check_class, KgCheckError
+
+from services.kg.kg_check import KgCheckError, check_class
+from services.kg.schema import BugClass, Evidence, Frontmatter, Related, Signature
 
 
 def _cls(class_id: str, related: Related, body: str = "") -> BugClass:
