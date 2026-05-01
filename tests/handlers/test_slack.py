@@ -654,6 +654,81 @@ async def test_cache_flushes_top_n_to_jsonb(_fake_metadata_store, fast_flush) ->
 
 
 @pytest.mark.asyncio
+async def test_flush_merges_with_persisted_so_workers_dont_clobber(_fake_metadata_store) -> None:
+    """Cross-worker safety: when worker A flushes after worker B already
+    persisted entries, A's flush must KEEP B's entries (cap willing) instead
+    of replacing the whole `user_names` blob.
+
+    Without merge, the 18-machine worker fleet would have whichever process
+    flushed last be the only contributor visible in JSONB; cold-starting
+    workers would lose all the others' discoveries.
+    """
+    # Worker B already wrote two users to JSONB.
+    _fake_metadata_store[("slack", "T1")] = {
+        "user_names": {
+            "U_B1": {"name": "B-only-1", "ts": "2026-04-30T01:00:00+00:00"},
+            "U_B2": {"name": "B-only-2", "ts": "2026-04-30T02:00:00+00:00"},
+        }
+    }
+
+    # Worker A has its own discoveries, including a more-recent ts for U_B1
+    # (proving the most-recent ts wins on conflict).
+    cache = _SlackUserCache("cust-1", "T1")
+    cache._entries["U_A1"] = {"name": "A-only", "ts": "2026-04-30T03:00:00+00:00"}
+    cache._entries["U_B1"] = {"name": "B-renamed-by-A", "ts": "2026-04-30T04:00:00+00:00"}
+    cache._dirty = True
+
+    await cache.flush_now()
+    persisted = _fake_metadata_store[("slack", "T1")]["user_names"]
+
+    # All three users present after the merge.
+    assert set(persisted.keys()) == {"U_A1", "U_B1", "U_B2"}
+    # B's untouched entry preserved.
+    assert persisted["U_B2"]["name"] == "B-only-2"
+    # Conflict resolved by latest ts.
+    assert persisted["U_B1"]["name"] == "B-renamed-by-A"
+    # A's new entry landed.
+    assert persisted["U_A1"]["name"] == "A-only"
+
+
+@pytest.mark.asyncio
+async def test_flush_merge_caps_at_max_persist_by_recency(_fake_metadata_store) -> None:
+    """When merged set exceeds MAX_PERSIST, oldest-ts entries get dropped —
+    no matter which worker contributed them. Recency, not source, decides."""
+    # JSONB already has MAX_PERSIST old entries (ts=2025-...).
+    _fake_metadata_store[("slack", "T1")] = {
+        "user_names": {
+            f"U_old{i}": {
+                "name": f"old-{i}",
+                "ts": f"2025-01-01T00:00:{i:02d}+00:00",
+            }
+            for i in range(_SlackUserCache.MAX_PERSIST)
+        }
+    }
+
+    # Local cache has 5 NEW entries with ts in 2026 (newer than all persisted).
+    cache = _SlackUserCache("cust-1", "T1")
+    for i in range(5):
+        cache._entries[f"U_new{i}"] = {
+            "name": f"new-{i}",
+            "ts": f"2026-05-01T00:00:{i:02d}+00:00",
+        }
+    cache._dirty = True
+
+    await cache.flush_now()
+    persisted = _fake_metadata_store[("slack", "T1")]["user_names"]
+
+    assert len(persisted) == _SlackUserCache.MAX_PERSIST
+    # All 5 new entries kept; 5 oldest from persisted (U_old0..U_old4) dropped.
+    for i in range(5):
+        assert f"U_new{i}" in persisted
+    assert "U_old0" not in persisted
+    assert f"U_old{_SlackUserCache.MAX_PERSIST - 1}" in persisted, (
+        "newest of the old entries should survive — recency is the cap criterion"
+    )
+
+
+@pytest.mark.asyncio
 async def test_cache_persists_only_top_max_persist(_fake_metadata_store) -> None:
     """When more than MAX_PERSIST entries are written, only the most-recent
     MAX_PERSIST land in JSONB. In-memory may hold up to MAX_IN_MEMORY."""

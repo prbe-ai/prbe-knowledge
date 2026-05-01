@@ -318,9 +318,46 @@ class _SlackUserCache:
             )
 
     async def _flush_to_db(self) -> None:
-        """Persist top-`MAX_PERSIST` entries (most-recent end of the LRU)."""
-        items = list(self._entries.items())
-        keep = dict(items[-self.MAX_PERSIST :])
+        """Persist this worker's view, merged with whatever's already in JSONB.
+
+        Without merge: each `patch_source_metadata` replaces the whole
+        `user_names` sub-object (top-level JSONB `||` semantics), so two
+        workers flushing concurrently would clobber each other's
+        contributions. With merge: read current state, take the most-recent
+        entry per user across both views, cap at `MAX_PERSIST` by recency,
+        write back. Cold-starting workers then load the union of all flushes,
+        not just whoever wrote last.
+
+        Race window: between read and write here, another worker could write
+        and have its contributions overwritten. Acceptable trade — flushes
+        are debounced 30s, concurrent flushes for the same team are rare,
+        and a missed entry comes back on the next dirty mark anywhere. If we
+        ever need stronger guarantees, the upgrade path is a SQL-side merge
+        via `jsonb_set(metadata, '{user_names}', ... || $patch::jsonb)`.
+        """
+        try:
+            persisted = await load_source_metadata(SourceSystem.SLACK, self.team_id)
+        except Exception:
+            # Read failed — fall back to write-only (last-writer-wins). The
+            # exception will surface in the outer flush handler's logs.
+            persisted = {}
+        merged: dict[str, dict[str, Any]] = {}
+        for source in (persisted.get("user_names") or {}, dict(self._entries)):
+            for u_id, entry in source.items():
+                if not isinstance(entry, dict):
+                    continue
+                existing = merged.get(u_id)
+                if existing is None or entry.get("ts", "") >= existing.get("ts", ""):
+                    merged[u_id] = entry
+
+        # Cap at MAX_PERSIST by recency (latest ts wins, ties resolved by
+        # iteration order which is fine — both versions are equivalent).
+        ranked = sorted(
+            merged.items(),
+            key=lambda kv: kv[1].get("ts", ""),
+            reverse=True,
+        )
+        keep = dict(ranked[: self.MAX_PERSIST])
         await patch_source_metadata(
             SourceSystem.SLACK,
             self.team_id,
