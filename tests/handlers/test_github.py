@@ -15,8 +15,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import SecretStr
 
 from services.ingestion.handlers.base import ConnectorContext
@@ -37,7 +35,6 @@ from shared.constants import (
     SourceSystem,
 )
 from shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
-from shared.github_auth import _reset_cache_for_tests
 from shared.models import IntegrationToken, WebhookEvent
 
 FIXTURES = Path(__file__).resolve().parents[1].parent / "fixtures" / "github"
@@ -479,28 +476,14 @@ def test_parse_codeowners_last_match_wins_on_duplicate_pattern() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fresh_private_key_pem() -> str:
-    key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
-    pem = key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    return pem.decode("ascii")
-
-
 def _make_github_ctx(
     *,
     app_slug: str | None = None,
-    app_id: str | None = None,
-    private_key_pem: str | None = None,
     http: httpx.AsyncClient | None = None,
 ) -> ConnectorContext:
     settings = Settings(
         environment="local",
         github_app_slug=app_slug,
-        github_app_id=app_id,
-        github_app_private_key=SecretStr(private_key_pem) if private_key_pem else None,
     )
     return ConnectorContext(
         settings=settings,
@@ -529,8 +512,7 @@ def test_oauth_install_url_raises_without_slug() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_oauth_code_without_installation_id_raises() -> None:
-    pem = _fresh_private_key_pem()
-    ctx = _make_github_ctx(app_id="12345", private_key_pem=pem)
+    ctx = _make_github_ctx()
     connector = build_connector(SourceSystem.GITHUB, ctx)
     with pytest.raises(InvalidWebhookPayload):
         await connector.exchange_oauth_code(
@@ -542,32 +524,19 @@ async def test_exchange_oauth_code_without_installation_id_raises() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_oauth_code_with_installation_id_returns_token_scoped_to_installation() -> None:
-    _reset_cache_for_tests()
-    pem = _fresh_private_key_pem()
+    """After PR B the connector no longer mints to validate — the token is
+    constructed directly. The first real fetch via prbe-backend's
+    /internal/github/installation_token endpoint surfaces any failure.
+    """
     installation_id = "99"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "POST"
-        assert request.url.path == f"/app/installations/{installation_id}/access_tokens"
-        return httpx.Response(
-            200,
-            json={"token": "ghs_abc", "expires_at": "2026-12-31T00:00:00Z"},
-        )
-
-    transport = httpx.MockTransport(handler)
-    http = httpx.AsyncClient(transport=transport)
-    ctx = _make_github_ctx(app_id="12345", private_key_pem=pem, http=http)
+    ctx = _make_github_ctx()
     connector = build_connector(SourceSystem.GITHUB, ctx)
 
-    try:
-        token = await connector.exchange_oauth_code(
-            code=None,
-            redirect_uri="https://api.example.com/oauth/github/callback",
-            extra_params={"installation_id": installation_id, "setup_action": "install"},
-        )
-    finally:
-        await http.aclose()
-        _reset_cache_for_tests()
+    token = await connector.exchange_oauth_code(
+        code=None,
+        redirect_uri="https://api.example.com/oauth/github/callback",
+        extra_params={"installation_id": installation_id, "setup_action": "install"},
+    )
 
     assert token.source_system is SourceSystem.GITHUB
     assert token.scope == f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}"
@@ -575,32 +544,14 @@ async def test_exchange_oauth_code_with_installation_id_returns_token_scoped_to_
 
 
 @pytest.mark.asyncio
-async def test_identify_workspaces_returns_installation_account() -> None:
-    _reset_cache_for_tests()
-    pem = _fresh_private_key_pem()
+async def test_identify_workspaces_returns_installation_id() -> None:
+    """Without the App private key (now in prbe-backend) we can't fetch
+    the account login from GitHub — return only the installation_id.
+    Webhook routing still works because extract_external_id_from_payload
+    keys on the same id.
+    """
     installation_id = "99"
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        path = request.url.path
-        if path == f"/app/installations/{installation_id}/access_tokens":
-            return httpx.Response(
-                200,
-                json={"token": "ghs_abc", "expires_at": "2026-12-31T00:00:00Z"},
-            )
-        if path == f"/app/installations/{installation_id}":
-            return httpx.Response(
-                200,
-                json={
-                    "id": int(installation_id),
-                    "account": {"login": "prbe", "type": "Organization"},
-                    "target_type": "Organization",
-                },
-            )
-        return httpx.Response(404, json={"message": f"unexpected path {path}"})
-
-    transport = httpx.MockTransport(handler)
-    http = httpx.AsyncClient(transport=transport)
-    ctx = _make_github_ctx(app_id="12345", private_key_pem=pem, http=http)
+    ctx = _make_github_ctx()
     connector = build_connector(SourceSystem.GITHUB, ctx)
 
     token = IntegrationToken(
@@ -609,16 +560,10 @@ async def test_identify_workspaces_returns_installation_account() -> None:
         access_token="installation-minted-on-demand",
         scope=f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}",
     )
-    try:
-        refs = await connector.identify_workspaces(token)
-    finally:
-        await http.aclose()
-        _reset_cache_for_tests()
+    refs = await connector.identify_workspaces(token)
 
     assert len(refs) == 1
     ref = refs[0]
     assert ref.external_id == installation_id
-    assert ref.external_name == "prbe"
+    assert ref.external_name is None
     assert ref.metadata["installation_id"] == installation_id
-    assert ref.metadata["account_type"] == "Organization"
-    assert ref.metadata["target_type"] == "Organization"
