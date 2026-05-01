@@ -46,6 +46,7 @@ dev = [
     "ruff>=0.7.0",
     "mypy>=1.13.0",
     "types-python-dateutil",
+    "hypothesis>=6.115.0",
 ]
 
 [tool.ruff]
