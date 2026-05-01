@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "cors-misconfig",
+    "type": "bug-class",
+    "description": "Browser is rejecting cross-origin requests due to a CORS configuration error",
+    "signature": {
+      "must_match": ["error_class == CORSError"],
+      "embedding_seed": "cors misconfig cross origin preflight access control"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "cors-config-current", "tool": "file_read", "params": {"path_hint": "config/cors"}},
+      {"priority": 1, "name": "preflight-request-log", "tool": "log_search", "params": {"query_hint": "OPTIONS preflight", "window": "1h"}},
+      {"priority": 2, "name": "recent-deploys-gateway", "tool": "github_diff", "params": {"window": "24h", "path_hint": "gateway/"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nA browser refuses to load a cross-origin request because the response is missing the right Access-Control headers. Often introduced by a gateway change, a new domain that was not added to the allow-list, or credentials/wildcard incompatibility.\n\n## Playbook\n1. Read cors-config-current to confirm the allowed origins, methods, and credentials flag.\n2. Pull preflight-request-log to capture the exact OPTIONS request the browser sent.\n3. Look at recent-deploys-gateway for changes to the CORS middleware or routing.\n"
+}

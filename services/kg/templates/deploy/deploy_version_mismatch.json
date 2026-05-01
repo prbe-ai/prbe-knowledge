@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "deploy-version-mismatch",
+    "type": "bug-class",
+    "description": "Two services on incompatible versions are interacting (client too new, server too old, or vice versa)",
+    "signature": {
+      "must_match": ["version_mismatch == true"],
+      "embedding_seed": "version skew api contract incompatible client server"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["deploy-rollback-required", "deploy-config-drift"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "service-version-matrix", "tool": "metric_query", "params": {"window": "1h", "metric_hint": "build_info"}},
+      {"priority": 1, "name": "api-contract-diff", "tool": "github_diff", "params": {"window": "7d", "path_hint": "api/"}},
+      {"priority": 2, "name": "tickets-similar-skew", "tool": "linear_search", "params": {"label": "version-skew", "limit": 5}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nA caller and a callee are on versions that disagree about the wire contract — a field was added, removed, or renamed, and one side is still running the old binary.\n\n## Playbook\n1. Pull service-version-matrix to confirm which two builds are talking.\n2. Read api-contract-diff to see what changed between those builds.\n3. Search tickets-similar-skew for the canonical resolution (usually: roll forward the laggard or revert the contract change).\n\n## Common confusion\nThis is *not* [[deploy-rollback-required]] (a fresh deploy itself failed) and *not* [[deploy-config-drift]] (config, not code, has drifted).\n"
+}

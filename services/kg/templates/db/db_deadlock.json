@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "db-deadlock",
+    "type": "bug-class",
+    "description": "Postgres deadlock detected (sql_state 40P01) between concurrent transactions",
+    "signature": {
+      "must_match": ["sql_state == 40P01"],
+      "embedding_seed": "deadlock concurrent transactions sql_state 40P01"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "deadlock-graph", "tool": "db_query", "params": {"query_hint": "pg_stat_activity_deadlock"}},
+      {"priority": 1, "name": "recent-deploys-db", "tool": "github_diff", "params": {"window": "24h", "path_hint": "db/"}},
+      {"priority": 2, "name": "tickets-similar-deadlocks", "tool": "linear_search", "params": {"label": "db-deadlock", "limit": 5}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nPostgres aborts a transaction with sql_state 40P01 because two transactions are waiting on each other's locks.\n\n## Playbook\n1. Pull the deadlock-graph to see which two statements were involved.\n2. Inspect recent-deploys-db for new queries or migrations that changed lock ordering.\n3. Search tickets-similar-deadlocks for prior fixes (typically: enforce a canonical lock order or shrink the transaction scope).\n"
+}

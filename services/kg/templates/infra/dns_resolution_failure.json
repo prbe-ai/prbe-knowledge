@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "dns-resolution-failure",
+    "type": "bug-class",
+    "description": "Service cannot resolve a hostname required for outbound traffic",
+    "signature": {
+      "must_match": ["error_class == DNSResolutionError"],
+      "embedding_seed": "dns resolution failure nxdomain coredns lookup"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "dns-probe", "tool": "dns_lookup", "params": {"record_hint": "A"}},
+      {"priority": 1, "name": "coredns-events", "tool": "k8s_events", "params": {"namespace_hint": "kube-system", "window": "30m"}},
+      {"priority": 2, "name": "provider-status", "tool": "provider_status_page", "params": {"provider_hint": "dns"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nName resolution is failing — NXDOMAIN, SERVFAIL, or timeouts on lookups. In Kubernetes this is most often a CoreDNS issue; on bare hosts it is usually upstream resolver flakiness.\n\n## Playbook\n1. Run dns-probe against the failing hostname from inside the affected workload's network namespace.\n2. Check coredns-events for crashloops or rate-limit errors.\n3. Read provider-status for any in-flight DNS provider incident.\n"
+}

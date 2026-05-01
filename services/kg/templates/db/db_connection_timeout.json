@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "db-connection-timeout",
+    "type": "bug-class",
+    "description": "Application cannot acquire a database connection within the configured timeout",
+    "signature": {
+      "must_match": ["error_class == ConnectionTimeout"],
+      "embedding_seed": "database connection timeout pool exhausted unreachable"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["db-replica-lag"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "db-pool-saturation", "tool": "grafana_query", "params": {"window": "1h", "panel_hint": "pg_pool_active"}},
+      {"priority": 1, "name": "db-host-status", "tool": "provider_status_page", "params": {"provider_hint": "managed-postgres"}},
+      {"priority": 2, "name": "recent-deploys-db", "tool": "github_diff", "params": {"window": "24h", "path_hint": "db/"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nThe app failed to obtain a connection from the pool within the configured timeout. Causes include pool exhaustion, an unreachable database host, or DNS issues to the DB endpoint.\n\n## Playbook\n1. Check db-pool-saturation to see if active connections are pinned at the limit.\n2. Read db-host-status to rule out a managed-database incident.\n3. Inspect recent-deploys-db for changes to pool sizing or DSN.\n\n## Common confusion\nThis is *not* [[db-replica-lag]]: that fires when the connection succeeds but the read returns stale data.\n"
+}

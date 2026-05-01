@@ -1,0 +1,23 @@
+{
+  "frontmatter": {
+    "id": "auth-403-rbac",
+    "type": "bug-class",
+    "description": "403 forbidden — user authenticated but lacks required role/permission",
+    "signature": {
+      "must_match": ["status_code == 403"],
+      "embedding_seed": "rbac forbidden permission role denied authorization"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["auth-401-jwt-refresh"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "rbac-policy-current", "tool": "file_read", "params": {"path_hint": "rbac/policies"}},
+      {"priority": 2, "name": "user-roles-snapshot", "tool": "db_query", "params": {"query_hint": "user_roles"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\n403 responses indicate the user is authenticated but RBAC denied the action.\n\n## Playbook\n1. Inspect rbac-policy-current to confirm the policy expected for this resource.\n2. Read user-roles-snapshot to verify the user's effective roles match what they need.\n3. If the policy is correct and the user lacks roles, escalate to the owning team.\n\n## Common confusion\nThis is *not* [[auth-401-jwt-refresh]]: 401 means the token itself failed validation, 403 means the token was valid but the principal isn't allowed.\n"
+}

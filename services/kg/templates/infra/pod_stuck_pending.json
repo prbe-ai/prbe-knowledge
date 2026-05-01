@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "pod-stuck-pending",
+    "type": "bug-class",
+    "description": "A pod has remained in Pending state past the operational threshold",
+    "signature": {
+      "must_match": ["pod_phase == Pending", "duration_s > 120"],
+      "embedding_seed": "pod pending unschedulable resource quota node selector"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["pod-oom-killed"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "pod-events", "tool": "k8s_events", "params": {"window": "30m"}},
+      {"priority": 1, "name": "pod-describe", "tool": "kube_describe", "params": {"resource_hint": "pod"}},
+      {"priority": 2, "name": "node-capacity", "tool": "kube_describe", "params": {"resource_hint": "nodes"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nA pod has been stuck in Pending for more than 2 minutes. Typical causes: no node satisfies the selector or taints, the resource quota is exhausted, the image is still pulling, or a PVC is unbound.\n\n## Playbook\n1. Pull pod-events for the scheduler's reason (Unschedulable, FailedScheduling, etc.).\n2. Run pod-describe to inspect requests, selectors, tolerations, and volumes.\n3. Cross-reference node-capacity to confirm available CPU/memory headroom.\n\n## Common confusion\nThis is *not* [[pod-oom-killed]]: that fires after a pod has run and exceeded memory; this fires before the pod ever runs.\n"
+}

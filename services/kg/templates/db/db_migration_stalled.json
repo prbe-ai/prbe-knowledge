@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "db-migration-stalled",
+    "type": "bug-class",
+    "description": "A schema migration has been running longer than the operational budget without completing",
+    "signature": {
+      "must_match": ["migration_state == in_progress", "duration_s > 300"],
+      "embedding_seed": "migration stalled long running schema change lock wait"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "migration-runner-log", "tool": "log_search", "params": {"query_hint": "alembic OR migration", "window": "1h"}},
+      {"priority": 1, "name": "lock-blockers", "tool": "db_query", "params": {"query_hint": "pg_locks_blocking"}},
+      {"priority": 2, "name": "recent-deploys-db", "tool": "github_diff", "params": {"window": "24h", "path_hint": "db/migrations"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nA migration is taking long enough to threaten the deploy or read traffic. Typical causes: an exclusive lock contended by an open transaction, a CREATE INDEX (without CONCURRENTLY) on a hot table, or a backfill scanning the full table.\n\n## Playbook\n1. Tail migration-runner-log to see what step is in flight.\n2. Pull lock-blockers to identify any transaction blocking the migration.\n3. Read recent-deploys-db to confirm what changed in the migration files.\n"
+}

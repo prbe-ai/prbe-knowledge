@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "auth-401-jwt-refresh",
+    "type": "bug-class",
+    "description": "401s on /api/* after JWT refresh fails (clock-skew, signing-key rotation, refresh-flow failure)",
+    "signature": {
+      "must_match": ["status_code == 401"],
+      "embedding_seed": "jwt refresh expired clock-skew authentication token"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["auth-403-rbac"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "recent-deploys-auth", "tool": "github_diff", "params": {"window": "24h"}},
+      {"priority": 1, "name": "jwt-config-current", "tool": "file_read", "params": {"path_hint": "config/jwt"}},
+      {"priority": 2, "name": "past-tickets-similar", "tool": "linear_search", "params": {"label": "auth-401", "limit": 5}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\n401 responses on protected endpoints typically mean expired JWT, signing-key rotation drift, or refresh-flow failure.\n\n## Playbook\n1. Check the recent-deploys-auth source — most common root cause is a recent change.\n2. Read jwt-config-current — verify clock-skew tolerance and rotation schedule.\n3. Search past-tickets-similar for the last 5 resolutions.\n\n## Common confusion\nThis is *not* [[auth-403-rbac]]: that fires on missing claims, not on token validity.\n"
+}

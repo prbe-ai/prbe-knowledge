@@ -1,0 +1,24 @@
+{
+  "frontmatter": {
+    "id": "upstream-5xx-spike",
+    "type": "bug-class",
+    "description": "Sustained spike in 5xx responses from an upstream dependency",
+    "signature": {
+      "must_match": ["status_code in [500, 502, 503, 504]"],
+      "embedding_seed": "upstream 5xx spike server error gateway timeout"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": ["rate-limit-tripped"],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "upstream-error-rate", "tool": "grafana_query", "params": {"window": "1h", "panel_hint": "http_requests_total{status=~\"5..\"}"}},
+      {"priority": 1, "name": "upstream-status", "tool": "provider_status_page", "params": {"provider_hint": "upstream"}},
+      {"priority": 2, "name": "recent-deploys-upstream", "tool": "github_diff", "params": {"window": "24h"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nThe error rate from a named upstream has crossed the alert threshold. Could be the upstream itself, a transient network partition, or a payload our caller started sending that the upstream cannot handle.\n\n## Playbook\n1. Plot upstream-error-rate to see whether the spike is sustained or a single burst.\n2. Read upstream-status for an active provider incident.\n3. Inspect recent-deploys-upstream for changes that landed near the spike.\n\n## Common confusion\nThis is *not* [[rate-limit-tripped]]: that fires on 429s, which signal quota, not failure.\n"
+}

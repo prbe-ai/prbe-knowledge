@@ -1,0 +1,23 @@
+{
+  "frontmatter": {
+    "id": "auth-token-leaked",
+    "type": "bug-class",
+    "description": "Authentication token observed in unexpected context (logs, client error reports, public repo)",
+    "signature": {
+      "must_match": ["category == security_alert"],
+      "embedding_seed": "token leaked credential exposure secret in logs"
+    },
+    "related": {
+      "analogous_to": [],
+      "overlaps_with": [],
+      "often_confused_with": [],
+      "regressed_by": []
+    },
+    "context_sources": [
+      {"priority": 1, "name": "audit-token-revocation", "tool": "audit_log", "params": {"action": "token_revoked"}},
+      {"priority": 1, "name": "scan-recent-repos", "tool": "secret_scan", "params": {"window": "7d"}}
+    ],
+    "evidence": {"match_count": 0, "recent_refinements": []}
+  },
+  "body": "## When this fires\nA token has been observed in a context that suggests exposure: error reports including bearer tokens, logs containing secrets, or a public repo commit.\n\n## Playbook\n1. Pull audit-token-revocation to confirm the suspect token was rotated.\n2. Run scan-recent-repos to find any other secrets in recent commits.\n3. Notify the security on-call and document the blast radius.\n"
+}
