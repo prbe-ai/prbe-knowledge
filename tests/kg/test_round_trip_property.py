@@ -40,6 +40,18 @@ _short_text = st.text(
     ),
 )
 
+# ContextSource.tool is capped at 64 chars by the schema (services/kg/schema.py).
+# Use a tighter strategy so Hypothesis doesn't generate values that fail
+# Pydantic validation before the round-trip ever runs.
+_tool_text = st.text(
+    min_size=1,
+    max_size=64,
+    alphabet=st.characters(
+        blacklist_categories=("Cs",),
+        blacklist_characters="\x00",
+    ),
+)
+
 # Embedding seed must be at least 3 chars after strip (Signature validator).
 _seed = st.text(
     min_size=3,
@@ -89,7 +101,7 @@ _context_source = st.builds(
     ContextSource,
     priority=st.sampled_from([1, 2, 3]),
     name=_short_text,
-    tool=_short_text,
+    tool=_tool_text,
     params=_params,
 )
 
