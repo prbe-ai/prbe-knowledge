@@ -396,18 +396,54 @@ def build_topic_pool(
 
 
 def _infer_kind(manifest: Manifest) -> ServiceKind:
-    """Heuristic: kind from manifest type. Plan 1 keeps it simple; richer
-    inference (Dockerfile presence, asyncpg.listen detection, etc.) lives
-    in plan 3 if needed."""
+    """Heuristic: kind from manifest type + dependency signals.
+
+    Worker deps are checked first (more specific than API; e.g., a celery
+    service may also use fastapi for /healthz). Then API, then FRONTEND
+    (package.json only). Falls through to the per-manifest-type default.
+    """
     from scripts.synth.extractor.manifests import ManifestKind
+
+    deps_lower = {d.lower() for d in manifest.dependencies}
+
+    if deps_lower & _WORKER_DEPS:
+        return ServiceKind.WORKER
+    if deps_lower & _API_DEPS:
+        return ServiceKind.API
     if manifest.kind == ManifestKind.PACKAGE_JSON:
-        return ServiceKind.FRONTEND
+        if deps_lower & _FRONTEND_DEPS:
+            return ServiceKind.FRONTEND
+        return ServiceKind.FRONTEND  # package.json default (preserves prior behavior)
     if manifest.kind == ManifestKind.FLY_TOML:
         return ServiceKind.API
     if manifest.kind == ManifestKind.DOCKER_COMPOSE:
         return ServiceKind.INFRA
     return ServiceKind.LIB
 
+
+# Common API frameworks across Python and JS ecosystems.
+_API_DEPS = frozenset({
+    # Python
+    "fastapi", "flask", "starlette", "django", "sanic", "quart", "litestar",
+    "bottle", "falcon", "pyramid", "tornado", "cherrypy", "uvicorn",
+    "gunicorn", "hypercorn",
+    # JS
+    "express", "koa", "hapi", "fastify", "nest", "@nestjs/core",
+})
+
+# Worker / queue frameworks.
+_WORKER_DEPS = frozenset({
+    # Python
+    "celery", "rq", "dramatiq", "huey", "arq", "taskiq",
+    # JS
+    "bull", "bullmq", "agenda",
+})
+
+# Frontend frameworks (typically package.json).
+_FRONTEND_DEPS = frozenset({
+    "react", "vue", "@angular/core", "svelte", "next", "nuxt", "gatsby",
+    "remix", "vite", "ember-source", "solid-js", "preact",
+})
 
 _GENERIC_CHANNELS = ("#general", "#random", "#incidents", "#engineering", "#announcements")
 

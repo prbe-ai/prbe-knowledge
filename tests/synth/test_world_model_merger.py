@@ -283,6 +283,96 @@ def test_infer_services_qualifies_on_collision() -> None:
     assert qualified == ["A/payments", "B/payments"]
 
 
+def test_infer_kind_pyproject_with_fastapi_is_api() -> None:
+    """A pyproject with fastapi/uvicorn deps is an API, not a LIB."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+    sig = RepoSignals(
+        url="github.com/x/svc", clone_path=Path("/tmp/svc"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/svc/pyproject.toml"),
+                     name="svc", description=None,
+                     dependencies=("fastapi", "uvicorn")),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    [s] = infer_services([sig])
+    assert s.kind == ServiceKind.API
+
+
+def test_infer_kind_pyproject_with_celery_is_worker() -> None:
+    """celery beats fastapi — worker classification is more specific."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+    sig = RepoSignals(
+        url="github.com/x/wrk", clone_path=Path("/tmp/wrk"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/wrk/pyproject.toml"),
+                     name="wrk", description=None,
+                     dependencies=("celery", "fastapi")),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    [s] = infer_services([sig])
+    assert s.kind == ServiceKind.WORKER
+
+
+def test_infer_kind_pyproject_with_no_web_deps_is_lib() -> None:
+    """A pure-library pyproject (no web framework) stays LIB."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+    sig = RepoSignals(
+        url="github.com/x/lib", clone_path=Path("/tmp/lib"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/lib/pyproject.toml"),
+                     name="lib", description=None,
+                     dependencies=("requests", "pydantic")),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    [s] = infer_services([sig])
+    assert s.kind == ServiceKind.LIB
+
+
+def test_infer_kind_package_json_with_express_is_api() -> None:
+    """Express-flavored package.json is an API, not the default FRONTEND."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+    sig = RepoSignals(
+        url="github.com/x/api", clone_path=Path("/tmp/api"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PACKAGE_JSON, path=Path("/tmp/api/package.json"),
+                     name="api", description=None,
+                     dependencies=("express", "body-parser")),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    [s] = infer_services([sig])
+    assert s.kind == ServiceKind.API
+
+
+def test_infer_kind_package_json_with_react_is_frontend() -> None:
+    """React-flavored package.json is FRONTEND (matches default behavior)."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+    sig = RepoSignals(
+        url="github.com/x/web", clone_path=Path("/tmp/web"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PACKAGE_JSON, path=Path("/tmp/web/package.json"),
+                     name="web", description=None,
+                     dependencies=("react", "react-dom", "vite")),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    [s] = infer_services([sig])
+    assert s.kind == ServiceKind.FRONTEND
+
+
 from scripts.synth.world_model import build_topic_pool  # noqa: E402
 
 
