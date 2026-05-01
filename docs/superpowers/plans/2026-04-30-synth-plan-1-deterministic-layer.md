@@ -135,7 +135,7 @@ from __future__ import annotations
 from scripts.synth.cli import main
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
 ```
 
 Create `scripts/synth/cli.py`:
@@ -175,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.cmd == "extract":
-        # Plan 1 task 26 wires this in. For now, surface a clear stub error.
+        # Plan 1 task 21 wires this in. For now, surface a clear stub error.
         print("extract: not yet implemented", file=sys.stderr)
         return 2
     parser.error(f"unknown command: {args.cmd}")
