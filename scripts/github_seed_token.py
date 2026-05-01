@@ -4,7 +4,7 @@ GitHub Apps don't round-trip through the standard OAuth callback the way the
 other connectors do: after installing the App on an org, GitHub redirects
 with `installation_id` as a query param, separate from any user OAuth code.
 This one-off CLI lets an operator drop that installation_id in so the
-backfill + CODEOWNERS hydration paths can mint installation tokens on demand.
+backfill + CODEOWNERS hydration paths can fetch installation tokens on demand.
 
 Usage:
     .venv/bin/python -m scripts.github_seed_token \\
@@ -13,11 +13,13 @@ Usage:
 
 What it does:
     1. Verifies the customer exists.
-    2. Verifies GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY are configured.
-    3. Dry-run mints an installation token (via shared.github_auth) to
-       confirm the App credentials + installation_id are reachable.
-    4. Upserts an `integration_tokens` row with scope=`installation:<id>`.
-    5. Upserts a `customer_source_mapping` row so live webhooks route.
+    2. Upserts a `customer_source_mapping` row so prbe-backend can resolve
+       the installation_id from this customer when it mints a token.
+    3. Verifies BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY are configured.
+    4. Dry-run fetches an installation token via prbe-backend's
+       /internal/github/installation_token endpoint to confirm the
+       end-to-end mint path is live.
+    5. Upserts an `integration_tokens` row with scope=`installation:<id>`.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import sys
 
 import httpx
 
+from shared.backend_client import fetch_github_installation_token
 from shared.config import get_settings
 from shared.constants import (
     GITHUB_INSTALLATION_SCOPE_PREFIX,
@@ -37,7 +40,6 @@ from shared.constants import (
 from shared.customer_mapping import record_mapping
 from shared.db import close_pool, init_pool, raw_conn
 from shared.encryption import encrypt_token
-from shared.github_auth import mint_installation_token
 from shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -65,18 +67,26 @@ async def seed(customer_id: str, installation_id: str) -> None:
             )
             raise SystemExit(1)
 
-        if settings.github_app_id is None or settings.github_app_private_key is None:
+        if not settings.backend_base_url or not settings.internal_backend_api_key.get_secret_value():
             sys.stderr.write(
-                "error: GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY must be set in .env\n"
+                "error: BACKEND_BASE_URL and INTERNAL_BACKEND_API_KEY must be set in .env\n"
             )
             raise SystemExit(1)
 
+        # Record the mapping FIRST so backend can resolve customer → installation
+        # when we dry-run-fetch the token below.
+        await record_mapping(
+            customer_id=customer_id,
+            source_system=SourceSystem.GITHUB,
+            external_id=installation_id,
+            external_name=None,
+            metadata={"installation_id": installation_id},
+        )
+
         async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as http:
-            _token, expires_at = await mint_installation_token(
+            _token, expires_at = await fetch_github_installation_token(
                 http,
-                settings.github_app_id,
-                settings.github_app_private_key.get_secret_value(),
-                installation_id,
+                customer_id=customer_id,
             )
 
         log.info(
@@ -88,7 +98,7 @@ async def seed(customer_id: str, installation_id: str) -> None:
 
         scope = f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}"
         # access_token_encrypted is NOT NULL in the schema. The actual value
-        # is never read — `_resolve_installation_bearer` triggers the mint path
+        # is never read — `_resolve_installation_bearer` fetches via backend
         # whenever scope starts with `installation:` — so we store an opaque
         # encrypted placeholder that makes the intent obvious in a DB dump.
         placeholder = encrypt_token("installation-minted-on-demand")
@@ -110,14 +120,6 @@ async def seed(customer_id: str, installation_id: str) -> None:
                 scope,
                 IntegrationStatus.ACTIVE.value,
             )
-
-        await record_mapping(
-            customer_id=customer_id,
-            source_system=SourceSystem.GITHUB,
-            external_id=installation_id,
-            external_name=None,
-            metadata={"installation_id": installation_id},
-        )
     finally:
         await close_pool()
 

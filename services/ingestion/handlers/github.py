@@ -31,6 +31,7 @@ from typing import Any, ClassVar
 from services.ingestion.chunker import count_tokens
 from services.ingestion.handlers.base import Connector
 from services.ingestion.handlers.registry import register_connector
+from shared.backend_client import fetch_github_installation_token
 from shared.constants import (
     GITHUB_INSTALLATION_SCOPE_PREFIX,
     DocClass,
@@ -44,11 +45,9 @@ from shared.constants import (
     SourceSystem,
 )
 from shared.exceptions import (
-    GitHubAuthError,
     InvalidWebhookPayload,
     NotSupportedByConnector,
 )
-from shared.github_auth import mint_installation_token
 from shared.logging import get_logger
 from shared.models import (
     ACLPrincipal,
@@ -311,30 +310,23 @@ class GitHubConnector(Connector):
     # 3. hydration — fetch CODEOWNERS file contents for push events
     # ------------------------------------------------------------------
 
-    async def _resolve_installation_bearer(self, token: IntegrationToken) -> str:
+    async def _resolve_installation_bearer(
+        self, token: IntegrationToken, *, customer_id: str
+    ) -> str:
         """Return the bearer to use for GitHub API calls.
 
-        If token.scope starts with 'installation:', mint a fresh installation
-        token via `shared.github_auth`. Otherwise return token.access_token
-        as-is (legacy path — assumes caller already provided a valid token).
+        If token.scope starts with 'installation:', fetch a fresh installation
+        token from prbe-backend (which mints + caches it server-side using the
+        GitHub App private key). Otherwise return token.access_token as-is
+        (legacy path — assumes caller already provided a valid token).
         """
         scope = token.scope or ""
         if not scope.startswith(GITHUB_INSTALLATION_SCOPE_PREFIX):
             return token.access_token
 
-        app_id = self.settings.github_app_id
-        private_key = self.settings.github_app_private_key
-        if app_id is None or private_key is None:
-            raise GitHubAuthError(
-                "installation scope requires GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY"
-            )
-
-        installation_id = scope.split(":", 1)[1]
-        bearer, _expires = await mint_installation_token(
+        bearer, _expires = await fetch_github_installation_token(
             self.http,
-            app_id,
-            private_key.get_secret_value(),
-            installation_id,
+            customer_id=customer_id,
         )
         return bearer
 
@@ -358,7 +350,9 @@ class GitHubConnector(Connector):
             # No installation token — defer to the fallback path in normalize().
             return {}
 
-        bearer = await self._resolve_installation_bearer(token)
+        bearer = await self._resolve_installation_bearer(
+            token, customer_id=event.customer_id
+        )
 
         # Try each canonical CODEOWNERS path in order. GitHub accepts all three.
         for path in _CODEOWNERS_PATHS:
@@ -418,24 +412,15 @@ class GitHubConnector(Connector):
                 "github OAuth callback missing installation_id — was the app installed?"
             )
 
-        app_id = self.settings.github_app_id
-        pk = self.settings.github_app_private_key
-        if not app_id or pk is None:
-            raise NotSupportedByConnector(
-                "github OAuth callback requires GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY"
-            )
-
-        # Validate the installation exists + credentials are live by minting once.
-        await mint_installation_token(
-            self.http, app_id, pk.get_secret_value(), installation_id
-        )
-
+        # GitHub App credentials live in prbe-backend now. We don't validate
+        # the installation here (we have no JWT to do so); the first real call
+        # via fetch_github_installation_token will surface any mint failure.
         return IntegrationToken(
             customer_id="",  # caller fills in — connector does not know the tenant
             source_system=SourceSystem.GITHUB,
             # access_token column is NOT NULL. GitHub installation tokens are
-            # re-minted on-demand via the App private key so the stored value
-            # is never read by the connector.
+            # fetched on-demand from prbe-backend so the stored value is never
+            # read by the connector.
             access_token="installation-minted-on-demand",
             scope=f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}",
         )
@@ -445,15 +430,14 @@ class GitHubConnector(Connector):
     # ------------------------------------------------------------------
 
     async def identify_workspaces(self, token):  # type: ignore[override]
-        """Resolve the GitHub installation's owning account for customer_source_mapping.
+        """Resolve the GitHub installation id for customer_source_mapping.
 
         `token.scope` carries `installation:<id>` from `exchange_oauth_code`.
-        We mint an installation token (cached) and call `GET /app/installations/<id>`
-        with the App JWT to fetch the account login without a second mint step.
-        On HTTP failure we return [] — the OAuth callback already downgrades
-        `identify_workspaces_failed` to a warning and the base webhook path
-        resolves the customer via `extract_external_id_from_payload` on the
-        first live webhook.
+        Pre-PR-B we'd also call `GET /app/installations/<id>` with the App JWT
+        to fetch the account login — that required the App private key, which
+        now lives only in prbe-backend. Without it we return just the
+        installation_id; webhook routing still works because
+        `extract_external_id_from_payload` keys on the same id.
         """
         scope = token.scope or ""
         if not scope.startswith(GITHUB_INSTALLATION_SCOPE_PREFIX):
@@ -462,70 +446,11 @@ class GitHubConnector(Connector):
         if not installation_id:
             return []
 
-        app_id = self.settings.github_app_id
-        pk = self.settings.github_app_private_key
-        if not app_id or pk is None:
-            return []
-
-        # Minting populates the cache (idempotent if already present) and
-        # proves the installation is still live before we look it up.
-        try:
-            await mint_installation_token(
-                self.http, app_id, pk.get_secret_value(), installation_id
-            )
-        except GitHubAuthError as exc:
-            log.warning(
-                "github.identify_workspaces_mint_failed",
-                installation=installation_id,
-                error=str(exc),
-            )
-            return []
-
-        # Fetch the installation's account via the App JWT. We rebuild a JWT
-        # here (cheap) rather than extend shared.github_auth's surface area.
-        from shared.github_auth import _build_app_jwt
-
-        jwt = _build_app_jwt(app_id, pk.get_secret_value())
-        try:
-            resp = await self.http.get(
-                f"{_GITHUB_API}/app/installations/{installation_id}",
-                headers={
-                    "Authorization": f"Bearer {jwt}",
-                    "Accept": "application/vnd.github+json",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
-            )
-        except (OSError, ValueError) as exc:
-            log.warning(
-                "github.identify_workspaces_http_error",
-                installation=installation_id,
-                error=str(exc),
-            )
-            return []
-
-        if resp.status_code != 200:
-            log.warning(
-                "github.identify_workspaces_non_200",
-                installation=installation_id,
-                status=resp.status_code,
-            )
-            return []
-
-        body = resp.json() if resp.content else {}
-        account = body.get("account") or {}
-        account_login = account.get("login") if isinstance(account, dict) else None
-        account_type = account.get("type") if isinstance(account, dict) else None
-        target_type = body.get("target_type")
-
         return [
             ExternalWorkspaceRef(
                 external_id=installation_id,
-                external_name=account_login,
-                metadata={
-                    "installation_id": installation_id,
-                    "account_type": account_type,
-                    "target_type": target_type,
-                },
+                external_name=None,
+                metadata={"installation_id": installation_id},
             )
         ]
 
@@ -546,9 +471,9 @@ class GitHubConnector(Connector):
     ):
         """Historical GitHub backfill — walks installation repos, PRs, and issues.
 
-        When `token.scope` starts with `installation:` we mint a fresh App
-        installation bearer via `shared.github_auth`. Otherwise we use
-        `token.access_token` verbatim (legacy / test path).
+        When `token.scope` starts with `installation:` we fetch a fresh App
+        installation bearer from prbe-backend (via `shared.backend_client`).
+        Otherwise we use `token.access_token` verbatim (legacy / test path).
 
         Resumable via the `cursor` arg: an opaque JSON blob capturing which
         repos remain, the current repo + phase (pulls/issues), and the next
@@ -563,7 +488,7 @@ class GitHubConnector(Connector):
         from shared.models import WebhookEvent
 
         state = _decode_github_cursor(cursor)
-        bearer = await self._resolve_installation_bearer(token)
+        bearer = await self._resolve_installation_bearer(token, customer_id=customer_id)
         auth_headers = {
             "Authorization": f"Bearer {bearer}",
             "Accept": "application/vnd.github+json",

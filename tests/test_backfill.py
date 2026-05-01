@@ -1251,8 +1251,11 @@ async def test_github_backfill_paginates_repos_pulls_and_issues() -> None:
 
 
 @pytest.mark.asyncio
-async def test_github_backfill_with_installation_scope_mints_token(monkeypatch) -> None:
-    """A token with scope='installation:<id>' mints a fresh bearer via github_auth."""
+async def test_github_backfill_with_installation_scope_fetches_token_from_backend(
+    monkeypatch,
+) -> None:
+    """A token with scope='installation:<id>' fetches a fresh bearer from
+    prbe-backend's /internal/github/installation_token endpoint."""
     from datetime import UTC, datetime
 
     observed_auth: list[str] = []
@@ -1292,14 +1295,15 @@ async def test_github_backfill_with_installation_scope_mints_token(monkeypatch) 
         }
     )
 
-    minted_for: list[str] = []
+    fetched_for: list[str] = []
 
-    async def fake_mint(http, app_id, private_key_pem, installation_id):
-        minted_for.append(installation_id)
+    async def fake_fetch(http, *, customer_id):
+        fetched_for.append(customer_id)
         return "ghs_fresh_bearer", datetime(2026, 12, 31, tzinfo=UTC)
 
     monkeypatch.setattr(
-        "services.ingestion.handlers.github.mint_installation_token", fake_mint
+        "services.ingestion.handlers.github.fetch_github_installation_token",
+        fake_fetch,
     )
 
     from services.ingestion.handlers.base import ConnectorContext
@@ -1308,10 +1312,7 @@ async def test_github_backfill_with_installation_scope_mints_token(monkeypatch) 
     from shared.models import IntegrationToken
 
     ctx = ConnectorContext(
-        settings=_S(
-            github_app_id="1",
-            github_app_private_key="dummy-key",  # type: ignore[arg-type]
-        ),
+        settings=_S(),
         http=httpx.AsyncClient(transport=transport),
     )
     gh = build_connector(SourceSystem.GITHUB, ctx)
@@ -1324,7 +1325,7 @@ async def test_github_backfill_with_installation_scope_mints_token(monkeypatch) 
 
     events = [e async for e in gh.backfill("cust", token)]
     assert len(events) == 1
-    assert minted_for == ["99"]
+    assert fetched_for == ["cust"]
     assert observed_auth, "mock transport should have captured requests"
     for auth in observed_auth:
         assert auth == "Bearer ghs_fresh_bearer"

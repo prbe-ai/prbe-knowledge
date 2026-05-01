@@ -80,6 +80,16 @@ class Settings(BaseSettings):
     # retrieval + /internal/ingest. Compared with hmac.compare_digest.
     internal_knowledge_api_key: SecretStr | None = None
 
+    # --- prbe-backend (upstream identity service) ---------------------------
+    # Knowledge calls backend's /internal/* endpoints for things only backend
+    # should hold credentials for — most importantly, minting GitHub App
+    # installation tokens (the App private key lives in backend, not here).
+    # `backend_base_url` is typically `http://prbe-backend.internal:8080` over
+    # Fly's 6PN private networking; `internal_backend_api_key` is shared with
+    # backend and sent as `X-Internal-Key`.
+    backend_base_url: str = ""
+    internal_backend_api_key: SecretStr = SecretStr("")
+
     # --- Per-source OAuth + webhook secrets ----
     # After the gateway migration, ACTIVE code in this service only uses
     # client_secrets (token exchange in /api/oauth/{source}/exchange). The
@@ -97,8 +107,10 @@ class Settings(BaseSettings):
     slack_client_secret: SecretStr | None = None
     slack_signing_secret: SecretStr | None = None  # unused in prod (gateway verifies)
 
-    github_app_id: str | None = None
-    github_app_private_key: SecretStr | None = None
+    # GitHub App credentials (id + private key) used to live here; they
+    # have moved to prbe-backend so the App private key only exists in one
+    # service. Knowledge fetches installation tokens via
+    # `shared.backend_client.fetch_github_installation_token` instead.
     github_app_slug: str | None = None  # unused in prod (gateway builds install URL)
     github_webhook_secret: SecretStr | None = None  # unused in prod
 

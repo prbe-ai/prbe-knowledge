@@ -72,10 +72,16 @@ SLACK_CLIENT_ID=
 SLACK_CLIENT_SECRET=
 SLACK_SIGNING_SECRET=
 
-GITHUB_APP_ID=
-GITHUB_APP_PRIVATE_KEY=                     # full PEM, use """ quoting if needed
+# GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY now live in prbe-backend (the
+# App private key only exists in one service). Knowledge fetches install
+# tokens via prbe-backend's /internal/github/installation_token endpoint —
+# see BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY below.
 GITHUB_APP_SLUG=                            # the last path component of github.com/apps/<slug>
 GITHUB_WEBHOOK_SECRET=
+
+# prbe-backend (upstream identity service)
+BACKEND_BASE_URL=                           # e.g. http://prbe-backend.internal:8080 (Fly 6PN) or http://localhost:8081 (local)
+INTERNAL_BACKEND_API_KEY=                   # shared secret, must match prbe-backend's value
 
 LINEAR_CLIENT_ID=
 LINEAR_CLIENT_SECRET=
@@ -121,8 +127,9 @@ and (where applicable) `signing_secret` for each, pasted into `.env.local`.
    - Repository: Contents, Issues, Metadata, Pull requests
    - Organization: Members
 4. **Subscribe to events**: `push`, `pull_request`, `issues`, `pull_request_review`
-5. Generate a **private key** (PEM file) → paste contents into `GITHUB_APP_PRIVATE_KEY`
-6. **App ID** → `GITHUB_APP_ID`
+5. Generate a **private key** (PEM file) → set as `GITHUB_APP_PRIVATE_KEY` in
+   **prbe-backend's** `.env` / Fly secrets. (Knowledge no longer holds it.)
+6. **App ID** → set as `GITHUB_APP_ID` in **prbe-backend's** `.env` / Fly secrets.
 7. On the App's **Basic Information** page, copy the slug (the last path
    component of `github.com/apps/<slug>`) → `GITHUB_APP_SLUG`. This is what
    the dashboard's Connect flow uses to build the install URL.
@@ -130,10 +137,11 @@ and (where applicable) `signing_secret` for each, pasted into `.env.local`.
    post-install redirect hits `/oauth/github/callback` which writes the
    integration token and customer_source_mapping row automatically.
 
-Backfill and CODEOWNERS hydration mint fresh installation tokens via the
-App private key whenever they need to call GitHub — there's no refresh cron
-for GitHub because installation tokens are ~1h-lived and always reissued
-from the App JWT.
+Backfill and CODEOWNERS hydration fetch fresh installation tokens from
+prbe-backend's `/internal/github/installation_token` endpoint whenever they
+need to call GitHub — backend mints + caches them server-side using the App
+private key. There's no refresh cron for GitHub because installation tokens
+are ~1h-lived and always reissued from the App JWT.
 
 Emergency / debug fallback only: if you need to seed an installation id
 without going through the dashboard Connect flow (e.g. a broken redirect),
@@ -348,8 +356,8 @@ for app in prbe-knowledge-ingestion prbe-knowledge-retrieval prbe-knowledge-work
     SLACK_SIGNING_SECRET="$SLACK_SIGNING_SECRET" \
     SLACK_CLIENT_ID="$SLACK_CLIENT_ID" \
     SLACK_CLIENT_SECRET="$SLACK_CLIENT_SECRET" \
-    GITHUB_APP_ID="$GITHUB_APP_ID" \
-    GITHUB_APP_PRIVATE_KEY="$GITHUB_APP_PRIVATE_KEY" \
+    BACKEND_BASE_URL="$BACKEND_BASE_URL" \
+    INTERNAL_BACKEND_API_KEY="$INTERNAL_BACKEND_API_KEY" \
     GITHUB_WEBHOOK_SECRET="$GITHUB_WEBHOOK_SECRET" \
     LINEAR_CLIENT_ID="$LINEAR_CLIENT_ID" \
     LINEAR_CLIENT_SECRET="$LINEAR_CLIENT_SECRET" \
