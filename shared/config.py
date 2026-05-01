@@ -34,7 +34,15 @@ class Settings(BaseSettings):
     # the pool. 18 * 6 = 108 slots; 30 covers the steady-state working set
     # (claims hold a conn only briefly per heartbeat/commit).
     db_pool_max_size: int = 30
-    db_statement_timeout_ms: int = 30_000
+    # 5 min, not 30s. We're a write-heavy multi-tenant queue worker: a single
+    # batched UPSERT can wait on row locks held by sibling workers operating
+    # on the same hot graph nodes. 30s caused pre-batched-writes contention
+    # to surface as TimeoutError → DLQ instead of just slow throughput. The
+    # batched-writes shape (PR #40 + this change) means a single statement
+    # genuinely shouldn't take this long; treat it as a backstop, not a SLO.
+    # Stuck workers are still caught by cron_stuck_queue_reclaim.py via the
+    # heartbeat (30s).
+    db_statement_timeout_ms: int = 300_000
     db_init_retry_attempts: int = 6
     db_init_retry_base_seconds: float = 1.0
 
@@ -111,7 +119,20 @@ class Settings(BaseSettings):
     # Tier 1 (1M TPM) → 2; Tier 5 (10M TPM) → 6 today (OpenAI permits 8+;
     # 3gb VM memory is the actual ceiling — resize before pushing higher).
     worker_max_concurrent: int = 2
-    worker_max_attempts: int = 5
+    # Effectively retry-forever for transient errors (TimeoutError, lock
+    # waits, network blips). The queue is the buffer; rows that hit the
+    # ceiling here are data we silently dropped on the customer's behalf,
+    # which is the worst possible failure mode. Permanent-DLQ-on-first-try
+    # is still possible for deterministic errors via PrbeError(transient=
+    # False) — that path is unchanged.
+    worker_max_attempts: int = 50
+    # Soft per-customer cap on simultaneously processing rows. Sized so one
+    # workspace's install-time burst can't monopolize the fleet; spare slots
+    # go to other customers. With 18 machines * 4 concurrency = 72 slots,
+    # 10 per customer means at least 7 customers can have headroom in
+    # parallel. Snapshot count, not a hard lock — slight over-spill under
+    # racing claims is fine.
+    worker_per_customer_max_inflight: int = 10
 
     # --- HTTP / outbound ----------------------------------------------------
     http_timeout_seconds: float = 30.0
