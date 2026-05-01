@@ -110,18 +110,17 @@ def _patch_settings(monkeypatch, settings: Settings) -> None:
 
 @pytest.fixture
 def kg_app() -> FastAPI:
-    """Tiny FastAPI app with the KG read router mounted at /kg.
+    """Tiny FastAPI app with the KG read + write routers mounted at /kg.
 
     Built per-test so the test-suite never carries app state between cases.
     No lifespan: the live_db fixture handles pool init/close.
-
-    NB: the write router is mounted in a follow-up task; this fixture will
-    grow to include it as soon as ``services/kg/api/write.py`` exists.
     """
     from services.kg.api.read import router as read_router
+    from services.kg.api.write import router as write_router
 
     app = FastAPI()
     app.include_router(read_router, prefix="/kg")
+    app.include_router(write_router, prefix="/kg")
     return app
 
 
