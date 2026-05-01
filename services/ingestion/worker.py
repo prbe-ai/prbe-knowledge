@@ -40,11 +40,13 @@ class Worker:
         ctx: ConnectorContext,
         max_attempts: int = 5,
         concurrency: int = 1,
+        per_customer_max_inflight: int = 10,
     ) -> None:
         self._ctx = ctx
         self._normalizer = Normalizer(ctx)
         self._max_attempts = max_attempts
         self._concurrency = max(1, concurrency)
+        self._per_customer_max_inflight = max(1, per_customer_max_inflight)
         self._shutdown = asyncio.Event()
 
     async def run(self, poll_interval: float = 1.0) -> None:
@@ -52,6 +54,7 @@ class Worker:
             "worker.start",
             max_attempts=self._max_attempts,
             concurrency=self._concurrency,
+            per_customer_max_inflight=self._per_customer_max_inflight,
         )
         # Each loop independently claims via FOR UPDATE SKIP LOCKED, so N
         # parallel loops in the same process safely share the queue.
@@ -98,17 +101,33 @@ class Worker:
         approximated this in PR #33 is now dead code, removed here.
         """
         async with get_pool().acquire() as conn, conn.transaction():
+            # Per-customer in-flight cap: a customer with N rows already in
+            # `processing` is excluded from this claim. Soft cap (snapshot
+            # count, not a hard lock) — the goal is preventing one
+            # workspace's install-time burst from monopolizing the fleet,
+            # not strict enforcement. Two racing claim loops can both pass
+            # the threshold and over-spill by 1; that's fine.
             row = await conn.fetchrow(
                 """
-                    SELECT queue_id, customer_id, source_system, source_event_id,
-                           payload_s3_key, payload_s3_keys, version, attempts
-                    FROM ingestion_queue
-                    WHERE status = $1
-                    ORDER BY priority DESC, enqueued_at
+                    WITH inflight AS (
+                        SELECT customer_id, COUNT(*) AS cnt
+                        FROM ingestion_queue
+                        WHERE status = $2
+                        GROUP BY customer_id
+                    )
+                    SELECT q.queue_id, q.customer_id, q.source_system, q.source_event_id,
+                           q.payload_s3_key, q.payload_s3_keys, q.version, q.attempts
+                    FROM ingestion_queue q
+                    LEFT JOIN inflight i ON i.customer_id = q.customer_id
+                    WHERE q.status = $1
+                      AND COALESCE(i.cnt, 0) < $3
+                    ORDER BY q.priority DESC, q.enqueued_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
                     """,
                 QueueStatus.PENDING.value,
+                QueueStatus.PROCESSING.value,
+                self._per_customer_max_inflight,
             )
             if row is None:
                 return None
@@ -638,6 +657,7 @@ async def run_worker_forever() -> None:
         ctx,
         max_attempts=settings.worker_max_attempts,
         concurrency=settings.worker_max_concurrent,
+        per_customer_max_inflight=settings.worker_per_customer_max_inflight,
     )
     backfill_worker = BackfillWorker(ctx, wake_event=wake_event)
     granola_listener = GranolaNotifyListener(settings.database_url, wake_event)

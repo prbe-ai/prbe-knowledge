@@ -659,6 +659,88 @@ async def _insert_chunk(
     )
 
 
+async def _insert_chunks_batch(
+    conn: asyncpg.Connection,
+    doc: Document,
+    added_pieces: list[tuple[ChunkPiece, list[float], str]],
+) -> None:
+    """Batched counterpart to `_insert_chunk` — one INSERT for all pieces.
+
+    Dedupes by content_hash before insert: the unique constraint is
+    (doc_id, content_hash), and ON CONFLICT DO UPDATE can't touch the same
+    target row twice in one statement. The prior loop handled duplicate
+    hashes by letting the second iteration UPDATE the row inserted by the
+    first; the batched form collapses duplicates upfront with last-wins
+    semantics on the per-piece fields (chunk_index, content) — they're
+    identical across same-hash entries in practice.
+    """
+    chunk_ids: list[str] = []
+    chunk_indexes: list[int] = []
+    contents: list[str] = []
+    content_hashes: list[str] = []
+    token_counts: list[int] = []
+    embeddings: list[str] = []
+    kinds: list[str] = []
+    seen_hashes: set[str] = set()
+
+    for piece, embedding, kind in added_pieces:
+        content_hash = _chunk_hash(piece.content)
+        if content_hash in seen_hashes:
+            continue
+        seen_hashes.add(content_hash)
+        # See _insert_chunk for rationale on the prefix — keeps a metadata
+        # chunk's chunk_id from colliding with a content chunk that happens
+        # to share content_hash.
+        prefix = "m_" if kind == "metadata" else "c_"
+        chunk_ids.append(f"{doc.doc_id}:{prefix}{content_hash[:16]}")
+        chunk_indexes.append(piece.chunk_index)
+        contents.append(piece.content)
+        content_hashes.append(content_hash)
+        token_counts.append(piece.token_count)
+        embeddings.append(_pg_vector(embedding))
+        kinds.append(kind)
+
+    if not chunk_ids:
+        return
+
+    await conn.execute(
+        """
+        INSERT INTO chunks (
+            chunk_id, doc_id, customer_id,
+            chunk_index, content, content_hash, token_count,
+            embedding, embedding_model, embedding_dim, chunker_version,
+            first_seen_version, last_seen_version, kind
+        )
+        SELECT
+            chunk_id, $2, $3,
+            chunk_index, content, content_hash, token_count,
+            embedding::halfvec, $9, $10, $11,
+            $12, $12, kind
+        FROM unnest(
+            $1::text[], $4::int[], $5::text[], $6::text[], $7::int[],
+            $8::text[], $13::text[]
+        ) AS t(chunk_id, chunk_index, content, content_hash, token_count,
+               embedding, kind)
+        ON CONFLICT (doc_id, content_hash) DO UPDATE
+            SET last_seen_version = EXCLUDED.last_seen_version,
+                valid_to = NULL
+        """,
+        chunk_ids,
+        doc.doc_id,
+        doc.customer_id,
+        chunk_indexes,
+        contents,
+        content_hashes,
+        token_counts,
+        embeddings,
+        EMBEDDING_MODEL,
+        EMBEDDING_DIM,
+        CHUNKER_VERSION,
+        doc.version,
+        kinds,
+    )
+
+
 async def _insert_failed_chunk(
     conn: asyncpg.Connection, doc: Document, failed: Any, piece: ChunkPiece | None = None
 ) -> None:
@@ -708,9 +790,12 @@ async def _apply_chunk_plan(
             list(reused_for_bump),
         )
 
-    # 2) Added: insert with pre-computed embeddings.
-    for piece, embedding, kind in plan.added_pieces:
-        await _insert_chunk(conn, doc, piece, embedding, kind=kind)
+    # 2) Added: insert with pre-computed embeddings. One INSERT for all
+    #    chunks regardless of count — per-chunk round-trips inside Phase B
+    #    were the next contention layer behind the per-node loop in
+    #    upsert_nodes.
+    if plan.added_pieces:
+        await _insert_chunks_batch(conn, doc, plan.added_pieces)
     for piece, fail in plan.failed_pieces:
         await _insert_failed_chunk(conn, doc, fail, piece)
 
