@@ -134,14 +134,16 @@ async def apply_template(
     if template is None:
         raise HTTPException(status_code=404, detail="template not found")
 
-    async with with_tenant(customer_id) as conn:
-        async with tenant_xact_lock(conn, customer_id=customer_id):
-            status_code = await upsert_class(
-                conn,
-                customer_id=customer_id,
-                class_id=template.frontmatter.id,
-                payload=template,
-            )
+    async with (
+        with_tenant(customer_id) as conn,
+        tenant_xact_lock(conn, customer_id=customer_id),
+    ):
+        status_code = await upsert_class(
+            conn,
+            customer_id=customer_id,
+            class_id=template.frontmatter.id,
+            payload=template,
+        )
 
     return JSONResponse(
         content={"status": "ok", "class_id": template.frontmatter.id},
