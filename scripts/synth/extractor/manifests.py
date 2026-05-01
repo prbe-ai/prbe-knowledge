@@ -1,6 +1,6 @@
 """Discover and parse manifest files in a repo.
 
-Scope: top-level + first-level subdirs. Skips known noise dirs
+Scope: top-level + first + second-level subdirs. Skips known noise dirs
 (node_modules, venv, vendor, dist, build, target).
 """
 
@@ -39,12 +39,23 @@ _SKIP_DIRS = {
 
 
 def _candidate_dirs(root: Path) -> list[Path]:
-    """Root + every first-level subdir that isn't in _SKIP_DIRS."""
+    """Root + every first-level subdir + their children (3 levels total).
+    Filters _SKIP_DIRS and dotdirs. Silently skips unreadable directories
+    (PermissionError, etc.) so a single chmod-0 dir doesn't break extraction.
+    """
     dirs = [root]
-    for child in root.iterdir():
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return dirs
+    for child in children:
         if child.is_dir() and child.name not in _SKIP_DIRS and not child.name.startswith("."):
             dirs.append(child)
-            for grandchild in child.iterdir():
+            try:
+                grandchildren = list(child.iterdir())
+            except OSError:
+                continue
+            for grandchild in grandchildren:
                 if (
                     grandchild.is_dir()
                     and grandchild.name not in _SKIP_DIRS
@@ -122,7 +133,7 @@ def _parse_docker_compose(path: Path) -> Manifest | None:
 
 def _dep_name(spec: str) -> str:
     """Strip versions/markers: 'pkg>=1.0' → 'pkg'."""
-    for sep in (";", "[", "==", ">=", "<=", "~=", ">", "<", "!="):
+    for sep in (" ", ";", "[", "==", ">=", "<=", "~=", ">", "<", "!=", "@"):
         if sep in spec:
             spec = spec.split(sep, 1)[0]
     return spec.strip()
@@ -131,7 +142,11 @@ def _dep_name(spec: str) -> str:
 def parse_manifests_in_repo(root: Path) -> list[Manifest]:
     found: list[Manifest] = []
     for d in _candidate_dirs(root):
-        for entry in d.iterdir():
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
             if not entry.is_file():
                 continue
             name = entry.name

@@ -97,3 +97,52 @@ def test_ignores_node_modules_and_venv(tmp_path: Path) -> None:
 
     [m] = parse_manifests_in_repo(tmp_path)
     assert m.name == "my-app"
+
+
+def test_dep_name_strips_url_and_space_forms(tmp_path: Path) -> None:
+    """PEP 508 deps with @-URL or space-separated extras: only the package name should remain."""
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "x"
+dependencies = [
+  "internal-lib @ git+https://github.com/org/internal-lib@main",
+  "another-pkg ; python_version >= '3.10'",
+  "extras-pkg [redis,sqlite]>=2.0",
+  "shared-billing>=2.0",
+]
+""".strip()
+    )
+    [m] = parse_manifests_in_repo(tmp_path)
+    assert "internal-lib" in m.dependencies
+    assert "another-pkg" in m.dependencies
+    assert "extras-pkg" in m.dependencies
+    assert "shared-billing" in m.dependencies
+    # And the noisy forms must NOT appear
+    assert not any("@" in d for d in m.dependencies)
+    assert not any(" " in d for d in m.dependencies)
+
+
+def test_walk_skips_unreadable_subdir(tmp_path: Path) -> None:
+    """A chmod-000 subdir must not crash the walk (real-world repos
+    contain test fixtures / Docker volumes / corrupted submodules)."""
+    import os
+    import stat
+
+    (tmp_path / "good").mkdir()
+    (tmp_path / "good" / "pyproject.toml").write_text('[project]\nname = "good"\n')
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    # Place a manifest inside, but make the dir unreadable so iterdir fails
+    (locked / "pyproject.toml").write_text('[project]\nname = "locked"\n')
+    os.chmod(locked, 0)
+    try:
+        manifests = parse_manifests_in_repo(tmp_path)
+        names = {m.name for m in manifests}
+        assert "good" in names
+        # The locked dir was unreachable — its manifest should be silently skipped
+        assert "locked" not in names
+    finally:
+        # Restore perms so pytest can clean up tmp_path
+        os.chmod(locked, stat.S_IRWXU)
