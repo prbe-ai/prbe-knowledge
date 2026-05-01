@@ -622,6 +622,31 @@ CREATE INDEX kg_candidates_notes_embedding_ivfflat
     WITH (lists = 100);
 
 -- ---------------------------------------------------------------------------
+-- kg_* RLS: tenant isolation on kg_classes, kg_evidence, kg_candidates.
+-- Same pattern as graph_nodes / graph_edges / usage_events: USING-only
+-- policy filtered on the `app.current_customer_id` GUC that
+-- shared/db.with_tenant() sets per transaction. FORCE applies the policy
+-- to the table owner too. No bypass role — services that need
+-- cross-tenant access just don't enter with_tenant() and therefore see
+-- zero rows on these tables (by design). See spec §5.1 / §12.3.
+-- ---------------------------------------------------------------------------
+ALTER TABLE kg_classes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kg_classes FORCE ROW LEVEL SECURITY;
+ALTER TABLE kg_evidence ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kg_evidence FORCE ROW LEVEL SECURITY;
+ALTER TABLE kg_candidates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kg_candidates FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY kg_classes_tenant_isolation ON kg_classes
+    USING (customer_id = current_setting('app.current_customer_id', true));
+
+CREATE POLICY kg_evidence_tenant_isolation ON kg_evidence
+    USING (customer_id = current_setting('app.current_customer_id', true));
+
+CREATE POLICY kg_candidates_tenant_isolation ON kg_candidates
+    USING (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents
