@@ -38,7 +38,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 
-from services.kg.embedding_query import query_similar
+from services.kg.embedding_query import _format_vector, query_similar
 from shared.db import raw_conn, with_tenant
 
 
@@ -234,7 +234,10 @@ async def test_pgvector_query_isolates_tenants(
           fixture.
     """
     vec = [1.0] * 1536
-    vec_literal = "[" + ",".join(repr(v) for v in vec) + "]"
+    # Use the canonical formatter from the module under test rather than
+    # reimplementing it here — protects against silent drift if the
+    # production format ever changes (e.g. precision, int-coercion).
+    vec_literal = _format_vector(vec)
 
     # Set the embedding on tA's existing seeded row. UPDATE rather than a
     # fresh INSERT keeps the test focused on isolation, not on duplicating
