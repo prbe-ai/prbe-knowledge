@@ -384,36 +384,87 @@ async def test_slack_still_uses_one_row_per_event(live_db) -> None:
 # ---- 6. R2 key namespace must stay unique per delivery ---------------------
 
 
-def test_webhook_handler_composes_unique_r2_keys_per_cc_batch() -> None:
-    """Regression: claude_code's queue source_event_id is now bare session_id
-    so the UPSERT can coalesce, but the R2 storage namespace must still
-    distinguish batches — otherwise batch N writes overwrite batch N-1's
-    envelope and only the last batch's events survive in storage.
+@pytest.mark.parametrize(
+    "source",
+    [SourceSystem.CLAUDE_CODE, SourceSystem.CODEX],
+    ids=["claude_code", "codex"],
+)
+def test_compose_storage_id_suffixes_batch_seq_per_agent_source(
+    source: SourceSystem,
+) -> None:
+    """Regression: agent-session sources coalesce by bare session_id at the
+    queue, so the R2 storage namespace must distinguish batches via a
+    `:<batch_seq>` suffix — otherwise batches overwrite each other in
+    storage and only the final delivery's envelope survives.
 
-    The webhook handler composes <session_id>:<batch_seq> as the storage_id
-    when source_system==CLAUDE_CODE and parse_hint carries batch_seq.
-    Pure-function check: build a parse_hint, run the same composition the
-    handler does, assert distinct storage_ids per batch_seq.
+    Calls the real `_compose_storage_id` used by the webhook handler so a
+    regression that drops a source from the predicate is caught here. CC
+    had this protection; CODEX was originally missing it and lost data
+    silently on multi-batch sessions until this fix.
     """
-    from services.ingestion.main import _payload_key
-    from shared.constants import SourceSystem
+    from services.ingestion.main import _compose_storage_id, _payload_key
 
-    customer = "kc-cust"
-    session = "sess-keys-unique"
+    customer = f"kc-{source.value}-cust"
+    session = f"{source.value}-sess-keys-unique"
 
     keys: set[str] = set()
+    storage_ids: set[str] = set()
     for batch_seq in range(5):
-        # Mirrors the storage_id composition in main.py:webhook
         parse_hint = {"session_id": session, "batch_seq": batch_seq}
-        source_event_id = session  # what parse_webhook_event returns now
-        storage_id = source_event_id
-        bs = parse_hint.get("batch_seq")
-        if isinstance(bs, int):
-            storage_id = f"{source_event_id}:{bs}"
-        keys.add(_payload_key(SourceSystem.CLAUDE_CODE, customer, storage_id))
+        storage_id = _compose_storage_id(source, session, parse_hint)
+        storage_ids.add(storage_id)
+        keys.add(_payload_key(source, customer, storage_id))
 
-    assert len(keys) == 5, (
-        f"expected 5 distinct R2 keys (one per batch), got {len(keys)}: {keys}. "
-        "If only 1 distinct key, the per-batch storage namespace collapsed "
-        "and batches will overwrite each other in R2."
+    assert len(storage_ids) == 5, (
+        f"{source.value}: storage_id collapsed across batches; got "
+        f"{storage_ids}. The compose function dropped the batch_seq suffix."
     )
+    assert len(keys) == 5, (
+        f"{source.value}: expected 5 distinct R2 keys, got {len(keys)}: {keys}. "
+        "If only 1 distinct key, multi-batch sessions will overwrite each "
+        "other in R2 before the worker reads them."
+    )
+
+
+def test_compose_storage_id_passes_through_for_non_agent_sources() -> None:
+    """Non-agent sources (slack, github, etc.) get their own queue row per
+    event — source_event_id is already unique per delivery, so the
+    storage_id should be the bare event id without a suffix.
+    """
+    from services.ingestion.main import _compose_storage_id
+
+    for source in (
+        SourceSystem.SLACK,
+        SourceSystem.GITHUB,
+        SourceSystem.LINEAR,
+        SourceSystem.NOTION,
+    ):
+        # parse_hint may carry whatever; non-agent sources should ignore it.
+        out = _compose_storage_id(
+            source, "evt-123", {"session_id": "x", "batch_seq": 7}
+        )
+        assert out == "evt-123", (
+            f"{source.value} should pass source_event_id through unchanged; "
+            f"got {out!r}"
+        )
+
+
+def test_compose_storage_id_handles_missing_batch_seq() -> None:
+    """The pair endpoint and finalize cron use a parse_hint without a
+    batch_seq — composition should fall back to bare session_id rather
+    than emit `<session>:None` or crash.
+    """
+    from services.ingestion.main import _compose_storage_id
+
+    # parse_hint missing batch_seq
+    assert _compose_storage_id(
+        SourceSystem.CODEX, "sess-1", {"session_id": "sess-1"}
+    ) == "sess-1"
+    # parse_hint not a dict
+    assert _compose_storage_id(
+        SourceSystem.CODEX, "sess-1", None
+    ) == "sess-1"
+    # batch_seq present but not an int (defensive)
+    assert _compose_storage_id(
+        SourceSystem.CODEX, "sess-1", {"batch_seq": "0"}
+    ) == "sess-1"

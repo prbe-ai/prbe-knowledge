@@ -32,6 +32,11 @@ _TOKEN_TO_DOC_TYPES: dict[str, tuple[DocType, ...]] = {
 
 
 # Source prefix → dotted DocType set, used to narrow by sources filter.
+# CODEX shares the `claude_code.` doc_type prefix because the connector
+# emits CLAUDE_CODE_SESSION docs for both — provenance differs at
+# `source_system`, doc shape is identical. Mapping CODEX here lets a
+# `sources=[codex]` retrieval filter resolve a token like "session" to
+# `claude_code.session` without dropping zero results.
 _SOURCE_PREFIX: dict[SourceSystem, str] = {
     SourceSystem.SLACK: "slack.",
     SourceSystem.LINEAR: "linear.",
@@ -40,6 +45,7 @@ _SOURCE_PREFIX: dict[SourceSystem, str] = {
     SourceSystem.SENTRY: "sentry.",
     SourceSystem.GRANOLA: "granola.",
     SourceSystem.CLAUDE_CODE: "claude_code.",
+    SourceSystem.CODEX: "claude_code.",
 }
 
 

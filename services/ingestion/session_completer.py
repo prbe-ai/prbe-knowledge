@@ -1,4 +1,4 @@
-"""Periodic finalizer for Claude Code sessions that go idle.
+"""Periodic finalizer for agent-session sources (Claude Code, Codex) that go idle.
 
 For each (customer, session) where the most recent ingestion_queue activity is
 older than `idle_minutes`, write a finalize.marker placeholder to R2 and
@@ -9,6 +9,13 @@ extraction (qa, code_change, decision, file_ref unit docs).
 Post-migration 0026 the live session row is keyed on bare session_id (no
 `:batch_seq` suffix), and finalize is no longer a separate row — it
 coalesces into the same row as live batches via the same UPSERT path.
+
+Codex sessions need the same finalizer treatment as Claude Code — both
+ingest in coalescing mode where idle sessions otherwise stay `pending`
+forever. We loop over both sources and write the marker under the
+source-prefixed R2 path (raw/claude_code/... vs raw/codex/...) so each
+source's marker collides correctly with that source's live batches and
+nothing else.
 """
 from __future__ import annotations
 
@@ -82,42 +89,54 @@ async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
             enqueued_at = NOW()
     """
 
-    cc_priority = SOURCE_INGESTION_PRIORITY.get(
-        SourceSystem.CLAUDE_CODE, DEFAULT_INGESTION_PRIORITY
-    )
+    # Both agent-session sources ingest in coalescing mode and need
+    # finalize markers when idle. We finalize each source independently so
+    # the R2 marker key lives under the source-prefixed namespace and
+    # collides with the right live batches.
+    AGENT_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX)
     store = get_store()
     enqueued = 0
+    total_candidates = 0
     async with get_pool().acquire() as conn:
-        rows = await conn.fetch(find_sql, SourceSystem.CLAUDE_CODE.value, idle_minutes)
         seen_buckets: set[str] = set()
-        for r in rows:
-            customer_id = r["customer_id"]
-            session_id = r["session_id"]
-            bucket = store.bucket_for(customer_id)
-            if bucket not in seen_buckets:
-                await store.ensure_bucket(bucket)
-                seen_buckets.add(bucket)
-            placeholder_key = f"raw/claude_code/{customer_id}/{session_id}/finalize.marker"
-            placeholder_body = orjson.dumps({
-                "device_id": "cron-finalize",
-                "session_id": session_id,
-                "batch_seq": -1,
-                "cwd": None,
-                "events": [],
-                "finalize": True,
-            })
-            await store.put(bucket, placeholder_key, placeholder_body)
-            await conn.execute(
-                upsert_sql,
-                customer_id,
-                SourceSystem.CLAUDE_CODE.value,
-                session_id,  # bare session_id — coalescing key
-                placeholder_key,
-                cc_priority,
-            )
-            enqueued += 1
+        for source in AGENT_SOURCES:
+            priority = SOURCE_INGESTION_PRIORITY.get(source, DEFAULT_INGESTION_PRIORITY)
+            rows = await conn.fetch(find_sql, source.value, idle_minutes)
+            total_candidates += len(rows)
+            for r in rows:
+                customer_id = r["customer_id"]
+                session_id = r["session_id"]
+                bucket = store.bucket_for(customer_id)
+                if bucket not in seen_buckets:
+                    await store.ensure_bucket(bucket)
+                    seen_buckets.add(bucket)
+                placeholder_key = (
+                    f"raw/{source.value}/{customer_id}/{session_id}/finalize.marker"
+                )
+                placeholder_body = orjson.dumps({
+                    "device_id": "cron-finalize",
+                    "session_id": session_id,
+                    "batch_seq": -1,
+                    "cwd": None,
+                    "events": [],
+                    "finalize": True,
+                })
+                await store.put(bucket, placeholder_key, placeholder_body)
+                await conn.execute(
+                    upsert_sql,
+                    customer_id,
+                    source.value,
+                    session_id,  # bare session_id — coalescing key
+                    placeholder_key,
+                    priority,
+                )
+                enqueued += 1
     log.info(
         "session_completer.run",
-        extra={"idle_minutes": idle_minutes, "enqueued": enqueued, "candidates": len(rows)},
+        extra={
+            "idle_minutes": idle_minutes,
+            "enqueued": enqueued,
+            "candidates": total_candidates,
+        },
     )
     return enqueued
