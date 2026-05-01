@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     db_statement_timeout_ms: int = 30_000
     db_init_retry_attempts: int = 6
     db_init_retry_base_seconds: float = 1.0
+    db_connect_timeout_seconds: float = 10.0
 
     # --- Object storage (R2 in prod, MinIO locally) -------------------------
     r2_endpoint_url: str = "http://localhost:9000"

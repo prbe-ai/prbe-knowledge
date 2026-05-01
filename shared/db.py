@@ -41,6 +41,7 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
                 min_size=settings.db_pool_min_size,
                 max_size=settings.db_pool_max_size,
                 command_timeout=settings.db_statement_timeout_ms / 1000,
+                timeout=settings.db_connect_timeout_seconds,
                 statement_cache_size=0,  # pgbouncer-compatible
             )
             return _pool
