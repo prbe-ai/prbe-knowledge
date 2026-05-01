@@ -27,6 +27,7 @@ from scripts.synth.archetypes.base import (
     ValidatorLevel,
 )
 from scripts.synth.ownership import OwnershipIndex
+from scripts.synth.scenarios import TimeWindow
 from scripts.synth.world_model import WorldModel
 
 STANDUP_UPDATE = Archetype(
@@ -61,13 +62,18 @@ def _safe_id(canonical_id: str) -> str:
 def build_standup_specs(
     world: WorldModel,
     ownership: OwnershipIndex,
-    time_window: object,  # TimeWindow from scenarios.py
+    time_window: TimeWindow,
     seed: int,
     top_n: int = 5,
 ) -> tuple[ScenarioSpec, ...]:
-    """Build STANDUP_UPDATE ScenarioSpecs for all working days in time_window."""
-    end: datetime = time_window.end  # type: ignore[attr-defined]
-    days: int = time_window.days  # type: ignore[attr-defined]
+    """Build STANDUP_UPDATE ScenarioSpecs for all working days in time_window.
+
+    The `seed` argument is accepted for API symmetry across archetype builders;
+    STANDUP_UPDATE achieves determinism via sorted iteration (no random selection),
+    so the seed is currently unused.
+    """
+    end: datetime = time_window.end
+    days: int = time_window.days
     work_days = _working_days(end, days)
 
     # Top-N personas by activity_score (descending), then canonical_id for tie-break.
