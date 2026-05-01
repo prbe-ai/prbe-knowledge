@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator
 import asyncpg
 import pytest
 import pytest_asyncio
+import structlog
 from fastapi import FastAPI
 
 from shared import db as db_module
@@ -56,6 +57,35 @@ _LIVE_DB_SKIP_REASON = (
     "requires live Postgres at localhost:5432 "
     "(start with `docker compose up -d`)"
 )
+
+
+@pytest.fixture
+def _route_structlog_to_stdlib() -> None:
+    """Route structlog output through stdlib logging so ``caplog`` sees it.
+
+    The production ``configure_logging`` uses ``make_filtering_bound_logger``,
+    which writes through ``structlog``'s own logger factory and bypasses
+    stdlib logging entirely — meaning ``caplog`` would catch nothing. For
+    tests, swap to ``structlog.stdlib.BoundLogger`` + ``LoggerFactory`` so
+    each ``log.warning(...)`` becomes a stdlib ``LogRecord`` that ``caplog``
+    can assert on.
+
+    Non-autouse — only tests that assert on captured log output should
+    request it. Other tests stay on the production structlog config so
+    we don't perturb the global state of every kg test run. Lifted here
+    from ``test_classifier_embedding.py`` / ``test_classifier_tiebreaker.py``
+    once a third file (``test_traversal_expand.py``) needed the same
+    behavior; consolidating avoids file-by-file copy drift.
+    """
+    structlog.configure(
+        processors=[
+            structlog.stdlib.add_log_level,
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
 
 
 @pytest_asyncio.fixture

@@ -30,31 +30,8 @@ import logging
 from unittest.mock import MagicMock
 
 import pytest
-import structlog
 
 from services.kg.classifier.tiebreaker import TiebreakerResult, resolve_ambiguity
-
-
-@pytest.fixture(autouse=True)
-def _route_structlog_to_stdlib() -> None:
-    """Route structlog output through stdlib logging so ``caplog`` sees it.
-
-    Same fixture as ``test_classifier_embedding.py``: the production
-    ``configure_logging`` uses ``make_filtering_bound_logger`` which
-    bypasses stdlib logging, so ``caplog`` would catch nothing without
-    this swap. Kept file-scope (matches the Task 16 author's choice);
-    if a third classifier test file repeats this fixture, lifting it
-    to ``tests/kg/conftest.py`` is the natural next step.
-    """
-    structlog.configure(
-        processors=[
-            structlog.stdlib.add_log_level,
-            structlog.processors.JSONRenderer(),
-        ],
-        wrapper_class=structlog.stdlib.BoundLogger,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        cache_logger_on_first_use=False,
-    )
 
 
 def _fake_anthropic(text: str) -> MagicMock:
@@ -91,7 +68,9 @@ def test_returns_none_when_judge_says_none() -> None:
     assert out == TiebreakerResult(choice=None, rationale="no good match")
 
 
-def test_fail_safe_on_invalid_json(caplog: pytest.LogCaptureFixture) -> None:
+def test_fail_safe_on_invalid_json(
+    _route_structlog_to_stdlib: None, caplog: pytest.LogCaptureFixture
+) -> None:
     """Garbage from the model fails safe to no-match + warning event."""
     a = _fake_anthropic("not json")
     with caplog.at_level(logging.WARNING):
@@ -109,7 +88,9 @@ def test_fail_safe_on_invalid_json(caplog: pytest.LogCaptureFixture) -> None:
     ), f"expected warning event in caplog; got {[r.getMessage() for r in caplog.records]}"
 
 
-def test_fail_safe_on_api_error(caplog: pytest.LogCaptureFixture) -> None:
+def test_fail_safe_on_api_error(
+    _route_structlog_to_stdlib: None, caplog: pytest.LogCaptureFixture
+) -> None:
     """A transport-layer exception fails safe to no-match + warning event."""
     a = MagicMock()
     a.messages.create.side_effect = RuntimeError("boom: 429 rate limited")
@@ -128,7 +109,9 @@ def test_fail_safe_on_api_error(caplog: pytest.LogCaptureFixture) -> None:
     ), f"expected warning event in caplog; got {[r.getMessage() for r in caplog.records]}"
 
 
-def test_unknown_class_id_rejected(caplog: pytest.LogCaptureFixture) -> None:
+def test_unknown_class_id_rejected(
+    _route_structlog_to_stdlib: None, caplog: pytest.LogCaptureFixture
+) -> None:
     """A hallucinated class_id is rejected without firing the failure warning.
 
     This is a guarded-against contract violation, not a transport /
