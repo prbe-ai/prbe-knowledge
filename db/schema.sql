@@ -514,6 +514,32 @@ CREATE TABLE kg_classes (
 );
 
 -- ---------------------------------------------------------------------------
+-- kg_evidence: debugging knowledge graph — episodic learning trail.
+--
+-- One row per refinement observation tied to a specific ticket. Distinct from
+-- the `frontmatter.evidence` aggregate summary on kg_classes: this table is
+-- the per-ticket trail the maintenance agent reads on each run to decide what
+-- to adjust on a class. A single ticket can produce multiple refinements over
+-- time, so observed_at is part of the primary key. See docs/superpowers/
+-- specs/2026-04-29-debugging-knowledge-graph-design.md §5.1, §7.
+--
+-- Composite FK to kg_classes(customer_id, class_id) ON DELETE CASCADE so
+-- deleting a class drops its evidence trail. RLS policy is added in a
+-- subsequent migration (Phase 1 Task 5).
+-- ---------------------------------------------------------------------------
+CREATE TABLE kg_evidence (
+    customer_id  TEXT         NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    class_id     TEXT         NOT NULL,
+    ticket_id    TEXT         NOT NULL,
+    refinement   TEXT         NOT NULL,
+    observed_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (customer_id, class_id, ticket_id, observed_at),
+    FOREIGN KEY (customer_id, class_id)
+        REFERENCES kg_classes(customer_id, class_id)
+        ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents
