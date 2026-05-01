@@ -11,6 +11,10 @@ class SourceSystem(StrEnum):
     SENTRY = "sentry"
     GRANOLA = "granola"
     CLAUDE_CODE = "claude_code"
+    # Codex CLI sessions arrive shimmed into Claude-Code shape by the plugin's
+    # sanitizer. Doc shape and unit extraction are identical to claude_code;
+    # this label exists so dashboard queries can distinguish provenance.
+    CODEX = "codex"
 
 
 class DocClass(StrEnum):

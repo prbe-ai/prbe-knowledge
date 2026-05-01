@@ -290,21 +290,22 @@ async def _enqueue(
 
     Two paths:
 
-    1. **claude_code (coalescing)** — multiple batches for the same session
-       collapse into a single queue row. UPSERT keyed on
-       (customer_id, source_system, source_event_id=session_id) appends
-       the new R2 key to `payload_s3_keys` and bumps `version`. The worker
-       captures `version` at claim time and CAS-commits on it, so any
-       batch landing during Phase A causes a clean re-claim with the
-       extended array. See migration 0026 for column shape.
+    1. **agent sessions (claude_code, codex) — coalescing** — multiple
+       batches for the same session collapse into a single queue row.
+       UPSERT keyed on (customer_id, source_system,
+       source_event_id=session_id) appends the new R2 key to
+       `payload_s3_keys` and bumps `version`. The worker captures
+       `version` at claim time and CAS-commits on it, so any batch landing
+       during Phase A causes a clean re-claim with the extended array.
+       See migration 0026 for column shape.
 
     2. **other connectors** — INSERT each event as its own row with
        `payload_s3_keys = ARRAY[key]`, `version = 0`. ON CONFLICT
        DO NOTHING dedupes redeliveries from the source platform.
 
-    Returns True if a new row was created OR an existing CC session row
-    had its array extended; False only on the non-CC duplicate path
-    (ON CONFLICT swallowed the insert).
+    Returns True if a new row was created OR an existing agent-session row
+    had its array extended; False only on the non-agent-session duplicate
+    path (ON CONFLICT swallowed the insert).
 
     `payload_s3_key` is also written to the legacy column for back-compat
     until a follow-up PR drops it. Both columns hold the same first key
@@ -313,7 +314,7 @@ async def _enqueue(
     """
     priority = SOURCE_INGESTION_PRIORITY.get(source, DEFAULT_INGESTION_PRIORITY)
 
-    if source == SourceSystem.CLAUDE_CODE:
+    if source in (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX):
         # Session-keyed UPSERT: append to array, bump version, refresh
         # status to 'pending' so the worker picks it up even if the row
         # was previously 'done' (session resumed after idle).
