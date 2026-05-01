@@ -116,3 +116,31 @@ def test_repos_active_in_recorded_per_person() -> None:
 
     [p] = canonicalize_people([sig_a, sig_b], min_threshold=1, max_personas=10)
     assert sorted(p.repos_active_in) == ["github.com/org/A", "github.com/org/B"]
+
+
+def test_canonicalize_is_order_independent() -> None:
+    """Two different commit orderings must produce the same persons (sets)."""
+    contributor = Contributor(
+        gh_username="alice",
+        display_name="Alice X",
+        email_aliases=("alice@work.com",),
+        contributions=10,
+    )
+    commits_forward = [
+        _commit("alice@work.com", "Alice", sha="1"),
+        _commit("alice@home.com", "Alice X", sha="2"),
+    ]
+    commits_reverse = list(reversed(commits_forward))
+
+    a = canonicalize_people(
+        [_signals(commits=commits_forward, contributors=(contributor,))],
+        min_threshold=1, max_personas=10,
+    )
+    b = canonicalize_people(
+        [_signals(commits=commits_reverse, contributors=(contributor,))],
+        min_threshold=1, max_personas=10,
+    )
+    # Both must collapse to one Person with both email aliases
+    assert len(a) == 1 and len(b) == 1
+    assert a[0].canonical_id == b[0].canonical_id == "gh:alice"
+    assert set(a[0].email_aliases) == set(b[0].email_aliases) == {"alice@home.com", "alice@work.com"}

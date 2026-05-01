@@ -171,7 +171,20 @@ def canonicalize_people(
         if dn and name_counts[dn] == 1:
             name_to_gh[dn] = gh_username
 
-    # Aggregate activity per canonical_id
+    # Pass 1: augment email_to_gh from commit name matches (order-independent —
+    # only adds, never overwrites). Must complete before activity aggregation so
+    # that every commit sees a stable email_to_gh regardless of commit order.
+    for sig in signals:
+        for commit in sig.commits:
+            email = commit.author_email.lower()
+            if email in email_to_gh:
+                continue
+            gh = name_to_gh.get(commit.author_name)
+            if gh:
+                email_to_gh[email] = gh
+                gh_meta[gh]["emails"].add(email)
+
+    # Pass 2: activity aggregation — pure read of stable email_to_gh.
     activity: dict[str, int] = defaultdict(int)
     repos_active_in: dict[str, set[str]] = defaultdict(set)
     aliases: dict[str, set[str]] = defaultdict(set)
@@ -180,19 +193,11 @@ def canonicalize_people(
     for sig in signals:
         for commit in sig.commits:
             email = commit.author_email.lower()
-            # Primary: email is in contributor's email_aliases
             gh = email_to_gh.get(email)
-            # Secondary: commit name uniquely matches a GH contributor's display_name
-            if gh is None:
-                gh = name_to_gh.get(commit.author_name)
-                if gh:
-                    # Record this email as an alias for future lookups
-                    email_to_gh[email] = gh
-                    gh_meta[gh]["emails"].add(email)
             cid = f"gh:{gh}" if gh else f"email:{email}"
             activity[cid] += 1
             repos_active_in[cid].add(sig.url)
-            aliases[cid].add(commit.author_email)
+            aliases[cid].add(commit.author_email.lower())
             display_names[cid][commit.author_name] += 1
 
     # Even contributors with zero recent commits should appear if they
