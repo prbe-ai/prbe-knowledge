@@ -490,6 +490,30 @@ CREATE POLICY usage_events_tenant_isolation ON usage_events
     USING (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
+-- kg_classes: debugging knowledge graph — class table (Phase 1 foundation).
+--
+-- One row per class per tenant. `frontmatter` is JSONB end-to-end (signature,
+-- related, context_sources, evidence — all structured fields). `body` is the
+-- opaque markdown playbook prose with [[wiki-links]]. `signature_embedding`
+-- is a pgvector column populated by the embed pass after write (nullable
+-- until first embed). See docs/superpowers/specs/2026-04-29-debugging-
+-- knowledge-graph-design.md §5.1.
+--
+-- Indexes (GIN on frontmatter->'related', ivfflat on signature_embedding) and
+-- RLS policy are added in subsequent migrations (Phase 1 Tasks 4 and 5).
+-- ---------------------------------------------------------------------------
+CREATE TABLE kg_classes (
+    customer_id          TEXT         NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    class_id             TEXT         NOT NULL,
+    frontmatter          JSONB        NOT NULL,
+    body                 TEXT         NOT NULL DEFAULT '',
+    signature_embedding  vector(1536),
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (customer_id, class_id)
+);
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents
