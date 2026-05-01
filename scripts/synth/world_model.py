@@ -112,3 +112,118 @@ class WorldModel:
     seed: int
     extracted_at: datetime
     sha_set: dict[str, str] = field(default_factory=dict)  # repo_url → sha
+
+
+# ---------------------------------------------------------------------------
+# WorldModelMerger — combines RepoSignals[] into a single WorldModel.
+#
+# Implemented across tasks 11-16. Each function is independently testable
+# so the merger pipeline (Task 17) can compose them confidently.
+# ---------------------------------------------------------------------------
+
+from collections import defaultdict  # noqa: E402
+from typing import TYPE_CHECKING  # noqa: E402
+
+if TYPE_CHECKING:
+    from scripts.synth.extractor.repo import RepoSignals
+
+
+def canonicalize_people(
+    signals: list[RepoSignals],
+    *,
+    min_threshold: int,
+    max_personas: int,
+) -> tuple[Person, ...]:
+    """Merge committers + GH contributors into canonical Persons.
+
+    Precedence for canonical_id:
+      1. gh:<username> if a contributor entry mentions an email/name we see
+      2. email:<lowercased> if no GH match
+    Display name = the GH name if available, else the most-frequent commit name.
+    Activity = total commit count across all repos.
+    """
+    # email -> gh_username (from contributor records)
+    email_to_gh: dict[str, str] = {}
+    # gh_username -> display_name + email_aliases
+    gh_meta: dict[str, dict] = {}
+    for sig in signals:
+        for c in (sig.contributors or ()):
+            for email in c.email_aliases:
+                email_to_gh[email.lower()] = c.gh_username
+            gh_meta.setdefault(
+                c.gh_username,
+                {"display_name": c.display_name, "emails": set()},
+            )
+            gh_meta[c.gh_username]["emails"].update(e.lower() for e in c.email_aliases)
+            if c.display_name:
+                gh_meta[c.gh_username]["display_name"] = c.display_name
+
+    # Build a name -> gh_username map for secondary matching, but only when
+    # the display name is unambiguous (maps to exactly one GH contributor).
+    name_to_gh: dict[str, str] = {}
+    name_counts: dict[str, int] = defaultdict(int)
+    for _gh_username, meta in gh_meta.items():
+        dn = meta.get("display_name")
+        if dn:
+            name_counts[dn] += 1
+    for gh_username, meta in gh_meta.items():
+        dn = meta.get("display_name")
+        if dn and name_counts[dn] == 1:
+            name_to_gh[dn] = gh_username
+
+    # Aggregate activity per canonical_id
+    activity: dict[str, int] = defaultdict(int)
+    repos_active_in: dict[str, set[str]] = defaultdict(set)
+    aliases: dict[str, set[str]] = defaultdict(set)
+    display_names: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    for sig in signals:
+        for commit in sig.commits:
+            email = commit.author_email.lower()
+            # Primary: email is in contributor's email_aliases
+            gh = email_to_gh.get(email)
+            # Secondary: commit name uniquely matches a GH contributor's display_name
+            if gh is None:
+                gh = name_to_gh.get(commit.author_name)
+                if gh:
+                    # Record this email as an alias for future lookups
+                    email_to_gh[email] = gh
+                    gh_meta[gh]["emails"].add(email)
+            cid = f"gh:{gh}" if gh else f"email:{email}"
+            activity[cid] += 1
+            repos_active_in[cid].add(sig.url)
+            aliases[cid].add(commit.author_email)
+            display_names[cid][commit.author_name] += 1
+
+    # Even contributors with zero recent commits should appear if they
+    # show up in the GH contributor list — but only if the merger run
+    # considers them above threshold. Per spec we drop low-activity, so
+    # we leave the activity counter as is.
+
+    rows: list[Person] = []
+    for cid, count in activity.items():
+        if count < min_threshold:
+            continue
+        gh_username: str | None = None
+        if cid.startswith("gh:"):
+            gh_username = cid.removeprefix("gh:")
+            display = gh_meta.get(gh_username, {}).get("display_name") or gh_username
+            aliases[cid].update(gh_meta.get(gh_username, {}).get("emails", set()))
+        else:
+            # most-frequent commit name
+            display = max(display_names[cid].items(), key=lambda kv: kv[1])[0]
+
+        rows.append(
+            Person(
+                canonical_id=cid,
+                gh_username=gh_username,
+                display_name=display,
+                email_aliases=tuple(sorted(aliases[cid])),
+                role_hint=None,                          # filled later by service-owner inference
+                repos_active_in=tuple(sorted(repos_active_in[cid])),
+                activity_score=float(count),
+            )
+        )
+
+    rows.sort(key=lambda p: p.activity_score, reverse=True)
+    return tuple(rows[:max_personas])
