@@ -80,12 +80,12 @@ class GithubClient:
     async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any | None:
         try:
             r = await self._http.get(path, params=params)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            return r.json()
         except httpx.HTTPError:
             return None
-        if r.status_code == 404:
-            return None
-        r.raise_for_status()
-        return r.json()
 
     async def fetch_contributors(self, owner: str, repo: str, limit: int = 100) -> list[Contributor]:
         rows = await self._get(f"/repos/{owner}/{repo}/contributors", {"per_page": limit})
@@ -109,6 +109,7 @@ class GithubClient:
         return out
 
     async def fetch_issues(self, owner: str, repo: str, limit: int = 200) -> list[Issue]:
+        # v1 returns at most one page (≤100); pagination via the Link header is a v2 concern.
         rows = await self._get(
             f"/repos/{owner}/{repo}/issues",
             {"state": "all", "per_page": min(limit, 100)},
@@ -136,6 +137,7 @@ class GithubClient:
         return issues
 
     async def fetch_prs(self, owner: str, repo: str, limit: int = 200) -> list[PullRequest]:
+        # v1 returns at most one page (≤100); pagination via the Link header is a v2 concern.
         rows = await self._get(
             f"/repos/{owner}/{repo}/pulls",
             {"state": "all", "per_page": min(limit, 100)},
@@ -178,7 +180,9 @@ class GithubClient:
             out.append(
                 Workflow(
                     name=row.get("name") or row.get("path") or "",
-                    last_run_status=row.get("state"),
+                    # last_run_status requires /actions/runs; deferred to v2 (row["state"] is
+                    # the workflow's enabled-state, not a run result — don't use it here).
+                    last_run_status=None,
                     last_run_at=None,  # full run history is heavy; skip in v1
                 )
             )

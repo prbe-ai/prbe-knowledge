@@ -50,7 +50,7 @@ async def test_fetch_contributors_returns_username_and_display() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_issues_paginates_and_strips_pull_requests() -> None:
+async def test_fetch_issues_strips_pull_requests() -> None:
     with respx.mock(base_url="https://api.github.com") as router:
         page1 = [
             {
@@ -92,5 +92,20 @@ async def test_fetch_handles_404_as_none() -> None:
         )
         client = GithubClient(token="t")
         contributors = await client.fetch_contributors("x", "missing")
+        await client.close()
+    assert contributors == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_handles_500_as_empty_list() -> None:
+    """A 5xx from the GitHub API should be absorbed and return [] — not
+    raise httpx.HTTPStatusError to the caller (regression for the bug where
+    raise_for_status() was outside the try block)."""
+    with respx.mock(base_url="https://api.github.com") as router:
+        router.get("/repos/x/y/contributors").mock(
+            return_value=httpx.Response(500, json={"message": "Internal Server Error"})
+        )
+        client = GithubClient(token="t")
+        contributors = await client.fetch_contributors("x", "y")
         await client.close()
     assert contributors == []
