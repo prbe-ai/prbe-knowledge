@@ -126,13 +126,17 @@ class Settings(BaseSettings):
     # is still possible for deterministic errors via PrbeError(transient=
     # False) — that path is unchanged.
     worker_max_attempts: int = 50
-    # Soft per-customer cap on simultaneously processing rows. Sized so one
-    # workspace's install-time burst can't monopolize the fleet; spare slots
-    # go to other customers. With 18 machines * 4 concurrency = 72 slots,
-    # 10 per customer means at least 7 customers can have headroom in
-    # parallel. Snapshot count, not a hard lock — slight over-spill under
-    # racing claims is fine.
-    worker_per_customer_max_inflight: int = 10
+    # Soft per-customer cap on simultaneously processing rows. Original
+    # value (10) was conservative against the per-row-loop contention model
+    # in graph_writer/normalizer that PR #41 retired (batched writes +
+    # sorted lock order + 5min timeout + 50 retries). With those layers in
+    # place, 30 is comfortable: 30 contending txs on a hot node serialize
+    # at ~5ms per acquisition, well under the 5min ceiling. Sized to keep
+    # at least 2-3 customers' worth of headroom against the 108-slot
+    # fleet (18 machines * 6 concurrency) when several burst at once.
+    # Snapshot count, not a hard lock — slight over-spill under racing
+    # claims is fine.
+    worker_per_customer_max_inflight: int = 30
 
     # --- HTTP / outbound ----------------------------------------------------
     http_timeout_seconds: float = 30.0
