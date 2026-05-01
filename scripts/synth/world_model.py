@@ -372,3 +372,74 @@ def _infer_kind(manifest: Manifest) -> ServiceKind:
     if manifest.kind == ManifestKind.DOCKER_COMPOSE:
         return ServiceKind.INFRA
     return ServiceKind.LIB
+
+
+_GENERIC_CHANNELS = ("#general", "#random", "#incidents", "#engineering", "#announcements")
+
+_FIXED_NOTION_SECTIONS = (
+    "Engineering", "Runbooks", "Postmortems", "Architecture",
+    "Onboarding", "Product", "People & Hiring",
+)
+
+
+def synthesize_channels(
+    services: tuple[Service, ...],
+    codeowner_teams: set[str],
+) -> tuple[ChannelHint, ...]:
+    out: list[ChannelHint] = []
+
+    # Per-service channel for api/worker/frontend
+    for svc in services:
+        if svc.kind in (ServiceKind.API, ServiceKind.WORKER, ServiceKind.FRONTEND):
+            out.append(
+                ChannelHint(
+                    name=f"#{svc.name}",
+                    suggested_topic=svc.description,
+                    related_services=(svc.qualified,),
+                )
+            )
+
+    # Top-5 deploy channels
+    top_active = sorted(services, key=lambda s: s.recent_activity, reverse=True)[:5]
+    for svc in top_active:
+        out.append(
+            ChannelHint(
+                name=f"#{svc.name}-deploys",
+                suggested_topic=None,
+                related_services=(svc.qualified,),
+            )
+        )
+
+    # Team channels
+    for team in sorted(codeowner_teams):
+        out.append(ChannelHint(name=f"#team-{team}", suggested_topic=None, related_services=()))
+
+    # Generic
+    for g in _GENERIC_CHANNELS:
+        out.append(ChannelHint(name=g, suggested_topic=None, related_services=()))
+
+    # Dedupe by name (preserve first occurrence)
+    seen: set[str] = set()
+    deduped: list[ChannelHint] = []
+    for c in out:
+        if c.name in seen:
+            continue
+        seen.add(c.name)
+        deduped.append(c)
+    return tuple(deduped)
+
+
+def synthesize_sections(services: tuple[Service, ...]) -> tuple[SectionHint, ...]:
+    out: list[SectionHint] = []
+    for title in _FIXED_NOTION_SECTIONS:
+        out.append(SectionHint(title=title, related_services=()))
+
+    top10 = sorted(services, key=lambda s: s.recent_activity, reverse=True)[:10]
+    for svc in top10:
+        out.append(
+            SectionHint(
+                title=f"{svc.name} runbook",
+                related_services=(svc.qualified,),
+            )
+        )
+    return tuple(out)

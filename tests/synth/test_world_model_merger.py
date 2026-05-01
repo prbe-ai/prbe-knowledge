@@ -267,3 +267,46 @@ def test_topic_recency_weighted_higher_for_recent_commits() -> None:
     new_weight = next(t.weight for t in pool if t.text == "new commit")
     old_weight = next(t.weight for t in pool if t.text == "old commit")
     assert new_weight > old_weight
+
+
+from scripts.synth.world_model import (  # noqa: E402
+    Service,
+    ServiceKind,
+    synthesize_channels,
+    synthesize_sections,
+)
+
+
+def _svc(name: str, kind: ServiceKind = ServiceKind.API, recent: float = 1.0) -> Service:
+    return Service(
+        name=name, qualified=name, repo_url="github.com/x/y", kind=kind,
+        description=None, owners=(), recent_activity=recent, deploy_target=None,
+    )
+
+
+def test_synthesize_channels_includes_per_service_and_generic() -> None:
+    services = (_svc("payments"), _svc("billing"))
+    channels = synthesize_channels(services, codeowner_teams=set())
+    names = {c.name for c in channels}
+    assert "#payments" in names
+    assert "#billing" in names
+    assert "#general" in names
+    assert "#incidents" in names
+
+
+def test_synthesize_channels_adds_deploy_channels_for_top_active() -> None:
+    services = tuple(_svc(f"svc{i}", recent=float(i)) for i in range(8))
+    channels = synthesize_channels(services, codeowner_teams=set())
+    deploy_channels = {c.name for c in channels if c.name.endswith("-deploys")}
+    # top-5 by activity → svc7,6,5,4,3
+    assert deploy_channels == {"#svc7-deploys", "#svc6-deploys", "#svc5-deploys", "#svc4-deploys", "#svc3-deploys"}
+
+
+def test_synthesize_sections_fixed_set_plus_per_service_runbooks() -> None:
+    services = (_svc("payments"), _svc("billing"))
+    sections = synthesize_sections(services)
+    titles = {s.title for s in sections}
+    assert "Engineering" in titles
+    assert "Postmortems" in titles
+    assert "payments runbook" in titles
+    assert "billing runbook" in titles
