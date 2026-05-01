@@ -38,6 +38,27 @@ or retry loop that increments version on conflict. ~10 lines.
 
 ## P2 — operational hygiene
 
+### Slack display-name cache: 429 / Retry-After retry
+**Where:** `services/ingestion/handlers/slack.py` (`_SlackUserCache.resolve` /
+`.prime`)
+
+`_SlackUserCache` currently returns None on transient failure (no cache
+poisoning, but no retry either). On a 429 storm during prime, the workspace
+falls back to per-message users.info indefinitely until the Retry-After
+window passes.
+
+**Fix:** read the `Retry-After` header, sleep, retry once or twice with
+exponential backoff. ~25 lines.
+
+**Trigger:** logs show repeated `slack.users_info_non_200` (status=429)
+followed by no recovery, OR cache hit rate visibly degrades after a known
+rate-limit burst.
+
+Discussed: 2026-05-01 in `/review` — flagged by performance specialist,
+deferred as slow-burn after the JSONB-backed LRU shipped (which already
+caps memory and survives worker restarts so the cost of a transient prime
+failure is much lower than it was with the in-memory-only cache).
+
 ### R2 bucket lifecycle rule
 **Where:** Cloudflare R2 dashboard (per bucket) OR `scripts/bootstrap_customer.py`
 

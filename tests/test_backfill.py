@@ -36,6 +36,34 @@ def _patch(monkeypatch, settings: Settings):
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
+@pytest.fixture(autouse=True)
+def _stub_slack_metadata_store(monkeypatch):
+    """Slack connector now persists its display-name cache to
+    customer_source_mapping.metadata via load/patch helpers. Tests don't have
+    a Postgres pool, so redirect both calls to a per-test in-memory dict."""
+    store: dict = {}
+
+    async def fake_load(source_system, external_id):
+        return dict(store.get((source_system.value, external_id), {}))
+
+    async def fake_patch(source_system, external_id, patch):
+        existing = store.setdefault((source_system.value, external_id), {})
+        existing.update(patch)
+
+    monkeypatch.setattr(
+        "services.ingestion.handlers.slack.load_source_metadata", fake_load
+    )
+    monkeypatch.setattr(
+        "services.ingestion.handlers.slack.patch_source_metadata", fake_patch
+    )
+    # Shrink the flush debounce so tests that trigger writes don't dangle a
+    # 30-second background task past test teardown.
+    from services.ingestion.handlers.slack import _SlackUserCache
+
+    monkeypatch.setattr(_SlackUserCache, "FLUSH_DEBOUNCE_S", 0.05)
+    return store
+
+
 # -------------------------------- runner ------------------------------------
 
 
@@ -822,6 +850,175 @@ async def test_slack_backfill_message_events_omit_cursor_field() -> None:
             "message events must not carry _cursor — bloat fix"
         )
     assert all("_cursor" in e.raw_payload for e in cp_events)
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_primes_user_cache_via_users_list() -> None:
+    """One paginated users.list call at backfill kickoff bulk-populates the
+    name cache. Without it, every yielded message would force a per-user
+    users.info round-trip — wasteful at workspace scale (1000s of users)
+    and easy to rate-limit."""
+    users_list_calls: list[str | None] = []
+    users_info_calls: list[str] = []
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [{"id": "C1", "is_member": True, "num_members": 5}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def users_list(req):
+        users_list_calls.append(req.url.params.get("cursor"))
+        # Two-page response: first page links to "p2", second page ends.
+        if req.url.params.get("cursor") == "p2":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "members": [
+                        {"id": "U2", "profile": {"display_name": "Bob", "real_name": "Robert"}},
+                    ],
+                    "response_metadata": {"next_cursor": ""},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "members": [
+                    {"id": "U1", "profile": {"display_name": "Alice", "real_name": "Alice A."}},
+                ],
+                "response_metadata": {"next_cursor": "p2"},
+            },
+        )
+
+    def users_info(req):
+        users_info_calls.append(req.url.params["user"])
+        return httpx.Response(200, json={"ok": False, "error": "should_not_call"})
+
+    def history(req):
+        ch = req.url.params["channel"]
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [
+                    {"type": "message", "channel": ch, "ts": "1713628800.0", "text": "hi", "user": "U1"},
+                    {"type": "message", "channel": ch, "ts": "1713628801.0", "text": "ho", "user": "U2"},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/users.list"): users_list,
+            ("GET", "/api/users.info"): users_info,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    [e async for e in slack.backfill("cust", token)]
+
+    # users.list was paginated through completely.
+    assert users_list_calls == [None, "p2"]
+    # No per-user users.info fetches — the prime warmed the cache.
+    assert users_info_calls == []
+    # Cache populated with both users on this connector's per-team cache.
+    cache = slack._caches["T1"]
+    assert cache._entries["U1"]["name"] == "Alice"
+    assert cache._entries["U2"]["name"] == "Bob"
+
+
+@pytest.mark.asyncio
+async def test_slack_backfill_event_carries_user_profile_when_cached() -> None:
+    """Synthetic backfill events must inline user_profile from the prime so
+    normalize() stamps the name without re-resolving. Without this, normalize
+    would land on the cache itself, but threading that read through the
+    pipeline relies on the event being self-describing (re-runnable from R2)."""
+
+    def auth_test(req):
+        return httpx.Response(200, json={"ok": True, "team_id": "T1", "team": "Acme"})
+
+    def list_channels(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channels": [{"id": "C1", "is_member": True, "num_members": 5}],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def users_list(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "members": [
+                    {"id": "U1", "profile": {"display_name": "Richard Wei"}},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    def history(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "messages": [
+                    {"type": "message", "channel": "C1", "ts": "1713628800.0", "text": "hi", "user": "U1"},
+                    # User missing from prime (rare race / late joiner): no
+                    # user_profile inlined, normalize falls back to no prefix.
+                    {"type": "message", "channel": "C1", "ts": "1713628801.0", "text": "ho", "user": "Uunknown"},
+                ],
+                "response_metadata": {"next_cursor": ""},
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("POST", "/api/auth.test"): auth_test,
+            ("GET", "/api/conversations.list"): list_channels,
+            ("GET", "/api/users.list"): users_list,
+            ("GET", "/api/conversations.history"): history,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.SLACK, access_token="x"
+    )
+
+    events = [e async for e in slack.backfill("cust", token)]
+    msg_events = [e for e in events if not e.raw_payload.get("_checkpoint")]
+
+    by_user = {e.raw_payload["event"]["user"]: e.raw_payload["event"] for e in msg_events}
+    assert by_user["U1"].get("user_profile") == {"display_name": "Richard Wei"}
+    assert "user_profile" not in by_user["Uunknown"], (
+        "uncached users must not synthesize a user_profile — normalize falls back to no prefix"
+    )
 
 
 # -------------------------------- linear ------------------------------------
