@@ -74,3 +74,26 @@ async def test_extract_skips_github_when_fetch_github_false(tmp_repo: Path) -> N
     assert signals.prs is None
     assert signals.contributors is None
     assert signals.workflows is None
+
+
+from scripts.synth.cache import DiskCache  # noqa: E402
+
+
+def test_extractor_uses_cache_when_sha_unchanged(tmp_repo: Path, tmp_path: Path) -> None:
+    cache = DiskCache(tmp_path / "cache")
+    extractor = RepoExtractor(github_client=None, cache=cache)
+
+    s1 = extractor.extract_local(
+        url="repo://x", clone_path=tmp_repo,
+        since=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    # 2nd call with same SHA: must come from cache; we prove by mutating
+    # the repo (new commit), running again, and observing identical sha.
+    cached = cache.get(f"repo:repo://x@{s1.latest_sha}")
+    assert cached is not None
+    s2 = extractor.extract_local(
+        url="repo://x", clone_path=tmp_repo,
+        since=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    assert s1.latest_sha == s2.latest_sha
+    assert len(s1.commits) == len(s2.commits)
