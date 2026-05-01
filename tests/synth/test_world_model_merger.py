@@ -225,3 +225,45 @@ def test_infer_services_qualifies_on_collision() -> None:
     services = infer_services([_sig_with("github.com/o/A", "payments"), _sig_with("github.com/o/B", "payments")])
     qualified = sorted(s.qualified for s in services)
     assert qualified == ["A/payments", "B/payments"]
+
+
+from scripts.synth.world_model import build_topic_pool  # noqa: E402
+
+
+def test_topic_pool_includes_recent_commits() -> None:
+    sigs = [_signals(commits=[
+        _commit("a@x.com", "A", sha="1"),
+        _commit("b@x.com", "B", sha="2"),
+    ])]
+    sigs[0] = RepoSignals(  # type: ignore[index]
+        url="github.com/x/y", clone_path=sigs[0].clone_path,
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(), readmes=(), codeowners=(), commits=(
+            Commit(sha="1", author_name="A", author_email="a@x.com",
+                   ts=datetime(2026, 4, 25, tzinfo=UTC),
+                   subject="fix(payments): null pointer in checkout",
+                   body="", files_touched=("services/payments/checkout.py",)),
+        ),
+        branches=(), issues=None, prs=None, contributors=None, workflows=None,
+    )
+    pool = build_topic_pool(sigs, services=(), now=datetime(2026, 4, 30, tzinfo=UTC))
+    assert any("checkout" in t.text for t in pool)
+
+
+def test_topic_recency_weighted_higher_for_recent_commits() -> None:
+    old = Commit(sha="o", author_name="A", author_email="a@x.com",
+                 ts=datetime(2026, 1, 1, tzinfo=UTC),
+                 subject="old commit", body="", files_touched=())
+    new = Commit(sha="n", author_name="A", author_email="a@x.com",
+                 ts=datetime(2026, 4, 28, tzinfo=UTC),
+                 subject="new commit", body="", files_touched=())
+    sig = _signals(commits=[])
+    sig = RepoSignals(
+        url=sig.url, clone_path=sig.clone_path, default_branch="main", latest_sha=sig.latest_sha,
+        description=None, manifests=(), readmes=(), codeowners=(), commits=(old, new),
+        branches=(), issues=None, prs=None, contributors=None, workflows=None,
+    )
+    pool = build_topic_pool([sig], services=(), now=datetime(2026, 4, 30, tzinfo=UTC))
+    new_weight = next(t.weight for t in pool if t.text == "new commit")
+    old_weight = next(t.weight for t in pool if t.text == "old commit")
+    assert new_weight > old_weight

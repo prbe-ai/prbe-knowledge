@@ -274,6 +274,92 @@ def infer_services(signals: list[RepoSignals]) -> tuple[Service, ...]:
     return tuple(services)
 
 
+import math  # noqa: E402
+
+
+def _recency_decay(ts: datetime, now: datetime, half_life_days: float = 30.0) -> float:
+    delta_days = (now - ts).total_seconds() / 86400.0
+    return 0.5 ** (delta_days / half_life_days)
+
+
+_TOPIC_KIND_WEIGHT = {
+    TopicKind.PR: 1.0,
+    TopicKind.ISSUE: 0.8,
+    TopicKind.COMMIT: 0.5,
+    TopicKind.README_SECTION: 0.3,
+    TopicKind.BRANCH: 0.4,
+}
+
+
+def build_topic_pool(
+    signals: list[RepoSignals],
+    services: tuple[Service, ...],
+    now: datetime,
+) -> tuple[Topic, ...]:
+    service_names = {s.name for s in services} | {s.qualified for s in services}
+
+    topics: list[Topic] = []
+    for sig in signals:
+        for c in sig.commits:
+            mentioned_services = tuple(
+                n for n in service_names if n.lower() in c.subject.lower() or any(n in f for f in c.files_touched)
+            )
+            recency = _recency_decay(c.ts, now)
+            weight = recency * _TOPIC_KIND_WEIGHT[TopicKind.COMMIT] * (
+                1.0 + math.log1p(len(mentioned_services))
+            )
+            topics.append(
+                Topic(
+                    text=c.subject,
+                    kind=TopicKind.COMMIT,
+                    repo_url=sig.url,
+                    ts=c.ts,
+                    mentioned_services=mentioned_services,
+                    mentioned_people=(),
+                    weight=weight,
+                )
+            )
+        for issue in sig.issues or ():
+            mentioned = tuple(n for n in service_names if n.lower() in issue.title.lower())
+            recency = _recency_decay(issue.updated_at, now)
+            topics.append(
+                Topic(
+                    text=issue.title, kind=TopicKind.ISSUE,
+                    repo_url=sig.url, ts=issue.updated_at,
+                    mentioned_services=mentioned, mentioned_people=(),
+                    weight=recency * _TOPIC_KIND_WEIGHT[TopicKind.ISSUE] * (
+                        1.0 + math.log1p(len(mentioned))
+                    ),
+                )
+            )
+        for pr in sig.prs or ():
+            mentioned = tuple(n for n in service_names if n.lower() in pr.title.lower())
+            base_ts = pr.merged_at or pr.created_at
+            recency = _recency_decay(base_ts, now)
+            topics.append(
+                Topic(
+                    text=pr.title, kind=TopicKind.PR,
+                    repo_url=sig.url, ts=base_ts,
+                    mentioned_services=mentioned, mentioned_people=(),
+                    weight=recency * _TOPIC_KIND_WEIGHT[TopicKind.PR] * (
+                        1.0 + math.log1p(len(mentioned))
+                    ),
+                )
+            )
+        for branch in sig.branches:
+            recency = _recency_decay(branch.last_commit_ts, now)
+            topics.append(
+                Topic(
+                    text=branch.name, kind=TopicKind.BRANCH,
+                    repo_url=sig.url, ts=branch.last_commit_ts,
+                    mentioned_services=(), mentioned_people=(),
+                    weight=recency * _TOPIC_KIND_WEIGHT[TopicKind.BRANCH],
+                )
+            )
+
+    return tuple(topics)
+
+
 def _infer_kind(manifest: Manifest) -> ServiceKind:
     """Heuristic: kind from manifest type. Plan 1 keeps it simple; richer
     inference (Dockerfile presence, asyncpg.listen detection, etc.) lives
