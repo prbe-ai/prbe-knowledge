@@ -31,10 +31,8 @@ from scripts.synth.world_model import WorldModel, _gh_username_from_noreply
 
 @dataclass(frozen=True)
 class OwnershipIndex:
-    # canonical_id -> top-3 service names (by commit frequency, alpha tie-break)
-    services_by_person: dict[str, tuple[str, ...]]
-    # service qualified name -> sorted canonical_ids that touched it >= 1 time
-    people_by_service: dict[str, tuple[str, ...]]
+    services_by_person: dict[str, tuple[str, ...]]  # canonical_id → top-3 service names by frequency (manifest.name)
+    people_by_service: dict[str, tuple[str, ...]]   # service name (manifest.name) → sorted canonical_ids
 
 
 def _resolve_canonical_id(email: str) -> str:
@@ -52,6 +50,20 @@ def _resolve_canonical_id(email: str) -> str:
     return f"email:{email_lower}"
 
 
+def _strip_path_root(parts: tuple[str, ...]) -> tuple[str, ...]:
+    """Drop leading root components so path parts are meaningful relative parts.
+
+    Removes a leading '/' (POSIX root) or any '<drive>:' component (Windows),
+    returning only the meaningful relative segments of the path.
+    """
+    if not parts:
+        return parts
+    head = parts[0]
+    if head in ("/", "\\") or (len(head) == 2 and head[1] == ":"):
+        return parts[1:]
+    return parts
+
+
 def _deepest_manifest_ancestor(
     file_path: str,
     manifests: tuple,
@@ -62,9 +74,12 @@ def _deepest_manifest_ancestor(
     We compare it against each manifest's path.parent, which may be absolute
     or relative. The deepest match (longest meaningful path prefix) wins.
 
-    Matching strategy: build a normalised "relative" form of the manifest's
-    directory by stripping any leading root components (e.g. '/' on POSIX).
-    Then check whether file_path starts with that relative prefix.
+    Matching strategy: strip root components from the manifest directory parts
+    via _strip_path_root, then check whether file_path starts with that
+    relative prefix. The longest matching prefix (highest matched_depth) wins.
+
+    Example: manifests at "/repo/services/payments" and "/repo/services" with
+    file "services/payments/handler.py" -> matched_depth=2 (payments wins).
     """
     file_parts = Path(file_path).parts
     best_name: str | None = None
@@ -77,20 +92,14 @@ def _deepest_manifest_ancestor(
         manifest_dir = m.path.parent
         manifest_dir_parts = manifest_dir.parts
 
-        # Strip leading root component ('/' on POSIX, drive letters on Windows)
-        # so that an absolute manifest path /repo/payments becomes ('payments',)
-        # when the repo root is unknown at this point.
-        # We use the shortest matching suffix of manifest_dir_parts against
-        # the leading parts of file_parts.
-        #
         # Try every suffix length from full length down to 1.
         # The deepest (longest suffix) that matches file_path wins.
         matched_depth = -1
         for suffix_len in range(len(manifest_dir_parts), 0, -1):
-            suffix = manifest_dir_parts[-suffix_len:]
-            # Skip suffix if it starts with a root component — that would
-            # never appear at the start of a repo-relative file path.
-            if suffix[0] in ("/", "\\") or (len(suffix[0]) == 2 and suffix[0][1] == ":"):
+            suffix = _strip_path_root(manifest_dir_parts[-suffix_len:])
+            # After stripping, an empty suffix means the slice was only root
+            # components — skip it.
+            if not suffix:
                 continue
             if len(suffix) > len(file_parts):
                 continue
