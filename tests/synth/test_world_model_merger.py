@@ -164,3 +164,64 @@ def test_canonicalize_lowercases_commit_emails_in_aliases() -> None:
     assert len(people) == 1
     # Must be exactly one entry, lowercased.
     assert people[0].email_aliases == ("alice@work.com",)
+
+
+from scripts.synth.world_model import infer_services  # noqa: E402
+
+
+def test_infer_service_from_top_level_pyproject() -> None:
+    """A repo with one top-level pyproject is one service named after it."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+    sig = _signals(commits=[])
+    sig = RepoSignals(
+        url="github.com/x/payments-api", clone_path=sig.clone_path,
+        default_branch="main", latest_sha="abc", description="Pay svc",
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/x/pyproject.toml"),
+                     name="payments-api", description="Pay svc", dependencies=()),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    services = infer_services([sig])
+    assert {s.name for s in services} == {"payments-api"}
+
+
+def test_infer_services_from_monorepo_subdirs() -> None:
+    """Children of services/<name>/pyproject.toml each become a Service."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+    sig = RepoSignals(
+        url="github.com/x/mono", clone_path=Path("/tmp/mono"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/mono/services/payments/pyproject.toml"),
+                     name="payments", description=None, dependencies=()),
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/mono/services/billing/pyproject.toml"),
+                     name="billing", description=None, dependencies=()),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    services = infer_services([sig])
+    assert {s.name for s in services} == {"payments", "billing"}
+
+
+def test_infer_services_qualifies_on_collision() -> None:
+    """Two repos define a service named 'payments' → qualified names."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+
+    def _sig_with(url, manifest_name):
+        return RepoSignals(
+            url=url, clone_path=Path("/tmp/x"),
+            default_branch="main", latest_sha="abc", description=None,
+            manifests=(
+                Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/x/pyproject.toml"),
+                         name=manifest_name, description=None, dependencies=()),
+            ),
+            readmes=(), codeowners=(), commits=(), branches=(),
+            issues=None, prs=None, contributors=None, workflows=None,
+        )
+
+    services = infer_services([_sig_with("github.com/o/A", "payments"), _sig_with("github.com/o/B", "payments")])
+    qualified = sorted(s.qualified for s in services)
+    assert qualified == ["A/payments", "B/payments"]

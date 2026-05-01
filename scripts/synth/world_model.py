@@ -125,6 +125,7 @@ from collections import defaultdict  # noqa: E402
 from typing import TYPE_CHECKING  # noqa: E402
 
 if TYPE_CHECKING:
+    from scripts.synth.extractor.manifests import Manifest
     from scripts.synth.extractor.repo import RepoSignals
 
 
@@ -232,3 +233,56 @@ def canonicalize_people(
 
     rows.sort(key=lambda p: p.activity_score, reverse=True)
     return tuple(rows[:max_personas])
+
+
+def infer_services(signals: list[RepoSignals]) -> tuple[Service, ...]:
+    """Each repo contributes 1+ Service. Collisions on bare name get
+    qualified by the repo's last URL segment (e.g. "A/payments")."""
+    candidates: list[tuple[str, str, Manifest]] = []  # (svc_name, repo_url, manifest)
+    for sig in signals:
+        for m in sig.manifests:
+            if m.name:
+                candidates.append((m.name, sig.url, m))
+
+    # Detect collisions across repos
+    name_to_repos: dict[str, set[str]] = defaultdict(set)
+    for name, repo_url, _ in candidates:
+        name_to_repos[name].add(repo_url)
+
+    services: list[Service] = []
+    seen: set[tuple[str, str]] = set()  # (name, repo_url) — dedupe within a repo
+    for name, repo_url, m in candidates:
+        if (name, repo_url) in seen:
+            continue
+        seen.add((name, repo_url))
+        if len(name_to_repos[name]) > 1:
+            qualified = f"{repo_url.rsplit('/', 1)[-1]}/{name}"
+        else:
+            qualified = name
+        services.append(
+            Service(
+                name=name,
+                qualified=qualified,
+                repo_url=repo_url,
+                kind=_infer_kind(m),
+                description=m.description,
+                owners=(),
+                recent_activity=0.0,
+                deploy_target=None,
+            )
+        )
+    return tuple(services)
+
+
+def _infer_kind(manifest: Manifest) -> ServiceKind:
+    """Heuristic: kind from manifest type. Plan 1 keeps it simple; richer
+    inference (Dockerfile presence, asyncpg.listen detection, etc.) lives
+    in plan 3 if needed."""
+    from scripts.synth.extractor.manifests import ManifestKind
+    if manifest.kind == ManifestKind.PACKAGE_JSON:
+        return ServiceKind.FRONTEND
+    if manifest.kind == ManifestKind.FLY_TOML:
+        return ServiceKind.API
+    if manifest.kind == ManifestKind.DOCKER_COMPOSE:
+        return ServiceKind.INFRA
+    return ServiceKind.LIB
