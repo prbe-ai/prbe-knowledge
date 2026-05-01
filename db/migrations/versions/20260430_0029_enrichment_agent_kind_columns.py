@@ -39,8 +39,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0029_enrichment_agent_kind_columns"
-down_revision = "0028_backfill_cc_person_name_email"
+revision = "0029_agent_kind_subject_kind"
+down_revision = "0028_backfill_cc_person_props"
 branch_labels = None
 depends_on = None
 
