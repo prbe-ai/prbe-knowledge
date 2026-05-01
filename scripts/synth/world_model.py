@@ -121,12 +121,29 @@ class WorldModel:
 # so the merger pipeline (Task 17) can compose them confidently.
 # ---------------------------------------------------------------------------
 
+import re  # noqa: E402
 from collections import defaultdict  # noqa: E402
 from typing import TYPE_CHECKING  # noqa: E402
 
 if TYPE_CHECKING:
     from scripts.synth.extractor.manifests import Manifest
     from scripts.synth.extractor.repo import RepoSignals
+
+_GH_NOREPLY_RE = re.compile(
+    r"^(?:\d+\+)?(?P<username>[\w-]+)@users\.noreply\.github\.com$",
+    re.IGNORECASE,
+)
+
+
+def _gh_username_from_noreply(email: str) -> str | None:
+    """Detect GitHub noreply email and extract the username portion.
+
+    Recognizes both the modern `<id>+<username>@users.noreply.github.com`
+    and legacy `<username>@users.noreply.github.com` forms. Username
+    matching is GitHub's alphanumeric + hyphen rule (we accept underscore
+    too via \\w; not legal but harmless)."""
+    m = _GH_NOREPLY_RE.match(email.strip())
+    return m.group("username") if m else None
 
 
 def canonicalize_people(
@@ -171,6 +188,22 @@ def canonicalize_people(
         dn = meta.get("display_name")
         if dn and name_counts[dn] == 1:
             name_to_gh[dn] = gh_username
+
+    # Pass 1a: GitHub noreply emails encode the username directly. Route them
+    # to gh:<username> even without a Contributor record.
+    for sig in signals:
+        for commit in sig.commits:
+            email = commit.author_email.lower()
+            if email in email_to_gh:
+                continue
+            username = _gh_username_from_noreply(commit.author_email)
+            if username:
+                email_to_gh[email] = username
+                gh_meta.setdefault(
+                    username,
+                    {"display_name": None, "emails": set()},
+                )
+                gh_meta[username]["emails"].add(email)
 
     # Pass 1: augment email_to_gh from commit name matches (order-independent —
     # only adds, never overwrites). Must complete before activity aggregation so

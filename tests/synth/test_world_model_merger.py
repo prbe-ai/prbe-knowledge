@@ -166,6 +166,62 @@ def test_canonicalize_lowercases_commit_emails_in_aliases() -> None:
     assert people[0].email_aliases == ("alice@work.com",)
 
 
+def test_canonicalize_collapses_modern_github_noreply_email() -> None:
+    """Modern noreply (<id>+<username>@users.noreply.github.com) routes to gh:<username>."""
+    sigs = [_signals(commits=[
+        _commit("48197502+richardwei6@users.noreply.github.com", "Richard Wei", sha="1"),
+        _commit("48197502+richardwei6@users.noreply.github.com", "Richard Wei", sha="2"),
+    ])]
+    people = canonicalize_people(sigs, min_threshold=1, max_personas=10)
+    assert len(people) == 1
+    assert people[0].canonical_id == "gh:richardwei6"
+    assert people[0].activity_score == 2.0
+
+
+def test_canonicalize_collapses_legacy_github_noreply_email() -> None:
+    """Legacy noreply (<username>@users.noreply.github.com) routes to gh:<username>."""
+    sigs = [_signals(commits=[
+        _commit("oldschool@users.noreply.github.com", "Oldschool", sha="1"),
+    ])]
+    people = canonicalize_people(sigs, min_threshold=1, max_personas=10)
+    assert len(people) == 1
+    assert people[0].canonical_id == "gh:oldschool"
+
+
+def test_canonicalize_collapses_noreply_with_real_email_via_contributor() -> None:
+    """Same person commits with both noreply AND real email; a Contributor
+    record links the real email. All three signals should collapse to gh:alice."""
+    contributor = Contributor(
+        gh_username="alice",
+        display_name="Alice X",
+        email_aliases=("alice@example.com",),
+        contributions=10,
+    )
+    sigs = [_signals(
+        commits=[
+            _commit("alice@example.com", "Alice", sha="1"),
+            _commit("12345+alice@users.noreply.github.com", "Alice", sha="2"),
+        ],
+        contributors=(contributor,),
+    )]
+    people = canonicalize_people(sigs, min_threshold=1, max_personas=10)
+    assert len(people) == 1
+    assert people[0].canonical_id == "gh:alice"
+    assert "alice@example.com" in people[0].email_aliases
+    assert "12345+alice@users.noreply.github.com" in people[0].email_aliases
+
+
+def test_canonicalize_does_not_treat_non_noreply_emails_as_noreply() -> None:
+    """Lookalike emails that don't match the noreply pattern stay email:."""
+    sigs = [_signals(commits=[
+        _commit("foo@github.com", "Foo", sha="1"),  # not users.noreply
+        _commit("bar@noreply.github.com", "Bar", sha="2"),  # missing 'users.'
+    ])]
+    people = canonicalize_people(sigs, min_threshold=1, max_personas=10)
+    canon = sorted(p.canonical_id for p in people)
+    assert canon == ["email:bar@noreply.github.com", "email:foo@github.com"]
+
+
 from scripts.synth.world_model import infer_services  # noqa: E402
 
 
