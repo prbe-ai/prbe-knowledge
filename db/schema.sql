@@ -540,6 +540,53 @@ CREATE TABLE kg_evidence (
 );
 
 -- ---------------------------------------------------------------------------
+-- kg_candidates: debugging-agent observation queue with two-layer dedup.
+--
+-- The debugging agent writes a row here whenever something is off (incident
+-- matched poorly, traversal went outside the playbook, agent disagreed with
+-- ordering, etc.). The maintenance agent (Phase 2) drains the queue. See
+-- docs/superpowers/specs/2026-04-29-debugging-knowledge-graph-design.md
+-- §5.1, §7.3.
+--
+-- Two-layer dedup:
+--   * payload_hash = sha256 over STRUCTURED fields only (type,
+--     top_class_match.id, score_bucket, agent_action,
+--     incident_signature_keys) — never prose `notes`. Hashing prose would
+--     defeat dedup the moment the LLM rephrases the same observation.
+--   * payload_hash is INTENTIONALLY NOT UNIQUE. Two genuinely-different
+--     observations can hash identically (e.g., two 401s with different root
+--     causes); the hash is a clustering key for layer-1 lookup, not a
+--     definitive dedup key.
+--   * notes_embedding (vector(1536)) is the layer-2 confirmation signal:
+--     on hash collision the agent compares notes embeddings and only
+--     increments repeat_count when cosine > 0.85.
+--   * repeat_count counts CONFIRMED duplicates only.
+--
+-- candidate_id uses gen_random_uuid() (pgcrypto; already used by
+-- oauth_tokens, ingestion_events). Status check constraint enforces the
+-- pending|accepted|rejected|merged state machine.
+--
+-- ivfflat index on notes_embedding and RLS policy land in subsequent
+-- migrations (Phase 1 Tasks 4 and 5).
+-- ---------------------------------------------------------------------------
+CREATE TABLE kg_candidates (
+    customer_id      TEXT         NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    candidate_id     UUID         NOT NULL DEFAULT gen_random_uuid(),
+    payload_hash     TEXT         NOT NULL,
+    payload          JSONB        NOT NULL,
+    notes_embedding  vector(1536),
+    repeat_count     INTEGER      NOT NULL DEFAULT 1,
+    status           TEXT         NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'accepted', 'rejected', 'merged')),
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    resolved_at      TIMESTAMPTZ,
+    PRIMARY KEY (customer_id, candidate_id)
+);
+
+CREATE INDEX kg_candidates_dedup
+    ON kg_candidates (customer_id, payload_hash, status, created_at);
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents
