@@ -5,7 +5,7 @@ One handler — ``GET /kg/candidates`` — returns the authenticated tenant's
 filter (default ``pending``) and a bounded ``limit`` (default 100, max
 500). Backs the staff dashboard's Task 25 triage surface.
 
-Schema notes (see migration ``0029_kg_candidates`` for the full shape):
+Schema notes (see migration ``0032_kg_candidates`` for the full shape):
 
   * ``status`` is a CHECK-constrained four-state enum
     (``pending|accepted|rejected|merged``); we mirror that as a Literal
