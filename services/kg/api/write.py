@@ -114,6 +114,7 @@ async def put_class(
                 customer_id,
                 class_id,
             )
+            status_code = 200 if existing is not None else 201
 
             await conn.execute(
                 """
@@ -122,6 +123,8 @@ async def put_class(
                 ON CONFLICT (customer_id, class_id) DO UPDATE
                   SET frontmatter = EXCLUDED.frontmatter,
                       body        = EXCLUDED.body,
+                      -- DEFAULT NOW() only fires on INSERT; the conflict
+                      -- branch must bump updated_at explicitly.
                       updated_at  = NOW()
                 """,
                 customer_id,
@@ -130,7 +133,4 @@ async def put_class(
                 payload.body,
             )
 
-    return JSONResponse(
-        content={"status": "ok"},
-        status_code=200 if existing is not None else 201,
-    )
+    return JSONResponse(content={"status": "ok"}, status_code=status_code)

@@ -127,9 +127,11 @@ async def test_put_updates_class(
     headers_for,
 ) -> None:
     """Existing class_id → 200, and the read endpoint reflects the update."""
+    new_body = "## When this fires\nrefined playbook with new step\n\n## Playbook\n1. updated"
     payload = _valid_class_payload(
         class_id="auth-401-jwt-refresh",
         description="updated description after refinement",
+        body=new_body,
     )
     resp = await _client_put(
         kg_app,
@@ -145,10 +147,16 @@ async def test_put_updates_class(
         headers_for("tA"),
     )
     assert fetched.status_code == 200, fetched.text
+    fetched_body = fetched.json()
     assert (
-        fetched.json()["frontmatter"]["description"]
+        fetched_body["frontmatter"]["description"]
         == "updated description after refinement"
     )
+    # Body must round-trip byte-equivalently — including newlines. Catches
+    # a future regression where someone drops `body = EXCLUDED.body` from
+    # the conflict clause or where asyncpg's TEXT codec mangles multi-line
+    # input.
+    assert fetched_body["body"] == new_body
 
 
 @pytest.mark.asyncio
@@ -187,3 +195,40 @@ async def test_put_path_id_must_match_payload_id(
         headers_for("tA"),
     )
     assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_put_kg_check_failure_does_not_modify_existing_row(
+    kg_app: FastAPI,
+    seeded_classes: None,
+    headers_for,
+) -> None:
+    """A 422 must rollback. The existing row's description must survive.
+
+    Catches future regressions where someone reorders the upsert above
+    kg_check, or wraps the handler in a transaction that swallows the
+    HTTPException-driven rollback. ``with_tenant`` opens the transaction
+    and FastAPI's HTTPException unwinds the async-with stack, which
+    rolls back — this test is the canonical proof.
+    """
+    seeded_description = "401 from upstream after JWT refresh"
+    payload = _valid_class_payload(
+        class_id="auth-401-jwt-refresh",
+        description="HIJACKED — should never land",
+        body="See [[ghost]] for the related class.",
+    )
+    resp = await _client_put(
+        kg_app,
+        "/kg/classes/auth-401-jwt-refresh",
+        payload,
+        headers_for("tA"),
+    )
+    assert resp.status_code == 422, resp.text
+
+    fetched = await _client_get(
+        kg_app,
+        "/kg/classes/auth-401-jwt-refresh",
+        headers_for("tA"),
+    )
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["frontmatter"]["description"] == seeded_description
