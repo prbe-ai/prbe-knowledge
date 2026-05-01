@@ -180,6 +180,14 @@ def canonicalize_people(
     # to gh:<username> even without a Contributor record. Also collect commit
     # display-name candidates so the name-merge pass below can link non-noreply
     # commits by the same author (e.g. local-clone gmail commits).
+    #
+    # Known limitation: when a user's local-clone display_name differs from
+    # their GitHub-noreply commit display_name AND no GITHUB_TOKEN is set,
+    # the two persona variants stay split. Fix path (later version): when
+    # GITHUB_TOKEN is available, hit the /users/<username> API to fetch the
+    # canonical display_name and any public email, then use those as the
+    # authoritative bridge instead of the commit-data heuristic. Tracked
+    # for Plan 2 follow-up.
     noreply_display_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for sig in signals:
         for commit in sig.commits:
