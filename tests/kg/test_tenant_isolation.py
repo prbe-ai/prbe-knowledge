@@ -19,7 +19,7 @@ The four paths under test:
    test (this repo uses pgvector, not Pinecone — the isolation surface
    is RLS, not a vector-store namespace).
 
-RLS contract (spec §5.1; migration ``0031_kg_rls``): policies are
+RLS contract (spec §5.1; migration ``0034_kg_rls``): policies are
 ``USING customer_id = current_setting('app.current_customer_id', true)``,
 USING-only, with ``FORCE ROW LEVEL SECURITY``. A query without the GUC
 set returns zero rows; a query with a different tenant's GUC returns

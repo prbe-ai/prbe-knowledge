@@ -1,13 +1,13 @@
 """kg RLS: tenant_isolation policies on kg_classes, kg_evidence, kg_candidates
 
-Revision ID: 0031_kg_rls
-Revises: 0030_kg_indexes
+Revision ID: 0034_kg_rls
+Revises: 0033_kg_indexes
 Create Date: 2026-04-30
 
 Fifth and final migration in the Phase 1 foundation of the debugging
 knowledge graph (see docs/superpowers/specs/2026-04-29-debugging-
 knowledge-graph-design.md §5.1, §12.3). Enables and forces row-level
-security on the three kg_* tables introduced by 0027/0028/0029, and
+security on the three kg_* tables introduced by 0030/0031/0032, and
 attaches a tenant_isolation policy filtering on the existing
 `app.current_customer_id` GUC that `shared/db.with_tenant()` sets.
 
@@ -49,8 +49,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0031_kg_rls"
-down_revision = "0030_kg_indexes"
+revision = "0034_kg_rls"
+down_revision = "0033_kg_indexes"
 branch_labels = None
 depends_on = None
 

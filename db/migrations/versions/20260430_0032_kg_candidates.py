@@ -1,7 +1,7 @@
 """kg_candidates: debugging-agent observation queue with two-layer dedup
 
-Revision ID: 0029_kg_candidates
-Revises: 0028_kg_evidence
+Revision ID: 0032_kg_candidates
+Revises: 0031_kg_evidence
 Create Date: 2026-04-30
 
 Third migration in the Phase 1 foundation of the debugging knowledge
@@ -72,7 +72,7 @@ Out of scope for this migration (separate Phase 1 tasks):
   * RLS enable + tenant_isolation policy (Task 5).
 
 Why raw SQL via op.execute rather than op.create_table: keeping the
-pattern consistent with 0027_kg_classes, 0028_kg_evidence, and the
+pattern consistent with 0030_kg_classes, 0031_kg_evidence, and the
 other recent DDL (0024_queue_priority, 0026_queue_payload_keys), and
 avoiding SQLAlchemy core's lack of a first-class pgvector type.
 """
@@ -81,8 +81,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0029_kg_candidates"
-down_revision = "0028_kg_evidence"
+revision = "0032_kg_candidates"
+down_revision = "0031_kg_evidence"
 branch_labels = None
 depends_on = None
 

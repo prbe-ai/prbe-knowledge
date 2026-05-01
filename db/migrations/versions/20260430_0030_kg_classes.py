@@ -1,7 +1,7 @@
 """kg_classes: debugging knowledge graph class table
 
-Revision ID: 0027_kg_classes
-Revises: 0026_queue_payload_keys
+Revision ID: 0030_kg_classes
+Revises: 0029_agent_kind_subject_kind
 Create Date: 2026-04-30
 
 First migration in the Phase 1 foundation of the debugging knowledge
@@ -50,8 +50,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0027_kg_classes"
-down_revision = "0026_queue_payload_keys"
+revision = "0030_kg_classes"
+down_revision = "0029_agent_kind_subject_kind"
 branch_labels = None
 depends_on = None
 

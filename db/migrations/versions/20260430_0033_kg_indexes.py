@@ -1,13 +1,13 @@
 """kg indexes + updated_at trigger: GIN on related, ivfflat on embeddings
 
-Revision ID: 0030_kg_indexes
-Revises: 0029_kg_candidates
+Revision ID: 0033_kg_indexes
+Revises: 0032_kg_candidates
 Create Date: 2026-04-30
 
 Fourth migration in the Phase 1 foundation of the debugging knowledge
 graph (see docs/superpowers/specs/2026-04-29-debugging-knowledge-graph-design.md
 §5.1, §6, §7.3). Adds the remaining required indexes deferred from the
-table-creation migrations (0027, 0029) plus an updated_at trigger on
+table-creation migrations (0030, 0032) plus an updated_at trigger on
 kg_classes.
 
 Indexes:
@@ -32,7 +32,7 @@ Indexes:
     increment repeat_count if cosine > 0.85. Same lists=100 rationale.
 
 The clustering index `kg_candidates_dedup` was already created by
-0029_kg_candidates and is NOT re-added here.
+0032_kg_candidates and is NOT re-added here.
 
 Trigger:
   * kg_set_updated_at() function + kg_classes_updated trigger so
@@ -48,7 +48,7 @@ Out of scope for this migration:
 The vector extension is already created in db/schema.sql; no
 CREATE EXTENSION needed here.
 
-Why raw SQL via op.execute: same rationale as 0027/0028/0029 — keeps
+Why raw SQL via op.execute: same rationale as 0030/0031/0032 — keeps
 the pattern consistent and sidesteps SQLAlchemy core's lack of
 first-class pgvector / ivfflat / GIN-with-opclass support.
 """
@@ -57,8 +57,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0030_kg_indexes"
-down_revision = "0029_kg_candidates"
+revision = "0033_kg_indexes"
+down_revision = "0032_kg_candidates"
 branch_labels = None
 depends_on = None
 

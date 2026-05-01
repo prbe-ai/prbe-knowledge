@@ -1,7 +1,7 @@
 """kg_evidence: episodic learning trail for debugging knowledge graph
 
-Revision ID: 0028_kg_evidence
-Revises: 0027_kg_classes
+Revision ID: 0031_kg_evidence
+Revises: 0030_kg_classes
 Create Date: 2026-04-30
 
 Second migration in the Phase 1 foundation of the debugging knowledge
@@ -28,7 +28,7 @@ Shape:
     `kg_classes(customer_id, class_id)` with ON DELETE CASCADE so
     deleting a class drops its full evidence trail. This requires the
     existing PRIMARY KEY on kg_classes to back the reference, which
-    it does (Task 1 / 0027).
+    it does (Task 1 / 0030).
   * `customer_id` also FKs to `customers(customer_id)` ON DELETE
     CASCADE so a tenant offboard cleans up evidence even if the
     parent class row was already gone.
@@ -46,7 +46,7 @@ Out of scope for this migration (separate Phase 1 tasks):
     cover).
 
 Why raw SQL via op.execute rather than op.create_table: keeping the
-pattern consistent with 0027_kg_classes and the other recent DDL
+pattern consistent with 0030_kg_classes and the other recent DDL
 (0024_queue_priority, 0026_queue_payload_keys), and keeping the
 composite FK readable inline.
 """
@@ -55,8 +55,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0028_kg_evidence"
-down_revision = "0027_kg_classes"
+revision = "0031_kg_evidence"
+down_revision = "0030_kg_classes"
 branch_labels = None
 depends_on = None
 
