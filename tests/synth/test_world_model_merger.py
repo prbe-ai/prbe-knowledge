@@ -310,3 +310,71 @@ def test_synthesize_sections_fixed_set_plus_per_service_runbooks() -> None:
     assert "Postmortems" in titles
     assert "payments runbook" in titles
     assert "billing runbook" in titles
+
+
+from scripts.synth.world_model import build_dep_graph  # noqa: E402
+
+
+def test_dep_edge_recorded_when_manifest_dep_matches_service() -> None:
+    """A repo with manifest deps that name a Service produces a DepEdge
+    from the manifest's owning service to the dependency service."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+
+    services = (
+        _svc("payments"),  # in repo A
+        _svc("billing"),   # in repo B
+    )
+    services = (
+        Service(name="payments", qualified="payments", repo_url="github.com/x/A",
+                kind=ServiceKind.API, description=None, owners=(), recent_activity=1.0,
+                deploy_target=None),
+        Service(name="billing", qualified="billing", repo_url="github.com/x/B",
+                kind=ServiceKind.LIB, description=None, owners=(), recent_activity=1.0,
+                deploy_target=None),
+    )
+    sig_a = RepoSignals(
+        url="github.com/x/A", clone_path=Path("/tmp/A"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/A/pyproject.toml"),
+                     name="payments", description=None, dependencies=("billing", "fastapi")),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    sig_b = RepoSignals(
+        url="github.com/x/B", clone_path=Path("/tmp/B"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/B/pyproject.toml"),
+                     name="billing", description=None, dependencies=()),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+
+    edges = build_dep_graph([sig_a, sig_b], services)
+    assert len(edges) == 1
+    assert edges[0].from_service == "payments"
+    assert edges[0].to_service == "billing"
+    assert edges[0].source_repo == "github.com/x/A"
+
+
+def test_no_dep_edge_for_external_deps() -> None:
+    """Manifest deps that don't match any Service are ignored."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+
+    services = (_svc("payments"),)
+    sig = RepoSignals(
+        url="github.com/x/A", clone_path=Path("/tmp/A"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/A/pyproject.toml"),
+                     name="payments", description=None,
+                     dependencies=("requests", "boto3", "stripe")),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    edges = build_dep_graph([sig], services)
+    assert edges == ()

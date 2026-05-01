@@ -443,3 +443,33 @@ def synthesize_sections(services: tuple[Service, ...]) -> tuple[SectionHint, ...
             )
         )
     return tuple(out)
+
+
+def build_dep_graph(
+    signals: list[RepoSignals],
+    services: tuple[Service, ...],
+) -> tuple[DepEdge, ...]:
+    by_name = {s.name: s for s in services}
+
+    edges: list[DepEdge] = []
+    for sig in signals:
+        for m in sig.manifests:
+            if not m.name:
+                continue
+            from_svc = by_name.get(m.name)
+            if not from_svc:
+                continue
+            for dep_name in m.dependencies:
+                to_svc = by_name.get(dep_name)
+                if not to_svc:
+                    continue
+                if to_svc.qualified == from_svc.qualified:
+                    continue  # don't record self-edges
+                edges.append(
+                    DepEdge(
+                        from_service=from_svc.qualified,
+                        to_service=to_svc.qualified,
+                        source_repo=sig.url,
+                    )
+                )
+    return tuple(edges)
