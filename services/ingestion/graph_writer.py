@@ -111,38 +111,81 @@ async def upsert_edges(
 
     `source_system` is recorded on initial insert and preserved on conflict
     (first asserting source wins; edges are not multi-sourced today).
+
+    One INSERT regardless of edge count — same shape as upsert_nodes. The
+    per-edge loop produced the same kind of row-lock-staircase contention
+    on hot edges (every PR creates a `repo_contains_pr` edge anchored on
+    the same repo node, etc.) that drove willow's DLQ flood.
     """
     if not edges:
         return 0
 
-    inserted = 0
+    # Resolve endpoints + dedupe. ON CONFLICT DO UPDATE can't touch the same
+    # row twice in one statement, so collapse repeated
+    # (edge_type, from_node_id, to_node_id) entries here. Merge semantics
+    # match the prior loop: shallow JSONB merge on properties (later wins on
+    # key collision), `LEAST` on valid_from, last-seen on valid_to.
+    deduped: dict[tuple[str, int, int], dict] = {}
     for edge in edges:
         from_id = node_ids.get((edge.from_label.value, edge.from_canonical_id))
         to_id = node_ids.get((edge.to_label.value, edge.to_canonical_id))
         if from_id is None or to_id is None:
-            # Endpoint missing — skip rather than insert a dangling edge.
             continue
-        await conn.execute(
-            """
-            INSERT INTO graph_edges (
-                customer_id, edge_type, from_node_id, to_node_id,
-                properties, valid_from, valid_to, source_system
-            )
-            VALUES ($1, $2, $3, $4, $5::jsonb, COALESCE($6, NOW()), $7, $8)
-            ON CONFLICT (customer_id, edge_type, from_node_id, to_node_id)
-            DO UPDATE SET
-                properties = graph_edges.properties || EXCLUDED.properties,
-                valid_from = LEAST(graph_edges.valid_from, EXCLUDED.valid_from),
-                valid_to   = EXCLUDED.valid_to
-            """,
-            customer_id,
-            edge.edge_type.value,
-            from_id,
-            to_id,
-            orjson.dumps(edge.properties).decode("utf-8"),
-            edge.valid_from,
-            edge.valid_to,
-            source_system,
+        key = (edge.edge_type.value, from_id, to_id)
+        existing = deduped.get(key)
+        if existing is None:
+            deduped[key] = {
+                "properties": dict(edge.properties),
+                "valid_from": edge.valid_from,
+                "valid_to": edge.valid_to,
+            }
+        else:
+            existing["properties"] = {**existing["properties"], **edge.properties}
+            if edge.valid_from is not None and (
+                existing["valid_from"] is None
+                or edge.valid_from < existing["valid_from"]
+            ):
+                existing["valid_from"] = edge.valid_from
+            existing["valid_to"] = edge.valid_to
+
+    if not deduped:
+        return 0
+
+    sorted_keys = sorted(deduped.keys())
+    edge_types = [k[0] for k in sorted_keys]
+    from_ids = [k[1] for k in sorted_keys]
+    to_ids = [k[2] for k in sorted_keys]
+    properties_json = [
+        orjson.dumps(deduped[k]["properties"]).decode("utf-8") for k in sorted_keys
+    ]
+    valid_from_list = [deduped[k]["valid_from"] for k in sorted_keys]
+    valid_to_list = [deduped[k]["valid_to"] for k in sorted_keys]
+
+    await conn.execute(
+        """
+        INSERT INTO graph_edges (
+            customer_id, edge_type, from_node_id, to_node_id,
+            properties, valid_from, valid_to, source_system
         )
-        inserted += 1
-    return inserted
+        SELECT $1, edge_type, from_node_id, to_node_id,
+               properties::jsonb, COALESCE(valid_from, NOW()), valid_to, $2
+        FROM unnest(
+            $3::text[], $4::bigint[], $5::bigint[],
+            $6::text[], $7::timestamptz[], $8::timestamptz[]
+        ) AS t(edge_type, from_node_id, to_node_id, properties, valid_from, valid_to)
+        ON CONFLICT (customer_id, edge_type, from_node_id, to_node_id)
+        DO UPDATE SET
+            properties = graph_edges.properties || EXCLUDED.properties,
+            valid_from = LEAST(graph_edges.valid_from, EXCLUDED.valid_from),
+            valid_to   = EXCLUDED.valid_to
+        """,
+        customer_id,
+        source_system,
+        edge_types,
+        from_ids,
+        to_ids,
+        properties_json,
+        valid_from_list,
+        valid_to_list,
+    )
+    return len(deduped)
