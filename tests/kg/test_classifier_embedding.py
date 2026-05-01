@@ -23,33 +23,10 @@ import logging
 from unittest.mock import MagicMock
 
 import pytest
-import structlog
 
 from services.kg.classifier import embedding as embedding_mod
 from services.kg.classifier.embedding import rank_by_embedding
 from services.kg.embedding_query import EmbeddingMatch, EmbeddingQueryError
-
-
-@pytest.fixture(autouse=True)
-def _route_structlog_to_stdlib() -> None:
-    """Route structlog output through stdlib logging so ``caplog`` sees it.
-
-    The production ``configure_logging`` uses ``make_filtering_bound_logger``,
-    which writes through ``structlog``'s own logger factory and bypasses
-    stdlib logging entirely — meaning ``caplog`` would catch nothing. For
-    tests, swap to ``structlog.stdlib.BoundLogger`` + ``LoggerFactory`` so
-    each ``log.warning(...)`` becomes a stdlib ``LogRecord`` that ``caplog``
-    can assert on.
-    """
-    structlog.configure(
-        processors=[
-            structlog.stdlib.add_log_level,
-            structlog.processors.JSONRenderer(),
-        ],
-        wrapper_class=structlog.stdlib.BoundLogger,
-        logger_factory=structlog.stdlib.LoggerFactory(),
-        cache_logger_on_first_use=False,
-    )
 
 
 @pytest.mark.asyncio
@@ -95,6 +72,7 @@ async def test_returns_top_k_matches_from_query_similar(
 
 @pytest.mark.asyncio
 async def test_embedding_query_error_is_logged_and_reraised(
+    _route_structlog_to_stdlib: None,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
