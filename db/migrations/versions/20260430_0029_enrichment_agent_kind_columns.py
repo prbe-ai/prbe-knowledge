@@ -7,17 +7,14 @@ Create Date: 2026-04-30
 Lands four schema changes on enrichment_runs in a single migration:
 
   * `agent_kind TEXT NOT NULL DEFAULT 'debug'` — discriminator for which
-    agent produced the run. The orchestrator currently has a single
-    enrichment agent; near-term work splits that into a debug vs prod
-    agent (see TODOS.md "debug+dev enrichment"). Defaulting existing rows
-    to 'debug' is intentional: pre-existing rows came from the legacy
-    one-shot path and are debug-quality; the prod agent is gated behind
-    the new column.
+    agent produced the run. The orchestrator currently runs one agent
+    kind ('debug', for ticket enrichment); a follow-up PR adds a second
+    kind ('development', for PR review). Existing rows backfill to
+    'debug' since they all came from the ticket enrichment path.
   * `subject_kind TEXT NOT NULL DEFAULT 'issue'` — discriminator for what
-    was enriched. Today every row enriches a Linear issue; the next wave
-    extends this to PRs, where the subject is a GitHub PR rather than a
-    Linear ticket. Default 'issue' faithfully reflects the historical
-    population.
+    was enriched. Today every row enriches an issue/ticket; the
+    development agent's runs target a 'pr' subject. Default 'issue'
+    faithfully reflects the historical population.
   * Replace the existing `enrichment_runs_status_check` CHECK constraint
     to include `'paused'` alongside the current values. Postgres doesn't
     support ALTER on CHECK constraints in place, so this is DROP + ADD.
