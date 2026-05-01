@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from services.ingestion.handlers.base import ConnectorContext
@@ -43,6 +44,28 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
 TOKEN_RECHECK_EVERY_N_EVENTS = 50
 
 
+class BackfillReclaimedError(Exception):
+    """The runner's claim was preempted (status flipped or started_at advanced).
+
+    Raised when an in-loop UPDATE matches 0 rows, meaning the reaper or another
+    worker now owns this (customer, source). The run loop bails without calling
+    _mark_failed since the row is no longer ours to mutate.
+    """
+
+
+@dataclass(frozen=True)
+class _ResumeState:
+    cursor: str | None
+    events_enqueued: int
+    started_at: datetime | None
+
+
+def _affected(command_tag: str) -> int:
+    # asyncpg execute() returns e.g. "UPDATE 1" / "UPDATE 0"; last token is rowcount.
+    parts = command_tag.split()
+    return int(parts[-1]) if parts and parts[-1].isdigit() else 0
+
+
 async def run_backfill(
     ctx: ConnectorContext,
     customer_id: str,
@@ -54,34 +77,51 @@ async def run_backfill(
     Assumes backfill_state row already exists (status='pending' or 'running').
     Responsible for marking it complete/failed.
     """
+    state = await _load_resume_state(customer_id, source)
+    cursor = state.cursor if state else None
+    initial_enqueued = state.events_enqueued if state else 0
+
     token = await _load_token(customer_id, source)
     if token is None:
-        await _mark_failed(customer_id, source, "no active integration_tokens row")
+        # Mark failed against the existing claim if there is one. If the row
+        # has no started_at (CLI fresh enqueue without claim), skip the mark
+        # — there's no claim to invalidate.
+        if state is not None and state.started_at is not None:
+            await _mark_failed(
+                customer_id,
+                source,
+                "no active integration_tokens row",
+                claim_token=state.started_at,
+            )
         return 0
 
-    cursor = await _load_cursor(customer_id, source)
     store = get_store()
     bucket = store.bucket_for(customer_id)
     await store.ensure_bucket(bucket)
 
     connector = build_connector(source, ctx)
 
-    await _mark_running(customer_id, source)
+    claim_token = await _mark_running(customer_id, source)
     log.info(
         "backfill.start",
         customer=customer_id,
         source=source.value,
         resume_cursor=bool(cursor),
+        resume_events_enqueued=initial_enqueued,
     )
 
     # Liveness ping is decoupled from progress writes. The reaper looks at
     # heartbeat_at; if we only updated it on enqueue (every 25 events), a
     # healthy runner blocked on a slow Slack page would look dead.
     heartbeat_task = asyncio.create_task(
-        _heartbeat_loop(customer_id, source, heartbeat_interval_seconds)
+        _heartbeat_loop(
+            customer_id, source, heartbeat_interval_seconds, claim_token
+        )
     )
 
-    enqueued = 0
+    # Cumulative across resumes: a reclaimed run continues incrementing the
+    # prior run's count rather than starting from zero.
+    enqueued = initial_enqueued
     try:
         try:
             events = connector.backfill(customer_id, token, cursor)
@@ -89,9 +129,13 @@ async def run_backfill(
             # Not auth-related; passing exc is harmless since _mark_failed
             # only flips the token on PermanentSourceError with 401/403.
             await _mark_failed(
-                customer_id, source, f"not supported: {exc}", exc=exc
+                customer_id,
+                source,
+                f"not supported: {exc}",
+                exc=exc,
+                claim_token=claim_token,
             )
-            return 0
+            return enqueued
 
         latest_cursor = cursor
         async for event in events:
@@ -127,7 +171,7 @@ async def run_backfill(
                 if cursor_str is not None:
                     latest_cursor = str(cursor_str)
                     await _update_progress(
-                        customer_id, source, latest_cursor, enqueued
+                        customer_id, source, latest_cursor, enqueued, claim_token
                     )
                 continue
 
@@ -176,9 +220,13 @@ async def run_backfill(
 
             enqueued += 1
             if enqueued % PROGRESS_EVERY_N_EVENTS == 0:
-                await _update_progress(customer_id, source, latest_cursor, enqueued)
+                await _update_progress(
+                    customer_id, source, latest_cursor, enqueued, claim_token
+                )
 
-        await _mark_done(customer_id, source, enqueued, latest_cursor)
+        await _mark_done(
+            customer_id, source, enqueued, latest_cursor, claim_token
+        )
         counter(
             "backfill.completed",
             1,
@@ -188,11 +236,23 @@ async def run_backfill(
         log.info(
             "backfill.done", customer=customer_id, source=source.value, events=enqueued
         )
+    except BackfillReclaimedError:
+        # Reaper or a competing claim took the row. The new owner is responsible
+        # for it now; do NOT call _mark_failed (would clobber their state).
+        log.warning(
+            "backfill.preempted_by_reclaim",
+            customer=customer_id,
+            source=source.value,
+            enqueued=enqueued,
+        )
+        counter("backfill.preempted", 1, source=source.value)
     except Exception as exc:
         # Pass exc so _mark_failed can detect PermanentSourceError(401/403)
         # raised by a connector mid-backfill (e.g. Granola key revoked) and
         # flip integration_tokens.status='auth_failed' atomically.
-        await _mark_failed(customer_id, source, str(exc), exc=exc)
+        await _mark_failed(
+            customer_id, source, str(exc), exc=exc, claim_token=claim_token
+        )
         counter("backfill.failed", 1, source=source.value)
         log.exception("backfill.failed", customer=customer_id, source=source.value)
         raise
@@ -208,14 +268,16 @@ async def _heartbeat_loop(
     customer_id: str,
     source: SourceSystem,
     interval_seconds: float,
+    claim_token: datetime,
 ) -> None:
     """Unconditionally ping heartbeat_at every interval_seconds while running.
 
-    The WHERE clause filters on status='running' so a row that's been marked
-    done/failed/reclaimed mid-loop won't get a stale heartbeat written. DB
-    errors are logged and swallowed: a transient blip should not kill the
-    only liveness signal — if Postgres is truly down, the next reaper tick
-    will catch it via the stale heartbeat anyway.
+    The WHERE clause is gated on (status='running' AND started_at = claim_token)
+    so a row that's been marked done/failed/reclaimed or re-claimed by another
+    worker won't get a stale heartbeat written. DB errors are logged and
+    swallowed: a transient blip should not kill the only liveness signal — if
+    Postgres is truly down, the next reaper tick will catch it via the stale
+    heartbeat anyway.
     """
     while True:
         try:
@@ -225,13 +287,15 @@ async def _heartbeat_loop(
                     """
                     UPDATE backfill_state
                        SET heartbeat_at = NOW()
-                     WHERE customer_id = $1
+                     WHERE customer_id   = $1
                        AND source_system = $2
-                       AND status = $3
+                       AND status        = $3
+                       AND started_at    = $4
                     """,
                     customer_id,
                     source.value,
                     BackfillStatus.RUNNING.value,
+                    claim_token,
                 )
         except asyncio.CancelledError:
             raise
@@ -306,18 +370,32 @@ async def re_enqueue_for_polling(customer_id: str, source: SourceSystem) -> bool
     return row is not None
 
 
-async def _mark_running(customer_id: str, source: SourceSystem) -> None:
+async def _mark_running(customer_id: str, source: SourceSystem) -> datetime:
+    """Flip to running and return started_at — the claim ownership token.
+
+    started_at uniquely identifies this claim because every fresh claim
+    (claim_pending_backfill, reaper-then-claim, fresh enqueue-then-mark_running)
+    sets it to NOW() at claim time. All in-loop UPDATEs filter on this value
+    to detect preemption by the reaper or a competing claim.
+    """
     async with raw_conn() as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             """
             UPDATE backfill_state
             SET status = $1, started_at = COALESCE(started_at, NOW()), heartbeat_at = NOW()
             WHERE customer_id = $2 AND source_system = $3
+            RETURNING started_at
             """,
             BackfillStatus.RUNNING.value,
             customer_id,
             source.value,
         )
+    if row is None or row["started_at"] is None:
+        raise BackfillReclaimedError(
+            f"backfill_state row vanished or has NULL started_at: "
+            f"{customer_id}/{source.value}"
+        )
+    return row["started_at"]
 
 
 async def _update_progress(
@@ -325,21 +403,38 @@ async def _update_progress(
     source: SourceSystem,
     cursor: str | None,
     enqueued: int,
+    claim_token: datetime,
 ) -> None:
+    """Write progress, gated on the row still being ours.
+
+    Filters on (status='running' AND started_at = claim_token). If the reaper
+    already flipped the row to 'pending' or another worker has re-claimed it
+    (advancing started_at), the UPDATE matches 0 rows and we raise so the
+    run loop can bail without overwriting the new owner's state.
+    """
     async with raw_conn() as conn:
-        await conn.execute(
+        tag = await conn.execute(
             """
             UPDATE backfill_state
             SET last_cursor      = $1,
                 events_enqueued  = $2,
                 last_progress_at = NOW(),
                 heartbeat_at     = NOW()
-            WHERE customer_id = $3 AND source_system = $4
+            WHERE customer_id   = $3
+              AND source_system = $4
+              AND status        = $5
+              AND started_at    = $6
             """,
             cursor,
             enqueued,
             customer_id,
             source.value,
+            BackfillStatus.RUNNING.value,
+            claim_token,
+        )
+    if _affected(tag) == 0:
+        raise BackfillReclaimedError(
+            f"progress write preempted: {customer_id}/{source.value}"
         )
 
 
@@ -348,7 +443,9 @@ async def _mark_done(
     source: SourceSystem,
     enqueued: int,
     cursor: str | None,
+    claim_token: datetime,
 ) -> None:
+    """Mark complete only if the row is still ours. No-op silently otherwise."""
     async with raw_conn() as conn:
         await conn.execute(
             """
@@ -359,13 +456,18 @@ async def _mark_done(
                 last_progress_at = NOW(),
                 heartbeat_at     = NOW(),
                 completed_at     = NOW()
-            WHERE customer_id = $4 AND source_system = $5
+            WHERE customer_id   = $4
+              AND source_system = $5
+              AND status        = $6
+              AND started_at    = $7
             """,
             BackfillStatus.COMPLETE.value,
             cursor,
             enqueued,
             customer_id,
             source.value,
+            BackfillStatus.RUNNING.value,
+            claim_token,
         )
 
 
@@ -375,20 +477,19 @@ async def _mark_failed(
     error: str,
     *,
     exc: Exception | None = None,
+    claim_token: datetime,
 ) -> None:
-    """Mark a backfill_state row as failed.
+    """Mark a backfill_state row as failed, gated on it still being ours.
 
-    When `exc` is a `PermanentSourceError` carrying a 401/403 status, ALSO flip
-    the active integration_tokens row to status='auth_failed'. This is what
+    The backfill_state UPDATE filters on (status='running' AND started_at =
+    claim_token). If the row was reclaimed and another worker has re-claimed
+    it, we no-op silently — the new owner's run is independent of our error.
+
+    When `exc` is a `PermanentSourceError` carrying a 401/403 status AND the
+    backfill_state UPDATE actually fired, we ALSO flip the active
+    integration_tokens row to status='auth_failed'. Sequencing these together
     surfaces "Reconnect" in the dashboard for revoked Granola keys without
-    flipping on Granola 503s (transient) or non-auth permanent errors.
-
-    The `WHERE status='active'` filter on the token UPDATE means a concurrent
-    disconnect (which deletes the row) leaves us with a 0-row UPDATE — silent,
-    no error.
-
-    Both updates run in a single transaction on the same connection so a crash
-    never leaves backfill_state='failed' but integration_tokens still 'active'.
+    flipping on transient errors or on rows we don't own anymore.
     """
     # PermanentSourceError stores kwargs in `self.context`, not as attributes
     # (see shared/exceptions.PrbeError). Granola raises with status=401/403.
@@ -398,20 +499,28 @@ async def _mark_failed(
         is_auth_failure = status_val in {401, 403}
 
     async with raw_conn() as conn, conn.transaction():
-        await conn.execute(
+        tag = await conn.execute(
             """
                 UPDATE backfill_state
                 SET status       = $1,
                     last_error   = $2,
                     heartbeat_at = NOW()
-                WHERE customer_id = $3 AND source_system = $4
+                WHERE customer_id   = $3
+                  AND source_system = $4
+                  AND status        = $5
+                  AND started_at    = $6
                 """,
             BackfillStatus.FAILED.value,
             error[:1000],
             customer_id,
             source.value,
+            BackfillStatus.RUNNING.value,
+            claim_token,
         )
-        if is_auth_failure:
+        # Token flip is gated on backfill_state actually flipping. If we
+        # were preempted, the row belongs to a new claim; their fate is
+        # not ours to decide.
+        if is_auth_failure and _affected(tag) > 0:
             # The status='active' filter means a concurrent disconnect
             # (DELETE FROM integration_tokens) leaves this UPDATE matching
             # 0 rows — safe no-op, no error raised.
@@ -448,14 +557,35 @@ async def _token_still_active(customer_id: str, source: SourceSystem) -> bool:
     return status == "active"
 
 
-async def _load_cursor(customer_id: str, source: SourceSystem) -> str | None:
+async def _load_resume_state(
+    customer_id: str, source: SourceSystem
+) -> _ResumeState | None:
+    """Load the cursor + cumulative event count + current ownership token.
+
+    events_enqueued is cumulative across resumes — the run loop initializes
+    its local counter from this value so that progress writes after a reclaim
+    or restart preserve the running total instead of clobbering it with a
+    fresh-from-zero count.
+
+    Returns None if no row exists (caller should treat as fresh state).
+    """
     async with raw_conn() as conn:
         row = await conn.fetchrow(
-            "SELECT last_cursor FROM backfill_state WHERE customer_id=$1 AND source_system=$2",
+            """
+            SELECT last_cursor, events_enqueued, started_at
+              FROM backfill_state
+             WHERE customer_id = $1 AND source_system = $2
+            """,
             customer_id,
             source.value,
         )
-    return row["last_cursor"] if row else None
+    if row is None:
+        return None
+    return _ResumeState(
+        cursor=row["last_cursor"],
+        events_enqueued=row["events_enqueued"],
+        started_at=row["started_at"],
+    )
 
 
 async def _load_token(
