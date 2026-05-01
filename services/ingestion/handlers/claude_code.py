@@ -276,11 +276,27 @@ class ClaudeCodeConnector(Connector):
         )
 
         documents: list[Document] = [session_doc]
+        # Stamp employee_name + employee_email on the Person node when the
+        # gateway provided them. These power name-keyed graph filters via
+        # idx_graph_nodes_lower_props_name; without them, queries like
+        # "Richard's claude code session" find no Person row whose
+        # properties->>'name' matches and fall through to nothing.
+        # Absent (not None/empty) keys mean "no value" — don't index empty
+        # strings, since the LOWER(properties->>'name') index would
+        # otherwise hold a useless "" entry per employee.
+        person_props: dict[str, Any] = {"employee_id": employee_id}
+        employee_name = self._employee_name_from_event(event, events)
+        employee_email = self._employee_email_from_event(event, events)
+        if employee_name:
+            person_props["name"] = employee_name
+        if employee_email:
+            person_props["email"] = employee_email
+
         graph_nodes: list[GraphNodeSpec] = [
             GraphNodeSpec(
                 label=NodeLabel.PERSON,
                 canonical_id=employee_id,
-                properties={"employee_id": employee_id},
+                properties=person_props,
             ),
             GraphNodeSpec(
                 label=NodeLabel.DOCUMENT,
@@ -449,6 +465,40 @@ class ClaudeCodeConnector(Connector):
                     return candidate
             raise InvalidWebhookPayload("claude_code: missing employee_id")
         return emp
+
+    def _employee_name_from_event(
+        self,
+        event: WebhookEvent,
+        merged_events: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        # Optional. Gateway (prbe-backend PR #67) injects this from
+        # neon_auth.user.name when present. Mirrors the finalize-fallback
+        # pattern of _employee_id_from_event: finalize events carry no
+        # per-event identity in raw_payload, so we walk merged_events for
+        # the first one with a populated value.
+        val = event.raw_payload.get("employee_name")
+        if isinstance(val, str) and val:
+            return val
+        for e in (merged_events or []):
+            candidate = e.get("employee_name")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return None
+
+    def _employee_email_from_event(
+        self,
+        event: WebhookEvent,
+        merged_events: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        # Optional. See _employee_name_from_event for the rationale.
+        val = event.raw_payload.get("employee_email")
+        if isinstance(val, str) and val:
+            return val
+        for e in (merged_events or []):
+            candidate = e.get("employee_email")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return None
 
     def _acl(self, employee_id: str) -> ACLSnapshot:
         return ACLSnapshot(

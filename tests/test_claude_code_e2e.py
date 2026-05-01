@@ -80,13 +80,17 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
         assert reg.status_code == 200, reg.text
 
         # 2. Gateway-forwarded webhook: X-Internal-Knowledge-Key + X-Prbe-Customer,
-        # no client bearer.
+        # no client bearer. employee_name + employee_email are injected by the
+        # gateway from neon_auth.user (prbe-backend PR #67) and stamp the
+        # Person graph node so name-keyed retrieval (Lane B) resolves.
         webhook_body = {
             "device_id": device_id,
             "session_id": "e2e-sess-1",
             "batch_seq": 0,
             "cwd": "/tmp/e2e",
             "employee_id": EMPLOYEE,
+            "employee_name": "Richard E2E",
+            "employee_email": "richard.e2e@example.com",
             "events": [{"line_no": 0, "raw": {"type": "user_prompt", "content": "hi from e2e"}}],
         }
         wh = await client.post(
@@ -149,3 +153,24 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
     assert "hi from e2e" in meta["body"], (
         f"event content should land in metadata['body']; got: {meta['body']!r}"
     )
+
+    # 5. Lane B: the Person graph node carries name + email from the
+    # gateway-injected payload. This is what powers
+    # idx_graph_nodes_lower_props_name lookups for "Richard's claude code
+    # session"-style queries.
+    async with raw_conn() as conn:
+        person_row = await conn.fetchrow(
+            "SELECT properties::text AS properties FROM graph_nodes "
+            "WHERE customer_id = $1 AND label = 'Person' AND canonical_id = $2",
+            CUSTOMER,
+            EMPLOYEE,
+        )
+    assert person_row is not None, "expected a Person graph node for the employee"
+    person_props = _orjson.loads(person_row["properties"])
+    assert person_props.get("name") == "Richard E2E", (
+        f"Person node missing 'name' from gateway payload; got: {person_props!r}"
+    )
+    assert person_props.get("email") == "richard.e2e@example.com", (
+        f"Person node missing 'email' from gateway payload; got: {person_props!r}"
+    )
+    assert person_props.get("employee_id") == EMPLOYEE
