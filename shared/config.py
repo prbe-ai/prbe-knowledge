@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     db_statement_timeout_ms: int = 300_000
     db_init_retry_attempts: int = 6
     db_init_retry_base_seconds: float = 1.0
+    db_connect_timeout_seconds: float = 10.0
     # Heartbeat is liveness, NOT progress. The runner spawns a background task
     # that pings heartbeat_at every N seconds regardless of whether events are
     # being enqueued, so a healthy-but-paused runner (Slack rate limit, large

@@ -19,11 +19,12 @@ class _FakePool:
         return None
 
 
-def _settings(attempts: int = 6) -> Settings:
+def _settings(attempts: int = 6, connect_timeout: float = 0.5) -> Settings:
     return Settings(
         database_url="postgresql://prbe:prbe@localhost:5432/prbe_knowledge",
         db_init_retry_attempts=attempts,
         db_init_retry_base_seconds=0.01,
+        db_connect_timeout_seconds=connect_timeout,
     )
 
 
@@ -64,4 +65,22 @@ async def test_init_pool_raises_database_unavailable_after_all_attempts(
         await db_module.init_pool(_settings(attempts=3))
 
     assert calls["n"] == 3
+    db_module.reset_pool()
+
+
+@pytest.mark.asyncio
+async def test_init_pool_passes_connect_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    db_module.reset_pool()
+    captured: dict[str, object] = {}
+
+    async def fake_create_pool(*args: object, **kwargs: object) -> _FakePool:
+        captured.update(kwargs)
+        return _FakePool()
+
+    monkeypatch.setattr(db_module.asyncpg, "create_pool", fake_create_pool)
+
+    settings = _settings(connect_timeout=0.25)
+    await db_module.init_pool(settings)
+
+    assert captured["timeout"] == settings.db_connect_timeout_seconds
     db_module.reset_pool()
