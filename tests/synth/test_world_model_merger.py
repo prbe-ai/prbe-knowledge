@@ -378,3 +378,32 @@ def test_no_dep_edge_for_external_deps() -> None:
     )
     edges = build_dep_graph([sig], services)
     assert edges == ()
+
+
+from scripts.synth.world_model import compute_time_anchors  # noqa: E402
+
+
+def test_time_anchors_groups_commits_by_iso_week() -> None:
+    sigs = [_signals(commits=[
+        Commit(sha=f"s{i}", author_name="A", author_email="a@x.com",
+               ts=datetime(2026, 4, 1 + (i % 7), 10, tzinfo=UTC),
+               subject=f"c{i}", body="", files_touched=())
+        for i in range(20)
+    ])]
+    anchors = compute_time_anchors(sigs)
+    # All 20 commits land in 1-2 ISO weeks; each anchor must have
+    # nonzero activity_score.
+    assert anchors
+    assert all(a.activity_score > 0 for a in anchors)
+
+
+def test_time_anchors_returned_in_chronological_order() -> None:
+    sigs = [_signals(commits=[
+        Commit(sha="a", author_name="A", author_email="a@x.com",
+               ts=datetime(2026, 1, 1, tzinfo=UTC), subject="x", body="", files_touched=()),
+        Commit(sha="b", author_name="A", author_email="a@x.com",
+               ts=datetime(2026, 4, 1, tzinfo=UTC), subject="y", body="", files_touched=()),
+    ])]
+    anchors = compute_time_anchors(sigs)
+    starts = [a.start for a in anchors]
+    assert starts == sorted(starts)

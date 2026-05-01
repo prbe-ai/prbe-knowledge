@@ -7,7 +7,7 @@ writer, validator) consumes this as cached prompt context.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 
@@ -473,3 +473,30 @@ def build_dep_graph(
                     )
                 )
     return tuple(edges)
+
+
+def compute_time_anchors(signals: list[RepoSignals]) -> tuple[TimeAnchor, ...]:
+    """Cluster commit timestamps by ISO week. Each non-empty week becomes
+    a TimeAnchor with activity_score = number of commits that week."""
+    week_counts: dict[tuple[int, int], int] = defaultdict(int)
+    for sig in signals:
+        for c in sig.commits:
+            year, week, _ = c.ts.isocalendar()
+            week_counts[(year, week)] += 1
+
+    anchors: list[TimeAnchor] = []
+    for (year, week), count in sorted(week_counts.items()):
+        # ISO week → start (Monday) of that week
+        # date.fromisocalendar exists in 3.8+
+        from datetime import date as date_cls
+        start_date = date_cls.fromisocalendar(year, week, 1)
+        start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=UTC)
+        anchors.append(
+            TimeAnchor(
+                label=f"active-{year}-W{week:02d}",
+                start=start,
+                end=start + timedelta(days=7),
+                activity_score=float(count),
+            )
+        )
+    return tuple(anchors)
