@@ -118,17 +118,25 @@ def test_repos_active_in_recorded_per_person() -> None:
     assert sorted(p.repos_active_in) == ["github.com/org/A", "github.com/org/B"]
 
 
-def test_canonicalize_is_order_independent() -> None:
-    """Two different commit orderings must produce the same persons (sets)."""
+def test_canonicalize_is_order_independent_shared_email() -> None:
+    """Order-of-commits must not change canonicalization output.
+
+    Pre-fix bug: a shared-email commit pair where one commit's author_name
+    resolves to a contributor and the other doesn't would split into two
+    personas in one order but collapse into one in the other order, because
+    `email_to_gh` was being mutated mid-loop.
+    """
     contributor = Contributor(
         gh_username="alice",
         display_name="Alice X",
         email_aliases=("alice@work.com",),
         contributions=10,
     )
+    # Two commits with the SAME email; one author_name resolves via name_to_gh,
+    # one does not.
     commits_forward = [
-        _commit("alice@work.com", "Alice", sha="1"),
-        _commit("alice@home.com", "Alice X", sha="2"),
+        _commit("shared@x.com", "Bob", sha="1"),       # not in name_to_gh
+        _commit("shared@x.com", "Alice X", sha="2"),   # resolves to gh:alice
     ]
     commits_reverse = list(reversed(commits_forward))
 
@@ -140,7 +148,19 @@ def test_canonicalize_is_order_independent() -> None:
         [_signals(commits=commits_reverse, contributors=(contributor,))],
         min_threshold=1, max_personas=10,
     )
-    # Both must collapse to one Person with both email aliases
-    assert len(a) == 1 and len(b) == 1
+    # Both must collapse to exactly one Person whose activity counts both commits.
+    assert len(a) == len(b) == 1
     assert a[0].canonical_id == b[0].canonical_id == "gh:alice"
-    assert set(a[0].email_aliases) == set(b[0].email_aliases) == {"alice@home.com", "alice@work.com"}
+    assert a[0].activity_score == b[0].activity_score == 2.0
+
+
+def test_canonicalize_lowercases_commit_emails_in_aliases() -> None:
+    """Mixed-case commit emails must be normalized in email_aliases."""
+    sigs = [_signals(commits=[
+        _commit("Alice@Work.com", "Alice", sha="1"),
+        _commit("alice@work.com", "Alice", sha="2"),
+    ])]
+    people = canonicalize_people(sigs, min_threshold=1, max_personas=10)
+    assert len(people) == 1
+    # Must be exactly one entry, lowercased.
+    assert people[0].email_aliases == ("alice@work.com",)
