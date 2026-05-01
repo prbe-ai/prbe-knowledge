@@ -500,3 +500,52 @@ def compute_time_anchors(signals: list[RepoSignals]) -> tuple[TimeAnchor, ...]:
             )
         )
     return tuple(anchors)
+
+
+def merge_world_model(
+    signals: list[RepoSignals],
+    *,
+    company_name: str,
+    seed: int,
+    min_threshold: int,
+    max_personas: int,
+    now: datetime,
+) -> WorldModel:
+    """Compose all merger steps into the immutable WorldModel."""
+    people = canonicalize_people(signals, min_threshold=min_threshold, max_personas=max_personas)
+    services = infer_services(signals)
+    topic_pool = build_topic_pool(signals, services=services, now=now)
+
+    # Codeowner team set: anything looking like @<team> with a slash (e.g. @org/team)
+    codeowner_teams: set[str] = set()
+    for sig in signals:
+        for rule in sig.codeowners:
+            for owner in rule.owners:
+                if "/" in owner:  # @org/team
+                    codeowner_teams.add(owner.split("/", 1)[1])
+
+    channels = synthesize_channels(services, codeowner_teams=codeowner_teams)
+    sections = synthesize_sections(services)
+    dep_graph = build_dep_graph(signals, services)
+    time_anchors = compute_time_anchors(signals)
+
+    repos = tuple(
+        RepoSummary(url=s.url, sha=s.latest_sha, default_branch=s.default_branch)
+        for s in signals
+    )
+    sha_set = {s.url: s.latest_sha for s in signals}
+
+    return WorldModel(
+        repos=repos,
+        people=people,
+        services=services,
+        topic_pool=topic_pool,
+        channels=channels,
+        notion_sections=sections,
+        time_anchors=time_anchors,
+        dep_graph=dep_graph,
+        company_name=company_name,
+        seed=seed,
+        extracted_at=now,
+        sha_set=sha_set,
+    )

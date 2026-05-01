@@ -407,3 +407,37 @@ def test_time_anchors_returned_in_chronological_order() -> None:
     anchors = compute_time_anchors(sigs)
     starts = [a.start for a in anchors]
     assert starts == sorted(starts)
+
+
+from scripts.synth.world_model import WorldModel, merge_world_model  # noqa: E402
+
+
+def test_merge_world_model_end_to_end(tmp_repo: Path) -> None:
+    from scripts.synth.extractor.repo import RepoExtractor
+    extractor = RepoExtractor(github_client=None)
+    sig = extractor.extract_local(
+        url=f"file://{tmp_repo}", clone_path=tmp_repo,
+        since=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    wm = merge_world_model(
+        signals=[sig], company_name="acme", seed=42,
+        min_threshold=1, max_personas=10,
+        now=datetime(2026, 4, 30, tzinfo=UTC),
+    )
+
+    assert isinstance(wm, WorldModel)
+    assert wm.company_name == "acme"
+    assert wm.seed == 42
+    assert wm.repos and wm.repos[0].url == f"file://{tmp_repo}"
+    assert wm.sha_set[f"file://{tmp_repo}"] == sig.latest_sha
+    # Personas: at least Alice, Bob, Carol (each has ≥ 1 commit)
+    names = {p.display_name for p in wm.people}
+    assert {"Alice", "Bob", "Carol"} <= names
+    # Services: payments + billing + fake-repo
+    svc_names = {s.name for s in wm.services}
+    assert {"payments", "billing", "fake-repo"} <= svc_names
+    # Channels: at least #general
+    assert any(c.name == "#general" for c in wm.channels)
+    # Time anchors: nonzero
+    assert wm.time_anchors
