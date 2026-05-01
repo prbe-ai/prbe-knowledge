@@ -451,20 +451,39 @@ def build_dep_graph(
     signals: list[RepoSignals],
     services: tuple[Service, ...],
 ) -> tuple[DepEdge, ...]:
-    by_name = {s.name: s for s in services}
+    """Build a dependency graph from manifest declarations.
+
+    When two services share a bare name (e.g. A/payments + B/payments after
+    collision qualification), disambiguation rules apply:
+      - from_svc: prefer same-repo match; fall back to unique candidate.
+      - to_svc: prefer intra-repo dep; fall back to unique cross-repo candidate.
+      - Skip (rather than guess) if to_svc is ambiguous across multiple repos.
+    """
+    by_name: dict[str, list[Service]] = defaultdict(list)
+    for s in services:
+        by_name[s.name].append(s)
 
     edges: list[DepEdge] = []
     for sig in signals:
         for m in sig.manifests:
             if not m.name:
                 continue
-            from_svc = by_name.get(m.name)
-            if not from_svc:
-                continue
+            # from_svc: the service whose manifest this is. Prefer same-repo;
+            # if ambiguous (no same-repo match), fall back to the unique candidate.
+            from_candidates = by_name.get(m.name, [])
+            from_svc = next((s for s in from_candidates if s.repo_url == sig.url), None)
+            if from_svc is None and len(from_candidates) == 1:
+                from_svc = from_candidates[0]
+            if from_svc is None:
+                continue  # can't attribute manifest to a service
             for dep_name in m.dependencies:
-                to_svc = by_name.get(dep_name)
-                if not to_svc:
-                    continue
+                # to_svc: prefer intra-repo dep (common case); else unique cross-repo.
+                to_candidates = by_name.get(dep_name, [])
+                to_svc = next((s for s in to_candidates if s.repo_url == sig.url), None)
+                if to_svc is None and len(to_candidates) == 1:
+                    to_svc = to_candidates[0]
+                if to_svc is None:
+                    continue  # not a tracked service, or ambiguous cross-repo
                 if to_svc.qualified == from_svc.qualified:
                     continue  # don't record self-edges
                 edges.append(

@@ -376,6 +376,82 @@ def test_dep_graph_no_edge_for_external_deps() -> None:
     assert edges == ()
 
 
+def test_dep_graph_attributes_from_service_to_correct_repo_on_name_collision() -> None:
+    """Two repos define a service named 'payments'; A's manifest declares
+    a dep on 'billing' which only exists in A. The DepEdge must attribute
+    from_service to A/payments (not B/payments)."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+
+    services = (
+        Service(name="payments", qualified="A/payments", repo_url="github.com/x/A",
+                kind=ServiceKind.API, description=None, owners=(), recent_activity=1.0,
+                deploy_target=None),
+        Service(name="payments", qualified="B/payments", repo_url="github.com/x/B",
+                kind=ServiceKind.API, description=None, owners=(), recent_activity=1.0,
+                deploy_target=None),
+        Service(name="billing", qualified="billing", repo_url="github.com/x/A",
+                kind=ServiceKind.LIB, description=None, owners=(), recent_activity=1.0,
+                deploy_target=None),
+    )
+    sig_a = RepoSignals(
+        url="github.com/x/A", clone_path=Path("/tmp/A"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/A/pyproject.toml"),
+                     name="payments", description=None, dependencies=("billing",)),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    sig_b = RepoSignals(
+        url="github.com/x/B", clone_path=Path("/tmp/B"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/B/pyproject.toml"),
+                     name="payments", description=None, dependencies=()),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+
+    edges = build_dep_graph([sig_a, sig_b], services)
+    assert len(edges) == 1
+    assert edges[0].from_service == "A/payments"
+    assert edges[0].to_service == "billing"
+    assert edges[0].source_repo == "github.com/x/A"
+
+
+def test_dep_graph_skips_ambiguous_cross_repo_to_service() -> None:
+    """Repo A's only service depends on 'log'. Two repos B and C each have a
+    service named 'log'. Source repo A has no 'log'. The dep is ambiguous —
+    skip rather than guess."""
+    from scripts.synth.extractor.manifests import Manifest, ManifestKind
+
+    services = (
+        Service(name="payments", qualified="payments", repo_url="github.com/x/A",
+                kind=ServiceKind.API, description=None, owners=(), recent_activity=1.0,
+                deploy_target=None),
+        Service(name="log", qualified="B/log", repo_url="github.com/x/B",
+                kind=ServiceKind.LIB, description=None, owners=(), recent_activity=1.0,
+                deploy_target=None),
+        Service(name="log", qualified="C/log", repo_url="github.com/x/C",
+                kind=ServiceKind.LIB, description=None, owners=(), recent_activity=1.0,
+                deploy_target=None),
+    )
+    sig_a = RepoSignals(
+        url="github.com/x/A", clone_path=Path("/tmp/A"),
+        default_branch="main", latest_sha="abc", description=None,
+        manifests=(
+            Manifest(kind=ManifestKind.PYPROJECT, path=Path("/tmp/A/pyproject.toml"),
+                     name="payments", description=None, dependencies=("log",)),
+        ),
+        readmes=(), codeowners=(), commits=(), branches=(),
+        issues=None, prs=None, contributors=None, workflows=None,
+    )
+    edges = build_dep_graph([sig_a], services)
+    assert edges == ()
+
+
 from scripts.synth.world_model import compute_time_anchors  # noqa: E402
 
 
