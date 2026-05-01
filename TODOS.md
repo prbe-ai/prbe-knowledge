@@ -69,6 +69,38 @@ degrades past ~10M rows.
 **Fix:** ~30 lines for cron sweep deleting >180d, OR pg_partman monthly
 partitions.
 
+### Hot-node write strategy (per-customer drain ceiling)
+**Where:** `services/ingestion/graph_writer.py:upsert_nodes` (and the
+provenance UPSERT in the same file)
+
+PRs #40, #41, and #44 closed the contention-driven DLQ failures (batched
+writes, sorted lock order, 5min timeout, 50 retries, per-customer cap=30).
+Per-customer drain rate is now bounded at ~150-600/min by hot-row
+serialization: every Slack/GitHub/Linear batch UPSERTs a small set of
+super-hot nodes (`team`, `channel`, `repo`, recurring `user`/`author`
+canonical_ids), and `ON CONFLICT DO UPDATE` row locks are held until COMMIT,
+so concurrent txs serialize on each other's full Phase B duration.
+
+**Trigger:** a customer's queue stays >1000 pending sustained for >30 min
+without DLQ, OR onboarding/replay drain takes >12 hours, OR Phase B p99
+duration climbs past ~1s.
+
+**Fix options** (do not bump knobs — adding workers does not help, they all
+queue on the same row lock):
+1. **Dedupe touches at the queue level:** if N pending rows for the same
+   customer all touch `team:X`, collapse the upsert into one statement at
+   claim time. Saves N-1 lock acquisitions on the hottest nodes.
+2. **Async hot-node provenance writes:** defer "bump last_seen_at" on
+   `graph_node_provenance` to a separate batched queue that flushes every
+   few seconds. Removes the second per-batch UPSERT entirely from the
+   critical path.
+3. **Skip no-op provenance updates:** check before writing — most touches
+   don't change anything material.
+
+These are real refactors, not config changes. Worth doing only when a real
+drain-rate incident motivates the complexity; for any reasonable workspace
+size today the queue absorbs and drains overnight at worst.
+
 ---
 
 ## P3 — connector completeness
