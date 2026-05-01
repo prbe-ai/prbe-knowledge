@@ -499,8 +499,9 @@ CREATE POLICY usage_events_tenant_isolation ON usage_events
 -- until first embed). See docs/superpowers/specs/2026-04-29-debugging-
 -- knowledge-graph-design.md §5.1.
 --
--- Indexes (GIN on frontmatter->'related', ivfflat on signature_embedding) and
--- RLS policy are added in subsequent migrations (Phase 1 Tasks 4 and 5).
+-- Indexes (GIN on frontmatter->'related', ivfflat on signature_embedding),
+-- updated_at trigger, and RLS policy are added in subsequent migrations
+-- (Phase 1 Tasks 4 and 5).
 -- ---------------------------------------------------------------------------
 CREATE TABLE kg_classes (
     customer_id          TEXT         NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
@@ -512,6 +513,33 @@ CREATE TABLE kg_classes (
     updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     PRIMARY KEY (customer_id, class_id)
 );
+
+-- GIN index on frontmatter->'related' for compute-on-read edge queries
+-- (1-hop expand: spec §6 step 5). jsonb_path_ops is the right opclass
+-- because we only need containment (@>) on the related array.
+CREATE INDEX kg_classes_related_gin
+    ON kg_classes USING GIN ((frontmatter->'related') jsonb_path_ops);
+
+-- ivfflat index on signature_embedding for the classifier's cosine
+-- similarity step (spec §6 step 2). lists=100 is the practical floor
+-- for ivfflat; revisit if classes-per-tenant exceeds ~10K.
+CREATE INDEX kg_classes_embedding_ivfflat
+    ON kg_classes USING ivfflat (signature_embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- Generic kg_* updated_at trigger function. No pre-existing
+-- set_updated_at() helper in this schema; kg-prefixed to avoid future
+-- collisions if a generic helper lands later.
+CREATE OR REPLACE FUNCTION kg_set_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER kg_classes_updated
+    BEFORE UPDATE ON kg_classes
+    FOR EACH ROW EXECUTE FUNCTION kg_set_updated_at();
 
 -- ---------------------------------------------------------------------------
 -- kg_evidence: debugging knowledge graph — episodic learning trail.
@@ -567,7 +595,7 @@ CREATE TABLE kg_evidence (
 -- pending|accepted|rejected|merged state machine.
 --
 -- ivfflat index on notes_embedding and RLS policy land in subsequent
--- migrations (Phase 1 Tasks 4 and 5).
+-- migrations (Phase 1 Task 5 for RLS; the ivfflat index lives below).
 -- ---------------------------------------------------------------------------
 CREATE TABLE kg_candidates (
     customer_id      TEXT         NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
@@ -585,6 +613,13 @@ CREATE TABLE kg_candidates (
 
 CREATE INDEX kg_candidates_dedup
     ON kg_candidates (customer_id, payload_hash, status, created_at);
+
+-- ivfflat index on notes_embedding for layer-2 dedup confirmation
+-- (spec §7.3): on hash collision, compare notes embeddings against
+-- pending candidates and increment repeat_count only when cosine > 0.85.
+CREATE INDEX kg_candidates_notes_embedding_ivfflat
+    ON kg_candidates USING ivfflat (notes_embedding vector_cosine_ops)
+    WITH (lists = 100);
 
 -- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
