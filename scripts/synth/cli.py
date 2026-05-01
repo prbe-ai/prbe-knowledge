@@ -1,4 +1,11 @@
-"""CLI dispatch for the synth tool. Subcommands grow over plans 1-3."""
+"""CLI dispatch for the synth tool.
+
+Plan 1: extract subcommand (WorldModel dump only, no DB).
+Plan 2: init / run / clean subcommands.
+
+Plan 2 commands default to local-files mode. The --integrate flag opts into
+DB + R2 writes (requires a prior `synth init`).
+"""
 
 from __future__ import annotations
 
@@ -8,9 +15,10 @@ import dataclasses
 import json
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from scripts.synth.bootstrap import clean_tenant, init_tenant
 from scripts.synth.cache import DiskCache, default_cache_root
 from scripts.synth.company_context import (
     CompanyContext,
@@ -20,7 +28,17 @@ from scripts.synth.company_context import (
 from scripts.synth.extractor.github_api import GithubClient
 from scripts.synth.extractor.repo import RepoExtractor, RepoSignals
 from scripts.synth.llm_client import LlmClient, LlmClientProtocol
+from scripts.synth.output.eval_artifacts import (
+    write_docs_index,
+    write_manifest,
+    write_profile,
+    write_warnings,
+)
+from scripts.synth.output.writer import IngestionWriter
+from scripts.synth.ownership import build_ownership_index
 from scripts.synth.profile import Profile, load_profile
+from scripts.synth.scenarios import TimeWindow, run_scenarios
+from scripts.synth.validator import validate_name_only
 from scripts.synth.world_model import merge_world_model
 
 
@@ -31,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
+    # extract — Plan 1, unchanged
     extract = sub.add_parser(
         "extract",
         help="Extract WorldModel from repos in a profile (no DB writes).",
@@ -43,14 +62,84 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where to write world_model.json (default: eval-datasets/<run-id>/).",
     )
 
+    # init — Plan 2
+    init = sub.add_parser(
+        "init",
+        help="Bootstrap a synthetic tenant: customers row + bucket + integration_tokens stubs.",
+    )
+    init.add_argument("--profile", required=True, type=str)
+
+    # run — Plan 2
+    run = sub.add_parser(
+        "run",
+        help="Run scenarios for a profile. Local files by default; --integrate writes to DB+R2.",
+    )
+    run.add_argument("--profile", required=True, type=str)
+    run.add_argument("--output-dir", type=str, default=None)
+    run.add_argument(
+        "--integrate",
+        action="store_true",
+        help="Also write to R2 + ingestion_queue. Requires prior `synth init`.",
+    )
+    run.add_argument(
+        "--reset",
+        action="store_true",
+        help="Call `synth clean` before running.",
+    )
+    run.add_argument(
+        "--time-window",
+        type=str,
+        default=None,
+        help="Override profile time_window.days (e.g., 30d, 14d). Default: 30d.",
+    )
+    run.add_argument(
+        "--archetypes",
+        type=str,
+        default=None,
+        help="Comma-separated archetype names to restrict the run.",
+    )
+    run.add_argument(
+        "--limit-scenarios",
+        type=int,
+        default=None,
+        help="Per-archetype scenario cap (debug).",
+    )
+    run.add_argument("--verbose", action="store_true")
+
+    # clean — Plan 2
+    clean = sub.add_parser(
+        "clean",
+        help="Tear down a synthetic tenant. Refuses non-synth customer prefixes.",
+    )
+    clean.add_argument("--customer", required=True, type=str)
+
     return parser
 
 
 def _resolve_output_dir(profile: Profile, override: str | None) -> Path:
     if override:
         return Path(override)
-    run_id = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ") + f"-{profile.preset}-seed{profile.seed}"
+    run_id = (
+        datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%SZ")
+        + f"-{profile.preset}-seed{profile.seed}"
+    )
     return Path("eval-datasets") / run_id
+
+
+def _parse_time_window(arg: str | None, profile: Profile) -> TimeWindow:
+    """CLI --time-window beats profile.time_window.days; both default to 30."""
+    if arg is not None:
+        days = int(arg.rstrip("d"))
+    else:
+        cfg = profile.raw.get("time_window") or {}
+        days = int(cfg.get("days", 30))
+    end = datetime.now(UTC).replace(microsecond=0)
+    return TimeWindow(end=end, days=days)
+
+
+# ---------------------------------------------------------------------------
+# extract — Plan 1 (unchanged)
+# ---------------------------------------------------------------------------
 
 
 async def _extract_async(profile: Profile, out: Path) -> int:
@@ -61,13 +150,10 @@ async def _extract_async(profile: Profile, out: Path) -> int:
 
     out.mkdir(parents=True, exist_ok=True)
 
-    # Profile world_model knobs override defaults from spec §12.3
     wm_cfg = profile.raw.get("world_model") or {}
     min_threshold = int(wm_cfg.get("min_commits_per_persona", 2))
     max_personas = int(wm_cfg.get("max_personas", 25))
     lookback_days = int(wm_cfg.get("topic_pool_lookback_days", 90))
-
-    from datetime import timedelta
     since = datetime.now(UTC).replace(microsecond=0) - timedelta(days=lookback_days)
 
     signals: list[RepoSignals] = []
@@ -114,8 +200,6 @@ async def _resolve_company_context(
         return load_company_context(profile.company_context_path)
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        # No LLM available; fall back to a minimal stub. The user can
-        # add company_context: ./<file> later for richer context.
         return CompanyContext(
             name=_infer_company_name_from_repos(signals),
             stage="unknown",
@@ -150,7 +234,6 @@ def _infer_company_name_from_repos(signals: list[RepoSignals]) -> str:
     """
     owners: set[str] = set()
     for sig in signals:
-        # github.com/owner/repo  →  owner
         parts = sig.url.rstrip("/").split("/")
         if len(parts) >= 2 and parts[-2]:  # skip empty owner segments
             owners.add(parts[-2])
@@ -176,13 +259,227 @@ def _dumps(obj) -> str:
     return json.dumps(encode(obj), indent=2, sort_keys=False)
 
 
+# ---------------------------------------------------------------------------
+# Plan 2 helpers — DB / bucket connection
+# ---------------------------------------------------------------------------
+
+
+async def _open_db_and_bucket():
+    """Construct (db_pool, bucket) for integrate mode. Pulls from settings.
+
+    Adaptation from plan spec: plan uses `await get_pool()` but get_pool()
+    is synchronous and raises DatabaseUnavailable if not initialized. We use
+    `await init_pool()` which initializes the pool from settings and returns it.
+    """
+    from shared.db import init_pool  # type: ignore[import-untyped]
+    from shared.storage import ObjectStore  # type: ignore[import-untyped]
+
+    db = await init_pool()
+    bucket = ObjectStore()
+    return db, bucket
+
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+
+
+async def _init_async(profile: Profile) -> int:
+    db, bucket = await _open_db_and_bucket()
+    try:
+        await init_tenant(profile, db, bucket)
+        print(f"initialized tenant {profile.customer_id}", file=sys.stderr)
+        return 0
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# clean
+# ---------------------------------------------------------------------------
+
+
+async def _clean_async(customer_id: str) -> int:
+    if not customer_id.startswith(("cust-eval-", "cust-synth-")):
+        print(
+            f"error: refuse to clean non-synthetic customer: {customer_id!r}",
+            file=sys.stderr,
+        )
+        return 4
+    db, bucket = await _open_db_and_bucket()
+    try:
+        await clean_tenant(customer_id, db, bucket)
+        print(f"cleaned tenant {customer_id}", file=sys.stderr)
+        return 0
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+
+
+async def _run_async(profile: Profile, out: Path, args) -> int:
+    started_at = datetime.now(UTC)
+
+    if args.reset:
+        await _clean_async(profile.customer_id)
+
+    cache = DiskCache(default_cache_root("repos"))
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    gh_client = GithubClient(token=gh_token) if gh_token else None
+    extractor = RepoExtractor(github_client=gh_client, cache=cache)
+
+    out.mkdir(parents=True, exist_ok=True)
+
+    wm_cfg = profile.raw.get("world_model") or {}
+    min_threshold = int(wm_cfg.get("min_commits_per_persona", 2))
+    max_personas = int(wm_cfg.get("max_personas", 25))
+    lookback_days = int(wm_cfg.get("topic_pool_lookback_days", 90))
+    since = datetime.now(UTC).replace(microsecond=0) - timedelta(days=lookback_days)
+
+    signals: list[RepoSignals] = []
+    for repo in profile.repos:
+        if repo.local_path is None:
+            print(f"warn: repo {repo.url!r} has no local_path; skipping", file=sys.stderr)
+            continue
+        if gh_client is not None:
+            sig = await extractor.extract(repo.url, repo.local_path, since=since, fetch_github=True)
+        else:
+            sig = extractor.extract_local(repo.url, repo.local_path, since=since)
+        signals.append(sig)
+
+    if gh_client is not None:
+        await gh_client.close()
+
+    if not signals:
+        print("error: no repos extracted; check profile.repos[*].local_path", file=sys.stderr)
+        return 3
+
+    cc = await _resolve_company_context(profile, signals, out)
+    world = merge_world_model(
+        signals=signals,
+        company_name=cc.name,
+        seed=profile.seed,
+        min_threshold=min_threshold,
+        max_personas=max_personas,
+        now=datetime.now(UTC),
+    )
+    ownership = build_ownership_index(signals, world)
+    time_window = _parse_time_window(args.time_window, profile)
+
+    archetype_filter: tuple[str, ...] | None = None
+    if args.archetypes:
+        archetype_filter = tuple(s.strip() for s in args.archetypes.split(",") if s.strip())
+
+    # Setup writer based on mode.
+    if args.integrate:
+        db, bucket = await _open_db_and_bucket()
+        writer = IngestionWriter(
+            out_dir=out,
+            mode="integrate",
+            customer_id=profile.customer_id,
+            bucket=bucket,
+            db=db,
+        )
+    else:
+        db = None
+        writer = IngestionWriter(out_dir=out, mode="local")
+
+    try:
+        emitted_docs: list = []
+        for doc in run_scenarios(
+            world,
+            ownership,
+            profile,
+            time_window,
+            archetype_filter=archetype_filter,
+            scenario_limit=args.limit_scenarios,
+        ):
+            await writer.write(doc)
+            emitted_docs.append(doc)
+        await writer.close()
+    finally:
+        if db is not None:
+            await db.close()
+
+    violations = validate_name_only(tuple(emitted_docs), world)
+
+    finished_at = datetime.now(UTC)
+    run_id = out.name if out.name else f"{profile.preset}-seed{profile.seed}"
+
+    archetypes_executed: dict[str, dict] = {}
+    for doc in emitted_docs:
+        slot = archetypes_executed.setdefault(
+            doc.archetype, {"requested": 0, "generated": 0, "dropped": 0}
+        )
+        slot["generated"] += 1
+        slot["requested"] += 1
+    totals = {
+        "archetypes_executed": archetypes_executed,
+        "totals": {
+            "scenarios": len({d.scenario_id for d in emitted_docs}),
+            "documents": len(emitted_docs),
+            "questions": 0,
+        },
+        "warnings_count": len(violations),
+    }
+
+    write_manifest(
+        out,
+        run_id=run_id,
+        profile=profile,
+        world=world,
+        totals=totals,
+        mode="integrate" if args.integrate else "local",
+        started_at=started_at,
+        finished_at=finished_at,
+    )
+    write_docs_index(out, emitted_docs)
+    write_profile(out, profile)
+    write_warnings(out, violations, [])
+    (out / "world_model.json").write_text(_dumps(world))
+    (out / "company_context.json").write_text(_dumps(cc))
+
+    print(f"wrote {out}/manifest.json ({len(emitted_docs)} docs)", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# main dispatch
+# ---------------------------------------------------------------------------
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
     if args.cmd == "extract":
         profile = load_profile(Path(args.profile))
         out = _resolve_output_dir(profile, args.output_dir)
         return asyncio.run(_extract_async(profile, out))
+
+    if args.cmd == "init":
+        profile = load_profile(Path(args.profile))
+        return asyncio.run(_init_async(profile))
+
+    if args.cmd == "run":
+        profile = load_profile(Path(args.profile))
+        out = _resolve_output_dir(profile, args.output_dir)
+        try:
+            return asyncio.run(_run_async(profile, out, args))
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 4
+
+    if args.cmd == "clean":
+        try:
+            return asyncio.run(_clean_async(args.customer))
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 4
+
     parser.error(f"unknown command: {args.cmd}")
     return 2
 

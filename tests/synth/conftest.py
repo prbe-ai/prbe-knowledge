@@ -122,3 +122,25 @@ def tmp_repo(tmp_path: Path) -> Path:
     _git(repo, "checkout", "main")
 
     return repo
+
+
+@pytest.fixture
+def tmp_repo_profile_dir(tmp_repo: Path, tmp_path: Path) -> Path:
+    """Build a profile YAML pointing at tmp_repo. Returns the dir."""
+    profile_dir = tmp_path / "profile_dir"
+    profile_dir.mkdir()
+    profile_path = profile_dir / "profile.yaml"
+    profile_path.write_text(
+        f"""
+customer_id: cust-eval-fake-01
+preset: tiny-test
+seed: 7
+repos:
+  - url: github.com/x/fake
+    local_path: {tmp_repo}
+world_model:
+  min_commits_per_persona: 1
+  topic_pool_lookback_days: 9999
+""".strip()
+    )
+    return profile_dir
