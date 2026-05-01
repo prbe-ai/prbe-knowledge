@@ -222,6 +222,83 @@ def test_canonicalize_does_not_treat_non_noreply_emails_as_noreply() -> None:
     assert canon == ["email:bar@noreply.github.com", "email:foo@github.com"]
 
 
+def test_canonicalize_collapses_noreply_and_local_email_via_display_name() -> None:
+    """Without a Contributor record, the noreply commit and a local-clone
+    gmail commit (same display_name) should still collapse to one gh: persona.
+
+    This is the real-world case: the user clones via SSH and commits with
+    their gmail; CI / web UI commits use the noreply form. Without GITHUB_TOKEN
+    we have no Contributor list, so we rely on display_name promotion from
+    the noreply commit to bridge them.
+    """
+    sigs = [_signals(commits=[
+        # 3 noreply commits — display_name "Richard Wei"
+        _commit("48197502+richardwei6@users.noreply.github.com", "Richard Wei", sha="1"),
+        _commit("48197502+richardwei6@users.noreply.github.com", "Richard Wei", sha="2"),
+        _commit("48197502+richardwei6@users.noreply.github.com", "Richard Wei", sha="3"),
+        # 5 local-clone gmail commits — same display_name
+        _commit("richardwei6@gmail.com", "Richard Wei", sha="4"),
+        _commit("richardwei6@gmail.com", "Richard Wei", sha="5"),
+        _commit("richardwei6@gmail.com", "Richard Wei", sha="6"),
+        _commit("richardwei6@gmail.com", "Richard Wei", sha="7"),
+        _commit("richardwei6@gmail.com", "Richard Wei", sha="8"),
+    ])]
+    people = canonicalize_people(sigs, min_threshold=1, max_personas=10)
+    assert len(people) == 1, [p.canonical_id for p in people]
+    p = people[0]
+    assert p.canonical_id == "gh:richardwei6"
+    assert p.activity_score == 8.0
+    assert "richardwei6@gmail.com" in p.email_aliases
+    assert "48197502+richardwei6@users.noreply.github.com" in p.email_aliases
+
+
+def test_canonicalize_preserves_explicit_contributor_display_name_over_noreply() -> None:
+    """If a Contributor record provides a display_name AND the noreply commit
+    has a different display_name, the Contributor display_name wins. Verifies
+    we don't overwrite explicit GitHub-API data with weaker signal."""
+    contributor = Contributor(
+        gh_username="alice",
+        display_name="Alice X (canonical)",
+        email_aliases=("alice@example.com",),
+        contributions=10,
+    )
+    sigs = [_signals(
+        commits=[
+            _commit("99+alice@users.noreply.github.com", "Alice (commit name)", sha="1"),
+        ],
+        contributors=(contributor,),
+    )]
+    people = canonicalize_people(sigs, min_threshold=1, max_personas=10)
+    assert len(people) == 1
+    assert people[0].display_name == "Alice X (canonical)"
+
+
+def test_canonicalize_does_not_promote_noreply_display_when_ambiguous_with_others() -> None:
+    """If the same noreply display_name also matches a Contributor's display_name
+    for a DIFFERENT username, name_to_gh remains ambiguous (count > 1) and the
+    name-merge pass doesn't fire. This protects against false merges."""
+    contributor = Contributor(
+        gh_username="otherperson",
+        display_name="Common Name",
+        email_aliases=("other@example.com",),
+        contributions=5,
+    )
+    sigs = [_signals(
+        commits=[
+            _commit("123+commonname@users.noreply.github.com", "Common Name", sha="1"),
+            _commit("commonname@gmail.com", "Common Name", sha="2"),  # should NOT merge
+            _commit("other@example.com", "Common Name", sha="3"),
+        ],
+        contributors=(contributor,),
+    )]
+    people = canonicalize_people(sigs, min_threshold=1, max_personas=10)
+    canon = sorted(p.canonical_id for p in people)
+    # gh:commonname (from noreply), gh:otherperson (Contributor), email:commonname@gmail.com (no merge)
+    assert "gh:commonname" in canon
+    assert "gh:otherperson" in canon
+    assert "email:commonname@gmail.com" in canon
+
+
 from scripts.synth.world_model import infer_services  # noqa: E402
 
 

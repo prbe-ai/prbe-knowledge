@@ -176,21 +176,11 @@ def canonicalize_people(
             if c.display_name:
                 gh_meta[c.gh_username]["display_name"] = c.display_name
 
-    # Build a name -> gh_username map for secondary matching, but only when
-    # the display name is unambiguous (maps to exactly one GH contributor).
-    name_to_gh: dict[str, str] = {}
-    name_counts: dict[str, int] = defaultdict(int)
-    for _gh_username, meta in gh_meta.items():
-        dn = meta.get("display_name")
-        if dn:
-            name_counts[dn] += 1
-    for gh_username, meta in gh_meta.items():
-        dn = meta.get("display_name")
-        if dn and name_counts[dn] == 1:
-            name_to_gh[dn] = gh_username
-
     # Pass 1a: GitHub noreply emails encode the username directly. Route them
-    # to gh:<username> even without a Contributor record.
+    # to gh:<username> even without a Contributor record. Also collect commit
+    # display-name candidates so the name-merge pass below can link non-noreply
+    # commits by the same author (e.g. local-clone gmail commits).
+    noreply_display_counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for sig in signals:
         for commit in sig.commits:
             email = commit.author_email.lower()
@@ -204,6 +194,30 @@ def canonicalize_people(
                     {"display_name": None, "emails": set()},
                 )
                 gh_meta[username]["emails"].add(email)
+                if commit.author_name:
+                    noreply_display_counts[username][commit.author_name] += 1
+
+    # Promote the most-frequent commit display_name to gh_meta entries that
+    # lack one. Contributor-supplied display_names always take precedence.
+    for username, name_counts in noreply_display_counts.items():
+        if gh_meta[username].get("display_name"):
+            continue
+        # Tie-break on name alphabetical for determinism.
+        best = max(name_counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+        gh_meta[username]["display_name"] = best
+
+    # Build a name -> gh_username map for secondary matching, but only when
+    # the display name is unambiguous (maps to exactly one GH contributor).
+    name_to_gh: dict[str, str] = {}
+    name_counts_map: dict[str, int] = defaultdict(int)
+    for _gh_username, meta in gh_meta.items():
+        dn = meta.get("display_name")
+        if dn:
+            name_counts_map[dn] += 1
+    for gh_username, meta in gh_meta.items():
+        dn = meta.get("display_name")
+        if dn and name_counts_map[dn] == 1:
+            name_to_gh[dn] = gh_username
 
     # Pass 1: augment email_to_gh from commit name matches (order-independent —
     # only adds, never overwrites). Must complete before activity aggregation so
