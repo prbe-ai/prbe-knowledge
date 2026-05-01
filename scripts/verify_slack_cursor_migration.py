@@ -73,10 +73,7 @@ def main() -> int:
         kept = old_channels & new_channels
 
         verdict = "OK"
-        if lost:
-            verdict = "FLAG"
-            flagged += 1
-        elif not new_channels and old_channels:
+        if lost or (old_channels and not new_channels):
             verdict = "FLAG"
             flagged += 1
 
