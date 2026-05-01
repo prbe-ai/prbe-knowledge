@@ -80,3 +80,10 @@ def test_upgrade_sql_has_required_clauses() -> None:
 
     # Person label only.
     assert "'Person'" in src
+
+    # RLS toggle: graph_nodes has FORCE ROW LEVEL SECURITY, so the migration
+    # must temporarily disable it for the UPDATE to actually touch rows
+    # (without app.current_customer_id set, the tenant_isolation policy
+    # would zero-match) and restore FORCE before the txn commits.
+    assert "NO FORCE ROW LEVEL SECURITY" in src
+    assert src.count("FORCE ROW LEVEL SECURITY") >= 2  # NO FORCE + restore FORCE

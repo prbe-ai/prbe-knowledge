@@ -66,6 +66,15 @@ _UUID_REGEX = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 
 
 def upgrade() -> None:
+    # graph_nodes has FORCE ROW LEVEL SECURITY (see migration 0002), so the
+    # tenant_isolation policy applies even to the table owner this migration
+    # runs as. Without app.current_customer_id set, the policy reduces to
+    # customer_id = '' and the UPDATE would silently touch zero rows. We
+    # briefly disable FORCE for the duration of this migration's transaction
+    # and restore it before commit. Alembic wraps migrations in a single
+    # transaction, so any failure rolls back the NO FORCE along with the
+    # UPDATE -- RLS posture is identical pre- and post-migration.
+    op.execute("ALTER TABLE graph_nodes NO FORCE ROW LEVEL SECURITY")
     op.execute(
         f"""
         UPDATE graph_nodes g
@@ -84,6 +93,7 @@ def upgrade() -> None:
           AND NOT (g.properties ? 'name' AND g.properties ? 'email')
         """
     )
+    op.execute("ALTER TABLE graph_nodes FORCE ROW LEVEL SECURITY")
 
 
 def downgrade() -> None:
