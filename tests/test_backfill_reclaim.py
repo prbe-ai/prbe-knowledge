@@ -28,6 +28,7 @@ from services.ingestion.backfill_runner import (
     _load_resume_state,
     _mark_done,
     _mark_failed,
+    _release_for_resume,
     _update_progress,
 )
 from services.ingestion.worker import ReclaimLoop
@@ -532,3 +533,92 @@ async def test_update_progress_preserves_cumulative_count_across_resume(
         )
     assert row["events_enqueued"] == 1625  # cumulative, not 25
     assert row["last_cursor"] == "after-25-more"
+
+
+@pytest.mark.asyncio
+async def test_release_for_resume_flips_running_to_pending(live_db) -> None:
+    """SIGTERM path: release the claim immediately so a peer can resume without
+    waiting for the 5-min stale-heartbeat reclaim cron. last_cursor and
+    events_enqueued are preserved."""
+    await _insert_customer("cust-release")
+    started_at = await _insert_backfill_state(
+        customer_id="cust-release",
+        source=SourceSystem.LINEAR,
+        status=BackfillStatus.RUNNING.value,
+        heartbeat_offset_seconds=10,  # fresh — we're killing it ourselves
+        last_cursor="cursor-mid-flight",
+        events_enqueued=420,
+    )
+
+    released = await _release_for_resume(
+        "cust-release", SourceSystem.LINEAR, claim_token=started_at
+    )
+    assert released is True
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, started_at, heartbeat_at, last_cursor, "
+            "events_enqueued FROM backfill_state "
+            "WHERE customer_id='cust-release'"
+        )
+    assert row["status"] == BackfillStatus.PENDING.value
+    assert row["started_at"] is None
+    assert row["heartbeat_at"] is None
+    assert row["last_cursor"] == "cursor-mid-flight"
+    assert row["events_enqueued"] == 420
+
+
+@pytest.mark.asyncio
+async def test_release_for_resume_no_op_on_token_mismatch(live_db) -> None:
+    """If a competing worker already re-claimed the row (started_at advanced),
+    releasing with the stale token must NOT clobber the new owner's state."""
+    await _insert_customer("cust-release-mismatch")
+    await _insert_backfill_state(
+        customer_id="cust-release-mismatch",
+        source=SourceSystem.LINEAR,
+        status=BackfillStatus.RUNNING.value,
+        heartbeat_offset_seconds=10,
+        last_cursor="new-owner-cursor",
+        events_enqueued=10,
+    )
+
+    stale_token = datetime.now(UTC) - timedelta(hours=1)
+    released = await _release_for_resume(
+        "cust-release-mismatch", SourceSystem.LINEAR, claim_token=stale_token
+    )
+    assert released is False
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, last_cursor FROM backfill_state "
+            "WHERE customer_id='cust-release-mismatch'"
+        )
+    assert row["status"] == BackfillStatus.RUNNING.value
+    assert row["last_cursor"] == "new-owner-cursor"
+
+
+@pytest.mark.asyncio
+async def test_release_for_resume_no_op_when_status_not_running(live_db) -> None:
+    """If the row is already pending/done/failed, release is a no-op."""
+    await _insert_customer("cust-release-done")
+    started_at = await _insert_backfill_state(
+        customer_id="cust-release-done",
+        source=SourceSystem.LINEAR,
+        status=BackfillStatus.COMPLETE.value,
+        heartbeat_offset_seconds=10,
+        last_cursor="finished",
+        events_enqueued=999,
+    )
+    assert started_at is not None
+
+    released = await _release_for_resume(
+        "cust-release-done", SourceSystem.LINEAR, claim_token=started_at
+    )
+    assert released is False
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status FROM backfill_state "
+            "WHERE customer_id='cust-release-done'"
+        )
+    assert row["status"] == BackfillStatus.COMPLETE.value
