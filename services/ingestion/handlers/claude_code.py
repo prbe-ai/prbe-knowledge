@@ -66,6 +66,13 @@ _FETCH_SUPP_R2_CONCURRENCY = 16
 class ClaudeCodeConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.CLAUDE_CODE
     display_name: ClassVar[str] = "Claude Code"
+    # Per-source identifiers used to tag persisted artifacts. Subclasses
+    # (e.g. CodexConnector below) override these so docs/edges/ACL rows
+    # carry the correct provenance label even though the doc shape and
+    # extraction pipeline are shared with Claude Code.
+    _doc_id_prefix: ClassVar[str] = "claude_code"
+    _agent_label: ClassVar[str] = "claude_code"
+    _session_title_prefix: ClassVar[str] = "Claude Code session"
 
     def verify_signature(
         self,
@@ -317,7 +324,7 @@ class ClaudeCodeConnector(Connector):
         acl = self._acl(employee_id)
         acl_rows: list[ACLSnapshotRow] = [
             ACLSnapshotRow(
-                source_system=SourceSystem.CLAUDE_CODE,
+                source_system=self.source_system,
                 principal_type=p.principal_type,
                 principal_id=p.principal_id,
                 resource_type="document",
@@ -431,7 +438,7 @@ class ClaudeCodeConnector(Connector):
             for p in acl.principals:
                 acl_rows.append(
                     ACLSnapshotRow(
-                        source_system=SourceSystem.CLAUDE_CODE,
+                        source_system=self.source_system,
                         principal_type=p.principal_type,
                         principal_id=p.principal_id,
                         resource_type="document",
@@ -526,7 +533,7 @@ class ClaudeCodeConnector(Connector):
         body_str = orjson.dumps({"events": events}).decode("utf-8")
         body_bytes = body_str.encode("utf-8")
         content_hash = hashlib.sha256(body_bytes).hexdigest()
-        doc_id = f"claude_code:{event.customer_id}:{session_id}"
+        doc_id = f"{self._doc_id_prefix}:{event.customer_id}:{session_id}"
         first_content = ""
         if events:
             raw = events[0].get("raw") or {}
@@ -536,14 +543,14 @@ class ClaudeCodeConnector(Connector):
         return Document(
             doc_id=doc_id,
             customer_id=event.customer_id,
-            source_system=SourceSystem.CLAUDE_CODE,
+            source_system=self.source_system,
             source_id=session_id,
             source_url=f"https://prbe.ai/dashboard/agent-sessions/{session_id}",
             doc_class=DocClass.RAW_SOURCE,
             doc_type=DocType.CLAUDE_CODE_SESSION,
             content_type="application/json",
             content_hash=content_hash,
-            title=f"Claude Code session {session_id[:8]}",
+            title=f"{self._session_title_prefix} {session_id[:8]}",
             body_preview=first_content[:200],
             body_size_bytes=len(body_bytes),
             body_token_count=0,
@@ -553,7 +560,7 @@ class ClaudeCodeConnector(Connector):
             valid_from=now,
             ingested_at=now,
             metadata={
-                "agent": "claude_code",
+                "agent": self._agent_label,
                 "cwd": cwd,
                 "device_id": event.raw_payload.get("device_id"),
                 "session_complete": complete,
@@ -581,13 +588,13 @@ class ClaudeCodeConnector(Connector):
         now: datetime,
     ) -> Document:
         source_id = f"{parent.source_id}:{unit_kind}:{idx}"
-        doc_id = f"claude_code:{event.customer_id}:{source_id}"
+        doc_id = f"{self._doc_id_prefix}:{event.customer_id}:{source_id}"
         body_bytes = body.encode("utf-8")
         content_hash = hashlib.sha256(body_bytes).hexdigest()
         return Document(
             doc_id=doc_id,
             customer_id=event.customer_id,
-            source_system=SourceSystem.CLAUDE_CODE,
+            source_system=self.source_system,
             source_id=source_id,
             source_url=parent.source_url + f"#{unit_kind}-{idx}",
             doc_class=DocClass.RAW_SOURCE,
@@ -759,3 +766,23 @@ def _render_assistant(raw: dict[str, Any]) -> str:
         extra_params: dict[str, str] | None = None,
     ) -> IntegrationToken:
         raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
+
+
+@register_connector(SourceSystem.CODEX)
+class CodexConnector(ClaudeCodeConnector):
+    """Codex CLI sessions, shimmed into Claude-Code shape by the plugin's
+    sanitizer. Inherits all parsing / fetch_supplementary / normalize logic
+    from ClaudeCodeConnector — only the source label and doc-id prefix differ
+    so dashboard queries can distinguish provenance.
+
+    Codex-only fields (sandbox_policy, network policy, developer_instructions,
+    sub-agent metadata, MessagePhase, structured reasoning_summary) ride along
+    on each event under the `_codex_extras` key. They survive into raw R2
+    storage but are not currently parsed into units; a v0.2 native pipeline
+    can read them without re-ingest.
+    """
+    source_system: ClassVar[SourceSystem] = SourceSystem.CODEX
+    display_name: ClassVar[str] = "Codex"
+    _doc_id_prefix: ClassVar[str] = "codex"
+    _agent_label: ClassVar[str] = "codex"
+    _session_title_prefix: ClassVar[str] = "Codex session"

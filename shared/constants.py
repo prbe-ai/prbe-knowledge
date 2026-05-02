@@ -11,6 +11,10 @@ class SourceSystem(StrEnum):
     SENTRY = "sentry"
     GRANOLA = "granola"
     CLAUDE_CODE = "claude_code"
+    # Codex CLI sessions arrive shimmed into Claude-Code shape by the plugin's
+    # sanitizer. Doc shape and unit extraction are identical to claude_code;
+    # this label exists so dashboard queries can distinguish provenance.
+    CODEX = "codex"
 
 
 class DocClass(StrEnum):
@@ -219,6 +223,11 @@ QUEUE_RECLAIM_THRESHOLD_SECONDS = 300
 DEFAULT_INGESTION_PRIORITY = 100
 SOURCE_INGESTION_PRIORITY: dict[SourceSystem, int] = {
     SourceSystem.CLAUDE_CODE: 75,
+    # CODEX is the OpenAI Codex CLI sibling source — same coalescing
+    # semantics + doc shape as CLAUDE_CODE, so it gets the same priority
+    # tier. Keeps a chatty Codex user from preempting interactive
+    # webhooks at the queue claim layer.
+    SourceSystem.CODEX: 75,
 }
 
 TOP_K_VECTOR = 50
@@ -236,6 +245,11 @@ DEDUP_COSINE_THRESHOLD = 0.95
 # so we down-weight them to keep authored content surfacing first.
 SOURCE_SCORE_MULTIPLIERS: dict[SourceSystem, float] = {
     SourceSystem.CLAUDE_CODE: 0.5,
+    # CODEX docs are the same shape and signal density as CLAUDE_CODE —
+    # both are agent transcripts, not authored team artifacts. Apply the
+    # same demotion so they rank consistently with each other below
+    # Slack/Linear/PR docs at equal vector relevance.
+    SourceSystem.CODEX: 0.5,
 }
 
 # Per-source-system half-life (days) for recency decay applied after the
@@ -247,6 +261,9 @@ SOURCE_SCORE_MULTIPLIERS: dict[SourceSystem, float] = {
 # Slack/Linear/PR docs stay relevant for months by design.
 SOURCE_HALF_LIFE_DAYS: dict[SourceSystem, float] = {
     SourceSystem.CLAUDE_CODE: 7.0,
+    # CODEX transcripts are scratchpads with the same staleness curve as
+    # CLAUDE_CODE — both lose relevance fast as authored docs catch up.
+    SourceSystem.CODEX: 7.0,
 }
 
 # Prefix used in `integration_tokens.scope` to signal the row represents a

@@ -214,17 +214,9 @@ async def webhook(
     )
     store = request.app.state.store
     bucket = store.bucket_for(customer_id)
-    # The R2 key namespace must stay UNIQUE per-delivery, even when the
-    # queue's source_event_id is intentionally non-unique (claude_code
-    # coalescing — every batch shares the same session_id). For CC we
-    # compose `<session_id>:<batch_seq>` as the storage_id so each batch
-    # writes a distinct R2 path; retries with the same batch_seq are
-    # idempotent (same R2 path, last-write-wins on identical content).
-    storage_id = parsed.source_event_id
-    if source_enum == SourceSystem.CLAUDE_CODE and isinstance(parsed.parse_hint, dict):
-        batch_seq = parsed.parse_hint.get("batch_seq")
-        if isinstance(batch_seq, int):
-            storage_id = f"{parsed.source_event_id}:{batch_seq}"
+    storage_id = _compose_storage_id(
+        source_enum, parsed.source_event_id, parsed.parse_hint
+    )
     key = _payload_key(source_enum, customer_id, storage_id)
 
     try:
@@ -271,6 +263,42 @@ _SENSITIVE_HEADERS: frozenset[str] = frozenset(
 )
 
 
+# Sources that ingest in coalescing mode: queue's source_event_id is the
+# bare session_id (so multiple batches collapse onto one queue row), and
+# the R2 storage path needs a per-batch suffix so deliveries don't
+# overwrite each other on object storage.
+_COALESCING_AGENT_SOURCES: frozenset[SourceSystem] = frozenset(
+    {SourceSystem.CLAUDE_CODE, SourceSystem.CODEX}
+)
+
+
+def _compose_storage_id(
+    source: SourceSystem,
+    source_event_id: str,
+    parse_hint: object,
+) -> str:
+    """Compose the R2 storage namespace key.
+
+    For agent-session sources (claude_code, codex) the queue source_event_id
+    is the bare session_id (so the UPSERT can coalesce). The R2 path must
+    still be unique per delivery — we suffix it with `:<batch_seq>` so
+    each batch writes a distinct envelope and retries with the same
+    batch_seq are idempotent (last-write-wins on identical content).
+
+    Without the suffix, batches 1..N-1 of a multi-batch session silently
+    overwrite each other in R2 before the worker reads them and only the
+    final batch survives.
+
+    Other sources use bare source_event_id — every event is its own queue
+    row, so the source_event_id is already unique per delivery.
+    """
+    if source in _COALESCING_AGENT_SOURCES and isinstance(parse_hint, dict):
+        batch_seq = parse_hint.get("batch_seq")
+        if isinstance(batch_seq, int):
+            return f"{source_event_id}:{batch_seq}"
+    return source_event_id
+
+
 def _payload_key(source: SourceSystem, customer_id: str, event_id: str) -> str:
     now = datetime.now(UTC)
     safe_event = event_id.replace("/", "_")
@@ -290,21 +318,22 @@ async def _enqueue(
 
     Two paths:
 
-    1. **claude_code (coalescing)** — multiple batches for the same session
-       collapse into a single queue row. UPSERT keyed on
-       (customer_id, source_system, source_event_id=session_id) appends
-       the new R2 key to `payload_s3_keys` and bumps `version`. The worker
-       captures `version` at claim time and CAS-commits on it, so any
-       batch landing during Phase A causes a clean re-claim with the
-       extended array. See migration 0026 for column shape.
+    1. **agent sessions (claude_code, codex) — coalescing** — multiple
+       batches for the same session collapse into a single queue row.
+       UPSERT keyed on (customer_id, source_system,
+       source_event_id=session_id) appends the new R2 key to
+       `payload_s3_keys` and bumps `version`. The worker captures
+       `version` at claim time and CAS-commits on it, so any batch landing
+       during Phase A causes a clean re-claim with the extended array.
+       See migration 0026 for column shape.
 
     2. **other connectors** — INSERT each event as its own row with
        `payload_s3_keys = ARRAY[key]`, `version = 0`. ON CONFLICT
        DO NOTHING dedupes redeliveries from the source platform.
 
-    Returns True if a new row was created OR an existing CC session row
-    had its array extended; False only on the non-CC duplicate path
-    (ON CONFLICT swallowed the insert).
+    Returns True if a new row was created OR an existing agent-session row
+    had its array extended; False only on the non-agent-session duplicate
+    path (ON CONFLICT swallowed the insert).
 
     `payload_s3_key` is also written to the legacy column for back-compat
     until a follow-up PR drops it. Both columns hold the same first key
@@ -313,7 +342,7 @@ async def _enqueue(
     """
     priority = SOURCE_INGESTION_PRIORITY.get(source, DEFAULT_INGESTION_PRIORITY)
 
-    if source == SourceSystem.CLAUDE_CODE:
+    if source in (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX):
         # Session-keyed UPSERT: append to array, bump version, refresh
         # status to 'pending' so the worker picks it up even if the row
         # was previously 'done' (session resumed after idle).
