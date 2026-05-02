@@ -257,9 +257,11 @@ async def query_stream(
     """
     request.state.customer_id = customer_id
     request.state.usage_summary = req.query
-    # Streaming responses can't be captured as a single payload; record
-    # the request shape so query_traces at least has the input. The
-    # response field will land as {} (None coerces to empty dict).
+    # Stash request payload now; response payload is built and stashed at
+    # the end of the SSE generator (after the 'done' event), so query_traces
+    # captures both sides for streaming queries — same shape as /query.
+    # Starlette runs response.background AFTER the generator exits, which
+    # is when the BackgroundTask reads request.state.
     request.state.usage_request_payload = req
     t_total = time.perf_counter()
     base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
@@ -333,6 +335,32 @@ async def query_stream(
                     "timing_ms": timing,
                     "trace_id": phase.trace_id,
                 },
+            )
+
+            # Stash a synthetic AnswerResponse on request.state so query_traces
+            # captures the streamed response in the same shape /query writes.
+            # Mirrors lines 190-207 above. Without this, the trace would land
+            # with response={} and consumers couldn't tell streaming rows apart
+            # from a real /query with zero results. Closes PR #64's documented
+            # known-limitation for usage_events as a bonus (result_count is
+            # already set on line 286).
+            request.state.usage_response_payload = AnswerResponse(
+                query=req.query,
+                answer=final.answer,
+                citations=final.citations,
+                insufficient_context=final.insufficient_context,
+                model=final.model,
+                chunks=rresp.chunks,
+                total_candidates=rresp.total_candidates,
+                applied_temporal=rresp.applied_temporal,
+                applied_sort=rresp.applied_sort,
+                applied_entity_filter=rresp.applied_entity_filter,
+                applied_mode=rresp.applied_mode,
+                applied_doc_types=rresp.applied_doc_types,
+                extracted_entities=rresp.extracted_entities,
+                aggregation=rresp.aggregation,
+                timing_ms=timing,
+                trace_id=rresp.trace_id,
             )
 
             log.info(
