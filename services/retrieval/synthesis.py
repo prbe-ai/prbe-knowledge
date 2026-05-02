@@ -26,6 +26,7 @@ import json
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from shared.config import get_settings
@@ -109,9 +110,23 @@ ANSWER_SCHEMA: dict[str, Any] = {
 }
 
 
-_SYSTEM_PROMPT = """You are a careful retrieval-augmented assistant. You answer the user's
+# The retrieval router resolves relative dates in the user's query into a
+# temporal filter, but the synthesizer still needs to know `today` so it can
+# write phrases like "in the past 7 days" or "this month" coherently in the
+# answer prose.
+_DATE_CONTEXT = """The user's current date (UTC) is: {today_iso}
+Use this when the question or chunks involve relative time ("last week",
+"in the past 7 days", "this month"). Resolve such phrases against today
+rather than refusing for lack of a date."""
+
+
+def _build_system_prompt(now: datetime) -> str:
+    today_iso = now.strftime("%Y-%m-%d")
+    return f"""You are a careful retrieval-augmented assistant. You answer the user's
 question using ONLY the chunks you've been given. The runtime enforces a
 structured output schema; just produce the values it asks for.
+
+{_DATE_CONTEXT.format(today_iso=today_iso)}
 
 Hard rules:
 - Use ONLY information present in the chunks. Do not invent facts.
@@ -126,8 +141,12 @@ Hard rules:
 # Streaming variant: no forced tool call (the Anthropic streaming API for
 # tool-input-delta is fragile to parse incrementally). Plain text out, with
 # `<<INSUFFICIENT>>` as a sentinel the caller strips after the stream ends.
-_STREAMING_SYSTEM_PROMPT = """You are a careful retrieval-augmented assistant. Answer the user's
+def _build_streaming_system_prompt(now: datetime) -> str:
+    today_iso = now.strftime("%Y-%m-%d")
+    return f"""You are a careful retrieval-augmented assistant. Answer the user's
 question using ONLY the chunks you've been given.
+
+{_DATE_CONTEXT.format(today_iso=today_iso)}
 
 Hard rules:
 - Use ONLY information present in the chunks. Do not invent facts.
@@ -138,6 +157,7 @@ Hard rules:
 - Be concise. 1-3 short paragraphs. No preamble.
 - Markdown formatting (bold, italic, code) is fine when it helps clarity.
 """
+
 
 _INSUFFICIENT_SENTINEL = "<<INSUFFICIENT>>"
 
@@ -179,7 +199,7 @@ async def synthesize(
     user_prompt = _format_user_prompt(query, chunks)
     parsed = await _dispatch(
         provider_name,
-        system=_SYSTEM_PROMPT,
+        system=_build_system_prompt(datetime.now(UTC)),
         user=user_prompt,
         model=model_id,
         max_tokens=max_tokens,
@@ -274,7 +294,7 @@ async def synthesize_stream(
         async with client.messages.stream(
             model=model_id,
             max_tokens=max_tokens,
-            system=_STREAMING_SYSTEM_PROMPT,
+            system=_build_streaming_system_prompt(datetime.now(UTC)),
             messages=[{"role": "user", "content": user_prompt}],
         ) as stream:
             async for text in stream.text_stream:
