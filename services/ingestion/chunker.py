@@ -55,7 +55,9 @@ def chunk_text(
     chunk_tokens = min(chunk_tokens, MAX_INPUT_TOKENS)
 
     enc = _enc()
-    tokens = enc.encode(text)
+    # Treat any literal special-token strings (e.g. "<|endoftext|>") as plain
+    # text — user content can contain them and they must not crash the worker.
+    tokens = enc.encode(text, disallowed_special=())
     if not tokens:
         return []
 
@@ -77,7 +79,7 @@ def chunk_text(
 def count_tokens(text: str) -> int:
     if not text:
         return 0
-    return len(_enc().encode(text))
+    return len(_enc().encode(text, disallowed_special=()))
 
 
 def chunker_version() -> str:

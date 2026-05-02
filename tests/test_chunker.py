@@ -23,3 +23,13 @@ def test_overlap_produces_multiple_pieces() -> None:
         assert p.chunk_index == i
     # Token counts should never exceed the window.
     assert all(p.token_count <= 512 for p in pieces)
+
+
+def test_literal_special_tokens_in_user_content_do_not_raise() -> None:
+    # Real user content (e.g. Linear comments quoting LLM prompts) can contain
+    # literal "<|endoftext|>" strings. tiktoken's default `disallowed_special`
+    # would raise ValueError; the chunker must tolerate them as plain text.
+    text = "before <|endoftext|> middle <|im_start|> after"
+    pieces = chunk_text(text)
+    assert len(pieces) == 1
+    assert count_tokens(text) > 0
