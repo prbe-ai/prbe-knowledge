@@ -178,3 +178,54 @@ def test_deterministic_tie_break() -> None:
     idx1 = build_ownership_index(signals, world)
     idx2 = build_ownership_index(signals, world)
     assert idx1.services_by_person == idx2.services_by_person
+
+
+def test_build_ownership_index_aggregates_across_repos() -> None:
+    """Same person commits to services in two different repos; their
+    services_by_person should include services from BOTH repos."""
+    commits_a = [
+        _make_commit("c1", "alice@example.com", "Alice", ("payments/main.py",)),
+    ]
+    commits_b = [
+        _make_commit("c2", "alice@example.com", "Alice", ("billing/main.py",)),
+    ]
+    manifests_a = [_make_manifest(Path("/repo-a/payments/pyproject.toml"), "payments")]
+    manifests_b = [_make_manifest(Path("/repo-b/billing/pyproject.toml"), "billing")]
+    signals = [
+        _make_signals("github.com/prbe-ai/repo-a", commits_a, manifests_a),
+        _make_signals("github.com/prbe-ai/repo-b", commits_b, manifests_b),
+    ]
+    person = _make_person("email:alice@example.com", "alice@example.com")
+    world = _make_world([person], [])
+    idx = build_ownership_index(signals, world)
+    # _resolve_canonical_id maps alice@example.com → email:alice@example.com
+    owned = idx.services_by_person.get("email:alice@example.com", ())
+    assert "payments" in owned
+    assert "billing" in owned
+
+
+def test_build_ownership_index_uses_bare_manifest_names_on_collision() -> None:
+    """Two repos define a service named 'billing'. The OwnershipIndex
+    stores bare manifest.name (not qualified), so commits in either repo
+    aggregate under the single service name 'billing'. This pins current
+    Plan 2 behavior; Plan 3 may revisit using Service.qualified instead.
+    """
+    commits_a = [
+        _make_commit("c1", "alice@example.com", "Alice", ("services/billing/main.py",)),
+    ]
+    commits_b = [
+        _make_commit("c2", "alice@example.com", "Alice", ("services/billing/main.py",)),
+    ]
+    manifests_a = [_make_manifest(Path("/repo-a/services/billing/pyproject.toml"), "billing")]
+    manifests_b = [_make_manifest(Path("/repo-b/services/billing/pyproject.toml"), "billing")]
+    signals = [
+        _make_signals("github.com/prbe-ai/repo-a", commits_a, manifests_a),
+        _make_signals("github.com/prbe-ai/repo-b", commits_b, manifests_b),
+    ]
+    person = _make_person("email:alice@example.com", "alice@example.com")
+    world = _make_world([person], [])
+    idx = build_ownership_index(signals, world)
+    # _resolve_canonical_id maps alice@example.com → email:alice@example.com.
+    # Both repos contribute to the same bare name "billing" — single entry, not duplicated.
+    owned = idx.services_by_person.get("email:alice@example.com", ())
+    assert owned == ("billing",)

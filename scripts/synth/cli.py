@@ -323,8 +323,12 @@ async def _clean_async(customer_id: str) -> int:
 async def _run_async(profile: Profile, out: Path, args) -> int:
     started_at = datetime.now(UTC)
 
-    if args.reset:
-        await _clean_async(profile.customer_id)
+    if args.reset and args.integrate:
+        rc = await _clean_async(profile.customer_id)
+        if rc != 0:
+            return rc  # propagate clean failure
+    elif args.reset:
+        print("warn: --reset has no effect in local mode (no DB to clean); ignoring", file=sys.stderr)
 
     cache = DiskCache(default_cache_root("repos"))
     gh_token = os.environ.get("GITHUB_TOKEN")
@@ -407,15 +411,17 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
     violations = validate_name_only(tuple(emitted_docs), world)
 
     finished_at = datetime.now(UTC)
-    run_id = out.name if out.name else f"{profile.preset}-seed{profile.seed}"
+    run_id = out.name
 
     archetypes_executed: dict[str, dict] = {}
     for doc in emitted_docs:
         slot = archetypes_executed.setdefault(
-            doc.archetype, {"requested": 0, "generated": 0, "dropped": 0}
+            doc.archetype, {"generated": 0, "dropped": 0}
         )
         slot["generated"] += 1
-        slot["requested"] += 1
+    # Plan 2 templated archetypes don't have a "requested" count distinct
+    # from generated; Plan 3's LLM planner will emit per-scenario request
+    # counts that distinguish these.
     totals = {
         "archetypes_executed": archetypes_executed,
         "totals": {

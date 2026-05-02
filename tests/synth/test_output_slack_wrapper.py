@@ -85,5 +85,7 @@ def test_fixture_shape_matches_wrapper_shape() -> None:
     wrapper_keys = set(wrapper_payload.keys())
     assert {"type", "event", "team_id"}.issubset(wrapper_keys)
     assert {"channel", "text", "ts", "type", "user"}.issubset(set(wrapper_payload["event"].keys()))
-    # Suppress unused-warning while preserving the assertion fixtures comparison
-    _ = fixture_keys
+    # Sanity: the real fixture also has the expected top-level keys (verifies
+    # our minimum-required-keys list is grounded in the actual connector input).
+    assert {"type", "event", "team_id"}.issubset(fixture_keys)
+    assert {"channel", "text", "ts", "type", "user"}.issubset(set(fixture["event"].keys()))
