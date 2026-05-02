@@ -21,15 +21,22 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.retrieval.auth import authenticate_query
 from services.retrieval.middleware import UsageLoggingMiddleware
-from services.retrieval.pipeline import run_retrieval
+from services.retrieval.pipeline import (
+    run_retrieval,
+    run_router_phase,
+    run_search_phase,
+)
 from services.retrieval.synthesis import (
+    StreamDelta,
+    StreamFinal,
     SynthesisChunk,
     SynthesisError,
     synthesize,
+    synthesize_stream,
 )
 from services.retrieval.usage import usage_router
 from shared.config import get_settings
@@ -208,6 +215,151 @@ async def query(
         extra={"model": result.model, "insufficient_context": answer.insufficient_context},
     )
     return answer
+
+
+def _sse(event: str, data: dict[str, object]) -> bytes:
+    """Format one Server-Sent Event frame.
+
+    Each chunk is `event: <name>\\ndata: <json>\\n\\n`. JSON is single-line
+    (no embedded newlines) so the SSE parser treats it as one `data` field.
+    """
+    return f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n".encode()
+
+
+@app.post("/query/stream")
+async def query_stream(
+    req: AnswerRequest,
+    request: Request,
+    customer_id: str = Depends(authenticate_query),
+) -> StreamingResponse:
+    """Streaming /query: emits SSE events as each phase finishes.
+
+    Event sequence (happy path):
+        step:refining     → router (Haiku) is running
+        entities          → router done; entities + temporal/sort/mode resolved
+        step:searching    → vec/bm25/graph/list pipeline starts
+        chunks            → retrieval done; chunks + applied_* fields ready
+        step:synthesizing → answer LLM starts
+        delta(*)          → 1+ text chunks of the answer
+        done              → final {answer, citations, insufficient_context,
+                            model, timing_ms, trace_id}
+
+    On error, a single `error` event with {detail} replaces the remainder
+    of the stream. The HTTP status is 200 either way (status comes through
+    the SSE channel) — that's the convention SSE-aware clients expect.
+    """
+    request.state.customer_id = customer_id
+    request.state.usage_summary = req.query
+    t_total = time.perf_counter()
+    base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
+    model = req.model or DEFAULT_SYNTHESIS_MODEL
+
+    async def _gen() -> AsyncIterator[bytes]:
+        try:
+            yield _sse("step", {"step": "refining"})
+            phase = await run_router_phase(base_req, customer_id)
+            yield _sse(
+                "entities",
+                {
+                    "extracted_entities": phase.extracted_entities,
+                    "applied_temporal": phase.temporal_meta,
+                    "applied_sort": phase.sort_meta,
+                    "applied_doc_types": phase.doc_types,
+                    "applied_mode": phase.dispatch_mode,
+                    "trace_id": phase.trace_id,
+                },
+            )
+
+            yield _sse("step", {"step": "searching"})
+            rresp = await run_search_phase(base_req, customer_id, phase)
+            request.state.result_count = len(rresp.chunks)
+            yield _sse(
+                "chunks",
+                {
+                    "chunks": [c.model_dump(mode="json") for c in rresp.chunks],
+                    "total_candidates": rresp.total_candidates,
+                    "applied_entity_filter": rresp.applied_entity_filter,
+                    "applied_mode": rresp.applied_mode,
+                    "applied_doc_types": rresp.applied_doc_types,
+                    "aggregation": rresp.aggregation,
+                },
+            )
+
+            yield _sse("step", {"step": "synthesizing"})
+            syn_chunks = [
+                SynthesisChunk(
+                    chunk_id=c.chunk_id,
+                    title=c.title,
+                    content=c.content,
+                    source_system=c.source_system.value,
+                    source_url=c.source_url,
+                    updated_at=c.updated_at.isoformat(),
+                )
+                for c in rresp.chunks
+            ]
+            t_syn = time.perf_counter()
+            final: StreamFinal | None = None
+            async for evt in synthesize_stream(
+                req.query, syn_chunks, model=model, max_tokens=req.max_tokens
+            ):
+                if isinstance(evt, StreamDelta):
+                    yield _sse("delta", {"text": evt.text})
+                else:
+                    final = evt
+
+            timing = dict(rresp.timing_ms)
+            timing["synthesis_ms"] = (time.perf_counter() - t_syn) * 1000
+            timing["total_ms"] = (time.perf_counter() - t_total) * 1000
+
+            assert final is not None  # synthesize_stream always yields a StreamFinal
+            yield _sse(
+                "done",
+                {
+                    "answer": final.answer,
+                    "citations": final.citations,
+                    "insufficient_context": final.insufficient_context,
+                    "model": final.model,
+                    "timing_ms": timing,
+                    "trace_id": phase.trace_id,
+                },
+            )
+
+            log.info(
+                "query.handled",
+                extra={
+                    "trace_id": phase.trace_id,
+                    "endpoint": "/query/stream",
+                    "query": req.query,
+                    "applied_mode": rresp.applied_mode,
+                    "applied_doc_types": rresp.applied_doc_types,
+                    "chunks_count": len(rresp.chunks),
+                    "total_candidates": rresp.total_candidates,
+                    "total_ms": timing["total_ms"],
+                    "stage_ms": timing,
+                    "model": final.model,
+                    "insufficient_context": final.insufficient_context,
+                },
+            )
+        except HTTPException as exc:
+            yield _sse("error", {"detail": str(exc.detail), "status": exc.status_code})
+        except SynthesisError as exc:
+            yield _sse("error", {"detail": f"synthesis failed: {exc}", "status": 502})
+        except Exception as exc:
+            log.exception("query.stream_failed", extra={"query": req.query})
+            yield _sse("error", {"detail": str(exc), "status": 500})
+
+    # `text/event-stream` + `Cache-Control: no-cache` are the SSE-required
+    # headers. `X-Accel-Buffering: no` disables nginx-style proxy buffering
+    # so deltas reach the browser immediately rather than being batched.
+    return StreamingResponse(
+        _gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/sources/{doc_id:path}", response_model=SourceResponse)
