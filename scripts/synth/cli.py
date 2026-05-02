@@ -27,7 +27,8 @@ from scripts.synth.company_context import (
 )
 from scripts.synth.extractor.github_api import GithubClient
 from scripts.synth.extractor.repo import RepoExtractor, RepoSignals
-from scripts.synth.llm_client import LlmClient, LlmClientProtocol
+from scripts.synth.llm.anthropic_client import AnthropicClient as LlmClient
+from scripts.synth.llm.base import LlmClientProtocol
 from scripts.synth.output.eval_artifacts import (
     write_docs_index,
     write_manifest,

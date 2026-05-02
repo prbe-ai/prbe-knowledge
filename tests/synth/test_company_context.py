@@ -12,7 +12,25 @@ from scripts.synth.company_context import (
     infer_company_context,
     load_company_context,
 )
-from scripts.synth.llm_client import StaticLlmClient
+from scripts.synth.llm.base import LlmRequest, LlmResponse
+
+
+class StaticLlmClient:
+    """Minimal canned-response stub (replaces llm_client.StaticLlmClient)."""
+
+    def __init__(self, mapping: dict[str, str]) -> None:
+        self._mapping = mapping
+
+    async def generate(self, req: LlmRequest) -> LlmResponse:
+        if req.prompt not in self._mapping:
+            raise KeyError(f"no canned response for prompt: {req.prompt!r}")
+        return LlmResponse(text=self._mapping[req.prompt])
+
+    async def generate_structured(self, req: LlmRequest, schema) -> dict:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        return None
 
 
 def test_load_minimal_yaml(tmp_path: Path) -> None:

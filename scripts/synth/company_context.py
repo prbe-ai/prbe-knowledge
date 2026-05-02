@@ -11,7 +11,7 @@ from pathlib import Path
 
 import yaml
 
-from scripts.synth.llm_client import LlmClientProtocol, LlmRequest
+from scripts.synth.llm.base import LlmClientProtocol, LlmRequest
 
 
 @dataclass(frozen=True)
