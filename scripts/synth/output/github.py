@@ -18,9 +18,16 @@ is validated by checking the JSON shape against the fixture files in tests.
 
 from __future__ import annotations
 
+import hashlib
+
 import orjson
 
 from scripts.synth.output.base import SynthDoc
+
+
+def _stable_int(s: str, mod: int) -> int:
+    """Deterministic int from a string, stable across processes (vs hash() which is PYTHONHASHSEED-seeded)."""
+    return int(hashlib.sha256(s.encode()).hexdigest()[:8], 16) % mod
 
 _SYNTH_REPO_OWNER = "prbe"
 _SYNTH_INSTALLATION_ID = 99001
@@ -45,14 +52,14 @@ def _event_kind_for_doc(doc: SynthDoc) -> str:
 def _user_from_doc(doc: SynthDoc) -> dict:
     """Build a minimal GitHub user object from the first persona."""
     login = doc.personas[0].replace("gh:", "") if doc.personas else "synth-bot"
-    return {"login": login, "id": abs(hash(login)) % 100_000}
+    return {"login": login, "id": _stable_int(login, 100_000)}
 
 
 def _repo_from_doc(doc: SynthDoc) -> dict:
     """Build a minimal repository object from the first service mentioned."""
     repo_name = doc.services_mentioned[0] if doc.services_mentioned else "synth-repo"
     return {
-        "id": abs(hash(repo_name)) % 100_000,
+        "id": _stable_int(repo_name, 100_000),
         "name": repo_name,
         "full_name": f"{_SYNTH_REPO_OWNER}/{repo_name}",
         "private": False,
@@ -72,7 +79,7 @@ def _title_from_doc(doc: SynthDoc) -> str:
 
 def _number_from_doc(doc: SynthDoc) -> int:
     """Derive a stable pseudo-issue/PR number from the doc id."""
-    return (abs(hash(doc.source_event_id)) % 9000) + 1
+    return _stable_int(doc.source_event_id, 9000) + 1
 
 
 def _iso(doc: SynthDoc) -> str:
@@ -87,7 +94,7 @@ def _wrap_pull_request(doc: SynthDoc) -> dict:
         "action": "opened",
         "number": number,
         "pull_request": {
-            "id": abs(hash(doc.id)) % 1_000_000,
+            "id": _stable_int(doc.id, 1_000_000),
             "number": number,
             "state": "open",
             "title": _title_from_doc(doc),
@@ -119,7 +126,7 @@ def _wrap_issue(doc: SynthDoc) -> dict:
     return {
         "action": "opened",
         "issue": {
-            "id": abs(hash(doc.id)) % 1_000_000,
+            "id": _stable_int(doc.id, 1_000_000),
             "number": number,
             "state": "open",
             "title": _title_from_doc(doc),

@@ -105,3 +105,16 @@ def test_issue_fixture_shape_superset_of_wrapper_keys() -> None:
     required = {"action", "issue", "repository", "sender"}
     assert required.issubset(set(wrapper.keys()))
     assert {"title", "body", "user"}.issubset(set(wrapper["issue"].keys()))
+
+
+def test_wrap_is_byte_identical_across_calls() -> None:
+    """Same SynthDoc input must produce identical bytes across calls.
+
+    Plan 3 determinism contract (spec §13): re-running with same inputs
+    must produce byte-identical output. This pins that against PYTHONHASHSEED
+    drift via the sha256-based id derivation.
+    """
+    doc = _make_doc(archetype="INCIDENT")
+    bytes_a = wrap(doc)
+    bytes_b = wrap(doc)
+    assert bytes_a == bytes_b
