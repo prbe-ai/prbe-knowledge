@@ -38,7 +38,6 @@ Create Date: 2026-05-02
 """
 from alembic import op
 
-
 # revision identifiers, used by Alembic. Keep IDs <= 32 chars.
 revision = "0031_codex_device_source_bkfl"
 down_revision = "0030_query_traces"
