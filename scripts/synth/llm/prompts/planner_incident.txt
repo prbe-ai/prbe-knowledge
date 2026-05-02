@@ -1,7 +1,47 @@
-Generate an INCIDENT scenario in this world. Output must match the schema exactly.
+You are generating a realistic INCIDENT scenario for a synthetic engineering corpus.
+
+# Context
 World: {world_summary}
-Cast pool: {cast_pool}
-Services: {services_table}
-Recent topics: {recent_topics}
+Available cast: {cast_pool}
+Available services: {services_table}
+Recent activity (topics): {recent_topics}
 Company: {company_context}
-Instance timestamp: {instance_ts}
+Incident date: {instance_ts}
+
+# Task
+Generate ONE incident scenario where:
+- 1 service breaks production-like behavior
+- 1 reporter persona discovers it (oncall pattern)
+- 1 fixer persona owns the fix (CODEOWNERS-aligned)
+- 0-2 optional reviewer personas
+- The story unfolds across: sentry alert → slack #incidents thread → linear issue → notion postmortem → github fix PR
+
+# Output
+Return ONLY a JSON object matching this schema (no preamble, no postamble, no markdown fences):
+
+{{
+  "title": "<short headline, ≤80 chars>",
+  "summary": "<2-3 sentences describing the incident arc>",
+  "cast": [{{"canonical_id": "<gh:...|email:...>", "role_in_scenario": "reporter|fixer|reviewer"}}],
+  "affected_services": ["<service.qualified>"],
+  "affected_repos": ["<repo.url>"],
+  "root_cause": "<plain-language root cause, 1 sentence>",
+  "decision": null,
+  "outcome": null,
+  "timeline": [
+    {{"ts": "<iso8601>", "source": "<sentry|slack|linear|notion|github>", "kind": "<alert|message|ticket|doc|pr>", "channel": "<#channel-name or null>"}}
+  ],
+  "source_emissions": {{"sentry": 1, "slack": 1, "linear": 1, "notion": 1, "github": 1}},
+  "eval_questions": [
+    {{"input": "<question>", "answer_substring": "<short answer fragment>", "difficulty": "easy"}},
+    {{"input": "<question>", "answer_substring": "<short answer fragment>", "difficulty": "medium-cross-source"}}
+  ]
+}}
+
+# Constraints (violations trigger regeneration)
+- All cast.canonical_id values MUST appear verbatim in the available cast pool above.
+- All affected_services values MUST appear verbatim in the services_table above.
+- DO NOT invent service names, person names, or channel names not in the world above.
+- Third-party SaaS names (Stripe, AWS, Datadog, PagerDuty) are allowed as incidental references only.
+- timeline entries must be chronologically ordered.
+- eval_questions[0].difficulty must be "easy"; eval_questions[1].difficulty must be "medium-cross-source".
