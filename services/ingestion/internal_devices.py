@@ -35,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from services.ingestion.admin_routes import verify_internal_knowledge_key
+from shared.config import get_settings
 from shared.constants import IntegrationStatus, SourceSystem
 from shared.customer_mapping import record_mapping
 from shared.db import get_pool
@@ -66,6 +67,10 @@ class DeviceRegisterRequest(BaseModel):
         max_length=128,
         description="SHA-256 hex digest of the device token (gateway hashes the plaintext).",
     )
+    source: SourceSystem = Field(
+        default=SourceSystem.CLAUDE_CODE,
+        description="Which CLI integration paired this device.",
+    )
     os: str | None = Field(default=None, max_length=64)
     hostname: str | None = Field(default=None, max_length=256)
 
@@ -78,6 +83,14 @@ class DeviceRegisterResponse(BaseModel):
 
 class DeviceVerifyTokenRequest(BaseModel):
     token_hash: str = Field(min_length=64, max_length=128)
+    expected_source: SourceSystem | None = Field(
+        default=None,
+        description=(
+            "If provided, escalate the device row's source_system from the "
+            "default 'claude_code' to expected_source on first hit. Never demotes. "
+            "Must be a known SourceSystem value or null; unknown strings raise 422."
+        ),
+    )
 
 
 class DeviceVerifyTokenResponse(BaseModel):
@@ -123,7 +136,7 @@ async def register_device(body: DeviceRegisterRequest) -> DeviceRegisterResponse
 
     token = IntegrationToken(
         customer_id=body.customer_id,
-        source_system=SourceSystem.CLAUDE_CODE,
+        source_system=body.source,
         access_token="device-token",
         webhook_secret=body.token_hash,
         device_id=body.device_id,
@@ -132,7 +145,7 @@ async def register_device(body: DeviceRegisterRequest) -> DeviceRegisterResponse
     await save_device_token(token)
     await record_mapping(
         customer_id=body.customer_id,
-        source_system=SourceSystem.CLAUDE_CODE,
+        source_system=body.source,
         external_id=body.device_id,
         external_name=body.hostname,
         metadata=metadata,
@@ -142,6 +155,7 @@ async def register_device(body: DeviceRegisterRequest) -> DeviceRegisterResponse
         customer=body.customer_id,
         employee=body.employee_id,
         device=body.device_id,
+        source=body.source.value,
     )
     return DeviceRegisterResponse(
         customer_id=body.customer_id,
@@ -158,25 +172,58 @@ async def register_device(body: DeviceRegisterRequest) -> DeviceRegisterResponse
 async def verify_device_token(
     body: DeviceVerifyTokenRequest,
 ) -> DeviceVerifyTokenResponse:
+    settings = get_settings()
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT customer_id, device_id, status, device_metadata
+            SELECT customer_id, device_id, status, device_metadata, source_system
             FROM integration_tokens
             WHERE webhook_secret = $1
-              AND source_system = $2
               AND device_id IS NOT NULL
             LIMIT 1
             """,
             body.token_hash,
-            SourceSystem.CLAUDE_CODE.value,
         )
-    if row is None:
-        raise HTTPException(status_code=401, detail="unknown device token")
-    if row["status"] != IntegrationStatus.ACTIVE.value:
-        raise HTTPException(
-            status_code=401, detail=f"device status is {row['status']}"
-        )
+        if row is None:
+            raise HTTPException(status_code=401, detail="unknown device token")
+        if row["status"] != IntegrationStatus.ACTIVE.value:
+            raise HTTPException(
+                status_code=401, detail=f"device status is {row['status']}"
+            )
+
+        # Escalate-only auto-reconcile: a row labeled with the default
+        # source_system="claude_code" hit by a webhook that says
+        # expected_source != "claude_code" gets promoted. Codex (or any
+        # future source) is locked once set — we never demote.
+        # TODO(per-device-stats): the UPDATE below scopes by device_id only,
+        # not by customer_id. Safe today because device_id is uuid4 (~10^-37
+        # cross-tenant collision). CodeRabbit on prbe-knowledge#70 flagged
+        # this for defense-in-depth — fix when adding the (customer_id,
+        # device_id) unique constraint that the source-agnostic helpers
+        # in shared/tokens.py also rely on.
+        if (
+            settings.auto_reconcile_device_source
+            and body.expected_source is not None
+            and row["source_system"] == SourceSystem.CLAUDE_CODE.value
+            and body.expected_source != SourceSystem.CLAUDE_CODE
+        ):
+            await conn.execute(
+                """
+                UPDATE integration_tokens
+                SET source_system = $1, updated_at = NOW()
+                WHERE device_id = $2
+                  AND source_system = $3
+                """,
+                body.expected_source.value,
+                row["device_id"],
+                SourceSystem.CLAUDE_CODE.value,
+            )
+            log.info(
+                "devices.source_reconciled",
+                device=row["device_id"],
+                from_source=SourceSystem.CLAUDE_CODE.value,
+                to_source=body.expected_source.value,
+            )
 
     metadata = row["device_metadata"] or {}
     if isinstance(metadata, (str, bytes, bytearray)):
@@ -204,9 +251,7 @@ async def verify_device_token(
 async def heartbeat(
     device_id: str, body: DeviceCustomerOnlyRequest
 ) -> DeviceMutationResponse:
-    updated = await update_device_heartbeat(
-        body.customer_id, SourceSystem.CLAUDE_CODE, device_id
-    )
+    updated = await update_device_heartbeat(body.customer_id, device_id)
     if not updated:
         raise HTTPException(status_code=404, detail="device not found or revoked")
     return DeviceMutationResponse(
@@ -222,9 +267,7 @@ async def heartbeat(
 async def revoke(
     device_id: str, body: DeviceCustomerOnlyRequest
 ) -> DeviceMutationResponse:
-    updated = await revoke_device_token(
-        body.customer_id, SourceSystem.CLAUDE_CODE, device_id
-    )
+    updated = await revoke_device_token(body.customer_id, device_id)
     return DeviceMutationResponse(
         customer_id=body.customer_id, device_id=device_id, updated=updated
     )
@@ -238,5 +281,5 @@ async def revoke(
 async def list_devices(
     customer_id: str = Query(min_length=1, max_length=64),
 ) -> DeviceListResponse:
-    devices = await list_devices_for_customer(customer_id, SourceSystem.CLAUDE_CODE)
+    devices = await list_devices_for_customer(customer_id)
     return DeviceListResponse(customer_id=customer_id, devices=devices)
