@@ -362,3 +362,142 @@ async def test_verify_token_finds_codex_device(client: httpx.AsyncClient) -> Non
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["device_id"] == "codex-dev-1"
+
+
+@pytest.mark.asyncio
+async def test_verify_promotes_claude_code_to_codex_when_expected(
+    client: httpx.AsyncClient,
+) -> None:
+    """A claude_code-labeled device hit by /verify-token with expected_source=codex
+    is promoted (escalate-only) and the next read shows codex."""
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": "drift-1",
+            "token_hash": "d" * 64,
+            "source": "claude_code",
+            "hostname": "h",
+        },
+        headers=_hdr(),
+    )
+
+    resp = await client.post(
+        "/api/devices/verify-token",
+        json={"token_hash": "d" * 64, "expected_source": "codex"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT source_system FROM integration_tokens WHERE device_id = $1",
+            "drift-1",
+        )
+    assert row["source_system"] == "codex"
+
+
+@pytest.mark.asyncio
+async def test_verify_does_not_demote_codex_to_claude_code(
+    client: httpx.AsyncClient,
+) -> None:
+    """A codex-labeled device hit with expected_source=claude_code is left alone."""
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": "no-demote-1",
+            "token_hash": "e" * 64,
+            "source": "codex",
+            "hostname": "h",
+        },
+        headers=_hdr(),
+    )
+
+    resp = await client.post(
+        "/api/devices/verify-token",
+        json={"token_hash": "e" * 64, "expected_source": "claude_code"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT source_system FROM integration_tokens WHERE device_id = $1",
+            "no-demote-1",
+        )
+    assert row["source_system"] == "codex"
+
+
+@pytest.mark.asyncio
+async def test_verify_no_reconcile_when_flag_off(
+    client: httpx.AsyncClient,
+    monkeypatch,
+) -> None:
+    """With AUTO_RECONCILE_DEVICE_SOURCE=False, the row is left alone."""
+    from shared.config import get_settings
+
+    monkeypatch.setenv("AUTO_RECONCILE_DEVICE_SOURCE", "false")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": "flag-off-1",
+            "token_hash": "f" * 64,
+            "source": "claude_code",
+            "hostname": "h",
+        },
+        headers=_hdr(),
+    )
+
+    resp = await client.post(
+        "/api/devices/verify-token",
+        json={"token_hash": "f" * 64, "expected_source": "codex"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT source_system FROM integration_tokens WHERE device_id = $1",
+            "flag-off-1",
+        )
+    assert row["source_system"] == "claude_code"
+
+
+@pytest.mark.asyncio
+async def test_verify_no_reconcile_when_expected_source_omitted(
+    client: httpx.AsyncClient,
+) -> None:
+    """When the caller doesn't pass expected_source, no row mutation."""
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": "no-expect-1",
+            "token_hash": "9" * 64,
+            "source": "claude_code",
+            "hostname": "h",
+        },
+        headers=_hdr(),
+    )
+
+    resp = await client.post(
+        "/api/devices/verify-token",
+        json={"token_hash": "9" * 64},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT source_system FROM integration_tokens WHERE device_id = $1",
+            "no-expect-1",
+        )
+    assert row["source_system"] == "claude_code"

@@ -35,6 +35,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from services.ingestion.admin_routes import verify_internal_knowledge_key
+from shared.config import get_settings
 from shared.constants import IntegrationStatus, SourceSystem
 from shared.customer_mapping import record_mapping
 from shared.db import get_pool
@@ -82,6 +83,13 @@ class DeviceRegisterResponse(BaseModel):
 
 class DeviceVerifyTokenRequest(BaseModel):
     token_hash: str = Field(min_length=64, max_length=128)
+    expected_source: SourceSystem | None = Field(
+        default=None,
+        description=(
+            "If provided, escalate the device row's source_system from the "
+            "default 'claude_code' to expected_source on first hit. Never demotes."
+        ),
+    )
 
 
 class DeviceVerifyTokenResponse(BaseModel):
@@ -163,6 +171,7 @@ async def register_device(body: DeviceRegisterRequest) -> DeviceRegisterResponse
 async def verify_device_token(
     body: DeviceVerifyTokenRequest,
 ) -> DeviceVerifyTokenResponse:
+    settings = get_settings()
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -174,12 +183,41 @@ async def verify_device_token(
             """,
             body.token_hash,
         )
-    if row is None:
-        raise HTTPException(status_code=401, detail="unknown device token")
-    if row["status"] != IntegrationStatus.ACTIVE.value:
-        raise HTTPException(
-            status_code=401, detail=f"device status is {row['status']}"
-        )
+        if row is None:
+            raise HTTPException(status_code=401, detail="unknown device token")
+        if row["status"] != IntegrationStatus.ACTIVE.value:
+            raise HTTPException(
+                status_code=401, detail=f"device status is {row['status']}"
+            )
+
+        # Escalate-only auto-reconcile: a row labeled with the default
+        # source_system="claude_code" hit by a webhook that says
+        # expected_source != "claude_code" gets promoted. Codex (or any
+        # future source) is locked once set — we never demote.
+        current_source = row["source_system"]
+        if (
+            settings.auto_reconcile_device_source
+            and body.expected_source is not None
+            and current_source == SourceSystem.CLAUDE_CODE.value
+            and body.expected_source != SourceSystem.CLAUDE_CODE
+        ):
+            await conn.execute(
+                """
+                UPDATE integration_tokens
+                SET source_system = $1, updated_at = NOW()
+                WHERE webhook_secret = $2
+                  AND source_system = $3
+                """,
+                body.expected_source.value,
+                body.token_hash,
+                SourceSystem.CLAUDE_CODE.value,
+            )
+            log.info(
+                "devices.source_reconciled",
+                device=row["device_id"],
+                from_source=current_source,
+                to_source=body.expected_source.value,
+            )
 
     metadata = row["device_metadata"] or {}
     if isinstance(metadata, (str, bytes, bytearray)):
