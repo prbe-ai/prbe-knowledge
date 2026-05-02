@@ -6,6 +6,7 @@ by templated archetype builders (standup.py, oncall.py).
 
 from __future__ import annotations
 
+import dataclasses
 import random
 from dataclasses import dataclass
 from datetime import datetime
@@ -19,6 +20,23 @@ from scripts.synth.world_model import WorldModel
 # Imported at call sites only to avoid a circular import with company_context.
 if TYPE_CHECKING:
     from scripts.synth.company_context import CompanyContext
+
+
+def with_abs_prompt_path(archetype: Archetype) -> Archetype:
+    """Return a copy of the archetype with spec_template_path resolved to an
+    absolute path under scripts/synth/llm/prompts/.
+
+    Plot archetypes ship their planner prompt templates as relative filenames
+    in spec_template_path (e.g. "planner_incident.txt"). This helper resolves
+    them to absolute paths so the planner's assemble_planner_prompt works
+    regardless of cwd.
+    """
+    if archetype.spec_template_path is None:
+        return archetype
+    if Path(archetype.spec_template_path).is_absolute():
+        return archetype
+    abs_path = Path(__file__).parent.parent / "llm" / "prompts" / archetype.spec_template_path
+    return dataclasses.replace(archetype, spec_template_path=str(abs_path))
 
 
 @dataclass(frozen=True)

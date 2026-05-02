@@ -2,14 +2,18 @@
 
 Emits 5 docs per scenario:
   1. Sentry alert      — TEMPLATED (no LLM Writer call)
-  2. Slack thread      — LLM Writer (reporter persona)
-  3. Linear issue      — LLM Writer (fixer persona)
-  4. Notion postmortem — LLM Writer (fixer persona)
-  5. GitHub fix PR     — LLM Writer (fixer persona)
+  2. Slack thread      — LLM Writer
+  3. Linear issue      — LLM Writer
+  4. Notion postmortem — LLM Writer
+  5. GitHub fix PR     — LLM Writer
 
 The planner emits 2 eval questions:
   - easy:               "What caused the {svc} outage on {date}?"
   - medium-cross-source: "Who reported the {svc} outage and who fixed it?"
+
+All emitted SynthDocs carry the full cast in `personas` (the planner's
+reporter/fixer role distinction is captured in the planner prompt context
+but not in the SynthDoc.personas field, which lists all participants).
 """
 
 from __future__ import annotations
@@ -17,7 +21,6 @@ from __future__ import annotations
 import textwrap
 from collections.abc import AsyncIterator
 from datetime import datetime
-from pathlib import Path
 
 from scripts.synth.archetypes.base import (
     Archetype,
@@ -27,6 +30,7 @@ from scripts.synth.archetypes.base import (
     Source,
     ValidatorLevel,
 )
+from scripts.synth.archetypes.plot_base import with_abs_prompt_path
 from scripts.synth.company_context import CompanyContext
 from scripts.synth.llm.planner import LLMPlanner
 from scripts.synth.llm.writer import LLMWriter
@@ -34,12 +38,6 @@ from scripts.synth.output.base import SynthDoc
 from scripts.synth.ownership import OwnershipIndex
 from scripts.synth.scenarios import TimeWindow
 from scripts.synth.world_model import WorldModel
-
-# Absolute path to the planner prompt template so it resolves correctly
-# regardless of cwd at runtime or during tests.
-_PLANNER_PROMPT_PATH = str(
-    Path(__file__).parent.parent / "llm" / "prompts" / "planner_incident.txt"
-)
 
 INCIDENT = Archetype(
     name="INCIDENT",
@@ -94,19 +92,9 @@ async def build_incident_scenarios(
     anchors = sorted(world.time_anchors, key=lambda a: a.activity_score, reverse=True)
     n_anchors = max(len(anchors), 1)
 
-    # Build an INCIDENT archetype variant that uses the absolute prompt path
-    # so assemble_planner_prompt can read the file regardless of cwd.
-    _incident_with_abs_path = Archetype(
-        name=INCIDENT.name,
-        category=INCIDENT.category,
-        cadence=INCIDENT.cadence,
-        sources_used=INCIDENT.sources_used,
-        cast_size=INCIDENT.cast_size,
-        needs_planner_call=INCIDENT.needs_planner_call,
-        validator_level=INCIDENT.validator_level,
-        eval_question_count=INCIDENT.eval_question_count,
-        spec_template_path=_PLANNER_PROMPT_PATH,
-    )
+    # Resolve the relative prompt template path to an absolute path so
+    # assemble_planner_prompt can read the file regardless of cwd.
+    incident_archetype = with_abs_prompt_path(INCIDENT)
 
     for i in range(count):
         # Pick instance_ts deterministically: use anchor.end as the reference ts
@@ -117,7 +105,7 @@ async def build_incident_scenarios(
 
         # --- Planner call (1 LLM call) ---
         spec = await planner.plan(
-            archetype=_incident_with_abs_path,
+            archetype=incident_archetype,
             world=world,
             ownership=ownership,
             company_ctx=company_ctx,

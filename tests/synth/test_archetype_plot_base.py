@@ -22,6 +22,7 @@ from scripts.synth.archetypes.plot_base import (
     assemble_planner_prompt,
     evidence_doc_keys,
     pick_cast,
+    with_abs_prompt_path,
 )
 from scripts.synth.ownership import OwnershipIndex
 from scripts.synth.world_model import (
@@ -226,3 +227,51 @@ def test_assemble_planner_prompt_substitutes_placeholders(tmp_path: Path) -> Non
     assert "{recent_topics}" not in result
     assert "{company_context}" not in result
     assert "{instance_ts}" not in result
+
+
+def test_with_abs_prompt_path_resolves_relative() -> None:
+    """with_abs_prompt_path turns a relative template name into an absolute path."""
+    arch = Archetype(
+        name="TEST_PLOT",
+        category=Category.PLOT,
+        cadence=Cadence.AD_HOC,
+        sources_used=(Source.SLACK,),
+        cast_size=(1, 1),
+        needs_planner_call=True,
+        validator_level=ValidatorLevel.STRICT,
+        eval_question_count=1,
+        spec_template_path="planner_test.txt",
+    )
+    resolved = with_abs_prompt_path(arch)
+    assert Path(resolved.spec_template_path).is_absolute()
+    assert resolved.spec_template_path.endswith("planner_test.txt")
+
+
+def test_with_abs_prompt_path_passthrough_when_already_absolute() -> None:
+    """An archetype with an absolute spec_template_path is returned unchanged."""
+    arch = Archetype(
+        name="TEST_PLOT",
+        category=Category.PLOT,
+        cadence=Cadence.AD_HOC,
+        sources_used=(Source.SLACK,),
+        cast_size=(1, 1),
+        needs_planner_call=True,
+        validator_level=ValidatorLevel.STRICT,
+        eval_question_count=1,
+        spec_template_path="/abs/path/planner.txt",
+    )
+    assert with_abs_prompt_path(arch) is arch  # passthrough
+
+
+def test_with_abs_prompt_path_passthrough_when_none() -> None:
+    """An archetype with spec_template_path=None is returned unchanged."""
+    arch = Archetype(
+        name="TEST_TEMPLATED",
+        category=Category.RECURRING,
+        cadence=Cadence.DAILY,
+        sources_used=(Source.SLACK,),
+        cast_size=(1, 1),
+        needs_planner_call=False,
+        validator_level=ValidatorLevel.NAME_ONLY,
+    )
+    assert with_abs_prompt_path(arch) is arch  # passthrough
