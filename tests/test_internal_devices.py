@@ -501,3 +501,111 @@ async def test_verify_no_reconcile_when_expected_source_omitted(
             "no-expect-1",
         )
     assert row["source_system"] == "claude_code"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_works_for_codex_device(client: httpx.AsyncClient) -> None:
+    """Heartbeat must update last_heartbeat_at for a Codex-source device."""
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": "codex-hb-1",
+            "token_hash": "1" * 64,
+            "source": "codex",
+            "hostname": "h",
+        },
+        headers=_hdr(),
+    )
+    resp = await client.post(
+        "/api/devices/codex-hb-1/heartbeat",
+        json={"customer_id": CUSTOMER},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated"] is True
+
+    async with raw_conn() as conn:
+        meta = await conn.fetchval(
+            "SELECT device_metadata FROM integration_tokens "
+            "WHERE customer_id=$1 AND source_system='codex' AND device_id=$2",
+            CUSTOMER, "codex-hb-1",
+        )
+    import orjson
+    if isinstance(meta, (str, bytes, bytearray)):
+        meta = orjson.loads(meta)
+    assert "last_heartbeat_at" in meta
+
+
+@pytest.mark.asyncio
+async def test_revoke_works_for_codex_device(client: httpx.AsyncClient) -> None:
+    """Revoke must flip status to 'revoked' for a Codex-source device."""
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": "codex-rv-1",
+            "token_hash": "2" * 64,
+            "source": "codex",
+            "hostname": "h",
+        },
+        headers=_hdr(),
+    )
+    resp = await client.post(
+        "/api/devices/codex-rv-1/revoke",
+        json={"customer_id": CUSTOMER},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["updated"] is True
+
+    async with raw_conn() as conn:
+        status = await conn.fetchval(
+            "SELECT status FROM integration_tokens "
+            "WHERE customer_id=$1 AND source_system='codex' AND device_id=$2",
+            CUSTOMER, "codex-rv-1",
+        )
+    assert status == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_list_devices_returns_both_claude_code_and_codex(
+    client: httpx.AsyncClient,
+) -> None:
+    """list_devices must return devices from both source systems for the customer."""
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": "cc-mix-1",
+            "token_hash": "3" * 64,
+            "source": "claude_code",
+            "hostname": "cc-laptop",
+        },
+        headers=_hdr(),
+    )
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": "codex-mix-1",
+            "token_hash": "4" * 64,
+            "source": "codex",
+            "hostname": "codex-laptop",
+        },
+        headers=_hdr(),
+    )
+
+    resp = await client.get(
+        "/api/devices",
+        params={"customer_id": CUSTOMER},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    ids = sorted(d["device_id"] for d in resp.json()["devices"])
+    assert "cc-mix-1" in ids
+    assert "codex-mix-1" in ids

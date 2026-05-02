@@ -245,9 +245,7 @@ async def verify_device_token(
 async def heartbeat(
     device_id: str, body: DeviceCustomerOnlyRequest
 ) -> DeviceMutationResponse:
-    updated = await update_device_heartbeat(
-        body.customer_id, SourceSystem.CLAUDE_CODE, device_id
-    )
+    updated = await update_device_heartbeat(body.customer_id, device_id)
     if not updated:
         raise HTTPException(status_code=404, detail="device not found or revoked")
     return DeviceMutationResponse(
@@ -263,9 +261,7 @@ async def heartbeat(
 async def revoke(
     device_id: str, body: DeviceCustomerOnlyRequest
 ) -> DeviceMutationResponse:
-    updated = await revoke_device_token(
-        body.customer_id, SourceSystem.CLAUDE_CODE, device_id
-    )
+    updated = await revoke_device_token(body.customer_id, device_id)
     return DeviceMutationResponse(
         customer_id=body.customer_id, device_id=device_id, updated=updated
     )
@@ -279,5 +275,5 @@ async def revoke(
 async def list_devices(
     customer_id: str = Query(min_length=1, max_length=64),
 ) -> DeviceListResponse:
-    devices = await list_devices_for_customer(customer_id, SourceSystem.CLAUDE_CODE)
+    devices = await list_devices_for_customer(customer_id)
     return DeviceListResponse(customer_id=customer_id, devices=devices)

@@ -13,8 +13,10 @@ Two access paths exist on the same `integration_tokens` table:
 - Device-scoped helpers — `save_device_token` / `load_device_token` /
   `revoke_device_token` / `update_device_heartbeat` /
   `list_devices_for_customer`. Many rows per (customer, source),
-  keyed by `device_id`. Used by the claude_code connector for per-laptop
-  bearer-token credentials.
+  keyed by `device_id`. Used by the claude_code and codex connectors for
+  per-laptop bearer-token credentials. The mutation/list helpers are
+  source-agnostic — `(customer_id, device_id)` already uniquely identifies
+  a device, and the dashboard surfaces all sources in one list.
 """
 
 from __future__ import annotations
@@ -250,23 +252,26 @@ async def load_device_token(
 
 async def revoke_device_token(
     customer_id: str,
-    source_system: SourceSystem,
     device_id: str,
 ) -> bool:
-    """Mark a device row revoked. Returns True if a row was updated."""
+    """Mark a device row revoked. Returns True if a row was updated.
+
+    Source-agnostic: `(customer_id, device_id)` already uniquely identifies
+    a device row, so we don't filter on source_system. This keeps the
+    endpoint working uniformly for claude_code and codex devices (and any
+    future per-laptop source).
+    """
     async with get_pool().acquire() as conn:
         result = await conn.execute(
             """
             UPDATE integration_tokens
             SET status = $1, updated_at = NOW()
             WHERE customer_id = $2
-              AND source_system = $3
-              AND device_id = $4
+              AND device_id = $3
               AND status != $1
             """,
             IntegrationStatus.REVOKED.value,
             customer_id,
-            source_system.value,
             device_id,
         )
     return result.endswith(" 1")
@@ -274,25 +279,25 @@ async def revoke_device_token(
 
 async def update_device_heartbeat(
     customer_id: str,
-    source_system: SourceSystem,
     device_id: str,
 ) -> bool:
-    """Stamp last_heartbeat_at into device_metadata. Returns True if a row was found."""
+    """Stamp last_heartbeat_at into device_metadata. Returns True if a row was found.
+
+    Source-agnostic: see `revoke_device_token` for rationale.
+    """
     now_iso = datetime.now().astimezone().isoformat()
     async with get_pool().acquire() as conn:
         result = await conn.execute(
             """
             UPDATE integration_tokens
             SET device_metadata = COALESCE(device_metadata, '{}'::jsonb)
-                                   || jsonb_build_object('last_heartbeat_at', $4::text),
+                                   || jsonb_build_object('last_heartbeat_at', $3::text),
                 updated_at = NOW()
             WHERE customer_id = $1
-              AND source_system = $2
-              AND device_id = $3
+              AND device_id = $2
               AND status = 'active'
             """,
             customer_id,
-            source_system.value,
             device_id,
             now_iso,
         )
@@ -301,25 +306,28 @@ async def update_device_heartbeat(
 
 async def list_devices_for_customer(
     customer_id: str,
-    source_system: SourceSystem,
 ) -> list[dict[str, Any]]:
-    """Return per-device summary rows for this customer + source."""
+    """Return per-device summary rows for this customer across all sources.
+
+    The dashboard surfaces a single "your devices" list spanning claude_code
+    and codex, so we intentionally do not filter by source_system here.
+    """
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT device_id, status, device_metadata, created_at, updated_at
+            SELECT device_id, source_system, status, device_metadata,
+                   created_at, updated_at
             FROM integration_tokens
             WHERE customer_id = $1
-              AND source_system = $2
               AND device_id IS NOT NULL
             ORDER BY created_at ASC
             """,
             customer_id,
-            source_system.value,
         )
     return [
         {
             "device_id": r["device_id"],
+            "source_system": r["source_system"],
             "status": r["status"],
             "metadata": _load_jsonb(r["device_metadata"]),
             "created_at": r["created_at"].isoformat() if r["created_at"] else None,
