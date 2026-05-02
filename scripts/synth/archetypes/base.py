@@ -79,3 +79,9 @@ class ScenarioSpec:
     cast: tuple[str, ...]           # canonical_ids in this scenario
     affected_services: tuple[str, ...]
     doc_specs: tuple[DocSpec, ...]
+    title: str | None = None
+    summary: str | None = None
+    root_cause: str | None = None
+    decision: str | None = None
+    outcome: str | None = None
+    eval_questions: tuple = ()   # tuple[EvalQuestion, ...] — typed at call site to avoid circular import

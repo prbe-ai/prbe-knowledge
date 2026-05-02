@@ -1,0 +1,7 @@
+Generate an INCIDENT scenario in this world. Output must match the schema exactly.
+World: {world_summary}
+Cast pool: {cast_pool}
+Services: {services_table}
+Recent topics: {recent_topics}
+Company: {company_context}
+Instance timestamp: {instance_ts}
