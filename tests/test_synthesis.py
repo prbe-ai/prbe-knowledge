@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from services.retrieval.synthesis import (
     ANSWER_SCHEMA,
+    StreamDelta,
+    StreamFinal,
     SynthesisChunk,
     SynthesisError,
     _extract_citations,
@@ -14,6 +18,7 @@ from services.retrieval.synthesis import (
     _strip_keys_recursive,
     normalize_citations_in_answer,
     synthesize,
+    synthesize_stream,
 )
 
 _NOW_ISO = "2026-04-24T00:00:00+00:00"
@@ -311,3 +316,183 @@ async def test_synthesize_normalizes_bare_citations(monkeypatch) -> None:
     assert "[chunk:1]" in result.answer
     assert "[chunk:2]" in result.answer
     assert "chunk:1." not in result.answer  # bare form was rewritten
+
+
+# ---------------------------------------------------------------------------
+# synthesize_stream — Anthropic streaming path
+# ---------------------------------------------------------------------------
+
+
+class _FakeStream:
+    """Mimics the async-context-manager returned by AsyncAnthropic.messages.stream.
+
+    Yields each entry of `texts` as a separate text-stream chunk so we can
+    verify synthesize_stream emits one StreamDelta per chunk.
+    """
+
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = texts
+
+    async def __aenter__(self) -> _FakeStream:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    @property
+    def text_stream(self):
+        async def _gen():
+            for t in self._texts:
+                yield t
+
+        return _gen()
+
+
+class _FakeMessages:
+    def __init__(self, texts: list[str]) -> None:
+        self._texts = texts
+        self.stream_calls: list[dict] = []
+
+    def stream(self, **kwargs: object) -> _FakeStream:
+        self.stream_calls.append(kwargs)
+        return _FakeStream(self._texts)
+
+
+class _FakeAsyncAnthropic:
+    """Stand-in for anthropic.AsyncAnthropic. Captures construction kwargs and
+    proxies messages.stream to a controllable fake.
+    """
+
+    last_instance: _FakeAsyncAnthropic | None = None
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.init_args = args
+        self.init_kwargs = kwargs
+        # texts is patched in by the test via `_FakeAsyncAnthropic.next_texts`.
+        texts = getattr(_FakeAsyncAnthropic, "next_texts", [""])
+        self.messages = _FakeMessages(texts)
+        _FakeAsyncAnthropic.last_instance = self
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_short_circuits_on_empty_chunks() -> None:
+    """No chunks → no model call → single StreamFinal flagged insufficient."""
+    events = []
+    async for evt in synthesize_stream(
+        "anything", [], model="anthropic/claude-sonnet-4-6"
+    ):
+        events.append(evt)
+    assert len(events) == 1
+    assert isinstance(events[0], StreamFinal)
+    assert events[0].insufficient_context is True
+    assert events[0].citations == []
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_rejects_unknown_model() -> None:
+    with pytest.raises(SynthesisError) as exc_info:
+        async for _ in synthesize_stream(
+            "q", [_chunk(1)], model="bogus/model-name"
+        ):
+            pass
+    assert "unsupported synthesis model" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_rejects_non_anthropic_model(monkeypatch) -> None:
+    """OpenAI / Google models would be valid for synthesize() but not yet
+    supported by synthesize_stream — must fail loudly rather than silently
+    use Anthropic. Patches SYNTHESIS_MODELS to register a fake openai entry
+    so the provider-check branch fires (today's allowlist is Anthropic-only).
+    """
+    monkeypatch.setitem(
+        __import__("services.retrieval.synthesis", fromlist=["SYNTHESIS_MODELS"])
+        .SYNTHESIS_MODELS,
+        "openai/gpt-4o-mini",
+        "openai",
+    )
+    with pytest.raises(SynthesisError) as exc_info:
+        async for _ in synthesize_stream(
+            "q", [_chunk(1)], model="openai/gpt-4o-mini"
+        ):
+            pass
+    assert "streaming synthesis only supports Anthropic" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_yields_deltas_then_final(monkeypatch) -> None:
+    """Happy path: streaming chunks arrive as StreamDelta events; the
+    accumulated text is parsed for citations and emitted as StreamFinal.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from shared.config import get_settings
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    _FakeAsyncAnthropic.next_texts = [
+        "Klavis ",
+        "shipped Tuesday [chunk:1]. ",
+        "It uses MCP [chunk:2].",
+    ]
+
+    chunks = [
+        _chunk(1, content="Klavis went live Tuesday"),
+        _chunk(2, content="Built on top of MCP"),
+    ]
+
+    with patch("anthropic.AsyncAnthropic", _FakeAsyncAnthropic):
+        events = []
+        async for evt in synthesize_stream(
+            "what is klavis?",
+            chunks,
+            model="anthropic/claude-sonnet-4-6",
+            max_tokens=200,
+        ):
+            events.append(evt)
+
+    deltas = [e for e in events if isinstance(e, StreamDelta)]
+    finals = [e for e in events if isinstance(e, StreamFinal)]
+    assert len(deltas) == 3
+    assert [d.text for d in deltas] == _FakeAsyncAnthropic.next_texts
+    assert len(finals) == 1
+    final = finals[0]
+    assert final.insufficient_context is False
+    assert final.model == "anthropic/claude-sonnet-4-6"
+    assert {c["chunk_id"] for c in final.citations} == {"chunk-1", "chunk-2"}
+    assert "[chunk:1]" in final.answer
+
+    # Verify max_tokens + system prompt routed to the SDK.
+    assert _FakeAsyncAnthropic.last_instance is not None
+    call_kwargs = _FakeAsyncAnthropic.last_instance.messages.stream_calls[0]
+    assert call_kwargs["model"] == "claude-sonnet-4-6"
+    assert call_kwargs["max_tokens"] == 200
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_strips_insufficient_sentinel(monkeypatch) -> None:
+    """Model-emitted <<INSUFFICIENT>> sentinel sets the flag and is stripped
+    from the final answer text.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    from shared.config import get_settings
+
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    _FakeAsyncAnthropic.next_texts = [
+        "<<INSUFFICIENT>>\n",
+        "The chunks don't mention Klavis at all.",
+    ]
+
+    with patch("anthropic.AsyncAnthropic", _FakeAsyncAnthropic):
+        events = []
+        async for evt in synthesize_stream(
+            "what is klavis?",
+            [_chunk(1, content="totally unrelated")],
+            model="anthropic/claude-sonnet-4-6",
+        ):
+            events.append(evt)
+
+    final = next(e for e in events if isinstance(e, StreamFinal))
+    assert final.insufficient_context is True
+    assert "<<INSUFFICIENT>>" not in final.answer
+    assert final.answer.startswith("The chunks don't mention")
