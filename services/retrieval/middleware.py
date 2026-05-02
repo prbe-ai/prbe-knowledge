@@ -144,15 +144,15 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
                 # Fire-and-forget. write_usage_event() swallows its own
                 # exceptions, so this task can never raise unhandled.
                 asyncio.create_task(write_usage_event(event))  # noqa: RUF006
-            trace = self._build_trace(
-                request,
-                path=path,
-                request_id=request_id,
-                error_class=error_class,
-                error_message=str(exc),
+            asyncio.create_task(  # noqa: RUF006
+                _build_and_write_trace(
+                    request,
+                    path=path,
+                    request_id=request_id,
+                    error_class=error_class,
+                    error_message=str(exc),
+                )
             )
-            if trace is not None:
-                asyncio.create_task(write_query_trace(trace))  # noqa: RUF006
             raise
 
         latency_ms = int((time.perf_counter() - start) * 1000)
@@ -166,34 +166,33 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
             error_class=error_class,
             latency_ms=latency_ms,
         )
-        trace = self._build_trace(
+        # Chain both writes onto the response's BackgroundTask. They run
+        # AFTER response bytes are flushed to the client, so neither write
+        # can affect the user-visible latency. Both writers swallow their
+        # own exceptions independently.
+        #
+        # The trace write reads request.state at TASK EXECUTION TIME (via
+        # _build_and_write_trace), not now. For StreamingResponse handlers
+        # (/query/stream), the SSE generator runs DURING body streaming,
+        # which is after `await call_next` returns but before the
+        # BackgroundTask fires. Reading request.state lazily means we
+        # capture state set inside the generator (e.g.
+        # usage_response_payload).
+        existing = response.background
+        tasks = BackgroundTasks()
+        if existing is not None:
+            tasks.add_task(_run_existing, existing)
+        if event is not None:
+            tasks.add_task(write_usage_event, event)
+        tasks.add_task(
+            _build_and_write_trace,
             request,
             path=path,
             request_id=request_id,
             error_class=error_class,
             error_message=None,
         )
-        # Chain both writes onto the response's BackgroundTask. They run
-        # AFTER response bytes are flushed to the client, so neither write
-        # can affect the user-visible latency. Both writers swallow their
-        # own exceptions independently.
-        background_writes: list[tuple[Any, Any]] = []
-        if event is not None:
-            background_writes.append((write_usage_event, event))
-        if trace is not None:
-            background_writes.append((write_query_trace, trace))
-        if background_writes:
-            existing = response.background
-            if existing is None and len(background_writes) == 1:
-                fn, arg = background_writes[0]
-                response.background = BackgroundTask(fn, arg)
-            else:
-                tasks = BackgroundTasks()
-                if existing is not None:
-                    tasks.add_task(_run_existing, existing)
-                for fn, arg in background_writes:
-                    tasks.add_task(fn, arg)
-                response.background = tasks
+        response.background = tasks
         return response
 
     def _build_event(
@@ -243,54 +242,58 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
             result_count=result_count,
         )
 
-    def _build_trace(
-        self,
-        request: Request,
-        *,
-        path: str,
-        request_id: str,
-        error_class: str | None,
-        error_message: str | None,
-    ) -> QueryTrace | None:
-        """Assemble the QueryTrace from request state. Returns None if
-        we lack enough context to record the trace safely.
 
-        Reads the raw pydantic request/response models that the handler
-        stashed on request.state. Stash is reference-only (no
-        serialization on the hot path) — the actual model_dump and
-        truncation happen inside write_query_trace, which runs
-        post-response in a BackgroundTask.
+async def _build_and_write_trace(
+    request: Request,
+    *,
+    path: str,
+    request_id: str,
+    error_class: str | None,
+    error_message: str | None,
+) -> None:
+    """Build a QueryTrace from request.state and write it.
 
-        For /sources GET (no request body), falls back to {doc_id} from
-        the URL path so the trace still has a non-empty `request` JSONB.
-        """
-        customer_id: str | None = getattr(request.state, "customer_id", None)
-        if not customer_id:
-            return None
+    Runs as a BackgroundTask AFTER the response body is flushed. Reading
+    state here (rather than at middleware-dispatch time) is critical for
+    StreamingResponse handlers: the SSE generator inside
+    /query/stream runs DURING body streaming, populating
+    request.state.usage_response_payload only after `await call_next`
+    has already returned. Reading lazily here captures that state.
 
-        event_type = event_type_for(path)
+    Returns silently if we lack the customer_id (auth failed). For
+    /sources GET (no request body), falls back to {doc_id} from the URL
+    path so the trace still has a non-empty `request` JSONB.
 
-        request_payload: Any = getattr(
-            request.state, "usage_request_payload", None
-        )
-        if request_payload is None and path.startswith("/sources/"):
-            doc_id = path[len("/sources/") :] or None
-            if doc_id is not None:
-                request_payload = {"doc_id": doc_id}
+    write_query_trace itself swallows all exceptions including
+    CancelledError, so this task can never raise unhandled.
+    """
+    customer_id: str | None = getattr(request.state, "customer_id", None)
+    if not customer_id:
+        return
 
-        response_payload: Any = getattr(
-            request.state, "usage_response_payload", None
-        )
+    request_payload: Any = getattr(
+        request.state, "usage_request_payload", None
+    )
+    if request_payload is None and path.startswith("/sources/"):
+        doc_id = path[len("/sources/") :] or None
+        if doc_id is not None:
+            request_payload = {"doc_id": doc_id}
 
-        return QueryTrace(
+    response_payload: Any = getattr(
+        request.state, "usage_response_payload", None
+    )
+
+    await write_query_trace(
+        QueryTrace(
             customer_id=customer_id,
             request_id=request_id,
-            event_type=event_type,
+            event_type=event_type_for(path),
             request_payload=request_payload,
             response_payload=response_payload,
             error_class=error_class,
             error_message=error_message,
         )
+    )
 
 
 async def _run_existing(task: BackgroundTask) -> None:

@@ -277,3 +277,130 @@ async def test_middleware_handler_raises_emits_error_trace(
     request = _jsonb(trace["request"])
     assert request is not None
     assert request["query"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_middleware_query_stream_captures_response(
+    live_db, settings, monkeypatch
+) -> None:
+    """/query/stream stashes a synthetic AnswerResponse on request.state at
+    the end of the SSE generator, so query_traces lands with the same shape
+    /query writes — not response={}. Closes the gap PR #64 documented for
+    usage_events.
+
+    Without the fix, response would be `{}` (size_bytes=2). With the fix,
+    response carries the full AnswerResponse: query, answer, chunks list,
+    citations, model, etc. — byte-for-byte equivalent to a non-streaming
+    /query trace."""
+    api_key = await _seed_customer("cust-mw-stream")
+
+    # Mock the streaming pipeline. Mirrors tests/retrieval/test_query_stream.py
+    # patterns but plumbed through the live middleware so we observe the
+    # query_traces row that lands.
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from services.retrieval.pipeline import RouterPhaseResult
+    from services.retrieval.router import RouterOutput
+    from services.retrieval.synthesis import StreamDelta, StreamFinal
+    from shared.models import QueryResponse, TemporalSpec
+
+    async def _async_return(value):  # type: ignore[no-untyped-def]
+        return value
+
+    phase = RouterPhaseResult(
+        routed=RouterOutput(),
+        spec=TemporalSpec(),
+        temporal_meta={"mode": "latest", "source": "default", "raw_phrase": None, "error": None},
+        sort_meta=None,
+        extracted_entities=[],
+        doc_types=None,
+        trace_id="trace-stream-1",
+        timing={"router_ms": 5.0},
+        dispatch_mode="search",
+    )
+    chunk = QueryChunk(
+        chunk_id="c0",
+        doc_id="github:foo/bar:pr:1",
+        doc_version=1,
+        source_system=SourceSystem.GITHUB,
+        source_url="https://example/1",
+        title="example",
+        content="hello",
+        created_at=_dt.now(UTC),
+        updated_at=_dt.now(UTC),
+        score=0.9,
+        rank=0,
+    )
+    rresp = QueryResponse(
+        query="streamed?",
+        chunks=[chunk],
+        total_candidates=1,
+        router_hit_cache=False,
+        applied_mode="search",
+        timing_ms={"router_ms": 5.0, "search_ms": 30.0},
+        trace_id="trace-stream-1",
+    )
+
+    async def fake_synth_stream(query, chunks, model, max_tokens):  # type: ignore[no-untyped-def]
+        yield StreamDelta(text="Hello ")
+        yield StreamDelta(text="world.")
+        yield StreamFinal(
+            answer="Hello world.",
+            citations=[{"index": 1, "chunk_id": "c0"}],
+            insufficient_context=False,
+            model=model,
+        )
+
+    import services.retrieval.main as main_mod
+
+    monkeypatch.setattr(
+        main_mod, "run_router_phase", lambda req, cid: _async_return(phase)
+    )
+    monkeypatch.setattr(
+        main_mod, "run_search_phase", lambda req, cid, p: _async_return(rresp)
+    )
+    monkeypatch.setattr(main_mod, "synthesize_stream", fake_synth_stream)
+
+    # ASGITransport with the SSE response. Consume the body so the SSE
+    # generator runs to completion — only then does request.state get
+    # populated and the BackgroundTask fire.
+    await close_pool()
+    transport = ASGITransport(app=main_mod.app, raise_app_exceptions=False)
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        main_mod.app.router.lifespan_context(main_mod.app),
+    ):
+        resp = await client.post(
+            "/query/stream",
+            json={"query": "streamed?", "top_k": 1},
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "X-Caller-Kind": "mcp",
+            },
+        )
+        # Force-consume the streamed body so the generator exits and the
+        # BackgroundTask scheduled by the middleware actually runs. httpx
+        # already buffers .text but be explicit.
+        body = resp.text
+    await init_pool(settings)
+    assert resp.status_code == 200, body
+    assert "event: done" in body
+
+    traces = await _wait_for_traces("cust-mw-stream", 1)
+    assert len(traces) == 1
+    trace = traces[0]
+    response = _jsonb(trace["response"])
+    assert response is not None
+    # Response is the full AnswerResponse shape, not an empty stub.
+    assert response["answer"] == "Hello world."
+    assert response["query"] == "streamed?"
+    assert len(response["chunks"]) == 1
+    assert response["chunks"][0]["chunk_id"] == "c0"
+    assert response["citations"][0]["chunk_id"] == "c0"
+    assert response["insufficient_context"] is False
+    assert response["model"] == "anthropic/claude-sonnet-4-6"
+    # Truncation flag stays false; size is non-trivial (well above the 2-byte
+    # `{}` placeholder this test was added to prevent).
+    assert trace["response_truncated"] is False
+    assert trace["response_size_bytes"] > 100
