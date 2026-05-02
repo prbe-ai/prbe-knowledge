@@ -1,13 +1,17 @@
 """Tests for write_questions_jsonl — questions.jsonl eval artifact writer."""
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import orjson
 
+from scripts.synth.archetypes.base import Source
+from scripts.synth.output.base import SynthDoc
 from scripts.synth.output.eval_artifacts import write_questions_jsonl
 from scripts.synth.scenarios import EvalQuestion, ScenarioSpec
-from scripts.synth.synth_doc import Source, SynthDoc
+
+_TS = datetime(2026, 5, 1, tzinfo=UTC)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -18,17 +22,14 @@ def _make_scenario(sid: str, questions: list[EvalQuestion]) -> ScenarioSpec:
     return ScenarioSpec(
         id=sid,
         archetype_name="INCIDENT",
-        instance_ts=None,
+        instance_ts=_TS,
         title=f"title-{sid}",
         summary="summary",
         cast=(),
         affected_services=(),
-        affected_repos=(),
         root_cause=None,
         decision=None,
         outcome=None,
-        timeline=(),
-        source_emissions={},
         eval_questions=tuple(questions),
     )
 

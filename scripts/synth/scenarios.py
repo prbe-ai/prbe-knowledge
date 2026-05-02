@@ -14,31 +14,8 @@ from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from scripts.synth.archetypes.base import DocSpec, ScenarioSpec, Source
+from scripts.synth.eval_question import EvalQuestion
 from scripts.synth.output.base import SynthDoc
-
-# ---------------------------------------------------------------------------
-# EvalQuestion — eval artifact data model
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class EvalQuestion:
-    """One eval question attached to a scenario.
-
-    Used by eval artifact writers (write_questions_jsonl).  The `question`
-    field is the user-facing prompt text; `answer_substring` is a phrase
-    that must appear in a correct model answer; `tags` are category labels
-    (e.g. "INCIDENT", "cross-source"); `difficulty` is one of "easy",
-    "medium", "hard-temporal"; `question_index` is the 0-based position
-    within the scenario's question list (used for deterministic sort).
-    """
-
-    question: str
-    answer_substring: str
-    tags: tuple[str, ...]
-    difficulty: str
-    question_index: int = 0
-
 
 # Re-export so downstream code can do:
 #   from scripts.synth.scenarios import ScenarioSpec, EvalQuestion

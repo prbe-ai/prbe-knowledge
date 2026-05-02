@@ -192,21 +192,17 @@ def write_questions_jsonl(
     for scenario in scenarios:
         doc_keys = docs_by_scenario.get(scenario.id, [])
         for q in scenario.eval_questions:
-            # Support both EvalQuestion.question (Task-17 model) and legacy .input
-            question_text = getattr(q, "question", None) or getattr(q, "input", "")
-            tags = list(getattr(q, "tags", ()))
-            question_index = getattr(q, "question_index", 0)
             row = {
-                "input": question_text,
+                "input": q.question,
                 "expected": {
                     "answer_substring": q.answer_substring,
                     "evidence_doc_keys": doc_keys,
                 },
-                "tags": tags,
+                "tags": list(q.tags),
                 "scenario_id": scenario.id,
                 "difficulty": q.difficulty,
             }
-            rows.append((scenario.id, q.difficulty, question_index, row))
+            rows.append((scenario.id, q.difficulty, q.question_index, row))
 
     rows.sort(key=lambda t: (t[0], t[1], t[2]))
 

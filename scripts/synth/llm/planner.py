@@ -9,7 +9,7 @@ Validation:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass  # TimelineEvent still needs this
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from scripts.synth.archetypes.base import Archetype, DocSpec, ScenarioSpec, Source
 from scripts.synth.archetypes.plot_base import CastMember, assemble_planner_prompt  # noqa: F401
+from scripts.synth.eval_question import EvalQuestion
 from scripts.synth.llm.base import LlmClientProtocol, LlmRequest
 
 if TYPE_CHECKING:
@@ -31,13 +32,6 @@ class TimelineEvent:
     source: str       # Source.value
     kind: str         # "alert", "message", "ticket", "doc", "pr"
     channel: str | None = None
-
-
-@dataclass(frozen=True)
-class EvalQuestion:
-    input: str
-    answer_substring: str
-    difficulty: str   # "easy" | "medium-cross-source" | "hard-temporal"
 
 
 class _CastMemberSchema(BaseModel):
@@ -230,13 +224,20 @@ class LLMPlanner:
 
         doc_specs = _build_doc_specs(output, scenario_id, instance_ts)
 
+        # Derive tags: archetype name + "cross-source" when >1 source is emitted
+        multi_source = len([v for v in output.source_emissions.values() if v > 0]) > 1
+        base_tags: tuple[str, ...] = (archetype.name,)
+        cross_source_tags: tuple[str, ...] = (archetype.name, "cross-source") if multi_source else base_tags
+
         eval_questions = tuple(
             EvalQuestion(
-                input=q.input,
+                question=q.input,
                 answer_substring=q.answer_substring,
+                tags=cross_source_tags if "cross-source" in q.difficulty else base_tags,
                 difficulty=q.difficulty,
+                question_index=idx,
             )
-            for q in output.eval_questions
+            for idx, q in enumerate(output.eval_questions)
         )
 
         return ScenarioSpec(

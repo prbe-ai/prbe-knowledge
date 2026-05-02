@@ -1,6 +1,7 @@
 """Tests for write_scenarios — scenarios/<id>.json artifact writer."""
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import orjson
@@ -8,22 +9,21 @@ import orjson
 from scripts.synth.output.eval_artifacts import write_scenarios
 from scripts.synth.scenarios import EvalQuestion, ScenarioSpec
 
+_TS = datetime(2026, 5, 1, tzinfo=UTC)
+
 
 def _make_scenario(sid: str, **extra) -> ScenarioSpec:
     defaults = dict(
         id=sid,
         archetype_name="INCIDENT",
-        instance_ts=None,
+        instance_ts=_TS,
         title=f"title-{sid}",
         summary="test summary",
         cast=(),
         affected_services=("payments-svc",),
-        affected_repos=("payments",),
         root_cause="feature flag default flipped",
         decision=None,
         outcome=None,
-        timeline=(),
-        source_emissions={},
         eval_questions=(),
     )
     defaults.update(extra)
@@ -59,7 +59,7 @@ def test_multiple_scenarios_multiple_files(tmp_path: Path) -> None:
 
 
 def test_full_spec_fields_serialized(tmp_path: Path) -> None:
-    """ScenarioSpec extra fields (title, summary, root_cause, eval_questions, timeline) all serialized."""
+    """ScenarioSpec extra fields (title, summary, root_cause, eval_questions) all serialized."""
     q = EvalQuestion(
         question="What caused the outage?",
         answer_substring="flag flipped",
