@@ -1,0 +1,6 @@
+Write a GitHub issue body for this scenario. Do not invent names not in the allowlists.
+Scenario: {scenario_summary}
+Prior context (persona view): {persona_view}
+Allowed services: {allowed_services} | Allowed people: {allowed_people} | Allowed channels: {allowed_channels}
+Current emission to write: {current_emission}
+Instance timestamp: {instance_ts}
