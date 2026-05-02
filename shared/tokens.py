@@ -12,8 +12,10 @@ Two access paths exist on the same `integration_tokens` table:
   pin `device_id IS NULL` so device-scoped rows are invisible.
 - Device-scoped helpers — `save_device_token` / `load_device_token` /
   `revoke_device_token` / `update_device_heartbeat` /
-  `list_devices_for_customer`. Many rows per (customer, source),
-  keyed by `device_id`. Used by the claude_code and codex connectors for
+  `list_devices_for_customer`. Many rows per customer, keyed by `device_id`
+  (uniqueness still enforced per-source by the partial unique index in
+  db/schema.sql, but the helpers themselves are source-agnostic).
+  Used by the claude_code and codex connectors for
   per-laptop bearer-token credentials. The mutation/list helpers are
   source-agnostic — `(customer_id, device_id)` already uniquely identifies
   a device, and the dashboard surfaces all sources in one list.

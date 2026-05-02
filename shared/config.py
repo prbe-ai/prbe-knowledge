@@ -171,9 +171,15 @@ class Settings(BaseSettings):
     # When True, verify_device_token escalates an integration_tokens row's
     # source_system from the default "claude_code" to a non-default source
     # if the webhook route says otherwise. Escalate-only — never demotes.
+    # Toggle off only during incident triage; mislabeled rows then require
+    # manual SQL or re-pair to correct.
     auto_reconcile_device_source: bool = Field(
         default=True,
-        description="Promote mislabeled device rows on first webhook hit.",
+        description=(
+            "Promote mislabeled device rows on first webhook hit. "
+            "Toggle off only during incident triage; mislabeled rows then "
+            "require manual SQL or re-pair to correct."
+        ),
     )
 
     @property

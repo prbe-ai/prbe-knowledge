@@ -5,6 +5,7 @@ import hashlib
 from collections.abc import AsyncIterator
 
 import httpx
+import orjson
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport
@@ -122,6 +123,7 @@ async def test_verify_token_resolves_to_device_claims(client: httpx.AsyncClient)
     assert body["device_id"] == DEVICE
     assert body["employee_id"] == EMPLOYEE
     assert body["status"] == "active"
+    assert "source_system" not in body, "DeviceVerifyTokenResponse must not leak the row's source_system"
 
 
 @pytest.mark.asyncio
@@ -437,8 +439,6 @@ async def test_verify_no_reconcile_when_flag_off(
     monkeypatch,
 ) -> None:
     """With AUTO_RECONCILE_DEVICE_SOURCE=False, the row is left alone."""
-    from shared.config import get_settings
-
     monkeypatch.setenv("AUTO_RECONCILE_DEVICE_SOURCE", "false")
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
@@ -468,6 +468,7 @@ async def test_verify_no_reconcile_when_flag_off(
             "flag-off-1",
         )
     assert row["source_system"] == "claude_code"
+    get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -532,7 +533,6 @@ async def test_heartbeat_works_for_codex_device(client: httpx.AsyncClient) -> No
             "WHERE customer_id=$1 AND source_system='codex' AND device_id=$2",
             CUSTOMER, "codex-hb-1",
         )
-    import orjson
     if isinstance(meta, (str, bytes, bytearray)):
         meta = orjson.loads(meta)
     assert "last_heartbeat_at" in meta

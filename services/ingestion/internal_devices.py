@@ -87,7 +87,8 @@ class DeviceVerifyTokenRequest(BaseModel):
         default=None,
         description=(
             "If provided, escalate the device row's source_system from the "
-            "default 'claude_code' to expected_source on first hit. Never demotes."
+            "default 'claude_code' to expected_source on first hit. Never demotes. "
+            "Must be a known SourceSystem value or null; unknown strings raise 422."
         ),
     )
 
@@ -194,28 +195,27 @@ async def verify_device_token(
         # source_system="claude_code" hit by a webhook that says
         # expected_source != "claude_code" gets promoted. Codex (or any
         # future source) is locked once set — we never demote.
-        current_source = row["source_system"]
         if (
             settings.auto_reconcile_device_source
             and body.expected_source is not None
-            and current_source == SourceSystem.CLAUDE_CODE.value
+            and row["source_system"] == SourceSystem.CLAUDE_CODE.value
             and body.expected_source != SourceSystem.CLAUDE_CODE
         ):
             await conn.execute(
                 """
                 UPDATE integration_tokens
                 SET source_system = $1, updated_at = NOW()
-                WHERE webhook_secret = $2
+                WHERE device_id = $2
                   AND source_system = $3
                 """,
                 body.expected_source.value,
-                body.token_hash,
+                row["device_id"],
                 SourceSystem.CLAUDE_CODE.value,
             )
             log.info(
                 "devices.source_reconciled",
                 device=row["device_id"],
-                from_source=current_source,
+                from_source=SourceSystem.CLAUDE_CODE.value,
                 to_source=body.expected_source.value,
             )
 
