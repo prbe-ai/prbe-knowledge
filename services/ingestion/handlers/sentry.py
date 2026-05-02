@@ -964,7 +964,12 @@ def _is_installation_payload(
     if resource == _RESOURCE_INSTALLATION:
         return True
     data = payload.get("data")
-    return isinstance(data, dict) and isinstance(data.get("installation"), dict)
+    if isinstance(data, dict) and isinstance(data.get("installation"), dict):
+        return True
+    # Unit tests and synthetic replays may not carry Sentry-Hook-Resource.
+    # Treat a bare installation object as installation-shaped only when no
+    # explicit non-installation resource header says this is an event payload.
+    return not resource and isinstance(payload.get("installation"), dict)
 
 
 def _oauth_scope(value: Any) -> str | None:
