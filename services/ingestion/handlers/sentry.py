@@ -31,7 +31,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 from services.ingestion.chunker import count_tokens
@@ -47,15 +47,23 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
+from shared.db import raw_conn
+from shared.exceptions import (
+    InvalidWebhookPayload,
+    MissingSecret,
+    PermanentSourceError,
+    TransientSourceError,
+)
 from shared.logging import get_logger
 from shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
     Document,
+    ExternalWorkspaceRef,
     GraphEdgeSpec,
     GraphNodeSpec,
+    IntegrationToken,
     NormalizationResult,
     WebhookEvent,
     WebhookParseResult,
@@ -67,6 +75,9 @@ log = get_logger(__name__)
 
 _HDR_RESOURCE = "sentry-hook-resource"
 _HDR_SIGNATURE = "sentry-hook-signature"
+
+_SENTRY_API = "https://sentry.io/api/0"
+_SENTRY_OAUTH_TOKEN = "https://sentry.io/oauth/token/"
 
 _RESOURCE_ISSUE = "issue"
 _RESOURCE_EVENT_ALERT = "event_alert"
@@ -619,28 +630,177 @@ class SentryConnector(Connector):
         )
 
     # ------------------------------------------------------------------
+    # 6. OAuth code-for-token exchange
+    # ------------------------------------------------------------------
+
+    async def exchange_oauth_code(
+        self,
+        code: str | None,
+        redirect_uri: str,
+        extra_params: dict[str, str] | None = None,
+    ) -> IntegrationToken:
+        cid = self.settings.sentry_client_id
+        secret = self.settings.sentry_client_secret
+        if not cid or secret is None:
+            raise MissingSecret("SENTRY_CLIENT_ID / SENTRY_CLIENT_SECRET not configured")
+        if not code:
+            raise InvalidWebhookPayload("sentry oauth callback missing code")
+
+        try:
+            resp = await self.http.post(
+                _SENTRY_OAUTH_TOKEN,
+                data={
+                    "grant_type": "authorization_code",
+                    "client_id": cid,
+                    "client_secret": secret.get_secret_value(),
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                },
+            )
+        except Exception as exc:
+            raise TransientSourceError(
+                "sentry /oauth/token request failed",
+                error=str(exc),
+            ) from exc
+
+        if resp.status_code >= 500:
+            raise TransientSourceError(
+                f"sentry /oauth/token returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        if resp.status_code >= 400:
+            raise PermanentSourceError(
+                f"sentry /oauth/token returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise PermanentSourceError(
+                "sentry /oauth/token 200 but response was not JSON",
+                body=resp.text[:500],
+            ) from exc
+
+        access_token = body.get("access_token") if isinstance(body, dict) else None
+        if not access_token:
+            raise PermanentSourceError(
+                "sentry /oauth/token 200 but missing access_token",
+                body=str(body)[:500],
+            )
+
+        return IntegrationToken(
+            customer_id="",  # caller fills in — connector does not know the tenant
+            source_system=SourceSystem.SENTRY,
+            access_token=access_token,
+            refresh_token=body.get("refresh_token"),
+            expires_at=_oauth_expires_at(body),
+            scope=_oauth_scope(body.get("scope")),
+        )
+
+    # ------------------------------------------------------------------
     # 7. workspace identification
     # ------------------------------------------------------------------
 
-    async def identify_workspaces(self, token):  # type: ignore[override]
-        """Sentry internal integrations don't go through a standard OAuth
-        code flow — the installation webhook carries organization info.
-        Phase 0 returns []; webhooks will be routed via
-        `extract_external_id_from_payload` + single_customer_fallback.
+    async def identify_workspaces(
+        self,
+        token: IntegrationToken,
+    ) -> list[ExternalWorkspaceRef]:
+        """Read accessible Sentry organizations for webhook routing.
 
-        Phase 1 TODO: handle `installation.created` webhook specially to
-        record the mapping at install time instead of on first real webhook.
+        We record both organization slug and organization id because Sentry
+        webhook payloads can carry either top-level `organization.slug` or
+        `data.event.organization_id` depending on resource shape.
         """
-        return []
+        try:
+            resp = await self.http.get(
+                f"{_SENTRY_API}/organizations/",
+                headers={"Authorization": f"Bearer {token.access_token}"},
+            )
+        except Exception as exc:
+            log.warning("sentry.identify_workspaces_failed", error=str(exc))
+            return []
+
+        if resp.status_code != 200:
+            log.warning(
+                "sentry.identify_workspaces_non_200",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+            return []
+
+        try:
+            orgs = resp.json()
+        except ValueError as exc:
+            log.warning("sentry.identify_workspaces_bad_json", error=str(exc))
+            return []
+        if not isinstance(orgs, list):
+            return []
+
+        refs: list[ExternalWorkspaceRef] = []
+        seen: set[str] = set()
+        for org in orgs:
+            if not isinstance(org, dict):
+                continue
+            slug = org.get("slug")
+            org_id = org.get("id")
+            name = org.get("name") or slug
+            metadata_base = {
+                "sentry_org_slug": slug,
+                "sentry_org_id": str(org_id) if org_id is not None else None,
+            }
+
+            if isinstance(slug, str) and slug and slug not in seen:
+                seen.add(slug)
+                refs.append(
+                    ExternalWorkspaceRef(
+                        external_id=slug,
+                        external_name=name,
+                        metadata={**metadata_base, "mapping_kind": "org_slug"},
+                    )
+                )
+            if org_id is not None:
+                org_id_str = str(org_id)
+                if org_id_str and org_id_str not in seen:
+                    seen.add(org_id_str)
+                    refs.append(
+                        ExternalWorkspaceRef(
+                            external_id=org_id_str,
+                            external_name=name,
+                            metadata={**metadata_base, "mapping_kind": "org_id"},
+                        )
+                    )
+        return refs
 
     def extract_external_id_from_payload(self, headers, raw_payload):
-        # Sentry payload shapes: top-level organization.slug OR installation.organization.slug
-        org = raw_payload.get("organization") or {}
-        slug = org.get("slug")
-        if not slug:
-            install = raw_payload.get("installation") or {}
-            slug = (install.get("organization") or {}).get("slug")
-        return str(slug) if slug else None
+        org = raw_payload.get("organization")
+        if isinstance(org, dict) and isinstance(org.get("slug"), str):
+            return org["slug"]
+        if isinstance(raw_payload.get("organization_slug"), str):
+            return raw_payload["organization_slug"]
+
+        data = raw_payload.get("data")
+        if isinstance(data, dict):
+            event = data.get("event")
+            if isinstance(event, dict):
+                org_id = event.get("organization_id")
+                if org_id is not None:
+                    return str(org_id)
+
+        if _is_installation_payload(raw_payload, headers):
+            install = raw_payload.get("installation")
+            if isinstance(install, dict):
+                install_org = install.get("organization")
+                if isinstance(install_org, dict):
+                    uuid = install_org.get("uuid")
+                    if isinstance(uuid, str):
+                        return uuid
+                    slug = install_org.get("slug")
+                    if isinstance(slug, str):
+                        return slug
+        return None
 
     # ------------------------------------------------------------------
     # backfill
@@ -667,12 +827,14 @@ class SentryConnector(Connector):
 
         auth_headers = {"Authorization": f"Bearer {token.access_token}"}
 
-        org_slug = await _sentry_org_slug(self.http, auth_headers)
+        org_slug = await _connected_sentry_org_slug(customer_id)
+        if org_slug is None:
+            org_slug = await _sentry_org_slug(self.http, auth_headers)
         if org_slug is None:
             log.warning("sentry.backfill_no_org", customer=customer_id)
             return
 
-        url = f"https://sentry.io/api/0/organizations/{org_slug}/issues/"
+        url = f"{_SENTRY_API}/organizations/{org_slug}/issues/"
         if cursor:
             url = f"{url}?cursor={cursor}"
 
@@ -723,7 +885,7 @@ class SentryConnector(Connector):
 
 async def _sentry_org_slug(http, headers: dict[str, str]) -> str | None:
     try:
-        resp = await http.get("https://sentry.io/api/0/organizations/", headers=headers)
+        resp = await http.get(f"{_SENTRY_API}/organizations/", headers=headers)
     except Exception:
         return None
     if resp.status_code != 200:
@@ -732,6 +894,29 @@ async def _sentry_org_slug(http, headers: dict[str, str]) -> str | None:
     if not orgs:
         return None
     return orgs[0].get("slug")
+
+
+async def _connected_sentry_org_slug(customer_id: str) -> str | None:
+    """Return the org slug recorded during OAuth install, if available."""
+    try:
+        async with raw_conn() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT external_id
+                FROM customer_source_mapping
+                WHERE customer_id = $1
+                  AND source_system = $2
+                  AND metadata->>'mapping_kind' = 'org_slug'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                customer_id,
+                SourceSystem.SENTRY.value,
+            )
+    except Exception as exc:
+        log.warning("sentry.connected_org_lookup_failed", error=str(exc))
+        return None
+    return row["external_id"] if row else None
 
 
 _SENTRY_CURSOR_RE = None  # set lazily in _parse_next_link
@@ -769,6 +954,37 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
         if k.lower() == name.lower():
             return v
     return None
+
+
+def _is_installation_payload(
+    payload: Mapping[str, Any],
+    headers: Mapping[str, str],
+) -> bool:
+    resource = (_header(headers, _HDR_RESOURCE) or "").lower()
+    if resource == _RESOURCE_INSTALLATION:
+        return True
+    data = payload.get("data")
+    return isinstance(data, dict) and isinstance(data.get("installation"), dict)
+
+
+def _oauth_scope(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = [str(item) for item in value if item is not None]
+        return " ".join(parts) if parts else None
+    return str(value) if value is not None else None
+
+
+def _oauth_expires_at(body: Mapping[str, Any]) -> datetime | None:
+    expires_in = body.get("expires_in")
+    if expires_in is None:
+        return None
+    try:
+        seconds = int(float(expires_in))
+    except (TypeError, ValueError):
+        return None
+    return datetime.now(UTC) + timedelta(seconds=max(0, seconds))
 
 
 def _sha256(text: str) -> str:
