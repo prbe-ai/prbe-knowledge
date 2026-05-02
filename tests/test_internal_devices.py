@@ -284,3 +284,56 @@ async def test_re_register_same_device_resets_status_and_merges_metadata(
     )
     assert verify.status_code == 200, verify.text
     assert verify.json()["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_register_device_writes_source_codex_when_specified(
+    client: httpx.AsyncClient,
+) -> None:
+    resp = await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": DEVICE,
+            "token_hash": TOKEN_HASH,
+            "source": "codex",
+            "hostname": "h",
+        },
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT source_system FROM integration_tokens WHERE device_id = $1",
+            DEVICE,
+        )
+    assert row is not None
+    assert row["source_system"] == "codex"
+
+
+@pytest.mark.asyncio
+async def test_register_device_defaults_source_to_claude_code(
+    client: httpx.AsyncClient,
+) -> None:
+    resp = await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": DEVICE + "-default",
+            "token_hash": TOKEN_HASH.replace("a", "b"),
+            "hostname": "h",
+        },
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT source_system FROM integration_tokens WHERE device_id = $1",
+            DEVICE + "-default",
+        )
+    assert row is not None
+    assert row["source_system"] == "claude_code"

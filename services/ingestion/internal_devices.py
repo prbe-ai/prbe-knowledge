@@ -66,6 +66,10 @@ class DeviceRegisterRequest(BaseModel):
         max_length=128,
         description="SHA-256 hex digest of the device token (gateway hashes the plaintext).",
     )
+    source: SourceSystem = Field(
+        default=SourceSystem.CLAUDE_CODE,
+        description="Which CLI integration paired this device.",
+    )
     os: str | None = Field(default=None, max_length=64)
     hostname: str | None = Field(default=None, max_length=256)
 
@@ -123,7 +127,7 @@ async def register_device(body: DeviceRegisterRequest) -> DeviceRegisterResponse
 
     token = IntegrationToken(
         customer_id=body.customer_id,
-        source_system=SourceSystem.CLAUDE_CODE,
+        source_system=body.source,
         access_token="device-token",
         webhook_secret=body.token_hash,
         device_id=body.device_id,
@@ -132,7 +136,7 @@ async def register_device(body: DeviceRegisterRequest) -> DeviceRegisterResponse
     await save_device_token(token)
     await record_mapping(
         customer_id=body.customer_id,
-        source_system=SourceSystem.CLAUDE_CODE,
+        source_system=body.source,
         external_id=body.device_id,
         external_name=body.hostname,
         metadata=metadata,
@@ -142,6 +146,7 @@ async def register_device(body: DeviceRegisterRequest) -> DeviceRegisterResponse
         customer=body.customer_id,
         employee=body.employee_id,
         device=body.device_id,
+        source=body.source.value,
     )
     return DeviceRegisterResponse(
         customer_id=body.customer_id,
