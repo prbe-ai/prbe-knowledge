@@ -128,11 +128,16 @@ async def retrieve(
     # Stash for UsageLoggingMiddleware. customer_id scopes the usage row;
     # usage_summary is the FTS-searchable text; result_count is set after
     # retrieval runs so the middleware can record it.
+    # usage_request_payload + usage_response_payload feed the query_traces
+    # write — reference-only assignments, the model_dump happens later
+    # inside the post-response BackgroundTask.
     request.state.customer_id = customer_id
     request.state.usage_summary = req.query
+    request.state.usage_request_payload = req
     t_total = time.perf_counter()
     resp = await run_retrieval(req, customer_id)
     request.state.result_count = len(resp.chunks)
+    request.state.usage_response_payload = resp
     total_ms = (time.perf_counter() - t_total) * 1000
     _log_query_handled(
         endpoint="/retrieve",
@@ -160,6 +165,7 @@ async def query(
     # Stash for UsageLoggingMiddleware (see /retrieve for shape).
     request.state.customer_id = customer_id
     request.state.usage_summary = req.query
+    request.state.usage_request_payload = req
     t_total = time.perf_counter()
     base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
     rresp = await run_retrieval(base_req, customer_id)
@@ -205,6 +211,7 @@ async def query(
         timing_ms=timing,
         trace_id=rresp.trace_id,
     )
+    request.state.usage_response_payload = answer
     total_ms = (time.perf_counter() - t_total) * 1000
     _log_query_handled(
         endpoint="/query",
@@ -250,6 +257,10 @@ async def query_stream(
     """
     request.state.customer_id = customer_id
     request.state.usage_summary = req.query
+    # Streaming responses can't be captured as a single payload; record
+    # the request shape so query_traces at least has the input. The
+    # response field will land as {} (None coerces to empty dict).
+    request.state.usage_request_payload = req
     t_total = time.perf_counter()
     base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
     model = req.model or DEFAULT_SYNTHESIS_MODEL
@@ -383,6 +394,9 @@ async def get_source(
     # X pulled github:foo/bar:pr:42".
     request.state.customer_id = customer_id
     request.state.usage_summary = doc_id
+    # query_traces request payload: GET has no body, so the doc_id +
+    # version are the entire request shape.
+    request.state.usage_request_payload = {"doc_id": doc_id, "version": version}
     async with with_tenant(customer_id) as conn:
         if version is not None:
             doc = await conn.fetchrow(
@@ -444,7 +458,7 @@ async def get_source(
             entities = []
 
     request.state.result_count = len(chunk_rows)
-    return SourceResponse(
+    source_response = SourceResponse(
         doc_id=doc["doc_id"],
         doc_version=doc["version"],
         source_system=SourceSystem(doc["source_system"]),
@@ -462,6 +476,8 @@ async def get_source(
         ingested_at=doc["ingested_at"],
         deleted_at=doc["deleted_at"],
     )
+    request.state.usage_response_payload = source_response
+    return source_response
 
 
 # Mount the usage_events read endpoints (/usage/feed, /usage/stats,

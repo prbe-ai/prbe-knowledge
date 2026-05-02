@@ -19,6 +19,7 @@ with_tenant() — but the write path additionally swallows every exception
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,7 @@ from pydantic import BaseModel
 from services.retrieval.auth import authenticate_query
 from shared.db import with_tenant
 from shared.logging import get_logger
+from shared.metrics import counter
 from shared.models import (
     UsageEventOut,
     UsageFeedResponse,
@@ -184,6 +186,181 @@ async def write_usage_event(event: UsageEvent) -> None:
             "usage_events.write_failed",
             customer_id=event.customer_id,
             endpoint=event.endpoint,
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
+
+
+# ---------------------------------------------------------------------------
+# query_traces: full request/response payload log per retrieval call.
+#
+# Sister table to usage_events. Where usage_events stores thin metrics
+# (latency, status, caller_kind), query_traces stores the parsed request
+# and response so we can evaluate retrieval effectiveness over time.
+#
+# Same write contract as write_usage_event: post-response BackgroundTask,
+# RLS-scoped via with_tenant(), swallows ALL exceptions including
+# CancelledError (Python 3.11+ doesn't let except Exception catch it).
+# ---------------------------------------------------------------------------
+
+# Cap the serialized response payload at 256KB. Real responses are
+# ~10-100KB; anything larger is a bug, a pathological top_k, or a 1MB
+# Linear comment that the chunker shouldn't have produced. We still
+# record the row so the audit trail stays complete — just substitute a
+# small marker for the response and flip response_truncated=true.
+RESPONSE_MAX_BYTES = 256 * 1024
+
+# Pre-serialization gate: skip the model_dump entirely if the response
+# carries an obvious-pathology number of chunks. Bounds CPU before we
+# pay for full JSON serialization. Tuned against typical top_k=10-50
+# with ~1-2KB chunks ≈ 100KB; 200 chunks comfortably exceeds the cap.
+MAX_CHUNK_COUNT_BEFORE_TRUNCATE = 200
+
+# Schema version stamped on every row. Bump when the request/response
+# JSONB shape changes in a way that breaks dashboard SQL — old rows
+# stay readable indefinitely, consumers filter by version.
+QUERY_TRACE_SCHEMA_VERSION = 1
+
+
+@dataclass
+class QueryTrace:
+    """In-flight shape passed from middleware to write_query_trace."""
+
+    customer_id: str
+    request_id: str
+    event_type: str
+    request_payload: BaseModel | dict[str, Any] | None
+    response_payload: BaseModel | dict[str, Any] | None
+    occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    error_class: str | None = None
+    error_message: str | None = None
+
+
+def _payload_to_jsonable(payload: BaseModel | dict[str, Any] | None) -> dict[str, Any]:
+    """Coerce a request or response payload to a JSON-serializable dict.
+
+    Pydantic models go through model_dump(mode='json') so datetimes,
+    enums, and other custom types serialize cleanly. Plain dicts pass
+    through unchanged. None becomes empty dict (the column is NOT NULL).
+    """
+    if payload is None:
+        return {}
+    if isinstance(payload, BaseModel):
+        return payload.model_dump(mode="json")
+    return dict(payload)
+
+
+def _truncated_marker(size_bytes: int, chunk_count: int | None) -> dict[str, Any]:
+    """Stub object stored in `response` when the real payload exceeds the cap.
+
+    Pairs with `response_truncated=true` on the row; consumers that want
+    to differentiate stub-vs-real must check the boolean column, not the
+    JSONB shape (a real response could legitimately contain a `_truncated`
+    key — the column avoids that existential ambiguity)."""
+    marker: dict[str, Any] = {"size_bytes": size_bytes}
+    if chunk_count is not None:
+        marker["chunk_count"] = chunk_count
+    return marker
+
+
+def _build_response_payload(
+    response: BaseModel | dict[str, Any] | None,
+) -> tuple[dict[str, Any], int, bool]:
+    """Return (payload_dict, size_bytes, truncated).
+
+    Three-stage gate:
+      1. Pre-check chunk count to short-circuit pathological responses
+         before we pay for serialization.
+      2. Serialize, measure size.
+      3. If serialized > RESPONSE_MAX_BYTES, replace with truncation marker.
+
+    The chunk-count pre-check looks at `.chunks` (QueryResponse,
+    AnswerResponse) — SourceResponse uses `chunk_count` instead and
+    returns reassembled `content`, which is bounded by the chunker.
+    """
+    chunks_attr = getattr(response, "chunks", None)
+    if (
+        chunks_attr is not None
+        and len(chunks_attr) > MAX_CHUNK_COUNT_BEFORE_TRUNCATE
+    ):
+        marker = _truncated_marker(size_bytes=0, chunk_count=len(chunks_attr))
+        # size_bytes=0 here means "not measured" — the gate fired before
+        # serialization. Distinguishable from a real 0 only via the
+        # response_truncated boolean.
+        marker["size_bytes"] = len(json.dumps(marker).encode("utf-8"))
+        return marker, marker["size_bytes"], True
+
+    payload = _payload_to_jsonable(response)
+    serialized = json.dumps(payload).encode("utf-8")
+    size_bytes = len(serialized)
+    if size_bytes > RESPONSE_MAX_BYTES:
+        chunk_count = len(chunks_attr) if chunks_attr is not None else None
+        marker = _truncated_marker(size_bytes=size_bytes, chunk_count=chunk_count)
+        return marker, size_bytes, True
+    return payload, size_bytes, False
+
+
+async def write_query_trace(trace: QueryTrace) -> None:
+    """Persist one query_traces row. Never raises.
+
+    Wrapped in `except (Exception, asyncio.CancelledError)`: this runs
+    in a post-response BackgroundTask, and the user-visible request has
+    already returned 200 (or its error) by the time we get here. If the
+    server is shutting down or the client disconnected, asyncio cancels
+    the task — `except Exception` alone would NOT catch that in Python
+    3.11+ since CancelledError became BaseException-rooted. Catching
+    both keeps the behavior identical: log a warning, drop the row,
+    let the request stream out cleanly.
+
+    On error responses (handler raised), `request_payload` is still
+    populated by the handler if it stashed before raising; `response_payload`
+    is None and we record `{error_class, error_message}` instead.
+    """
+    try:
+        request_dict = _payload_to_jsonable(trace.request_payload)
+
+        if trace.error_class is not None:
+            response_dict: dict[str, Any] = {
+                "error_class": trace.error_class,
+                "error_message": (trace.error_message or "")[: SUMMARY_MAX_BYTES],
+            }
+            response_size_bytes = len(json.dumps(response_dict).encode("utf-8"))
+            response_truncated = False
+        else:
+            response_dict, response_size_bytes, response_truncated = (
+                _build_response_payload(trace.response_payload)
+            )
+
+        request_json = json.dumps(request_dict)
+        response_json = json.dumps(response_dict)
+
+        async with with_tenant(trace.customer_id) as conn:
+            await conn.execute(
+                """
+                INSERT INTO query_traces (
+                    customer_id, occurred_at, request_id, event_type,
+                    schema_version, request, response,
+                    response_size_bytes, response_truncated
+                ) VALUES (
+                    $1, $2, $3::uuid, $4, $5, $6::jsonb, $7::jsonb, $8, $9
+                )
+                """,
+                trace.customer_id,
+                trace.occurred_at,
+                trace.request_id,
+                trace.event_type,
+                QUERY_TRACE_SCHEMA_VERSION,
+                request_json,
+                response_json,
+                response_size_bytes,
+                response_truncated,
+            )
+    except (Exception, asyncio.CancelledError) as exc:
+        counter("query_traces.write_failed", 1, event_type=trace.event_type)
+        log.warning(
+            "query_traces.write_failed",
+            customer_id=trace.customer_id,
+            event_type=trace.event_type,
             error=str(exc),
             error_class=type(exc).__name__,
         )
@@ -398,12 +575,17 @@ __all__ = [
     "EVENT_TYPE_RETRIEVE",
     "EVENT_TYPE_UNKNOWN",
     "KNOWN_CALLER_KINDS",
+    "MAX_CHUNK_COUNT_BEFORE_TRUNCATE",
+    "QUERY_TRACE_SCHEMA_VERSION",
+    "RESPONSE_MAX_BYTES",
     "STATUS_ERROR",
     "STATUS_OK",
     "SUMMARY_MAX_BYTES",
+    "QueryTrace",
     "UsageEvent",
     "event_type_for",
     "parse_window",
     "usage_router",
+    "write_query_trace",
     "write_usage_event",
 ]

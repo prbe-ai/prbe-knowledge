@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
+from typing import Any
 
 from starlette.background import BackgroundTask, BackgroundTasks
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -43,8 +44,10 @@ from services.retrieval.usage import (
     CALLER_KIND_UNKNOWN,
     STATUS_ERROR,
     STATUS_OK,
+    QueryTrace,
     UsageEvent,
     event_type_for,
+    write_query_trace,
     write_usage_event,
 )
 from shared.logging import get_logger
@@ -141,6 +144,15 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
                 # Fire-and-forget. write_usage_event() swallows its own
                 # exceptions, so this task can never raise unhandled.
                 asyncio.create_task(write_usage_event(event))  # noqa: RUF006
+            trace = self._build_trace(
+                request,
+                path=path,
+                request_id=request_id,
+                error_class=error_class,
+                error_message=str(exc),
+            )
+            if trace is not None:
+                asyncio.create_task(write_query_trace(trace))  # noqa: RUF006
             raise
 
         latency_ms = int((time.perf_counter() - start) * 1000)
@@ -154,20 +166,33 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
             error_class=error_class,
             latency_ms=latency_ms,
         )
+        trace = self._build_trace(
+            request,
+            path=path,
+            request_id=request_id,
+            error_class=error_class,
+            error_message=None,
+        )
+        # Chain both writes onto the response's BackgroundTask. They run
+        # AFTER response bytes are flushed to the client, so neither write
+        # can affect the user-visible latency. Both writers swallow their
+        # own exceptions independently.
+        background_writes: list[tuple[Any, Any]] = []
         if event is not None:
-            # Chain to any BackgroundTask the handler already set, so we
-            # don't clobber existing post-response work.
+            background_writes.append((write_usage_event, event))
+        if trace is not None:
+            background_writes.append((write_query_trace, trace))
+        if background_writes:
             existing = response.background
-            new_task = BackgroundTask(write_usage_event, event)
-            if existing is None:
-                response.background = new_task
+            if existing is None and len(background_writes) == 1:
+                fn, arg = background_writes[0]
+                response.background = BackgroundTask(fn, arg)
             else:
-                # Starlette doesn't expose a public "and then" combinator.
-                # The pragmatic option is to wrap into a tasks list via
-                # BackgroundTasks; both will run in order.
                 tasks = BackgroundTasks()
-                tasks.add_task(_run_existing, existing)
-                tasks.add_task(write_usage_event, event)
+                if existing is not None:
+                    tasks.add_task(_run_existing, existing)
+                for fn, arg in background_writes:
+                    tasks.add_task(fn, arg)
                 response.background = tasks
         return response
 
@@ -216,6 +241,55 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
             summary=summary,
             latency_ms=latency_ms,
             result_count=result_count,
+        )
+
+    def _build_trace(
+        self,
+        request: Request,
+        *,
+        path: str,
+        request_id: str,
+        error_class: str | None,
+        error_message: str | None,
+    ) -> QueryTrace | None:
+        """Assemble the QueryTrace from request state. Returns None if
+        we lack enough context to record the trace safely.
+
+        Reads the raw pydantic request/response models that the handler
+        stashed on request.state. Stash is reference-only (no
+        serialization on the hot path) — the actual model_dump and
+        truncation happen inside write_query_trace, which runs
+        post-response in a BackgroundTask.
+
+        For /sources GET (no request body), falls back to {doc_id} from
+        the URL path so the trace still has a non-empty `request` JSONB.
+        """
+        customer_id: str | None = getattr(request.state, "customer_id", None)
+        if not customer_id:
+            return None
+
+        event_type = event_type_for(path)
+
+        request_payload: Any = getattr(
+            request.state, "usage_request_payload", None
+        )
+        if request_payload is None and path.startswith("/sources/"):
+            doc_id = path[len("/sources/") :] or None
+            if doc_id is not None:
+                request_payload = {"doc_id": doc_id}
+
+        response_payload: Any = getattr(
+            request.state, "usage_response_payload", None
+        )
+
+        return QueryTrace(
+            customer_id=customer_id,
+            request_id=request_id,
+            event_type=event_type,
+            request_payload=request_payload,
+            response_payload=response_payload,
+            error_class=error_class,
+            error_message=error_message,
         )
 
 

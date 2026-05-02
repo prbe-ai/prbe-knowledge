@@ -78,17 +78,21 @@ Complements R2 lifecycle — delete `ingestion_events` rows older than the R2
 retention window so the table stays bounded. Write `scripts/cron_events_retention.py`
 (pattern matches the other crons). Run hourly via Fly cron.
 
-### usage_events retention
+### usage_events + query_traces retention
 **Where:** new cron `scripts/cron_usage_retention.py` or pg_partman config
 
-**Why:** search needs history but the table grows unbounded. Search latency
-degrades past ~10M rows.
+**Why:** search needs history but both tables grow unbounded. Search
+latency on usage_events degrades past ~10M rows; query_traces rows are
+~50x fatter (full request/response JSONB) so storage pressure hits
+sooner.
 
-**Trigger:** when a tenant crosses 1M rows OR /usage/search latency exceeds
-500ms.
+**Trigger:** when a tenant crosses 1M rows on usage_events, OR
+query_traces exceeds ~10GB total, OR /usage/search latency exceeds 500ms.
 
-**Fix:** ~30 lines for cron sweep deleting >180d, OR pg_partman monthly
-partitions.
+**Fix:** ~30 lines for cron sweep deleting >180d on BOTH tables, OR
+pg_partman monthly partitions on both. Pair them — one cron, two DELETEs.
+The two tables share `request_id` and a 1:1 row relationship, so the
+retention window must match to avoid orphan traces.
 
 ### Hot-node write strategy (per-customer drain ceiling)
 **Where:** `services/ingestion/graph_writer.py:upsert_nodes` (and the
