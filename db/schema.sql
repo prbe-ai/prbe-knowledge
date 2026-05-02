@@ -490,6 +490,43 @@ CREATE POLICY usage_events_tenant_isolation ON usage_events
     USING (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
+-- query_traces: full request/response payload log per retrieval call.
+-- Sister table to usage_events. usage_events stores thin metrics; this
+-- stores the parsed request body and response body so we can evaluate
+-- retrieval effectiveness — zero-result rate, score distributions,
+-- retrieve->get_source click-through, etc. Written from the same
+-- middleware BackgroundTask chain. response_truncated is a separate
+-- boolean (not a JSONB sentinel) so consumers can distinguish a stub
+-- row from a real response that happens to contain a `_truncated` key.
+-- request_id is plain BTREE (NOT UNIQUE) — clients may supply
+-- X-Request-Id and a UNIQUE constraint would silently drop legitimate
+-- retries that we'd want to study.
+-- ---------------------------------------------------------------------------
+CREATE TABLE query_traces (
+    trace_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id          UUID NOT NULL,
+    customer_id         TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    occurred_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    event_type          TEXT NOT NULL,
+    schema_version      SMALLINT NOT NULL DEFAULT 1,
+    request             JSONB NOT NULL,
+    response            JSONB NOT NULL,
+    response_size_bytes INT NOT NULL,
+    response_truncated  BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE INDEX idx_query_traces_customer_time
+    ON query_traces (customer_id, occurred_at DESC);
+CREATE INDEX idx_query_traces_request_id
+    ON query_traces (request_id);
+
+ALTER TABLE query_traces ENABLE ROW LEVEL SECURITY;
+ALTER TABLE query_traces FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY query_traces_tenant_isolation ON query_traces
+    USING (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents

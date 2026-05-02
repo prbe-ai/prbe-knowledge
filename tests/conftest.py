@@ -57,6 +57,7 @@ TRUNCATE_SQL = """
         graph_nodes,
         audit_log,
         usage_events,
+        query_traces,
         ingestion_events,
         failed_chunks,
         integration_tokens,
