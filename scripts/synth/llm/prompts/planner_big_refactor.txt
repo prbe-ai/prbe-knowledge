@@ -1,0 +1,51 @@
+You are generating a realistic BIG_REFACTOR scenario for a synthetic engineering corpus.
+
+# Context
+World: {world_summary}
+Available cast: {cast_pool}
+Available services: {services_table}
+Recent activity (topics): {recent_topics}
+Company: {company_context}
+Refactor date (RFC opened): {instance_ts}
+
+# Task
+Generate ONE big-refactor scenario where:
+- 1 RFC author opens a long-form GitHub issue proposing a significant architectural change
+- 2-3 debaters engage in a Slack thread debating trade-offs
+- The debate leads to a recorded decision in a Notion architecture doc
+- A Linear migration ticket captures the follow-up work
+
+The scenario must emphasize DEBATE — contrasting viewpoints, trade-off discussion, and a documented decision. The temporal arc: RFC issue → debate thread → architecture doc recording decision → migration ticket.
+
+# Output
+Return ONLY a JSON object matching this schema (no preamble, no postamble, no markdown fences):
+
+{{
+  "title": "<RFC title, ≤80 chars, starts with 'RFC:'>",
+  "summary": "<2-3 sentences: what is being changed, why, and the outcome of the debate>",
+  "cast": [{{"canonical_id": "<gh:...|email:...>", "role_in_scenario": "rfc_author|debater"}}],
+  "affected_services": ["<service.qualified>"],
+  "affected_repos": ["<repo.url>"],
+  "root_cause": null,
+  "decision": "<1-2 sentences recording the final architectural decision>",
+  "outcome": null,
+  "timeline": [
+    {{"ts": "<iso8601>", "source": "<github|notion|slack|linear>", "kind": "<issue|doc|message|ticket>", "channel": "<#channel-name or null>"}}
+  ],
+  "source_emissions": {{"github": 1, "notion": 1, "slack": 2, "linear": 1}},
+  "eval_questions": [
+    {{"input": "Why did we move {{X}} from {{A}} to {{B}}? Who proposed it?", "answer_substring": "<short answer naming proposer + rationale>", "difficulty": "hard-temporal"}}
+  ]
+}}
+
+# Constraints (violations trigger regeneration)
+- All cast.canonical_id values MUST appear verbatim in the available cast pool above.
+- All affected_services values MUST appear verbatim in the services_table above.
+- All channel values MUST be channel names listed in the available cast above, or null.
+- DO NOT invent service names, person names, or channel names not in the lists above.
+- cast length must be between 3 and 4 inclusive (1 rfc_author + 2-3 debaters).
+- source_emissions.slack must be 2 or 3 (parent message + 1-2 replies); never 1.
+- The github emission kind must be "issue" (RFC), not "pr".
+- timeline entries must be chronologically ordered.
+- eval_questions must contain exactly 1 question with difficulty "hard-temporal".
+- title must begin with "RFC:".
