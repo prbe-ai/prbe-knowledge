@@ -195,6 +195,12 @@ async def verify_device_token(
         # source_system="claude_code" hit by a webhook that says
         # expected_source != "claude_code" gets promoted. Codex (or any
         # future source) is locked once set — we never demote.
+        # TODO(per-device-stats): the UPDATE below scopes by device_id only,
+        # not by customer_id. Safe today because device_id is uuid4 (~10^-37
+        # cross-tenant collision). CodeRabbit on prbe-knowledge#70 flagged
+        # this for defense-in-depth — fix when adding the (customer_id,
+        # device_id) unique constraint that the source-agnostic helpers
+        # in shared/tokens.py also rely on.
         if (
             settings.auto_reconcile_device_source
             and body.expected_source is not None

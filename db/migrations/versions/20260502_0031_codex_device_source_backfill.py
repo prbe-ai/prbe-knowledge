@@ -48,6 +48,11 @@ depends_on = None
 
 def upgrade() -> None:
     # 1. Backfill mislabeled Codex devices.
+    # TODO(per-device-stats): the IN-subquery groups documents by device_id
+    # alone, not (customer_id, device_id). Safe today because device_id is
+    # uuid4 — cross-tenant collision is ~10^-37. CodeRabbit on PR #70 flagged
+    # this for defense-in-depth; correlate by customer_id when we tighten the
+    # schema with a (customer_id, device_id) unique constraint.
     op.execute(
         """
         UPDATE integration_tokens t

@@ -19,6 +19,16 @@ Two access paths exist on the same `integration_tokens` table:
   per-laptop bearer-token credentials. The mutation/list helpers are
   source-agnostic — `(customer_id, device_id)` already uniquely identifies
   a device, and the dashboard surfaces all sources in one list.
+
+  TODO(per-device-stats): the schema's partial unique index is on
+  `(customer_id, source_system, device_id)`, NOT `(customer_id, device_id)`,
+  so two rows with the same (customer_id, device_id) under different
+  source_systems are technically permitted by the DB — even though our
+  uuid4 generation in /agent-tap/pair never produces them. CodeRabbit on
+  PR #70 flagged the read/write asymmetry. When we tighten the schema,
+  drop the old partial index and add `(customer_id, device_id) WHERE
+  device_id IS NOT NULL`, then update `save_device_token`'s ON CONFLICT
+  target to match.
 """
 
 from __future__ import annotations
