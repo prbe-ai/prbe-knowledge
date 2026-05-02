@@ -11,11 +11,18 @@ Flow:
 Defensive recheck: even when Haiku says `mode=list`, we re-verify the gate
 locally. If a topic entity slipped through (Haiku misclassification under
 the new schema), we route to search instead. Trust-but-verify the LLM.
+
+The pipeline is split into two phases so the streaming endpoint
+(/query/stream) can emit progress events between them:
+    run_router_phase  → resolves entities + temporal + mode (Haiku call)
+    run_search_phase  → executes the chosen retrieval pipeline
+The non-streaming `run_retrieval` runs both back-to-back unchanged.
 """
 
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from fastapi import HTTPException
@@ -60,9 +67,29 @@ def _gate_verify_list(routed: RouterOutput, spec: TemporalSpec) -> bool:
     return not any(e.entity_type in TOPIC_ENTITY_TYPES for e in routed.entities)
 
 
-async def run_retrieval(req: QueryRequest, customer_id: str) -> QueryResponse:
-    """Run the full retrieval pipeline. The single entry point for the
-    /retrieve endpoint and (via /query) the synthesis layer."""
+@dataclass(slots=True)
+class RouterPhaseResult:
+    """Everything resolved before retrieval runs.
+
+    Streaming callers consume this between the `refining` and `searching`
+    stages so the UI can render extracted entities while retrieval is
+    still working. Mode dispatch (list vs search) is also baked in here
+    so the streaming endpoint doesn't have to re-derive it.
+    """
+
+    routed: RouterOutput
+    spec: TemporalSpec
+    temporal_meta: dict[str, object]
+    sort_meta: dict[str, object] | None
+    extracted_entities: list[dict[str, object]]
+    doc_types: list[str] | None
+    trace_id: str
+    timing: dict[str, float]
+    dispatch_mode: str  # "list" or "search" — already gate-verified
+
+
+async def run_router_phase(req: QueryRequest, customer_id: str) -> RouterPhaseResult:
+    """Run only the Haiku router + post-route resolution. No retrieval."""
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="empty query")
 
@@ -138,46 +165,12 @@ async def run_retrieval(req: QueryRequest, customer_id: str) -> QueryResponse:
     else:
         doc_types = resolve_doc_type_token(routed.doc_type, sources=req.sources)
 
-    # Mode dispatch with defensive recheck.
     routed_mode = (routed.mode or "search").lower()
-    if routed_mode == "list" and _gate_verify_list(routed, spec):
-        log.info(
-            "query.dispatch",
-            extra={
-                "trace_id": trace_id,
-                "mode": "list",
-                "doc_type": routed.doc_type,
-                "operation": routed.operation,
-                "router_mode": routed.mode,
-                "query_len": len(req.query),
-            },
-        )
-        return await run_list(
-            req=req,
-            customer_id=customer_id,
-            routed=routed,
-            spec=spec,
-            temporal_meta=temporal_meta,
-            sort_meta=sort_meta,
-            extracted_entities=extracted_entities,
-            doc_types=doc_types,
-            trace_id=trace_id,
-            timing=timing,
-        )
-
-    log.info(
-        "query.dispatch",
-        extra={
-            "trace_id": trace_id,
-            "mode": "search",
-            "doc_type": routed.doc_type,
-            "router_mode": routed.mode,
-            "query_len": len(req.query),
-        },
+    dispatch_mode = (
+        "list" if routed_mode == "list" and _gate_verify_list(routed, spec) else "search"
     )
-    return await run_search(
-        req=req,
-        customer_id=customer_id,
+
+    return RouterPhaseResult(
         routed=routed,
         spec=spec,
         temporal_meta=temporal_meta,
@@ -186,4 +179,65 @@ async def run_retrieval(req: QueryRequest, customer_id: str) -> QueryResponse:
         doc_types=doc_types,
         trace_id=trace_id,
         timing=timing,
+        dispatch_mode=dispatch_mode,
     )
+
+
+async def run_search_phase(
+    req: QueryRequest, customer_id: str, phase: RouterPhaseResult
+) -> QueryResponse:
+    """Run the chosen retrieval pipeline (list or search) given a router result."""
+    if phase.dispatch_mode == "list":
+        log.info(
+            "query.dispatch",
+            extra={
+                "trace_id": phase.trace_id,
+                "mode": "list",
+                "doc_type": phase.routed.doc_type,
+                "operation": phase.routed.operation,
+                "router_mode": phase.routed.mode,
+                "query_len": len(req.query),
+            },
+        )
+        return await run_list(
+            req=req,
+            customer_id=customer_id,
+            routed=phase.routed,
+            spec=phase.spec,
+            temporal_meta=phase.temporal_meta,
+            sort_meta=phase.sort_meta,
+            extracted_entities=phase.extracted_entities,
+            doc_types=phase.doc_types,
+            trace_id=phase.trace_id,
+            timing=phase.timing,
+        )
+
+    log.info(
+        "query.dispatch",
+        extra={
+            "trace_id": phase.trace_id,
+            "mode": "search",
+            "doc_type": phase.routed.doc_type,
+            "router_mode": phase.routed.mode,
+            "query_len": len(req.query),
+        },
+    )
+    return await run_search(
+        req=req,
+        customer_id=customer_id,
+        routed=phase.routed,
+        spec=phase.spec,
+        temporal_meta=phase.temporal_meta,
+        sort_meta=phase.sort_meta,
+        extracted_entities=phase.extracted_entities,
+        doc_types=phase.doc_types,
+        trace_id=phase.trace_id,
+        timing=phase.timing,
+    )
+
+
+async def run_retrieval(req: QueryRequest, customer_id: str) -> QueryResponse:
+    """Run the full retrieval pipeline. The single entry point for the
+    /retrieve endpoint and (via /query) the synthesis layer."""
+    phase = await run_router_phase(req, customer_id)
+    return await run_search_phase(req, customer_id, phase)

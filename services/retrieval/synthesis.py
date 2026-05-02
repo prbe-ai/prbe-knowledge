@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -122,6 +123,25 @@ Hard rules:
 """
 
 
+# Streaming variant: no forced tool call (the Anthropic streaming API for
+# tool-input-delta is fragile to parse incrementally). Plain text out, with
+# `<<INSUFFICIENT>>` as a sentinel the caller strips after the stream ends.
+_STREAMING_SYSTEM_PROMPT = """You are a careful retrieval-augmented assistant. Answer the user's
+question using ONLY the chunks you've been given.
+
+Hard rules:
+- Use ONLY information present in the chunks. Do not invent facts.
+- Every sentence that makes a claim must end with at least one [chunk:N].
+- If the chunks don't support a confident answer, START your reply with the
+  literal token <<INSUFFICIENT>> on its own line, then a one-line
+  explanation of what's missing. Do not fabricate.
+- Be concise. 1-3 short paragraphs. No preamble.
+- Markdown formatting (bold, italic, code) is fine when it helps clarity.
+"""
+
+_INSUFFICIENT_SENTINEL = "<<INSUFFICIENT>>"
+
+
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -175,6 +195,118 @@ async def synthesize(
         insufficient_context=bool(parsed.get("insufficient_context", False)),
         model=model,
         raw_provider_response=json.dumps(parsed, default=str)[:4000],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streaming synthesis (Anthropic only) — used by /query/stream
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class StreamDelta:
+    """A piece of generated text from the model."""
+
+    text: str
+
+
+@dataclass(slots=True)
+class StreamFinal:
+    """End-of-stream payload: parsed final answer + extracted citations.
+
+    Emitted exactly once after all StreamDeltas. The streaming endpoint
+    converts this into the SSE `done` event so the UI can swap its
+    in-flight buffer for the canonical answer + citation list.
+    """
+
+    answer: str
+    citations: list[dict[str, object]]
+    insufficient_context: bool
+    model: str
+
+
+async def synthesize_stream(
+    query: str,
+    chunks: list[SynthesisChunk],
+    model: str,
+    max_tokens: int = 600,
+) -> AsyncIterator[StreamDelta | StreamFinal]:
+    """Streaming variant of `synthesize`.
+
+    Yields StreamDelta(...) for each token chunk, then exactly one
+    StreamFinal(...) with the parsed answer + citations.
+
+    Anthropic only today — streaming through OpenAI/Google can be added
+    later if we expose those models in the synthesis dropdown. The
+    `synthesize` (non-streaming) path still supports all three.
+    """
+    if not chunks:
+        yield StreamFinal(
+            answer="No chunks were retrieved for this query, so there's nothing to summarize.",
+            citations=[],
+            insufficient_context=True,
+            model=model,
+        )
+        return
+
+    if model not in SYNTHESIS_MODELS:
+        raise SynthesisError(
+            f"unsupported synthesis model: {model}. Allowed: {sorted(SYNTHESIS_MODELS)}"
+        )
+    provider_name = SYNTHESIS_MODELS[model]
+    if provider_name != "anthropic":
+        raise SynthesisError(
+            f"streaming synthesis only supports Anthropic models today (got {provider_name})"
+        )
+    model_id = model.split("/", 1)[1]
+
+    user_prompt = _format_user_prompt(query, chunks)
+
+    from anthropic import APIError, AsyncAnthropic
+
+    api_key = get_settings().anthropic_api_key.get_secret_value()
+    if not api_key:
+        raise SynthesisError("ANTHROPIC_API_KEY not configured")
+    client = AsyncAnthropic(api_key=api_key, timeout=SYNTHESIS_TIMEOUT_SECONDS)
+
+    accumulated = ""
+    try:
+        async with client.messages.stream(
+            model=model_id,
+            max_tokens=max_tokens,
+            system=_STREAMING_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_prompt}],
+        ) as stream:
+            async for text in stream.text_stream:
+                if not text:
+                    continue
+                accumulated += text
+                yield StreamDelta(text=text)
+    except APIError as exc:
+        raise SynthesisError(f"anthropic api error: {exc}") from exc
+
+    # Detect the insufficient-context sentinel and strip it before parsing
+    # citations. Models occasionally emit it lowercased or with surrounding
+    # whitespace — be tolerant.
+    raw = accumulated.strip()
+    insufficient = False
+    cleaned = raw
+    if raw.upper().startswith(_INSUFFICIENT_SENTINEL):
+        insufficient = True
+        cleaned = raw[len(_INSUFFICIENT_SENTINEL) :].lstrip(" \t\r\n:-")
+    else:
+        # Heuristic fallback for models that ignore the sentinel rule.
+        lowered = raw.lower()
+        if any(marker in lowered for marker in _INSUFFICIENT_MARKERS) and len(raw) < 200:
+            insufficient = True
+
+    answer = normalize_citations_in_answer(cleaned)
+    citations = _extract_citations(answer, chunks, declared=None)
+    yield StreamFinal(
+        answer=answer,
+        citations=citations,
+        insufficient_context=insufficient,
+        model=model,
     )
 
 
