@@ -75,13 +75,21 @@ class ScenarioSpec:
     """One instance of an archetype producing one or more DocSpecs."""
     id: str
     archetype_name: str
-    instance_ts: datetime
+    instance_ts: datetime | None
     cast: tuple[str, ...]           # canonical_ids in this scenario
     affected_services: tuple[str, ...]
-    doc_specs: tuple[DocSpec, ...]
+    doc_specs: tuple[DocSpec, ...] = ()
     title: str | None = None
     summary: str | None = None
     root_cause: str | None = None
     decision: str | None = None
     outcome: str | None = None
+    affected_repos: tuple[str, ...] = ()
+    timeline: tuple = ()           # tuple[TimelineEvent, ...] — typed at call site
+    source_emissions: dict = None  # type: ignore[assignment]  — defaults to {} via __post_init__
     eval_questions: tuple = ()   # tuple[EvalQuestion, ...] — typed at call site to avoid circular import
+
+    def __post_init__(self) -> None:
+        # frozen dataclasses can't assign via self.x = ...; use object.__setattr__
+        if self.source_emissions is None:
+            object.__setattr__(self, "source_emissions", {})
