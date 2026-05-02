@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import signal
 from datetime import UTC, datetime
 
 import asyncpg
@@ -725,14 +726,55 @@ async def run_worker_forever() -> None:
         health_port=health_port,
         timestamp=datetime.now(UTC).isoformat(),
     )
+
+    # Signal-driven graceful shutdown. On SIGTERM (fly stop / rolling deploy)
+    # or SIGINT, we:
+    #   1. Set _shutdown on each loop so they stop claiming new work.
+    #   2. Tell uvicorn to drain in-flight HTTP requests.
+    #   3. Cancel the gather. CancelledError propagates into BackfillWorker.run's
+    #      `await run_backfill(...)`; run_backfill's CancelledError handler
+    #      releases its backfill_state claim (status -> pending, last_cursor
+    #      preserved) before re-raising. Without this, deploys leave rows
+    #      in 'running' until the 5-min reclaim cron sweeps them.
+    loop = asyncio.get_running_loop()
+    gather_future: asyncio.Future | None = None  # type: ignore[type-arg]
+    shutdown_started = False
+
+    def handle_signal(signame: str) -> None:
+        nonlocal shutdown_started
+        if shutdown_started:
+            return
+        shutdown_started = True
+        log.info("worker.shutdown_signal", signal=signame)
+        ingestion_worker.shutdown()
+        backfill_worker.shutdown()
+        granola_listener.shutdown()
+        reclaim_loop.shutdown()
+        health_server.should_exit = True
+        if gather_future is not None and not gather_future.done():
+            gather_future.cancel()
+
+    for signame in ("SIGTERM", "SIGINT"):
+        with contextlib.suppress(NotImplementedError):
+            # Some platforms (Windows, sandboxed environments) don't support
+            # add_signal_handler; on those, the default Python signal behavior
+            # (KeyboardInterrupt for SIGINT, terminate for SIGTERM) applies.
+            loop.add_signal_handler(
+                getattr(signal, signame), handle_signal, signame
+            )
+
     try:
-        await asyncio.gather(
+        gather_future = asyncio.gather(
             ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
             backfill_worker.run(),
             granola_listener.run(),
             reclaim_loop.run(),
             health_server.serve(),
         )
+        try:
+            await gather_future
+        except asyncio.CancelledError:
+            log.info("worker.shutdown_complete")
     finally:
         await ctx.http.aclose()
 

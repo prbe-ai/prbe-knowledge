@@ -246,6 +246,29 @@ async def run_backfill(
             enqueued=enqueued,
         )
         counter("backfill.preempted", 1, source=source.value)
+    except asyncio.CancelledError:
+        # Process is shutting down (SIGTERM during a deploy) mid-backfill.
+        # Release the claim now so the next worker resumes from `last_cursor`
+        # within seconds, rather than waiting for the 5-min stale-heartbeat
+        # reclaim cron. The asyncpg call inside the handler runs to completion
+        # because asyncio.gather hasn't torn down yet — it's still waiting on
+        # this task to exit.
+        log.warning(
+            "backfill.released_on_cancel",
+            customer=customer_id,
+            source=source.value,
+            enqueued=enqueued,
+        )
+        counter("backfill.released_on_cancel", 1, source=source.value)
+        try:
+            await _release_for_resume(customer_id, source, claim_token)
+        except Exception:
+            log.exception(
+                "backfill.release_on_cancel_failed",
+                customer=customer_id,
+                source=source.value,
+            )
+        raise
     except Exception as exc:
         # Pass exc so _mark_failed can detect PermanentSourceError(401/403)
         # raised by a connector mid-backfill (e.g. Granola key revoked) and
@@ -336,6 +359,46 @@ async def enqueue_backfill(customer_id: str, source: SourceSystem) -> None:
             source.value,
             BackfillStatus.PENDING.value,
         )
+
+
+async def _release_for_resume(
+    customer_id: str,
+    source: SourceSystem,
+    claim_token: datetime,
+) -> bool:
+    """Flip the row back to 'pending' so the next worker resumes immediately.
+
+    Used when this process is shutting down mid-backfill (SIGTERM during a
+    rolling deploy). Releasing the claim now means the next worker can
+    re-claim within seconds instead of waiting for the 5-min stale-heartbeat
+    reclaim threshold.
+
+    Fenced on (status='running' AND started_at = claim_token) so we don't
+    clobber a row that was already reclaimed or re-claimed by a competing
+    worker. last_cursor and events_enqueued are preserved so the resume
+    continues exactly where we stopped.
+
+    Returns True if a row was released, False if already preempted / not ours.
+    """
+    async with raw_conn() as conn:
+        tag = await conn.execute(
+            """
+            UPDATE backfill_state
+            SET status       = $1,
+                started_at   = NULL,
+                heartbeat_at = NULL
+            WHERE customer_id   = $2
+              AND source_system = $3
+              AND status        = $4
+              AND started_at    = $5
+            """,
+            BackfillStatus.PENDING.value,
+            customer_id,
+            source.value,
+            BackfillStatus.RUNNING.value,
+            claim_token,
+        )
+    return _affected(tag) > 0
 
 
 async def re_enqueue_for_polling(customer_id: str, source: SourceSystem) -> bool:
