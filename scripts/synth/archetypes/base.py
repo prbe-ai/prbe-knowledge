@@ -52,6 +52,8 @@ class Archetype:
     cast_size: tuple[int, int]       # (min, max) personas per scenario
     needs_planner_call: bool         # False for all Plan 2 archetypes
     validator_level: ValidatorLevel  # NAME_ONLY for all Plan 2 archetypes
+    eval_question_count: int = 0
+    spec_template_path: str | None = None
 
 
 @dataclass(frozen=True)
