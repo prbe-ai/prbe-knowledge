@@ -166,15 +166,13 @@ async def verify_device_token(
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT customer_id, device_id, status, device_metadata
+            SELECT customer_id, device_id, status, device_metadata, source_system
             FROM integration_tokens
             WHERE webhook_secret = $1
-              AND source_system = $2
               AND device_id IS NOT NULL
             LIMIT 1
             """,
             body.token_hash,
-            SourceSystem.CLAUDE_CODE.value,
         )
     if row is None:
         raise HTTPException(status_code=401, detail="unknown device token")

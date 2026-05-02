@@ -337,3 +337,28 @@ async def test_register_device_defaults_source_to_claude_code(
         )
     assert row is not None
     assert row["source_system"] == "claude_code"
+
+
+@pytest.mark.asyncio
+async def test_verify_token_finds_codex_device(client: httpx.AsyncClient) -> None:
+    """A device registered with source=codex must verify via /verify-token."""
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": "codex-dev-1",
+            "token_hash": "c" * 64,
+            "source": "codex",
+            "hostname": "h",
+        },
+        headers=_hdr(),
+    )
+    resp = await client.post(
+        "/api/devices/verify-token",
+        json={"token_hash": "c" * 64},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["device_id"] == "codex-dev-1"
