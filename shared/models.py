@@ -290,6 +290,18 @@ class QueryRequest(BaseModel):
             "higher (e.g. 0.9) only filters on dead-certain entities."
         ),
     )
+    min_confidence: str | None = Field(
+        default="INFERRED",
+        description=(
+            "Floor for graph-edge confidence tier when joining graph "
+            "neighbors into the result set. Values: 'EXTRACTED' (only "
+            "deterministic edges), 'INFERRED' (default — drops AMBIGUOUS), "
+            "'AMBIGUOUS' or null (include everything; debug mode). "
+            "Filters edges produced by code-graph (PR-A) and Graphify "
+            "(PR-B); has no effect on retrievers that don't traverse "
+            "the graph (vector / BM25)."
+        ),
+    )
 
 
 def normalize_author_id(value: str | None) -> str | None:
@@ -307,6 +319,21 @@ def normalize_author_id(value: str | None) -> str | None:
     return value
 
 
+class GraphEvidence(BaseModel):
+    """Per-chunk hint that a graph traversal anchored this chunk's surfacing.
+
+    Populated only when a chunk reached the result set via the graph
+    retriever; left null on chunks that surfaced via vector / BM25 alone.
+    Lets MCP / dashboard consumers filter on confidence tier without
+    re-running the retrieval.
+    """
+
+    edge_type: str
+    confidence: str  # EXTRACTED | INFERRED | AMBIGUOUS
+    via_entity: str
+    reason: str | None = None
+
+
 class QueryChunk(BaseModel):
     chunk_id: str
     doc_id: str
@@ -318,6 +345,7 @@ class QueryChunk(BaseModel):
     source_url: str
     title: str | None
     content: str
+    graph_evidence: GraphEvidence | None = None
     # Raw author identifier from the source system: GitHub login (`mahit`),
     # commit-author email when no GitHub login resolved (`mahit@prbe.ai`),
     # Slack user id (`U07ABC123`), Linear user id (`user_a3f9`), etc.
@@ -332,6 +360,25 @@ class QueryChunk(BaseModel):
     retriever_scores: dict[str, float] = Field(default_factory=dict)
 
 
+class QueryBundle(BaseModel):
+    """Entity-keyed grouping of related chunks. New in code-graph PR-A.
+
+    For multi-entity / entity-bag queries (the dominant MCP access pattern
+    per `project_mcp_entity_bag_queries.md`), the graph retriever can
+    return chunks grouped by their seeding entity instead of flat top-k.
+    Dashboard NL consumers can ignore this field; MCP consumers prefer it.
+
+    `confidence_breakdown` is a count of edges per tier, so consumers can
+    decide whether the bundle is worth surfacing without re-walking the
+    chunks themselves.
+    """
+
+    seed_entity: str  # canonical_id of the seeding node (e.g., "prbe-ai/prbe-knowledge:Normalizer.process_queue_row")
+    seed_label: str   # NodeLabel for the seed (e.g., "Method")
+    related_chunk_ids: list[str] = Field(default_factory=list)
+    confidence_breakdown: dict[str, int] = Field(default_factory=dict)
+
+
 class QueryResponse(BaseModel):
     query: str
     chunks: list[QueryChunk]
@@ -342,10 +389,14 @@ class QueryResponse(BaseModel):
     applied_entity_filter: dict[str, object] | None = None
     applied_mode: str | None = None
     applied_doc_types: list[str] | None = None
+    applied_min_confidence: str | None = None
     extracted_entities: list[dict[str, object]] = Field(default_factory=list)
     aggregation: dict[str, object] | None = None
     timing_ms: dict[str, float] = Field(default_factory=dict)
     trace_id: str
+    # Code-graph PR-A: entity-keyed groupings for MCP entity-bag queries.
+    # Null on dashboard NL responses.
+    bundles: list[QueryBundle] | None = None
 
 
 class AnswerRequest(QueryRequest):
