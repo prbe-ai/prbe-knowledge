@@ -324,8 +324,11 @@ WIKI_SYNTHESIS_CLAIM_BATCH = 200
 WIKI_TRIAGE_TOKEN_BUDGET = 120_000
 
 # Importance threshold for triage to keep an event. Below this score the row
-# is marked 'rejected' and never reaches synthesis.
-WIKI_TRIAGE_SCORE_THRESHOLD = 5.0
+# is marked 'rejected' and never reaches synthesis. Raised from 5.0 → 7.0
+# to align triage with the wiki's actual scope (slow-moving company
+# knowledge, not a per-event log). Step down stepwise (7.0 → 6.0 → 5.0)
+# if the wiki is under-populated; step up if it gets spammy.
+WIKI_TRIAGE_SCORE_THRESHOLD = 7.0
 
 # Per-row attempt cap before a queue row is parked in 'failed'.
 WIKI_SYNTHESIS_MAX_ATTEMPTS = 3
@@ -333,3 +336,29 @@ WIKI_SYNTHESIS_MAX_ATTEMPTS = 3
 # Defensive periodic wake interval. The cron also wakes on every NOTIFY; this
 # is a safety net if a notify is missed during a connection drop.
 WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
+
+# Provider knobs. Each stage independently picks a provider via env var so
+# we can flip triage to Gemini Flash Lite for cost without touching
+# synthesis, or vice versa. Defaults are Anthropic (current behavior).
+#   "haiku"    | "claude-haiku"           → Anthropic Haiku 4.5
+#   "sonnet"   | "claude-sonnet"          → Anthropic Sonnet 4.6
+#   "gemini-flash-lite" | "gemini-flash-lite-preview" → Gemini Flash Lite
+#   "gemini-pro" | "gemini-3.1-pro-preview"          → Gemini 3.1 Pro Preview
+WIKI_TRIAGE_MODEL = "haiku"
+WIKI_SYNTHESIS_MODEL = "sonnet"
+WIKI_VERIFIER_MODEL = "sonnet"
+
+# Verifier stage: per-cluster sanity check between triage and synthesize.
+# Inputs are the existing page body + the cluster of triaged events.
+# Output is `kept_doc_ids[]`; empty kept set → mark queue rows
+# 'verifier_rejected' (terminal, distinct from 'done' so audit queries can
+# tell verifier-reject and synthesized apart).
+WIKI_SYNTHESIS_VERIFIER_BUDGET_TOKENS = 60_000
+
+# Tier-jump guard: Gemini 3.1 Pro Preview pricing is $2/$12 ≤200K tokens,
+# $4/$18 >200K. Capping cluster events keeps every synthesize call in the
+# cheaper tier. The synthesis worker truncates oldest events past the cap
+# before building SynthesisInput; dropped events still mark 'done' with a
+# synthesis_error noting the truncation.
+WIKI_SYNTHESIS_CLUSTER_MAX_EVENTS = 10
+WIKI_SYNTHESIS_CLUSTER_MAX_TOKENS = 180_000

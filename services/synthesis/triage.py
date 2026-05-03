@@ -1,33 +1,42 @@
-"""Triage stage — Haiku call + token-budget batching.
+"""Triage stage — token-budget batching + provider-dispatched call.
 
 Inputs are full document bodies, never chunks: triage decides whether a doc
 is wiki-worthy, and that judgment requires reading the whole document, not
-retrieval-chunked windows. See plan §3.
+retrieval-chunked windows.
 
 Public surface:
-- `pack_into_batches(events, budget)` — pure function, used by the cron and
-  by tests.
-- `call_triage(client, events, *, now)` — fires one Haiku tool-use call,
-  validates the response against `TriageOutput`.
+- `pack_into_batches(events, budget)` — pure function, used by the worker
+  and by tests.
+- `call_triage(client, events, *, now)` — fires one batch via the
+  configured provider (Anthropic Haiku by default, Gemini Flash Lite if
+  `WIKI_TRIAGE_MODEL` env var flips it). The function signature stays
+  Anthropic-shaped (takes `client`) for call-site compatibility — when
+  the provider is Gemini, `client` is unused.
+- `TriageParseError` — re-exported from `providers` so existing call sites
+  importing it from this module still work.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
 
 from anthropic import AsyncAnthropic
 
 from services.synthesis.models import TriageInput, TriageOutput
-from services.synthesis.prompts import build_triage_prompt, triage_tool_name
-from shared.constants import HAIKU_MODEL, WIKI_TRIAGE_TOKEN_BUDGET
+from services.synthesis.providers import (
+    TriageParseError,
+    get_triage_provider,
+)
+from shared.constants import WIKI_TRIAGE_TOKEN_BUDGET
 from shared.logging import get_logger
 
+__all__ = [
+    "TriageParseError",
+    "call_triage",
+    "pack_into_batches",
+]
+
 log = get_logger(__name__)
-
-
-class TriageParseError(RuntimeError):
-    """Haiku returned a tool_use block we couldn't parse into TriageOutput."""
 
 
 def pack_into_batches(
@@ -65,28 +74,14 @@ async def call_triage(
     *,
     now: datetime,
 ) -> TriageOutput:
-    """Fire one Haiku call for one batch and return the validated output.
+    """Fire one triage call for one batch and return the validated output.
+
+    Dispatches to the configured provider (Anthropic Haiku or Gemini
+    Flash Lite). The Anthropic `client` is only used when the configured
+    provider is Anthropic; passed through for caller compatibility.
 
     Raises `TriageParseError` if the model didn't return the expected
-    tool_use block or the input dict failed Pydantic validation.
+    structured output.
     """
-    if not events:
-        return TriageOutput(verdicts={})
-
-    kwargs = build_triage_prompt(events, now=now)
-    resp = await client.messages.create(model=HAIKU_MODEL, **kwargs)
-    payload = _extract_tool_input(resp.content, expected_name=triage_tool_name())
-    try:
-        return TriageOutput(**payload)
-    except Exception as exc:
-        raise TriageParseError(f"triage tool input failed validation: {exc}") from exc
-
-
-def _extract_tool_input(blocks: list[Any], *, expected_name: str) -> dict[str, Any]:
-    for block in blocks:
-        if getattr(block, "type", "") == "tool_use" and getattr(block, "name", "") == expected_name:
-            payload = getattr(block, "input", None)
-            if isinstance(payload, dict):
-                return payload
-            raise TriageParseError(f"tool_use input was not a dict: {type(payload).__name__}")
-    raise TriageParseError(f"haiku response had no {expected_name} tool_use block")
+    provider = get_triage_provider(client)
+    return await provider.triage(events, now=now)

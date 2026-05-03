@@ -95,3 +95,51 @@ class SynthesisOutput(BaseModel):
         max_length=240,
         description="One-line audit message describing what changed and why.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Verifier — between triage and synthesize
+# ---------------------------------------------------------------------------
+
+
+class VerifierInput(BaseModel):
+    """One cluster of triaged events the verifier should sanity-check before
+    synthesis. Same shape as `SynthesisInput`; deliberately separate so the
+    verifier's tool schema can evolve independently.
+    """
+
+    wiki_type: Literal["service_card", "decision", "feature", "runbook"]
+    slug: str
+    action: Literal["create", "update"]
+    current_title: str | None = None
+    current_body: str | None = None
+    current_summary: str | None = None
+    events: list[TriageInput] = Field(min_length=1)
+
+
+class VerifierOutput(BaseModel):
+    """Per-cluster verifier verdict.
+
+    `kept_doc_ids` is the subset of events that the verifier judges
+    actually changes the page. Empty list → cluster is rejected (queue
+    rows land in `status='verifier_rejected'`, no synthesize call fires).
+    Non-empty → synthesis worker filters cluster.events to `kept_doc_ids`
+    before invoking synthesize.
+    """
+
+    kept_doc_ids: list[str] = Field(default_factory=list)
+    rationale_per_doc: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Per-doc-id one-line rationale. Audit trail for tuning the "
+            "verifier prompt without touching triage."
+        ),
+    )
+    drop_reason: str | None = Field(
+        default=None,
+        description=(
+            "When kept_doc_ids is empty, one short sentence explaining why "
+            "the cluster doesn't change the page (recorded as the queue "
+            "row's synthesis_error for audit)."
+        ),
+    )
