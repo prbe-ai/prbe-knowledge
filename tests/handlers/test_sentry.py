@@ -10,10 +10,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
-from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -75,7 +74,10 @@ def _make_oauth_ctx(
     def handler(request: httpx.Request) -> httpx.Response:
         if requests is not None:
             requests.append(request)
-        assert str(request.url) == "https://sentry.io/oauth/token/"
+        assert (
+            str(request.url)
+            == "https://sentry.io/api/0/sentry-app-installations/install-uuid/authorizations/"
+        )
         if isinstance(body, str):
             return httpx.Response(status_code, text=body)
         return httpx.Response(status_code, json=body)
@@ -192,40 +194,33 @@ async def test_exchange_oauth_code_success() -> None:
     ctx = _make_oauth_ctx(
         200,
         {
-            "access_token": "sntrys_access",
-            "refresh_token": "sntrys_refresh",
-            "expires_in": 3600,
+            "token": "sntrys_access",
+            "refreshToken": "sntrys_refresh",
+            "expiresAt": "2026-05-03T10:30:00Z",
             "scope": "org:read project:read event:read project:releases",
         },
         requests=requests,
     )
     sentry = build_connector(SourceSystem.SENTRY, ctx)
 
-    before = datetime.now(UTC)
     token = await sentry.exchange_oauth_code(
         code="auth-code",
         redirect_uri="https://api.prbe.ai/oauth/sentry/callback",
+        extra_params={"installation_id": "install-uuid"},
     )
-    after = datetime.now(UTC)
 
     assert token.source_system == SourceSystem.SENTRY
     assert token.access_token == "sntrys_access"
     assert token.refresh_token == "sntrys_refresh"
     assert token.scope == "org:read project:read event:read project:releases"
-    assert token.expires_at is not None
-    assert (
-        before + timedelta(seconds=3590)
-        <= token.expires_at
-        <= after + timedelta(seconds=3610)
-    )
+    assert token.expires_at == datetime(2026, 5, 3, 10, 30, tzinfo=UTC)
 
     assert len(requests) == 1
-    form = parse_qs(requests[0].content.decode())
-    assert form["grant_type"] == ["authorization_code"]
-    assert form["client_id"] == ["sentry-cid"]
-    assert form["client_secret"] == ["sentry-secret"]
-    assert form["code"] == ["auth-code"]
-    assert form["redirect_uri"] == ["https://api.prbe.ai/oauth/sentry/callback"]
+    request_body = json.loads(requests[0].content.decode())
+    assert request_body["grant_type"] == "authorization_code"
+    assert request_body["client_id"] == "sentry-cid"
+    assert request_body["client_secret"] == "sentry-secret"
+    assert request_body["code"] == "auth-code"
 
 
 @pytest.mark.asyncio
@@ -237,6 +232,7 @@ async def test_exchange_oauth_code_5xx_raises_transient() -> None:
         await sentry.exchange_oauth_code(
             code="auth-code",
             redirect_uri="https://api.prbe.ai/oauth/sentry/callback",
+            extra_params={"installation_id": "install-uuid"},
         )
 
     assert exc_info.value.context["status"] == 503
@@ -252,6 +248,7 @@ async def test_exchange_oauth_code_4xx_raises_permanent() -> None:
         await sentry.exchange_oauth_code(
             code="auth-code",
             redirect_uri="https://api.prbe.ai/oauth/sentry/callback",
+            extra_params={"installation_id": "install-uuid"},
         )
 
     assert exc_info.value.context["status"] == 400
@@ -260,16 +257,31 @@ async def test_exchange_oauth_code_4xx_raises_permanent() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_oauth_code_missing_access_token_raises_permanent() -> None:
-    ctx = _make_oauth_ctx(200, {"refresh_token": "refresh-only"})
+    ctx = _make_oauth_ctx(200, {"refreshToken": "refresh-only"})
     sentry = build_connector(SourceSystem.SENTRY, ctx)
 
     with pytest.raises(PermanentSourceError) as exc_info:
         await sentry.exchange_oauth_code(
             code="auth-code",
             redirect_uri="https://api.prbe.ai/oauth/sentry/callback",
+            extra_params={"installation_id": "install-uuid"},
         )
 
-    assert "missing access_token" in str(exc_info.value)
+    assert "missing token" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_requires_installation_id() -> None:
+    ctx = _make_oauth_ctx(200, {"token": "sntrys_access"})
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+
+    with pytest.raises(InvalidWebhookPayload) as exc_info:
+        await sentry.exchange_oauth_code(
+            code="auth-code",
+            redirect_uri="https://api.prbe.ai/oauth/sentry/callback",
+        )
+
+    assert "missing installationId" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
