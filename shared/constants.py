@@ -22,6 +22,7 @@ class SourceSystem(StrEnum):
     # external webhook. doc_class distinguishes human authorship (MANUAL_ENTRY)
     # from agent-compiled summaries (COMPILED_WIKI).
     WIKI = "wiki"
+    CODE_GRAPH = "code_graph"
 
 
 class DocClass(StrEnum):
@@ -72,6 +73,7 @@ class DocType(StrEnum):
     # Auto-generated table of contents. Exactly one per customer; regenerated
     # at the end of each synthesis run from the live set of wiki pages.
     WIKI_INDEX = "wiki.index"
+    CODE_SYMBOL = "code.symbol"
 
 
 # DocTypes that count as "wiki pages" for index/listing purposes — the union
@@ -119,6 +121,12 @@ class NodeLabel(StrEnum):
     FIX_ARTIFACT = "FixArtifact"
     VERIFICATION_RESULT = "VerificationResult"
 
+    MODULE = "Module"
+    FUNCTION = "Function"
+    CLASS = "Class"
+    METHOD = "Method"
+    SYMBOL = "Symbol"
+
 
 class EdgeType(StrEnum):
     OWNS = "OWNS"
@@ -140,6 +148,13 @@ class EdgeType(StrEnum):
     ASSIGNED_TO = "ASSIGNED_TO"
     COMPILED_FROM = "COMPILED_FROM"
     DESCRIBES = "DESCRIBES"
+
+    CALLS = "CALLS"
+    IMPORTS = "IMPORTS"
+    INHERITS = "INHERITS"
+    IMPLEMENTS = "IMPLEMENTS"
+    REFERENCES = "REFERENCES"
+    DEFINED_IN = "DEFINED_IN"
 
 
 class PrincipalType(StrEnum):
@@ -278,6 +293,10 @@ SOURCE_INGESTION_PRIORITY: dict[SourceSystem, int] = {
     # webhooks at the queue claim layer.
     SourceSystem.CODEX: 75,
     SourceSystem.CUSTOM_INGEST: 75,
+    # CODE_GRAPH is bursty (initial-backfill batches) and search-indexable,
+    # not user-facing latency-critical — sits in the same tier as backfill
+    # rows so a large repo onboarding can't block live webhooks.
+    SourceSystem.CODE_GRAPH: 50,
 }
 
 TOP_K_VECTOR = 50
@@ -324,6 +343,9 @@ SOURCE_HALF_LIFE_DAYS: dict[SourceSystem, float] = {
     # CODEX transcripts are scratchpads with the same staleness curve as
     # CLAUDE_CODE — both lose relevance fast as authored docs catch up.
     SourceSystem.CODEX: 7.0,
+    # Code symbols decay slower than CC/Codex transcripts (a function still
+    # exists weeks later) but faster than authored docs (refactors happen).
+    SourceSystem.CODE_GRAPH: 30.0,
 }
 
 # Prefix used in `integration_tokens.scope` to signal the row represents a
