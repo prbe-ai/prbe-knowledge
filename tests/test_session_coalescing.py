@@ -329,15 +329,23 @@ async def test_full_session_body_has_events_from_all_batches(live_db, monkeypatc
 
     assert outcome.doc_ids, "expected at least one document"
 
-    # The session document's body (from metadata.body, the chunkable text
-    # rendering of merged events) must contain markers from ALL three
-    # batches. Pre-coalescing only the latest batch's content survived.
+    # The session document's body (joined from live content chunks, the
+    # canonical source of truth post-storage-cleanup) must contain markers
+    # from ALL three batches. Pre-coalescing only the latest batch's content
+    # survived.
     async with db_module.raw_conn() as conn:
-        body = await conn.fetchval(
-            "SELECT metadata->>'body' FROM documents "
+        doc_id = await conn.fetchval(
+            "SELECT doc_id FROM documents "
             "WHERE customer_id=$1 AND doc_type='claude_code.session' "
             "AND valid_to IS NULL",
             customer,
+        )
+        body = await conn.fetchval(
+            "SELECT string_agg(content, '' ORDER BY chunk_index) "
+            "FROM chunks WHERE customer_id=$1 AND doc_id=$2 "
+            "AND kind = 'content' AND valid_to IS NULL",
+            customer,
+            doc_id,
         )
 
     assert body is not None

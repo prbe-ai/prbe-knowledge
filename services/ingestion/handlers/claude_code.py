@@ -530,8 +530,8 @@ class ClaudeCodeConnector(Connector):
         complete: bool,
         now: datetime,
     ) -> Document:
-        body_str = orjson.dumps({"events": events}).decode("utf-8")
-        body_bytes = body_str.encode("utf-8")
+        rendered_body = _events_to_text(events)
+        body_bytes = rendered_body.encode("utf-8")
         content_hash = hashlib.sha256(body_bytes).hexdigest()
         doc_id = f"{self._doc_id_prefix}:{event.customer_id}:{session_id}"
         first_content = ""
@@ -565,12 +565,16 @@ class ClaudeCodeConnector(Connector):
                 "device_id": event.raw_payload.get("device_id"),
                 "session_complete": complete,
                 "event_count": len(events),
-                # `body` drives Normalizer._stringify_body → chunker.
-                # Surface a human-readable rendering of the merged events so
-                # full-session retrieval works (every other connector follows
-                # the same metadata["body"] convention).
-                "body": _events_to_text(events),
             },
+            # Body drives Normalizer._stringify_body -> chunker. Lives on the
+            # transient Document.body field, never on metadata jsonb.
+            body=rendered_body,
+            # Coalesce in-place while the session is still incomplete: each
+            # tick UPDATEs the live row instead of opening a new SCD2 version.
+            # Without this, a 5-tick session writes 5 doc rows + 5 chunk
+            # versions for the same conversation. See migration 0036 for the
+            # one-time cleanup that prunes the prior accumulation.
+            coalesce_into_live=not complete,
             acl=self._acl(employee_id),
         )
 
@@ -611,10 +615,11 @@ class ClaudeCodeConnector(Connector):
             valid_from=now,
             ingested_at=now,
             parent_doc_id=parent.doc_id,
-            # `body` drives Normalizer._stringify_body → chunker. Without it,
+            metadata=dict(metadata),
+            # body drives Normalizer._stringify_body -> chunker. Without it,
             # only the 200-char preview gets indexed and the unit's full
             # content (Q+A, code change, decision text, file ref) is lost.
-            metadata={**metadata, "body": body},
+            body=body,
             acl=parent.acl,
         )
 
