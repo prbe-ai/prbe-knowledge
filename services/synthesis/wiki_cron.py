@@ -147,12 +147,20 @@ class WikiSynthesisCron:
     async def _tick(self, *, woken_by_notify: bool) -> None:
         if self._shutdown.is_set():
             return
+        # Defense-in-depth opt-in gate: only drain customers whose
+        # `preferences->>'wiki_generation_enabled'` is explicitly true.
+        # The Normalizer enqueue path is gated too, but a tenant who
+        # toggled the flag off after enqueue could leave 'pending' rows
+        # behind — those must NOT drain. JSONB path-text comparison
+        # avoids casting a missing key (NULL) through ::boolean.
         async with raw_conn() as conn:
             rows = await conn.fetch(
                 """
-                SELECT DISTINCT customer_id
-                FROM wiki_synthesis_queue
-                WHERE status = 'pending'
+                SELECT DISTINCT q.customer_id
+                FROM wiki_synthesis_queue q
+                JOIN customers c ON c.customer_id = q.customer_id
+                WHERE q.status = 'pending'
+                  AND c.preferences->>'wiki_generation_enabled' = 'true'
                 """
             )
         customer_ids = [row["customer_id"] for row in rows]

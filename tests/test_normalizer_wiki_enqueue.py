@@ -40,10 +40,33 @@ CUSTOMER = "wiki-enqueue-cust"
 
 @pytest_asyncio.fixture
 async def reset_db(live_db: None, settings: Settings) -> AsyncIterator[None]:
+    # Seed the customer with `wiki_generation_enabled: true` so the existing
+    # happy-path tests still exercise the live enqueue code. The opt-in gate
+    # is covered separately in test_persist_skips_enqueue_when_disabled.
     async with raw_conn() as conn:
         await conn.execute(
-            "INSERT INTO customers(customer_id, display_name, api_key_hash) "
-            "VALUES ($1, 'wiki-enqueue', 'h') ON CONFLICT DO NOTHING",
+            "INSERT INTO customers(customer_id, display_name, api_key_hash, preferences) "
+            "VALUES ($1, 'wiki-enqueue', 'h', $2::jsonb) "
+            "ON CONFLICT (customer_id) DO UPDATE SET preferences = EXCLUDED.preferences",
+            CUSTOMER,
+            '{"wiki_generation_enabled": true}',
+        )
+    yield None
+
+
+@pytest_asyncio.fixture
+async def reset_db_opt_out(live_db: None, settings: Settings) -> AsyncIterator[None]:
+    """Customer exists but has NOT opted into wiki generation.
+
+    Mirrors a fresh tenant whose dashboard has never flipped the
+    `wiki_generation_enabled` toggle. Default-off opt-in policy means
+    no queue rows, no notify, no LLM work.
+    """
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO customers(customer_id, display_name, api_key_hash, preferences) "
+            "VALUES ($1, 'wiki-enqueue-off', 'h', '{}'::jsonb) "
+            "ON CONFLICT (customer_id) DO UPDATE SET preferences = EXCLUDED.preferences",
             CUSTOMER,
         )
     yield None
@@ -212,6 +235,56 @@ async def test_persist_enqueue_idempotent_on_redelivery(
             CUSTOMER,
         )
     assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_persist_skips_enqueue_when_wiki_generation_disabled(
+    reset_db_opt_out: None, normalizer: Normalizer, settings: Settings
+) -> None:
+    """OPT-IN CONTRACT regression gate.
+
+    A tenant whose `customers.preferences.wiki_generation_enabled` is
+    missing or false must NOT have queue rows appended and must NOT
+    receive a pg_notify on the wiki_synthesize channel — even when raw
+    docs are persisted normally. Inverting this back to "default-on"
+    will trip this test.
+    """
+    received: list[str] = []
+    notify_event = asyncio.Event()
+
+    listener = await asyncpg.connect(settings.database_url)
+    try:
+
+        def _on_notify(_conn, _pid, _channel, payload) -> None:
+            received.append(payload)
+            notify_event.set()
+
+        await listener.add_listener(WIKI_SYNTHESIZE_CHANNEL, _on_notify)
+
+        doc = _doc(
+            "github:commit:opt-out",
+            source_system=SourceSystem.GITHUB,
+            doc_type=DocType.GITHUB_COMMIT,
+        )
+        await normalizer._persist(CUSTOMER, SourceSystem.GITHUB, _result(doc))
+
+        # Notify is async — give it a beat. A real enqueue would have
+        # arrived in well under this; absence after the wait is the
+        # negative assertion.
+        with contextlib_suppress():
+            await asyncio.wait_for(notify_event.wait(), timeout=0.5)
+        assert CUSTOMER not in received
+    finally:
+        with contextlib_suppress():
+            await listener.remove_listener(WIKI_SYNTHESIZE_CHANNEL, _on_notify)
+        await listener.close()
+
+    async with raw_conn() as conn:
+        count = await conn.fetchval(
+            "SELECT count(*) FROM wiki_synthesis_queue WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    assert count == 0
 
 
 # Tiny shim so the suppress idiom doesn't import contextlib at module top

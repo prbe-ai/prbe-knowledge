@@ -63,11 +63,16 @@ def _patch_internal_key(monkeypatch) -> None:
 
 @pytest_asyncio.fixture
 async def reset_db(live_db: None, settings: Settings) -> AsyncIterator[None]:
+    # Opt the test customer into wiki generation so the existing cron
+    # tests still exercise the live drain path. The disabled-tenant case
+    # is covered by test_cron_skips_drain_when_wiki_generation_disabled.
     async with raw_conn() as conn:
         await conn.execute(
-            "INSERT INTO customers(customer_id, display_name, api_key_hash) "
-            "VALUES ($1, 'wiki-cron', 'h') ON CONFLICT DO NOTHING",
+            "INSERT INTO customers(customer_id, display_name, api_key_hash, preferences) "
+            "VALUES ($1, 'wiki-cron', 'h', $2::jsonb) "
+            "ON CONFLICT (customer_id) DO UPDATE SET preferences = EXCLUDED.preferences",
             CUSTOMER,
+            '{"wiki_generation_enabled": true}',
         )
     yield None
 
@@ -433,6 +438,67 @@ async def test_cron_does_not_clobber_manual_entry_pages(reset_db: None) -> None:
             "wiki:runbook:auth-flow",
         )
         assert versions == 1
+
+
+@pytest.mark.asyncio
+async def test_cron_skips_drain_when_wiki_generation_disabled(
+    reset_db: None,
+) -> None:
+    """OPT-IN CONTRACT regression gate (cron side).
+
+    Even with pending queue rows, a tenant whose
+    `wiki_generation_enabled` is missing or false must not be drained.
+    Models a tenant who toggled the flag off after rows had already been
+    enqueued; those rows must stay 'pending' rather than firing LLM work.
+    """
+    # Seed a row, then flip the tenant's flag to false. The Normalizer
+    # gate would also have skipped enqueue, but we want to assert the
+    # cron's defense-in-depth filter independently.
+    normalizer = Normalizer(make_default_context())
+    await normalizer._persist(
+        CUSTOMER,
+        SourceSystem.GITHUB,
+        _result(_doc("github:commit:disabled", "Body for disabled tenant.")),
+    )
+    async with raw_conn() as conn:
+        await conn.execute(
+            "UPDATE customers SET preferences = '{}'::jsonb WHERE customer_id = $1",
+            CUSTOMER,
+        )
+        pending_before = await conn.fetchval(
+            "SELECT count(*) FROM wiki_synthesis_queue "
+            "WHERE customer_id = $1 AND status = 'pending'",
+            CUSTOMER,
+        )
+    assert pending_before >= 1
+
+    # Anthropic client raises if the cron decides to call it — sharper
+    # signal than a silent pass.
+    forbidden_client = SimpleNamespace()
+    forbidden_client.messages = SimpleNamespace(
+        create=AsyncMock(side_effect=AssertionError("LLM must not be called")),
+    )
+
+    cron = WikiSynthesisCron(
+        ctx=make_default_context(),
+        store=get_store(),
+        wake_event=asyncio.Event(),
+        anthropic_client=forbidden_client,
+    )
+    await cron._tick(woken_by_notify=True)
+
+    async with raw_conn() as conn:
+        statuses = await conn.fetch(
+            "SELECT status FROM wiki_synthesis_queue WHERE customer_id = $1",
+            CUSTOMER,
+        )
+        runs = await conn.fetchval(
+            "SELECT count(*) FROM wiki_synthesis_runs WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    # Rows untouched: still pending, no run row opened.
+    assert {row["status"] for row in statuses} == {"pending"}
+    assert runs == 0
 
 
 async def _read_queue_ids(customer_id: str) -> list[int]:

@@ -43,6 +43,7 @@ from shared.constants import (
     WIKI_SYNTHESIZE_CHANNEL,
     SourceSystem,
 )
+from shared.customer_prefs import is_wiki_generation_enabled
 from shared.db import get_pool, with_tenant
 from shared.embeddings import Embedder, get_embedder
 from shared.encryption import decrypt_token
@@ -260,10 +261,17 @@ class Normalizer:
         # After Phase B's commit, append one row per persisted doc into
         # wiki_synthesis_queue and pg_notify the synthesis cron. Skip when
         # the source IS the wiki — otherwise the cron's own COMPILED_WIKI
-        # writes would feed back into its own queue. Wrapped so a queue
-        # failure logs a warning but does not fail an already-committed
-        # ingestion.
-        if source_system != SourceSystem.WIKI and doc_ids:
+        # writes would feed back into its own queue. Also skip when the
+        # tenant has not opted into wiki generation: customers.preferences
+        # ['wiki_generation_enabled'] must be explicitly true. Default-off
+        # is fail-closed; matches the per-source enrichment opt-in posture
+        # in prbe-orchestrator. Wrapped so a queue failure logs a warning
+        # but does not fail an already-committed ingestion.
+        if (
+            source_system != SourceSystem.WIKI
+            and doc_ids
+            and await is_wiki_generation_enabled(customer_id)
+        ):
             try:
                 await self._enqueue_wiki_synthesis(customer_id, doc_ids)
             except Exception as exc:
