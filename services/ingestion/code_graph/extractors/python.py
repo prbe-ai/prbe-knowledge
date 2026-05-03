@@ -400,15 +400,27 @@ class _Walker:
         """LOW-ambition resolver. Returns a resolved qualified name or None.
 
         Order of precedence:
-            1. If the target is a bare name and matches a frame local → unresolved
-               (we know it's a parameter or local but don't know its type).
-            2. If the target is a bare name and matches an import alias →
-               resolve to `<imported_module>.<name>`.
-            3. If the target is `self.foo` and we're inside a class scope →
+            1. If the target is `self.foo` and we're inside a class scope →
                resolve to the class's `foo` attribute (unverified — could
-               be inherited).
+               be inherited from a base). Checked FIRST so `self` being
+               in `frame.locals` doesn't short-circuit to AMBIGUOUS.
+            2. If the target is a bare name and matches a frame local →
+               unresolved (we know it's a parameter or local but don't
+               know its type).
+            3. If the target is a bare name and matches an import alias →
+               resolve to `<imported_module>.<name>`.
             4. Otherwise → None (caller emits AMBIGUOUS).
         """
+        if raw_target.startswith("self."):
+            # Walk up to find the enclosing class. `_ScopeFrame` doesn't
+            # track parent frames, but the class qname is everything
+            # except the last segment of the function's qname:
+            #   frame.qname = <module>.<Class>.<method>
+            parts = frame.qname.rsplit(".", 1)
+            if len(parts) == 2:
+                class_qname = parts[0]
+                attr = raw_target.split(".", 1)[1]
+                return f"{class_qname}.{attr}"
         head = raw_target.split(".", 1)[0]
         if head in frame.locals:
             return None
@@ -416,17 +428,6 @@ class _Walker:
             module_path = self._imports_by_alias[head]
             tail = raw_target[len(head) :]
             return f"{module_path}{tail}" if tail else module_path
-        if raw_target.startswith("self."):
-            # Walk up to find the enclosing class — `_ScopeFrame` doesn't
-            # currently track parent frames, so we approximate from the
-            # function's `parent_qname` baked into its qname.
-            #   frame.qname = <module>.<Class>.<method>
-            # → the class qname is everything except the last segment.
-            parts = frame.qname.rsplit(".", 1)
-            if len(parts) == 2:
-                class_qname = parts[0]
-                attr = raw_target.split(".", 1)[1]
-                return f"{class_qname}.{attr}"
         return None
 
 

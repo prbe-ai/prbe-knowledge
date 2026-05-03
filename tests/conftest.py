@@ -73,6 +73,7 @@ TRUNCATE_SQL = """
         wiki_synthesis_runs,
         documents,
         customer_source_mapping,
+        code_repo_state,
         customers
     RESTART IDENTITY CASCADE;
 """
