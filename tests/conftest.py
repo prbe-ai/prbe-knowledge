@@ -62,6 +62,7 @@ TRUNCATE_SQL = """
         failed_chunks,
         integration_tokens,
         backfill_state,
+        manual_uploads,
         ingestion_queue,
         acl_snapshots,
         chunks,

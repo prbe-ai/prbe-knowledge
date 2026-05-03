@@ -114,6 +114,21 @@ class ObjectStore:
 
         return await asyncio.to_thread(_head)
 
+    async def delete(self, bucket: str, key: str) -> None:
+        """Delete one object. Missing buckets/keys are treated as already gone."""
+        def _delete() -> None:
+            try:
+                self._client.delete_object(Bucket=bucket, Key=key)
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"NoSuchBucket", "NoSuchKey", "404", "NotFound"}:
+                    return
+                raise StorageUnavailable(f"delete_object failed: {exc}") from exc
+            except BotoCoreError as exc:
+                raise StorageUnavailable(f"delete_object failed: {exc}") from exc
+
+        await asyncio.to_thread(_delete)
+
     async def delete_bucket_recursive(self, bucket: str) -> None:
         """Delete every object in a bucket, then delete the bucket.
 

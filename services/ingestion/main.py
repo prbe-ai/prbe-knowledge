@@ -22,13 +22,17 @@ do the per-source token exchange + storage. See admin_routes.py.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import hmac
+import os
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import orjson
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
@@ -41,6 +45,13 @@ from services.ingestion.handlers.registry import (
     list_registered,
 )
 from services.ingestion.internal_devices import router as devices_router
+from services.ingestion.manual_uploads import (
+    MAX_MANUAL_UPLOAD_BYTES,
+    MAX_MANUAL_UPLOAD_FILES,
+    ManualUploadParseError,
+    parse_manual_upload,
+    safe_filename,
+)
 from services.system_settings import get_ingestion_killswitch
 from shared.config import get_settings
 from shared.constants import (
@@ -128,6 +139,238 @@ async def ingestion_status(request: Request) -> JSONResponse:
     _verify_internal_key(request)
     ks = await get_ingestion_killswitch(force_refresh=True)
     return JSONResponse({"enabled": ks.enabled, "reason": ks.reason})
+
+
+@app.post("/api/manual-uploads")
+async def create_manual_uploads(
+    request: Request,
+    files: list[UploadFile] = File(...),
+    uploaded_by: str | None = Form(default=None),
+    x_trace_id: str | None = Header(default=None),
+    x_prbe_customer: str | None = Header(default=None),
+) -> JSONResponse:
+    """Accept dashboard manual uploads, stage originals, and enqueue extracted text."""
+    _verify_internal_key(request)
+
+    ks = await get_ingestion_killswitch()
+    if not ks.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "reason": ks.reason or "ingestion paused",
+                "retry_after_s": 300,
+            },
+            headers={"Retry-After": "300"},
+        )
+
+    if not x_prbe_customer:
+        raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
+    if not files:
+        raise HTTPException(status_code=400, detail="at least one file is required")
+    if len(files) > MAX_MANUAL_UPLOAD_FILES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"at most {MAX_MANUAL_UPLOAD_FILES} files can be uploaded at once",
+        )
+
+    customer_id = x_prbe_customer
+    trace_id = x_trace_id or f"manual-{int(datetime.now().timestamp() * 1000)}"
+    bind_trace(trace_id)
+
+    store = request.app.state.store
+    bucket = store.bucket_for(customer_id)
+    try:
+        await store.ensure_bucket(bucket)
+    except PrbeError as exc:
+        log.error("manual_upload.bucket_failed", customer=customer_id, error=str(exc))
+        raise HTTPException(status_code=503, detail="storage unavailable") from exc
+
+    uploads: list[dict[str, object]] = []
+    for upload in files:
+        uploaded_at = datetime.now(UTC)
+        upload_id = f"manual-{uuid.uuid4().hex}"
+        filename = safe_filename(upload.filename)
+        content_type = upload.content_type or "application/octet-stream"
+        file_size = _upload_file_size(upload)
+        staging_key = _manual_staging_key(customer_id, upload_id, filename, uploaded_at)
+        doc_id = f"manual_upload:{upload_id}"
+
+        if file_size > MAX_MANUAL_UPLOAD_BYTES:
+            uploads.append(
+                await _record_rejected_manual_upload(
+                    customer_id=customer_id,
+                    upload_id=upload_id,
+                    filename=filename,
+                    content_type=content_type,
+                    file_size_bytes=file_size,
+                    file_sha256="",
+                    uploaded_by=uploaded_by,
+                    uploaded_at=uploaded_at,
+                    parse_error=f"file exceeds {MAX_MANUAL_UPLOAD_BYTES} byte limit",
+                )
+            )
+            continue
+
+        body = await upload.read()
+        file_sha256 = hashlib.sha256(body).hexdigest()
+
+        try:
+            await store.put(
+                bucket,
+                staging_key,
+                body,
+                content_type=content_type,
+            )
+        except PrbeError as exc:
+            log.error("manual_upload.stage_failed", customer=customer_id, error=str(exc))
+            raise HTTPException(status_code=503, detail="storage unavailable") from exc
+
+        try:
+            parsed = parse_manual_upload(filename, content_type, body)
+        except ManualUploadParseError as exc:
+            with contextlib.suppress(PrbeError):
+                await store.delete(bucket, staging_key)
+            uploads.append(
+                await _record_rejected_manual_upload(
+                    customer_id=customer_id,
+                    upload_id=upload_id,
+                    filename=filename,
+                    content_type=content_type,
+                    file_size_bytes=file_size,
+                    file_sha256=file_sha256,
+                    uploaded_by=uploaded_by,
+                    uploaded_at=uploaded_at,
+                    parse_error=str(exc),
+                    original_deleted=True,
+                )
+            )
+            continue
+
+        payload = {
+            "upload_id": upload_id,
+            "filename": parsed.filename,
+            "content_type": content_type,
+            "file_size_bytes": file_size,
+            "file_sha256": file_sha256,
+            "uploaded_by": uploaded_by,
+            "uploaded_at": uploaded_at.isoformat(),
+            "original_object_key": staging_key,
+            "extracted_text": parsed.text,
+            "parse_engine": parsed.parse_engine,
+            "doc_type": parsed.doc_type.value,
+            "doc_id": doc_id,
+        }
+        safe_headers = {
+            k: v
+            for k, v in request.headers.items()
+            if k.lower() not in _SENSITIVE_HEADERS
+        }
+        envelope = orjson.dumps(
+            {
+                "_headers": safe_headers,
+                "payload": payload,
+                "received_at": uploaded_at.isoformat(),
+                "trace_id": trace_id,
+            }
+        )
+        payload_key = _payload_key(SourceSystem.MANUAL_UPLOAD, customer_id, upload_id)
+
+        try:
+            await store.put(bucket, payload_key, envelope)
+            await _insert_manual_upload_row(
+                customer_id=customer_id,
+                upload_id=upload_id,
+                filename=parsed.filename,
+                content_type=content_type,
+                file_size_bytes=file_size,
+                file_sha256=file_sha256,
+                staging_object_key=staging_key,
+                payload_object_key=payload_key,
+                uploaded_by=uploaded_by,
+                uploaded_at=uploaded_at,
+                status="queued",
+                parse_engine=parsed.parse_engine,
+                extracted_chars=len(parsed.text),
+                doc_id=doc_id,
+            )
+            inserted = await _enqueue(
+                customer_id=customer_id,
+                source=SourceSystem.MANUAL_UPLOAD,
+                source_event_id=upload_id,
+                payload_s3_key=payload_key,
+            )
+        except Exception as exc:
+            with contextlib.suppress(PrbeError):
+                await store.delete(bucket, staging_key)
+            with contextlib.suppress(PrbeError):
+                await store.delete(bucket, payload_key)
+            with contextlib.suppress(Exception):
+                await _mark_manual_upload_enqueue_failed(
+                    customer_id, upload_id, str(exc)
+                )
+            log.exception(
+                "manual_upload.enqueue_failed",
+                customer=customer_id,
+                error=str(exc),
+            )
+            raise HTTPException(status_code=503, detail="manual upload enqueue failed") from exc
+
+        uploads.append(
+            {
+                "upload_id": upload_id,
+                "filename": parsed.filename,
+                "content_type": content_type,
+                "file_size_bytes": file_size,
+                "file_sha256": file_sha256,
+                "status": "queued" if inserted else "duplicate",
+                "parse_engine": parsed.parse_engine,
+                "parse_error": None,
+                "extracted_chars": len(parsed.text),
+                "doc_id": doc_id,
+                "uploaded_by": uploaded_by,
+                "uploaded_at": uploaded_at.isoformat(),
+                "indexed_at": None,
+                "original_deleted_at": None,
+            }
+        )
+
+    return JSONResponse(
+        {
+            "trace_id": trace_id,
+            "uploads": uploads,
+            "accepted": sum(1 for u in uploads if u["status"] == "queued"),
+            "failed": sum(1 for u in uploads if u["status"] == "failed_parse"),
+        }
+    )
+
+
+@app.get("/api/manual-uploads")
+async def list_manual_uploads(
+    request: Request,
+    x_prbe_customer: str | None = Header(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> JSONResponse:
+    """List manual uploads for dashboard file explorer views."""
+    _verify_internal_key(request)
+    if not x_prbe_customer:
+        raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
+
+    async with get_pool().acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT upload_id, filename, content_type, file_size_bytes, file_sha256,
+                   uploaded_by, uploaded_at, status, parse_engine, parse_error,
+                   extracted_chars, doc_id, indexed_at, original_deleted_at,
+                   updated_at
+            FROM manual_uploads
+            WHERE customer_id = $1
+            ORDER BY uploaded_at DESC
+            LIMIT $2
+            """,
+            x_prbe_customer,
+            limit,
+        )
+    return JSONResponse({"uploads": [_manual_upload_json(row) for row in rows]})
 
 
 @app.post("/webhooks/{source}")
@@ -306,6 +549,174 @@ def _payload_key(source: SourceSystem, customer_id: str, event_id: str) -> str:
         f"raw/{source.value}/{customer_id}/"
         f"{now.strftime('%Y/%m/%d')}/{safe_event}.json"
     )
+
+
+def _manual_staging_key(
+    customer_id: str,
+    upload_id: str,
+    filename: str,
+    uploaded_at: datetime,
+) -> str:
+    return (
+        f"manual_uploads/staging/{customer_id}/"
+        f"{uploaded_at.strftime('%Y/%m/%d')}/{upload_id}/{filename}"
+    )
+
+
+async def _insert_manual_upload_row(
+    *,
+    customer_id: str,
+    upload_id: str,
+    filename: str,
+    content_type: str,
+    file_size_bytes: int,
+    file_sha256: str,
+    staging_object_key: str | None,
+    payload_object_key: str | None,
+    uploaded_by: str | None,
+    uploaded_at: datetime,
+    status: str,
+    parse_engine: str | None = None,
+    parse_error: str | None = None,
+    extracted_chars: int = 0,
+    doc_id: str | None = None,
+    original_deleted_at: datetime | None = None,
+) -> None:
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO manual_uploads (
+                upload_id, customer_id, filename, content_type, file_size_bytes,
+                file_sha256, staging_object_key, payload_object_key, uploaded_by,
+                uploaded_at, status, parse_engine, parse_error, extracted_chars,
+                doc_id, original_deleted_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9,
+                $10, $11, $12, $13, $14,
+                $15, $16
+            )
+            """,
+            upload_id,
+            customer_id,
+            filename,
+            content_type,
+            file_size_bytes,
+            file_sha256,
+            staging_object_key,
+            payload_object_key,
+            uploaded_by,
+            uploaded_at,
+            status,
+            parse_engine,
+            parse_error,
+            extracted_chars,
+            doc_id,
+            original_deleted_at,
+        )
+
+
+async def _record_rejected_manual_upload(
+    *,
+    customer_id: str,
+    upload_id: str,
+    filename: str,
+    content_type: str,
+    file_size_bytes: int,
+    file_sha256: str,
+    uploaded_by: str | None,
+    uploaded_at: datetime,
+    parse_error: str,
+    original_deleted: bool = False,
+) -> dict[str, object]:
+    original_deleted_at = datetime.now(UTC) if original_deleted else None
+    await _insert_manual_upload_row(
+        customer_id=customer_id,
+        upload_id=upload_id,
+        filename=filename,
+        content_type=content_type,
+        file_size_bytes=file_size_bytes,
+        file_sha256=file_sha256,
+        staging_object_key=None,
+        payload_object_key=None,
+        uploaded_by=uploaded_by,
+        uploaded_at=uploaded_at,
+        status="failed_parse",
+        parse_error=parse_error,
+        original_deleted_at=original_deleted_at,
+    )
+    return {
+        "upload_id": upload_id,
+        "filename": filename,
+        "content_type": content_type,
+        "file_size_bytes": file_size_bytes,
+        "file_sha256": file_sha256,
+        "status": "failed_parse",
+        "parse_engine": None,
+        "parse_error": parse_error,
+        "extracted_chars": 0,
+        "doc_id": None,
+        "uploaded_by": uploaded_by,
+        "uploaded_at": uploaded_at.isoformat(),
+        "indexed_at": None,
+        "original_deleted_at": _iso_or_none(original_deleted_at),
+    }
+
+
+def _manual_upload_json(row) -> dict[str, object]:
+    return {
+        "upload_id": row["upload_id"],
+        "filename": row["filename"],
+        "content_type": row["content_type"],
+        "file_size_bytes": row["file_size_bytes"],
+        "file_sha256": row["file_sha256"],
+        "uploaded_by": row["uploaded_by"],
+        "uploaded_at": _iso_or_none(row["uploaded_at"]),
+        "status": row["status"],
+        "parse_engine": row["parse_engine"],
+        "parse_error": row["parse_error"],
+        "extracted_chars": row["extracted_chars"],
+        "doc_id": row["doc_id"],
+        "indexed_at": _iso_or_none(row["indexed_at"]),
+        "original_deleted_at": _iso_or_none(row["original_deleted_at"]),
+        "updated_at": _iso_or_none(row["updated_at"]),
+    }
+
+
+def _upload_file_size(upload: UploadFile) -> int:
+    try:
+        upload.file.seek(0, os.SEEK_END)
+        return upload.file.tell()
+    finally:
+        upload.file.seek(0)
+
+
+async def _mark_manual_upload_enqueue_failed(
+    customer_id: str,
+    upload_id: str,
+    error: str,
+) -> None:
+    async with get_pool().acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE manual_uploads
+            SET status = 'failed_ingest',
+                parse_error = $3,
+                original_deleted_at = COALESCE(original_deleted_at, NOW()),
+                updated_at = NOW()
+            WHERE customer_id = $1 AND upload_id = $2
+            """,
+            customer_id,
+            upload_id,
+            error[:4000],
+        )
+
+
+def _iso_or_none(value: object) -> str | None:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return None
 
 
 async def _enqueue(

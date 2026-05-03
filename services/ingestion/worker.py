@@ -22,6 +22,7 @@ from shared.constants import (
     QUEUE_RECLAIM_THRESHOLD_SECONDS,
     BackfillStatus,
     IngestionEventStatus,
+    IngestionEventType,
     QueueStatus,
     SourceSystem,
 )
@@ -32,6 +33,7 @@ from shared.exceptions import (
     UnsupportedEventType,
 )
 from shared.logging import bind_trace, get_logger
+from shared.storage import get_store
 
 log = get_logger(__name__)
 
@@ -179,6 +181,8 @@ class Worker:
                 source_event_id=event_id,
                 payload_s3_keys=payload_s3_keys,
             )
+            if source == SourceSystem.MANUAL_UPLOAD:
+                await self._cleanup_manual_upload_original(customer_id, event_id)
             await self._mark_done(
                 queue_id, customer_id, source, event_id, payload_s3_key,
                 outcome, captured_version,
@@ -197,7 +201,10 @@ class Worker:
             )
         except PrbeError as exc:
             transient = getattr(exc, "transient", False)
-            await self._on_error(queue_id, attempts, str(exc), transient=transient)
+            dead = await self._on_error(queue_id, attempts, str(exc), transient=transient)
+            if dead and source == SourceSystem.MANUAL_UPLOAD:
+                with contextlib.suppress(Exception):
+                    await self._mark_manual_upload_failed_ingest(customer_id, event_id, str(exc))
         except Exception as exc:  # pragma: no cover — last-resort
             # Unknown error: assume transient so we don't burn data on a single
             # network blip / OOM / unwrapped httpx error / asyncpg connection
@@ -205,7 +212,11 @@ class Worker:
             # Anything that should permanently DLQ on first try must raise a
             # PrbeError subclass with `transient = False`.
             log.exception("worker.unhandled", queue_id=queue_id)
-            await self._on_error(queue_id, attempts, repr(exc), transient=True)
+            error = repr(exc)
+            dead = await self._on_error(queue_id, attempts, error, transient=True)
+            if dead and source == SourceSystem.MANUAL_UPLOAD:
+                with contextlib.suppress(Exception):
+                    await self._mark_manual_upload_failed_ingest(customer_id, event_id, error)
         finally:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -271,13 +282,14 @@ class Worker:
                     customer_id, source_system, event_type, source_event_id,
                     payload_s3_key, status, doc_ids_produced, processed_at,
                     normalizer_version
-                ) VALUES ($1, $2, 'webhook', $3, $4, $5, $6, NOW(), 'v1')
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), 'v1')
                 ON CONFLICT (customer_id, source_system, source_event_id)
                 DO UPDATE SET status = EXCLUDED.status, processed_at = NOW(),
                               doc_ids_produced = EXCLUDED.doc_ids_produced
                 """,
                 customer_id,
                 source.value,
+                _event_type_for_source(source),
                 event_id,
                 payload_s3_key,
                 IngestionEventStatus.PROCESSED.value,
@@ -325,22 +337,92 @@ class Worker:
                 INSERT INTO ingestion_events (
                     customer_id, source_system, event_type, source_event_id,
                     payload_s3_key, status, error, processed_at, normalizer_version
-                ) VALUES ($1, $2, 'webhook', $3, $4, $5, $6, NOW(), 'v1')
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), 'v1')
                 ON CONFLICT (customer_id, source_system, source_event_id)
                 DO UPDATE SET status = EXCLUDED.status, error = EXCLUDED.error,
                               processed_at = NOW()
                 """,
                 customer_id,
                 source.value,
+                _event_type_for_source(source),
                 event_id,
                 payload_s3_key,
                 IngestionEventStatus.SKIPPED.value,
                 reason,
             )
 
+    async def _cleanup_manual_upload_original(
+        self,
+        customer_id: str,
+        upload_id: str,
+    ) -> None:
+        """Delete staged original bytes after normalization succeeds.
+
+        This runs before _mark_done. If storage deletion fails, the queue row
+        remains retryable and the original object is not orphaned.
+        """
+        async with get_pool().acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT staging_object_key, original_deleted_at
+                FROM manual_uploads
+                WHERE customer_id = $1 AND upload_id = $2
+                """,
+                customer_id,
+                upload_id,
+            )
+        if row is None:
+            log.warning(
+                "manual_upload.cleanup_missing_row",
+                customer=customer_id,
+                upload_id=upload_id,
+            )
+            return
+
+        staging_key = row["staging_object_key"]
+        should_delete = staging_key and row["original_deleted_at"] is None
+        if should_delete:
+            store = get_store()
+            await store.delete(store.bucket_for(customer_id), staging_key)
+
+        async with get_pool().acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE manual_uploads
+                SET status = 'indexed',
+                    indexed_at = COALESCE(indexed_at, NOW()),
+                    original_deleted_at = COALESCE(original_deleted_at, NOW()),
+                    updated_at = NOW(),
+                    parse_error = NULL
+                WHERE customer_id = $1 AND upload_id = $2
+                """,
+                customer_id,
+                upload_id,
+            )
+
+    async def _mark_manual_upload_failed_ingest(
+        self,
+        customer_id: str,
+        upload_id: str,
+        error: str,
+    ) -> None:
+        async with get_pool().acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE manual_uploads
+                SET status = 'failed_ingest',
+                    parse_error = $3,
+                    updated_at = NOW()
+                WHERE customer_id = $1 AND upload_id = $2
+                """,
+                customer_id,
+                upload_id,
+                error[:4000],
+            )
+
     async def _on_error(
         self, queue_id: int, attempts: int, error: str, *, transient: bool
-    ) -> None:
+    ) -> bool:
         dead = (not transient) or attempts >= self._max_attempts
         log.warning(
             "worker.error",
@@ -373,6 +455,13 @@ class Worker:
                     error,
                     queue_id,
                 )
+        return dead
+
+
+def _event_type_for_source(source: SourceSystem) -> str:
+    if source == SourceSystem.MANUAL_UPLOAD:
+        return IngestionEventType.MANUAL.value
+    return IngestionEventType.WEBHOOK.value
 
 
 class BackfillWorker:

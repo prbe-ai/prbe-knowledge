@@ -463,6 +463,7 @@ async def get_source(
             WHERE customer_id = $1
               AND doc_id = $2
               AND valid_to IS NULL
+              AND kind = 'content'
               AND $3 BETWEEN first_seen_version AND last_seen_version
             ORDER BY chunk_index
             """,
