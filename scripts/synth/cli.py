@@ -50,6 +50,8 @@ from scripts.synth.output.eval_artifacts import (
     write_docs_index,
     write_manifest,
     write_profile,
+    write_questions_jsonl,
+    write_scenarios,
     write_warnings,
 )
 from scripts.synth.output.writer import IngestionWriter
@@ -208,6 +210,14 @@ def build_llm_clients(cfg: LlmClientConfig) -> LlmClients:
         writer_provider=writer_provider,
         validator_provider=validator_provider,
     )
+
+
+def _build_args(argv: list[str]) -> argparse.Namespace:
+    """Thin wrapper: parse *argv* with build_parser() and return the Namespace.
+
+    Intended for in-process test invocations so tests don't shell out.
+    """
+    return build_parser().parse_args(argv)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -634,12 +644,29 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
     # Plan 2 templated archetypes don't have a "requested" count distinct
     # from generated; Plan 3's LLM planner will emit per-scenario request
     # counts that distinguish these.
+
+    # Collect ScenarioSpec objects for scenarios/ and questions.jsonl.
+    # Templated archetypes: re-run BUILDERS to get specs (same inputs -> same
+    # deterministic output). Plot archetypes are not tracked here yet.
+    from scripts.synth.archetypes.library import BUILDERS, get_active
+
+    emitted_scenario_ids = {d.scenario_id for d in emitted_docs}
+    all_specs = []
+    active = get_active(profile, archetype_filter=archetype_filter)
+    for name, archetype in active.items():
+        if not archetype.needs_planner_call and name in BUILDERS:
+            builder_specs = BUILDERS[name](world, ownership, time_window, profile.seed)
+            if args.limit_scenarios is not None:
+                builder_specs = builder_specs[: args.limit_scenarios]
+            # Only include specs whose scenario was actually emitted (not dropped).
+            all_specs.extend(s for s in builder_specs if s.id in emitted_scenario_ids)
+
     totals = {
         "archetypes_executed": archetypes_executed,
         "totals": {
-            "scenarios": len({d.scenario_id for d in emitted_docs}),
+            "scenarios": len(emitted_scenario_ids),
             "documents": len(emitted_docs),
-            "questions": 0,
+            "questions": sum(len(s.eval_questions) for s in all_specs),
         },
         "warnings_count": len(violations),
     }
@@ -657,6 +684,8 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
     write_docs_index(out, emitted_docs)
     write_profile(out, profile)
     write_warnings(out, violations, [])
+    write_scenarios(out, all_specs)
+    write_questions_jsonl(out, all_specs, emitted_docs)
     (out / "world_model.json").write_text(_dumps(world))
     (out / "company_context.json").write_text(_dumps(cc))
 
