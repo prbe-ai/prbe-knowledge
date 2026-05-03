@@ -52,6 +52,7 @@ from services.ingestion.manual_uploads import (
     parse_manual_upload,
     safe_filename,
 )
+from services.ingestion.wiki_routes import router as wiki_router
 from services.system_settings import get_ingestion_killswitch
 from shared.config import get_settings
 from shared.constants import (
@@ -98,6 +99,7 @@ app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 app.include_router(backfill_router)
 app.include_router(admin_router)
 app.include_router(devices_router)
+app.include_router(wiki_router)
 
 
 @app.get("/health")

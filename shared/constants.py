@@ -16,6 +16,11 @@ class SourceSystem(StrEnum):
     # this label exists so dashboard queries can distinguish provenance.
     CODEX = "codex"
     MANUAL_UPLOAD = "manual_upload"
+    # Curated team-knowledge layer (runbooks, decisions, service cards, feature
+    # notes). Pages are authored programmatically via /api/wiki/pages/* — no
+    # external webhook. doc_class distinguishes human authorship (MANUAL_ENTRY)
+    # from agent-compiled summaries (COMPILED_WIKI).
+    WIKI = "wiki"
 
 
 class DocClass(StrEnum):
@@ -40,15 +45,15 @@ class DocType(StrEnum):
     SENTRY_ISSUE = "sentry.issue"
     SENTRY_EVENT = "sentry.event"
     GRANOLA_MEETING = "granola.meeting"
-    CLAUDE_CODE_SESSION     = "claude_code.session"
-    CLAUDE_CODE_QA          = "claude_code.qa"
+    CLAUDE_CODE_SESSION = "claude_code.session"
+    CLAUDE_CODE_QA = "claude_code.qa"
     CLAUDE_CODE_CODE_CHANGE = "claude_code.code_change"
-    CLAUDE_CODE_DECISION    = "claude_code.decision"
-    CLAUDE_CODE_FILE_REF    = "claude_code.file_ref"
-    MANUAL_UPLOAD_TEXT      = "manual_upload.text"
-    MANUAL_UPLOAD_MARKDOWN  = "manual_upload.markdown"
-    MANUAL_UPLOAD_DOCX      = "manual_upload.docx"
-    MANUAL_UPLOAD_FILE      = "manual_upload.file"
+    CLAUDE_CODE_DECISION = "claude_code.decision"
+    CLAUDE_CODE_FILE_REF = "claude_code.file_ref"
+    MANUAL_UPLOAD_TEXT = "manual_upload.text"
+    MANUAL_UPLOAD_MARKDOWN = "manual_upload.markdown"
+    MANUAL_UPLOAD_DOCX = "manual_upload.docx"
+    MANUAL_UPLOAD_FILE = "manual_upload.file"
     WIKI_SERVICE_CARD = "wiki.service_card"
     WIKI_DECISION = "wiki.decision"
     WIKI_FEATURE = "wiki.feature"
@@ -208,7 +213,7 @@ SONNET_MODEL = "claude-sonnet-4-6"
 # the synthesis dispatcher uses to pick a client.
 SYNTHESIS_MODELS: dict[str, str] = {
     "anthropic/claude-haiku-4-5-20251001": "anthropic",
-    "anthropic/claude-sonnet-4-6":          "anthropic",
+    "anthropic/claude-sonnet-4-6": "anthropic",
 }
 DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-6"
 
