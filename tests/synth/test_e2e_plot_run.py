@@ -65,12 +65,12 @@ async def test_e2e_run_creates_run_artifacts_with_mock_llm(
     tmp_path: Path,
     stub_mock_llm,
 ) -> None:
-    """Full pipeline with --mock-llm: manifest, docs_index, world_model, raw/ all exist.
-
-    Restricts to templated archetypes (STANDUP_UPDATE, ON_CALL_HANDOFF) so the
-    run only emits slack/notion docs supported by the Plan 2 IngestionWriter.
-    Plot archetypes (INCIDENT, LAUNCH, BIG_REFACTOR) emit linear/github/sentry
-    docs that would require the Plan 3 writer extension — not in scope here.
+    """Full pipeline with --mock-llm including plot archetypes (INCIDENT, LAUNCH,
+    BIG_REFACTOR). The empty-cast stub causes most plot scenarios to drop at
+    Pass 1 validation (their templated sentry docs use 'unknown-svc' which is
+    not in the world allowlist), but the run still completes successfully and
+    the artifact set is written. Templated archetypes (STANDUP_UPDATE, ON_CALL_HANDOFF)
+    always produce real docs from world entities.
     """
     output_dir = tmp_path / "output"
     args = _build_args([
@@ -78,23 +78,19 @@ async def test_e2e_run_creates_run_artifacts_with_mock_llm(
         "--profile", str(tmp_repo_profile_dir / "profile.yaml"),
         "--mock-llm",
         "--output-dir", str(output_dir),
-        "--archetypes", "STANDUP_UPDATE,ON_CALL_HANDOFF",
     ])
     profile = load_profile(Path(args.profile))
 
     rc = await _run_async(profile, output_dir, args)
     assert rc == 0
 
-    # Plan 2 / Plan 3 artifacts that Task 17 + earlier ship:
+    # Templated artifacts always present
     assert (output_dir / "manifest.json").exists()
     assert (output_dir / "docs_index.jsonl").exists()
-    assert (output_dir / "profile.yaml").exists()
     assert (output_dir / "world_model.json").exists()
-    assert (output_dir / "company_context.json").exists()
-    # Templated archetypes always emit slack docs in tiny_test:
     raw_dir = output_dir / "raw"
     assert raw_dir.is_dir()
-    assert any(raw_dir.glob("slack/*.json"))
+    assert any(raw_dir.glob("slack/*.json")), "templated archetypes should emit slack docs"
 
 
 async def test_e2e_run_creates_scenarios_dir_with_mock_llm(

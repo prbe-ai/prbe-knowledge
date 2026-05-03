@@ -19,7 +19,10 @@ from pathlib import Path
 from typing import Literal
 
 from scripts.synth.archetypes.base import Source
+from scripts.synth.output import github as github_wrapper
+from scripts.synth.output import linear as linear_wrapper
 from scripts.synth.output import notion as notion_wrapper
+from scripts.synth.output import sentry as sentry_wrapper
 from scripts.synth.output import slack as slack_wrapper
 from scripts.synth.output.base import SynthDoc
 
@@ -109,7 +112,13 @@ class IngestionWriter:
             return slack_wrapper.wrap(doc)
         if doc.source == Source.NOTION:
             return notion_wrapper.wrap(doc)
+        if doc.source == Source.GITHUB:
+            return github_wrapper.wrap(doc)
+        if doc.source == Source.LINEAR:
+            return linear_wrapper.wrap(doc)
+        if doc.source == Source.SENTRY:
+            return sentry_wrapper.wrap(doc)
         raise ValueError(
-            f"Plan 2 doesn't support source: {doc.source.value}. "
-            "GitHub/Linear/Sentry/Granola wrappers land in Plan 3."
+            f"Unsupported source for envelope wrapping: {doc.source.value}. "
+            "Granola/Claude_Code wrappers are not yet implemented."
         )
