@@ -26,9 +26,7 @@ from shared.storage import reset_store
 
 @pytest.fixture(autouse=True)
 def _patch_settings(monkeypatch, settings: Settings) -> None:
-    monkeypatch.setenv(
-        "TOKEN_ENCRYPTION_KEY", settings.token_encryption_key.get_secret_value()
-    )
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", settings.token_encryption_key.get_secret_value())
     monkeypatch.setenv("ENVIRONMENT", "local")
     reset_embedder()
     reset_store()
@@ -296,9 +294,7 @@ async def test_source_view_defaults_to_bounded_preview(live_db, settings) -> Non
 
 
 @pytest.mark.asyncio
-async def test_source_view_supports_range_cursor_search_grep_and_chunk(
-    live_db, settings
-) -> None:
+async def test_source_view_supports_range_cursor_search_grep_and_chunk(live_db, settings) -> None:
     api_key = await _seed_customer("cust-view-modes")
     await _seed_doc_with_chunks(
         "cust-view-modes",
@@ -352,3 +348,89 @@ async def test_source_view_supports_range_cursor_search_grep_and_chunk(
     chunk_body = chunk_resp.json()
     assert chunk_body["content"] == "delta\nneedle here"
     assert chunk_body["sections"][0]["chunk_index"] == 1
+
+
+@pytest.mark.asyncio
+async def test_source_view_full_mode_returns_whole_doc(live_db, settings) -> None:
+    api_key = await _seed_customer("cust-full")
+    await _seed_doc_with_chunks(
+        "cust-full",
+        "slack:T1:C1:full",
+        chunks=[
+            "first chunk line a\nfirst chunk line b",
+            "second chunk line a\nsecond chunk line b\nsecond chunk line c",
+        ],
+    )
+
+    resp = await _get_source_view(
+        "slack:T1:C1:full",
+        headers={"Authorization": f"Bearer {api_key}"},
+        query="?mode=full",
+    )
+    await init_pool(settings)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["mode"] == "full"
+    # Chunks reassembled in chunk_index order with double-newline separator
+    # (matches /sources reassembly).
+    assert body["content"] == (
+        "first chunk line a\nfirst chunk line b\n\n"
+        "second chunk line a\nsecond chunk line b\nsecond chunk line c"
+    )
+    assert body["truncated"] is False
+    assert body["next_cursor"] is None
+    assert body["max_bytes"] == 100_000_000
+
+
+@pytest.mark.asyncio
+async def test_source_view_full_mode_ignores_limit_and_byte_caps(live_db, settings) -> None:
+    """Caller-passed limit_lines / max_bytes do not constrain mode=full;
+    only the 100MB OOM-defense ceiling does."""
+    api_key = await _seed_customer("cust-full-ignore")
+    body_text = "\n".join(f"line {i}" for i in range(1, 251))
+    await _seed_doc_with_chunks(
+        "cust-full-ignore",
+        "slack:T1:C1:fullignore",
+        chunks=[body_text],
+    )
+
+    resp = await _get_source_view(
+        "slack:T1:C1:fullignore",
+        headers={"Authorization": f"Bearer {api_key}"},
+        # Bounded modes would clamp to limit_lines<=100 and max_bytes<=20000.
+        # Pass values inside those bounded ceilings so we can prove they
+        # are NOT applied to mode=full.
+        query="?mode=full&limit_lines=10&max_bytes=50",
+    )
+    await init_pool(settings)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["mode"] == "full"
+    assert body["total_lines"] == 250
+    assert body["line_start"] == 1
+    assert body["line_end"] == 250
+    assert "line 1\n" in body["content"]
+    assert "line 250" in body["content"]
+    assert body["truncated"] is False
+    assert body["max_bytes"] == 100_000_000
+
+
+@pytest.mark.asyncio
+async def test_source_view_preview_max_bytes_unchanged_by_full_constant(live_db, settings) -> None:
+    """Pin: mode=preview still uses _SOURCE_VIEW_MAX_BYTES=20000, not the
+    new full cap. Guards against accidentally widening bounded modes."""
+    api_key = await _seed_customer("cust-pin-preview")
+    await _seed_doc_with_chunks(
+        "cust-pin-preview",
+        "slack:T1:C1:preview-pin",
+        chunks=["short content"],
+    )
+    resp = await _get_source_view(
+        "slack:T1:C1:preview-pin",
+        headers={"Authorization": f"Bearer {api_key}"},
+        query="?mode=preview",
+    )
+    await init_pool(settings)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["max_bytes"] == 12_000  # _SOURCE_VIEW_DEFAULT_MAX_BYTES

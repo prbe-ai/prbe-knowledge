@@ -55,13 +55,18 @@ from shared.models import (
 
 log = get_logger(__name__)
 
-_SOURCE_VIEW_MODES = frozenset({"preview", "search", "grep", "range", "chunk", "tail"})
+_SOURCE_VIEW_MODES = frozenset({"preview", "search", "grep", "range", "chunk", "tail", "full"})
 _SOURCE_VIEW_DEFAULT_LIMIT_LINES = 80
 _SOURCE_VIEW_MAX_LIMIT_LINES = 100
 _SOURCE_VIEW_DEFAULT_MAX_BYTES = 12_000
 _SOURCE_VIEW_MAX_BYTES = 20_000
 _SOURCE_VIEW_MAX_CONTEXT_LINES = 20
 _SOURCE_VIEW_MAX_MATCHES = 50
+# OOM-defense ceiling for mode="full". Real-world docs are <1MB; 100MB
+# exists only to keep one pathological doc from killing the worker.
+# Per-request peak memory is ~4-5x doc size through reassembly +
+# serialization, so a 100MB doc reaches ~500MB peak.
+_SOURCE_VIEW_MAX_FULL_BYTES = 100_000_000
 
 
 @asynccontextmanager
@@ -775,6 +780,34 @@ async def get_source_view(
             max_bytes=max_bytes,
             context_lines=context_lines,
             max_matches=max_matches,
+        )
+    elif mode == "full":
+        # Explicit opt-in for whole-document retrieval. limit_lines /
+        # max_bytes / start_line params are ignored — the only ceiling
+        # is the OOM-defense cap. cursor is honored so a doc that
+        # exceeds the cap (rare) can still be paginated.
+        start = _parse_cursor(cursor) or 1
+        content, line_start, line_end, next_cursor, truncated = _bounded_lines(
+            full_lines,
+            start_line=start,
+            limit_lines=max(total_lines, 1),
+            max_bytes=_SOURCE_VIEW_MAX_FULL_BYTES,
+        )
+        if line_start is not None and line_end is not None:
+            sections.append(SourceViewSection(line_start=line_start, line_end=line_end))
+        source_response = _source_view_response(
+            doc=doc,
+            chunk_rows=chunk_rows,
+            mode=mode,
+            content=content,
+            sections=sections,
+            line_start=line_start,
+            line_end=line_end,
+            total_lines=total_lines,
+            next_cursor=next_cursor,
+            truncated=truncated,
+            max_bytes=_SOURCE_VIEW_MAX_FULL_BYTES,
+            limit_lines=total_lines,
         )
     elif mode == "chunk":
         if chunk_index is None:
