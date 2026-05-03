@@ -62,6 +62,14 @@ from scripts.synth.world_model import merge_world_model
 # Default fixture root for MockLlmClient replay mode — relative to repo root.
 _DEFAULT_FIXTURE_ROOT = Path(__file__).parent.parent.parent / "tests" / "fixtures" / "synth_llm"
 
+# Canonical model roster for the three LLM roles.  Profile `llm:` section can
+# override individual keys; these are the fallback defaults.
+_LLM_DEFAULTS: dict[str, str] = {
+    "planner_model": "claude-opus-4-7",
+    "writer_model": "claude-sonnet-4-6",
+    "validator_model": "claude-haiku-4-5-20251001",
+}
+
 
 # ---------------------------------------------------------------------------
 # Plan 3 — LLM client dataclasses + CachingLlmClient + build_llm_clients
@@ -553,12 +561,7 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
     time_window = _parse_time_window(args.time_window, profile)
 
     # Plan 3 — build LLM clients and the Planner/Writer/Validator helpers
-    _llm_defaults = {
-        "planner_model": "claude-opus-4-7",
-        "writer_model": "claude-sonnet-4-6",
-        "validator_model": "claude-haiku-4-5-20251001",
-    }
-    llm_cfg: dict = {**_llm_defaults, **(profile.raw.get("llm") or {})}
+    llm_cfg: dict = {**_LLM_DEFAULTS, **(profile.raw.get("llm") or {})}
     client_cfg = LlmClientConfig(
         llm_cfg=llm_cfg,
         mock_llm=getattr(args, "mock_llm", False),

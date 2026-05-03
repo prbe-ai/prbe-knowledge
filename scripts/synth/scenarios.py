@@ -121,6 +121,7 @@ async def run_scenarios(
     """
     # Lazy import to break the circular dependency at module load time.
     from scripts.synth.archetypes.library import BUILDERS, PLOT_BUILDERS, get_active
+    from scripts.synth.llm.structured import StructuredOutputValidationError
     from scripts.synth.validator import validate as combined_validate
 
     active = get_active(profile, archetype_filter=archetype_filter)
@@ -182,14 +183,18 @@ async def run_scenarios(
                     count=count,
                 ):
                     docs = tuple(docs_list)
-                    result = await combined_validate(
-                        docs,
-                        world,
-                        scenario=spec,
-                        archetype=archetype,
-                        pass2_client=validator_pass2_client,
-                        pass2_model=validator_pass2_model,
-                    )
+                    try:
+                        result = await combined_validate(
+                            docs,
+                            world,
+                            scenario=spec,
+                            archetype=archetype,
+                            pass2_client=validator_pass2_client,
+                            pass2_model=validator_pass2_model,
+                        )
+                    except StructuredOutputValidationError:
+                        log.exception("plot_validator_error", scenario_id=spec.id, archetype=name)
+                        continue
                     if result.should_drop:
                         # TODO(plan3-cleanup): implement validator regen loop (max 2 rounds,
                         # surgical doc-level replacement preserving thread_parent_id wiring)
@@ -203,5 +208,5 @@ async def run_scenarios(
                     for doc in docs:
                         yield doc
             except Exception:
-                log.exception("plot_builder_error", archetype=name)
+                log.exception("plot_archetype_error", archetype=name)
                 continue

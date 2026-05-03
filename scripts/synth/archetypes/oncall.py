@@ -74,7 +74,8 @@ def _person_slug(canonical_id: str) -> str:
     if ":" in canonical_id:
         rest = canonical_id.split(":", 1)[1]
         # For email-based IDs like "alice@example.com", use only the local part.
-        return rest.split("@")[0]
+        slug = rest.split("@")[0]
+        return slug or canonical_id
     return canonical_id
 
 

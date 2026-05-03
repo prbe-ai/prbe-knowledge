@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from scripts.synth.archetypes.base import Source
-from scripts.synth.archetypes.oncall import ON_CALL_HANDOFF, build_oncall_specs
+from scripts.synth.archetypes.oncall import ON_CALL_HANDOFF, _notion_body, build_oncall_specs
 from scripts.synth.ownership import OwnershipIndex
 from scripts.synth.scenarios import TimeWindow
 from scripts.synth.world_model import (
@@ -135,6 +135,21 @@ def test_zero_incident_week_emits_quiet_week_text() -> None:
     if specs:
         slack_doc = next(d for d in specs[0].doc_specs if d.source == Source.SLACK)
         assert "Quiet week" in slack_doc.text
+
+
+def test_person_slug_empty_guard_no_bare_at_mention() -> None:
+    """Malformed canonical_id 'email:@example.com' must not produce a bare '@' mention.
+
+    Before the fix, _person_slug returned "" and _notion_body emitted "Outgoing: @".
+    After the fix, the raw canonical_id is used as a fallback instead.
+    """
+    from datetime import date as _date
+    body = _notion_body(_date(2026, 5, 4), [], "email:@example.com")
+    mention_line = body.split("\n")[1]
+    # Must NOT be the broken empty-slug form.
+    assert mention_line != "Outgoing: @"
+    # Must contain the raw canonical_id as fallback.
+    assert "email:@example.com" in mention_line
 
 
 def test_rotation_determinism() -> None:
