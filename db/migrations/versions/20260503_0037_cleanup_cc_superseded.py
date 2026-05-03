@@ -1,7 +1,7 @@
 """Coalesce superseded claude_code session versions into one row.
 
-Revision ID: 0036_cleanup_cc_superseded
-Revises: 0035_strip_metadata_body
+Revision ID: 0037_cleanup_cc_superseded
+Revises: 0036_strip_metadata_body
 Create Date: 2026-05-03
 
 WHY
@@ -70,8 +70,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0036_cleanup_cc_superseded"
-down_revision = "0035_strip_metadata_body"
+revision = "0037_cleanup_cc_superseded"
+down_revision = "0036_strip_metadata_body"
 branch_labels = None
 depends_on = None
 

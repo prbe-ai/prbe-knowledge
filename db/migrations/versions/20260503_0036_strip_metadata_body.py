@@ -1,7 +1,7 @@
 """Strip the redundant `body` key from documents.metadata.
 
-Revision ID: 0035_strip_metadata_body
-Revises: 0034_wiki_synthesis_no_rls
+Revision ID: 0036_strip_metadata_body
+Revises: 0035_wiki_verifier_rejected
 Create Date: 2026-05-03
 
 WHY
@@ -62,8 +62,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0035_strip_metadata_body"
-down_revision = "0034_wiki_synthesis_no_rls"
+revision = "0036_strip_metadata_body"
+down_revision = "0035_wiki_verifier_rejected"
 branch_labels = None
 depends_on = None
 
