@@ -18,7 +18,7 @@ def _profile(customer_id: str = "cust-eval-test-01") -> Profile:
     raw = {
         "customer_id": customer_id,
         "repos": [{"url": "github.com/x/y", "local_path": "/tmp/y"}],
-        "preset": "tiny-test",
+        "preset": "tiny_test",
         "seed": 42,
         "sources": ["slack", "notion"],
     }

@@ -27,7 +27,7 @@ def _profile(raw_extras: dict | None = None) -> Profile:
     raw = {
         "customer_id": "cust-eval-test-01",
         "repos": [{"url": "github.com/x/y", "local_path": "/tmp/y"}],
-        "preset": "tiny-test",
+        "preset": "tiny_test",
         "seed": 7,
     }
     if raw_extras:

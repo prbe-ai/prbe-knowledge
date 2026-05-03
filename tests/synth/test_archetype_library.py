@@ -19,7 +19,7 @@ def _profile(raw: dict | None = None) -> Profile:
     base = {
         "customer_id": "cust-eval-test-01",
         "repos": [{"url": "github.com/x/y", "local_path": "/tmp/y"}],
-        "preset": "tiny-test",
+        "preset": "tiny_test",
         "seed": 42,
     }
     base.update(raw)
