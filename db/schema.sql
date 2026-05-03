@@ -30,7 +30,11 @@ CREATE TABLE customers (
     status               TEXT NOT NULL DEFAULT 'active',
     organization_id      UUID REFERENCES neon_auth.organization(id) ON DELETE RESTRICT,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    metadata             JSONB NOT NULL DEFAULT '{}'
+    metadata             JSONB NOT NULL DEFAULT '{}',
+    -- Per-tenant feature toggles (added by migration 0023). Read by
+    -- shared.customer_prefs for the wiki-generation gate. Schema-on-read
+    -- bool keys; missing keys resolve to False on every reader.
+    preferences          JSONB NOT NULL DEFAULT '{}'
 );
 
 -- One customer per organization (where the link is set).
