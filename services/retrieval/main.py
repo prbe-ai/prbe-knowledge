@@ -49,9 +49,19 @@ from shared.models import (
     QueryRequest,
     QueryResponse,
     SourceResponse,
+    SourceViewResponse,
+    SourceViewSection,
 )
 
 log = get_logger(__name__)
+
+_SOURCE_VIEW_MODES = frozenset({"preview", "search", "grep", "range", "chunk", "tail"})
+_SOURCE_VIEW_DEFAULT_LIMIT_LINES = 80
+_SOURCE_VIEW_MAX_LIMIT_LINES = 100
+_SOURCE_VIEW_DEFAULT_MAX_BYTES = 12_000
+_SOURCE_VIEW_MAX_BYTES = 20_000
+_SOURCE_VIEW_MAX_CONTEXT_LINES = 20
+_SOURCE_VIEW_MAX_MATCHES = 50
 
 
 @asynccontextmanager
@@ -399,6 +409,452 @@ async def query_stream(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _cap_bytes(text: str, max_bytes: int) -> tuple[str, bool]:
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+    return encoded[:max_bytes].decode("utf-8", errors="ignore"), True
+
+
+def _bounded_lines(
+    lines: list[str],
+    *,
+    start_line: int,
+    limit_lines: int,
+    max_bytes: int,
+) -> tuple[str, int | None, int | None, str | None, bool]:
+    total_lines = len(lines)
+    start = max(start_line, 1)
+    if total_lines == 0 or start > total_lines:
+        return "", None, None, None, False
+
+    end = min(total_lines, start + limit_lines - 1)
+    content, byte_truncated = _cap_bytes("\n".join(lines[start - 1 : end]), max_bytes)
+    next_cursor = str(end + 1) if end < total_lines else None
+    return content, start, end, next_cursor, byte_truncated or end < total_lines
+
+
+def _chunk_line_offsets(chunk_rows: list[object]) -> dict[int, tuple[int, int]]:
+    offsets: dict[int, tuple[int, int]] = {}
+    current_line = 1
+    for row in chunk_rows:
+        line_count = len(str(row["content"]).splitlines()) or 1  # type: ignore[index]
+        chunk_index = int(row["chunk_index"])  # type: ignore[index]
+        offsets[chunk_index] = (current_line, current_line + line_count - 1)
+        # Full source reassembly joins chunks with "\n\n", which creates one
+        # blank separator line between adjacent chunk bodies.
+        current_line += line_count + 1
+    return offsets
+
+
+def _parse_cursor(cursor: str | None) -> int | None:
+    if cursor is None:
+        return None
+    try:
+        value = int(cursor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="cursor must be a line number") from exc
+    if value < 1:
+        raise HTTPException(status_code=400, detail="cursor must be a positive line number")
+    return value
+
+
+def _source_view_response(
+    *,
+    doc: object,
+    chunk_rows: list[object],
+    mode: str,
+    content: str,
+    sections: list[SourceViewSection],
+    line_start: int | None,
+    line_end: int | None,
+    total_lines: int,
+    next_cursor: str | None,
+    truncated: bool,
+    max_bytes: int,
+    limit_lines: int,
+) -> SourceViewResponse:
+    return SourceViewResponse(
+        doc_id=doc["doc_id"],  # type: ignore[index]
+        doc_version=doc["version"],  # type: ignore[index]
+        source_system=SourceSystem(doc["source_system"]),  # type: ignore[index]
+        source_url=doc["source_url"],  # type: ignore[index]
+        title=doc["title"],  # type: ignore[index]
+        content=content,
+        author_id=doc["author_id"],  # type: ignore[index]
+        mode=mode,  # type: ignore[arg-type]
+        sections=sections,
+        line_start=line_start,
+        line_end=line_end,
+        total_lines=total_lines,
+        next_cursor=next_cursor,
+        truncated=truncated,
+        chunk_count=len(chunk_rows),
+        body_size_bytes=doc["body_size_bytes"] or 0,  # type: ignore[index]
+        max_bytes=max_bytes,
+        limit_lines=limit_lines,
+    )
+
+
+async def _load_source_doc_and_chunks(
+    *,
+    customer_id: str,
+    doc_id: str,
+    version: int | None,
+) -> tuple[object, list[object]]:
+    async with with_tenant(customer_id) as conn:
+        if version is not None:
+            doc = await conn.fetchrow(
+                """
+                SELECT doc_id, version, source_system, source_id, source_url,
+                       title, body_size_bytes, author_id, metadata, entities,
+                       created_at, updated_at, ingested_at, deleted_at
+                FROM documents
+                WHERE customer_id = $1 AND doc_id = $2 AND version = $3
+                """,
+                customer_id,
+                doc_id,
+                version,
+            )
+        else:
+            doc = await conn.fetchrow(
+                """
+                SELECT doc_id, version, source_system, source_id, source_url,
+                       title, body_size_bytes, author_id, metadata, entities,
+                       created_at, updated_at, ingested_at, deleted_at
+                FROM documents
+                WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                customer_id,
+                doc_id,
+            )
+        if doc is None:
+            raise HTTPException(status_code=404, detail=f"document not found: {doc_id}")
+
+        chunk_rows = await conn.fetch(
+            """
+            SELECT content, chunk_index
+            FROM chunks
+            WHERE customer_id = $1
+              AND doc_id = $2
+              AND valid_to IS NULL
+              AND kind = 'content'
+              AND $3 BETWEEN first_seen_version AND last_seen_version
+            ORDER BY chunk_index
+            """,
+            customer_id,
+            doc_id,
+            doc["version"],
+        )
+    return doc, list(chunk_rows)
+
+
+def _rank_source_chunks(chunk_rows: list[object], query: str) -> list[tuple[object, float]]:
+    terms = [term.casefold() for term in query.split() if term.strip()]
+    if not terms:
+        raise HTTPException(status_code=400, detail="query is required for search mode")
+
+    ranked: list[tuple[object, float]] = []
+    for row in chunk_rows:
+        content = str(row["content"]).casefold()  # type: ignore[index]
+        score = sum(content.count(term) for term in terms)
+        if score:
+            ranked.append((row, float(score)))
+    return sorted(ranked, key=lambda item: (-item[1], int(item[0]["chunk_index"])))  # type: ignore[index]
+
+
+def _source_search_view(
+    *,
+    doc: object,
+    chunk_rows: list[object],
+    query: str,
+    total_lines: int,
+    limit_lines: int,
+    max_bytes: int,
+    max_matches: int,
+) -> SourceViewResponse:
+    offsets = _chunk_line_offsets(chunk_rows)
+    ranked = _rank_source_chunks(chunk_rows, query)
+    sections: list[SourceViewSection] = []
+    parts: list[str] = []
+    remaining_lines = limit_lines
+    truncated = len(ranked) > max_matches
+
+    for row, score in ranked[:max_matches]:
+        if remaining_lines <= 0:
+            truncated = True
+            break
+        chunk_index = int(row["chunk_index"])  # type: ignore[index]
+        chunk_lines = str(row["content"]).splitlines()  # type: ignore[index]
+        take = min(len(chunk_lines), remaining_lines)
+        if take <= 0:
+            continue
+        chunk_start, _ = offsets[chunk_index]
+        sections.append(
+            SourceViewSection(
+                chunk_index=chunk_index,
+                line_start=chunk_start,
+                line_end=chunk_start + take - 1,
+                score=score,
+            )
+        )
+        parts.append("\n".join(chunk_lines[:take]))
+        remaining_lines -= take
+        if take < len(chunk_lines):
+            truncated = True
+            break
+
+    content, byte_truncated = _cap_bytes("\n\n".join(parts), max_bytes)
+    truncated = truncated or byte_truncated
+    return _source_view_response(
+        doc=doc,
+        chunk_rows=chunk_rows,
+        mode="search",
+        content=content,
+        sections=sections,
+        line_start=sections[0].line_start if sections else None,
+        line_end=sections[-1].line_end if sections else None,
+        total_lines=total_lines,
+        next_cursor=None,
+        truncated=truncated,
+        max_bytes=max_bytes,
+        limit_lines=limit_lines,
+    )
+
+
+def _source_grep_view(
+    *,
+    doc: object,
+    chunk_rows: list[object],
+    pattern: str,
+    full_lines: list[str],
+    limit_lines: int,
+    max_bytes: int,
+    context_lines: int,
+    max_matches: int,
+) -> SourceViewResponse:
+    if not pattern:
+        raise HTTPException(status_code=400, detail="pattern is required for grep mode")
+
+    needle = pattern.casefold()
+    windows: list[tuple[int, int]] = []
+    total_lines = len(full_lines)
+    for line_number, line in enumerate(full_lines, start=1):
+        if needle not in line.casefold():
+            continue
+        start = max(1, line_number - context_lines)
+        end = min(total_lines, line_number + context_lines)
+        if windows and start <= windows[-1][1] + 1:
+            windows[-1] = (windows[-1][0], max(windows[-1][1], end))
+        else:
+            windows.append((start, end))
+        if len(windows) >= max_matches:
+            break
+
+    sections: list[SourceViewSection] = []
+    parts: list[str] = []
+    remaining_lines = limit_lines
+    truncated = len(windows) >= max_matches
+    for start, end in windows:
+        if remaining_lines <= 0:
+            truncated = True
+            break
+        take_end = min(end, start + remaining_lines - 1)
+        sections.append(SourceViewSection(line_start=start, line_end=take_end))
+        parts.append("\n".join(full_lines[start - 1 : take_end]))
+        remaining_lines -= take_end - start + 1
+        if take_end < end:
+            truncated = True
+            break
+
+    content, byte_truncated = _cap_bytes("\n\n---\n\n".join(parts), max_bytes)
+    truncated = truncated or byte_truncated
+    return _source_view_response(
+        doc=doc,
+        chunk_rows=chunk_rows,
+        mode="grep",
+        content=content,
+        sections=sections,
+        line_start=sections[0].line_start if sections else None,
+        line_end=sections[-1].line_end if sections else None,
+        total_lines=total_lines,
+        next_cursor=None,
+        truncated=truncated,
+        max_bytes=max_bytes,
+        limit_lines=limit_lines,
+    )
+
+
+@app.get("/source-view/{doc_id:path}", response_model=SourceViewResponse)
+async def get_source_view(
+    doc_id: str,
+    request: Request,
+    customer_id: str = Depends(authenticate_query),
+    version: int | None = Query(default=None),
+    mode: str = Query(default="preview"),
+    query: str | None = Query(default=None),
+    pattern: str | None = Query(default=None),
+    start_line: int | None = Query(default=None, ge=1),
+    limit_lines: int = Query(default=_SOURCE_VIEW_DEFAULT_LIMIT_LINES, ge=1),
+    chunk_index: int | None = Query(default=None, ge=0),
+    context_lines: int = Query(default=3, ge=0),
+    max_matches: int = Query(default=20, ge=1),
+    cursor: str | None = Query(default=None),
+    max_bytes: int = Query(default=_SOURCE_VIEW_DEFAULT_MAX_BYTES, ge=1),
+) -> SourceViewResponse:
+    """Bounded source content for MCP/agent drill-down.
+
+    The full dashboard/debug endpoint remains `/sources/{doc_id}`. This
+    endpoint is deliberately bounded so agents can inspect source context
+    without pulling an entire Slack thread, PR, or generated session log
+    into model context.
+    """
+    if mode not in _SOURCE_VIEW_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown mode {mode!r}; allowed: {sorted(_SOURCE_VIEW_MODES)}",
+        )
+
+    limit_lines = min(limit_lines, _SOURCE_VIEW_MAX_LIMIT_LINES)
+    max_bytes = min(max_bytes, _SOURCE_VIEW_MAX_BYTES)
+    context_lines = min(context_lines, _SOURCE_VIEW_MAX_CONTEXT_LINES)
+    max_matches = min(max_matches, _SOURCE_VIEW_MAX_MATCHES)
+
+    request.state.customer_id = customer_id
+    request.state.usage_summary = doc_id
+    request.state.usage_request_payload = {
+        "doc_id": doc_id,
+        "version": version,
+        "mode": mode,
+        "query": query,
+        "pattern": pattern,
+        "start_line": start_line,
+        "limit_lines": limit_lines,
+        "chunk_index": chunk_index,
+        "context_lines": context_lines,
+        "max_matches": max_matches,
+        "cursor": cursor,
+        "max_bytes": max_bytes,
+    }
+
+    doc, chunk_rows = await _load_source_doc_and_chunks(
+        customer_id=customer_id,
+        doc_id=doc_id,
+        version=version,
+    )
+    full_content = "\n\n".join(str(c["content"]) for c in chunk_rows)  # type: ignore[index]
+    full_lines = full_content.splitlines()
+    total_lines = len(full_lines)
+    sections: list[SourceViewSection] = []
+
+    if mode == "search":
+        if query is None:
+            raise HTTPException(status_code=400, detail="query is required for search mode")
+        source_response = _source_search_view(
+            doc=doc,
+            chunk_rows=chunk_rows,
+            query=query,
+            total_lines=total_lines,
+            limit_lines=limit_lines,
+            max_bytes=max_bytes,
+            max_matches=max_matches,
+        )
+    elif mode == "grep":
+        if pattern is None:
+            raise HTTPException(status_code=400, detail="pattern is required for grep mode")
+        source_response = _source_grep_view(
+            doc=doc,
+            chunk_rows=chunk_rows,
+            pattern=pattern,
+            full_lines=full_lines,
+            limit_lines=limit_lines,
+            max_bytes=max_bytes,
+            context_lines=context_lines,
+            max_matches=max_matches,
+        )
+    elif mode == "chunk":
+        if chunk_index is None:
+            raise HTTPException(status_code=400, detail="chunk_index is required for chunk mode")
+        chunk = next(
+            (row for row in chunk_rows if int(row["chunk_index"]) == chunk_index),  # type: ignore[index]
+            None,
+        )
+        if chunk is None:
+            raise HTTPException(status_code=404, detail=f"chunk not found: {chunk_index}")
+        offsets = _chunk_line_offsets(chunk_rows)
+        chunk_start, _ = offsets[chunk_index]
+        chunk_lines = str(chunk["content"]).splitlines()  # type: ignore[index]
+        content, local_start, local_end, next_cursor, truncated = _bounded_lines(
+            chunk_lines,
+            start_line=1,
+            limit_lines=limit_lines,
+            max_bytes=max_bytes,
+        )
+        line_start = chunk_start + local_start - 1 if local_start is not None else None
+        line_end = chunk_start + local_end - 1 if local_end is not None else None
+        if line_start is not None and line_end is not None:
+            sections.append(
+                SourceViewSection(
+                    chunk_index=chunk_index,
+                    line_start=line_start,
+                    line_end=line_end,
+                )
+            )
+        source_response = _source_view_response(
+            doc=doc,
+            chunk_rows=chunk_rows,
+            mode=mode,
+            content=content,
+            sections=sections,
+            line_start=line_start,
+            line_end=line_end,
+            total_lines=total_lines,
+            next_cursor=next_cursor,
+            truncated=truncated,
+            max_bytes=max_bytes,
+            limit_lines=limit_lines,
+        )
+    else:
+        if mode == "tail":
+            start = max(1, total_lines - limit_lines + 1)
+        elif mode == "range":
+            start = _parse_cursor(cursor) or start_line or 1
+        else:
+            start = 1
+
+        content, line_start, line_end, next_cursor, truncated = _bounded_lines(
+            full_lines,
+            start_line=start,
+            limit_lines=limit_lines,
+            max_bytes=max_bytes,
+        )
+        if mode == "tail" and start > 1:
+            truncated = True
+            next_cursor = None
+        if line_start is not None and line_end is not None:
+            sections.append(SourceViewSection(line_start=line_start, line_end=line_end))
+        source_response = _source_view_response(
+            doc=doc,
+            chunk_rows=chunk_rows,
+            mode=mode,
+            content=content,
+            sections=sections,
+            line_start=line_start,
+            line_end=line_end,
+            total_lines=total_lines,
+            next_cursor=next_cursor,
+            truncated=truncated,
+            max_bytes=max_bytes,
+            limit_lines=limit_lines,
+        )
+
+    request.state.result_count = len(source_response.sections)
+    request.state.usage_response_payload = source_response
+    return source_response
 
 
 @app.get("/sources/{doc_id:path}", response_model=SourceResponse)

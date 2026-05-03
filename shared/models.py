@@ -400,6 +400,41 @@ class SourceResponse(BaseModel):
     deleted_at: datetime | None = None
 
 
+class SourceViewSection(BaseModel):
+    chunk_index: int | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    score: float | None = None
+
+
+class SourceViewResponse(BaseModel):
+    """Bounded source view for agent/MCP callers.
+
+    Unlike SourceResponse, this never returns a full document by default.
+    Callers pick a mode (preview/search/grep/range/chunk/tail) and the
+    service enforces max line/byte ceilings.
+    """
+
+    doc_id: str
+    doc_version: int
+    source_system: SourceSystem
+    source_url: str
+    title: str | None
+    content: str
+    author_id: str | None = None
+    mode: Literal["preview", "search", "grep", "range", "chunk", "tail"]
+    sections: list[SourceViewSection] = Field(default_factory=list)
+    line_start: int | None = None
+    line_end: int | None = None
+    total_lines: int
+    next_cursor: str | None = None
+    truncated: bool
+    chunk_count: int
+    body_size_bytes: int
+    max_bytes: int
+    limit_lines: int
+
+
 class BootstrapConfig(BaseModel):
     customer_id: str
     display_name: str

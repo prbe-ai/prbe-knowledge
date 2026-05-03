@@ -59,7 +59,12 @@ log = get_logger(__name__)
 # /usage/* and /health are explicitly excluded — logging reads of the
 # usage table itself would create a self-amplifying audit loop, and the
 # health endpoint is hit every few seconds by the load balancer.
-_LOGGED_PREFIXES: tuple[str, ...] = ("/retrieve", "/query", "/sources")
+_LOGGED_PREFIXES: tuple[str, ...] = (
+    "/retrieve",
+    "/query",
+    "/sources",
+    "/source-view",
+)
 _SKIPPED_PREFIXES: tuple[str, ...] = ("/health", "/usage")
 
 

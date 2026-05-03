@@ -137,6 +137,25 @@ async def _get_source(
     return resp
 
 
+async def _get_source_view(
+    doc_id: str,
+    headers: dict[str, str] | None = None,
+    *,
+    query: str = "",
+) -> httpx.Response:
+    from services.retrieval.main import app as retrieval_app
+
+    await close_pool()
+    transport = ASGITransport(app=retrieval_app)
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        retrieval_app.router.lifespan_context(retrieval_app),
+    ):
+        url = f"/source-view/{doc_id}{query}"
+        resp = await client.get(url, headers=headers or {})
+    return resp
+
+
 @pytest.mark.asyncio
 async def test_sources_requires_bearer(live_db, settings) -> None:
     resp = await _get_source("anything")
@@ -244,3 +263,92 @@ async def test_sources_specific_version(live_db, settings) -> None:
     body = resp_v1.json()
     assert body["doc_version"] == 1
     assert body["content"] == "v1 content"
+
+
+@pytest.mark.asyncio
+async def test_source_view_defaults_to_bounded_preview(live_db, settings) -> None:
+    api_key = await _seed_customer("cust-view")
+    await _seed_doc_with_chunks(
+        "cust-view",
+        "slack:T1:C1:view",
+        chunks=[
+            "\n".join(f"line {i}" for i in range(1, 151)),
+            "second chunk should not appear in preview",
+        ],
+    )
+
+    resp = await _get_source_view(
+        "slack:T1:C1:view",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    await init_pool(settings)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["mode"] == "preview"
+    assert body["line_start"] == 1
+    assert body["line_end"] == 80
+    assert body["limit_lines"] == 80
+    assert body["truncated"] is True
+    assert body["next_cursor"] == "81"
+    assert "line 80" in body["content"]
+    assert "line 81" not in body["content"]
+    assert "second chunk should not appear" not in body["content"]
+
+
+@pytest.mark.asyncio
+async def test_source_view_supports_range_cursor_search_grep_and_chunk(
+    live_db, settings
+) -> None:
+    api_key = await _seed_customer("cust-view-modes")
+    await _seed_doc_with_chunks(
+        "cust-view-modes",
+        "slack:T1:C1:modes",
+        chunks=[
+            "alpha\nbeta target\ngamma",
+            "delta\nneedle here\nepsilon target\nzeta",
+        ],
+    )
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    range_resp = await _get_source_view(
+        "slack:T1:C1:modes",
+        headers=headers,
+        query="?mode=range&start_line=5&limit_lines=2",
+    )
+    assert range_resp.status_code == 200, range_resp.text
+    range_body = range_resp.json()
+    assert range_body["content"] == "delta\nneedle here"
+    assert range_body["line_start"] == 5
+    assert range_body["line_end"] == 6
+
+    search_resp = await _get_source_view(
+        "slack:T1:C1:modes",
+        headers=headers,
+        query="?mode=search&query=target&limit_lines=10",
+    )
+    assert search_resp.status_code == 200, search_resp.text
+    search_body = search_resp.json()
+    assert search_body["mode"] == "search"
+    assert "target" in search_body["content"]
+    assert search_body["sections"][0]["chunk_index"] in {0, 1}
+
+    grep_resp = await _get_source_view(
+        "slack:T1:C1:modes",
+        headers=headers,
+        query="?mode=grep&pattern=needle&context_lines=0",
+    )
+    assert grep_resp.status_code == 200, grep_resp.text
+    grep_body = grep_resp.json()
+    assert grep_body["content"] == "needle here"
+    assert grep_body["line_start"] == 6
+
+    chunk_resp = await _get_source_view(
+        "slack:T1:C1:modes",
+        headers=headers,
+        query="?mode=chunk&chunk_index=1&limit_lines=2",
+    )
+    await init_pool(settings)
+    assert chunk_resp.status_code == 200, chunk_resp.text
+    chunk_body = chunk_resp.json()
+    assert chunk_body["content"] == "delta\nneedle here"
+    assert chunk_body["sections"][0]["chunk_index"] == 1
