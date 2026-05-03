@@ -1,8 +1,8 @@
 """wiki_synthesis_queue + wiki_synthesis_runs
 
-Revision ID: 0032_wiki_synthesis
-Revises: 0031_codex_device_source_bkfl
-Create Date: 2026-05-02
+Revision ID: 0033_wiki_synthesis
+Revises: 0032_manual_uploads
+Create Date: 2026-05-03
 
 Two tables for the Phase 2 LLM-Wiki synthesis loop.
 
@@ -30,8 +30,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "0032_wiki_synthesis"
-down_revision = "0031_codex_device_source_bkfl"
+revision = "0033_wiki_synthesis"
+down_revision = "0032_manual_uploads"
 branch_labels = None
 depends_on = None
 

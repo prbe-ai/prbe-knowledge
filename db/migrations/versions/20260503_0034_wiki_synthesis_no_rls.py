@@ -1,10 +1,10 @@
 """Drop RLS from wiki_synthesis_queue + wiki_synthesis_runs
 
-Revision ID: 0033_wiki_synthesis_no_rls
-Revises: 0032_wiki_synthesis
-Create Date: 2026-05-02
+Revision ID: 0034_wiki_synthesis_no_rls
+Revises: 0033_wiki_synthesis
+Create Date: 2026-05-03
 
-Migration 0032 created both tables with `ENABLE` + `FORCE ROW LEVEL
+Migration 0033 created both tables with `ENABLE` + `FORCE ROW LEVEL
 SECURITY` and a tenant-isolation policy. That was wrong: these are
 **internal queue tables** drained cross-customer by the worker (the
 synthesis cron's `_tick` does `SELECT DISTINCT customer_id FROM
@@ -19,7 +19,7 @@ by application code: every per-customer query uses
 `shared.db.with_tenant(customer_id)` AND filters on `customer_id`
 explicitly. The cron loop uses the same discipline.
 
-This migration brings 0032 into line with that convention by dropping
+This migration brings 0033 into line with that convention by dropping
 the RLS policy and disabling RLS on both tables.
 """
 
@@ -27,8 +27,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0033_wiki_synthesis_no_rls"
-down_revision = "0032_wiki_synthesis"
+revision = "0034_wiki_synthesis_no_rls"
+down_revision = "0033_wiki_synthesis"
 branch_labels = None
 depends_on = None
 
