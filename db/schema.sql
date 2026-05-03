@@ -603,7 +603,8 @@ CREATE TABLE wiki_synthesis_queue (
     synthesis_error         TEXT,
     CONSTRAINT uq_wsq_customer_doc_version UNIQUE (customer_id, doc_id, doc_version),
     CONSTRAINT ck_wsq_status CHECK (status IN (
-        'pending','triaging','triaged','rejected','synthesizing','done','failed'
+        'pending','triaging','triaged','rejected',
+        'synthesizing','done','failed','verifier_rejected'
     ))
 );
 
