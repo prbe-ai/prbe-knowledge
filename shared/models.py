@@ -411,8 +411,10 @@ class SourceViewResponse(BaseModel):
     """Bounded source view for agent/MCP callers.
 
     Unlike SourceResponse, this never returns a full document by default.
-    Callers pick a mode (preview/search/grep/range/chunk/tail) and the
-    service enforces max line/byte ceilings.
+    Callers pick a mode (preview/search/grep/range/chunk/tail/full) and the
+    service enforces max line/byte ceilings. mode="full" is the explicit
+    opt-in for whole-document retrieval, gated only by a high
+    OOM-defense cap.
     """
 
     doc_id: str
@@ -422,7 +424,7 @@ class SourceViewResponse(BaseModel):
     title: str | None
     content: str
     author_id: str | None = None
-    mode: Literal["preview", "search", "grep", "range", "chunk", "tail"]
+    mode: Literal["preview", "search", "grep", "range", "chunk", "tail", "full"]
     sections: list[SourceViewSection] = Field(default_factory=list)
     line_start: int | None = None
     line_end: int | None = None
