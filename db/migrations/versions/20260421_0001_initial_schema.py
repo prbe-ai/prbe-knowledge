@@ -30,7 +30,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     # Order matters: drop children before parents.
     op.execute("""
-        DROP TABLE IF EXISTS query_cache CASCADE;
         DROP TABLE IF EXISTS graph_edges CASCADE;
         DROP TABLE IF EXISTS graph_nodes CASCADE;
         DROP TABLE IF EXISTS audit_log CASCADE;

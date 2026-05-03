@@ -8,6 +8,7 @@ graph tables + RLS tenant isolation.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_GRAPH
@@ -24,6 +25,8 @@ class GraphHit:
     source_url: str
     title: str | None
     content: str
+    created_at: datetime
+    updated_at: datetime
     score: float
     via_entity: str  # canonical_id that anchored this hit
 
@@ -102,6 +105,7 @@ async def graph_search(
             )
             SELECT c.chunk_id, c.doc_id, d.version AS doc_version,
                    d.source_system, d.source_url, d.title, c.content,
+                   d.created_at, d.updated_at,
                    MIN(n.via) AS via_entity
             FROM neighbors n
             JOIN graph_nodes gn ON gn.node_id = n.node_id
@@ -116,7 +120,8 @@ async def graph_search(
               {pred.chunk_sql}
               {pred.doc_sql}
             GROUP BY c.chunk_id, c.doc_id, d.version,
-                     d.source_system, d.source_url, d.title, c.content
+                     d.source_system, d.source_url, d.title, c.content,
+                     d.created_at, d.updated_at
             LIMIT $4
             """,
             *params,
@@ -131,6 +136,8 @@ async def graph_search(
             source_url=r["source_url"],
             title=r["title"],
             content=r["content"],
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
             score=1.0,
             via_entity=r["via_entity"],
         )

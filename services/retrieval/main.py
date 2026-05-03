@@ -199,6 +199,7 @@ async def query(
     fused = fuse(
         {"vector": vec_hits, "bm25": bm25_hits, "graph": graph_hits},
         top_k=req.top_k * 2,
+        recency_half_life_days=req.recency_half_life_days,
     )
     timing["fusion_ms"] = (time.perf_counter() - t_fuse) * 1000
 
@@ -223,6 +224,8 @@ async def query(
             source_url=h.source_url,
             title=h.title,
             content=h.content,
+            created_at=h.created_at,
+            updated_at=h.updated_at,
             score=h.score,
             rank=i + 1,
             retriever_scores=h.retriever_scores,

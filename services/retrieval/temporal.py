@@ -12,6 +12,7 @@ for whichever query shape a retriever happens to use.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
 from shared.models import TemporalMode, TemporalSpec
 
@@ -81,3 +82,66 @@ def build_predicate(
         )
 
     raise ValueError(f"unhandled TemporalMode: {spec.mode}")
+
+
+def resolve_temporal(
+    symbolic: dict | None, now: datetime
+) -> tuple[TemporalSpec | None, str | None]:
+    """Resolve symbolic temporal output from Haiku into a TemporalSpec.
+
+    Returns (spec, error). If `symbolic` has `unresolvable_anchor` set,
+    returns (None, "could not resolve event anchor: <phrase>"). If symbolic
+    is None or empty, returns (None, None) so caller falls back to default.
+    """
+    if symbolic is None:
+        return None, None
+
+    anchor = symbolic.get("unresolvable_anchor")
+    if anchor:
+        return None, f"could not resolve event anchor: '{anchor}'"
+
+    since = _resolve_endpoint(symbolic.get("since"), now)
+    until = _resolve_endpoint(symbolic.get("until"), now)
+
+    if since is None and until is None:
+        return None, None
+
+    # Clamp open-ended ranges so TemporalSpec's validator (since < until) holds.
+    if since is None:
+        since = datetime(1970, 1, 1, tzinfo=UTC)
+    if until is None:
+        until = now
+    if until < since:
+        return None, "until is before since"
+
+    basis = symbolic.get("basis") or "source"
+    if basis not in ("source", "ingest"):
+        basis = "source"
+
+    spec = TemporalSpec(
+        mode=TemporalMode.CHANGED_BETWEEN,
+        since=since,
+        until=until,
+        time_basis=basis,
+    )
+    return spec, None
+
+
+def _resolve_endpoint(endpoint: dict | None, now: datetime) -> datetime | None:
+    if endpoint is None:
+        return None
+    kind = endpoint.get("kind")
+    if kind == "rel":
+        offset = endpoint.get("offset_days")
+        if offset is None:
+            return None
+        return now + timedelta(days=float(offset))
+    if kind == "abs":
+        iso = endpoint.get("iso")
+        if not iso:
+            return None
+        try:
+            return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
+    return None

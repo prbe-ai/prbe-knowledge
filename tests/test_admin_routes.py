@@ -237,12 +237,9 @@ async def test_delete_customer_removes_row_and_cascades(live_db, settings) -> No
         )
         await conn.execute(
             """
-            INSERT INTO query_cache
-                (cache_key, customer_id, query_text_hash,
-                 entities, expansions, expires_at)
-            VALUES ('del-key', 'del', 'hash',
-                    '{}'::jsonb, '{}'::jsonb,
-                    NOW() + INTERVAL '1 hour')
+            INSERT INTO audit_log
+                (customer_id, actor_id, action)
+            VALUES ('del', 'tester', 'noop')
             """
         )
 
@@ -260,7 +257,7 @@ async def test_delete_customer_removes_row_and_cascades(live_db, settings) -> No
             "SELECT COUNT(*) FROM integration_tokens WHERE customer_id='del'"
         ) == 0
         assert await conn.fetchval(
-            "SELECT COUNT(*) FROM query_cache WHERE customer_id='del'"
+            "SELECT COUNT(*) FROM audit_log WHERE customer_id='del'"
         ) == 0
 
 

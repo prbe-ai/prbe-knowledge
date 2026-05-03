@@ -348,21 +348,6 @@ CREATE POLICY tenant_isolation ON graph_edges
     USING (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
--- query_cache: router (Haiku) output cache keyed by query hash. 1-hour TTL.
--- ---------------------------------------------------------------------------
-CREATE TABLE query_cache (
-    cache_key            TEXT PRIMARY KEY,
-    customer_id          TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    query_text_hash      TEXT NOT NULL,
-    entities             JSONB NOT NULL,
-    expansions           JSONB NOT NULL,
-    expires_at           TIMESTAMPTZ NOT NULL,
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX idx_query_cache_expiry ON query_cache (expires_at);
-CREATE INDEX idx_query_cache_customer ON query_cache (customer_id, query_text_hash);
-
--- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents

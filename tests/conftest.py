@@ -53,7 +53,6 @@ def settings() -> Settings:
 
 TRUNCATE_SQL = """
     TRUNCATE TABLE
-        query_cache,
         graph_edges,
         graph_nodes,
         audit_log,

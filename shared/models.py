@@ -212,7 +212,15 @@ class QueryRequest(BaseModel):
     sources: list[SourceSystem] | None = None
     requesting_user_id: str | None = None
     trace_id: str | None = None
-    temporal: TemporalSpec = Field(default_factory=TemporalSpec)
+    temporal: TemporalSpec | None = None
+    recency_half_life_days: float | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "If set, multiply each fused chunk's score by exp(-ln2 * age_days / half_life). "
+            "Age uses documents.updated_at vs. now (UTC). Off by default."
+        ),
+    )
 
 
 class QueryChunk(BaseModel):
@@ -226,6 +234,8 @@ class QueryChunk(BaseModel):
     source_url: str
     title: str | None
     content: str
+    created_at: datetime
+    updated_at: datetime
     score: float
     rank: int
     retriever_scores: dict[str, float] = Field(default_factory=dict)
@@ -236,6 +246,7 @@ class QueryResponse(BaseModel):
     chunks: list[QueryChunk]
     total_candidates: int
     router_hit_cache: bool
+    applied_temporal: dict | None = None
     timing_ms: dict[str, float] = Field(default_factory=dict)
     trace_id: str
 
