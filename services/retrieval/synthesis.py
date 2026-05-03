@@ -326,7 +326,17 @@ async def synthesize_stream(
             stream = await client.aio.models.generate_content_stream(
                 model=model_id,
                 contents=contents,
-                config={"max_output_tokens": max_tokens},
+                config={
+                    "max_output_tokens": max_tokens,
+                    # Gemini 3 Flash thinks by default; thinking tokens are
+                    # billed against `max_output_tokens` and produce no
+                    # visible output. For retrieval-grounded synthesis the
+                    # answer must come from the chunks, so extended reasoning
+                    # adds latency + truncates the user-visible answer for
+                    # zero benefit. Forcing budget=0 keeps the full token
+                    # allowance available for the cited prose.
+                    "thinking_config": {"thinking_budget": 0},
+                },
             )
             async for resp in stream:
                 text = getattr(resp, "text", None) or ""
@@ -541,6 +551,10 @@ async def _call_google(
                 "max_output_tokens": max_tokens,
                 "response_mime_type": "application/json",
                 "response_schema": google_schema,
+                # Disable Gemini 3 thinking so the full token budget is
+                # available for structured JSON output (see streaming
+                # branch for full rationale).
+                "thinking_config": {"thinking_budget": 0},
             },
         )
     except Exception as exc:
