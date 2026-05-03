@@ -40,6 +40,7 @@ from shared.constants import (
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
     NORMALIZER_VERSION,
+    WIKI_SYNTHESIZE_CHANNEL,
     SourceSystem,
 )
 from shared.db import get_pool, with_tenant
@@ -242,6 +243,28 @@ class Normalizer:
                     )
                 await conn.execute(f"RELEASE SAVEPOINT {sp}")
 
+        # ---- Wiki-synthesis enqueue + wake ------------------------------
+        # After Phase B's commit, append one row per persisted doc into
+        # wiki_synthesis_queue and pg_notify the synthesis cron. Skip when
+        # the source IS the wiki — otherwise the cron's own COMPILED_WIKI
+        # writes would feed back into its own queue. Wrapped so a queue
+        # failure logs a warning but does not fail an already-committed
+        # ingestion.
+        if source_system != SourceSystem.WIKI and doc_ids:
+            try:
+                await self._enqueue_wiki_synthesis(customer_id, doc_ids)
+            except Exception as exc:
+                # Boundary swallow: ingestion already committed, queue
+                # enqueue is best-effort. The defensive periodic cron tick
+                # picks up anything we missed.
+                log.warning(
+                    "wiki.synthesis.enqueue_failed",
+                    customer=customer_id,
+                    doc_count=len(doc_ids),
+                    error=str(exc),
+                    error_class=type(exc).__name__,
+                )
+
         log.info(
             "normalizer.done",
             customer=customer_id,
@@ -262,6 +285,45 @@ class Normalizer:
             removed_chunk_count=total_removed,
             quarantined_doc_ids=quarantined,
         )
+
+    async def _enqueue_wiki_synthesis(
+        self,
+        customer_id: str,
+        doc_ids: list[str],
+    ) -> None:
+        """Append a wiki_synthesis_queue row per persisted doc, then notify.
+
+        Idempotent on `(customer_id, doc_id, doc_version)` — a redelivered
+        webhook that re-persists the same content (same version) won't
+        double-enqueue. The doc_version comes from the DB rather than the
+        in-memory Document because `_upsert_document` mutates `doc.version`
+        in place; we re-read to be defensive against future callers that
+        skip that mutation.
+        """
+        async with with_tenant(customer_id) as conn:
+            await conn.execute(
+                """
+                INSERT INTO wiki_synthesis_queue
+                    (customer_id, doc_id, doc_version, source_system,
+                     doc_type, status, enqueued_at)
+                SELECT customer_id, doc_id, version, source_system,
+                       doc_type, 'pending', NOW()
+                FROM documents
+                WHERE customer_id = $1
+                  AND doc_id = ANY($2::text[])
+                  AND valid_to IS NULL
+                ON CONFLICT (customer_id, doc_id, doc_version) DO NOTHING
+                """,
+                customer_id,
+                doc_ids,
+            )
+            # One notify per call regardless of doc count — the cron drains
+            # whatever's pending when it wakes.
+            await conn.execute(
+                "SELECT pg_notify($1, $2)",
+                WIKI_SYNTHESIZE_CHANNEL,
+                customer_id,
+            )
 
     async def _plan_chunks(self, customer_id: str, doc: Document) -> _ChunkPlan:
         """Phase A: build a `_ChunkPlan` for one document — without holding

@@ -58,6 +58,9 @@ class DocType(StrEnum):
     WIKI_DECISION = "wiki.decision"
     WIKI_FEATURE = "wiki.feature"
     WIKI_RUNBOOK = "wiki.runbook"
+    # Auto-generated table of contents. Exactly one per customer; regenerated
+    # at the end of each synthesis run from the live set of wiki pages.
+    WIKI_INDEX = "wiki.index"
 
 
 class NodeLabel(StrEnum):
@@ -303,3 +306,30 @@ GRANOLA_REQUEST_INTERVAL_SECONDS = 0.25
 # Manual-refresh debounce. Repeated /refresh hits within this window collapse
 # into a single enqueue + notify; the second hit returns 429 with Retry-After.
 GRANOLA_REFRESH_DEBOUNCE_SECONDS = 30
+
+
+# pg_notify channel the synthesis worker LISTENs on. Normalizer._persist NOTIFYs
+# after appending wiki_synthesis_queue rows; the cron wakes within seconds.
+WIKI_SYNTHESIZE_CHANNEL = "wiki_synthesize"
+
+# How many wiki_synthesis_queue rows the cron claims per drain tick. Triage is
+# token-budget batched on top of this; this is just the upper bound on rows
+# pulled into memory at once.
+WIKI_SYNTHESIS_CLAIM_BATCH = 200
+
+# Token budget per Haiku triage call. Rows are packed greedily by
+# `documents.body_token_count` until this ceiling is hit, then the batch fires.
+# A row whose body alone exceeds the ceiling becomes its own single-row call;
+# Haiku has 200K context so even big claude_code sessions usually fit alone.
+WIKI_TRIAGE_TOKEN_BUDGET = 120_000
+
+# Importance threshold for triage to keep an event. Below this score the row
+# is marked 'rejected' and never reaches synthesis.
+WIKI_TRIAGE_SCORE_THRESHOLD = 5.0
+
+# Per-row attempt cap before a queue row is parked in 'failed'.
+WIKI_SYNTHESIS_MAX_ATTEMPTS = 3
+
+# Defensive periodic wake interval. The cron also wakes on every NOTIFY; this
+# is a safety net if a notify is missed during a connection drop.
+WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
