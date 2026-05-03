@@ -829,6 +829,23 @@ async def run_worker_forever() -> None:
     reclaim_loop = ReclaimLoop(
         backfill_threshold_seconds=settings.backfill_stale_heartbeat_seconds,
     )
+    # Wiki synthesis: separate wake event so a granola notify doesn't burn
+    # a synthesis tick (and vice-versa). Cron drains wiki_synthesis_queue and
+    # writes COMPILED_WIKI pages via build_normalization_result + Normalizer.
+    from services.synthesis.wiki_cron import WikiSynthesisCron
+    from services.synthesis.wiki_listener import WikiSynthesisListener
+
+    wiki_wake_event = asyncio.Event()
+    wiki_synthesis_listener = WikiSynthesisListener(
+        settings.database_url, wiki_wake_event
+    )
+    from shared.storage import get_store as _get_store
+
+    wiki_synthesis_cron = WikiSynthesisCron(
+        ctx=ctx,
+        store=_get_store(),
+        wake_event=wiki_wake_event,
+    )
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
     health_config = uvicorn.Config(
@@ -871,6 +888,8 @@ async def run_worker_forever() -> None:
         backfill_worker.shutdown()
         granola_listener.shutdown()
         reclaim_loop.shutdown()
+        wiki_synthesis_listener.shutdown()
+        wiki_synthesis_cron.shutdown()
         health_server.should_exit = True
         if gather_future is not None and not gather_future.done():
             gather_future.cancel()
@@ -890,6 +909,8 @@ async def run_worker_forever() -> None:
             backfill_worker.run(),
             granola_listener.run(),
             reclaim_loop.run(),
+            wiki_synthesis_listener.run(),
+            wiki_synthesis_cron.run(),
             health_server.serve(),
         )
         try:

@@ -66,6 +66,8 @@ TRUNCATE_SQL = """
         ingestion_queue,
         acl_snapshots,
         chunks,
+        wiki_synthesis_queue,
+        wiki_synthesis_runs,
         documents,
         customer_source_mapping,
         customers

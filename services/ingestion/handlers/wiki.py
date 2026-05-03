@@ -76,7 +76,21 @@ WIKI_TYPE_TO_DOC_TYPE: dict[str, DocType] = {
     "decision": DocType.WIKI_DECISION,
     "feature": DocType.WIKI_FEATURE,
     "runbook": DocType.WIKI_RUNBOOK,
+    # The auto-generated table of contents. Singleton per customer.
+    # User-facing PUT/DELETE routes reject this type — only the synthesis
+    # cron writes it. GET /api/wiki/index reads it.
+    "index": DocType.WIKI_INDEX,
 }
+
+# Subset of wiki_types that humans can author through PUT/DELETE. The cron
+# is allowed to write any type via build_normalization_result directly.
+USER_AUTHORED_WIKI_TYPES: frozenset[str] = frozenset(
+    {"service_card", "decision", "feature", "runbook"}
+)
+
+# Singleton slug for the auto-generated index page. The cron always writes
+# `wiki:index:contents`; GET /api/wiki/index resolves to that doc_id.
+INDEX_SLUG = "contents"
 
 # `[[<kind>: ...]]` -> (graph node label, edge type emitted from the wiki page).
 #
@@ -251,6 +265,37 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
         "dangling_links": dangling_links,
         "doc_class": doc_class.value,
     }
+
+    # Optional one-sentence summary for the wiki.index page. The synthesis
+    # cron always provides one; manual uploads may omit it (the index falls
+    # back to body_preview in that case).
+    summary = payload.get("summary")
+    if summary is not None:
+        if not isinstance(summary, str):
+            raise InvalidWebhookPayload("summary must be a string")
+        metadata["summary"] = summary
+
+    # Audit-trail metadata. Manual route fills with the human caller; the
+    # synthesis cron fills with the run-id + model name. Stored in the same
+    # JSONB column so history/revert endpoints can return it without a
+    # schema change.
+    commit_message = payload.get("commit_message")
+    commit_author = payload.get("commit_author")
+    commit_run_id = payload.get("commit_run_id")
+    if commit_message is not None or commit_author is not None or commit_run_id is not None:
+        commit: dict[str, Any] = {}
+        if commit_message is not None:
+            if not isinstance(commit_message, str):
+                raise InvalidWebhookPayload("commit_message must be a string")
+            commit["message"] = commit_message
+        if commit_author is not None:
+            if not isinstance(commit_author, str):
+                raise InvalidWebhookPayload("commit_author must be a string")
+            commit["author"] = commit_author
+        if commit_run_id is not None:
+            commit["run_id"] = commit_run_id
+        commit["recorded_at"] = received_at.isoformat()
+        metadata["commit"] = commit
 
     compile_trigger: CompileTrigger | None = None
     compiled_at: datetime | None = None

@@ -47,13 +47,15 @@ from pydantic import BaseModel, Field, field_validator
 
 from services.ingestion.admin_routes import verify_internal_knowledge_key
 from services.ingestion.handlers.wiki import (
+    INDEX_SLUG,
+    USER_AUTHORED_WIKI_TYPES,
     WIKI_PAYLOAD_KEY,
     WIKI_TYPE_TO_DOC_TYPE,
     build_normalization_result,
 )
 from services.ingestion.normalizer import Normalizer
 from services.ingestion.wiki_links import parse_page_links
-from shared.constants import DocClass, SourceSystem
+from shared.constants import DocClass, DocType, SourceSystem
 from shared.db import with_tenant
 from shared.exceptions import InvalidWebhookPayload
 from shared.logging import get_logger
@@ -84,6 +86,8 @@ class WikiUpsertBody(BaseModel):
     compiled_from_doc_ids: list[str] | None = None
     compile_trigger: str | None = None
     updated_at: datetime | None = None
+    commit_message: str | None = Field(default=None, max_length=240)
+    summary: str | None = Field(default=None, max_length=240)
 
     @field_validator("doc_class")
     @classmethod
@@ -101,6 +105,44 @@ class WikiUpsertBody(BaseModel):
                 "use 'manual_entry' for human uploads"
             )
         return value
+
+
+class WikiRevertBody(BaseModel):
+    to_version: int = Field(ge=1)
+    reason: str = Field(min_length=1, max_length=240)
+    author_id: str | None = Field(default=None, max_length=128)
+
+
+class WikiHistoryEntry(BaseModel):
+    version: int
+    updated_at: datetime
+    author_id: str | None
+    commit_message: str | None
+    commit_author: str | None
+    commit_run_id: str | int | None
+    content_hash: str
+    is_live: bool
+
+
+class WikiHistoryResponse(BaseModel):
+    doc_id: str
+    entries: list[WikiHistoryEntry]
+
+
+class WikiIndexEntry(BaseModel):
+    wiki_type: str
+    slug: str
+    title: str | None
+    summary: str | None
+    updated_at: datetime
+    version: int
+
+
+class WikiIndexResponse(BaseModel):
+    body: str
+    entries: list[WikiIndexEntry]
+    updated_at: datetime | None
+    version: int | None
 
 
 class WikiLinkOut(BaseModel):
@@ -166,12 +208,18 @@ def _require_customer(
 
 
 def _validate_wiki_type(wiki_type: str) -> str:
-    if wiki_type not in WIKI_TYPE_TO_DOC_TYPE:
+    """Validate the path wiki_type for human-author routes (PUT/GET/DELETE).
+
+    The 'index' type is a singleton synthesized by the cron — never a valid
+    target for human upload, so we reject it here. The cron writes the
+    index by calling `build_normalization_result` directly.
+    """
+    if wiki_type not in USER_AUTHORED_WIKI_TYPES:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"unsupported wiki_type {wiki_type!r}; expected one of "
-                f"{sorted(WIKI_TYPE_TO_DOC_TYPE)}"
+                f"{sorted(USER_AUTHORED_WIKI_TYPES)}"
             ),
         )
     return wiki_type
@@ -210,6 +258,9 @@ def _build_event(
     compile_trigger: str | None,
     received_at: datetime,
     is_delete: bool,
+    commit_message: str | None = None,
+    commit_author: str | None = None,
+    summary: str | None = None,
 ) -> WebhookEvent:
     raw_payload = {
         WIKI_PAYLOAD_KEY: {
@@ -224,6 +275,9 @@ def _build_event(
             "compile_trigger": compile_trigger,
             "is_delete": is_delete,
             "updated_at": received_at.isoformat(),
+            "commit_message": commit_message,
+            "commit_author": commit_author,
+            "summary": summary,
         }
     }
     tail = "delete" if is_delete else "edit"
@@ -286,6 +340,14 @@ async def upsert_wiki_page(
         compile_trigger=body.compile_trigger,
         received_at=received_at,
         is_delete=False,
+        commit_message=body.commit_message
+        or (
+            f"Manual upload by {body.author_id}"
+            if body.author_id
+            else "Manual upload"
+        ),
+        commit_author=body.author_id,
+        summary=body.summary,
     )
 
     try:
@@ -479,6 +541,10 @@ async def list_wiki_pages(
             if len(parts) == 2:
                 wiki_type_value = wiki_type_value or parts[0]
                 slug_value = slug_value or parts[1]
+        # The auto-generated index is exposed via /api/wiki/index, not in the
+        # general list of user-authored pages.
+        if wiki_type_value == "index":
+            continue
         items.append(
             WikiListItem(
                 wiki_type=wiki_type_value or "unknown",
@@ -489,3 +555,265 @@ async def list_wiki_pages(
             )
         )
     return WikiListResponse(items=items, count=len(items))
+
+
+# ---------------------------------------------------------------------------
+# History + revert + index
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/pages/{wiki_type}/{slug}/history",
+    response_model=WikiHistoryResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def get_wiki_page_history(
+    wiki_type: str,
+    slug: str,
+    customer_id: str = Depends(_require_customer),
+) -> WikiHistoryResponse:
+    """Every persisted version of a wiki page, newest first.
+
+    Includes both the live version (valid_to IS NULL) and all closed-out
+    historical versions. Each entry surfaces the commit metadata stamped at
+    write time so consumers can render an audit trail.
+    """
+    wiki_type = _validate_wiki_type(wiki_type)
+    slug = _validate_slug(slug)
+    doc_id = f"wiki:{wiki_type}:{slug}"
+
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT version, updated_at, author_id, content_hash, valid_to,
+                   metadata
+            FROM documents
+            WHERE customer_id = $1 AND doc_id = $2
+            ORDER BY version DESC
+            """,
+            customer_id,
+            doc_id,
+        )
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="wiki page not found")
+
+    entries: list[WikiHistoryEntry] = []
+    for row in rows:
+        metadata = _coerce_metadata(row["metadata"])
+        commit = metadata.get("commit") if isinstance(metadata, dict) else None
+        if not isinstance(commit, dict):
+            commit = {}
+        entries.append(
+            WikiHistoryEntry(
+                version=row["version"],
+                updated_at=row["updated_at"],
+                author_id=row["author_id"],
+                commit_message=commit.get("message"),
+                commit_author=commit.get("author"),
+                commit_run_id=commit.get("run_id"),
+                content_hash=row["content_hash"],
+                is_live=row["valid_to"] is None,
+            )
+        )
+    return WikiHistoryResponse(doc_id=doc_id, entries=entries)
+
+
+@router.post(
+    "/pages/{wiki_type}/{slug}/revert",
+    response_model=WikiUpsertResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def revert_wiki_page(
+    wiki_type: str,
+    slug: str,
+    body: WikiRevertBody,
+    request: Request,
+    customer_id: str = Depends(_require_customer),
+) -> WikiUpsertResponse:
+    """Roll a wiki page back to a prior version.
+
+    Reads version `to_version` from `documents`, copies its body + frontmatter
+    + summary into a new write through `build_normalization_result`. The new
+    row's commit metadata explains the revert. Original history is untouched.
+    """
+    wiki_type = _validate_wiki_type(wiki_type)
+    slug = _validate_slug(slug)
+    doc_id = f"wiki:{wiki_type}:{slug}"
+
+    async with with_tenant(customer_id) as conn:
+        target = await conn.fetchrow(
+            """
+            SELECT title, metadata
+            FROM documents
+            WHERE customer_id = $1 AND doc_id = $2 AND version = $3
+            """,
+            customer_id,
+            doc_id,
+            body.to_version,
+        )
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"version {body.to_version} not found for {doc_id}",
+        )
+
+    target_meta = _coerce_metadata(target["metadata"])
+    received_at = datetime.now(UTC)
+    event = _build_event(
+        customer_id=customer_id,
+        wiki_type=wiki_type,
+        slug=slug,
+        title=target["title"] or "",
+        body=target_meta.get("body") or "",
+        frontmatter=target_meta.get("frontmatter") or {},
+        doc_class=DocClass.MANUAL_ENTRY.value,
+        author_id=body.author_id,
+        compiled_from_doc_ids=None,
+        compile_trigger=None,
+        received_at=received_at,
+        is_delete=False,
+        commit_message=f"Revert to v{body.to_version}: {body.reason}",
+        commit_author=body.author_id,
+        summary=target_meta.get("summary"),
+    )
+
+    try:
+        result = build_normalization_result(event)
+    except InvalidWebhookPayload as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    normalizer = Normalizer(ctx=request.app.state.ctx, store=request.app.state.store)
+    outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
+    if not outcome.doc_ids:
+        # The revert produced byte-identical content to the live version
+        # (the user reverted to the version that was already live). Surface
+        # that as a 200 with the existing version, not a 500.
+        version = await _read_doc_version(customer_id, doc_id) or body.to_version
+    else:
+        version = await _read_doc_version(customer_id, doc_id) or result.documents[0].version
+
+    log.info(
+        "wiki.reverted",
+        customer=customer_id,
+        doc_id=doc_id,
+        to_version=body.to_version,
+        new_version=version,
+    )
+
+    doc = result.documents[0]
+    parsed_links = parse_page_links(target_meta.get("body") or "")
+    dangling = [link.raw for link in parsed_links if link.kind == "plain"]
+    return WikiUpsertResponse(
+        doc_id=doc.doc_id,
+        source_url=doc.source_url,
+        version=version,
+        chunk_count=outcome.chunk_count,
+        links=[
+            WikiLinkOut(raw=link.raw, kind=link.kind, target=link.target)
+            for link in parsed_links
+        ],
+        dangling_links=dangling,
+    )
+
+
+@router.get(
+    "/index",
+    response_model=WikiIndexResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def get_wiki_index(
+    customer_id: str = Depends(_require_customer),
+) -> WikiIndexResponse:
+    """Return the auto-generated table of contents.
+
+    The synthesis cron regenerates this at the end of each tick from the
+    live set of wiki pages. If the cron has never run for this customer
+    yet, return a deterministic fallback assembled from current page
+    titles + summaries (so the dashboard always has something to show).
+    """
+    index_doc_id = f"wiki:index:{INDEX_SLUG}"
+
+    async with with_tenant(customer_id) as conn:
+        index_row = await conn.fetchrow(
+            """
+            SELECT version, updated_at, metadata
+            FROM documents
+            WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+            """,
+            customer_id,
+            index_doc_id,
+        )
+        page_rows = await conn.fetch(
+            """
+            SELECT title, source_id, version, updated_at, metadata
+            FROM documents
+            WHERE customer_id = $1
+              AND source_system = $2
+              AND doc_type = ANY($3::text[])
+              AND valid_to IS NULL
+              AND deleted_at IS NULL
+            ORDER BY updated_at DESC
+            """,
+            customer_id,
+            SourceSystem.WIKI.value,
+            [
+                DocType.WIKI_SERVICE_CARD.value,
+                DocType.WIKI_DECISION.value,
+                DocType.WIKI_FEATURE.value,
+                DocType.WIKI_RUNBOOK.value,
+            ],
+        )
+
+    entries: list[WikiIndexEntry] = []
+    for row in page_rows:
+        metadata = _coerce_metadata(row["metadata"])
+        wiki_type_value = metadata.get("wiki_type") or row["source_id"].split(":", 1)[0]
+        slug_value = metadata.get("slug") or row["source_id"].split(":", 1)[-1]
+        entries.append(
+            WikiIndexEntry(
+                wiki_type=wiki_type_value,
+                slug=slug_value,
+                title=row["title"],
+                summary=metadata.get("summary"),
+                updated_at=row["updated_at"],
+                version=row["version"],
+            )
+        )
+
+    if index_row is not None:
+        index_meta = _coerce_metadata(index_row["metadata"])
+        body_text = index_meta.get("body") or _render_index_body(entries)
+        return WikiIndexResponse(
+            body=body_text,
+            entries=entries,
+            updated_at=index_row["updated_at"],
+            version=index_row["version"],
+        )
+
+    # Fallback: cron has not produced an index yet. Render deterministically.
+    return WikiIndexResponse(
+        body=_render_index_body(entries),
+        entries=entries,
+        updated_at=None,
+        version=None,
+    )
+
+
+def _render_index_body(entries: list[WikiIndexEntry]) -> str:
+    """Plain markdown TOC. Used when the cron-generated index is missing."""
+    if not entries:
+        return "# Wiki\n\nNo pages yet.\n"
+    by_type: dict[str, list[WikiIndexEntry]] = {}
+    for entry in entries:
+        by_type.setdefault(entry.wiki_type, []).append(entry)
+    parts = ["# Wiki", ""]
+    for wiki_type in sorted(by_type):
+        parts.append(f"## {wiki_type.replace('_', ' ').title()}")
+        for entry in by_type[wiki_type]:
+            title = entry.title or entry.slug
+            summary = entry.summary or ""
+            line = f"- [[{title}]] — {summary}" if summary else f"- [[{title}]]"
+            parts.append(line)
+        parts.append("")
+    return "\n".join(parts).rstrip() + "\n"
