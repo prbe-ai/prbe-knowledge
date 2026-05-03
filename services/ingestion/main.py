@@ -214,7 +214,10 @@ async def webhook(
     )
     store = request.app.state.store
     bucket = store.bucket_for(customer_id)
-    key = _payload_key(source_enum, customer_id, parsed.source_event_id)
+    storage_id = _compose_storage_id(
+        source_enum, parsed.source_event_id, parsed.parse_hint
+    )
+    key = _payload_key(source_enum, customer_id, storage_id)
 
     try:
         await store.ensure_bucket(bucket)
@@ -267,6 +270,24 @@ def _payload_key(source: SourceSystem, customer_id: str, event_id: str) -> str:
         f"raw/{source.value}/{customer_id}/"
         f"{now.strftime('%Y/%m/%d')}/{safe_event}.json"
     )
+
+
+def _compose_storage_id(
+    source: SourceSystem,
+    source_event_id: str,
+    parse_hint: object,
+) -> str:
+    """Keep coalesced Claude Code batches distinct in object storage.
+
+    The queue row is keyed by session_id so batches coalesce, but the raw
+    payload object must include batch_seq or each batch overwrites the prior
+    envelope before the worker can read it.
+    """
+    if source == SourceSystem.CLAUDE_CODE and isinstance(parse_hint, dict):
+        batch_seq = parse_hint.get("batch_seq")
+        if isinstance(batch_seq, int):
+            return f"{source_event_id}:{batch_seq}"
+    return source_event_id
 
 
 async def _enqueue(
