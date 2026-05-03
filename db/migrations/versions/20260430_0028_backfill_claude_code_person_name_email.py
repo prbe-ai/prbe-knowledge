@@ -1,6 +1,6 @@
 """backfill claude_code Person nodes with name + email from neon_auth.user
 
-Revision ID: 0028_backfill_cc_person_name_email
+Revision ID: 0028_cc_person_email_bkfl
 Revises: 0027_mcp_oauth_sessions
 Create Date: 2026-04-30
 
@@ -52,7 +52,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0028_backfill_cc_person_name_email"
+revision = "0028_cc_person_email_bkfl"
 down_revision = "0027_mcp_oauth_sessions"
 branch_labels = None
 depends_on = None

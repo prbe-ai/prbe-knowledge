@@ -1,7 +1,7 @@
 """enrichment_runs: agent_kind + subject_kind + paused status + by-subject index
 
-Revision ID: 0029_enrichment_agent_kind_columns
-Revises: 0028_backfill_cc_person_name_email
+Revision ID: 0029_enrichment_agent_kind
+Revises: 0028_cc_person_email_bkfl
 Create Date: 2026-04-30
 
 Lands four schema changes on enrichment_runs in a single migration:
@@ -39,8 +39,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0029_enrichment_agent_kind_columns"
-down_revision = "0028_backfill_cc_person_name_email"
+revision = "0029_enrichment_agent_kind"
+down_revision = "0028_cc_person_email_bkfl"
 branch_labels = None
 depends_on = None
 
