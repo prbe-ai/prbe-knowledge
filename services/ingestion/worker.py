@@ -197,7 +197,13 @@ class Worker:
             )
         except PrbeError as exc:
             transient = getattr(exc, "transient", False)
-            await self._on_error(queue_id, attempts, str(exc), transient=transient)
+            await self._on_error(
+                queue_id,
+                attempts,
+                str(exc),
+                transient=transient,
+                captured_version=captured_version,
+            )
         except Exception as exc:  # pragma: no cover — last-resort
             # Unknown error: assume transient so we don't burn data on a single
             # network blip / OOM / unwrapped httpx error / asyncpg connection
@@ -205,7 +211,13 @@ class Worker:
             # Anything that should permanently DLQ on first try must raise a
             # PrbeError subclass with `transient = False`.
             log.exception("worker.unhandled", queue_id=queue_id)
-            await self._on_error(queue_id, attempts, repr(exc), transient=True)
+            await self._on_error(
+                queue_id,
+                attempts,
+                repr(exc),
+                transient=True,
+                captured_version=captured_version,
+            )
         finally:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -339,7 +351,13 @@ class Worker:
             )
 
     async def _on_error(
-        self, queue_id: int, attempts: int, error: str, *, transient: bool
+        self,
+        queue_id: int,
+        attempts: int,
+        error: str,
+        *,
+        transient: bool,
+        captured_version: int,
     ) -> None:
         dead = (not transient) or attempts >= self._max_attempts
         log.warning(
@@ -352,27 +370,36 @@ class Worker:
         )
         async with get_pool().acquire() as conn:
             if dead:
-                await conn.execute(
+                result = await conn.execute(
                     """
                     UPDATE ingestion_queue
                     SET status = $1, completed_at = NOW(), error = $2
-                    WHERE queue_id = $3
+                    WHERE queue_id = $3 AND version = $4
                     """,
                     QueueStatus.DLQ.value,
                     error,
                     queue_id,
+                    captured_version,
                 )
             else:
-                await conn.execute(
+                result = await conn.execute(
                     """
                     UPDATE ingestion_queue
                     SET status = $1, error = $2, heartbeat_at = NULL, started_at = NULL
-                    WHERE queue_id = $3
+                    WHERE queue_id = $3 AND version = $4
                     """,
                     QueueStatus.PENDING.value,
                     error,
                     queue_id,
+                    captured_version,
                 )
+        if result == "UPDATE 0":
+            log.info(
+                "worker.cas_retry",
+                queue_id=queue_id,
+                captured_version=captured_version,
+                reason="new batch arrived during processing (error path)",
+            )
 
 
 class BackfillWorker:
