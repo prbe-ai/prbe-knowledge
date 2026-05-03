@@ -217,6 +217,8 @@ SONNET_MODEL = "claude-sonnet-4-6"
 SYNTHESIS_MODELS: dict[str, str] = {
     "anthropic/claude-haiku-4-5-20251001": "anthropic",
     "anthropic/claude-sonnet-4-6": "anthropic",
+    "google/gemini-3-flash-preview": "google",
+    "google/gemini-3.1-flash-lite-preview": "google",
 }
 DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-6"
 
