@@ -15,6 +15,7 @@ class SourceSystem(StrEnum):
     # sanitizer. Doc shape and unit extraction are identical to claude_code;
     # this label exists so dashboard queries can distinguish provenance.
     CODEX = "codex"
+    MANUAL_UPLOAD = "manual_upload"
 
 
 class DocClass(StrEnum):
@@ -44,6 +45,10 @@ class DocType(StrEnum):
     CLAUDE_CODE_CODE_CHANGE = "claude_code.code_change"
     CLAUDE_CODE_DECISION    = "claude_code.decision"
     CLAUDE_CODE_FILE_REF    = "claude_code.file_ref"
+    MANUAL_UPLOAD_TEXT      = "manual_upload.text"
+    MANUAL_UPLOAD_MARKDOWN  = "manual_upload.markdown"
+    MANUAL_UPLOAD_DOCX      = "manual_upload.docx"
+    MANUAL_UPLOAD_FILE      = "manual_upload.file"
     WIKI_SERVICE_CARD = "wiki.service_card"
     WIKI_DECISION = "wiki.decision"
     WIKI_FEATURE = "wiki.feature"

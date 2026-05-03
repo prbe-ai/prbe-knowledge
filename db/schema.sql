@@ -268,6 +268,44 @@ CREATE INDEX idx_queue_processing ON ingestion_queue (status, heartbeat_at) WHER
 CREATE INDEX idx_queue_customer_status ON ingestion_queue (customer_id, status, enqueued_at);
 
 -- ---------------------------------------------------------------------------
+-- manual_uploads: dashboard-originated file upload audit and cleanup state.
+--
+-- Original bytes are staged in R2, text is extracted into a raw payload and
+-- queued like any other source, then the worker deletes the staged original
+-- after documents/chunks are persisted successfully.
+-- ---------------------------------------------------------------------------
+CREATE TABLE manual_uploads (
+    upload_id           TEXT PRIMARY KEY,
+    customer_id         TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    filename            TEXT NOT NULL,
+    content_type        TEXT NOT NULL DEFAULT 'application/octet-stream',
+    file_size_bytes     BIGINT NOT NULL DEFAULT 0,
+    file_sha256         TEXT NOT NULL,
+    staging_object_key  TEXT,
+    payload_object_key  TEXT,
+    uploaded_by         TEXT,
+    uploaded_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status              TEXT NOT NULL,
+    parse_engine        TEXT,
+    parse_error         TEXT,
+    extracted_chars     INT NOT NULL DEFAULT 0,
+    doc_id              TEXT,
+    indexed_at          TIMESTAMPTZ,
+    original_deleted_at TIMESTAMPTZ,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT manual_uploads_status_check CHECK (
+        status IN ('queued', 'indexed', 'failed_parse', 'failed_ingest')
+    )
+);
+CREATE INDEX idx_manual_uploads_customer_uploaded
+    ON manual_uploads (customer_id, uploaded_at DESC);
+CREATE INDEX idx_manual_uploads_customer_status
+    ON manual_uploads (customer_id, status, uploaded_at DESC);
+CREATE INDEX idx_manual_uploads_doc
+    ON manual_uploads (customer_id, doc_id)
+    WHERE doc_id IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
 -- backfill_state: pagination cursor per (customer, source). Resumable.
 -- ---------------------------------------------------------------------------
 CREATE TABLE backfill_state (

@@ -11,6 +11,7 @@ from services.ingestion.handlers import (
     github,  # noqa: F401
     granola,  # noqa: F401
     linear,  # noqa: F401
+    manual_upload,  # noqa: F401
     notion,  # noqa: F401
     sentry,  # noqa: F401
     slack,  # noqa: F401
