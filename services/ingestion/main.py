@@ -358,13 +358,20 @@ async def list_manual_uploads(
     async with get_pool().acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT upload_id, filename, content_type, file_size_bytes, file_sha256,
-                   uploaded_by, uploaded_at, status, parse_engine, parse_error,
-                   extracted_chars, doc_id, indexed_at, original_deleted_at,
-                   updated_at
-            FROM manual_uploads
-            WHERE customer_id = $1
-            ORDER BY uploaded_at DESC
+            SELECT mu.upload_id, mu.filename, mu.content_type, mu.file_size_bytes,
+                   mu.file_sha256, mu.uploaded_by, mu.uploaded_at, mu.status,
+                   mu.parse_engine, mu.parse_error, mu.extracted_chars, mu.doc_id,
+                   mu.indexed_at, mu.original_deleted_at, mu.updated_at,
+                   COALESCE((
+                       SELECT COUNT(*)
+                       FROM chunks c
+                       WHERE c.customer_id = mu.customer_id
+                         AND c.doc_id = mu.doc_id
+                         AND c.valid_to IS NULL
+                   ), 0)::INT AS chunk_count
+            FROM manual_uploads mu
+            WHERE mu.customer_id = $1
+            ORDER BY mu.uploaded_at DESC
             LIMIT $2
             """,
             x_prbe_customer,
@@ -677,6 +684,7 @@ def _manual_upload_json(row) -> dict[str, object]:
         "parse_engine": row["parse_engine"],
         "parse_error": row["parse_error"],
         "extracted_chars": row["extracted_chars"],
+        "chunk_count": row["chunk_count"],
         "doc_id": row["doc_id"],
         "indexed_at": _iso_or_none(row["indexed_at"]),
         "original_deleted_at": _iso_or_none(row["original_deleted_at"]),
