@@ -21,13 +21,16 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 import pytest_asyncio
+from httpx import ASGITransport
 
 from services.ingestion.handlers.base import make_default_context
+from services.ingestion.main import app
 from services.ingestion.normalizer import Normalizer
 from services.synthesis.wiki_cron import WikiSynthesisCron
-from shared.config import Settings
+from shared.config import Settings, get_settings
 from shared.constants import (
     HAIKU_MODEL,
     DocClass,
@@ -36,7 +39,7 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.db import raw_conn
+from shared.db import close_pool, raw_conn
 from shared.models import (
     ACLPrincipal,
     ACLSnapshot,
@@ -47,6 +50,15 @@ from shared.models import (
 from shared.storage import get_store
 
 CUSTOMER = "wiki-cron-cust"
+
+
+@pytest.fixture(autouse=True)
+def _patch_internal_key(monkeypatch) -> None:
+    """The MANUAL_ENTRY-protection test routes through the HTTP wiki PUT route,
+    which gates on X-Internal-Knowledge-Key.
+    """
+    monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", "test-internal-key")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
 @pytest_asyncio.fixture
@@ -312,6 +324,114 @@ async def test_cron_rejects_low_score_events(reset_db: None) -> None:
             CUSTOMER,
         )
     assert wiki_count == 0
+
+
+@pytest.mark.asyncio
+async def test_cron_does_not_clobber_manual_entry_pages(reset_db: None) -> None:
+    """When a MANUAL_ENTRY wiki page already exists for a target slug,
+    the cron must NOT regenerate the body. Queue rows are marked done
+    with a skip reason; the human-authored page stays exactly as it was.
+    """
+    # ---- arrange: a MANUAL_ENTRY page exists for the target slug.
+    httpx_client = httpx.AsyncClient(transport=ASGITransport(app=app), base_url="http://t")
+    await close_pool()
+    async with app.router.lifespan_context(app), httpx_client as c:
+        await c.put(
+            "/api/wiki/pages/runbook/auth-flow",
+            json={
+                "title": "Auth flow runbook (human authored)",
+                "body": "Hand-written instructions. Do not regenerate.",
+                "author_id": "richard@prbe.ai",
+            },
+            headers={
+                "X-Internal-Knowledge-Key": "test-internal-key",
+                "X-Prbe-Customer": CUSTOMER,
+            },
+        )
+
+    # ---- arrange: enqueue a raw event that triage will target at that slug.
+    normalizer = Normalizer(make_default_context())
+    await normalizer._persist(
+        CUSTOMER,
+        SourceSystem.GITHUB,
+        _result(_doc("github:commit:auth-update", "We updated the auth flow today.")),
+    )
+
+    queue_ids = await _read_queue_ids(CUSTOMER)
+    # Filter to the github commit's queue row (the manual upload also enqueued
+    # but skipped by the source_system=WIKI guard, so we just have one).
+    triage_payload = {
+        "verdicts": {
+            str(qid): {
+                "important": True,
+                "score": 9.0,
+                "targets": [
+                    {"wiki_type": "runbook", "slug": "auth-flow", "action": "update"},
+                ],
+                "reason": "auth incident",
+            }
+            for qid in queue_ids
+        }
+    }
+    # If the cron erroneously calls synthesize, the test fails at that point.
+    forbidden_synthesis = {
+        "title": "SHOULD NOT APPEAR",
+        "body_markdown": "SHOULD NOT APPEAR",
+        "summary": "x",
+        "commit_message": "x",
+    }
+    client = _make_mock_client(triage_payload, forbidden_synthesis)
+
+    cron = WikiSynthesisCron(
+        ctx=make_default_context(),
+        store=get_store(),
+        wake_event=asyncio.Event(),
+        anthropic_client=client,
+    )
+    await cron._tick(woken_by_notify=True)
+
+    # ---- assert: the human-authored page is untouched.
+    async with raw_conn() as conn:
+        page = await conn.fetchrow(
+            """
+            SELECT title, doc_class, metadata
+            FROM documents
+            WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+            """,
+            CUSTOMER,
+            "wiki:runbook:auth-flow",
+        )
+        assert page is not None
+        assert page["doc_class"] == DocClass.MANUAL_ENTRY.value
+        assert page["title"] == "Auth flow runbook (human authored)"
+
+        # ---- assert: queue rows for the github commit landed in 'done'
+        # with a skip note (not 'failed', not still 'triaged' — done so they
+        # don't keep re-firing the cron).
+        skip_rows = await conn.fetch(
+            """
+            SELECT status, synthesis_error
+            FROM wiki_synthesis_queue
+            WHERE customer_id = $1 AND doc_id = $2
+            """,
+            CUSTOMER,
+            "github:commit:auth-update",
+        )
+        assert skip_rows
+        assert all(row["status"] == "done" for row in skip_rows)
+        assert all(
+            row["synthesis_error"] and "MANUAL_ENTRY" in row["synthesis_error"]
+            for row in skip_rows
+        )
+
+        # ---- assert: no version 2 of the page was written.
+        versions = await conn.fetchval(
+            "SELECT count(*) FROM documents "
+            "WHERE customer_id = $1 AND doc_id = $2",
+            CUSTOMER,
+            "wiki:runbook:auth-flow",
+        )
+        assert versions == 1
 
 
 async def _read_queue_ids(customer_id: str) -> list[int]:

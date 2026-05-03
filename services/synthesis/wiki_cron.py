@@ -262,6 +262,34 @@ class WikiSynthesisCron:
                     existing = await _fetch_existing_page(customer_id, wiki_type, slug)
                     cluster_inputs = [item[1] for item in cluster]
                     queue_ids_in_cluster = [item[0]["queue_id"] for item in cluster]
+
+                    # MANUAL_ENTRY pages are read-only to the cron. The design
+                    # invariant: humans own pages they author; the synthesizer
+                    # observes events that *would* affect them but does not
+                    # silently regenerate the body. Mark queue rows as 'done'
+                    # with a skip note so they don't keep re-firing the cron.
+                    # A future Phase 3 lint/annotate pass can write a
+                    # "would-have-updated" sidecar; for now we just record
+                    # the skip in synthesis_error and move on.
+                    if (
+                        existing is not None
+                        and existing.get("doc_class") == DocClass.MANUAL_ENTRY.value
+                    ):
+                        log.info(
+                            "wiki_synthesis_cron.skipped_manual_entry",
+                            customer=customer_id,
+                            wiki_type=wiki_type,
+                            slug=slug,
+                            event_count=len(queue_ids_in_cluster),
+                        )
+                        await _mark_synthesis_skipped(
+                            customer_id,
+                            queue_ids_in_cluster,
+                            run_id,
+                            reason="page is MANUAL_ENTRY (human-authored)",
+                        )
+                        continue
+
                     action = "update" if existing is not None else "create"
                     synth_input = SynthesisInput(
                         wiki_type=wiki_type,  # type: ignore[arg-type]
@@ -704,16 +732,55 @@ async def _mark_synthesis_done(
         )
 
 
+async def _mark_synthesis_skipped(
+    customer_id: str,
+    queue_ids: list[int],
+    run_id: int,
+    *,
+    reason: str,
+) -> None:
+    """Mark events 'done' without firing synthesis.
+
+    Used when the cron declines to clobber a page (e.g. MANUAL_ENTRY).
+    The events still complete — they don't keep re-driving the cron — but
+    the audit trail records why no synthesis occurred via synthesis_error.
+    """
+    if not queue_ids:
+        return
+    async with with_tenant(customer_id) as conn:
+        await conn.execute(
+            """
+            UPDATE wiki_synthesis_queue
+            SET status = 'done',
+                synthesis_run_id = $2,
+                synthesis_completed_at = NOW(),
+                synthesis_error = $3
+            WHERE customer_id = $1 AND queue_id = ANY($4::bigint[])
+            """,
+            customer_id,
+            run_id,
+            f"skipped: {reason}",
+            queue_ids,
+        )
+
+
 async def _fetch_existing_page(
     customer_id: str,
     wiki_type: str,
     slug: str,
 ) -> dict[str, Any] | None:
+    """Return the live wiki page for `(wiki_type, slug)`, or None.
+
+    The returned `doc_class` is what the cluster loop checks before deciding
+    whether the cron is allowed to rewrite the body. MANUAL_ENTRY pages are
+    read-only to the cron; only COMPILED_WIKI / AGENT_ARTIFACT pages are
+    open for regeneration.
+    """
     doc_id = f"wiki:{wiki_type}:{slug}"
     async with with_tenant(customer_id) as conn:
         row = await conn.fetchrow(
             """
-            SELECT title, metadata
+            SELECT title, doc_class, metadata
             FROM documents
             WHERE customer_id = $1
               AND doc_id = $2
@@ -734,6 +801,7 @@ async def _fetch_existing_page(
         metadata = {}
     return {
         "title": row["title"],
+        "doc_class": row["doc_class"],
         "body": metadata.get("body"),
         "frontmatter": metadata.get("frontmatter") or {},
         "summary": metadata.get("summary"),

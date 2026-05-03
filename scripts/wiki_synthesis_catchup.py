@@ -78,6 +78,26 @@ async def seed(customer_id: str, *, dry_run: bool) -> int:
                 SourceSystem.WIKI.value,
             )
             inserted = int(inserted or 0)
+
+            # Open a wiki_synthesis_runs row with kind='onboarding'. The
+            # cron itself opens its own per-tick 'wake'/'scheduled' rows
+            # while draining; this row is the durable marker that an
+            # onboarding-style mass enqueue happened, and is what the
+            # dashboard reads to surface "Wiki being generated, X events
+            # left." Status stays 'running' until something explicitly
+            # closes it (a future finalize step that fires when no
+            # queue rows for this customer remain pending).
+            run_id = await conn.fetchval(
+                """
+                INSERT INTO wiki_synthesis_runs
+                    (customer_id, kind, events_total, status)
+                VALUES ($1, 'onboarding', $2, 'running')
+                RETURNING run_id
+                """,
+                customer_id,
+                inserted,
+            )
+
             await conn.execute(
                 "SELECT pg_notify($1, $2)",
                 WIKI_SYNTHESIZE_CHANNEL,
@@ -85,7 +105,8 @@ async def seed(customer_id: str, *, dry_run: bool) -> int:
             )
             print(
                 f"customer={customer_id} enqueued={inserted} "
-                f"already_queued={count - inserted} notified={WIKI_SYNTHESIZE_CHANNEL}"
+                f"already_queued={count - inserted} run_id={run_id} "
+                f"notified={WIKI_SYNTHESIZE_CHANNEL}"
             )
             return inserted
     finally:
