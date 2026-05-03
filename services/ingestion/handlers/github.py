@@ -726,7 +726,6 @@ class GitHubConnector(Connector):
             ingested_at=datetime.now(UTC),
             acl=_repo_acl_snapshot(repo, event.received_at),
             metadata={
-                "body": body,
                 "action": action,
                 "repo_full_name": full_name,
                 "number": number,
@@ -739,6 +738,7 @@ class GitHubConnector(Connector):
                 "state": pr.get("state"),
                 "visibility": _repo_visibility(repo),
             },
+            body=body,
             doc_references=_references_from_text(body, full_name, html_url),
         )
 
@@ -873,7 +873,6 @@ class GitHubConnector(Connector):
             ingested_at=datetime.now(UTC),
             acl=_repo_acl_snapshot(repo, event.received_at),
             metadata={
-                "body": body,
                 "action": action,
                 "repo_full_name": full_name,
                 "number": number,
@@ -881,6 +880,7 @@ class GitHubConnector(Connector):
                 "labels": [la.get("name") for la in issue.get("labels", []) or []],
                 "visibility": _repo_visibility(repo),
             },
+            body=body,
             doc_references=_references_from_text(body, full_name, html_url),
         )
 
@@ -1055,13 +1055,13 @@ class GitHubConnector(Connector):
             parent_doc_id=parent_doc_id,
             acl=_repo_acl_snapshot(repo, event.received_at),
             metadata={
-                "body": body,
                 "repo_full_name": full_name,
                 "pr_number": pr_number,
                 "review_id": review_id,
                 "state": review.get("state"),
                 "visibility": _repo_visibility(repo),
             },
+            body=body,
             doc_references=_references_from_text(body, full_name, html_url),
         )
 
@@ -1359,7 +1359,6 @@ def _commit_to_doc(
     content_hash = _sha256(f"{doc_id}|{message}")
 
     metadata: dict[str, Any] = {
-        "body": message,
         "repo_full_name": full_name,
         "commit_id": commit_id,
         "added": commit.get("added") or [],
@@ -1391,6 +1390,7 @@ def _commit_to_doc(
         ingested_at=datetime.now(UTC),
         acl=_repo_acl_snapshot(repo, event.received_at),
         metadata=metadata,
+        body=message,
         doc_references=_references_from_text(message, full_name, html_url),
     )
 
@@ -1548,13 +1548,13 @@ def _codeowners_artifacts(
         ingested_at=datetime.now(UTC),
         acl=_repo_acl_snapshot(repo, event.received_at),
         metadata={
-            "body": body,
             "repo_full_name": full_name,
             "path": path,
             "ownership_map": ownership_map,
             "codeowners_fetch_skipped": skipped,
             "visibility": _repo_visibility(repo),
         },
+        body=body,
     )
 
     nodes.append(

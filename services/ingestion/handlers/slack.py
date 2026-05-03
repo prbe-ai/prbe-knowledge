@@ -712,7 +712,6 @@ class SlackConnector(Connector):
             ),
             acl=ACLSnapshot(principals=acl_principals, captured_at=event.received_at),
             metadata={
-                "body": body_text,
                 "team_id": team_id,
                 "channel_id": channel,
                 "thread_ts": thread_ts,
@@ -720,6 +719,7 @@ class SlackConnector(Connector):
                 "deleted": is_delete,
                 "reactions": msg.get("reactions", []),
             },
+            body=body_text,
             doc_references=_references_from_text(text),
         )
 

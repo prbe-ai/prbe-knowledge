@@ -16,9 +16,11 @@ Per tick:
      c. Regenerate the wiki.index page from the live set of wiki pages.
      d. Close the run row.
 
-Triage and synthesis read FULL document bodies from
-`documents.metadata->>'body'`, never from `chunks`. Chunking is for
-retrieval; the LLM-Wiki decision needs whole documents.
+Triage and synthesis read FULL document bodies from `chunks.content`
+(joined in chunk_index order). Until the storage-cleanup migration the
+body was duplicated into `documents.metadata->>'body'`; that key is no
+longer written. The chunk-join may include ~10-15% overlap inflation
+between adjacent chunks, which is harmless for LLM synthesis input.
 """
 
 from __future__ import annotations
@@ -37,7 +39,11 @@ from services.ingestion.handlers.wiki import (
     WIKI_PAYLOAD_KEY,
     build_normalization_result,
 )
-from services.ingestion.normalizer import Normalizer
+from services.ingestion.normalizer import (
+    Normalizer,
+    fetch_body_from_chunks_for_version,
+    fetch_live_body_from_chunks,
+)
 from services.synthesis.models import (
     SynthesisInput,
     TriageInput,
@@ -552,7 +558,7 @@ async def _fetch_bodies(
         rows = await conn.fetch(
             """
             SELECT q.doc_id, q.version, d.title, d.author_id,
-                   d.body_token_count, d.metadata
+                   d.body_token_count, d.body_preview
             FROM unnest($2::text[], $3::int[]) AS q(doc_id, version)
             JOIN documents d
               ON d.customer_id = $1
@@ -564,36 +570,43 @@ async def _fetch_bodies(
             versions,
         )
 
-    body_lookup: dict[tuple[str, int], asyncpg.Record] = {
-        (row["doc_id"], row["version"]): row for row in rows
-    }
-    triage_inputs: list[TriageInput] = []
-    for queue_id, info in by_queue_id.items():
-        key = (info["doc_id"], info["doc_version"])
-        doc_row = body_lookup.get(key)
-        if doc_row is None:
-            # Doc was deleted out from under us between enqueue and drain.
-            # Skip — the queue row will be marked rejected by the missing
-            # verdict path.
-            continue
-        metadata = doc_row["metadata"] or {}
-        if isinstance(metadata, (str, bytes, bytearray)):
-            import orjson
-
-            metadata = orjson.loads(metadata)
-        body = (metadata.get("body") if isinstance(metadata, dict) else "") or ""
-        triage_inputs.append(
-            TriageInput(
-                queue_id=queue_id,
-                doc_id=info["doc_id"],
-                doc_type=info["doc_type"],
-                source_system=info["source_system"],
-                title=doc_row["title"],
-                author_id=doc_row["author_id"],
-                body=body,
-                body_token_count=doc_row["body_token_count"] or 0,
+        meta_lookup: dict[tuple[str, int], asyncpg.Record] = {
+            (row["doc_id"], row["version"]): row for row in rows
+        }
+        # Body is reconstructed by joining live content chunks per (doc_id,
+        # version). Fetched inside the same with_tenant block so RLS sees the
+        # tenant GUC. A missing body falls back to body_preview so triage at
+        # least has *something* to score on; mid-version doc deletes still
+        # short-circuit via the meta_lookup miss above.
+        triage_inputs: list[TriageInput] = []
+        for queue_id, info in by_queue_id.items():
+            key = (info["doc_id"], info["doc_version"])
+            doc_row = meta_lookup.get(key)
+            if doc_row is None:
+                # Doc was deleted out from under us between enqueue and drain.
+                # Skip — the queue row will be marked rejected by the missing
+                # verdict path.
+                continue
+            body = await fetch_body_from_chunks_for_version(
+                conn,
+                customer_id,
+                info["doc_id"],
+                info["doc_version"],
             )
-        )
+            if not body:
+                body = doc_row["body_preview"] or ""
+            triage_inputs.append(
+                TriageInput(
+                    queue_id=queue_id,
+                    doc_id=info["doc_id"],
+                    doc_type=info["doc_type"],
+                    source_system=info["source_system"],
+                    title=doc_row["title"],
+                    author_id=doc_row["author_id"],
+                    body=body,
+                    body_token_count=doc_row["body_token_count"] or 0,
+                )
+            )
     return triage_inputs
 
 
@@ -790,8 +803,9 @@ async def _fetch_existing_page(
             customer_id,
             doc_id,
         )
-    if row is None:
-        return None
+        if row is None:
+            return None
+        body = await fetch_live_body_from_chunks(conn, customer_id, doc_id)
     metadata = row["metadata"] or {}
     if isinstance(metadata, (str, bytes, bytearray)):
         import orjson
@@ -802,7 +816,7 @@ async def _fetch_existing_page(
     return {
         "title": row["title"],
         "doc_class": row["doc_class"],
-        "body": metadata.get("body"),
+        "body": body or None,
         "frontmatter": metadata.get("frontmatter") or {},
         "summary": metadata.get("summary"),
     }

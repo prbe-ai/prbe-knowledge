@@ -184,6 +184,19 @@ class Normalizer:
         total_removed = 0
         total_failed = 0
 
+        # ---- Storage guard: handlers must NOT stuff body into metadata.
+        # body lives on the transient Document.body field; persisting it into
+        # metadata jsonb doubles storage on every doc (the original
+        # documents.metadata["body"] duplication bug). See migration 0035.
+        for doc in result.documents:
+            if "body" in doc.metadata:
+                raise NormalizationError(
+                    f"connector {source_system.value} set metadata['body'] on "
+                    f"doc {doc.doc_id} — body must be passed via Document.body "
+                    "(transient field). See services/ingestion/normalizer.py "
+                    "_stringify_body."
+                )
+
         # ---- Phase A: pre-compute chunk plans WITHOUT holding a write txn.
         #
         # Each plan does a tiny read txn for the live-chunks SELECT under
@@ -552,10 +565,16 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
 
     Mutates `doc.version` to the newly-written version so callers can use it
     when writing chunks.
+
+    `doc.coalesce_into_live` opts the doc into update-in-place semantics:
+    when True AND a live version exists AND that live version is itself in a
+    coalesce-eligible state (e.g. session_complete=False), we UPDATE the
+    live row in place rather than opening a new SCD2 version. This kills
+    the per-batch SCD2 amplification on long-running claude_code sessions.
     """
     existing = await conn.fetchrow(
         """
-        SELECT version, content_hash
+        SELECT version, content_hash, metadata
         FROM documents
         WHERE doc_id = $1 AND customer_id = $2 AND valid_to IS NULL
         LIMIT 1
@@ -566,7 +585,59 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
 
     if existing and existing["content_hash"] == doc.content_hash and doc.deleted_at is None:
         # Same content, not a delete → idempotent no-op.
+        # Preserve the live version on the in-memory doc so chunk writes
+        # (which use doc.version) target the existing row.
+        doc.version = existing["version"]
         return False
+
+    # Coalesce-in-place path: while the live version is still in an
+    # incomplete state (e.g. session_complete=False) and the incoming doc
+    # asks for coalescing, UPDATE the live row in place. Same version,
+    # refreshed content_hash + metadata + body_preview + token counts.
+    # Chunk writes (called after this returns True) then diff against the
+    # same version, so reused chunks just bump last_seen_version.
+    if existing is not None and doc.coalesce_into_live and doc.deleted_at is None:
+        existing_meta = _coerce_jsonb(existing["metadata"])
+        prior_complete = bool(existing_meta.get("session_complete"))
+        if not prior_complete:
+            doc.version = existing["version"]
+            await conn.execute(
+                """
+                UPDATE documents
+                SET content_hash = $3,
+                    title = $4,
+                    body_preview = $5,
+                    body_size_bytes = $6,
+                    body_token_count = $7,
+                    updated_at = $8,
+                    valid_from = $9,
+                    metadata = $10::jsonb,
+                    entities = $11::jsonb,
+                    attachments = $12::jsonb,
+                    doc_references = $13::jsonb,
+                    ingested_at = $14
+                WHERE customer_id = $1 AND doc_id = $2 AND version = $15
+                  AND valid_to IS NULL
+                """,
+                doc.customer_id,
+                doc.doc_id,
+                doc.content_hash,
+                doc.title,
+                doc.body_preview,
+                doc.body_size_bytes,
+                doc.body_token_count,
+                doc.updated_at,
+                doc.valid_from,
+                _json(doc.metadata),
+                _json([e.model_dump() for e in doc.entities]),
+                _json([a.model_dump() for a in doc.attachments]),
+                _json([r.model_dump() for r in doc.doc_references]),
+                doc.ingested_at,
+                existing["version"],
+            )
+            # Returning True so the caller proceeds to chunk diff against the
+            # same version; the chunk diff handles add/reuse/remove correctly.
+            return True
 
     if existing is not None:
         # Close out the prior live version in the same transaction.
@@ -920,6 +991,24 @@ def _json(obj: Any) -> str:
     return orjson.dumps(obj, default=_json_default).decode("utf-8")
 
 
+def _coerce_jsonb(raw: Any) -> dict[str, Any]:
+    """Decode an asyncpg jsonb value into a dict.
+
+    asyncpg returns jsonb as bytes/str (raw JSON) or as already-decoded dict
+    depending on codec configuration. This util collapses both into a dict
+    so callers don't have to branch.
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, (bytes, bytearray, str)):
+        decoded = orjson.loads(raw)
+        if isinstance(decoded, dict):
+            return decoded
+    return {}
+
+
 def _json_default(obj: Any) -> Any:
     if isinstance(obj, datetime):
         if obj.tzinfo is None:
@@ -1028,19 +1117,89 @@ def _metadata_piece(doc: Document) -> ChunkPiece | None:
 def _stringify_body(doc: Document) -> str:
     """Pull the embeddable body text off a document.
 
-    Phase 0 convention: connectors put the full normalized body in
-    `metadata["body"]`, since the documents table doesn't carry a body column
-    (chunks is the source of truth for full text). body_preview is short
-    enough that we don't want to chunk off that alone.
+    Connectors set `doc.body` (a transient, never-persisted field on Document)
+    so the chunker can see the full text. The documents table itself only
+    carries `body_preview`; the source of truth for full text is chunks.content.
+
+    Historically connectors stuffed body into `metadata["body"]`, which
+    duplicated ~440 MB of storage. That key is no longer written by any
+    handler. The fallback to metadata["body"] below remains only for stray
+    test fixtures or mid-deploy queue rows that predate the migration; it
+    can be removed after the wiki/runbook/storage-cleanup migration drains.
     """
-    body = doc.metadata.get("body")
-    if not body:
-        # Fall back to title + preview so we still get a chunk for short entities.
-        parts = [p for p in (doc.title, doc.body_preview) if p]
-        body = "\n\n".join(parts) if parts else ""
-    return str(body)
+    if doc.body is not None and doc.body != "":
+        return doc.body
+    legacy = doc.metadata.get("body")
+    if legacy:
+        return str(legacy)
+    # Fall back to title + preview so we still get a chunk for short entities.
+    parts = [p for p in (doc.title, doc.body_preview) if p]
+    return "\n\n".join(parts) if parts else ""
 
 
 def ensure_tenant_bound(customer_id: str) -> None:
     if not customer_id:
         raise TenantIsolationError("customer_id required for normalize")
+
+
+async def fetch_live_body_from_chunks(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    doc_id: str,
+) -> str:
+    """Reconstruct a document's live body by joining its content chunks.
+
+    Replaces the ~440 MB documents.metadata['body'] duplication: chunks.content
+    is the source of truth for full text, ordered by chunk_index. Filters to
+    kind='content' so the synthetic per-doc metadata chunk doesn't bleed in.
+    Returns an empty string when no live content chunks exist (e.g. deleted
+    or never-chunked doc).
+
+    Note: chunker overlap means string_agg can include some duplicated text
+    between adjacent chunks (typically 10-15% inflation). That's harmless for
+    LLM synthesis input but callers comparing exact byte equality vs the
+    original source body need to keep that in mind.
+    """
+    body = await conn.fetchval(
+        """
+        SELECT string_agg(content, '' ORDER BY chunk_index)
+        FROM chunks
+        WHERE customer_id = $1
+          AND doc_id = $2
+          AND kind = 'content'
+          AND valid_to IS NULL
+        """,
+        customer_id,
+        doc_id,
+    )
+    return body or ""
+
+
+async def fetch_body_from_chunks_for_version(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    doc_id: str,
+    version: int,
+) -> str:
+    """Reconstruct a specific document version's body from chunks.
+
+    Chunks span versions via [first_seen_version, last_seen_version]; a row
+    is part of version V if first_seen_version <= V <= last_seen_version.
+    Used by wiki history/revert flows where any prior version may need to
+    be read back.
+    """
+    body = await conn.fetchval(
+        """
+        SELECT string_agg(content, '' ORDER BY chunk_index)
+        FROM chunks
+        WHERE customer_id = $1
+          AND doc_id = $2
+          AND kind = 'content'
+          AND first_seen_version <= $3
+          AND last_seen_version >= $3
+        """,
+        customer_id,
+        doc_id,
+        version,
+    )
+    return body or ""

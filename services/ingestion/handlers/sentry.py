@@ -308,7 +308,6 @@ class SentryConnector(Connector):
             ingested_at=datetime.now(UTC),
             acl=ACLSnapshot(principals=acl_principals, captured_at=event.received_at),
             metadata={
-                "body": body,
                 "action": action,
                 "project_slug": project_slug,
                 "project_id": project_id,
@@ -320,6 +319,7 @@ class SentryConnector(Connector):
                 "release": None,
                 "tags": [],
             },
+            body=body,
         )
 
         # --- graph ----------------------------------------------------
@@ -539,7 +539,6 @@ class SentryConnector(Connector):
             parent_doc_id=parent_doc_id,
             acl=ACLSnapshot(principals=acl_principals, captured_at=event.received_at),
             metadata={
-                "body": body,
                 "group_id": group_id,
                 "project_slug": project_slug,
                 "project_id": project_id,
@@ -552,6 +551,7 @@ class SentryConnector(Connector):
                 "first_sample_tags": ev.get("tags", []),
                 "sample_strategy": "first_event_per_issue",
             },
+            body=body,
         )
 
         nodes: list[GraphNodeSpec] = [

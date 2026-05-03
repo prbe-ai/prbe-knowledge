@@ -236,12 +236,12 @@ class GranolaConnector(Connector):
             ingested_at=datetime.now(UTC),
             acl=ACLSnapshot(principals=acl_principals, captured_at=event.received_at),
             metadata={
-                "body": body,
                 "owner_email": owner_email,
                 "owner_name": owner_name,
                 "transcript_segments": len(transcript),
                 "has_transcript": bool(transcript),
             },
+            body=body,
         )
 
         nodes: list[GraphNodeSpec] = [
@@ -602,9 +602,9 @@ def _transcript_digest(transcript: list[dict[str, Any]]) -> str:
 def _compose_body(summary: str, transcript: list[dict[str, Any]]) -> str:
     """Human-readable doc body. Summary first, transcript second under a header.
 
-    Goes into Document.metadata['body'] — the chunker pulls from there. Keeping
-    summary first means short queries against this doc match summary text
-    before transcript noise.
+    Goes into Document.body (transient field) — the chunker pulls from there.
+    Keeping summary first means short queries against this doc match summary
+    text before transcript noise.
     """
     if not transcript:
         return summary

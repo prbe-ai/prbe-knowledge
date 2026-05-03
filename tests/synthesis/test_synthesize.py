@@ -160,7 +160,7 @@ def test_synthesis_to_normalization_emits_compiled_wiki_doc() -> None:
         "github:commit:abc2",
     ]
     assert doc.compile_trigger == CompileTrigger.SCHEDULED
-    assert doc.metadata["body"] == "When auth fails, ping [[Person: alice]]."
+    assert doc.body == "When auth fails, ping [[Person: alice]]."
     assert doc.metadata["summary"] == "Procedure when auth fails."
     assert doc.metadata["commit"]["message"] == "Initial compilation from 2 events."
     assert doc.metadata["commit"]["run_id"] == 42

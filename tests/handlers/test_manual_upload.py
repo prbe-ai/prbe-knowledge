@@ -101,5 +101,5 @@ async def test_manual_upload_connector_normalize() -> None:
     assert doc.source_system == SourceSystem.MANUAL_UPLOAD
     assert doc.doc_class == DocClass.MANUAL_ENTRY
     assert doc.doc_type == DocType.MANUAL_UPLOAD_MARKDOWN
-    assert doc.metadata["body"] == "# Runbook\n\nRestart the worker."
+    assert doc.body == "# Runbook\n\nRestart the worker."
     assert doc.metadata["original_deleted_after_ingest"] is True

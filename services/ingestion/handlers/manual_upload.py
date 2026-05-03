@@ -126,7 +126,6 @@ class ManualUploadConnector(Connector):
             ingested_at=datetime.now(UTC),
             acl=ACLSnapshot(principals=acl_principals, captured_at=event.received_at),
             metadata={
-                "body": body,
                 "upload_id": upload_id,
                 "filename": filename,
                 "content_type": content_type,
@@ -137,6 +136,7 @@ class ManualUploadConnector(Connector):
                 "original_object_key": payload.get("original_object_key"),
                 "original_deleted_after_ingest": True,
             },
+            body=body,
         )
 
         return NormalizationResult(

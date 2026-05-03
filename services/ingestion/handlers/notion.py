@@ -699,7 +699,6 @@ class NotionConnector(Connector):
             ),
             acl=ACLSnapshot(principals=acl_principals, captured_at=event.received_at),
             metadata={
-                "body": body,
                 "workspace_id": workspace_id,
                 "resource_type": resource_type,
                 "properties": properties,
@@ -709,6 +708,7 @@ class NotionConnector(Connector):
                 "last_edited_time": last_edited_time,
                 "hydrated": bool(entity),
             },
+            body=body,
             doc_references=_references_from_parent(parent),
         )
 

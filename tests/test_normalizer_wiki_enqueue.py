@@ -81,7 +81,8 @@ def _doc(doc_id: str, *, source_system: SourceSystem, doc_type: DocType) -> Docu
             ],
             captured_at=now,
         ),
-        metadata={"body": body},
+        metadata={},
+        body=body,
     )
 
 
