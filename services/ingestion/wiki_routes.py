@@ -828,7 +828,7 @@ class SynthesisTriggerBody(BaseModel):
 
 class SynthesisTriggerResponse(BaseModel):
     triggered: bool
-    pending_count: int
+    pending_events: int
     last_run_at: datetime | None
 
 
@@ -892,7 +892,7 @@ async def trigger_wiki_synthesis(
     )
     return SynthesisTriggerResponse(
         triggered=True,
-        pending_count=int(pending_count or 0),
+        pending_events=int(pending_count or 0),
         last_run_at=last_run_row["started_at"] if last_run_row else None,
     )
 

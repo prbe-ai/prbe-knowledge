@@ -28,7 +28,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from datetime import UTC, datetime
-from typing import Any
 
 import asyncpg
 from anthropic import AsyncAnthropic
@@ -36,7 +35,6 @@ from anthropic import AsyncAnthropic
 from services.synthesis import persistence
 from services.synthesis.models import TriageInput, TriageVerdict
 from services.synthesis.triage import (
-    TriageParseError,
     call_triage,
     pack_into_batches,
 )
@@ -183,7 +181,6 @@ class TriageWorker:
                 events_kept += await self._apply_verdicts(
                     customer_id,
                     queue_rows,
-                    triage_inputs,
                     verdicts,
                 )
         except Exception as exc:
@@ -231,7 +228,7 @@ class TriageWorker:
             async with self._batch_sem:
                 try:
                     output = await call_triage(client, batch, now=now)
-                except (TriageParseError, Exception) as exc:
+                except Exception as exc:
                     log.warning(
                         "triage_worker.triage_failed",
                         customer=customer_id,
@@ -261,7 +258,6 @@ class TriageWorker:
         self,
         customer_id: str,
         queue_rows: list[asyncpg.Record],
-        triage_inputs: list[TriageInput],
         verdicts: dict[int, TriageVerdict],
     ) -> int:
         """Apply verdicts: rejected/retry one-shot, triaged batched + notified.
@@ -295,12 +291,7 @@ class TriageWorker:
                 triaged_verdicts,
                 notify_channel=self._notify_channel,
             )
-        # Suppress unused-arg warning while keeping signature stable for
-        # future use (e.g. metrics that need the input bodies).
-        _ = triage_inputs
         return len(triaged_verdicts)
 
 
 __all__ = ["TriageWorker"]
-# Placate ruff F401 — keep `Any` import for downstream type hints if added.
-_ = Any

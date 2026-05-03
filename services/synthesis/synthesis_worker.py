@@ -51,8 +51,6 @@ from services.synthesis.models import (
     VerifierInput,
 )
 from services.synthesis.synthesize import (
-    SynthesisParseError,
-    VerifierParseError,
     call_synthesize,
     call_verifier,
     synthesis_to_normalization,
@@ -204,7 +202,9 @@ class SynthesisWorker:
                 if not claimed:
                     break
                 # Reconstruct cluster -> events mapping from triage_targets.
-                cluster_map = await self._build_clusters(customer_id, claimed)
+                cluster_map = await self._build_clusters(
+                    customer_id, claimed, run_id=run_id
+                )
 
                 # Fan out cluster processing.
                 async def _process(
@@ -275,6 +275,8 @@ class SynthesisWorker:
         self,
         customer_id: str,
         claimed: list[asyncpg.Record],
+        *,
+        run_id: int,
     ) -> dict[
         tuple[str, str],
         list[tuple[asyncpg.Record, TriageInput, list[dict[str, Any]]]],
@@ -284,6 +286,9 @@ class SynthesisWorker:
         Each claimed row's `triage_targets` JSON has the shape produced
         by `persistence.verdict_targets_json`. The list of `targets`
         determines which (wiki_type, slug) clusters this row joins.
+
+        `run_id` stamps any orphan-row skip-marks so the audit trail
+        links back to the actual open run.
         """
         triage_inputs = await persistence.fetch_bodies(customer_id, claimed)
         inputs_by_qid: dict[int, TriageInput] = {inp.queue_id: inp for inp in triage_inputs}
@@ -291,15 +296,14 @@ class SynthesisWorker:
             tuple[str, str],
             list[tuple[asyncpg.Record, TriageInput, list[dict[str, Any]]]],
         ] = {}
+        orphan_qids: list[int] = []
+        no_target_qids: list[int] = []
         for row in claimed:
             qid = row["queue_id"]
             inp = inputs_by_qid.get(qid)
             if inp is None:
-                # Doc was deleted between claim and body-fetch. Mark
-                # done with a skip note so the row exits the queue.
-                await persistence.mark_synthesis_skipped(
-                    customer_id, [qid], 0, reason="document missing at synthesize"
-                )
+                # Doc was deleted between claim and body-fetch.
+                orphan_qids.append(qid)
                 continue
             targets_json = row["triage_targets"]
             if isinstance(targets_json, (str, bytes, bytearray)):
@@ -316,9 +320,7 @@ class SynthesisWorker:
                 # Triage said "yes important" but didn't pin a target —
                 # shouldn't happen given the threshold gate, but mark
                 # done so the row doesn't loop.
-                await persistence.mark_synthesis_skipped(
-                    customer_id, [qid], 0, reason="no triage targets"
-                )
+                no_target_qids.append(qid)
                 continue
             for target in targets:
                 if not isinstance(target, dict):
@@ -328,6 +330,23 @@ class SynthesisWorker:
                 if not wiki_type or not slug:
                     continue
                 clusters.setdefault((wiki_type, slug), []).append((row, inp, targets))
+
+        # Bulk-mark orphan rows in one round-trip each, stamped with the
+        # actual open run_id (not 0) so the audit trail links correctly.
+        if orphan_qids:
+            await persistence.mark_synthesis_skipped(
+                customer_id,
+                orphan_qids,
+                run_id,
+                reason="document missing at synthesize",
+            )
+        if no_target_qids:
+            await persistence.mark_synthesis_skipped(
+                customer_id,
+                no_target_qids,
+                run_id,
+                reason="no triage targets",
+            )
         return clusters
 
     async def _process_cluster(
@@ -401,7 +420,7 @@ class SynthesisWorker:
         )
         try:
             verifier_output = await call_verifier(client, verifier_input, now=datetime.now(UTC))
-        except (VerifierParseError, Exception) as exc:
+        except Exception as exc:
             log.warning(
                 "synthesis_worker.verifier_failed",
                 customer=customer_id,
@@ -459,7 +478,7 @@ class SynthesisWorker:
         )
         try:
             synth_output = await call_synthesize(client, synth_input, now=datetime.now(UTC))
-        except (SynthesisParseError, Exception) as exc:
+        except Exception as exc:
             log.warning(
                 "synthesis_worker.synthesize_failed",
                 customer=customer_id,

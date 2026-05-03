@@ -6,11 +6,12 @@ fly apps but operate on the same `wiki_synthesis_queue` and
 every read and write against those tables flows through here so the
 two workers stay coherent on row-level state machine transitions:
 
-    pending  ──[claim_pending_batch]──> triaging
-    triaging ──[mark_triaged]─────────> triaged
-    triaging ──[mark_rejected]────────> rejected (terminal: triage threshold)
-    triaging ──[mark_for_retry]───────> pending | failed
-    triaged  ──[claim_triaged_batch]──> synthesizing
+    pending  ──[claim_pending_batch]──────────> triaging  (attempts++)
+    triaging ──[mark_batch_triaged_and_notify]─> triaged   (UPDATE+NOTIFY same txn)
+    triaging ──[mark_rejected]────────────────> rejected  (terminal: triage threshold)
+    triaging ──[mark_for_retry]───────────────> pending | failed
+    triaging ──[mark_batch_triage_error]──────> pending | failed
+    triaged  ──[claim_triaged_rows]───────────> synthesizing  (attempts++)
     synthesizing ──[mark_synthesis_done]────────> done
     synthesizing ──[mark_synthesis_skipped]─────> done (MANUAL_ENTRY guard, cluster cap)
     synthesizing ──[mark_verifier_rejected]─────> verifier_rejected (terminal)
@@ -204,12 +205,18 @@ async def claim_triaged_rows(customer_id: str, *, limit: int) -> list[asyncpg.Re
     Returns the rows along with their stored `triage_targets` JSON so the
     synthesis worker can rebuild the cluster map without re-running
     triage.
+
+    Increments `attempts` so the synthesis-stage retry loop
+    (`mark_synthesis_error` → 'triaged' → re-claim) actually advances
+    the counter and dead-letters at WIKI_SYNTHESIS_MAX_ATTEMPTS instead
+    of looping forever and burning LLM spend.
     """
     async with with_tenant(customer_id) as conn:
         return await conn.fetch(
             """
             UPDATE wiki_synthesis_queue
-            SET status = 'synthesizing'
+            SET status = 'synthesizing',
+                attempts = attempts + 1
             WHERE queue_id IN (
                 SELECT queue_id FROM wiki_synthesis_queue
                 WHERE customer_id = $1
@@ -258,6 +265,12 @@ async def fetch_bodies(
 
     triage_inputs: list[TriageInput] = []
     async with with_tenant(customer_id) as conn:
+        # Filter to live, non-deleted versions. A doc enqueued at
+        # version N then soft-deleted at N+1 (deleted_at set on the
+        # superseding row, valid_to set on N) must NOT be compiled
+        # into a wiki page — that's a privacy / right-to-delete
+        # contract. Mid-version deletes drop out of meta_lookup and
+        # are handled by the orphan path in synthesis_worker.
         rows = await conn.fetch(
             """
             SELECT q.doc_id, q.version, d.title, d.author_id,
@@ -267,6 +280,8 @@ async def fetch_bodies(
               ON d.customer_id = $1
              AND d.doc_id = q.doc_id
              AND d.version = q.version
+             AND d.valid_to IS NULL
+             AND d.deleted_at IS NULL
             """,
             customer_id,
             doc_ids,
