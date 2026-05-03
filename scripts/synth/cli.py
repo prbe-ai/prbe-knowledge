@@ -5,6 +5,8 @@ Plan 2: init / run / clean subcommands.
 
 Plan 2 commands default to local-files mode. The --integrate flag opts into
 DB + R2 writes (requires a prior `synth init`).
+
+Plan 3 additions: LlmClientConfig, LlmClients, CachingLlmClient, build_llm_clients.
 """
 
 from __future__ import annotations
@@ -15,8 +17,11 @@ import dataclasses
 import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from pydantic import BaseModel
 
 from scripts.synth.bootstrap import clean_tenant, init_tenant
 from scripts.synth.cache import DiskCache, default_cache_root
@@ -27,8 +32,19 @@ from scripts.synth.company_context import (
 )
 from scripts.synth.extractor.github_api import GithubClient
 from scripts.synth.extractor.repo import RepoExtractor, RepoSignals
+from scripts.synth.llm.anthropic_client import AnthropicClient
 from scripts.synth.llm.anthropic_client import AnthropicClient as LlmClient
-from scripts.synth.llm.base import LlmClientProtocol
+from scripts.synth.llm.base import (
+    LlmClientProtocol,
+    LlmRequest,
+    LlmResponse,
+    Provider,
+    provider_from_model,
+)
+from scripts.synth.llm.cache import PromptCache
+from scripts.synth.llm.fixtures import FixtureStore
+from scripts.synth.llm.gemini_client import GeminiClient
+from scripts.synth.llm.mock_client import MockLlmClient
 from scripts.synth.output.eval_artifacts import (
     write_docs_index,
     write_manifest,
@@ -41,6 +57,148 @@ from scripts.synth.profile import Profile, load_profile
 from scripts.synth.scenarios import TimeWindow, run_scenarios
 from scripts.synth.validator import validate_name_only
 from scripts.synth.world_model import merge_world_model
+
+# Default fixture root for MockLlmClient replay mode — relative to repo root.
+_DEFAULT_FIXTURE_ROOT = Path(__file__).parent.parent.parent / "tests" / "fixtures" / "synth_llm"
+
+
+# ---------------------------------------------------------------------------
+# Plan 3 — LLM client dataclasses + CachingLlmClient + build_llm_clients
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LlmClientConfig:
+    """Configuration bundle passed to build_llm_clients."""
+
+    llm_cfg: dict
+    mock_llm: bool
+    no_llm_cache: bool
+    record_llm: bool
+    fixture_root: Path | None = None
+    cache_root: Path | None = None
+
+
+@dataclass
+class LlmClients:
+    """Container for the three role clients + their resolved providers."""
+
+    planner_client: LlmClientProtocol
+    writer_client: LlmClientProtocol
+    validator_client: LlmClientProtocol
+    planner_provider: Provider
+    writer_provider: Provider
+    validator_provider: Provider
+
+
+class CachingLlmClient:
+    """LlmClientProtocol wrapper that consults PromptCache before calling the inner client."""
+
+    def __init__(self, inner: LlmClientProtocol, cache: PromptCache, provider: Provider) -> None:
+        self._inner = inner
+        self._cache = cache
+        self._provider = provider
+
+    async def generate(self, req: LlmRequest) -> LlmResponse:
+        cached = await self._cache.get(self._provider, req, schema_json=None)
+        if cached is not None:
+            return LlmResponse(text=cached.get("text", ""))
+        resp = await self._inner.generate(req)
+        await self._cache.put(self._provider, req, schema_json=None, response_dict={"text": resp.text})
+        return resp
+
+    async def generate_structured(self, req: LlmRequest, schema: type[BaseModel]) -> dict:
+        schema_json = json.dumps(schema.model_json_schema(), sort_keys=True)
+        cached = await self._cache.get(self._provider, req, schema_json)
+        if cached is not None:
+            return cached
+        result = await self._inner.generate_structured(req, schema)
+        await self._cache.put(self._provider, req, schema_json, result)
+        return result
+
+    async def close(self) -> None:
+        await self._inner.close()
+
+
+def build_llm_clients(cfg: LlmClientConfig) -> LlmClients:
+    """Construct the three role clients according to the flag combination in cfg.
+
+    Routing logic:
+      - mock_llm=True  → all three clients are MockLlmClient(replay). No API keys needed.
+      - record_llm=True → wrap each real client with MockLlmClient(record). Raises if keys absent.
+      - no_llm_cache=True → use raw real clients (no CachingLlmClient wrapper).
+      - default         → wrap each real client in CachingLlmClient.
+    """
+    planner_model = cfg.llm_cfg["planner_model"]
+    writer_model = cfg.llm_cfg["writer_model"]
+    validator_model = cfg.llm_cfg["validator_model"]
+
+    planner_provider = provider_from_model(planner_model)
+    writer_provider = provider_from_model(writer_model)
+    validator_provider = provider_from_model(validator_model)
+
+    # --- mock path: no API keys, pure fixture replay ---
+    if cfg.mock_llm:
+        store = FixtureStore(cfg.fixture_root or _DEFAULT_FIXTURE_ROOT)
+        mock = MockLlmClient(store=store, mode="replay")
+        return LlmClients(
+            planner_client=mock,
+            writer_client=mock,
+            validator_client=mock,
+            planner_provider=planner_provider,
+            writer_provider=writer_provider,
+            validator_provider=validator_provider,
+        )
+
+    # --- record path: validate required API keys up front ---
+    if cfg.record_llm:
+        needs_anthropic = any(
+            p == Provider.ANTHROPIC
+            for p in (planner_provider, writer_provider, validator_provider)
+        )
+        needs_google = any(
+            p == Provider.GEMINI
+            for p in (planner_provider, writer_provider, validator_provider)
+        )
+        if needs_anthropic and not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY required for --record-llm with Anthropic models"
+            )
+        if needs_google and not os.environ.get("GOOGLE_API_KEY"):
+            raise RuntimeError(
+                "GOOGLE_API_KEY required for --record-llm with Gemini models"
+            )
+
+    # --- build one real client per role ---
+    fixture_root = cfg.fixture_root or _DEFAULT_FIXTURE_ROOT
+
+    def _make_client(model: str, provider: Provider) -> LlmClientProtocol:
+        if provider == Provider.ANTHROPIC:
+            inner: LlmClientProtocol = AnthropicClient(
+                api_key=os.environ.get("ANTHROPIC_API_KEY", "")
+            )
+        else:
+            inner = GeminiClient(api_key=os.environ.get("GOOGLE_API_KEY", ""))
+
+        if cfg.record_llm:
+            store = FixtureStore(fixture_root)
+            return MockLlmClient(store=store, mode="record", real_client=inner)
+
+        if cfg.no_llm_cache:
+            return inner
+
+        # default: wrap in caching layer
+        cache = PromptCache(cfg.cache_root or default_cache_root("llm"))
+        return CachingLlmClient(inner=inner, cache=cache, provider=provider)
+
+    return LlmClients(
+        planner_client=_make_client(planner_model, planner_provider),
+        writer_client=_make_client(writer_model, writer_provider),
+        validator_client=_make_client(validator_model, validator_provider),
+        planner_provider=planner_provider,
+        writer_provider=writer_provider,
+        validator_provider=validator_provider,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,6 +264,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-archetype scenario cap (debug).",
     )
     run.add_argument("--verbose", action="store_true")
+    # Plan 3 LLM flags (run subcommand only)
+    run.add_argument(
+        "--mock-llm",
+        action="store_true",
+        default=False,
+        help="Use MockLlmClient (fixture replay). No API keys required.",
+    )
+    run.add_argument(
+        "--no-llm-cache",
+        action="store_true",
+        default=False,
+        help="Bypass PromptCache; always call the real LLM API.",
+    )
+    run.add_argument(
+        "--record-llm",
+        action="store_true",
+        default=False,
+        help="Record real LLM responses to fixtures for later replay.",
+    )
 
     # clean — Plan 2
     clean = sub.add_parser(
