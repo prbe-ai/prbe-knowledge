@@ -33,7 +33,6 @@ from scripts.synth.company_context import (
 from scripts.synth.extractor.github_api import GithubClient
 from scripts.synth.extractor.repo import RepoExtractor, RepoSignals
 from scripts.synth.llm.anthropic_client import AnthropicClient
-from scripts.synth.llm.anthropic_client import AnthropicClient as LlmClient
 from scripts.synth.llm.base import (
     LlmClientProtocol,
     LlmRequest,
@@ -45,6 +44,8 @@ from scripts.synth.llm.cache import PromptCache
 from scripts.synth.llm.fixtures import FixtureStore
 from scripts.synth.llm.gemini_client import GeminiClient
 from scripts.synth.llm.mock_client import MockLlmClient
+from scripts.synth.llm.planner import LLMPlanner
+from scripts.synth.llm.writer import LLMWriter
 from scripts.synth.output.eval_artifacts import (
     write_docs_index,
     write_manifest,
@@ -384,7 +385,7 @@ async def _resolve_company_context(
             headcount=0,
             inferred=True,
         )
-    llm: LlmClientProtocol = LlmClient(api_key=api_key)
+    llm: LlmClientProtocol = AnthropicClient(api_key=api_key)
     try:
         readme_blob = "\n\n".join(
             r.content for sig in signals for r in sig.readmes if r.content
@@ -551,6 +552,31 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
     ownership = build_ownership_index(signals, world)
     time_window = _parse_time_window(args.time_window, profile)
 
+    # Plan 3 — build LLM clients and the Planner/Writer/Validator helpers
+    _llm_defaults = {
+        "planner_model": "claude-opus-4-7",
+        "writer_model": "claude-sonnet-4-6",
+        "validator_model": "claude-haiku-4-5-20251001",
+    }
+    llm_cfg: dict = {**_llm_defaults, **(profile.raw.get("llm") or {})}
+    client_cfg = LlmClientConfig(
+        llm_cfg=llm_cfg,
+        mock_llm=getattr(args, "mock_llm", False),
+        no_llm_cache=getattr(args, "no_llm_cache", False),
+        record_llm=getattr(args, "record_llm", False),
+    )
+    llm_clients = build_llm_clients(client_cfg)
+    llm_planner = LLMPlanner(
+        client=llm_clients.planner_client,
+        model=llm_cfg["planner_model"],
+    )
+    llm_writer = LLMWriter(
+        client=llm_clients.writer_client,
+        model=llm_cfg["writer_model"],
+    )
+    validator_pass2_client = llm_clients.validator_client
+    validator_pass2_model = llm_cfg["validator_model"]
+
     archetype_filter: tuple[str, ...] | None = None
     if args.archetypes:
         archetype_filter = tuple(s.strip() for s in args.archetypes.split(",") if s.strip())
@@ -558,7 +584,7 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
     # Setup writer based on mode.
     if args.integrate:
         db, bucket = await _open_db_and_bucket()
-        writer = IngestionWriter(
+        ingestion_writer = IngestionWriter(
             out_dir=out,
             mode="integrate",
             customer_id=profile.customer_id,
@@ -567,21 +593,26 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
         )
     else:
         db = None
-        writer = IngestionWriter(out_dir=out, mode="local")
+        ingestion_writer = IngestionWriter(out_dir=out, mode="local")
 
     try:
         emitted_docs: list = []
-        for doc in run_scenarios(
+        async for doc in run_scenarios(
             world,
             ownership,
             profile,
             time_window,
             archetype_filter=archetype_filter,
             scenario_limit=args.limit_scenarios,
+            company_ctx=cc,
+            planner=llm_planner,
+            writer=llm_writer,
+            validator_pass2_client=validator_pass2_client,
+            validator_pass2_model=validator_pass2_model,
         ):
-            await writer.write(doc)
+            await ingestion_writer.write(doc)
             emitted_docs.append(doc)
-        await writer.close()
+        await ingestion_writer.close()
     finally:
         if db is not None:
             await db.close()

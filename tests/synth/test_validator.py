@@ -1,12 +1,19 @@
-"""Validator Pass 1: name-only WorldModel check."""
+"""Validator Pass 1: name-only WorldModel check + combined validate()."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from scripts.synth.archetypes.base import Source
+from scripts.synth.archetypes.base import (
+    Archetype,
+    Cadence,
+    Category,
+    ScenarioSpec,
+    Source,
+    ValidatorLevel,
+)
 from scripts.synth.output.base import SynthDoc
-from scripts.synth.validator import validate_name_only
+from scripts.synth.validator import validate, validate_name_only
 from scripts.synth.world_model import (
     ChannelHint,
     Person,
@@ -108,3 +115,89 @@ def test_world_model_service_name_not_flagged() -> None:
     doc = _make_doc("deployed payments-api to production.")
     violations = validate_name_only((doc,), world)
     assert violations == ()
+
+
+# ---------------------------------------------------------------------------
+# Combined validate() tests
+# ---------------------------------------------------------------------------
+
+_NAME_ONLY_ARCHETYPE = Archetype(
+    name="STANDUP_UPDATE",
+    category=Category.RECURRING,
+    cadence=Cadence.DAILY,
+    sources_used=(Source.SLACK,),
+    cast_size=(1, 1),
+    needs_planner_call=False,
+    validator_level=ValidatorLevel.NAME_ONLY,
+)
+
+_STRICT_ARCHETYPE = Archetype(
+    name="INCIDENT",
+    category=Category.PLOT,
+    cadence=Cadence.AD_HOC,
+    sources_used=(Source.SLACK, Source.NOTION),
+    cast_size=(2, 4),
+    needs_planner_call=True,
+    validator_level=ValidatorLevel.STRICT,
+)
+
+_FAKE_SPEC = ScenarioSpec(
+    id="scn-fake-1",
+    archetype_name="INCIDENT",
+    instance_ts=datetime(2026, 5, 1, 9, 0, 0, tzinfo=UTC),
+    cast=("gh:alice",),
+    affected_services=("payments-api",),
+)
+
+
+async def test_combined_validate_no_violations_name_only_archetype() -> None:
+    """NAME_ONLY archetype + clean doc → should_drop=False, pass2_result=None."""
+    world = _make_world()
+    doc = _make_doc("deployed payments-api to production.")
+    result = await validate(
+        (doc,),
+        world,
+        scenario=None,
+        archetype=_NAME_ONLY_ARCHETYPE,
+        pass2_client=None,
+        pass2_model=None,
+    )
+    assert result.should_drop is False
+    assert result.pass1_violations == ()
+    assert result.pass2_result is None
+    assert result.failing_doc_ids == ()
+
+
+async def test_combined_validate_pass1_failure_drops_scenario() -> None:
+    """Doc with unknown service → pass1 violation → should_drop=True."""
+    world = _make_world()
+    doc = _make_doc("shipped unknown-service yesterday.")
+    result = await validate(
+        (doc,),
+        world,
+        scenario=None,
+        archetype=_NAME_ONLY_ARCHETYPE,
+        pass2_client=None,
+        pass2_model=None,
+    )
+    assert result.should_drop is True
+    assert len(result.pass1_violations) == 1
+    assert "doc-test-1" in result.failing_doc_ids
+
+
+async def test_combined_validate_strict_archetype_no_client_skips_pass2() -> None:
+    """STRICT archetype but pass2_client=None → Pass 2 skipped, only Pass 1 runs."""
+    world = _make_world()
+    doc = _make_doc("deployed payments-api to production.")
+    result = await validate(
+        (doc,),
+        world,
+        scenario=_FAKE_SPEC,
+        archetype=_STRICT_ARCHETYPE,
+        pass2_client=None,
+        pass2_model=None,
+    )
+    # Pass 2 skipped because no client; clean doc means no pass1 violations either
+    assert result.should_drop is False
+    assert result.pass2_result is None
+    assert result.pass1_violations == ()
