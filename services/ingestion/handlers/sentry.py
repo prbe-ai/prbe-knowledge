@@ -77,7 +77,6 @@ _HDR_RESOURCE = "sentry-hook-resource"
 _HDR_SIGNATURE = "sentry-hook-signature"
 
 _SENTRY_API = "https://sentry.io/api/0"
-_SENTRY_OAUTH_TOKEN = "https://sentry.io/oauth/token/"
 
 _RESOURCE_ISSUE = "issue"
 _RESOURCE_EVENT_ALERT = "event_alert"
@@ -645,33 +644,40 @@ class SentryConnector(Connector):
             raise MissingSecret("SENTRY_CLIENT_ID / SENTRY_CLIENT_SECRET not configured")
         if not code:
             raise InvalidWebhookPayload("sentry oauth callback missing code")
+        params = extra_params or {}
+        installation_id = params.get("installation_id") or params.get("installationId")
+        if not installation_id:
+            raise InvalidWebhookPayload("sentry oauth callback missing installationId")
+
+        token_url = (
+            f"{_SENTRY_API}/sentry-app-installations/{installation_id}/authorizations/"
+        )
 
         try:
             resp = await self.http.post(
-                _SENTRY_OAUTH_TOKEN,
-                data={
+                token_url,
+                json={
                     "grant_type": "authorization_code",
                     "client_id": cid,
                     "client_secret": secret.get_secret_value(),
                     "code": code,
-                    "redirect_uri": redirect_uri,
                 },
             )
         except Exception as exc:
             raise TransientSourceError(
-                "sentry /oauth/token request failed",
+                "sentry installation authorization request failed",
                 error=str(exc),
             ) from exc
 
         if resp.status_code >= 500:
             raise TransientSourceError(
-                f"sentry /oauth/token returned {resp.status_code}",
+                f"sentry installation authorization returned {resp.status_code}",
                 status=resp.status_code,
                 body=resp.text[:500],
             )
         if resp.status_code >= 400:
             raise PermanentSourceError(
-                f"sentry /oauth/token returned {resp.status_code}",
+                f"sentry installation authorization returned {resp.status_code}",
                 status=resp.status_code,
                 body=resp.text[:500],
             )
@@ -680,14 +686,14 @@ class SentryConnector(Connector):
             body = resp.json()
         except ValueError as exc:
             raise PermanentSourceError(
-                "sentry /oauth/token 200 but response was not JSON",
+                "sentry installation authorization 200 but response was not JSON",
                 body=resp.text[:500],
             ) from exc
 
-        access_token = body.get("access_token") if isinstance(body, dict) else None
+        access_token = body.get("token") if isinstance(body, dict) else None
         if not access_token:
             raise PermanentSourceError(
-                "sentry /oauth/token 200 but missing access_token",
+                "sentry installation authorization 200 but missing token",
                 body=str(body)[:500],
             )
 
@@ -695,7 +701,7 @@ class SentryConnector(Connector):
             customer_id="",  # caller fills in — connector does not know the tenant
             source_system=SourceSystem.SENTRY,
             access_token=access_token,
-            refresh_token=body.get("refresh_token"),
+            refresh_token=body.get("refreshToken"),
             expires_at=_oauth_expires_at(body),
             scope=_oauth_scope(body.get("scope")),
         )
@@ -982,6 +988,10 @@ def _oauth_scope(value: Any) -> str | None:
 
 
 def _oauth_expires_at(body: Mapping[str, Any]) -> datetime | None:
+    parsed = _parse_iso8601(body.get("expiresAt") or body.get("expires_at"))
+    if parsed is not None:
+        return parsed
+
     expires_in = body.get("expires_in")
     if expires_in is None:
         return None
