@@ -223,6 +223,7 @@ class Normalizer:
             )
             await upsert_edges(conn, customer_id, result.graph_edges, node_ids, source_system.value)
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
+            await _upsert_code_repo_state(conn, customer_id, result.code_repo_state_updates)
 
             for idx, (doc, plan) in enumerate(zip(result.documents, plans, strict=True)):
                 # Per-doc SAVEPOINT: a deterministic-permanent error on one doc
@@ -1053,6 +1054,44 @@ async def _insert_acl_snapshots(
             r.valid_from,
             r.valid_to,
             _json(r.metadata),
+        )
+
+
+async def _upsert_code_repo_state(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    rows: list,
+) -> None:
+    """Upsert code-graph per-file cache rows. No-op for non-code-graph runs.
+
+    `code_repo_state` is keyed (customer_id, repo, file_path). The cache
+    short-circuits re-extraction when content_hash + extractor_version match
+    the prior run, so this is the cumulative source of truth for "what
+    extraction state is current."
+    """
+    if not rows:
+        return
+    for r in rows:
+        await conn.execute(
+            """
+            INSERT INTO code_repo_state
+                (customer_id, repo, file_path, content_hash, language,
+                 symbol_count, last_extracted_at, last_extractor_version)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+            ON CONFLICT (customer_id, repo, file_path) DO UPDATE SET
+                content_hash = EXCLUDED.content_hash,
+                language = EXCLUDED.language,
+                symbol_count = EXCLUDED.symbol_count,
+                last_extracted_at = NOW(),
+                last_extractor_version = EXCLUDED.last_extractor_version
+            """,
+            customer_id,
+            r.repo,
+            r.file_path,
+            r.content_hash,
+            r.language,
+            r.symbol_count,
+            r.extractor_version,
         )
 
 

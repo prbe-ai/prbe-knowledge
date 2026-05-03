@@ -125,6 +125,12 @@ async def upsert_edges(
     # (edge_type, from_node_id, to_node_id) entries here. Merge semantics
     # match the prior loop: shallow JSONB merge on properties (later wins on
     # key collision), `LEAST` on valid_from, last-seen on valid_to.
+    # Confidence semantics on dedupe + conflict: never demote. If the
+    # batch contains both an EXTRACTED and an AMBIGUOUS assertion of the
+    # same edge (one extractor resolved it, a sibling didn't), EXTRACTED
+    # wins. Same rule on ON CONFLICT — an existing EXTRACTED row stays
+    # EXTRACTED even if a later AMBIGUOUS write touches it.
+    # Order: EXTRACTED > INFERRED > AMBIGUOUS.
     deduped: dict[tuple[str, int, int], dict] = {}
     for edge in edges:
         from_id = node_ids.get((edge.from_label.value, edge.from_canonical_id))
@@ -138,6 +144,7 @@ async def upsert_edges(
                 "properties": dict(edge.properties),
                 "valid_from": edge.valid_from,
                 "valid_to": edge.valid_to,
+                "confidence": edge.confidence,
             }
         else:
             existing["properties"] = {**existing["properties"], **edge.properties}
@@ -147,6 +154,9 @@ async def upsert_edges(
             ):
                 existing["valid_from"] = edge.valid_from
             existing["valid_to"] = edge.valid_to
+            existing["confidence"] = _stronger_confidence(
+                existing["confidence"], edge.confidence
+            )
 
     if not deduped:
         return 0
@@ -160,24 +170,31 @@ async def upsert_edges(
     ]
     valid_from_list = [deduped[k]["valid_from"] for k in sorted_keys]
     valid_to_list = [deduped[k]["valid_to"] for k in sorted_keys]
+    confidences = [deduped[k]["confidence"] for k in sorted_keys]
 
     await conn.execute(
         """
         INSERT INTO graph_edges (
             customer_id, edge_type, from_node_id, to_node_id,
-            properties, valid_from, valid_to, source_system
+            properties, valid_from, valid_to, source_system, confidence
         )
         SELECT $1, edge_type, from_node_id, to_node_id,
-               properties::jsonb, COALESCE(valid_from, NOW()), valid_to, $2
+               properties::jsonb, COALESCE(valid_from, NOW()), valid_to, $2, confidence
         FROM unnest(
             $3::text[], $4::bigint[], $5::bigint[],
-            $6::text[], $7::timestamptz[], $8::timestamptz[]
-        ) AS t(edge_type, from_node_id, to_node_id, properties, valid_from, valid_to)
+            $6::text[], $7::timestamptz[], $8::timestamptz[], $9::text[]
+        ) AS t(edge_type, from_node_id, to_node_id, properties, valid_from, valid_to, confidence)
         ON CONFLICT (customer_id, edge_type, from_node_id, to_node_id)
         DO UPDATE SET
             properties = graph_edges.properties || EXCLUDED.properties,
             valid_from = LEAST(graph_edges.valid_from, EXCLUDED.valid_from),
-            valid_to   = EXCLUDED.valid_to
+            valid_to   = EXCLUDED.valid_to,
+            confidence = CASE
+                WHEN graph_edges.confidence = 'EXTRACTED' THEN graph_edges.confidence
+                WHEN EXCLUDED.confidence = 'EXTRACTED' THEN EXCLUDED.confidence
+                WHEN graph_edges.confidence = 'INFERRED' THEN graph_edges.confidence
+                ELSE EXCLUDED.confidence
+            END
         """,
         customer_id,
         source_system,
@@ -187,5 +204,14 @@ async def upsert_edges(
         properties_json,
         valid_from_list,
         valid_to_list,
+        confidences,
     )
     return len(deduped)
+
+
+_CONFIDENCE_RANK: dict[str, int] = {"AMBIGUOUS": 0, "INFERRED": 1, "EXTRACTED": 2}
+
+
+def _stronger_confidence(a: str, b: str) -> str:
+    """Return the stronger of two confidence tiers (never demote)."""
+    return a if _CONFIDENCE_RANK.get(a, 0) >= _CONFIDENCE_RANK.get(b, 0) else b

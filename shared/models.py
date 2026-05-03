@@ -536,7 +536,13 @@ class GraphNodeSpec(BaseModel):
 
 class GraphEdgeSpec(BaseModel):
     """One graph edge to upsert. Endpoints reference (label, canonical_id) pairs
-    and are resolved to node_ids after their GraphNodeSpec peers are upserted."""
+    and are resolved to node_ids after their GraphNodeSpec peers are upserted.
+
+    `confidence` is the spec's three-tier tag (EXTRACTED | INFERRED | AMBIGUOUS).
+    Default 'EXTRACTED' so existing connectors don't have to know about it.
+    Code-graph emits 'AMBIGUOUS' for unresolved CALLS targets; PR-B's Graphify
+    proposer/promoter emits 'INFERRED'.
+    """
 
     edge_type: EdgeType
     from_label: NodeLabel
@@ -546,6 +552,7 @@ class GraphEdgeSpec(BaseModel):
     properties: dict[str, Any] = Field(default_factory=dict)
     valid_from: datetime | None = None
     valid_to: datetime | None = None
+    confidence: str = "EXTRACTED"
 
 
 class ACLSnapshotRow(BaseModel):
@@ -563,6 +570,26 @@ class ACLSnapshotRow(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class CodeRepoStateUpdate(BaseModel):
+    """One row to upsert into `code_repo_state` (code-graph cache).
+
+    Allows the code-graph connector to record per-file extraction status
+    inside the same write txn the normalizer opens for documents/chunks/
+    graph_nodes/graph_edges. Other connectors leave the list empty; the
+    normalizer's _persist no-ops on them.
+
+    `language` may be the sentinel `_skipped_secrets` when the file matched
+    the secrets skip-list — see `services/ingestion/code_graph/secrets.py`.
+    """
+
+    repo: str
+    file_path: str
+    content_hash: str
+    language: str
+    symbol_count: int = 0
+    extractor_version: str
+
+
 class NormalizationResult(BaseModel):
     """Uniform output shape produced by every connector's .normalize().
 
@@ -574,12 +601,21 @@ class NormalizationResult(BaseModel):
     graph_nodes: list[GraphNodeSpec] = Field(default_factory=list)
     graph_edges: list[GraphEdgeSpec] = Field(default_factory=list)
     acl_snapshots: list[ACLSnapshotRow] = Field(default_factory=list)
+    # Code-graph only: per-file cache state to upsert into `code_repo_state`.
+    # Other connectors leave this empty; normalizer._persist no-ops on it.
+    code_repo_state_updates: list[CodeRepoStateUpdate] = Field(default_factory=list)
     # Non-fatal reason this event produced no documents (e.g. "slack edit of deleted msg").
     skipped_reason: str | None = None
 
     @property
     def is_empty(self) -> bool:
-        return not (self.documents or self.graph_nodes or self.graph_edges or self.acl_snapshots)
+        return not (
+            self.documents
+            or self.graph_nodes
+            or self.graph_edges
+            or self.acl_snapshots
+            or self.code_repo_state_updates
+        )
 
 
 class WebhookParseResult(BaseModel):
