@@ -10,8 +10,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -29,8 +31,12 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
-from shared.models import WebhookEvent
+from shared.exceptions import (
+    InvalidWebhookPayload,
+    PermanentSourceError,
+    TransientSourceError,
+)
+from shared.models import IntegrationToken, WebhookEvent
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "sentry"
 
@@ -52,6 +58,32 @@ def _load(name: str) -> dict:
 def _build() -> SentryConnector:
     ctx = _make_ctx()
     return build_connector(SourceSystem.SENTRY, ctx)  # type: ignore[return-value]
+
+
+def _make_oauth_ctx(
+    status_code: int,
+    body: str | dict,
+    *,
+    requests: list[httpx.Request] | None = None,
+) -> ConnectorContext:
+    settings = Settings(
+        environment="local",
+        sentry_client_id="sentry-cid",
+        sentry_client_secret=SecretStr("sentry-secret"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if requests is not None:
+            requests.append(request)
+        assert str(request.url) == "https://sentry.io/oauth/token/"
+        if isinstance(body, str):
+            return httpx.Response(status_code, text=body)
+        return httpx.Response(status_code, json=body)
+
+    return ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +179,183 @@ def test_verify_signature_valid_and_tampered() -> None:
     assert sentry.verify_signature(headers, body + b"x") is False
     # Missing header fails.
     assert sentry.verify_signature({}, body) is False
+
+
+# ---------------------------------------------------------------------------
+# exchange_oauth_code
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_success() -> None:
+    requests: list[httpx.Request] = []
+    ctx = _make_oauth_ctx(
+        200,
+        {
+            "access_token": "sntrys_access",
+            "refresh_token": "sntrys_refresh",
+            "expires_in": 3600,
+            "scope": "org:read project:read event:read project:releases",
+        },
+        requests=requests,
+    )
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+
+    before = datetime.now(UTC)
+    token = await sentry.exchange_oauth_code(
+        code="auth-code",
+        redirect_uri="https://api.prbe.ai/oauth/sentry/callback",
+    )
+    after = datetime.now(UTC)
+
+    assert token.source_system == SourceSystem.SENTRY
+    assert token.access_token == "sntrys_access"
+    assert token.refresh_token == "sntrys_refresh"
+    assert token.scope == "org:read project:read event:read project:releases"
+    assert token.expires_at is not None
+    assert (
+        before + timedelta(seconds=3590)
+        <= token.expires_at
+        <= after + timedelta(seconds=3610)
+    )
+
+    assert len(requests) == 1
+    form = parse_qs(requests[0].content.decode())
+    assert form["grant_type"] == ["authorization_code"]
+    assert form["client_id"] == ["sentry-cid"]
+    assert form["client_secret"] == ["sentry-secret"]
+    assert form["code"] == ["auth-code"]
+    assert form["redirect_uri"] == ["https://api.prbe.ai/oauth/sentry/callback"]
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_5xx_raises_transient() -> None:
+    ctx = _make_oauth_ctx(503, "temporarily unavailable")
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+
+    with pytest.raises(TransientSourceError) as exc_info:
+        await sentry.exchange_oauth_code(
+            code="auth-code",
+            redirect_uri="https://api.prbe.ai/oauth/sentry/callback",
+        )
+
+    assert exc_info.value.context["status"] == 503
+    assert "temporarily unavailable" in exc_info.value.context["body"]
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_4xx_raises_permanent() -> None:
+    ctx = _make_oauth_ctx(400, {"error": "invalid_grant"})
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+
+    with pytest.raises(PermanentSourceError) as exc_info:
+        await sentry.exchange_oauth_code(
+            code="auth-code",
+            redirect_uri="https://api.prbe.ai/oauth/sentry/callback",
+        )
+
+    assert exc_info.value.context["status"] == 400
+    assert "invalid_grant" in exc_info.value.context["body"]
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_missing_access_token_raises_permanent() -> None:
+    ctx = _make_oauth_ctx(200, {"refresh_token": "refresh-only"})
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+
+    with pytest.raises(PermanentSourceError) as exc_info:
+        await sentry.exchange_oauth_code(
+            code="auth-code",
+            redirect_uri="https://api.prbe.ai/oauth/sentry/callback",
+        )
+
+    assert "missing access_token" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# identify_workspaces
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_identify_workspaces_records_org_slug_and_id() -> None:
+    settings = Settings(environment="local")
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert str(request.url) == "https://sentry.io/api/0/organizations/"
+        return httpx.Response(
+            200,
+            json=[
+                {"id": "12345", "slug": "acme", "name": "Acme"},
+                {"id": "67890", "slug": "beta", "name": "Beta"},
+            ],
+        )
+
+    ctx = ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.SENTRY,
+        access_token="sntrys_access",
+    )
+
+    refs = await sentry.identify_workspaces(token)
+
+    by_id = {ref.external_id: ref for ref in refs}
+    assert set(by_id) == {"acme", "12345", "beta", "67890"}
+    assert by_id["acme"].external_name == "Acme"
+    assert by_id["acme"].metadata["mapping_kind"] == "org_slug"
+    assert by_id["12345"].external_name == "Acme"
+    assert by_id["12345"].metadata["mapping_kind"] == "org_id"
+    assert requests[0].headers["authorization"] == "Bearer sntrys_access"
+
+
+@pytest.mark.asyncio
+async def test_backfill_starts_from_connected_org_mapping() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert str(request.url) == "https://sentry.io/api/0/organizations/acme/issues/"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "1234567890",
+                    "title": "TypeError: boom",
+                    "lastSeen": "2026-04-22T14:10:02Z",
+                    "project": {"slug": "payments-api"},
+                }
+            ],
+        )
+
+    ctx = ConnectorContext(
+        settings=Settings(environment="local"),
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.SENTRY,
+        access_token="sntrys_access",
+    )
+
+    with patch(
+        "services.ingestion.handlers.sentry._connected_sentry_org_slug",
+        new_callable=AsyncMock,
+        return_value="acme",
+    ):
+        events = [event async for event in sentry.backfill("cust-1", token)]
+
+    assert len(events) == 1
+    assert events[0].source_event_id == "issue:1234567890:backfill"
+    assert events[0].raw_payload["organization"]["slug"] == "acme"
+    assert requests[0].headers["authorization"] == "Bearer sntrys_access"
 
 
 # ---------------------------------------------------------------------------

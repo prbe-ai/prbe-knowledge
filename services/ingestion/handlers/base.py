@@ -34,7 +34,7 @@ The normalizer/worker treats all connectors identically:
 Only `verify_signature`, `parse_webhook_event`, and `normalize` are required.
 `fetch_supplementary` has a no-op default; `backfill` raises NotSupportedByConnector.
 `oauth_install_url` / `exchange_oauth_code` are optional too — connectors
-without OAuth (or with shared-secret-only auth like Sentry) can omit them.
+without OAuth can omit them.
 """
 
 from __future__ import annotations
