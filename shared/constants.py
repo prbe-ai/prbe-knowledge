@@ -310,9 +310,29 @@ GRANOLA_REQUEST_INTERVAL_SECONDS = 0.25
 GRANOLA_REFRESH_DEBOUNCE_SECONDS = 30
 
 
-# pg_notify channel the synthesis worker LISTENs on. Normalizer._persist NOTIFYs
-# after appending wiki_synthesis_queue rows; the cron wakes within seconds.
-WIKI_SYNTHESIZE_CHANNEL = "wiki_synthesize"
+# pg_notify channels for the wiki synthesis pipeline.
+#
+# Pre-redesign: a single `wiki_synthesize` channel — Normalizer._persist
+# fired NOTIFY on every webhook, the in-process cron drained immediately,
+# resulting in continuous daytime synthesis. That model didn't match the
+# wiki's actual scope (slow-moving company knowledge). The redesign:
+#
+# - Normalizer._persist NO LONGER fires NOTIFY. Queue rows accumulate
+#   silently during the day at status='pending'.
+# - The wiki-cron fly app fires NOTIFY on `wiki_synthesize_pending`
+#   nightly at 02:00 UTC (per opted-in customer with pending rows). The
+#   /api/wiki/synthesize/trigger endpoint also fires it for manual wakes
+#   from the dashboard "Generate Wiki Now" button.
+# - The wiki-worker (triage) app LISTENs on `wiki_synthesize_pending` →
+#   drains pending rows through triage → marks them triaged/rejected/
+#   verifier_rejected → fires NOTIFY on `wiki_synthesize_triaged` from
+#   the same transaction that committed the UPDATE (Postgres delivers
+#   NOTIFY only after COMMIT, so listeners never wake on un-visible rows).
+# - The wiki-synthesis app LISTENs on `wiki_synthesize_triaged` → drains
+#   triaged rows through verifier + synthesize → writes wiki pages →
+#   regenerates the index.
+WIKI_PENDING_CHANNEL = "wiki_synthesize_pending"
+WIKI_TRIAGED_CHANNEL = "wiki_synthesize_triaged"
 
 # How many wiki_synthesis_queue rows the cron claims per drain tick. Triage is
 # token-budget batched on top of this; this is just the upper bound on rows
@@ -364,3 +384,21 @@ WIKI_SYNTHESIS_VERIFIER_BUDGET_TOKENS = 60_000
 # synthesis_error noting the truncation.
 WIKI_SYNTHESIS_CLUSTER_MAX_EVENTS = 10
 WIKI_SYNTHESIS_CLUSTER_MAX_TOKENS = 180_000
+
+# Concurrency caps. The wiki-worker fans out customers, then triage batches
+# per customer; the wiki-synthesis app fans out customers, then clusters per
+# customer. asyncio.Semaphore at each fan-out point.
+WIKI_SYNTHESIS_CUSTOMER_CONCURRENCY = 4
+WIKI_TRIAGE_BATCH_CONCURRENCY = 8
+WIKI_SYNTHESIS_CLUSTER_CONCURRENCY = 5
+
+# Manual trigger rate limit (advisory-lock + lookback in the BFF). The
+# /api/wiki/synthesize/trigger endpoint here surfaces the same value so
+# the dashboard can render an accurate "try again in Xs" toast.
+WIKI_TRIGGER_RATE_LIMIT_SECONDS = 300
+
+# Hour-of-day (UTC) the wiki-cron fly machine fires its nightly NOTIFY.
+# 02:00 UTC = 18:00 PT / 21:00 ET — picked so the drain finishes before
+# the team's morning standup but doesn't compete with the rest of the
+# nightly pipeline (Granola steady-poll cycles, etc.).
+WIKI_NIGHTLY_HOUR_UTC = 2

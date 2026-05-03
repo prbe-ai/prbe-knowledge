@@ -1,13 +1,17 @@
-"""Verify Normalizer._persist enqueues the right wiki_synthesis_queue rows
-and emits a pg_notify on the WIKI_SYNTHESIZE_CHANNEL.
+"""Verify Normalizer._persist enqueues the right wiki_synthesis_queue rows.
 
-The hot path itself is just an INSERT + a notify; the LLM stages run
-elsewhere and are tested in tests/synthesis/test_*.py.
+The hot path is now INSERT-only — the redesign moved daytime synthesis
+to a nightly batch fired by the wiki-cron fly app, so Normalizer no
+longer fires `pg_notify` on every webhook. This file pins both the
+positive (rows are inserted, idempotent on redelivery, opt-in gated)
+and the negative (NO pg_notify on either the legacy `wiki_synthesize`
+channel or the new `wiki_synthesize_pending` channel).
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -19,7 +23,7 @@ from services.ingestion.handlers.base import make_default_context
 from services.ingestion.normalizer import Normalizer
 from shared.config import Settings
 from shared.constants import (
-    WIKI_SYNTHESIZE_CHANNEL,
+    WIKI_PENDING_CHANNEL,
     DocClass,
     DocType,
     Permission,
@@ -40,9 +44,6 @@ CUSTOMER = "wiki-enqueue-cust"
 
 @pytest_asyncio.fixture
 async def reset_db(live_db: None, settings: Settings) -> AsyncIterator[None]:
-    # Seed the customer with `wiki_generation_enabled: true` so the existing
-    # happy-path tests still exercise the live enqueue code. The opt-in gate
-    # is covered separately in test_persist_skips_enqueue_when_disabled.
     async with raw_conn() as conn:
         await conn.execute(
             "INSERT INTO customers(customer_id, display_name, api_key_hash, preferences) "
@@ -56,12 +57,6 @@ async def reset_db(live_db: None, settings: Settings) -> AsyncIterator[None]:
 
 @pytest_asyncio.fixture
 async def reset_db_opt_out(live_db: None, settings: Settings) -> AsyncIterator[None]:
-    """Customer exists but has NOT opted into wiki generation.
-
-    Mirrors a fresh tenant whose dashboard has never flipped the
-    `wiki_generation_enabled` toggle. Default-off opt-in policy means
-    no queue rows, no notify, no LLM work.
-    """
     async with raw_conn() as conn:
         await conn.execute(
             "INSERT INTO customers(customer_id, display_name, api_key_hash, preferences) "
@@ -131,7 +126,6 @@ def _result(*docs: Document) -> NormalizationResult:
 
 @pytest.fixture
 def normalizer() -> Normalizer:
-    """Real normalizer; embedder is the in-process stub when ANTHROPIC_API_KEY=''."""
     return Normalizer(make_default_context())
 
 
@@ -163,9 +157,9 @@ async def test_persist_enqueues_wiki_synthesis_row(reset_db: None, normalizer: N
 async def test_persist_does_not_enqueue_wiki_self_writes(
     reset_db: None, normalizer: Normalizer
 ) -> None:
-    """Wiki connector writes (Phase 1 manual upload, Phase 2 cron compile)
-    must NOT feed back into the synthesis queue — otherwise the cron
-    triages its own outputs."""
+    """Wiki connector writes (Phase 1 manual upload, synthesis worker
+    compile) must NOT feed back into the synthesis queue — otherwise
+    the cron triages its own outputs."""
     doc = _doc(
         "wiki:runbook:auth",
         source_system=SourceSystem.WIKI,
@@ -182,36 +176,57 @@ async def test_persist_does_not_enqueue_wiki_self_writes(
 
 
 @pytest.mark.asyncio
-async def test_persist_emits_pg_notify(
+async def test_persist_does_not_emit_pg_notify(
     reset_db: None, normalizer: Normalizer, settings: Settings
 ) -> None:
-    """Open a separate LISTEN connection, persist, assert we received the notify
-    on `wiki_synthesize` with the customer_id payload."""
-    received: list[str] = []
+    """REGRESSION GATE: Normalizer._persist must NOT fire a pg_notify on
+    either the new `wiki_synthesize_pending` channel or the legacy
+    `wiki_synthesize` channel.
+
+    Synthesis is now nightly-batch — the wiki-cron fly app fires NOTIFY
+    at 02:00 UTC, plus a manual trigger endpoint for the dashboard
+    button. Re-introducing daytime NOTIFY here breaks the slow-moving
+    knowledge-base scope of the wiki.
+    """
+    received: list[tuple[str, str]] = []
     notify_event = asyncio.Event()
 
     listener = await asyncpg.connect(settings.database_url)
     try:
 
-        def _on_notify(_conn, _pid, _channel, payload) -> None:
-            received.append(payload)
+        def _on_notify(_conn, _pid, channel, payload) -> None:
+            received.append((channel, payload))
             notify_event.set()
 
-        await listener.add_listener(WIKI_SYNTHESIZE_CHANNEL, _on_notify)
+        # Listen on both the new channel and the legacy one — either
+        # firing should fail this test.
+        await listener.add_listener(WIKI_PENDING_CHANNEL, _on_notify)
+        await listener.add_listener("wiki_synthesize", _on_notify)
 
         doc = _doc(
-            "github:commit:notify",
+            "github:commit:no-notify",
             source_system=SourceSystem.GITHUB,
             doc_type=DocType.GITHUB_COMMIT,
         )
         await normalizer._persist(CUSTOMER, SourceSystem.GITHUB, _result(doc))
 
-        # Notify is asynchronous — wait briefly.
-        await asyncio.wait_for(notify_event.wait(), timeout=5.0)
-        assert CUSTOMER in received
+        # Wait briefly — a real enqueue+notify would arrive well under
+        # this; absence after the wait is the assertion.
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(notify_event.wait(), timeout=0.5)
+        assert received == [], f"Normalizer._persist fired unexpected pg_notify: {received}"
+
+        # The row must still have been INSERTed.
+        async with raw_conn() as conn:
+            count = await conn.fetchval(
+                "SELECT count(*) FROM wiki_synthesis_queue WHERE customer_id = $1",
+                CUSTOMER,
+            )
+        assert count == 1
     finally:
-        with contextlib_suppress():
-            await listener.remove_listener(WIKI_SYNTHESIZE_CHANNEL, _on_notify)
+        with contextlib.suppress(Exception):
+            await listener.remove_listener(WIKI_PENDING_CHANNEL, _on_notify)
+            await listener.remove_listener("wiki_synthesize", _on_notify)
         await listener.close()
 
 
@@ -219,8 +234,6 @@ async def test_persist_emits_pg_notify(
 async def test_persist_enqueue_idempotent_on_redelivery(
     reset_db: None, normalizer: Normalizer
 ) -> None:
-    """Re-persisting the same doc version (idempotent webhook) must not
-    create a second queue row."""
     doc = _doc(
         "github:commit:idem",
         source_system=SourceSystem.GITHUB,
@@ -244,40 +257,14 @@ async def test_persist_skips_enqueue_when_wiki_generation_disabled(
     """OPT-IN CONTRACT regression gate.
 
     A tenant whose `customers.preferences.wiki_generation_enabled` is
-    missing or false must NOT have queue rows appended and must NOT
-    receive a pg_notify on the wiki_synthesize channel — even when raw
-    docs are persisted normally. Inverting this back to "default-on"
-    will trip this test.
+    missing or false must NOT have queue rows appended.
     """
-    received: list[str] = []
-    notify_event = asyncio.Event()
-
-    listener = await asyncpg.connect(settings.database_url)
-    try:
-
-        def _on_notify(_conn, _pid, _channel, payload) -> None:
-            received.append(payload)
-            notify_event.set()
-
-        await listener.add_listener(WIKI_SYNTHESIZE_CHANNEL, _on_notify)
-
-        doc = _doc(
-            "github:commit:opt-out",
-            source_system=SourceSystem.GITHUB,
-            doc_type=DocType.GITHUB_COMMIT,
-        )
-        await normalizer._persist(CUSTOMER, SourceSystem.GITHUB, _result(doc))
-
-        # Notify is async — give it a beat. A real enqueue would have
-        # arrived in well under this; absence after the wait is the
-        # negative assertion.
-        with contextlib_suppress():
-            await asyncio.wait_for(notify_event.wait(), timeout=0.5)
-        assert CUSTOMER not in received
-    finally:
-        with contextlib_suppress():
-            await listener.remove_listener(WIKI_SYNTHESIZE_CHANNEL, _on_notify)
-        await listener.close()
+    doc = _doc(
+        "github:commit:opt-out",
+        source_system=SourceSystem.GITHUB,
+        doc_type=DocType.GITHUB_COMMIT,
+    )
+    await normalizer._persist(CUSTOMER, SourceSystem.GITHUB, _result(doc))
 
     async with raw_conn() as conn:
         count = await conn.fetchval(
@@ -285,10 +272,3 @@ async def test_persist_skips_enqueue_when_wiki_generation_disabled(
             CUSTOMER,
         )
     assert count == 0
-
-
-# Tiny shim so the suppress idiom doesn't import contextlib at module top
-def contextlib_suppress():
-    import contextlib
-
-    return contextlib.suppress(Exception)

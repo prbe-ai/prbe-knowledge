@@ -59,8 +59,13 @@ from services.ingestion.normalizer import (
     fetch_live_body_from_chunks,
 )
 from services.ingestion.wiki_links import parse_page_links
-from shared.constants import DocClass, DocType, SourceSystem
-from shared.db import with_tenant
+from shared.constants import (
+    WIKI_PENDING_CHANNEL,
+    DocClass,
+    DocType,
+    SourceSystem,
+)
+from shared.db import raw_conn, with_tenant
 from shared.exceptions import InvalidWebhookPayload
 from shared.logging import get_logger
 from shared.models import WebhookEvent
@@ -345,11 +350,7 @@ async def upsert_wiki_page(
         received_at=received_at,
         is_delete=False,
         commit_message=body.commit_message
-        or (
-            f"Manual upload by {body.author_id}"
-            if body.author_id
-            else "Manual upload"
-        ),
+        or (f"Manual upload by {body.author_id}" if body.author_id else "Manual upload"),
         commit_author=body.author_id,
         summary=body.summary,
     )
@@ -727,8 +728,7 @@ async def revert_wiki_page(
         version=version,
         chunk_count=outcome.chunk_count,
         links=[
-            WikiLinkOut(raw=link.raw, kind=link.kind, target=link.target)
-            for link in parsed_links
+            WikiLinkOut(raw=link.raw, kind=link.kind, target=link.target) for link in parsed_links
         ],
         dangling_links=dangling,
     )
@@ -814,6 +814,131 @@ async def get_wiki_index(
         entries=entries,
         updated_at=None,
         version=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Synthesis trigger + status (manual wake from the dashboard button)
+# ---------------------------------------------------------------------------
+
+
+class SynthesisTriggerBody(BaseModel):
+    reason: str | None = Field(default=None, max_length=240)
+
+
+class SynthesisTriggerResponse(BaseModel):
+    triggered: bool
+    pending_count: int
+    last_run_at: datetime | None
+
+
+class SynthesisStatusResponse(BaseModel):
+    pending_events: int
+    triaged_events: int
+    last_run_at: datetime | None
+    last_run_status: str | None
+    last_run_pages_updated: int | None
+    last_run_pages_created: int | None
+
+
+@router.post(
+    "/synthesize/trigger",
+    response_model=SynthesisTriggerResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def trigger_wiki_synthesis(
+    body: SynthesisTriggerBody,
+    customer_id: str = Depends(_require_customer),
+) -> SynthesisTriggerResponse:
+    """Wake the wiki-worker for this customer NOW.
+
+    Fires `pg_notify(WIKI_PENDING_CHANNEL, customer_id)`. The wiki-worker
+    fly app's NotifyListener wakes within seconds and starts triage; the
+    wiki-synthesis app picks up the triaged rows the worker produces.
+
+    Rate-limit + advisory-lock are enforced upstream in the BFF
+    (prbe-backend), not here — this endpoint is the internal-keyed
+    pass-through. Returns the pending count + last-run timestamp so the
+    dashboard can render an accurate status badge.
+    """
+    async with raw_conn() as conn:
+        pending_count = await conn.fetchval(
+            """
+            SELECT count(*)::bigint
+            FROM wiki_synthesis_queue
+            WHERE customer_id = $1 AND status = 'pending'
+            """,
+            customer_id,
+        )
+        last_run_row = await conn.fetchrow(
+            """
+            SELECT started_at FROM wiki_synthesis_runs
+            WHERE customer_id = $1
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            customer_id,
+        )
+        await conn.execute(
+            "SELECT pg_notify($1, $2)",
+            WIKI_PENDING_CHANNEL,
+            customer_id,
+        )
+    log.info(
+        "wiki.synthesize.trigger",
+        customer=customer_id,
+        pending=int(pending_count or 0),
+        reason=body.reason,
+    )
+    return SynthesisTriggerResponse(
+        triggered=True,
+        pending_count=int(pending_count or 0),
+        last_run_at=last_run_row["started_at"] if last_run_row else None,
+    )
+
+
+@router.get(
+    "/synthesize/status",
+    response_model=SynthesisStatusResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def get_wiki_synthesis_status(
+    customer_id: str = Depends(_require_customer),
+) -> SynthesisStatusResponse:
+    """Counts + last-run summary for the dashboard status badge.
+
+    No write side effects. Reads `wiki_synthesis_queue` for current
+    pending/triaged counts, and the latest `wiki_synthesis_runs` row for
+    last-run summary.
+    """
+    async with raw_conn() as conn:
+        counts = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                COUNT(*) FILTER (WHERE status = 'triaged') AS triaged
+            FROM wiki_synthesis_queue
+            WHERE customer_id = $1
+            """,
+            customer_id,
+        )
+        last_run = await conn.fetchrow(
+            """
+            SELECT started_at, status, pages_updated, pages_created
+            FROM wiki_synthesis_runs
+            WHERE customer_id = $1
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            customer_id,
+        )
+    return SynthesisStatusResponse(
+        pending_events=int(counts["pending"] or 0) if counts else 0,
+        triaged_events=int(counts["triaged"] or 0) if counts else 0,
+        last_run_at=last_run["started_at"] if last_run else None,
+        last_run_status=last_run["status"] if last_run else None,
+        last_run_pages_updated=last_run["pages_updated"] if last_run else None,
+        last_run_pages_created=last_run["pages_created"] if last_run else None,
     )
 
 

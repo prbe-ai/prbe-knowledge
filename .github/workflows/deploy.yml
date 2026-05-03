@@ -13,10 +13,13 @@ jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
-      ingestion: ${{ steps.filter.outputs.ingestion == 'true' || github.event_name == 'workflow_dispatch' }}
-      retrieval: ${{ steps.filter.outputs.retrieval == 'true' || github.event_name == 'workflow_dispatch' }}
-      worker:    ${{ steps.filter.outputs.worker    == 'true' || github.event_name == 'workflow_dispatch' }}
-      poller:    ${{ steps.filter.outputs.poller    == 'true' || github.event_name == 'workflow_dispatch' }}
+      ingestion:      ${{ steps.filter.outputs.ingestion      == 'true' || github.event_name == 'workflow_dispatch' }}
+      retrieval:      ${{ steps.filter.outputs.retrieval      == 'true' || github.event_name == 'workflow_dispatch' }}
+      worker:         ${{ steps.filter.outputs.worker         == 'true' || github.event_name == 'workflow_dispatch' }}
+      poller:         ${{ steps.filter.outputs.poller         == 'true' || github.event_name == 'workflow_dispatch' }}
+      wiki_worker:    ${{ steps.filter.outputs.wiki_worker    == 'true' || github.event_name == 'workflow_dispatch' }}
+      wiki_synthesis: ${{ steps.filter.outputs.wiki_synthesis == 'true' || github.event_name == 'workflow_dispatch' }}
+      wiki_cron:      ${{ steps.filter.outputs.wiki_cron      == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -46,6 +49,28 @@ jobs:
               - 'services/worker/**'
               - 'shared/**'
               - 'fly.poller.toml'
+              - 'pyproject.toml'
+            wiki_worker:
+              - 'services/synthesis/**'
+              - 'services/ingestion/normalizer.py'
+              - 'services/ingestion/handlers/**'
+              - 'services/worker/**'
+              - 'shared/**'
+              - 'fly.wiki-worker.toml'
+              - 'pyproject.toml'
+            wiki_synthesis:
+              - 'services/synthesis/**'
+              - 'services/ingestion/normalizer.py'
+              - 'services/ingestion/handlers/**'
+              - 'services/worker/**'
+              - 'shared/**'
+              - 'fly.wiki-synthesis.toml'
+              - 'pyproject.toml'
+            wiki_cron:
+              - 'services/synthesis/**'
+              - 'services/worker/**'
+              - 'shared/**'
+              - 'fly.wiki-cron.toml'
               - 'pyproject.toml'
 
   deploy-ingestion:
@@ -110,5 +135,60 @@ jobs:
       # Re-asserting count=1 every deploy is idempotent and cheap insurance.
       - name: Pin poller to exactly 1 machine
         run: flyctl scale count poller=1 -a prbe-knowledge-poller --yes
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-wiki-worker:
+    needs: [changes, deploy-ingestion]
+    if: |
+      always() &&
+      needs.changes.outputs.wiki_worker == 'true' &&
+      (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy wiki-worker
+        run: flyctl deploy --remote-only -c fly.wiki-worker.toml
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy —
+      # follow up with explicit scale count to actually move the dial.
+      - name: Pin wiki-worker to 4 machines
+        run: flyctl scale count worker=4 -a prbe-knowledge-wiki-worker --yes
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-wiki-synthesis:
+    needs: [changes, deploy-ingestion]
+    if: |
+      always() &&
+      needs.changes.outputs.wiki_synthesis == 'true' &&
+      (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy wiki-synthesis
+        run: flyctl deploy --remote-only -c fly.wiki-synthesis.toml
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      - name: Pin wiki-synthesis to 2 machines
+        run: flyctl scale count worker=2 -a prbe-knowledge-wiki-synthesis --yes
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-wiki-cron:
+    needs: [changes, deploy-ingestion]
+    if: |
+      always() &&
+      needs.changes.outputs.wiki_cron == 'true' &&
+      (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy wiki-cron
+        run: flyctl deploy --remote-only -c fly.wiki-cron.toml
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

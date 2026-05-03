@@ -62,9 +62,7 @@ class Worker:
         )
         # Each loop independently claims via FOR UPDATE SKIP LOCKED, so N
         # parallel loops in the same process safely share the queue.
-        await asyncio.gather(
-            *(self._claim_loop(poll_interval) for _ in range(self._concurrency))
-        )
+        await asyncio.gather(*(self._claim_loop(poll_interval) for _ in range(self._concurrency)))
         log.info("worker.stop")
 
     async def _claim_loop(self, poll_interval: float) -> None:
@@ -72,9 +70,7 @@ class Worker:
             claimed = await self._claim_one()
             if claimed is None:
                 with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self._shutdown.wait(), timeout=poll_interval
-                    )
+                    await asyncio.wait_for(self._shutdown.wait(), timeout=poll_interval)
                 continue
             await self._process(claimed)
 
@@ -184,20 +180,35 @@ class Worker:
             if source == SourceSystem.MANUAL_UPLOAD:
                 await self._cleanup_manual_upload_original(customer_id, event_id)
             await self._mark_done(
-                queue_id, customer_id, source, event_id, payload_s3_key,
-                outcome, captured_version,
+                queue_id,
+                customer_id,
+                source,
+                event_id,
+                payload_s3_key,
+                outcome,
+                captured_version,
             )
         except DuplicateEventIgnored as exc:
             log.info("worker.skipped", queue_id=queue_id, reason=str(exc))
             await self._mark_skipped(
-                queue_id, customer_id, source, event_id, payload_s3_key,
-                str(exc), captured_version,
+                queue_id,
+                customer_id,
+                source,
+                event_id,
+                payload_s3_key,
+                str(exc),
+                captured_version,
             )
         except UnsupportedEventType as exc:
             log.info("worker.unsupported", queue_id=queue_id, reason=str(exc))
             await self._mark_skipped(
-                queue_id, customer_id, source, event_id, payload_s3_key,
-                str(exc), captured_version,
+                queue_id,
+                customer_id,
+                source,
+                event_id,
+                payload_s3_key,
+                str(exc),
+                captured_version,
             )
         except PrbeError as exc:
             transient = getattr(exc, "transient", False)
@@ -210,9 +221,7 @@ class Worker:
             )
             if dead and source == SourceSystem.MANUAL_UPLOAD:
                 with contextlib.suppress(Exception):
-                    await self._mark_manual_upload_failed_ingest(
-                        customer_id, event_id, str(exc)
-                    )
+                    await self._mark_manual_upload_failed_ingest(customer_id, event_id, str(exc))
         except Exception as exc:  # pragma: no cover — last-resort
             # Unknown error: assume transient so we don't burn data on a single
             # network blip / OOM / unwrapped httpx error / asyncpg connection
@@ -230,9 +239,7 @@ class Worker:
             )
             if dead and source == SourceSystem.MANUAL_UPLOAD:
                 with contextlib.suppress(Exception):
-                    await self._mark_manual_upload_failed_ingest(
-                        customer_id, event_id, error
-                    )
+                    await self._mark_manual_upload_failed_ingest(customer_id, event_id, error)
         finally:
             heartbeat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -614,6 +621,7 @@ class GranolaNotifyListener:
 
             backoff = 1.0
             try:
+
                 def _on_notify(_conn, _pid, _channel, payload) -> None:
                     log.info(
                         "granola_listener.notified",
@@ -701,9 +709,7 @@ class ReclaimLoop:
             except Exception:  # pragma: no cover — keep loop alive
                 log.exception("reclaim_loop.tick_failed")
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    self._shutdown.wait(), timeout=self._interval
-                )
+                await asyncio.wait_for(self._shutdown.wait(), timeout=self._interval)
         log.info("reclaim_loop.stop")
 
     async def _reclaim_once(self) -> tuple[int, int]:
@@ -829,23 +835,11 @@ async def run_worker_forever() -> None:
     reclaim_loop = ReclaimLoop(
         backfill_threshold_seconds=settings.backfill_stale_heartbeat_seconds,
     )
-    # Wiki synthesis: separate wake event so a granola notify doesn't burn
-    # a synthesis tick (and vice-versa). Cron drains wiki_synthesis_queue and
-    # writes COMPILED_WIKI pages via build_normalization_result + Normalizer.
-    from services.synthesis.wiki_cron import WikiSynthesisCron
-    from services.synthesis.wiki_listener import WikiSynthesisListener
-
-    wiki_wake_event = asyncio.Event()
-    wiki_synthesis_listener = WikiSynthesisListener(
-        settings.database_url, wiki_wake_event
-    )
-    from shared.storage import get_store as _get_store
-
-    wiki_synthesis_cron = WikiSynthesisCron(
-        ctx=ctx,
-        store=_get_store(),
-        wake_event=wiki_wake_event,
-    )
+    # Wiki triage + synthesis run in their own dedicated fly apps
+    # (prbe-knowledge-wiki-worker / prbe-knowledge-wiki-synthesis), driven
+    # by pg_notify channels and a nightly cron. Removed from this app's
+    # gather as part of the wiki triage redesign — see services/synthesis/
+    # triage_app.py and synthesis_app.py for the new entry points.
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
     health_config = uvicorn.Config(
@@ -888,8 +882,6 @@ async def run_worker_forever() -> None:
         backfill_worker.shutdown()
         granola_listener.shutdown()
         reclaim_loop.shutdown()
-        wiki_synthesis_listener.shutdown()
-        wiki_synthesis_cron.shutdown()
         health_server.should_exit = True
         if gather_future is not None and not gather_future.done():
             gather_future.cancel()
@@ -899,9 +891,7 @@ async def run_worker_forever() -> None:
             # Some platforms (Windows, sandboxed environments) don't support
             # add_signal_handler; on those, the default Python signal behavior
             # (KeyboardInterrupt for SIGINT, terminate for SIGTERM) applies.
-            loop.add_signal_handler(
-                getattr(signal, signame), handle_signal, signame
-            )
+            loop.add_signal_handler(getattr(signal, signame), handle_signal, signame)
 
     try:
         gather_future = asyncio.gather(
@@ -909,8 +899,6 @@ async def run_worker_forever() -> None:
             backfill_worker.run(),
             granola_listener.run(),
             reclaim_loop.run(),
-            wiki_synthesis_listener.run(),
-            wiki_synthesis_cron.run(),
             health_server.serve(),
         )
         try:

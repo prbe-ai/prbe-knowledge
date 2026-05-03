@@ -1,0 +1,35 @@
+app = "prbe-knowledge-wiki-cron"
+primary_region = "sjc"
+kill_signal = "SIGINT"
+kill_timeout = "10s"
+
+[build]
+  dockerfile = "services/worker/Dockerfile"
+
+[env]
+  ENVIRONMENT  = "main"
+  LOG_LEVEL    = "INFO"
+  SERVICE_NAME = "prbe-knowledge-wiki-cron"
+
+# One-shot script. Connects, fires pg_notify per opted-in customer with
+# pending rows, exits. The wiki-worker's NotifyListener picks up the
+# wake; the wiki-synthesis app picks up the triaged rows the worker
+# produces. Decoupled so a long pebble drain doesn't hold the cron
+# machine alive.
+[processes]
+  cron = "python -m services.synthesis.nightly_trigger"
+
+# Daily at 02:00 UTC. The drain timing rationale lives in
+# WIKI_NIGHTLY_HOUR_UTC's docstring (shared/constants.py) — TL;DR:
+# finishes well before US morning standup, doesn't compete with the
+# rest of the nightly pipeline.
+[[machines]]
+  schedule = "daily"
+
+# Tiny — script lives <60s. 256MB is generous for the asyncpg connect +
+# small SELECT + per-customer NOTIFY loop.
+[[vm]]
+  size      = "shared-cpu-1x"
+  memory    = "256mb"
+  count     = 1
+  processes = ["cron"]

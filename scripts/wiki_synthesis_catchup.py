@@ -22,7 +22,7 @@ import asyncio
 import sys
 
 from shared.config import get_settings
-from shared.constants import WIKI_SYNTHESIZE_CHANNEL, SourceSystem
+from shared.constants import WIKI_PENDING_CHANNEL, SourceSystem
 from shared.db import close_pool, init_pool, with_tenant
 from shared.logging import configure_logging, get_logger
 
@@ -100,13 +100,13 @@ async def seed(customer_id: str, *, dry_run: bool) -> int:
 
             await conn.execute(
                 "SELECT pg_notify($1, $2)",
-                WIKI_SYNTHESIZE_CHANNEL,
+                WIKI_PENDING_CHANNEL,
                 customer_id,
             )
             print(
                 f"customer={customer_id} enqueued={inserted} "
                 f"already_queued={count - inserted} run_id={run_id} "
-                f"notified={WIKI_SYNTHESIZE_CHANNEL}"
+                f"notified={WIKI_PENDING_CHANNEL}"
             )
             return inserted
     finally:
