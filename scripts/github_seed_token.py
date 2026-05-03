@@ -16,10 +16,10 @@ What it does:
     2. Upserts a `customer_source_mapping` row so prbe-backend can resolve
        the installation_id from this customer when it mints a token.
     3. Verifies BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY are configured.
-    4. Dry-run fetches an installation token via prbe-backend's
+    4. Upserts an `integration_tokens` row with scope=`installation:<id>`.
+    5. Dry-run fetches an installation token via prbe-backend's
        /internal/github/installation_token endpoint to confirm the
        end-to-end mint path is live.
-    5. Upserts an `integration_tokens` row with scope=`installation:<id>`.
 """
 
 from __future__ import annotations
@@ -73,8 +73,15 @@ async def seed(customer_id: str, installation_id: str) -> None:
             )
             raise SystemExit(1)
 
-        # Record the mapping FIRST so backend can resolve customer → installation
-        # when we dry-run-fetch the token below.
+        scope = f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}"
+        # access_token_encrypted is NOT NULL in the schema. The actual value
+        # is never read — `_resolve_installation_bearer` fetches via backend
+        # whenever scope starts with `installation:` — so we store an opaque
+        # encrypted placeholder that makes the intent obvious in a DB dump.
+        placeholder = encrypt_token("installation-minted-on-demand")
+
+        # Record the mapping + token row FIRST so backend can resolve customer
+        # → installation when we dry-run-fetch the token below.
         await record_mapping(
             customer_id=customer_id,
             source_system=SourceSystem.GITHUB,
@@ -82,26 +89,6 @@ async def seed(customer_id: str, installation_id: str) -> None:
             external_name=None,
             metadata={"installation_id": installation_id},
         )
-
-        async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as http:
-            _token, expires_at = await fetch_github_installation_token(
-                http,
-                customer_id=customer_id,
-            )
-
-        log.info(
-            "github_seed_token.dry_run_ok",
-            customer=customer_id,
-            installation=installation_id,
-            expires_at=expires_at.isoformat(),
-        )
-
-        scope = f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}"
-        # access_token_encrypted is NOT NULL in the schema. The actual value
-        # is never read — `_resolve_installation_bearer` fetches via backend
-        # whenever scope starts with `installation:` — so we store an opaque
-        # encrypted placeholder that makes the intent obvious in a DB dump.
-        placeholder = encrypt_token("installation-minted-on-demand")
 
         async with raw_conn() as conn:
             await conn.execute(
@@ -120,6 +107,19 @@ async def seed(customer_id: str, installation_id: str) -> None:
                 scope,
                 IntegrationStatus.ACTIVE.value,
             )
+
+        async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as http:
+            _token, expires_at = await fetch_github_installation_token(
+                http,
+                customer_id=customer_id,
+            )
+
+        log.info(
+            "github_seed_token.dry_run_ok",
+            customer=customer_id,
+            installation=installation_id,
+            expires_at=expires_at.isoformat(),
+        )
     finally:
         await close_pool()
 
