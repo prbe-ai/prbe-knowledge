@@ -32,7 +32,6 @@ from services.ingestion.normalizer import Normalizer
 from services.synthesis.wiki_cron import WikiSynthesisCron
 from shared.config import Settings, get_settings
 from shared.constants import (
-    HAIKU_MODEL,
     DocClass,
     DocType,
     Permission,
@@ -127,27 +126,62 @@ def _result(*docs: Document) -> NormalizationResult:
     )
 
 
-def _haiku_response(payload: dict) -> SimpleNamespace:
-    block = SimpleNamespace(type="tool_use", name="record_triage", input=payload)
+def _tool_use_response(tool_name: str, payload: dict) -> SimpleNamespace:
+    block = SimpleNamespace(type="tool_use", name=tool_name, input=payload)
     return SimpleNamespace(content=[block])
 
 
-def _sonnet_response(payload: dict) -> SimpleNamespace:
-    block = SimpleNamespace(type="tool_use", name="render_wiki_page", input=payload)
-    return SimpleNamespace(content=[block])
+def _make_mock_client(
+    triage_payload: dict,
+    synthesis_payload: dict,
+    verifier_payload: dict | None = None,
+) -> SimpleNamespace:
+    """Routes calls by the forced tool name in `tools=[...]` kwargs.
 
-
-def _make_mock_client(triage_payload: dict, synthesis_payload: dict) -> SimpleNamespace:
-    """Routes Haiku calls -> triage, Sonnet calls -> synthesis."""
+    record_triage → triage_payload
+    record_verifier_verdict → verifier_payload (defaults to keeping every
+        doc_id present in the cluster's events; tests that rely on
+        verifier rejection should pass an explicit empty kept_doc_ids).
+    render_wiki_page → synthesis_payload
+    """
 
     async def create(*, model: str, **kwargs):
-        if model == HAIKU_MODEL:
-            return _haiku_response(triage_payload)
-        return _sonnet_response(synthesis_payload)
+        tools = kwargs.get("tools") or []
+        tool_name = tools[0]["name"] if tools else ""
+        if tool_name == "record_triage":
+            return _tool_use_response("record_triage", triage_payload)
+        if tool_name == "record_verifier_verdict":
+            if verifier_payload is not None:
+                return _tool_use_response(
+                    "record_verifier_verdict", verifier_payload
+                )
+            # Default: keep every doc_id we can see in the user message.
+            user_msg = kwargs.get("messages", [{}])[0].get("content", "")
+            kept = _extract_doc_ids_from_user_msg(user_msg)
+            return _tool_use_response(
+                "record_verifier_verdict",
+                {"kept_doc_ids": kept, "rationale_per_doc": {}},
+            )
+        return _tool_use_response("render_wiki_page", synthesis_payload)
 
     client = SimpleNamespace()
     client.messages = SimpleNamespace(create=AsyncMock(side_effect=create))
     return client
+
+
+def _extract_doc_ids_from_user_msg(user_msg: str) -> list[str]:
+    """Pull doc_id values out of the verifier user message.
+
+    The prompt builder formats each candidate event with a `doc_id: <id>`
+    line. The default mock keeps every event the verifier saw — useful so
+    existing happy-path tests don't have to enumerate doc_ids.
+    """
+    out: list[str] = []
+    for line in user_msg.splitlines():
+        line = line.strip()
+        if line.startswith("doc_id: "):
+            out.append(line[len("doc_id: "):])
+    return out
 
 
 @pytest.mark.asyncio
@@ -441,3 +475,249 @@ async def _read_queue_ids(customer_id: str) -> list[int]:
             customer_id,
         )
     return [row["queue_id"] for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Verifier stage tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cron_marks_cluster_verifier_rejected_when_kept_empty(
+    reset_db: None,
+) -> None:
+    """When the verifier returns an empty kept_doc_ids list, queue rows
+    for the cluster land in `verifier_rejected` (terminal, distinct from
+    `done`/`rejected`). No wiki page is written.
+    """
+    normalizer = Normalizer(make_default_context())
+    body = "We discussed an auth idea but didn't decide anything."
+    await normalizer._persist(
+        CUSTOMER,
+        SourceSystem.GITHUB,
+        _result(_doc("github:commit:vr-cluster", body)),
+    )
+
+    queue_ids = await _read_queue_ids(CUSTOMER)
+    triage_payload = {
+        "verdicts": {
+            str(qid): {
+                "important": True,
+                "score": 8.0,
+                "targets": [
+                    {"wiki_type": "decision", "slug": "auth-idea", "action": "create"},
+                ],
+                "reason": "auth discussion",
+            }
+            for qid in queue_ids
+        }
+    }
+    forbidden_synthesis = {
+        "title": "SHOULD NOT APPEAR",
+        "body_markdown": "SHOULD NOT APPEAR",
+        "summary": "x",
+        "commit_message": "x",
+    }
+    verifier_rejection = {
+        "kept_doc_ids": [],
+        "rationale_per_doc": {},
+        "drop_reason": "discussion did not produce a decision",
+    }
+    client = _make_mock_client(
+        triage_payload, forbidden_synthesis, verifier_payload=verifier_rejection
+    )
+
+    cron = WikiSynthesisCron(
+        ctx=make_default_context(),
+        store=get_store(),
+        wake_event=asyncio.Event(),
+        anthropic_client=client,
+    )
+    await cron._tick(woken_by_notify=True)
+
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT status, synthesis_error
+            FROM wiki_synthesis_queue
+            WHERE customer_id = $1 AND doc_id = $2
+            """,
+            CUSTOMER,
+            "github:commit:vr-cluster",
+        )
+        assert rows
+        assert all(r["status"] == "verifier_rejected" for r in rows)
+        assert all(
+            r["synthesis_error"] and "did not produce" in r["synthesis_error"]
+            for r in rows
+        )
+
+        # No wiki:decision page written.
+        page_count = await conn.fetchval(
+            "SELECT count(*) FROM documents "
+            "WHERE customer_id = $1 AND doc_id = $2",
+            CUSTOMER,
+            "wiki:decision:auth-idea",
+        )
+        assert page_count == 0
+
+
+@pytest.mark.asyncio
+async def test_cron_filters_synthesis_input_to_verifier_kept_docs(
+    reset_db: None,
+) -> None:
+    """When the verifier returns a non-empty kept_doc_ids subset, the
+    synthesize call must see ONLY those events. Dropped events still
+    mark `done` (they participated in the cluster, the verifier just
+    judged they didn't change the page).
+    """
+    normalizer = Normalizer(make_default_context())
+    await normalizer._persist(
+        CUSTOMER,
+        SourceSystem.GITHUB,
+        _result(_doc("github:commit:keep-1", "We adopted pgvector for embeddings.")),
+    )
+    await normalizer._persist(
+        CUSTOMER,
+        SourceSystem.GITHUB,
+        _result(_doc("github:commit:drop-1", "Unrelated CSS tweak.")),
+    )
+
+    queue_ids = await _read_queue_ids(CUSTOMER)
+    triage_payload = {
+        "verdicts": {
+            str(qid): {
+                "important": True,
+                "score": 8.0,
+                "targets": [
+                    {"wiki_type": "decision", "slug": "adopt-pgvector", "action": "create"},
+                ],
+                "reason": "decision-adjacent",
+            }
+            for qid in queue_ids
+        }
+    }
+    synthesis_payload = {
+        "title": "Adopt pgvector",
+        "body_markdown": "We chose pgvector inside Neon Postgres.",
+        "summary": "Embedding store decision.",
+        "commit_message": "Initial decision.",
+    }
+    verifier_payload = {
+        "kept_doc_ids": ["github:commit:keep-1"],
+        "rationale_per_doc": {
+            "github:commit:keep-1": "states the decision",
+            "github:commit:drop-1": "unrelated to the page topic",
+        },
+    }
+    client = _make_mock_client(
+        triage_payload, synthesis_payload, verifier_payload=verifier_payload
+    )
+
+    cron = WikiSynthesisCron(
+        ctx=make_default_context(),
+        store=get_store(),
+        wake_event=asyncio.Event(),
+        anthropic_client=client,
+    )
+    await cron._tick(woken_by_notify=True)
+
+    # Inspect the synthesize call's user message — must only mention keep-1.
+    create_calls = client.messages.create.await_args_list
+    synth_calls = [
+        c for c in create_calls
+        if (c.kwargs.get("tools") or [{}])[0].get("name") == "render_wiki_page"
+    ]
+    assert len(synth_calls) == 1
+    user_msg = synth_calls[0].kwargs["messages"][0]["content"]
+    assert "github:commit:keep-1" in user_msg
+    assert "github:commit:drop-1" not in user_msg
+
+    async with raw_conn() as conn:
+        # Both queue rows mark done — the cluster as a whole completed.
+        statuses = await conn.fetch(
+            "SELECT doc_id, status FROM wiki_synthesis_queue "
+            "WHERE customer_id = $1 ORDER BY doc_id",
+            CUSTOMER,
+        )
+        by_doc = {row["doc_id"]: row["status"] for row in statuses}
+        assert by_doc["github:commit:keep-1"] == "done"
+        assert by_doc["github:commit:drop-1"] == "done"
+
+        page = await conn.fetchrow(
+            "SELECT title FROM documents WHERE customer_id = $1 AND doc_id = $2 "
+            "AND valid_to IS NULL",
+            CUSTOMER,
+            "wiki:decision:adopt-pgvector",
+        )
+        assert page is not None
+        assert page["title"] == "Adopt pgvector"
+
+
+@pytest.mark.asyncio
+async def test_cron_truncates_cluster_above_max_events(
+    reset_db: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a cluster exceeds WIKI_SYNTHESIS_CLUSTER_MAX_EVENTS, the cron
+    must keep the newest N (oldest dropped). Dropped events still mark
+    `done` with a synthesis_error noting the truncation.
+    """
+    # Set the cap small for the test so we don't have to seed 11+ rows.
+    import services.synthesis.wiki_cron as wiki_cron_mod
+
+    monkeypatch.setattr(wiki_cron_mod, "WIKI_SYNTHESIS_CLUSTER_MAX_EVENTS", 2)
+
+    normalizer = Normalizer(make_default_context())
+    for i in range(4):  # 4 events; cap=2 → drop oldest 2
+        await normalizer._persist(
+            CUSTOMER,
+            SourceSystem.GITHUB,
+            _result(_doc(f"github:commit:trunc-{i}", f"event {i}")),
+        )
+
+    queue_ids = await _read_queue_ids(CUSTOMER)
+    assert len(queue_ids) == 4
+    triage_payload = {
+        "verdicts": {
+            str(qid): {
+                "important": True,
+                "score": 8.0,
+                "targets": [
+                    {"wiki_type": "runbook", "slug": "trunc-runbook", "action": "create"},
+                ],
+                "reason": "runbook-y",
+            }
+            for qid in queue_ids
+        }
+    }
+    synthesis_payload = {
+        "title": "Trunc runbook",
+        "body_markdown": "body",
+        "summary": "summary",
+        "commit_message": "msg",
+    }
+    client = _make_mock_client(triage_payload, synthesis_payload)
+
+    cron = WikiSynthesisCron(
+        ctx=make_default_context(),
+        store=get_store(),
+        wake_event=asyncio.Event(),
+        anthropic_client=client,
+    )
+    await cron._tick(woken_by_notify=True)
+
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            "SELECT doc_id, status, synthesis_error "
+            "FROM wiki_synthesis_queue WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    statuses = [r["status"] for r in rows]
+    errors = [r["synthesis_error"] for r in rows]
+    # All 4 rows terminal at 'done'. 2 carry "capped" skip note (oldest);
+    # 2 do not (newest, were synthesized).
+    assert statuses == ["done"] * 4
+    capped = sum(1 for e in errors if e and "capped" in e)
+    not_capped = sum(1 for e in errors if not e or "capped" not in e)
+    assert capped == 2, f"expected 2 capped rows, got {capped}: {errors}"
+    assert not_capped == 2, f"expected 2 non-capped rows, got {not_capped}: {errors}"

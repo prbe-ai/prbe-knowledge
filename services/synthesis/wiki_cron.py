@@ -42,10 +42,13 @@ from services.synthesis.models import (
     SynthesisInput,
     TriageInput,
     TriageVerdict,
+    VerifierInput,
 )
 from services.synthesis.synthesize import (
     SynthesisParseError,
+    VerifierParseError,
     call_synthesize,
+    call_verifier,
     synthesis_to_normalization,
 )
 from services.synthesis.triage import (
@@ -56,6 +59,7 @@ from services.synthesis.triage import (
 from shared.config import get_settings
 from shared.constants import (
     WIKI_SYNTHESIS_CLAIM_BATCH,
+    WIKI_SYNTHESIS_CLUSTER_MAX_EVENTS,
     WIKI_SYNTHESIS_MAX_ATTEMPTS,
     WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
     WIKI_TRIAGE_SCORE_THRESHOLD,
@@ -268,9 +272,6 @@ class WikiSynthesisCron:
                     # observes events that *would* affect them but does not
                     # silently regenerate the body. Mark queue rows as 'done'
                     # with a skip note so they don't keep re-firing the cron.
-                    # A future Phase 3 lint/annotate pass can write a
-                    # "would-have-updated" sidecar; for now we just record
-                    # the skip in synthesis_error and move on.
                     if (
                         existing is not None
                         and existing.get("doc_class") == DocClass.MANUAL_ENTRY.value
@@ -290,16 +291,112 @@ class WikiSynthesisCron:
                         )
                         continue
 
+                    # Cluster cap. Cluster items arrive in enqueued_at ASC
+                    # (oldest first); keep the newest N so the verifier +
+                    # synthesize stages stay under the Pro pricing tier
+                    # (200K-token boundary). Dropped events still mark
+                    # 'done' with a synthesis_error noting the truncation —
+                    # they don't keep re-driving the cron, but the audit
+                    # trail records the drop.
+                    if len(cluster_inputs) > WIKI_SYNTHESIS_CLUSTER_MAX_EVENTS:
+                        keep_n = WIKI_SYNTHESIS_CLUSTER_MAX_EVENTS
+                        dropped_qids = queue_ids_in_cluster[:-keep_n]
+                        cluster_inputs = cluster_inputs[-keep_n:]
+                        queue_ids_in_cluster = queue_ids_in_cluster[-keep_n:]
+                        log.info(
+                            "wiki_synthesis_cron.cluster_truncated",
+                            customer=customer_id,
+                            wiki_type=wiki_type,
+                            slug=slug,
+                            dropped=len(dropped_qids),
+                            kept=keep_n,
+                        )
+                        await _mark_synthesis_skipped(
+                            customer_id,
+                            dropped_qids,
+                            run_id,
+                            reason=(
+                                f"cluster capped at {keep_n} events; "
+                                f"dropped {len(dropped_qids)} oldest"
+                            ),
+                        )
+
                     action = "update" if existing is not None else "create"
+
+                    # Verifier stage: cheap second look between triage and
+                    # synthesize. Empty kept_doc_ids → mark cluster
+                    # verifier_rejected (no synthesize). Non-empty → filter
+                    # cluster.events to the kept set, then synthesize.
+                    verifier_input = VerifierInput(
+                        wiki_type=wiki_type,  # type: ignore[arg-type]
+                        slug=slug,
+                        action=action,  # type: ignore[arg-type]
+                        current_title=existing.get("title") if existing else None,
+                        current_body=(existing or {}).get("body"),
+                        current_summary=(existing or {}).get("summary"),
+                        events=cluster_inputs,
+                    )
+                    try:
+                        verifier_output = await call_verifier(
+                            client, verifier_input, now=datetime.now(UTC)
+                        )
+                    except (VerifierParseError, Exception) as exc:
+                        log.warning(
+                            "wiki_synthesis_cron.verifier_failed",
+                            customer=customer_id,
+                            wiki_type=wiki_type,
+                            slug=slug,
+                            error=str(exc),
+                        )
+                        await _mark_synthesis_error(customer_id, queue_ids_in_cluster, str(exc))
+                        continue
+
+                    if not verifier_output.kept_doc_ids:
+                        log.info(
+                            "wiki_synthesis_cron.verifier_rejected_cluster",
+                            customer=customer_id,
+                            wiki_type=wiki_type,
+                            slug=slug,
+                            event_count=len(queue_ids_in_cluster),
+                            reason=verifier_output.drop_reason,
+                        )
+                        await _mark_verifier_rejected(
+                            customer_id,
+                            queue_ids_in_cluster,
+                            run_id,
+                            reason=(verifier_output.drop_reason or "verifier rejected cluster"),
+                        )
+                        continue
+
+                    kept_set = set(verifier_output.kept_doc_ids)
+                    filtered_inputs = [inp for inp in cluster_inputs if inp.doc_id in kept_set]
+                    if not filtered_inputs:
+                        # Verifier returned doc_ids that don't match any
+                        # event in the cluster — treat as full rejection.
+                        log.warning(
+                            "wiki_synthesis_cron.verifier_kept_unknown_docs",
+                            customer=customer_id,
+                            wiki_type=wiki_type,
+                            slug=slug,
+                            kept_doc_ids=list(kept_set),
+                        )
+                        await _mark_verifier_rejected(
+                            customer_id,
+                            queue_ids_in_cluster,
+                            run_id,
+                            reason="verifier kept_doc_ids did not match cluster",
+                        )
+                        continue
+
                     synth_input = SynthesisInput(
                         wiki_type=wiki_type,  # type: ignore[arg-type]
                         slug=slug,
-                        action=action,
+                        action=action,  # type: ignore[arg-type]
                         current_title=existing.get("title") if existing else None,
                         current_body=(existing or {}).get("body"),
                         current_frontmatter=(existing or {}).get("frontmatter") or {},
                         current_summary=(existing or {}).get("summary"),
-                        events=cluster_inputs,
+                        events=filtered_inputs,
                     )
                     try:
                         synth_output = await call_synthesize(
@@ -343,6 +440,11 @@ class WikiSynthesisCron:
                         pages_created += 1
                     else:
                         pages_updated += 1
+                    # Mark all queue rows in the cluster done — including
+                    # those whose doc_ids were dropped by the verifier.
+                    # Their participation in the cluster is complete; if
+                    # they're also in another cluster, that cluster's run
+                    # will handle them independently.
                     await _mark_synthesis_done(customer_id, queue_ids_in_cluster, run_id)
 
             # ----- regenerate the index after the drain finishes
@@ -741,9 +843,10 @@ async def _mark_synthesis_skipped(
 ) -> None:
     """Mark events 'done' without firing synthesis.
 
-    Used when the cron declines to clobber a page (e.g. MANUAL_ENTRY).
-    The events still complete — they don't keep re-driving the cron — but
-    the audit trail records why no synthesis occurred via synthesis_error.
+    Used when the cron declines to clobber a page (e.g. MANUAL_ENTRY) or
+    when the cluster cap drops oldest events. The events still complete —
+    they don't keep re-driving the cron — but the audit trail records
+    why no synthesis occurred via synthesis_error.
     """
     if not queue_ids:
         return
@@ -760,6 +863,39 @@ async def _mark_synthesis_skipped(
             customer_id,
             run_id,
             f"skipped: {reason}",
+            queue_ids,
+        )
+
+
+async def _mark_verifier_rejected(
+    customer_id: str,
+    queue_ids: list[int],
+    run_id: int,
+    *,
+    reason: str,
+) -> None:
+    """Mark a cluster's queue rows as `verifier_rejected`.
+
+    Distinct from 'done' (synthesized) and 'rejected' (triage threshold
+    miss). The verifier decided the cluster doesn't actually change the
+    target page after a closer look. Terminal state — these rows do not
+    re-enter triage.
+    """
+    if not queue_ids:
+        return
+    async with with_tenant(customer_id) as conn:
+        await conn.execute(
+            """
+            UPDATE wiki_synthesis_queue
+            SET status = 'verifier_rejected',
+                synthesis_run_id = $2,
+                synthesis_completed_at = NOW(),
+                synthesis_error = $3
+            WHERE customer_id = $1 AND queue_id = ANY($4::bigint[])
+            """,
+            customer_id,
+            run_id,
+            reason,
             queue_ids,
         )
 

@@ -1,11 +1,20 @@
-"""Synthesize stage — Sonnet call.
+"""Synthesize + verifier stages — provider-dispatched calls.
 
-One call per (target wiki page, cluster of triaged events). Inputs are the
-current page body (if any) plus the FULL body of every clustered event. The
-output (`SynthesisOutput`) is converted into a synthetic `WebhookEvent` and
-persisted via Phase 1's `build_normalization_result` + `Normalizer._persist`,
-so the cron writes wiki pages through the exact same path the manual upload
-route uses.
+Synthesize: one call per (target wiki page, cluster of triaged events).
+Inputs are the current page body (if any) plus the FULL body of every
+clustered event. The output (`SynthesisOutput`) is converted into a
+synthetic `WebhookEvent` and persisted via Phase 1's
+`build_normalization_result` + `Normalizer._persist`, so the cron writes
+wiki pages through the exact same path the manual upload route uses.
+
+Verifier: one call per cluster, between triage and synthesize. The
+verifier returns `kept_doc_ids[]`; empty → mark queue rows
+`verifier_rejected` (no synthesize). Non-empty → filter the cluster to
+the kept docs, then synthesize.
+
+Both stages dispatch to the configured provider (Anthropic by default,
+Gemini if env var flips). The Anthropic `client` arg is kept for call-
+site compatibility; unused when provider is Gemini.
 """
 
 from __future__ import annotations
@@ -19,10 +28,19 @@ from services.ingestion.handlers.wiki import (
     WIKI_PAYLOAD_KEY,
     build_normalization_result,
 )
-from services.synthesis.models import SynthesisInput, SynthesisOutput
-from services.synthesis.prompts import build_synthesis_prompt, synthesis_tool_name
+from services.synthesis.models import (
+    SynthesisInput,
+    SynthesisOutput,
+    VerifierInput,
+    VerifierOutput,
+)
+from services.synthesis.providers import (
+    SynthesisParseError,
+    VerifierParseError,
+    get_synthesis_provider,
+    get_verifier_provider,
+)
 from shared.constants import (
-    SONNET_MODEL,
     CompileTrigger,
     DocClass,
     SourceSystem,
@@ -30,11 +48,16 @@ from shared.constants import (
 from shared.logging import get_logger
 from shared.models import NormalizationResult, WebhookEvent
 
+__all__ = [
+    "SynthesisParseError",
+    "VerifierParseError",
+    "call_synthesize",
+    "call_verifier",
+    "render_synthesis_to_event",
+    "synthesis_to_normalization",
+]
+
 log = get_logger(__name__)
-
-
-class SynthesisParseError(RuntimeError):
-    """Sonnet returned a tool_use block we couldn't parse into SynthesisOutput."""
 
 
 async def call_synthesize(
@@ -43,13 +66,24 @@ async def call_synthesize(
     *,
     now: datetime,
 ) -> SynthesisOutput:
-    kwargs = build_synthesis_prompt(cluster, now=now)
-    resp = await client.messages.create(model=SONNET_MODEL, **kwargs)
-    payload = _extract_tool_input(resp.content, expected_name=synthesis_tool_name())
-    try:
-        return SynthesisOutput(**payload)
-    except Exception as exc:
-        raise SynthesisParseError(f"synthesis tool input failed validation: {exc}") from exc
+    provider = get_synthesis_provider(client)
+    return await provider.synthesize(cluster, now=now)
+
+
+async def call_verifier(
+    client: AsyncAnthropic,
+    cluster: VerifierInput,
+    *,
+    now: datetime,
+) -> VerifierOutput:
+    """Run the cluster through the verifier provider.
+
+    Empty `kept_doc_ids` means the cluster is rejected (no synthesize
+    call). Non-empty means filter `cluster.events` to the kept doc_ids
+    before invoking `call_synthesize`.
+    """
+    provider = get_verifier_provider(client)
+    return await provider.verify(cluster, now=now)
 
 
 def render_synthesis_to_event(
@@ -61,11 +95,7 @@ def render_synthesis_to_event(
     compile_trigger: CompileTrigger = CompileTrigger.SCHEDULED,
     received_at: datetime | None = None,
 ) -> WebhookEvent:
-    """Build the synthetic WebhookEvent that drives `build_normalization_result`.
-
-    The cron calls this per cluster. `compile_trigger` defaults to SCHEDULED;
-    pass SOURCE_UPDATE when the run was wake-driven, MANUAL for human-kicked.
-    """
+    """Build the synthetic WebhookEvent that drives `build_normalization_result`."""
     received_at = received_at or datetime.now(UTC)
     raw_payload: dict[str, Any] = {
         WIKI_PAYLOAD_KEY: {
@@ -117,13 +147,3 @@ def synthesis_to_normalization(
         received_at=received_at,
     )
     return build_normalization_result(event)
-
-
-def _extract_tool_input(blocks: list[Any], *, expected_name: str) -> dict[str, Any]:
-    for block in blocks:
-        if getattr(block, "type", "") == "tool_use" and getattr(block, "name", "") == expected_name:
-            payload = getattr(block, "input", None)
-            if isinstance(payload, dict):
-                return payload
-            raise SynthesisParseError(f"tool_use input was not a dict: {type(payload).__name__}")
-    raise SynthesisParseError(f"sonnet response had no {expected_name} tool_use block")
