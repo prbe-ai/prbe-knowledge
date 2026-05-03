@@ -274,36 +274,68 @@ async def synthesize_stream(
             f"unsupported synthesis model: {model}. Allowed: {sorted(SYNTHESIS_MODELS)}"
         )
     provider_name = SYNTHESIS_MODELS[model]
-    if provider_name != "anthropic":
+    if provider_name not in ("anthropic", "google"):
         raise SynthesisError(
-            f"streaming synthesis only supports Anthropic models today (got {provider_name})"
+            f"streaming synthesis only supports Anthropic and Google models today (got {provider_name})"
         )
     model_id = model.split("/", 1)[1]
 
     user_prompt = _format_user_prompt(query, chunks)
-
-    from anthropic import APIError, AsyncAnthropic
-
-    api_key = get_settings().anthropic_api_key.get_secret_value()
-    if not api_key:
-        raise SynthesisError("ANTHROPIC_API_KEY not configured")
-    client = AsyncAnthropic(api_key=api_key, timeout=SYNTHESIS_TIMEOUT_SECONDS)
+    system_prompt = _build_streaming_system_prompt(datetime.now(UTC))
 
     accumulated = ""
-    try:
-        async with client.messages.stream(
-            model=model_id,
-            max_tokens=max_tokens,
-            system=_build_streaming_system_prompt(datetime.now(UTC)),
-            messages=[{"role": "user", "content": user_prompt}],
-        ) as stream:
-            async for text in stream.text_stream:
+    if provider_name == "anthropic":
+        from anthropic import APIError, AsyncAnthropic
+
+        api_key = get_settings().anthropic_api_key.get_secret_value()
+        if not api_key:
+            raise SynthesisError("ANTHROPIC_API_KEY not configured")
+        client = AsyncAnthropic(api_key=api_key, timeout=SYNTHESIS_TIMEOUT_SECONDS)
+        try:
+            async with client.messages.stream(
+                model=model_id,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            ) as stream:
+                async for text in stream.text_stream:
+                    if not text:
+                        continue
+                    accumulated += text
+                    yield StreamDelta(text=text)
+        except APIError as exc:
+            raise SynthesisError(f"anthropic api error: {exc}") from exc
+    else:
+        # Google: plain-text streaming via google-genai's async generator.
+        # No response_schema — same reason as the Anthropic streaming
+        # branch (incremental structured-output parsing is fragile).
+        try:
+            from google import genai
+        except ImportError as exc:
+            raise SynthesisError(
+                "google-genai not installed; run pip install -e '.[dev]'"
+            ) from exc
+
+        api_key = get_settings().google_api_key.get_secret_value()
+        if not api_key:
+            raise SynthesisError("GOOGLE_API_KEY not configured")
+        client = genai.Client(api_key=api_key)
+        # Google has no separate system slot — prepend.
+        contents = f"{system_prompt}\n\n---\n\n{user_prompt}"
+        try:
+            stream = await client.aio.models.generate_content_stream(
+                model=model_id,
+                contents=contents,
+                config={"max_output_tokens": max_tokens},
+            )
+            async for resp in stream:
+                text = getattr(resp, "text", None) or ""
                 if not text:
                     continue
                 accumulated += text
                 yield StreamDelta(text=text)
-    except APIError as exc:
-        raise SynthesisError(f"anthropic api error: {exc}") from exc
+        except Exception as exc:
+            raise SynthesisError(f"google api error: {exc}") from exc
 
     # Detect the insufficient-context sentinel and strip it before parsing
     # citations. Models occasionally emit it lowercased or with surrounding

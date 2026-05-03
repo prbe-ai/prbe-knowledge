@@ -399,11 +399,12 @@ async def test_synthesize_stream_rejects_unknown_model() -> None:
 
 
 @pytest.mark.asyncio
-async def test_synthesize_stream_rejects_non_anthropic_model(monkeypatch) -> None:
-    """OpenAI / Google models would be valid for synthesize() but not yet
-    supported by synthesize_stream — must fail loudly rather than silently
-    use Anthropic. Patches SYNTHESIS_MODELS to register a fake openai entry
-    so the provider-check branch fires (today's allowlist is Anthropic-only).
+async def test_synthesize_stream_rejects_unsupported_provider(monkeypatch) -> None:
+    """Streaming today supports anthropic + google. OpenAI (or any other
+    provider in SYNTHESIS_MODELS) must fail loudly rather than silently
+    falling through to one of the supported branches. Patches
+    SYNTHESIS_MODELS to register a fake openai entry so the provider-check
+    branch fires.
     """
     monkeypatch.setitem(
         __import__("services.retrieval.synthesis", fromlist=["SYNTHESIS_MODELS"])
@@ -416,7 +417,9 @@ async def test_synthesize_stream_rejects_non_anthropic_model(monkeypatch) -> Non
             "q", [_chunk(1)], model="openai/gpt-4o-mini"
         ):
             pass
-    assert "streaming synthesis only supports Anthropic" in str(exc_info.value)
+    assert "streaming synthesis only supports Anthropic and Google" in str(
+        exc_info.value
+    )
 
 
 @pytest.mark.asyncio
