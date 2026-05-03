@@ -22,14 +22,14 @@ def test_minimal_profile_loads(tmp_path: Path) -> None:
 customer_id: cust-eval-prbe-01
 repos:
   - github.com/prbe-ai/prbe-knowledge
-preset: flagship
+preset: tiny_test
 seed: 42
 """.strip()
     )
     profile = load_profile(p)
     assert isinstance(profile, Profile)
     assert profile.customer_id == "cust-eval-prbe-01"
-    assert profile.preset == "flagship"
+    assert profile.preset == "tiny_test"
     assert profile.seed == 42
     assert profile.repos == (RepoSpec(url="github.com/prbe-ai/prbe-knowledge", local_path=None, branch=None),)
 
@@ -43,7 +43,7 @@ repos:
   - url: github.com/prbe-ai/prbe-knowledge
     local_path: /tmp/clone
     branch: main
-preset: tiny-test
+preset: tiny_test
 seed: 7
 """.strip()
     )
@@ -67,7 +67,7 @@ def test_customer_id_prefix_enforced(tmp_path: Path) -> None:
 customer_id: cust-prod-real
 repos:
   - github.com/x/y
-preset: tiny-test
+preset: tiny_test
 seed: 1
 """.strip()
     )

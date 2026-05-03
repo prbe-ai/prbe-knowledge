@@ -12,6 +12,8 @@ from pathlib import Path
 
 import yaml
 
+from scripts.synth.presets.loader import apply_preset
+
 
 class ProfileError(ValueError):
     """Raised when a profile YAML is missing required fields or otherwise
@@ -31,6 +33,8 @@ class Profile:
     repos: tuple[RepoSpec, ...]
     preset: str
     seed: int
+    archetypes: dict = field(default_factory=dict)
+    llm: dict = field(default_factory=dict)
     company_context_path: Path | None = None
     raw: dict = field(default_factory=dict)  # full YAML for plan 3 to consume
 
@@ -67,6 +71,8 @@ def load_profile(path: Path) -> Profile:
     if not isinstance(raw, dict):
         raise ProfileError(f"profile must be a YAML mapping, got {type(raw).__name__}")
 
+    raw = apply_preset(raw, raw.get("preset"))
+
     missing = [k for k in ("customer_id", "repos", "preset", "seed") if k not in raw]
     if missing:
         raise ProfileError(f"profile missing required fields: {sorted(missing)}")
@@ -101,6 +107,8 @@ def load_profile(path: Path) -> Profile:
         repos=repos,
         preset=preset,
         seed=seed,
+        archetypes=raw.get("archetypes", {}),
+        llm=raw.get("llm", {}),
         company_context_path=cc_path,
         raw=raw,
     )

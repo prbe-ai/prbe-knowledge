@@ -1,0 +1,10 @@
+archetypes:
+  STANDUP_UPDATE: { count: 0 }
+  ON_CALL_HANDOFF: { count: 0 }
+  INCIDENT: { count: 8 }
+  LAUNCH: { count: 0 }
+  BIG_REFACTOR: { count: 0 }
+llm:
+  planner_model: claude-opus-4-7
+  writer_model: claude-sonnet-4-6
+  validator_model: claude-haiku-4-5-20251001
