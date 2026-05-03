@@ -1,7 +1,6 @@
-"""Pure parsing utilities for `[[wiki-link]]` syntax.
+"""Pure parsing utilities for `[[wiki-page-link]]` syntax.
 
-A wiki page body can reference other entities through `[[Target]]` markers.
-Two shapes are supported:
+Parses typed entity references inside wiki page bodies:
 
     [[Plain target]]            kind="plain", target="Plain target"
     [[Person: Mahit]]           kind="person", target="Mahit"
@@ -15,6 +14,13 @@ A token before the colon that we don't recognize collapses to `kind="plain"`
 (target keeps the full inner text) — so unknown forms don't silently drop
 references; the connector still emits an unresolved-link entry the future
 lint job can flag.
+
+Sibling parser: `services/kg/links.py` (PR #47, debugging knowledge graph)
+parses a different `[[...]]` grammar — `[[ClassName/file/path]]` and
+`[[#section-anchor]]` — for class refs with line+col coordinates. The two
+modules share only the `[[...]]` surface syntax; their kind taxonomies and
+output shapes are deliberately disjoint. Callers that need both should
+import them under explicit aliases.
 
 This module is dependency-free below `pydantic` so the dashboard / a future
 synthesize cron can reuse it without dragging in connector wiring.
@@ -39,8 +45,13 @@ _KNOWN_KINDS: Final[frozenset[str]] = frozenset(
 )
 
 
-class WikiLink(BaseModel):
-    """One `[[...]]` token parsed out of a wiki body."""
+class WikiPageLink(BaseModel):
+    """One `[[...]]` token parsed out of a wiki page body.
+
+    Distinct from `services/kg/links.py:WikiLink` (PR #47) — that module
+    parses class-graph refs with line/col coordinates, this one parses
+    typed entity refs (`[[Person: X]]`) for graph-node emission.
+    """
 
     raw: str
     kind: str
@@ -48,7 +59,7 @@ class WikiLink(BaseModel):
     span: tuple[int, int]
 
 
-def parse_wiki_links(body: str) -> list[WikiLink]:
+def parse_page_links(body: str) -> list[WikiPageLink]:
     """Extract every `[[...]]` reference from `body` in source order.
 
     Returns an empty list for empty / link-free bodies. Order is preserved so
@@ -56,14 +67,14 @@ def parse_wiki_links(body: str) -> list[WikiLink]:
     """
     if not body:
         return []
-    out: list[WikiLink] = []
+    out: list[WikiPageLink] = []
     for match in _LINK_RE.finditer(body):
         inner = match.group(1).strip()
         if not inner:
             continue
         kind, target = _split_kind(inner)
         out.append(
-            WikiLink(
+            WikiPageLink(
                 raw=match.group(0),
                 kind=kind,
                 target=target,

@@ -1,7 +1,7 @@
 """Unit tests for the Wiki connector + wiki-link parser.
 
 Covers:
-- parse_wiki_links across plain / typed / malformed / Unicode targets
+- parse_page_links across plain / typed / malformed / Unicode targets
 - slugify round-trip
 - WikiConnector.parse_webhook_event for upsert + delete + bad payloads
 - build_normalization_result emits Document, graph_nodes/edges, ACL correctly
@@ -22,7 +22,7 @@ from services.ingestion.handlers.wiki import (  # noqa: F401 — registers the c
     WikiConnector,
     build_normalization_result,
 )
-from services.ingestion.wiki_links import parse_wiki_links, slugify
+from services.ingestion.wiki_links import parse_page_links, slugify
 from shared.config import Settings
 from shared.constants import (
     CompileTrigger,
@@ -64,22 +64,22 @@ def _make_event(payload: dict, *, customer_id: str = "cust-1") -> WebhookEvent:
 # ---------------------------------------------------------------------------
 
 
-def test_parse_wiki_links_plain() -> None:
+def test_parse_page_links_plain() -> None:
     body = "See [[onboarding guide]] for the steps."
-    [link] = parse_wiki_links(body)
+    [link] = parse_page_links(body)
     assert link.kind == "plain"
     assert link.target == "onboarding guide"
     assert link.raw == "[[onboarding guide]]"
     assert body[link.span[0] : link.span[1]] == link.raw
 
 
-def test_parse_wiki_links_typed_kinds() -> None:
+def test_parse_page_links_typed_kinds() -> None:
     body = (
         "Ping [[Person: mahit]] and [[Person: rich]] when [[Service: prbe-knowledge]] "
         "is degraded. See [[Decision: pgvector]] and [[Repo: prbe-backend]] "
         "and [[Ticket: PRB-9]] and [[Feature: auth]]."
     )
-    links = parse_wiki_links(body)
+    links = parse_page_links(body)
     by_kind = {(link.kind, link.target) for link in links}
     assert ("person", "mahit") in by_kind
     assert ("person", "rich") in by_kind
@@ -90,9 +90,9 @@ def test_parse_wiki_links_typed_kinds() -> None:
     assert ("feature", "auth") in by_kind
 
 
-def test_parse_wiki_links_unknown_kind_is_plain() -> None:
+def test_parse_page_links_unknown_kind_is_plain() -> None:
     body = "[[Sentinel: alpha]] but [[plain target]]."
-    links = parse_wiki_links(body)
+    links = parse_page_links(body)
     assert links[0].kind == "plain"
     # Unknown prefix preserves the full inner text so the dangling-link surfacer
     # can still flag it.
@@ -100,20 +100,20 @@ def test_parse_wiki_links_unknown_kind_is_plain() -> None:
     assert links[1].kind == "plain"
 
 
-def test_parse_wiki_links_empty_and_unicode() -> None:
-    assert parse_wiki_links("") == []
-    assert parse_wiki_links("no links here") == []
+def test_parse_page_links_empty_and_unicode() -> None:
+    assert parse_page_links("") == []
+    assert parse_page_links("no links here") == []
 
     body = "Run the [[Service: café-export]] job — coordinate with [[Person: 田中]]."
-    [svc, person] = parse_wiki_links(body)
+    [svc, person] = parse_page_links(body)
     assert svc.target == "café-export"
     assert person.target == "田中"
 
 
-def test_parse_wiki_links_ignores_empty_brackets() -> None:
-    assert parse_wiki_links("[[]]") == []
+def test_parse_page_links_ignores_empty_brackets() -> None:
+    assert parse_page_links("[[]]") == []
     # Colon with no target collapses to plain so the raw form is preserved.
-    [link] = parse_wiki_links("[[Person:]]")
+    [link] = parse_page_links("[[Person:]]")
     assert link.kind == "plain"
 
 
@@ -241,9 +241,12 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     assert principal.permission == Permission.READ
 
     # Graph: DOCUMENT node + one node per typed link, deduped on (label, id).
+    # `[[Person: X]]` resolves to WIKI_PERSON, not PERSON — wiki bodies carry
+    # only a rendered name, not a canonical platform id.
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
     assert (NodeLabel.DOCUMENT, doc.doc_id) in labels
-    assert (NodeLabel.PERSON, "mahit") in labels
+    assert (NodeLabel.WIKI_PERSON, "mahit") in labels
+    assert (NodeLabel.PERSON, "mahit") not in labels
     assert (NodeLabel.SERVICE, "prbe-knowledge") in labels
     assert (NodeLabel.DECISION, "serialize-cc-claims") in labels
 
@@ -254,7 +257,7 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     assert (
         EdgeType.MENTIONS,
         doc.doc_id,
-        NodeLabel.PERSON,
+        NodeLabel.WIKI_PERSON,
         "mahit",
     ) in edge_keys
     assert (
@@ -363,8 +366,10 @@ def test_build_dedupes_repeated_typed_links() -> None:
         }
     )
     result = build_normalization_result(event)
-    # One DOCUMENT + one Person node (deduped), three MENTIONS edges (one per link).
-    person_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.PERSON]
-    assert len(person_nodes) == 1
+    # One DOCUMENT + one WikiPerson node (deduped), three MENTIONS edges.
+    wiki_person_nodes = [
+        n for n in result.graph_nodes if n.label == NodeLabel.WIKI_PERSON
+    ]
+    assert len(wiki_person_nodes) == 1
     person_edges = [e for e in result.graph_edges if e.edge_type == EdgeType.MENTIONS]
     assert len(person_edges) == 3

@@ -16,6 +16,23 @@ Routes:
 Auth: every route depends on `verify_internal_knowledge_key` and reads tenant
 from `X-Prbe-Customer`. The dashboard reaches these via the prbe-backend BFF
 (separate session).
+
+## Access model — who writes what doc_class
+
+Public PUT/PATCH/DELETE accept `doc_class=manual_entry` ONLY (validated by
+`_reject_non_manual_doc_class` on `WikiUpsertBody.doc_class`). Anything else
+is rejected with 422.
+
+`doc_class=compiled_wiki` writes are produced by the synthesis cron in
+`services/synthesis/wiki_cron.py` (Phase 2). The cron does NOT call this
+HTTP route; it builds a synthetic `WebhookEvent` and calls
+`build_normalization_result` + `Normalizer._persist` directly — same code
+path the route handlers use, just bypassing the FastAPI/HTTP boundary.
+There is no internal-only route variant: the cron is in-process inside
+the worker fly app, so there's nothing for HTTP to mediate. If a future
+out-of-process synthesizer needs to write `compiled_wiki`, it should
+either re-use the in-process path or get its own dedicated route — don't
+loosen this validator.
 """
 
 from __future__ import annotations
@@ -35,7 +52,7 @@ from services.ingestion.handlers.wiki import (
     build_normalization_result,
 )
 from services.ingestion.normalizer import Normalizer
-from services.ingestion.wiki_links import parse_wiki_links
+from services.ingestion.wiki_links import parse_page_links
 from shared.constants import DocClass, SourceSystem
 from shared.db import with_tenant
 from shared.exceptions import InvalidWebhookPayload
@@ -70,10 +87,14 @@ class WikiUpsertBody(BaseModel):
 
     @field_validator("doc_class")
     @classmethod
-    def _doc_class_allowlist(cls, value: str) -> str:
-        # Phase 1 gates the public route to MANUAL_ENTRY only. The future
-        # synthesize cron will write COMPILED_WIKI pages by calling
-        # `build_normalization_result` directly, not through this endpoint.
+    def _reject_non_manual_doc_class(cls, value: str) -> str:
+        """Public route accepts MANUAL_ENTRY only.
+
+        See module docstring "Access model" — `compiled_wiki` writes are
+        produced by `services/synthesis/wiki_cron.py` calling
+        `build_normalization_result` directly, in-process. The HTTP route
+        is the human-authoring surface and stays narrowly scoped.
+        """
         if value != DocClass.MANUAL_ENTRY.value:
             raise ValueError(
                 f"doc_class={value!r} not allowed via this endpoint; "
@@ -279,7 +300,7 @@ async def upsert_wiki_page(
         raise HTTPException(status_code=500, detail="wiki normalize produced no documents")
 
     doc = result.documents[0]
-    parsed_links = parse_wiki_links(body.body)
+    parsed_links = parse_page_links(body.body)
     dangling = [link.raw for link in parsed_links if link.kind == "plain"]
     version = await _read_doc_version(customer_id, doc.doc_id) or doc.version
 

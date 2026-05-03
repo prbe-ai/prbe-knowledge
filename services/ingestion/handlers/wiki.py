@@ -39,7 +39,7 @@ from typing import Any, ClassVar
 from services.ingestion.chunker import count_tokens
 from services.ingestion.handlers.base import Connector
 from services.ingestion.handlers.registry import register_connector
-from services.ingestion.wiki_links import WikiLink, parse_wiki_links
+from services.ingestion.wiki_links import WikiPageLink, parse_page_links
 from shared.constants import (
     CompileTrigger,
     DocClass,
@@ -79,8 +79,17 @@ WIKI_TYPE_TO_DOC_TYPE: dict[str, DocType] = {
 }
 
 # `[[<kind>: ...]]` -> (graph node label, edge type emitted from the wiki page).
+#
+# `[[Person: X]]` resolves to NodeLabel.WIKI_PERSON (not PERSON) — wiki page
+# bodies carry only a rendered name, not a canonical platform id (e.g. a Slack
+# user_id or GitHub login). Merging into the canonical PERSON namespace at
+# ingest time would create false-canonical nodes whenever the rendered name
+# happens to match an existing PERSON canonical_id by accident. A future alias
+# resolver can fold WIKI_PERSON into PERSON via fuzzy match. The other typed
+# refs use canonical-shaped ids (slugs, repo names, ticket numbers) and slot
+# straight into their canonical NodeLabel.
 _LINK_NODE_MAP: dict[str, tuple[NodeLabel, EdgeType]] = {
-    "person": (NodeLabel.PERSON, EdgeType.MENTIONS),
+    "person": (NodeLabel.WIKI_PERSON, EdgeType.MENTIONS),
     "service": (NodeLabel.SERVICE, EdgeType.DESCRIBES),
     "repo": (NodeLabel.REPO, EdgeType.DESCRIBES),
     "ticket": (NodeLabel.TICKET, EdgeType.DESCRIBES),
@@ -204,12 +213,12 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
         body = ""
         deleted_at: datetime | None = received_at
         content_hash = _sha256(f"{doc_id}|__deleted__|{received_at.isoformat()}")
-        links: list[WikiLink] = []
+        links: list[WikiPageLink] = []
         dangling_links: list[str] = []
     else:
         deleted_at = None
         content_hash = _sha256(f"{doc_id}|{received_at.isoformat()}|{title}|{body}")
-        links = parse_wiki_links(body)
+        links = parse_page_links(body)
         dangling_links = [link.raw for link in links if link.kind == "plain"]
 
     acl = ACLSnapshot(
@@ -295,7 +304,7 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
 def _build_graph(
     doc_id: str,
     doc_type: DocType,
-    links: list[WikiLink],
+    links: list[WikiPageLink],
     valid_from: datetime,
 ) -> tuple[list[GraphNodeSpec], list[GraphEdgeSpec]]:
     nodes: list[GraphNodeSpec] = [
