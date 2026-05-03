@@ -3,7 +3,8 @@
 Three concerns live in this module:
 
   1. UsageEvent dataclass + write_usage_event() — used by the post-response
-     middleware to persist one row per /retrieve, /query, /sources call.
+     middleware to persist one row per /retrieve, /query, /sources, or
+     /source-view call.
   2. event_type_for() / parse_window() — small pure helpers shared between
      the middleware and the read endpoints.
   3. usage_router — three GET endpoints (/usage/feed, /usage/stats,
@@ -97,7 +98,7 @@ def event_type_for(endpoint: str, body: BaseModel | None = None) -> str:
         return EVENT_TYPE_RETRIEVE
     if endpoint.startswith("/query"):
         return EVENT_TYPE_QUERY
-    if endpoint.startswith("/sources"):
+    if endpoint.startswith("/sources") or endpoint.startswith("/source-view"):
         return EVENT_TYPE_GET_SOURCE
     return EVENT_TYPE_UNKNOWN
 
