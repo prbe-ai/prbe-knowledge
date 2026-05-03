@@ -15,6 +15,7 @@ from services.ingestion.handlers import (
     notion,  # noqa: F401
     sentry,  # noqa: F401
     slack,  # noqa: F401
+    wiki,  # noqa: F401
 )
 
 __all__: list[str] = []
