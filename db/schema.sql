@@ -565,6 +565,68 @@ CREATE POLICY query_traces_tenant_isolation ON query_traces
     USING (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
+-- wiki_synthesis_queue / wiki_synthesis_runs
+--
+-- Internal queue tables for the LLM-Wiki synthesis cron (services/synthesis/).
+-- `Normalizer._persist` enqueues one row per persisted document; the cron
+-- drains them, runs Haiku triage + Sonnet synthesis, and writes wiki pages
+-- via build_normalization_result.
+--
+-- Convention for internal queue tables (matches ingestion_queue,
+-- backfill_state): NO row-level security. Tenant scoping for per-customer
+-- operations is enforced by application code (`with_tenant(customer_id)`
+-- + explicit WHERE customer_id = $1). The cron's cross-customer
+-- `SELECT DISTINCT customer_id` in `_tick` would silently return zero
+-- rows under FORCE RLS without a tenant GUC; see migration
+-- 20260503_0034_wiki_synthesis_no_rls.py for the rationale.
+-- ---------------------------------------------------------------------------
+CREATE TABLE wiki_synthesis_queue (
+    queue_id                BIGSERIAL PRIMARY KEY,
+    customer_id             TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    doc_id                  TEXT NOT NULL,
+    doc_version             INT  NOT NULL,
+    source_system           TEXT NOT NULL,
+    doc_type                TEXT NOT NULL,
+    enqueued_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status                  TEXT NOT NULL DEFAULT 'pending',
+    triage_score            REAL,
+    triage_targets          JSONB,
+    triage_error            TEXT,
+    triage_completed_at     TIMESTAMPTZ,
+    attempts                INT NOT NULL DEFAULT 0,
+    synthesis_run_id        BIGINT,
+    synthesis_completed_at  TIMESTAMPTZ,
+    synthesis_error         TEXT,
+    CONSTRAINT uq_wsq_customer_doc_version UNIQUE (customer_id, doc_id, doc_version),
+    CONSTRAINT ck_wsq_status CHECK (status IN (
+        'pending','triaging','triaged','rejected','synthesizing','done','failed'
+    ))
+);
+
+CREATE INDEX idx_wsq_drain
+    ON wiki_synthesis_queue (customer_id, status, enqueued_at);
+
+CREATE TABLE wiki_synthesis_runs (
+    run_id          BIGSERIAL PRIMARY KEY,
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    kind            TEXT NOT NULL,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at     TIMESTAMPTZ,
+    events_total    INT NOT NULL DEFAULT 0,
+    events_triaged  INT NOT NULL DEFAULT 0,
+    events_kept     INT NOT NULL DEFAULT 0,
+    pages_updated   INT NOT NULL DEFAULT 0,
+    pages_created   INT NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'running',
+    error           TEXT,
+    CONSTRAINT ck_wsr_kind CHECK (kind IN ('onboarding','wake','scheduled')),
+    CONSTRAINT ck_wsr_status CHECK (status IN ('running','complete','failed','partial'))
+);
+
+CREATE INDEX idx_wsr_customer
+    ON wiki_synthesis_runs (customer_id, started_at DESC);
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents
