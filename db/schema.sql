@@ -30,7 +30,13 @@ CREATE TABLE customers (
     status               TEXT NOT NULL DEFAULT 'active',
     organization_id      UUID REFERENCES neon_auth.organization(id) ON DELETE RESTRICT,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    metadata             JSONB NOT NULL DEFAULT '{}'
+    metadata             JSONB NOT NULL DEFAULT '{}',
+    -- Per-tenant feature toggles (e.g. ticket_enrichment_enabled,
+    -- wiki_generation_enabled). Added by migration 0023; schema.sql
+    -- missed the update when 0023 originally landed and a later PR
+    -- shipped code that reads this column without re-syncing the
+    -- baseline — broke CI's `psql -f db/schema.sql` bootstrap path.
+    preferences          JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 -- One customer per organization (where the link is set).
