@@ -317,7 +317,6 @@ class LinearConnector(Connector):
             ingested_at=datetime.now(UTC),
             acl=ACLSnapshot(principals=principals, captured_at=event.received_at),
             metadata={
-                "body": body,
                 "identifier": data.get("identifier"),
                 "organization_id": org_id,
                 "team_id": team_id,
@@ -325,6 +324,7 @@ class LinearConnector(Connector):
                 "priority": priority,
                 "assignee_id": assignee_id,
             },
+            body=body,
             doc_references=_references_from_text(body),
         )
 
@@ -523,11 +523,11 @@ class LinearConnector(Connector):
             parent_doc_id=parent_doc_id,
             acl=ACLSnapshot(principals=principals, captured_at=event.received_at),
             metadata={
-                "body": body,
                 "organization_id": org_id,
                 "team_id": team_id,
                 "issue_id": issue_id,
             },
+            body=body,
             doc_references=_references_from_text(body),
         )
 

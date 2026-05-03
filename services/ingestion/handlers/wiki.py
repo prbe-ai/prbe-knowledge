@@ -9,7 +9,7 @@ carries everything `normalize` needs:
         "wiki_type": "runbook" | "decision" | "feature" | "service_card",
         "slug": "<a-z0-9->",
         "title": "...",
-        "body": "<markdown>",
+        "body": "<markdown>",                  # required, persisted via chunks
         "frontmatter": {...},                  # optional
         "doc_class": "manual_entry"|...,      # optional, default MANUAL_ENTRY
         "author_id": "...",                    # optional
@@ -261,7 +261,6 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
         "wiki_type": wiki_type,
         "slug": slug,
         "frontmatter": dict(frontmatter),
-        "body": body,
         "dangling_links": dangling_links,
         "doc_class": doc_class.value,
     }
@@ -332,6 +331,7 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
         ingested_at=datetime.now(UTC),
         acl=acl,
         metadata=metadata,
+        body=body,
         compiled_from_doc_ids=compiled_from_doc_ids,
         compile_trigger=compile_trigger,
         compiled_at=compiled_at,

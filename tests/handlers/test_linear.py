@@ -185,7 +185,7 @@ async def test_normalize_issue_produces_document_and_graph() -> None:
         doc.doc_id
         == "linear:org_test:issue:11111111-2222-3333-4444-555555555555"
     )
-    assert doc.metadata["body"].startswith("The payments service")
+    assert doc.body.startswith("The payments service")
     assert doc.metadata["team_id"] == "team_eng"
     assert doc.metadata["assignee_id"] == "user_bob"
 

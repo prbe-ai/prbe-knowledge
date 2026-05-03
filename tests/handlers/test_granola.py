@@ -107,8 +107,8 @@ async def test_normalize_macos_no_diarization() -> None:
     assert doc.body_preview == "Decisions: ship Granola integration. Next steps: ..."
     assert doc.metadata["transcript_segments"] == 2
     assert doc.metadata["has_transcript"] is True
-    assert "## Transcript" in doc.metadata["body"]
-    assert "microphone: Let's start with infra." in doc.metadata["body"]
+    assert "## Transcript" in doc.body
+    assert "microphone: Let's start with infra." in doc.body
 
     # Owner ACL: USER, WRITE.
     assert len(result.acl_snapshots) == 1
@@ -152,7 +152,7 @@ async def test_normalize_ios_with_diarization_label() -> None:
     }
 
     result = await granola.normalize(_make_event(note), {})
-    body = result.documents[0].metadata["body"]
+    body = result.documents[0].body
     assert "Speaker A: How are you using PRBE today?" in body
     assert "Speaker B: Mostly via the dashboard." in body
 
@@ -173,10 +173,10 @@ async def test_normalize_summary_only_no_transcript() -> None:
 
     result = await granola.normalize(_make_event(note), {})
     doc = result.documents[0]
-    assert doc.metadata["body"] == "Just a few thoughts."
+    assert doc.body == "Just a few thoughts."
     assert doc.metadata["has_transcript"] is False
     assert doc.metadata["transcript_segments"] == 0
-    assert "## Transcript" not in doc.metadata["body"]
+    assert "## Transcript" not in doc.body
 
 
 @pytest.mark.asyncio

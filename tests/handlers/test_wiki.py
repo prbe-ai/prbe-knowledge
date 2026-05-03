@@ -226,7 +226,7 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     assert doc.doc_type == DocType.WIKI_RUNBOOK
     assert doc.doc_class == DocClass.MANUAL_ENTRY
     assert doc.title == "Slack backfill stuck"
-    assert doc.metadata["body"] == body
+    assert doc.body == body
     assert doc.metadata["frontmatter"] == {"owner": "mahit", "severity": "high"}
     assert doc.metadata["dangling_links"] == ["[[plain runbook]]"]
     assert doc.compiled_from_doc_ids is None

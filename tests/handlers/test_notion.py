@@ -409,7 +409,7 @@ async def test_normalize_without_token_empty_body() -> None:
 
     assert doc.doc_id == "notion:page:page_abc123"
     assert doc.doc_type == DocType.NOTION_PAGE
-    assert doc.metadata["body"] == ""
+    assert doc.body == ""
     assert doc.metadata["hydrated"] is False
     assert doc.source_system == SourceSystem.NOTION
     assert doc.author_id == "unknown"  # no hydration → no last_edited_by id
@@ -454,8 +454,8 @@ async def test_normalize_with_hydrated_content() -> None:
     doc = result.documents[0]
 
     # Body populated.
-    assert "Incident runbook" in doc.metadata["body"]
-    assert "Check Stripe dashboard" in doc.metadata["body"]
+    assert "Incident runbook" in doc.body
+    assert "Check Stripe dashboard" in doc.body
     assert doc.title == "Payments runbook"
     assert doc.author_id == "user_alice"
     assert doc.source_url == "https://www.notion.so/Payments-runbook-abc123"

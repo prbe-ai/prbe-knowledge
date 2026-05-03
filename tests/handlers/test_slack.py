@@ -200,7 +200,7 @@ async def test_normalize_produces_document_and_graph() -> None:
     assert doc.doc_type == DocType.SLACK_MESSAGE
     assert doc.author_id == "U789"
     assert doc.title and "deploying" in doc.title
-    assert doc.metadata["body"].startswith("deploying")
+    assert doc.body.startswith("deploying")
 
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
     assert (NodeLabel.CHANNEL, "C456") in labels
@@ -856,7 +856,7 @@ async def test_normalize_prefixes_body_with_display_name() -> None:
 
     result = await slack.normalize(event, {})
     doc = result.documents[0]
-    assert doc.metadata["body"] == "Richard Wei: deploying payments service"
+    assert doc.body == "Richard Wei: deploying payments service"
     assert doc.body_preview.startswith("Richard Wei: ")
     # body_size_bytes / body_token_count must reflect the prefixed text
     assert doc.body_size_bytes == len(b"Richard Wei: deploying payments service")
@@ -896,8 +896,8 @@ async def test_normalize_falls_back_to_no_prefix_when_user_unknown() -> None:
 
     result = await slack.normalize(event, {})
     doc = result.documents[0]
-    assert doc.metadata["body"] == "deploying payments service"
-    assert "U07ABC123" not in doc.metadata["body"], (
+    assert doc.body == "deploying payments service"
+    assert "U07ABC123" not in doc.body, (
         "raw Slack user ID must not appear in embedded body — pollutes vectors"
     )
 
@@ -981,7 +981,7 @@ async def test_normalize_user_id_still_authoritative_in_author_id() -> None:
     assert doc.author_id == "U07ABC123"
     assert person.canonical_id == "U07ABC123"
     # …and the name landed where it's supposed to.
-    assert doc.metadata["body"].startswith("Richard Wei: ")
+    assert doc.body.startswith("Richard Wei: ")
     assert person.properties.get("display_name") == "Richard Wei"
 
 
@@ -1021,7 +1021,7 @@ async def test_normalize_bot_message_gets_no_prefix_and_no_person_name() -> None
     result = await slack.normalize(event, {})
     doc = result.documents[0]
     person = next(n for n in result.graph_nodes if n.label == NodeLabel.PERSON)
-    assert doc.metadata["body"] == "deploy succeeded"
+    assert doc.body == "deploy succeeded"
     assert doc.author_id == "B01"
     assert person.canonical_id == "B01"
     assert "display_name" not in person.properties
@@ -1080,4 +1080,4 @@ async def test_fetch_supplementary_resolves_user_for_webhook() -> None:
 
         # And normalize() consumes it correctly.
         result = await slack.normalize(event, hydrated)
-        assert result.documents[0].metadata["body"] == "Richard Wei: hello"
+        assert result.documents[0].body == "Richard Wei: hello"

@@ -53,7 +53,11 @@ from services.ingestion.handlers.wiki import (
     WIKI_TYPE_TO_DOC_TYPE,
     build_normalization_result,
 )
-from services.ingestion.normalizer import Normalizer
+from services.ingestion.normalizer import (
+    Normalizer,
+    fetch_body_from_chunks_for_version,
+    fetch_live_body_from_chunks,
+)
 from services.ingestion.wiki_links import parse_page_links
 from shared.constants import DocClass, DocType, SourceSystem
 from shared.db import with_tenant
@@ -415,8 +419,12 @@ async def get_wiki_page(
             customer_id,
             doc_id,
         )
-    if row is None or row["deleted_at"] is not None:
-        raise HTTPException(status_code=404, detail="wiki page not found")
+        if row is None or row["deleted_at"] is not None:
+            raise HTTPException(status_code=404, detail="wiki page not found")
+        # Body lives in chunks, not metadata (storage-cleanup migration 0035).
+        # Fetched inside the same with_tenant block so RLS on chunks sees the
+        # tenant GUC.
+        body = await fetch_live_body_from_chunks(conn, customer_id, doc_id)
 
     metadata = _coerce_metadata(row["metadata"])
     return WikiPageResponse(
@@ -425,7 +433,7 @@ async def get_wiki_page(
         wiki_type=metadata.get("wiki_type", wiki_type),
         slug=metadata.get("slug", slug),
         title=row["title"],
-        body=metadata.get("body", ""),
+        body=body,
         frontmatter=metadata.get("frontmatter", {}),
         doc_class=metadata.get("doc_class", DocClass.MANUAL_ENTRY.value),
         author_id=row["author_id"],
@@ -652,10 +660,19 @@ async def revert_wiki_page(
             doc_id,
             body.to_version,
         )
-    if target is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"version {body.to_version} not found for {doc_id}",
+        if target is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"version {body.to_version} not found for {doc_id}",
+            )
+        # Reconstruct the prior version's body from chunks. Chunks are
+        # version-spanning via [first_seen_version, last_seen_version], so a
+        # row participates in version V iff it covers V. Falls back to empty
+        # when the prior version had no chunks (e.g. a delete tombstone) —
+        # the caller's "revert" semantics on an empty page mean the new
+        # version is empty too.
+        target_body = await fetch_body_from_chunks_for_version(
+            conn, customer_id, doc_id, body.to_version
         )
 
     target_meta = _coerce_metadata(target["metadata"])
@@ -665,7 +682,7 @@ async def revert_wiki_page(
         wiki_type=wiki_type,
         slug=slug,
         title=target["title"] or "",
-        body=target_meta.get("body") or "",
+        body=target_body,
         frontmatter=target_meta.get("frontmatter") or {},
         doc_class=DocClass.MANUAL_ENTRY.value,
         author_id=body.author_id,

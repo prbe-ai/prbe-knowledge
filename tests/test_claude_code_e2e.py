@@ -132,6 +132,7 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
 
     # 4. Confirm a claude_code.session Document was persisted AND the live
     # webhook event content actually flowed end-to-end (not just a stub doc).
+    # Body is now sourced from chunks.content (storage-cleanup migration 0035).
     async with raw_conn() as conn:
         rows = await conn.fetch(
             "SELECT doc_id, doc_type, metadata::text AS metadata, body_size_bytes "
@@ -147,11 +148,22 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
         f"session doc was emitted with no events — fetch_supplementary likely "
         f"never picked up the gateway-forwarded body. metadata={meta}"
     )
-    assert meta.get("body"), (
-        "session doc has no metadata['body'] — chunker won't see the transcript"
+    assert "body" not in meta, (
+        f"metadata['body'] is forbidden after storage-cleanup migration; got: {meta!r}"
     )
-    assert "hi from e2e" in meta["body"], (
-        f"event content should land in metadata['body']; got: {meta['body']!r}"
+    async with raw_conn() as conn:
+        chunk_body = await conn.fetchval(
+            "SELECT string_agg(content, '' ORDER BY chunk_index) "
+            "FROM chunks WHERE customer_id = $1 AND doc_id = $2 "
+            "AND kind = 'content' AND valid_to IS NULL",
+            CUSTOMER,
+            session_row["doc_id"],
+        )
+    assert chunk_body, (
+        "session doc has no live content chunks — chunker never saw the transcript"
+    )
+    assert "hi from e2e" in chunk_body, (
+        f"event content should appear in chunks.content; got: {chunk_body!r}"
     )
 
     # 5. Lane B: the Person graph node carries name + email from the

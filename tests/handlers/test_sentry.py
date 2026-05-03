@@ -404,7 +404,7 @@ async def test_normalize_issue_emits_document_graph_and_acl() -> None:
     assert doc.metadata["project_slug"] == "payments-api"
     assert doc.metadata["platform"] == "python"
     assert doc.metadata["action"] == "created"
-    assert "payments.charges.handle_webhook" in doc.metadata["body"]
+    assert "payments.charges.handle_webhook" in doc.body
     # ACL embedded on the doc includes both workspace and project principals.
     principal_types = {p.principal_type for p in doc.acl.principals}
     assert PrincipalType.WORKSPACE in principal_types
@@ -473,8 +473,8 @@ async def test_normalize_event_alert_produces_issue_sample_doc() -> None:
     assert doc.author_id is None
     assert not any(e.edge_type == EdgeType.AUTHORED for e in result.graph_edges)
     # Body contains the exception header + a top stack frame.
-    assert "TypeError" in doc.metadata["body"]
-    assert "handle_webhook" in doc.metadata["body"]
+    assert "TypeError" in doc.body
+    assert "handle_webhook" in doc.body
     # Sample strategy is recorded in metadata so downstream callers / agents
     # know this is one-per-issue, not per-event.
     assert doc.metadata["sample_strategy"] == "first_event_per_issue"

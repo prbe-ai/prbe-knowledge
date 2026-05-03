@@ -103,6 +103,20 @@ class Document(BaseModel):
     attachments: list[AttachmentRef] = Field(default_factory=list)
     doc_references: list[DocRef] = Field(default_factory=list)
 
+    # Transient body text. Excluded from model_dump so it never serializes
+    # into the documents row's metadata jsonb. The normalizer reads `doc.body`
+    # to feed the chunker; chunks.content is the persisted source of truth.
+    # Historically connectors stuffed the full body into metadata["body"],
+    # which doubled storage on every doc. See migration 0035.
+    body: str | None = Field(default=None, exclude=True, repr=False)
+
+    # When True, the normalizer coalesces re-ingests of this doc into the
+    # current live SCD2 version (UPDATE in place) instead of opening a new
+    # version per content edit. Cleared when a final state is reached.
+    # Used by claude_code to fold per-batch session updates into one row
+    # until session_complete=True. See migration 0036.
+    coalesce_into_live: bool = Field(default=False, exclude=True, repr=False)
+
     ingestion_event_id: int | None = None
     normalizer_version: str = "v1"
 

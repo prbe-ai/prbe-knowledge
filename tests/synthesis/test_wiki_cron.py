@@ -103,7 +103,8 @@ def _doc(doc_id: str, body: str) -> Document:
             ],
             captured_at=now,
         ),
-        metadata={"body": body},
+        metadata={},
+        body=body,
     )
 
 
