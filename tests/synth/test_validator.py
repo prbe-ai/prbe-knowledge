@@ -201,3 +201,37 @@ async def test_combined_validate_strict_archetype_no_client_skips_pass2() -> Non
     assert result.should_drop is False
     assert result.pass2_result is None
     assert result.pass1_violations == ()
+
+
+async def test_combined_validate_name_only_archetype_skips_pass2_even_with_client() -> None:
+    """A NAME_ONLY archetype must skip Pass 2 even when pass2_client is provided.
+
+    This is the dual of test_combined_validate_strict_archetype_no_client_skips_pass2 —
+    together they pin down both required conditions for Pass 2 to fire:
+    archetype.validator_level == STRICT AND pass2_client is not None.
+    """
+
+    class _UncallableClient:
+        async def generate_structured(self, *a: object, **kw: object) -> None:
+            raise AssertionError("Pass 2 must not run for NAME_ONLY archetype")
+
+        async def generate(self, *a: object, **kw: object) -> None:
+            raise AssertionError("Pass 2 must not run for NAME_ONLY archetype")
+
+        async def close(self) -> None:
+            pass
+
+    world = _make_world()
+    doc = _make_doc("deployed payments-api to production.")
+    result = await validate(
+        (doc,),
+        world,
+        scenario=_FAKE_SPEC,
+        archetype=_NAME_ONLY_ARCHETYPE,
+        pass2_client=_UncallableClient(),  # type: ignore[arg-type]
+        pass2_model="claude-sonnet-4-6",
+    )
+    # validator_level guard prevents Pass 2 from running despite client being provided
+    assert result.pass2_result is None
+    assert result.should_drop is False
+    assert result.failing_doc_ids == ()
