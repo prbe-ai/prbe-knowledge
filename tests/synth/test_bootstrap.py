@@ -61,6 +61,15 @@ async def test_init_tenant_inserts_customer_and_tokens() -> None:
     assert any("INSERT INTO customers" in q for q in calls)
     assert sum("INSERT INTO integration_tokens" in q for q in calls) == 2
     bucket.ensure_bucket.assert_awaited_once()
+    # customers.api_key_hash is NOT NULL — the customers insert must include
+    # api_key_hash and pass a non-null placeholder so the row commits.
+    customers_call = next(
+        c for c in db.execute.await_args_list
+        if "INSERT INTO customers" in c.args[0]
+    )
+    assert "api_key_hash" in customers_call.args[0]
+    placeholder = customers_call.args[3]
+    assert placeholder and len(placeholder) == 64  # sha256 hex digest
 
 
 @pytest.mark.asyncio

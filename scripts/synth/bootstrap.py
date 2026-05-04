@@ -10,6 +10,7 @@ init can re-bind without race.
 
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING
 
 from shared.logging import get_logger
@@ -55,14 +56,24 @@ async def init_tenant(profile: Profile, db, bucket: ObjectStore) -> None:
     display_name = profile.raw.get("display_name") or f"synth-{customer_id}"
     sources = profile.raw.get("sources") or ["slack", "notion"]
 
+    # customers.api_key_hash is NOT NULL. Synth tenants don't have a real
+    # bearer key — stamp a deterministic placeholder so the row inserts.
+    # Bearer auth never resolves to this row because no caller can know
+    # the pre-hash input. ON CONFLICT DO NOTHING below preserves any
+    # real api_key_hash already on an existing tenant.
+    placeholder_hash = hashlib.sha256(
+        f"synth-stub-no-bearer-{customer_id}".encode()
+    ).hexdigest()
+
     await db.execute(
         """
-        INSERT INTO customers (customer_id, display_name, status)
-        VALUES ($1, $2, 'active')
+        INSERT INTO customers (customer_id, display_name, api_key_hash, status)
+        VALUES ($1, $2, $3, 'active')
         ON CONFLICT (customer_id) DO NOTHING
         """,
         customer_id,
         display_name,
+        placeholder_hash,
     )
 
     bucket_name = bucket.bucket_for(customer_id)
