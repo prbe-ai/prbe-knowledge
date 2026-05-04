@@ -109,8 +109,12 @@ async def run_scenarios(
     writer: LLMWriter | None = None,
     validator_pass2_client: LlmClientProtocol | None = None,
     validator_pass2_model: str | None = None,
-) -> AsyncIterator[SynthDoc]:
-    """Walk active archetypes, validate each scenario, yield SynthDocs.
+) -> AsyncIterator[tuple[ScenarioSpec, SynthDoc]]:
+    """Walk active archetypes, validate each scenario, yield (ScenarioSpec, SynthDoc) pairs.
+
+    Each doc is paired with the scenario it came from. Callers that need
+    per-scenario state (eval question writers, manifest tallies) deduplicate
+    by spec.id.
 
     Templated archetypes (needs_planner_call=False) → call BUILDERS sync builder.
     Plot archetypes (needs_planner_call=True) → call PLOT_BUILDERS async builder.
@@ -153,7 +157,7 @@ async def run_scenarios(
                     )
                     continue
                 for doc in docs:
-                    yield doc
+                    yield spec, doc
         else:
             # Plot path
             if planner is None or writer is None or company_ctx is None:
@@ -206,7 +210,7 @@ async def run_scenarios(
                         )
                         continue
                     for doc in docs:
-                        yield doc
+                        yield spec, doc
             except Exception:
                 log.exception("plot_archetype_error", archetype=name)
                 continue

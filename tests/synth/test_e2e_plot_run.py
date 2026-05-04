@@ -183,14 +183,18 @@ async def test_e2e_plot_pipeline_emits_plot_docs(
     scenarios = list((output_dir / "scenarios").glob("*.json"))
     assert len(scenarios) > 0
 
-    # The deferred-cleanup tracker (item Q1) notes that run_scenarios doesn't currently
-    # yield plot specs in cli.py's BUILDERS-rerun loop, so plot archetypes may not
-    # appear in scenarios/. We intentionally don't assert plot_scenarios is non-empty here.
+    # Plot archetypes now yield (spec, doc) pairs — their specs reach write_scenarios.
     plot_scenarios = [
         s for s in scenarios
         if any(p in s.read_text() for p in ("INCIDENT", "LAUNCH", "BIG_REFACTOR"))
     ]
-    _ = plot_scenarios  # see note above
+    assert len(plot_scenarios) > 0, "expected at least one plot scenario JSON in scenarios/"
+
+    # questions.jsonl should be non-empty: plot specs carry eval_questions now.
+    questions_bytes = (output_dir / "questions.jsonl").read_bytes()
+    assert questions_bytes, "expected plot eval questions in questions.jsonl"
+    question_lines = questions_bytes.strip().splitlines()
+    assert len(question_lines) > 0, "expected at least one plot eval question row"
 
     # At least one github doc exists
     github_docs = list(raw.glob("github/*.json"))

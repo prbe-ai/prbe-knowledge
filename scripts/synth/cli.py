@@ -23,6 +23,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from scripts.synth.archetypes.base import ScenarioSpec
 from scripts.synth.bootstrap import clean_tenant, init_tenant
 from scripts.synth.cache import DiskCache, default_cache_root
 from scripts.synth.company_context import (
@@ -610,7 +611,8 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
 
     try:
         emitted_docs: list = []
-        async for doc in run_scenarios(
+        specs_by_id: dict[str, ScenarioSpec] = {}
+        async for spec, doc in run_scenarios(
             world,
             ownership,
             profile,
@@ -625,10 +627,13 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
         ):
             await ingestion_writer.write(doc)
             emitted_docs.append(doc)
+            specs_by_id.setdefault(spec.id, spec)
         await ingestion_writer.close()
     finally:
         if db is not None:
             await db.close()
+
+    all_specs = list(specs_by_id.values())
 
     violations = validate_name_only(tuple(emitted_docs), world)
 
@@ -645,26 +650,10 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
     # from generated; Plan 3's LLM planner will emit per-scenario request
     # counts that distinguish these.
 
-    # Collect ScenarioSpec objects for scenarios/ and questions.jsonl.
-    # Templated archetypes: re-run BUILDERS to get specs (same inputs -> same
-    # deterministic output). Plot archetypes are not tracked here yet.
-    from scripts.synth.archetypes.library import BUILDERS, get_active
-
-    emitted_scenario_ids = {d.scenario_id for d in emitted_docs}
-    all_specs = []
-    active = get_active(profile, archetype_filter=archetype_filter)
-    for name, archetype in active.items():
-        if not archetype.needs_planner_call and name in BUILDERS:
-            builder_specs = BUILDERS[name](world, ownership, time_window, profile.seed)
-            if args.limit_scenarios is not None:
-                builder_specs = builder_specs[: args.limit_scenarios]
-            # Only include specs whose scenario was actually emitted (not dropped).
-            all_specs.extend(s for s in builder_specs if s.id in emitted_scenario_ids)
-
     totals = {
         "archetypes_executed": archetypes_executed,
         "totals": {
-            "scenarios": len(emitted_scenario_ids),
+            "scenarios": len(specs_by_id),
             "documents": len(emitted_docs),
             "questions": sum(len(s.eval_questions) for s in all_specs),
         },
