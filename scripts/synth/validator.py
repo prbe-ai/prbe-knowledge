@@ -128,8 +128,8 @@ def validate_name_only(
 class CombinedValidatorResult:
     pass1_violations: tuple[Violation, ...]
     pass2_result: Pass2Result | None
-    should_drop: bool
     failing_doc_ids: tuple[str, ...]
+    should_drop: bool
 
 
 async def validate(

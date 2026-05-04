@@ -203,6 +203,67 @@ async def test_combined_validate_strict_archetype_no_client_skips_pass2() -> Non
     assert result.pass1_violations == ()
 
 
+async def test_validate_name_only_allows_email_prefix_canonical_id_slugs() -> None:
+    """Persons with email:foo@bar canonical_ids contribute 'foo' and '@foo' to allowlist."""
+    from datetime import UTC, datetime
+
+    from scripts.synth.archetypes.base import Source
+    from scripts.synth.output.base import SynthDoc
+    from scripts.synth.validator import validate_name_only
+    from scripts.synth.world_model import (
+        ChannelHint,
+        Person,
+        RepoSummary,
+        Service,
+        ServiceKind,
+        WorldModel,
+    )
+
+    now = datetime(2026, 5, 1, tzinfo=UTC)
+    world = WorldModel(
+        repos=(RepoSummary(url="github.com/prbe-ai/prbe", sha="abc", default_branch="main"),),
+        people=(Person(
+            canonical_id="email:alice@example.com",
+            gh_username=None,
+            display_name="Alice",
+            email_aliases=("alice@example.com",),
+            role_hint=None,
+            repos_active_in=("github.com/prbe-ai/prbe",),
+            activity_score=5.0,
+        ),),
+        services=(Service(
+            name="payments",
+            qualified="payments",
+            repo_url="github.com/prbe-ai/prbe",
+            kind=ServiceKind.API,
+            description=None,
+            owners=(),
+            recent_activity=1.0,
+            deploy_target=None,
+        ),),
+        topic_pool=(),
+        channels=(ChannelHint(name="#general", suggested_topic=None, related_services=()),),
+        notion_sections=(),
+        time_anchors=(),
+        dep_graph=(),
+        company_name="prbe",
+        seed=42,
+        extracted_at=now,
+        sha_set={"github.com/prbe-ai/prbe": "abc"},
+    )
+    doc = SynthDoc(
+        id="d1", source=Source.SLACK, source_event_id="d1",
+        text="Hi @alice, can you check payments?",
+        occurred_at=datetime(2026, 5, 1, tzinfo=UTC),
+        channel="#general", page_id=None, thread_parent_id=None,
+        scenario_id="s1", archetype="STANDUP_UPDATE",
+        personas=("email:alice@example.com",), services_mentioned=("payments",),
+        priority=10,
+    )
+    violations = validate_name_only((doc,), world)
+    assert violations == ()
+
+
 async def test_combined_validate_name_only_archetype_skips_pass2_even_with_client() -> None:
     """A NAME_ONLY archetype must skip Pass 2 even when pass2_client is provided.
 

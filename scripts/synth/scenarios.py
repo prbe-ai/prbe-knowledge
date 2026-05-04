@@ -9,7 +9,7 @@ eval-artifact writers and tests can use a stable, top-level path.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Iterator
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -109,7 +109,7 @@ async def run_scenarios(
     writer: LLMWriter | None = None,
     validator_pass2_client: LlmClientProtocol | None = None,
     validator_pass2_model: str | None = None,
-) -> AsyncIterator[tuple[ScenarioSpec, SynthDoc]]:
+) -> AsyncGenerator[tuple[ScenarioSpec, SynthDoc], None]:
     """Walk active archetypes, validate each scenario, yield (ScenarioSpec, SynthDoc) pairs.
 
     Each doc is paired with the scenario it came from. Callers that need

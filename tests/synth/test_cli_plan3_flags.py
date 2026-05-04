@@ -113,3 +113,22 @@ def test_anthropic_model_prefix_records_anthropic_provider(tmp_path: Path) -> No
     )
     clients = build_llm_clients(cfg)
     assert clients.planner_provider == Provider.ANTHROPIC
+
+
+def test_record_llm_flag_raises_for_gemini_missing_key(tmp_path: Path, monkeypatch) -> None:
+    """--record-llm with all-Gemini config + missing GOOGLE_API_KEY → RuntimeError matching GOOGLE_API_KEY."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    cfg = LlmClientConfig(
+        llm_cfg=_make_llm_cfg(
+            planner_model="gemini-2.5-pro",
+            writer_model="gemini-2.5-pro",
+            validator_model="gemini-2.5-pro",
+        ),
+        mock_llm=False,
+        no_llm_cache=False,
+        record_llm=True,
+        fixture_root=tmp_path,
+    )
+    with pytest.raises(RuntimeError, match="GOOGLE_API_KEY"):
+        build_llm_clients(cfg)

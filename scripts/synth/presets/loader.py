@@ -30,6 +30,8 @@ def apply_preset(profile_raw: dict, preset_name: str | None) -> dict:
     Returns the merged dict. profile_raw is not mutated.
     Raises PresetNotFoundError if the preset name does not match a shipped file.
     Returns profile_raw unchanged if preset_name is None or empty string.
+    Empty/falsy `archetypes` or `llm` blocks in the preset are skipped (not
+    merged as empty dicts).
     """
     if not preset_name:
         return profile_raw

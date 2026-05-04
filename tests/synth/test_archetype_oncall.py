@@ -5,7 +5,12 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from scripts.synth.archetypes.base import Source
-from scripts.synth.archetypes.oncall import ON_CALL_HANDOFF, _notion_body, build_oncall_specs
+from scripts.synth.archetypes.oncall import (
+    ON_CALL_HANDOFF,
+    _notion_body,
+    _person_slug,
+    build_oncall_specs,
+)
 from scripts.synth.ownership import OwnershipIndex
 from scripts.synth.scenarios import TimeWindow
 from scripts.synth.world_model import (
@@ -150,6 +155,23 @@ def test_person_slug_empty_guard_no_bare_at_mention() -> None:
     assert mention_line != "Outgoing: @"
     # Must contain the raw canonical_id as fallback.
     assert "email:@example.com" in mention_line
+
+
+def test_person_slug_strips_gh_prefix() -> None:
+    assert _person_slug("gh:alice") == "alice"
+
+
+def test_person_slug_strips_email_prefix_to_local_part() -> None:
+    assert _person_slug("email:alice@example.com") == "alice"
+
+
+def test_person_slug_returns_canonical_id_when_no_prefix() -> None:
+    assert _person_slug("alice") == "alice"
+
+
+def test_person_slug_falls_back_to_canonical_when_local_part_is_empty() -> None:
+    """Malformed canonical_id like 'email:@example.com' returns full canonical_id (the empty-slug guard)."""
+    assert _person_slug("email:@example.com") == "email:@example.com"
 
 
 def test_rotation_determinism() -> None:

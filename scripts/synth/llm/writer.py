@@ -1,8 +1,7 @@
 """LLMWriter — produces plain text for a single DocSpec via one LLM call.
 
 Persona-scoped prior context: prior_emitted_docs is filtered to only include
-docs whose occurred_at is strictly before the current persona's first emission
-in the scenario timeline (determined by the DocSpec's occurred_at).
+docs whose occurred_at is strictly before the current DocSpec's occurred_at.
 
 Allowlist injection: every prompt includes the explicit list of allowed
 service/people/channel names. Writers must not invent names outside this list,

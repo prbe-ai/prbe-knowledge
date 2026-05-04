@@ -117,8 +117,6 @@ async def test_local_unsupported_source_raises(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_local_writes_github_envelope_to_disk(tmp_path: Path) -> None:
     """Plan 3 dispatch: github source → IngestionWriter calls github_wrapper.wrap."""
-    import orjson
-
     doc = SynthDoc(
         id="scn-test-github-0",
         source=Source.GITHUB,

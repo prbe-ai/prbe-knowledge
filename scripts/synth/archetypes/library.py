@@ -16,9 +16,9 @@ from scripts.synth.archetypes.incident import INCIDENT, build_incident_scenarios
 from scripts.synth.archetypes.launch import LAUNCH, build_launch_scenarios
 from scripts.synth.archetypes.oncall import ON_CALL_HANDOFF, build_oncall_specs
 from scripts.synth.archetypes.standup import STANDUP_UPDATE, build_standup_specs
-from scripts.synth.output.base import SynthDoc
 
 if TYPE_CHECKING:
+    from scripts.synth.output.base import SynthDoc
     from scripts.synth.profile import Profile
 
 
@@ -34,17 +34,13 @@ ARCHETYPE_LIBRARY: dict[str, Archetype] = {
 # default), so the registry is typed loosely. Callers (run_scenarios) pass
 # only the positional args common to all builders.
 #
-# Plot archetypes (INCIDENT, LAUNCH, BIG_REFACTOR) are registered here with
-# no-op stubs so the Plan 2 sync run_scenarios path skips them without
-# crashing. The real async builders live in PLOT_BUILDERS below and are
-# invoked by the Plan 3 ScenarioRunner (Task 19B).
+# Only templated (non-planner) archetypes are registered here.
+# Plot archetypes (INCIDENT, LAUNCH, BIG_REFACTOR) use PLOT_BUILDERS below;
+# run_scenarios branches on archetype.needs_planner_call and never looks up
+# plot archetype names in BUILDERS.
 BUILDERS: dict[str, Callable[..., tuple[ScenarioSpec, ...]]] = {
     "STANDUP_UPDATE": build_standup_specs,
     "ON_CALL_HANDOFF": build_oncall_specs,
-    # Plot archetypes: no-op stubs for the sync runner; async path uses PLOT_BUILDERS.
-    "INCIDENT": lambda *_a, **_kw: (),
-    "LAUNCH": lambda *_a, **_kw: (),
-    "BIG_REFACTOR": lambda *_a, **_kw: (),
 }
 
 # Async plot builders — Plan 3. Each yields (ScenarioSpec, list[SynthDoc]).

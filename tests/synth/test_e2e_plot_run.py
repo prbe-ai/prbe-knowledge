@@ -263,3 +263,5 @@ async def test_e2e_manifest_and_templated_artifacts(
     assert (output_dir / "questions.jsonl").exists()
     assert (output_dir / "raw").is_dir()
     assert any((output_dir / "raw").glob("slack/*.json")), "templated archetypes should emit slack docs"
+    assert (output_dir / "profile.yaml").exists()
+    assert (output_dir / "company_context.json").exists()

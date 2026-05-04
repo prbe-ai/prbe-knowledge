@@ -575,9 +575,9 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
     llm_cfg: dict = {**_LLM_DEFAULTS, **(profile.raw.get("llm") or {})}
     client_cfg = LlmClientConfig(
         llm_cfg=llm_cfg,
-        mock_llm=getattr(args, "mock_llm", False),
-        no_llm_cache=getattr(args, "no_llm_cache", False),
-        record_llm=getattr(args, "record_llm", False),
+        mock_llm=args.mock_llm,
+        no_llm_cache=args.no_llm_cache,
+        record_llm=args.record_llm,
     )
     llm_clients = build_llm_clients(client_cfg)
     llm_planner = LLMPlanner(

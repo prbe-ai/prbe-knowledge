@@ -16,7 +16,7 @@ def test_apply_preset_tiny_test_populates_archetypes() -> None:
     assert "archetypes" in result
     archetypes = result["archetypes"]
     assert "INCIDENT" in archetypes
-    assert archetypes["INCIDENT"]["count"] >= 1
+    assert archetypes["INCIDENT"]["count"] == 2
 
 
 def test_profile_archetype_wins_over_preset() -> None:
@@ -41,6 +41,15 @@ def test_apply_preset_none_returns_unchanged() -> None:
     result = apply_preset(raw, None)
     assert result == raw
     assert raw["archetypes"]["INCIDENT"]["count"] == 3
+    assert result is raw
+
+
+def test_apply_preset_does_not_mutate_profile_raw() -> None:
+    """apply_preset must not modify the input dict, even when merging archetypes."""
+    profile_raw = {"archetypes": {"INCIDENT": {"count": 5}}}
+    snapshot = {"archetypes": {"INCIDENT": {"count": 5}}}
+    apply_preset(profile_raw, "tiny_test")
+    assert profile_raw == snapshot
 
 
 def test_apply_preset_unknown_name_raises() -> None:

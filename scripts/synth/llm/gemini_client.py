@@ -44,7 +44,9 @@ class GeminiClient:
             contents=req.prompt,
             config=config,
         )
-        raw = response.text or "{}"
+        raw = response.text
+        if not raw:
+            raise ValueError("Gemini returned empty response.text for structured output")
         return json.loads(raw)
 
     async def close(self) -> None:
