@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Sync .env to Fly secrets on the four prbe-knowledge apps.
+# Sync .env to Fly secrets on the seven prbe-knowledge apps.
 #
 # Usage:
-#   scripts/fly-secrets-sync.sh                  # sync all four apps
+#   scripts/fly-secrets-sync.sh                  # sync all seven apps
 #   scripts/fly-secrets-sync.sh ingestion        # sync a single app
 #   scripts/fly-secrets-sync.sh -f .env.staging  # use a different env file
 #
-# App shortcuts: ingestion | retrieval | worker | poller | all (default)
+# App shortcuts: ingestion | retrieval | worker | poller |
+#                wiki-worker | wiki-synthesis | wiki-cron |
+#                all (default)
 #
 # Requires: flyctl in PATH, logged in (`flyctl auth whoami`), and a .env file
 # at the repo root (override with -f). The file format is the standard KEY=VALUE
@@ -30,13 +32,13 @@ while [[ $# -gt 0 ]]; do
             awk '/^#!/{next} /^[^#]/{exit} {sub(/^# ?/,""); print}' "$0"
             exit 0
             ;;
-        ingestion|retrieval|worker|poller|all)
+        ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-cron|all)
             TARGET="$1"
             shift
             ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 [ingestion|retrieval|worker|poller|all] [-f env-file]" >&2
+            echo "Usage: $0 [ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-cron|all] [-f env-file]" >&2
             exit 1
             ;;
     esac
@@ -74,14 +76,20 @@ ALL_APPS=(
     "prbe-knowledge-retrieval"
     "prbe-knowledge-worker"
     "prbe-knowledge-poller"
+    "prbe-knowledge-wiki-worker"
+    "prbe-knowledge-wiki-synthesis"
+    "prbe-knowledge-wiki-cron"
 )
 
 case "$TARGET" in
-    all)        APPS=("${ALL_APPS[@]}") ;;
-    ingestion)  APPS=("prbe-knowledge-ingestion") ;;
-    retrieval)  APPS=("prbe-knowledge-retrieval") ;;
-    worker)     APPS=("prbe-knowledge-worker") ;;
-    poller)     APPS=("prbe-knowledge-poller") ;;
+    all)             APPS=("${ALL_APPS[@]}") ;;
+    ingestion)       APPS=("prbe-knowledge-ingestion") ;;
+    retrieval)       APPS=("prbe-knowledge-retrieval") ;;
+    worker)          APPS=("prbe-knowledge-worker") ;;
+    poller)          APPS=("prbe-knowledge-poller") ;;
+    wiki-worker)     APPS=("prbe-knowledge-wiki-worker") ;;
+    wiki-synthesis)  APPS=("prbe-knowledge-wiki-synthesis") ;;
+    wiki-cron)       APPS=("prbe-knowledge-wiki-cron") ;;
 esac
 
 # -- parse -------------------------------------------------------------------
