@@ -1,4 +1,4 @@
-"""Re-embed the metadata chunks for live Claude Code session documents.
+"""Re-embed metadata chunks for live coding-agent session documents.
 
 Companion to migration 0040_backfill_cc_doc_titles. The migration rewrites
 documents.title + identity metadata for live Claude Code session docs;
@@ -15,6 +15,7 @@ Usage:
     .venv/bin/python -m scripts.backfill_cc_metadata_chunks
     .venv/bin/python -m scripts.backfill_cc_metadata_chunks --dry-run
     .venv/bin/python -m scripts.backfill_cc_metadata_chunks --customer cust-X
+    .venv/bin/python -m scripts.backfill_cc_metadata_chunks --source codex
 
 Idempotent: re-running picks up only docs whose live metadata-chunk
 content_hash differs from what _metadata_text(doc) now produces, so a
@@ -63,7 +64,7 @@ log = get_logger(__name__)
 
 
 # Bounded concurrency for the OpenAI embed calls. 8 is enough to drain
-# the ~100 live CC docs in a few seconds without spiking provider load.
+# the small coding-agent session corpus without spiking provider load.
 _DEFAULT_CONCURRENCY = 8
 
 
@@ -108,8 +109,11 @@ def _doc_from_row(row: Any) -> Document:
     )
 
 
-async def _list_live_cc_docs(customer: str | None) -> list[dict[str, Any]]:
-    """Return every live Claude Code session doc, optionally filtered to
+async def _list_live_agent_docs(
+    customer: str | None,
+    source_system: SourceSystem,
+) -> list[dict[str, Any]]:
+    """Return every live coding-agent session doc, optionally filtered to
     a single customer. Returned as plain dicts so the caller doesn't need
     to keep a connection alive.
 
@@ -120,15 +124,18 @@ async def _list_live_cc_docs(customer: str | None) -> list[dict[str, Any]]:
     async with raw_conn() as conn:
         # asyncpg returns metadata as bytes/str/dict depending on codec; we
         # accept whichever and coerce in _coerce_meta below at row-build time.
-        params: list[Any] = []
+        params: list[Any] = [
+            source_system.value,
+            DocType.CLAUDE_CODE_SESSION.value,
+        ]
         where = (
-            "source_system = 'claude_code' "
-            "AND doc_type = 'claude_code.session' "
+            "source_system = $1 "
+            "AND doc_type = $2 "
             "AND valid_to IS NULL"
         )
         if customer:
             params.append(customer)
-            where += " AND customer_id = $1"
+            where += " AND customer_id = $3"
         rows = await conn.fetch(
             f"""
             SELECT doc_id, customer_id, version, source_system, source_id,
@@ -156,6 +163,11 @@ async def _list_live_cc_docs(customer: str | None) -> list[dict[str, Any]]:
                 d["metadata"] = {}
         out.append(d)
     return out
+
+
+async def _list_live_cc_docs(customer: str | None) -> list[dict[str, Any]]:
+    """Backward-compatible helper for the original Claude Code-only script."""
+    return await _list_live_agent_docs(customer, SourceSystem.CLAUDE_CODE)
 
 
 async def _process_doc(
@@ -303,7 +315,13 @@ async def _amain() -> int:
     parser.add_argument(
         "--customer",
         default=None,
-        help="Restrict to one customer (default: every active customer's CC docs)",
+        help="Restrict to one customer (default: every active customer's selected source docs)",
+    )
+    parser.add_argument(
+        "--source",
+        choices=(SourceSystem.CLAUDE_CODE.value, SourceSystem.CODEX.value),
+        default=SourceSystem.CLAUDE_CODE.value,
+        help="Coding-agent source to backfill (default: claude_code)",
     )
     parser.add_argument(
         "--dry-run",
@@ -327,8 +345,14 @@ async def _amain() -> int:
     updated = 0
     errored = 0
     try:
-        docs = await _list_live_cc_docs(args.customer)
-        log.info("backfill_cc_metadata.start", scanned=len(docs), dry_run=args.dry_run)
+        source_system = SourceSystem(args.source)
+        docs = await _list_live_agent_docs(args.customer, source_system)
+        log.info(
+            "backfill_cc_metadata.start",
+            source=source_system.value,
+            scanned=len(docs),
+            dry_run=args.dry_run,
+        )
 
         embedder = get_embedder()
         sem = asyncio.Semaphore(max(1, args.concurrency))
