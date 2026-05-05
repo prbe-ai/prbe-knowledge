@@ -5,6 +5,16 @@ _is_notion_webhook() checks: isinstance(entity, dict) and isinstance(type, str).
 _parse_notion_webhook reads: type, entity.type, entity.id, data.last_edited_time,
 workspace_id.
 
+Synth-only inlining (the notion-handler bypass):
+    Real Notion webhooks notify-only — content lives behind a Notion API call
+    that the prod handler makes via fetch_supplementary(integration_token).
+    Synth has no live OAuth token, so we inline the would-be hydrated content
+    on `entity` itself: `entity.properties` (title) and `entity.body_markdown`
+    (pre-rendered block content). The prod handler reads these as a fallback
+    when its API fetch returns nothing; on real webhook traffic neither field
+    is present and behavior is unchanged. See services/ingestion/handlers/
+    notion.py::normalize for the reader-side comment.
+
 v1 is minimal: title property + plain-text paragraph blocks. Plan 3 can extend
 to richer block shapes when LLM-generated content warrants it.
 """
@@ -16,6 +26,11 @@ from datetime import datetime
 import orjson
 
 from scripts.synth.output.base import SynthDoc
+
+# blocks_to_markdown is the same renderer the prod handler uses post-fetch,
+# so synth's inlined body_markdown matches what real Notion ingestion would
+# have produced for the same block tree.
+from services.ingestion.handlers.notion import blocks_to_markdown
 
 _SYNTH_WORKSPACE_ID = "ws-synth"
 _SYNTH_WORKSPACE_NAME = "Synth"
@@ -76,10 +91,27 @@ def _blocks_from_text(text: str) -> list[dict]:
 
 
 def wrap(doc: SynthDoc) -> bytes:
-    """Produce a Notion page.updated webhook envelope as JSON bytes."""
+    """Produce a Notion page.updated webhook envelope as JSON bytes.
+
+    Inlines properties + pre-rendered body_markdown on `entity` so the prod
+    handler can ingest synth content without a live OAuth fetch (see module
+    docstring for the bypass contract).
+    """
     page_id = doc.page_id or f"page-{doc.source_event_id}"
     iso_ts = _iso(doc.occurred_at)
     title = _title_from_doc(doc)
+    blocks = _blocks_from_text(doc.text)
+
+    title_property = {
+        "type": "title",
+        "title": [
+            {
+                "type": "text",
+                "plain_text": title,
+                "text": {"content": title},
+            }
+        ],
+    }
 
     payload = {
         "id": doc.source_event_id,
@@ -90,24 +122,18 @@ def wrap(doc: SynthDoc) -> bytes:
         "entity": {
             "type": "page",
             "id": page_id,
+            # Synth-only: inlined hydration (see module docstring).
+            "properties": {"title": title_property},
+            "body_markdown": blocks_to_markdown(blocks),
         },
         "data": {
             "last_edited_time": iso_ts,
             "last_edited_by": {"id": _user_slug(doc)},
             "updated_properties": ["title"],
-            "properties": {
-                "title": {
-                    "type": "title",
-                    "title": [
-                        {
-                            "type": "text",
-                            "plain_text": title,
-                            "text": {"content": title},
-                        }
-                    ],
-                }
-            },
-            "blocks": _blocks_from_text(doc.text),
+            # data.* is left for legacy compatibility with any consumer that
+            # reads webhook bodies before the entity-side inlining landed.
+            "properties": {"title": title_property},
+            "blocks": blocks,
         },
     }
 

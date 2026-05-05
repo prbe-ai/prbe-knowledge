@@ -71,3 +71,22 @@ def test_fixture_shape_matches_wrapper_top_level_keys() -> None:
     assert {"type", "id"}.issubset(set(wrapper["entity"].keys()))
     # Sanity: the real fixture also satisfies these required keys.
     assert required.issubset(set(fixture.keys()))
+
+
+def test_wrap_inlines_properties_on_entity_for_synth_bypass() -> None:
+    """Synth-only bypass: entity carries properties.title so the prod handler
+    can read the title without a live Notion API hydration call."""
+    doc = _make_notion_doc(text="# My Heading\n\nFirst paragraph body.")
+    payload = json.loads(wrap(doc))
+    title = payload["entity"]["properties"]["title"]["title"][0]["plain_text"]
+    assert title == "My Heading"
+
+
+def test_wrap_inlines_body_markdown_on_entity_for_synth_bypass() -> None:
+    """Synth-only bypass: entity carries pre-rendered body_markdown so the
+    prod handler can populate document body without Notion API hydration."""
+    doc = _make_notion_doc(text="## Section\n\nSome paragraph content.")
+    payload = json.loads(wrap(doc))
+    body_md = payload["entity"]["body_markdown"]
+    assert "## Section" in body_md
+    assert "Some paragraph content." in body_md
