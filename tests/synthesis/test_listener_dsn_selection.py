@@ -10,43 +10,45 @@ prefer `settings.database_url_unpooled` when set, else fall back to
 `settings.database_url`. The fallback keeps local dev (no pooler) and
 any pre-pooler deploys working without forcing a config var on every
 caller.
+
+Implementation note: we instantiate `Settings()` directly inside each
+test rather than going through `get_settings()` (which is lru_cache'd)
+or `importlib.reload`. Both of those pollute global state and cascade
+into other tests in this suite — the prior version of this file did
+`importlib.reload(config)` and broke unrelated webhook + synthesis
+tests on main. A bare `Settings()` reads env on construction without
+touching module caches, so monkeypatch is fully isolated to this test.
 """
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
 
-from shared import config
+from shared.config import Settings
 
 
-@pytest.fixture
-def fresh_settings(monkeypatch):
-    """Each test gets a freshly-rebuilt Settings instance from env."""
-
-    def _build(env: dict[str, str]) -> config.Settings:
-        for k, v in env.items():
-            monkeypatch.setenv(k, v)
-        # Bust the lru_cache around get_settings.
-        importlib.reload(config)
-        return config.get_settings()
-
-    return _build
-
-
-def test_database_url_unpooled_defaults_to_none(fresh_settings, monkeypatch):
+@pytest.fixture(autouse=True)
+def _isolate_env(monkeypatch):
+    """Strip any DSN env vars before each test so tests see only what
+    they explicitly set. Without this, a stray DATABASE_URL_UNPOOLED in
+    the dev shell or .env file could mask the field-default test.
+    """
+    monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL_UNPOOLED", raising=False)
-    s = fresh_settings({"DATABASE_URL": "postgresql://x:y@example/db"})
+    yield
+
+
+def test_database_url_unpooled_defaults_to_none():
+    s = Settings()
     assert s.database_url_unpooled is None
 
 
-def test_database_url_unpooled_picks_up_env(fresh_settings):
+def test_database_url_unpooled_picks_up_env(monkeypatch):
     pooled = "postgresql://x:y@ep-foo-pooler.region/db"
     direct = "postgresql://x:y@ep-foo.region/db"
-    s = fresh_settings(
-        {"DATABASE_URL": pooled, "DATABASE_URL_UNPOOLED": direct}
-    )
+    monkeypatch.setenv("DATABASE_URL", pooled)
+    monkeypatch.setenv("DATABASE_URL_UNPOOLED", direct)
+    s = Settings()
     assert s.database_url == pooled
     assert s.database_url_unpooled == direct
 
