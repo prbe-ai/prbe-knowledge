@@ -406,3 +406,53 @@ WIKI_TRIGGER_RATE_LIMIT_SECONDS = 300
 # the team's morning standup but doesn't compete with the rest of the
 # nightly pipeline (Granola steady-poll cycles, etc.).
 WIKI_NIGHTLY_HOUR_UTC = 2
+
+
+# ---------------------------------------------------------------------------
+# Wiki agent loop (v4: Gemini 3.1 Pro driving the synthesis stage)
+# ---------------------------------------------------------------------------
+
+# Hard cap on agent turns per drain. Picked at 200 to leave headroom for
+# pebble's ~3000-event drains; smaller customers typically finish in
+# 10-50 turns. Exceeding this cap halts the drain and DLQs the in-flight
+# rows; admin reset is the recovery path.
+WIKI_AGENT_TURN_CAP = 200
+
+# Hard cap on staged page updates per drain. The wiki is supposed to
+# move slowly — 30 page edits per night is generous. Exceeding this cap
+# means the agent is hallucinating page mass and we'd rather DLQ than
+# write 100 brand-new pages.
+WIKI_AGENT_UPDATE_CAP = 30
+
+# Stall threshold. If the agent makes no consequential tool call (no
+# page update / create / skip) for this many consecutive turns, halt.
+# Three turns is generous — one read-page, one read-event, one think.
+WIKI_AGENT_STALL_TURNS = 3
+
+# Auto-compaction trigger. When estimated input tokens cross this
+# fraction of Gemini 3.1 Pro's 2M context window, summarize the
+# conversation history (preserving structured runtime state) before
+# the next turn.
+WIKI_AGENT_COMPACT_THRESHOLD = 0.60
+
+# Number of triaged events per next_events() page. Gemini reads the
+# day in batches; the agent re-calls next_events() until drain_complete.
+WIKI_AGENT_BATCH_SIZE = 200
+
+# Maximum number of customer drains running simultaneously per
+# wiki-synthesis fly machine. Higher than per-customer concurrency (1
+# under advisory lock) so two small customers can drain in parallel
+# while pebble holds its own machine.
+WIKI_AGENT_GLOBAL_CONCURRENCY = 2
+
+# Gemini model used by the wiki agent loop. Triage stays Flash Lite;
+# only the agent uses Pro because per-cluster reasoning + cross-event
+# pattern recognition need the bigger model.
+WIKI_AGENT_MODEL = "gemini-3.1-pro-preview"
+
+# Compactor model. Cheaper Flash variant since it only summarizes the
+# conversation; preserves the structured runtime state untouched.
+WIKI_AGENT_COMPACTOR_MODEL = "gemini-flash-lite-preview"
+
+# Agent's CachedContent TTL. Re-create on miss; alert if hit_rate < 80%.
+WIKI_AGENT_CACHE_TTL = "3600s"
