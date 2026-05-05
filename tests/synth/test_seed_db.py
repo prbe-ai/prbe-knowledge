@@ -4,7 +4,6 @@ locally. Uses the local MinIO at localhost:9000."""
 
 from __future__ import annotations
 
-import json
 import secrets
 from pathlib import Path
 
@@ -19,7 +18,7 @@ from shared.db import get_pool, raw_conn
 from shared.storage import ObjectStore
 
 
-CANONICAL_MINI = Path("tests/fixtures/canonical-mini")
+CANONICAL_MINI = Path(__file__).parent.parent / "fixtures" / "canonical-mini"
 
 
 async def _seed_customer(customer_id: str) -> None:
@@ -70,6 +69,7 @@ async def test_seed_idempotent(live_db):
     assert first.queued == 2
     # Second run: R2 PUT overwrites (uploaded > 0), queue ON CONFLICT skips.
     assert second.queued == 0
+    assert second.r2_uploaded == 2  # PUTs are unconditional; idempotent overwrite
 
 
 async def test_seed_missing_canonical_raises(live_db):

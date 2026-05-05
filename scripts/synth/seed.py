@@ -155,6 +155,16 @@ async def seed_tenant(
     Caller is responsible for gate checks (eligibility, typed-confirm,
     customer existence) — seed_tenant assumes you've done them.
 
+    Bucket creation: this function calls bucket.ensure_bucket() defensively
+    because customers created via prbe-backend signup do NOT run synth's
+    init_tenant (which is the usual creator of the R2 bucket). Calling
+    ensure_bucket() on an existing bucket is a no-op.
+
+    Canonical assumption: all envelopes under canonical_dir/raw/ must share
+    the same customer_id (captured from the first envelope walked). Mixed
+    canonical_id values across envelopes will silently produce incorrect
+    R2 keys for the second-and-later sources.
+
     Real schema deviations from plan pseudo-code:
     - Column is `source_system`, not `source`.
     - Payload column is `payload_s3_keys TEXT[]`, not `r2_key TEXT`.
@@ -208,6 +218,10 @@ async def seed_tenant(
         # payload_s3_keys is TEXT[] — wrap key in a list.
         # priority=100 matches schema DEFAULT and SynthDoc default.
         # version=1 matches IngestionWriter's convention for new rows.
+        # Mirrors IngestionWriter's INSERT contract verbatim — see
+        # scripts/synth/output/writer.py for the reference call site.
+        # version=1 (not the schema DEFAULT 0) matches the worker's CAS
+        # contract that expects rows to start at version >= 1.
         result = await db.execute(
             """
             INSERT INTO ingestion_queue
