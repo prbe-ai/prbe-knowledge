@@ -32,11 +32,34 @@ def _profile(customer_id: str = "cust-eval-test-01") -> Profile:
 
 
 def _mock_db() -> AsyncMock:
+    """Mock asyncpg.Pool.
+
+    init_tenant uses Pool.execute() directly. clean_tenant acquires a
+    Connection from the Pool via `async with pool.acquire() as conn` and
+    runs `async with conn.transaction()`, so the mock has to simulate
+    BOTH surfaces: pool-level execute (for init) AND a connection
+    yielded from acquire() with its own .execute() and .transaction()
+    (for clean). Tests inspect `db.execute` for init paths and the
+    same mock's connection-side execute for clean.
+    """
     db = AsyncMock()
+    # Pool-level execute (init_tenant calls this).
     db.execute = AsyncMock(return_value=None)
-    db.transaction = MagicMock()
-    db.transaction.return_value.__aenter__ = AsyncMock()
-    db.transaction.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    # Pool.acquire() returns an async context manager yielding a Connection.
+    # The Connection mock shares the SAME execute attribute as the Pool so
+    # tests can keep asserting against `db.execute` regardless of which
+    # call path used it. (This is a test-only conflation; real asyncpg
+    # gives you distinct objects.)
+    conn = AsyncMock()
+    conn.execute = db.execute
+    conn.transaction = MagicMock()
+    conn.transaction.return_value.__aenter__ = AsyncMock()
+    conn.transaction.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    db.acquire = MagicMock()
+    db.acquire.return_value.__aenter__ = AsyncMock(return_value=conn)
+    db.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
     return db
 
 

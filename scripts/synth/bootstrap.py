@@ -121,9 +121,14 @@ async def clean_tenant(customer_id: str, db, bucket: ObjectStore) -> None:
             f"refuse to clean non-synthetic customer: {customer_id!r}"
         )
 
-    async with db.transaction():
+    # asyncpg's Pool has .execute() (auto-acquires per call) but NOT
+    # .transaction() — transactions are scoped to a single Connection so
+    # every statement in them sees the same MVCC snapshot and rolls back
+    # together. Acquire a Connection from the Pool, then run the
+    # transaction on that one connection.
+    async with db.acquire() as conn, conn.transaction():
         for table in CUSTOMER_OWNED_TABLES:
-            await db.execute(
+            await conn.execute(
                 f"DELETE FROM {table} WHERE customer_id = $1",
                 customer_id,
             )
