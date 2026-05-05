@@ -23,9 +23,17 @@ A doc whose only candidate-pool entry is its metadata chunk (no content
 chunk surfaced from any retriever) is dropped — metadata-only ranking is
 too noisy to trust as the lone signal that this doc should be returned.
 
-Optional `recency_half_life_days` multiplies the per-doc combined score
-by exp(-ln2 * age_days / half_life). All chunks of a doc share
-`updated_at`, so decay shifts between-doc ranking only.
+Recency decay is always-on: every doc is multiplied by
+exp(-ln2 * age_days / half_life). Half-life resolution order:
+
+  1. Per-source override in SOURCE_HALF_LIFE_DAYS (e.g. claude_code/codex
+     at 7d for noisy transcript sources).
+  2. Caller-supplied `recency_half_life_days` if not None.
+  3. DEFAULT_RECENCY_HALF_LIFE_DAYS — universal baseline so backfilled
+     tenants don't surface stale year-old content at parity with fresh docs.
+
+All chunks of a doc share `updated_at`, so decay shifts between-doc ranking
+only.
 
 `sort` (deterministic time sort) is supported but the search pipeline no
 longer uses it — sort intent on the search path becomes amplified
@@ -41,6 +49,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from shared.constants import (
+    DEFAULT_RECENCY_HALF_LIFE_DAYS,
     RRF_K,
     SOURCE_HALF_LIFE_DAYS,
     SOURCE_SCORE_MULTIPLIERS,
@@ -131,14 +140,20 @@ def fuse(
     for doc_id, content_score in content_score_for_doc.items():
         combined_for_doc[doc_id] = content_score + metadata_score_for_doc.get(doc_id, 0.0)
 
-    # Per-source-system score multiplier (Change A) and per-source-system
-    # recency decay (Change C). Multiplier first so a brand-new claude_code
-    # doc still gets demoted; otherwise zero-decay at age=0 would bypass it.
-    # Per-source half-life beats the caller's global half-life when set, and
-    # applies even when the global is None — that's how claude_code decays
-    # in days without forcing other sources to.
+    # Per-source-system score multiplier (Change A) and recency decay
+    # (Change C). Multiplier first so a brand-new claude_code doc still gets
+    # demoted; otherwise zero-decay at age=0 would bypass it.
+    #
+    # Half-life resolution: per-source override > caller global > universal
+    # baseline. The baseline is always-on so backfilled tenants don't surface
+    # 8-12 month old docs ranked equally with fresh ones.
     ref_now = now or datetime.now(UTC)
     ln2 = math.log(2)
+    baseline_half_life = (
+        recency_half_life_days
+        if recency_half_life_days is not None
+        else DEFAULT_RECENCY_HALF_LIFE_DAYS
+    )
     for doc_id, combined in list(combined_for_doc.items()):
         chunk_id = best_content_for_doc[doc_id]
         hit = per_chunk_meta[chunk_id]
@@ -148,11 +163,10 @@ def fuse(
         if multiplier != 1.0:
             combined *= multiplier
 
-        half_life = SOURCE_HALF_LIFE_DAYS.get(source_system, recency_half_life_days)
-        if half_life is not None:
-            age_days = (ref_now - hit.updated_at).total_seconds() / 86400.0
-            if age_days >= 0:
-                combined *= math.exp(-ln2 * age_days / half_life)
+        half_life = SOURCE_HALF_LIFE_DAYS.get(source_system, baseline_half_life)
+        age_days = (ref_now - hit.updated_at).total_seconds() / 86400.0
+        if age_days >= 0:
+            combined *= math.exp(-ln2 * age_days / half_life)
 
         combined_for_doc[doc_id] = combined
 

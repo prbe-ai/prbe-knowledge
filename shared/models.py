@@ -252,9 +252,12 @@ class QueryRequest(BaseModel):
         default=None,
         gt=0,
         description=(
-            "If set, multiply each fused chunk's score by exp(-ln2 * age_days "
-            "/ half_life). Age uses documents.updated_at vs. now (UTC). "
-            "Off by default."
+            "Override the half-life used for recency decay. Each fused chunk "
+            "is multiplied by exp(-ln2 * age_days / half_life), where age uses "
+            "documents.updated_at vs. now (UTC). When unset, fusion falls back "
+            "to per-source overrides (e.g. claude_code/codex at 7d) or the "
+            "universal baseline (DEFAULT_RECENCY_HALF_LIFE_DAYS); decay is "
+            "always-on so backfilled tenants don't surface stale content."
         ),
     )
     entity_must_match: bool = Field(

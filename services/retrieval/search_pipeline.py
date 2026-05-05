@@ -135,7 +135,9 @@ async def run_search(
 
     # Recency half-life: caller's explicit value always wins. Otherwise
     # amplify when Haiku detected sort intent (the "most recent X about Y"
-    # case), else use whatever default the request carried (None → no decay).
+    # case). When neither applies we hand fusion None and it falls back to
+    # DEFAULT_RECENCY_HALF_LIFE_DAYS — the universal baseline keeps stale
+    # backfilled content from surfacing at parity with fresh docs.
     if req.recency_half_life_days is not None:
         effective_half_life: float | None = req.recency_half_life_days
     elif routed.sort:

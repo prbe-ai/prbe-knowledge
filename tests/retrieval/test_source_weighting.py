@@ -4,19 +4,22 @@ Two knobs covered:
   - SOURCE_SCORE_MULTIPLIERS — post-RRF score multiplier per source.
   - SOURCE_HALF_LIFE_DAYS — per-source recency half-life override.
 
-Multiplier applies first, then recency decay. Per-source half-life wins
-over the caller's global half_life_days, and applies even when the
-global is None — the whole point is that claude_code decays in days
-without forcing other sources to decay too.
+Multiplier applies first, then recency decay. Resolution order for
+half-life: per-source override > caller global > universal baseline
+(DEFAULT_RECENCY_HALF_LIFE_DAYS). Sources without an override still
+decay against the baseline so backfilled tenants don't surface stale
+year-old docs at parity with fresh ones; the per-source overrides exist
+to make noisy sources (claude_code/codex) decay *faster* than baseline.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from services.retrieval.fusion import fuse
-from shared.constants import SourceSystem
+from shared.constants import DEFAULT_RECENCY_HALF_LIFE_DAYS, SourceSystem
 
 _NOW = datetime(2026, 4, 28, tzinfo=UTC)
 
@@ -75,9 +78,10 @@ def test_claude_code_half_life_applies_when_global_none() -> None:
     assert abs(fused[0].score - expected) < 1e-9
 
 
-def test_non_claude_code_source_no_decay_when_global_none() -> None:
-    """A 7-day-old Slack hit gets full RRF score when no global half-life
-    is set — proves the per-source dict isolates CC from other sources."""
+def test_non_claude_code_source_uses_baseline_when_global_none() -> None:
+    """A 7-day-old Slack hit decays against the universal baseline when no
+    caller half-life is set — Slack has no per-source override so it rides
+    DEFAULT_RECENCY_HALF_LIFE_DAYS."""
     sl = FakeHit(
         chunk_id="sl",
         doc_id="d-sl",
@@ -85,7 +89,29 @@ def test_non_claude_code_source_no_decay_when_global_none() -> None:
         updated_at=_NOW - timedelta(days=7),
     )
     fused = fuse({"vector": [sl]}, top_k=10, now=_NOW)
-    assert abs(fused[0].score - 1.0 / 61) < 1e-9
+    expected_decay = math.exp(-math.log(2) * 7.0 / DEFAULT_RECENCY_HALF_LIFE_DAYS)
+    assert abs(fused[0].score - (1.0 / 61) * expected_decay) < 1e-9
+
+
+def test_per_source_override_beats_explicit_caller_global() -> None:
+    """Precedence: SOURCE_HALF_LIFE_DAYS override wins over a non-None caller
+    global. A 7-day-old CC hit decays at the 7d override, not the caller's 365d."""
+    cc = FakeHit(
+        chunk_id="cc",
+        doc_id="d-cc",
+        source_system=SourceSystem.CLAUDE_CODE.value,
+        updated_at=_NOW - timedelta(days=7),
+    )
+    fused = fuse(
+        {"vector": [cc]},
+        top_k=10,
+        recency_half_life_days=365,  # lenient caller value
+        now=_NOW,
+    )
+    # If the override is honored: multiplier=0.5 * decay=0.5 (one CC half-life) * 1/61.
+    # If the caller value were used instead: multiplier=0.5 * decay≈0.987 * 1/61 — much higher.
+    expected = 0.5 * 0.5 * (1.0 / 61)
+    assert abs(fused[0].score - expected) < 1e-9
 
 
 def test_multiplier_and_decay_apply_in_order() -> None:
@@ -128,18 +154,20 @@ def test_mixed_sources_claude_code_falls_below_slack() -> None:
 
 def test_unknown_source_system_uses_defaults() -> None:
     """Forward-compat: an unknown source_system gets multiplier=1.0 and
-    falls back to the caller's global half-life (or no decay if None)."""
+    falls back to the caller's global half-life (or the universal baseline
+    if no caller value is set)."""
     unknown = FakeHit(
         chunk_id="u",
         doc_id="d-u",
         source_system="unmapped_source",
         updated_at=_NOW - timedelta(days=14),
     )
-    # Global half-life unset → no decay, no multiplier → raw RRF.
+    # Global half-life unset → baseline decay applies, no multiplier.
     fused = fuse({"vector": [unknown]}, top_k=10, now=_NOW)
-    assert abs(fused[0].score - 1.0 / 61) < 1e-9
+    expected_decay = math.exp(-math.log(2) * 14.0 / DEFAULT_RECENCY_HALF_LIFE_DAYS)
+    assert abs(fused[0].score - (1.0 / 61) * expected_decay) < 1e-9
 
-    # Caller-provided global half-life applies to unknown sources.
+    # Caller-provided global half-life beats the baseline for unknown sources.
     fused2 = fuse(
         {"vector": [unknown]},
         top_k=10,

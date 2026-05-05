@@ -267,13 +267,23 @@ SOURCE_SCORE_MULTIPLIERS: dict[SourceSystem, float] = {
     SourceSystem.CODEX: 0.5,
 }
 
-# Per-source-system half-life (days) for recency decay applied after the
-# multiplier. Smaller = faster decay. Sources not listed fall back to the
-# caller-supplied global half_life_days, or no decay if that's None.
+# Baseline recency half-life (days) applied to every source. Smaller = faster
+# decay. Acts as the universal floor so backfilled tenants don't see 8-12 month
+# old docs ranked equally with last week's. Per-source overrides below win when
+# a source is noisier than baseline and needs faster decay.
+#
+# At 120d: a 4-month-old doc keeps 50% of its score, 8-month 25%, 12-month 12%.
+# Strongly-relevant old docs still win on raw signal; tied semantic matches go
+# to the fresher one.
+DEFAULT_RECENCY_HALF_LIFE_DAYS = 120.0
+
+# Per-source-system half-life (days) overrides for recency decay applied after
+# the multiplier. Smaller = faster decay. Sources not listed fall back to the
+# caller-supplied global half_life_days if set, else DEFAULT_RECENCY_HALF_LIFE_DAYS.
 #
 # Rationale: a CC session is a point-in-time scratchpad — by week two it's
-# almost always stale or contradicted by something authored elsewhere.
-# Slack/Linear/PR docs stay relevant for months by design.
+# almost always stale or contradicted by something authored elsewhere. Slack/
+# Linear/PR docs stay relevant for months and ride the baseline by design.
 SOURCE_HALF_LIFE_DAYS: dict[SourceSystem, float] = {
     SourceSystem.CLAUDE_CODE: 7.0,
     # CODEX transcripts are scratchpads with the same staleness curve as
