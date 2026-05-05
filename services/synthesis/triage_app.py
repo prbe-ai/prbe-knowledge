@@ -75,9 +75,17 @@ async def run_triage_app_forever() -> None:
     reclaim_loop = WikiReclaimLoop(max_attempts=WIKI_SYNTHESIS_MAX_ATTEMPTS)
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
+    # Bind on 0.0.0.0 to match services/ingestion/worker.py — Fly's
+    # `[[http_service.checks]]` health probe reaches the machine via
+    # IPv4, and on this Docker base image binding `::` doesn't accept
+    # IPv4 connections (kernel default `bindv6only=1` or runtime quirk).
+    # Result was every health check getting ECONNREFUSED until the
+    # 30-min hard limit hit and Fly SIGTERMed the machine. The wiki
+    # workers don't need 6PN-internal HTTP ingress (they're driven by
+    # pg_notify, not RPC), so IPv4-only is correct here.
     health_config = uvicorn.Config(
         _build_health_app(),
-        host="::",
+        host="0.0.0.0",
         port=health_port,
         log_config=None,
         lifespan="off",
