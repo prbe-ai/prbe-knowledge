@@ -126,7 +126,7 @@ async def _reset_terminal(conn, customer_id: str) -> int:
     preserved.
     """
     reset = await conn.fetchval(
-        f"""
+        """
         WITH reset AS (
             UPDATE wiki_synthesis_queue
             SET status = 'pending',
@@ -186,7 +186,7 @@ async def seed(
 
         terminal_pending = (
             await conn.fetchval(
-                f"""
+                """
                 SELECT count(*) FROM wiki_synthesis_queue
                 WHERE customer_id = $1
                   AND status = ANY($2::text[])
@@ -204,23 +204,22 @@ async def seed(
             reset = await _reset_terminal(conn, customer_id)
 
         run_id: int | None = None
-        if not dry_run and inserted > 0:
-            # Mark the onboarding-style mass enqueue. The dashboard
-            # reads this to surface "Wiki being generated, X events
-            # left." Backfill runs (reset_terminal) don't open a
-            # separate run row — the regular wake/scheduled run row
-            # the worker opens on next claim is enough audit.
-            if not reset_terminal:
-                run_id = await conn.fetchval(
-                    """
-                    INSERT INTO wiki_synthesis_runs
-                        (customer_id, kind, events_total, status)
-                    VALUES ($1, 'onboarding', $2, 'running')
-                    RETURNING run_id
-                    """,
-                    customer_id,
-                    inserted,
-                )
+        # Mark the onboarding-style mass enqueue. The dashboard reads
+        # this to surface "Wiki being generated, X events left."
+        # Backfill runs (reset_terminal) don't open a separate run
+        # row — the regular wake/scheduled run row the worker opens
+        # on next claim is enough audit.
+        if not dry_run and inserted > 0 and not reset_terminal:
+            run_id = await conn.fetchval(
+                """
+                INSERT INTO wiki_synthesis_runs
+                    (customer_id, kind, events_total, status)
+                VALUES ($1, 'onboarding', $2, 'running')
+                RETURNING run_id
+                """,
+                customer_id,
+                inserted,
+            )
 
         if not dry_run and notify and (inserted > 0 or reset > 0):
             await conn.execute(
