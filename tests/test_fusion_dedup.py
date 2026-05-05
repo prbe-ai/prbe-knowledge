@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from services.retrieval.dedup import cosine, dedupe
 from services.retrieval.fusion import fuse
+from shared.constants import DEFAULT_RECENCY_HALF_LIFE_DAYS
 
 _NOW = datetime(2026, 4, 24, tzinfo=UTC)
 
@@ -115,13 +117,15 @@ def test_fusion_recency_decay_skips_future_timestamps() -> None:
     assert by_chunk["future"] == 1.0 / 62
 
 
-def test_fusion_no_decay_when_half_life_unset() -> None:
-    week_old = FakeHit(
+def test_fusion_baseline_decay_applies_when_half_life_unset() -> None:
+    """No caller half-life and no per-source override → universal baseline
+    kicks in. A 365-day-old slack hit is decayed by exp(-ln2 * 365 / baseline)."""
+    year_old = FakeHit(
         chunk_id="old", doc_id="d", updated_at=_NOW - timedelta(days=365)
     )
-    fused = fuse({"vector": [week_old]}, top_k=10, now=_NOW)
-    # No decay → raw RRF score (rank 1 = 1/(60+1)).
-    assert abs(fused[0].score - 1.0 / 61) < 1e-12
+    fused = fuse({"vector": [year_old]}, top_k=10, now=_NOW)
+    expected_decay = math.exp(-math.log(2) * 365.0 / DEFAULT_RECENCY_HALF_LIFE_DAYS)
+    assert abs(fused[0].score - (1.0 / 61) * expected_decay) < 1e-12
 
 
 # ---------------------------------------------------------------------------
@@ -130,15 +134,20 @@ def test_fusion_no_decay_when_half_life_unset() -> None:
 
 
 def test_fusion_tie_breaks_on_updated_at_desc() -> None:
-    """Identical RRF score → later updated_at ranks first."""
+    """Identical RRF score → later updated_at ranks first.
+
+    Uses a `now` earlier than both timestamps so the clock-skew skip
+    suppresses baseline decay for both — keeping scores equal so the
+    secondary tie-break is what's actually under test.
+    """
     older = FakeHit(
         chunk_id="aaa", doc_id="d-old", updated_at=_NOW - timedelta(days=30)
     )
     newer = FakeHit(chunk_id="zzz", doc_id="d-new", updated_at=_NOW)
-    # Both rank 1 in their retriever → identical pre-sort score.
     fused = fuse(
         {"vector": [older], "bm25": [newer]},
         top_k=10,
+        now=_NOW - timedelta(days=60),
     )
     assert fused[0].chunk_id == "zzz"  # later updated_at wins
     assert fused[1].chunk_id == "aaa"
