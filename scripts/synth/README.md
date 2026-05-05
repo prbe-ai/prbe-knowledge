@@ -255,6 +255,77 @@ Drops every row across `CUSTOMER_OWNED_TABLES` (14 tables — `ingestion_queue`,
 **Hard guard:** refuses any `customer_id` that doesn't start with `cust-eval-` or
 `cust-synth-`. This is intentional — synth never touches real customer data.
 
+## Seeding a real-shape tenant (Plan 4 V1)
+
+For demoing Probe to a customer who hasn't connected real sources yet.
+Admin-triggered, costs ~$0 per seed (replays a canonical corpus, no LLM at
+seed time). The customer can never trigger this themselves.
+
+### One-time setup: record the canonical corpus
+
+(Already done if `scripts/synth/canonical/v1/raw/` is committed in this repo.
+Re-run only if you need to regenerate after a model upgrade or to capture
+new archetypes.)
+
+Choose or copy a profile from `scripts/synth/profiles/` and adjust its
+`customer_id` to `cust-eval-canonical-v1` before running:
+
+````bash
+python -m scripts.synth init --profile scripts/synth/profiles/<canonical-profile>.yml
+python -m scripts.synth run \
+    --profile scripts/synth/profiles/<canonical-profile>.yml \
+    --integrate --record-llm --archetypes standup,oncall \
+    --output-dir scripts/synth/canonical/v1/
+python -m scripts.synth clean --customer cust-eval-canonical-v1
+git add scripts/synth/canonical/v1/raw/
+git commit -m "chore(synth): refresh canonical v1 corpus"
+````
+
+### Per-customer seed: two valid paths
+
+**Path 1 — opt-in flag (recommended for any customer you'll seed more than once):**
+
+````bash
+python -m scripts.synth allow-seed --customer cust-prbe-acme-co
+python -m scripts.synth seed --customer cust-prbe-acme-co
+````
+
+The first command sets `customers.metadata.allow_synth_seed = true`. Once
+the flag is set, future re-seeds are a single `synth seed` call with no
+prompt.
+
+**Path 2 — escape hatch (one-off, no DB state change):**
+
+````bash
+python -m scripts.synth seed --customer cust-prbe-acme-co --allow-non-sandbox
+# Prompts: type "cust-prbe-acme-co" to confirm.
+````
+
+Use this for one-time seeds where you don't want to leave the metadata flag
+behind.
+
+### Cleanup caveat (V1)
+
+`synth clean --customer cust-prbe-acme-co` will refuse the customer (existing
+prefix gate stays — V1 does not extend `clean_tenant`). To wipe a real-shape
+tenant, you currently have to either:
+- Drop the customer row by hand via SQL (cascade deletes everything).
+- Wait for V2's surgical cleanup (`synth seed clear`) which will remove
+  only synth-tagged rows.
+
+For a customer that has connected real sources after being seeded, **do
+not** wipe — synth and real data are intermixed and there's no surgical
+removal in V1. This is a known V1 limitation; V2 adds per-row provenance
+tagging.
+
+### Gate failures
+
+`synth seed` exits non-zero on:
+- exit 2: customer not found, no path satisfied, or confirm mismatch
+- exit 1: canonical fixtures missing
+
+In all cases, no R2 or DB writes happen.
+
 ## Customer ID conventions
 
 | Prefix | Used by | Notes |
