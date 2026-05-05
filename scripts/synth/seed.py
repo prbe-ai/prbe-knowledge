@@ -75,3 +75,40 @@ async def set_allow_synth_seed(customer_id: str, db) -> None:
             f"customer {customer_id!r} not found in customers table; "
             f"create the tenant via prbe-backend signup first"
         )
+
+
+def _substitute_customer_id(
+    *,
+    payload: dict,
+    old_key: str,
+    old_id: str,
+    new_id: str,
+) -> tuple[dict, str]:
+    """Rewrite a canonical envelope's customer_id field and R2 key for
+    a target tenant.
+
+    V1 scope: only the top-level `customer_id` field on the payload is
+    rewritten. Nested references (e.g. thread_parent_id segments that
+    happen to contain the canonical customer_id) are left untouched —
+    no downstream consumer interprets them as customer_ids.
+
+    Idempotent: if old_id is not in old_key but payload has new_id,
+    the transformation was already applied; return unchanged.
+    Raises ValueError if old_id is not in old_key and payload doesn't
+    have new_id (malformed fixture).
+    """
+    new_payload = dict(payload)
+
+    if old_id not in old_key:
+        # Key was already substituted or is malformed
+        if new_payload.get("customer_id") == new_id:
+            # Already transformed, return as-is (idempotent)
+            return new_payload, old_key
+        # Malformed: old_id not in key and payload doesn't match new_id
+        raise ValueError(
+            f"old_id not found in R2 key: old_id={old_id!r}, old_key={old_key!r}"
+        )
+
+    new_payload["customer_id"] = new_id
+    new_key = old_key.replace(old_id, new_id)
+    return new_payload, new_key
