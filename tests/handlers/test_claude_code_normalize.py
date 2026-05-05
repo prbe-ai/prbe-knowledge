@@ -245,6 +245,38 @@ async def test_normalize_pulls_name_from_merged_events_on_finalize() -> None:
 
 
 @pytest.mark.asyncio
+async def test_normalize_uses_hydrated_batch_identity() -> None:
+    """Identity can come from later coalesced payloads, not event.raw_payload."""
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    hydrated = {
+        "session_id": "s-1",
+        "events": [{"line_no": 0, "raw": {}}],
+        "session_complete": False,
+        "cwd": "/tmp/p",
+        "employee_name": "Richard Wei",
+        "employee_email": "richard@prbe.ai",
+        "employee_hostname": "Richards-MacBook-Pro.local",
+    }
+
+    result = await c.normalize(ev, hydrated)
+
+    props = _person_props(result)
+    assert props["name"] == "Richard Wei"
+    assert props["email"] == "richard@prbe.ai"
+    assert props["hostname"] == "Richards-MacBook-Pro.local"
+
+    doc = _session_doc(result)
+    assert doc.title == (
+        "Richard Wei's (richard@prbe.ai) Claude Code session s-1 "
+        "(Richards-MacBook-Pro.local)"
+    )
+    assert doc.metadata["employee_name"] == "Richard Wei"
+    assert doc.metadata["employee_email"] == "richard@prbe.ai"
+    assert doc.metadata["employee_hostname"] == "Richards-MacBook-Pro.local"
+
+
+@pytest.mark.asyncio
 async def test_normalize_treats_empty_string_name_as_absent() -> None:
     """Empty strings must not land in properties — the
     LOWER(properties->>'name') index would otherwise hold a useless ''

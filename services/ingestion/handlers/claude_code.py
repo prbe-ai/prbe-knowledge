@@ -62,6 +62,10 @@ from shared.storage import get_store
 _FETCH_SUPP_R2_CONCURRENCY = 16
 
 
+def _nonempty_str(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 @register_connector(SourceSystem.CLAUDE_CODE)
 class ClaudeCodeConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.CLAUDE_CODE
@@ -189,6 +193,23 @@ class ClaudeCodeConnector(Connector):
 
         merged_events: list[dict[str, Any]] = []
         seen_line_nos: set[int] = set()
+        session_identity: dict[str, str] = {}
+
+        def _remember_payload_identity(payload: Mapping[str, Any]) -> None:
+            # In coalesced sessions, Normalizer.event.raw_payload is the
+            # oldest payload. A session that started before a gateway identity
+            # deploy can therefore have name/email/hostname only on later
+            # payloads. Keep the latest non-empty batch-level identity so
+            # normalize() can still render the live doc with human labels.
+            for key in (
+                "employee_id",
+                "employee_name",
+                "employee_email",
+                "employee_hostname",
+            ):
+                val = _nonempty_str(payload.get(key))
+                if val is not None:
+                    session_identity[key] = val
 
         def _ingest(obj: dict[str, Any]) -> None:
             """Append `obj` to merged_events, deduplicating by line_no when present."""
@@ -235,6 +256,7 @@ class ClaudeCodeConnector(Connector):
             payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else {}
             if not isinstance(payload, dict):
                 continue
+            _remember_payload_identity(payload)
             for obj in payload.get("events") or []:
                 if isinstance(obj, dict):
                     _ingest(obj)
@@ -258,6 +280,7 @@ class ClaudeCodeConnector(Connector):
             "events": merged_events,
             "session_complete": complete,
             "cwd": event.raw_payload.get("cwd"),
+            **session_identity,
         }
 
     async def normalize(
@@ -269,10 +292,22 @@ class ClaudeCodeConnector(Connector):
         events = hydrated.get("events") or []
         cwd = hydrated.get("cwd")
         complete = bool(hydrated.get("session_complete"))
-        employee_id = self._employee_id_from_event(event, events)
-        employee_name = self._employee_name_from_event(event, events)
-        employee_email = self._employee_email_from_event(event, events)
-        employee_hostname = self._employee_hostname_from_event(event, events)
+        employee_id = (
+            _nonempty_str(hydrated.get("employee_id"))
+            or self._employee_id_from_event(event, events)
+        )
+        employee_name = (
+            _nonempty_str(hydrated.get("employee_name"))
+            or self._employee_name_from_event(event, events)
+        )
+        employee_email = (
+            _nonempty_str(hydrated.get("employee_email"))
+            or self._employee_email_from_event(event, events)
+        )
+        employee_hostname = (
+            _nonempty_str(hydrated.get("employee_hostname"))
+            or self._employee_hostname_from_event(event, events)
+        )
 
         now = datetime.now(UTC)
         session_doc = self._build_session_doc(
