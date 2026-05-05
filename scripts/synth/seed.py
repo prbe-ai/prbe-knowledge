@@ -68,7 +68,8 @@ async def set_allow_synth_seed(customer_id: str, db) -> None:
         """,
         customer_id,
     )
-    affected = int(result.split()[-1]) if result.startswith("UPDATE ") else 0
+    parts = result.split()
+    affected = int(parts[-1]) if parts and parts[-1].isdigit() else 0
     if affected == 0:
         raise ValueError(
             f"customer {customer_id!r} not found in customers table; "
