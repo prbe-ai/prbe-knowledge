@@ -117,11 +117,16 @@ def upgrade() -> None:
                 u.name  AS u_name,
                 u.email AS u_email,
                 (
-                    SELECT it.device_metadata->>'hostname'
+                    -- NULLIF coerces empty-string hostnames to NULL so
+                    -- jsonb_strip_nulls drops them and the title's
+                    -- CASE WHEN ... IS NOT NULL skips the trailing " ()".
+                    -- Mirrors the Python handler's `if employee_hostname:`
+                    -- truthy check.
+                    SELECT NULLIF(it.device_metadata->>'hostname', '')
                     FROM integration_tokens it
                     WHERE it.customer_id = d.customer_id
                       AND it.device_id   = d.metadata->>'device_id'
-                      AND it.device_metadata->>'hostname' IS NOT NULL
+                      AND NULLIF(it.device_metadata->>'hostname', '') IS NOT NULL
                     ORDER BY it.updated_at DESC NULLS LAST
                     LIMIT 1
                 ) AS u_hostname
@@ -162,16 +167,23 @@ def upgrade() -> None:
     op.execute("ALTER TABLE graph_nodes NO FORCE ROW LEVEL SECURITY")
     op.execute(
         f"""
+        -- NOTE: no `it.source_system = 'claude_code'` filter here. The
+        -- verify_device_token endpoint auto-reconciles claude_code rows
+        -- to codex on first non-CC hit and never demotes; a user with one
+        -- laptop used for both CC and Codex ends up on a single
+        -- source_system=codex row, and filtering would give them no
+        -- hostname on their CC Person at all. Following migration 0028's
+        -- (name/email Lane B) pattern of source-agnostic lookup.
         WITH user_hostname AS (
             SELECT DISTINCT ON (it.customer_id, it.device_metadata->>'employee_id')
                 it.customer_id,
-                (it.device_metadata->>'employee_id') AS employee_id,
-                it.device_metadata->>'hostname'      AS hostname
+                (it.device_metadata->>'employee_id')         AS employee_id,
+                NULLIF(it.device_metadata->>'hostname', '')  AS hostname
             FROM integration_tokens it
             WHERE it.device_metadata ? 'hostname'
               AND it.device_metadata ? 'employee_id'
-              AND it.device_metadata->>'hostname'    IS NOT NULL
-              AND it.device_metadata->>'employee_id' IS NOT NULL
+              AND NULLIF(it.device_metadata->>'hostname', '')    IS NOT NULL
+              AND NULLIF(it.device_metadata->>'employee_id', '') IS NOT NULL
             ORDER BY
                 it.customer_id,
                 it.device_metadata->>'employee_id',
