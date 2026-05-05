@@ -305,15 +305,7 @@ async def test_write_persona_view_excludes_docs_after_first_emission(tmp_path: P
 
 @pytest.mark.asyncio
 async def test_write_logs_llm_call(tmp_path: Path) -> None:
-    import structlog
     import structlog.testing
-
-    # If an earlier test in the suite called shared.logging.configure_logging,
-    # structlog caches a filtering BoundLogger at INFO level (see
-    # cache_logger_on_first_use=True in shared/logging.py). LLMWriter logs at
-    # DEBUG, which then gets filtered before reaching capture_logs(). Reset
-    # so capture_logs can install its own processor chain at any level.
-    structlog.reset_defaults()
 
     prompts_dir = tmp_path / "prompts"
     prompts_dir.mkdir()

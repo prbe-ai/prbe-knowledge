@@ -164,7 +164,12 @@ class LLMWriter:
             temperature=0.0,
         )
 
-        log.debug(
+        # INFO (not DEBUG): every LLM call is an external-service event worth
+        # surfacing in synth-run observability without re-running with a
+        # debug filter. Volume is bounded (~10-80 lines per synth run
+        # depending on preset) — matches the pattern used elsewhere for
+        # outbound calls to Anthropic/OpenAI.
+        log.info(
             "llm_writer.write",
             source=source_val,
             emission_index=emission_index,
