@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING
 
+from shared.encryption import encrypt_token
 from shared.logging import get_logger
 
 if TYPE_CHECKING:
@@ -79,18 +80,29 @@ async def init_tenant(profile: Profile, db, bucket: ObjectStore) -> None:
     bucket_name = bucket.bucket_for(customer_id)
     await bucket.ensure_bucket(bucket_name)
 
+    # The worker decrypts integration_tokens.access_token_encrypted with the
+    # Fernet key from TOKEN_ENCRYPTION_KEY. Storing a literal placeholder
+    # ('synth-stub') breaks decrypt; encrypt with the active key so any caller
+    # that has the same key (the worker reading config) can round-trip it.
+    # The plaintext is meaningless — synth connectors never make outbound
+    # OAuth calls — but the bytes have to be valid Fernet ciphertext.
+    encrypted_stub = encrypt_token("synth-stub")
+
     for source in sources:
         await db.execute(
             """
             INSERT INTO integration_tokens
               (customer_id, source_system, access_token_encrypted, status)
-            VALUES ($1, $2, 'synth-stub', 'active')
+            VALUES ($1, $2, $3, 'active')
             ON CONFLICT (customer_id, source_system)
               WHERE device_id IS NULL
-            DO NOTHING
+            DO UPDATE SET
+              access_token_encrypted = EXCLUDED.access_token_encrypted,
+              status = 'active'
             """,
             customer_id,
             source,
+            encrypted_stub,
         )
 
     log.info("tenant_init_complete", customer_id=customer_id, sources=sources)
