@@ -1,6 +1,6 @@
 """Re-embed the metadata chunks for live Claude Code session documents.
 
-Companion to migration 0038_backfill_cc_doc_titles. The migration rewrites
+Companion to migration 0039_backfill_cc_doc_titles. The migration rewrites
 documents.title + identity metadata for live Claude Code session docs;
 this script picks up the change and re-embeds the synthetic kind='metadata'
 chunk for each so retrieval queries see the new identity-bearing text

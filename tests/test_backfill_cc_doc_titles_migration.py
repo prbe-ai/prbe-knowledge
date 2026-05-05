@@ -1,4 +1,4 @@
-"""Smoke test for migration 0038_backfill_cc_doc_titles.
+"""Smoke test for migration 0039_backfill_cc_doc_titles.
 
 Like its sibling test_backfill_cc_person_name_email_migration.py, this
 test loads the migration file by path and asserts the upgrade SQL has
@@ -23,12 +23,12 @@ _MIGRATION_PATH = (
     / "db"
     / "migrations"
     / "versions"
-    / "20260504_0038_backfill_cc_doc_titles.py"
+    / "20260504_0039_backfill_cc_doc_titles.py"
 )
 
 
 def _load_migration():
-    spec = importlib.util.spec_from_file_location("_mig_0038", str(_MIGRATION_PATH))
+    spec = importlib.util.spec_from_file_location("_mig_0039", str(_MIGRATION_PATH))
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -41,8 +41,8 @@ def test_migration_file_exists() -> None:
 
 def test_revision_chain() -> None:
     m = _load_migration()
-    assert m.revision == "0038_backfill_cc_doc_titles"
-    assert m.down_revision == "0037_cleanup_cc_superseded"
+    assert m.revision == "0039_backfill_cc_doc_titles"
+    assert m.down_revision == "0038_backfill_prefs_off"
 
 
 def test_revision_id_fits_alembic_version_column() -> None:

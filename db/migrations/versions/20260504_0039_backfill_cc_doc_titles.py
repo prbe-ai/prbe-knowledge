@@ -1,7 +1,7 @@
 """backfill claude_code session Document titles + identity metadata.
 
-Revision ID: 0038_backfill_cc_doc_titles
-Revises: 0037_cleanup_cc_superseded
+Revision ID: 0039_backfill_cc_doc_titles
+Revises: 0038_backfill_prefs_off
 Create Date: 2026-05-04
 
 NOTE: revision id kept under 32 chars because alembic_version.version_num
@@ -75,8 +75,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0038_backfill_cc_doc_titles"
-down_revision = "0037_cleanup_cc_superseded"
+revision = "0039_backfill_cc_doc_titles"
+down_revision = "0038_backfill_prefs_off"
 branch_labels = None
 depends_on = None
 
