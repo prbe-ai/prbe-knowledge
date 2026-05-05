@@ -596,7 +596,7 @@ CREATE TABLE wiki_synthesis_queue (
     -- Granola startedAt, Notion last_edited_time, fallback documents.created_at).
     -- Populated by Normalizer at insert. The wiki agent reads triaged events
     -- ordered by source_ts ASC to walk the day in time order.
-    source_ts               TIMESTAMPTZ NOT NULL,
+    source_ts               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     status                  TEXT NOT NULL DEFAULT 'pending',
     triage_score            REAL,
     triage_error            TEXT,

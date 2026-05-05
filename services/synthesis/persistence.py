@@ -13,7 +13,7 @@ two workers stay coherent on row-level state machine transitions:
     triaging ──[mark_batch_triage_error]──────> pending | failed
     triaged  ──[claim_triaged_rows]───────────> synthesizing  (attempts++)
     synthesizing ──[mark_synthesis_done]────────> done
-    synthesizing ──[mark_synthesis_skipped]─────> done (MANUAL_ENTRY guard, cluster cap)
+    synthesizing ──[mark_synthesis_skipped]─────> synthesis_skipped (agent skip / no-op rewrite)
     synthesizing ──[mark_verifier_rejected]─────> verifier_rejected (terminal)
     synthesizing ──[mark_synthesis_error]───────> triaged | failed (retry)
 
@@ -570,13 +570,14 @@ async def mark_synthesis_skipped(
     *,
     reason: str,
 ) -> None:
-    """Mark events 'done' without firing synthesis.
+    """Mark events as terminal-but-no-page-change.
 
-    Used when the synthesis worker declines to clobber a page (e.g.
-    MANUAL_ENTRY) or when the cluster cap drops oldest events. The
-    events still complete — they don't keep re-driving the cron — but
-    the audit trail records why no synthesis occurred via
-    synthesis_error.
+    Used by the wiki agent when (a) it explicitly skip_events()'d an
+    event as agent-reviewed-but-not-page-changing, or (b) the rewriter
+    no-op'd a cluster (should_rewrite=False). Status moves to
+    'synthesis_skipped' (terminal v4 state — distinct from 'done',
+    which means "page actually rewrote based on this event"). Reason
+    is captured in synthesis_error for the audit trail.
     """
     if not queue_ids:
         return
@@ -584,7 +585,7 @@ async def mark_synthesis_skipped(
         await conn.execute(
             """
             UPDATE wiki_synthesis_queue
-            SET status = 'done',
+            SET status = 'synthesis_skipped',
                 synthesis_run_id = $2,
                 synthesis_completed_at = NOW(),
                 synthesis_error = $3

@@ -262,7 +262,7 @@ async def test_tool_read_page_on_disk_returns_db_row(reset_db: None) -> None:
 
     received_at = datetime.now(UTC)
     payload = {
-        "wiki": {
+        "wiki_page": {
             "wiki_type": "decision",
             "slug": "ondisk",
             "title": "On Disk",

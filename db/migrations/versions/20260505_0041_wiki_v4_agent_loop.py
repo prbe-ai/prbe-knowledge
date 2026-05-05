@@ -83,7 +83,17 @@ def upgrade() -> None:
         "UPDATE wiki_synthesis_queue "
         "SET source_ts = enqueued_at WHERE source_ts IS NULL"
     )
-    op.alter_column("wiki_synthesis_queue", "source_ts", nullable=False)
+    # NOT NULL with a NOW() default. Normalizer passes source_ts
+    # explicitly (extracted from per-source metadata); the default is
+    # the safety net for any other path that inserts a queue row
+    # without going through Normalizer (admin scripts, the reclaim
+    # tests, opt-out fixtures, etc.).
+    op.alter_column(
+        "wiki_synthesis_queue",
+        "source_ts",
+        nullable=False,
+        server_default=sa.text("NOW()"),
+    )
 
     # 3. DLQ tracking columns.
     op.execute(
