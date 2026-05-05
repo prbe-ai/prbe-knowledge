@@ -311,6 +311,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clean.add_argument("--customer", required=True, type=str)
 
+    # allow-seed — Plan 4
+    allow_seed = sub.add_parser(
+        "allow-seed",
+        help="Toggle customers.metadata.allow_synth_seed=true for a real-shape tenant.",
+    )
+    allow_seed.add_argument("--customer", required=True, type=str)
+
     return parser
 
 
@@ -511,6 +518,29 @@ async def _clean_async(customer_id: str) -> int:
         return 0
     finally:
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# allow-seed — Plan 4
+# ---------------------------------------------------------------------------
+
+
+async def _allow_seed_async(args) -> int:
+    """CLI handler for `synth allow-seed`. Returns process exit code."""
+    from scripts.synth.seed import set_allow_synth_seed
+
+    pool, _bucket = await _open_db_and_bucket()
+    try:
+        try:
+            await set_allow_synth_seed(args.customer, pool)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    finally:
+        await pool.close()
+
+    print(f"metadata.allow_synth_seed=true for {args.customer}")
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +745,9 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 4
+
+    if args.cmd == "allow-seed":
+        return asyncio.run(_allow_seed_async(args))
 
     parser.error(f"unknown command: {args.cmd}")
     return 2
