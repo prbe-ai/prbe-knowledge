@@ -188,18 +188,25 @@ until the call has cleared everything else):
 
 1. **Customer not found** → `error: customer 'cust-X' not found in customers
    table; create the tenant via prbe-backend signup first`. Exit 2.
-2. **No path satisfied** (non-eval-prefix, no metadata flag, no
+2. **Canonical fixtures missing** (`scripts/synth/canonical/v1/raw/` empty
+   or absent) → `error: canonical corpus not found at <path>; generate it
+   first (see scripts/synth/README.md)`. Exit 1.
+3. **No path satisfied** (non-eval-prefix, no metadata flag, no
    `--allow-non-sandbox`) → `error: customer 'cust-X' is not seed-eligible.
-   Either run 'synth allow-seed cust-X' first, or pass --allow-non-sandbox
-   to seed one-off.` Exit 2.
-3. **Typed-confirm mismatch** → `error: confirmation mismatch; expected
-   'cust-X', got '<typed>'. No data written.` Exit 2.
-4. **Canonical fixtures missing** (`scripts/synth/canonical/v1/raw/` empty
-   or absent) → `error: canonical corpus not found at <path>. Generate it
-   first; see scripts/synth/README.md → "Recording the canonical corpus".`
-   Exit 1.
+   Either run 'synth allow-seed --customer cust-X' first, or pass
+   --allow-non-sandbox to seed one-off.` Exit 2.
+4. **Typed-confirm mismatch** → `error: confirmation mismatch; expected
+   'cust-X'. No data written.` Exit 2.
 
 All four exit before any R2 or Postgres write.
+
+Note: the canonical-missing check was promoted ahead of the eligibility/typed-
+confirm gates as a UX optimization — an operator using `--allow-non-sandbox`
+shouldn't be asked to type the customer_id back only to discover the canonical
+fixtures aren't present. The original spec ordering put canonical last; the
+implementation in `cli.py::_seed_async` (Task 8 + polish commit 9c70db4) moved
+it to slot 2. `seed_tenant` still raises `MissingCanonicalError` as
+defense-in-depth in case the dir disappears between the check and the walk.
 
 ### Partial-state recovery — idempotency carries the weight
 
