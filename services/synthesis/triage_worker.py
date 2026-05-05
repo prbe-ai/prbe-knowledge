@@ -178,14 +178,54 @@ class TriageWorker:
                 verdicts = await self._call_triage_batches(client, batches, customer_id)
                 events_triaged += len(verdicts)
 
+                # v4: every batch failed -> unrecoverable for this drain.
+                # DLQ all pending + triaging rows for the customer with a
+                # categorized reason so the dashboard surface and the
+                # admin reset endpoint can handle it. Distinguishing
+                # anthropic vs gemini vs timeout is best-effort; the
+                # broad reason "triage.batch_failure" is the safe fallback.
+                if batches and not verdicts:
+                    reason = self._classify_triage_failure(customer_id, batches)
+                    dlq_count = await persistence.dlq_customer_for_triage_failure(
+                        customer_id, reason=reason
+                    )
+                    log.warning(
+                        "triage_worker.dlq_customer",
+                        customer=customer_id,
+                        reason=reason,
+                        dlq_count=dlq_count,
+                    )
+                    run_status = "failed"
+                    run_error = reason
+                    return
+
                 events_kept += await self._apply_verdicts(
                     customer_id,
                     queue_rows,
                     verdicts,
                 )
         except Exception as exc:
+            # Unrecoverable customer-level crash (DB error, RLS issue,
+            # SDK setup failure). DLQ the whole pending+triaging slice
+            # and re-raise; the outer `_tick` catches it.
             run_status = "failed"
             run_error = str(exc)
+            try:
+                dlq_count = await persistence.dlq_customer_for_triage_failure(
+                    customer_id, reason=f"triage.crash: {type(exc).__name__}"
+                )
+                log.warning(
+                    "triage_worker.dlq_customer_on_crash",
+                    customer=customer_id,
+                    error=str(exc),
+                    error_class=type(exc).__name__,
+                    dlq_count=dlq_count,
+                )
+            except Exception:
+                # Best-effort DLQ. If the DB itself is gone, at least
+                # the run row will record the failure once we re-raise
+                # past the finally block.
+                log.exception("triage_worker.dlq_failed", customer=customer_id)
             raise
         finally:
             await persistence.close_run(
@@ -208,6 +248,27 @@ class TriageWorker:
                 events_triaged=events_triaged,
                 events_kept=events_kept,
             )
+
+    def _classify_triage_failure(
+        self,
+        customer_id: str,
+        batches: list[list[TriageInput]],
+    ) -> str:
+        """Best-effort classifier for the dlq_reason tag.
+
+        The provider-specific exception type is lost by the time we
+        reach this hook (per-batch errors are swallowed inside
+        _call_triage_batches). We log per batch; the reason string here
+        is the single tag the dashboard shows.
+        """
+        from shared.constants import WIKI_TRIAGE_MODEL
+
+        model = (WIKI_TRIAGE_MODEL or "").lower()
+        if model.startswith("gemini"):
+            return "triage.gemini"
+        if "haiku" in model or "claude" in model:
+            return "triage.anthropic"
+        return "triage.batch_failure"
 
     async def _call_triage_batches(
         self,
@@ -266,10 +327,12 @@ class TriageWorker:
         UPDATE'd in a single SQL statement that also fires the NOTIFY,
         all in one transaction — so the synthesis worker's listener
         cannot wake on rows that haven't committed yet.
+
+        v4: triage produces score-only verdicts. Below-threshold rows
+        are 'rejected'; at-or-above rows go to 'triaged' for the wiki
+        agent. The agent picks pages downstream.
         """
         triaged_verdicts: list[tuple[int, TriageVerdict]] = []
-        # Track which inputs we kept just for events_kept accounting; the
-        # synthesis worker re-reads triage_targets from the queue row.
         for row in queue_rows:
             qid = row["queue_id"]
             verdict = verdicts.get(qid)
@@ -279,7 +342,6 @@ class TriageWorker:
             if (
                 not verdict.important
                 or verdict.score < WIKI_TRIAGE_SCORE_THRESHOLD
-                or not verdict.targets
             ):
                 await persistence.mark_rejected(customer_id, qid, verdict)
                 continue

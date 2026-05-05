@@ -30,11 +30,16 @@ from services.synthesis.models import SynthesisInput, TriageInput, VerifierInput
 
 _TRIAGE_TOOL_NAME = "record_triage"
 
+# v4: triage is binary-ish gating. The cheap model only answers "could
+# this durably move a long-term company signal?" with a 0..10 score plus
+# a one-line reason. It no longer picks pages, slugs, or wiki types —
+# the downstream wiki agent (Gemini Pro) handles all taxonomy decisions
+# while reading the day in time order.
 _TRIAGE_TOOL: dict[str, Any] = {
     "name": _TRIAGE_TOOL_NAME,
     "description": (
-        "For each queued event, decide whether it should change the wiki "
-        "and which page(s) it belongs on."
+        "For each queued event, decide whether it could durably move a "
+        "long-term company signal. Score-only; do not reference pages."
     ),
     "input_schema": {
         "type": "object",
@@ -50,7 +55,10 @@ _TRIAGE_TOOL: dict[str, Any] = {
                     "properties": {
                         "important": {
                             "type": "boolean",
-                            "description": "Should this event change the wiki at all?",
+                            "description": (
+                                "Could this event durably move a long-term "
+                                "company signal? Default false."
+                            ),
                         },
                         "score": {
                             "type": "number",
@@ -63,44 +71,12 @@ _TRIAGE_TOOL: dict[str, Any] = {
                                 "company signal should score >= 7."
                             ),
                         },
-                        "targets": {
-                            "type": "array",
-                            "description": (
-                                "Wiki pages this event should land on. Empty "
-                                "for unimportant events. Multiple entries are "
-                                "allowed if the event genuinely affects more "
-                                "than one page."
-                            ),
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "wiki_type": {
-                                        "type": "string",
-                                        "enum": [
-                                            "service_card",
-                                            "decision",
-                                            "feature",
-                                            "runbook",
-                                        ],
-                                    },
-                                    "slug": {
-                                        "type": "string",
-                                        "pattern": "^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
-                                    },
-                                    "action": {
-                                        "type": "string",
-                                        "enum": ["create", "update"],
-                                    },
-                                },
-                                "required": ["wiki_type", "slug", "action"],
-                            },
-                        },
                         "reason": {
                             "type": "string",
                             "description": "One short sentence explaining the verdict.",
                         },
                     },
-                    "required": ["important", "score", "targets"],
+                    "required": ["important", "score"],
                 },
             }
         },
@@ -111,24 +87,18 @@ _TRIAGE_TOOL: dict[str, Any] = {
 
 def _triage_system(now: datetime) -> str:
     return (
-        "You are the triage editor for a team-wide engineering wiki. "
+        "You are the triage gate for an engineering wiki. "
         f"Today's date is {now.date().isoformat()}.\n\n"
-        "The wiki is a small, slow-moving knowledge base. Pages are "
-        'things like "auth runbook," "we adopted pgvector," "the '
-        'prbe-knowledge service architecture," "Q3 roadmap." A page '
-        "typically changes a few times a quarter, not a few times a "
-        "day. **Most events you see today will NOT change a wiki page.** "
-        "Default to rejecting; only flag events that materially shift a "
-        "long-term company signal.\n\n"
-        "Wiki types:\n"
-        "  - service_card: stable facts about a system or service "
-        "(owner, runtime, deploy target, SLOs).\n"
-        "  - decision: 'we decided to do X because Y' write-ups, "
-        "ADRs, RFCs.\n"
-        "  - feature: how a customer-visible capability is built and "
-        "intended to behave.\n"
-        "  - runbook: how to handle an operational situation "
-        "(incident, oncall, recurring task).\n\n"
+        "A downstream agent will read the events you flag and decide "
+        "which wiki pages (if any) to update. Your job is narrower: a "
+        "single binary-ish question per event:\n\n"
+        "    Could this event durably move a long-term company signal?\n\n"
+        "Long-term company signals are slow-moving facts: which "
+        "systems exist, who owns them, what decisions were made and "
+        "why, how to handle operational incidents, where the product is "
+        "headed. **Most events of any given day will NOT move one of "
+        "these signals.** Default to rejecting (low score); only flag "
+        "events that materially shift a long-term signal.\n\n"
         "**DO flag** (score >= 7):\n"
         "  - A decision was made and recorded ('we chose X over Y').\n"
         "  - A runbook step was added, changed, or invalidated.\n"
@@ -144,12 +114,9 @@ def _triage_system(now: datetime) -> str:
         "decision.\n"
         "  - A meeting that didn't conclude.\n"
         "  - A question + answer that doesn't generalize beyond one "
-        "person's confusion.\n"
-        "  - Anything that restates content already on an existing "
-        "wiki page.\n\n"
+        "person's confusion.\n\n"
         "Scoring rubric (0..10):\n"
-        "  - 0-2: noise (acks, status updates, restates existing "
-        "knowledge).\n"
+        "  - 0-2: noise (acks, status updates).\n"
         "  - 3-4: routine work (commits, ticket comments, ordinary "
         "reviews).\n"
         "  - 5-6: novel but ephemeral (a debug session, a one-off Q+A, "
@@ -159,10 +126,8 @@ def _triage_system(now: datetime) -> str:
         "  - 9-10: roadmap or company-direction shift (new product "
         "line, ownership change, system retirement, customer "
         "contract).\n\n"
-        "Slugs are lowercase a-z0-9 with single hyphens. If you propose "
-        "a new page, choose a slug that matches the topic, not the "
-        "current event (e.g. 'slack-backfill-stuck' not "
-        "'incident-2026-05-02')."
+        "Output: per-event score + one-line reason. Do not propose "
+        "page titles, slugs, or wiki types — that is the agent's job."
     )
 
 

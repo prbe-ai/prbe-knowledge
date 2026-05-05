@@ -35,20 +35,16 @@ class TriageInput(BaseModel):
     body_token_count: int
 
 
-class TriageTarget(BaseModel):
-    """One wiki page this event should land on, per the triage decision."""
-
-    wiki_type: Literal["service_card", "decision", "feature", "runbook"]
-    slug: str = Field(min_length=1, max_length=64)
-    action: Literal["create", "update"]
-
-
 class TriageVerdict(BaseModel):
-    """Per-event verdict produced by Haiku."""
+    """Per-event verdict produced by Flash Lite (or Haiku fallback).
+
+    v4: score-only. The downstream wiki agent decides which page (if
+    any) the event lands on after reading the day in time order; triage
+    no longer picks (wiki_type, slug).
+    """
 
     important: bool
     score: float = Field(ge=0.0, le=10.0)
-    targets: list[TriageTarget] = Field(default_factory=list)
     reason: str | None = Field(
         default=None,
         description="One sentence explaining the decision for the audit log.",

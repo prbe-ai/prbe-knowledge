@@ -84,24 +84,18 @@ def test_pack_minimum_50_token_charge() -> None:
 @pytest.mark.asyncio
 async def test_call_triage_round_trip() -> None:
     events = [_ev(1, 100), _ev(2, 100)]
+    # v4: triage produces score-only verdicts. No targets / wiki_type /
+    # slug — the wiki agent decides downstream.
     payload = {
         "verdicts": {
             "1": {
                 "important": True,
                 "score": 7.5,
-                "targets": [
-                    {
-                        "wiki_type": "runbook",
-                        "slug": "auth-failures",
-                        "action": "update",
-                    }
-                ],
                 "reason": "Auth incident",
             },
             "2": {
                 "important": False,
                 "score": 1.0,
-                "targets": [],
                 "reason": "Routine ack",
             },
         }
@@ -112,8 +106,10 @@ async def test_call_triage_round_trip() -> None:
     assert isinstance(out, TriageOutput)
     assert out.verdicts["1"].important is True
     assert out.verdicts["1"].score == pytest.approx(7.5)
-    assert out.verdicts["1"].targets[0].wiki_type == "runbook"
+    assert out.verdicts["1"].reason == "Auth incident"
     assert out.verdicts["2"].important is False
+    # No targets field on TriageVerdict in v4.
+    assert not hasattr(out.verdicts["1"], "targets")
 
 
 @pytest.mark.asyncio
@@ -143,7 +139,6 @@ async def test_call_triage_raises_on_validation_failure() -> None:
             "1": {
                 "important": True,
                 "score": "not-a-number",  # invalid
-                "targets": [],
             }
         }
     }

@@ -34,7 +34,7 @@ import asyncpg
 from services.ingestion.normalizer import fetch_body_from_chunks_for_version
 from services.synthesis.models import TriageInput, TriageVerdict
 from shared.constants import WIKI_SYNTHESIS_MAX_ATTEMPTS
-from shared.db import with_tenant
+from shared.db import raw_conn, with_tenant
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -44,7 +44,7 @@ __all__ = [
     "claim_pending_batch",
     "claim_triaged_rows",
     "close_run",
-    "cluster_kept_rows",
+    "dlq_customer_for_triage_failure",
     "fetch_bodies",
     "fetch_existing_page",
     "list_pending_customers",
@@ -61,7 +61,6 @@ __all__ = [
     "open_run",
     "reclaim_stuck_rows",
     "render_index_markdown",
-    "verdict_targets_json",
 ]
 
 
@@ -206,7 +205,7 @@ async def claim_pending_batch(customer_id: str, *, limit: int) -> list[asyncpg.R
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING queue_id, doc_id, doc_version, source_system, doc_type,
-                      attempts, triage_score, triage_targets
+                      attempts, triage_score, source_ts
             """,
             customer_id,
             limit,
@@ -216,14 +215,14 @@ async def claim_pending_batch(customer_id: str, *, limit: int) -> list[asyncpg.R
 async def claim_triaged_rows(customer_id: str, *, limit: int) -> list[asyncpg.Record]:
     """Claim up to `limit` triaged rows and flip them to 'synthesizing'.
 
-    Returns the rows along with their stored `triage_targets` JSON so the
-    synthesis worker can rebuild the cluster map without re-running
-    triage.
-
     Increments `attempts` so the synthesis-stage retry loop
-    (`mark_synthesis_error` → 'triaged' → re-claim) actually advances
+    (`mark_synthesis_error` -> 'triaged' -> re-claim) actually advances
     the counter and dead-letters at WIKI_SYNTHESIS_MAX_ATTEMPTS instead
     of looping forever and burning LLM spend.
+
+    v4: ordered by source_ts ASC, queue_id ASC so the wiki agent reads
+    the day in time order. The composite index ix_wsq_drain_cursor
+    backs this scan.
     """
     async with with_tenant(customer_id) as conn:
         return await conn.fetch(
@@ -236,12 +235,12 @@ async def claim_triaged_rows(customer_id: str, *, limit: int) -> list[asyncpg.Re
                 SELECT queue_id FROM wiki_synthesis_queue
                 WHERE customer_id = $1
                   AND status = 'triaged'
-                ORDER BY triage_completed_at NULLS FIRST, enqueued_at
+                ORDER BY source_ts, queue_id
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING queue_id, doc_id, doc_version, source_system, doc_type,
-                      attempts, triage_score, triage_targets
+                      attempts, triage_score, source_ts
             """,
             customer_id,
             limit,
@@ -395,13 +394,11 @@ async def mark_rejected(
             UPDATE wiki_synthesis_queue
             SET status = 'rejected',
                 triage_score = $2,
-                triage_targets = $3::jsonb,
                 triage_completed_at = NOW()
-            WHERE customer_id = $1 AND queue_id = $4
+            WHERE customer_id = $1 AND queue_id = $3
             """,
             customer_id,
             verdict.score,
-            verdict_targets_json(verdict),
             queue_id,
         )
 
@@ -417,13 +414,11 @@ async def mark_triaged(
             UPDATE wiki_synthesis_queue
             SET status = 'triaged',
                 triage_score = $2,
-                triage_targets = $3::jsonb,
                 triage_completed_at = NOW()
-            WHERE customer_id = $1 AND queue_id = $4
+            WHERE customer_id = $1 AND queue_id = $3
             """,
             customer_id,
             verdict.score,
-            verdict_targets_json(verdict),
             queue_id,
         )
 
@@ -444,28 +439,27 @@ async def mark_batch_triaged_and_notify(
     This function exists separately from `mark_triaged` so the per-row
     UPDATE pattern (used for one-off rejects / retries) doesn't accidentally
     fire a NOTIFY. NOTIFY only matters at batch boundaries.
+
+    v4: no longer writes triage_targets — the wiki agent picks pages
+    downstream by reading the day in time order.
     """
     if not triaged_verdicts:
         return
     queue_ids = [qid for qid, _ in triaged_verdicts]
     scores = [verdict.score for _, verdict in triaged_verdicts]
-    targets = [verdict_targets_json(verdict) for _, verdict in triaged_verdicts]
     async with with_tenant(customer_id) as conn:
         await conn.execute(
             """
             UPDATE wiki_synthesis_queue
             SET status = 'triaged',
                 triage_score = u.score,
-                triage_targets = u.targets::jsonb,
                 triage_completed_at = NOW()
-            FROM unnest($2::bigint[], $3::float[], $4::text[])
-                 AS u(qid, score, targets)
+            FROM unnest($2::bigint[], $3::float[]) AS u(qid, score)
             WHERE customer_id = $1 AND queue_id = u.qid
             """,
             customer_id,
             queue_ids,
             scores,
-            targets,
         )
         # NOTIFY in the same transaction as the UPDATE — Postgres holds
         # the notify in its queue until COMMIT, so the listener wakes
@@ -475,6 +469,42 @@ async def mark_batch_triaged_and_notify(
             notify_channel,
             customer_id,
         )
+
+
+async def dlq_customer_for_triage_failure(
+    customer_id: str,
+    *,
+    reason: str,
+) -> int:
+    """DLQ all pending + triaging rows for a customer after triage crash.
+
+    v4 halt policy: an unrecoverable batch failure (Anthropic outage,
+    Gemini outage, repeated parse error) parks the customer's whole
+    in-flight slice in DLQ. Admin reset (POST .../dlq/reset) flips
+    them back to pending.
+
+    Returns the number of rows DLQ'd. Does NOT use with_tenant because
+    wiki_synthesis_queue has RLS disabled (see migration 0034); the
+    explicit WHERE customer_id = $1 enforces the scoping.
+    """
+    async with raw_conn() as conn:
+        result = await conn.execute(
+            """
+            UPDATE wiki_synthesis_queue
+            SET status = 'dlq',
+                dlq_reason = $2,
+                dlq_at = NOW()
+            WHERE customer_id = $1
+              AND status IN ('pending', 'triaging')
+            """,
+            customer_id,
+            reason,
+        )
+    # asyncpg returns 'UPDATE N' as the command tag string.
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError):
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -648,34 +678,6 @@ async def fetch_existing_page(
     }
 
 
-def cluster_kept_rows(
-    kept_rows: list[tuple[dict[str, Any], TriageInput, TriageVerdict]],
-) -> dict[tuple[str, str], list[tuple[dict[str, Any], TriageInput]]]:
-    out: dict[tuple[str, str], list[tuple[dict[str, Any], TriageInput]]] = {}
-    for row, inp, verdict in kept_rows:
-        for target in verdict.targets:
-            key = (target.wiki_type, target.slug)
-            out.setdefault(key, []).append((row, inp))
-    return out
-
-
-def verdict_targets_json(verdict: TriageVerdict) -> str:
-    """Serialize triage_targets as a JSONB-friendly string."""
-    import orjson
-
-    return orjson.dumps(
-        {
-            "important": verdict.important,
-            "score": verdict.score,
-            "reason": verdict.reason,
-            "targets": [
-                {"wiki_type": t.wiki_type, "slug": t.slug, "action": t.action}
-                for t in verdict.targets
-            ],
-        }
-    ).decode("utf-8")
-
-
 # ---------------------------------------------------------------------------
 # Index regeneration
 # ---------------------------------------------------------------------------
@@ -743,8 +745,6 @@ async def reclaim_stuck_rows(
     migration 0034). The single statement covers both states + both
     branches via CASE so the sweep is one round-trip per cycle.
     """
-    from shared.db import raw_conn
-
     async with raw_conn() as conn:
         rows = await conn.fetch(
             """
