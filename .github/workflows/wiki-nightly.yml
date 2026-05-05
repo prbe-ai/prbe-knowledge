@@ -1,0 +1,40 @@
+name: wiki-nightly
+
+# Nightly trigger for wiki synthesis. Pinned to 02:00 UTC explicitly —
+# Fly's [[machines]] schedule = "daily" is too coarse (Fly picks the
+# fire hour). GitHub Actions cron is exact + auditable in the workflow
+# logs.
+#
+# Fires `flyctl machine run` against the prbe-knowledge-wiki-cron app
+# which executes services.synthesis.nightly_trigger:main — that script
+# selects opted-in customers with pending rows and pg_notify's the
+# wiki-worker app per customer.
+
+on:
+  schedule:
+    # 02:00 UTC daily. WIKI_NIGHTLY_HOUR_UTC=2 in shared/constants.py
+    # is the source-of-truth doc; this cron expression enforces it.
+    - cron: "0 2 * * *"
+  # Manual trigger for ops + testing.
+  workflow_dispatch:
+
+jobs:
+  fire-nightly-trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Run nightly_trigger on wiki-cron app
+        # `--rm` so the ephemeral machine cleans up after exit.
+        # `--command` overrides the toml's [processes].cron with the
+        # explicit module path — keeps the entry-point coupling local
+        # to this workflow.
+        run: |
+          flyctl machine run \
+            --app prbe-knowledge-wiki-cron \
+            --rm \
+            --command "python -m services.synthesis.nightly_trigger" \
+            --image registry.fly.io/prbe-knowledge-wiki-cron:latest
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

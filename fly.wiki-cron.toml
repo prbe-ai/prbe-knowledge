@@ -1,0 +1,34 @@
+app = "prbe-knowledge-wiki-cron"
+primary_region = "sjc"
+kill_signal = "SIGINT"
+kill_timeout = "10s"
+
+[build]
+  dockerfile = "services/worker/Dockerfile"
+
+[env]
+  ENVIRONMENT  = "main"
+  LOG_LEVEL    = "INFO"
+  SERVICE_NAME = "prbe-knowledge-wiki-cron"
+
+# One-shot script. Connects, fires pg_notify per opted-in customer with
+# pending rows, exits. The wiki-worker's NotifyListener picks up the
+# wake; the wiki-synthesis app picks up the triaged rows the worker
+# produces. Decoupled so a long pebble drain doesn't hold the cron
+# machine alive.
+[processes]
+  cron = "python -m services.synthesis.nightly_trigger"
+
+# Scheduling lives in .github/workflows/wiki-nightly.yml (cron expr
+# "0 2 * * *" UTC) which fires `flyctl machine run` against this app's
+# image. Fly's [[machines]] schedule = "daily" is coarse (Fly picks
+# the hour) and didn't enforce the 02:00 UTC rationale; GitHub Actions
+# cron is exact + auditable.
+
+# Tiny — script lives <60s. 256MB is generous for the asyncpg connect +
+# small SELECT + per-customer NOTIFY loop.
+[[vm]]
+  size      = "shared-cpu-1x"
+  memory    = "256mb"
+  count     = 1
+  processes = ["cron"]

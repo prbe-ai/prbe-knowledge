@@ -1,0 +1,48 @@
+app = "prbe-knowledge-wiki-synthesis"
+primary_region = "sjc"
+kill_signal = "SIGINT"
+kill_timeout = "60s"
+
+[build]
+  dockerfile = "services/worker/Dockerfile"
+
+[env]
+  ENVIRONMENT        = "main"
+  LOG_LEVEL          = "INFO"
+  SERVICE_NAME       = "prbe-knowledge-wiki-synthesis"
+  WORKER_HEALTH_PORT = "8082"
+
+[processes]
+  worker = "python -m services.synthesis.synthesis_app"
+
+[[restart]]
+  policy      = "always"
+  max_retries = 10
+
+[http_service]
+  internal_port        = 8082
+  force_https          = true
+  auto_stop_machines   = false
+  auto_start_machines  = true
+  min_machines_running = 1
+  processes            = ["worker"]
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval     = "15s"
+    method       = "GET"
+    timeout      = "5s"
+    path         = "/health"
+
+# 2 × 3GB. Verifier + synthesize each load the existing page body + the
+# cluster of triaged event bodies. WIKI_SYNTHESIS_CLUSTER_MAX_TOKENS is
+# capped at 180K (under Gemini Pro's $4/$18 tier boundary), but the
+# Normalizer._persist call also chunks + embeds the new wiki page
+# inline, holding ~430MB peak per concurrent cluster. Cluster fan-out
+# at WIKI_SYNTHESIS_CLUSTER_CONCURRENCY=5 gives ~2.1GB peak; 3GB leaves
+# OS+GC headroom. Resize to 4GB before pushing concurrency past 5.
+[[vm]]
+  size      = "shared-cpu-2x"
+  memory    = "3gb"
+  count     = 2
+  processes = ["worker"]

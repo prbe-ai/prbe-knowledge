@@ -40,7 +40,6 @@ from shared.constants import (
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
     NORMALIZER_VERSION,
-    WIKI_SYNTHESIZE_CHANNEL,
     SourceSystem,
 )
 from shared.customer_prefs import is_wiki_generation_enabled
@@ -257,16 +256,20 @@ class Normalizer:
                     )
                 await conn.execute(f"RELEASE SAVEPOINT {sp}")
 
-        # ---- Wiki-synthesis enqueue + wake ------------------------------
+        # ---- Wiki-synthesis enqueue (no NOTIFY) -------------------------
         # After Phase B's commit, append one row per persisted doc into
-        # wiki_synthesis_queue and pg_notify the synthesis cron. Skip when
-        # the source IS the wiki — otherwise the cron's own COMPILED_WIKI
-        # writes would feed back into its own queue. Also skip when the
-        # tenant has not opted into wiki generation: customers.preferences
-        # ['wiki_generation_enabled'] must be explicitly true. Default-off
-        # is fail-closed; matches the per-source enrichment opt-in posture
-        # in prbe-orchestrator. Wrapped so a queue failure logs a warning
-        # but does not fail an already-committed ingestion.
+        # wiki_synthesis_queue. Queue rows accumulate at status='pending'
+        # silently during the day — synthesis is nightly-only, driven by
+        # the wiki-cron fly app firing pg_notify('wiki_synthesize_pending')
+        # at 02:00 UTC, plus a manual trigger endpoint for the dashboard.
+        #
+        # Pre-redesign this path also fired pg_notify for each persisted
+        # doc, causing continuous daytime synthesis. Removed so the wiki
+        # behaves like the slow-moving knowledge base it's supposed to be.
+        #
+        # Skip when the source IS the wiki (cron's own COMPILED_WIKI
+        # writes must not feed back into its own queue). Also skip when
+        # the tenant has not opted into wiki generation.
         if (
             source_system != SourceSystem.WIKI
             and doc_ids
@@ -276,8 +279,8 @@ class Normalizer:
                 await self._enqueue_wiki_synthesis(customer_id, doc_ids)
             except Exception as exc:
                 # Boundary swallow: ingestion already committed, queue
-                # enqueue is best-effort. The defensive periodic cron tick
-                # picks up anything we missed.
+                # enqueue is best-effort. The nightly trigger picks up
+                # anything we missed.
                 log.warning(
                     "wiki.synthesis.enqueue_failed",
                     customer=customer_id,
@@ -312,7 +315,7 @@ class Normalizer:
         customer_id: str,
         doc_ids: list[str],
     ) -> None:
-        """Append a wiki_synthesis_queue row per persisted doc, then notify.
+        """Append a wiki_synthesis_queue row per persisted doc.
 
         Idempotent on `(customer_id, doc_id, doc_version)` — a redelivered
         webhook that re-persists the same content (same version) won't
@@ -320,6 +323,10 @@ class Normalizer:
         in-memory Document because `_upsert_document` mutates `doc.version`
         in place; we re-read to be defensive against future callers that
         skip that mutation.
+
+        Does NOT fire pg_notify — synthesis is nightly-batch via the
+        wiki-cron fly app, not realtime. See the comment block in
+        `_persist` for the why.
         """
         async with with_tenant(customer_id) as conn:
             await conn.execute(
@@ -337,13 +344,6 @@ class Normalizer:
                 """,
                 customer_id,
                 doc_ids,
-            )
-            # One notify per call regardless of doc count — the cron drains
-            # whatever's pending when it wakes.
-            await conn.execute(
-                "SELECT pg_notify($1, $2)",
-                WIKI_SYNTHESIZE_CHANNEL,
-                customer_id,
             )
 
     async def _plan_chunks(self, customer_id: str, doc: Document) -> _ChunkPlan:
@@ -540,6 +540,7 @@ class _ChunkPlan:
     `graph_nodes` upserts from concurrent workers to time out and DLQ.
     See incident 2026-04-29.
     """
+
     # Content-chunk hashes that already exist live → just bump last_seen_version.
     reused_content_hashes: set[str] = field(default_factory=set)
     # Metadata chunk's hash if it already exists live (singleton). None if no

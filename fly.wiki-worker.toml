@@ -1,0 +1,53 @@
+app = "prbe-knowledge-wiki-worker"
+primary_region = "sjc"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "services/worker/Dockerfile"
+
+[env]
+  ENVIRONMENT        = "main"
+  LOG_LEVEL          = "INFO"
+  SERVICE_NAME       = "prbe-knowledge-wiki-worker"
+  WORKER_HEALTH_PORT = "8082"
+
+[processes]
+  worker = "python -m services.synthesis.triage_app"
+
+# Same restart policy as the main worker — Fly should always bring this
+# back. Wake-on-NOTIFY means a transient DB reconnect during a deploy is
+# enough to exit non-zero, and without an explicit policy Fly leaves the
+# machine stopped until human intervention.
+[[restart]]
+  policy      = "always"
+  max_retries = 10
+
+# Health endpoint must stay up; auto_stop=false because the listener is
+# always supposed to be connected (no inbound HTTP to idle on).
+[http_service]
+  internal_port        = 8082
+  force_https          = true
+  auto_stop_machines   = false
+  auto_start_machines  = true
+  min_machines_running = 1
+  processes            = ["worker"]
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval     = "15s"
+    method       = "GET"
+    timeout      = "5s"
+    path         = "/health"
+
+# 4 × 1GB. Triage holds the in-flight Haiku/Flash-Lite batch (≤120K
+# input tokens) plus the per-batch fetch_bodies result. Memory peak per
+# customer drain is dominated by triage_inputs (FULL bodies, decoded
+# from chunks). 1GB gives headroom for two concurrent customer drains
+# at the WIKI_SYNTHESIS_CUSTOMER_CONCURRENCY=4 cap; bump if pebble
+# starts OOMing on a fresh nightly tick.
+[[vm]]
+  size      = "shared-cpu-1x"
+  memory    = "1gb"
+  count     = 4
+  processes = ["worker"]
