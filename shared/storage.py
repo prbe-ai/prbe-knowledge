@@ -180,19 +180,6 @@ class ObjectStore:
 
         return await asyncio.to_thread(_list)
 
-    async def delete(self, bucket: str, key: str) -> None:
-        """Delete a single object. Idempotent — silent on missing key."""
-        def _delete() -> None:
-            try:
-                self._client.delete_object(Bucket=bucket, Key=key)
-            except ClientError as exc:
-                code = exc.response.get("Error", {}).get("Code", "")
-                if code in {"NoSuchKey", "404"}:
-                    return
-                raise StorageUnavailable(f"delete_object failed: {exc}") from exc
-
-        await asyncio.to_thread(_delete)
-
 
 _store: ObjectStore | None = None
 
