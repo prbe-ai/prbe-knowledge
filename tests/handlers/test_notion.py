@@ -440,7 +440,7 @@ async def test_normalize_reads_entity_body_markdown_synth_bypass() -> None:
 
     doc = result.documents[0]
     assert doc.title == "Synth page"
-    assert "Body content from synth corpus." in doc.metadata["body"]
+    assert "Body content from synth corpus." in doc.body
     assert doc.body_size_bytes > 0
     assert doc.source_system == SourceSystem.NOTION
     assert doc.author_id == "unknown"  # no hydration → no last_edited_by id
