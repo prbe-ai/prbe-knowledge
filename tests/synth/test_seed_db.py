@@ -78,3 +78,62 @@ async def test_seed_missing_canonical_raises(live_db):
     bucket = ObjectStore()
     with pytest.raises(MissingCanonicalError):
         await seed_tenant(cid, Path("/tmp/does-not-exist"), get_pool(), bucket)
+
+
+# ---------------------------------------------------------------------------
+# Gate-failure tests — Task 8 (invoke CLI via subprocess)
+# ---------------------------------------------------------------------------
+
+import subprocess
+
+
+def test_cli_seed_missing_customer(live_db):
+    result = subprocess.run(
+        ["python", "-m", "scripts.synth", "seed",
+         "--customer", "cust-prbe-doesnotexist-zzz"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "not found" in result.stderr
+
+
+async def test_cli_seed_no_path_satisfied(live_db):
+    cid = f"cust-prbe-test-nopath-{secrets.token_hex(4)}"
+    await _seed_customer(cid)  # inserted without metadata flag
+    result = subprocess.run(
+        ["python", "-m", "scripts.synth", "seed", "--customer", cid],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "not seed-eligible" in result.stderr
+    rows = await _queue_rows(cid)
+    assert rows == []
+
+
+async def test_cli_seed_confirm_mismatch(live_db):
+    cid = f"cust-prbe-test-confirm-{secrets.token_hex(4)}"
+    await _seed_customer(cid)
+    result = subprocess.run(
+        ["python", "-m", "scripts.synth", "seed",
+         "--customer", cid, "--allow-non-sandbox"],
+        input="wrong-customer-id\n",
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 2
+    assert "confirmation mismatch" in result.stderr
+    rows = await _queue_rows(cid)
+    assert rows == []
+
+
+async def test_cli_seed_canonical_missing(live_db):
+    # Eval prefix bypasses Path 1 / Path 2 gates; the canonical-missing
+    # check fires next.
+    cid = "cust-eval-test-can-missing"
+    await _seed_customer(cid)
+    result = subprocess.run(
+        ["python", "-m", "scripts.synth", "seed",
+         "--customer", cid, "--canonical-dir", "/tmp/nope-dir"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 1
+    assert "canonical corpus not found" in result.stderr
