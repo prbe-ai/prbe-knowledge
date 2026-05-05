@@ -98,6 +98,10 @@ class DeviceVerifyTokenResponse(BaseModel):
     employee_id: str
     device_id: str
     status: str
+    # Hostname surfaces the human-readable machine label so the gateway
+    # (prbe-backend) can forward it on the webhook envelope. Optional —
+    # devices registered before hostname capture won't carry one.
+    hostname: str | None = None
 
 
 class DeviceCustomerOnlyRequest(BaseModel):
@@ -234,12 +238,14 @@ async def verify_device_token(
             status_code=500,
             detail="device row is missing employee_id metadata",
         )
+    hostname = metadata.get("hostname") if isinstance(metadata, dict) else None
 
     return DeviceVerifyTokenResponse(
         customer_id=row["customer_id"],
         employee_id=employee_id,
         device_id=row["device_id"],
         status=row["status"],
+        hostname=hostname,
     )
 
 

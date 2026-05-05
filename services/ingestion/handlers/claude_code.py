@@ -270,6 +270,9 @@ class ClaudeCodeConnector(Connector):
         cwd = hydrated.get("cwd")
         complete = bool(hydrated.get("session_complete"))
         employee_id = self._employee_id_from_event(event, events)
+        employee_name = self._employee_name_from_event(event, events)
+        employee_email = self._employee_email_from_event(event, events)
+        employee_hostname = self._employee_hostname_from_event(event, events)
 
         now = datetime.now(UTC)
         session_doc = self._build_session_doc(
@@ -277,27 +280,30 @@ class ClaudeCodeConnector(Connector):
             session_id=session_id,
             cwd=cwd,
             employee_id=employee_id,
+            employee_name=employee_name,
+            employee_email=employee_email,
+            employee_hostname=employee_hostname,
             events=events,
             complete=complete,
             now=now,
         )
 
         documents: list[Document] = [session_doc]
-        # Stamp employee_name + employee_email on the Person node when the
-        # gateway provided them. These power name-keyed graph filters via
-        # idx_graph_nodes_lower_props_name; without them, queries like
-        # "Richard's claude code session" find no Person row whose
-        # properties->>'name' matches and fall through to nothing.
-        # Absent (not None/empty) keys mean "no value" — don't index empty
-        # strings, since the LOWER(properties->>'name') index would
-        # otherwise hold a useless "" entry per employee.
+        # Stamp employee_name + employee_email + hostname on the Person
+        # node when the gateway provided them. name/email power
+        # name-keyed graph filters via idx_graph_nodes_lower_props_name;
+        # hostname rides along so dashboard queries can disambiguate
+        # multi-device users. Absent (not None/empty) keys mean
+        # "no value" — never index empty strings, since the
+        # LOWER(properties->>'name') index would otherwise hold a useless
+        # "" entry per employee.
         person_props: dict[str, Any] = {"employee_id": employee_id}
-        employee_name = self._employee_name_from_event(event, events)
-        employee_email = self._employee_email_from_event(event, events)
         if employee_name:
             person_props["name"] = employee_name
         if employee_email:
             person_props["email"] = employee_email
+        if employee_hostname:
+            person_props["hostname"] = employee_hostname
 
         graph_nodes: list[GraphNodeSpec] = [
             GraphNodeSpec(
@@ -355,6 +361,9 @@ class ClaudeCodeConnector(Connector):
                     event=event,
                     parent=session_doc,
                     employee_id=employee_id,
+                    employee_name=employee_name,
+                    employee_email=employee_email,
+                    employee_hostname=employee_hostname,
                     doc_type=DocType.CLAUDE_CODE_QA,
                     unit_kind="qa",
                     idx=idx,
@@ -373,6 +382,9 @@ class ClaudeCodeConnector(Connector):
                     event=event,
                     parent=session_doc,
                     employee_id=employee_id,
+                    employee_name=employee_name,
+                    employee_email=employee_email,
+                    employee_hostname=employee_hostname,
                     doc_type=DocType.CLAUDE_CODE_CODE_CHANGE,
                     unit_kind="code_change",
                     idx=idx,
@@ -392,6 +404,9 @@ class ClaudeCodeConnector(Connector):
                     event=event,
                     parent=session_doc,
                     employee_id=employee_id,
+                    employee_name=employee_name,
+                    employee_email=employee_email,
+                    employee_hostname=employee_hostname,
                     doc_type=DocType.CLAUDE_CODE_DECISION,
                     unit_kind="decision",
                     idx=idx,
@@ -414,6 +429,9 @@ class ClaudeCodeConnector(Connector):
                     event=event,
                     parent=session_doc,
                     employee_id=employee_id,
+                    employee_name=employee_name,
+                    employee_email=employee_email,
+                    employee_hostname=employee_hostname,
                     doc_type=DocType.CLAUDE_CODE_FILE_REF,
                     unit_kind="file_ref",
                     idx=idx,
@@ -507,6 +525,24 @@ class ClaudeCodeConnector(Connector):
                 return candidate
         return None
 
+    def _employee_hostname_from_event(
+        self,
+        event: WebhookEvent,
+        merged_events: list[dict[str, Any]] | None = None,
+    ) -> str | None:
+        # Optional. Gateway (prbe-backend PR #2 lane B) injects this from
+        # the device's registered hostname so the human-readable machine
+        # label rides along with each event. Same finalize-fallback shape
+        # as _employee_name_from_event / _employee_email_from_event.
+        val = event.raw_payload.get("employee_hostname")
+        if isinstance(val, str) and val:
+            return val
+        for e in (merged_events or []):
+            candidate = e.get("employee_hostname")
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return None
+
     def _acl(self, employee_id: str) -> ACLSnapshot:
         return ACLSnapshot(
             principals=[
@@ -526,6 +562,9 @@ class ClaudeCodeConnector(Connector):
         session_id: str,
         cwd: str | None,
         employee_id: str,
+        employee_name: str | None,
+        employee_email: str | None,
+        employee_hostname: str | None,
         events: list[dict[str, Any]],
         complete: bool,
         now: datetime,
@@ -540,6 +579,32 @@ class ClaudeCodeConnector(Connector):
             first_content = raw.get("content", "") or ""
             if not isinstance(first_content, str):
                 first_content = ""
+        # Title format graceful-degrades through all 8 combinations of
+        # (name, email, hostname) presence. With nothing it falls back to
+        # the pre-Lane-B "Claude Code session XXXXXXXX" status quo.
+        title = _format_session_title(
+            short_id=session_id[:8],
+            name=employee_name,
+            email=employee_email,
+            hostname=employee_hostname,
+            kind=self._session_title_prefix,
+        )
+        # Identity keys land on metadata only when present — keeps JSONB
+        # null-free and matches the rest of the handler's "omit when
+        # absent" convention.
+        md: dict[str, Any] = {
+            "agent": self._agent_label,
+            "cwd": cwd,
+            "device_id": event.raw_payload.get("device_id"),
+            "session_complete": complete,
+            "event_count": len(events),
+        }
+        if employee_name:
+            md["employee_name"] = employee_name
+        if employee_email:
+            md["employee_email"] = employee_email
+        if employee_hostname:
+            md["employee_hostname"] = employee_hostname
         return Document(
             doc_id=doc_id,
             customer_id=event.customer_id,
@@ -550,7 +615,7 @@ class ClaudeCodeConnector(Connector):
             doc_type=DocType.CLAUDE_CODE_SESSION,
             content_type="application/json",
             content_hash=content_hash,
-            title=f"{self._session_title_prefix} {session_id[:8]}",
+            title=title,
             body_preview=first_content[:200],
             body_size_bytes=len(body_bytes),
             body_token_count=0,
@@ -559,13 +624,7 @@ class ClaudeCodeConnector(Connector):
             updated_at=now,
             valid_from=now,
             ingested_at=now,
-            metadata={
-                "agent": self._agent_label,
-                "cwd": cwd,
-                "device_id": event.raw_payload.get("device_id"),
-                "session_complete": complete,
-                "event_count": len(events),
-            },
+            metadata=md,
             # Body drives Normalizer._stringify_body -> chunker. Lives on the
             # transient Document.body field, never on metadata jsonb.
             body=rendered_body,
@@ -584,6 +643,9 @@ class ClaudeCodeConnector(Connector):
         event: WebhookEvent,
         parent: Document,
         employee_id: str,
+        employee_name: str | None,
+        employee_email: str | None,
+        employee_hostname: str | None,
         doc_type: DocType,
         unit_kind: str,
         idx: int,
@@ -595,6 +657,26 @@ class ClaudeCodeConnector(Connector):
         doc_id = f"{self._doc_id_prefix}:{event.customer_id}:{source_id}"
         body_bytes = body.encode("utf-8")
         content_hash = hashlib.sha256(body_bytes).hexdigest()
+        # Mirror the session-doc title shape so a unit doc surface like
+        # "Richard Wei's (richard@prbe.ai) decision 82861aa0 (Richards-Macbook-Pro)"
+        # — same identity-bearing prefix, with unit_kind substituted for
+        # the session-prefix so retrieval can rank both equally.
+        title = _format_session_title(
+            short_id=parent.source_id[:8],
+            name=employee_name,
+            email=employee_email,
+            hostname=employee_hostname,
+            kind=unit_kind,
+        )
+        # Identity keys land on metadata only when present — same
+        # "omit when absent" convention as the session doc above.
+        md = dict(metadata)
+        if employee_name:
+            md["employee_name"] = employee_name
+        if employee_email:
+            md["employee_email"] = employee_email
+        if employee_hostname:
+            md["employee_hostname"] = employee_hostname
         return Document(
             doc_id=doc_id,
             customer_id=event.customer_id,
@@ -605,7 +687,7 @@ class ClaudeCodeConnector(Connector):
             doc_type=doc_type,
             content_type="text/plain",
             content_hash=content_hash,
-            title=f"{unit_kind} from {parent.source_id[:8]}",
+            title=title,
             body_preview=body[:200],
             body_size_bytes=len(body_bytes),
             body_token_count=0,
@@ -615,7 +697,7 @@ class ClaudeCodeConnector(Connector):
             valid_from=now,
             ingested_at=now,
             parent_doc_id=parent.doc_id,
-            metadata=dict(metadata),
+            metadata=md,
             # body drives Normalizer._stringify_body -> chunker. Without it,
             # only the 200-char preview gets indexed and the unit's full
             # content (Q+A, code change, decision text, file ref) is lost.
@@ -632,6 +714,33 @@ class ClaudeCodeConnector(Connector):
         raise NotSupportedByConnector(
             "claude_code backfill happens client-side via the agent-tap daemon"
         )
+
+
+def _format_session_title(
+    short_id: str,
+    name: str | None,
+    email: str | None,
+    hostname: str | None,
+    kind: str = "Claude Code session",
+) -> str:
+    """Render the human-friendly identity-bearing Document title.
+
+    Builds something like:
+        "Richard Wei's (richard@prbe.ai) Claude Code session 82861aa0 (Richards-Macbook-Pro)"
+
+    Each identity field contributes only when present so all 8 combinations
+    of (name, email, hostname) presence/absence yield a sensible string.
+    With nothing extra it degrades to "Claude Code session 82861aa0", which
+    matches the pre-Lane-B status quo.
+
+    `kind` lets unit docs (decision/qa/code_change/file_ref) reuse the same
+    shape — they pass their unit_kind in place of "Claude Code session".
+    """
+    name_part = f"{name}'s " if name else ""
+    email_part = f"({email}) " if email else ""
+    base = f"{kind} {short_id}"
+    host_part = f" ({hostname})" if hostname else ""
+    return f"{name_part}{email_part}{base}{host_part}"
 
 
 def _events_to_text(events: list[dict[str, Any]]) -> str:
