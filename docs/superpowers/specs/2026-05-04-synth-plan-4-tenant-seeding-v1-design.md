@@ -53,13 +53,16 @@ No schema migrations. No new infra. The path through prbe-knowledge from
 
 Six pieces, all in `scripts/synth/` (plus README and tests):
 
-1. **Prefix-guard extension** in `scripts/synth/profile.py:42` (the
-   `_VALID_PREFIXES` tuple) and `scripts/synth/bootstrap.py:114-119` (the
-   `startswith` check inside `init_tenant`). The existing string match on
-   `cust-eval-`/`cust-synth-` also passes when
-   `customers.metadata.allow_synth_seed = true`. Implementation lifts the gate
-   into a small helper (`_is_seed_eligible(customer_id, metadata)`) used by both
-   call sites and unit-tested independently.
+1. **`is_seed_eligible(customer_id, metadata)` helper** in
+   `scripts/synth/bootstrap.py`. Returns True when the customer_id matches
+   `cust-eval-`/`cust-synth-` (existing rule, see `profile.py:42`
+   `_VALID_PREFIXES`) OR when `metadata.allow_synth_seed = true`. Pure
+   function — caller fetches metadata from the DB. Unit-tested independently.
+   Consumed only by the new `seed` flow (Component 4); existing `profile.py`
+   prefix check at line 81 stays prefix-only (it gates `run`/`init`, not
+   `seed`, and seed doesn't load profiles), and existing `clean_tenant`
+   prefix check at `bootstrap.py:119` stays prefix-only (V1 preserves clean
+   semantics; surgical clean is V2).
 
 2. **`--allow-non-sandbox` typed-confirmation flag** in `scripts/synth/cli.py`.
    Required for any `synth seed` against a non-eval-prefix tenant when the
