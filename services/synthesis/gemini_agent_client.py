@@ -9,7 +9,23 @@ This module wraps the production Gemini SDK with that contract. Stays
 out of the unit-test path (tests pass their own stub client into
 SynthesisWorker via llm_client=...).
 
-Reference shape (from google-genai==1.x):
+Critical Gemini constraint (caused v4 first-turn halt):
+
+    When a request sets `cached_content`, it MUST NOT also set
+    `system_instruction`, `tools`, or `tool_config`. The API rejects
+    that combination with a 400 ("CachedContent can not be used with
+    GenerateContent request setting system_instruction, tools or
+    tool_config"); the SDK surfaces it as a ValueError.
+
+    Tools/system_instruction live on the cache itself (they're set at
+    create_cache time). The per-call config only carries the *new*
+    user turn and the cache pointer.
+
+Second constraint: `contents` must be non-empty. On turn 0 the
+harness's conversation tail is `[]`, so we send a minimal nudge so
+the model takes its first turn against the cached seed.
+
+Reference shape (google-genai==1.x):
 
     client = google.genai.Client(api_key=...)
     cache = await client.aio.caches.create(
@@ -21,13 +37,11 @@ Reference shape (from google-genai==1.x):
             ttl="3600s",
         ),
     )
+    # WITH cache: tools/system_instruction omitted from per-call config.
     resp = await client.aio.models.generate_content(
         model="gemini-3.1-pro-preview",
-        contents=[...],
-        config=GenerateContentConfig(
-            cached_content=cache.name,
-            tools=[Tool(function_declarations=[...])],
-        ),
+        contents=[...],   # non-empty
+        config=GenerateContentConfig(cached_content=cache.name),
     )
 """
 
@@ -40,6 +54,47 @@ from shared.constants import WIKI_AGENT_CACHE_TTL, WIKI_AGENT_MODEL
 from shared.logging import get_logger
 
 log = get_logger(__name__)
+
+
+# Schema keys Gemini's strict OpenAPI subset rejects. Mirrors
+# `services/synthesis/providers.py:_GEMINI_REJECTED_SCHEMA_KEYS` so
+# any tool schema we hand to FunctionDeclaration is sanitized the
+# same way response_schemas are. `additionalProperties` and `$ref`
+# are the dangerous ones; the others are belt-and-suspenders for
+# older SDK versions that were stricter.
+_GEMINI_REJECTED_SCHEMA_KEYS: tuple[str, ...] = (
+    "additionalProperties",
+    "$ref",
+    "$schema",
+)
+
+
+# Nudge message used when the harness's conversation tail is empty
+# (turn 0 with a cache). The SDK requires `contents` to be non-empty
+# even when the entire context lives in the cache.
+_TURN_ZERO_NUDGE = "Begin the drain. Use the cached wiki index and manifest to decide your first action."
+
+
+def _strip_keys_recursive(value: Any, keys: tuple[str, ...]) -> Any:
+    """Recursively drop dict keys Gemini's Schema validator rejects."""
+    if isinstance(value, dict):
+        return {
+            k: _strip_keys_recursive(v, keys) for k, v in value.items() if k not in keys
+        }
+    if isinstance(value, list):
+        return [_strip_keys_recursive(v, keys) for v in value]
+    return value
+
+
+def _sanitize_parameters(parameters: dict[str, Any] | None) -> dict[str, Any]:
+    """Return a Gemini-safe copy of a tool's `parameters` schema.
+
+    Empty / None becomes `{"type": "object", "properties": {}}` so
+    FunctionDeclaration always has a valid schema.
+    """
+    if not parameters:
+        return {"type": "object", "properties": {}}
+    return _strip_keys_recursive(parameters, _GEMINI_REJECTED_SCHEMA_KEYS)
 
 
 class GeminiAgentClient:
@@ -83,7 +138,7 @@ class GeminiAgentClient:
             FunctionDeclaration(
                 name=t["name"],
                 description=t.get("description"),
-                parameters=t.get("parameters") or {"type": "object", "properties": {}},
+                parameters=_sanitize_parameters(t.get("parameters")),
             )
             for t in tools
         ]
@@ -105,6 +160,17 @@ class GeminiAgentClient:
         contents: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> dict[str, Any]:
+        """Issue one cached `generate_content` call.
+
+        When `cache_name` is set, tools/system_instruction live on the
+        cache; the per-call config carries ONLY the cache pointer.
+        Gemini rejects requests that set both `cached_content` and
+        `tools` (400 -> SDK ValueError -> tenacity exhaustion).
+
+        When `cache_name` is empty (cache creation failed; we logged
+        a warning and fell through), we pay full input cost AND have
+        to attach tools+system_instruction to every call ourselves.
+        """
         client = self._ensure_client()
         from google.genai.types import (
             FunctionDeclaration,
@@ -112,24 +178,31 @@ class GeminiAgentClient:
             Tool,
         )
 
-        function_decls = [
-            FunctionDeclaration(
-                name=t["name"],
-                description=t.get("description"),
-                parameters=t.get("parameters") or {"type": "object", "properties": {}},
-            )
-            for t in tools
+        # Gemini requires non-empty `contents`. Turn 0 with cache has
+        # an empty conversation tail (the seed lives in the cache);
+        # send a minimal nudge so the model takes its first turn.
+        effective_contents: list[Any] = list(contents) if contents else [
+            {"role": "user", "parts": [{"text": _TURN_ZERO_NUDGE}]}
         ]
-        kwargs: dict[str, Any] = {}
+
         if cache_name:
-            kwargs["cached_content"] = cache_name
-        config = GenerateContentConfig(
-            tools=[Tool(function_declarations=function_decls)],
-            **kwargs,
-        )
+            config = GenerateContentConfig(cached_content=cache_name)
+        else:
+            function_decls = [
+                FunctionDeclaration(
+                    name=t["name"],
+                    description=t.get("description"),
+                    parameters=_sanitize_parameters(t.get("parameters")),
+                )
+                for t in tools
+            ]
+            config = GenerateContentConfig(
+                tools=[Tool(function_declarations=function_decls)],
+            )
+
         resp = await client.aio.models.generate_content(
             model=self._model,
-            contents=contents,
+            contents=effective_contents,
             config=config,
         )
         return _extract_response(resp)
