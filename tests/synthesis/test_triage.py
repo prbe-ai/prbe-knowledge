@@ -45,35 +45,49 @@ def _tool_use_response(payload: dict) -> SimpleNamespace:
 
 def test_pack_tiny_events_fit_in_one_batch() -> None:
     events = [_ev(i, 100) for i in range(10)]
-    batches = pack_into_batches(events, budget=120_000)
+    batches, oversized = pack_into_batches(events, budget=150_000)
+    assert oversized == []
     assert len(batches) == 1
     assert [e.queue_id for e in batches[0]] == list(range(10))
 
 
 def test_pack_splits_when_budget_exceeded() -> None:
-    # 3 events at 50K tokens each = 150K. Budget 120K -> [50K+50K], [50K].
+    # Each event: 50_000 cl100k * 1.30 = 65_000 + 80 framing = 65_080
+    # estimated Anthropic tokens. Budget 150_000 - 2_000 overhead =
+    # 148_000 available -> [65_080 + 65_080 = 130_160], next event
+    # would push to 195_240 > 148_000, so it goes in a second batch.
     events = [_ev(i, 50_000) for i in range(3)]
-    batches = pack_into_batches(events, budget=120_000)
+    batches, oversized = pack_into_batches(events, budget=150_000)
+    assert oversized == []
     assert len(batches) == 2
     assert [e.queue_id for e in batches[0]] == [0, 1]
     assert [e.queue_id for e in batches[1]] == [2]
 
 
-def test_pack_oversized_event_gets_own_batch() -> None:
+def test_pack_oversized_event_is_dropped_not_packed() -> None:
+    # 200K cl100k * 1.30 = 260K Anthropic tokens — over the 150K
+    # OVERSIZED_EVENT_TOKENS cap. It cannot fit even alone; the packer
+    # surfaces it via the oversized list so the worker can DLQ it.
     events = [_ev(0, 10), _ev(1, 200_000), _ev(2, 10)]
-    batches = pack_into_batches(events, budget=120_000)
-    assert len(batches) == 3
-    assert batches[0][0].queue_id == 0
-    assert batches[1][0].queue_id == 1
-    assert batches[2][0].queue_id == 2
+    batches, oversized = pack_into_batches(events, budget=150_000)
+    assert len(oversized) == 1
+    assert oversized[0].queue_id == 1
+    # The two surviving small events fit in one batch.
+    assert len(batches) == 1
+    assert [e.queue_id for e in batches[0]] == [0, 2]
 
 
-def test_pack_minimum_50_token_charge() -> None:
-    # 100 zero-cost events shouldn't all collapse into one batch with budget 100;
-    # the 50-token-per-event floor forces splits.
+def test_pack_minimum_per_event_charge() -> None:
+    # Even zero-token bodies cost framing tokens (EVENT_FRAMING_TOKENS =
+    # 80) so 100 zero-byte events cannot collapse into one call when the
+    # budget is small.
     events = [_ev(i, 0) for i in range(100)]
-    batches = pack_into_batches(events, budget=100)
-    assert len(batches) >= 50  # at least 2 events per batch (100 budget / 50 floor)
+    # 100 events at min 80 each = 8_000 Anthropic tokens. With budget
+    # 1_000 available after overhead, that's 12+ batches.
+    batches, oversized = pack_into_batches(events, budget=3_000)
+    assert oversized == []
+    # available = 3_000 - 2_000 overhead = 1_000; per-event ~80 -> ~12 per batch.
+    assert len(batches) >= 8
 
 
 # ---------------------------------------------------------------------------
