@@ -1,13 +1,15 @@
-"""Provider Protocol dispatch tests.
+"""Provider Protocol dispatch tests for the triage stage.
 
-The triage / synthesis / verifier stages each select a provider via env
-var. These tests verify:
-  - default model names resolve to the Anthropic implementation.
-  - explicit `model_override` flips the dispatch.
+The triage stage selects a provider via the constant `WIKI_TRIAGE_MODEL`.
+v4 dropped the verifier + synthesis providers (the wiki agent uses
+Gemini directly via `services.synthesis.gemini_agent_client`); only
+the triage provider abstraction remains.
+
+These tests verify:
+  - default model name resolves to the Anthropic implementation.
+  - explicit `model_override` flips dispatch to Gemini Flash Lite.
   - unknown model names raise.
-  - the Protocol round-trip works for the Anthropic path with a mocked
-    AsyncAnthropic client (Gemini path is exercised separately if a real
-    GOOGLE_API_KEY is set; CI doesn't, so it stays a smoke test).
+  - Anthropic round-trip works with a mocked AsyncAnthropic client.
 """
 
 from __future__ import annotations
@@ -18,21 +20,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.synthesis.models import (
-    SynthesisInput,
-    TriageInput,
-    VerifierInput,
-)
+from services.synthesis.models import TriageInput
 from services.synthesis.providers import (
-    SynthesisParseError,
     TriageParseError,
-    VerifierParseError,
-    _AnthropicSynthesis,
     _AnthropicTriage,
-    _AnthropicVerifier,
-    get_synthesis_provider,
     get_triage_provider,
-    get_verifier_provider,
 )
 
 
@@ -75,37 +67,11 @@ def test_default_triage_provider_is_anthropic() -> None:
     assert isinstance(provider, _AnthropicTriage)
 
 
-def test_default_synthesis_provider_is_anthropic() -> None:
-    client = _mock_anthropic({})
-    provider = get_synthesis_provider(client)
-    assert isinstance(provider, _AnthropicSynthesis)
-
-
-def test_default_verifier_provider_is_anthropic() -> None:
-    client = _mock_anthropic({})
-    provider = get_verifier_provider(client)
-    assert isinstance(provider, _AnthropicVerifier)
-
-
 def test_triage_provider_dispatches_to_gemini_on_override() -> None:
     from services.synthesis.providers import _GeminiTriage
 
     provider = get_triage_provider(model_override="gemini-flash-lite-preview")
     assert isinstance(provider, _GeminiTriage)
-
-
-def test_synthesis_provider_dispatches_to_gemini_on_override() -> None:
-    from services.synthesis.providers import _GeminiSynthesis
-
-    provider = get_synthesis_provider(model_override="gemini-3.1-pro-preview")
-    assert isinstance(provider, _GeminiSynthesis)
-
-
-def test_verifier_provider_dispatches_to_gemini_on_override() -> None:
-    from services.synthesis.providers import _GeminiVerifier
-
-    provider = get_verifier_provider(model_override="gemini-3.1-pro-preview")
-    assert isinstance(provider, _GeminiVerifier)
 
 
 def test_unknown_triage_model_raises() -> None:
@@ -119,90 +85,13 @@ def test_anthropic_provider_requires_client() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Anthropic round-trips (verifier is the new path; triage/synthesis are
-# already covered in test_triage / test_synthesize but re-asserted at the
-# Protocol layer for symmetry)
+# Anthropic round-trip (Protocol-shape compatibility)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_anthropic_verifier_kept_subset_round_trip() -> None:
-    cluster = VerifierInput(
-        wiki_type="decision",
-        slug="x",
-        action="create",
-        events=[_ev(1, "doc:keep"), _ev(2, "doc:drop")],
-    )
-    client = _mock_anthropic(
-        {
-            "record_verifier_verdict": {
-                "kept_doc_ids": ["doc:keep"],
-                "rationale_per_doc": {
-                    "doc:keep": "states a decision",
-                    "doc:drop": "unrelated",
-                },
-            }
-        }
-    )
-    provider = get_verifier_provider(client)
-    out = await provider.verify(cluster, now=datetime.now(UTC))
-    assert out.kept_doc_ids == ["doc:keep"]
-    assert out.rationale_per_doc["doc:drop"] == "unrelated"
-
-
-@pytest.mark.asyncio
-async def test_anthropic_verifier_empty_kept_round_trip() -> None:
-    cluster = VerifierInput(
-        wiki_type="runbook",
-        slug="x",
-        action="update",
-        current_body="existing content",
-        events=[_ev(1)],
-    )
-    client = _mock_anthropic(
-        {
-            "record_verifier_verdict": {
-                "kept_doc_ids": [],
-                "drop_reason": "restates existing content",
-            }
-        }
-    )
-    provider = get_verifier_provider(client)
-    out = await provider.verify(cluster, now=datetime.now(UTC))
-    assert out.kept_doc_ids == []
-    assert out.drop_reason == "restates existing content"
-
-
-@pytest.mark.asyncio
-async def test_anthropic_verifier_raises_on_malformed_response() -> None:
-    cluster = VerifierInput(wiki_type="decision", slug="x", action="create", events=[_ev(1)])
-
-    # Response has a tool_use block but with the WRONG name — extractor
-    # should not find the verifier block and raise.
-    async def create(*, model: str, **kwargs):
-        return _tool_use("not_the_verifier_tool", {})
-
-    client = SimpleNamespace()
-    client.messages = SimpleNamespace(create=AsyncMock(side_effect=create))
-    provider = get_verifier_provider(client)
-    with pytest.raises(VerifierParseError):
-        await provider.verify(cluster, now=datetime.now(UTC))
-
-
-@pytest.mark.asyncio
-async def test_anthropic_synthesis_raises_on_validation_error() -> None:
-    cluster = SynthesisInput(wiki_type="decision", slug="x", action="create", events=[_ev(1)])
-    # body_markdown is required by SynthesisOutput; omit it.
-    client = _mock_anthropic(
-        {"render_wiki_page": {"title": "x", "summary": "x", "commit_message": "x"}}
-    )
-    provider = get_synthesis_provider(client)
-    with pytest.raises(SynthesisParseError):
-        await provider.synthesize(cluster, now=datetime.now(UTC))
-
-
-@pytest.mark.asyncio
 async def test_anthropic_triage_raises_on_validation_error() -> None:
+    """Provider parses tool input through Pydantic; missing fields raise."""
     client = _mock_anthropic({"record_triage": {"verdicts": {"1": {"important": True}}}})
     provider = get_triage_provider(client)
     with pytest.raises(TriageParseError):
