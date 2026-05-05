@@ -601,6 +601,10 @@ CREATE TABLE wiki_synthesis_queue (
     synthesis_run_id        BIGINT,
     synthesis_completed_at  TIMESTAMPTZ,
     synthesis_error         TEXT,
+    -- Stamped at claim time. ReclaimLoop sweeps stale rows back to the
+    -- prior state if attempts < cap, else to terminal 'failed' so ops
+    -- can investigate via the dashboard. See migration 0038.
+    heartbeat_at            TIMESTAMPTZ,
     CONSTRAINT uq_wsq_customer_doc_version UNIQUE (customer_id, doc_id, doc_version),
     CONSTRAINT ck_wsq_status CHECK (status IN (
         'pending','triaging','triaged','rejected',
@@ -611,10 +615,20 @@ CREATE TABLE wiki_synthesis_queue (
 CREATE INDEX idx_wsq_drain
     ON wiki_synthesis_queue (customer_id, status, enqueued_at);
 
+-- Reclaim only ever scans rows in 'triaging'/'synthesizing' — partial
+-- index keeps the sweep cheap as the queue's done/rejected tail grows.
+CREATE INDEX idx_wsq_heartbeat_reclaim
+    ON wiki_synthesis_queue (heartbeat_at)
+    WHERE status IN ('triaging', 'synthesizing');
+
 CREATE TABLE wiki_synthesis_runs (
     run_id          BIGSERIAL PRIMARY KEY,
     customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     kind            TEXT NOT NULL,
+    -- Discriminator: which worker wrote this run row. Triage and
+    -- synthesis each open their own run per drain; the status endpoint
+    -- filters stage='synthesis' for `last_run_pages_*`.
+    stage           TEXT NOT NULL DEFAULT 'synthesis',
     started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at     TIMESTAMPTZ,
     events_total    INT NOT NULL DEFAULT 0,
@@ -625,11 +639,15 @@ CREATE TABLE wiki_synthesis_runs (
     status          TEXT NOT NULL DEFAULT 'running',
     error           TEXT,
     CONSTRAINT ck_wsr_kind CHECK (kind IN ('onboarding','wake','scheduled')),
+    CONSTRAINT ck_wsr_stage CHECK (stage IN ('triage','synthesis')),
     CONSTRAINT ck_wsr_status CHECK (status IN ('running','complete','failed','partial'))
 );
 
 CREATE INDEX idx_wsr_customer
     ON wiki_synthesis_runs (customer_id, started_at DESC);
+
+CREATE INDEX idx_wsr_stage_started
+    ON wiki_synthesis_runs (customer_id, stage, started_at DESC);
 
 -- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.

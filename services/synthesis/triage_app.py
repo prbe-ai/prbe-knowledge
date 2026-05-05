@@ -20,9 +20,10 @@ from datetime import UTC, datetime
 import uvicorn
 
 from services.synthesis.listeners import NotifyListener
+from services.synthesis.reclaim import WikiReclaimLoop
 from services.synthesis.triage_worker import TriageWorker
 from shared.config import get_settings
-from shared.constants import WIKI_PENDING_CHANNEL
+from shared.constants import WIKI_PENDING_CHANNEL, WIKI_SYNTHESIS_MAX_ATTEMPTS
 from shared.db import init_pool
 from shared.logging import configure_logging, get_logger
 
@@ -71,6 +72,7 @@ async def run_triage_app_forever() -> None:
         log_prefix="triage_listener",
     )
     worker = TriageWorker(wake_event)
+    reclaim_loop = WikiReclaimLoop(max_attempts=WIKI_SYNTHESIS_MAX_ATTEMPTS)
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
     health_config = uvicorn.Config(
@@ -102,6 +104,7 @@ async def run_triage_app_forever() -> None:
         log.info("triage_app.shutdown_signal", signal=signame)
         listener.shutdown()
         worker.shutdown()
+        reclaim_loop.shutdown()
         health_server.should_exit = True
         if gather_future is not None and not gather_future.done():
             gather_future.cancel()
@@ -113,6 +116,7 @@ async def run_triage_app_forever() -> None:
     gather_future = asyncio.gather(
         listener.run(),
         worker.run(),
+        reclaim_loop.run(),
         health_server.serve(),
     )
     try:

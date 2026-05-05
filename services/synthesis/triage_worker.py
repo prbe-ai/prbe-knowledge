@@ -154,7 +154,7 @@ class TriageWorker:
         *,
         run_kind: str,
     ) -> None:
-        run_id = await persistence.open_run(customer_id, kind=run_kind)
+        run_id = await persistence.open_run(customer_id, kind=run_kind, stage="triage")
         log.info(
             "triage_worker.run_open",
             customer=customer_id,

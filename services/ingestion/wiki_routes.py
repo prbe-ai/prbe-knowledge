@@ -835,6 +835,9 @@ class SynthesisTriggerResponse(BaseModel):
 class SynthesisStatusResponse(BaseModel):
     pending_events: int
     triaged_events: int
+    in_flight_events: int
+    failed_events: int
+    verifier_rejected_events: int
     last_run_at: datetime | None
     last_run_status: str | None
     last_run_pages_updated: int | None
@@ -873,7 +876,7 @@ async def trigger_wiki_synthesis(
         last_run_row = await conn.fetchrow(
             """
             SELECT started_at FROM wiki_synthesis_runs
-            WHERE customer_id = $1
+            WHERE customer_id = $1 AND stage = 'synthesis'
             ORDER BY started_at DESC
             LIMIT 1
             """,
@@ -907,16 +910,27 @@ async def get_wiki_synthesis_status(
 ) -> SynthesisStatusResponse:
     """Counts + last-run summary for the dashboard status badge.
 
-    No write side effects. Reads `wiki_synthesis_queue` for current
-    pending/triaged counts, and the latest `wiki_synthesis_runs` row for
-    last-run summary.
+    No write side effects. Reads `wiki_synthesis_queue` for per-status
+    counts (covers all 8 states so the dashboard can surface stuck /
+    failed / verifier-rejected backlogs), and the latest synthesis-stage
+    `wiki_synthesis_runs` row for last-run pages_*. The `stage` filter
+    matters because the triage worker also opens its own run row per
+    drain — those rows have pages_updated/pages_created=0 by design and
+    would flap the dashboard if surfaced.
     """
     async with raw_conn() as conn:
         counts = await conn.fetchrow(
             """
             SELECT
                 COUNT(*) FILTER (WHERE status = 'pending') AS pending,
-                COUNT(*) FILTER (WHERE status = 'triaged') AS triaged
+                COUNT(*) FILTER (WHERE status = 'triaged') AS triaged,
+                COUNT(*) FILTER (
+                    WHERE status IN ('triaging', 'synthesizing')
+                ) AS in_flight,
+                COUNT(*) FILTER (WHERE status = 'failed') AS failed,
+                COUNT(*) FILTER (
+                    WHERE status = 'verifier_rejected'
+                ) AS verifier_rejected
             FROM wiki_synthesis_queue
             WHERE customer_id = $1
             """,
@@ -926,7 +940,7 @@ async def get_wiki_synthesis_status(
             """
             SELECT started_at, status, pages_updated, pages_created
             FROM wiki_synthesis_runs
-            WHERE customer_id = $1
+            WHERE customer_id = $1 AND stage = 'synthesis'
             ORDER BY started_at DESC
             LIMIT 1
             """,
@@ -935,6 +949,9 @@ async def get_wiki_synthesis_status(
     return SynthesisStatusResponse(
         pending_events=int(counts["pending"] or 0) if counts else 0,
         triaged_events=int(counts["triaged"] or 0) if counts else 0,
+        in_flight_events=int(counts["in_flight"] or 0) if counts else 0,
+        failed_events=int(counts["failed"] or 0) if counts else 0,
+        verifier_rejected_events=(int(counts["verifier_rejected"] or 0) if counts else 0),
         last_run_at=last_run["started_at"] if last_run else None,
         last_run_status=last_run["status"] if last_run else None,
         last_run_pages_updated=last_run["pages_updated"] if last_run else None,

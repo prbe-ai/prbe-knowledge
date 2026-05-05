@@ -19,12 +19,11 @@ kill_timeout = "10s"
 [processes]
   cron = "python -m services.synthesis.nightly_trigger"
 
-# Daily at 02:00 UTC. The drain timing rationale lives in
-# WIKI_NIGHTLY_HOUR_UTC's docstring (shared/constants.py) — TL;DR:
-# finishes well before US morning standup, doesn't compete with the
-# rest of the nightly pipeline.
-[[machines]]
-  schedule = "daily"
+# Scheduling lives in .github/workflows/wiki-nightly.yml (cron expr
+# "0 2 * * *" UTC) which fires `flyctl machine run` against this app's
+# image. Fly's [[machines]] schedule = "daily" is coarse (Fly picks
+# the hour) and didn't enforce the 02:00 UTC rationale; GitHub Actions
+# cron is exact + auditable.
 
 # Tiny — script lives <60s. 256MB is generous for the asyncpg connect +
 # small SELECT + per-customer NOTIFY loop.

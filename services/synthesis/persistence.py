@@ -59,6 +59,7 @@ __all__ = [
     "mark_triaged",
     "mark_verifier_rejected",
     "open_run",
+    "reclaim_stuck_rows",
     "render_index_markdown",
     "verdict_targets_json",
 ]
@@ -114,16 +115,24 @@ async def list_triaged_customers(conn: asyncpg.Connection) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-async def open_run(customer_id: str, *, kind: str) -> int:
+async def open_run(customer_id: str, *, kind: str, stage: str) -> int:
+    """Open a wiki_synthesis_runs row.
+
+    `kind` is the trigger flavor ('wake' / 'scheduled' / 'onboarding').
+    `stage` is the worker writing this row ('triage' / 'synthesis').
+    Triage and synthesis each open their own run per drain; the status
+    endpoint filters by stage='synthesis' for pages_* counts.
+    """
     async with with_tenant(customer_id) as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO wiki_synthesis_runs (customer_id, kind)
-            VALUES ($1, $2)
+            INSERT INTO wiki_synthesis_runs (customer_id, kind, stage)
+            VALUES ($1, $2, $3)
             RETURNING run_id
             """,
             customer_id,
             kind,
+            stage,
         )
     return int(row["run_id"])
 
@@ -176,13 +185,18 @@ async def claim_pending_batch(customer_id: str, *, limit: int) -> list[asyncpg.R
     `FOR UPDATE SKIP LOCKED` lets multiple wiki-worker machines drain the
     same customer in parallel without double-claiming. Increments
     `attempts` so the retry/failed bookkeeping in `mark_*` works.
+
+    Stamps `heartbeat_at = NOW()` so reclaim_stuck_rows can detect a
+    crashed worker and reset/dead-letter rows whose heartbeat goes
+    stale.
     """
     async with with_tenant(customer_id) as conn:
         return await conn.fetch(
             """
             UPDATE wiki_synthesis_queue
             SET status = 'triaging',
-                attempts = attempts + 1
+                attempts = attempts + 1,
+                heartbeat_at = NOW()
             WHERE queue_id IN (
                 SELECT queue_id FROM wiki_synthesis_queue
                 WHERE customer_id = $1
@@ -216,7 +230,8 @@ async def claim_triaged_rows(customer_id: str, *, limit: int) -> list[asyncpg.Re
             """
             UPDATE wiki_synthesis_queue
             SET status = 'synthesizing',
-                attempts = attempts + 1
+                attempts = attempts + 1,
+                heartbeat_at = NOW()
             WHERE queue_id IN (
                 SELECT queue_id FROM wiki_synthesis_queue
                 WHERE customer_id = $1
@@ -701,3 +716,78 @@ def render_index_markdown(rows: list[asyncpg.Record]) -> str:
             parts.append(line)
         parts.append("")
     return "\n".join(parts).rstrip() + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Reclaim — recover rows wedged after a worker SIGKILL/OOM
+# ---------------------------------------------------------------------------
+
+
+async def reclaim_stuck_rows(
+    *,
+    threshold_seconds: int,
+    max_attempts: int,
+) -> tuple[int, int]:
+    """Sweep stuck rows whose heartbeat has gone stale.
+
+    Two terminal paths:
+      - `attempts < max_attempts` → reset to prior state ('triaging'
+        rows go back to 'pending', 'synthesizing' rows go back to
+        'triaged'). The next claim picks them up and bumps attempts.
+      - `attempts >= max_attempts` → mark 'failed'. Surfaces in the
+        dashboard so ops can investigate. Manual recovery: SQL UPDATE
+        back to 'pending' once the root cause is fixed.
+
+    Returns (retried_count, failed_count). Cross-tenant — uses
+    `raw_conn` because wiki_synthesis_queue has RLS disabled (see
+    migration 0034). The single statement covers both states + both
+    branches via CASE so the sweep is one round-trip per cycle.
+    """
+    from shared.db import raw_conn
+
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE wiki_synthesis_queue
+            SET status = CASE
+                  WHEN attempts >= $2 THEN 'failed'
+                  WHEN status = 'triaging'    THEN 'pending'
+                  WHEN status = 'synthesizing' THEN 'triaged'
+                END,
+                heartbeat_at = NULL,
+                synthesis_error = CASE
+                  WHEN status = 'synthesizing' AND attempts >= $2
+                    THEN COALESCE(synthesis_error, '')
+                         || ' | reclaimed: heartbeat stale, attempts exhausted'
+                  WHEN status = 'synthesizing'
+                    THEN COALESCE(synthesis_error, '')
+                         || ' | reclaimed: heartbeat stale'
+                  ELSE synthesis_error
+                END,
+                triage_error = CASE
+                  WHEN status = 'triaging' AND attempts >= $2
+                    THEN COALESCE(triage_error, '')
+                         || ' | reclaimed: heartbeat stale, attempts exhausted'
+                  WHEN status = 'triaging'
+                    THEN COALESCE(triage_error, '')
+                         || ' | reclaimed: heartbeat stale'
+                  ELSE triage_error
+                END
+            WHERE status IN ('triaging', 'synthesizing')
+              AND heartbeat_at IS NOT NULL
+              AND heartbeat_at < NOW() - make_interval(secs => $1)
+            RETURNING queue_id, customer_id, status, attempts
+            """,
+            threshold_seconds,
+            max_attempts,
+        )
+    retried = sum(1 for r in rows if r["status"] in ("pending", "triaged"))
+    failed = sum(1 for r in rows if r["status"] == "failed")
+    if rows:
+        log.warning(
+            "wiki_reclaim.reclaimed",
+            total=len(rows),
+            retried=retried,
+            failed=failed,
+        )
+    return retried, failed

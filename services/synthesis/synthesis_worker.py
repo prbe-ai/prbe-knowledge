@@ -184,7 +184,7 @@ class SynthesisWorker:
         *,
         run_kind: str,
     ) -> None:
-        run_id = await persistence.open_run(customer_id, kind=run_kind)
+        run_id = await persistence.open_run(customer_id, kind=run_kind, stage="synthesis")
         log.info(
             "synthesis_worker.run_open",
             customer=customer_id,
@@ -202,9 +202,7 @@ class SynthesisWorker:
                 if not claimed:
                     break
                 # Reconstruct cluster -> events mapping from triage_targets.
-                cluster_map = await self._build_clusters(
-                    customer_id, claimed, run_id=run_id
-                )
+                cluster_map = await self._build_clusters(customer_id, claimed, run_id=run_id)
 
                 # Fan out cluster processing.
                 async def _process(
