@@ -123,7 +123,39 @@ async def test_verify_token_resolves_to_device_claims(client: httpx.AsyncClient)
     assert body["device_id"] == DEVICE
     assert body["employee_id"] == EMPLOYEE
     assert body["status"] == "active"
+    # Hostname surfaces from device_metadata so the gateway can forward it
+    # on each webhook envelope; absence would leave docs without an
+    # identity-bearing title clause.
+    assert body["hostname"] == "h"
     assert "source_system" not in body, "DeviceVerifyTokenResponse must not leak the row's source_system"
+
+
+@pytest.mark.asyncio
+async def test_verify_token_returns_null_hostname_when_absent(
+    client: httpx.AsyncClient,
+) -> None:
+    """A device registered without a hostname must verify with hostname=null
+    (NOT a missing key, NOT an empty string)."""
+    await client.post(
+        "/api/devices/register",
+        json={
+            "customer_id": CUSTOMER,
+            "employee_id": EMPLOYEE,
+            "device_id": DEVICE + "-nohost",
+            "token_hash": _hash("nohost"),
+            # no hostname
+        },
+        headers=_hdr(),
+    )
+    resp = await client.post(
+        "/api/devices/verify-token",
+        json={"token_hash": _hash("nohost")},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["device_id"] == DEVICE + "-nohost"
+    assert body["hostname"] is None
 
 
 @pytest.mark.asyncio

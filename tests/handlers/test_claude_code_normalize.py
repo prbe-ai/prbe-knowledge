@@ -262,3 +262,261 @@ async def test_normalize_treats_empty_string_name_as_absent() -> None:
     assert "name" not in props
     assert "email" not in props
     assert props == {"employee_id": "emp-1"}
+
+
+# ---- Title format + identity metadata + Person hostname --------------------
+#
+# The handler renders the session Document title via _format_session_title
+# so it carries the human's identity. The same routine drives unit-doc
+# titles. Identity fields also land on documents.metadata and Person
+# graph_nodes.properties so retrieval has multiple ranking surfaces.
+
+
+_HOSTNAME = "Richards-Macbook-Pro"
+
+
+def _session_doc(result):
+    from shared.constants import DocType
+
+    docs = [d for d in result.documents if d.doc_type == DocType.CLAUDE_CODE_SESSION]
+    assert len(docs) == 1
+    return docs[0]
+
+
+@pytest.mark.parametrize(
+    "name,email,hostname,expected_title",
+    [
+        # All 8 combinations of (name, email, hostname) presence.
+        (None, None, None, "Claude Code session s-1"),
+        ("Richard Wei", None, None, "Richard Wei's Claude Code session s-1"),
+        (None, "richard@prbe.ai", None, "(richard@prbe.ai) Claude Code session s-1"),
+        (None, None, _HOSTNAME, f"Claude Code session s-1 ({_HOSTNAME})"),
+        (
+            "Richard Wei",
+            "richard@prbe.ai",
+            None,
+            "Richard Wei's (richard@prbe.ai) Claude Code session s-1",
+        ),
+        (
+            "Richard Wei",
+            None,
+            _HOSTNAME,
+            f"Richard Wei's Claude Code session s-1 ({_HOSTNAME})",
+        ),
+        (
+            None,
+            "richard@prbe.ai",
+            _HOSTNAME,
+            f"(richard@prbe.ai) Claude Code session s-1 ({_HOSTNAME})",
+        ),
+        (
+            "Richard Wei",
+            "richard@prbe.ai",
+            _HOSTNAME,
+            f"Richard Wei's (richard@prbe.ai) Claude Code session s-1 ({_HOSTNAME})",
+        ),
+    ],
+)
+def test_format_session_title_all_combinations(
+    name: str | None,
+    email: str | None,
+    hostname: str | None,
+    expected_title: str,
+) -> None:
+    """Direct unit test on the title formatter — exercises every presence
+    combination so future changes to the format are explicit."""
+    from services.ingestion.handlers.claude_code import _format_session_title
+
+    assert (
+        _format_session_title("s-1", name, email, hostname) == expected_title
+    )
+
+
+def test_format_session_title_uses_kind_for_unit_docs() -> None:
+    from services.ingestion.handlers.claude_code import _format_session_title
+
+    title = _format_session_title("abcd1234", "Ada", None, None, kind="decision")
+    assert title == "Ada's decision abcd1234"
+
+
+@pytest.mark.asyncio
+async def test_normalize_session_title_full_identity() -> None:
+    """Session doc title carries name + email + hostname when all present."""
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event(session_id="82861aa0XXXX")
+    ev.raw_payload["employee_name"] = "Richard Wei"
+    ev.raw_payload["employee_email"] = "richard@prbe.ai"
+    ev.raw_payload["employee_hostname"] = _HOSTNAME
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "82861aa0XXXX", "events": [], "session_complete": False, "cwd": None},
+    )
+    doc = _session_doc(result)
+    assert (
+        doc.title
+        == f"Richard Wei's (richard@prbe.ai) Claude Code session 82861aa0 ({_HOSTNAME})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_normalize_session_title_id_only_regression() -> None:
+    """Regression: a payload with no identity fields keeps the pre-Lane-B
+    title shape ("Claude Code session XXXXXXXX")."""
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event(session_id="82861aa0XXXX")
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "82861aa0XXXX", "events": [], "session_complete": False, "cwd": None},
+    )
+    doc = _session_doc(result)
+    assert doc.title == "Claude Code session 82861aa0"
+
+
+@pytest.mark.asyncio
+async def test_normalize_metadata_includes_identity_when_present() -> None:
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    ev.raw_payload["employee_name"] = "Richard Wei"
+    ev.raw_payload["employee_email"] = "richard@prbe.ai"
+    ev.raw_payload["employee_hostname"] = _HOSTNAME
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "s-1", "events": [], "session_complete": False, "cwd": None},
+    )
+    md = _session_doc(result).metadata
+    assert md["employee_name"] == "Richard Wei"
+    assert md["employee_email"] == "richard@prbe.ai"
+    assert md["employee_hostname"] == _HOSTNAME
+
+
+@pytest.mark.asyncio
+async def test_normalize_metadata_omits_identity_when_absent() -> None:
+    """Absent identity fields must not appear on metadata — keeps JSONB
+    null-free and matches the rest of the handler's omit-when-absent
+    convention."""
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "s-1", "events": [], "session_complete": False, "cwd": None},
+    )
+    md = _session_doc(result).metadata
+    assert "employee_name" not in md
+    assert "employee_email" not in md
+    assert "employee_hostname" not in md
+
+
+@pytest.mark.asyncio
+async def test_normalize_person_props_includes_hostname_when_present() -> None:
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    ev.raw_payload["employee_name"] = "Richard Wei"
+    ev.raw_payload["employee_email"] = "richard@prbe.ai"
+    ev.raw_payload["employee_hostname"] = _HOSTNAME
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "s-1", "events": [], "session_complete": False, "cwd": None},
+    )
+    props = _person_props(result)
+    assert props["hostname"] == _HOSTNAME
+    # Existing fields still stamped.
+    assert props["name"] == "Richard Wei"
+    assert props["email"] == "richard@prbe.ai"
+
+
+@pytest.mark.asyncio
+async def test_normalize_person_props_omits_hostname_when_absent() -> None:
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    ev.raw_payload["employee_name"] = "Richard Wei"
+    ev.raw_payload["employee_email"] = "richard@prbe.ai"
+
+    result = await c.normalize(
+        ev,
+        {"session_id": "s-1", "events": [], "session_complete": False, "cwd": None},
+    )
+    props = _person_props(result)
+    assert "hostname" not in props
+
+
+@pytest.mark.asyncio
+async def test_normalize_unit_doc_title_uses_identity(monkeypatch) -> None:
+    """Unit docs (qa/code_change/decision/file_ref) reuse the same
+    identity-bearing title shape, with their unit_kind in place of the
+    session prefix."""
+    import services.ingestion.handlers.claude_code as cc_mod
+
+    ext_mod = cc_mod._ext
+    bundle = ext_mod.UnitBundle(
+        qa=[],
+        code_change=[],
+        decision=[
+            ext_mod.Decision(
+                question="?",
+                options_considered=["a", "b"],
+                chosen="b",
+                rationale="r",
+            )
+        ],
+        file_ref=[],
+    )
+
+    async def fake_extract(*a, **k):
+        return bundle
+
+    monkeypatch.setattr(cc_mod._ext, "extract_units_from_session", fake_extract)
+
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event(session_id="82861aa0XXXX")
+    ev.raw_payload["employee_name"] = "Richard Wei"
+    ev.raw_payload["employee_email"] = "richard@prbe.ai"
+    ev.raw_payload["employee_hostname"] = _HOSTNAME
+
+    result = await c.normalize(
+        ev,
+        {
+            "session_id": "82861aa0XXXX",
+            "events": [],
+            "session_complete": True,
+            "cwd": None,
+        },
+    )
+
+    from shared.constants import DocType
+
+    decisions = [d for d in result.documents if d.doc_type == DocType.CLAUDE_CODE_DECISION]
+    assert len(decisions) == 1
+    assert (
+        decisions[0].title
+        == f"Richard Wei's (richard@prbe.ai) decision 82861aa0 ({_HOSTNAME})"
+    )
+    # Unit metadata also carries identity.
+    md = decisions[0].metadata
+    assert md["employee_name"] == "Richard Wei"
+    assert md["employee_email"] == "richard@prbe.ai"
+    assert md["employee_hostname"] == _HOSTNAME
+
+
+@pytest.mark.asyncio
+async def test_normalize_pulls_hostname_from_merged_events_on_finalize() -> None:
+    """Mirrors the existing _employee_name finalize-fallback test —
+    finalize events have no per-event identity in raw_payload."""
+    c = ClaudeCodeConnector(make_default_context())
+    ev = _event()
+    ev.raw_payload.pop("employee_hostname", None)
+    hydrated = {
+        "session_id": "s-1",
+        "events": [
+            {"line_no": 0, "raw": {}, "employee_hostname": _HOSTNAME}
+        ],
+        "session_complete": False,
+        "cwd": None,
+    }
+    result = await c.normalize(ev, hydrated)
+    props = _person_props(result)
+    assert props["hostname"] == _HOSTNAME
