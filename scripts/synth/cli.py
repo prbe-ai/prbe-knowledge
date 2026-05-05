@@ -529,17 +529,17 @@ async def _allow_seed_async(args) -> int:
     """CLI handler for `synth allow-seed`. Returns process exit code."""
     from scripts.synth.seed import set_allow_synth_seed
 
-    pool, _bucket = await _open_db_and_bucket()
+    db, _bucket = await _open_db_and_bucket()
     try:
         try:
-            await set_allow_synth_seed(args.customer, pool)
+            await set_allow_synth_seed(args.customer, db)
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
     finally:
-        await pool.close()
+        await db.close()
 
-    print(f"metadata.allow_synth_seed=true for {args.customer}")
+    print(f"metadata.allow_synth_seed=true for {args.customer}", file=sys.stderr)
     return 0
 
 
