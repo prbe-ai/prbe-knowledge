@@ -1,8 +1,8 @@
 """CodeGraph PR-A precursor: confidence column + code_repo_state
 
-Revision ID: 0033_codegraph_phase_a
-Revises: 0032_manual_uploads
-Create Date: 2026-05-03
+Revision ID: 0043_codegraph_phase_a
+Revises: 0042_backfill_codex_doc_titles
+Create Date: 2026-05-05
 
 Sets up the schema PR-A's CodeGraph connector requires:
 
@@ -30,8 +30,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0033_codegraph_phase_a"
-down_revision = "0032_manual_uploads"
+revision = "0043_codegraph_phase_a"
+down_revision = "0042_backfill_codex_doc_titles"
 branch_labels = None
 depends_on = None
 
