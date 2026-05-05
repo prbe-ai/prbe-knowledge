@@ -309,7 +309,11 @@ behind.
 `synth clean --customer cust-prbe-acme-co` will refuse the customer (existing
 prefix gate stays — V1 does not extend `clean_tenant`). To wipe a real-shape
 tenant, you currently have to either:
-- Drop the customer row by hand via SQL (cascade deletes everything).
+- Drop the customer row by hand via SQL (cascade deletes all DB rows;
+  R2 objects are NOT cascade-deleted and will remain as orphans under
+  `raw/<source>/<customer_id>/synth/*.json`. Clean them up via the
+  MinIO/R2 console, or with:
+  `aws s3 rm s3://<bucket>/raw/ --recursive --include "*/<customer_id>/synth/*"`).
 - Wait for V2's surgical cleanup (`synth seed clear`) which will remove
   only synth-tagged rows.
 
@@ -434,8 +438,9 @@ or use the in-container psql: `docker exec -it prbe-knowledge-postgres psql -U p
 ```
 scripts/synth/
 ├── README.md                  # this file
-├── cli.py                     # `synth init / run / clean / extract` argparse + main
+├── cli.py                     # `synth init / run / clean / extract / allow-seed / seed` argparse + main
 ├── bootstrap.py               # init_tenant + clean_tenant (DB + R2 customer lifecycle)
+├── seed.py                    # Plan 4: synth allow-seed + synth seed gate stack and orchestration
 ├── profile.py                 # YAML loader + Profile dataclass
 ├── scenarios.py               # async run_scenarios — yields (ScenarioSpec, SynthDoc)
 ├── validator.py               # Pass 1 (name allowlist) + combined Pass 2 wrapper
