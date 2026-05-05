@@ -602,6 +602,20 @@ class NotionConnector(Connector):
         if not isinstance(entity, dict):
             entity = {}
 
+        # Synth corpus bypass: when hydration produced no entity (no live
+        # OAuth fetch — synth has no real Notion token), fall back to the
+        # entity inlined on the raw webhook payload. scripts/synth/output/
+        # notion.py inlines properties.title and body_markdown there so the
+        # corpus can be ingested without calling Notion's API. Real Notion
+        # webhooks ship `entity` with only {type, id}; that shape doesn't
+        # carry properties or body_markdown, so the title + body extraction
+        # below produces the same nulls/empties prod sees today, and the
+        # behavior is unchanged for real traffic.
+        if not entity:
+            raw_entity = event.raw_payload.get("entity")
+            if isinstance(raw_entity, dict):
+                entity = raw_entity
+
         last_edited_time = (
             entity.get("last_edited_time")
             or _hint(event, "last_edited_time")
@@ -629,7 +643,16 @@ class NotionConnector(Connector):
 
         properties = entity.get("properties") or {}
         title = _title_from_properties(properties) or _title_from_database(entity)
-        body = hydrated.get("body_markdown") or ""
+        # Synth corpus bypass: scripts/synth/output/notion.py inlines a
+        # pre-rendered body_markdown on `entity` so the synth corpus can be
+        # ingested without a live Notion OAuth token (the prod hydration path
+        # would 401 against Notion's API). Real Notion webhooks NEVER set
+        # entity.body_markdown, so this fallback is a no-op on prod traffic.
+        body = (
+            hydrated.get("body_markdown")
+            or entity.get("body_markdown")
+            or ""
+        )
         if not is_page and not body:
             body = _database_schema_summary(entity)
 
@@ -706,7 +729,12 @@ class NotionConnector(Connector):
                 "archived": entity.get("archived", False),
                 "mentioned_user_ids": mentioned_user_ids,
                 "last_edited_time": last_edited_time,
-                "hydrated": bool(entity),
+                # `hydrated` reflects whether fetch_supplementary returned data —
+                # NOT whether `entity` happens to be non-empty (a raw webhook
+                # payload always has entity={type, id}, and the synth corpus
+                # bypass populates entity from the raw payload too). Use the
+                # presence of the hydrated dict itself as the signal.
+                "hydrated": bool(hydrated),
             },
             body=body,
             doc_references=_references_from_parent(parent),

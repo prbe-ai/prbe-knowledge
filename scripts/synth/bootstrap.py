@@ -10,8 +10,10 @@ init can re-bind without race.
 
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING
 
+from shared.encryption import encrypt_token
 from shared.logging import get_logger
 
 if TYPE_CHECKING:
@@ -55,31 +57,52 @@ async def init_tenant(profile: Profile, db, bucket: ObjectStore) -> None:
     display_name = profile.raw.get("display_name") or f"synth-{customer_id}"
     sources = profile.raw.get("sources") or ["slack", "notion"]
 
+    # customers.api_key_hash is NOT NULL. Synth tenants don't have a real
+    # bearer key — stamp a deterministic placeholder so the row inserts.
+    # Bearer auth never resolves to this row because no caller can know
+    # the pre-hash input. ON CONFLICT DO NOTHING below preserves any
+    # real api_key_hash already on an existing tenant.
+    placeholder_hash = hashlib.sha256(
+        f"synth-stub-no-bearer-{customer_id}".encode()
+    ).hexdigest()
+
     await db.execute(
         """
-        INSERT INTO customers (customer_id, display_name, status)
-        VALUES ($1, $2, 'active')
+        INSERT INTO customers (customer_id, display_name, api_key_hash, status)
+        VALUES ($1, $2, $3, 'active')
         ON CONFLICT (customer_id) DO NOTHING
         """,
         customer_id,
         display_name,
+        placeholder_hash,
     )
 
     bucket_name = bucket.bucket_for(customer_id)
     await bucket.ensure_bucket(bucket_name)
+
+    # The worker decrypts integration_tokens.access_token_encrypted with the
+    # Fernet key from TOKEN_ENCRYPTION_KEY. Storing a literal placeholder
+    # ('synth-stub') breaks decrypt; encrypt with the active key so any caller
+    # that has the same key (the worker reading config) can round-trip it.
+    # The plaintext is meaningless — synth connectors never make outbound
+    # OAuth calls — but the bytes have to be valid Fernet ciphertext.
+    encrypted_stub = encrypt_token("synth-stub")
 
     for source in sources:
         await db.execute(
             """
             INSERT INTO integration_tokens
               (customer_id, source_system, access_token_encrypted, status)
-            VALUES ($1, $2, 'synth-stub', 'active')
+            VALUES ($1, $2, $3, 'active')
             ON CONFLICT (customer_id, source_system)
               WHERE device_id IS NULL
-            DO NOTHING
+            DO UPDATE SET
+              access_token_encrypted = EXCLUDED.access_token_encrypted,
+              status = 'active'
             """,
             customer_id,
             source,
+            encrypted_stub,
         )
 
     log.info("tenant_init_complete", customer_id=customer_id, sources=sources)
@@ -98,9 +121,14 @@ async def clean_tenant(customer_id: str, db, bucket: ObjectStore) -> None:
             f"refuse to clean non-synthetic customer: {customer_id!r}"
         )
 
-    async with db.transaction():
+    # asyncpg's Pool has .execute() (auto-acquires per call) but NOT
+    # .transaction() — transactions are scoped to a single Connection so
+    # every statement in them sees the same MVCC snapshot and rolls back
+    # together. Acquire a Connection from the Pool, then run the
+    # transaction on that one connection.
+    async with db.acquire() as conn, conn.transaction():
         for table in CUSTOMER_OWNED_TABLES:
-            await db.execute(
+            await conn.execute(
                 f"DELETE FROM {table} WHERE customer_id = $1",
                 customer_id,
             )

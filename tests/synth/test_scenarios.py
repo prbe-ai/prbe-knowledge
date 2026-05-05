@@ -27,7 +27,7 @@ def _profile(raw_extras: dict | None = None) -> Profile:
     raw = {
         "customer_id": "cust-eval-test-01",
         "repos": [{"url": "github.com/x/y", "local_path": "/tmp/y"}],
-        "preset": "tiny-test",
+        "preset": "tiny_test",
         "seed": 7,
     }
     if raw_extras:
@@ -174,35 +174,39 @@ def test_weekly_mondays_window_starting_on_monday() -> None:
 
 # --- run_scenarios --------------------------------------------------------
 
-def test_run_scenarios_yields_docs_for_full_library() -> None:
+async def test_run_scenarios_yields_docs_for_full_library() -> None:
     world = _build_test_world()
     own = _ownership_full()
     p = _profile()
     window = TimeWindow(end=datetime(2026, 5, 1, tzinfo=UTC), days=14)
-    docs = list(run_scenarios(world, own, p, window))
+    docs = [doc async for _, doc in run_scenarios(world, own, p, window)]
     # Expect both archetypes to produce docs (count varies; just assert > 0).
     sources = {d.source for d in docs}
     assert Source.SLACK in sources
     assert Source.NOTION in sources
 
 
-def test_run_scenarios_archetype_filter_restricts_output() -> None:
+async def test_run_scenarios_archetype_filter_restricts_output() -> None:
     world = _build_test_world()
     own = _ownership_full()
     p = _profile()
     window = TimeWindow(end=datetime(2026, 5, 1, tzinfo=UTC), days=14)
-    docs = list(run_scenarios(world, own, p, window, archetype_filter=("STANDUP_UPDATE",)))
+    docs = [
+        doc async for _, doc in run_scenarios(
+            world, own, p, window, archetype_filter=("STANDUP_UPDATE",)
+        )
+    ]
     # STANDUP_UPDATE is slack-only; no notion docs.
     assert all(d.source == Source.SLACK for d in docs)
     assert all(d.archetype == "STANDUP_UPDATE" for d in docs)
 
 
-def test_run_scenarios_scenario_limit_caps_per_archetype() -> None:
+async def test_run_scenarios_scenario_limit_caps_per_archetype() -> None:
     world = _build_test_world()
     own = _ownership_full()
     p = _profile()
     window = TimeWindow(end=datetime(2026, 5, 1, tzinfo=UTC), days=30)
-    docs = list(run_scenarios(world, own, p, window, scenario_limit=2))
+    docs = [doc async for _, doc in run_scenarios(world, own, p, window, scenario_limit=2)]
     # Each archetype contributes <= 2 scenarios (each scenario yields 1+ docs).
     standup_scenarios = {d.scenario_id for d in docs if d.archetype == "STANDUP_UPDATE"}
     oncall_scenarios = {d.scenario_id for d in docs if d.archetype == "ON_CALL_HANDOFF"}

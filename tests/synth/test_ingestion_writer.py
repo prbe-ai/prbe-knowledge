@@ -85,10 +85,20 @@ async def test_local_overwrite_on_repeat_write(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_local_unsupported_source_raises(tmp_path: Path) -> None:
+    """Granola/Claude_Code sources (not yet implemented) should raise ValueError."""
     writer = IngestionWriter(out_dir=tmp_path)
+
+    # Use a Source value that is genuinely unimplemented.  We reach into the
+    # enum to find one that is NOT in the 5 dispatched sources; if all are
+    # supported this test is vacuously skipped.
+    supported = {Source.SLACK, Source.NOTION, Source.GITHUB, Source.LINEAR, Source.SENTRY}
+    unsupported = [s for s in Source if s not in supported]
+    if not unsupported:
+        pytest.skip("All known sources are now implemented; no unsupported source to test.")
+
     doc = SynthDoc(
         id="x",
-        source=Source.GITHUB,  # GitHub wrapper deferred to Plan 3
+        source=unsupported[0],
         source_event_id="x",
         text="",
         occurred_at=datetime(2026, 5, 1, tzinfo=UTC),
@@ -100,8 +110,37 @@ async def test_local_unsupported_source_raises(tmp_path: Path) -> None:
         personas=(),
         services_mentioned=(),
     )
-    with pytest.raises(ValueError, match="Plan 2 doesn't support source"):
+    with pytest.raises(ValueError, match="Unsupported source for envelope wrapping"):
         await writer.write(doc)
+
+
+@pytest.mark.asyncio
+async def test_local_writes_github_envelope_to_disk(tmp_path: Path) -> None:
+    """Plan 3 dispatch: github source → IngestionWriter calls github_wrapper.wrap."""
+    doc = SynthDoc(
+        id="scn-test-github-0",
+        source=Source.GITHUB,
+        source_event_id="scn-test-github-0",
+        text="Title: Sample PR\n\nBody text",
+        occurred_at=datetime(2026, 5, 1, tzinfo=UTC),
+        channel=None,
+        page_id=None,
+        thread_parent_id=None,
+        scenario_id="scn-test",
+        archetype="INCIDENT",
+        personas=("gh:alice",),
+        services_mentioned=("payments",),
+        priority=10,
+    )
+    writer = IngestionWriter(out_dir=tmp_path)
+    await writer.write(doc)
+    await writer.close()
+
+    out_file = tmp_path / "raw" / "github" / "scn-test-github-0.json"
+    assert out_file.exists(), "expected raw/github/<id>.json"
+    payload = orjson.loads(out_file.read_bytes())
+    # github_wrapper produces pull_request.opened for non-BIG_REFACTOR archetypes
+    assert "pull_request" in payload or "issue" in payload
 
 
 # ---------------------------------------------------------------------------

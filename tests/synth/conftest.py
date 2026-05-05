@@ -133,7 +133,7 @@ def tmp_repo_profile_dir(tmp_repo: Path, tmp_path: Path) -> Path:
     profile_path.write_text(
         f"""
 customer_id: cust-eval-fake-01
-preset: tiny-test
+preset: tiny_test
 seed: 7
 repos:
   - url: github.com/x/fake

@@ -52,6 +52,8 @@ class Archetype:
     cast_size: tuple[int, int]       # (min, max) personas per scenario
     needs_planner_call: bool         # False for all Plan 2 archetypes
     validator_level: ValidatorLevel  # NAME_ONLY for all Plan 2 archetypes
+    eval_question_count: int = 0
+    spec_template_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,4 +78,10 @@ class ScenarioSpec:
     instance_ts: datetime
     cast: tuple[str, ...]           # canonical_ids in this scenario
     affected_services: tuple[str, ...]
-    doc_specs: tuple[DocSpec, ...]
+    doc_specs: tuple[DocSpec, ...] = ()
+    title: str | None = None
+    summary: str | None = None
+    root_cause: str | None = None
+    decision: str | None = None
+    outcome: str | None = None
+    eval_questions: tuple = ()   # tuple[EvalQuestion, ...] — typed at call site to avoid circular import

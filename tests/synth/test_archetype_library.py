@@ -19,7 +19,7 @@ def _profile(raw: dict | None = None) -> Profile:
     base = {
         "customer_id": "cust-eval-test-01",
         "repos": [{"url": "github.com/x/y", "local_path": "/tmp/y"}],
-        "preset": "tiny-test",
+        "preset": "tiny_test",
         "seed": 42,
     }
     base.update(raw)
@@ -33,10 +33,16 @@ def _profile(raw: dict | None = None) -> Profile:
 
 
 def test_library_contains_both_archetypes() -> None:
-    assert set(ARCHETYPE_LIBRARY.keys()) == {"STANDUP_UPDATE", "ON_CALL_HANDOFF"}
+    # Plan 2 recurring archetypes.
+    assert "STANDUP_UPDATE" in ARCHETYPE_LIBRARY
+    assert "ON_CALL_HANDOFF" in ARCHETYPE_LIBRARY
     assert isinstance(ARCHETYPE_LIBRARY["STANDUP_UPDATE"], Archetype)
     assert ARCHETYPE_LIBRARY["STANDUP_UPDATE"] is STANDUP_UPDATE
     assert ARCHETYPE_LIBRARY["ON_CALL_HANDOFF"] is ON_CALL_HANDOFF
+    # Plan 3 plot archetypes are also registered.
+    assert "INCIDENT" in ARCHETYPE_LIBRARY
+    assert "LAUNCH" in ARCHETYPE_LIBRARY
+    assert "BIG_REFACTOR" in ARCHETYPE_LIBRARY
 
 
 def test_builders_resolve_to_correct_functions() -> None:
@@ -47,13 +53,20 @@ def test_builders_resolve_to_correct_functions() -> None:
 def test_get_active_default_returns_full_library() -> None:
     p = _profile()
     active = get_active(p)
-    assert set(active.keys()) == {"STANDUP_UPDATE", "ON_CALL_HANDOFF"}
+    # Plan 2 recurring archetypes always present.
+    assert "STANDUP_UPDATE" in active
+    assert "ON_CALL_HANDOFF" in active
+    # Plan 3 plot archetypes also present by default.
+    assert "INCIDENT" in active
+    assert "LAUNCH" in active
+    assert "BIG_REFACTOR" in active
 
 
 def test_get_active_respects_count_zero_disable() -> None:
     p = _profile({"archetypes": {"STANDUP_UPDATE": {"count": 0}}})
     active = get_active(p)
-    assert set(active.keys()) == {"ON_CALL_HANDOFF"}
+    assert "STANDUP_UPDATE" not in active
+    assert "ON_CALL_HANDOFF" in active
 
 
 def test_get_active_respects_archetype_filter() -> None:

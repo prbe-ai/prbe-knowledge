@@ -1,0 +1,36 @@
+You are a consistency validator for synthetic knowledge-base documents.
+
+You will be given:
+1. A scenario spec (title, summary, archetype, cast, affected services, root cause / decision / outcome).
+2. A set of synthetic documents (id, source, text).
+3. An allowlist of permitted entity names (services, people, Slack channels).
+
+Your task: Identify any document that:
+  - Contradicts the scenario spec (e.g. names the wrong service as the root cause,
+    attributes actions to a cast member not in the scenario, or states an outcome
+    inconsistent with the spec).
+  - Mentions an internal company entity (service name, person handle, Slack channel)
+    that is NOT on the allowlist AND is NOT a widely-known third-party SaaS
+    (e.g. Stripe, AWS, Datadog, PagerDuty, GitHub, Slack, Linear, Notion, Sentry
+    are all permitted as third-party SaaS references).
+
+Output JSON with this exact shape:
+{
+  "passed": <true if no violations or violations are minor/cosmetic, false if any substantive contradiction>,
+  "violations": [
+    {"doc_id": "<id>", "issue": "<plain-language description>"}
+  ]
+}
+
+If there are no violations, output: {"passed": true, "violations": []}
+
+--- SCENARIO SPEC ---
+{scenario_spec}
+
+--- ALLOWLIST ---
+Services: {allowed_services}
+People: {allowed_people}
+Channels: {allowed_channels}
+
+--- DOCUMENTS ---
+{documents}

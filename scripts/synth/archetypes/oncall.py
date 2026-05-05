@@ -65,9 +65,24 @@ def _incident_summary(incidents: list) -> str:
     return "\n".join(lines)
 
 
+def _person_slug(canonical_id: str) -> str:
+    """Extract a short, safe username slug from a canonical_id.
+
+    Handles both "gh:alice" (GitHub) and "email:alice@example.com" (local git)
+    canonical_id formats, so templates don't embed full email addresses.
+    """
+    if ":" in canonical_id:
+        rest = canonical_id.split(":", 1)[1]
+        # For email-based IDs like "alice@example.com", use only the local part.
+        slug = rest.split("@")[0]
+        return slug or canonical_id
+    return canonical_id
+
+
 def _notion_body(day: date, incidents: list, outgoing_id: str) -> str:
     """Render Notion page body with H2 per incident."""
-    lines = [f"On-call handoff {day.isoformat()}", f"Outgoing: @{outgoing_id.replace('gh:', '')}"]
+    slug = _person_slug(outgoing_id)
+    lines = [f"On-call handoff {day.isoformat()}", f"Outgoing: @{slug}"]
     if not incidents:
         lines.append("## Status")
         lines.append("Quiet week, nothing on fire.")

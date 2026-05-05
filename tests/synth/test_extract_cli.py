@@ -19,7 +19,7 @@ customer_id: cust-eval-fake-01
 repos:
   - url: repo://fake
     local_path: {tmp_repo}
-preset: tiny-test
+preset: tiny_test
 seed: 7
 world_model:
   min_commits_per_persona: 1

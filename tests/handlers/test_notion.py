@@ -411,6 +411,37 @@ async def test_normalize_without_token_empty_body() -> None:
     assert doc.doc_type == DocType.NOTION_PAGE
     assert doc.body == ""
     assert doc.metadata["hydrated"] is False
+
+
+@pytest.mark.asyncio
+async def test_normalize_reads_entity_body_markdown_synth_bypass() -> None:
+    """Synth corpus bypass: when the webhook payload's entity carries an
+    inlined body_markdown (and properties.title), the handler must use them
+    instead of the empty hydrated dict. Real Notion webhooks never set
+    entity.body_markdown, so this fallback is a no-op on prod traffic.
+    """
+    payload = _load("page_updated.json")
+    # scripts/synth/output/notion.py inlines these fields on entity.
+    payload["entity"]["body_markdown"] = "# Synth page\n\nBody content from synth corpus."
+    payload["entity"]["properties"] = {
+        "title": {
+            "type": "title",
+            "title": [{"type": "text", "plain_text": "Synth page",
+                       "text": {"content": "Synth page"}}],
+        },
+    }
+
+    ctx = _make_ctx()
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    event = _webhook_event(payload)
+
+    # No hydration available — the synth path doesn't fetch from Notion's API.
+    result = await notion.normalize(event, {})
+
+    doc = result.documents[0]
+    assert doc.title == "Synth page"
+    assert "Body content from synth corpus." in doc.body
+    assert doc.body_size_bytes > 0
     assert doc.source_system == SourceSystem.NOTION
     assert doc.author_id == "unknown"  # no hydration → no last_edited_by id
 

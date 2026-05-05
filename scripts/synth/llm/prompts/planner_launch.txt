@@ -1,0 +1,49 @@
+You are generating a realistic LAUNCH scenario for a synthetic engineering corpus.
+
+# Context
+World: {world_summary}
+Available cast: {cast_pool}
+Available services: {services_table}
+Recent activity (topics): {recent_topics}
+Company: {company_context}
+Launch date: {instance_ts}
+
+# Task
+Generate ONE launch scenario where:
+- 1 product owner announces a feature shipping to production
+- 1-2 engineering leads own the implementation
+- Optional: reference a named customer as design partner (only if the Company context lists non-empty customers)
+- The story spans: slack #announcements announcement → notion product page → linear feature ticket (marked done) → github merge PR
+
+# Output
+Return ONLY a JSON object matching this schema (no preamble, no postamble, no markdown fences):
+
+{{
+  "title": "<short feature name, ≤60 chars>",
+  "summary": "<2-3 sentences describing what shipped and why it matters>",
+  "cast": [{{"canonical_id": "<gh:...|email:...>", "role_in_scenario": "product_owner|engineering_lead"}}],
+  "affected_services": ["<service.qualified>"],
+  "affected_repos": ["<repo.url>"],
+  "root_cause": null,
+  "decision": null,
+  "outcome": "<1-sentence outcome describing what shipped>",
+  "timeline": [
+    {{"ts": "<iso8601>", "source": "<slack|notion|linear|github>", "kind": "<message|doc|ticket|pr>", "channel": "<#channel-name or null>"}}
+  ],
+  "source_emissions": {{"slack": 1, "notion": 1, "linear": 1, "github": 1}},
+  "eval_questions": [
+    {{"input": "When did <feature> ship?", "answer_substring": "<date fragment>", "difficulty": "easy"}},
+    {{"input": "<conditional: design-partner question if customers non-empty; else ownership question>", "answer_substring": "<short answer>", "difficulty": "medium-cross-source"}}
+  ]
+}}
+
+# Constraints (violations trigger regeneration)
+- All cast.canonical_id values MUST appear verbatim in the available cast pool above.
+- All affected_services values MUST appear verbatim in the services_table above.
+- All channel values MUST be channel names listed in the available cast above, or null.
+- DO NOT invent service names, person names, or channel names not in the lists above.
+- cast length must be between 2 and 3 inclusive.
+- timeline entries must be chronologically ordered.
+- If the Company context has no customers: eval_questions[1].input must ask about ownership, not design partners.
+- If the Company context lists customers: eval_questions[1].input SHOULD reference a named customer as design partner.
+- eval_questions[0].difficulty must be "easy"; eval_questions[1].difficulty must be "medium-cross-source".
