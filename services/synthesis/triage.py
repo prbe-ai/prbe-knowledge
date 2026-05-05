@@ -59,7 +59,10 @@ from services.synthesis.providers import (
     TriageParseError,
     get_triage_provider,
 )
-from shared.constants import WIKI_TRIAGE_TOKEN_BUDGET
+from shared.constants import (
+    WIKI_TRIAGE_MAX_EVENTS_PER_BATCH,
+    WIKI_TRIAGE_TOKEN_BUDGET,
+)
 from shared.logging import get_logger
 
 __all__ = [
@@ -99,10 +102,18 @@ EVENT_FRAMING_TOKENS = 80
 PROMPT_OVERHEAD_TOKENS = 2_000
 
 # A single event whose estimated Anthropic cost exceeds this threshold
-# can't be triaged at all — even alone in a batch it would exceed Haiku's
-# 200K context. Drop it (caller DLQ's) rather than letting it poison the
+# can't be triaged at all — even alone in a batch the event + prompt
+# overhead + tokenizer drift would land near or over Haiku's 200K
+# context. Drop it (caller DLQ's) rather than letting it poison the
 # pipeline.
-OVERSIZED_EVENT_TOKENS = 150_000
+#
+# Lowered from 150_000 to 100_000 after probe-founders' first run
+# exposed the failure mode: a single event of ~150K Anthropic tokens
+# on its own pushed a 1-event batch to 214K wire tokens because the
+# 1.30x ANTHROPIC_TOKEN_MULTIPLIER undershot. 100K leaves real room
+# for prompt overhead + tokenizer drift even when the offender is
+# alone in its batch.
+OVERSIZED_EVENT_TOKENS = 100_000
 
 # Floor charge per event. Even a one-line body costs framing + body tokens
 # > zero; cap the lower bound so 1000 zero-byte events don't pretend to
@@ -126,22 +137,38 @@ def pack_into_batches(
     events: list[TriageInput],
     *,
     budget: int = WIKI_TRIAGE_TOKEN_BUDGET,
+    max_events: int = WIKI_TRIAGE_MAX_EVENTS_PER_BATCH,
 ) -> tuple[list[list[TriageInput]], list[TriageInput]]:
-    """Greedy bin-pack by estimated Anthropic token cost.
+    """Greedy bin-pack by estimated Anthropic token cost AND event count.
 
     Returns `(batches, oversized)`:
 
-    - `batches` is the list of batches, each guaranteed to fit in
-      `budget - PROMPT_OVERHEAD_TOKENS` Anthropic tokens of user content
-      (so the full wire request stays under `budget` plus envelope).
+    - `batches` is the list of batches, each guaranteed to fit BOTH:
+        (a) `budget - PROMPT_OVERHEAD_TOKENS` Anthropic tokens of user
+            content (input ceiling), AND
+        (b) at most `max_events` rows (output ceiling — see below).
     - `oversized` is the list of events whose own body alone exceeds
       `OVERSIZED_EVENT_TOKENS`. These cannot be triaged regardless of
       batching; the worker should DLQ them with a logged reason rather
       than letting them blow up a real batch.
 
+    Why a max-events cap (not just a token budget):
+
+      Haiku's `max_tokens` ceiling is 8192 (Anthropic's wire limit for
+      its 4.5 family). The triage tool returns one TriageVerdict per
+      event packed into the request — so a batch of N events produces
+      ~N x WIKI_TRIAGE_VERDICT_TOKENS (~150) of structured output.
+      Without an event cap, a batch of 100 events would generate ~15K
+      output tokens, hit max_tokens before finishing the tool_use,
+      return a partially-built `{}` payload, and the Pydantic parser
+      would crash on the missing `verdicts` field — DLQ-ing the entire
+      batch. Production drains saw exactly this on May 5: ~50% of
+      batches DLQ'd because Haiku stopped at max_tokens, NOT because
+      the input was too long.
+
     Order is preserved per FIFO within `batches`. Tiny events accumulate
-    into big batches; medium-but-large events get their own single-row
-    batch (Haiku still handles them up to its 200K context).
+    until either the input budget OR the event cap binds; medium-but-
+    large events get their own single-row batch.
     """
     available = max(budget - PROMPT_OVERHEAD_TOKENS, 1)
     batches: list[list[TriageInput]] = []
@@ -162,7 +189,11 @@ def pack_into_batches(
             )
             oversized.append(event)
             continue
-        if current and current_tokens + cost > available:
+        # Close current batch if EITHER constraint would be violated by
+        # appending this event: input-token budget OR output-side event cap.
+        would_exceed_tokens = current_tokens + cost > available
+        would_exceed_events = len(current) >= max_events
+        if current and (would_exceed_tokens or would_exceed_events):
             batches.append(current)
             current = []
             current_tokens = 0
@@ -273,25 +304,37 @@ async def call_triage_with_split_retry(
     *,
     now: datetime,
 ) -> TriageOutput:
-    """Call triage; on oversize-prompt 400, recursively split + retry.
+    """Call triage; on overflow-shaped failure, recursively split + retry.
 
-    The upfront packer in `pack_into_batches` is the first line of
-    defense — it estimates Anthropic-tokenizer counts and trims batches
-    to stay under 200K. This wrapper is the second line: tokenizer
-    drift, prompt changes, or a single freakishly dense doc could still
-    push a batch past Anthropic's hard limit. Rather than failing the
-    whole batch to DLQ, halve and retry.
+    Two failure modes both signal "the batch was too big":
+
+      A) Input-side overflow — Anthropic 400 with "prompt is too long".
+         Caught via `BadRequestError` matching the oversize signature.
+
+      B) Output-side overflow — Haiku stops at `max_tokens` before
+         finishing the tool_use. The SDK returns a successful 200 with
+         either no tool_use block or a partial `{}` payload, and the
+         downstream parser raises `TriageParseError`. We use this as a
+         signal that the batch produced more verdicts than fit in the
+         output budget — same shape as input overflow, same recovery.
+
+    The upfront packer caps both axes (input tokens via
+    `WIKI_TRIAGE_TOKEN_BUDGET`, output verdicts via
+    `WIKI_TRIAGE_MAX_EVENTS_PER_BATCH`). This wrapper is the second
+    line of defense for tokenizer drift, prompt changes, or a freakish
+    doc that slipped through the upfront packer.
 
     Algorithm:
 
     - Try `call_triage(client, events, now=now)`.
-    - If it raises `BadRequestError` with the oversize signature:
+    - If it raises an overflow-shaped error:
       - `len(events) > 1`: split the batch into two halves, recurse on
         each half, merge the resulting dicts, return.
       - `len(events) == 1`: the single event is the offender — return
         a rejected verdict tagged with `OVERSIZED_AT_CALL_TIME_REASON`
         so the worker DLQ-routes it. Do NOT recurse further.
-    - On any other exception (non-oversize 400, 401, 5xx, network):
+    - On any other exception (non-oversize 400, 401, 5xx, network,
+      a TriageParseError from a malformed-but-not-truncated response):
       re-raise unchanged.
 
     The merged return shape is identical to a single `call_triage`
@@ -299,8 +342,8 @@ async def call_triage_with_split_retry(
     """
     try:
         return await call_triage(client, events, now=now)
-    except BadRequestError as exc:
-        if not is_anthropic_oversize_error(exc):
+    except (BadRequestError, TriageParseError) as exc:
+        if not _is_overflow_shaped(exc):
             raise
         if len(events) <= 1:
             # Single event is itself oversized; mark rejected so the
@@ -310,7 +353,8 @@ async def call_triage_with_split_retry(
                 "triage.split_retry.single_event_oversize",
                 queue_id=events[0].queue_id if events else None,
                 doc_id=events[0].doc_id if events else None,
-                error=_bad_request_message(exc),
+                cause=type(exc).__name__,
+                error=_overflow_error_message(exc),
             )
             if not events:
                 # Defensive: shouldn't happen — call_triage short-circuits
@@ -325,8 +369,48 @@ async def call_triage_with_split_retry(
             batch_size=len(events),
             left_size=len(left),
             right_size=len(right),
-            error=_bad_request_message(exc),
+            cause=type(exc).__name__,
+            error=_overflow_error_message(exc),
         )
         left_out = await call_triage_with_split_retry(client, left, now=now)
         right_out = await call_triage_with_split_retry(client, right, now=now)
         return _merge_outputs(left_out, right_out)
+
+
+# Output-side overflow signature on TriageParseError: the parser's
+# error message contains either "no <name> tool_use block" (Anthropic
+# returned no tool_use blocks because Haiku stopped at max_tokens) OR
+# Pydantic's "Field required" (Anthropic returned a tool_use block but
+# its input is `{}` because Haiku stopped mid-output). Both indicate
+# the model ran out of output budget for the batch size.
+_PARSE_OVERFLOW_REGEXES = (
+    re.compile(r"no\s+\w+\s+tool_use\s+block", re.IGNORECASE),
+    re.compile(r"Field required", re.IGNORECASE),
+    re.compile(r"max_tokens", re.IGNORECASE),
+)
+
+
+def _is_parse_overflow_error(exc: TriageParseError) -> bool:
+    """True iff a TriageParseError indicates an output-truncated response.
+
+    Other parse errors (e.g. wrong tool name, malformed schema) MUST
+    return False so the caller propagates them instead of split-retrying.
+    """
+    msg = str(exc)
+    return any(rx.search(msg) for rx in _PARSE_OVERFLOW_REGEXES)
+
+
+def _is_overflow_shaped(exc: BaseException) -> bool:
+    """Combined predicate: input-side BadRequestError OR output-side parse-fail."""
+    if isinstance(exc, BadRequestError):
+        return is_anthropic_oversize_error(exc)
+    if isinstance(exc, TriageParseError):
+        return _is_parse_overflow_error(exc)
+    return False
+
+
+def _overflow_error_message(exc: BaseException) -> str:
+    """Best-effort human-readable message for either overflow shape."""
+    if isinstance(exc, BadRequestError):
+        return _bad_request_message(exc)
+    return str(exc)
