@@ -59,8 +59,14 @@ async def run_synthesis_app_forever() -> None:
     import services.ingestion.handlers  # noqa: F401
 
     wake_event = asyncio.Event()
+    # LISTEN must run on a direct (non-pooler) DSN. Neon's pgbouncer
+    # transaction-pooler resets `LISTEN *` between txns, so a listener
+    # holding a pooled conn never receives any NOTIFY. See config.py
+    # `database_url_unpooled` for the rationale; falls back to
+    # `database_url` for local dev / non-pooler deploys.
+    listener_dsn = settings.database_url_unpooled or settings.database_url
     listener = NotifyListener(
-        settings.database_url,
+        listener_dsn,
         WIKI_TRIAGED_CHANNEL,
         wake_event,
         log_prefix="synthesis_listener",

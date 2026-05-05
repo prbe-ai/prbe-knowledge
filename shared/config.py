@@ -29,6 +29,16 @@ class Settings(BaseSettings):
 
     # --- Postgres ------------------------------------------------------------
     database_url: str = "postgresql://prbe:prbe@localhost:5432/prbe_knowledge"
+    # Direct (non-pooler) DSN used ONLY by LISTEN/NOTIFY consumers. Neon's
+    # pooler endpoint runs pgbouncer in transaction mode, which resets
+    # session state ("UNLISTEN *; RESET ALL") between every transaction —
+    # so a LISTEN registered on a pooler conn never receives any NOTIFY.
+    # The fix: listeners hold a dedicated asyncpg conn against the direct
+    # endpoint (same Neon project, hostname without the `-pooler` suffix).
+    # Other queries continue to use database_url (pooled) for connection
+    # efficiency. If unset, listeners fall back to database_url, preserving
+    # local-dev + non-pooler deploys without a config burden.
+    database_url_unpooled: str | None = None
     db_pool_min_size: int = 2
     # >= machine_count * WORKER_MAX_CONCURRENT so claim loops never queue on
     # the pool. 18 * 6 = 108 slots; 30 covers the steady-state working set
