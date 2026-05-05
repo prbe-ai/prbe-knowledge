@@ -6,7 +6,10 @@ See docs/superpowers/specs/2026-05-04-synth-plan-4-tenant-seeding-v1-design.md.
 
 from __future__ import annotations
 
+import json
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 
 _VALID_PREFIXES: tuple[str, ...] = ("cust-eval-", "cust-synth-")
 
@@ -113,3 +116,122 @@ def _substitute_customer_id(
     new_payload["customer_id"] = new_id
     new_key = old_key.replace(old_id, new_id)
     return new_payload, new_key
+
+
+# ---------------------------------------------------------------------------
+# MissingCanonicalError, SeedResult, seed_tenant
+# ---------------------------------------------------------------------------
+
+
+class MissingCanonicalError(FileNotFoundError):
+    """Raised when seed_tenant is given a canonical_dir that doesn't exist
+    or has no envelope files."""
+
+
+@dataclass(frozen=True)
+class SeedResult:
+    envelopes_processed: int
+    r2_uploaded: int
+    queued: int
+    canonical_customer_id: str
+
+
+async def seed_tenant(
+    customer_id: str,
+    canonical_dir: Path,
+    db,
+    bucket,
+) -> SeedResult:
+    """Replay a canonical envelope set against a target customer.
+
+    Walks canonical_dir/raw/<source>/*.json. For each envelope:
+      1. Substitute customer_id in payload + R2 key.
+      2. Upload to R2 under the target customer's prefix (overwrites).
+      3. INSERT into ingestion_queue ON CONFLICT DO NOTHING.
+
+    Idempotent on re-run: R2 PUT always overwrites; queue INSERT skips on
+    the (customer_id, source_system, source_event_id) unique constraint.
+
+    Caller is responsible for gate checks (eligibility, typed-confirm,
+    customer existence) — seed_tenant assumes you've done them.
+
+    Real schema deviations from plan pseudo-code:
+    - Column is `source_system`, not `source`.
+    - Payload column is `payload_s3_keys TEXT[]`, not `r2_key TEXT`.
+    - ON CONFLICT target is (customer_id, source_system, source_event_id).
+    - `priority`, `version`, `enqueued_at` are populated explicitly.
+    See scripts/synth/output/writer.py::IngestionWriter._flush_queue for
+    the authoritative column list.
+    """
+    raw_root = canonical_dir / "raw"
+    if not raw_root.exists() or not any(raw_root.rglob("*.json")):
+        raise MissingCanonicalError(
+            f"canonical corpus not found at {canonical_dir}; "
+            f"generate it first (see scripts/synth/README.md)"
+        )
+
+    bucket_name = bucket.bucket_for(customer_id)
+    await bucket.ensure_bucket(bucket_name)
+
+    envelopes = sorted(raw_root.rglob("*.json"))
+    canonical_id: str | None = None
+    uploaded = 0
+    queued = 0
+
+    for env_path in envelopes:
+        payload = json.loads(env_path.read_text(encoding="utf-8"))
+        if canonical_id is None:
+            canonical_id = payload["customer_id"]
+
+        # Derive source and event_id from file path:
+        # canonical_dir/raw/<source>/<event_id>.json
+        rel = env_path.relative_to(raw_root)
+        source = rel.parts[0]         # e.g. "slack"
+        event_id = rel.stem           # e.g. "std-001"
+
+        # Reconstruct the canonical R2 key then substitute for target.
+        old_key = f"raw/{source}/{canonical_id}/synth/{event_id}.json"
+        new_payload, new_key = _substitute_customer_id(
+            payload=payload,
+            old_key=old_key,
+            old_id=canonical_id,
+            new_id=customer_id,
+        )
+
+        # Upload to R2 (overwrites on re-run — idempotent).
+        body = json.dumps(new_payload).encode("utf-8")
+        await bucket.put(bucket_name, new_key, body)
+        uploaded += 1
+
+        # INSERT into ingestion_queue using the real prbe-knowledge schema.
+        # Column list mirrors scripts/synth/output/writer.py::_flush_queue.
+        # payload_s3_keys is TEXT[] — wrap key in a list.
+        # priority=100 matches schema DEFAULT and SynthDoc default.
+        # version=1 matches IngestionWriter's convention for new rows.
+        result = await db.execute(
+            """
+            INSERT INTO ingestion_queue
+              (customer_id, source_system, source_event_id, payload_s3_keys,
+               status, priority, version, enqueued_at)
+            VALUES ($1, $2, $3, $4, 'pending', 100, 1, NOW())
+            ON CONFLICT (customer_id, source_system, source_event_id) DO NOTHING
+            """,
+            customer_id, source, event_id, [new_key],
+        )
+        # asyncpg returns "INSERT 0 N" where N is the number of rows inserted.
+        # ON CONFLICT DO NOTHING yields "INSERT 0 0"; a real insert "INSERT 0 1".
+        parts = result.split()
+        if parts and len(parts) >= 3 and parts[-1].isdigit() and int(parts[-1]) > 0:
+            queued += 1
+
+    if canonical_id is None:
+        raise MissingCanonicalError(
+            f"no envelopes found under {canonical_dir}/raw/"
+        )
+
+    return SeedResult(
+        envelopes_processed=len(envelopes),
+        r2_uploaded=uploaded,
+        queued=queued,
+        canonical_customer_id=canonical_id,
+    )
