@@ -143,3 +143,58 @@ async def test_cli_seed_canonical_missing(live_db):
     # exists + eval prefix bypasses eligibility) for gate 1a to fire.
     assert "not found" not in result.stderr or "canonical corpus not found" in result.stderr
     assert "not seed-eligible" not in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# CLI happy-path tests — subprocess exercises full dispatch + success paths
+# ---------------------------------------------------------------------------
+
+
+async def test_cli_seed_path1_happy(live_db):
+    cid = f"cust-prbe-test-cli-happy-{secrets.token_hex(4)}"
+    await _seed_customer(cid)
+
+    # Step 1: set the allow_synth_seed metadata flag via allow-seed subcommand
+    result1 = subprocess.run(
+        [sys.executable, "-m", "scripts.synth", "allow-seed", "--customer", cid],
+        capture_output=True, text=True,
+    )
+    assert result1.returncode == 0, f"allow-seed failed: stderr={result1.stderr!r}"
+    assert f"metadata.allow_synth_seed=true for {cid}" in result1.stderr
+
+    # Step 2: seed via Path 1 (metadata flag satisfied)
+    result2 = subprocess.run(
+        [sys.executable, "-m", "scripts.synth", "seed",
+         "--customer", cid,
+         "--canonical-dir", "tests/fixtures/canonical-mini"],
+        capture_output=True, text=True,
+    )
+    assert result2.returncode == 0, f"seed failed: stderr={result2.stderr!r}"
+    assert "seeded 2 envelopes" in result2.stderr
+    assert result2.stdout == ""
+
+    rows = await _queue_rows(cid)
+    assert {ev for _, ev in rows} == {"std-001", "oncall-001"}
+
+
+async def test_cli_seed_path2_happy_with_confirm(live_db):
+    cid = f"cust-prbe-test-cli-escape-{secrets.token_hex(4)}"
+    await _seed_customer(cid)
+
+    # Path 2: escape hatch flag + typed confirmation matches customer id
+    result = subprocess.run(
+        [sys.executable, "-m", "scripts.synth", "seed",
+         "--customer", cid,
+         "--allow-non-sandbox",
+         "--canonical-dir", "tests/fixtures/canonical-mini"],
+        input=cid + "\n",
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"seed failed: stderr={result.stderr!r}"
+    assert "seeded 2 envelopes" in result.stderr
+    # The typed-confirm prompt is written to stdout; allow it but ensure no
+    # unexpected extra output beyond the prompt line.
+    assert "seeded" not in result.stdout  # success message stays on stderr
+
+    rows = await _queue_rows(cid)
+    assert {ev for _, ev in rows} == {"std-001", "oncall-001"}
