@@ -359,13 +359,17 @@ WIKI_SYNTHESIS_MAX_ATTEMPTS = 3
 # is a safety net if a notify is missed during a connection drop.
 WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
 
-# Provider knobs. Each stage independently picks a provider via env var so
-# we can flip triage to Gemini Flash Lite for cost without touching
-# synthesis, or vice versa. Defaults are Anthropic (current behavior).
+# Provider knobs. Each stage independently picks a provider via the
+# constant below; flip the value and redeploy to switch a stage from
+# Anthropic to Gemini (or vice versa). Defaults are Anthropic.
+# Recognized values:
 #   "haiku"    | "claude-haiku"           → Anthropic Haiku 4.5
 #   "sonnet"   | "claude-sonnet"          → Anthropic Sonnet 4.6
 #   "gemini-flash-lite" | "gemini-flash-lite-preview" → Gemini Flash Lite
 #   "gemini-pro" | "gemini-3.1-pro-preview"          → Gemini 3.1 Pro Preview
+# There is no env-var override path — the prior `getattr(settings, ...)`
+# plumbing referenced fields that didn't exist on Settings, so the env
+# var was silently inert. Constants-only is honest.
 WIKI_TRIAGE_MODEL = "haiku"
 WIKI_SYNTHESIS_MODEL = "sonnet"
 WIKI_VERIFIER_MODEL = "sonnet"
