@@ -83,7 +83,15 @@ class IngestionWriter:
             await self._flush_queue()
 
     async def _flush_queue(self) -> None:
-        """Batch-INSERT to ingestion_queue using the actual prbe-knowledge schema."""
+        """Batch-INSERT to ingestion_queue using the actual prbe-knowledge schema.
+
+        Column shape matches services/ingestion/main.py's canonical insert
+        (the prod webhook handler). ingestion_queue has no occurred_at —
+        the doc's occurred_at travels in the R2 payload, the queue row only
+        tracks lifecycle timestamps (enqueued_at / started_at / etc.).
+        ON CONFLICT targets the (customer_id, source_system, source_event_id)
+        unique constraint to make re-runs idempotent.
+        """
         rows = [
             (
                 self.customer_id,
@@ -91,7 +99,6 @@ class IngestionWriter:
                 doc.source_event_id,
                 [key],                     # payload_s3_keys: TEXT[]
                 doc.priority,
-                doc.occurred_at,
             )
             for doc, key in self._batch
         ]
@@ -99,9 +106,9 @@ class IngestionWriter:
             """
             INSERT INTO ingestion_queue
               (customer_id, source_system, source_event_id, payload_s3_keys,
-               status, priority, occurred_at, enqueued_at)
-            VALUES ($1, $2, $3, $4, 'pending', $5, $6, NOW())
-            ON CONFLICT (source_system, source_event_id) DO NOTHING
+               status, priority, version, enqueued_at)
+            VALUES ($1, $2, $3, $4, 'pending', $5, 1, NOW())
+            ON CONFLICT (customer_id, source_system, source_event_id) DO NOTHING
             """,
             rows,
         )

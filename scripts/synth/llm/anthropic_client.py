@@ -27,14 +27,28 @@ class AnthropicClient:
             return system
         return [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
 
+    def _create_kwargs(self, req: LlmRequest) -> dict[str, Any]:
+        """Build messages.create kwargs.
+
+        Anthropic's newer reasoning models (claude-opus-4-7+) deprecated the
+        temperature parameter entirely and reject any request that includes it
+        — they pick an internal temperature that callers can't override. We
+        therefore drop ``req.temperature`` here unconditionally; the
+        determinism contract for synthetic data on these models comes from
+        seed-driven prompt content + prompt cache, not from a temperature knob
+        callers can set. Older models (e.g. sonnet-4-6, haiku-4-5) accept
+        temperature but happily run without it too, so always-omit keeps the
+        wire shape consistent across the roster.
+        """
+        return {
+            "model": req.model,
+            "system": self._system_arg(req.system),
+            "max_tokens": req.max_tokens,
+            "messages": [{"role": "user", "content": req.prompt}],
+        }
+
     async def generate(self, req: LlmRequest) -> LlmResponse:
-        msg = await self._client.messages.create(
-            model=req.model,
-            system=self._system_arg(req.system),
-            max_tokens=req.max_tokens,
-            temperature=req.temperature,
-            messages=[{"role": "user", "content": req.prompt}],
-        )
+        msg = await self._client.messages.create(**self._create_kwargs(req))
         text_parts: list[str] = []
         for block in msg.content:
             if getattr(block, "type", None) == "text":
@@ -50,13 +64,9 @@ class AnthropicClient:
             "input_schema": json_schema,
         }
         msg = await self._client.messages.create(
-            model=req.model,
-            system=self._system_arg(req.system),
-            max_tokens=req.max_tokens,
-            temperature=req.temperature,
+            **self._create_kwargs(req),
             tools=[tool_def],
             tool_choice={"type": "tool", "name": "structured_output"},
-            messages=[{"role": "user", "content": req.prompt}],
         )
         for block in msg.content:
             if getattr(block, "type", None) == "tool_use":
