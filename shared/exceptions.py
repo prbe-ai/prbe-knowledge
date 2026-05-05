@@ -191,6 +191,45 @@ class RouterTimeout(RetrievalError):
 class RouterParseError(RetrievalError): ...
 
 
+# --- Wiki agent loop --------------------------------------------------------
+
+
+class AgentHaltError(PrbeError):
+    """Wiki agent loop halted before tool_done was called.
+
+    Raised by the agent harness on any unrecoverable mid-drain failure:
+    turn cap reached, stall (3 turns no consequential tool call), update
+    cap exceeded, persistent Gemini API error, or compactor crash. The
+    synthesis worker catches this and parks all 'synthesizing' rows in
+    DLQ with `dlq_reason='agent.{halt_reason}'`. Admin reset is the
+    recovery path.
+    """
+
+    def __init__(self, reason: str, /, **context: Any) -> None:
+        super().__init__(reason, **context)
+        self.reason = reason
+
+
+class ToolValidationError(PrbeError):
+    """Agent tool input failed Pydantic validation.
+
+    The harness captures this from a tool dispatch and returns a typed
+    tool_result error to the model — the agent re-decides on the next
+    turn. Distinct from AgentHaltError because the loop continues.
+    """
+
+
+class AgentCompactionError(PrbeError):
+    """Compactor (Flash Lite summarizer) failed.
+
+    Raised by `agent_compactor.call_summarizer` when the summary call
+    errors or produces unparseable output. The harness re-raises as
+    AgentHaltError('agent.compaction_failed') so the drain DLQs cleanly
+    and the operator can see in the dashboard that compaction was the
+    root cause.
+    """
+
+
 # --- Queue ------------------------------------------------------------------
 
 class QueueError(PrbeError): ...
@@ -230,6 +269,8 @@ class NotSupportedByConnector(IngestionError):
 
 
 __all__ = [
+    "AgentCompactionError",
+    "AgentHaltError",
     "AuthError",
     "BackfillCursorCorrupt",
     "BackfillError",
@@ -271,6 +312,7 @@ __all__ = [
     "TokenExpired",
     "TokenMissing",
     "TokenRefreshFailed",
+    "ToolValidationError",
     "TransientSourceError",
     "UnsupportedEventType",
 ]
