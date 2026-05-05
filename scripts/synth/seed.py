@@ -213,24 +213,30 @@ async def seed_tenant(
         await bucket.put(bucket_name, new_key, body)
         uploaded += 1
 
-        # INSERT into ingestion_queue using the real prbe-knowledge schema.
-        # Column list mirrors scripts/synth/output/writer.py::_flush_queue.
-        # payload_s3_keys is TEXT[] — wrap key in a list.
+        # INSERT into ingestion_queue. Column list mirrors the production
+        # paths in services/ingestion/backfill_runner.py and
+        # services/ingestion/session_completer.py — both write BOTH the
+        # legacy `payload_s3_key` (singular, NOT NULL on prod) AND the
+        # new `payload_s3_keys` (TEXT[], introduced in migration 0026
+        # for claude_code session-coalescing). The legacy column was
+        # intentionally not dropped in 0026 to avoid a rolling-deploy
+        # race; a follow-up null-allow ALTER never landed, so prod still
+        # enforces NOT NULL even though local db/schema.sql shows it
+        # nullable. scripts/synth/output/writer.py::_flush_queue has the
+        # same drift and would also fail against prod — separate fix.
         # priority=100 matches schema DEFAULT and SynthDoc default.
-        # version=1 matches IngestionWriter's convention for new rows.
-        # Mirrors IngestionWriter's INSERT contract verbatim — see
-        # scripts/synth/output/writer.py for the reference call site.
         # version=1 (not the schema DEFAULT 0) matches the worker's CAS
         # contract that expects rows to start at version >= 1.
         result = await db.execute(
             """
             INSERT INTO ingestion_queue
-              (customer_id, source_system, source_event_id, payload_s3_keys,
+              (customer_id, source_system, source_event_id,
+               payload_s3_key, payload_s3_keys,
                status, priority, version, enqueued_at)
-            VALUES ($1, $2, $3, $4, 'pending', 100, 1, NOW())
+            VALUES ($1, $2, $3, $4, ARRAY[$4], 'pending', 100, 1, NOW())
             ON CONFLICT (customer_id, source_system, source_event_id) DO NOTHING
             """,
-            customer_id, source, event_id, [new_key],
+            customer_id, source, event_id, new_key,
         )
         # asyncpg returns "INSERT 0 N" where N is the number of rows inserted.
         # ON CONFLICT DO NOTHING yields "INSERT 0 0"; a real insert "INSERT 0 1".
