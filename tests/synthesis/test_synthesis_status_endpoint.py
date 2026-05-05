@@ -41,14 +41,16 @@ async def reset_db(live_db: None, settings: Settings) -> AsyncIterator[None]:
 
 
 async def _seed_queue_row(*, doc_id: str, status: str, attempts: int = 0) -> None:
+    """Seed a v4 queue row. source_ts is NOT NULL after migration 0041
+    so we fall back to NOW() for the test fixture."""
     async with raw_conn() as conn:
         await conn.execute(
             """
             INSERT INTO wiki_synthesis_queue (
                 customer_id, doc_id, doc_version, source_system, doc_type,
-                status, attempts
+                status, attempts, source_ts
             )
-            VALUES ($1, $2, 1, 'github', 'github.commit', $3, $4)
+            VALUES ($1, $2, 1, 'github', 'github.commit', $3, $4, NOW())
             """,
             CUSTOMER,
             doc_id,
@@ -83,8 +85,8 @@ async def test_status_endpoint_exposes_all_typed_fields(reset_db: None) -> None:
     await _seed_queue_row(doc_id="github:commit:tg1", status="triaging")
     await _seed_queue_row(doc_id="github:commit:s1", status="synthesizing")
     await _seed_queue_row(doc_id="github:commit:f1", status="failed")
-    await _seed_queue_row(doc_id="github:commit:vr1", status="verifier_rejected")
-    await _seed_queue_row(doc_id="github:commit:vr2", status="verifier_rejected")
+    await _seed_queue_row(doc_id="github:commit:ss1", status="synthesis_skipped")
+    await _seed_queue_row(doc_id="github:commit:ss2", status="synthesis_skipped")
     # done / rejected are deliberately not surfaced — confirm by adding
     # one and asserting it doesn't bleed into any of the typed fields.
     await _seed_queue_row(doc_id="github:commit:d1", status="done")
@@ -106,7 +108,9 @@ async def test_status_endpoint_exposes_all_typed_fields(reset_db: None) -> None:
     assert body["triaged_events"] == 1
     assert body["in_flight_events"] == 2  # triaging + synthesizing
     assert body["failed_events"] == 1
-    assert body["verifier_rejected_events"] == 2
+    assert body["synthesis_skipped_events"] == 2
+    assert body["dlq_count"] == 0
+    assert body["oldest_dlq_at"] is None
 
 
 @pytest.mark.asyncio
@@ -150,3 +154,92 @@ async def test_status_last_run_filters_to_synthesis_stage(reset_db: None) -> Non
     assert body["last_run_pages_updated"] == 3
     assert body["last_run_pages_created"] == 1
     assert body["last_run_status"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# v4: DLQ count + reset endpoint
+# ---------------------------------------------------------------------------
+
+
+async def _seed_dlq_row(*, doc_id: str, dlq_reason: str) -> None:
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO wiki_synthesis_queue (
+                customer_id, doc_id, doc_version, source_system, doc_type,
+                status, source_ts, dlq_reason, dlq_at
+            )
+            VALUES ($1, $2, 1, 'github', 'github.commit',
+                    'dlq', NOW(), $3, NOW())
+            """,
+            CUSTOMER,
+            doc_id,
+            dlq_reason,
+        )
+
+
+@pytest.mark.asyncio
+async def test_status_surfaces_dlq_count_and_oldest(reset_db: None) -> None:
+    """dlq_count + oldest_dlq_at populate when rows are in DLQ."""
+    await _seed_dlq_row(doc_id="github:commit:dlq-1", dlq_reason="agent.stall")
+    await _seed_dlq_row(doc_id="github:commit:dlq-2", dlq_reason="triage.gemini")
+
+    httpx_client = httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://t"
+    )
+    await close_pool()
+    async with app.router.lifespan_context(app), httpx_client as c:
+        resp = await c.get(
+            "/api/wiki/synthesize/status",
+            headers={
+                "X-Internal-Knowledge-Key": "test-internal-key",
+                "X-Prbe-Customer": CUSTOMER,
+            },
+        )
+    body = resp.json()
+    assert body["dlq_count"] == 2
+    assert body["oldest_dlq_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_dlq_reset_routes_agent_to_triaged_and_others_to_pending(
+    reset_db: None,
+) -> None:
+    """agent.* dlq_reason -> triaged; everything else -> pending."""
+    await _seed_dlq_row(doc_id="github:commit:agent-halt", dlq_reason="agent.stall")
+    await _seed_dlq_row(
+        doc_id="github:commit:triage-fail", dlq_reason="triage.gemini"
+    )
+
+    httpx_client = httpx.AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://t"
+    )
+    await close_pool()
+    async with app.router.lifespan_context(app), httpx_client as c:
+        resp = await c.post(
+            "/api/wiki/synthesize/dlq/reset",
+            json={"reason": "test reset"},
+            headers={
+                "X-Internal-Knowledge-Key": "test-internal-key",
+                "X-Prbe-Customer": CUSTOMER,
+            },
+        )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["reset_count"] == 2
+    assert body["triaged_reset"] == 1
+    assert body["pending_reset"] == 1
+    assert body["oldest_dlq_at"] is None  # all reset
+
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            "SELECT doc_id, status, dlq_reason, attempts FROM wiki_synthesis_queue "
+            "WHERE customer_id = $1 ORDER BY doc_id",
+            CUSTOMER,
+        )
+    by_doc = {r["doc_id"]: dict(r) for r in rows}
+    assert by_doc["github:commit:agent-halt"]["status"] == "triaged"
+    assert by_doc["github:commit:triage-fail"]["status"] == "pending"
+    # attempts reset to 0 so we don't immediately re-fail.
+    assert all(r["attempts"] == 0 for r in rows)
+    assert all(r["dlq_reason"] is None for r in rows)
