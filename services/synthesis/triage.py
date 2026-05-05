@@ -14,6 +14,14 @@ Public surface:
   `WIKI_TRIAGE_MODEL` env var flips it). The function signature stays
   Anthropic-shaped (takes `client`) for call-site compatibility — when
   the provider is Gemini, `client` is unused.
+- `call_triage_with_split_retry(client, events, *, now)` — defense in
+  depth on top of the upfront packer. If the wire request still trips
+  Anthropic's 200K hard limit (because of tokenizer drift, prompt
+  changes, or an unusually large doc that snuck past the packer), this
+  wrapper recursively splits the batch in half and retries instead of
+  failing the whole batch. A single-event batch that overflows is
+  marked rejected with reason
+  `OVERSIZED_AT_CALL_TIME_REASON` so the worker can DLQ-route it.
 - `TriageParseError` — re-exported from `providers` so existing call sites
   importing it from this module still work.
 
@@ -41,11 +49,12 @@ body count. We:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropic, BadRequestError
 
-from services.synthesis.models import TriageInput, TriageOutput
+from services.synthesis.models import TriageInput, TriageOutput, TriageVerdict
 from services.synthesis.providers import (
     TriageParseError,
     get_triage_provider,
@@ -56,11 +65,14 @@ from shared.logging import get_logger
 __all__ = [
     "ANTHROPIC_TOKEN_MULTIPLIER",
     "EVENT_FRAMING_TOKENS",
+    "OVERSIZED_AT_CALL_TIME_REASON",
     "OVERSIZED_EVENT_TOKENS",
     "PROMPT_OVERHEAD_TOKENS",
     "TriageParseError",
     "call_triage",
+    "call_triage_with_split_retry",
     "estimate_event_cost",
+    "is_anthropic_oversize_error",
     "pack_into_batches",
 ]
 
@@ -178,3 +190,143 @@ async def call_triage(
     """
     provider = get_triage_provider(client)
     return await provider.triage(events, now=now)
+
+
+# ---------------------------------------------------------------------------
+# Split-on-overflow retry — defense in depth over the upfront packer.
+# ---------------------------------------------------------------------------
+
+
+# Reason tag for events that the packer thought were under-budget but
+# Anthropic still rejected at the wire as too long. Surfaced on the
+# rejected verdict so the dashboard / DLQ surface can distinguish them
+# from regular score-rejected rows.
+OVERSIZED_AT_CALL_TIME_REASON = "triage.oversized_event_at_call_time"
+
+
+# Anthropic's BadRequestError message for an oversized prompt looks like:
+#   "prompt is too long: 211739 tokens > 200000 maximum"
+# Match either the literal "prompt is too long" prefix OR the more
+# generic "<N> tokens > <M> maximum" suffix; the SDK has occasionally
+# shifted wording across versions.
+_OVERSIZE_REGEXES = (
+    re.compile(r"prompt is too long", re.IGNORECASE),
+    re.compile(r"\btokens?\s*>\s*\d+\s*maximum\b", re.IGNORECASE),
+)
+
+
+def _bad_request_message(exc: BadRequestError) -> str:
+    """Pull the human-readable message out of a BadRequestError.
+
+    Tries `.message` (set by APIStatusError.__init__) first, then falls
+    back to `.body['error']['message']` for SDK versions that didn't
+    populate `.message`, then `str(exc)`.
+    """
+    msg = getattr(exc, "message", None)
+    if isinstance(msg, str) and msg:
+        return msg
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            inner = err.get("message")
+            if isinstance(inner, str) and inner:
+                return inner
+    return str(exc)
+
+
+def is_anthropic_oversize_error(exc: BaseException) -> bool:
+    """True iff `exc` is the Anthropic 400 for an oversized prompt.
+
+    Other 400s (bad API key, bad model name, malformed schema) MUST
+    return False so the caller propagates them instead of split-retrying.
+    """
+    if not isinstance(exc, BadRequestError):
+        return False
+    msg = _bad_request_message(exc)
+    return any(rx.search(msg) for rx in _OVERSIZE_REGEXES)
+
+
+def _rejected_output_for_single_oversize(event: TriageInput) -> TriageOutput:
+    """Synthesize a rejected verdict for a single event that the wire
+    rejected as too long. The worker's `_apply_verdicts` will route this
+    into `mark_rejected` via the score-below-threshold path, with the
+    reason string preserved for the audit log.
+    """
+    verdict = TriageVerdict(
+        important=False,
+        score=0.0,
+        reason=OVERSIZED_AT_CALL_TIME_REASON,
+    )
+    return TriageOutput(verdicts={str(event.queue_id): verdict})
+
+
+def _merge_outputs(a: TriageOutput, b: TriageOutput) -> TriageOutput:
+    merged = dict(a.verdicts)
+    merged.update(b.verdicts)
+    return TriageOutput(verdicts=merged)
+
+
+async def call_triage_with_split_retry(
+    client: AsyncAnthropic,
+    events: list[TriageInput],
+    *,
+    now: datetime,
+) -> TriageOutput:
+    """Call triage; on oversize-prompt 400, recursively split + retry.
+
+    The upfront packer in `pack_into_batches` is the first line of
+    defense — it estimates Anthropic-tokenizer counts and trims batches
+    to stay under 200K. This wrapper is the second line: tokenizer
+    drift, prompt changes, or a single freakishly dense doc could still
+    push a batch past Anthropic's hard limit. Rather than failing the
+    whole batch to DLQ, halve and retry.
+
+    Algorithm:
+
+    - Try `call_triage(client, events, now=now)`.
+    - If it raises `BadRequestError` with the oversize signature:
+      - `len(events) > 1`: split the batch into two halves, recurse on
+        each half, merge the resulting dicts, return.
+      - `len(events) == 1`: the single event is the offender — return
+        a rejected verdict tagged with `OVERSIZED_AT_CALL_TIME_REASON`
+        so the worker DLQ-routes it. Do NOT recurse further.
+    - On any other exception (non-oversize 400, 401, 5xx, network):
+      re-raise unchanged.
+
+    The merged return shape is identical to a single `call_triage`
+    success — callers don't see the recursion.
+    """
+    try:
+        return await call_triage(client, events, now=now)
+    except BadRequestError as exc:
+        if not is_anthropic_oversize_error(exc):
+            raise
+        if len(events) <= 1:
+            # Single event is itself oversized; mark rejected so the
+            # worker's apply-verdicts path durably moves it out of the
+            # pending pool. No further recursion.
+            log.warning(
+                "triage.split_retry.single_event_oversize",
+                queue_id=events[0].queue_id if events else None,
+                doc_id=events[0].doc_id if events else None,
+                error=_bad_request_message(exc),
+            )
+            if not events:
+                # Defensive: shouldn't happen — call_triage short-circuits
+                # on empty input — but if it does, surface it.
+                raise
+            return _rejected_output_for_single_oversize(events[0])
+        midpoint = len(events) // 2
+        left = events[:midpoint]
+        right = events[midpoint:]
+        log.warning(
+            "triage.split_retry.splitting",
+            batch_size=len(events),
+            left_size=len(left),
+            right_size=len(right),
+            error=_bad_request_message(exc),
+        )
+        left_out = await call_triage_with_split_retry(client, left, now=now)
+        right_out = await call_triage_with_split_retry(client, right, now=now)
+        return _merge_outputs(left_out, right_out)

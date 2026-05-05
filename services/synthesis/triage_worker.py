@@ -35,7 +35,7 @@ from anthropic import AsyncAnthropic
 from services.synthesis import persistence
 from services.synthesis.models import TriageInput, TriageVerdict
 from services.synthesis.triage import (
-    call_triage,
+    call_triage_with_split_retry,
     pack_into_batches,
 )
 from shared.config import get_settings
@@ -295,7 +295,7 @@ class TriageWorker:
         async def _one(batch: list[TriageInput]) -> dict[int, TriageVerdict]:
             async with self._batch_sem:
                 try:
-                    output = await call_triage(client, batch, now=now)
+                    output = await call_triage_with_split_retry(client, batch, now=now)
                 except Exception as exc:
                     log.warning(
                         "triage_worker.triage_failed",
