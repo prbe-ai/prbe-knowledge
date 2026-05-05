@@ -174,7 +174,14 @@ class TriageWorker:
                 events_total += len(queue_rows)
 
                 triage_inputs = await persistence.fetch_bodies(customer_id, queue_rows)
-                batches = pack_into_batches(triage_inputs)
+                batches, oversized = pack_into_batches(triage_inputs)
+                # Events whose own body exceeds the per-event cap can never
+                # fit in a triage call alone; mark them rejected (with a
+                # zero-score verdict + reason) so they don't churn forever.
+                # Logged at WARN inside pack_into_batches; here we durably
+                # transition the queue rows.
+                if oversized:
+                    await self._reject_oversized(customer_id, oversized)
                 verdicts = await self._call_triage_batches(client, batches, customer_id)
                 events_triaged += len(verdicts)
 
@@ -354,6 +361,37 @@ class TriageWorker:
                 notify_channel=self._notify_channel,
             )
         return len(triaged_verdicts)
+
+    async def _reject_oversized(
+        self,
+        customer_id: str,
+        oversized: list[TriageInput],
+    ) -> None:
+        """Mark events that exceed the per-event token cap as rejected.
+
+        These rows have bodies so large they can't fit in even a
+        single-event triage call (Haiku's 200K context). Synthesizing a
+        zero-score verdict reuses the existing `mark_rejected` path so
+        the dashboard sees them as triage-rejected (not stuck in
+        pending) and the per-row attempts counter doesn't churn.
+        """
+        for event in oversized:
+            verdict = TriageVerdict(
+                important=False,
+                score=0.0,
+                reason=(
+                    f"Body too large for triage "
+                    f"({event.body_token_count} cl100k tokens; cap is "
+                    f"~{int(150_000 / 1.30)} cl100k after Anthropic scaling)."
+                ),
+            )
+            await persistence.mark_rejected(customer_id, event.queue_id, verdict)
+        log.warning(
+            "triage_worker.oversized_events_rejected",
+            customer=customer_id,
+            count=len(oversized),
+            queue_ids=[e.queue_id for e in oversized],
+        )
 
 
 __all__ = ["TriageWorker"]

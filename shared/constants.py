@@ -349,11 +349,22 @@ WIKI_TRIAGED_CHANNEL = "wiki_synthesize_triaged"
 # pulled into memory at once.
 WIKI_SYNTHESIS_CLAIM_BATCH = 200
 
-# Token budget per Haiku triage call. Rows are packed greedily by
-# `documents.body_token_count` until this ceiling is hit, then the batch fires.
-# A row whose body alone exceeds the ceiling becomes its own single-row call;
-# Haiku has 200K context so even big claude_code sessions usually fit alone.
-WIKI_TRIAGE_TOKEN_BUDGET = 120_000
+# Token budget per Haiku triage call, expressed in *estimated Anthropic
+# tokens* (post-multiplier — see `services.synthesis.triage`). Rows are
+# packed greedily until this ceiling is hit, then the batch fires. The
+# packer adds prompt + tool-schema + per-event framing overhead on top
+# of body tokens before comparing to this budget, so it represents the
+# user-content slice of the wire request, not the full request size.
+#
+# Headroom: Anthropic Haiku's hard context limit is 200K tokens. We
+# budget 150K for content; the remaining 50K is left as margin for
+# (1) prompt + tool-schema + envelope (~2K), (2) tokenizer drift between
+# our cl100k estimate and Anthropic's true tokenizer, and (3) the model's
+# own response. Production drains were DLQ'ing entire batches at the
+# previous 120K budget because the packer counted only raw body text in
+# cl100k and Anthropic's tokenizer + request envelope pushed the wire
+# count past 200K (e.g. batch_size=66 produced 208K Anthropic tokens).
+WIKI_TRIAGE_TOKEN_BUDGET = 150_000
 
 # Importance threshold for triage to keep an event. Below this score the row
 # is marked 'rejected' and never reaches synthesis. Raised from 5.0 → 7.0
