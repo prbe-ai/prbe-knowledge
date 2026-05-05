@@ -366,6 +366,29 @@ WIKI_SYNTHESIS_CLAIM_BATCH = 200
 # count past 200K (e.g. batch_size=66 produced 208K Anthropic tokens).
 WIKI_TRIAGE_TOKEN_BUDGET = 150_000
 
+# Output-side budget for the triage Anthropic call.
+#
+# Haiku 4.5's `max_tokens` ceiling is 8192. We set 8000 to leave a 192-
+# token cushion against SDK-version drift / per-conversation token
+# bookkeeping. The original 4096 was way too low: a batch of ~28+ events
+# would produce more verdicts than fit in 4096 output tokens, so Haiku
+# would stop at max_tokens with NO tool_use block — causing a Pydantic
+# crash on the missing `verdicts` field and DLQ-ing the whole batch.
+WIKI_TRIAGE_MAX_OUTPUT_TOKENS = 8000
+
+# Per-verdict size estimate, in Anthropic tokens. TriageVerdict is
+# {important: bool, score: float, reason: str ≤ ~100 tokens}; with the
+# JSON envelope `"queue_id": {...}` and pretty-printing, a verdict lands
+# around 80-120 Anthropic tokens. 150 is the conservative cap.
+WIKI_TRIAGE_VERDICT_TOKENS = 150
+
+# Output-side cap on events per batch:
+#   floor(WIKI_TRIAGE_MAX_OUTPUT_TOKENS / WIKI_TRIAGE_VERDICT_TOKENS)
+#   = 8000 / 150 = 53 → round down to 50 for envelope + drift margin.
+# The packer enforces MIN(input-token-budget, this-event-cap) so the
+# limiting factor is whichever binds first for a given batch.
+WIKI_TRIAGE_MAX_EVENTS_PER_BATCH = 50
+
 # Importance threshold for triage to keep an event. Below this score the row
 # is marked 'rejected' and never reaches synthesis. Raised from 5.0 → 7.0
 # to align triage with the wiki's actual scope (slow-moving company

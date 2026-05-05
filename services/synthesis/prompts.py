@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any
 
 from services.synthesis.models import TriageInput
+from shared.constants import WIKI_TRIAGE_MAX_OUTPUT_TOKENS
 
 # ---------------------------------------------------------------------------
 # Triage — Haiku
@@ -129,12 +130,18 @@ def build_triage_prompt(
     events: list[TriageInput],
     *,
     now: datetime,
-    max_tokens: int = 4096,
+    max_tokens: int = WIKI_TRIAGE_MAX_OUTPUT_TOKENS,
 ) -> dict[str, Any]:
     """Construct the kwargs for `AsyncAnthropic.messages.create`.
 
     Caller adds `model=HAIKU_MODEL` and supplies `messages` from this dict.
     The system block + tool schema are marked for ephemeral prompt caching.
+
+    `max_tokens` defaults to `WIKI_TRIAGE_MAX_OUTPUT_TOKENS` (8000), which
+    sits just under Haiku 4.5's 8192 hard ceiling. Combined with the
+    packer's `WIKI_TRIAGE_MAX_EVENTS_PER_BATCH=50` cap, this leaves
+    ~150 Anthropic tokens of output headroom per verdict — enough for
+    `{important, score, reason}` at any realistic reason length.
     """
     user = _format_triage_user_message(events)
     return {

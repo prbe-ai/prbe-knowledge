@@ -33,6 +33,11 @@ from services.synthesis.triage import (
     estimate_event_cost,
     pack_into_batches,
 )
+from shared.constants import (
+    WIKI_TRIAGE_MAX_EVENTS_PER_BATCH,
+    WIKI_TRIAGE_MAX_OUTPUT_TOKENS,
+    WIKI_TRIAGE_VERDICT_TOKENS,
+)
 
 ANTHROPIC_HARD_LIMIT = 200_000
 
@@ -182,3 +187,80 @@ def test_anthropic_token_multiplier_is_conservative() -> None:
         "Anthropic counts more tokens than cl100k_base for the same text; "
         "lowering the multiplier risks 200K-context overflows."
     )
+
+
+# ---------------------------------------------------------------------------
+# Output-side cap: WIKI_TRIAGE_MAX_EVENTS_PER_BATCH
+# ---------------------------------------------------------------------------
+#
+# Even if events are tiny enough to fit dozens-to-hundreds in the input
+# token budget, the OUTPUT side bounds us: Haiku 4.5's max_tokens is
+# 8192, and each TriageVerdict occupies ~150 Anthropic tokens. The
+# packer must cap at floor(WIKI_TRIAGE_MAX_OUTPUT_TOKENS /
+# WIKI_TRIAGE_VERDICT_TOKENS) events so the response can finish before
+# hitting max_tokens. Without this cap, a 200-event batch of tiny docs
+# would overflow output and crash Pydantic on a missing `verdicts`
+# field — which is the failure mode the second drain hit.
+
+
+def test_pack_caps_at_max_events_when_input_budget_underbinds() -> None:
+    """200 tiny events would all fit in the 150K input budget, but the
+    output side caps each batch at WIKI_TRIAGE_MAX_EVENTS_PER_BATCH.
+    The packer must close the batch when the event-count cap binds."""
+    # Each event ~150 cl100k tokens (~195 Anthropic), well under any
+    # single-event cap. Total cl100k for 200 events = ~30K, way under
+    # the 150K input budget — so without the event cap, this packs
+    # into ONE batch of 200.
+    events = [_ev(i, 150) for i in range(200)]
+    batches, oversized = pack_into_batches(events)
+
+    assert oversized == []
+    for batch in batches:
+        assert len(batch) <= WIKI_TRIAGE_MAX_EVENTS_PER_BATCH, (
+            f"batch of {len(batch)} events exceeds output cap "
+            f"{WIKI_TRIAGE_MAX_EVENTS_PER_BATCH}"
+        )
+
+    # Sanity: 200 events at cap=50 must produce >= 4 batches.
+    assert len(batches) >= 4, (
+        f"expected >= 4 batches at cap 50; got {len(batches)}"
+    )
+
+    # Order preserved: flatten batches and check FIFO.
+    flat = [ev.queue_id for batch in batches for ev in batch]
+    assert flat == list(range(200))
+
+
+def test_max_events_cap_keeps_output_under_max_tokens() -> None:
+    """Sanity-check the constant arithmetic: a full-cap batch's expected
+    output should fit under WIKI_TRIAGE_MAX_OUTPUT_TOKENS with margin.
+    If a future tuning lowers max_tokens or raises the per-verdict
+    estimate, this catches the inconsistency."""
+    expected_output = (
+        WIKI_TRIAGE_MAX_EVENTS_PER_BATCH * WIKI_TRIAGE_VERDICT_TOKENS
+    )
+    assert expected_output <= WIKI_TRIAGE_MAX_OUTPUT_TOKENS, (
+        f"WIKI_TRIAGE_MAX_EVENTS_PER_BATCH ({WIKI_TRIAGE_MAX_EVENTS_PER_BATCH}) "
+        f"x WIKI_TRIAGE_VERDICT_TOKENS ({WIKI_TRIAGE_VERDICT_TOKENS}) = "
+        f"{expected_output} would exceed WIKI_TRIAGE_MAX_OUTPUT_TOKENS "
+        f"({WIKI_TRIAGE_MAX_OUTPUT_TOKENS}). Lower the event cap or raise "
+        f"max_tokens."
+    )
+
+
+def test_pack_input_budget_binds_first_for_large_events() -> None:
+    """When events are large enough that the input budget binds before
+    the event cap, batches must still respect the input budget — i.e.
+    the cap doesn't artificially force more events into a batch when
+    they wouldn't fit."""
+    # Each event ~50K cl100k -> ~65K Anthropic. At 150K budget, only ~2
+    # events per batch fit by input. Event cap of 50 would never bind.
+    events = [_ev(i, 50_000) for i in range(10)]
+    batches, oversized = pack_into_batches(events)
+
+    assert oversized == []
+    for batch in batches:
+        # Input budget is the binder: each batch should be 1-2 events.
+        assert len(batch) <= 3, (
+            f"batch of {len(batch)} large events should not pack so wide"
+        )

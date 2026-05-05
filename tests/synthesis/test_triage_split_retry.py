@@ -241,11 +241,91 @@ async def test_non_oversize_400_propagates() -> None:
 
 @pytest.mark.asyncio
 async def test_non_anthropic_exception_propagates() -> None:
-    """Non-Anthropic exceptions (network, parse error, 5xx) must not
-    trigger split-retry either."""
+    """Non-Anthropic exceptions (network, 5xx) must not trigger
+    split-retry either. (Note: a TriageParseError whose message matches
+    the overflow signature DOES trigger a split — see the parse-overflow
+    section below.)"""
     events = [_ev(1), _ev(2)]
     client = _make_client_with_responses([RuntimeError("kaboom")])
 
     with pytest.raises(RuntimeError, match="kaboom"):
         await call_triage_with_split_retry(client, events, now=NOW)
+    assert client.messages.create.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Output-side overflow: max_tokens-truncated response triggers split too
+# ---------------------------------------------------------------------------
+#
+# When Haiku stops at max_tokens before finishing the tool_use block,
+# the SDK returns a successful 200. Two surfaces:
+#   1. tool_use block exists but its input is `{}` -> Pydantic raises
+#      "Field required" on `verdicts` -> wrapped as TriageParseError.
+#   2. No tool_use block at all (model produced text only) -> parser
+#      raises "response had no record_triage tool_use block" ->
+#      TriageParseError.
+# Both indicate the model ran out of output budget for the batch size.
+# call_triage_with_split_retry must treat these as overflow-shaped and
+# halve the batch — same recovery as a 400 oversize.
+
+
+def _empty_tool_use_response() -> SimpleNamespace:
+    """SDK shape for a tool_use response whose input is `{}` (Haiku
+    started the tool_use, hit max_tokens before finishing the JSON)."""
+    block = SimpleNamespace(type="tool_use", name="record_triage", input={})
+    return SimpleNamespace(content=[block])
+
+
+def _no_tool_use_response() -> SimpleNamespace:
+    """SDK shape when Haiku produced ONLY text content (no tool_use
+    block). Hit max_tokens before opening the tool_use at all."""
+    text_block = SimpleNamespace(type="text", text="...")
+    return SimpleNamespace(content=[text_block])
+
+
+@pytest.mark.asyncio
+async def test_parse_failure_empty_input_triggers_split() -> None:
+    """Anthropic returns a 200 with an empty {} tool_use input — that
+    means max_tokens cut Haiku off mid-output. Same recovery as a 400:
+    halve and retry."""
+    events = [_ev(i) for i in range(4)]
+    client = _make_client_with_responses(
+        [
+            _empty_tool_use_response(),     # full batch fails Pydantic
+            _success_response(events[:2]),  # left half: ok
+            _success_response(events[2:]),  # right half: ok
+        ]
+    )
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+    assert isinstance(out, TriageOutput)
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    assert client.messages.create.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_parse_failure_no_tool_use_triggers_split() -> None:
+    """Same overflow shape, different SDK surface: no tool_use block
+    at all. The parser raises 'response had no record_triage tool_use
+    block', which the wrapper recognizes as overflow."""
+    events = [_ev(i) for i in range(4)]
+    client = _make_client_with_responses(
+        [
+            _no_tool_use_response(),
+            _success_response(events[:2]),
+            _success_response(events[2:]),
+        ]
+    )
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+
+
+@pytest.mark.asyncio
+async def test_single_event_parse_overflow_marked_rejected() -> None:
+    """Bottom-out: 1 event whose response is empty/truncated gets the
+    same call-time-oversize rejection as a 400 single-event leaf."""
+    events = [_ev(99)]
+    client = _make_client_with_responses([_empty_tool_use_response()])
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+    assert list(out.verdicts.keys()) == ["99"]
+    assert out.verdicts["99"].reason == OVERSIZED_AT_CALL_TIME_REASON
     assert client.messages.create.await_count == 1
