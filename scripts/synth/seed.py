@@ -87,33 +87,39 @@ def _substitute_customer_id(
     old_id: str,
     new_id: str,
 ) -> tuple[dict, str]:
-    """Rewrite a canonical envelope's customer_id field and R2 key for
-    a target tenant.
+    """Rewrite a canonical envelope's R2 key for a target tenant.
 
-    V1 scope: only the top-level `customer_id` field on the payload is
-    rewritten. Nested references (e.g. thread_parent_id segments that
-    happen to contain the canonical customer_id) are left untouched —
-    no downstream consumer interprets them as customer_ids.
+    Real source-specific envelopes (Slack Events API, Notion webhooks, etc.)
+    do NOT carry a top-level `customer_id` field — the customer is identified
+    by the R2 bucket and the key path's customer_id segment. So payload
+    rewrite is opt-in: only modified when the payload happens to already
+    have a `customer_id` field (legacy / synth-only envelopes). Real
+    envelopes pass through untouched on the payload axis; only the key is
+    substituted.
 
-    Idempotent: if old_id is not in old_key but payload has new_id,
-    the transformation was already applied; return unchanged.
-    Raises ValueError if old_id is not in old_key and payload doesn't
-    have new_id (malformed fixture).
+    Idempotent: if old_id isn't in old_key, assume the substitution has
+    already happened and return unchanged. Raises ValueError only if old_id
+    is missing AND the payload's optional customer_id (if present) isn't new_id
+    yet — that combination indicates a malformed input.
     """
-    # Affirmative idempotency: payload already transformed AND key already
-    # substituted → return unchanged.
-    if old_id not in old_key and payload.get("customer_id") == new_id:
+    # Affirmative idempotency: key already substituted (and, if a legacy
+    # customer_id field is present, it matches the target).
+    if old_id not in old_key and payload.get("customer_id", new_id) == new_id:
         return dict(payload), old_key
 
-    # Malformed input: old_id missing from key but payload not yet transformed.
+    # Malformed: key claims un-substituted state but the payload's customer_id
+    # field disagrees.
     if old_id not in old_key:
         raise ValueError(
             f"old_id not found in R2 key: old_id={old_id!r}, old_key={old_key!r}"
         )
 
-    # Normal case: rewrite both payload and key.
     new_payload = dict(payload)
-    new_payload["customer_id"] = new_id
+    if "customer_id" in new_payload:
+        # Legacy / synth-only envelopes that carry an explicit customer_id
+        # field get it rewritten too. Real source-API envelopes don't and
+        # are left untouched.
+        new_payload["customer_id"] = new_id
     new_key = old_key.replace(old_id, new_id)
     return new_payload, new_key
 
@@ -160,10 +166,13 @@ async def seed_tenant(
     init_tenant (which is the usual creator of the R2 bucket). Calling
     ensure_bucket() on an existing bucket is a no-op.
 
-    Canonical assumption: all envelopes under canonical_dir/raw/ must share
-    the same customer_id (captured from the first envelope walked). Mixed
-    canonical_id values across envelopes will silently produce incorrect
-    R2 keys for the second-and-later sources.
+    Canonical identity: read from canonical_dir/MANIFEST.json which must
+    contain {"canonical_customer_id": "<id>", ...}. This is the customer_id
+    the canonical was originally recorded against; seed_tenant substitutes
+    it for the target customer_id wherever it appears in R2 keys. Reading
+    the canonical_id from a manifest (rather than per-envelope payload)
+    works for real source-API envelopes that don't carry a customer_id
+    field (Slack Events API, Notion webhooks, etc.).
 
     Real schema deviations from plan pseudo-code:
     - Column is `source_system`, not `source`.
@@ -180,18 +189,35 @@ async def seed_tenant(
             f"generate it first (see scripts/synth/README.md)"
         )
 
+    manifest_path = canonical_dir / "MANIFEST.json"
+    if not manifest_path.exists():
+        raise MissingCanonicalError(
+            f"canonical MANIFEST.json not found at {manifest_path}; "
+            f"the manifest must declare canonical_customer_id (the "
+            f"customer_id the canonical corpus was recorded against)"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise MissingCanonicalError(
+            f"canonical MANIFEST.json is not valid JSON: {exc}"
+        ) from exc
+    canonical_id = manifest.get("canonical_customer_id")
+    if not isinstance(canonical_id, str) or not canonical_id:
+        raise MissingCanonicalError(
+            f"canonical MANIFEST.json missing required 'canonical_customer_id' "
+            f"string field; got {canonical_id!r}"
+        )
+
     bucket_name = bucket.bucket_for(customer_id)
     await bucket.ensure_bucket(bucket_name)
 
     envelopes = sorted(raw_root.rglob("*.json"))
-    canonical_id: str | None = None
     uploaded = 0
     queued = 0
 
     for env_path in envelopes:
         payload = json.loads(env_path.read_text(encoding="utf-8"))
-        if canonical_id is None:
-            canonical_id = payload["customer_id"]
 
         # Derive source and event_id from file path:
         # canonical_dir/raw/<source>/<event_id>.json
@@ -243,11 +269,6 @@ async def seed_tenant(
         parts = result.split()
         if parts and len(parts) >= 3 and parts[-1].isdigit() and int(parts[-1]) > 0:
             queued += 1
-
-    if canonical_id is None:
-        raise MissingCanonicalError(
-            f"no envelopes found under {canonical_dir}/raw/"
-        )
 
     return SeedResult(
         envelopes_processed=len(envelopes),

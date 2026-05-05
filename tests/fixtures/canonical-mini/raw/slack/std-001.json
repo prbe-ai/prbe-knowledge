@@ -1,5 +1,4 @@
 {
-  "customer_id": "cust-eval-canonical-v1",
   "type": "event_callback",
   "team_id": "T_SYNTH",
   "api_app_id": "A_SYNTH",

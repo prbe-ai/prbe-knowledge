@@ -55,11 +55,17 @@ async def test_seed_happy_path(live_db):
         db=get_pool(),
         bucket=bucket,
     )
-    assert result.envelopes_processed == 2
-    assert result.r2_uploaded == 2
-    assert result.queued == 2
+    # canonical-mini has 3 envelopes: 2 slack + 1 notion (per MANIFEST.json).
+    assert result.envelopes_processed == 3
+    assert result.r2_uploaded == 3
+    assert result.queued == 3
+    assert result.canonical_customer_id == "cust-eval-canonical-v1"
     rows = await _queue_rows(cid)
-    assert {ev for _, ev in rows} == {"std-001", "oncall-001"}
+    assert set(rows) == {
+        ("slack", "std-001"),
+        ("slack", "oncall-001"),
+        ("notion", "page-001"),
+    }
 
 
 async def test_seed_idempotent(live_db):
@@ -68,10 +74,10 @@ async def test_seed_idempotent(live_db):
     bucket = ObjectStore()
     first = await seed_tenant(cid, CANONICAL_MINI, get_pool(), bucket)
     second = await seed_tenant(cid, CANONICAL_MINI, get_pool(), bucket)
-    assert first.queued == 2
+    assert first.queued == 3
     # Second run: R2 PUT overwrites (uploaded > 0), queue ON CONFLICT skips.
     assert second.queued == 0
-    assert second.r2_uploaded == 2  # PUTs are unconditional; idempotent overwrite
+    assert second.r2_uploaded == 3  # PUTs are unconditional; idempotent overwrite
 
 
 async def test_seed_missing_canonical_raises(live_db):
@@ -170,11 +176,11 @@ async def test_cli_seed_path1_happy(live_db):
         capture_output=True, text=True,
     )
     assert result2.returncode == 0, f"seed failed: stderr={result2.stderr!r}"
-    assert "seeded 2 envelopes" in result2.stderr
+    assert "seeded 3 envelopes" in result2.stderr
     assert result2.stdout == ""
 
     rows = await _queue_rows(cid)
-    assert {ev for _, ev in rows} == {"std-001", "oncall-001"}
+    assert {ev for _, ev in rows} == {"std-001", "oncall-001", "page-001"}
 
 
 async def test_cli_seed_path2_happy_with_confirm(live_db):
@@ -191,10 +197,10 @@ async def test_cli_seed_path2_happy_with_confirm(live_db):
         capture_output=True, text=True,
     )
     assert result.returncode == 0, f"seed failed: stderr={result.stderr!r}"
-    assert "seeded 2 envelopes" in result.stderr
+    assert "seeded 3 envelopes" in result.stderr
     # The typed-confirm prompt is written to stdout; allow it but ensure no
     # unexpected extra output beyond the prompt line.
     assert "seeded" not in result.stdout  # success message stays on stderr
 
     rows = await _queue_rows(cid)
-    assert {ev for _, ev in rows} == {"std-001", "oncall-001"}
+    assert {ev for _, ev in rows} == {"std-001", "oncall-001", "page-001"}

@@ -1,0 +1,79 @@
+{
+  "id": "page-synth-notion-001",
+  "type": "page.updated",
+  "timestamp": "2026-04-25T12:00:00.000Z",
+  "workspace_id": "ws-synth",
+  "workspace_name": "Synth",
+  "entity": {
+    "type": "page",
+    "id": "page-synth-doc-001",
+    "properties": {
+      "title": {
+        "type": "title",
+        "title": [
+          {
+            "type": "text",
+            "plain_text": "Onboarding playbook",
+            "text": {"content": "Onboarding playbook"}
+          }
+        ]
+      }
+    },
+    "body_markdown": "## Day 1\nGet a laptop, set up SSO, install the dev stack.\n\n## Day 2\nClaim a starter ticket from the onboarding board and ship a one-line PR.\n"
+  },
+  "data": {
+    "last_edited_time": "2026-04-25T12:00:00.000Z",
+    "last_edited_by": {"id": "user-synth-alice"},
+    "updated_properties": ["title"],
+    "properties": {
+      "title": {
+        "type": "title",
+        "title": [
+          {
+            "type": "text",
+            "plain_text": "Onboarding playbook",
+            "text": {"content": "Onboarding playbook"}
+          }
+        ]
+      }
+    },
+    "blocks": [
+      {
+        "type": "heading_2",
+        "id": "block-0",
+        "heading_2": {
+          "rich_text": [
+            {"type": "text", "plain_text": "Day 1", "text": {"content": "Day 1"}}
+          ]
+        }
+      },
+      {
+        "type": "paragraph",
+        "id": "block-1",
+        "paragraph": {
+          "rich_text": [
+            {"type": "text", "plain_text": "Get a laptop, set up SSO, install the dev stack.", "text": {"content": "Get a laptop, set up SSO, install the dev stack."}}
+          ]
+        }
+      },
+      {
+        "type": "heading_2",
+        "id": "block-2",
+        "heading_2": {
+          "rich_text": [
+            {"type": "text", "plain_text": "Day 2", "text": {"content": "Day 2"}}
+          ]
+        }
+      },
+      {
+        "type": "paragraph",
+        "id": "block-3",
+        "paragraph": {
+          "rich_text": [
+            {"type": "text", "plain_text": "Claim a starter ticket from the onboarding board and ship a one-line PR.", "text": {"content": "Claim a starter ticket from the onboarding board and ship a one-line PR."}}
+          ]
+        }
+      }
+    ]
+  }
+}
