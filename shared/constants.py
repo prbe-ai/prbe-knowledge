@@ -359,42 +359,25 @@ WIKI_SYNTHESIS_MAX_ATTEMPTS = 3
 # is a safety net if a notify is missed during a connection drop.
 WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
 
-# Provider knobs. Each stage independently picks a provider via the
-# constant below; flip the value and redeploy to switch a stage from
-# Anthropic to Gemini (or vice versa). Defaults are Anthropic.
+# Provider knob for the triage stage. v4 uses the wiki agent (Gemini
+# Pro) for synthesis, so the synthesis + verifier provider knobs are
+# gone. Triage is provider-pluggable: flip the value and redeploy to
+# switch from Anthropic Haiku -> Gemini Flash Lite (or back). Defaults
+# to Anthropic.
 # Recognized values:
-#   "haiku"    | "claude-haiku"           → Anthropic Haiku 4.5
-#   "sonnet"   | "claude-sonnet"          → Anthropic Sonnet 4.6
-#   "gemini-flash-lite" | "gemini-flash-lite-preview" → Gemini Flash Lite
-#   "gemini-pro" | "gemini-3.1-pro-preview"          → Gemini 3.1 Pro Preview
-# There is no env-var override path — the prior `getattr(settings, ...)`
-# plumbing referenced fields that didn't exist on Settings, so the env
-# var was silently inert. Constants-only is honest.
+#   "haiku" | "claude-haiku"           -> Anthropic Haiku 4.5
+#   "gemini-flash-lite" | "gemini-flash-lite-preview" -> Gemini Flash Lite
+# No env-var override path — the prior `getattr(settings, ...)` plumbing
+# referenced fields that didn't exist on Settings, so the env var was
+# silently inert. Constants-only is honest.
 WIKI_TRIAGE_MODEL = "haiku"
-WIKI_SYNTHESIS_MODEL = "sonnet"
-WIKI_VERIFIER_MODEL = "sonnet"
 
-# Verifier stage: per-cluster sanity check between triage and synthesize.
-# Inputs are the existing page body + the cluster of triaged events.
-# Output is `kept_doc_ids[]`; empty kept set → mark queue rows
-# 'verifier_rejected' (terminal, distinct from 'done' so audit queries can
-# tell verifier-reject and synthesized apart).
-WIKI_SYNTHESIS_VERIFIER_BUDGET_TOKENS = 60_000
-
-# Tier-jump guard: Gemini 3.1 Pro Preview pricing is $2/$12 ≤200K tokens,
-# $4/$18 >200K. Capping cluster events keeps every synthesize call in the
-# cheaper tier. The synthesis worker truncates oldest events past the cap
-# before building SynthesisInput; dropped events still mark 'done' with a
-# synthesis_error noting the truncation.
-WIKI_SYNTHESIS_CLUSTER_MAX_EVENTS = 10
-WIKI_SYNTHESIS_CLUSTER_MAX_TOKENS = 180_000
-
-# Concurrency caps. The wiki-worker fans out customers, then triage batches
-# per customer; the wiki-synthesis app fans out customers, then clusters per
-# customer. asyncio.Semaphore at each fan-out point.
+# Concurrency caps. The wiki-worker fans out customers, then triage
+# batches per customer. (The v4 wiki agent uses
+# WIKI_AGENT_GLOBAL_CONCURRENCY for synthesis-side fan-out plus a
+# per-customer advisory lock; it doesn't cluster events anymore.)
 WIKI_SYNTHESIS_CUSTOMER_CONCURRENCY = 4
 WIKI_TRIAGE_BATCH_CONCURRENCY = 8
-WIKI_SYNTHESIS_CLUSTER_CONCURRENCY = 5
 
 # Manual trigger rate limit (advisory-lock + lookback in the BFF). The
 # /api/wiki/synthesize/trigger endpoint here surfaces the same value so
