@@ -5,6 +5,8 @@ locally. Uses the local MinIO at localhost:9000."""
 from __future__ import annotations
 
 import secrets
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -84,12 +86,10 @@ async def test_seed_missing_canonical_raises(live_db):
 # Gate-failure tests — Task 8 (invoke CLI via subprocess)
 # ---------------------------------------------------------------------------
 
-import subprocess
-
 
 def test_cli_seed_missing_customer(live_db):
     result = subprocess.run(
-        ["python", "-m", "scripts.synth", "seed",
+        [sys.executable, "-m", "scripts.synth", "seed",
          "--customer", "cust-prbe-doesnotexist-zzz"],
         capture_output=True, text=True,
     )
@@ -101,7 +101,8 @@ async def test_cli_seed_no_path_satisfied(live_db):
     cid = f"cust-prbe-test-nopath-{secrets.token_hex(4)}"
     await _seed_customer(cid)  # inserted without metadata flag
     result = subprocess.run(
-        ["python", "-m", "scripts.synth", "seed", "--customer", cid],
+        [sys.executable, "-m", "scripts.synth", "seed", "--customer", cid,
+         "--canonical-dir", str(CANONICAL_MINI)],
         capture_output=True, text=True,
     )
     assert result.returncode == 2
@@ -114,8 +115,9 @@ async def test_cli_seed_confirm_mismatch(live_db):
     cid = f"cust-prbe-test-confirm-{secrets.token_hex(4)}"
     await _seed_customer(cid)
     result = subprocess.run(
-        ["python", "-m", "scripts.synth", "seed",
-         "--customer", cid, "--allow-non-sandbox"],
+        [sys.executable, "-m", "scripts.synth", "seed",
+         "--customer", cid, "--allow-non-sandbox",
+         "--canonical-dir", str(CANONICAL_MINI)],
         input="wrong-customer-id\n",
         capture_output=True, text=True,
     )
@@ -131,9 +133,13 @@ async def test_cli_seed_canonical_missing(live_db):
     cid = "cust-eval-test-can-missing"
     await _seed_customer(cid)
     result = subprocess.run(
-        ["python", "-m", "scripts.synth", "seed",
+        [sys.executable, "-m", "scripts.synth", "seed",
          "--customer", cid, "--canonical-dir", "/tmp/nope-dir"],
         capture_output=True, text=True,
     )
     assert result.returncode == 1
     assert "canonical corpus not found" in result.stderr
+    # Confirm gate ordering: gates 1 and 2 must have passed (customer
+    # exists + eval prefix bypasses eligibility) for gate 1a to fire.
+    assert "not found" not in result.stderr or "canonical corpus not found" in result.stderr
+    assert "not seed-eligible" not in result.stderr

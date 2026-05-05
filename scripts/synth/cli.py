@@ -573,12 +573,11 @@ async def _seed_async(args) -> int:
 
     Gate stack order (cheap → expensive):
       1. Customer exists in DB
+      1a. Canonical fixtures present (cheap check before typed confirm)
       2. Path 1 (metadata flag) OR Path 2 (--allow-non-sandbox + typed confirm)
-      3. Canonical fixtures present
-      4. Execute seed
+      3. Execute seed
     """
     import json as _json
-    from pathlib import Path
     from scripts.synth.seed import (
         is_seed_eligible,
         prompt_typed_confirm,
@@ -605,6 +604,20 @@ async def _seed_async(args) -> int:
         if isinstance(metadata, str):
             metadata = _json.loads(metadata)
 
+        # Gate 1a: cheap canonical-dir existence check, BEFORE the typed-confirm
+        # prompt — don't make the operator type the customer_id back only to
+        # discover the canonical fixtures aren't there. seed_tenant still raises
+        # MissingCanonicalError as defense-in-depth.
+        canonical = Path(args.canonical_dir)
+        raw_root = canonical / "raw"
+        if not raw_root.exists() or not any(raw_root.rglob("*.json")):
+            print(
+                f"error: canonical corpus not found at {canonical}; "
+                f"generate it first (see scripts/synth/README.md)",
+                file=sys.stderr,
+            )
+            return 1
+
         # Gate 2: Path 1 (flag) OR Path 2 (escape hatch).
         if not is_seed_eligible(args.customer, metadata):
             if not args.allow_non_sandbox:
@@ -624,11 +637,11 @@ async def _seed_async(args) -> int:
                 )
                 return 2
 
-        # Gate 3 + execute (MissingCanonicalError raised by seed_tenant).
+        # Gate 3 + execute (MissingCanonicalError raised by seed_tenant as defense-in-depth).
         try:
             result = await seed_tenant(
                 customer_id=args.customer,
-                canonical_dir=Path(args.canonical_dir),
+                canonical_dir=canonical,
                 db=db,
                 bucket=bucket,
             )
