@@ -44,3 +44,33 @@ def prompt_typed_confirm(expected_customer_id: str) -> bool:
     if not typed:
         return False
     return typed == expected_customer_id
+
+
+async def set_allow_synth_seed(customer_id: str, db) -> None:
+    """Toggle customers.metadata.allow_synth_seed = true for the named customer.
+
+    Idempotent: re-running on an already-set tenant is a no-op (the UPDATE
+    re-writes the same value). Refuses with ValueError if the customer row
+    doesn't exist — synth doesn't auto-create real-shape tenants.
+
+    `db` is an asyncpg Pool (matches the signature of bootstrap.py::init_tenant).
+    """
+    result = await db.execute(
+        """
+        UPDATE customers
+           SET metadata = jsonb_set(
+                   COALESCE(metadata, '{}'::jsonb),
+                   '{allow_synth_seed}',
+                   'true'::jsonb,
+                   true
+               )
+         WHERE customer_id = $1
+        """,
+        customer_id,
+    )
+    affected = int(result.split()[-1]) if result.startswith("UPDATE ") else 0
+    if affected == 0:
+        raise ValueError(
+            f"customer {customer_id!r} not found in customers table; "
+            f"create the tenant via prbe-backend signup first"
+        )
