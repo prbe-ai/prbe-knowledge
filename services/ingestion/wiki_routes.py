@@ -837,11 +837,30 @@ class SynthesisStatusResponse(BaseModel):
     triaged_events: int
     in_flight_events: int
     failed_events: int
-    verifier_rejected_events: int
+    # v4: synthesis_skipped covers both verifier_rejected (legacy) and
+    # the new agent skip_events tool. The dashboard surfaces both
+    # together; tracking them apart wasn't useful in practice.
+    synthesis_skipped_events: int
+    # v4: rows DLQ'd by triage batch crash or wiki agent halt. Admin
+    # reset (POST .../dlq/reset) flips them back to pending or triaged.
+    dlq_count: int
+    oldest_dlq_at: datetime | None
     last_run_at: datetime | None
     last_run_status: str | None
     last_run_pages_updated: int | None
     last_run_pages_created: int | None
+
+
+class DlqResetBody(BaseModel):
+    reason: str | None = Field(default=None, max_length=240)
+    max_rows: int = Field(default=5000, ge=1, le=100_000)
+
+
+class DlqResetResponse(BaseModel):
+    reset_count: int
+    triaged_reset: int
+    pending_reset: int
+    oldest_dlq_at: datetime | None
 
 
 @router.post(
@@ -911,12 +930,14 @@ async def get_wiki_synthesis_status(
     """Counts + last-run summary for the dashboard status badge.
 
     No write side effects. Reads `wiki_synthesis_queue` for per-status
-    counts (covers all 8 states so the dashboard can surface stuck /
-    failed / verifier-rejected backlogs), and the latest synthesis-stage
-    `wiki_synthesis_runs` row for last-run pages_*. The `stage` filter
-    matters because the triage worker also opens its own run row per
-    drain — those rows have pages_updated/pages_created=0 by design and
-    would flap the dashboard if surfaced.
+    counts and the latest synthesis-stage `wiki_synthesis_runs` row.
+    The `stage` filter matters because the triage worker also opens
+    its own run row per drain — those rows have
+    pages_updated/pages_created=0 by design and would flap the
+    dashboard if surfaced.
+
+    v4 surfaces dlq_count + oldest_dlq_at so the dashboard can render
+    a "drain stuck — N events need admin reset" banner.
     """
     async with raw_conn() as conn:
         counts = await conn.fetchrow(
@@ -929,8 +950,10 @@ async def get_wiki_synthesis_status(
                 ) AS in_flight,
                 COUNT(*) FILTER (WHERE status = 'failed') AS failed,
                 COUNT(*) FILTER (
-                    WHERE status = 'verifier_rejected'
-                ) AS verifier_rejected
+                    WHERE status = 'synthesis_skipped'
+                ) AS synthesis_skipped,
+                COUNT(*) FILTER (WHERE status = 'dlq') AS dlq,
+                MIN(dlq_at) FILTER (WHERE status = 'dlq') AS oldest_dlq_at
             FROM wiki_synthesis_queue
             WHERE customer_id = $1
             """,
@@ -951,11 +974,111 @@ async def get_wiki_synthesis_status(
         triaged_events=int(counts["triaged"] or 0) if counts else 0,
         in_flight_events=int(counts["in_flight"] or 0) if counts else 0,
         failed_events=int(counts["failed"] or 0) if counts else 0,
-        verifier_rejected_events=(int(counts["verifier_rejected"] or 0) if counts else 0),
+        synthesis_skipped_events=(
+            int(counts["synthesis_skipped"] or 0) if counts else 0
+        ),
+        dlq_count=int(counts["dlq"] or 0) if counts else 0,
+        oldest_dlq_at=counts["oldest_dlq_at"] if counts else None,
         last_run_at=last_run["started_at"] if last_run else None,
         last_run_status=last_run["status"] if last_run else None,
         last_run_pages_updated=last_run["pages_updated"] if last_run else None,
         last_run_pages_created=last_run["pages_created"] if last_run else None,
+    )
+
+
+@router.post(
+    "/synthesize/dlq/reset",
+    response_model=DlqResetResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def reset_wiki_synthesis_dlq(
+    body: DlqResetBody,
+    customer_id: str = Depends(_require_customer),
+) -> DlqResetResponse:
+    """Flip DLQ rows back to pending / triaged for retry.
+
+    Behavior: rows with dlq_reason starting 'agent.' (the wiki agent
+    halted mid-drain) -> back to 'triaged' (they were already triaged
+    when the agent saw them; just need another pass). Other rows
+    (triage batch crashes -> dlq_reason starts 'triage.') -> back to
+    'pending' (the triage layer needs to re-score).
+
+    Capped by max_rows so an enormous backlog reset doesn't lock the
+    queue table for minutes. Defaults to 5000; max 100k. attempts is
+    reset to 0 so the per-row attempt cap doesn't immediately kick
+    them straight back to 'failed'.
+
+    Admin-gated upstream in the BFF (require_role('admin')); this
+    endpoint is the internal-keyed pass-through.
+    """
+    async with raw_conn() as conn:
+        # First pass: snapshot how many rows in each "would-reset" bucket
+        # so we can return both counts to the caller.
+        counts = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE dlq_reason LIKE 'agent.%'
+                ) AS triaged_reset,
+                COUNT(*) FILTER (
+                    WHERE dlq_reason IS NULL
+                       OR NOT (dlq_reason LIKE 'agent.%')
+                ) AS pending_reset
+            FROM wiki_synthesis_queue
+            WHERE customer_id = $1 AND status = 'dlq'
+            LIMIT $2
+            """,
+            customer_id,
+            body.max_rows,
+        )
+        # Second pass: actually flip the rows.
+        result = await conn.execute(
+            """
+            UPDATE wiki_synthesis_queue
+            SET status = CASE
+                  WHEN dlq_reason LIKE 'agent.%' THEN 'triaged'
+                  ELSE 'pending'
+                END,
+                attempts = 0,
+                dlq_reason = NULL,
+                dlq_at = NULL
+            WHERE queue_id IN (
+                SELECT queue_id FROM wiki_synthesis_queue
+                WHERE customer_id = $1 AND status = 'dlq'
+                LIMIT $2
+            )
+            """,
+            customer_id,
+            body.max_rows,
+        )
+        # Read remaining oldest_dlq_at after the reset for the response.
+        oldest = await conn.fetchval(
+            """
+            SELECT MIN(dlq_at)
+            FROM wiki_synthesis_queue
+            WHERE customer_id = $1 AND status = 'dlq'
+            """,
+            customer_id,
+        )
+    try:
+        reset_count = int(result.split()[-1])
+    except (ValueError, IndexError):
+        reset_count = 0
+    triaged_reset = int(counts["triaged_reset"] or 0) if counts else 0
+    pending_reset = int(counts["pending_reset"] or 0) if counts else 0
+    log.info(
+        "wiki.synthesize.dlq_reset",
+        customer=customer_id,
+        reset_count=reset_count,
+        triaged_reset=triaged_reset,
+        pending_reset=pending_reset,
+        reason=body.reason,
+    )
+    return DlqResetResponse(
+        reset_count=reset_count,
+        triaged_reset=triaged_reset,
+        pending_reset=pending_reset,
+        oldest_dlq_at=oldest,
     )
 
 

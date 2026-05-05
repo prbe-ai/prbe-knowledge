@@ -369,42 +369,25 @@ WIKI_SYNTHESIS_MAX_ATTEMPTS = 3
 # is a safety net if a notify is missed during a connection drop.
 WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
 
-# Provider knobs. Each stage independently picks a provider via the
-# constant below; flip the value and redeploy to switch a stage from
-# Anthropic to Gemini (or vice versa). Defaults are Anthropic.
+# Provider knob for the triage stage. v4 uses the wiki agent (Gemini
+# Pro) for synthesis, so the synthesis + verifier provider knobs are
+# gone. Triage is provider-pluggable: flip the value and redeploy to
+# switch from Anthropic Haiku -> Gemini Flash Lite (or back). Defaults
+# to Anthropic.
 # Recognized values:
-#   "haiku"    | "claude-haiku"           → Anthropic Haiku 4.5
-#   "sonnet"   | "claude-sonnet"          → Anthropic Sonnet 4.6
-#   "gemini-flash-lite" | "gemini-flash-lite-preview" → Gemini Flash Lite
-#   "gemini-pro" | "gemini-3.1-pro-preview"          → Gemini 3.1 Pro Preview
-# There is no env-var override path — the prior `getattr(settings, ...)`
-# plumbing referenced fields that didn't exist on Settings, so the env
-# var was silently inert. Constants-only is honest.
+#   "haiku" | "claude-haiku"           -> Anthropic Haiku 4.5
+#   "gemini-flash-lite" | "gemini-flash-lite-preview" -> Gemini Flash Lite
+# No env-var override path — the prior `getattr(settings, ...)` plumbing
+# referenced fields that didn't exist on Settings, so the env var was
+# silently inert. Constants-only is honest.
 WIKI_TRIAGE_MODEL = "haiku"
-WIKI_SYNTHESIS_MODEL = "sonnet"
-WIKI_VERIFIER_MODEL = "sonnet"
 
-# Verifier stage: per-cluster sanity check between triage and synthesize.
-# Inputs are the existing page body + the cluster of triaged events.
-# Output is `kept_doc_ids[]`; empty kept set → mark queue rows
-# 'verifier_rejected' (terminal, distinct from 'done' so audit queries can
-# tell verifier-reject and synthesized apart).
-WIKI_SYNTHESIS_VERIFIER_BUDGET_TOKENS = 60_000
-
-# Tier-jump guard: Gemini 3.1 Pro Preview pricing is $2/$12 ≤200K tokens,
-# $4/$18 >200K. Capping cluster events keeps every synthesize call in the
-# cheaper tier. The synthesis worker truncates oldest events past the cap
-# before building SynthesisInput; dropped events still mark 'done' with a
-# synthesis_error noting the truncation.
-WIKI_SYNTHESIS_CLUSTER_MAX_EVENTS = 10
-WIKI_SYNTHESIS_CLUSTER_MAX_TOKENS = 180_000
-
-# Concurrency caps. The wiki-worker fans out customers, then triage batches
-# per customer; the wiki-synthesis app fans out customers, then clusters per
-# customer. asyncio.Semaphore at each fan-out point.
+# Concurrency caps. The wiki-worker fans out customers, then triage
+# batches per customer. (The v4 wiki agent uses
+# WIKI_AGENT_GLOBAL_CONCURRENCY for synthesis-side fan-out plus a
+# per-customer advisory lock; it doesn't cluster events anymore.)
 WIKI_SYNTHESIS_CUSTOMER_CONCURRENCY = 4
 WIKI_TRIAGE_BATCH_CONCURRENCY = 8
-WIKI_SYNTHESIS_CLUSTER_CONCURRENCY = 5
 
 # Manual trigger rate limit (advisory-lock + lookback in the BFF). The
 # /api/wiki/synthesize/trigger endpoint here surfaces the same value so
@@ -416,3 +399,53 @@ WIKI_TRIGGER_RATE_LIMIT_SECONDS = 300
 # the team's morning standup but doesn't compete with the rest of the
 # nightly pipeline (Granola steady-poll cycles, etc.).
 WIKI_NIGHTLY_HOUR_UTC = 2
+
+
+# ---------------------------------------------------------------------------
+# Wiki agent loop (v4: Gemini 3.1 Pro driving the synthesis stage)
+# ---------------------------------------------------------------------------
+
+# Hard cap on agent turns per drain. Picked at 200 to leave headroom for
+# pebble's ~3000-event drains; smaller customers typically finish in
+# 10-50 turns. Exceeding this cap halts the drain and DLQs the in-flight
+# rows; admin reset is the recovery path.
+WIKI_AGENT_TURN_CAP = 200
+
+# Hard cap on staged page updates per drain. The wiki is supposed to
+# move slowly — 30 page edits per night is generous. Exceeding this cap
+# means the agent is hallucinating page mass and we'd rather DLQ than
+# write 100 brand-new pages.
+WIKI_AGENT_UPDATE_CAP = 30
+
+# Stall threshold. If the agent makes no consequential tool call (no
+# page update / create / skip) for this many consecutive turns, halt.
+# Three turns is generous — one read-page, one read-event, one think.
+WIKI_AGENT_STALL_TURNS = 3
+
+# Auto-compaction trigger. When estimated input tokens cross this
+# fraction of Gemini 3.1 Pro's 2M context window, summarize the
+# conversation history (preserving structured runtime state) before
+# the next turn.
+WIKI_AGENT_COMPACT_THRESHOLD = 0.60
+
+# Number of triaged events per next_events() page. Gemini reads the
+# day in batches; the agent re-calls next_events() until drain_complete.
+WIKI_AGENT_BATCH_SIZE = 200
+
+# Maximum number of customer drains running simultaneously per
+# wiki-synthesis fly machine. Higher than per-customer concurrency (1
+# under advisory lock) so two small customers can drain in parallel
+# while pebble holds its own machine.
+WIKI_AGENT_GLOBAL_CONCURRENCY = 2
+
+# Gemini model used by the wiki agent loop. Triage stays Flash Lite;
+# only the agent uses Pro because per-cluster reasoning + cross-event
+# pattern recognition need the bigger model.
+WIKI_AGENT_MODEL = "gemini-3.1-pro-preview"
+
+# Compactor model. Cheaper Flash variant since it only summarizes the
+# conversation; preserves the structured runtime state untouched.
+WIKI_AGENT_COMPACTOR_MODEL = "gemini-flash-lite-preview"
+
+# Agent's CachedContent TTL. Re-create on miss; alert if hit_rate < 80%.
+WIKI_AGENT_CACHE_TTL = "3600s"

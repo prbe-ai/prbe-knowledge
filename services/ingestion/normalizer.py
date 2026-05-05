@@ -276,7 +276,15 @@ class Normalizer:
             and await is_wiki_generation_enabled(customer_id)
         ):
             try:
-                await self._enqueue_wiki_synthesis(customer_id, doc_ids)
+                # Use the in-memory documents that were just persisted —
+                # they carry the source-side metadata extract_source_ts
+                # needs (Slack ts, GitHub created_at, etc.). The DB only
+                # stores body_preview/title/etc., not the raw source-side
+                # event timestamp surface.
+                persisted_docs = [
+                    doc for doc in result.documents if doc.doc_id in set(doc_ids)
+                ]
+                await self._enqueue_wiki_synthesis(customer_id, persisted_docs)
             except Exception as exc:
                 # Boundary swallow: ingestion already committed, queue
                 # enqueue is best-effort. The nightly trigger picks up
@@ -313,7 +321,7 @@ class Normalizer:
     async def _enqueue_wiki_synthesis(
         self,
         customer_id: str,
-        doc_ids: list[str],
+        docs: list[Document],
     ) -> None:
         """Append a wiki_synthesis_queue row per persisted doc.
 
@@ -324,27 +332,50 @@ class Normalizer:
         in place; we re-read to be defensive against future callers that
         skip that mutation.
 
+        Populates `source_ts` from per-source metadata via
+        `extract_source_ts(doc)` so the wiki agent can read the day in
+        time order. Falls back to documents.created_at when the connector
+        didn't surface a parseable source-side timestamp.
+
         Does NOT fire pg_notify — synthesis is nightly-batch via the
         wiki-cron fly app, not realtime. See the comment block in
         `_persist` for the why.
         """
+        from services.synthesis.source_ts import extract_source_ts
+
+        if not docs:
+            return
+        doc_ids = [doc.doc_id for doc in docs]
+        # Map doc_id -> source_ts for the parameterized join below.
+        source_ts_by_doc_id: dict[str, datetime] = {
+            doc.doc_id: extract_source_ts(doc) for doc in docs
+        }
+        # asyncpg doesn't accept Python dicts as parameters; pass two
+        # parallel arrays and join by index.
+        ts_doc_ids = list(source_ts_by_doc_id.keys())
+        ts_values = [source_ts_by_doc_id[d] for d in ts_doc_ids]
         async with with_tenant(customer_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO wiki_synthesis_queue
                     (customer_id, doc_id, doc_version, source_system,
-                     doc_type, status, enqueued_at)
-                SELECT customer_id, doc_id, version, source_system,
-                       doc_type, 'pending', NOW()
-                FROM documents
-                WHERE customer_id = $1
-                  AND doc_id = ANY($2::text[])
-                  AND valid_to IS NULL
+                     doc_type, status, enqueued_at, source_ts)
+                SELECT d.customer_id, d.doc_id, d.version, d.source_system,
+                       d.doc_type, 'pending', NOW(), ts.source_ts
+                FROM documents d
+                JOIN unnest($2::text[], $3::timestamptz[])
+                     AS ts(doc_id, source_ts)
+                  ON ts.doc_id = d.doc_id
+                WHERE d.customer_id = $1
+                  AND d.doc_id = ANY($2::text[])
+                  AND d.valid_to IS NULL
                 ON CONFLICT (customer_id, doc_id, doc_version) DO NOTHING
                 """,
                 customer_id,
-                doc_ids,
+                ts_doc_ids,
+                ts_values,
             )
+        _ = doc_ids  # retained for potential future logging
 
     async def _plan_chunks(self, customer_id: str, doc: Document) -> _ChunkPlan:
         """Phase A: build a `_ChunkPlan` for one document — without holding

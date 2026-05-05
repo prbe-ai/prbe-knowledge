@@ -1,14 +1,22 @@
 """Pydantic models for wiki synthesis I/O.
 
-Triage in/out and synthesis in/out shapes used both as type hints inside the
-cron loop AND as Anthropic tool-use `input_schema` for forced structured
-output. Keeping the schema in Python (rather than hand-rolled JSON) means
-the prompt + the parser + the type checker share one source of truth.
+Triage in/out shapes used both as type hints inside the worker AND as
+Anthropic tool-use `input_schema` for forced structured output. Keeping
+the schema in Python (rather than hand-rolled JSON) means the prompt +
+the parser + the type checker share one source of truth.
+
+v4 also defines the wiki agent's data shapes — `RouterEvent` (the
+manifest entry the agent reads), `WikiIndexEntry` (one page in the
+agent's CachedContent index), `PageUpdate` / `PageCreate` (staged
+write intents), `AgentRunResult` (one drain's audit summary). These
+do NOT correspond to v3's removed router stage; the name is the
+agent-facing shape, not a router output.
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -35,20 +43,16 @@ class TriageInput(BaseModel):
     body_token_count: int
 
 
-class TriageTarget(BaseModel):
-    """One wiki page this event should land on, per the triage decision."""
-
-    wiki_type: Literal["service_card", "decision", "feature", "runbook"]
-    slug: str = Field(min_length=1, max_length=64)
-    action: Literal["create", "update"]
-
-
 class TriageVerdict(BaseModel):
-    """Per-event verdict produced by Haiku."""
+    """Per-event verdict produced by Flash Lite (or Haiku fallback).
+
+    v4: score-only. The downstream wiki agent decides which page (if
+    any) the event lands on after reading the day in time order; triage
+    no longer picks (wiki_type, slug).
+    """
 
     important: bool
     score: float = Field(ge=0.0, le=10.0)
-    targets: list[TriageTarget] = Field(default_factory=list)
     reason: str | None = Field(
         default=None,
         description="One sentence explaining the decision for the audit log.",
@@ -62,84 +66,92 @@ class TriageOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Synthesis
+# Wiki agent (v4 Gemini Pro loop)
 # ---------------------------------------------------------------------------
 
 
-class SynthesisInput(BaseModel):
-    """One cluster of triaged events that all target the same wiki page."""
+class RouterEvent(BaseModel):
+    """One manifest entry the wiki agent reads via `next_events()`.
+
+    The name "RouterEvent" is the agent-facing shape, not a router stage
+    (v4 has no router; the agent does all routing itself). It carries
+    just enough metadata for the agent to decide whether to read the
+    event body in full via `get_event_body()`. Body is omitted from
+    the manifest to keep CachedContent size bounded — the agent
+    expands what it needs.
+    """
+
+    queue_id: int
+    doc_id: str
+    doc_type: str
+    source_system: str
+    title: str | None = None
+    author_id: str | None = None
+    source_ts: datetime
+    body_preview: str = Field(
+        default="",
+        description=(
+            "First few hundred chars of the body. Lets the agent skip "
+            "noisy events without paying a get_event_body() call."
+        ),
+    )
+    body_token_count: int = 0
+
+
+class WikiIndexEntry(BaseModel):
+    """One wiki page in the agent's CachedContent index.
+
+    Built by `persistence.fetch_wiki_index(customer_id)` at drain start
+    and embedded in the agent's CachedContent. Lets the agent see
+    every COMPILED_WIKI page's title + slug + summary without paying
+    a `read_page` call up front.
+    """
 
     wiki_type: Literal["service_card", "decision", "feature", "runbook"]
     slug: str
-    action: Literal["create", "update"]
-    current_title: str | None = None
-    current_body: str | None = None
-    current_frontmatter: dict[str, object] = Field(default_factory=dict)
-    current_summary: str | None = None
-    events: list[TriageInput] = Field(min_length=1)
+    title: str
+    summary: str | None = None
+    last_updated: datetime
+    version: int
 
 
-class SynthesisOutput(BaseModel):
-    """Sonnet's tool-use return shape per page."""
+class PageUpdate(BaseModel):
+    """Staged update intent — written to runtime state, persisted at done()."""
 
+    wiki_type: Literal["service_card", "decision", "feature", "runbook"]
+    slug: str
+    body_markdown: str
+    summary: str = Field(min_length=1, max_length=240)
+    commit_message: str = Field(min_length=1, max_length=240)
+    applied_queue_ids: list[int] = Field(default_factory=list)
+
+
+class PageCreate(BaseModel):
+    """Staged create intent — same shape as PageUpdate plus title + frontmatter."""
+
+    wiki_type: Literal["service_card", "decision", "feature", "runbook"]
+    slug: str
     title: str = Field(min_length=1, max_length=200)
     body_markdown: str
-    summary: str = Field(
-        min_length=1,
-        max_length=240,
-        description="One-sentence summary used by the wiki.index page.",
-    )
-    frontmatter: dict[str, object] = Field(default_factory=dict)
-    commit_message: str = Field(
-        min_length=1,
-        max_length=240,
-        description="One-line audit message describing what changed and why.",
-    )
+    summary: str = Field(min_length=1, max_length=240)
+    frontmatter: dict[str, Any] = Field(default_factory=dict)
+    commit_message: str = Field(min_length=1, max_length=240)
+    applied_queue_ids: list[int] = Field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# Verifier — between triage and synthesize
-# ---------------------------------------------------------------------------
+class AgentRunResult(BaseModel):
+    """One drain's audit summary returned to the synthesis worker."""
 
-
-class VerifierInput(BaseModel):
-    """One cluster of triaged events the verifier should sanity-check before
-    synthesis. Same shape as `SynthesisInput`; deliberately separate so the
-    verifier's tool schema can evolve independently.
-    """
-
-    wiki_type: Literal["service_card", "decision", "feature", "runbook"]
-    slug: str
-    action: Literal["create", "update"]
-    current_title: str | None = None
-    current_body: str | None = None
-    current_summary: str | None = None
-    events: list[TriageInput] = Field(min_length=1)
-
-
-class VerifierOutput(BaseModel):
-    """Per-cluster verifier verdict.
-
-    `kept_doc_ids` is the subset of events that the verifier judges
-    actually changes the page. Empty list → cluster is rejected (queue
-    rows land in `status='verifier_rejected'`, no synthesize call fires).
-    Non-empty → synthesis worker filters cluster.events to `kept_doc_ids`
-    before invoking synthesize.
-    """
-
-    kept_doc_ids: list[str] = Field(default_factory=list)
-    rationale_per_doc: dict[str, str] = Field(
-        default_factory=dict,
-        description=(
-            "Per-doc-id one-line rationale. Audit trail for tuning the "
-            "verifier prompt without touching triage."
-        ),
-    )
-    drop_reason: str | None = Field(
-        default=None,
-        description=(
-            "When kept_doc_ids is empty, one short sentence explaining why "
-            "the cluster doesn't change the page (recorded as the queue "
-            "row's synthesis_error for audit)."
-        ),
-    )
+    agent_run_id: str
+    pages_updated: int
+    pages_created: int
+    events_applied: int
+    events_skipped: int
+    halt_reason: str | None = None
+    turns: int
+    compaction_count: int = 0
+    cache_hit_rate: float | None = None
+    total_input_tokens: int = 0
+    total_cached_tokens: int = 0
+    total_output_tokens: int = 0
+    gemini_call_count: int = 0

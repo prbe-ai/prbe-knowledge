@@ -13,7 +13,7 @@ two workers stay coherent on row-level state machine transitions:
     triaging ──[mark_batch_triage_error]──────> pending | failed
     triaged  ──[claim_triaged_rows]───────────> synthesizing  (attempts++)
     synthesizing ──[mark_synthesis_done]────────> done
-    synthesizing ──[mark_synthesis_skipped]─────> done (MANUAL_ENTRY guard, cluster cap)
+    synthesizing ──[mark_synthesis_skipped]─────> synthesis_skipped (agent skip / no-op rewrite)
     synthesizing ──[mark_verifier_rejected]─────> verifier_rejected (terminal)
     synthesizing ──[mark_synthesis_error]───────> triaged | failed (retry)
 
@@ -34,7 +34,7 @@ import asyncpg
 from services.ingestion.normalizer import fetch_body_from_chunks_for_version
 from services.synthesis.models import TriageInput, TriageVerdict
 from shared.constants import WIKI_SYNTHESIS_MAX_ATTEMPTS
-from shared.db import with_tenant
+from shared.db import raw_conn, with_tenant
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -44,9 +44,13 @@ __all__ = [
     "claim_pending_batch",
     "claim_triaged_rows",
     "close_run",
-    "cluster_kept_rows",
+    "dlq_agent_synthesizing_rows",
+    "dlq_customer_for_triage_failure",
     "fetch_bodies",
     "fetch_existing_page",
+    "fetch_triaged_manifest",
+    "fetch_wiki_index",
+    "get_event_body_for_agent",
     "list_pending_customers",
     "list_triaged_customers",
     "mark_batch_triage_error",
@@ -61,7 +65,6 @@ __all__ = [
     "open_run",
     "reclaim_stuck_rows",
     "render_index_markdown",
-    "verdict_targets_json",
 ]
 
 
@@ -206,7 +209,7 @@ async def claim_pending_batch(customer_id: str, *, limit: int) -> list[asyncpg.R
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING queue_id, doc_id, doc_version, source_system, doc_type,
-                      attempts, triage_score, triage_targets
+                      attempts, triage_score, source_ts
             """,
             customer_id,
             limit,
@@ -216,14 +219,14 @@ async def claim_pending_batch(customer_id: str, *, limit: int) -> list[asyncpg.R
 async def claim_triaged_rows(customer_id: str, *, limit: int) -> list[asyncpg.Record]:
     """Claim up to `limit` triaged rows and flip them to 'synthesizing'.
 
-    Returns the rows along with their stored `triage_targets` JSON so the
-    synthesis worker can rebuild the cluster map without re-running
-    triage.
-
     Increments `attempts` so the synthesis-stage retry loop
-    (`mark_synthesis_error` → 'triaged' → re-claim) actually advances
+    (`mark_synthesis_error` -> 'triaged' -> re-claim) actually advances
     the counter and dead-letters at WIKI_SYNTHESIS_MAX_ATTEMPTS instead
     of looping forever and burning LLM spend.
+
+    v4: ordered by source_ts ASC, queue_id ASC so the wiki agent reads
+    the day in time order. The composite index ix_wsq_drain_cursor
+    backs this scan.
     """
     async with with_tenant(customer_id) as conn:
         return await conn.fetch(
@@ -236,12 +239,12 @@ async def claim_triaged_rows(customer_id: str, *, limit: int) -> list[asyncpg.Re
                 SELECT queue_id FROM wiki_synthesis_queue
                 WHERE customer_id = $1
                   AND status = 'triaged'
-                ORDER BY triage_completed_at NULLS FIRST, enqueued_at
+                ORDER BY source_ts, queue_id
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING queue_id, doc_id, doc_version, source_system, doc_type,
-                      attempts, triage_score, triage_targets
+                      attempts, triage_score, source_ts
             """,
             customer_id,
             limit,
@@ -395,13 +398,11 @@ async def mark_rejected(
             UPDATE wiki_synthesis_queue
             SET status = 'rejected',
                 triage_score = $2,
-                triage_targets = $3::jsonb,
                 triage_completed_at = NOW()
-            WHERE customer_id = $1 AND queue_id = $4
+            WHERE customer_id = $1 AND queue_id = $3
             """,
             customer_id,
             verdict.score,
-            verdict_targets_json(verdict),
             queue_id,
         )
 
@@ -417,13 +418,11 @@ async def mark_triaged(
             UPDATE wiki_synthesis_queue
             SET status = 'triaged',
                 triage_score = $2,
-                triage_targets = $3::jsonb,
                 triage_completed_at = NOW()
-            WHERE customer_id = $1 AND queue_id = $4
+            WHERE customer_id = $1 AND queue_id = $3
             """,
             customer_id,
             verdict.score,
-            verdict_targets_json(verdict),
             queue_id,
         )
 
@@ -444,28 +443,27 @@ async def mark_batch_triaged_and_notify(
     This function exists separately from `mark_triaged` so the per-row
     UPDATE pattern (used for one-off rejects / retries) doesn't accidentally
     fire a NOTIFY. NOTIFY only matters at batch boundaries.
+
+    v4: no longer writes triage_targets — the wiki agent picks pages
+    downstream by reading the day in time order.
     """
     if not triaged_verdicts:
         return
     queue_ids = [qid for qid, _ in triaged_verdicts]
     scores = [verdict.score for _, verdict in triaged_verdicts]
-    targets = [verdict_targets_json(verdict) for _, verdict in triaged_verdicts]
     async with with_tenant(customer_id) as conn:
         await conn.execute(
             """
             UPDATE wiki_synthesis_queue
             SET status = 'triaged',
                 triage_score = u.score,
-                triage_targets = u.targets::jsonb,
                 triage_completed_at = NOW()
-            FROM unnest($2::bigint[], $3::float[], $4::text[])
-                 AS u(qid, score, targets)
+            FROM unnest($2::bigint[], $3::float[]) AS u(qid, score)
             WHERE customer_id = $1 AND queue_id = u.qid
             """,
             customer_id,
             queue_ids,
             scores,
-            targets,
         )
         # NOTIFY in the same transaction as the UPDATE — Postgres holds
         # the notify in its queue until COMMIT, so the listener wakes
@@ -475,6 +473,42 @@ async def mark_batch_triaged_and_notify(
             notify_channel,
             customer_id,
         )
+
+
+async def dlq_customer_for_triage_failure(
+    customer_id: str,
+    *,
+    reason: str,
+) -> int:
+    """DLQ all pending + triaging rows for a customer after triage crash.
+
+    v4 halt policy: an unrecoverable batch failure (Anthropic outage,
+    Gemini outage, repeated parse error) parks the customer's whole
+    in-flight slice in DLQ. Admin reset (POST .../dlq/reset) flips
+    them back to pending.
+
+    Returns the number of rows DLQ'd. Does NOT use with_tenant because
+    wiki_synthesis_queue has RLS disabled (see migration 0034); the
+    explicit WHERE customer_id = $1 enforces the scoping.
+    """
+    async with raw_conn() as conn:
+        result = await conn.execute(
+            """
+            UPDATE wiki_synthesis_queue
+            SET status = 'dlq',
+                dlq_reason = $2,
+                dlq_at = NOW()
+            WHERE customer_id = $1
+              AND status IN ('pending', 'triaging')
+            """,
+            customer_id,
+            reason,
+        )
+    # asyncpg returns 'UPDATE N' as the command tag string.
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError):
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -536,13 +570,14 @@ async def mark_synthesis_skipped(
     *,
     reason: str,
 ) -> None:
-    """Mark events 'done' without firing synthesis.
+    """Mark events as terminal-but-no-page-change.
 
-    Used when the synthesis worker declines to clobber a page (e.g.
-    MANUAL_ENTRY) or when the cluster cap drops oldest events. The
-    events still complete — they don't keep re-driving the cron — but
-    the audit trail records why no synthesis occurred via
-    synthesis_error.
+    Used by the wiki agent when (a) it explicitly skip_events()'d an
+    event as agent-reviewed-but-not-page-changing, or (b) the rewriter
+    no-op'd a cluster (should_rewrite=False). Status moves to
+    'synthesis_skipped' (terminal v4 state — distinct from 'done',
+    which means "page actually rewrote based on this event"). Reason
+    is captured in synthesis_error for the audit trail.
     """
     if not queue_ids:
         return
@@ -550,7 +585,7 @@ async def mark_synthesis_skipped(
         await conn.execute(
             """
             UPDATE wiki_synthesis_queue
-            SET status = 'done',
+            SET status = 'synthesis_skipped',
                 synthesis_run_id = $2,
                 synthesis_completed_at = NOW(),
                 synthesis_error = $3
@@ -648,34 +683,6 @@ async def fetch_existing_page(
     }
 
 
-def cluster_kept_rows(
-    kept_rows: list[tuple[dict[str, Any], TriageInput, TriageVerdict]],
-) -> dict[tuple[str, str], list[tuple[dict[str, Any], TriageInput]]]:
-    out: dict[tuple[str, str], list[tuple[dict[str, Any], TriageInput]]] = {}
-    for row, inp, verdict in kept_rows:
-        for target in verdict.targets:
-            key = (target.wiki_type, target.slug)
-            out.setdefault(key, []).append((row, inp))
-    return out
-
-
-def verdict_targets_json(verdict: TriageVerdict) -> str:
-    """Serialize triage_targets as a JSONB-friendly string."""
-    import orjson
-
-    return orjson.dumps(
-        {
-            "important": verdict.important,
-            "score": verdict.score,
-            "reason": verdict.reason,
-            "targets": [
-                {"wiki_type": t.wiki_type, "slug": t.slug, "action": t.action}
-                for t in verdict.targets
-            ],
-        }
-    ).decode("utf-8")
-
-
 # ---------------------------------------------------------------------------
 # Index regeneration
 # ---------------------------------------------------------------------------
@@ -719,6 +726,216 @@ def render_index_markdown(rows: list[asyncpg.Record]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Wiki agent helpers (v4)
+# ---------------------------------------------------------------------------
+
+
+async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:
+    """Return live COMPILED_WIKI / MANUAL_ENTRY pages for the agent's index.
+
+    The agent reads this once at drain start and keeps it in CachedContent
+    so it can pick (wiki_type, slug) targets without paying a round-trip.
+    Includes only user-authored types (no auto-index page); the agent
+    can call read_page(...) for any individual body.
+    """
+    from shared.constants import DocType, SourceSystem
+
+    wiki_doc_types = [
+        DocType.WIKI_SERVICE_CARD.value,
+        DocType.WIKI_DECISION.value,
+        DocType.WIKI_FEATURE.value,
+        DocType.WIKI_RUNBOOK.value,
+    ]
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT title, source_id, version, updated_at, metadata
+            FROM documents
+            WHERE customer_id = $1
+              AND source_system = $2
+              AND doc_type = ANY($3::text[])
+              AND valid_to IS NULL
+              AND deleted_at IS NULL
+            ORDER BY updated_at DESC
+            """,
+            customer_id,
+            SourceSystem.WIKI.value,
+            wiki_doc_types,
+        )
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        meta = row["metadata"] or {}
+        if isinstance(meta, (str, bytes, bytearray)):
+            import orjson
+
+            meta = orjson.loads(meta)
+        if not isinstance(meta, dict):
+            meta = {}
+        wiki_type = meta.get("wiki_type") or row["source_id"].split(":", 1)[0]
+        slug = meta.get("slug") or row["source_id"].split(":", 1)[-1]
+        out.append(
+            {
+                "wiki_type": wiki_type,
+                "slug": slug,
+                "title": row["title"] or slug,
+                "summary": meta.get("summary"),
+                "last_updated": row["updated_at"],
+                "version": row["version"],
+            }
+        )
+    return out
+
+
+async def fetch_triaged_manifest(
+    customer_id: str,
+    *,
+    excluded_queue_ids: list[int],
+    count: int,
+) -> tuple[list[dict[str, Any]], int]:
+    """Fetch the next manifest window for the agent's next_events tool.
+
+    Reads up to `count` triaged rows ordered by source_ts ASC, queue_id
+    ASC; excludes any queue_ids the runtime has already applied or
+    skipped this drain. Body is replaced by body_preview to keep
+    CachedContent / per-turn token cost bounded.
+
+    Returns (events, remaining) where `remaining` is the count of
+    additional triaged rows beyond this window.
+    """
+    excluded = excluded_queue_ids or [0]
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT q.queue_id, q.doc_id, q.doc_type, q.source_system,
+                   q.source_ts, d.title, d.author_id, d.body_preview,
+                   d.body_token_count
+            FROM wiki_synthesis_queue q
+            JOIN documents d
+              ON d.customer_id = q.customer_id
+             AND d.doc_id = q.doc_id
+             AND d.version = q.doc_version
+             AND d.valid_to IS NULL
+             AND d.deleted_at IS NULL
+            WHERE q.customer_id = $1
+              AND q.status = 'synthesizing'
+              AND NOT (q.queue_id = ANY($2::bigint[]))
+            ORDER BY q.source_ts, q.queue_id
+            LIMIT $3
+            """,
+            customer_id,
+            excluded,
+            count,
+        )
+        # Get remaining count (cheap; status='synthesizing' is the
+        # in-flight slice for this drain).
+        remaining = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM wiki_synthesis_queue
+            WHERE customer_id = $1
+              AND status = 'synthesizing'
+              AND NOT (queue_id = ANY($2::bigint[]))
+            """,
+            customer_id,
+            excluded,
+        )
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        events.append(
+            {
+                "queue_id": int(row["queue_id"]),
+                "doc_id": row["doc_id"],
+                "doc_type": row["doc_type"],
+                "source_system": row["source_system"],
+                "source_ts": row["source_ts"],
+                "title": row["title"],
+                "author_id": row["author_id"],
+                "body_preview": row["body_preview"] or "",
+                "body_token_count": int(row["body_token_count"] or 0),
+            }
+        )
+    after_window = max(int(remaining or 0) - len(events), 0)
+    return events, after_window
+
+
+async def get_event_body_for_agent(
+    customer_id: str,
+    queue_id: int,
+) -> tuple[str, dict[str, Any]] | None:
+    """Fetch the full body of one triaged event for the agent.
+
+    Returns (body, metadata) where metadata contains doc_id, version,
+    title, source_system, source_ts. None if the queue row is missing
+    or the doc was deleted between triage and the agent's read.
+    """
+    async with with_tenant(customer_id) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT q.doc_id, q.doc_version, q.source_ts, q.source_system,
+                   d.title, d.author_id
+            FROM wiki_synthesis_queue q
+            JOIN documents d
+              ON d.customer_id = q.customer_id
+             AND d.doc_id = q.doc_id
+             AND d.version = q.doc_version
+             AND d.valid_to IS NULL
+             AND d.deleted_at IS NULL
+            WHERE q.customer_id = $1 AND q.queue_id = $2
+            """,
+            customer_id,
+            queue_id,
+        )
+        if row is None:
+            return None
+        body = await fetch_body_from_chunks_for_version(
+            conn, customer_id, row["doc_id"], row["doc_version"]
+        )
+    return body, {
+        "doc_id": row["doc_id"],
+        "version": int(row["doc_version"]),
+        "title": row["title"],
+        "source_system": row["source_system"],
+        "source_ts": row["source_ts"],
+    }
+
+
+async def dlq_agent_synthesizing_rows(
+    customer_id: str,
+    *,
+    reason: str,
+) -> int:
+    """DLQ all 'synthesizing' rows after a wiki agent halt.
+
+    v4 halt policy: an agent halt (turn cap, stall, update cap, Gemini
+    outage, compactor crash) parks the customer's whole in-flight slice
+    in DLQ. The pending_updates / pending_creates the agent had staged
+    are dropped (they were never persisted). Admin reset flips them
+    back to triaged for the next drain.
+
+    Returns the number of rows DLQ'd. Does NOT use with_tenant because
+    wiki_synthesis_queue has RLS disabled (migration 0034); the
+    explicit WHERE customer_id enforces the scoping.
+    """
+    async with raw_conn() as conn:
+        result = await conn.execute(
+            """
+            UPDATE wiki_synthesis_queue
+            SET status = 'dlq',
+                dlq_reason = $2,
+                dlq_at = NOW(),
+                attempts = attempts + 1
+            WHERE customer_id = $1
+              AND status = 'synthesizing'
+            """,
+            customer_id,
+            reason,
+        )
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+# ---------------------------------------------------------------------------
 # Reclaim — recover rows wedged after a worker SIGKILL/OOM
 # ---------------------------------------------------------------------------
 
@@ -743,8 +960,6 @@ async def reclaim_stuck_rows(
     migration 0034). The single statement covers both states + both
     branches via CASE so the sweep is one round-trip per cycle.
     """
-    from shared.db import raw_conn
-
     async with raw_conn() as conn:
         rows = await conn.fetch(
             """

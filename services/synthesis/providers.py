@@ -1,22 +1,23 @@
-"""Provider Protocol for triage + synthesis + verifier stages.
+"""Provider Protocol for the triage stage only.
 
-Each stage of the wiki pipeline can independently target a different
-provider (Anthropic vs Google). The Protocol lets the worker code
-depend on a uniform interface; provider-specific shape conversion
-(Anthropic tool_use blocks vs Gemini response_schema +
-application/json) lives inside the implementations.
+v4 collapses the synthesis pipeline to:
 
-Selection: the model name is read from `shared.constants`
-(`WIKI_TRIAGE_MODEL`, `WIKI_SYNTHESIS_MODEL`, `WIKI_VERIFIER_MODEL`).
-To flip a stage from Haiku → Flash Lite (or Sonnet → Gemini Pro),
-edit the constant and redeploy. There is no env-var override path:
-an earlier iteration tried `getattr(settings, ...)` plumbing but the
-Settings class had no matching fields, so the env var was silently
-inert. Better to be honest than to claim flexibility we don't have.
+  TRIAGE (cheap model) -> WIKI AGENT (Gemini 3.1 Pro)
 
-Default behavior matches the pre-redesign pipeline (Anthropic for all
-three stages). Tests can pin a different provider via the
-`model_override` kwarg on the `get_*_provider` factories.
+The triage provider abstraction stays — Anthropic Haiku and Gemini
+Flash Lite are still both viable for the binary-ish triage call. The
+agent uses Gemini directly via `services.synthesis.gemini_agent_client`;
+no provider abstraction there because the agent harness's surface
+(CachedContent + cached generate calls) doesn't translate to
+Anthropic's prompt-cache model.
+
+Selection: the model name is read from `shared.constants.WIKI_TRIAGE_MODEL`.
+To flip a stage from Haiku -> Flash Lite (or back), edit the constant
+and redeploy. There is no env-var override path; the prior
+`getattr(settings, ...)` plumbing referenced fields that didn't exist
+on Settings, so the env var was silently inert.
+
+Default: Anthropic Haiku.
 """
 
 from __future__ import annotations
@@ -28,28 +29,17 @@ from typing import Any, Protocol
 from anthropic import AsyncAnthropic
 
 from services.synthesis.models import (
-    SynthesisInput,
-    SynthesisOutput,
     TriageInput,
     TriageOutput,
-    VerifierInput,
-    VerifierOutput,
 )
 from services.synthesis.prompts import (
-    build_synthesis_prompt,
     build_triage_prompt,
-    build_verifier_prompt,
-    synthesis_tool_name,
     triage_tool_name,
-    verifier_tool_name,
 )
 from shared.config import get_settings
 from shared.constants import (
     HAIKU_MODEL,
-    SONNET_MODEL,
-    WIKI_SYNTHESIS_MODEL,
     WIKI_TRIAGE_MODEL,
-    WIKI_VERIFIER_MODEL,
 )
 from shared.logging import get_logger
 
@@ -65,14 +55,6 @@ class TriageParseError(RuntimeError):
     """Provider returned output we couldn't parse into TriageOutput."""
 
 
-class SynthesisParseError(RuntimeError):
-    """Provider returned output we couldn't parse into SynthesisOutput."""
-
-
-class VerifierParseError(RuntimeError):
-    """Provider returned output we couldn't parse into VerifierOutput."""
-
-
 # ---------------------------------------------------------------------------
 # Protocols
 # ---------------------------------------------------------------------------
@@ -82,42 +64,22 @@ class TriageProvider(Protocol):
     async def triage(self, events: list[TriageInput], *, now: datetime) -> TriageOutput: ...
 
 
-class SynthesisProvider(Protocol):
-    async def synthesize(self, cluster: SynthesisInput, *, now: datetime) -> SynthesisOutput: ...
-
-
-class VerifierProvider(Protocol):
-    async def verify(self, cluster: VerifierInput, *, now: datetime) -> VerifierOutput: ...
-
-
 # ---------------------------------------------------------------------------
 # Provider name resolution
 # ---------------------------------------------------------------------------
 
 
 _ANTHROPIC_TRIAGE_NAMES = {"haiku", "claude-haiku", HAIKU_MODEL}
-_ANTHROPIC_SYNTH_NAMES = {"sonnet", "claude-sonnet", SONNET_MODEL}
-_ANTHROPIC_VERIFIER_NAMES = _ANTHROPIC_SYNTH_NAMES
 _GEMINI_FLASH_LITE_NAMES = {
     "gemini-flash-lite",
     "gemini-flash-lite-preview",
     "gemini-3.1-flash-lite-preview",
     "gemini-2.5-flash-lite",
 }
-_GEMINI_PRO_NAMES = {
-    "gemini-pro",
-    "gemini-3.1-pro",
-    "gemini-3.1-pro-preview",
-}
-
-
-# The model name is the constant from shared/constants.py. To flip a
-# stage to a different provider, edit the constant and redeploy. See
-# the module docstring for why there's no env-var override path.
 
 
 # ---------------------------------------------------------------------------
-# Anthropic implementations (tool_use blocks)
+# Anthropic implementation (tool_use blocks)
 # ---------------------------------------------------------------------------
 
 
@@ -125,11 +87,16 @@ def _extract_tool_use_input(
     blocks: list[Any], *, expected_name: str, error_cls: type[RuntimeError]
 ) -> dict[str, Any]:
     for block in blocks:
-        if getattr(block, "type", "") == "tool_use" and getattr(block, "name", "") == expected_name:
+        if (
+            getattr(block, "type", "") == "tool_use"
+            and getattr(block, "name", "") == expected_name
+        ):
             payload = getattr(block, "input", None)
             if isinstance(payload, dict):
                 return payload
-            raise error_cls(f"tool_use input was not a dict: {type(payload).__name__}")
+            raise error_cls(
+                f"tool_use input was not a dict: {type(payload).__name__}"
+            )
     raise error_cls(f"response had no {expected_name} tool_use block")
 
 
@@ -153,53 +120,13 @@ class _AnthropicTriage:
         try:
             return TriageOutput(**payload)
         except Exception as exc:
-            raise TriageParseError(f"triage tool input failed validation: {exc}") from exc
-
-
-class _AnthropicSynthesis:
-    """Anthropic Sonnet via tool_use forced output."""
-
-    def __init__(self, client: AsyncAnthropic, *, model: str = SONNET_MODEL) -> None:
-        self._client = client
-        self._model = model
-
-    async def synthesize(self, cluster: SynthesisInput, *, now: datetime) -> SynthesisOutput:
-        kwargs = build_synthesis_prompt(cluster, now=now)
-        resp = await self._client.messages.create(model=self._model, **kwargs)
-        payload = _extract_tool_use_input(
-            resp.content,
-            expected_name=synthesis_tool_name(),
-            error_cls=SynthesisParseError,
-        )
-        try:
-            return SynthesisOutput(**payload)
-        except Exception as exc:
-            raise SynthesisParseError(f"synthesis tool input failed validation: {exc}") from exc
-
-
-class _AnthropicVerifier:
-    """Anthropic Sonnet running the verifier prompt."""
-
-    def __init__(self, client: AsyncAnthropic, *, model: str = SONNET_MODEL) -> None:
-        self._client = client
-        self._model = model
-
-    async def verify(self, cluster: VerifierInput, *, now: datetime) -> VerifierOutput:
-        kwargs = build_verifier_prompt(cluster, now=now)
-        resp = await self._client.messages.create(model=self._model, **kwargs)
-        payload = _extract_tool_use_input(
-            resp.content,
-            expected_name=verifier_tool_name(),
-            error_cls=VerifierParseError,
-        )
-        try:
-            return VerifierOutput(**payload)
-        except Exception as exc:
-            raise VerifierParseError(f"verifier tool input failed validation: {exc}") from exc
+            raise TriageParseError(
+                f"triage tool input failed validation: {exc}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
-# Gemini implementations (response_schema + application/json)
+# Gemini implementation (response_schema + application/json)
 # ---------------------------------------------------------------------------
 
 
@@ -209,7 +136,9 @@ def _strip_keys_recursive(schema: Any, keys: tuple[str, ...]) -> Any:
     `services/retrieval/synthesis.py:_strip_keys_recursive`.
     """
     if isinstance(schema, dict):
-        return {k: _strip_keys_recursive(v, keys) for k, v in schema.items() if k not in keys}
+        return {
+            k: _strip_keys_recursive(v, keys) for k, v in schema.items() if k not in keys
+        }
     if isinstance(schema, list):
         return [_strip_keys_recursive(v, keys) for v in schema]
     return schema
@@ -233,56 +162,53 @@ def _gemini_client() -> Any:
     try:
         from google import genai
     except ImportError as exc:
-        raise RuntimeError("google-genai not installed; cannot use Gemini provider") from exc
+        raise RuntimeError(
+            "google-genai not installed; cannot use Gemini provider"
+        ) from exc
     api_key = get_settings().google_api_key.get_secret_value()
     if not api_key:
         raise RuntimeError("GOOGLE_API_KEY not configured for Gemini provider")
     return genai.Client(api_key=api_key)
 
 
-def _gemini_call_json(
+async def _gemini_call_json(
     *,
     model: str,
     system: str,
     user: str,
     schema: dict[str, Any],
     max_tokens: int,
-) -> Any:
-    """Issue one Gemini structured-output call. Returns the parsed dict.
-
-    Marked as a thin helper so the three Gemini provider classes share
-    error handling and schema sanitization. Caller is responsible for
-    Pydantic validation.
-    """
-
-    async def _go() -> dict[str, Any]:
-        client = _gemini_client()
-        contents = f"{system}\n\n---\n\n{user}"
-        sanitized = _strip_keys_recursive(schema, _GEMINI_REJECTED_SCHEMA_KEYS)
-        resp = await client.aio.models.generate_content(
-            model=model,
-            contents=contents,
-            config={
-                "max_output_tokens": max_tokens,
-                "response_mime_type": "application/json",
-                "response_schema": sanitized,
-            },
+) -> dict[str, Any]:
+    """Issue one Gemini structured-output call. Returns the parsed dict."""
+    client = _gemini_client()
+    contents = f"{system}\n\n---\n\n{user}"
+    sanitized = _strip_keys_recursive(schema, _GEMINI_REJECTED_SCHEMA_KEYS)
+    resp = await client.aio.models.generate_content(
+        model=model,
+        contents=contents,
+        config={
+            "max_output_tokens": max_tokens,
+            "response_mime_type": "application/json",
+            "response_schema": sanitized,
+        },
+    )
+    text = getattr(resp, "text", None) or ""
+    if not text:
+        raise RuntimeError("gemini response was empty")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"gemini response was not JSON: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(
+            f"gemini response was not a JSON object: {type(parsed).__name__}"
         )
-        text = getattr(resp, "text", None) or ""
-        if not text:
-            raise RuntimeError("gemini response was empty")
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"gemini response was not JSON: {exc}") from exc
-        if not isinstance(parsed, dict):
-            raise RuntimeError(f"gemini response was not a JSON object: {type(parsed).__name__}")
-        return parsed
-
-    return _go()
+    return parsed
 
 
-def _flatten_anthropic_kwargs(kwargs: dict[str, Any]) -> tuple[str, str, dict[str, Any], int]:
+def _flatten_anthropic_kwargs(
+    kwargs: dict[str, Any],
+) -> tuple[str, str, dict[str, Any], int]:
     """Pull the system text, user text, tool input_schema, and max_tokens
     out of an Anthropic-shaped `messages.create` kwargs dict so the same
     prompt builder feeds Gemini.
@@ -326,61 +252,13 @@ class _GeminiTriage:
         try:
             return TriageOutput(**payload)
         except Exception as exc:
-            raise TriageParseError(f"gemini triage output failed validation: {exc}") from exc
-
-
-class _GeminiSynthesis:
-    """Gemini 3.1 Pro Preview synthesis via response_schema."""
-
-    def __init__(self, *, model: str = "gemini-3.1-pro-preview") -> None:
-        self._model = model
-
-    async def synthesize(self, cluster: SynthesisInput, *, now: datetime) -> SynthesisOutput:
-        kwargs = build_synthesis_prompt(cluster, now=now)
-        system, user, schema, max_tokens = _flatten_anthropic_kwargs(kwargs)
-        try:
-            payload = await _gemini_call_json(
-                model=self._model,
-                system=system,
-                user=user,
-                schema=schema,
-                max_tokens=max_tokens,
-            )
-        except Exception as exc:
-            raise SynthesisParseError(f"gemini synthesis call failed: {exc}") from exc
-        try:
-            return SynthesisOutput(**payload)
-        except Exception as exc:
-            raise SynthesisParseError(f"gemini synthesis output failed validation: {exc}") from exc
-
-
-class _GeminiVerifier:
-    """Gemini 3.1 Pro Preview running the verifier prompt."""
-
-    def __init__(self, *, model: str = "gemini-3.1-pro-preview") -> None:
-        self._model = model
-
-    async def verify(self, cluster: VerifierInput, *, now: datetime) -> VerifierOutput:
-        kwargs = build_verifier_prompt(cluster, now=now)
-        system, user, schema, max_tokens = _flatten_anthropic_kwargs(kwargs)
-        try:
-            payload = await _gemini_call_json(
-                model=self._model,
-                system=system,
-                user=user,
-                schema=schema,
-                max_tokens=max_tokens,
-            )
-        except Exception as exc:
-            raise VerifierParseError(f"gemini verifier call failed: {exc}") from exc
-        try:
-            return VerifierOutput(**payload)
-        except Exception as exc:
-            raise VerifierParseError(f"gemini verifier output failed validation: {exc}") from exc
+            raise TriageParseError(
+                f"gemini triage output failed validation: {exc}"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
-# Factory functions used by the workers
+# Factory function used by the triage worker
 # ---------------------------------------------------------------------------
 
 
@@ -405,37 +283,3 @@ def get_triage_provider(
             raise ValueError("Anthropic triage requires an AsyncAnthropic client")
         return _AnthropicTriage(anthropic_client, model=HAIKU_MODEL)
     raise ValueError(f"unknown WIKI_TRIAGE_MODEL: {name}")
-
-
-def get_synthesis_provider(
-    anthropic_client: AsyncAnthropic | None = None,
-    *,
-    model_override: str | None = None,
-) -> SynthesisProvider:
-    name = (model_override or WIKI_SYNTHESIS_MODEL).lower()
-    if name in _GEMINI_PRO_NAMES:
-        return _GeminiSynthesis(
-            model=name if name.startswith("gemini") else "gemini-3.1-pro-preview"
-        )
-    if name in _ANTHROPIC_SYNTH_NAMES:
-        if anthropic_client is None:
-            raise ValueError("Anthropic synthesis requires an AsyncAnthropic client")
-        return _AnthropicSynthesis(anthropic_client, model=SONNET_MODEL)
-    raise ValueError(f"unknown WIKI_SYNTHESIS_MODEL: {name}")
-
-
-def get_verifier_provider(
-    anthropic_client: AsyncAnthropic | None = None,
-    *,
-    model_override: str | None = None,
-) -> VerifierProvider:
-    name = (model_override or WIKI_VERIFIER_MODEL).lower()
-    if name in _GEMINI_PRO_NAMES:
-        return _GeminiVerifier(
-            model=name if name.startswith("gemini") else "gemini-3.1-pro-preview"
-        )
-    if name in _ANTHROPIC_VERIFIER_NAMES:
-        if anthropic_client is None:
-            raise ValueError("Anthropic verifier requires an AsyncAnthropic client")
-        return _AnthropicVerifier(anthropic_client, model=SONNET_MODEL)
-    raise ValueError(f"unknown WIKI_VERIFIER_MODEL: {name}")

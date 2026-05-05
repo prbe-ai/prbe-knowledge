@@ -592,9 +592,13 @@ CREATE TABLE wiki_synthesis_queue (
     source_system           TEXT NOT NULL,
     doc_type                TEXT NOT NULL,
     enqueued_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Source-side timestamp (Slack ts, GitHub created_at, Linear updatedAt,
+    -- Granola startedAt, Notion last_edited_time, fallback documents.created_at).
+    -- Populated by Normalizer at insert. The wiki agent reads triaged events
+    -- ordered by source_ts ASC to walk the day in time order.
+    source_ts               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     status                  TEXT NOT NULL DEFAULT 'pending',
     triage_score            REAL,
-    triage_targets          JSONB,
     triage_error            TEXT,
     triage_completed_at     TIMESTAMPTZ,
     attempts                INT NOT NULL DEFAULT 0,
@@ -605,15 +609,27 @@ CREATE TABLE wiki_synthesis_queue (
     -- prior state if attempts < cap, else to terminal 'failed' so ops
     -- can investigate via the dashboard. See migration 0038.
     heartbeat_at            TIMESTAMPTZ,
+    -- DLQ surface for unrecoverable failures: triage batch crash, agent
+    -- halt (turn cap, stall, compactor failure, Gemini outage). Admin
+    -- reset (POST .../dlq/reset) flips rows back to pending or triaged.
+    dlq_reason              TEXT,
+    dlq_at                  TIMESTAMPTZ,
     CONSTRAINT uq_wsq_customer_doc_version UNIQUE (customer_id, doc_id, doc_version),
     CONSTRAINT ck_wsq_status CHECK (status IN (
         'pending','triaging','triaged','rejected',
-        'synthesizing','done','failed','verifier_rejected'
+        'synthesizing','done','failed',
+        'synthesis_skipped','dlq'
     ))
 );
 
 CREATE INDEX idx_wsq_drain
     ON wiki_synthesis_queue (customer_id, status, enqueued_at);
+
+-- Cursor index for the wiki agent's next_events() pagination. The
+-- agent reads triaged events ordered by source_ts ASC, queue_id ASC,
+-- skipping rows already applied or skipped in the current run.
+CREATE INDEX ix_wsq_drain_cursor
+    ON wiki_synthesis_queue (customer_id, status, source_ts, queue_id);
 
 -- Reclaim only ever scans rows in 'triaging'/'synthesizing' — partial
 -- index keeps the sweep cheap as the queue's done/rejected tail grows.
