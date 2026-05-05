@@ -230,6 +230,32 @@ def test_fuse_drops_doc_with_only_metadata_chunk() -> None:
     assert fused == []
 
 
+def test_fuse_metadata_only_doc_can_use_content_fallback() -> None:
+    """Search can let metadata select a doc while still returning real
+    content, not synthetic key:value metadata text."""
+    fused = fuse(
+        ranked_lists={
+            "bm25": [_FakeHit(chunk_id="m1", doc_id="docA", kind="metadata", score=0.9)],
+            "metadata_content_fallback": [
+                _FakeHit(
+                    chunk_id="c1",
+                    doc_id="docA",
+                    kind="content_fallback",
+                    content="real transcript text",
+                    score=0.0,
+                )
+            ],
+        },
+        top_k=10,
+    )
+    assert len(fused) == 1
+    assert fused[0].doc_id == "docA"
+    assert fused[0].kind == "content"
+    assert fused[0].content == "real transcript text"
+    assert "metadata_bm25" in fused[0].retriever_scores
+    assert "bm25" not in fused[0].retriever_scores
+
+
 def test_fuse_metadata_score_boosts_doc_ranking() -> None:
     """A doc with both content and metadata matches should out-rank a doc
     with only a content match (assuming similar RRF positions)."""

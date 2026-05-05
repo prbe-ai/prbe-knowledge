@@ -20,8 +20,10 @@ best CONTENT chunk for that doc, with the doc's metadata-chunk score
 folded into the per-doc score as a booster.
 
 A doc whose only candidate-pool entry is its metadata chunk (no content
-chunk surfaced from any retriever) is dropped — metadata-only ranking is
-too noisy to trust as the lone signal that this doc should be returned.
+chunk surfaced from any retriever) is dropped unless the caller supplies a
+`content_fallback` hit for the same doc. Fallback hits let metadata select
+the doc while preserving the response contract: agents still see only real
+content chunks, never synthetic key:value metadata text.
 
 Recency decay is always-on: every doc is multiplied by
 exp(-ln2 * age_days / half_life). Half-life resolution order:
@@ -99,6 +101,13 @@ def fuse(
 
     for retriever_name, hits in ranked_lists.items():
         for rank, hit in enumerate(hits, start=1):
+            kind = getattr(hit, "kind", "content")
+            if kind == "content_fallback":
+                # A fallback only provides displayable content for a doc
+                # that surfaced via metadata. It should not earn its own
+                # RRF score or arbitrary rank-based boost.
+                per_chunk_meta.setdefault(hit.chunk_id, hit)
+                continue
             rrf = 1.0 / (k + rank)
             per_chunk_rrf[hit.chunk_id] += rrf
             per_chunk_breakdown[hit.chunk_id][retriever_name] = float(hit.score)
@@ -111,8 +120,13 @@ def fuse(
     #     (typically one per doc, but defensive against future cardinality)
     best_content_for_doc: dict[str, str] = {}
     content_score_for_doc: dict[str, float] = {}
+    fallback_content_for_doc: dict[str, str] = {}
     metadata_score_for_doc: dict[str, float] = defaultdict(float)
     metadata_breakdown_for_doc: dict[str, dict[str, float]] = defaultdict(dict)
+
+    for chunk_id, hit in per_chunk_meta.items():
+        if getattr(hit, "kind", "content") == "content_fallback":
+            fallback_content_for_doc.setdefault(hit.doc_id, chunk_id)
 
     for chunk_id, rrf_score in per_chunk_rrf.items():
         hit = per_chunk_meta[chunk_id]
@@ -139,6 +153,15 @@ def fuse(
     combined_for_doc: dict[str, float] = {}
     for doc_id, content_score in content_score_for_doc.items():
         combined_for_doc[doc_id] = content_score + metadata_score_for_doc.get(doc_id, 0.0)
+    for doc_id, metadata_score in metadata_score_for_doc.items():
+        if doc_id in combined_for_doc:
+            continue
+        fallback_chunk_id = fallback_content_for_doc.get(doc_id)
+        if fallback_chunk_id is None:
+            continue
+        best_content_for_doc[doc_id] = fallback_chunk_id
+        content_score_for_doc[doc_id] = 0.0
+        combined_for_doc[doc_id] = metadata_score
 
     # Per-source-system score multiplier (Change A) and recency decay
     # (Change C). Multiplier first so a brand-new claude_code doc still gets

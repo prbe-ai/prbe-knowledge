@@ -34,17 +34,20 @@ from services.retrieval.helpers import (
     apply_entity_filter,
     embeddings_for_chunks,
 )
-from services.retrieval.retrievers.bm25 import bm25_search
+from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search
 from services.retrieval.retrievers.graph import graph_search
 from services.retrieval.retrievers.vector import vector_search
 from services.retrieval.router import RouterOutput
+from services.retrieval.temporal import build_predicate
 from shared.constants import SourceSystem
+from shared.db import with_tenant
 from shared.logging import get_logger
 from shared.models import (
     QueryChunk,
     QueryRequest,
     QueryResponse,
     TemporalSpec,
+    normalize_author_id,
 )
 
 log = get_logger(__name__)
@@ -54,6 +57,92 @@ log = get_logger(__name__)
 # explicit `recency_half_life_days` always wins.
 _SORT_INTENT_HALF_LIFE_DIVISOR = 4
 _SORT_INTENT_MIN_HALF_LIFE_DAYS = 7.0
+_CODING_AGENT_SOURCES = {
+    SourceSystem.CLAUDE_CODE.value,
+    SourceSystem.CODEX.value,
+}
+
+
+async def _content_fallbacks_for_metadata_only_agent_hits(
+    customer_id: str,
+    ranked_lists: dict[str, list],
+    spec: TemporalSpec,
+) -> list[BM25Hit]:
+    """Return displayable content chunks for coding-agent metadata-only hits.
+
+    Metadata chunks carry searchable titles, names, emails, hostnames, and
+    source URLs. Fusion must not return that synthetic text directly, but for
+    coding-agent sessions the metadata is often the only place a user/person
+    name appears. When a Codex/Claude Code doc matches only via metadata, fetch
+    the first real content chunk so fusion can return the transcript with the
+    metadata score.
+    """
+    metadata_doc_ids: set[str] = set()
+    content_doc_ids: set[str] = set()
+
+    for hits in ranked_lists.values():
+        for hit in hits:
+            kind = getattr(hit, "kind", "content")
+            if kind == "metadata" and hit.source_system in _CODING_AGENT_SOURCES:
+                metadata_doc_ids.add(hit.doc_id)
+            elif kind != "metadata":
+                content_doc_ids.add(hit.doc_id)
+
+    doc_ids = sorted(metadata_doc_ids - content_doc_ids)
+    if not doc_ids:
+        return []
+
+    async with with_tenant(customer_id) as conn:
+        params: list = [customer_id, doc_ids]
+        pred = build_predicate(
+            spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
+        )
+        params.extend(pred.params)
+        rows = await conn.fetch(
+            f"""
+            SELECT DISTINCT ON (c.doc_id)
+                   c.chunk_id,
+                   c.doc_id,
+                   d.version AS doc_version,
+                   d.source_system,
+                   d.source_url,
+                   d.title,
+                   d.author_id,
+                   c.content,
+                   d.created_at,
+                   d.updated_at
+            FROM chunks c
+            JOIN documents d
+              ON c.doc_id = d.doc_id
+             AND d.customer_id = c.customer_id
+             AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
+            WHERE c.customer_id = $1
+              AND c.doc_id = ANY($2::text[])
+              AND COALESCE(c.kind, 'content') = 'content'
+              {pred.chunk_sql}
+              {pred.doc_sql}
+            ORDER BY c.doc_id, c.chunk_index ASC
+            """,
+            *params,
+        )
+
+    return [
+        BM25Hit(
+            chunk_id=r["chunk_id"],
+            doc_id=r["doc_id"],
+            doc_version=r["doc_version"],
+            source_system=r["source_system"],
+            source_url=r["source_url"],
+            title=r["title"],
+            content=r["content"],
+            created_at=r["created_at"],
+            updated_at=r["updated_at"],
+            score=0.0,
+            author_id=normalize_author_id(r["author_id"]),
+            kind="content_fallback",
+        )
+        for r in rows
+    ]
 
 
 async def run_search(
@@ -131,6 +220,10 @@ async def run_search(
     vec_hits, bm25_hits, graph_hits = await asyncio.gather(
         _vec_runner(), _bm25_runner(), _graph_runner()
     )
+    ranked_lists = {"vector": vec_hits, "bm25": bm25_hits, "graph": graph_hits}
+    metadata_content_fallbacks = await _content_fallbacks_for_metadata_only_agent_hits(
+        customer_id, ranked_lists, spec
+    )
     timing["vector_ms"] = (time.perf_counter() - t_retrieve) * 1000
 
     # Recency half-life: caller's explicit value always wins. Otherwise
@@ -148,7 +241,10 @@ async def run_search(
 
     t_fuse = time.perf_counter()
     fused = fuse(
-        {"vector": vec_hits, "bm25": bm25_hits, "graph": graph_hits},
+        {
+            **ranked_lists,
+            "metadata_content_fallback": metadata_content_fallbacks,
+        },
         top_k=req.top_k * pool_multiplier,
         recency_half_life_days=effective_half_life,
         now=datetime.now(UTC),
