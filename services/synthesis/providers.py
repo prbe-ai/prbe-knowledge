@@ -1,18 +1,22 @@
 """Provider Protocol for triage + synthesis + verifier stages.
 
 Each stage of the wiki pipeline can independently target a different
-provider (Anthropic vs Google) via env var. The Protocol lets the
-worker code depend on a uniform interface; provider-specific shape
-conversion (Anthropic tool_use blocks vs Gemini response_schema +
+provider (Anthropic vs Google). The Protocol lets the worker code
+depend on a uniform interface; provider-specific shape conversion
+(Anthropic tool_use blocks vs Gemini response_schema +
 application/json) lives inside the implementations.
 
-Selection: read the model name from `shared.constants` (defaults) but
-allow `shared.config.Settings` env overrides at runtime — that's how we
-flip a stage from Haiku → Flash Lite without code deploy.
+Selection: the model name is read from `shared.constants`
+(`WIKI_TRIAGE_MODEL`, `WIKI_SYNTHESIS_MODEL`, `WIKI_VERIFIER_MODEL`).
+To flip a stage from Haiku → Flash Lite (or Sonnet → Gemini Pro),
+edit the constant and redeploy. There is no env-var override path:
+an earlier iteration tried `getattr(settings, ...)` plumbing but the
+Settings class had no matching fields, so the env var was silently
+inert. Better to be honest than to claim flexibility we don't have.
 
 Default behavior matches the pre-redesign pipeline (Anthropic for all
-three stages). Set `WIKI_TRIAGE_MODEL`, `WIKI_SYNTHESIS_MODEL`, or
-`WIKI_VERIFIER_MODEL` env vars to flip.
+three stages). Tests can pin a different provider via the
+`model_override` kwarg on the `get_*_provider` factories.
 """
 
 from __future__ import annotations
@@ -107,19 +111,9 @@ _GEMINI_PRO_NAMES = {
 }
 
 
-def _resolve_triage_model() -> str:
-    settings = get_settings()
-    return getattr(settings, "wiki_triage_model", None) or WIKI_TRIAGE_MODEL
-
-
-def _resolve_synthesis_model() -> str:
-    settings = get_settings()
-    return getattr(settings, "wiki_synthesis_model", None) or WIKI_SYNTHESIS_MODEL
-
-
-def _resolve_verifier_model() -> str:
-    settings = get_settings()
-    return getattr(settings, "wiki_verifier_model", None) or WIKI_VERIFIER_MODEL
+# The model name is the constant from shared/constants.py. To flip a
+# stage to a different provider, edit the constant and redeploy. See
+# the module docstring for why there's no env-var override path.
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +395,7 @@ def get_triage_provider(
     Anthropic; the caller already owns one. `model_override` lets tests
     pin the choice without env vars.
     """
-    name = (model_override or _resolve_triage_model()).lower()
+    name = (model_override or WIKI_TRIAGE_MODEL).lower()
     if name in _GEMINI_FLASH_LITE_NAMES:
         return _GeminiTriage(
             model=name if name.startswith("gemini") else "gemini-flash-lite-preview"
@@ -418,7 +412,7 @@ def get_synthesis_provider(
     *,
     model_override: str | None = None,
 ) -> SynthesisProvider:
-    name = (model_override or _resolve_synthesis_model()).lower()
+    name = (model_override or WIKI_SYNTHESIS_MODEL).lower()
     if name in _GEMINI_PRO_NAMES:
         return _GeminiSynthesis(
             model=name if name.startswith("gemini") else "gemini-3.1-pro-preview"
@@ -435,7 +429,7 @@ def get_verifier_provider(
     *,
     model_override: str | None = None,
 ) -> VerifierProvider:
-    name = (model_override or _resolve_verifier_model()).lower()
+    name = (model_override or WIKI_VERIFIER_MODEL).lower()
     if name in _GEMINI_PRO_NAMES:
         return _GeminiVerifier(
             model=name if name.startswith("gemini") else "gemini-3.1-pro-preview"
