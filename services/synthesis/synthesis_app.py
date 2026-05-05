@@ -69,9 +69,10 @@ async def run_synthesis_app_forever() -> None:
     reclaim_loop = WikiReclaimLoop(max_attempts=WIKI_SYNTHESIS_MAX_ATTEMPTS)
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
+    # See triage_app.py for the rationale on 0.0.0.0 vs ::. Same fix.
     health_config = uvicorn.Config(
         _build_health_app(),
-        host="::",
+        host="0.0.0.0",
         port=health_port,
         log_config=None,
         lifespan="off",
