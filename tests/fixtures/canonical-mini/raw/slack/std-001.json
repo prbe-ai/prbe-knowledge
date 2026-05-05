@@ -1,0 +1,10 @@
+{
+  "customer_id": "cust-eval-canonical-v1",
+  "source": "slack",
+  "event_id": "std-001",
+  "channel": "#standup",
+  "user": "alice",
+  "ts": "1714000000.000001",
+  "text": "Yesterday: shipped the rate-limiter PR. Today: code review backlog.",
+  "thread_ts": null
+}

@@ -1,0 +1,10 @@
+{
+  "customer_id": "cust-eval-canonical-v1",
+  "source": "slack",
+  "event_id": "oncall-001",
+  "channel": "#oncall",
+  "user": "bob",
+  "ts": "1714003600.000001",
+  "text": "Handing off oncall to @charlie. Open: payments-api 503 spike (mitigated, monitoring).",
+  "thread_ts": null
+}
