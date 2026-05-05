@@ -97,18 +97,19 @@ def _substitute_customer_id(
     Raises ValueError if old_id is not in old_key and payload doesn't
     have new_id (malformed fixture).
     """
-    new_payload = dict(payload)
+    # Affirmative idempotency: payload already transformed AND key already
+    # substituted → return unchanged.
+    if old_id not in old_key and payload.get("customer_id") == new_id:
+        return dict(payload), old_key
 
+    # Malformed input: old_id missing from key but payload not yet transformed.
     if old_id not in old_key:
-        # Key was already substituted or is malformed
-        if new_payload.get("customer_id") == new_id:
-            # Already transformed, return as-is (idempotent)
-            return new_payload, old_key
-        # Malformed: old_id not in key and payload doesn't match new_id
         raise ValueError(
             f"old_id not found in R2 key: old_id={old_id!r}, old_key={old_key!r}"
         )
 
+    # Normal case: rewrite both payload and key.
+    new_payload = dict(payload)
     new_payload["customer_id"] = new_id
     new_key = old_key.replace(old_id, new_id)
     return new_payload, new_key

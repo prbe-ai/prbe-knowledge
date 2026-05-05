@@ -44,6 +44,10 @@ def test_leaves_other_fields_untouched():
     assert new_payload["body"] == "Yesterday: closed PRs. Today: review."
     assert new_payload["source"] == "slack"
     assert new_payload["event_id"] == "std-001"
+    # V1 scope: thread_parent_id is intentionally NOT rewritten even though it
+    # contains the canonical customer_id as a substring (no downstream consumer
+    # parses this field as a customer_id — verified in slack/base.py).
+    assert new_payload["thread_parent_id"] == "cust-eval-canonical-v1:thread-99"
 
 
 def test_idempotent_on_repeat_application():
