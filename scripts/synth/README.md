@@ -267,13 +267,15 @@ seed time). The customer can never trigger this themselves.
 Re-run only if you need to regenerate after a model upgrade or to capture
 new archetypes.)
 
-Choose or copy a profile from `scripts/synth/profiles/` and adjust its
-`customer_id` to `cust-eval-canonical-v1` before running:
+Use the committed `scripts/synth/profiles/canonical-v1.yaml` (its
+`customer_id` is already set to `cust-eval-canonical-v1`; adjust the
+`repos[0].local_path` if your local clone of prbe-knowledge lives somewhere
+other than `~/Desktop/prbe/prbe-knowledge`):
 
 ````bash
-python -m scripts.synth init --profile scripts/synth/profiles/<canonical-profile>.yml
+python -m scripts.synth init --profile scripts/synth/profiles/canonical-v1.yaml
 python -m scripts.synth run \
-    --profile scripts/synth/profiles/<canonical-profile>.yml \
+    --profile scripts/synth/profiles/canonical-v1.yaml \
     --integrate --record-llm --archetypes standup,oncall \
     --output-dir scripts/synth/canonical/v1/
 python -m scripts.synth clean --customer cust-eval-canonical-v1

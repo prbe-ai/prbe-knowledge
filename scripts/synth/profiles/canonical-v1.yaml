@@ -1,0 +1,31 @@
+# canonical-v1.yaml — profile for recording the Plan 4 canonical corpus.
+#
+# Walks a local clone of prbe-knowledge to build the WorldModel, then
+# generates templated archetypes (standup + oncall) at small scale. Used
+# by the `synth seed` flow once the corpus is recorded; see
+# scripts/synth/README.md → "Seeding a real-shape tenant" for the workflow.
+#
+# To regenerate the canonical corpus:
+#   synth init  --profile scripts/synth/profiles/canonical-v1.yaml
+#   synth run   --profile scripts/synth/profiles/canonical-v1.yaml \
+#               --integrate --record-llm --archetypes standup,oncall \
+#               --output-dir scripts/synth/canonical/v1/
+#   synth clean --customer cust-eval-canonical-v1
+#
+# Plot archetypes (incident / launch / big_refactor) are filtered OUT until
+# the validator regen loop ships (scripts/synth/scenarios.py:202-211 TODO);
+# they would mostly be dropped by the strict Pass 2 validator today.
+
+customer_id: cust-eval-canonical-v1
+preset: tiny_test
+seed: 1
+
+repos:
+  # Adjust to point at your local clone of prbe-knowledge. The extractor
+  # walks this on disk to build the WorldModel (people, services, channels).
+  - url: github.com/prbe-ai/prbe-knowledge
+    local_path: ~/Desktop/prbe/prbe-knowledge
+
+world_model:
+  min_commits_per_persona: 2
+  topic_pool_lookback_days: 30
