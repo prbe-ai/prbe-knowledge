@@ -1,10 +1,17 @@
 {
   "customer_id": "cust-eval-canonical-v1",
-  "source": "slack",
-  "event_id": "std-001",
-  "channel": "#standup",
-  "user": "alice",
-  "ts": "1714000000.000001",
-  "text": "Yesterday: shipped the rate-limiter PR. Today: code review backlog.",
-  "thread_ts": null
+  "type": "event_callback",
+  "team_id": "T_SYNTH",
+  "api_app_id": "A_SYNTH",
+  "event_id": "Ev_synth_std_001",
+  "event_time": 1714000000,
+  "event": {
+    "type": "message",
+    "channel": "C_STANDUP",
+    "user": "U_ALICE",
+    "text": "Yesterday: shipped the rate-limiter PR. Today: code review backlog.",
+    "ts": "1714000000.000100",
+    "client_msg_id": "synth-std-001",
+    "team": "T_SYNTH"
+  }
 }
