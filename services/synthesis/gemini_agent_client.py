@@ -244,13 +244,28 @@ def _extract_response(resp: Any) -> dict[str, Any]:
     The harness expects:
       {
         "text": str | None,
-        "tool_calls": [{"name": ..., "args": {...}}, ...],
+        "tool_calls": [
+            {"name": ..., "args": {...}, "thought_signature": bytes | None},
+            ...
+        ],
         "usage_metadata": {
             "prompt_token_count": int,
             "cached_content_token_count": int,
             "candidates_token_count": int,
         },
       }
+
+    `thought_signature` is required on Gemini 3.x models. The SDK
+    attaches it to the part that holds a function_call. When the
+    harness echoes the model's prior function_call back as part of
+    the conversation history (turn 2+), the SAME thought_signature
+    must accompany it. Otherwise Gemini rejects the request:
+
+        400 INVALID_ARGUMENT: 'Function call is missing a
+        thought_signature in functionCall parts. This is required
+        for tools to work correctly...'
+
+    See: https://ai.google.dev/gemini-api/docs/thought-signatures
     """
     text: str | None = getattr(resp, "text", None)
     tool_calls: list[dict[str, Any]] = []
@@ -266,8 +281,13 @@ def _extract_response(resp: Any) -> dict[str, Any]:
             args = getattr(fc, "args", None) or {}
             if not isinstance(args, dict):
                 args = dict(args) if hasattr(args, "items") else {}
+            thought_sig = getattr(part, "thought_signature", None)
             tool_calls.append(
-                {"name": getattr(fc, "name", ""), "args": dict(args)}
+                {
+                    "name": getattr(fc, "name", ""),
+                    "args": dict(args),
+                    "thought_signature": thought_sig,
+                }
             )
     usage = getattr(resp, "usage_metadata", None)
     usage_dict: dict[str, Any] = {}

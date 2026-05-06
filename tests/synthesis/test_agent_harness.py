@@ -221,6 +221,96 @@ async def test_dispatch_single_tool_use() -> None:
 
 
 @pytest.mark.asyncio
+async def test_function_call_thought_signature_round_trips_to_conversation() -> None:
+    """Regression for `agent.gemini_persistent_error` at turn 1+.
+
+    Gemini 3.x emits a thought_signature on every function_call part.
+    When the harness echoes the function_call back as part of the
+    conversation history (turn 2's request), the SAME signature must
+    be on the part. Otherwise Gemini 400s:
+
+        'Function call is missing a thought_signature in functionCall
+        parts. This is required for tools to work correctly...'
+
+    The harness lifts the signature off `tool_call["thought_signature"]`
+    (set by gemini_agent_client._extract_response) and attaches it to
+    the synthesized model-turn part.
+    """
+    sig = b"opaque-bytes-from-gemini"
+
+    async def read_h(rt, n, a):
+        return {"body": "..."}
+
+    async def done_h(rt, n, a):
+        rt.is_done = True
+        return {"committed": True}
+
+    runtime = StubRuntime(tool_handlers={"read_page": read_h, "done": done_h})
+    llm = StubLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "name": "read_page",
+                        "args": {"slug": "auth"},
+                        "thought_signature": sig,
+                    }
+                ],
+                "usage_metadata": {},
+            },
+            {
+                "tool_calls": [{"name": "done", "args": {}}],
+                "usage_metadata": {},
+            },
+        ]
+    )
+    loop = _make_loop(runtime, llm)
+    await loop.run()
+
+    # The model-turn part for read_page must carry the same signature.
+    model_turn = next(
+        c for c in loop._conversation if c.get("role") == "model"
+    )
+    parts = model_turn["parts"]
+    assert len(parts) == 1
+    assert parts[0]["function_call"]["name"] == "read_page"
+    assert parts[0]["thought_signature"] == sig
+
+
+@pytest.mark.asyncio
+async def test_missing_thought_signature_omitted_from_part() -> None:
+    """When the SDK omitted thought_signature (e.g. older model,
+    text-only response upstream), the harness must NOT include the
+    key as None on the echoed part — the field is bytes-typed at
+    Gemini's API and JSON-encoding None there would fail validation
+    differently from omitting it entirely."""
+
+    async def done_h(rt, n, a):
+        rt.is_done = True
+        return {"committed": True}
+
+    runtime = StubRuntime(tool_handlers={"done": done_h})
+    llm = StubLLM(
+        [
+            {
+                # No thought_signature key (older Gemini, no signature).
+                "tool_calls": [{"name": "done", "args": {}}],
+                "usage_metadata": {},
+            }
+        ]
+    )
+    loop = _make_loop(runtime, llm)
+    await loop.run()
+
+    model_turn = next(
+        c for c in loop._conversation if c.get("role") == "model"
+    )
+    part = model_turn["parts"][0]
+    assert part["function_call"]["name"] == "done"
+    assert "thought_signature" not in part
+
+
+@pytest.mark.asyncio
 async def test_dispatch_multiple_tool_use_in_one_response() -> None:
     """Model emits multiple tool calls in one turn — all dispatched."""
 
