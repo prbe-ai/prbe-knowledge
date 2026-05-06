@@ -677,3 +677,52 @@ def test_turn_cap_is_finite() -> None:
     """Sanity: the cap must be > stall threshold or stall-halt is dead code."""
     assert WIKI_AGENT_TURN_CAP > WIKI_AGENT_STALL_TURNS
     assert WIKI_AGENT_UPDATE_CAP >= 1
+
+
+# ---------------------------------------------------------------------------
+# CancelledError propagation regression guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_propagates_cancelled_error() -> None:
+    """Required for the bootstrap force-cancel path to actually stop a
+    running agent. The harness has three broad ``except Exception:``
+    blocks (cache create, tool dispatch, summarizer); none must swallow
+    ``asyncio.CancelledError``. ``CancelledError`` inherits from
+    ``BaseException`` (not ``Exception``) on Python 3.8+ so that's the
+    invariant being pinned here. If a future refactor changes any of
+    those handlers to ``except BaseException:`` without a re-raise, this
+    test fails.
+    """
+    import asyncio
+
+    cancelled_inside_tool = asyncio.Event()
+    waiter_started = asyncio.Event()
+
+    async def slow_done_handler(rt: StubRuntime, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        # Park inside a tool dispatch; the outer task gets cancelled
+        # while we're waiting here. The harness's per-tool
+        # ``except Exception`` must let CancelledError propagate.
+        waiter_started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled_inside_tool.set()
+            raise
+        return {"committed": True}
+
+    runtime = StubRuntime(tool_handlers={"done": slow_done_handler})
+    llm = StubLLM([_done_call()])
+    loop = _make_loop(runtime, llm)
+    task = asyncio.create_task(loop.run())
+    await asyncio.wait_for(waiter_started.wait(), timeout=2.0)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cancelled_inside_tool.is_set(), (
+        "the tool handler should have observed CancelledError; if this "
+        "assertion fails the harness is swallowing CancelledError before "
+        "the awaitable inside the tool sees it"
+    )

@@ -218,7 +218,7 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy —
       # follow up with explicit scale count to actually move the dial.
-      - name: Pin wiki-bootstrap to 2 machines
-        run: flyctl scale count worker=2 -a prbe-knowledge-wiki-bootstrap --yes
+      - name: Pin wiki-bootstrap to 4 machines
+        run: flyctl scale count worker=4 -a prbe-knowledge-wiki-bootstrap --yes
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

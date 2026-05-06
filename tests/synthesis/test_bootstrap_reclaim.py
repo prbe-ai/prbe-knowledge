@@ -1,11 +1,12 @@
 """Tests for the bootstrap-run reclaim path.
 
 Covers:
-- Stale `kind='bootstrap'` row in `running` → flipped to `failed`,
-  finished_at populated, error contains the reclaim marker.
+- Stale `kind='bootstrap'` row in `running` → flipped to `pending`
+  (NOT `failed`), error contains the reclaim marker. Worker reclaims
+  on next claim tick.
 - Fresh `running` row (started recently) → untouched.
-- Rows in `complete`/`failed`/`partial` terminal states → never swept,
-  even if `started_at` is older than the threshold.
+- Rows in `complete`/`failed`/`partial`/`cancelled` terminal states →
+  never swept, even if `started_at` is older than the threshold.
 - `kind='wake'` (daily-replay) row in `running` → untouched. Reclaim
   only targets bootstrap kind because daily replays use the queue's
   own heartbeat-based reclaim.
@@ -83,7 +84,11 @@ async def _seed_run_row(
 
 
 @pytest.mark.asyncio
-async def test_reclaim_flips_stale_running_to_failed(reset_db: None) -> None:
+async def test_reclaim_flips_stale_running_to_pending(reset_db: None) -> None:
+    """A row that's been 'running' beyond the threshold goes back to
+    'pending' (NOT 'failed'). Workers re-claim it on the next tick.
+    `finished_at` is intentionally NOT populated — the row isn't
+    finished, it's being requeued."""
     run_id = await _seed_run_row(
         customer_id=CUSTOMER,
         kind="bootstrap",
@@ -99,8 +104,8 @@ async def test_reclaim_flips_stale_running_to_failed(reset_db: None) -> None:
             "SELECT status, finished_at, error FROM wiki_synthesis_runs WHERE run_id = $1",
             run_id,
         )
-    assert row["status"] == "failed"
-    assert row["finished_at"] is not None
+    assert row["status"] == "pending"
+    assert row["finished_at"] is None
     assert row["error"] is not None
     assert "reclaimed:" in row["error"]
 
@@ -155,9 +160,10 @@ async def test_reclaim_leaves_fresh_running_alone(reset_db: None) -> None:
 
 @pytest.mark.asyncio
 async def test_reclaim_leaves_terminal_states_alone(reset_db: None) -> None:
-    """Rows in any terminal state (complete/failed/partial) are
-    untouched even when started_at is older than the threshold —
-    the WHERE filter is `status='running'`."""
+    """Rows in any terminal state (complete/failed/partial/cancelled)
+    are untouched even when started_at is older than the threshold —
+    the WHERE filter is `status='running'`. Pending rows are also
+    untouched (they're queued, not stuck)."""
     complete_id = await _seed_run_row(
         customer_id=CUSTOMER,
         kind="bootstrap",
@@ -179,6 +185,20 @@ async def test_reclaim_leaves_terminal_states_alone(reset_db: None) -> None:
         source="slack",
         started_age_hours=8.0,
     )
+    cancelled_id = await _seed_run_row(
+        customer_id=CUSTOMER,
+        kind="bootstrap",
+        status="cancelled",
+        source="notion",
+        started_age_hours=8.0,
+    )
+    pending_id = await _seed_run_row(
+        customer_id=CUSTOMER,
+        kind="bootstrap",
+        status="pending",
+        source="granola",
+        started_age_hours=8.0,
+    )
 
     reclaimed = await reclaim_stale_bootstrap_runs()
     assert reclaimed == 0
@@ -186,12 +206,14 @@ async def test_reclaim_leaves_terminal_states_alone(reset_db: None) -> None:
     async with raw_conn() as conn:
         rows = await conn.fetch(
             "SELECT run_id, status FROM wiki_synthesis_runs WHERE run_id = ANY($1::bigint[])",
-            [complete_id, failed_id, partial_id],
+            [complete_id, failed_id, partial_id, cancelled_id, pending_id],
         )
     by_id = {r["run_id"]: r["status"] for r in rows}
     assert by_id[complete_id] == "complete"
     assert by_id[failed_id] == "failed"
     assert by_id[partial_id] == "partial"
+    assert by_id[cancelled_id] == "cancelled"
+    assert by_id[pending_id] == "pending"
 
 
 @pytest.mark.asyncio
@@ -233,7 +255,32 @@ async def test_reclaim_only_targets_bootstrap_kind(reset_db: None) -> None:
     by_id = {r["run_id"]: r["status"] for r in rows}
     assert by_id[wake_id] == "running"
     assert by_id[scheduled_id] == "running"
-    assert by_id[bootstrap_id] == "failed"
+    # New semantics: bootstrap row goes back to pending, not failed.
+    assert by_id[bootstrap_id] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_reclaim_does_not_touch_v4_runs(reset_db: None) -> None:
+    """Defense-in-depth: even if some other kind shows up in a 'running'
+    state for >threshold (e.g. an onboarding row from a v4 daily-replay
+    flavor), bootstrap reclaim must not touch it. Same WHERE filter as
+    above; explicit second test pinning the contract on a separate kind
+    so a future widening of the filter trips here."""
+    onboarding_id = await _seed_run_row(
+        customer_id=CUSTOMER,
+        kind="onboarding",
+        status="running",
+        source=None,
+        started_age_hours=12.0,
+    )
+    reclaimed = await reclaim_stale_bootstrap_runs()
+    assert reclaimed == 0
+    async with raw_conn() as conn:
+        status = await conn.fetchval(
+            "SELECT status FROM wiki_synthesis_runs WHERE run_id = $1",
+            onboarding_id,
+        )
+    assert status == "running"
 
 
 @pytest.mark.asyncio

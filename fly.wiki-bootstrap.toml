@@ -7,10 +7,16 @@ kill_timeout = "60s"
   dockerfile = "services/worker/Dockerfile"
 
 [env]
-  ENVIRONMENT        = "main"
-  LOG_LEVEL          = "INFO"
-  SERVICE_NAME       = "prbe-knowledge-wiki-bootstrap"
-  WORKER_HEALTH_PORT = "8082"
+  ENVIRONMENT          = "main"
+  LOG_LEVEL            = "INFO"
+  SERVICE_NAME         = "prbe-knowledge-wiki-bootstrap"
+  WORKER_HEALTH_PORT   = "8082"
+  # Per-machine cap on concurrent crawler agents. With 4 machines x
+  # 6 = 24 concurrent crawls cluster-wide, drawn from any tenant's
+  # pending queue ordered by started_at. Sized against the 4 GB / 2
+  # vCPU envelope: idle ~150 MB + ~150-250 MB per active crawler =>
+  # ~1.5 GB peak crawler load + ~2.5 GB headroom.
+  BOOTSTRAP_PARALLELISM = "6"
 
 [processes]
   worker = "python -m services.synthesis.bootstrap_app"
@@ -34,15 +40,15 @@ kill_timeout = "60s"
     timeout      = "5s"
     path         = "/health"
 
-# 2 x 4GB. Originally specced at 6GB but Fly's account limit caps
-# shared VMs at 4GB. 4GB still holds the Pebble-scale fan-out (N
-# in-flight CachedContent + per-source API page buffers + the
-# Normalizer._persist embed/chunk pipeline) but leaves less OS+GC
-# headroom. Watch first real bootstrap for OOM signals; if hit, scale
-# down concurrency in the orchestrator instead of trying to bump
-# memory past the cap.
+# 4 x 4GB. Up from 2 now that the queue+claim worker model actually
+# scales horizontally — each machine drains pending bootstrap rows in
+# parallel via FOR UPDATE SKIP LOCKED, capped at BOOTSTRAP_PARALLELISM
+# crawls per machine. 4 GB envelope holds ~6 concurrent crawlers
+# (~150-250 MB each) with ~2.5 GB headroom; if first real bootstrap
+# OOMs, drop BOOTSTRAP_PARALLELISM in [env] before bumping memory past
+# Fly's shared-VM 4 GB cap.
 [[vm]]
   size      = "shared-cpu-2x"
   memory    = "4gb"
-  count     = 2
+  count     = 4
   processes = ["worker"]
