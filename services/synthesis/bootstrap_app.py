@@ -112,6 +112,45 @@ def _no_bearer_factory(_customer_id: str, _source: str) -> BearerResolver:
     return _resolver  # type: ignore[return-value]
 
 
+def _make_default_bearer_factory(http: httpx.AsyncClient) -> Any:
+    """Production bearer factory: dispatches per-source to the
+    matching ``shared.backend_client`` mint helper.
+
+    Each source's resolver is a closure that calls the appropriate
+    fetch_<source>_token helper. Helpers we don't have yet (slack,
+    linear, ...) return None — their crawler will halt with
+    ``auth.missing`` until a resolver lands.
+    """
+    from shared.backend_client import fetch_github_installation_token
+
+    def factory(customer_id: str, source: str) -> BearerResolver:
+        if source == "github":
+
+            async def _gh_resolver() -> str | None:
+                try:
+                    bearer, _expires = await fetch_github_installation_token(
+                        http, customer_id=customer_id
+                    )
+                    return bearer
+                except Exception as exc:
+                    log.warning(
+                        "bootstrap.bearer_resolver_failed",
+                        customer=customer_id,
+                        source=source,
+                        error=str(exc),
+                    )
+                    return None
+
+            return _gh_resolver  # type: ignore[return-value]
+
+        async def _no_bearer() -> str | None:
+            return None
+
+        return _no_bearer  # type: ignore[return-value]
+
+    return factory
+
+
 class BootstrapWorker:
     """Drain pending bootstrap rows through per-source crawler agents.
 
@@ -346,9 +385,7 @@ class BootstrapWorker:
                     and result.halt_reason is not None
                     and (result.pages_created + result.pages_updated) == 0
                 ):
-                    result = result.model_copy(
-                        update={"error": f"halt:{result.halt_reason}"}
-                    )
+                    result = result.model_copy(update={"error": f"halt:{result.halt_reason}"})
                 await self._close_run(claim, result)
         except asyncio.CancelledError:
             # Hard-cancel path: trigger route fired the cancel NOTIFY
@@ -383,16 +420,13 @@ class BootstrapWorker:
         normal three-way status branch instead of needing a special path.
         """
         factory_map: dict[str, _CrawlerFactory] = (
-            self._crawler_factories
-            if self._crawler_factories is not None
-            else REGISTRY  # type: ignore[assignment]
+            self._crawler_factories if self._crawler_factories is not None else REGISTRY  # type: ignore[assignment]
         )
 
         factory = factory_map.get(claim.source)
         if factory is None:
             err = (
-                f"unknown crawler source {claim.source!r}; "
-                f"registered: {sorted(factory_map.keys())}"
+                f"unknown crawler source {claim.source!r}; registered: {sorted(factory_map.keys())}"
             )
             log.warning(
                 "bootstrap_worker.unknown_source",
@@ -412,9 +446,7 @@ class BootstrapWorker:
             agent: BootstrapAgent = factory(
                 customer_id=claim.customer_id,
                 run_id=claim.run_id,
-                bearer_resolver=self._bearer_resolver_factory(
-                    claim.customer_id, claim.source
-                ),
+                bearer_resolver=self._bearer_resolver_factory(claim.customer_id, claim.source),
                 http=self._http,
                 settings=self._settings,
             )
@@ -443,9 +475,7 @@ class BootstrapWorker:
     # Run-row close paths
     # ------------------------------------------------------------------
 
-    async def _close_run(
-        self, claim: _Claim, result: BootstrapAgentResult
-    ) -> None:
+    async def _close_run(self, claim: _Claim, result: BootstrapAgentResult) -> None:
         """Three-way status branch (matches the CHECK constraint):
           - error set                 -> 'failed' (includes zero-page
                                           halts; their error field was
@@ -459,10 +489,7 @@ class BootstrapWorker:
         """
         if result.error is not None:
             status = "failed"
-        elif (
-            result.halt_reason is not None
-            and (result.pages_created + result.pages_updated) > 0
-        ):
+        elif result.halt_reason is not None and (result.pages_created + result.pages_updated) > 0:
             status = "partial"
         else:
             status = "complete"
@@ -588,9 +615,7 @@ class BootstrapWorker:
                     self._cancel_payloads.put_nowait(payload)
                     self._wake_cancel.set()
 
-                await conn.add_listener(
-                    WIKI_BOOTSTRAP_CANCEL_CHANNEL, _on_cancel_notify
-                )
+                await conn.add_listener(WIKI_BOOTSTRAP_CANCEL_CHANNEL, _on_cancel_notify)
                 log.info("bootstrap_worker.cancel_listener.ready")
                 while not self._shutdown.is_set():
                     try:
@@ -625,9 +650,7 @@ class BootstrapWorker:
         try:
             data = orjson.loads(payload)
         except orjson.JSONDecodeError:
-            log.warning(
-                "bootstrap_worker.cancel_payload_unparseable", payload=payload
-            )
+            log.warning("bootstrap_worker.cancel_payload_unparseable", payload=payload)
             return
         run_ids = data.get("run_ids") or []
         if not isinstance(run_ids, list):
@@ -748,6 +771,7 @@ async def run_bootstrap_app_forever() -> None:
             dsn=listener_dsn,
             http=http,
             settings=settings,
+            bearer_resolver_factory=_make_default_bearer_factory(http),
         )
         reclaim_loop = BootstrapReclaimLoop()
 
