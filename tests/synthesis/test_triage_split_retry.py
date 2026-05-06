@@ -329,3 +329,130 @@ async def test_single_event_parse_overflow_marked_rejected() -> None:
     assert list(out.verdicts.keys()) == ["99"]
     assert out.verdicts["99"].reason == OVERSIZED_AT_CALL_TIME_REASON
     assert client.messages.create.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Partial response: parse succeeds but verdicts cover only some events
+# ---------------------------------------------------------------------------
+#
+# Production observation on probe-founders post-#100/#104: 379 events
+# stuck in `failed` with reason "no verdict from triage batch". Haiku
+# returned a structurally-valid tool_use but the dict only covered SOME
+# of the input queue_ids — late events were silently missing because
+# max_tokens clipped output mid-list. The exception path didn't trigger
+# (parse succeeded), so split-retry didn't run, and the worker fell
+# through to mark_for_retry which exhausts at attempts=3.
+
+
+def _partial_success_response(
+    events_to_score: list[TriageInput],
+) -> SimpleNamespace:
+    """Build a response that scores ONLY `events_to_score` — i.e. a
+    partial response that omits whichever input events aren't in this
+    list. Mirrors what Haiku does when max_tokens cuts it off."""
+    payload = {
+        "verdicts": {
+            str(ev.queue_id): {
+                "important": True,
+                "score": 7.0,
+                "reason": "ok",
+            }
+            for ev in events_to_score
+        }
+    }
+    block = SimpleNamespace(type="tool_use", name="record_triage", input=payload)
+    return SimpleNamespace(content=[block])
+
+
+@pytest.mark.asyncio
+async def test_partial_response_recurses_on_missing_only() -> None:
+    """4 events sent. Haiku scored only events 0,1 (truncation cut off
+    2,3). Wrapper detects the 2 missing qids and recurses on JUST those
+    two (not the full batch — the verdicts we got are kept).
+    """
+    events = [_ev(i) for i in range(4)]
+    # Order: full batch returns partial (0,1), then missing-subset
+    # call returns the rest.
+    client = _make_client_with_responses(
+        [
+            _partial_success_response([events[0], events[1]]),
+            _success_response([events[2], events[3]]),
+        ]
+    )
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    # 2 calls only: the original + 1 recurse on the missing subset.
+    # The 0,1 verdicts from the first call are kept, not redone.
+    assert client.messages.create.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_partial_response_single_missing_marked_rejected() -> None:
+    """Bottom-out for partial path: 1 event in the recurse subset and
+    Haiku again returns no verdict for it -> mark rejected with the
+    same call-time-oversize reason. Same recovery as the 400 leaf."""
+    events = [_ev(99)]
+    # Haiku returns a verdicts dict with NOTHING (skipped the 1 input).
+    empty_verdicts = SimpleNamespace(
+        type="tool_use", name="record_triage", input={"verdicts": {}}
+    )
+    client = _make_client_with_responses(
+        [SimpleNamespace(content=[empty_verdicts])]
+    )
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+    assert list(out.verdicts.keys()) == ["99"]
+    assert out.verdicts["99"].reason == OVERSIZED_AT_CALL_TIME_REASON
+    assert client.messages.create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_response_with_recurse_into_further_partial() -> None:
+    """Recurse can itself produce partial responses. 8 events; first
+    call scores 3, recurse on missing 5 scores 2, recurse on missing 3
+    scores all 3. Final output covers all 8."""
+    events = [_ev(i) for i in range(8)]
+    client = _make_client_with_responses(
+        [
+            _partial_success_response(events[:3]),  # 0,1,2
+            _partial_success_response([events[3], events[4]]),  # 3,4 of missing 3-7
+            _success_response(events[5:]),  # 5,6,7
+        ]
+    )
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+    assert sorted(out.verdicts.keys(), key=int) == [str(i) for i in range(8)]
+    assert client.messages.create.await_count == 3
+
+
+# ---------------------------------------------------------------------------
+# dict-type Pydantic error: Haiku returned `verdicts` as a JSON-string
+# rather than a dict. Same overflow recovery shape.
+# ---------------------------------------------------------------------------
+
+
+def _dict_type_error_response() -> SimpleNamespace:
+    """SDK shape when Haiku returned the verdicts FIELD as a string
+    containing JSON instead of a dict. Pydantic raises type=dict_type."""
+    block = SimpleNamespace(
+        type="tool_use",
+        name="record_triage",
+        input={"verdicts": '{"1": {"important": false, "score": 0, "reason": "n/a"}}'},
+    )
+    return SimpleNamespace(content=[block])
+
+
+@pytest.mark.asyncio
+async def test_dict_type_pydantic_error_triggers_split() -> None:
+    """When verdicts arrives as str instead of dict, Pydantic raises
+    type=dict_type. Wrapper now treats this as overflow-shaped and
+    halves the batch."""
+    events = [_ev(i) for i in range(4)]
+    client = _make_client_with_responses(
+        [
+            _dict_type_error_response(),     # full batch fails Pydantic
+            _success_response(events[:2]),   # left half ok
+            _success_response(events[2:]),   # right half ok
+        ]
+    )
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    assert client.messages.create.await_count == 3

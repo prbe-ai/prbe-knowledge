@@ -339,9 +339,25 @@ async def call_triage_with_split_retry(
 
     The merged return shape is identical to a single `call_triage`
     success — callers don't see the recursion.
+
+    Third overflow shape (post-#100/#104 production observation):
+
+      C) Partial response — Haiku returns a structurally-valid
+         tool_use with a verdicts dict, but the dict only covers
+         SOME of the input queue_ids. This happens when max_tokens
+         clipped output mid-list: the JSON parser still succeeds on
+         what's there, but late events in the batch are silently
+         missing from the output. Without recovery, those events
+         loop through `mark_for_retry` (3 attempts), then end up
+         marked `failed` with reason "no verdict from triage batch".
+
+         The wrapper now compares input queue_ids to output keys
+         after a successful parse; missing keys -> split-retry on
+         the missing subset only (the events that DID get verdicts
+         keep them, no double work).
     """
     try:
-        return await call_triage(client, events, now=now)
+        output = await call_triage(client, events, now=now)
     except (BadRequestError, TriageParseError) as exc:
         if not _is_overflow_shaped(exc):
             raise
@@ -376,6 +392,40 @@ async def call_triage_with_split_retry(
         right_out = await call_triage_with_split_retry(client, right, now=now)
         return _merge_outputs(left_out, right_out)
 
+    # Successful parse — but did Haiku cover every input event?
+    # Output keys are stringified queue_ids per the schema.
+    input_qids = {str(ev.queue_id) for ev in events}
+    output_qids = set(output.verdicts.keys())
+    missing_qids = input_qids - output_qids
+    if not missing_qids:
+        return output
+    if len(events) <= 1:
+        # Single-event batch with no verdict — same recovery as the
+        # exception path leaf. Mark it rejected with the oversize
+        # reason so the worker's apply-verdicts path moves it out of
+        # the pending pool deterministically.
+        log.warning(
+            "triage.split_retry.single_event_no_verdict",
+            queue_id=events[0].queue_id,
+            doc_id=events[0].doc_id,
+        )
+        return _rejected_output_for_single_oversize(events[0])
+    # Partial response: keep the verdicts we got, recurse on just
+    # the events Haiku skipped. Splitting the skipped subset further
+    # (rather than the full batch) avoids redoing successful work
+    # and converges quickly on the truncation tail.
+    missing_events = [ev for ev in events if str(ev.queue_id) in missing_qids]
+    log.warning(
+        "triage.split_retry.partial_response",
+        batch_size=len(events),
+        verdicts_returned=len(output_qids),
+        missing=len(missing_qids),
+    )
+    missing_out = await call_triage_with_split_retry(
+        client, missing_events, now=now
+    )
+    return _merge_outputs(output, missing_out)
+
 
 # Output-side overflow signature on TriageParseError: the parser's
 # error message contains either "no <name> tool_use block" (Anthropic
@@ -387,6 +437,13 @@ _PARSE_OVERFLOW_REGEXES = (
     re.compile(r"no\s+\w+\s+tool_use\s+block", re.IGNORECASE),
     re.compile(r"Field required", re.IGNORECASE),
     re.compile(r"max_tokens", re.IGNORECASE),
+    # Haiku occasionally returns the `verdicts` field as a JSON-string
+    # rather than a dict. Pydantic surfaces this as type=dict_type with
+    # input_type=str. Same root cause (model output deviated from
+    # tool schema, often when truncating) so the same split-retry
+    # recovery applies.
+    re.compile(r"type=dict_type", re.IGNORECASE),
+    re.compile(r"valid dictionary", re.IGNORECASE),
 )
 
 
