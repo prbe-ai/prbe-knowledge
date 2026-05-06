@@ -699,6 +699,11 @@ CREATE TABLE wiki_links (
     link_source     TEXT NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT ck_wiki_links_source CHECK (link_source IN ('markdown','frontmatter','manual')),
+    -- The parser slices a ~80-char window for `context`. Cap of 200 leaves
+    -- 2.5x headroom for multibyte characters and future window adjustments
+    -- without a re-migration. Pure "don't misuse this field" guard rail —
+    -- context is not in the unique key, so this isn't btree protection.
+    CONSTRAINT ck_wiki_links_context_len CHECK (length(context) <= 200),
     CONSTRAINT uq_wiki_links UNIQUE NULLS NOT DISTINCT
         (customer_id, src_wiki_type, src_slug,
          dst_wiki_type, dst_slug, link_type, link_source)
@@ -720,12 +725,19 @@ CREATE TABLE wiki_timeline_entries (
     -- grouped by entry_date DESC.
     entry_date      DATE NOT NULL,
     source          TEXT NOT NULL,
+    -- One-line headline for the timeline UI. Capped at 1000 chars because
+    -- this column participates in `uq_wiki_timeline_dedup`, and Postgres
+    -- btree keys are limited to ~2704 bytes per row. The other columns
+    -- in the unique total ~150 bytes; 1000 leaves comfortable headroom
+    -- and is well above any sensible "one-line audit entry" length.
+    -- Long-form expansion goes in `detail` (uncapped, not in the unique).
     summary         TEXT NOT NULL,
     detail          TEXT NOT NULL DEFAULT '',
     -- Optional source-side ref (Slack thread_ts, GitHub PR number, ...).
     -- Lets the dashboard deep-link from a timeline entry to its source.
     source_ref      TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_wiki_timeline_summary_len CHECK (length(summary) <= 1000),
     CONSTRAINT uq_wiki_timeline_dedup UNIQUE
         (customer_id, wiki_type, slug, entry_date, summary)
 );
