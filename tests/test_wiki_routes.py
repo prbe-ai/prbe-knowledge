@@ -368,3 +368,273 @@ async def test_put_rejects_index_wiki_type(client: httpx.AsyncClient) -> None:
         headers=_hdr(),
     )
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap trigger
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_requires_internal_key(
+    client: httpx.AsyncClient,
+) -> None:
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger",
+        json={"sources": ["github"]},
+        headers={"X-Prbe-Customer": CUSTOMER},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.fixture
+def _stub_bootstrap_registry(monkeypatch) -> None:
+    """Make the trigger route's REGISTRY validation see a known set of
+    sources during tests. Lane C ships the registry empty, so without
+    this any /bootstrap/trigger payload with `sources=[...]` would 400.
+    Lane D will register real crawlers; tests can then drop this stub."""
+    from services.ingestion import wiki_routes as _wr
+
+    monkeypatch.setattr(
+        _wr,
+        "BOOTSTRAP_CRAWLER_REGISTRY",
+        {"github": object, "slack": object},
+        raising=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_fires_pg_notify(
+    client: httpx.AsyncClient, _stub_bootstrap_registry: None
+) -> None:
+    """POSTing the trigger fires pg_notify on WIKI_BOOTSTRAP_CHANNEL with
+    a JSON-encoded payload carrying customer_id + sources + wipe_first +
+    pre-opened run_ids."""
+    import asyncio
+    import json as _json
+
+    import asyncpg
+
+    from shared.config import get_settings as _get_settings
+    from shared.constants import WIKI_BOOTSTRAP_CHANNEL
+
+    notifications: list[str] = []
+    listen_dsn = _get_settings().database_url
+    listener_conn = await asyncpg.connect(listen_dsn)
+
+    def _on_notify(_c, _pid, _channel, payload) -> None:
+        notifications.append(payload)
+
+    try:
+        await listener_conn.add_listener(WIKI_BOOTSTRAP_CHANNEL, _on_notify)
+
+        resp = await client.post(
+            "/api/wiki/bootstrap/trigger",
+            json={
+                "sources": ["github", "slack"],
+                "wipe_first": True,
+                "reason": "first run",
+            },
+            headers=_hdr(),
+        )
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["triggered"] is True
+        assert isinstance(body["run_ids"], list)
+        assert len(body["run_ids"]) == 2
+        assert all(isinstance(rid, int) for rid in body["run_ids"])
+
+        # Give the NOTIFY a moment to deliver — Postgres queues NOTIFY
+        # at NOTIFY-time and delivers on commit; ASGITransport runs the
+        # endpoint synchronously inside the same loop.
+        for _ in range(20):
+            if notifications:
+                break
+            await asyncio.sleep(0.05)
+        assert notifications, "expected pg_notify on the bootstrap channel"
+        decoded = _json.loads(notifications[0])
+        assert decoded["customer_id"] == CUSTOMER
+        assert decoded["sources"] == ["github", "slack"]
+        assert decoded["wipe_first"] is True
+        assert decoded["reason"] == "first run"
+        # run_ids embedded so the listener doesn't re-create rows.
+        assert set(decoded["run_ids"].keys()) == {"github", "slack"}
+        assert all(isinstance(v, int) for v in decoded["run_ids"].values())
+
+        # The route pre-creates the wiki_synthesis_runs rows itself.
+        async with raw_conn() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT source, kind, stage, status FROM wiki_synthesis_runs
+                WHERE customer_id = $1 AND kind = 'bootstrap'
+                ORDER BY source
+                """,
+                CUSTOMER,
+            )
+        assert {r["source"] for r in rows} == {"github", "slack"}
+        assert all(r["kind"] == "bootstrap" for r in rows)
+        assert all(r["stage"] == "synthesis" for r in rows)
+        assert all(r["status"] == "running" for r in rows)
+    finally:
+        await listener_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_defaults(
+    client: httpx.AsyncClient, _stub_bootstrap_registry: None
+) -> None:
+    """Empty body defaults to all registered crawlers; wipe_first=True."""
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger",
+        json={},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["triggered"] is True
+    assert isinstance(body["run_ids"], list)
+    # Stub registry has two entries (github + slack), so all-default
+    # should pre-open one run per source.
+    assert len(body["run_ids"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_rejects_unknown_sources(
+    client: httpx.AsyncClient, _stub_bootstrap_registry: None
+) -> None:
+    """An unknown source name returns 400, not a silent drop."""
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger",
+        json={"sources": ["github", "definitely-not-real"]},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "definitely-not-real" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_debounces_back_to_back(
+    client: httpx.AsyncClient, _stub_bootstrap_registry: None
+) -> None:
+    """Two triggers within 60s: first 202s, second 429s with Retry-After."""
+    first = await client.post(
+        "/api/wiki/bootstrap/trigger",
+        json={"sources": ["github"]},
+        headers=_hdr(),
+    )
+    assert first.status_code == 202, first.text
+    second = await client.post(
+        "/api/wiki/bootstrap/trigger",
+        json={"sources": ["github"]},
+        headers=_hdr(),
+    )
+    assert second.status_code == 429, second.text
+    assert "Retry-After" in second.headers
+    assert int(second.headers["Retry-After"]) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap status
+# ---------------------------------------------------------------------------
+
+
+async def _insert_bootstrap_run(
+    *,
+    source: str,
+    status: str,
+    pages_created: int = 0,
+    pages_updated: int = 0,
+    error: str | None = None,
+    started_offset_seconds: int = 0,
+) -> int:
+    async with raw_conn() as conn:
+        return int(
+            await conn.fetchval(
+                """
+                INSERT INTO wiki_synthesis_runs
+                    (customer_id, kind, stage, source, status,
+                     pages_created, pages_updated, error,
+                     started_at, finished_at)
+                VALUES ($1, 'bootstrap', 'synthesis', $2, $3, $4, $5, $6,
+                        NOW() - make_interval(secs => $7),
+                        CASE WHEN $3 = 'running' THEN NULL
+                             ELSE NOW() - make_interval(secs => $7) END)
+                RETURNING run_id
+                """,
+                CUSTOMER,
+                source,
+                status,
+                pages_created,
+                pages_updated,
+                error,
+                started_offset_seconds,
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_status_when_never_run(client: httpx.AsyncClient) -> None:
+    """Empty payload when the customer has never bootstrapped."""
+    resp = await client.get("/api/wiki/bootstrap/status", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body == {
+        "in_progress": False,
+        "started_at": None,
+        "sources_attempted": [],
+        "sources_succeeded": [],
+        "sources_failed": {},
+        "pages_created": 0,
+        "pages_updated": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_status_aggregates_recent_burst(
+    client: httpx.AsyncClient,
+) -> None:
+    """One burst with three sources: complete, partial, failed."""
+    await _insert_bootstrap_run(
+        source="github", status="complete", pages_created=3, pages_updated=2
+    )
+    await _insert_bootstrap_run(source="slack", status="partial", pages_created=1, pages_updated=4)
+    await _insert_bootstrap_run(source="linear", status="failed", error="rate-limited")
+
+    resp = await client.get("/api/wiki/bootstrap/status", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["in_progress"] is False
+    assert sorted(body["sources_attempted"]) == ["github", "linear", "slack"]
+    # complete + partial both count as "succeeded"; failed surfaces the error.
+    assert sorted(body["sources_succeeded"]) == ["github", "slack"]
+    assert body["sources_failed"] == {"linear": "rate-limited"}
+    assert body["pages_created"] == 4
+    assert body["pages_updated"] == 6
+    assert body["started_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_status_in_progress(client: httpx.AsyncClient) -> None:
+    """A 'running' row in the burst flips in_progress=True."""
+    await _insert_bootstrap_run(source="github", status="complete")
+    await _insert_bootstrap_run(source="slack", status="running")
+
+    resp = await client.get("/api/wiki/bootstrap/status", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["in_progress"] is True
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_status_ignores_old_runs_outside_burst(
+    client: httpx.AsyncClient,
+) -> None:
+    """Rows older than 60s before the anchor are NOT in the current burst."""
+    # Old burst from a prior trigger — anchor should ignore.
+    await _insert_bootstrap_run(source="ancient", status="complete", started_offset_seconds=3600)
+    # Recent burst.
+    await _insert_bootstrap_run(source="github", status="complete", pages_created=1)
+    resp = await client.get("/api/wiki/bootstrap/status", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sources_attempted"] == ["github"]
+    assert body["pages_created"] == 1
