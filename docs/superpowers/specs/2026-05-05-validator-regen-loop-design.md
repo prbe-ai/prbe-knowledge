@@ -290,25 +290,124 @@ spend during development.
 
 ---
 
-## What this unblocks
+## Real-workspace-scale synth: the eventual destination
 
-Once regen lands, the larger synthetic-data-generation roadmap opens:
+The regen loop is a tactical fix for the immediate "plot scenarios drop"
+problem, but the long-arc destination is generating synth corpora that
+approximate the **shape of a real customer workspace at production
+volume**. Worth painting that picture so design choices in Q1–Q6 are
+made with the eventual scale in mind, not just the current
+`tiny_test`-shaped one.
 
-1. **Plan 4 V1.5: re-record canonical with plot content.** Replace
-   `tests/fixtures/canonical-mini/` consumption with the real
-   `scripts/synth/canonical/v1/raw/`. Customer playgrounds become
+What "real-workspace scale" means concretely:
+
+- **Time horizon.** Real workspaces have docs spanning years, not
+  `tiny_test`'s 30-day window. Synth needs to weight content distribution
+  across long time ranges with realistic temporal patterns (business-hour
+  bias, weekly standup cadence, quarterly planning bursts, on-call
+  rotations).
+- **Volume.** Hundreds of personas (vs ~10 in `tiny_test`), hundreds of
+  channels / repos / projects (vs ~5), thousands of Slack messages,
+  hundreds of Notion pages, dozens of GitHub PRs per week. Today's
+  `tiny_test` produces 2–10 scenarios = ~20–50 docs total. Production
+  scale is 3–4 orders of magnitude higher.
+- **Cross-source threading depth.** A real incident spans Slack
+  discussion (50+ messages) → Linear ticket → multiple GitHub PRs →
+  Sentry alerts → Notion postmortem. Today's plot scenarios produce 5–7
+  docs each across 2–3 sources. Production-shape scenarios need deeper
+  cross-source threads.
+- **Realistic activity distribution.** On-call follows weekly schedules;
+  deploys cluster on Mondays; incidents spike during business hours; PR
+  reviews lag 1–2 days. Today's synthetic timeline is approximately
+  uniform.
+
+### Design lenses for the regen loop (not scope creep)
+
+Several decisions in Q1–Q6 above are easier to make right when the
+eventual scale is held in mind. None of these expand the regen plan's
+scope — they just inform how to build it so it isn't load-bearing
+rework later:
+
+- **Cost ceiling (Q5).** Today's recommendation of "always-on regen for
+  V1" is correct for `tiny_test` scale (~$5–10 per recording). At
+  production scale (thousands of scenarios × N regen rounds × multiple
+  LLM calls per round), opt-in or budget-capped becomes load-bearing.
+  Build the observability now so the future cost ceiling is informed by
+  measured data, not guesses.
+
+- **Drop-rate observability.** At scale, "30% of incidents drop" means
+  hundreds of wasted scenarios. Per-archetype regen-attempted /
+  regen-succeeded / regen-exhausted counters surface which archetypes
+  are systemically hard so prompt engineering can target them. Skipping
+  this in V1 means flying blind when scale arrives.
+
+- **Pass 2 caching.** The existing `scripts/synth/llm/cache.py` covers
+  the writer; Pass 2 isn't cached today. Irrelevant at dev scale; at
+  production scale, re-running Pass 2 on identical docs during regen
+  iteration is pure waste. Worth wiring Pass 2 through the same cache
+  while building the regen loop, not after.
+
+- **Scenario-level parallelism.** Scenarios within an archetype are
+  independent; regen rounds within a scenario are sequential by
+  necessity. At scale, fanning out scenarios via `asyncio.gather`
+  unlocks 10x throughput. The regen loop's design must not introduce
+  sequential dependencies between scenarios that block this.
+
+- **Determinism contract under nondeterminism.** Today's contract is
+  "byte-identical for (profile, seed)" but only with `--mock-llm` or
+  `--record-llm` replay. Regen introduces additional LLM calls per
+  scenario; the contract should explicitly state what's preserved
+  across regen rounds (`source_event_id`, `thread_parent_id`,
+  `occurred_at` — the wiring) and what isn't (doc body text). At
+  production scale, this matters operationally — re-runs must be
+  reproducible.
+
+- **Incremental regeneration.** Today canonical is recorded once per
+  release. At production scale, "regenerate just the slack archetypes
+  while keeping notion/github/linear stable" is a real workflow —
+  supports iterative prompt tuning without re-spending on stable parts.
+  The regen loop's per-doc design (Q1) lays the groundwork; an
+  `--archetype-filter`-extended-to-regen path could be a small
+  follow-up if the design isn't path-dependent against it.
+
+### The roadmap after regen lands
+
+Following the regen loop, the synth roadmap orders roughly:
+
+1. **Plan 4 V1.5: re-record canonical/v1 → v2 with plot content.**
+   Replace test-fixture consumption with the real
+   `scripts/synth/canonical/v1/` corpus. Customer playgrounds become
    demonstrably richer (incidents, launches, refactor narratives).
 2. **New plot archetypes** (PERF_REGRESSION, DEPENDENCY_BUMP,
-   CUSTOMER_ESCALATION) — mentioned as Plan 3 deferred work. Each adds
-   a new flavor to the corpus.
-3. **Meeting archetypes + Granola wrapper** — another Plan 3 carry-over.
-4. **Per-tenant corpus parameterization** — feed the customer's actual
-   repo into the WorldModel extractor; their playground references their
-   own services / people / channels.
-5. **Eval extension** — plot scenarios drive eval question generation;
-   richer corpus → richer evals. The whole "synthetic eval" motion gets
-   meaningful coverage of incident-response retrieval, not just
-   conversational standup retrieval.
+   CUSTOMER_ESCALATION) from Plan 3 deferred work. Each ~1–2 days of
+   prompt-eng + validation cycles.
+3. **Meeting archetypes + Granola wrapper** — Plan 3 carry-over.
+4. **Time-axis realism** — `profile.time_distribution` config (business-
+   hour bias, weekly cadence, quarterly bursts) + scenario scheduler
+   refactor. Moves synth from "uniform timeline" to "real-feeling
+   activity rhythm."
+5. **Persona realism** — extend WorldModel with org structure
+   (managers / ICs / on-call rotation / PMs / role hierarchies). Today's
+   WorldModel is flat.
+6. **Per-tenant WorldModel** — feed the customer's actual GitHub repo +
+   Notion workspace + Slack channel list as input; their playground
+   references their own services / people / channels. Unlocks demos
+   that feel native to each prospect rather than the same fictional
+   "Acme Co."
+7. **Cross-source incident threading at scale** — incidents that span
+   50+ docs across all 5 sources, with realistic timing (Slack burst
+   → ticket creation → PR draft → fix → postmortem the next morning).
+8. **Eval extension** — synth-driven eval question generation across
+   the richer corpus. Synthetic eval gets meaningful coverage of
+   incident-response retrieval, not just standup retrieval.
+
+Each of items 4–8 likely warrants its own handoff doc in turn.
+
+Plan 4 V2 (surgical clean + prbe-backend admin endpoint + dashboard
+"sample data" banner + self-serve signup-flow seeding) is a **parallel**
+work stream focused on the operational safety and self-serve UX of the
+seed motion itself; it doesn't depend on regen and is tracked
+separately.
 
 ---
 
