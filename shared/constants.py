@@ -344,6 +344,14 @@ GRANOLA_REFRESH_DEBOUNCE_SECONDS = 30
 WIKI_PENDING_CHANNEL = "wiki_synthesize_pending"
 WIKI_TRIAGED_CHANNEL = "wiki_synthesize_triaged"
 
+# Bootstrap pipeline channel — fired by the /api/wiki/bootstrap/trigger
+# route and the OAuth-callback per-source hook. The bootstrap fly app's
+# listener wakes per NOTIFY, parses the payload (json: customer_id +
+# optional sources + wipe_first + reason), and calls the orchestrator.
+# Distinct from WIKI_PENDING_CHANNEL because the daily-replay path
+# operates on the v4 queue, while bootstrap reads from source APIs.
+WIKI_BOOTSTRAP_CHANNEL = "wiki_bootstrap_pending"
+
 # How many wiki_synthesis_queue rows the cron claims per drain tick. Triage is
 # token-budget batched on top of this; this is just the upper bound on rows
 # pulled into memory at once.

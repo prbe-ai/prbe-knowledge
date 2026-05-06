@@ -20,6 +20,7 @@ jobs:
       wiki_worker:    ${{ steps.filter.outputs.wiki_worker    == 'true' || github.event_name == 'workflow_dispatch' }}
       wiki_synthesis: ${{ steps.filter.outputs.wiki_synthesis == 'true' || github.event_name == 'workflow_dispatch' }}
       wiki_cron:      ${{ steps.filter.outputs.wiki_cron      == 'true' || github.event_name == 'workflow_dispatch' }}
+      wiki_bootstrap: ${{ steps.filter.outputs.wiki_bootstrap == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -71,6 +72,14 @@ jobs:
               - 'services/worker/**'
               - 'shared/**'
               - 'fly.wiki-cron.toml'
+              - 'pyproject.toml'
+            wiki_bootstrap:
+              - 'services/synthesis/**'
+              - 'services/ingestion/normalizer.py'
+              - 'services/ingestion/handlers/**'
+              - 'services/worker/**'
+              - 'shared/**'
+              - 'fly.wiki-bootstrap.toml'
               - 'pyproject.toml'
 
   deploy-ingestion:
@@ -190,5 +199,26 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy wiki-cron
         run: flyctl deploy --remote-only -c fly.wiki-cron.toml
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-wiki-bootstrap:
+    needs: [changes, deploy-ingestion]
+    if: |
+      always() &&
+      needs.changes.outputs.wiki_bootstrap == 'true' &&
+      (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy wiki-bootstrap
+        run: flyctl deploy --remote-only -c fly.wiki-bootstrap.toml
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy —
+      # follow up with explicit scale count to actually move the dial.
+      - name: Pin wiki-bootstrap to 2 machines
+        run: flyctl scale count worker=2 -a prbe-knowledge-wiki-bootstrap --yes
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

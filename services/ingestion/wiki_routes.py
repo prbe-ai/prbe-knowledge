@@ -60,6 +60,7 @@ from services.ingestion.normalizer import (
 )
 from services.ingestion.wiki_links import parse_page_links
 from shared.constants import (
+    WIKI_BOOTSTRAP_CHANNEL,
     WIKI_PENDING_CHANNEL,
     DocClass,
     DocType,
@@ -974,9 +975,7 @@ async def get_wiki_synthesis_status(
         triaged_events=int(counts["triaged"] or 0) if counts else 0,
         in_flight_events=int(counts["in_flight"] or 0) if counts else 0,
         failed_events=int(counts["failed"] or 0) if counts else 0,
-        synthesis_skipped_events=(
-            int(counts["synthesis_skipped"] or 0) if counts else 0
-        ),
+        synthesis_skipped_events=(int(counts["synthesis_skipped"] or 0) if counts else 0),
         dlq_count=int(counts["dlq"] or 0) if counts else 0,
         oldest_dlq_at=counts["oldest_dlq_at"] if counts else None,
         last_run_at=last_run["started_at"] if last_run else None,
@@ -1079,6 +1078,85 @@ async def reset_wiki_synthesis_dlq(
         triaged_reset=triaged_reset,
         pending_reset=pending_reset,
         oldest_dlq_at=oldest,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap trigger (per-source crawler agents — not the daily replay loop)
+# ---------------------------------------------------------------------------
+
+
+class BootstrapTriggerBody(BaseModel):
+    """Request body for ``POST /api/wiki/bootstrap/trigger``.
+
+    All three fields are optional. Defaults mirror the locked plan:
+    every registered source, wipe-first re-bootstrap, generic reason.
+    """
+
+    sources: list[str] | None = Field(default=None)
+    wipe_first: bool = Field(default=True)
+    reason: str | None = Field(default=None, max_length=240)
+
+
+class BootstrapTriggerResponse(BaseModel):
+    triggered: bool
+    customer_id: str
+    sources: list[str] | None
+    wipe_first: bool
+
+
+@router.post(
+    "/bootstrap/trigger",
+    response_model=BootstrapTriggerResponse,
+    status_code=202,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def trigger_wiki_bootstrap(
+    body: BootstrapTriggerBody,
+    customer_id: str = Depends(_require_customer),
+) -> BootstrapTriggerResponse:
+    """Fire a wiki bootstrap NOTIFY for ``customer_id``.
+
+    The ``prbe-knowledge-wiki-bootstrap`` fly app's ``BootstrapListener``
+    LISTENs on ``WIKI_BOOTSTRAP_CHANNEL``, parses the JSON payload, and
+    runs the orchestrator. Per-source crawlers fan out in parallel; on
+    completion each writes its own ``wiki_synthesis_runs`` row. The
+    dashboard polls those for progress.
+
+    Returns 202 because work is asynchronous: the run rows are created
+    by the bootstrap app on receipt, not by this endpoint. Callers that
+    need the run IDs can hit the status endpoint shortly after the
+    NOTIFY lands.
+
+    Auth: same internal-key + customer-header as the rest of the wiki
+    routes. Rate-limit/admin gating is enforced upstream in the BFF.
+    """
+    payload = orjson.dumps(
+        {
+            "customer_id": customer_id,
+            "sources": body.sources,
+            "wipe_first": body.wipe_first,
+            "reason": body.reason or "bootstrap",
+        }
+    ).decode("utf-8")
+    async with raw_conn() as conn:
+        await conn.execute(
+            "SELECT pg_notify($1, $2)",
+            WIKI_BOOTSTRAP_CHANNEL,
+            payload,
+        )
+    log.info(
+        "wiki.bootstrap.trigger",
+        customer=customer_id,
+        sources=body.sources,
+        wipe_first=body.wipe_first,
+        reason=body.reason,
+    )
+    return BootstrapTriggerResponse(
+        triggered=True,
+        customer_id=customer_id,
+        sources=body.sources,
+        wipe_first=body.wipe_first,
     )
 
 

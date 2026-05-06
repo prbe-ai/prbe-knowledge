@@ -368,3 +368,92 @@ async def test_put_rejects_index_wiki_type(client: httpx.AsyncClient) -> None:
         headers=_hdr(),
     )
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap trigger
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_requires_internal_key(
+    client: httpx.AsyncClient,
+) -> None:
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger",
+        json={"sources": ["github"]},
+        headers={"X-Prbe-Customer": CUSTOMER},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_fires_pg_notify(
+    client: httpx.AsyncClient,
+) -> None:
+    """POSTing the trigger fires pg_notify on WIKI_BOOTSTRAP_CHANNEL with
+    a JSON-encoded payload carrying customer_id + sources + wipe_first."""
+    import asyncio
+    import json as _json
+
+    import asyncpg
+
+    from shared.config import get_settings as _get_settings
+    from shared.constants import WIKI_BOOTSTRAP_CHANNEL
+
+    notifications: list[str] = []
+    listen_dsn = _get_settings().database_url
+    listener_conn = await asyncpg.connect(listen_dsn)
+
+    def _on_notify(_c, _pid, _channel, payload) -> None:
+        notifications.append(payload)
+
+    try:
+        await listener_conn.add_listener(WIKI_BOOTSTRAP_CHANNEL, _on_notify)
+
+        resp = await client.post(
+            "/api/wiki/bootstrap/trigger",
+            json={
+                "sources": ["github", "slack"],
+                "wipe_first": True,
+                "reason": "first run",
+            },
+            headers=_hdr(),
+        )
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["triggered"] is True
+        assert body["customer_id"] == CUSTOMER
+        assert body["sources"] == ["github", "slack"]
+        assert body["wipe_first"] is True
+
+        # Give the NOTIFY a moment to deliver — Postgres queues NOTIFY
+        # at NOTIFY-time and delivers on commit; ASGITransport runs the
+        # endpoint synchronously inside the same loop.
+        for _ in range(20):
+            if notifications:
+                break
+            await asyncio.sleep(0.05)
+        assert notifications, "expected pg_notify on the bootstrap channel"
+        decoded = _json.loads(notifications[0])
+        assert decoded["customer_id"] == CUSTOMER
+        assert decoded["sources"] == ["github", "slack"]
+        assert decoded["wipe_first"] is True
+        assert decoded["reason"] == "first run"
+    finally:
+        await listener_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_defaults(client: httpx.AsyncClient) -> None:
+    """Empty body uses defaults: sources=None, wipe_first=True."""
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger",
+        json={},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["triggered"] is True
+    assert body["sources"] is None
+    assert body["wipe_first"] is True
