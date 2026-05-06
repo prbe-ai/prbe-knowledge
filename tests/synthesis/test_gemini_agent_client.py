@@ -52,14 +52,29 @@ class _FakeTool:
         self.function_declarations = list(function_declarations)
 
 
+class _FakeAutomaticFunctionCallingConfig:
+    def __init__(self, *, disable: bool = False) -> None:
+        self.disable = disable
+
+
 class _FakeGenerateContentConfig:
-    def __init__(self, *, cached_content=None, tools=None, system_instruction=None) -> None:
+    def __init__(
+        self,
+        *,
+        cached_content=None,
+        tools=None,
+        system_instruction=None,
+        automatic_function_calling=None,
+    ) -> None:
         # Accept the same kwargs the real type does. Storing them so
         # the test can assert on what actually went into the per-call
-        # config — the bug was passing tools alongside cached_content.
+        # config — the bug was passing tools alongside cached_content,
+        # PLUS leaving AFC at its default (on) which broke turn 2+ of
+        # multi-turn agent runs.
         self.cached_content = cached_content
         self.tools = tools
         self.system_instruction = system_instruction
+        self.automatic_function_calling = automatic_function_calling
 
 
 class _FakeCreateCachedContentConfig:
@@ -114,6 +129,7 @@ def _install_fake_genai(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     fake_types_module.Tool = _FakeTool  # type: ignore[attr-defined]
     fake_types_module.GenerateContentConfig = _FakeGenerateContentConfig  # type: ignore[attr-defined]
     fake_types_module.CreateCachedContentConfig = _FakeCreateCachedContentConfig  # type: ignore[attr-defined]
+    fake_types_module.AutomaticFunctionCallingConfig = _FakeAutomaticFunctionCallingConfig  # type: ignore[attr-defined]
 
     fake_google_module = ModuleType("google")
     fake_google_module.genai = fake_genai_module  # type: ignore[attr-defined]
@@ -183,6 +199,70 @@ async def test_generate_with_cache_omits_tools_when_cache_set(
         "combination with 400; that's the bug we're fixing."
     )
     assert config.system_instruction is None
+    # AFC must be disabled — see test_afc_disabled_on_cache_path for why.
+    assert config.automatic_function_calling is not None
+    assert config.automatic_function_calling.disable is True
+
+
+@pytest.mark.asyncio
+async def test_afc_disabled_on_cache_path(
+    fake_genai: SimpleNamespace, patched_settings: None
+) -> None:
+    """Regression for `agent.gemini_persistent_error` at turn 1+.
+
+    The google-genai SDK defaults Automatic Function Calling ON
+    whenever a request mentions functions — INCLUDING via
+    cached_content. Our agent harness does manual dispatch (receive
+    function_call -> run tool -> send function_response back). With
+    AFC engaged, turn 2's request shape collides with the SDK's
+    auto-handling and Gemini 400s every retry. Symptom in production:
+
+        turn=1: HTTP 200 OK   (model returns function_call)
+        turn=2: HTTP 400      (3x tenacity retries all 400)
+        agent.halt reason=gemini_persistent_error turns=1
+
+    The fix: pass AutomaticFunctionCallingConfig(disable=True) on
+    EVERY generate_content call. This test pins the config carries
+    that knob with disable=True.
+    """
+    from services.synthesis.gemini_agent_client import GeminiAgentClient
+
+    client = GeminiAgentClient()
+    await client.generate_with_cache(
+        cache_name="cachedContents/abc",
+        contents=[{"role": "user", "parts": [{"text": "hi"}]}],
+        tools=[_tool("done")],
+    )
+    config = fake_genai.generate_calls[0]["config"]
+    assert config.automatic_function_calling is not None, (
+        "AFC config must be explicitly set; SDK default is enabled."
+    )
+    assert config.automatic_function_calling.disable is True
+
+
+@pytest.mark.asyncio
+async def test_afc_disabled_on_cache_miss_fallback(
+    fake_genai: SimpleNamespace, patched_settings: None
+) -> None:
+    """AFC must be disabled on the cache-miss fallback path too.
+
+    When cache creation fails, the harness re-attaches tools+system
+    on every call. AFC would still default to ON for those calls,
+    re-introducing the same multi-turn 400 failure. Disable must
+    apply to BOTH config branches.
+    """
+    from services.synthesis.gemini_agent_client import GeminiAgentClient
+
+    client = GeminiAgentClient()
+    await client.generate_with_cache(
+        cache_name="",  # cache miss
+        contents=[{"role": "user", "parts": [{"text": "hi"}]}],
+        tools=[_tool("done")],
+    )
+    config = fake_genai.generate_calls[0]["config"]
+    assert config.tools is not None  # cache-miss path SHOULD attach tools
+    assert config.automatic_function_calling is not None
+    assert config.automatic_function_calling.disable is True
 
 
 @pytest.mark.asyncio

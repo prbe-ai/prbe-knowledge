@@ -173,6 +173,7 @@ class GeminiAgentClient:
         """
         client = self._ensure_client()
         from google.genai.types import (
+            AutomaticFunctionCallingConfig,
             FunctionDeclaration,
             GenerateContentConfig,
             Tool,
@@ -184,9 +185,25 @@ class GeminiAgentClient:
         effective_contents: list[Any] = list(contents) if contents else [
             {"role": "user", "parts": [{"text": _TURN_ZERO_NUDGE}]}
         ]
+        # AFC must be disabled. The google-genai SDK defaults Automatic
+        # Function Calling ON whenever a request mentions functions —
+        # including functions resolved through `cached_content`. Our
+        # agent harness does manual dispatch (receive function_call ->
+        # run tool -> send function_response back). AFC engaging on
+        # turn 2+ produces a 400 on every multi-turn call:
+        #   turn=1: HTTP 200 OK   (model returns function_call)
+        #   turn=2: HTTP 400      (AFC + manual response collide)
+        #   tenacity exhausts:    400 / 400 / 400
+        #   agent.halt reason=gemini_persistent_error turns=1
+        # Disabling AFC keeps the request shape unambiguous and lets
+        # the harness own the dispatch loop end-to-end.
+        afc_disabled = AutomaticFunctionCallingConfig(disable=True)
 
         if cache_name:
-            config = GenerateContentConfig(cached_content=cache_name)
+            config = GenerateContentConfig(
+                cached_content=cache_name,
+                automatic_function_calling=afc_disabled,
+            )
         else:
             function_decls = [
                 FunctionDeclaration(
@@ -198,13 +215,26 @@ class GeminiAgentClient:
             ]
             config = GenerateContentConfig(
                 tools=[Tool(function_declarations=function_decls)],
+                automatic_function_calling=afc_disabled,
             )
 
-        resp = await client.aio.models.generate_content(
-            model=self._model,
-            contents=effective_contents,
-            config=config,
-        )
+        try:
+            resp = await client.aio.models.generate_content(
+                model=self._model,
+                contents=effective_contents,
+                config=config,
+            )
+        except Exception as exc:
+            # Surface enough of the SDK's ClientError body to diagnose
+            # future Gemini regressions without redeploying for logs.
+            log.warning(
+                "agent.gemini_call_failed",
+                error_class=type(exc).__name__,
+                error_message=str(exc)[:500],
+                cache_name_set=bool(cache_name),
+                conversation_length=len(effective_contents),
+            )
+            raise
         return _extract_response(resp)
 
 
