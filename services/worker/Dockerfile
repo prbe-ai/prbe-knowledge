@@ -15,6 +15,10 @@ COPY pyproject.toml ./
 COPY shared/ ./shared/
 COPY services/ ./services/
 COPY db/ ./db/
+# scripts/ ships into the worker image so operators can run one-shot
+# admin/maintenance scripts via `flyctl ssh console`. The deploy workflow's
+# paths-filter includes 'scripts/**' under worker/poller so adding a new
+# script triggers a worker rebuild that bakes it in.
 COPY scripts/ ./scripts/
 COPY alembic.ini ./
 

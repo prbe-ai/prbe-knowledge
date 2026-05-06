@@ -43,12 +43,14 @@ jobs:
               - 'services/ingestion/**'
               - 'services/worker/**'
               - 'shared/**'
+              - 'scripts/**'
               - 'fly.worker.toml'
               - 'pyproject.toml'
             poller:
               - 'services/ingestion/**'
               - 'services/worker/**'
               - 'shared/**'
+              - 'scripts/**'
               - 'fly.poller.toml'
               - 'pyproject.toml'
             wiki_worker:
