@@ -177,6 +177,11 @@ class Settings(BaseSettings):
     # --- Claude Code session completer --------------------------------------
     claude_code_session_idle_minutes: int = Field(default=5, ge=1)
 
+    # --- Custom ingest -------------------------------------------------------
+    custom_ingest_max_request_bytes: int = Field(default=5_000_000, ge=1)
+    custom_ingest_max_body_bytes: int = Field(default=1_000_000, ge=1)
+    custom_ingest_max_metadata_bytes: int = Field(default=64_000, ge=1)
+
     # --- Device source reconciliation
     # When True, verify_device_token escalates an integration_tokens row's
     # source_system from the default "claude_code" to a non-default source

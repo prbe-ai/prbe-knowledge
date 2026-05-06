@@ -38,6 +38,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from services.ingestion.admin_routes import router as admin_router
 from services.ingestion.backfill_routes import router as backfill_router
+from services.ingestion.custom_ingest_routes import router as custom_ingest_router
 from services.ingestion.handlers.base import make_default_context
 from services.ingestion.handlers.registry import (
     build_connector,
@@ -101,6 +102,7 @@ app.include_router(backfill_router)
 app.include_router(admin_router)
 app.include_router(devices_router)
 app.include_router(wiki_router)
+app.include_router(custom_ingest_router)
 
 
 @app.get("/health")

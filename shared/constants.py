@@ -16,6 +16,7 @@ class SourceSystem(StrEnum):
     # this label exists so dashboard queries can distinguish provenance.
     CODEX = "codex"
     MANUAL_UPLOAD = "manual_upload"
+    CUSTOM_INGEST = "custom_ingest"
     # Curated team-knowledge layer (runbooks, decisions, service cards, feature
     # notes). Pages are authored programmatically via /api/wiki/pages/* — no
     # external webhook. doc_class distinguishes human authorship (MANUAL_ENTRY)
@@ -54,6 +55,7 @@ class DocType(StrEnum):
     MANUAL_UPLOAD_MARKDOWN = "manual_upload.markdown"
     MANUAL_UPLOAD_DOCX = "manual_upload.docx"
     MANUAL_UPLOAD_FILE = "manual_upload.file"
+    CUSTOM_DOCUMENT = "custom.document"
     WIKI_SERVICE_CARD = "wiki.service_card"
     WIKI_DECISION = "wiki.decision"
     WIKI_FEATURE = "wiki.feature"
@@ -243,6 +245,7 @@ SOURCE_INGESTION_PRIORITY: dict[SourceSystem, int] = {
     # tier. Keeps a chatty Codex user from preempting interactive
     # webhooks at the queue claim layer.
     SourceSystem.CODEX: 75,
+    SourceSystem.CUSTOM_INGEST: 75,
 }
 
 TOP_K_VECTOR = 50

@@ -44,3 +44,4 @@ fly.toml.local
 # `.claude/skills/` are still tracked intentionally.
 .claude/worktrees/
 .claude/settings.local.json
+.worktrees/
