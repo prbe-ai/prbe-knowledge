@@ -15,19 +15,22 @@ Three pieces:
    in the dashboard. The cleartext token is shown to the user exactly
    once at mint time and never persisted.
 
-2. Forced RLS isolation on `app.current_customer_id`. Matches the GUC
-   used by graph_nodes / graph_edges / usage_events. FORCE is required
-   because the migration role owns the table on Neon, and Postgres
-   exempts owners from RLS by default.
+2. RLS enabled with WITH CHECK policy; not FORCE'd so the SECURITY
+   DEFINER verifier path bypasses cleanly via owner privileges.
+   Matches the `integration_tokens` convention: ENABLE + policy as
+   defense-in-depth for non-owner runtime roles, while owner-role
+   callers (the SECURITY DEFINER verifier) can read rows without a
+   tenant GUC set.
 
 3. `verify_and_touch_custom_ingest_token(text)` SECURITY DEFINER
    function. The verifier path can't have a tenant GUC set yet (it's
    trying to figure out which tenant the bearer belongs to), so a
-   plain SELECT under RLS would return zero rows. The SECURITY DEFINER
-   function executes as its OWNER (the migration role), which is
-   exempt from FORCE'd RLS only via the function boundary -- callers
-   can't read rows directly, only via this single narrow surface
-   that takes a token_hash and returns (token_id, customer_id).
+   plain SELECT under RLS would return zero rows for non-owner roles.
+   The SECURITY DEFINER function executes as its OWNER (the migration
+   role), which by Postgres default is exempt from RLS unless FORCE
+   is set -- callers can't read rows directly, only via this single
+   narrow surface that takes a token_hash and returns
+   (token_id, customer_id).
 
    It also touches `last_used_at` atomically with the lookup, but
    throttled to one update per 5 minutes to keep verification cheap on
@@ -74,8 +77,10 @@ def upgrade() -> None:
         """
     )
 
+    # RLS enabled with WITH CHECK policy; not FORCE'd so the SECURITY DEFINER
+    # verifier path bypasses cleanly via owner privileges. (Matches the
+    # integration_tokens convention.)
     op.execute("ALTER TABLE custom_ingest_tokens ENABLE ROW LEVEL SECURITY")
-    op.execute("ALTER TABLE custom_ingest_tokens FORCE ROW LEVEL SECURITY")
     # FOR ALL + WITH CHECK is required: USING-only is read-side, so a
     # tenant-context INSERT/UPDATE could otherwise write a row with some
     # other tenant's customer_id. WITH CHECK enforces the same predicate
@@ -90,11 +95,11 @@ def upgrade() -> None:
     )
 
     # SECURITY DEFINER lookup-and-touch. Runs as the function OWNER (the
-    # migration role), so it bypasses the custom_ingest_tokens_tenant_isolation
-    # policy on the table -- which is the whole point: the verifier path can't know the
-    # tenant until *after* the lookup. Callers can only see (token_id,
-    # customer_id) for the row matching the hash they supplied; no
-    # cross-tenant rows are ever exposed.
+    # migration role). Because the table is ENABLE'd but not FORCE'd, the
+    # owner is naturally exempt from RLS -- which is the whole point: the
+    # verifier path can't know the tenant until *after* the lookup. Callers
+    # can only see (token_id, customer_id) for the row matching the hash
+    # they supplied; no cross-tenant rows are ever exposed.
     op.execute(
         """
         CREATE OR REPLACE FUNCTION verify_and_touch_custom_ingest_token(p_token_hash text)
