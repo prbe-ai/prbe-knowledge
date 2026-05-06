@@ -76,6 +76,15 @@ WIKI_TYPE_TO_DOC_TYPE: dict[str, DocType] = {
     "decision": DocType.WIKI_DECISION,
     "feature": DocType.WIKI_FEATURE,
     "runbook": DocType.WIKI_RUNBOOK,
+    # Bootstrap-only entity types (migration 0044). The synthesis cron is
+    # allowed to write these via build_normalization_result; the user-
+    # authored PUT/DELETE routes still reject them via USER_AUTHORED_WIKI_TYPES.
+    "person": DocType.WIKI_PERSON_PAGE,
+    "company": DocType.WIKI_COMPANY,
+    "vendor": DocType.WIKI_VENDOR,
+    "customer": DocType.WIKI_CUSTOMER,
+    "project": DocType.WIKI_PROJECT,
+    "event": DocType.WIKI_EVENT,
     # The auto-generated table of contents. Singleton per customer.
     # User-facing PUT/DELETE routes reject this type — only the synthesis
     # cron writes it. GET /api/wiki/index reads it.

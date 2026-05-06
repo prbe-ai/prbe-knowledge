@@ -23,6 +23,21 @@ from services.synthesis.crawlers.base import (
 REGISTRY: dict[str, type[BootstrapAgent]] = {}
 
 
+def _register_default_crawlers() -> None:
+    """Eagerly register every concrete crawler module that ships today.
+
+    Lane D adds GitHub. Subsequent lanes append. Imported lazily inside the
+    function so unit tests can monkeypatch REGISTRY without dragging in
+    a real GitHub client at module import time.
+    """
+    from services.synthesis.crawlers.github import GitHubCrawlerAgent
+
+    REGISTRY[GitHubCrawlerAgent.source] = GitHubCrawlerAgent
+
+
+_register_default_crawlers()
+
+
 def register_crawler(cls: type[BootstrapAgent]) -> type[BootstrapAgent]:
     """Decorator (or plain call) to add a crawler to ``REGISTRY``.
 
