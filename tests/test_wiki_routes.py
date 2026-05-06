@@ -719,6 +719,7 @@ async def test_bootstrap_status_when_never_run(client: httpx.AsyncClient) -> Non
         "sources_failed": {},
         "pages_created": 0,
         "pages_updated": 0,
+        "targets": {},
     }
 
 
