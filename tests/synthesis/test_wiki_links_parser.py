@@ -66,6 +66,21 @@ def test_no_links_returns_empty_list() -> None:
     assert extract_links_from_markdown("") == []
 
 
+def test_slug_with_underscore_extracts() -> None:
+    """`agent_tools` accepts arbitrary slug chars; parser must match
+    `[[decision:auth_rollback]]` (underscore) or such links silently
+    drop on extract."""
+    body = "see [[decision:auth_rollback]] for context."
+    links = extract_links_from_markdown(body)
+    assert len(links) == 1
+    assert links[0].dst_wiki_type == "decision"
+    assert links[0].dst_slug == "auth_rollback"
+    # Frontmatter scalar grammar must accept the same shape.
+    fm_links = extract_links_from_frontmatter({"references": "decision:auth_rollback"})
+    assert len(fm_links) == 1
+    assert fm_links[0].dst_slug == "auth_rollback"
+
+
 def test_invalid_wiki_type_dropped_with_warning(capsys: pytest.CaptureFixture[str]) -> None:
     body = "see [[bogus:foo]] and [[person:maison]]"
     links = extract_links_from_markdown(body)

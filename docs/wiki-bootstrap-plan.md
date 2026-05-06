@@ -304,13 +304,21 @@ def extract_links(body_markdown: str, frontmatter: dict) -> list[Link]:
             ))
     return links
 
-# Wrap update_page / create_page atomic commit with:
+# Wrap update_page / create_page commit with:
 #   1. Persist page (compiled_truth, timeline, frontmatter, ...)
 #   2. extracted = extract_links(body, frontmatter)
 #   3. DELETE FROM wiki_links WHERE customer_id=... AND src=...
 #   4. INSERT extracted links (ON CONFLICT DO NOTHING)
 #   5. Update content_hash, trigger search_vector refresh
-# All in one txn so writes are atomic.
+#
+# The atomic boundary is at the page write. Link extraction +
+# persistence runs as a separate transaction immediately after the
+# page commits, with transient/IO exceptions swallowed (logged as
+# warnings). The page is the source of truth; if link writes fail
+# transiently, the link graph goes stale but the page is intact.
+# Reconciliation: a future cron job (TODO, deferred) can detect
+# pages whose body contains [[type:slug]] markers absent from
+# wiki_links and re-run extraction.
 ```
 
 Crawlers don't need to call the link-extraction LLM — they just produce
@@ -545,6 +553,7 @@ Auto-compact:
 - **`page_versions` snapshot table.** Skipped for v1 — `documents.version` is enough. Add when rollback UX gets built.
 - **Stale-bootstrap alert.** A bootstrap job that's been `running` for > 6 hours probably wedged. Add a daily metric query + alert.
 - **Per-customer time-horizon UI.** v1 hardcodes the per-source defaults above. Add a customer-settings UI once we see customers actually want this dial.
+- **Link-graph reconciliation cron.** Detect pages whose body / frontmatter contains `[[type:slug]]` markers not reflected in `wiki_links` and re-run extraction. Mitigates the staleness window from the two-transaction page-then-links design (Normalizer._persist owns its own connection, so link writes can't share the page's tx; transient link-write failures are logged-and-swallowed today).
 
 ## Failure modes
 

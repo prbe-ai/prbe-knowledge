@@ -53,8 +53,11 @@ _WIKI_TYPES: frozenset[str] = frozenset(get_args(WikiType))
 # one or two `|`-separated suffixes. Both `type` and `slug` use a
 # restrictive character class (lowercase ASCII + digits + dashes /
 # underscores) to avoid matching arbitrary text inside `[[ ... ]]`.
+# `agent_tools` accepts arbitrary slug chars up to 64; we keep the
+# parser's class narrow but include underscore so legitimate slugs
+# like `auth_rollback` extract instead of silently dropping.
 _MARKDOWN_LINK_RE = re.compile(
-    r"\[\[(?P<type>[a-z_]+):(?P<slug>[a-z0-9-]+)"
+    r"\[\[(?P<type>[a-z_]+):(?P<slug>[a-z0-9_-]+)"
     r"(?:\|(?P<a>[^\]|]+))?"
     r"(?:\|(?P<b>[^\]|]+))?\]\]"
 )
@@ -62,7 +65,7 @@ _MARKDOWN_LINK_RE = re.compile(
 # Frontmatter scalar grammar. A value is treated as a link iff it
 # matches `<wiki_type>:<slug>` exactly. Same character classes as the
 # markdown matcher.
-_FRONTMATTER_REF_RE = re.compile(r"^([a-z_]+):([a-z0-9-]+)$")
+_FRONTMATTER_REF_RE = re.compile(r"^([a-z_]+):([a-z0-9_-]+)$")
 
 _CONTEXT_WINDOW = 80
 _CONTEXT_MAX = 200
