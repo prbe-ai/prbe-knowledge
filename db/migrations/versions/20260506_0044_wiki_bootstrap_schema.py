@@ -1,7 +1,7 @@
 """wiki bootstrap: link graph, timeline, raw-data sidecar + run tracking
 
-Revision ID: 0043_wiki_bootstrap_schema
-Revises: 0042_backfill_codex_doc_titles
+Revision ID: 0044_wiki_bootstrap_schema
+Revises: 0043_agent_turn_traces
 Create Date: 2026-05-06
 
 Schema foundation for the wiki bootstrap pipeline (per-source crawler
@@ -52,8 +52,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0043_wiki_bootstrap_schema"
-down_revision = "0042_backfill_codex_doc_titles"
+revision = "0044_wiki_bootstrap_schema"
+down_revision = "0043_agent_turn_traces"
 branch_labels = None
 depends_on = None
 
