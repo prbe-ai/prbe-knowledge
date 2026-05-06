@@ -45,6 +45,7 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
+from shared.customer_prefs import code_graph_indexed_branch
 from shared.exceptions import (
     InvalidWebhookPayload,
     NotSupportedByConnector,
@@ -1201,6 +1202,13 @@ class GitHubConnector(Connector):
         """After a verified push lands, forward the changed-files set to the
         code-graph bridge for symbol-level diff extraction.
 
+        Branch gating: only pushes to the repo's tracked branch fire the
+        bridge. The tracked branch is per-(customer, repo), resolved via
+        `code_graph_indexed_branch` — falls back to the repo's
+        `default_branch` when no override is set. This prevents feature
+        branches from polluting the (customer, repo, file_path)-keyed
+        `code_repo_state` cache with non-default-branch content.
+
         Failures are logged and swallowed — symbol extraction must never
         block the github.commit ingestion path. The bridge writes a
         separate ingestion_queue row keyed on (customer, code_graph,
@@ -1208,11 +1216,36 @@ class GitHubConnector(Connector):
         resync without re-ingesting commit Documents.
         """
         payload = event.raw_payload
-        repo = (payload.get("repository") or {}).get("full_name") or ""
+        repository = payload.get("repository") or {}
+        repo = repository.get("full_name") or ""
         head = payload.get("head_commit") or {}
         sha = head.get("id") or payload.get("after") or ""
         if not repo or not sha:
             return
+
+        push_branch = _push_branch_from_ref(payload.get("ref"))
+        default_branch = repository.get("default_branch")
+        if not push_branch or not isinstance(default_branch, str) or not default_branch:
+            log.info(
+                "code_graph.bridge.skip_unknown_branch",
+                customer=event.customer_id,
+                repo=repo,
+                ref=payload.get("ref"),
+            )
+            return
+        tracked_branch = await code_graph_indexed_branch(
+            event.customer_id, repo, default_branch
+        )
+        if push_branch != tracked_branch:
+            log.info(
+                "code_graph.bridge.skip_non_tracked_branch",
+                customer=event.customer_id,
+                repo=repo,
+                push_branch=push_branch,
+                tracked_branch=tracked_branch,
+            )
+            return
+
         added: list[str] = []
         modified: list[str] = []
         removed: list[str] = []
@@ -1536,6 +1569,18 @@ def _repo_acl_row(repo: Mapping[str, Any], valid_from: datetime) -> ACLSnapshotR
         valid_from=valid_from,
         metadata={"visibility": _repo_visibility(repo)},
     )
+
+
+def _push_branch_from_ref(ref: object) -> str | None:
+    """Strip `refs/heads/` from a push payload's `ref` field.
+
+    Returns None for tag pushes (`refs/tags/...`), missing refs, or any
+    non-branch ref shape we don't want to extract code-graph from.
+    """
+    if not isinstance(ref, str) or not ref.startswith("refs/heads/"):
+        return None
+    branch = ref[len("refs/heads/"):]
+    return branch or None
 
 
 def _push_touches_codeowners(payload: Mapping[str, Any]) -> bool:
