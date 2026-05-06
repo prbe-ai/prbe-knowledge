@@ -1,3 +1,27 @@
+> **Status update 2026-05-05:** Decisions Q1–Q6 locked. Implementation plan
+> at `docs/superpowers/specs/2026-05-05-validator-regen-loop-plan.md` (now
+> shipped on branch `feat/synth-validator-regen-loop`). Diverges from this
+> handoff in three places:
+> - **Round budget = 3** (not 2), profile-configurable via `regen.max_rounds`.
+> - **`--no-regen` opt-out flag** added to the CLI.
+> - **Terminal log includes "what went right"** — `survived_doc_ids` +
+>   per-round `passing_doc_ids` (event `plot_scenario_regen_round`) on top
+>   of the failure events, so operators can see flip-flop convergence
+>   patterns.
+>
+> Pass 1 / Pass 2 violations are handled by a **single unified regen loop**
+> with one prompt template (`writer_regen.txt`) — not split. Pass 2 retry
+> as a separate axis remains deferred (Q6).
+>
+> The `regen_enabled: bool = True` kwarg on `run_scenarios` controls the
+> loop; the gate auto-disables when `writer is None` or `company_ctx is None`
+> (e.g., templated-only runs). The runtime tests at
+> `tests/synth/test_scenarios.py` rely on `run_scenarios` validating once
+> before delegating to `regen_loop` (which validates again at the top of
+> each round) — if a future refactor passes the outer result into the loop
+> to skip the redundant validate, those tests will need to drop their
+> call-count thresholds.
+
 # Validator Regen Loop (handoff)
 
 **Status:** handoff / pre-spec. Decisions still open. Not yet a buildable plan.
