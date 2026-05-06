@@ -65,16 +65,22 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _backfill_run_lock_key(customer_id: str, source: str) -> int:
-    """Per-(customer, source) lock key for the BackfillWorker.
+def _backfill_run_lock_key(customer_id: str, source: str, target: str | None = None) -> int:
+    """Per-(customer, source, target) lock key for the BackfillWorker.
 
     Defense-in-depth on top of ``FOR UPDATE SKIP LOCKED``: the queue
     claim already prevents two workers from grabbing the same row, but
     reclaim's ``running -> pending`` flip can in principle requeue a row
     whose original worker is still alive but stuck. The advisory lock
     catches that overlap before the new worker invokes the agent.
+
+    Including ``target`` in the key means Phase 1 (target=NULL) and
+    Phase 2 rows for the same (customer, source) get distinct locks —
+    Phase 1 + Phase 2 can run concurrently if the orchestrator
+    fan-out happens before Phase 1's row is fully closed (it doesn't,
+    but the key still distinguishes them on principle).
     """
-    return advisory_lock_key("backfill-run", customer_id, source)
+    return advisory_lock_key("backfill-run", customer_id, source, target or "")
 
 
 # Idle-pool eviction window. Neon kills pooled connections after roughly
@@ -122,12 +128,22 @@ class _Claim:
     surface stays minimal and asyncpg row -> Claim conversion is explicit.
     """
 
-    __slots__ = ("customer_id", "run_id", "source")
+    __slots__ = ("customer_id", "run_id", "source", "target")
 
-    def __init__(self, *, customer_id: str, source: str, run_id: int) -> None:
+    def __init__(
+        self,
+        *,
+        customer_id: str,
+        source: str,
+        run_id: int,
+        target: str | None = None,
+    ) -> None:
         self.customer_id = customer_id
         self.source = source
         self.run_id = run_id
+        # Phase 2 fan-out target. None for Phase 1 (broad pass);
+        # 'owner/repo' (or equivalent) for Phase 2 deep-dive rows.
+        self.target = target
 
 
 # Type alias mirroring the orchestrator's previous ``CrawlerFactory``.
@@ -365,7 +381,7 @@ class BackfillWorker:
         async with raw_conn() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
-                SELECT customer_id, source, run_id
+                SELECT customer_id, source, run_id, target
                 FROM wiki_synthesis_runs
                 WHERE kind = 'bootstrap' AND status = 'pending'
                 ORDER BY started_at
@@ -383,6 +399,7 @@ class BackfillWorker:
                 customer_id=row["customer_id"],
                 source=row["source"],
                 run_id=int(row["run_id"]),
+                target=row["target"],
             )
 
     # ------------------------------------------------------------------
@@ -401,7 +418,7 @@ class BackfillWorker:
         ``InterfaceError`` on commit. ``_lock_conn_heartbeat`` runs
         ``SELECT 1`` every 60s on the held connection to keep it live.
         """
-        lock_key = _backfill_run_lock_key(claim.customer_id, claim.source)
+        lock_key = _backfill_run_lock_key(claim.customer_id, claim.source, claim.target)
         try:
             async with raw_conn() as lock_conn, lock_conn.transaction():
                 acquired = await lock_conn.fetchval(
@@ -431,6 +448,19 @@ class BackfillWorker:
                     ):
                         result = result.model_copy(update={"error": f"halt:{result.halt_reason}"})
                     await self._close_run(claim, result)
+                    # Phase 2 fan-out hook: only Phase 1 rows (target=None)
+                    # that succeeded (complete or partial-with-pages) trigger
+                    # per-target subtasks. Failed Phase 1 -> no fan-out.
+                    # Phase 2 rows (target set) never recurse.
+                    if (
+                        claim.target is None
+                        and result.error is None
+                        and (
+                            result.halt_reason is None
+                            or (result.pages_created + result.pages_updated) > 0
+                        )
+                    ):
+                        await self._maybe_fanout_phase2(claim)
                 finally:
                     # Stop the heartbeat before the txn ``__aexit__``
                     # commits, so the COMMIT doesn't race with an
@@ -490,6 +520,7 @@ class BackfillWorker:
                 source=claim.source,
                 customer_id=claim.customer_id,
                 run_id=claim.run_id,
+                target=claim.target,
                 error=err,
             )
 
@@ -500,6 +531,7 @@ class BackfillWorker:
                 bearer_resolver=self._bearer_resolver_factory(claim.customer_id, claim.source),
                 http=self._http,
                 settings=self._settings,
+                target=claim.target,
             )
         except Exception as exc:
             log.warning(
@@ -514,6 +546,7 @@ class BackfillWorker:
                 source=claim.source,
                 customer_id=claim.customer_id,
                 run_id=claim.run_id,
+                target=claim.target,
                 error=f"{type(exc).__name__}: {exc}",
             )
 
@@ -606,6 +639,90 @@ class BackfillWorker:
                 claim.run_id,
                 err,
             )
+
+    async def _maybe_fanout_phase2(self, claim: _Claim) -> int:
+        """Insert Phase 2 rows for each per-target deep-dive after a
+        successful Phase 1 close.
+
+        Returns the count of rows inserted. Errors in discovery or
+        insert are swallowed + logged (D4) — Phase 1 already committed,
+        so a fan-out failure shouldn't propagate. User can re-click
+        Rebuild to retry; future TODO is a sweeper.
+
+        No-ops when:
+          - source has no registered ``BackfillFanout`` discoverer
+          - bearer resolver returns None (auth not connected)
+          - discoverer returns empty list (no targets)
+        """
+        try:
+            from services.synthesis.fanout import REGISTRY as FANOUT_REGISTRY
+
+            fanout = FANOUT_REGISTRY.get(claim.source)
+            if fanout is None:
+                return 0
+            resolver = self._bearer_resolver_factory(claim.customer_id, claim.source)
+            bearer = await resolver()
+            if not bearer:
+                log.warning(
+                    "backfill.fanout_no_bearer",
+                    customer=claim.customer_id,
+                    source=claim.source,
+                    run_id=claim.run_id,
+                )
+                return 0
+            targets = await fanout.discover_targets(
+                customer_id=claim.customer_id,
+                bearer=bearer,
+                http=self._http,
+            )
+            if not targets:
+                log.info(
+                    "backfill.fanout_no_targets",
+                    customer=claim.customer_id,
+                    source=claim.source,
+                    run_id=claim.run_id,
+                )
+                return 0
+            # Batched INSERT one row per target. Mirrors the trigger
+            # route's _insert_pending_runs shape but with target set.
+            async with raw_conn() as conn:
+                rows = await conn.fetch(
+                    """
+                    INSERT INTO wiki_synthesis_runs
+                        (customer_id, kind, source, target, stage, status)
+                    SELECT $1, 'bootstrap', $2, t, 'synthesis', 'pending'
+                    FROM unnest($3::text[]) AS t
+                    RETURNING run_id, target
+                    """,
+                    claim.customer_id,
+                    claim.source,
+                    targets,
+                )
+                # Wake any LISTENing worker so it picks up the new rows
+                # without waiting for the 30s safety-net poll.
+                await conn.execute(
+                    "SELECT pg_notify($1, '')",
+                    WIKI_BACKFILL_CHANNEL,
+                )
+            log.info(
+                "backfill.fanout_inserted",
+                customer=claim.customer_id,
+                source=claim.source,
+                run_id=claim.run_id,
+                target_count=len(rows),
+                targets=[r["target"] for r in rows],
+            )
+            return len(rows)
+        except Exception as exc:
+            log.warning(
+                "backfill.fanout_failed",
+                customer=claim.customer_id,
+                source=claim.source,
+                run_id=claim.run_id,
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
+            return 0
 
     async def _mark_cancelled(self, claim: _Claim, *, error: str) -> None:
         """Idempotent UPDATE to status='cancelled'. Skips if already cancelled."""

@@ -409,3 +409,46 @@ async def test_alternating_429_success_eventually_exhausts(http: httpx.AsyncClie
         # Third call: 5 consecutive 429s with no 2xx -> exhausted.
         with pytest.raises(GitHubRateLimitExhausted):
             await client.get_repo("x/y")
+
+
+# ---------------------------------------------------------------------------
+# Shared bucket registry (D6 — Phase 2 fan-out concurrency)
+# ---------------------------------------------------------------------------
+
+
+def test_get_shared_bucket_returns_same_instance_per_customer() -> None:
+    """Multiple GitHubAPIClient instances on the same fly machine must
+    share one ``_AsyncTokenBucket`` per (customer, source) so aggregate
+    request rate stays at target_rps regardless of parallelism. The
+    registry returns the same instance for repeated calls."""
+    from services.synthesis.api_clients.github import (
+        _SHARED_BUCKETS,
+        _AsyncTokenBucket,
+        get_shared_bucket,
+    )
+
+    # Pop any prior test pollution so this test is hermetic.
+    _SHARED_BUCKETS.clear()
+
+    b1 = get_shared_bucket("cust-A")
+    b2 = get_shared_bucket("cust-A")
+    assert b1 is b2, "same key must return the same bucket"
+
+    b3 = get_shared_bucket("cust-B")
+    assert b1 is not b3, "different customer must get a different bucket"
+    assert isinstance(b3, _AsyncTokenBucket)
+
+
+def test_get_shared_bucket_ignores_target_rps_after_first_call() -> None:
+    """The rate envelope is set on first creation; subsequent calls
+    return the existing bucket as-is. A change to target_rps mid-run
+    shouldn't shift an in-flight customer's quota."""
+    from services.synthesis.api_clients.github import _SHARED_BUCKETS, get_shared_bucket
+
+    _SHARED_BUCKETS.clear()
+    b1 = get_shared_bucket("cust-X", target_rps=2.0)
+    b2 = get_shared_bucket("cust-X", target_rps=10.0)
+    assert b1 is b2
+    # ``_AsyncTokenBucket._rate`` is private API but the test asserts
+    # we didn't replace the bucket with a faster one.
+    assert b1._rate == 2.0

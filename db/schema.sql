@@ -677,6 +677,11 @@ CREATE TABLE wiki_synthesis_runs (
     -- Per-source discriminator for bootstrap runs ('slack', 'github',
     -- 'linear', etc.). NULL for daily-replay (kind='wake'/'scheduled').
     source          TEXT,
+    -- Phase 2 fan-out target. NULL for Phase 1 rows (one per source per
+    -- trigger). Phase 2 rows carry a target like 'owner/repo' (GitHub),
+    -- 'channel_id' (Slack), etc. The orchestrator's post-Phase-1 hook
+    -- inserts these by querying the source's BackfillFanout discoverer.
+    target          TEXT,
     started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at     TIMESTAMPTZ,
     events_total    INT NOT NULL DEFAULT 0,
@@ -699,6 +704,9 @@ CREATE INDEX idx_wsr_stage_started
 
 CREATE INDEX idx_wsr_kind_source
     ON wiki_synthesis_runs (customer_id, kind, source, started_at DESC);
+
+CREATE INDEX idx_wsr_kind_source_target
+    ON wiki_synthesis_runs (customer_id, kind, source, target, started_at DESC);
 
 -- ---------------------------------------------------------------------------
 -- wiki_links / wiki_timeline_entries / wiki_raw_data

@@ -1134,6 +1134,14 @@ class BackfillStatusResponse(BaseModel):
     sources_failed: dict[str, str]
     pages_created: int
     pages_updated: int
+    # Phase 2 per-target progress, keyed by source then target.
+    # Example: ``{"github": {"prbe-ai/prbe-knowledge": "complete",
+    # "prbe-ai/prbe-backend": "running", "prbe-ai/prbe-dashboard": "failed"}}``.
+    # Phase 1 rows (target=None) appear in sources_attempted/succeeded/failed
+    # above and DO NOT appear here. Empty dict when no Phase 2 fan-out has
+    # been issued (e.g., before the GitHub crawler ships Phase 2, or for
+    # sources that don't fan out).
+    targets: dict[str, dict[str, str]] = {}
 
 
 # Back-compat aliases. Existing test imports + the prbe-backend BFF
@@ -1394,11 +1402,12 @@ async def _do_get_wiki_backfill_status(customer_id: str) -> BackfillStatusRespon
                 sources_failed={},
                 pages_created=0,
                 pages_updated=0,
+                targets={},
             )
         rows = await conn.fetch(
             """
-            SELECT source, status, error, pages_created, pages_updated,
-                   started_at
+            SELECT source, target, status, error, pages_created,
+                   pages_updated, started_at
             FROM wiki_synthesis_runs
             WHERE customer_id = $1
               AND kind = 'bootstrap'
@@ -1413,28 +1422,37 @@ async def _do_get_wiki_backfill_status(customer_id: str) -> BackfillStatusRespon
     sources_attempted: list[str] = []
     sources_succeeded: list[str] = []
     sources_failed: dict[str, str] = {}
+    # Phase 2 per-target progress. Keyed by source -> target -> status
+    # (one of: pending, running, complete, partial, failed, cancelled).
+    # Phase 1 rows (target=NULL) flow into sources_* above; Phase 2
+    # rows (target set) flow into this dict only.
+    targets: dict[str, dict[str, str]] = {}
     in_progress = False
     pages_created = 0
     pages_updated = 0
     started_at = rows[0]["started_at"] if rows else None
     for row in rows:
         source = row["source"] or ""
+        target = row["target"]
         status = row["status"]
-        sources_attempted.append(source)
         # Both 'pending' (queued, not yet claimed) and 'running' (a
         # worker is actively crawling) count as in-progress so the
         # dashboard's "Backfilling..." pill stays up across the claim
         # boundary.
         if status in ("pending", "running"):
             in_progress = True
-        if status in ("complete", "partial"):
-            sources_succeeded.append(source)
-        elif status == "failed":
-            sources_failed[source] = row["error"] or "failed"
-        elif status == "cancelled":
-            sources_failed[source] = row["error"] or "cancelled"
         pages_created += int(row["pages_created"] or 0)
         pages_updated += int(row["pages_updated"] or 0)
+        if target is None:
+            sources_attempted.append(source)
+            if status in ("complete", "partial"):
+                sources_succeeded.append(source)
+            elif status == "failed":
+                sources_failed[source] = row["error"] or "failed"
+            elif status == "cancelled":
+                sources_failed[source] = row["error"] or "cancelled"
+        else:
+            targets.setdefault(source, {})[target] = status
 
     return BackfillStatusResponse(
         in_progress=in_progress,
@@ -1444,6 +1462,7 @@ async def _do_get_wiki_backfill_status(customer_id: str) -> BackfillStatusRespon
         sources_failed=sources_failed,
         pages_created=pages_created,
         pages_updated=pages_updated,
+        targets=targets,
     )
 
 

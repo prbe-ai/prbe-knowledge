@@ -392,3 +392,71 @@ def build_github_crawler_system_prompt(
         "  - Cite sources at the bottom of every page (PR / issue URL).\n\n"
         "Stay focused. Produce tool calls; no chat."
     )
+
+
+def build_github_repo_subtask_prompt(
+    *,
+    customer_id: str,
+    target_repo: str,
+    quiet_streak: int = 50,
+) -> str:
+    """System prompt for a Phase 2 GitHub crawler scoped to one repo.
+
+    Phase 1 (the broad pass) ran first and produced topology pages
+    (service_cards, decisions, persons, vendors). Phase 2's job is to
+    AUGMENT those pages with this specific repo's detail — not to
+    create duplicate pages with the same slug. Optimistic concurrency
+    on documents.version handles parallel writes from sibling Phase 2
+    agents on shared pages.
+    """
+    return (
+        f"You are doing a DEEP DIVE on the GitHub repo `{target_repo}` "
+        f"for customer {customer_id}. A broad-pass agent has already "
+        "run and produced the wiki's high-level topology (service_cards "
+        "for each repo, decisions, persons, vendors). Your job is to "
+        "AUGMENT those existing pages with detail specific to "
+        f"`{target_repo}` — not to recreate them.\n\n"
+        "**Workflow you should follow:**\n"
+        "  1. Call `list_wiki_pages()` to see what already exists.\n"
+        "  2. Call `read_page(wiki_type, slug)` on the pages most "
+        f"likely related to this repo (especially service_card/{target_repo.split('/')[-1]} "
+        "if it exists).\n"
+        "  3. Walk the repo's PRs, issues, commits, and reviews via "
+        "list_pulls / list_issues / list_commits / get_pull_reviews.\n"
+        "  4. When you find content that belongs on an existing page, "
+        "call `update_page` to APPEND or refine. Don't overwrite — "
+        "the existing content from Phase 1 should remain.\n"
+        "  5. Only call `create_page` for content the broad pass "
+        "missed — typically per-PR runbooks, repo-specific decisions, "
+        "or person/vendor entries the broad pass didn't surface.\n\n"
+        "**Augment, don't replace.** When updating service_card/"
+        f"{target_repo.split('/')[-1]}, your additions should:\n"
+        "  - flesh out the 'recent activity' section with this repo's "
+        "specific PRs (titles, authors, links)\n"
+        "  - identify per-file owners + reviewers (from PR review "
+        "data) and link them via [[person:login]]\n"
+        "  - capture vendor adoptions / removals visible in PRs of "
+        "this repo (package.json, requirements.txt, etc.) — link "
+        "[[vendor:slug]]\n"
+        "  - call out repo-specific runbook steps if PRs reference "
+        "deploy/operate/recover procedures\n\n"
+        "**Tool palette is the same as Phase 1.** `list_repos()` will "
+        f"return only `{target_repo}` since you are scoped to this one. "
+        "Other tools work normally but you should pass "
+        f"`full_name='{target_repo}'` everywhere.\n\n"
+        "**Audit:** call `wiki_raw_save` and `record_timeline` for "
+        "every contributing event you absorb, same as Phase 1.\n\n"
+        "**Cross-references:** liberally use [[person:slug]], "
+        "[[vendor:slug]], [[decision:slug]] when augmenting. Phase 1 "
+        "already created many of these pages; the link extractor "
+        "indexes the references.\n\n"
+        "**Stopping rule:** if your last "
+        f"{quiet_streak} source items in a row produced no wiki "
+        "change, call done(). Don't churn the entire history.\n\n"
+        "**Concurrency:** sibling Phase 2 agents are running in "
+        "parallel on other repos. Optimistic concurrency on the page "
+        "version means your update_page may fail with STALE_VERSION; "
+        "re-read and re-stage your delta. The harness handles this "
+        "transparently — just keep going.\n\n"
+        "Stay focused. Produce tool calls; no chat."
+    )

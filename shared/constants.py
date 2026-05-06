@@ -1,5 +1,6 @@
 """Phase 0 canonical enums. Every string used as a type/label/edge/status lives here."""
 
+import os
 from enum import StrEnum
 
 
@@ -593,6 +594,15 @@ WIKI_BACKFILL_QUIET_STREAK = 50
 # all-time per the locked plan so old structural commits ("first added
 # auth middleware") still surface even when ticket history is bounded.
 WIKI_BACKFILL_GITHUB_PRS_DAYS = 365
+
+
+# Cap on Phase 2 fan-out per (customer, source). After Phase 1 completes,
+# the orchestrator queries the source's discoverer for targets (e.g.,
+# repos for GitHub) and inserts one Phase 2 row per target up to this
+# cap. Above the cap, take the top-N by recent activity. At ~$0.30-0.60
+# per Phase 2 agent run (Gemini Pro), 30 caps worst-case spend at
+# ~$15/backfill on the largest customers we have today.
+BACKFILL_MAX_TARGETS_PER_SOURCE = int(os.environ.get("BACKFILL_MAX_TARGETS_PER_SOURCE", "30"))
 
 # Agent's CachedContent TTL. Re-create on miss; alert if hit_rate < 80%.
 WIKI_AGENT_CACHE_TTL = "3600s"
