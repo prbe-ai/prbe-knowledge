@@ -23,6 +23,23 @@ from services.synthesis.crawlers.base import (
 REGISTRY: dict[str, type[BootstrapAgent]] = {}
 
 
+def _register_default_crawlers() -> None:
+    """Eagerly register every concrete crawler module that ships today.
+
+    Called at module load time below — matches the eager-registration
+    convention used elsewhere in this codebase. The crawler imports happen
+    inside the function (rather than at module top) so unit tests that
+    monkeypatch REGISTRY don't have to drag a real GitHub client through
+    test collection.
+    """
+    from services.synthesis.crawlers.github import GitHubCrawlerAgent
+
+    REGISTRY[GitHubCrawlerAgent.source] = GitHubCrawlerAgent
+
+
+_register_default_crawlers()
+
+
 def register_crawler(cls: type[BootstrapAgent]) -> type[BootstrapAgent]:
     """Decorator (or plain call) to add a crawler to ``REGISTRY``.
 

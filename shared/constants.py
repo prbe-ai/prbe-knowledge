@@ -60,9 +60,41 @@ class DocType(StrEnum):
     WIKI_DECISION = "wiki.decision"
     WIKI_FEATURE = "wiki.feature"
     WIKI_RUNBOOK = "wiki.runbook"
+    # Bootstrap-only entity types (migration 0044). Crawlers emit these to
+    # stitch the wiki's link graph; they aren't user-authored. Daily replay
+    # may also write them when it absorbs a crawler-seeded page.
+    WIKI_PERSON_PAGE = "wiki.person"
+    WIKI_COMPANY = "wiki.company"
+    WIKI_VENDOR = "wiki.vendor"
+    WIKI_CUSTOMER = "wiki.customer"
+    WIKI_PROJECT = "wiki.project"
+    WIKI_EVENT = "wiki.event"
     # Auto-generated table of contents. Exactly one per customer; regenerated
     # at the end of each synthesis run from the live set of wiki pages.
     WIKI_INDEX = "wiki.index"
+
+
+# DocTypes that count as "wiki pages" for index/listing purposes — the union
+# of the original 4 user-authored types and the 6 bootstrap-only entity types
+# (migration 0044). Mirrors the entries in
+# `services/ingestion/handlers/wiki.py::WIKI_TYPE_TO_DOC_TYPE` (minus the
+# singleton WIKI_INDEX itself). Single source of truth for:
+#   - GET /api/wiki/index (services/ingestion/wiki_routes.py)
+#   - fetch_wiki_index (services/synthesis/persistence.py), used by the
+#     wiki/bootstrap agent's _tool_list_wiki_pages
+#   - _regenerate_index (services/synthesis/wiki_agent.py)
+INDEXABLE_WIKI_DOC_TYPES: tuple[DocType, ...] = (
+    DocType.WIKI_SERVICE_CARD,
+    DocType.WIKI_DECISION,
+    DocType.WIKI_FEATURE,
+    DocType.WIKI_RUNBOOK,
+    DocType.WIKI_PERSON_PAGE,
+    DocType.WIKI_COMPANY,
+    DocType.WIKI_VENDOR,
+    DocType.WIKI_CUSTOMER,
+    DocType.WIKI_PROJECT,
+    DocType.WIKI_EVENT,
+)
 
 
 class NodeLabel(StrEnum):
@@ -502,6 +534,23 @@ WIKI_AGENT_MODEL = "gemini-3.1-pro-preview"
 # Compactor model. Cheaper Flash variant since it only summarizes the
 # conversation; preserves the structured runtime state untouched.
 WIKI_AGENT_COMPACTOR_MODEL = "gemini-flash-lite-preview"
+
+# Per-source bootstrap crawler models. Default to the same Pro model the
+# daily-replay agent uses; per-source knobs let us swap a cheaper /
+# bigger model for one source without redeploying the rest. Mentioned
+# under "Per-source models" in docs/wiki-bootstrap-plan.md.
+WIKI_BOOTSTRAP_MODEL_GITHUB = "gemini-3.1-pro-preview"
+
+# Stop-walking heuristic for bootstrap crawlers. After this many
+# consecutive source items that don't cause the agent to call
+# update_page / create_page, the crawler treats the repo as drained and
+# moves on. Picked at 50 to match the system prompt's stopping rule.
+WIKI_BOOTSTRAP_QUIET_STREAK = 50
+
+# Time horizon (days) for GitHub PR + issue ingestion. Commits walk
+# all-time per the locked plan so old structural commits ("first added
+# auth middleware") still surface even when ticket history is bounded.
+WIKI_BOOTSTRAP_GITHUB_PRS_DAYS = 365
 
 # Agent's CachedContent TTL. Re-create on miss; alert if hit_rate < 80%.
 WIKI_AGENT_CACHE_TTL = "3600s"

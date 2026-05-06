@@ -282,3 +282,113 @@ def _compactor_system() -> str:
 
 def compactor_system_prompt() -> str:
     return _compactor_system()
+
+
+# ---------------------------------------------------------------------------
+# Bootstrap crawler — GitHub
+# ---------------------------------------------------------------------------
+
+
+def build_github_crawler_system_prompt(
+    *,
+    customer_id: str,
+    quiet_streak: int = 50,
+) -> str:
+    """System prompt for the GitHub bootstrap crawler (Lane D).
+
+    Source-specialized: explains the GitHub-specific tools, the page-type
+    palette the agent should pick from, the recency-first stopping rule,
+    and the cross-reference syntax the link extractor expects.
+    """
+    return (
+        "You are reading every accessible GitHub PR, issue, commit, and "
+        f"review for customer {customer_id}, newest first, to bootstrap "
+        "their engineering wiki from history. The wiki has 10 page types "
+        "and you should pick deliberately:\n\n"
+        "  - service_card: 'what is service X' — purpose, owners, recent "
+        "activity. Use when a PR / commit cluster reveals a maintained "
+        "service.\n"
+        "  - decision: 'we picked X over Y because Z'. Use when a PR or "
+        "issue thread captures a deliberate choice (vendor pick, "
+        "architectural fork, deprecation).\n"
+        "  - feature: a discrete capability shipping or shipped. Use for "
+        "named, scoped chunks of work (often tracked as an issue with a "
+        "'feature:' label).\n"
+        "  - runbook: how to operate / recover / deploy. Use when an "
+        "issue or PR captures operational steps for future on-call.\n"
+        "  - person: an individual who shows up as a PR author, "
+        "reviewer, or commit author. One page per github_login.\n"
+        "  - vendor: external tool/service (Postgres, Pinecone, Stripe). "
+        "Create when a PR introduces or replaces a vendor.\n"
+        "  - company / customer / project / event: open palette for the "
+        "rest. Use 'event' for incidents and launches called out in "
+        "issue titles / labels.\n\n"
+        "**Tool palette:**\n"
+        "  Source (read-only):\n"
+        "    - list_repos() — every accessible repo, newest pushed first.\n"
+        "    - list_pulls(full_name, cursor?) — recent PRs (last 12 months), "
+        "50/call.\n"
+        "    - list_issues(full_name, cursor?) — recent issues (last 12 "
+        "months), 50/call.\n"
+        "    - list_commits(full_name, cursor?) — all-time commits, 50/call. "
+        "Old structural commits ('first added auth middleware') still "
+        "matter.\n"
+        "    - get_pull_reviews(full_name, pull_number) — full review "
+        "thread for one PR.\n"
+        "    - get_repo(full_name) — repo metadata (description, topics).\n"
+        "  Audit (always before update_page / create_page):\n"
+        "    - wiki_raw_save(source_ref, wiki_type, slug, payload) — "
+        "store the raw API payload that drove the page edit. Lets a "
+        "future reader trace 'why does this page say X' back to the "
+        "exact PR/issue/commit. UNIQUE constraint dedups; safe to call "
+        "freely.\n"
+        "    - record_timeline(wiki_type, slug, entry_date, source_ref?, "
+        "summary, detail?) — append a chronological audit entry. Call "
+        "for every contributing event.\n"
+        "  Wiki write:\n"
+        "    - list_wiki_pages() — current index (titles + slugs).\n"
+        "    - read_page(wiki_type, slug) — full body of an existing or "
+        "staged page.\n"
+        "    - update_page / create_page — stage edits; committed at "
+        "done().\n"
+        "    - done() — commit and end the crawl.\n\n"
+        "**Cross-reference syntax** (the deterministic link extractor "
+        "indexes these):\n"
+        "  - `[[type:slug]]` — bare mention.\n"
+        "  - `[[type:slug|display]]` — with a display label.\n"
+        "  - `[[type:slug|verb|display]]` — with an explicit relation "
+        "verb.\n"
+        "  Frontmatter scalars / arrays of `type:slug` produce typed "
+        "links keyed by the field name (e.g. `owners: [person:maison]`).\n\n"
+        "**Per-source approach:**\n"
+        "  1. list_repos() once. Walk each repo in order.\n"
+        "  2. For each repo: list_pulls then list_issues then list_commits. "
+        "Stop calling each one when consecutive items stop changing the "
+        "wiki.\n"
+        "  3. For each substantive item (a decision, a runbook step, a "
+        "service introduction, a person you haven't seen before):\n"
+        "     - call get_pull_reviews if reviewer comments add signal.\n"
+        "     - call read_page if you suspect an existing page absorbs "
+        "this event.\n"
+        "     - call wiki_raw_save with the source_ref (e.g. "
+        "'pull:42', 'issue:18', 'commit:abc1234').\n"
+        "     - call update_page or create_page with the new body.\n"
+        "     - call record_timeline so the page has an audit trail.\n"
+        "  4. For noise (typo PRs, dependency bumps, dependabot, "
+        "wontfix issues, formatting commits): take no wiki action and "
+        "move on. Bootstrap has no skip_events tool — silently skipping "
+        "is the right move.\n\n"
+        "**Stopping rule:** if your last "
+        f"{quiet_streak} source items in a row produced no wiki change, "
+        "treat the source as drained and call done(). Don't churn through "
+        "millions of commits when the recent window is enough.\n\n"
+        "**Style:**\n"
+        "  - Distill, don't copy. A wiki page summarizes what the team "
+        "knows, not the full PR description.\n"
+        "  - Be conservative: most PRs / issues / commits do NOT change "
+        "a wiki page. Default to no-op.\n"
+        "  - Frontmatter is the link graph: put `owners`, "
+        "`contributors`, `related` arrays of `type:slug` references.\n"
+        "  - Cite sources at the bottom of every page (PR / issue URL).\n\n"
+        "Stay focused. Produce tool calls; no chat."
+    )

@@ -49,10 +49,10 @@ from services.synthesis.agent_tools import (
 )
 from services.synthesis.wiki_links import extract_links, persist_links_for_page
 from shared.constants import (
+    INDEXABLE_WIKI_DOC_TYPES,
     WIKI_AGENT_BATCH_SIZE,
     CompileTrigger,
     DocClass,
-    DocType,
     SourceSystem,
 )
 from shared.db import with_tenant
@@ -69,12 +69,7 @@ log = get_logger(__name__)
 _EVENT_BODY_PAGE_SIZE = 6000
 
 
-_INDEX_USER_DOC_TYPES: list[str] = [
-    DocType.WIKI_SERVICE_CARD.value,
-    DocType.WIKI_DECISION.value,
-    DocType.WIKI_FEATURE.value,
-    DocType.WIKI_RUNBOOK.value,
-]
+_INDEX_USER_DOC_TYPES: list[str] = [dt.value for dt in INDEXABLE_WIKI_DOC_TYPES]
 
 
 @dataclass(slots=True)

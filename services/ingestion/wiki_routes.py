@@ -63,10 +63,10 @@ from services.ingestion.wiki_links import parse_page_links
 from services.synthesis.bootstrap_orchestrator import open_bootstrap_runs
 from services.synthesis.crawlers import REGISTRY as BOOTSTRAP_CRAWLER_REGISTRY
 from shared.constants import (
+    INDEXABLE_WIKI_DOC_TYPES,
     WIKI_BOOTSTRAP_CHANNEL,
     WIKI_PENDING_CHANNEL,
     DocClass,
-    DocType,
     SourceSystem,
 )
 from shared.db import raw_conn, with_tenant
@@ -778,12 +778,7 @@ async def get_wiki_index(
             """,
             customer_id,
             SourceSystem.WIKI.value,
-            [
-                DocType.WIKI_SERVICE_CARD.value,
-                DocType.WIKI_DECISION.value,
-                DocType.WIKI_FEATURE.value,
-                DocType.WIKI_RUNBOOK.value,
-            ],
+            [dt.value for dt in INDEXABLE_WIKI_DOC_TYPES],
         )
 
     entries: list[WikiIndexEntry] = []
@@ -1312,7 +1307,7 @@ async def get_wiki_bootstrap_status(
             FROM wiki_synthesis_runs
             WHERE customer_id = $1
               AND kind = 'bootstrap'
-              AND started_at >= $2 - INTERVAL '60 seconds'
+              AND started_at >= $2::timestamptz - INTERVAL '60 seconds'
               AND started_at <= NOW()
             ORDER BY started_at ASC
             """,
