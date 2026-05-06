@@ -16,10 +16,10 @@ kill_timeout = "60s"
   # pending queue ordered by started_at. Sized against the 4 GB / 2
   # vCPU envelope: idle ~150 MB + ~150-250 MB per active crawler =>
   # ~1.5 GB peak crawler load + ~2.5 GB headroom.
-  BOOTSTRAP_PARALLELISM = "6"
+  BACKFILL_PARALLELISM = "6"
 
 [processes]
-  worker = "python -m services.synthesis.bootstrap_app"
+  worker = "python -m services.synthesis.backfill_app"
 
 [[restart]]
   policy      = "always"
@@ -41,11 +41,11 @@ kill_timeout = "60s"
     path         = "/health"
 
 # 4 x 4GB. Up from 2 now that the queue+claim worker model actually
-# scales horizontally — each machine drains pending bootstrap rows in
-# parallel via FOR UPDATE SKIP LOCKED, capped at BOOTSTRAP_PARALLELISM
+# scales horizontally — each machine drains pending backfill rows in
+# parallel via FOR UPDATE SKIP LOCKED, capped at BACKFILL_PARALLELISM
 # crawls per machine. 4 GB envelope holds ~6 concurrent crawlers
-# (~150-250 MB each) with ~2.5 GB headroom; if first real bootstrap
-# OOMs, drop BOOTSTRAP_PARALLELISM in [env] before bumping memory past
+# (~150-250 MB each) with ~2.5 GB headroom; if first real backfill
+# OOMs, drop BACKFILL_PARALLELISM in [env] before bumping memory past
 # Fly's shared-VM 4 GB cap.
 [[vm]]
   size      = "shared-cpu-2x"

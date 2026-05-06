@@ -1,10 +1,10 @@
-"""``GitHubCrawlerAgent`` — Lane D's first concrete BootstrapAgent.
+"""``GitHubCrawlerAgent`` — Lane D's first concrete BackfillAgent.
 
 Walks every accessible installation repo for the customer, reading
 PRs/issues/commits/reviews via ``GitHubAPIClient``, and emits wiki pages
 through the shared ``WikiAgentRuntime`` write tools (update_page /
 create_page / done). Recency-first: each repo's PRs/issues are bounded
-to ``WIKI_BOOTSTRAP_GITHUB_PRS_DAYS`` (12 months by default per the
+to ``WIKI_BACKFILL_GITHUB_PRS_DAYS`` (12 months by default per the
 locked plan), commits walk all-time so old structural commits ("first
 added auth middleware") still surface even when ticket history is
 bounded.
@@ -13,7 +13,7 @@ Architecture (see PR body for the (a)/(b) write-only-runtime decision):
 
     GitHubCrawlerAgent
       ├─ GitHubAPIClient         (token bucket + 429 ladder, Lane E)
-      ├─ BootstrapWikiRuntime    (queue-less subclass of WikiAgentRuntime)
+      ├─ BackfillWikiRuntime    (queue-less subclass of WikiAgentRuntime)
       └─ AgentLoop                (the v4 harness, reused verbatim)
 
 Tool dispatch routing (in ``_dispatch``):
@@ -24,8 +24,8 @@ Tool dispatch routing (in ``_dispatch``):
                                                   →  runtime.dispatch_tool
 
 Bookkeeping tools that the daily-replay agent uses (next_events,
-get_event_body, skip_events) are intentionally NOT in the bootstrap
-palette: there is no triaged-events queue to drain on bootstrap. The
+get_event_body, skip_events) are intentionally NOT in the backfill
+palette: there is no triaged-events queue to drain on backfill. The
 agent walks the live source via list_pulls / list_issues / list_commits
 and decides per-item whether to write a page or move on.
 """
@@ -54,8 +54,8 @@ from services.synthesis.api_clients.github import (
     GitHubRateLimitExhausted,
 )
 from services.synthesis.crawlers.base import (
-    BootstrapAgent,
-    BootstrapAgentResult,
+    BackfillAgent,
+    BackfillAgentResult,
     empty_result,
 )
 from services.synthesis.gemini_agent_client import GeminiAgentClient
@@ -63,9 +63,9 @@ from services.synthesis.models import WikiType
 from services.synthesis.prompts import build_github_crawler_system_prompt
 from services.synthesis.wiki_agent import WikiAgentRuntime
 from shared.constants import (
-    WIKI_BOOTSTRAP_GITHUB_PRS_DAYS,
-    WIKI_BOOTSTRAP_MODEL_GITHUB,
-    WIKI_BOOTSTRAP_QUIET_STREAK,
+    WIKI_BACKFILL_GITHUB_PRS_DAYS,
+    WIKI_BACKFILL_MODEL_GITHUB,
+    WIKI_BACKFILL_QUIET_STREAK,
 )
 from shared.db import with_tenant
 from shared.exceptions import AgentHaltError, ToolValidationError
@@ -180,7 +180,7 @@ def _list_pulls_tool() -> dict[str, Any]:
         "name": "list_pulls",
         "description": (
             "List pulls (PRs) for a repo, newest-updated first, bounded "
-            "to the last 12 months per the locked bootstrap plan. Returns "
+            "to the last 12 months per the locked backfill plan. Returns "
             "up to 50 PRs per call. Pass cursor from the previous result "
             "to continue; absent cursor restarts at the newest PR."
         ),
@@ -324,10 +324,10 @@ def _all_source_tools() -> list[dict[str, Any]]:
     ]
 
 
-def _bootstrap_wiki_tools() -> list[dict[str, Any]]:
-    """Subset of agent_tools.ALL_TOOLS that bootstrap exposes.
+def _backfill_wiki_tools() -> list[dict[str, Any]]:
+    """Subset of agent_tools.ALL_TOOLS that backfill exposes.
 
-    Bootstrap drops next_events / get_event_body / skip_events because
+    Backfill drops next_events / get_event_body / skip_events because
     there's no triaged queue to drain. The agent walks the source live.
     """
     return [
@@ -377,23 +377,23 @@ class _Cursor:
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap-mode wiki runtime (option (b) per the design discussion)
+# Backfill-mode wiki runtime (option (b) per the design discussion)
 # ---------------------------------------------------------------------------
 
 
-class BootstrapWikiRuntime(WikiAgentRuntime):
-    """Queue-less subclass of WikiAgentRuntime for bootstrap crawlers.
+class BackfillWikiRuntime(WikiAgentRuntime):
+    """Queue-less subclass of WikiAgentRuntime for backfill crawlers.
 
     Reuses the page-write machinery (``_persist_update`` / ``_persist_create``
     / link extraction / index regeneration / snapshot-restore) verbatim.
-    Strips the queue lifecycle: bootstrap never reads from
+    Strips the queue lifecycle: backfill never reads from
     wiki_synthesis_queue, so next_events / get_event_body / skip_events
     are unsupported and ``commit()`` skips the queue mark-done /
     mark-skipped steps. ``initial_manifest`` returns an empty payload so
     the AgentLoop's cache build still works.
 
     The agent still uses ``state_snapshot_for_summary``, ``wiki_index``,
-    and ``dispatch_tool`` — but only for the bootstrap-permitted tools.
+    and ``dispatch_tool`` — but only for the backfill-permitted tools.
     Calls to next_events / get_event_body / skip_events from a misbehaving
     LLM produce a typed ``ToolValidationError`` so the harness routes the
     error back as a tool result instead of crashing the loop.
@@ -403,11 +403,11 @@ class BootstrapWikiRuntime(WikiAgentRuntime):
 
     async def _dispatch_validated(self, name: str, validated: Any) -> dict[str, Any]:
         if name in self._BLOCKED_TOOLS:
-            raise ToolValidationError(f"tool {name!r} is not available in bootstrap mode")
+            raise ToolValidationError(f"tool {name!r} is not available in backfill mode")
         return await super()._dispatch_validated(name, validated)
 
     async def initial_manifest(self, count: int) -> dict[str, Any]:
-        # No queue rows in bootstrap. Return a minimal, well-shaped payload
+        # No queue rows in backfill. Return a minimal, well-shaped payload
         # so the AgentLoop's cache builder still works.
         return {"events": [], "remaining": 0, "drain_complete": True}
 
@@ -424,7 +424,7 @@ class BootstrapWikiRuntime(WikiAgentRuntime):
 
         Same per-page persist + link-extraction path as the parent runtime
         (so wiki_links rows show up exactly the same way), but skips the
-        queue mark-done / mark-skipped / regenerate-index steps. Bootstrap
+        queue mark-done / mark-skipped / regenerate-index steps. Backfill
         regenerates the index at the end of run() instead — the per-source
         crawler doesn't own the customer-wide index lifecycle.
         """
@@ -523,8 +523,8 @@ class _Counters:
     skipped_commit_shas: list[str] = field(default_factory=list)
 
 
-class GitHubCrawlerAgent(BootstrapAgent):
-    """Per-customer GitHub bootstrap crawler.
+class GitHubCrawlerAgent(BackfillAgent):
+    """Per-customer GitHub backfill crawler.
 
     Walks every accessible installation repo for the customer, reading
     PRs/issues/commits/reviews via ``GitHubAPIClient``, and emits wiki
@@ -537,7 +537,7 @@ class GitHubCrawlerAgent(BootstrapAgent):
     # Per locked plan #1: GitHub PRs/issues 12mo, commits all-time.
     # The single attr can't represent two windows; the run() implementation
     # applies the per-resource bounding (see _since_for_prs vs commits).
-    time_horizon_days: ClassVar[int | None] = WIKI_BOOTSTRAP_GITHUB_PRS_DAYS
+    time_horizon_days: ClassVar[int | None] = WIKI_BACKFILL_GITHUB_PRS_DAYS
 
     def __init__(
         self,
@@ -548,7 +548,7 @@ class GitHubCrawlerAgent(BootstrapAgent):
         http: Any,
         settings: Any,
         llm_client: Any | None = None,
-        runtime: BootstrapWikiRuntime | None = None,
+        runtime: BackfillWikiRuntime | None = None,
         client: GitHubAPIClient | None = None,
     ) -> None:
         super().__init__(
@@ -562,25 +562,25 @@ class GitHubCrawlerAgent(BootstrapAgent):
         # production code passes None and the run() path constructs the
         # production-flavored objects from the resolved bearer.
         self._llm_client = llm_client
-        self._runtime: BootstrapWikiRuntime | None = runtime
+        self._runtime: BackfillWikiRuntime | None = runtime
         self._client: GitHubAPIClient | None = client
         self._counters = _Counters()
         self._cached_repos: list[dict[str, Any]] | None = None
         # Per-repo cached resource lists. The synchronous list-then-yield
         # shape is OK because each repo's per_page=100 fits in one collection
-        # for the bootstrap volumes we see in practice.
+        # for the backfill volumes we see in practice.
         self._pulls_cache: dict[str, list[dict[str, Any]]] = {}
         self._issues_cache: dict[str, list[dict[str, Any]]] = {}
         self._commits_cache: dict[str, list[dict[str, Any]]] = {}
 
     # -----------------------------------------------------------------------
-    # BootstrapAgent surface
+    # BackfillAgent surface
     # -----------------------------------------------------------------------
 
     def system_prompt(self) -> str:
         return build_github_crawler_system_prompt(
             customer_id=self.customer_id,
-            quiet_streak=WIKI_BOOTSTRAP_QUIET_STREAK,
+            quiet_streak=WIKI_BACKFILL_QUIET_STREAK,
         )
 
     def source_api_tools(self) -> list[dict[str, Any]]:
@@ -596,7 +596,7 @@ class GitHubCrawlerAgent(BootstrapAgent):
             raise ToolValidationError(f"invalid args for {name}: {exc}") from exc
         return await self._dispatch_source_validated(name, validated)
 
-    async def run(self) -> BootstrapAgentResult:
+    async def run(self) -> BackfillAgentResult:
         started_at = datetime.now(UTC)
 
         # Resolve bearer. None -> auth not connected; return a clean result.
@@ -618,14 +618,14 @@ class GitHubCrawlerAgent(BootstrapAgent):
         if self._client is None:
             self._client = GitHubAPIClient(bearer=bearer, http=self._http)
         if self._runtime is None:
-            self._runtime = BootstrapWikiRuntime(
+            self._runtime = BackfillWikiRuntime(
                 self.customer_id,
                 agent_run_id=new_agent_run_id(),
                 run_id=self.run_id,
                 run_kind="bootstrap",
             )
         if self._llm_client is None:
-            self._llm_client = GeminiAgentClient(model=WIKI_BOOTSTRAP_MODEL_GITHUB)
+            self._llm_client = GeminiAgentClient(model=WIKI_BACKFILL_MODEL_GITHUB)
 
         # Wire the AgentLoop. Tools = source-API tools + write subset of the
         # daily-replay tool palette. Dispatch is routed in _dispatch.
@@ -633,8 +633,8 @@ class GitHubCrawlerAgent(BootstrapAgent):
             runtime=self._runtime,
             llm=self._llm_client,
             system_prompt=self.system_prompt(),
-            tool_schemas=self.source_api_tools() + _bootstrap_wiki_tools(),
-            model=WIKI_BOOTSTRAP_MODEL_GITHUB,
+            tool_schemas=self.source_api_tools() + _backfill_wiki_tools(),
+            model=WIKI_BACKFILL_MODEL_GITHUB,
         )
         # The AgentLoop dispatches via runtime.dispatch_tool. Wrap the
         # runtime so source tools route through self.dispatch_source_tool
@@ -698,7 +698,7 @@ class GitHubCrawlerAgent(BootstrapAgent):
             halt_reason = "rate_limited"
 
         finished_at = datetime.now(UTC)
-        return BootstrapAgentResult(
+        return BackfillAgentResult(
             source=self.source,
             customer_id=self.customer_id,
             run_id=self.run_id,
@@ -725,7 +725,7 @@ class GitHubCrawlerAgent(BootstrapAgent):
         return self._counters
 
     @property
-    def runtime(self) -> BootstrapWikiRuntime | None:
+    def runtime(self) -> BackfillWikiRuntime | None:
         return self._runtime
 
     # -----------------------------------------------------------------------
@@ -941,7 +941,7 @@ class GitHubCrawlerAgent(BootstrapAgent):
 
     def _since_for_prs(self) -> datetime:
         """Cutoff for PR + issue listing. Commits use no cutoff."""
-        return datetime.now(UTC) - timedelta(days=WIKI_BOOTSTRAP_GITHUB_PRS_DAYS)
+        return datetime.now(UTC) - timedelta(days=WIKI_BACKFILL_GITHUB_PRS_DAYS)
 
     # -----------------------------------------------------------------------
     # Shrinkers — drop fields the agent doesn't need so the tool result
@@ -1052,7 +1052,7 @@ class GitHubCrawlerAgent(BootstrapAgent):
         *,
         halt_reason: str | None = None,
         error: str | None = None,
-    ) -> BootstrapAgentResult:
+    ) -> BackfillAgentResult:
         result = empty_result(
             source=self.source,
             customer_id=self.customer_id,
@@ -1062,13 +1062,13 @@ class GitHubCrawlerAgent(BootstrapAgent):
         )
         # ``empty_result`` stamps started_at = finished_at = now(); reuse
         # the started_at the caller measured so the row's window matches
-        # the orchestrator's bootstrap.start log.
+        # the orchestrator's backfill.start log.
         return result.model_copy(
             update={"started_at": started_at, "finished_at": datetime.now(UTC)}
         )
 
 
 __all__ = [
-    "BootstrapWikiRuntime",
+    "BackfillWikiRuntime",
     "GitHubCrawlerAgent",
 ]

@@ -1,7 +1,7 @@
 """Reclaim stale bootstrap runs.
 
-Bootstrap runs (`wiki_synthesis_runs.kind='bootstrap'`) open with
-`status='pending'`, are claimed by a ``BootstrapWorker`` (flips to
+Backfill runs (`wiki_synthesis_runs.kind='bootstrap'`) open with
+`status='pending'`, are claimed by a ``BackfillWorker`` (flips to
 `running`), and the worker writes a terminal state on completion. If
 the worker's fly machine crashes mid-run (OOM, deploy mid-flight,
 infra blip), the row is orphaned in `running` indefinitely.
@@ -51,10 +51,10 @@ log = get_logger(__name__)
 
 
 # 6 hours — see module docstring for sizing rationale.
-BOOTSTRAP_RECLAIM_THRESHOLD_HOURS = 6
+BACKFILL_RECLAIM_THRESHOLD_HOURS = 6
 
 # 15 minutes — cleanup cadence, not heartbeat tracking.
-BOOTSTRAP_RECLAIM_INTERVAL_SECONDS = 15 * 60.0
+BACKFILL_RECLAIM_INTERVAL_SECONDS = 15 * 60.0
 
 
 # Marker appended to wiki_synthesis_runs.error so the audit trail
@@ -63,16 +63,16 @@ BOOTSTRAP_RECLAIM_INTERVAL_SECONDS = 15 * 60.0
 RECLAIM_ERROR_MARKER = "reclaimed: stale running row released for retry"
 
 
-async def reclaim_stale_bootstrap_runs(
+async def reclaim_stale_backfill_runs(
     *,
-    threshold_hours: int = BOOTSTRAP_RECLAIM_THRESHOLD_HOURS,
+    threshold_hours: int = BACKFILL_RECLAIM_THRESHOLD_HOURS,
 ) -> int:
     """One pass: flip stale `running` bootstrap rows back to `pending`.
 
     Returns the number of rows reclaimed. Idempotent — running a
     second time immediately after returns 0 because the WHERE
     clause filters on `status='running'`. Once a row is back at
-    `pending`, the BootstrapWorker on any machine claims it via
+    `pending`, the BackfillWorker on any machine claims it via
     ``FOR UPDATE SKIP LOCKED`` on the next tick.
 
     `finished_at` is intentionally NOT set — the row is being requeued,
@@ -103,7 +103,7 @@ async def reclaim_stale_bootstrap_runs(
         )
     if rows:
         log.warning(
-            "bootstrap_reclaim.stale_runs_requeued",
+            "backfill_reclaim.stale_runs_requeued",
             count=len(rows),
             run_ids=[r["run_id"] for r in rows],
             customers=sorted({r["customer_id"] for r in rows}),
@@ -111,7 +111,7 @@ async def reclaim_stale_bootstrap_runs(
     return len(rows)
 
 
-class BootstrapReclaimLoop:
+class BackfillReclaimLoop:
     """Periodically reclaim stale bootstrap runs.
 
     Mirrors `WikiReclaimLoop` — asyncio.Event for shutdown,
@@ -122,8 +122,8 @@ class BootstrapReclaimLoop:
     def __init__(
         self,
         *,
-        threshold_hours: int = BOOTSTRAP_RECLAIM_THRESHOLD_HOURS,
-        interval_seconds: float = BOOTSTRAP_RECLAIM_INTERVAL_SECONDS,
+        threshold_hours: int = BACKFILL_RECLAIM_THRESHOLD_HOURS,
+        interval_seconds: float = BACKFILL_RECLAIM_INTERVAL_SECONDS,
     ) -> None:
         self._threshold_hours = threshold_hours
         self._interval = interval_seconds
@@ -131,27 +131,27 @@ class BootstrapReclaimLoop:
 
     async def run(self) -> None:
         log.info(
-            "bootstrap_reclaim_loop.start",
+            "backfill_reclaim_loop.start",
             threshold_hours=self._threshold_hours,
             interval_seconds=self._interval,
         )
         # Brief initial delay so the loop doesn't fire mid-boot
-        # before the bootstrap orchestrator has had a chance to
+        # before the backfill worker has had a chance to
         # open its first run row.
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(self._shutdown.wait(), timeout=self._interval)
         while not self._shutdown.is_set():
             try:
-                await reclaim_stale_bootstrap_runs(
+                await reclaim_stale_backfill_runs(
                     threshold_hours=self._threshold_hours,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover — keep loop alive
-                log.exception("bootstrap_reclaim_loop.tick_failed")
+                log.exception("backfill_reclaim_loop.tick_failed")
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._shutdown.wait(), timeout=self._interval)
-        log.info("bootstrap_reclaim_loop.stop")
+        log.info("backfill_reclaim_loop.stop")
 
     def shutdown(self) -> None:
         self._shutdown.set()

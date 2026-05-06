@@ -397,7 +397,7 @@ def _stub_bootstrap_registry(monkeypatch) -> None:
 
     monkeypatch.setattr(
         _wr,
-        "BOOTSTRAP_CRAWLER_REGISTRY",
+        "BACKFILL_CRAWLER_REGISTRY",
         {"github": object, "slack": object},
         raising=False,
     )
@@ -408,7 +408,7 @@ async def test_bootstrap_trigger_fires_pg_notify(
     client: httpx.AsyncClient, _stub_bootstrap_registry: None
 ) -> None:
     """POSTing the trigger fires payload-less pg_notify on
-    WIKI_BOOTSTRAP_CHANNEL and inserts pending rows the worker will
+    WIKI_BACKFILL_CHANNEL and inserts pending rows the worker will
     claim. Body is now empty payload (workers claim via FOR UPDATE
     SKIP LOCKED), so the listener no longer routes per-payload."""
     import asyncio
@@ -416,7 +416,7 @@ async def test_bootstrap_trigger_fires_pg_notify(
     import asyncpg
 
     from shared.config import get_settings as _get_settings
-    from shared.constants import WIKI_BOOTSTRAP_CHANNEL
+    from shared.constants import WIKI_BACKFILL_CHANNEL
 
     notifications: list[str] = []
     listen_dsn = _get_settings().database_url
@@ -426,7 +426,7 @@ async def test_bootstrap_trigger_fires_pg_notify(
         notifications.append(payload)
 
     try:
-        await listener_conn.add_listener(WIKI_BOOTSTRAP_CHANNEL, _on_notify)
+        await listener_conn.add_listener(WIKI_BACKFILL_CHANNEL, _on_notify)
 
         resp = await client.post(
             "/api/wiki/bootstrap/trigger",
@@ -565,7 +565,7 @@ async def test_bootstrap_trigger_force_proceeds_after_drain_timeout(
     Drain timeout patched down so the test runs fast."""
     from services.ingestion import wiki_routes as _wr
 
-    monkeypatch.setattr(_wr, "BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(_wr, "BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
 
     async with raw_conn() as conn:
         old_id = int(
@@ -609,7 +609,7 @@ async def test_bootstrap_trigger_force_fires_cancel_notify(
     _stub_bootstrap_registry: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``?force=true`` fires pg_notify on WIKI_BOOTSTRAP_CANCEL_CHANNEL
+    """``?force=true`` fires pg_notify on WIKI_BACKFILL_CANCEL_CHANNEL
     with a JSON payload carrying customer_id + cancelled run_ids so
     workers can cancel matching tasks."""
     import asyncio
@@ -618,9 +618,9 @@ async def test_bootstrap_trigger_force_fires_cancel_notify(
 
     from services.ingestion import wiki_routes as _wr
     from shared.config import get_settings as _get_settings
-    from shared.constants import WIKI_BOOTSTRAP_CANCEL_CHANNEL
+    from shared.constants import WIKI_BACKFILL_CANCEL_CHANNEL
 
-    monkeypatch.setattr(_wr, "BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(_wr, "BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
 
     listen_dsn = _get_settings().database_url
     listener_conn = await asyncpg.connect(listen_dsn)
@@ -630,9 +630,7 @@ async def test_bootstrap_trigger_force_fires_cancel_notify(
         cancel_payloads.append(payload)
 
     try:
-        await listener_conn.add_listener(
-            WIKI_BOOTSTRAP_CANCEL_CHANNEL, _on_cancel
-        )
+        await listener_conn.add_listener(WIKI_BACKFILL_CANCEL_CHANNEL, _on_cancel)
 
         async with raw_conn() as conn:
             old_id = int(

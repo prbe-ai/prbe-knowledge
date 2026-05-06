@@ -285,7 +285,7 @@ def compactor_system_prompt() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap crawler — GitHub
+# Backfill crawler — GitHub
 # ---------------------------------------------------------------------------
 
 
@@ -294,7 +294,7 @@ def build_github_crawler_system_prompt(
     customer_id: str,
     quiet_streak: int = 50,
 ) -> str:
-    """System prompt for the GitHub bootstrap crawler (Lane D).
+    """System prompt for the GitHub backfill crawler (Lane D).
 
     Source-specialized: explains the GitHub-specific tools, the page-type
     palette the agent should pick from, the recency-first stopping rule,
@@ -302,7 +302,7 @@ def build_github_crawler_system_prompt(
     """
     return (
         "You are reading every accessible GitHub PR, issue, commit, and "
-        f"review for customer {customer_id}, newest first, to bootstrap "
+        f"review for customer {customer_id}, newest first, to backfill "
         "their engineering wiki from history. The wiki has 10 page types "
         "and you should pick deliberately:\n\n"
         "  - service_card: 'what is service X' — purpose, owners, recent "
@@ -376,7 +376,7 @@ def build_github_crawler_system_prompt(
         "     - call record_timeline so the page has an audit trail.\n"
         "  4. For noise (typo PRs, dependency bumps, dependabot, "
         "wontfix issues, formatting commits): take no wiki action and "
-        "move on. Bootstrap has no skip_events tool — silently skipping "
+        "move on. Backfill has no skip_events tool — silently skipping "
         "is the right move.\n\n"
         "**Stopping rule:** if your last "
         f"{quiet_streak} source items in a row produced no wiki change, "

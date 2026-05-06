@@ -1,7 +1,7 @@
-"""Tests for ``BootstrapWorker`` — the bootstrap fly app's queue-claim worker.
+"""Tests for ``BackfillWorker`` — the bootstrap fly app's queue-claim worker.
 
-The worker LISTENs on ``WIKI_BOOTSTRAP_CHANNEL`` (wake hint) +
-``WIKI_BOOTSTRAP_CANCEL_CHANNEL`` (force-cancel), claims pending
+The worker LISTENs on ``WIKI_BACKFILL_CHANNEL`` (wake hint) +
+``WIKI_BACKFILL_CANCEL_CHANNEL`` (force-cancel), claims pending
 ``wiki_synthesis_runs`` rows via ``FOR UPDATE SKIP LOCKED``, runs each
 (customer, source) crawl under a per-pair advisory lock + per-machine
 semaphore, and writes the terminal status.
@@ -26,16 +26,16 @@ import orjson
 import pytest
 import pytest_asyncio
 
-from services.synthesis.bootstrap_app import (
-    BootstrapWorker,
-    _bootstrap_run_lock_key,
+from services.synthesis.backfill_app import (
+    BackfillWorker,
+    _backfill_run_lock_key,
 )
 from services.synthesis.crawlers.base import (
-    BootstrapAgent,
-    BootstrapAgentResult,
+    BackfillAgent,
+    BackfillAgentResult,
 )
 from shared.config import Settings, get_settings
-from shared.constants import WIKI_BOOTSTRAP_CANCEL_CHANNEL
+from shared.constants import WIKI_BACKFILL_CANCEL_CHANNEL
 from shared.db import raw_conn
 
 CUSTOMER = "bootstrap-app-test-cust"
@@ -70,12 +70,12 @@ def _settings() -> Settings:
 
 
 # ---------------------------------------------------------------------------
-# Mock crawler — small BootstrapAgent stub the worker can drive.
+# Mock crawler — small BackfillAgent stub the worker can drive.
 # ---------------------------------------------------------------------------
 
 
-class _MockCrawler(BootstrapAgent):
-    """Plain BootstrapAgent that returns a configurable result."""
+class _MockCrawler(BackfillAgent):
+    """Plain BackfillAgent that returns a configurable result."""
 
     sleep_seconds: float = 0.0
     pages_created_value: int = 0
@@ -92,13 +92,13 @@ class _MockCrawler(BootstrapAgent):
     async def dispatch_source_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         return {}
 
-    async def run(self) -> BootstrapAgentResult:
+    async def run(self) -> BackfillAgentResult:
         started = datetime.now(UTC)
         if self.sleep_seconds:
             await asyncio.sleep(self.sleep_seconds)
         if self.raise_on_run is not None:
             raise self.raise_on_run
-        return BootstrapAgentResult(
+        return BackfillAgentResult(
             source=self.source,
             customer_id=self.customer_id,
             run_id=self.run_id,
@@ -119,7 +119,7 @@ def _make_factory(
     halt_reason: str | None = None,
     raise_on_run: BaseException | None = None,
 ):
-    def factory(**kwargs: Any) -> BootstrapAgent:
+    def factory(**kwargs: Any) -> BackfillAgent:
         cls = type(
             f"_Mock_{source}",
             (_MockCrawler,),
@@ -158,9 +158,9 @@ def _build_worker(
     parallelism: int = 6,
     crawler_factories: dict[str, Any] | None = None,
     http: httpx.AsyncClient,
-) -> BootstrapWorker:
+) -> BackfillWorker:
     settings = _settings()
-    return BootstrapWorker(
+    return BackfillWorker(
         dsn=settings.database_url,
         http=http,
         settings=settings,
@@ -178,7 +178,7 @@ def _build_worker(
 async def test_worker_claim_skip_locked_no_overlap(
     seeded_customer: None, http_client: httpx.AsyncClient
 ) -> None:
-    """Two BootstrapWorker instances racing on 5 pending rows: each claim
+    """Two BackfillWorker instances racing on 5 pending rows: each claim
     returns a distinct row, total claimed = 5, no double-claim."""
     seeded_ids = [await _seed_pending(source=f"src{i}") for i in range(5)]
 
@@ -188,7 +188,7 @@ async def test_worker_claim_skip_locked_no_overlap(
     claims_a: list[Any] = []
     claims_b: list[Any] = []
 
-    async def drain(worker: BootstrapWorker, sink: list[Any]) -> None:
+    async def drain(worker: BackfillWorker, sink: list[Any]) -> None:
         while True:
             claim = await worker._claim_one()
             if claim is None:
@@ -212,10 +212,10 @@ async def test_per_run_advisory_lock_skips_concurrent(
     seeded_customer: None, http_client: httpx.AsyncClient
 ) -> None:
     """Pre-acquire the per-(customer, source) lock from another conn;
-    BootstrapWorker._run_one bails without invoking the agent."""
+    BackfillWorker._run_one bails without invoking the agent."""
     invoked: list[int] = []
 
-    def factory(**kwargs: Any) -> BootstrapAgent:
+    def factory(**kwargs: Any) -> BackfillAgent:
         cls = type(
             "_Spy",
             (_MockCrawler,),
@@ -231,7 +231,7 @@ async def test_per_run_advisory_lock_skips_concurrent(
         agent = cls(**kwargs)
         original_run = agent.run
 
-        async def tracked_run() -> BootstrapAgentResult:
+        async def tracked_run() -> BackfillAgentResult:
             invoked.append(1)
             return await original_run()
 
@@ -245,11 +245,9 @@ async def test_per_run_advisory_lock_skips_concurrent(
     )
 
     # Hold the per-run lock from a separate conn.
-    lock_key = _bootstrap_run_lock_key(CUSTOMER, "spy")
+    lock_key = _backfill_run_lock_key(CUSTOMER, "spy")
     async with raw_conn() as held_conn, held_conn.transaction():
-        acquired = await held_conn.fetchval(
-            "SELECT pg_try_advisory_xact_lock($1)", lock_key
-        )
+        acquired = await held_conn.fetchval("SELECT pg_try_advisory_xact_lock($1)", lock_key)
         assert acquired is True
 
         # Manually claim the row first (mirrors what run() does after
@@ -288,9 +286,7 @@ async def test_zero_page_halt_marks_failed(
     worker = _build_worker(
         http=http_client,
         crawler_factories={
-            "auth_missing": _make_factory(
-                source="auth_missing", halt_reason="auth.missing"
-            )
+            "auth_missing": _make_factory(source="auth_missing", halt_reason="auth.missing")
         },
     )
     claim = await worker._claim_one()
@@ -349,9 +345,7 @@ async def test_clean_run_marks_complete(
     worker = _build_worker(
         http=http_client,
         crawler_factories={
-            "winner": _make_factory(
-                source="winner", pages_created=3, pages_updated=2
-            )
+            "winner": _make_factory(source="winner", pages_created=3, pages_updated=2)
         },
     )
     claim = await worker._claim_one()
@@ -388,7 +382,7 @@ async def test_run_one_propagates_cancelled_error_and_marks_row(
     class _LongCrawler(_MockCrawler):
         source = "long_runner"
 
-        async def run(self) -> BootstrapAgentResult:
+        async def run(self) -> BackfillAgentResult:
             started.set()
             await asyncio.sleep(60)  # cancel arrives long before this returns
             return await super().run()
@@ -432,7 +426,7 @@ async def test_handle_cancel_payload_cancels_matching_in_flight_task(
     class _A(_MockCrawler):
         source = "a"
 
-        async def run(self) -> BootstrapAgentResult:
+        async def run(self) -> BackfillAgentResult:
             started_a.set()
             await asyncio.sleep(60)
             return await super().run()
@@ -440,7 +434,7 @@ async def test_handle_cancel_payload_cancels_matching_in_flight_task(
     class _B(_MockCrawler):
         source = "b"
 
-        async def run(self) -> BootstrapAgentResult:
+        async def run(self) -> BackfillAgentResult:
             started_b.set()
             await asyncio.sleep(60)
             return await super().run()
@@ -467,9 +461,7 @@ async def test_handle_cancel_payload_cancels_matching_in_flight_task(
         await asyncio.wait_for(started_a.wait(), timeout=2.0)
         await asyncio.wait_for(started_b.wait(), timeout=2.0)
 
-        payload = orjson.dumps(
-            {"customer_id": CUSTOMER, "run_ids": [run_id_a]}
-        ).decode("utf-8")
+        payload = orjson.dumps({"customer_id": CUSTOMER, "run_ids": [run_id_a]}).decode("utf-8")
         await worker._handle_cancel_payload(payload)
 
         # task_a was cancelled; task_b is still running.
@@ -490,9 +482,7 @@ async def test_handle_cancel_payload_unknown_run_id_is_noop(
     """A cancel referencing an unknown run_id silently no-ops; doesn't
     crash the cancel processor."""
     worker = _build_worker(http=http_client)
-    payload = orjson.dumps(
-        {"customer_id": CUSTOMER, "run_ids": [99_999_999]}
-    ).decode("utf-8")
+    payload = orjson.dumps({"customer_id": CUSTOMER, "run_ids": [99_999_999]}).decode("utf-8")
     await worker._handle_cancel_payload(payload)  # must not raise
 
 
@@ -513,7 +503,7 @@ async def test_handle_cancel_payload_unparseable_is_noop(
 async def test_worker_cancel_notify_cancels_task(
     seeded_customer: None, http_client: httpx.AsyncClient
 ) -> None:
-    """Send a real NOTIFY on WIKI_BOOTSTRAP_CANCEL_CHANNEL with a run_id
+    """Send a real NOTIFY on WIKI_BACKFILL_CANCEL_CHANNEL with a run_id
     matching an in-flight task; the worker's cancel listener picks it
     up, the processor cancels the task, and the row is marked
     'cancelled' within ~2s."""
@@ -525,7 +515,7 @@ async def test_worker_cancel_notify_cancels_task(
     class _LongCrawler(_MockCrawler):
         source = "long"
 
-        async def run(self) -> BootstrapAgentResult:
+        async def run(self) -> BackfillAgentResult:
             started.set()
             await asyncio.sleep(60)
             return await super().run()
@@ -544,12 +534,10 @@ async def test_worker_cancel_notify_cancels_task(
         # Fire the cancel NOTIFY.
         notify_conn = await asyncpg.connect(settings.database_url)
         try:
-            payload = orjson.dumps(
-                {"customer_id": CUSTOMER, "run_ids": [run_id]}
-            ).decode("utf-8")
+            payload = orjson.dumps({"customer_id": CUSTOMER, "run_ids": [run_id]}).decode("utf-8")
             await notify_conn.execute(
                 "SELECT pg_notify($1, $2)",
-                WIKI_BOOTSTRAP_CANCEL_CHANNEL,
+                WIKI_BACKFILL_CANCEL_CHANNEL,
                 payload,
             )
         finally:
@@ -583,13 +571,13 @@ async def test_worker_cancel_notify_cancels_task(
 
 def test_lock_keys_distinct_per_salt_and_parts() -> None:
     """A regression that the three salts the codebase uses
-    (bootstrap-trigger, bootstrap-run, page) yield different lock keys
+    (backfill-trigger, backfill-run, page) yield different lock keys
     for the same customer/source so trigger lock + worker lock + page
     lock can't accidentally serialize on the same value."""
     from shared.locks import advisory_lock_key
 
-    a = advisory_lock_key("bootstrap-trigger", "c1")
-    b = advisory_lock_key("bootstrap-run", "c1", "github")
+    a = advisory_lock_key("backfill-trigger", "c1")
+    b = advisory_lock_key("backfill-run", "c1", "github")
     c = advisory_lock_key("page", "c1", "team:engineering")
     assert a != b != c
     assert a != c
@@ -616,7 +604,7 @@ async def test_worker_semaphore_cap_respected_under_concurrent_spawn(
     class _Holder(_MockCrawler):
         source = "capped"  # overwritten below
 
-        async def run(self) -> BootstrapAgentResult:
+        async def run(self) -> BackfillAgentResult:
             # Find the matching event by source's trailing index.
             try:
                 idx = int(self.source.removeprefix("capped"))
@@ -625,7 +613,7 @@ async def test_worker_semaphore_cap_respected_under_concurrent_spawn(
             if 0 <= idx < len(started_events):
                 started_events[idx].set()
             await release_event.wait()
-            return BootstrapAgentResult(
+            return BackfillAgentResult(
                 source=self.source,
                 customer_id=self.customer_id,
                 run_id=self.run_id,
@@ -636,11 +624,9 @@ async def test_worker_semaphore_cap_respected_under_concurrent_spawn(
     factories: dict[str, Any] = {}
     for i in range(6):
         s = f"capped{i}"
-        factories[s] = (
-            lambda src=s, **kwargs: type(  # type: ignore[misc]
-                f"_H_{src}", (_Holder,), {"source": src}
-            )(**kwargs)
-        )
+        factories[s] = lambda src=s, **kwargs: type(  # type: ignore[misc]
+            f"_H_{src}", (_Holder,), {"source": src}
+        )(**kwargs)
 
     worker = _build_worker(
         http=http_client,
@@ -691,9 +677,9 @@ async def test_worker_shutdown_drains_in_flight(
     class _PausingCrawler(_MockCrawler):
         source = "drain"
 
-        async def run(self) -> BootstrapAgentResult:
+        async def run(self) -> BackfillAgentResult:
             await proceed.wait()
-            return BootstrapAgentResult(
+            return BackfillAgentResult(
                 source=self.source,
                 customer_id=self.customer_id,
                 run_id=self.run_id,
@@ -704,11 +690,9 @@ async def test_worker_shutdown_drains_in_flight(
     factories: dict[str, Any] = {}
     for i in range(3):
         s = f"draining{i}"
-        factories[s] = (
-            lambda src=s, **kwargs: type(  # type: ignore[misc]
-                f"_P_{src}", (_PausingCrawler,), {"source": src}
-            )(**kwargs)
-        )
+        factories[s] = lambda src=s, **kwargs: type(  # type: ignore[misc]
+            f"_P_{src}", (_PausingCrawler,), {"source": src}
+        )(**kwargs)
 
     worker = _build_worker(
         http=http_client,

@@ -11,7 +11,7 @@ Covers:
   only targets bootstrap kind because daily replays use the queue's
   own heartbeat-based reclaim.
 - Reclaim returns the row count (idempotency check on second pass).
-- BootstrapReclaimLoop swallows exceptions in the inner tick so a
+- BackfillReclaimLoop swallows exceptions in the inner tick so a
   transient DB blip doesn't kill the whole loop.
 """
 
@@ -24,10 +24,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 
-from services.synthesis import bootstrap_reclaim
-from services.synthesis.bootstrap_reclaim import (
-    BootstrapReclaimLoop,
-    reclaim_stale_bootstrap_runs,
+from services.synthesis import backfill_reclaim
+from services.synthesis.backfill_reclaim import (
+    BackfillReclaimLoop,
+    reclaim_stale_backfill_runs,
 )
 from shared.config import Settings
 from shared.db import raw_conn
@@ -96,7 +96,7 @@ async def test_reclaim_flips_stale_running_to_pending(reset_db: None) -> None:
         source="github",
         started_age_hours=7.0,  # 1h past 6h threshold
     )
-    reclaimed = await reclaim_stale_bootstrap_runs()
+    reclaimed = await reclaim_stale_backfill_runs()
     assert reclaimed == 1
 
     async with raw_conn() as conn:
@@ -122,7 +122,7 @@ async def test_reclaim_preserves_existing_error_text(reset_db: None) -> None:
         started_age_hours=7.0,
         error="rate limit hit on commit page 42",
     )
-    reclaimed = await reclaim_stale_bootstrap_runs()
+    reclaimed = await reclaim_stale_backfill_runs()
     assert reclaimed == 1
 
     async with raw_conn() as conn:
@@ -145,7 +145,7 @@ async def test_reclaim_leaves_fresh_running_alone(reset_db: None) -> None:
         source="github",
         started_age_hours=0.5,  # 30 min
     )
-    reclaimed = await reclaim_stale_bootstrap_runs()
+    reclaimed = await reclaim_stale_backfill_runs()
     assert reclaimed == 0
 
     async with raw_conn() as conn:
@@ -200,7 +200,7 @@ async def test_reclaim_leaves_terminal_states_alone(reset_db: None) -> None:
         started_age_hours=8.0,
     )
 
-    reclaimed = await reclaim_stale_bootstrap_runs()
+    reclaimed = await reclaim_stale_backfill_runs()
     assert reclaimed == 0
 
     async with raw_conn() as conn:
@@ -244,7 +244,7 @@ async def test_reclaim_only_targets_bootstrap_kind(reset_db: None) -> None:
         started_age_hours=7.0,
     )
 
-    reclaimed = await reclaim_stale_bootstrap_runs()
+    reclaimed = await reclaim_stale_backfill_runs()
     assert reclaimed == 1
 
     async with raw_conn() as conn:
@@ -273,7 +273,7 @@ async def test_reclaim_does_not_touch_v4_runs(reset_db: None) -> None:
         source=None,
         started_age_hours=12.0,
     )
-    reclaimed = await reclaim_stale_bootstrap_runs()
+    reclaimed = await reclaim_stale_backfill_runs()
     assert reclaimed == 0
     async with raw_conn() as conn:
         status = await conn.fetchval(
@@ -296,10 +296,10 @@ async def test_reclaim_returns_count_and_is_idempotent(reset_db: None) -> None:
             started_age_hours=7.0,
         )
 
-    first = await reclaim_stale_bootstrap_runs()
+    first = await reclaim_stale_backfill_runs()
     assert first == 3
 
-    second = await reclaim_stale_bootstrap_runs()
+    second = await reclaim_stale_backfill_runs()
     assert second == 0
 
 
@@ -307,7 +307,7 @@ async def test_reclaim_returns_count_and_is_idempotent(reset_db: None) -> None:
 async def test_reclaim_loop_swallows_exceptions(monkeypatch: pytest.MonkeyPatch) -> None:
     """The loop's inner tick must catch and log exceptions so a
     transient DB blip doesn't kill the whole reclaim task. We patch
-    `reclaim_stale_bootstrap_runs` to raise on the first call and
+    `reclaim_stale_backfill_runs` to raise on the first call and
     succeed on the second, then assert both calls were attempted
     and no exception propagated out of the loop.
 
@@ -327,15 +327,15 @@ async def test_reclaim_loop_swallows_exceptions(monkeypatch: pytest.MonkeyPatch)
         return 0
 
     monkeypatch.setattr(
-        bootstrap_reclaim,
-        "reclaim_stale_bootstrap_runs",
+        backfill_reclaim,
+        "reclaim_stale_backfill_runs",
         flaky_reclaim,
     )
 
     # interval_seconds=0 → wait_for(timeout=0) raises TimeoutError on
     # every iteration without sleeping, so the loop spins as fast as
     # asyncio's event loop will let it.
-    loop = BootstrapReclaimLoop(threshold_hours=6, interval_seconds=0)
+    loop = BackfillReclaimLoop(threshold_hours=6, interval_seconds=0)
     task = _asyncio.create_task(loop.run())
 
     # Yield until the loop has called flaky_reclaim at least twice

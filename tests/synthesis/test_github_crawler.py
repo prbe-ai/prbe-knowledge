@@ -22,7 +22,7 @@ from services.synthesis.api_clients.github import (
     GitHubRateLimitExhausted,
 )
 from services.synthesis.crawlers.github import (
-    BootstrapWikiRuntime,
+    BackfillWikiRuntime,
     GitHubCrawlerAgent,
     _Cursor,
 )
@@ -43,7 +43,7 @@ def _make_agent(
     http_client: httpx.AsyncClient,
     *,
     bearer: str | None = "ghs_x",
-    runtime: BootstrapWikiRuntime | None = None,
+    runtime: BackfillWikiRuntime | None = None,
     client: GitHubAPIClient | None = None,
     llm_client: Any | None = None,
 ) -> GitHubCrawlerAgent:
@@ -64,7 +64,7 @@ def _make_agent(
     )
 
 
-class _NoopRuntime(BootstrapWikiRuntime):
+class _NoopRuntime(BackfillWikiRuntime):
     """Bootstrap runtime initialized without a Normalizer / store / DB.
 
     Mirrors the eval harness's in-memory runtime: bypass __init__, set
