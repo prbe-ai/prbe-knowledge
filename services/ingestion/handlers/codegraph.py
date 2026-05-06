@@ -349,9 +349,11 @@ class CodeGraphConnector(Connector):
                     repo,
                 )
                 # Close graph_node_provenance for code_graph on the affected
-                # nodes. The existing per-source disconnect path soft-deletes
-                # nodes whose last provenance source disappears; we mirror
-                # that semantic here at the per-repo grain.
+                # nodes. Anchor on graph_nodes.canonical_id (which we wrote
+                # as `<repo>:<qname>` or `<repo>:<file_path>`); a substring
+                # match against `qualified_name` would tombstone unrelated
+                # nodes when one repo's name is a prefix/substring of
+                # another's (acme/app vs acme/app-staging).
                 await conn.execute(
                     """
                     UPDATE graph_node_provenance gnp
@@ -360,11 +362,11 @@ class CodeGraphConnector(Connector):
                     WHERE gnp.node_id = n.node_id
                       AND gnp.customer_id = $1
                       AND gnp.source_system = $2
-                      AND n.properties->>'qualified_name' LIKE $3
+                      AND n.canonical_id LIKE $3
                     """,
                     event.customer_id,
                     SourceSystem.CODE_GRAPH.value,
-                    f"%{repo}%",
+                    f"{repo}:%",
                 )
 
         log.info(
@@ -372,11 +374,14 @@ class CodeGraphConnector(Connector):
             customer=event.customer_id,
             repos=len(repos),
         )
-        # Empty result — all writes already happened. is_empty() on our
-        # response would raise NormalizationError, so we synthesize a
-        # single CodeRepoStateUpdate-shaped breadcrumb that becomes a
-        # no-op insert (no rows match the prefix).
-        return NormalizationResult()
+        # All writes happened above via raw SQL — return a result the
+        # normalizer will treat as a deliberate no-op. is_empty + a
+        # skipped_reason short-circuits to DuplicateEventIgnored at
+        # normalizer.py, which marks the queue row completed instead of
+        # raising NormalizationError.
+        return NormalizationResult(
+            skipped_reason="code_graph.disconnect.bulk_applied",
+        )
 
 
 def _recompute_event_id(payload: Mapping[str, Any]) -> str:
