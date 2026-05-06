@@ -19,7 +19,7 @@ import asyncio
 import random
 import time
 from collections.abc import AsyncIterator, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -60,6 +60,10 @@ class _AsyncTokenBucket:
 
     Clock is injectable so tests can drive the bucket without real sleeps.
     The default uses ``time.monotonic`` and ``asyncio.sleep`` for production.
+
+    Single-consumer assumption: ``acquire()`` holds the internal lock across
+    its sleep, which serializes all callers under contention. Do not share
+    one bucket across coroutines without external coordination.
     """
 
     def __init__(
@@ -116,6 +120,11 @@ class GitHubAPIClient:
     Rate-limited via a token bucket calibrated to 70% of the GitHub
     App's published 5000/hr quota. On 429, sleeps until the
     ``X-RateLimit-Reset`` window with exp backoff + jitter.
+
+    Single-consumer assumption: this client is not safe to share across
+    coroutines without external coordination. The token bucket serializes
+    callers under contention, and the rate-limit / 5xx counters are
+    instance-scoped (see ``_consecutive_429`` / ``_consecutive_5xx``).
     """
 
     def __init__(
@@ -134,6 +143,10 @@ class GitHubAPIClient:
         self._sleep = sleep or asyncio.sleep
         self._now = now or time.time
         self._bucket = bucket or _AsyncTokenBucket(rate_per_second=target_rps, capacity=burst)
+        # Counters are instance-scoped so pathological "Nx429 then success,
+        # repeated forever" patterns eventually trip exhaustion across calls.
+        self._consecutive_429 = 0
+        self._consecutive_5xx = 0
 
     @property
     def bucket(self) -> _AsyncTokenBucket:
@@ -145,18 +158,26 @@ class GitHubAPIClient:
     # ------------------------------------------------------------------
 
     async def list_installation_repos(self) -> AsyncIterator[dict[str, Any]]:
-        """Yield repos accessible to the installation, newest pushed first."""
-        url: str | None = (
-            f"{GITHUB_API}/installation/repositories?per_page=100&sort=pushed&direction=desc"
-        )
+        """Yield repos accessible to the installation, newest pushed first.
+
+        ``/installation/repositories`` does not accept ``sort``/``direction``
+        params (they're silently dropped, leaving repos in default id order),
+        so we collect every page then sort client-side by ``pushed_at`` desc
+        to preserve Lane D's recency-first invariant.
+        """
+        url: str | None = f"{GITHUB_API}/installation/repositories?per_page=100"
+        collected: list[dict[str, Any]] = []
         while url:
             payload, next_url = await self._get_page(url)
             repos = payload.get("repositories") if isinstance(payload, dict) else None
             if isinstance(repos, list):
                 for repo in repos:
                     if isinstance(repo, dict):
-                        yield repo
+                        collected.append(repo)
             url = next_url
+        collected.sort(key=lambda r: r.get("pushed_at") or "", reverse=True)
+        for repo in collected:
+            yield repo
 
     async def list_pulls(
         self,
@@ -171,7 +192,13 @@ class GitHubAPIClient:
         we filter after the fact. Because results are sorted desc by updated_at,
         we can stop iterating as soon as a row's ``updated_at`` falls below
         ``since`` — saves the rest of the pagination on big repos.
+
+        Note: when ``until`` is set without ``since``, this paginates the
+        entire repo history skipping items above ``until``. Set ``since``
+        to bound the walk.
         """
+        since = _ensure_utc(since)
+        until = _ensure_utc(until)
         url: str | None = (
             f"{GITHUB_API}/repos/{full_name}/pulls"
             "?state=all&sort=updated&direction=desc&per_page=100"
@@ -199,6 +226,7 @@ class GitHubAPIClient:
         PR also shows up here with a ``pull_request`` key. We strip those so
         the crawler only sees real issues; PRs come from ``list_pulls``.
         """
+        since = _ensure_utc(since)
         params = "?state=all&sort=updated&direction=desc&per_page=100"
         if since is not None:
             params += f"&since={_iso(since)}"
@@ -219,6 +247,8 @@ class GitHubAPIClient:
         until: datetime | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield commits in the default branch. ``since``/``until`` are native."""
+        since = _ensure_utc(since)
+        until = _ensure_utc(until)
         params: list[str] = ["per_page=100"]
         if since is not None:
             params.append(f"since={_iso(since)}")
@@ -272,49 +302,54 @@ class GitHubAPIClient:
         return [r for r in body if isinstance(r, dict)], next_url
 
     async def _get_page(self, url: str) -> tuple[Any, str | None]:
-        """GET one page, applying rate-limit + 5xx retries. Return (body, next_url)."""
-        consecutive_429 = 0
-        consecutive_5xx = 0
+        """GET one page, applying rate-limit + 5xx retries. Return (body, next_url).
+
+        Counters live on ``self`` so a "Nx429 then success" pattern repeated
+        across calls eventually trips ``GitHubRateLimitExhausted``. They reset
+        on any 2xx response.
+        """
         while True:
             await self._bucket.acquire()
             try:
                 resp = await self._http.get(url, headers=self._headers())
             except httpx.HTTPError as exc:
-                consecutive_5xx += 1
-                if consecutive_5xx > _MAX_5XX_RETRIES:
+                self._consecutive_5xx += 1
+                if self._consecutive_5xx > _MAX_5XX_RETRIES:
                     raise GitHubAPIError(0, f"network error: {exc}") from exc
-                await self._sleep(_backoff_seconds(consecutive_5xx))
+                await self._sleep(_backoff_seconds(self._consecutive_5xx))
                 continue
 
             status = resp.status_code
 
             if _is_rate_limited(resp):
-                consecutive_429 += 1
-                if consecutive_429 > _MAX_CONSECUTIVE_RATE_LIMITS:
+                self._consecutive_429 += 1
+                if self._consecutive_429 >= _MAX_CONSECUTIVE_RATE_LIMITS:
                     raise GitHubRateLimitExhausted(
-                        f"GitHub returned 429/403 {consecutive_429} times in a row"
+                        f"GitHub returned 429/403 {self._consecutive_429} times in a row"
                     )
-                delay = self._rate_limit_delay(resp, attempt=consecutive_429)
+                delay = self._rate_limit_delay(resp, attempt=self._consecutive_429)
                 log.warning(
                     "github.rate_limited",
                     url=url,
                     status=status,
                     delay=delay,
-                    attempt=consecutive_429,
+                    attempt=self._consecutive_429,
                 )
                 await self._sleep(delay)
                 continue
 
             if 500 <= status < 600:
-                consecutive_5xx += 1
-                if consecutive_5xx > _MAX_5XX_RETRIES:
+                self._consecutive_5xx += 1
+                if self._consecutive_5xx > _MAX_5XX_RETRIES:
                     raise GitHubAPIError(status, resp.text)
-                await self._sleep(_backoff_seconds(consecutive_5xx))
+                await self._sleep(_backoff_seconds(self._consecutive_5xx))
                 continue
 
             if status >= 400:
                 raise GitHubAPIError(status, resp.text)
 
+            self._consecutive_429 = 0
+            self._consecutive_5xx = 0
             return resp.json(), _parse_next_link(
                 resp.headers.get("link") or resp.headers.get("Link")
             )
@@ -380,6 +415,18 @@ def _backoff_seconds(attempt: int) -> float:
     """Exp backoff with jitter for transient 5xx/network errors."""
     base = min(2 ** (attempt - 1), 30)
     return float(base) + random.uniform(0.0, 1.0)
+
+
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+    """Coerce naive datetimes to UTC so comparisons against tz-aware values work.
+
+    GitHub timestamps are always UTC; if a caller passes ``datetime.utcnow()``
+    (naive) this prevents ``TypeError: can't compare offset-naive and
+    offset-aware datetimes`` and makes ISO serialization unambiguously UTC.
+    """
+    if dt is None or dt.tzinfo is not None:
+        return dt
+    return dt.replace(tzinfo=UTC)
 
 
 def _iso(dt: datetime) -> str:

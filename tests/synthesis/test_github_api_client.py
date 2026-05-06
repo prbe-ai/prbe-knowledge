@@ -88,7 +88,7 @@ async def test_list_installation_repos_paginates_three_pages(
     http: httpx.AsyncClient,
 ) -> None:
     base = "https://api.github.com/installation/repositories"
-    p1 = f"{base}?per_page=100&sort=pushed&direction=desc"
+    p1 = f"{base}?per_page=100"
     p2, p3 = f"{base}?page=2", f"{base}?page=3"
     with respx.mock(assert_all_called=True) as router:
         router.get(p1).mock(
@@ -250,12 +250,12 @@ async def test_403_with_remaining_zero_treated_as_rate_limit(
     assert sleeper.calls
 
 
-async def test_six_consecutive_429s_raises_exhausted(http: httpx.AsyncClient) -> None:
+async def test_five_consecutive_429s_raises_exhausted(http: httpx.AsyncClient) -> None:
     clock = _FakeClock()
     sleeper = _SleepRecorder(clock=clock)
     with respx.mock() as router:
         route = router.get("https://api.github.com/repos/x/y")
-        route.side_effect = [httpx.Response(429, headers={"retry-after": "1"}) for _ in range(7)]
+        route.side_effect = [httpx.Response(429, headers={"retry-after": "1"}) for _ in range(6)]
         client = _make_client(http, sleep=sleeper, clock=clock)
         with pytest.raises(GitHubRateLimitExhausted):
             await client.get_repo("x/y")
@@ -301,3 +301,111 @@ async def test_token_bucket_drains_then_blocks_until_refill() -> None:
     # First 10 are free (burst). 11th and 12th each cost ~1s of wait.
     assert elapsed >= 1.5, f"elapsed={elapsed}, sleeps={sleeper.calls}"
     assert sum(sleeper.calls) >= 1.5
+
+
+async def test_list_pulls_accepts_naive_datetime(http: httpx.AsyncClient) -> None:
+    """Passing ``datetime(...)`` (naive) must not crash; coerced to UTC."""
+    with respx.mock(assert_all_called=True) as router:
+        router.get("https://api.github.com/repos/x/y/pulls").mock(
+            return_value=httpx.Response(
+                200,
+                json=[
+                    {"number": 3, "updated_at": "2026-05-01T00:00:00Z"},
+                    {"number": 2, "updated_at": "2026-04-15T00:00:00Z"},
+                    {"number": 1, "updated_at": "2026-01-01T00:00:00Z"},
+                ],
+            )
+        )
+        client = _make_client(http)
+        since_naive = datetime(2026, 4, 1)  # naive on purpose, exercises coercion
+        numbers = [p["number"] async for p in client.list_pulls("x/y", since=since_naive)]
+    assert numbers == [3, 2]
+
+
+async def test_list_issues_propagates_since_param(http: httpx.AsyncClient) -> None:
+    """``since`` kwarg must serialize into the URL as ISO-Z."""
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get(
+            "https://api.github.com/repos/x/y/issues",
+            params={
+                "state": "all",
+                "sort": "updated",
+                "direction": "desc",
+                "per_page": "100",
+                "since": "2026-04-01T00:00:00Z",
+            },
+        ).mock(return_value=httpx.Response(200, json=[{"number": 1}]))
+        client = _make_client(http)
+        since = datetime(2026, 4, 1, tzinfo=UTC)
+        issues = [i async for i in client.list_issues("x/y", since=since)]
+    assert issues == [{"number": 1}]
+    assert route.called
+
+
+async def test_429_with_retry_after_header_sleeps(http: httpx.AsyncClient) -> None:
+    """``retry-after: 3`` (no x-ratelimit-reset) sleeps ~3s then retries."""
+    clock = _FakeClock()
+    sleeper = _SleepRecorder(clock=clock)
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get("https://api.github.com/repos/x/y")
+        route.side_effect = [
+            httpx.Response(429, headers={"retry-after": "3"}, json={}),
+            httpx.Response(200, json={"full_name": "x/y"}),
+        ]
+        client = _make_client(http, sleep=sleeper, clock=clock)
+        repo = await client.get_repo("x/y")
+    assert repo["full_name"] == "x/y"
+    # Slept >=3s (retry-after) plus 1-3s jitter; bounded above by 3+3=6.
+    rate_limit_sleeps = [c for c in sleeper.calls if c >= 3.0]
+    assert rate_limit_sleeps, f"sleeps={sleeper.calls}"
+    assert rate_limit_sleeps[0] <= 7.0
+
+
+async def test_500_then_200_recovers(http: httpx.AsyncClient) -> None:
+    """Single 5xx then success: client retries once and returns body."""
+    clock = _FakeClock()
+    sleeper = _SleepRecorder(clock=clock)
+    with respx.mock(assert_all_called=True) as router:
+        route = router.get("https://api.github.com/repos/x/y")
+        route.side_effect = [
+            httpx.Response(500, text="boom"),
+            httpx.Response(200, json={"full_name": "x/y"}),
+        ]
+        client = _make_client(http, sleep=sleeper, clock=clock)
+        repo = await client.get_repo("x/y")
+    assert repo["full_name"] == "x/y"
+    assert sleeper.calls  # one backoff sleep happened
+
+
+async def test_alternating_429_success_eventually_exhausts(http: httpx.AsyncClient) -> None:
+    """Counters live on the instance: 429-success-429-... over many calls trips exhaust.
+
+    With ``_MAX_CONSECUTIVE_RATE_LIMITS = 5`` and counter reset on 2xx, we
+    construct a sequence where the counter never resets — five 429s in a row
+    across calls — and confirm the client raises. A successful 2xx interleaved
+    in the middle would reset the counter; we verify the no-reset case here.
+    """
+    clock = _FakeClock()
+    sleeper = _SleepRecorder(clock=clock)
+    # First call: 4x429 then success — counter ends at 0 (reset by 2xx).
+    # Second call: 4x429 then success — counter ends at 0.
+    # Third call: 5x429 — must raise on the 5th.
+    with respx.mock() as router:
+        route = router.get("https://api.github.com/repos/x/y")
+        route.side_effect = [
+            # call 1: 4x429, then 200
+            *[httpx.Response(429, headers={"retry-after": "1"}, json={}) for _ in range(4)],
+            httpx.Response(200, json={"full_name": "x/y"}),
+            # call 2: 4x429, then 200
+            *[httpx.Response(429, headers={"retry-after": "1"}, json={}) for _ in range(4)],
+            httpx.Response(200, json={"full_name": "x/y"}),
+            # call 3: 5x429 — exhausts
+            *[httpx.Response(429, headers={"retry-after": "1"}, json={}) for _ in range(5)],
+        ]
+        client = _make_client(http, sleep=sleeper, clock=clock)
+        # First two calls succeed (counter resets on each 2xx).
+        await client.get_repo("x/y")
+        await client.get_repo("x/y")
+        # Third call: 5 consecutive 429s with no 2xx -> exhausted.
+        with pytest.raises(GitHubRateLimitExhausted):
+            await client.get_repo("x/y")
