@@ -340,12 +340,18 @@ class AgentLoop:
         # Append the model turn (with tool_call parts) to conversation
         # before we record results, so the function_response parts are
         # in the right order in the trace.
+        #
+        # Each part MUST preserve the thought_signature from the
+        # original SDK response. Gemini 3.x rejects subsequent calls
+        # whose echoed function_call lacks the signature (400
+        # INVALID_ARGUMENT). The signature is opaque bytes from the
+        # model — we don't inspect it, just round-trip it.
+        # See https://ai.google.dev/gemini-api/docs/thought-signatures
         self._conversation.append(
             {
                 "role": "model",
                 "parts": [
-                    {"function_call": {"name": tc["name"], "args": tc.get("args", {})}}
-                    for tc in tool_calls
+                    _model_part_with_signature(tc) for tc in tool_calls
                 ],
             }
         )
@@ -504,6 +510,29 @@ class AgentLoop:
 # ---------------------------------------------------------------------------
 # Helpers (rendering)
 # ---------------------------------------------------------------------------
+
+
+def _model_part_with_signature(tool_call: dict[str, Any]) -> dict[str, Any]:
+    """Build a model-turn part carrying the function_call AND its
+    thought_signature from the prior Gemini response.
+
+    Gemini 3.x requires the signature on every echoed function_call
+    in conversation history. If the SDK didn't return one (older
+    model, missing field), we omit the key so the dict shape stays
+    JSON-serializable for tests/logs — Gemini only complains when
+    the part has a function_call without the signature on a
+    Gemini-3.x model.
+    """
+    part: dict[str, Any] = {
+        "function_call": {
+            "name": tool_call["name"],
+            "args": tool_call.get("args", {}),
+        }
+    }
+    sig = tool_call.get("thought_signature")
+    if sig is not None:
+        part["thought_signature"] = sig
+    return part
 
 
 def _render_index(index: list[dict[str, Any]]) -> str:

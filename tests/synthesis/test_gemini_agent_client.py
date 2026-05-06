@@ -362,8 +362,62 @@ async def test_generate_with_cache_returns_normalized_dict(
         tools=[_tool("done")],
     )
     assert out["text"] is None
-    assert out["tool_calls"] == [{"name": "done", "args": {"why": "ok"}}]
+    # Newer code carries thought_signature (None when SDK omitted it).
+    assert out["tool_calls"] == [
+        {"name": "done", "args": {"why": "ok"}, "thought_signature": None}
+    ]
     assert out["usage_metadata"]["cached_content_token_count"] == 900
+
+
+@pytest.mark.asyncio
+async def test_thought_signature_extracted_from_part(
+    fake_genai: SimpleNamespace, patched_settings: None
+) -> None:
+    """Regression for `agent.gemini_persistent_error` at turn 1+ on
+    Gemini 3.x.
+
+    The Gemini 3.x API emits an opaque `thought_signature` (bytes)
+    on every part that holds a function_call. When the harness
+    echoes that function_call back in the conversation history on
+    turn 2+, the SAME signature must accompany it. Otherwise:
+
+        400 INVALID_ARGUMENT: 'Function call is missing a
+        thought_signature in functionCall parts. This is required
+        for tools to work correctly...'
+
+    `_extract_response` must capture the signature off the SDK's
+    Part so the harness can round-trip it.
+    """
+    from services.synthesis.gemini_agent_client import GeminiAgentClient
+
+    sig_bytes = b"opaque-sdk-bytes-for-this-call"
+    fake_genai.generate_response = SimpleNamespace(
+        text=None,
+        candidates=[
+            SimpleNamespace(
+                content=SimpleNamespace(
+                    parts=[
+                        SimpleNamespace(
+                            function_call=SimpleNamespace(
+                                name="next_events", args={"count": 50}
+                            ),
+                            thought_signature=sig_bytes,
+                        )
+                    ]
+                )
+            )
+        ],
+        usage_metadata=SimpleNamespace(
+            prompt_token_count=1, cached_content_token_count=0, candidates_token_count=1
+        ),
+    )
+    client = GeminiAgentClient()
+    out = await client.generate_with_cache(
+        cache_name="cachedContents/abc",
+        contents=[{"role": "user", "parts": [{"text": "hi"}]}],
+        tools=[_tool("next_events")],
+    )
+    assert out["tool_calls"][0]["thought_signature"] == sig_bytes
 
 
 # ---------------------------------------------------------------------------
