@@ -1,7 +1,7 @@
 """Per-turn structured trace events for enrichment agent runs.
 
-Revision ID: 89063d360118
-Revises: 0040_backfill_cc_doc_titles
+Revision ID: 0043_agent_turn_traces
+Revises: 0042_backfill_codex_doc_titles
 Create Date: 2026-05-05
 
 WHY
@@ -48,8 +48,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "89063d360118"
-down_revision = "0040_backfill_cc_doc_titles"
+revision = "0043_agent_turn_traces"
+down_revision = "0042_backfill_codex_doc_titles"
 branch_labels = None
 depends_on = None
 
