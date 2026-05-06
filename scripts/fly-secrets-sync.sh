@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Sync .env to Fly secrets on the seven prbe-knowledge apps.
+# Sync .env to Fly secrets on the eight prbe-knowledge apps.
 #
 # Usage:
-#   scripts/fly-secrets-sync.sh                  # sync all seven apps
+#   scripts/fly-secrets-sync.sh                  # sync all eight apps
 #   scripts/fly-secrets-sync.sh ingestion        # sync a single app
 #   scripts/fly-secrets-sync.sh -f .env.staging  # use a different env file
 #
 # App shortcuts: ingestion | retrieval | worker | poller |
-#                wiki-worker | wiki-synthesis | wiki-cron |
+#                wiki-worker | wiki-synthesis | wiki-cron | wiki-bootstrap |
 #                all (default)
 #
 # Requires: flyctl in PATH, logged in (`flyctl auth whoami`), and a .env file
@@ -32,13 +32,13 @@ while [[ $# -gt 0 ]]; do
             awk '/^#!/{next} /^[^#]/{exit} {sub(/^# ?/,""); print}' "$0"
             exit 0
             ;;
-        ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-cron|all)
+        ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-cron|wiki-bootstrap|all)
             TARGET="$1"
             shift
             ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 [ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-cron|all] [-f env-file]" >&2
+            echo "Usage: $0 [ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-cron|wiki-bootstrap|all] [-f env-file]" >&2
             exit 1
             ;;
     esac
@@ -79,6 +79,7 @@ ALL_APPS=(
     "prbe-knowledge-wiki-worker"
     "prbe-knowledge-wiki-synthesis"
     "prbe-knowledge-wiki-cron"
+    "prbe-knowledge-wiki-bootstrap"
 )
 
 case "$TARGET" in
@@ -90,6 +91,7 @@ case "$TARGET" in
     wiki-worker)     APPS=("prbe-knowledge-wiki-worker") ;;
     wiki-synthesis)  APPS=("prbe-knowledge-wiki-synthesis") ;;
     wiki-cron)       APPS=("prbe-knowledge-wiki-cron") ;;
+    wiki-bootstrap)  APPS=("prbe-knowledge-wiki-bootstrap") ;;
 esac
 
 # -- parse -------------------------------------------------------------------
