@@ -218,7 +218,13 @@ class CodeGraphConnector(Connector):
 
         files: list[FileEntry] = []
         if to_fetch:
-            fetched = await fetch_files_at_sha(repo=repo, sha=sha, paths=to_fetch, token=token)
+            fetched = await fetch_files_at_sha(
+                repo=repo,
+                sha=sha,
+                paths=to_fetch,
+                token=token,
+                customer_id=event.customer_id,
+            )
             for f in fetched:
                 if f.not_found:
                     # File listed in payload but absent at SHA — push race;
