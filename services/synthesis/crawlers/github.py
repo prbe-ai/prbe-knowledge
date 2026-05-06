@@ -52,6 +52,7 @@ from services.synthesis.api_clients.github import (
     GitHubAPIClient,
     GitHubAPIError,
     GitHubRateLimitExhausted,
+    get_shared_bucket,
 )
 from services.synthesis.crawlers.base import (
     BackfillAgent,
@@ -60,7 +61,10 @@ from services.synthesis.crawlers.base import (
 )
 from services.synthesis.gemini_agent_client import GeminiAgentClient
 from services.synthesis.models import WikiType
-from services.synthesis.prompts import build_github_crawler_system_prompt
+from services.synthesis.prompts import (
+    build_github_crawler_system_prompt,
+    build_github_repo_subtask_prompt,
+)
 from services.synthesis.wiki_agent import WikiAgentRuntime
 from shared.constants import (
     WIKI_BACKFILL_GITHUB_PRS_DAYS,
@@ -547,6 +551,7 @@ class GitHubCrawlerAgent(BackfillAgent):
         bearer_resolver: Any,
         http: Any,
         settings: Any,
+        target: str | None = None,
         llm_client: Any | None = None,
         runtime: BackfillWikiRuntime | None = None,
         client: GitHubAPIClient | None = None,
@@ -557,6 +562,7 @@ class GitHubCrawlerAgent(BackfillAgent):
             bearer_resolver=bearer_resolver,
             http=http,
             settings=settings,
+            target=target,
         )
         # Optional injection points used by the eval harness + unit tests:
         # production code passes None and the run() path constructs the
@@ -578,6 +584,14 @@ class GitHubCrawlerAgent(BackfillAgent):
     # -----------------------------------------------------------------------
 
     def system_prompt(self) -> str:
+        # Phase 2 (target set) uses the augment-not-create prompt scoped
+        # to one repo. Phase 1 (target=None) uses the broad prompt.
+        if self.target:
+            return build_github_repo_subtask_prompt(
+                customer_id=self.customer_id,
+                target_repo=self.target,
+                quiet_streak=WIKI_BACKFILL_QUIET_STREAK,
+            )
         return build_github_crawler_system_prompt(
             customer_id=self.customer_id,
             quiet_streak=WIKI_BACKFILL_QUIET_STREAK,
@@ -614,9 +628,16 @@ class GitHubCrawlerAgent(BackfillAgent):
             return self._empty_result(started_at, halt_reason="auth.missing")
 
         # Build the API client + runtime if the test harness didn't inject
-        # them. Production always falls through this branch.
+        # them. Production always falls through this branch. Use the
+        # shared per-customer token bucket so parallel Phase 2 agents
+        # on the same machine share the rate envelope (D6) and don't
+        # multiply aggregate request rate above GitHub's 5000/hr cap.
         if self._client is None:
-            self._client = GitHubAPIClient(bearer=bearer, http=self._http)
+            self._client = GitHubAPIClient(
+                bearer=bearer,
+                http=self._http,
+                bucket=get_shared_bucket(self.customer_id, "github"),
+            )
         if self._runtime is None:
             self._runtime = BackfillWikiRuntime(
                 self.customer_id,
@@ -702,6 +723,7 @@ class GitHubCrawlerAgent(BackfillAgent):
             source=self.source,
             customer_id=self.customer_id,
             run_id=self.run_id,
+            target=self.target,
             pages_created=self._runtime.pages_created_count,
             pages_updated=self._runtime.pages_updated_count,
             items_processed=self._counters.items_processed,
@@ -770,6 +792,21 @@ class GitHubCrawlerAgent(BackfillAgent):
     # -----------------------------------------------------------------------
 
     async def _tool_list_repos(self) -> dict[str, Any]:
+        # Phase 2 (target set): hardcoded single-repo answer. The agent
+        # is scoped to one repo for this run; it has no business calling
+        # /installation/repositories for the whole org.
+        if self.target:
+            _owner, _, name = self.target.partition("/")
+            single = {
+                "name": name or self.target,
+                "full_name": self.target,
+                "description": None,
+                "pushed_at": None,
+                "default_branch": None,
+            }
+            self._counters.items_processed += 1
+            return {"repos": [single], "next_cursor": None}
+
         client = self._require_client()
         if self._cached_repos is None:
             try:
@@ -1057,6 +1094,7 @@ class GitHubCrawlerAgent(BackfillAgent):
             source=self.source,
             customer_id=self.customer_id,
             run_id=self.run_id,
+            target=self.target,
             halt_reason=halt_reason,
             error=error,
         )

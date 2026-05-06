@@ -69,6 +69,10 @@ class BackfillAgentResult(BaseModel):
     source: str
     customer_id: str
     run_id: int
+    # Phase 2 fan-out target. None for Phase 1 rows; 'owner/repo' (or
+    # equivalent per-source identifier) for Phase 2. Round-tripped through
+    # the worker into ``wiki_synthesis_runs.target`` on close.
+    target: str | None = None
     pages_created: int = 0
     pages_updated: int = 0
     items_processed: int = 0
@@ -106,11 +110,16 @@ class BackfillAgent(ABC):
         bearer_resolver: BearerResolver | BearerResolverCallable,
         http: httpx.AsyncClient,
         settings: Settings,
+        target: str | None = None,
     ) -> None:
         if not self.source:
             raise ValueError(f"{type(self).__name__} must set a non-empty `source` ClassVar")
         self.customer_id = customer_id
         self.run_id = run_id
+        # Phase 2 fan-out target. None for Phase 1 broad-pass; a specific
+        # target ('owner/repo' for GitHub) when the orchestrator fanned
+        # out per-target subtasks after Phase 1 completed.
+        self.target = target
         self._bearer_resolver = bearer_resolver
         self._http = http
         self._settings = settings
@@ -202,6 +211,7 @@ def empty_result(
     source: str,
     customer_id: str,
     run_id: int,
+    target: str | None = None,
     halt_reason: str | None = None,
     error: str | None = None,
 ) -> BackfillAgentResult:
@@ -217,6 +227,7 @@ def empty_result(
         source=source,
         customer_id=customer_id,
         run_id=run_id,
+        target=target,
         started_at=now,
         finished_at=now,
         halt_reason=halt_reason,

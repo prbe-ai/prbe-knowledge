@@ -108,6 +108,44 @@ class _AsyncTokenBucket:
             self._tokens -= 1.0
 
 
+# Module-level shared bucket registry, keyed by (customer_id, source).
+# Phase 2 fan-out spawns multiple parallel ``GitHubAPIClient`` instances
+# on the same fly machine; each instance with its own bucket would
+# multiply aggregate request rate by parallelism and trip GitHub's
+# 5000/hr installation cap. Sharing one bucket across instances keeps
+# aggregate at ``target_rps`` regardless of parallelism.
+#
+# Buckets live for the process lifetime — they're tiny (kilobytes) and
+# the worker process restarts on every deploy, so leak risk is bounded.
+_SHARED_BUCKETS: dict[tuple[str, str], _AsyncTokenBucket] = {}
+
+
+def get_shared_bucket(
+    customer_id: str,
+    source: str = "github",
+    *,
+    target_rps: float = _DEFAULT_TARGET_RPS,
+    capacity: int = _DEFAULT_BURST,
+) -> _AsyncTokenBucket:
+    """Return the shared token bucket for ``(customer_id, source)``.
+
+    Creates one on first access and caches it. Subsequent calls with the
+    same key return the same bucket — multiple ``GitHubAPIClient``
+    instances pass it via ``bucket=`` so they share the rate budget.
+
+    The ``target_rps`` / ``capacity`` arguments only apply on FIRST
+    creation; subsequent calls ignore them (returning the existing
+    bucket as-is). This is intentional — a per-customer rate envelope
+    shouldn't shift mid-backfill.
+    """
+    key = (customer_id, source)
+    bucket = _SHARED_BUCKETS.get(key)
+    if bucket is None:
+        bucket = _AsyncTokenBucket(rate_per_second=target_rps, capacity=capacity)
+        _SHARED_BUCKETS[key] = bucket
+    return bucket
+
+
 class GitHubAPIClient:
     """Read-only GitHub client used by the wiki backfill crawler.
 

@@ -583,6 +583,21 @@ def test_lock_keys_distinct_per_salt_and_parts() -> None:
     assert a != c
 
 
+def test_run_lock_key_phase1_vs_phase2_distinct() -> None:
+    """Phase 1 (target=None) and Phase 2 (target='owner/repo') for the
+    same (customer, source) must yield distinct lock keys so they don't
+    serialize against each other. Two Phase 2 rows for different
+    targets must also be distinct so they run in parallel."""
+    p1 = _backfill_run_lock_key("c", "github")
+    p2_a = _backfill_run_lock_key("c", "github", "o/repo-a")
+    p2_b = _backfill_run_lock_key("c", "github", "o/repo-b")
+    assert p1 != p2_a
+    assert p1 != p2_b
+    assert p2_a != p2_b
+    # Stable: same args -> same key.
+    assert p2_a == _backfill_run_lock_key("c", "github", "o/repo-a")
+
+
 # ---------------------------------------------------------------------------
 # Semaphore cap — pure unit (no DB) check on the worker's bookkeeping
 # ---------------------------------------------------------------------------
