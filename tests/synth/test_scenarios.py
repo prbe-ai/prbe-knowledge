@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, date, datetime
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from scripts.synth.archetypes.base import Source
 from scripts.synth.ownership import OwnershipIndex
@@ -212,3 +215,324 @@ async def test_run_scenarios_scenario_limit_caps_per_archetype() -> None:
     oncall_scenarios = {d.scenario_id for d in docs if d.archetype == "ON_CALL_HANDOFF"}
     assert len(standup_scenarios) <= 2
     assert len(oncall_scenarios) <= 2
+
+
+# --- regen wiring ---------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_scenarios_regen_recovers_failing_plot_doc(monkeypatch) -> None:
+    """End-to-end: a plot scenario fails Pass 1 in round 1, succeeds round 2 via regen.
+
+    Asserts the scenario is yielded (not dropped) and that the final doc
+    text reflects the regenerated content.
+    """
+    from scripts.synth.archetypes.base import (
+        Archetype,
+        Cadence,
+        Category,
+        DocSpec,
+        ScenarioSpec,
+        Source,
+        ValidatorLevel,
+    )
+    from scripts.synth.output.base import SynthDoc
+    from scripts.synth.scenarios import run_scenarios
+    from scripts.synth.validator import CombinedValidatorResult, Violation
+
+    # Build a one-doc plot scenario whose initial text fails Pass 1.
+    spec = ScenarioSpec(
+        id="scn-incident-1",
+        archetype_name="INCIDENT",
+        instance_ts=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+        cast=("gh:alice",),
+        affected_services=("payments",),
+        doc_specs=(
+            DocSpec(
+                id="d0",
+                source=Source.SLACK,
+                occurred_at=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+                channel="#incidents",
+                page_section=None,
+                text="",
+                thread_parent_id=None,
+                personas=("gh:alice",),
+                services_mentioned=("payments",),
+            ),
+        ),
+        title="x", summary="y", root_cause="z", eval_questions=(),
+    )
+
+    failing_doc = SynthDoc(
+        id="d0",
+        source=Source.SLACK,
+        source_event_id="d0",
+        text="auto-scaling broke",
+        occurred_at=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+        channel="#incidents",
+        page_id=None,
+        thread_parent_id=None,
+        scenario_id="scn-incident-1",
+        archetype="INCIDENT",
+        personas=("gh:alice",),
+        services_mentioned=("payments",),
+        priority=10,
+    )
+
+    # IMPORTANT: Archetype shape — see Task 6's findings. Use the REAL field
+    # names: sources_used, cast_size, spec_template_path. Cadence has AD_HOC,
+    # not RARE. eval_question_count defaults to 0.
+    incident_archetype = Archetype(
+        name="INCIDENT",
+        category=Category.PLOT,
+        cadence=Cadence.AD_HOC,
+        validator_level=ValidatorLevel.STRICT,
+        needs_planner_call=True,
+        sources_used=(Source.SLACK,),
+        cast_size=(1, 3),
+        spec_template_path=None,
+    )
+
+    async def fake_plot_builder(**kwargs):
+        yield spec, [failing_doc]
+
+    monkeypatch.setattr(
+        "scripts.synth.archetypes.library.PLOT_BUILDERS",
+        {"INCIDENT": fake_plot_builder},
+    )
+    monkeypatch.setattr(
+        "scripts.synth.archetypes.library.get_active",
+        lambda profile, archetype_filter=None: {"INCIDENT": incident_archetype},
+    )
+
+    # Mock validator: fail outer + regen_loop's first internal call, pass after one
+    # regeneration. (run_scenarios validates once before entering regen_loop, and
+    # regen_loop validates again at the start of round 1; both must fail for the
+    # writer.regenerate path to be exercised. Then round-2 validation must pass.)
+    call_count = {"n": 0}
+
+    async def fake_validate(docs, world, *, scenario, archetype, pass2_client, pass2_model):
+        call_count["n"] += 1
+        if call_count["n"] <= 2:
+            return CombinedValidatorResult(
+                pass1_violations=(Violation(doc_id="d0", out_of_world=("auto-scaling",)),),
+                pass2_result=None,
+                failing_doc_ids=("d0",),
+                should_drop=True,
+            )
+        return CombinedValidatorResult(
+            pass1_violations=(),
+            pass2_result=None,
+            failing_doc_ids=(),
+            should_drop=False,
+        )
+
+    monkeypatch.setattr("scripts.synth.validator.validate", fake_validate)
+
+    # Mock writer with .regenerate that returns clean text
+    mock_writer = MagicMock()
+    mock_writer.regenerate = AsyncMock(return_value="payments service had errors")
+    mock_planner = MagicMock()
+
+    yielded: list[tuple] = []
+    profile = _profile({"archetypes": {"INCIDENT": {"count": 1}}})
+    company_ctx = MagicMock()
+    world = _build_test_world()
+    ownership = _ownership_full()
+    time_window = TimeWindow(end=datetime(2026, 4, 13, tzinfo=UTC), days=7)
+
+    async for s, doc in run_scenarios(
+        world=world,
+        ownership=ownership,
+        profile=profile,
+        time_window=time_window,
+        company_ctx=company_ctx,
+        planner=mock_planner,
+        writer=mock_writer,
+        validator_pass2_client=None,
+        validator_pass2_model=None,
+    ):
+        yielded.append((s, doc))
+
+    assert len(yielded) == 1
+    assert yielded[0][1].text == "payments service had errors"
+    assert mock_writer.regenerate.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_run_scenarios_regen_disabled_drops_immediately(monkeypatch) -> None:
+    """When regen_enabled=False, a failing plot scenario drops on round 1
+    without calling writer.regenerate."""
+    from scripts.synth.archetypes.base import (
+        Archetype,
+        Cadence,
+        Category,
+        DocSpec,
+        ScenarioSpec,
+        Source,
+        ValidatorLevel,
+    )
+    from scripts.synth.output.base import SynthDoc
+    from scripts.synth.scenarios import run_scenarios
+    from scripts.synth.validator import CombinedValidatorResult, Violation
+
+    spec = ScenarioSpec(
+        id="scn-1", archetype_name="INCIDENT",
+        instance_ts=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+        cast=("gh:alice",), affected_services=("payments",),
+        doc_specs=(DocSpec(
+            id="d0", source=Source.SLACK,
+            occurred_at=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+            channel="#incidents", page_section=None, text="",
+            thread_parent_id=None, personas=("gh:alice",),
+            services_mentioned=("payments",),
+        ),),
+        title="x", summary="y", root_cause="z", eval_questions=(),
+    )
+    doc = SynthDoc(
+        id="d0", source=Source.SLACK, source_event_id="d0",
+        text="auto-scaling", occurred_at=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+        channel="#incidents", page_id=None, thread_parent_id=None,
+        scenario_id="scn-1", archetype="INCIDENT", personas=("gh:alice",),
+        services_mentioned=("payments",), priority=10,
+    )
+    arch = Archetype(
+        name="INCIDENT", category=Category.PLOT, cadence=Cadence.AD_HOC,
+        validator_level=ValidatorLevel.STRICT, needs_planner_call=True,
+        sources_used=(Source.SLACK,), cast_size=(1, 3), spec_template_path=None,
+    )
+
+    async def fake_plot_builder(**_kwargs):
+        yield spec, [doc]
+
+    monkeypatch.setattr(
+        "scripts.synth.archetypes.library.PLOT_BUILDERS",
+        {"INCIDENT": fake_plot_builder},
+    )
+    monkeypatch.setattr(
+        "scripts.synth.archetypes.library.get_active",
+        lambda profile, archetype_filter=None: {"INCIDENT": arch},
+    )
+
+    async def fake_validate(*_a, **_kw):
+        return CombinedValidatorResult(
+            pass1_violations=(Violation(doc_id="d0", out_of_world=("auto-scaling",)),),
+            pass2_result=None, failing_doc_ids=("d0",), should_drop=True,
+        )
+
+    monkeypatch.setattr("scripts.synth.validator.validate", fake_validate)
+
+    mock_writer = MagicMock()
+    mock_writer.regenerate = AsyncMock(return_value="should not be called")
+
+    yielded: list[tuple] = []
+    profile = _profile({"archetypes": {"INCIDENT": {"count": 1}}})
+    async for _ in run_scenarios(
+        world=_build_test_world(),
+        ownership=_ownership_full(),
+        profile=profile,
+        time_window=TimeWindow(end=datetime(2026, 4, 13, tzinfo=UTC), days=7),
+        company_ctx=MagicMock(),
+        planner=MagicMock(),
+        writer=mock_writer,
+        validator_pass2_client=None,
+        validator_pass2_model=None,
+        regen_enabled=False,
+    ):
+        yielded.append(_)
+
+    assert yielded == []
+    assert mock_writer.regenerate.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_run_scenarios_regen_skips_docs_with_empty_failure_context(monkeypatch) -> None:
+    """Rare validator state: failing_doc_ids includes a doc that has no
+    Pass 1 nor Pass 2 detail. regen_loop should NOT call writer.regenerate
+    for it (saves LLM calls), and the scenario should still drop after
+    max_rounds.
+    """
+    from scripts.synth.archetypes.base import (
+        Archetype,
+        Cadence,
+        Category,
+        DocSpec,
+        ScenarioSpec,
+        Source,
+        ValidatorLevel,
+    )
+    from scripts.synth.output.base import SynthDoc
+    from scripts.synth.scenarios import run_scenarios
+    from scripts.synth.validator import CombinedValidatorResult
+
+    spec = ScenarioSpec(
+        id="scn-empty-ctx-1", archetype_name="INCIDENT",
+        instance_ts=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+        cast=("gh:alice",), affected_services=("payments",),
+        doc_specs=(DocSpec(
+            id="d0", source=Source.SLACK,
+            occurred_at=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+            channel="#incidents", page_section=None, text="",
+            thread_parent_id=None, personas=("gh:alice",),
+            services_mentioned=("payments",),
+        ),),
+        title="x", summary="y", root_cause="z", eval_questions=(),
+    )
+    doc = SynthDoc(
+        id="d0", source=Source.SLACK, source_event_id="d0",
+        text="some text", occurred_at=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+        channel="#incidents", page_id=None, thread_parent_id=None,
+        scenario_id="scn-empty-ctx-1", archetype="INCIDENT",
+        personas=("gh:alice",), services_mentioned=("payments",), priority=10,
+    )
+    arch = Archetype(
+        name="INCIDENT", category=Category.PLOT, cadence=Cadence.AD_HOC,
+        validator_level=ValidatorLevel.STRICT, needs_planner_call=True,
+        sources_used=(Source.SLACK,), cast_size=(1, 3), spec_template_path=None,
+    )
+
+    async def fake_plot_builder(**_kwargs):
+        yield spec, [doc]
+
+    monkeypatch.setattr(
+        "scripts.synth.archetypes.library.PLOT_BUILDERS",
+        {"INCIDENT": fake_plot_builder},
+    )
+    monkeypatch.setattr(
+        "scripts.synth.archetypes.library.get_active",
+        lambda profile, archetype_filter=None: {"INCIDENT": arch},
+    )
+
+    # Validator says doc fails but provides NO Pass 1 violations and NO
+    # Pass 2 result — so format_failure_context returns "".
+    async def fake_validate(*_a, **_kw):
+        return CombinedValidatorResult(
+            pass1_violations=(),
+            pass2_result=None,
+            failing_doc_ids=("d0",),
+            should_drop=True,
+        )
+
+    monkeypatch.setattr("scripts.synth.validator.validate", fake_validate)
+
+    mock_writer = MagicMock()
+    mock_writer.regenerate = AsyncMock(return_value="should not be called")
+
+    yielded: list[tuple] = []
+    profile = _profile({"archetypes": {"INCIDENT": {"count": 1}}})
+    async for _ in run_scenarios(
+        world=_build_test_world(),
+        ownership=_ownership_full(),
+        profile=profile,
+        time_window=TimeWindow(end=datetime(2026, 4, 13, tzinfo=UTC), days=7),
+        company_ctx=MagicMock(),
+        planner=MagicMock(),
+        writer=mock_writer,
+        validator_pass2_client=None,
+        validator_pass2_model=None,
+    ):
+        yielded.append(_)
+
+    # Drops after max_rounds (default 3). Writer was never asked to regenerate
+    # because the failure context was empty.
+    assert yielded == []
+    assert mock_writer.regenerate.await_count == 0

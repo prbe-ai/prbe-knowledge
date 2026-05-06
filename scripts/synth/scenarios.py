@@ -109,6 +109,7 @@ async def run_scenarios(
     writer: LLMWriter | None = None,
     validator_pass2_client: LlmClientProtocol | None = None,
     validator_pass2_model: str | None = None,
+    regen_enabled: bool = True,
 ) -> AsyncGenerator[tuple[ScenarioSpec, SynthDoc], None]:
     """Walk active archetypes, validate each scenario, yield (ScenarioSpec, SynthDoc) pairs.
 
@@ -120,8 +121,11 @@ async def run_scenarios(
     Plot archetypes (needs_planner_call=True) → call PLOT_BUILDERS async builder.
       Requires planner, writer, company_ctx; warning logged & skipped if absent.
 
-    Each scenario goes through validate(); dropped if should_drop is True.
-    Regen loop deferred — see deferred-cleanup tracker.
+    Each scenario goes through validate(). Plot scenarios that fail strict
+    validation are routed through the regen loop (max ``profile.regen_max_rounds``
+    rounds) when ``regen_enabled`` is True and the LLM dependencies are
+    present; otherwise they drop immediately. Templated scenarios still drop
+    on first failure (no regen path for templated builders).
     """
     # Lazy import to break the circular dependency at module load time.
     from scripts.synth.archetypes.library import BUILDERS, PLOT_BUILDERS, get_active
@@ -200,15 +204,71 @@ async def run_scenarios(
                         log.exception("plot_validator_error", scenario_id=spec.id, archetype=name)
                         continue
                     if result.should_drop:
-                        # TODO(plan3-cleanup): implement validator regen loop (max 2 rounds,
-                        # surgical doc-level replacement preserving thread_parent_id wiring)
-                        log.warning(
-                            "plot_scenario_dropped",
-                            scenario_id=spec.id,
-                            archetype=name,
-                            failing=result.failing_doc_ids,
+                        if not regen_enabled or writer is None or company_ctx is None:
+                            log.warning(
+                                "plot_scenario_dropped",
+                                scenario_id=spec.id,
+                                archetype=name,
+                                failing=result.failing_doc_ids,
+                                regen_enabled=regen_enabled,
+                            )
+                            continue
+
+                        from scripts.synth.regen import regen_loop
+
+                        async def _validate_again(
+                            d: tuple[SynthDoc, ...],
+                            *,
+                            _world=world,
+                            _spec=spec,
+                            _arch=archetype,
+                            _pass2_client=validator_pass2_client,
+                            _pass2_model=validator_pass2_model,
+                        ):
+                            return await combined_validate(
+                                d,
+                                _world,
+                                scenario=_spec,
+                                archetype=_arch,
+                                pass2_client=_pass2_client,
+                                pass2_model=_pass2_model,
+                            )
+
+                        regen_result = await regen_loop(
+                            spec=spec,
+                            archetype=archetype,
+                            docs=docs,
+                            max_rounds=profile.regen_max_rounds,
+                            writer=writer,
+                            validate_fn=_validate_again,
+                            world=world,
+                            company_ctx=company_ctx,
                         )
-                        continue
+
+                        for round_report in regen_result.rounds:
+                            log.info(
+                                "plot_scenario_regen_round",
+                                scenario_id=spec.id,
+                                archetype=name,
+                                round=round_report.round_num,
+                                failing_doc_ids=list(round_report.failing_doc_ids),
+                                passing_doc_ids=list(round_report.passing_doc_ids),
+                                violation_reasons=list(round_report.violation_reasons),
+                            )
+
+                        if not regen_result.succeeded:
+                            log.warning(
+                                "plot_scenario_dropped_after_regen",
+                                scenario_id=spec.id,
+                                archetype=name,
+                                rounds_attempted=len(regen_result.rounds),
+                                survived_doc_ids=list(regen_result.survived_doc_ids),
+                                never_converged_doc_ids=list(regen_result.never_converged_doc_ids),
+                            )
+                            continue
+
+                        docs = regen_result.final_docs
+
                     for doc in docs:
                         yield spec, doc
             except Exception:
