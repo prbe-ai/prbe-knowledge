@@ -166,10 +166,18 @@ async def test_run_turn_cap_halts(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_stall_3_turns_halts() -> None:
-    """No consequential tool for STALL turns -> halt('agent.stall')."""
+async def test_run_stall_halts_after_threshold(monkeypatch) -> None:
+    """No consequential tool for STALL_TURNS turns -> halt('agent.stall').
+
+    Patches the threshold to a small value (3) for test speed — the
+    production value (15) is high to accommodate normal read-heavy
+    exploration before a decision. The behaviour we're pinning is
+    threshold-relative, not the specific number.
+    """
+    import services.synthesis.agent_harness as h
+
+    monkeypatch.setattr(h, "WIKI_AGENT_STALL_TURNS", 3)
     runtime = StubRuntime()
-    # Three turns of pure text (no tool call).
     llm = StubLLM(
         [
             {"text": "thinking 1", "tool_calls": [], "usage_metadata": {}},
@@ -178,13 +186,83 @@ async def test_run_stall_3_turns_halts() -> None:
             {"text": "thinking 4", "tool_calls": [], "usage_metadata": {}},
         ]
     )
-    # NOTE: with WIKI_AGENT_STALL_TURNS=3, after 3 turns of zero
-    # consequential the gap == 3 and we halt.
     loop = _make_loop(runtime, llm)
     with pytest.raises(AgentHaltError) as exc_info:
         await loop.run()
     assert "stall" in exc_info.value.reason
-    assert loop.metrics.turns >= WIKI_AGENT_STALL_TURNS
+    assert loop.metrics.turns >= 3
+
+
+@pytest.mark.asyncio
+async def test_stall_threshold_tolerates_realistic_read_exploration(
+    monkeypatch,
+) -> None:
+    """A realistic agent decision flow on a chunk of triaged events
+    looks like:
+        next_events -> list_wiki_pages -> read_page x3 ->
+        get_event_body x2 -> update_page (CONSEQUENTIAL) -> done
+
+    That's 7 non-consequential turns before the first decision. The
+    production stall threshold (15) must NOT halt this — that's what
+    bit run 105 on probe-founders when STALL_TURNS=3 was the default.
+    """
+    import services.synthesis.agent_harness as h
+
+    # Production value 15. Don't patch — exercise the real default.
+    assert h.WIKI_AGENT_STALL_TURNS >= 10, (
+        "STALL_TURNS regressed below the realistic-exploration floor; "
+        "raise it back to >= 10 so a normal read-heavy chunk doesn't "
+        "halt mid-decision."
+    )
+
+    async def next_events_h(rt, n, a):
+        return {"events": [{"queue_id": 1, "title": "x"}], "drain_complete": True}
+
+    async def list_h(rt, n, a):
+        return {"index": []}
+
+    async def read_h(rt, n, a):
+        return {"body": "page body"}
+
+    async def body_h(rt, n, a):
+        return {"body": "event body"}
+
+    async def update_h(rt, n, a):
+        return {"committed": True}
+
+    async def done_h(rt, n, a):
+        rt.is_done = True
+        return {"committed": True}
+
+    runtime = StubRuntime(
+        tool_handlers={
+            "next_events": next_events_h,
+            "list_wiki_pages": list_h,
+            "read_page": read_h,
+            "get_event_body": body_h,
+            "update_page": update_h,
+            "done": done_h,
+        }
+    )
+    llm = StubLLM(
+        [
+            {"tool_calls": [{"name": "next_events", "args": {"count": 50}}], "usage_metadata": {}},
+            {"tool_calls": [{"name": "list_wiki_pages", "args": {}}], "usage_metadata": {}},
+            {"tool_calls": [{"name": "read_page", "args": {"slug": "a"}}], "usage_metadata": {}},
+            {"tool_calls": [{"name": "read_page", "args": {"slug": "b"}}], "usage_metadata": {}},
+            {"tool_calls": [{"name": "read_page", "args": {"slug": "c"}}], "usage_metadata": {}},
+            {"tool_calls": [{"name": "get_event_body", "args": {"queue_id": 1}}], "usage_metadata": {}},
+            {"tool_calls": [{"name": "get_event_body", "args": {"queue_id": 2}}], "usage_metadata": {}},
+            {"tool_calls": [{"name": "update_page", "args": {"slug": "a", "applied_queue_ids": [1]}}], "usage_metadata": {}},
+            {"tool_calls": [{"name": "done", "args": {}}], "usage_metadata": {}},
+        ]
+    )
+    loop = _make_loop(runtime, llm)
+    # Should complete without raising.
+    await loop.run()
+    # update_page reached on turn 8 -> consequential counter resets;
+    # done() ends the loop cleanly.
+    assert runtime.is_done is True
 
 
 @pytest.mark.asyncio

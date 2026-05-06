@@ -453,8 +453,19 @@ WIKI_AGENT_UPDATE_CAP = 30
 
 # Stall threshold. If the agent makes no consequential tool call (no
 # page update / create / skip) for this many consecutive turns, halt.
-# Three turns is generous — one read-page, one read-event, one think.
-WIKI_AGENT_STALL_TURNS = 3
+#
+# Bumped from 3 to 15 after probe-founders' run 105 stalled with 200
+# events DLQ'd despite the agent making real progress on reads. The
+# old "one read-page, one read-event, one think" math was wrong — a
+# realistic decision flow on a chunk of 200 events looks like:
+#   next_events -> list_wiki_pages -> read_page x3 -> get_event_body x2
+#   -> update_page (CONSEQUENTIAL)
+# That's 7 read-style turns before the first consequential one.
+# Three would have halted in the middle of normal exploration. 15
+# leaves margin for the agent to read 5 pages and 3 event bodies
+# before deciding, with extra room for a re-read or thought-only
+# turn. Stuck loops still trip eventually.
+WIKI_AGENT_STALL_TURNS = 15
 
 # Auto-compaction trigger. When estimated input tokens cross this
 # fraction of Gemini 3.1 Pro's 2M context window, summarize the
