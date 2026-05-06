@@ -142,6 +142,51 @@ class SeedResult:
     canonical_customer_id: str
 
 
+def _load_canonical_id(canonical_dir: Path) -> str:
+    """Resolve the canonical_customer_id from a corpus directory's manifest.
+
+    Looks for the manifest under either casing — `synth run --record-llm`
+    writes `manifest.json` (lowercase); hand-authored canonical corpora
+    (e.g. `tests/fixtures/canonical-mini/`) use `MANIFEST.json`
+    (uppercase). On case-insensitive filesystems (macOS APFS) the two
+    collapse to the same inode; on Linux they are distinct, so check both.
+
+    Accepts either `canonical_customer_id` (preferred — emitted by
+    hand-authored manifests and by `synth run --record-llm`) or
+    `customer_id` (run-summary fallback). When both are present, the
+    canonical alias wins.
+    """
+    manifest_path: Path | None = None
+    for candidate in ("MANIFEST.json", "manifest.json"):
+        p = canonical_dir / candidate
+        if p.exists():
+            manifest_path = p
+            break
+    if manifest_path is None:
+        raise MissingCanonicalError(
+            f"canonical manifest not found in {canonical_dir} "
+            f"(looked for MANIFEST.json and manifest.json); the manifest "
+            f"must declare canonical_customer_id (the customer_id the "
+            f"canonical corpus was recorded against)"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise MissingCanonicalError(
+            f"canonical manifest at {manifest_path} is not valid JSON: {exc}"
+        ) from exc
+    canonical_id = manifest.get("canonical_customer_id") or manifest.get("customer_id")
+    if not isinstance(canonical_id, str) or not canonical_id:
+        raise MissingCanonicalError(
+            f"manifest at {manifest_path} missing required identifier; "
+            f"need 'canonical_customer_id' (preferred) or 'customer_id' "
+            f"as a non-empty string; got canonical_customer_id="
+            f"{manifest.get('canonical_customer_id')!r} customer_id="
+            f"{manifest.get('customer_id')!r}"
+        )
+    return canonical_id
+
+
 async def seed_tenant(
     customer_id: str,
     canonical_dir: Path,
@@ -189,25 +234,7 @@ async def seed_tenant(
             f"generate it first (see scripts/synth/README.md)"
         )
 
-    manifest_path = canonical_dir / "MANIFEST.json"
-    if not manifest_path.exists():
-        raise MissingCanonicalError(
-            f"canonical MANIFEST.json not found at {manifest_path}; "
-            f"the manifest must declare canonical_customer_id (the "
-            f"customer_id the canonical corpus was recorded against)"
-        )
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise MissingCanonicalError(
-            f"canonical MANIFEST.json is not valid JSON: {exc}"
-        ) from exc
-    canonical_id = manifest.get("canonical_customer_id")
-    if not isinstance(canonical_id, str) or not canonical_id:
-        raise MissingCanonicalError(
-            f"canonical MANIFEST.json missing required 'canonical_customer_id' "
-            f"string field; got {canonical_id!r}"
-        )
+    canonical_id = _load_canonical_id(canonical_dir)
 
     bucket_name = bucket.bucket_for(customer_id)
     await bucket.ensure_bucket(bucket_name)

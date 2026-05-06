@@ -94,6 +94,10 @@ def test_write_manifest_produces_expected_keys(tmp_path: Path) -> None:
     assert payload["world_model"]["people_count"] == 0
     assert payload["archetypes_executed"]["STANDUP_UPDATE"]["generated"] == 5
     assert payload["totals"]["scenarios"] == 5
+    # The manifest doubles as the canonical-corpus manifest read by
+    # `synth seed`; canonical_customer_id is an alias for customer_id so
+    # that --record-llm output can be passed straight to --canonical-dir.
+    assert payload["canonical_customer_id"] == "cust-eval-test-01"
 
 
 def test_write_docs_index_orders_by_occurred_at_then_id(tmp_path: Path) -> None:
