@@ -303,6 +303,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Record real LLM responses to fixtures for later replay.",
     )
+    run.add_argument(
+        "--no-regen",
+        action="store_true",
+        default=False,
+        help="Disable validator regen loop. Plot scenarios that fail strict "
+        "validation will drop immediately (pre-regen behavior).",
+    )
 
     # clean — Plan 2
     clean = sub.add_parser(
@@ -772,6 +779,7 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
             writer=llm_writer,
             validator_pass2_client=validator_pass2_client,
             validator_pass2_model=validator_pass2_model,
+            regen_enabled=not args.no_regen,
         ):
             await ingestion_writer.write(doc)
             emitted_docs.append(doc)
