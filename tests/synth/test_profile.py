@@ -74,3 +74,37 @@ seed: 1
     with pytest.raises(ProfileError) as exc:
         load_profile(p)
     assert "cust-eval-" in str(exc.value) or "cust-synth-" in str(exc.value)
+
+
+def _write_profile(tmp_path: Path, extra: str = "") -> Path:
+    body = (
+        "customer_id: cust-eval-test\n"
+        "preset: tiny_test\n"
+        "seed: 1\n"
+        "repos:\n"
+        "  - https://github.com/acme/repo\n"
+        f"{extra}"
+    )
+    p = tmp_path / "profile.yaml"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def test_load_profile_default_regen_max_rounds(tmp_path: Path) -> None:
+    profile = load_profile(_write_profile(tmp_path))
+    assert profile.regen_max_rounds == 3
+
+
+def test_load_profile_explicit_regen_max_rounds(tmp_path: Path) -> None:
+    profile = load_profile(_write_profile(tmp_path, "regen:\n  max_rounds: 5\n"))
+    assert profile.regen_max_rounds == 5
+
+
+def test_load_profile_regen_max_rounds_must_be_int(tmp_path: Path) -> None:
+    with pytest.raises(ProfileError, match="regen.max_rounds"):
+        load_profile(_write_profile(tmp_path, "regen:\n  max_rounds: 'three'\n"))
+
+
+def test_load_profile_regen_max_rounds_must_be_positive(tmp_path: Path) -> None:
+    with pytest.raises(ProfileError, match="regen.max_rounds"):
+        load_profile(_write_profile(tmp_path, "regen:\n  max_rounds: 0\n"))
