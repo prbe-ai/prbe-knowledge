@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import os
 import signal
 from collections.abc import AsyncIterator
@@ -38,10 +39,26 @@ from services.synthesis.bootstrap_orchestrator import (
 from services.synthesis.bootstrap_reclaim import BootstrapReclaimLoop
 from shared.config import get_settings
 from shared.constants import WIKI_BOOTSTRAP_CHANNEL
-from shared.db import init_pool
+from shared.db import init_pool, raw_conn
 from shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
+
+
+def _bootstrap_dispatch_lock_key(customer_id: str) -> int:
+    """Hash 'bootstrap-dispatch:<customer_id>' to a 64-bit signed int.
+
+    Distinct salt from the trigger route's ``_bootstrap_lock_key`` (which
+    uses 'bootstrap:'). The trigger holds its lock for a short rate-limit
+    lookup; this lock is held for the entire orchestrator drain (often
+    minutes). Using the same key would let one in-flight drain block
+    every new trigger lookup for that customer.
+
+    Mirrors ``SynthesisWorker._lock_key`` (sha256 -> low 8 bytes ->
+    signed bigint) so the in-DB lock-keyspace stays uniform.
+    """
+    digest = hashlib.sha256(f"bootstrap-dispatch:{customer_id}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
 
 
 # ---------------------------------------------------------------------------
@@ -141,15 +158,33 @@ class BootstrapListener:
         if not customer_id:
             log.warning("bootstrap_listener.missing_customer_id", payload=payload)
             return
-        try:
-            await self._orchestrator.bootstrap(customer_id=customer_id, **kwargs)
-        except Exception as exc:
-            log.warning(
-                "bootstrap_listener.orchestrator_crashed",
-                customer=customer_id,
-                error=str(exc),
-                error_class=type(exc).__name__,
+
+        # Per-customer advisory lock prevents two listener machines from
+        # running the same NOTIFY in parallel. Postgres broadcasts NOTIFY
+        # to every LISTENing session, so without this every machine in
+        # the wiki-bootstrap fly app would wipe + re-crawl the same
+        # customer in lockstep. Mirrors ``SynthesisWorker._drain_customer``.
+        lock_key = _bootstrap_dispatch_lock_key(customer_id)
+        async with raw_conn() as lock_conn, lock_conn.transaction():
+            acquired = await lock_conn.fetchval(
+                "SELECT pg_try_advisory_xact_lock($1)", lock_key
             )
+            if not acquired:
+                log.info(
+                    "bootstrap_listener.skip_concurrent",
+                    customer=customer_id,
+                    lock_key=lock_key,
+                )
+                return
+            try:
+                await self._orchestrator.bootstrap(customer_id=customer_id, **kwargs)
+            except Exception as exc:
+                log.warning(
+                    "bootstrap_listener.orchestrator_crashed",
+                    customer=customer_id,
+                    error=str(exc),
+                    error_class=type(exc).__name__,
+                )
 
     def shutdown(self) -> None:
         self._shutdown.set()

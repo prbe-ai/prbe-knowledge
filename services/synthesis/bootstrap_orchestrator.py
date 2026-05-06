@@ -217,9 +217,21 @@ class BootstrapOrchestrator:
                     error_class=type(result).__name__,
                 )
             else:
-                # Crawler returned a result. It may still describe a
-                # halt — that's a successful return, not a failure.
-                # Only the `error` field flips it to "failed".
+                # Crawler returned a result. A halt with NO pages means
+                # the source produced nothing useful (auth.missing on a
+                # disconnected source, immediate rate-limit, etc.) —
+                # treat that as a failure so the dashboard surfaces it
+                # instead of rendering a green checkmark on an empty
+                # source. Halts WITH pages stay non-error and land as
+                # 'partial' downstream (stalled but productive).
+                if (
+                    result.error is None
+                    and result.halt_reason is not None
+                    and (result.pages_created + result.pages_updated) == 0
+                ):
+                    result = result.model_copy(
+                        update={"error": f"halt:{result.halt_reason}"}
+                    )
                 per_source.append(result)
                 if result.error:
                     failed[source] = result.error
@@ -228,7 +240,10 @@ class BootstrapOrchestrator:
 
         # Close every run row according to its outcome. Three-way status
         # branch matches the wiki_synthesis_runs CHECK constraint:
-        #   - error set                 -> 'failed'
+        #   - error set                 -> 'failed' (includes zero-page
+        #                                  halts; their error field was
+        #                                  synthesized above as
+        #                                  'halt:<reason>')
         #   - halted but produced pages -> 'partial' (stalled but productive)
         #   - clean return              -> 'complete'
         for result in per_source:

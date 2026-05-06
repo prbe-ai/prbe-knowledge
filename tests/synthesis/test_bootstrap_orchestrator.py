@@ -474,11 +474,16 @@ async def test_orchestrator_partial_status_when_halted_with_pages(
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_complete_status_when_halted_with_no_pages(
+async def test_orchestrator_failed_status_when_halted_with_no_pages(
     seeded_customer: None, http_client: httpx.AsyncClient
 ) -> None:
-    """halt_reason without pages = clean halt (e.g. auth.missing) =>
-    'complete'. The dashboard treats this as a successful no-op."""
+    """halt_reason without pages (e.g. auth.missing on a disconnected
+    source) => status='failed' with error='halt:<reason>'.
+
+    Earlier behaviour silently mapped this to 'complete', which made an
+    unconnected source indistinguishable from a real successful run on
+    the dashboard.
+    """
     factories = {
         "auth_missing": _make_factory(
             source="auth_missing",
@@ -486,7 +491,7 @@ async def test_orchestrator_complete_status_when_halted_with_no_pages(
         ),
     }
     orch = BootstrapOrchestrator(settings=_settings(), http=http_client)
-    await orch.bootstrap(
+    res = await orch.bootstrap(
         customer_id=CUSTOMER,
         sources=["auth_missing"],
         wipe_first=False,
@@ -494,14 +499,19 @@ async def test_orchestrator_complete_status_when_halted_with_no_pages(
     )
 
     async with raw_conn() as conn:
-        status = await conn.fetchval(
+        row = await conn.fetchrow(
             """
-            SELECT status FROM wiki_synthesis_runs
+            SELECT status, error FROM wiki_synthesis_runs
             WHERE customer_id = $1 AND source = 'auth_missing'
             """,
             CUSTOMER,
         )
-    assert status == "complete"
+    assert row is not None
+    assert row["status"] == "failed"
+    assert row["error"] == "halt:auth.missing"
+    # In-memory result agrees with DB: source lands in failed, not succeeded.
+    assert res.sources_succeeded == []
+    assert res.sources_failed == {"auth_missing": "halt:auth.missing"}
 
 
 # ---------------------------------------------------------------------------
