@@ -311,6 +311,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clean.add_argument("--customer", required=True, type=str)
 
+    # allow-seed — Plan 4
+    allow_seed = sub.add_parser(
+        "allow-seed",
+        help="Toggle customers.metadata.allow_synth_seed=true for a real-shape tenant.",
+    )
+    allow_seed.add_argument("--customer", required=True, type=str)
+
+    # seed — Plan 4
+    seed = sub.add_parser(
+        "seed",
+        help="Replay canonical synthetic envelopes against an existing customer.",
+    )
+    seed.add_argument("--customer", required=True, type=str)
+    seed.add_argument(
+        "--allow-non-sandbox",
+        action="store_true",
+        default=False,
+        help="Escape hatch: seed a non-eval-prefix tenant without setting "
+             "metadata.allow_synth_seed first. Prompts for typed confirmation.",
+    )
+    seed.add_argument(
+        "--canonical-dir",
+        type=str,
+        default="scripts/synth/canonical/v1",
+        help="Path to the canonical corpus (default: scripts/synth/canonical/v1).",
+    )
+
     return parser
 
 
@@ -508,6 +535,127 @@ async def _clean_async(customer_id: str) -> int:
     try:
         await clean_tenant(customer_id, db, bucket)
         print(f"cleaned tenant {customer_id}", file=sys.stderr)
+        return 0
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# allow-seed — Plan 4
+# ---------------------------------------------------------------------------
+
+
+async def _allow_seed_async(args) -> int:
+    """CLI handler for `synth allow-seed`. Returns process exit code."""
+    from scripts.synth.seed import set_allow_synth_seed
+
+    db, _bucket = await _open_db_and_bucket()
+    try:
+        try:
+            await set_allow_synth_seed(args.customer, db)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+    finally:
+        await db.close()
+
+    print(f"metadata.allow_synth_seed=true for {args.customer}", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# seed — Plan 4
+# ---------------------------------------------------------------------------
+
+
+async def _seed_async(args) -> int:
+    """CLI handler for `synth seed`. Returns process exit code.
+
+    Gate stack order (cheap → expensive):
+      1. Customer exists in DB
+      1a. Canonical fixtures present (cheap check before typed confirm)
+      2. Path 1 (metadata flag) OR Path 2 (--allow-non-sandbox + typed confirm)
+      3. Execute seed
+    """
+    import json as _json
+
+    from scripts.synth.seed import (
+        MissingCanonicalError,
+        is_seed_eligible,
+        prompt_typed_confirm,
+        seed_tenant,
+    )
+
+    db, bucket = await _open_db_and_bucket()
+    try:
+        # Gate 1: customer must exist; fetch metadata while we're at it.
+        row = await db.fetchrow(
+            "SELECT metadata FROM customers WHERE customer_id = $1",
+            args.customer,
+        )
+        if row is None:
+            print(
+                f"error: customer {args.customer!r} not found in customers table; "
+                f"create the tenant via prbe-backend signup first",
+                file=sys.stderr,
+            )
+            return 2
+
+        metadata = row["metadata"]
+        if isinstance(metadata, str):
+            metadata = _json.loads(metadata)
+
+        # Gate 1a: cheap canonical-dir existence check, BEFORE the typed-confirm
+        # prompt — don't make the operator type the customer_id back only to
+        # discover the canonical fixtures aren't there. seed_tenant still raises
+        # MissingCanonicalError as defense-in-depth.
+        canonical = Path(args.canonical_dir)
+        raw_root = canonical / "raw"
+        if not raw_root.exists() or not any(raw_root.rglob("*.json")):
+            print(
+                f"error: canonical corpus not found at {canonical}; "
+                f"generate it first (see scripts/synth/README.md)",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Gate 2: Path 1 (flag) OR Path 2 (escape hatch).
+        if not is_seed_eligible(args.customer, metadata):
+            if not args.allow_non_sandbox:
+                print(
+                    f"error: customer {args.customer!r} is not seed-eligible. "
+                    f"Either run 'synth allow-seed --customer {args.customer}' "
+                    f"first, or pass --allow-non-sandbox to seed one-off.",
+                    file=sys.stderr,
+                )
+                return 2
+            # Path 2: escape hatch requires typed confirm.
+            if not prompt_typed_confirm(args.customer):
+                print(
+                    f"error: confirmation mismatch; expected "
+                    f"{args.customer!r}. No data written.",
+                    file=sys.stderr,
+                )
+                return 2
+
+        # Gate 3 + execute (MissingCanonicalError raised by seed_tenant as defense-in-depth).
+        try:
+            result = await seed_tenant(
+                customer_id=args.customer,
+                canonical_dir=canonical,
+                db=db,
+                bucket=bucket,
+            )
+        except MissingCanonicalError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+
+        print(
+            f"seeded {result.envelopes_processed} envelopes "
+            f"({result.r2_uploaded} uploaded, {result.queued} newly queued) "
+            f"for {args.customer}",
+            file=sys.stderr,
+        )
         return 0
     finally:
         await db.close()
@@ -715,6 +863,12 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 4
+
+    if args.cmd == "allow-seed":
+        return asyncio.run(_allow_seed_async(args))
+
+    if args.cmd == "seed":
+        return asyncio.run(_seed_async(args))
 
     parser.error(f"unknown command: {args.cmd}")
     return 2

@@ -1,0 +1,29 @@
+# smoke.yaml — minimal local profile for verifying the synth pipeline end-to-end.
+#
+# Use this when you want to quickly exercise the full
+# `init → run --integrate → worker → retrieval` path against the local
+# docker-compose stack. Templated archetypes only by default (no real LLM
+# spend) when you pass --mock-llm; drop --mock-llm to use real Anthropic +
+# OpenAI keys for plot archetypes.
+#
+# Quickstart:
+#   docker compose up -d
+#   synth init --profile scripts/synth/profiles/smoke.yaml
+#   synth run  --profile scripts/synth/profiles/smoke.yaml --integrate --mock-llm
+#   synth clean --customer cust-eval-smoke
+#
+# Compared to canonical-v1.yaml: same shape, different customer_id, slightly
+# different seed (so output is distinguishable).
+
+customer_id: cust-eval-smoke
+preset: tiny_test
+seed: 7
+
+repos:
+  # Adjust to point at your local clone of prbe-knowledge.
+  - url: github.com/prbe-ai/prbe-knowledge
+    local_path: ~/Desktop/prbe/prbe-knowledge
+
+world_model:
+  min_commits_per_persona: 2
+  topic_pool_lookback_days: 30

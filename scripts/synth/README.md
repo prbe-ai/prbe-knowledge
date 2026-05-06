@@ -255,6 +255,83 @@ Drops every row across `CUSTOMER_OWNED_TABLES` (14 tables — `ingestion_queue`,
 **Hard guard:** refuses any `customer_id` that doesn't start with `cust-eval-` or
 `cust-synth-`. This is intentional — synth never touches real customer data.
 
+## Seeding a real-shape tenant (Plan 4 V1)
+
+For demoing Probe to a customer who hasn't connected real sources yet.
+Admin-triggered, costs ~$0 per seed (replays a canonical corpus, no LLM at
+seed time). The customer can never trigger this themselves.
+
+### One-time setup: record the canonical corpus
+
+(Already done if `scripts/synth/canonical/v1/raw/` is committed in this repo.
+Re-run only if you need to regenerate after a model upgrade or to capture
+new archetypes.)
+
+Use the committed `scripts/synth/profiles/canonical-v1.yaml` (its
+`customer_id` is already set to `cust-eval-canonical-v1`; adjust the
+`repos[0].local_path` if your local clone of prbe-knowledge lives somewhere
+other than `~/Desktop/prbe/prbe-knowledge`):
+
+````bash
+python -m scripts.synth init --profile scripts/synth/profiles/canonical-v1.yaml
+python -m scripts.synth run \
+    --profile scripts/synth/profiles/canonical-v1.yaml \
+    --integrate --record-llm --archetypes standup,oncall \
+    --output-dir scripts/synth/canonical/v1/
+python -m scripts.synth clean --customer cust-eval-canonical-v1
+git add scripts/synth/canonical/v1/raw/
+git commit -m "chore(synth): refresh canonical v1 corpus"
+````
+
+### Per-customer seed: two valid paths
+
+**Path 1 — opt-in flag (recommended for any customer you'll seed more than once):**
+
+````bash
+python -m scripts.synth allow-seed --customer cust-prbe-acme-co
+python -m scripts.synth seed --customer cust-prbe-acme-co
+````
+
+The first command sets `customers.metadata.allow_synth_seed = true`. Once
+the flag is set, future re-seeds are a single `synth seed` call with no
+prompt.
+
+**Path 2 — escape hatch (one-off, no DB state change):**
+
+````bash
+python -m scripts.synth seed --customer cust-prbe-acme-co --allow-non-sandbox
+# Prompts: type "cust-prbe-acme-co" to confirm.
+````
+
+Use this for one-time seeds where you don't want to leave the metadata flag
+behind.
+
+### Cleanup caveat (V1)
+
+`synth clean --customer cust-prbe-acme-co` will refuse the customer (existing
+prefix gate stays — V1 does not extend `clean_tenant`). To wipe a real-shape
+tenant, you currently have to either:
+- Drop the customer row by hand via SQL (cascade deletes all DB rows;
+  R2 objects are NOT cascade-deleted and will remain as orphans under
+  `raw/<source>/<customer_id>/synth/*.json`. Clean them up via the
+  MinIO/R2 console, or with:
+  `aws s3 rm s3://<bucket>/raw/ --recursive --include "*/<customer_id>/synth/*"`).
+- Wait for V2's surgical cleanup (`synth seed clear`) which will remove
+  only synth-tagged rows.
+
+For a customer that has connected real sources after being seeded, **do
+not** wipe — synth and real data are intermixed and there's no surgical
+removal in V1. This is a known V1 limitation; V2 adds per-row provenance
+tagging.
+
+### Gate failures
+
+`synth seed` exits non-zero on:
+- exit 2: customer not found, no path satisfied, or confirm mismatch
+- exit 1: canonical fixtures missing
+
+In all cases, no R2 or DB writes happen.
+
 ## Customer ID conventions
 
 | Prefix | Used by | Notes |
@@ -363,8 +440,9 @@ or use the in-container psql: `docker exec -it prbe-knowledge-postgres psql -U p
 ```
 scripts/synth/
 ├── README.md                  # this file
-├── cli.py                     # `synth init / run / clean / extract` argparse + main
+├── cli.py                     # `synth init / run / clean / extract / allow-seed / seed` argparse + main
 ├── bootstrap.py               # init_tenant + clean_tenant (DB + R2 customer lifecycle)
+├── seed.py                    # Plan 4: synth allow-seed + synth seed gate stack and orchestration
 ├── profile.py                 # YAML loader + Profile dataclass
 ├── scenarios.py               # async run_scenarios — yields (ScenarioSpec, SynthDoc)
 ├── validator.py               # Pass 1 (name allowlist) + combined Pass 2 wrapper

@@ -1,0 +1,16 @@
+{
+  "type": "event_callback",
+  "team_id": "T_SYNTH",
+  "api_app_id": "A_SYNTH",
+  "event_id": "Ev_synth_oncall_001",
+  "event_time": 1714003600,
+  "event": {
+    "type": "message",
+    "channel": "C_ONCALL",
+    "user": "U_BOB",
+    "text": "Handing off oncall to @charlie. Open: payments-api 503 spike (mitigated, monitoring).",
+    "ts": "1714003600.000100",
+    "client_msg_id": "synth-oncall-001",
+    "team": "T_SYNTH"
+  }
+}
