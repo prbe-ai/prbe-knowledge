@@ -1,7 +1,7 @@
 """Entry point for the prbe-knowledge-wiki-bootstrap fly app.
 
-Per-machine ``BootstrapWorker`` that LISTENs on ``WIKI_BOOTSTRAP_CHANNEL``
-(wake hint) and ``WIKI_BOOTSTRAP_CANCEL_CHANNEL`` (force-cancel), claims
+Per-machine ``BackfillWorker`` that LISTENs on ``WIKI_BACKFILL_CHANNEL``
+(wake hint) and ``WIKI_BACKFILL_CANCEL_CHANNEL`` (force-cancel), claims
 ``wiki_synthesis_runs`` rows where ``kind='bootstrap' AND status='pending'``
 via ``FOR UPDATE SKIP LOCKED``, runs each (customer, source) crawl under
 a per-(customer, source) advisory lock + per-machine semaphore, and
@@ -10,12 +10,12 @@ in shape — both use NotifyListener + asyncpg queue claim.
 
 Concurrent tasks running in this process:
 
-  - ``BootstrapWorker.run`` — pending-row drain loop.
-  - ``NotifyListener`` for ``WIKI_BOOTSTRAP_CHANNEL`` (wake hint).
+  - ``BackfillWorker.run`` — pending-row drain loop.
+  - ``NotifyListener`` for ``WIKI_BACKFILL_CHANNEL`` (wake hint).
   - Cancel listener (custom asyncpg add_listener that delivers payloads
     to the worker's cancel queue, since the generic NotifyListener
     discards payload bytes).
-  - ``BootstrapReclaimLoop`` — periodic stale-run sweep that flips
+  - ``BackfillReclaimLoop`` — periodic stale-run sweep that flips
     long-running rows back to ``pending``.
   - tiny health server (Fly probe on port 8082).
   - signal handler that drains in-flight crawl tasks on SIGTERM.
@@ -36,20 +36,20 @@ import httpx
 import orjson
 import uvicorn
 
-from services.synthesis.bootstrap_reclaim import BootstrapReclaimLoop
+from services.synthesis.backfill_reclaim import BackfillReclaimLoop
 from services.synthesis.crawlers import REGISTRY
 from services.synthesis.crawlers.base import (
+    BackfillAgent,
+    BackfillAgentResult,
     BearerResolver,
-    BootstrapAgent,
-    BootstrapAgentResult,
     empty_result,
 )
 from services.synthesis.listeners import NotifyListener
 from shared.config import Settings, get_settings
 from shared.constants import (
-    BOOTSTRAP_PARALLELISM,
-    WIKI_BOOTSTRAP_CANCEL_CHANNEL,
-    WIKI_BOOTSTRAP_CHANNEL,
+    BACKFILL_PARALLELISM,
+    WIKI_BACKFILL_CANCEL_CHANNEL,
+    WIKI_BACKFILL_CHANNEL,
 )
 from shared.db import init_pool, raw_conn
 from shared.locks import advisory_lock_key
@@ -65,8 +65,8 @@ log = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _bootstrap_run_lock_key(customer_id: str, source: str) -> int:
-    """Per-(customer, source) lock key for the BootstrapWorker.
+def _backfill_run_lock_key(customer_id: str, source: str) -> int:
+    """Per-(customer, source) lock key for the BackfillWorker.
 
     Defense-in-depth on top of ``FOR UPDATE SKIP LOCKED``: the queue
     claim already prevents two workers from grabbing the same row, but
@@ -74,7 +74,7 @@ def _bootstrap_run_lock_key(customer_id: str, source: str) -> int:
     whose original worker is still alive but stuck. The advisory lock
     catches that overlap before the new worker invokes the agent.
     """
-    return advisory_lock_key("bootstrap-run", customer_id, source)
+    return advisory_lock_key("backfill-run", customer_id, source)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ def _make_default_bearer_factory(http: httpx.AsyncClient) -> Any:
                     return bearer
                 except Exception as exc:
                     log.warning(
-                        "bootstrap.bearer_resolver_failed",
+                        "backfill.bearer_resolver_failed",
                         customer=customer_id,
                         source=source,
                         error=str(exc),
@@ -151,13 +151,13 @@ def _make_default_bearer_factory(http: httpx.AsyncClient) -> Any:
     return factory
 
 
-class BootstrapWorker:
+class BackfillWorker:
     """Drain pending bootstrap rows through per-source crawler agents.
 
     One instance per machine. Wakes on either NOTIFY channel + a 30s
     safety-net timeout. Per-machine cap on concurrent crawls via
-    ``Semaphore(BOOTSTRAP_PARALLELISM)``. Cooperative cancel via
-    ``WIKI_BOOTSTRAP_CANCEL_CHANNEL``: the trigger route inserts new
+    ``Semaphore(BACKFILL_PARALLELISM)``. Cooperative cancel via
+    ``WIKI_BACKFILL_CANCEL_CHANNEL``: the trigger route inserts new
     pending rows after firing the cancel + sleeping 10s; in-flight tasks
     receive ``CancelledError`` and (idempotently) mark their row
     ``cancelled``.
@@ -180,7 +180,7 @@ class BootstrapWorker:
         self._parallelism = int(
             parallelism
             if parallelism is not None
-            else os.environ.get("BOOTSTRAP_PARALLELISM", BOOTSTRAP_PARALLELISM)
+            else os.environ.get("BACKFILL_PARALLELISM", BACKFILL_PARALLELISM)
         )
         self._bearer_resolver_factory = bearer_resolver_factory or _no_bearer_factory
         # ``REGISTRY`` is the production source of truth; tests pass a
@@ -206,25 +206,25 @@ class BootstrapWorker:
 
     async def run(self) -> None:
         log.info(
-            "bootstrap_worker.start",
+            "backfill_worker.start",
             parallelism=self._parallelism,
-            channel=WIKI_BOOTSTRAP_CHANNEL,
-            cancel_channel=WIKI_BOOTSTRAP_CANCEL_CHANNEL,
+            channel=WIKI_BACKFILL_CHANNEL,
+            cancel_channel=WIKI_BACKFILL_CANCEL_CHANNEL,
         )
 
         # Wake-hint listener: generic NotifyListener (payload-less wake).
         wake_listener = NotifyListener(
             self._dsn,
-            WIKI_BOOTSTRAP_CHANNEL,
+            WIKI_BACKFILL_CHANNEL,
             self._wake_pending,
-            log_prefix="bootstrap_worker.wake_listener",
+            log_prefix="backfill_worker.wake_listener",
         )
-        wake_task = asyncio.create_task(wake_listener.run(), name="bootstrap.wake_listener")
+        wake_task = asyncio.create_task(wake_listener.run(), name="backfill.wake_listener")
         cancel_listener_task = asyncio.create_task(
-            self._cancel_listener_loop(), name="bootstrap.cancel_listener"
+            self._cancel_listener_loop(), name="backfill.cancel_listener"
         )
         cancel_processor_task = asyncio.create_task(
-            self._process_cancel_payloads(), name="bootstrap.cancel_processor"
+            self._process_cancel_payloads(), name="backfill.cancel_processor"
         )
 
         # Boot drain: pending rows that already exist at startup must
@@ -250,7 +250,7 @@ class BootstrapWorker:
                     except Exception:
                         # Surface but don't kill the loop on a transient
                         # DB blip; release the semaphore and bail this tick.
-                        log.exception("bootstrap_worker.claim_failed")
+                        log.exception("backfill_worker.claim_failed")
                         self._sem.release()
                         break
                     if claim is None:
@@ -258,7 +258,7 @@ class BootstrapWorker:
                         break
                     task = asyncio.create_task(
                         self._run_one(claim),
-                        name=f"bootstrap.run_one[{claim.run_id}]",
+                        name=f"backfill.run_one[{claim.run_id}]",
                     )
                     self._in_flight[claim.run_id] = task
                     task.add_done_callback(self._on_task_done)
@@ -278,7 +278,7 @@ class BootstrapWorker:
             # process alive past Fly's kill_timeout.
             if self._in_flight:
                 log.info(
-                    "bootstrap_worker.draining",
+                    "backfill_worker.draining",
                     in_flight=len(self._in_flight),
                 )
                 tasks = list(self._in_flight.values())
@@ -287,7 +287,7 @@ class BootstrapWorker:
                         asyncio.gather(*tasks, return_exceptions=True),
                         timeout=30.0,
                     )
-            log.info("bootstrap_worker.stop")
+            log.info("backfill_worker.stop")
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -359,7 +359,7 @@ class BootstrapWorker:
         lock. Idempotent on the row state machine — if the row was
         cancelled mid-flight, ``_close_run`` skips writing.
         """
-        lock_key = _bootstrap_run_lock_key(claim.customer_id, claim.source)
+        lock_key = _backfill_run_lock_key(claim.customer_id, claim.source)
         try:
             async with raw_conn() as lock_conn, lock_conn.transaction():
                 acquired = await lock_conn.fetchval(
@@ -370,7 +370,7 @@ class BootstrapWorker:
                     # back; reclaim handles the orphan if the holder
                     # genuinely dies.
                     log.info(
-                        "bootstrap_worker.skip_concurrent_run",
+                        "backfill_worker.skip_concurrent_run",
                         customer=claim.customer_id,
                         source=claim.source,
                         run_id=claim.run_id,
@@ -394,7 +394,7 @@ class BootstrapWorker:
             # 'cancelled' before NOTIFY, this is defense-in-depth) and
             # re-raise so the asyncio.Task ends in cancelled state.
             log.info(
-                "bootstrap_worker.cancelled",
+                "backfill_worker.cancelled",
                 customer=claim.customer_id,
                 source=claim.source,
                 run_id=claim.run_id,
@@ -404,7 +404,7 @@ class BootstrapWorker:
             raise
         except Exception as exc:
             log.exception(
-                "bootstrap_worker.run_failed",
+                "backfill_worker.run_failed",
                 customer=claim.customer_id,
                 source=claim.source,
                 run_id=claim.run_id,
@@ -412,7 +412,7 @@ class BootstrapWorker:
             with contextlib.suppress(Exception):
                 await self._close_run_with_error(claim, exc)
 
-    async def _invoke_agent(self, claim: _Claim) -> BootstrapAgentResult:
+    async def _invoke_agent(self, claim: _Claim) -> BackfillAgentResult:
         """Resolve the factory + bearer, build the crawler, run it.
 
         Constructor / pre-run failures get translated into an
@@ -429,7 +429,7 @@ class BootstrapWorker:
                 f"unknown crawler source {claim.source!r}; registered: {sorted(factory_map.keys())}"
             )
             log.warning(
-                "bootstrap_worker.unknown_source",
+                "backfill_worker.unknown_source",
                 customer=claim.customer_id,
                 source=claim.source,
                 run_id=claim.run_id,
@@ -443,7 +443,7 @@ class BootstrapWorker:
             )
 
         try:
-            agent: BootstrapAgent = factory(
+            agent: BackfillAgent = factory(
                 customer_id=claim.customer_id,
                 run_id=claim.run_id,
                 bearer_resolver=self._bearer_resolver_factory(claim.customer_id, claim.source),
@@ -452,7 +452,7 @@ class BootstrapWorker:
             )
         except Exception as exc:
             log.warning(
-                "bootstrap_worker.construct_failed",
+                "backfill_worker.construct_failed",
                 customer=claim.customer_id,
                 source=claim.source,
                 run_id=claim.run_id,
@@ -475,7 +475,7 @@ class BootstrapWorker:
     # Run-row close paths
     # ------------------------------------------------------------------
 
-    async def _close_run(self, claim: _Claim, result: BootstrapAgentResult) -> None:
+    async def _close_run(self, claim: _Claim, result: BackfillAgentResult) -> None:
         """Three-way status branch (matches the CHECK constraint):
           - error set                 -> 'failed' (includes zero-page
                                           halts; their error field was
@@ -501,7 +501,7 @@ class BootstrapWorker:
             )
             if current == "cancelled":
                 log.info(
-                    "bootstrap_worker.close_skipped_cancelled",
+                    "backfill_worker.close_skipped_cancelled",
                     customer=claim.customer_id,
                     source=claim.source,
                     run_id=claim.run_id,
@@ -524,7 +524,7 @@ class BootstrapWorker:
                 result.error,
             )
         log.info(
-            "bootstrap_worker.run_closed",
+            "backfill_worker.run_closed",
             customer=claim.customer_id,
             source=claim.source,
             run_id=claim.run_id,
@@ -577,7 +577,7 @@ class BootstrapWorker:
     # ------------------------------------------------------------------
 
     async def _cancel_listener_loop(self) -> None:
-        """LISTEN on WIKI_BOOTSTRAP_CANCEL_CHANNEL with a dedicated conn,
+        """LISTEN on WIKI_BACKFILL_CANCEL_CHANNEL with a dedicated conn,
         push every payload onto the cancel queue. Doesn't itself cancel
         tasks; the processor coroutine does.
 
@@ -591,7 +591,7 @@ class BootstrapWorker:
                 conn = await asyncpg.connect(self._dsn)
             except (asyncpg.PostgresError, OSError) as exc:
                 log.warning(
-                    "bootstrap_worker.cancel_listener.connect_failed",
+                    "backfill_worker.cancel_listener.connect_failed",
                     error=str(exc),
                     backoff_seconds=backoff,
                 )
@@ -605,7 +605,7 @@ class BootstrapWorker:
 
                 def _on_cancel_notify(_conn, _pid, _channel, payload) -> None:
                     log.info(
-                        "bootstrap_worker.cancel_listener.notified",
+                        "backfill_worker.cancel_listener.notified",
                         channel=_channel,
                         payload=payload,
                     )
@@ -615,8 +615,8 @@ class BootstrapWorker:
                     self._cancel_payloads.put_nowait(payload)
                     self._wake_cancel.set()
 
-                await conn.add_listener(WIKI_BOOTSTRAP_CANCEL_CHANNEL, _on_cancel_notify)
-                log.info("bootstrap_worker.cancel_listener.ready")
+                await conn.add_listener(WIKI_BACKFILL_CANCEL_CHANNEL, _on_cancel_notify)
+                log.info("backfill_worker.cancel_listener.ready")
                 while not self._shutdown.is_set():
                     try:
                         await asyncio.wait_for(self._shutdown.wait(), timeout=30.0)
@@ -625,7 +625,7 @@ class BootstrapWorker:
                             await conn.fetchval("SELECT 1")
                         except (asyncpg.PostgresError, OSError) as exc:
                             log.warning(
-                                "bootstrap_worker.cancel_listener.lost",
+                                "backfill_worker.cancel_listener.lost",
                                 error=str(exc),
                             )
                             break
@@ -633,7 +633,7 @@ class BootstrapWorker:
                 with contextlib.suppress(Exception):
                     await conn.close()
 
-        log.info("bootstrap_worker.cancel_listener.stop")
+        log.info("backfill_worker.cancel_listener.stop")
 
     async def _process_cancel_payloads(self) -> None:
         """Pull cancel payloads off the queue; cancel matching in-flight tasks."""
@@ -650,7 +650,7 @@ class BootstrapWorker:
         try:
             data = orjson.loads(payload)
         except orjson.JSONDecodeError:
-            log.warning("bootstrap_worker.cancel_payload_unparseable", payload=payload)
+            log.warning("backfill_worker.cancel_payload_unparseable", payload=payload)
             return
         run_ids = data.get("run_ids") or []
         if not isinstance(run_ids, list):
@@ -664,7 +664,7 @@ class BootstrapWorker:
             if task is None or task.done():
                 continue
             log.info(
-                "bootstrap_worker.cancelling_task",
+                "backfill_worker.cancelling_task",
                 run_id=run_id,
             )
             task.cancel()
@@ -696,7 +696,7 @@ def _build_health_app():
     from shared.db import health_check
 
     app = FastAPI(
-        title="prbe-knowledge-wiki-bootstrap health",
+        title="prbe-knowledge-wiki-backfill health",
         docs_url=None,
         redoc_url=None,
     )
@@ -733,12 +733,12 @@ async def build_http_client() -> AsyncIterator[httpx.AsyncClient]:
 # ---------------------------------------------------------------------------
 
 
-async def run_bootstrap_app_forever() -> None:
+async def run_backfill_app_forever() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     await init_pool(settings)
     # Import handlers package so any decorators run (mirror the other
-    # wiki apps; bootstrap reuses the same Normalizer write path inside
+    # wiki apps; backfill reuses the same Normalizer write path inside
     # the wiki tools).
     import services.ingestion.handlers  # noqa: F401
 
@@ -760,20 +760,20 @@ async def run_bootstrap_app_forever() -> None:
     health_server = uvicorn.Server(health_config)
 
     log.info(
-        "bootstrap_app.boot",
+        "backfill_app.boot",
         environment=settings.environment,
         health_port=health_port,
         timestamp=datetime.now(UTC).isoformat(),
     )
 
     async with build_http_client() as http:
-        worker = BootstrapWorker(
+        worker = BackfillWorker(
             dsn=listener_dsn,
             http=http,
             settings=settings,
             bearer_resolver_factory=_make_default_bearer_factory(http),
         )
-        reclaim_loop = BootstrapReclaimLoop()
+        reclaim_loop = BackfillReclaimLoop()
 
         loop = asyncio.get_running_loop()
         gather_future: asyncio.Future | None = None  # type: ignore[type-arg]
@@ -784,7 +784,7 @@ async def run_bootstrap_app_forever() -> None:
             if shutdown_started:
                 return
             shutdown_started = True
-            log.info("bootstrap_app.shutdown_signal", signal=signame)
+            log.info("backfill_app.shutdown_signal", signal=signame)
             worker.shutdown()
             reclaim_loop.shutdown()
             health_server.should_exit = True
@@ -803,8 +803,8 @@ async def run_bootstrap_app_forever() -> None:
         try:
             await gather_future
         except asyncio.CancelledError:
-            log.info("bootstrap_app.shutdown_complete")
+            log.info("backfill_app.shutdown_complete")
 
 
 if __name__ == "__main__":  # pragma: no cover
-    asyncio.run(run_bootstrap_app_forever())
+    asyncio.run(run_backfill_app_forever())

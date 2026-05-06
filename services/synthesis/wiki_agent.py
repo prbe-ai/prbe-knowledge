@@ -519,9 +519,7 @@ class WikiAgentRuntime:
         page_slug = f"{update.wiki_type}:{update.slug}"
         lock_key = advisory_lock_key("page", self.customer_id, page_slug)
         async with with_tenant(self.customer_id) as lock_conn:
-            await lock_conn.execute(
-                "SELECT pg_advisory_xact_lock($1)", lock_key
-            )
+            await lock_conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
             # Re-fetch the existing page so MANUAL_ENTRY pages are skipped
             # (we don't want the agent to clobber a human-authored page).
             # The fetch happens AFTER the lock so it sees the latest
@@ -584,9 +582,7 @@ class WikiAgentRuntime:
         page_slug = f"{create.wiki_type}:{create.slug}"
         lock_key = advisory_lock_key("page", self.customer_id, page_slug)
         async with with_tenant(self.customer_id) as lock_conn:
-            await lock_conn.execute(
-                "SELECT pg_advisory_xact_lock($1)", lock_key
-            )
+            await lock_conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
             event = self._build_wiki_event(
                 wiki_type=create.wiki_type,
                 slug=create.slug,
@@ -629,7 +625,7 @@ class WikiAgentRuntime:
         errors, OSError, TimeoutError) are swallowed-with-warning.
         Programmer errors (TypeError, AttributeError, KeyError, ...) from
         a parser bug propagate, so tests catch them rather than silently
-        skipping a link write. See the wiki-bootstrap-plan TODO entry
+        skipping a link write. See the wiki-backfill-plan TODO entry
         ("Link-graph reconciliation cron") for the planned mitigation of
         the staleness window.
         """

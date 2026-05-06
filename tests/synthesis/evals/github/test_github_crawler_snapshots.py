@@ -37,7 +37,7 @@ import pytest
 import respx
 
 from services.synthesis.crawlers.github import (
-    BootstrapWikiRuntime,
+    BackfillWikiRuntime,
     GitHubCrawlerAgent,
 )
 from services.synthesis.wiki_links import extract_links
@@ -476,10 +476,10 @@ class _SnapshotReplayLLM:
 # ---------------------------------------------------------------------------
 
 
-class _InMemoryBootstrapRuntime(BootstrapWikiRuntime):
+class _InMemoryBootstrapRuntime(BackfillWikiRuntime):
     """Test-only runtime that captures pages in dicts instead of writing
     to the real DB. Inherits dispatch + state machinery from
-    ``BootstrapWikiRuntime``; only ``commit()`` is overridden to materialize
+    ``BackfillWikiRuntime``; only ``commit()`` is overridden to materialize
     the in-memory page set + run the link extractor.
     """
 

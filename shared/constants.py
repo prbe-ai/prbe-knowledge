@@ -379,33 +379,33 @@ GRANOLA_REFRESH_DEBOUNCE_SECONDS = 30
 WIKI_PENDING_CHANNEL = "wiki_synthesize_pending"
 WIKI_TRIAGED_CHANNEL = "wiki_synthesize_triaged"
 
-# Bootstrap pipeline wake channel — fired by the
-# /api/wiki/bootstrap/trigger route after it inserts pending rows. Empty
-# payload; the BootstrapWorker treats this as a "drain pending rows now"
+# Backfill pipeline wake channel — fired by the
+# /api/wiki/backfill/trigger route after it inserts pending rows. Empty
+# payload; the BackfillWorker treats this as a "drain pending rows now"
 # wake hint and claims rows via FOR UPDATE SKIP LOCKED. Distinct from
 # WIKI_PENDING_CHANNEL because the daily-replay path operates on the v4
-# queue, while bootstrap reads from source APIs.
-WIKI_BOOTSTRAP_CHANNEL = "wiki_bootstrap_pending"
+# queue, while backfill reads from source APIs.
+WIKI_BACKFILL_CHANNEL = "wiki_backfill_pending"
 
-# Bootstrap cancel channel — fired by the trigger route's force-cancel
+# Backfill cancel channel — fired by the trigger route's force-cancel
 # path. Payload is a JSON object ``{customer_id, run_ids: [int]}``;
-# every BootstrapWorker LISTENing on this channel cancels in-flight
+# every BackfillWorker LISTENing on this channel cancels in-flight
 # tasks whose run_id matches. Coarse 10s drain window — see
-# BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS.
-WIKI_BOOTSTRAP_CANCEL_CHANNEL = "wiki_bootstrap_cancel"
+# BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS.
+WIKI_BACKFILL_CANCEL_CHANNEL = "wiki_backfill_cancel"
 
 # Cooperative drain window the trigger route waits after firing the
 # cancel NOTIFY before proceeding to wipe + insert new pending rows.
 # Sized larger than the worker's per-tick cadence but small enough that
 # admin-initiated force-restart still feels interactive in the dashboard.
-BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS = 10.0
+BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS = 10.0
 
-# Per-machine cap on concurrent bootstrap crawler agents. Read at boot
-# from the BOOTSTRAP_PARALLELISM env var by ``BootstrapWorker``; the
+# Per-machine cap on concurrent backfill crawler agents. Read at boot
+# from the BACKFILL_PARALLELISM env var by ``BackfillWorker``; the
 # constant here is the default. Sized at 6 against the 4 GB / 2 vCPU
 # fly machine envelope (idle ~150 MB, ~150-250 MB per active crawler ->
 # ~1.5 GB peak crawler load + headroom). Tune via env, not code.
-BOOTSTRAP_PARALLELISM = 6
+BACKFILL_PARALLELISM = 6
 
 # How many wiki_synthesis_queue rows the cron claims per drain tick. Triage is
 # token-budget batched on top of this; this is just the upper bound on rows
@@ -555,22 +555,22 @@ WIKI_AGENT_MODEL = "gemini-3.1-pro-preview"
 # conversation; preserves the structured runtime state untouched.
 WIKI_AGENT_COMPACTOR_MODEL = "gemini-flash-lite-preview"
 
-# Per-source bootstrap crawler models. Default to the same Pro model the
+# Per-source backfill crawler models. Default to the same Pro model the
 # daily-replay agent uses; per-source knobs let us swap a cheaper /
 # bigger model for one source without redeploying the rest. Mentioned
-# under "Per-source models" in docs/wiki-bootstrap-plan.md.
-WIKI_BOOTSTRAP_MODEL_GITHUB = "gemini-3.1-pro-preview"
+# under "Per-source models" in docs/wiki-backfill-plan.md.
+WIKI_BACKFILL_MODEL_GITHUB = "gemini-3.1-pro-preview"
 
-# Stop-walking heuristic for bootstrap crawlers. After this many
+# Stop-walking heuristic for backfill crawlers. After this many
 # consecutive source items that don't cause the agent to call
 # update_page / create_page, the crawler treats the repo as drained and
 # moves on. Picked at 50 to match the system prompt's stopping rule.
-WIKI_BOOTSTRAP_QUIET_STREAK = 50
+WIKI_BACKFILL_QUIET_STREAK = 50
 
 # Time horizon (days) for GitHub PR + issue ingestion. Commits walk
 # all-time per the locked plan so old structural commits ("first added
 # auth middleware") still surface even when ticket history is bounded.
-WIKI_BOOTSTRAP_GITHUB_PRS_DAYS = 365
+WIKI_BACKFILL_GITHUB_PRS_DAYS = 365
 
 # Agent's CachedContent TTL. Re-create on miss; alert if hit_rate < 80%.
 WIKI_AGENT_CACHE_TTL = "3600s"

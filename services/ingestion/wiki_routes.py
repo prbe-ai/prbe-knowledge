@@ -61,12 +61,12 @@ from services.ingestion.normalizer import (
     fetch_live_body_from_chunks,
 )
 from services.ingestion.wiki_links import parse_page_links
-from services.synthesis.crawlers import REGISTRY as BOOTSTRAP_CRAWLER_REGISTRY
+from services.synthesis.crawlers import REGISTRY as BACKFILL_CRAWLER_REGISTRY
 from shared.constants import (
-    BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS,
+    BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS,
     INDEXABLE_WIKI_DOC_TYPES,
-    WIKI_BOOTSTRAP_CANCEL_CHANNEL,
-    WIKI_BOOTSTRAP_CHANNEL,
+    WIKI_BACKFILL_CANCEL_CHANNEL,
+    WIKI_BACKFILL_CHANNEL,
     WIKI_PENDING_CHANNEL,
     DocClass,
     SourceSystem,
@@ -1083,15 +1083,21 @@ async def reset_wiki_synthesis_dlq(
 
 
 # ---------------------------------------------------------------------------
-# Bootstrap trigger (per-source crawler agents — not the daily replay loop)
+# Backfill trigger (per-source crawler agents — not the daily replay loop)
+#
+# Both /api/wiki/backfill/* and the legacy /api/wiki/bootstrap/* aliases
+# share the same handler logic via _do_trigger_wiki_backfill /
+# _do_get_wiki_backfill_status. The DB value `kind='bootstrap'` and the
+# fly app name stay unchanged for now; only the public surface, Python
+# identifiers, and structlog events are renamed.
 # ---------------------------------------------------------------------------
 
 
-class BootstrapTriggerBody(BaseModel):
-    """Request body for ``POST /api/wiki/bootstrap/trigger``.
+class BackfillTriggerBody(BaseModel):
+    """Request body for ``POST /api/wiki/backfill/trigger``.
 
     All three fields are optional. Defaults mirror the locked plan:
-    every registered source, wipe-first re-bootstrap, generic reason.
+    every registered source, wipe-first re-backfill, generic reason.
     """
 
     sources: list[str] | None = Field(default=None)
@@ -1099,8 +1105,8 @@ class BootstrapTriggerBody(BaseModel):
     reason: str | None = Field(default=None, max_length=240)
 
 
-class BootstrapTriggerResponse(BaseModel):
-    """Shape consumed by the BFF ``POST /api/wiki/bootstrap/trigger`` proxy.
+class BackfillTriggerResponse(BaseModel):
+    """Shape consumed by the BFF ``POST /api/wiki/backfill/trigger`` proxy.
 
     ``run_ids`` are the freshly-inserted ``wiki_synthesis_runs`` row IDs
     (one per requested source) at status='pending'. A worker on any
@@ -1112,13 +1118,13 @@ class BootstrapTriggerResponse(BaseModel):
     run_ids: list[int]
 
 
-class BootstrapStatusResponse(BaseModel):
-    """Aggregate over the most recent bootstrap "burst" for the customer.
+class BackfillStatusResponse(BaseModel):
+    """Aggregate over the most recent backfill "burst" for the customer.
 
     A burst = the runs opened by a single trigger (one per source). We
     detect it by anchoring on the most recent ``kind='bootstrap'`` row's
     ``started_at`` and including everything within 60 seconds before
-    that. Empty payload when the customer has never bootstrapped.
+    that. Empty payload when the customer has never backfilled.
     """
 
     in_progress: bool
@@ -1130,13 +1136,18 @@ class BootstrapStatusResponse(BaseModel):
     pages_updated: int
 
 
+# Back-compat aliases. Existing test imports + the prbe-backend BFF
+# response models still reference the old names.
+BootstrapTriggerBody = BackfillTriggerBody
+BootstrapTriggerResponse = BackfillTriggerResponse
+BootstrapStatusResponse = BackfillStatusResponse
+
+
 # In-flight states for the trigger route's pre-flight check.
 _IN_FLIGHT_STATUSES: tuple[str, ...] = ("pending", "running")
 
 
-async def _get_in_flight_runs(
-    conn: asyncpg.Connection, customer_id: str
-) -> list[dict[str, Any]]:
+async def _get_in_flight_runs(conn: asyncpg.Connection, customer_id: str) -> list[dict[str, Any]]:
     """Return every in-flight bootstrap run row for ``customer_id``.
 
     "In-flight" = ``status IN ('pending','running')``. Used by the
@@ -1158,9 +1169,7 @@ async def _get_in_flight_runs(
     return [dict(r) for r in rows]
 
 
-async def _wipe_wiki_for_customer(
-    conn: asyncpg.Connection, customer_id: str
-) -> None:
+async def _wipe_wiki_for_customer(conn: asyncpg.Connection, customer_id: str) -> None:
     """Drop the customer's compiled-wiki rows so re-bootstrap starts clean.
 
     Operates on the passed-in connection (which the trigger route holds
@@ -1233,57 +1242,25 @@ async def _insert_pending_runs(
     return {row["source"]: int(row["run_id"]) for row in rows}
 
 
-@router.post(
-    "/bootstrap/trigger",
-    response_model=BootstrapTriggerResponse,
-    status_code=202,
-    dependencies=[Depends(verify_internal_knowledge_key)],
-)
-async def trigger_wiki_bootstrap(
-    body: BootstrapTriggerBody,
-    customer_id: str = Depends(_require_customer),
-    force: bool = Query(
-        default=False,
-        description=(
-            "Cancel any in-flight bootstrap for this customer and start a "
-            "fresh one. Without force, an in-flight run returns 409."
-        ),
-    ),
-) -> BootstrapTriggerResponse:
-    """Enqueue a wiki bootstrap for ``customer_id``.
+async def _do_trigger_wiki_backfill(
+    body: BackfillTriggerBody,
+    customer_id: str,
+    force: bool,
+) -> BackfillTriggerResponse:
+    """Shared handler for both /backfill/trigger and the legacy
+    /bootstrap/trigger alias.
 
     Inserts one ``wiki_synthesis_runs`` row per requested source at
     ``status='pending'`` and fires a payload-less ``pg_notify`` on
-    ``WIKI_BOOTSTRAP_CHANNEL`` as a wake hint. ``BootstrapWorker``s on
-    every wiki-bootstrap fly machine claim rows via
+    ``WIKI_BACKFILL_CHANNEL`` as a wake hint. ``BackfillWorker``s on
+    every wiki-backfill fly machine claim rows via
     ``FOR UPDATE SKIP LOCKED`` and run crawlers in parallel.
-
-    Concurrency control:
-      - 409 on in-flight (pending or running) rows when ``force=false``.
-        Body carries the in-flight run_ids + per-source status so the
-        dashboard can render an informative "cancel and restart?" prompt.
-      - ``force=true`` marks the in-flight rows ``cancelled``, fires
-        ``WIKI_BOOTSTRAP_CANCEL_CHANNEL`` so workers can ``task.cancel()``
-        live crawlers, sleeps ``BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS``
-        for a coarse cooperative drain, then proceeds with the wipe +
-        new pending insert.
-
-    All three of (in-flight check, cancel, wipe + insert) run inside a
-    single transaction holding a per-customer advisory lock so two
-    concurrent triggers serialize.
-
-    Body's ``sources`` is validated against the crawler registry
-    (``REGISTRY.keys()``); unknown names 400 with a helpful error.
-    Defaults to all registered crawlers when omitted.
-
-    Auth: same internal-key + customer-header as the rest of the wiki
-    routes.
     """
     requested = body.sources
     if requested is None:
-        sources = sorted(BOOTSTRAP_CRAWLER_REGISTRY.keys())
+        sources = sorted(BACKFILL_CRAWLER_REGISTRY.keys())
     else:
-        unknown = [s for s in requested if s not in BOOTSTRAP_CRAWLER_REGISTRY]
+        unknown = [s for s in requested if s not in BACKFILL_CRAWLER_REGISTRY]
         if unknown:
             raise HTTPException(
                 status_code=400,
@@ -1291,7 +1268,7 @@ async def trigger_wiki_bootstrap(
             )
         sources = list(requested)
 
-    lock_key = advisory_lock_key("bootstrap-trigger", customer_id)
+    lock_key = advisory_lock_key("backfill-trigger", customer_id)
     cancelled_ids: list[int] = []
 
     # Critical section: hold the per-customer trigger lock for in-flight
@@ -1303,16 +1280,12 @@ async def trigger_wiki_bootstrap(
 
         in_flight = await _get_in_flight_runs(conn, customer_id)
         if in_flight and not force:
-            running_sources = [
-                str(r["source"]) for r in in_flight if r["status"] == "running"
-            ]
-            pending_sources = [
-                str(r["source"]) for r in in_flight if r["status"] == "pending"
-            ]
+            running_sources = [str(r["source"]) for r in in_flight if r["status"] == "running"]
+            pending_sources = [str(r["source"]) for r in in_flight if r["status"] == "pending"]
             run_ids = [int(r["run_id"]) for r in in_flight]
             started_at = in_flight[0]["started_at"] if in_flight else None
             log.info(
-                "wiki.bootstrap.trigger.in_flight",
+                "wiki.backfill.trigger.in_flight",
                 customer=customer_id,
                 run_ids=run_ids,
                 running=running_sources,
@@ -1351,11 +1324,11 @@ async def trigger_wiki_bootstrap(
             ).decode("utf-8")
             await conn.execute(
                 "SELECT pg_notify($1, $2)",
-                WIKI_BOOTSTRAP_CANCEL_CHANNEL,
+                WIKI_BACKFILL_CANCEL_CHANNEL,
                 cancel_payload,
             )
             log.info(
-                "wiki.bootstrap.trigger.cancel_fired",
+                "wiki.backfill.trigger.cancel_fired",
                 customer=customer_id,
                 cancelled_run_ids=cancelled_ids,
             )
@@ -1363,8 +1336,8 @@ async def trigger_wiki_bootstrap(
             # finish current API calls / commit in-flight pages. We
             # don't need an ack channel — the per-page advisory lock
             # in wiki_agent prevents post-wipe writes from a stuck
-            # worker from clobbering new bootstrap output.
-            await asyncio.sleep(BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS)
+            # worker from clobbering new backfill output.
+            await asyncio.sleep(BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS)
 
         if body.wipe_first:
             await _wipe_wiki_for_customer(conn, customer_id)
@@ -1379,11 +1352,11 @@ async def trigger_wiki_bootstrap(
         # needed.
         await conn.execute(
             "SELECT pg_notify($1, '')",
-            WIKI_BOOTSTRAP_CHANNEL,
+            WIKI_BACKFILL_CHANNEL,
         )
 
     log.info(
-        "wiki.bootstrap.trigger",
+        "wiki.backfill.trigger",
         customer=customer_id,
         sources=sources,
         wipe_first=body.wipe_first,
@@ -1392,30 +1365,15 @@ async def trigger_wiki_bootstrap(
         run_ids=run_ids_map,
         cancelled_run_ids=cancelled_ids or None,
     )
-    return BootstrapTriggerResponse(
+    return BackfillTriggerResponse(
         triggered=True,
         run_ids=[run_ids_map[s] for s in sources],
     )
 
 
-@router.get(
-    "/bootstrap/status",
-    response_model=BootstrapStatusResponse,
-    dependencies=[Depends(verify_internal_knowledge_key)],
-)
-async def get_wiki_bootstrap_status(
-    customer_id: str = Depends(_require_customer),
-) -> BootstrapStatusResponse:
-    """Aggregate over the most-recent bootstrap burst for ``customer_id``.
-
-    A "burst" = the per-source runs opened by a single trigger. We
-    anchor on the most recent ``kind='bootstrap'`` row's ``started_at``
-    and pull every bootstrap row in [T_anchor - 60s, NOW()] for this
-    customer. That window covers the slight skew between sources
-    inserted by the same batched INSERT.
-
-    Empty payload when the customer has never bootstrapped — the
-    dashboard renders "Bootstrap not yet run" instead of an error.
+async def _do_get_wiki_backfill_status(customer_id: str) -> BackfillStatusResponse:
+    """Shared handler for both /backfill/status and the legacy
+    /bootstrap/status alias.
     """
     async with raw_conn() as conn:
         anchor = await conn.fetchrow(
@@ -1428,7 +1386,7 @@ async def get_wiki_bootstrap_status(
             customer_id,
         )
         if anchor is None:
-            return BootstrapStatusResponse(
+            return BackfillStatusResponse(
                 in_progress=False,
                 started_at=None,
                 sources_attempted=[],
@@ -1465,7 +1423,7 @@ async def get_wiki_bootstrap_status(
         sources_attempted.append(source)
         # Both 'pending' (queued, not yet claimed) and 'running' (a
         # worker is actively crawling) count as in-progress so the
-        # dashboard's "Bootstrapping..." pill stays up across the claim
+        # dashboard's "Backfilling..." pill stays up across the claim
         # boundary.
         if status in ("pending", "running"):
             in_progress = True
@@ -1478,7 +1436,7 @@ async def get_wiki_bootstrap_status(
         pages_created += int(row["pages_created"] or 0)
         pages_updated += int(row["pages_updated"] or 0)
 
-    return BootstrapStatusResponse(
+    return BackfillStatusResponse(
         in_progress=in_progress,
         started_at=started_at,
         sources_attempted=sources_attempted,
@@ -1487,6 +1445,69 @@ async def get_wiki_bootstrap_status(
         pages_created=pages_created,
         pages_updated=pages_updated,
     )
+
+
+_FORCE_QUERY = Query(
+    default=False,
+    description=(
+        "Cancel any in-flight backfill for this customer and start a "
+        "fresh one. Without force, an in-flight run returns 409."
+    ),
+)
+
+
+@router.post(
+    "/backfill/trigger",
+    response_model=BackfillTriggerResponse,
+    status_code=202,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def trigger_wiki_backfill(
+    body: BackfillTriggerBody,
+    customer_id: str = Depends(_require_customer),
+    force: bool = _FORCE_QUERY,
+) -> BackfillTriggerResponse:
+    """Enqueue a wiki backfill for ``customer_id``."""
+    return await _do_trigger_wiki_backfill(body, customer_id, force)
+
+
+@router.post(
+    "/bootstrap/trigger",
+    response_model=BackfillTriggerResponse,
+    status_code=202,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def trigger_wiki_bootstrap(
+    body: BackfillTriggerBody,
+    customer_id: str = Depends(_require_customer),
+    force: bool = _FORCE_QUERY,
+) -> BackfillTriggerResponse:
+    """Legacy alias for ``POST /api/wiki/backfill/trigger``."""
+    return await _do_trigger_wiki_backfill(body, customer_id, force)
+
+
+@router.get(
+    "/backfill/status",
+    response_model=BackfillStatusResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def get_wiki_backfill_status(
+    customer_id: str = Depends(_require_customer),
+) -> BackfillStatusResponse:
+    """Aggregate over the most-recent backfill burst for ``customer_id``."""
+    return await _do_get_wiki_backfill_status(customer_id)
+
+
+@router.get(
+    "/bootstrap/status",
+    response_model=BackfillStatusResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def get_wiki_bootstrap_status(
+    customer_id: str = Depends(_require_customer),
+) -> BackfillStatusResponse:
+    """Legacy alias for ``GET /api/wiki/backfill/status``."""
+    return await _do_get_wiki_backfill_status(customer_id)
 
 
 def _render_index_body(entries: list[WikiIndexEntry]) -> str:

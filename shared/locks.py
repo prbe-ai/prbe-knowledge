@@ -7,10 +7,10 @@ recipe; this module is the single home for that helper.
 
 Salts in production:
 
-    bootstrap-trigger : per-customer wipe + insert critical section in
+    backfill-trigger  : per-customer wipe + insert critical section in
                         the trigger route.
-    bootstrap-run     : per-(customer, source) defense-in-depth lock the
-                        BootstrapWorker takes around the per-source crawl.
+    backfill-run      : per-(customer, source) defense-in-depth lock the
+                        BackfillWorker takes around the per-source crawl.
     page              : per-(customer, page_slug) lock the wiki agent
                         takes around the read-then-write in
                         update_page / create_page.

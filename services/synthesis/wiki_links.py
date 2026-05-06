@@ -16,7 +16,7 @@ Two responsibilities, kept in one module:
       writes can commit/rollback alongside the page persist when the
       caller threads a single connection through both).
 
-Design notes (per docs/wiki-bootstrap-plan.md "Zero-LLM-call link
+Design notes (per docs/wiki-backfill-plan.md "Zero-LLM-call link
 extraction"):
 
   - Markdown grammar:

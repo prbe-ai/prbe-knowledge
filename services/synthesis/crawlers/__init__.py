@@ -1,8 +1,8 @@
 """Per-source bootstrap crawler agents.
 
-The ``BootstrapWorker`` (``services.synthesis.bootstrap_app``) claims
+The ``BackfillWorker`` (``services.synthesis.backfill_app``) claims
 ``wiki_synthesis_runs`` rows at ``status='pending'`` and instantiates
-one ``BootstrapAgent`` per claim from this REGISTRY. Each subclass
+one ``BackfillAgent`` per claim from this REGISTRY. Each subclass
 lives in its own module here (``github_agent.py``, ``slack_agent.py``,
 ...) and registers itself at import time via ``register_crawler``.
 
@@ -13,15 +13,15 @@ lanes add Slack, Linear, Notion, Granola, Claude Code, codebase.
 from __future__ import annotations
 
 from services.synthesis.crawlers.base import (
+    BackfillAgent,
+    BackfillAgentResult,
     BearerResolver,
-    BootstrapAgent,
-    BootstrapAgentResult,
 )
 
 # Module-level registry. Populated at import time by `register_crawler`
 # calls in each concrete crawler module. The orchestrator looks up
 # subclasses here when resolving the `sources=[...]` payload.
-REGISTRY: dict[str, type[BootstrapAgent]] = {}
+REGISTRY: dict[str, type[BackfillAgent]] = {}
 
 
 def _register_default_crawlers() -> None:
@@ -41,13 +41,13 @@ def _register_default_crawlers() -> None:
 _register_default_crawlers()
 
 
-def register_crawler(cls: type[BootstrapAgent]) -> type[BootstrapAgent]:
+def register_crawler(cls: type[BackfillAgent]) -> type[BackfillAgent]:
     """Decorator (or plain call) to add a crawler to ``REGISTRY``.
 
     Usage:
 
         @register_crawler
-        class GitHubCrawlerAgent(BootstrapAgent):
+        class GitHubCrawlerAgent(BackfillAgent):
             source = "github"
             ...
 
@@ -64,8 +64,8 @@ def register_crawler(cls: type[BootstrapAgent]) -> type[BootstrapAgent]:
 
 __all__ = [
     "REGISTRY",
+    "BackfillAgent",
+    "BackfillAgentResult",
     "BearerResolver",
-    "BootstrapAgent",
-    "BootstrapAgentResult",
     "register_crawler",
 ]

@@ -1,4 +1,4 @@
-"""Read-only GitHub client used by the wiki bootstrap crawler (Lane E).
+"""Read-only GitHub client used by the wiki backfill crawler (Lane E).
 
 The ingestion-side `services/ingestion/handlers/github.py` keeps its own
 inline pagination + cursor encoding because it has to interleave with
@@ -109,7 +109,7 @@ class _AsyncTokenBucket:
 
 
 class GitHubAPIClient:
-    """Read-only GitHub client used by the wiki bootstrap crawler.
+    """Read-only GitHub client used by the wiki backfill crawler.
 
     Holds a bearer token and shared httpx.AsyncClient. Surfaces
     paginating async iterators for the resources the crawler needs:

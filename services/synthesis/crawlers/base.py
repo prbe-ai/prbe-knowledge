@@ -1,11 +1,11 @@
-"""``BootstrapAgent`` ABC — per-source crawler agent skeleton.
+"""``BackfillAgent`` ABC — per-source crawler agent skeleton.
 
 Each concrete crawler (Slack, GitHub, Linear, ...) subclasses this. The
 base class owns the lifecycle the orchestrator expects:
 
   ``__init__(customer_id, run_id, bearer_resolver, http, settings)``
   -> ``await self.run()``
-  -> returns a ``BootstrapAgentResult``
+  -> returns a ``BackfillAgentResult``
 
 Subclasses provide:
 
@@ -23,7 +23,7 @@ The harness (``AgentLoop``) is reused verbatim. Compaction, halt, snapshot
 semantics, cap enforcement — all the v4 daily-replay machinery applies.
 
 The orchestrator instantiates the subclass, calls ``run()`` once, and
-records the returned ``BootstrapAgentResult`` against the
+records the returned ``BackfillAgentResult`` against the
 ``wiki_synthesis_runs`` row it opened for this crawler.
 """
 
@@ -57,9 +57,9 @@ class BearerResolver(Protocol):
 BearerResolverCallable = Callable[[], Awaitable[str | None]]
 
 
-class BootstrapAgentResult(BaseModel):
+class BackfillAgentResult(BaseModel):
     """One crawler's outcome. Written into ``wiki_synthesis_runs`` by
-    the BootstrapWorker after the crawler returns or crashes.
+    the BackfillWorker after the crawler returns or crashes.
 
     ``error`` is set if the crawler raised before completing; the
     worker catches the exception, fills this field via ``empty_result``,
@@ -84,7 +84,7 @@ class BootstrapAgentResult(BaseModel):
     error: str | None = None
 
 
-class BootstrapAgent(ABC):
+class BackfillAgent(ABC):
     """Per-source crawler agent. Concrete subclasses implement the
     source-specific tool palette + system prompt; the base class owns
     the harness, the wiki write tools, and lifecycle bookkeeping.
@@ -153,13 +153,13 @@ class BootstrapAgent(ABC):
     # ------------------------------------------------------------------
 
     @abstractmethod
-    async def run(self) -> BootstrapAgentResult:
+    async def run(self) -> BackfillAgentResult:
         """Drive the crawler from construction to completion or halt.
 
         The expected shape (concrete crawlers should follow):
 
             1. Resolve bearer via ``self._bearer_resolver()``. If None,
-               return a ``BootstrapAgentResult`` with halt_reason=
+               return a ``BackfillAgentResult`` with halt_reason=
                'auth.missing' and zero counters.
             2. Build the ``WikiAgentRuntime`` (shared with v4) and the
                combined tool palette (source tools + wiki tools).
@@ -167,8 +167,8 @@ class BootstrapAgent(ABC):
                client + the system prompt.
             4. Call ``await loop.run()`` and translate its
                ``AgentMetrics`` + the runtime's commit counters into a
-               ``BootstrapAgentResult``.
-            5. On exception, return a ``BootstrapAgentResult`` with
+               ``BackfillAgentResult``.
+            5. On exception, return a ``BackfillAgentResult`` with
                ``error`` set; do NOT re-raise (the orchestrator catches
                via ``return_exceptions=True``, but a clean result keeps
                the per-source row write path simple).
@@ -204,8 +204,8 @@ def empty_result(
     run_id: int,
     halt_reason: str | None = None,
     error: str | None = None,
-) -> BootstrapAgentResult:
-    """Build a ``BootstrapAgentResult`` for the early-exit paths.
+) -> BackfillAgentResult:
+    """Build a ``BackfillAgentResult`` for the early-exit paths.
 
     Used by:
       - Auth-not-connected paths (halt_reason='auth.missing').
@@ -213,7 +213,7 @@ def empty_result(
     All counters land at zero; ``started_at == finished_at == now``.
     """
     now = datetime.now(UTC)
-    return BootstrapAgentResult(
+    return BackfillAgentResult(
         source=source,
         customer_id=customer_id,
         run_id=run_id,
@@ -225,10 +225,10 @@ def empty_result(
 
 
 __all__ = [
+    "BackfillAgent",
+    "BackfillAgentResult",
     "BearerResolver",
     "BearerResolverCallable",
-    "BootstrapAgent",
-    "BootstrapAgentResult",
     "Field",
     "empty_result",
 ]
