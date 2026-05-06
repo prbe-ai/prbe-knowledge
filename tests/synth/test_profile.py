@@ -101,10 +101,10 @@ def test_load_profile_explicit_regen_max_rounds(tmp_path: Path) -> None:
 
 
 def test_load_profile_regen_max_rounds_must_be_int(tmp_path: Path) -> None:
-    with pytest.raises(ProfileError, match="regen.max_rounds"):
+    with pytest.raises(ProfileError, match=r"regen\.max_rounds"):
         load_profile(_write_profile(tmp_path, "regen:\n  max_rounds: 'three'\n"))
 
 
 def test_load_profile_regen_max_rounds_must_be_positive(tmp_path: Path) -> None:
-    with pytest.raises(ProfileError, match="regen.max_rounds"):
+    with pytest.raises(ProfileError, match=r"regen\.max_rounds"):
         load_profile(_write_profile(tmp_path, "regen:\n  max_rounds: 0\n"))
