@@ -1,4 +1,4 @@
-"""Per-source bootstrap crawler agents.
+"""Per-source backfill crawler agents.
 
 The ``BackfillWorker`` (``services.synthesis.backfill_app``) claims
 ``wiki_synthesis_runs`` rows at ``status='pending'`` and instantiates
