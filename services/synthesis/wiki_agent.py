@@ -45,6 +45,7 @@ from services.synthesis.agent_tools import (
     SkipEventsArgs,
     UpdatePageArgs,
 )
+from services.synthesis.wiki_links import extract_links, persist_links_for_page
 from shared.constants import (
     WIKI_AGENT_BATCH_SIZE,
     CompileTrigger,
@@ -121,9 +122,7 @@ class WikiAgentRuntime:
         self._run_kind = run_kind
         self._ctx = ctx or make_default_context()
         self._store = store or get_store()
-        self._normalizer = normalizer or Normalizer(
-            self._ctx, store=self._store, embedder=embedder
-        )
+        self._normalizer = normalizer or Normalizer(self._ctx, store=self._store, embedder=embedder)
 
         # Mutable state (snapshot/restore in dispatch_tool).
         self._pending_updates: dict[tuple[str, str], _StagedUpdate] = {}
@@ -234,9 +233,7 @@ class WikiAgentRuntime:
             "drain_complete": remaining == 0,
         }
 
-    async def _tool_list_wiki_pages(
-        self, args: ListWikiPagesArgs
-    ) -> dict[str, Any]:
+    async def _tool_list_wiki_pages(self, args: ListWikiPagesArgs) -> dict[str, Any]:
         # Always re-fetch on explicit call; the agent might be looking
         # for an entry that was added between the cache build and now.
         self._wiki_index_cache = await persistence.fetch_wiki_index(self.customer_id)
@@ -290,12 +287,8 @@ class WikiAgentRuntime:
             "stage_kind": None,
         }
 
-    async def _tool_get_event_body(
-        self, args: GetEventBodyArgs
-    ) -> dict[str, Any]:
-        loaded = await persistence.get_event_body_for_agent(
-            self.customer_id, args.queue_id
-        )
+    async def _tool_get_event_body(self, args: GetEventBodyArgs) -> dict[str, Any]:
+        loaded = await persistence.get_event_body_for_agent(self.customer_id, args.queue_id)
         if loaded is None:
             return {"error": "event_not_found", "queue_id": args.queue_id}
         body, meta = loaded
@@ -326,17 +319,13 @@ class WikiAgentRuntime:
             },
         }
 
-    async def _tool_update_page(
-        self, args: UpdatePageArgs
-    ) -> dict[str, Any]:
+    async def _tool_update_page(self, args: UpdatePageArgs) -> dict[str, Any]:
         key = (args.wiki_type, args.slug)
         # Last-write-wins on body / summary / commit_message; union-merge
         # applied_queue_ids so a re-stage doesn't drop earlier events.
         if key in self._pending_updates:
             existing = self._pending_updates[key]
-            merged_qids = sorted(
-                set(existing.applied_queue_ids) | set(args.applied_queue_ids)
-            )
+            merged_qids = sorted(set(existing.applied_queue_ids) | set(args.applied_queue_ids))
         else:
             merged_qids = sorted(set(args.applied_queue_ids))
         self._pending_updates[key] = _StagedUpdate(
@@ -360,9 +349,7 @@ class WikiAgentRuntime:
             "events_applied_total": len(self._applied_queue_ids),
         }
 
-    async def _tool_create_page(
-        self, args: CreatePageArgs
-    ) -> dict[str, Any]:
+    async def _tool_create_page(self, args: CreatePageArgs) -> dict[str, Any]:
         key = (args.wiki_type, args.slug)
         # If the slug already exists on disk, the agent must call
         # update_page instead. Detect by re-checking persistence.
@@ -380,9 +367,7 @@ class WikiAgentRuntime:
 
         if key in self._pending_creates:
             existing_c = self._pending_creates[key]
-            merged_qids = sorted(
-                set(existing_c.applied_queue_ids) | set(args.applied_queue_ids)
-            )
+            merged_qids = sorted(set(existing_c.applied_queue_ids) | set(args.applied_queue_ids))
         else:
             merged_qids = sorted(set(args.applied_queue_ids))
         self._pending_creates[key] = _StagedCreate(
@@ -405,9 +390,7 @@ class WikiAgentRuntime:
             "events_applied_total": len(self._applied_queue_ids),
         }
 
-    async def _tool_skip_events(
-        self, args: SkipEventsArgs
-    ) -> dict[str, Any]:
+    async def _tool_skip_events(self, args: SkipEventsArgs) -> dict[str, Any]:
         # Skip wins over apply: any qid the agent skips is removed from
         # the applied set, so a later re-stage of update_page can't
         # rescue it.
@@ -479,9 +462,7 @@ class WikiAgentRuntime:
         applied_qids = sorted(self._applied_queue_ids - self._skipped_queue_ids)
         skipped_qids = sorted(self._skipped_queue_ids)
         if applied_qids:
-            await persistence.mark_synthesis_done(
-                self.customer_id, applied_qids, self._run_id
-            )
+            await persistence.mark_synthesis_done(self.customer_id, applied_qids, self._run_id)
         if skipped_qids:
             await persistence.mark_synthesis_skipped(
                 self.customer_id,
@@ -563,6 +544,16 @@ class WikiAgentRuntime:
         )
         norm: NormalizationResult = build_normalization_result(event)
         await self._normalizer._persist(self.customer_id, SourceSystem.WIKI, norm)
+        # Lane B: extract typed links from the body and replace this
+        # page's markdown+frontmatter rows in wiki_links. Updates carry
+        # no frontmatter on _StagedUpdate today, so we pass {} and only
+        # body links land. Best-effort — page persist already committed.
+        await self._persist_links_safely(
+            wiki_type=update.wiki_type,
+            slug=update.slug,
+            body_markdown=update.body_markdown,
+            frontmatter={},
+        )
 
     async def _persist_create(self, create: _StagedCreate) -> None:
         event = self._build_wiki_event(
@@ -578,6 +569,49 @@ class WikiAgentRuntime:
         )
         norm: NormalizationResult = build_normalization_result(event)
         await self._normalizer._persist(self.customer_id, SourceSystem.WIKI, norm)
+        # Lane B: extract typed links from body + frontmatter. Best-effort.
+        await self._persist_links_safely(
+            wiki_type=create.wiki_type,
+            slug=create.slug,
+            body_markdown=create.body_markdown,
+            frontmatter=create.frontmatter,
+        )
+
+    async def _persist_links_safely(
+        self,
+        *,
+        wiki_type: str,
+        slug: str,
+        body_markdown: str,
+        frontmatter: dict[str, Any],
+    ) -> None:
+        """Extract + persist typed links for a freshly-written wiki page.
+
+        Opens its own `with_tenant` connection because Normalizer._persist
+        hides the connection it used. That means link writes are NOT in
+        the same DB transaction as the page write — but extraction
+        failures are swallowed (warning logged) so a malformed link
+        cannot fail the page. The page is more important than the graph.
+        """
+        try:
+            extracted = extract_links(body_markdown, frontmatter)
+            async with with_tenant(self.customer_id) as conn:
+                await persist_links_for_page(
+                    conn,
+                    customer_id=self.customer_id,
+                    src_wiki_type=wiki_type,
+                    src_slug=slug,
+                    extracted=extracted,
+                )
+        except Exception as exc:
+            log.warning(
+                "agent.link_persist_failed",
+                customer=self.customer_id,
+                wiki_type=wiki_type,
+                slug=slug,
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
 
     def _build_wiki_event(
         self,
@@ -594,9 +628,7 @@ class WikiAgentRuntime:
     ) -> WebhookEvent:
         received_at = datetime.now(UTC)
         compile_trigger = (
-            CompileTrigger.SOURCE_UPDATE
-            if self._run_kind == "wake"
-            else CompileTrigger.SCHEDULED
+            CompileTrigger.SOURCE_UPDATE if self._run_kind == "wake" else CompileTrigger.SCHEDULED
         )
         raw_payload: dict[str, Any] = {
             WIKI_PAYLOAD_KEY: {
