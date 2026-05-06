@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+import asyncpg
+
 from services.ingestion.handlers.base import ConnectorContext, make_default_context
 from services.ingestion.handlers.wiki import (
     INDEX_SLUG,
@@ -531,12 +533,18 @@ class WikiAgentRuntime:
                 slug=update.slug,
             )
             return
+        # Reuse the existing page's frontmatter for BOTH the page write
+        # and the link-graph extraction. _StagedUpdate has no frontmatter
+        # of its own; the prior page's frontmatter is what stays on disk
+        # and what the link writer must mirror, otherwise frontmatter-
+        # derived rows in wiki_links get wiped on every body-only update.
+        existing_frontmatter: dict[str, Any] = existing.get("frontmatter") or {}
         event = self._build_wiki_event(
             wiki_type=update.wiki_type,
             slug=update.slug,
             title=existing.get("title") or "",
             body=update.body_markdown,
-            frontmatter=existing.get("frontmatter") or {},
+            frontmatter=existing_frontmatter,
             summary=update.summary,
             commit_message=update.commit_message,
             compiled_from_doc_ids=[],  # filled in by the agent's applied_queue_ids translation
@@ -544,15 +552,14 @@ class WikiAgentRuntime:
         )
         norm: NormalizationResult = build_normalization_result(event)
         await self._normalizer._persist(self.customer_id, SourceSystem.WIKI, norm)
-        # Lane B: extract typed links from the body and replace this
-        # page's markdown+frontmatter rows in wiki_links. Updates carry
-        # no frontmatter on _StagedUpdate today, so we pass {} and only
-        # body links land. Best-effort — page persist already committed.
+        # Lane B: extract typed links from the body + the (preserved)
+        # frontmatter and replace this page's markdown+frontmatter rows
+        # in wiki_links. Best-effort — page persist already committed.
         await self._persist_links_safely(
             wiki_type=update.wiki_type,
             slug=update.slug,
             body_markdown=update.body_markdown,
-            frontmatter={},
+            frontmatter=existing_frontmatter,
         )
 
     async def _persist_create(self, create: _StagedCreate) -> None:
@@ -587,11 +594,20 @@ class WikiAgentRuntime:
     ) -> None:
         """Extract + persist typed links for a freshly-written wiki page.
 
-        Opens its own `with_tenant` connection because Normalizer._persist
-        hides the connection it used. That means link writes are NOT in
-        the same DB transaction as the page write — but extraction
-        failures are swallowed (warning logged) so a malformed link
-        cannot fail the page. The page is more important than the graph.
+        Two-transaction design: Normalizer._persist opens (and closes) its
+        own `with_tenant` connection internally, so the page write and
+        the link write cannot share a transaction. Link persistence runs
+        here as a second tx immediately after the page commits. The page
+        is the source of truth; if the link write fails transiently, the
+        link graph goes stale but the page is intact.
+
+        Best-effort semantics: only transient / IO errors (asyncpg
+        errors, OSError, TimeoutError) are swallowed-with-warning.
+        Programmer errors (TypeError, AttributeError, KeyError, ...) from
+        a parser bug propagate, so tests catch them rather than silently
+        skipping a link write. See the wiki-bootstrap-plan TODO entry
+        ("Link-graph reconciliation cron") for the planned mitigation of
+        the staleness window.
         """
         try:
             extracted = extract_links(body_markdown, frontmatter)
@@ -603,7 +619,7 @@ class WikiAgentRuntime:
                     src_slug=slug,
                     extracted=extracted,
                 )
-        except Exception as exc:
+        except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
             log.warning(
                 "agent.link_persist_failed",
                 customer=self.customer_id,

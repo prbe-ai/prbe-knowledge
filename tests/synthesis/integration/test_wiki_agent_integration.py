@@ -207,9 +207,7 @@ async def test_tool_next_events_excludes_applied_and_skipped(reset_db: None) -> 
         },
     )
     # Skip another.
-    await rt.dispatch_tool(
-        "skip_events", {"queue_ids": [qids[1]], "reason": "noise"}
-    )
+    await rt.dispatch_tool("skip_events", {"queue_ids": [qids[1]], "reason": "noise"})
     out = await rt.dispatch_tool("next_events", {"count": 50})
     returned_qids = {ev["queue_id"] for ev in out["events"]}
     assert qids[2] in returned_qids
@@ -290,9 +288,7 @@ async def test_tool_read_page_on_disk_returns_db_row(reset_db: None) -> None:
 
     run_id = await _open_run()
     rt = _make_runtime(run_id)
-    out = await rt.dispatch_tool(
-        "read_page", {"wiki_type": "decision", "slug": "ondisk"}
-    )
+    out = await rt.dispatch_tool("read_page", {"wiki_type": "decision", "slug": "ondisk"})
     assert out["is_staged"] is False
     assert "on disk" in (out["body_markdown"] or "")
 
@@ -312,9 +308,7 @@ async def test_tool_read_page_staged_for_update_returns_staged(reset_db: None) -
             "applied_queue_ids": [],
         },
     )
-    out = await rt.dispatch_tool(
-        "read_page", {"wiki_type": "decision", "slug": "stagedu"}
-    )
+    out = await rt.dispatch_tool("read_page", {"wiki_type": "decision", "slug": "stagedu"})
     assert out["is_staged"] is True
     assert out["stage_kind"] == "update"
     assert out["body_markdown"] == "STAGED BODY"
@@ -336,9 +330,7 @@ async def test_tool_read_page_staged_for_create_returns_staged(reset_db: None) -
             "applied_queue_ids": [],
         },
     )
-    out = await rt.dispatch_tool(
-        "read_page", {"wiki_type": "decision", "slug": "stagedc"}
-    )
+    out = await rt.dispatch_tool("read_page", {"wiki_type": "decision", "slug": "stagedc"})
     assert out["is_staged"] is True
     assert out["stage_kind"] == "create"
     assert out["title"] == "T"
@@ -380,9 +372,7 @@ async def test_tool_get_event_body_needs_pagination(reset_db: None) -> None:
 async def test_tool_done_atomic_commit_one_version_per_slug(
     reset_db: None,
 ) -> None:
-    qid = await _seed_synthesizing(
-        "github:commit:q1", "We chose pgvector inside Neon."
-    )
+    qid = await _seed_synthesizing("github:commit:q1", "We chose pgvector inside Neon.")
     run_id = await _open_run()
     rt = _make_runtime(run_id)
     await rt.dispatch_tool(
@@ -417,8 +407,7 @@ async def test_tool_done_atomic_commit_one_version_per_slug(
 
     async with raw_conn() as conn:
         page_versions = await conn.fetch(
-            "SELECT version FROM documents "
-            "WHERE customer_id = $1 AND doc_id = $2 ORDER BY version",
+            "SELECT version FROM documents WHERE customer_id = $1 AND doc_id = $2 ORDER BY version",
             CUSTOMER,
             "wiki:decision:adopt-pg",
         )
@@ -426,8 +415,7 @@ async def test_tool_done_atomic_commit_one_version_per_slug(
         assert len(page_versions) == 1
         # The queue row marked done.
         statuses = await conn.fetch(
-            "SELECT status FROM wiki_synthesis_queue "
-            "WHERE customer_id = $1",
+            "SELECT status FROM wiki_synthesis_queue WHERE customer_id = $1",
             CUSTOMER,
         )
         # All of the customer's queue rows should be in a terminal state
@@ -456,15 +444,12 @@ async def test_tool_done_marks_applied_and_skipped_correctly(
             "applied_queue_ids": [qid_apply],
         },
     )
-    await rt.dispatch_tool(
-        "skip_events", {"queue_ids": [qid_skip], "reason": "noise"}
-    )
+    await rt.dispatch_tool("skip_events", {"queue_ids": [qid_skip], "reason": "noise"})
     await rt.dispatch_tool("done", {})
 
     async with raw_conn() as conn:
         rows = await conn.fetch(
-            "SELECT queue_id, status FROM wiki_synthesis_queue "
-            "WHERE customer_id = $1",
+            "SELECT queue_id, status FROM wiki_synthesis_queue WHERE customer_id = $1",
             CUSTOMER,
         )
     by_qid = {int(r["queue_id"]): r["status"] for r in rows}
@@ -506,6 +491,123 @@ async def test_tool_done_regenerates_wiki_index(reset_db: None) -> None:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Lane B: wiki_links written by the agent's commit() path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_commit_writes_wiki_links_for_created_page(reset_db: None) -> None:
+    """End-to-end: stage create_page -> commit -> wiki_links populated.
+
+    Guards against a future refactor that drops the link-writer hook
+    inside _persist_create. Page body has one markdown link with a
+    relation verb; frontmatter has one scalar reference. Both must
+    show up in wiki_links with the right (src, dst, link_type,
+    link_source) tuples."""
+    qid = await _seed_synthesizing("github:commit:link-create", "src body")
+    run_id = await _open_run()
+    rt = _make_runtime(run_id)
+    await rt.dispatch_tool(
+        "create_page",
+        {
+            "wiki_type": "service_card",
+            "slug": "auth",
+            "title": "Auth",
+            "body_markdown": "Owner is [[person:maison|works_at|Maison]].",
+            "summary": "service card.",
+            "frontmatter": {"owns": "service_card:auth"},
+            "commit_message": "Initial",
+            "applied_queue_ids": [qid],
+        },
+    )
+    await rt.dispatch_tool("done", {})
+
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            "SELECT dst_wiki_type, dst_slug, link_type, link_source "
+            "FROM wiki_links "
+            "WHERE customer_id = $1 AND src_wiki_type = $2 AND src_slug = $3 "
+            "ORDER BY link_source, dst_slug",
+            CUSTOMER,
+            "service_card",
+            "auth",
+        )
+    tuples = {(r["dst_wiki_type"], r["dst_slug"], r["link_type"], r["link_source"]) for r in rows}
+    assert tuples == {
+        ("service_card", "auth", "owns", "frontmatter"),
+        ("person", "maison", "works_at", "markdown"),
+    }
+
+
+@pytest.mark.asyncio
+async def test_commit_update_preserves_frontmatter_links(reset_db: None) -> None:
+    """Regression for the P1: _persist_update used to pass frontmatter={}
+    to the link writer, wiping all frontmatter-derived rows on every body
+    edit. Fix reads the existing page's frontmatter and forwards it to
+    the writer; this test asserts the frontmatter row survives an update.
+    """
+    qid_create = await _seed_synthesizing("github:commit:fm-create", "seed")
+    run_id = await _open_run()
+    rt = _make_runtime(run_id)
+    await rt.dispatch_tool(
+        "create_page",
+        {
+            "wiki_type": "service_card",
+            "slug": "billing",
+            "title": "Billing",
+            "body_markdown": "Initial body.",
+            "summary": "s",
+            "frontmatter": {"owns": "service_card:billing"},
+            "commit_message": "create",
+            "applied_queue_ids": [qid_create],
+        },
+    )
+    await rt.dispatch_tool("done", {})
+
+    # Confirm the frontmatter link row is present after create.
+    async with raw_conn() as conn:
+        before = await conn.fetchval(
+            "SELECT COUNT(*) FROM wiki_links "
+            "WHERE customer_id = $1 AND src_wiki_type = $2 AND src_slug = $3 "
+            "AND link_source = 'frontmatter'",
+            CUSTOMER,
+            "service_card",
+            "billing",
+        )
+    assert before == 1
+
+    # Stage an update that changes body but carries no frontmatter on
+    # the _StagedUpdate (today's shape). The fix re-fetches the existing
+    # page's frontmatter and forwards it to the link writer.
+    qid_update = await _seed_synthesizing("github:commit:fm-update", "next")
+    run_id2 = await _open_run()
+    rt2 = _make_runtime(run_id2)
+    await rt2.dispatch_tool(
+        "update_page",
+        {
+            "wiki_type": "service_card",
+            "slug": "billing",
+            "body_markdown": "Updated body without any markdown links.",
+            "summary": "s",
+            "commit_message": "update",
+            "applied_queue_ids": [qid_update],
+        },
+    )
+    await rt2.dispatch_tool("done", {})
+
+    async with raw_conn() as conn:
+        after = await conn.fetchval(
+            "SELECT COUNT(*) FROM wiki_links "
+            "WHERE customer_id = $1 AND src_wiki_type = $2 AND src_slug = $3 "
+            "AND link_source = 'frontmatter'",
+            CUSTOMER,
+            "service_card",
+            "billing",
+        )
+    assert after == 1, "frontmatter link must survive a body-only update"
+
+
 @pytest.mark.asyncio
 async def test_discard_dlqs_triaged_rows_with_reason(reset_db: None) -> None:
     """The runtime's discard() drops in-memory state; the worker calls
@@ -528,9 +630,7 @@ async def test_discard_dlqs_triaged_rows_with_reason(reset_db: None) -> None:
         },
     )
     await rt.discard()
-    n = await persistence.dlq_agent_synthesizing_rows(
-        CUSTOMER, reason="agent.test_halt"
-    )
+    n = await persistence.dlq_agent_synthesizing_rows(CUSTOMER, reason="agent.test_halt")
     assert n >= 1
     async with raw_conn() as conn:
         row = await conn.fetchrow(
