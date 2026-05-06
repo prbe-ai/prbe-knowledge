@@ -55,7 +55,7 @@ def upgrade() -> None:
         """
         CREATE TABLE custom_ingest_tokens (
             token_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            customer_id         TEXT NOT NULL,
+            customer_id         TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
             name                TEXT NOT NULL,
             token_hash          TEXT NOT NULL UNIQUE,
             token_prefix        TEXT NOT NULL,
@@ -76,16 +76,22 @@ def upgrade() -> None:
 
     op.execute("ALTER TABLE custom_ingest_tokens ENABLE ROW LEVEL SECURITY")
     op.execute("ALTER TABLE custom_ingest_tokens FORCE ROW LEVEL SECURITY")
+    # FOR ALL + WITH CHECK is required: USING-only is read-side, so a
+    # tenant-context INSERT/UPDATE could otherwise write a row with some
+    # other tenant's customer_id. WITH CHECK enforces the same predicate
+    # on the post-image of writes.
     op.execute(
         """
-        CREATE POLICY tenant_isolation ON custom_ingest_tokens
+        CREATE POLICY custom_ingest_tokens_tenant_isolation ON custom_ingest_tokens
+            FOR ALL
             USING (customer_id = current_setting('app.current_customer_id', true))
+            WITH CHECK (customer_id = current_setting('app.current_customer_id', true))
         """
     )
 
     # SECURITY DEFINER lookup-and-touch. Runs as the function OWNER (the
-    # migration role), so it bypasses the tenant_isolation policy on the
-    # table -- which is the whole point: the verifier path can't know the
+    # migration role), so it bypasses the custom_ingest_tokens_tenant_isolation
+    # policy on the table -- which is the whole point: the verifier path can't know the
     # tenant until *after* the lookup. Callers can only see (token_id,
     # customer_id) for the row matching the hash they supplied; no
     # cross-tenant rows are ever exposed.
@@ -113,8 +119,20 @@ def upgrade() -> None:
         """
     )
 
+    # SECURITY DEFINER functions inherit EXECUTE to PUBLIC by default, which
+    # would let any role bypass RLS via this surface. Lock that down.
+    # Note: PUBLIC has been revoked; default-public-grant elsewhere in the
+    # codebase implies the app role inherits via group membership. If a
+    # future migration introduces an explicit app role, add GRANT EXECUTE
+    # here.
+    op.execute(
+        "REVOKE ALL ON FUNCTION verify_and_touch_custom_ingest_token(text) FROM PUBLIC"
+    )
+
 
 def downgrade() -> None:
     op.execute("DROP FUNCTION IF EXISTS verify_and_touch_custom_ingest_token(text)")
-    op.execute("DROP POLICY IF EXISTS tenant_isolation ON custom_ingest_tokens")
+    op.execute(
+        "DROP POLICY IF EXISTS custom_ingest_tokens_tenant_isolation ON custom_ingest_tokens"
+    )
     op.execute("DROP TABLE IF EXISTS custom_ingest_tokens")
