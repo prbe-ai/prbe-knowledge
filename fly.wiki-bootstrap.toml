@@ -34,15 +34,15 @@ kill_timeout = "60s"
     timeout      = "5s"
     path         = "/health"
 
-# 2 x 6GB. Bootstrap fans out N source crawlers in parallel for one
-# customer, each running its own Gemini Pro AgentLoop with a CachedContent
-# at 60% of 2M tokens. Pebble-scale customer with 6 connected sources can
-# hold ~6 in-flight CachedContent + per-source API page buffers + the
-# Normalizer._persist embed/chunk pipeline simultaneously. 6GB leaves
-# OS+GC headroom; resize down once we have actual bootstrap memory
-# numbers from a real run.
+# 2 x 4GB. Originally specced at 6GB but Fly's account limit caps
+# shared VMs at 4GB. 4GB still holds the Pebble-scale fan-out (N
+# in-flight CachedContent + per-source API page buffers + the
+# Normalizer._persist embed/chunk pipeline) but leaves less OS+GC
+# headroom. Watch first real bootstrap for OOM signals; if hit, scale
+# down concurrency in the orchestrator instead of trying to bump
+# memory past the cap.
 [[vm]]
   size      = "shared-cpu-2x"
-  memory    = "6gb"
+  memory    = "4gb"
   count     = 2
   processes = ["worker"]
