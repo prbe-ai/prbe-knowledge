@@ -447,18 +447,16 @@ class BackfillWorker:
                         and (result.pages_created + result.pages_updated) == 0
                     ):
                         result = result.model_copy(update={"error": f"halt:{result.halt_reason}"})
-                    await self._close_run(claim, result)
+                    closed_status = await self._close_run(claim, result)
                     # Phase 2 fan-out hook: only Phase 1 rows (target=None)
-                    # that succeeded (complete or partial-with-pages) trigger
-                    # per-target subtasks. Failed Phase 1 -> no fan-out.
-                    # Phase 2 rows (target set) never recurse.
+                    # whose row was actually written by _close_run with a
+                    # successful terminal status (not skipped because the
+                    # trigger route force-cancelled mid-flight). Failed
+                    # Phase 1 also short-circuits. Phase 2 rows
+                    # (target set) never recurse.
                     if (
                         claim.target is None
-                        and result.error is None
-                        and (
-                            result.halt_reason is None
-                            or (result.pages_created + result.pages_updated) > 0
-                        )
+                        and closed_status in ("complete", "partial")
                     ):
                         await self._maybe_fanout_phase2(claim)
                 finally:
@@ -559,7 +557,7 @@ class BackfillWorker:
     # Run-row close paths
     # ------------------------------------------------------------------
 
-    async def _close_run(self, claim: _Claim, result: BackfillAgentResult) -> None:
+    async def _close_run(self, claim: _Claim, result: BackfillAgentResult) -> str | None:
         """Three-way status branch (matches the CHECK constraint):
           - error set                 -> 'failed' (includes zero-page
                                           halts; their error field was
@@ -570,6 +568,11 @@ class BackfillWorker:
         Safety net: read the row's current status first; if 'cancelled',
         do nothing — the cancel NOTIFY happened mid-flight and the
         trigger route's UPDATE already marked the row.
+
+        Returns the status actually written (one of 'failed', 'partial',
+        'complete') or None if the close was skipped because the row was
+        already 'cancelled'. Callers (the fan-out hook) gate on this so
+        a cancelled Phase 1 doesn't trigger Phase 2 rows.
         """
         if result.error is not None:
             status = "failed"
@@ -590,7 +593,7 @@ class BackfillWorker:
                     source=claim.source,
                     run_id=claim.run_id,
                 )
-                return
+                return None
             await conn.execute(
                 """
                 UPDATE wiki_synthesis_runs
@@ -617,6 +620,7 @@ class BackfillWorker:
             pages_created=result.pages_created,
             error=result.error,
         )
+        return status
 
     async def _close_run_with_error(self, claim: _Claim, exc: BaseException) -> None:
         """Catch-all close path for unexpected exceptions inside _run_one."""
