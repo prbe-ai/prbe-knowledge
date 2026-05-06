@@ -188,6 +188,14 @@ class BootstrapWorker:
             self._process_cancel_payloads(), name="bootstrap.cancel_processor"
         )
 
+        # Boot drain: pending rows that already exist at startup must
+        # be picked up without waiting for the next NOTIFY. Real cases:
+        # machine reboot while pending rows exist; reclaim flipped
+        # running -> pending without a NOTIFY; tests that seed rows
+        # before starting the worker. Pre-setting the wake event makes
+        # the first iteration of the loop drain immediately; subsequent
+        # iterations wait normally.
+        self._wake_pending.set()
         try:
             while not self._shutdown.is_set():
                 await self._wait_for_wake()
