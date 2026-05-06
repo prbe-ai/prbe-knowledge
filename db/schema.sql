@@ -645,6 +645,9 @@ CREATE TABLE wiki_synthesis_runs (
     -- synthesis each open their own run per drain; the status endpoint
     -- filters stage='synthesis' for `last_run_pages_*`.
     stage           TEXT NOT NULL DEFAULT 'synthesis',
+    -- Per-source discriminator for bootstrap runs ('slack', 'github',
+    -- 'linear', etc.). NULL for daily-replay (kind='wake'/'scheduled').
+    source          TEXT,
     started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     finished_at     TIMESTAMPTZ,
     events_total    INT NOT NULL DEFAULT 0,
@@ -654,7 +657,7 @@ CREATE TABLE wiki_synthesis_runs (
     pages_created   INT NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'running',
     error           TEXT,
-    CONSTRAINT ck_wsr_kind CHECK (kind IN ('onboarding','wake','scheduled')),
+    CONSTRAINT ck_wsr_kind CHECK (kind IN ('onboarding','wake','scheduled','bootstrap')),
     CONSTRAINT ck_wsr_stage CHECK (stage IN ('triage','synthesis')),
     CONSTRAINT ck_wsr_status CHECK (status IN ('running','complete','failed','partial'))
 );
@@ -664,6 +667,96 @@ CREATE INDEX idx_wsr_customer
 
 CREATE INDEX idx_wsr_stage_started
     ON wiki_synthesis_runs (customer_id, stage, started_at DESC);
+
+CREATE INDEX idx_wsr_kind_source
+    ON wiki_synthesis_runs (customer_id, kind, source, started_at DESC);
+
+-- ---------------------------------------------------------------------------
+-- wiki_links / wiki_timeline_entries / wiki_raw_data
+--
+-- Bootstrap-era extensions for the wiki page graph. All three tables share
+-- the wiki_synthesis_queue precedent (migration 0034): NO row-level security.
+-- Tenant scoping is application-enforced (explicit WHERE customer_id = $1).
+-- See migration 20260506_0043_wiki_bootstrap_schema.py for rationale.
+-- ---------------------------------------------------------------------------
+CREATE TABLE wiki_links (
+    id              BIGSERIAL PRIMARY KEY,
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    src_wiki_type   TEXT NOT NULL,
+    src_slug        TEXT NOT NULL,
+    dst_wiki_type   TEXT NOT NULL,
+    dst_slug        TEXT NOT NULL,
+    -- Optional relation verb extracted from `[[type:slug|verb]]` markdown
+    -- syntax or a frontmatter field name. Empty string when the link is a
+    -- bare `[[type:slug]]` mention.
+    link_type       TEXT NOT NULL DEFAULT '',
+    -- ~80 chars surrounding the link site in the source markdown. Useful
+    -- for backlink rendering ("mentioned in: '... [[person:X|works_at]]
+    -- the auth migration ...'").
+    context         TEXT NOT NULL DEFAULT '',
+    -- Where the link came from. 'markdown' = body inline; 'frontmatter' =
+    -- YAML field; 'manual' = admin / migration-set.
+    link_source     TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_wiki_links_source CHECK (link_source IN ('markdown','frontmatter','manual')),
+    CONSTRAINT uq_wiki_links UNIQUE NULLS NOT DISTINCT
+        (customer_id, src_wiki_type, src_slug,
+         dst_wiki_type, dst_slug, link_type, link_source)
+);
+
+CREATE INDEX ix_wiki_links_from
+    ON wiki_links (customer_id, src_wiki_type, src_slug);
+
+CREATE INDEX ix_wiki_links_to
+    ON wiki_links (customer_id, dst_wiki_type, dst_slug);
+
+CREATE TABLE wiki_timeline_entries (
+    id              BIGSERIAL PRIMARY KEY,
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    wiki_type       TEXT NOT NULL,
+    slug            TEXT NOT NULL,
+    -- Day-bucket the source event falls under (typically the source
+    -- system's own timestamp). The dashboard renders the timeline
+    -- grouped by entry_date DESC.
+    entry_date      DATE NOT NULL,
+    source          TEXT NOT NULL,
+    summary         TEXT NOT NULL,
+    detail          TEXT NOT NULL DEFAULT '',
+    -- Optional source-side ref (Slack thread_ts, GitHub PR number, ...).
+    -- Lets the dashboard deep-link from a timeline entry to its source.
+    source_ref      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_wiki_timeline_dedup UNIQUE
+        (customer_id, wiki_type, slug, entry_date, summary)
+);
+
+CREATE INDEX ix_wiki_timeline_page
+    ON wiki_timeline_entries (customer_id, wiki_type, slug, entry_date DESC);
+
+CREATE INDEX ix_wiki_timeline_date
+    ON wiki_timeline_entries (customer_id, entry_date DESC);
+
+CREATE TABLE wiki_raw_data (
+    id              BIGSERIAL PRIMARY KEY,
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    wiki_type       TEXT NOT NULL,
+    slug            TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    -- Source-system identifier (Slack thread_ts, GitHub PR id, Linear
+    -- issue id, ...). Together with (customer_id, wiki_type, slug,
+    -- source) this is the dedup key — re-bootstrap of the same source
+    -- doesn't duplicate raw rows.
+    source_ref      TEXT NOT NULL,
+    data            JSONB NOT NULL,
+    fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_wiki_raw_data UNIQUE (customer_id, wiki_type, slug, source, source_ref)
+);
+
+CREATE INDEX ix_wiki_raw_data_page
+    ON wiki_raw_data (customer_id, wiki_type, slug, fetched_at DESC);
+
+CREATE INDEX ix_wiki_raw_data_source
+    ON wiki_raw_data (customer_id, source, source_ref);
 
 -- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.

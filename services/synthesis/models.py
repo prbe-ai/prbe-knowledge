@@ -21,6 +21,31 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
+# WikiType — the page-kind discriminator.
+#
+# v1 had 4 topical types (service_card / decision / feature / runbook).
+# Bootstrap (migration 0043) extends with 6 entity types so crawlers can
+# emit person/company/vendor/customer/project/event pages alongside the
+# topical ones. The DB stores wiki_type as TEXT (no CHECK constraint), so
+# extending here is a pure code change. Single source of truth — both the
+# data-shape models below and the agent tool schemas in agent_tools.py
+# import this literal.
+# ---------------------------------------------------------------------------
+WikiType = Literal[
+    "service_card",
+    "decision",
+    "feature",
+    "runbook",
+    "person",
+    "company",
+    "vendor",
+    "customer",
+    "project",
+    "event",
+]
+
+
+# ---------------------------------------------------------------------------
 # Triage
 # ---------------------------------------------------------------------------
 
@@ -64,8 +89,7 @@ class TriageVerdict(BaseModel):
         default=None,
         max_length=240,
         description=(
-            "One short sentence (<= 240 chars) explaining the decision "
-            "for the audit log. Be terse."
+            "One short sentence (<= 240 chars) explaining the decision for the audit log. Be terse."
         ),
     )
 
@@ -118,7 +142,7 @@ class WikiIndexEntry(BaseModel):
     a `read_page` call up front.
     """
 
-    wiki_type: Literal["service_card", "decision", "feature", "runbook"]
+    wiki_type: WikiType
     slug: str
     title: str
     summary: str | None = None
@@ -129,7 +153,7 @@ class WikiIndexEntry(BaseModel):
 class PageUpdate(BaseModel):
     """Staged update intent — written to runtime state, persisted at done()."""
 
-    wiki_type: Literal["service_card", "decision", "feature", "runbook"]
+    wiki_type: WikiType
     slug: str
     body_markdown: str
     summary: str = Field(min_length=1, max_length=240)
@@ -140,7 +164,7 @@ class PageUpdate(BaseModel):
 class PageCreate(BaseModel):
     """Staged create intent — same shape as PageUpdate plus title + frontmatter."""
 
-    wiki_type: Literal["service_card", "decision", "feature", "runbook"]
+    wiki_type: WikiType
     slug: str
     title: str = Field(min_length=1, max_length=200)
     body_markdown: str

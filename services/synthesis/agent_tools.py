@@ -29,16 +29,19 @@ Tools (BOOKKEEPING):
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, get_args
 
 from pydantic import BaseModel, Field
+
+from services.synthesis.models import WikiType
 
 # ---------------------------------------------------------------------------
 # Tool schemas (Gemini function-call format)
 # ---------------------------------------------------------------------------
 
-# Reused enum literal for wiki types. Matches DocType.WIKI_*.
-_WIKI_TYPES = ["service_card", "decision", "feature", "runbook"]
+# Pulled from the WikiType literal so adding a new wiki_type in models.py
+# automatically widens the tool schema's enum without a second edit.
+_WIKI_TYPES = list(get_args(WikiType))
 
 
 # Note on schema shape:
@@ -220,9 +223,6 @@ ALL_TOOLS: list[dict[str, Any]] = [
 # ---------------------------------------------------------------------------
 # Pydantic input validators
 # ---------------------------------------------------------------------------
-
-
-WikiType = Literal["service_card", "decision", "feature", "runbook"]
 
 
 class NextEventsArgs(BaseModel):
