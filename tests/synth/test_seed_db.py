@@ -19,7 +19,6 @@ from shared.db import get_pool, raw_conn
 # uses ObjectStore() with no arguments, pulling config from settings.
 from shared.storage import ObjectStore
 
-
 CANONICAL_MINI = Path(__file__).parent.parent / "fixtures" / "canonical-mini"
 
 

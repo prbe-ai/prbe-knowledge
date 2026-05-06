@@ -578,11 +578,12 @@ async def _seed_async(args) -> int:
       3. Execute seed
     """
     import json as _json
+
     from scripts.synth.seed import (
+        MissingCanonicalError,
         is_seed_eligible,
         prompt_typed_confirm,
         seed_tenant,
-        MissingCanonicalError,
     )
 
     db, bucket = await _open_db_and_bucket()
