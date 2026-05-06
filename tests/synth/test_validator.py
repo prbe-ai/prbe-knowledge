@@ -296,3 +296,69 @@ async def test_combined_validate_name_only_archetype_skips_pass2_even_with_clien
     assert result.pass2_result is None
     assert result.should_drop is False
     assert result.failing_doc_ids == ()
+
+
+# ---------------------------------------------------------------------------
+# pass1_advisory mode — demote Pass 1 violations to logging-only for STRICT
+# ---------------------------------------------------------------------------
+
+
+async def test_pass1_advisory_demotes_strict_archetype_pass1_violation() -> None:
+    """STRICT archetype + Pass 1 violation + pass1_advisory=True → should_drop=False.
+
+    The pass1_violations field still carries the violation for callers to log,
+    but the doc is excluded from failing_doc_ids and does not trigger drop.
+    """
+    world = _make_world()
+    doc = _make_doc("deploying mystery-service after standup.")
+    result = await validate(
+        (doc,),
+        world,
+        scenario=_FAKE_SPEC,
+        archetype=_STRICT_ARCHETYPE,
+        pass2_client=None,
+        pass2_model=None,
+        pass1_advisory=True,
+    )
+    assert result.should_drop is False
+    assert len(result.pass1_violations) == 1, "violation still surfaced for logging"
+    assert "mystery-service" in result.pass1_violations[0].out_of_world
+    assert result.failing_doc_ids == (), "demoted Pass 1 doc must not appear in failing_doc_ids"
+
+
+async def test_pass1_advisory_does_not_demote_name_only_archetype() -> None:
+    """NAME_ONLY (templated) archetype + Pass 1 violation + pass1_advisory=True
+    → still drops. The flag only affects STRICT plot archetypes; templated
+    archetypes never had Pass 1 false-positive issues and keep their gate."""
+    world = _make_world()
+    doc = _make_doc("deploying mystery-service after standup.")
+    result = await validate(
+        (doc,),
+        world,
+        scenario=None,
+        archetype=_NAME_ONLY_ARCHETYPE,
+        pass2_client=None,
+        pass2_model=None,
+        pass1_advisory=True,
+    )
+    assert result.should_drop is True
+    assert "doc-test-1" in result.failing_doc_ids
+
+
+async def test_pass1_advisory_default_is_strict() -> None:
+    """Without pass1_advisory=True, Pass 1 violations on STRICT archetypes
+    still trigger drop. Belt-and-suspenders against accidentally flipping
+    the default."""
+    world = _make_world()
+    doc = _make_doc("deploying mystery-service after standup.")
+    result = await validate(
+        (doc,),
+        world,
+        scenario=_FAKE_SPEC,
+        archetype=_STRICT_ARCHETYPE,
+        pass2_client=None,
+        pass2_model=None,
+        # pass1_advisory not passed — must default to False
+    )
+    assert result.should_drop is True
+    assert "doc-test-1" in result.failing_doc_ids

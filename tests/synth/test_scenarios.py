@@ -310,7 +310,7 @@ async def test_run_scenarios_regen_recovers_failing_plot_doc(monkeypatch) -> Non
     # writer.regenerate path to be exercised. Then round-2 validation must pass.)
     call_count = {"n": 0}
 
-    async def fake_validate(docs, world, *, scenario, archetype, pass2_client, pass2_model):
+    async def fake_validate(docs, world, *, scenario, archetype, pass2_client, pass2_model, **_kw):
         call_count["n"] += 1
         if call_count["n"] <= 2:
             return CombinedValidatorResult(

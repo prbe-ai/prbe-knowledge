@@ -310,6 +310,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Disable validator regen loop. Plot scenarios that fail strict "
         "validation will drop immediately (pre-regen behavior).",
     )
+    run.add_argument(
+        "--pass1-advisory",
+        action="store_true",
+        default=False,
+        help="Demote Pass 1 (name-only) violations to logging-only for STRICT "
+        "(plot) archetypes. Pass 2 (LLM consistency) remains the gate. Use "
+        "when the kebab regex generates too many false positives on natural "
+        "English compounds (port-sync, follow-up, health-check, etc.). "
+        "Templated archetypes are unaffected.",
+    )
 
     # clean — Plan 2
     clean = sub.add_parser(
@@ -780,6 +790,7 @@ async def _run_async(profile: Profile, out: Path, args) -> int:
             validator_pass2_client=validator_pass2_client,
             validator_pass2_model=validator_pass2_model,
             regen_enabled=not args.no_regen,
+            pass1_advisory=args.pass1_advisory,
         ):
             await ingestion_writer.write(doc)
             emitted_docs.append(doc)

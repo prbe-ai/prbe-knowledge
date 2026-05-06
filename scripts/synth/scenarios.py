@@ -110,6 +110,7 @@ async def run_scenarios(
     validator_pass2_client: LlmClientProtocol | None = None,
     validator_pass2_model: str | None = None,
     regen_enabled: bool = True,
+    pass1_advisory: bool = False,
 ) -> AsyncGenerator[tuple[ScenarioSpec, SynthDoc], None]:
     """Walk active archetypes, validate each scenario, yield (ScenarioSpec, SynthDoc) pairs.
 
@@ -151,6 +152,7 @@ async def run_scenarios(
                     archetype=archetype,
                     pass2_client=None,
                     pass2_model=None,
+                    pass1_advisory=pass1_advisory,
                 )
                 if result.should_drop:
                     log.warning(
@@ -199,6 +201,7 @@ async def run_scenarios(
                             archetype=archetype,
                             pass2_client=validator_pass2_client,
                             pass2_model=validator_pass2_model,
+                            pass1_advisory=pass1_advisory,
                         )
                     except StructuredOutputValidationError:
                         log.exception("plot_validator_error", scenario_id=spec.id, archetype=name)
@@ -224,6 +227,7 @@ async def run_scenarios(
                             _arch=archetype,
                             _pass2_client=validator_pass2_client,
                             _pass2_model=validator_pass2_model,
+                            _pass1_advisory=pass1_advisory,
                         ):
                             return await combined_validate(
                                 d,
@@ -232,6 +236,7 @@ async def run_scenarios(
                                 archetype=_arch,
                                 pass2_client=_pass2_client,
                                 pass2_model=_pass2_model,
+                                pass1_advisory=_pass1_advisory,
                             )
 
                         regen_result = await regen_loop(
