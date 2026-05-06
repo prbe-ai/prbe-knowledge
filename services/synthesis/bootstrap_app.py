@@ -35,6 +35,7 @@ from services.synthesis.bootstrap_orchestrator import (
     BootstrapOrchestrator,
     parse_trigger_payload,
 )
+from services.synthesis.bootstrap_reclaim import BootstrapReclaimLoop
 from shared.config import get_settings
 from shared.constants import WIKI_BOOTSTRAP_CHANNEL
 from shared.db import init_pool
@@ -239,6 +240,7 @@ async def run_bootstrap_app_forever() -> None:
     async with build_http_client() as http:
         orchestrator = BootstrapOrchestrator(settings=settings, http=http)
         listener = BootstrapListener(dsn=listener_dsn, orchestrator=orchestrator)
+        reclaim_loop = BootstrapReclaimLoop()
 
         loop = asyncio.get_running_loop()
         gather_future: asyncio.Future | None = None  # type: ignore[type-arg]
@@ -251,6 +253,7 @@ async def run_bootstrap_app_forever() -> None:
             shutdown_started = True
             log.info("bootstrap_app.shutdown_signal", signal=signame)
             listener.shutdown()
+            reclaim_loop.shutdown()
             health_server.should_exit = True
             if gather_future is not None and not gather_future.done():
                 gather_future.cancel()
@@ -262,6 +265,7 @@ async def run_bootstrap_app_forever() -> None:
         gather_future = asyncio.gather(
             listener.run(),
             health_server.serve(),
+            reclaim_loop.run(),
         )
         try:
             await gather_future
