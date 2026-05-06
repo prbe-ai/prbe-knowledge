@@ -269,10 +269,15 @@ class Normalizer:
         # behaves like the slow-moving knowledge base it's supposed to be.
         #
         # Skip when the source IS the wiki (cron's own COMPILED_WIKI
-        # writes must not feed back into its own queue). Also skip when
-        # the tenant has not opted into wiki generation.
+        # writes must not feed back into its own queue). Skip CODE_GRAPH
+        # too: code.symbol docs are deterministic AST extractions whose
+        # body is a function signature + docstring — wiki synthesis would
+        # burn LLM tokens trying to extract Decisions/Runbooks from them
+        # and produce nothing. Also skip when the tenant has not opted
+        # into wiki generation.
         if (
             source_system != SourceSystem.WIKI
+            and source_system != SourceSystem.CODE_GRAPH
             and doc_ids
             and await is_wiki_generation_enabled(customer_id)
         ):

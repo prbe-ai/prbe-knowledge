@@ -63,17 +63,22 @@ async def shallow_clone(
     """Shallow-clone `repo` at `sha` into `target_dir`.
 
     `git clone --filter=blob:none --depth=1` keeps disk pressure low — only
-    the committed blobs at HEAD, no history. Re-uses the existing dir if
-    one is already present (no-op in the steady state of a resumed
-    backfill).
+    the committed blobs at HEAD, no history.
+
+    Always clobbers any existing target_dir before cloning. If a prior
+    worker crashed mid-clone, the leftover dir may have a `.git` directory
+    but an incomplete worktree, and trusting it would silently corrupt
+    extraction. Re-cloning is cheap (blob:none, depth:1) and the per-file
+    content_hash cache in `code_repo_state` short-circuits redundant
+    extraction work, so we trade a few seconds of git for correctness.
 
     Auth: HTTPS with `x-access-token:<token>` per GitHub App convention. If
     token is None we attempt anonymous clone (works for public repos in
     dev / fixture flows).
     """
-    if target_dir.exists() and (target_dir / ".git").exists():
-        log.info("code_graph.clone.reuse", repo=repo, dir=str(target_dir))
-        return
+    if target_dir.exists():
+        shutil.rmtree(target_dir, ignore_errors=True)
+        log.info("code_graph.clone.clobber_stale", repo=repo, dir=str(target_dir))
 
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     url = (
