@@ -1,0 +1,23 @@
+[
+  {
+    "number": 12,
+    "title": "feat(dashboard): wire wiki bootstrap admin button",
+    "body": "Adds the `Rebuild wiki from scratch` button on the wiki dashboard page (admin-gated). POSTs to the new BFF route which forwards to the prbe-knowledge bootstrap trigger endpoint.\n\nFollow-up to [[feature:wiki-bootstrap]].",
+    "state": "closed",
+    "created_at": "2026-04-21T13:00:00Z",
+    "updated_at": "2026-04-22T09:11:03Z",
+    "closed_at": "2026-04-22T09:11:03Z",
+    "merged_at": "2026-04-22T09:11:03Z",
+    "user": {"login": "richard", "id": 5001},
+    "head": {"ref": "feat/wiki-bootstrap-button"},
+    "base": {"ref": "main"},
+    "html_url": "https://github.com/prbe-ai/prbe-backend/pull/12",
+    "requested_reviewers": [
+      {"login": "maison", "id": 5002}
+    ],
+    "labels": [
+      {"name": "area:dashboard"},
+      {"name": "size:s"}
+    ]
+  }
+]

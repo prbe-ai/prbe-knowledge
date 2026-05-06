@@ -1,0 +1,26 @@
+[
+  {
+    "id": 700045,
+    "user": {"login": "maison", "id": 5002},
+    "state": "CHANGES_REQUESTED",
+    "body": "First pass — the regex for [[type:slug]] greedily matches across line breaks. Tighten it before merge. Otherwise the design is right.",
+    "submitted_at": "2026-04-22T10:14:00Z",
+    "pull_request_url": "https://api.github.com/repos/prbe-ai/prbe-knowledge/pulls/45"
+  },
+  {
+    "id": 700046,
+    "user": {"login": "janedoe", "id": 5003},
+    "state": "COMMENTED",
+    "body": "Worth adding a test for nested brackets too — `[[a:b [stuff] c:d]]` should not match.",
+    "submitted_at": "2026-04-22T11:32:18Z",
+    "pull_request_url": "https://api.github.com/repos/prbe-ai/prbe-knowledge/pulls/45"
+  },
+  {
+    "id": 700047,
+    "user": {"login": "maison", "id": 5002},
+    "state": "APPROVED",
+    "body": "Regex tightened, tests cover the nested-bracket case. Ship it.",
+    "submitted_at": "2026-04-23T10:55:42Z",
+    "pull_request_url": "https://api.github.com/repos/prbe-ai/prbe-knowledge/pulls/45"
+  }
+]

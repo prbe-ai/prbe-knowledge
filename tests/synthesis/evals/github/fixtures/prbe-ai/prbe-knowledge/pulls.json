@@ -1,0 +1,127 @@
+[
+  {
+    "number": 46,
+    "title": "wiki: bootstrap GitHub crawler eval corpus",
+    "body": "Builds on the architecture decision in #42 and the bootstrap design in issue #18. Pre-builds the Lane D test corpus so once the crawler lands the snapshot tests are live. Reviewers wanted before merge.",
+    "state": "open",
+    "created_at": "2026-04-30T14:08:00Z",
+    "updated_at": "2026-04-30T17:55:32Z",
+    "closed_at": null,
+    "merged_at": null,
+    "user": {"login": "richard", "id": 5001},
+    "head": {"ref": "feat/wiki-bootstrap-eval-fixtures"},
+    "base": {"ref": "main"},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/pull/46",
+    "requested_reviewers": [
+      {"login": "maison", "id": 5002}
+    ],
+    "labels": [
+      {"name": "area:wiki"},
+      {"name": "size:m"}
+    ]
+  },
+  {
+    "number": 45,
+    "title": "wiki: ship typed-link extractor + persister",
+    "body": "Lane B of the wiki bootstrap initiative. Implements zero-LLM-call link extraction parsing `[[type:slug]]` markdown and frontmatter scalars per the plan. Multi-reviewer because this touches the writer hook used by every crawler. cc [[person:richard]] [[person:maison]].",
+    "state": "closed",
+    "created_at": "2026-04-21T09:30:00Z",
+    "updated_at": "2026-04-23T11:14:08Z",
+    "closed_at": "2026-04-23T11:14:08Z",
+    "merged_at": "2026-04-23T11:14:08Z",
+    "user": {"login": "richard", "id": 5001},
+    "head": {"ref": "feat/wiki-link-extractor"},
+    "base": {"ref": "main"},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/pull/45",
+    "requested_reviewers": [
+      {"login": "maison", "id": 5002},
+      {"login": "janedoe", "id": 5003}
+    ],
+    "labels": [
+      {"name": "area:wiki"},
+      {"name": "size:l"}
+    ]
+  },
+  {
+    "number": 44,
+    "title": "fix: typo in retrieval module docstring",
+    "body": "One-line typo fix. No behavior change.",
+    "state": "closed",
+    "created_at": "2026-04-19T10:02:00Z",
+    "updated_at": "2026-04-19T10:18:44Z",
+    "closed_at": "2026-04-19T10:18:44Z",
+    "merged_at": "2026-04-19T10:18:44Z",
+    "user": {"login": "janedoe", "id": 5003},
+    "head": {"ref": "fix/retrieval-typo"},
+    "base": {"ref": "main"},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/pull/44",
+    "requested_reviewers": [],
+    "labels": [
+      {"name": "size:xs"},
+      {"name": "type:chore"}
+    ]
+  },
+  {
+    "number": 43,
+    "title": "fix(auth): refresh OAuth tokens before 60s expiry window",
+    "body": "Fixes intermittent 401s during long-running ingestion drains. The auth service was refreshing tokens at expiry rather than ahead of expiry; under load the request would race the refresh and 401. Bumps the refresh window to 60s ahead of expiry and adds a regression test.\n\nDoesn't introduce a new wiki page; this is a bug-fix on the existing auth service. Touches [[service_card:auth]].",
+    "state": "closed",
+    "created_at": "2026-04-17T13:44:00Z",
+    "updated_at": "2026-04-18T08:02:19Z",
+    "closed_at": "2026-04-18T08:02:19Z",
+    "merged_at": "2026-04-18T08:02:19Z",
+    "user": {"login": "maison", "id": 5002},
+    "head": {"ref": "fix/auth-refresh-window"},
+    "base": {"ref": "main"},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/pull/43",
+    "requested_reviewers": [
+      {"login": "richard", "id": 5001}
+    ],
+    "labels": [
+      {"name": "area:auth"},
+      {"name": "type:bug"},
+      {"name": "size:s"}
+    ]
+  },
+  {
+    "number": 42,
+    "title": "decision: pick pgvector over Pinecone for vector store",
+    "body": "Closes #18.\n\nContext: we evaluated pgvector (inside our existing Neon Postgres) against a managed Pinecone cluster for the Phase 0 retrieval stack.\n\nDecision: pgvector wins.\n\nRationale:\n- One less moving part (no separate vector DB to operate)\n- Significantly lower monthly cost at our query volume\n- Strong existing Postgres ops muscle memory on the team\n- Hybrid retrieval (BM25 + dense) is straightforward when both indexes live in the same database\n\nTrade-offs accepted:\n- pgvector lacks Pinecone's sharding-out-of-the-box; we'll revisit at >50M vectors\n- IVFFlat tuning is on us\n\nReviewed and approved by [[person:maison]].",
+    "state": "closed",
+    "created_at": "2026-04-14T16:20:00Z",
+    "updated_at": "2026-04-15T10:00:00Z",
+    "closed_at": "2026-04-15T10:00:00Z",
+    "merged_at": "2026-04-15T10:00:00Z",
+    "user": {"login": "richard", "id": 5001},
+    "head": {"ref": "decision/pgvector-over-pinecone"},
+    "base": {"ref": "main"},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/pull/42",
+    "requested_reviewers": [
+      {"login": "maison", "id": 5002}
+    ],
+    "labels": [
+      {"name": "area:retrieval"},
+      {"name": "type:decision"},
+      {"name": "size:m"}
+    ]
+  },
+  {
+    "number": 41,
+    "title": "chore: bump httpx 0.27.2 -> 0.27.3",
+    "body": "Routine dependency bump. No code changes.",
+    "state": "closed",
+    "created_at": "2026-04-12T11:00:00Z",
+    "updated_at": "2026-04-12T11:25:09Z",
+    "closed_at": "2026-04-12T11:25:09Z",
+    "merged_at": "2026-04-12T11:25:09Z",
+    "user": {"login": "janedoe", "id": 5003},
+    "head": {"ref": "chore/bump-httpx"},
+    "base": {"ref": "main"},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/pull/41",
+    "requested_reviewers": [],
+    "labels": [
+      {"name": "type:chore"},
+      {"name": "size:xs"}
+    ]
+  }
+]

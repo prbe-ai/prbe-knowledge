@@ -1,0 +1,332 @@
+{
+  "_comment": "Expected wiki_links rows produced by the link extractor running on every snapshot page in pages/. Tuples are (src_wiki_type, src_slug, dst_wiki_type, dst_slug, link_type, link_source). Deduped per the (dst_wiki_type, dst_slug, link_type, link_source) uniqueness shape. Markdown [[type:slug|display]] (one pipe) -> link_type=''. Markdown [[type:slug|verb|display]] (two pipes) -> link_type=verb. Frontmatter values matching 'type:slug' -> link_type=<field_name>, link_source=frontmatter.",
+  "links": [
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "person",
+      "dst_slug": "richard",
+      "link_type": "contributors",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "person",
+      "dst_slug": "maison",
+      "link_type": "contributors",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "service_card",
+      "dst_slug": "retrieval",
+      "link_type": "related",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "vendor",
+      "dst_slug": "pgvector",
+      "link_type": "related",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "vendor",
+      "dst_slug": "pinecone",
+      "link_type": "related",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "vendor",
+      "dst_slug": "neon",
+      "link_type": "related",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "vendor",
+      "dst_slug": "pgvector",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "vendor",
+      "dst_slug": "neon",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "vendor",
+      "dst_slug": "pinecone",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "person",
+      "dst_slug": "richard",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "decision",
+      "src_slug": "pgvector-over-pinecone",
+      "dst_wiki_type": "person",
+      "dst_slug": "maison",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+
+    {
+      "src_wiki_type": "service_card",
+      "src_slug": "auth",
+      "dst_wiki_type": "person",
+      "dst_slug": "maison",
+      "link_type": "owners",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "service_card",
+      "src_slug": "auth",
+      "dst_wiki_type": "person",
+      "dst_slug": "maison",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+
+    {
+      "src_wiki_type": "feature",
+      "src_slug": "wiki-bootstrap",
+      "dst_wiki_type": "person",
+      "dst_slug": "richard",
+      "link_type": "owners",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "feature",
+      "src_slug": "wiki-bootstrap",
+      "dst_wiki_type": "person",
+      "dst_slug": "richard",
+      "link_type": "contributors",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "feature",
+      "src_slug": "wiki-bootstrap",
+      "dst_wiki_type": "person",
+      "dst_slug": "maison",
+      "link_type": "contributors",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "feature",
+      "src_slug": "wiki-bootstrap",
+      "dst_wiki_type": "person",
+      "dst_slug": "janedoe",
+      "link_type": "contributors",
+      "link_source": "frontmatter"
+    },
+
+    {
+      "src_wiki_type": "runbook",
+      "src_slug": "recover-stuck-ingestion-drain",
+      "dst_wiki_type": "person",
+      "dst_slug": "maison",
+      "link_type": "owners",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "runbook",
+      "src_slug": "recover-stuck-ingestion-drain",
+      "dst_wiki_type": "person",
+      "dst_slug": "maison",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+
+    {
+      "src_wiki_type": "person",
+      "src_slug": "richard",
+      "dst_wiki_type": "company",
+      "dst_slug": "probe",
+      "link_type": "works_at",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "richard",
+      "dst_wiki_type": "person",
+      "dst_slug": "richard",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "richard",
+      "dst_wiki_type": "company",
+      "dst_slug": "probe",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "richard",
+      "dst_wiki_type": "decision",
+      "dst_slug": "pgvector-over-pinecone",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "richard",
+      "dst_wiki_type": "feature",
+      "dst_slug": "wiki-bootstrap",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "richard",
+      "dst_wiki_type": "service_card",
+      "dst_slug": "auth",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+
+    {
+      "src_wiki_type": "person",
+      "src_slug": "maison",
+      "dst_wiki_type": "company",
+      "dst_slug": "probe",
+      "link_type": "works_at",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "maison",
+      "dst_wiki_type": "service_card",
+      "dst_slug": "auth",
+      "link_type": "owns",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "maison",
+      "dst_wiki_type": "person",
+      "dst_slug": "maison",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "maison",
+      "dst_wiki_type": "company",
+      "dst_slug": "probe",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "maison",
+      "dst_wiki_type": "service_card",
+      "dst_slug": "auth",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "maison",
+      "dst_wiki_type": "decision",
+      "dst_slug": "pgvector-over-pinecone",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "maison",
+      "dst_wiki_type": "runbook",
+      "dst_slug": "recover-stuck-ingestion-drain",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+
+    {
+      "src_wiki_type": "person",
+      "src_slug": "janedoe",
+      "dst_wiki_type": "company",
+      "dst_slug": "probe",
+      "link_type": "works_at",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "janedoe",
+      "dst_wiki_type": "person",
+      "dst_slug": "janedoe",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "person",
+      "src_slug": "janedoe",
+      "dst_wiki_type": "company",
+      "dst_slug": "probe",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+
+    {
+      "src_wiki_type": "service_card",
+      "src_slug": "wiki-link-extractor",
+      "dst_wiki_type": "person",
+      "dst_slug": "richard",
+      "link_type": "owners",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "service_card",
+      "src_slug": "wiki-link-extractor",
+      "dst_wiki_type": "feature",
+      "dst_slug": "wiki-bootstrap",
+      "link_type": "related",
+      "link_source": "frontmatter"
+    },
+    {
+      "src_wiki_type": "service_card",
+      "src_slug": "wiki-link-extractor",
+      "dst_wiki_type": "person",
+      "dst_slug": "richard",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "service_card",
+      "src_slug": "wiki-link-extractor",
+      "dst_wiki_type": "person",
+      "dst_slug": "maison",
+      "link_type": "",
+      "link_source": "markdown"
+    },
+    {
+      "src_wiki_type": "service_card",
+      "src_slug": "wiki-link-extractor",
+      "dst_wiki_type": "person",
+      "dst_slug": "janedoe",
+      "link_type": "",
+      "link_source": "markdown"
+    }
+  ]
+}

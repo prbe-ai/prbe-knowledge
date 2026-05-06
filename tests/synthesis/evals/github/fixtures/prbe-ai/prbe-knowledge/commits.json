@@ -1,0 +1,65 @@
+[
+  {
+    "sha": "a1b2c3d4e5f60718293a4b5c6d7e8f9001020304",
+    "commit": {
+      "message": "wiki: ship typed-link extractor + persister (#45)\n\nLane B of the wiki bootstrap initiative. Implements zero-LLM-call link extraction parsing [[type:slug]] markdown and frontmatter scalars.",
+      "author": {"name": "Richard", "date": "2026-04-23T11:14:08Z"}
+    },
+    "author": {"login": "richard", "id": 5001},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/commit/a1b2c3d4e5f60718293a4b5c6d7e8f9001020304"
+  },
+  {
+    "sha": "b2c3d4e5f607182939a4b5c6d7e8f90010203040",
+    "commit": {
+      "message": "fix: typo in retrieval module docstring (#44)",
+      "author": {"name": "Jane Doe", "date": "2026-04-19T10:18:44Z"}
+    },
+    "author": {"login": "janedoe", "id": 5003},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/commit/b2c3d4e5f607182939a4b5c6d7e8f90010203040"
+  },
+  {
+    "sha": "c3d4e5f607182930a4b5c6d7e8f900102030405a",
+    "commit": {
+      "message": "fix(auth): refresh OAuth tokens before 60s expiry window (#43)\n\nPrevents intermittent 401s during long-running ingestion drains.",
+      "author": {"name": "Maison", "date": "2026-04-18T08:02:19Z"}
+    },
+    "author": {"login": "maison", "id": 5002},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/commit/c3d4e5f607182930a4b5c6d7e8f900102030405a"
+  },
+  {
+    "sha": "d4e5f607182930a4b5c6d7e8f900102030405a6b",
+    "commit": {
+      "message": "decision: pick pgvector over Pinecone for vector store (#42)\n\nAdopt pgvector inside Neon Postgres. Closes #18.",
+      "author": {"name": "Richard", "date": "2026-04-15T10:00:00Z"}
+    },
+    "author": {"login": "richard", "id": 5001},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/commit/d4e5f607182930a4b5c6d7e8f900102030405a6b"
+  },
+  {
+    "sha": "e5f607182930a4b5c6d7e8f900102030405a6b7c",
+    "commit": {
+      "message": "chore: bump httpx 0.27.2 -> 0.27.3 (#41)",
+      "author": {"name": "Jane Doe", "date": "2026-04-12T11:25:09Z"}
+    },
+    "author": {"login": "janedoe", "id": 5003},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/commit/e5f607182930a4b5c6d7e8f900102030405a6b7c"
+  },
+  {
+    "sha": "f607182930a4b5c6d7e8f900102030405a6b7c8d",
+    "commit": {
+      "message": "feat(auth): add OAuth middleware for ingestion service\n\nAdds the auth middleware that wraps every ingestion handler. Enforces a per-customer token, rate-limits unauthenticated calls, surfaces 401s with a structured body.",
+      "author": {"name": "Maison", "date": "2026-04-05T16:42:11Z"}
+    },
+    "author": {"login": "maison", "id": 5002},
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/commit/f607182930a4b5c6d7e8f900102030405a6b7c8d"
+  },
+  {
+    "sha": "0718293a4b5c6d7e8f9001020304a5b6c7d8e9f0",
+    "commit": {
+      "message": "chore: bump ruff 0.7.0 -> 0.7.1",
+      "author": {"name": "dependabot", "date": "2026-04-02T03:11:00Z"}
+    },
+    "author": null,
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/commit/0718293a4b5c6d7e8f9001020304a5b6c7d8e9f0"
+  }
+]
