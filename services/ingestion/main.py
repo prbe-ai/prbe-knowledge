@@ -52,6 +52,7 @@ from services.ingestion.manual_uploads import (
     parse_manual_upload,
     safe_filename,
 )
+from services.ingestion.slack_lifecycle import handle_slack_lifecycle_event
 from services.ingestion.wiki_routes import router as wiki_router
 from services.system_settings import get_ingestion_killswitch
 from shared.config import get_settings
@@ -437,6 +438,16 @@ async def webhook(
         raise HTTPException(status_code=400, detail=f"invalid json: {exc}") from exc
 
     customer_id = x_prbe_customer
+    if source_enum == SourceSystem.SLACK:
+        lifecycle = await handle_slack_lifecycle_event(
+            request.app.state.ctx,
+            customer_id,
+            payload,
+        )
+        if lifecycle is not None:
+            lifecycle["trace_id"] = trace_id
+            return JSONResponse(lifecycle)
+
     try:
         parsed = connector.parse_webhook_event(
             customer_id, dict(request.headers), payload

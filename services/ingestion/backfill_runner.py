@@ -60,10 +60,63 @@ class _ResumeState:
     started_at: datetime | None
 
 
+@dataclass(frozen=True)
+class ChannelBackfillEnqueueResult:
+    queued: bool
+    reason: str
+
+
 def _affected(command_tag: str) -> int:
     # asyncpg execute() returns e.g. "UPDATE 1" / "UPDATE 0"; last token is rowcount.
     parts = command_tag.split()
     return int(parts[-1]) if parts and parts[-1].isdigit() else 0
+
+
+def _decode_json_object(raw: str | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _slack_state_from_cursor(raw: str | None) -> dict:
+    data = _decode_json_object(raw)
+    if isinstance(data.get("active"), dict):
+        return {
+            "active": dict(data["active"]),
+            "done": list(data.get("done", [])),
+        }
+
+    if "channels_remaining" in data or "current_channel" in data:
+        active = {ch: None for ch in (data.get("channels_remaining") or []) if ch}
+        current = data.get("current_channel")
+        if current:
+            active[current] = data.get("history_cursor")
+        return {"active": active, "done": []}
+
+    return {"active": {}, "done": []}
+
+
+def _slack_deferred_channels(raw: str | None) -> dict[str, str | None]:
+    data = _decode_json_object(raw)
+    pending = data.get("pending_channels")
+    if not isinstance(pending, dict):
+        return {}
+    return {str(ch): cursor for ch, cursor in pending.items() if ch}
+
+
+def _slack_channel_cursor(channels: dict[str, str | None]) -> str:
+    return json.dumps(
+        {
+            "active": channels,
+            "done": [],
+            "mode": "channel_join",
+        },
+        sort_keys=True,
+    )
 
 
 async def run_backfill(
@@ -361,6 +414,112 @@ async def enqueue_backfill(customer_id: str, source: SourceSystem) -> None:
         )
 
 
+async def enqueue_slack_channel_backfill(
+    customer_id: str,
+    channel_id: str,
+) -> ChannelBackfillEnqueueResult:
+    """Queue a Slack backfill for one newly visible channel.
+
+    Slack has a singleton backfill_state row per customer/source. For normal
+    idle/complete/failed states we can replace that row with a channel-scoped
+    cursor. If the source-wide Slack backfill is currently running, defer the
+    channel in `pending_channels`; `_mark_done` will immediately requeue a
+    follow-up channel run instead of marking the row complete.
+    """
+    if not channel_id:
+        return ChannelBackfillEnqueueResult(queued=False, reason="missing_channel")
+
+    async with raw_conn() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            """
+            SELECT status, last_cursor
+            FROM backfill_state
+            WHERE customer_id = $1 AND source_system = $2
+            FOR UPDATE
+            """,
+            customer_id,
+            SourceSystem.SLACK.value,
+        )
+
+        if row is None:
+            await conn.execute(
+                """
+                INSERT INTO backfill_state
+                    (customer_id, source_system, status, last_cursor,
+                     started_at, events_enqueued)
+                VALUES ($1, $2, $3, $4, NULL, 0)
+                """,
+                customer_id,
+                SourceSystem.SLACK.value,
+                BackfillStatus.PENDING.value,
+                _slack_channel_cursor({channel_id: None}),
+            )
+            return ChannelBackfillEnqueueResult(queued=True, reason="inserted")
+
+        status = row["status"]
+        last_cursor = row["last_cursor"]
+
+        if status == BackfillStatus.PENDING.value and last_cursor is None:
+            return ChannelBackfillEnqueueResult(
+                queued=False,
+                reason="covered_by_full_backfill",
+            )
+
+        if status == BackfillStatus.RUNNING.value:
+            data = _decode_json_object(last_cursor)
+            pending = _slack_deferred_channels(last_cursor)
+            if channel_id in pending:
+                return ChannelBackfillEnqueueResult(
+                    queued=False,
+                    reason="already_deferred",
+                )
+            pending[channel_id] = None
+            data["pending_channels"] = pending
+            await conn.execute(
+                """
+                UPDATE backfill_state
+                SET last_cursor = $1,
+                    last_error = NULL,
+                    heartbeat_at = NOW()
+                WHERE customer_id = $2 AND source_system = $3
+                """,
+                json.dumps(data, sort_keys=True),
+                customer_id,
+                SourceSystem.SLACK.value,
+            )
+            return ChannelBackfillEnqueueResult(
+                queued=True,
+                reason="deferred_until_running_backfill_finishes",
+            )
+
+        state = _slack_state_from_cursor(last_cursor)
+        active: dict[str, str | None] = {
+            str(ch): cursor for ch, cursor in state["active"].items() if ch
+        }
+        if channel_id in active and status == BackfillStatus.PENDING.value:
+            return ChannelBackfillEnqueueResult(queued=False, reason="already_pending")
+        active[channel_id] = None
+
+        await conn.execute(
+            """
+            UPDATE backfill_state
+            SET status = $1,
+                last_cursor = $2,
+                last_error = NULL,
+                events_enqueued = 0,
+                started_at = NULL,
+                heartbeat_at = NULL,
+                completed_at = NULL
+            WHERE customer_id = $3 AND source_system = $4
+            """,
+            BackfillStatus.PENDING.value,
+            _slack_channel_cursor(active),
+            customer_id,
+            SourceSystem.SLACK.value,
+        )
+        return ChannelBackfillEnqueueResult(queued=True, reason="queued")
+
+
 async def _release_for_resume(
     customer_id: str,
     source: SourceSystem,
@@ -475,7 +634,33 @@ async def _update_progress(
     (advancing started_at), the UPDATE matches 0 rows and we raise so the
     run loop can bail without overwriting the new owner's state.
     """
-    async with raw_conn() as conn:
+    async with raw_conn() as conn, conn.transaction():
+        if source == SourceSystem.SLACK and cursor is not None:
+            row = await conn.fetchrow(
+                """
+                SELECT last_cursor
+                FROM backfill_state
+                WHERE customer_id   = $1
+                  AND source_system = $2
+                  AND status        = $3
+                  AND started_at    = $4
+                FOR UPDATE
+                """,
+                customer_id,
+                source.value,
+                BackfillStatus.RUNNING.value,
+                claim_token,
+            )
+            if row is not None:
+                pending = _slack_deferred_channels(row["last_cursor"])
+                if pending:
+                    data = _decode_json_object(cursor)
+                    data["pending_channels"] = {
+                        **_slack_deferred_channels(cursor),
+                        **pending,
+                    }
+                    cursor = json.dumps(data, sort_keys=True)
+
         tag = await conn.execute(
             """
             UPDATE backfill_state
@@ -509,7 +694,49 @@ async def _mark_done(
     claim_token: datetime,
 ) -> None:
     """Mark complete only if the row is still ours. No-op silently otherwise."""
-    async with raw_conn() as conn:
+    async with raw_conn() as conn, conn.transaction():
+        if source == SourceSystem.SLACK:
+            row = await conn.fetchrow(
+                """
+                SELECT last_cursor
+                FROM backfill_state
+                WHERE customer_id   = $1
+                  AND source_system = $2
+                  AND status        = $3
+                  AND started_at    = $4
+                FOR UPDATE
+                """,
+                customer_id,
+                source.value,
+                BackfillStatus.RUNNING.value,
+                claim_token,
+            )
+            pending = _slack_deferred_channels(row["last_cursor"] if row else None)
+            if pending:
+                await conn.execute(
+                    """
+                    UPDATE backfill_state
+                    SET status           = $1,
+                        last_cursor      = $2,
+                        events_enqueued  = 0,
+                        last_progress_at = NOW(),
+                        heartbeat_at     = NULL,
+                        started_at       = NULL,
+                        completed_at     = NULL
+                    WHERE customer_id   = $3
+                      AND source_system = $4
+                      AND status        = $5
+                      AND started_at    = $6
+                    """,
+                    BackfillStatus.PENDING.value,
+                    _slack_channel_cursor(pending),
+                    customer_id,
+                    source.value,
+                    BackfillStatus.RUNNING.value,
+                    claim_token,
+                )
+                return
+
         await conn.execute(
             """
             UPDATE backfill_state

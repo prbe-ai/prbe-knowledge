@@ -113,7 +113,7 @@ and (where applicable) `signing_secret` for each, pasted into `.env.local`.
    - Bot token: `channels:history`, `channels:join`, `channels:read`, `groups:history`, `groups:read`, `users:read`, `team:read`
 3. **Event Subscriptions** → enable:
    - Request URL: `https://<your-tunnel>.ngrok.app/webhooks/slack` (fill in after §6)
-   - Subscribe to bot events: `message.channels`, `message.groups`
+   - Subscribe to bot events: `message.channels`, `message.groups`, `member_joined_channel`, `channel_created`
 4. **Basic Information** → copy:
    - Client ID → `SLACK_CLIENT_ID`
    - Client Secret → `SLACK_CLIENT_SECRET`
@@ -412,6 +412,6 @@ to be reissued — they're the same across environments (we use shared Neon).
 
 - **Fernet key rotation**: change `TOKEN_ENCRYPTION_KEY` and every stored token becomes undecryptable. Rotation is a Tier 7 TODO — for now, treat the key as permanent per environment.
 - **ngrok session rotation**: free-tier URLs change on every restart. Save cycles with a paid subdomain or Cloudflare tunnel.
-- **Slack app install scope**: the bot auto-joins every public channel on first backfill (via `channels:join`). Private channels still need a manual `/invite @prbe-knowledge` — there is no scope for self-joining private channels.
+- **Slack app install scope**: the bot auto-joins every public channel on first backfill (via `channels:join`). With the `channel_created` event subscription it also joins newly-created public channels. Private channels still need a manual `/invite @prbe-knowledge` — there is no scope for self-joining private channels.
 - **GitHub Apps vs OAuth Apps**: this connector expects a GitHub App (not a Personal Access Token). App installations ≠ OAuth user tokens.
 - **Python 3.14 local**: Python 3.12 is what CI + Fly run. 3.14 mostly works; some asyncio edge cases differ. If you hit one, match CI's 3.12.

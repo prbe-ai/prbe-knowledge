@@ -894,7 +894,11 @@ class SlackConnector(Connector):
             ExternalWorkspaceRef(
                 external_id=team_id,
                 external_name=body.get("team"),
-                metadata={"url": body.get("url")},
+                metadata={
+                    "url": body.get("url"),
+                    "bot_user_id": body.get("user_id"),
+                    "bot_id": body.get("bot_id"),
+                },
             )
         ]
 

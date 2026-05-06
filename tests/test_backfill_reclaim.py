@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -30,6 +31,7 @@ from services.ingestion.backfill_runner import (
     _mark_failed,
     _release_for_resume,
     _update_progress,
+    enqueue_slack_channel_backfill,
 )
 from services.ingestion.worker import ReclaimLoop
 from shared.constants import BackfillStatus, SourceSystem
@@ -389,6 +391,72 @@ async def test_update_progress_succeeds_with_matching_token(live_db) -> None:
         )
     assert row["last_cursor"] == "new"
     assert row["events_enqueued"] == 125
+
+
+@pytest.mark.asyncio
+async def test_enqueue_slack_channel_backfill_creates_channel_cursor(live_db) -> None:
+    await _insert_customer("cust-slack-channel")
+
+    result = await enqueue_slack_channel_backfill("cust-slack-channel", "CNEW")
+
+    assert result.queued is True
+    assert result.reason == "inserted"
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, last_cursor, events_enqueued FROM backfill_state "
+            "WHERE customer_id='cust-slack-channel'"
+        )
+    cursor = json.loads(row["last_cursor"])
+    assert row["status"] == BackfillStatus.PENDING.value
+    assert row["events_enqueued"] == 0
+    assert cursor["active"] == {"CNEW": None}
+    assert cursor["mode"] == "channel_join"
+
+
+@pytest.mark.asyncio
+async def test_running_slack_backfill_defers_new_channel_until_done(live_db) -> None:
+    await _insert_customer("cust-slack-deferred")
+    started_at = await _insert_backfill_state(
+        customer_id="cust-slack-deferred",
+        source=SourceSystem.SLACK,
+        status=BackfillStatus.RUNNING.value,
+        heartbeat_offset_seconds=30,
+        last_cursor=json.dumps({"active": {"COLD": None}, "done": []}),
+        events_enqueued=10,
+    )
+
+    result = await enqueue_slack_channel_backfill("cust-slack-deferred", "CNEW")
+    assert result.queued is True
+    assert result.reason == "deferred_until_running_backfill_finishes"
+
+    await _update_progress(
+        "cust-slack-deferred",
+        SourceSystem.SLACK,
+        json.dumps({"active": {}, "done": ["COLD"]}),
+        25,
+        claim_token=started_at,
+    )
+    await _mark_done(
+        "cust-slack-deferred",
+        SourceSystem.SLACK,
+        25,
+        json.dumps({"active": {}, "done": ["COLD"]}),
+        claim_token=started_at,
+    )
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, started_at, heartbeat_at, completed_at, "
+            "last_cursor, events_enqueued FROM backfill_state "
+            "WHERE customer_id='cust-slack-deferred'"
+        )
+    cursor = json.loads(row["last_cursor"])
+    assert row["status"] == BackfillStatus.PENDING.value
+    assert row["started_at"] is None
+    assert row["heartbeat_at"] is None
+    assert row["completed_at"] is None
+    assert row["events_enqueued"] == 0
+    assert cursor["active"] == {"CNEW": None}
 
 
 @pytest.mark.asyncio
