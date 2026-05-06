@@ -659,7 +659,7 @@ CREATE TABLE wiki_synthesis_runs (
     error           TEXT,
     CONSTRAINT ck_wsr_kind CHECK (kind IN ('onboarding','wake','scheduled','bootstrap')),
     CONSTRAINT ck_wsr_stage CHECK (stage IN ('triage','synthesis')),
-    CONSTRAINT ck_wsr_status CHECK (status IN ('running','complete','failed','partial'))
+    CONSTRAINT ck_wsr_status CHECK (status IN ('pending','running','complete','failed','partial','cancelled'))
 );
 
 CREATE INDEX idx_wsr_customer
@@ -769,6 +769,64 @@ CREATE INDEX ix_wiki_raw_data_page
 
 CREATE INDEX ix_wiki_raw_data_source
     ON wiki_raw_data (customer_id, source, source_ref);
+
+-- ---------------------------------------------------------------------------
+-- Custom Ingest Tokens (migration 0046)
+-- Self-serve bearer tokens for the Custom Ingest API. Customers mint a
+-- token from the dashboard; that token authenticates writes to the
+-- Custom Ingest endpoint without dragging the user through full OAuth.
+-- ---------------------------------------------------------------------------
+CREATE TABLE custom_ingest_tokens (
+    token_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id         TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    name                TEXT NOT NULL,
+    token_hash          TEXT NOT NULL UNIQUE,
+    token_prefix        TEXT NOT NULL,
+    created_by_user_id  TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_used_at        TIMESTAMPTZ,
+    revoked_at          TIMESTAMPTZ
+);
+
+CREATE INDEX ix_custom_ingest_tokens_customer_active
+    ON custom_ingest_tokens (customer_id, revoked_at);
+
+-- RLS enabled (not FORCE'd) so the SECURITY DEFINER verifier path
+-- bypasses cleanly via owner privileges. Matches the integration_tokens
+-- convention.
+ALTER TABLE custom_ingest_tokens ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY custom_ingest_tokens_tenant_isolation ON custom_ingest_tokens
+    FOR ALL
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- SECURITY DEFINER lookup-and-touch. Runs as the function OWNER (the
+-- migration role); because the table is ENABLE'd but not FORCE'd, the
+-- owner is naturally exempt from RLS — the verifier path can't know
+-- the tenant until *after* the lookup. Throttles last_used_at to one
+-- update per 5 minutes to keep verification cheap on hot paths.
+CREATE OR REPLACE FUNCTION verify_and_touch_custom_ingest_token(p_token_hash text)
+RETURNS TABLE(token_id uuid, customer_id text)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+BEGIN
+    RETURN QUERY
+    UPDATE custom_ingest_tokens
+       SET last_used_at = now()
+     WHERE token_hash = p_token_hash
+       AND revoked_at IS NULL
+       AND (last_used_at IS NULL OR last_used_at < now() - interval '5 minutes')
+     RETURNING custom_ingest_tokens.token_id, custom_ingest_tokens.customer_id;
+    IF NOT FOUND THEN
+        RETURN QUERY
+            SELECT t.token_id, t.customer_id
+              FROM custom_ingest_tokens t
+             WHERE t.token_hash = p_token_hash
+               AND t.revoked_at IS NULL;
+    END IF;
+END $$;
+
+REVOKE ALL ON FUNCTION verify_and_touch_custom_ingest_token(text) FROM PUBLIC;
 
 -- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
