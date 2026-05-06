@@ -34,6 +34,34 @@ class GraphHit:
     # metadata chunks out — graph anchoring is about entity proximity,
     # not synthetic-text similarity).
     kind: str = "content"
+    # Edge metadata threaded through from the join to graph_edges so
+    # min_confidence filtering and downstream bundle construction
+    # don't need a second SQL pass. (PR-A)
+    edge_type: str | None = None
+    confidence: str | None = None
+    via_label: str | None = None
+
+
+# Confidence tier ordering — higher rank = stronger. Mirrors graph_writer.
+_CONFIDENCE_RANK: dict[str, int] = {"AMBIGUOUS": 0, "INFERRED": 1, "EXTRACTED": 2}
+
+
+def passes_confidence_filter(confidence: str | None, min_confidence: str | None) -> bool:
+    """Return True if `confidence` clears the `min_confidence` floor.
+
+    `min_confidence` semantics:
+        None        — accept all tiers (debug mode)
+        EXTRACTED   — only deterministic edges
+        INFERRED    — drops AMBIGUOUS (default for MCP consumers)
+        AMBIGUOUS   — accepts everything (synonym for None at the floor)
+
+    Edges whose source predates the confidence column come back as None
+    from the DB; treat as EXTRACTED (the migration's default).
+    """
+    if min_confidence is None:
+        return True
+    effective = confidence or "EXTRACTED"
+    return _CONFIDENCE_RANK.get(effective, 0) >= _CONFIDENCE_RANK.get(min_confidence, 0)
 
 
 _ENTITY_TO_LABEL = {
@@ -47,7 +75,19 @@ _ENTITY_TO_LABEL = {
     "feature": "Feature",
     "decision": "Decision",
     "file_path": "Repo",  # fall-back: file paths live under a repo node
+    # Code-graph PR-A: symbol entity types map to their respective NodeLabels.
+    # Router can extract these directly from entity-bag queries that include
+    # qualified names like `Normalizer.process_queue_row`.
+    "function": "Function",
+    "method": "Method",
+    "class": "Class",
+    "module": "Module",
+    "symbol": "Symbol",
 }
+
+# Code-graph node labels — used by the bundle builder to detect when a
+# query seeded on a symbol so it can group results under that seed.
+CODE_GRAPH_LABELS = frozenset({"Function", "Method", "Class", "Module", "Symbol"})
 
 
 async def graph_search(
@@ -56,6 +96,7 @@ async def graph_search(
     top_k: int = TOP_K_GRAPH,
     doc_types: list[str] | None = None,
     temporal: TemporalSpec | None = None,
+    min_confidence: str | None = "INFERRED",
 ) -> list[GraphHit]:
     """Return chunks from documents within 1 hop of any matching entity node.
 
@@ -96,14 +137,18 @@ async def graph_search(
         rows = await conn.fetch(
             f"""
             WITH anchors AS (
-                SELECT node_id, canonical_id
+                SELECT node_id, canonical_id, label
                 FROM graph_nodes
                 WHERE customer_id = $1
                   AND label = ANY($2::text[])
                   AND canonical_id = ANY($3::text[])
             ),
             neighbors AS (
-                SELECT DISTINCT n.node_id, a.canonical_id AS via
+                SELECT DISTINCT n.node_id,
+                                a.canonical_id AS via,
+                                a.label        AS via_label,
+                                e.edge_type    AS edge_type,
+                                e.confidence   AS confidence
                 FROM anchors a
                 JOIN graph_edges e
                   ON e.customer_id = $1
@@ -113,14 +158,22 @@ async def graph_search(
                                       THEN e.to_node_id ELSE e.from_node_id END
                  AND n.label = 'Document'
                 UNION
-                SELECT node_id, canonical_id AS via FROM anchors
+                SELECT node_id,
+                       canonical_id AS via,
+                       label        AS via_label,
+                       NULL         AS edge_type,
+                       NULL         AS confidence
+                FROM anchors
                   WHERE EXISTS (SELECT 1 FROM graph_nodes gn
                                 WHERE gn.node_id = anchors.node_id AND gn.label = 'Document')
             )
             SELECT c.chunk_id, c.doc_id, d.version AS doc_version,
                    d.source_system, d.source_url, d.title, d.author_id,
                    c.content, d.created_at, d.updated_at,
-                   MIN(n.via) AS via_entity
+                   MIN(n.via)        AS via_entity,
+                   MIN(n.via_label)  AS via_label,
+                   MIN(n.edge_type)  AS edge_type,
+                   MIN(n.confidence) AS confidence
             FROM neighbors n
             JOIN graph_nodes gn ON gn.node_id = n.node_id
             JOIN documents d
@@ -143,20 +196,28 @@ async def graph_search(
             *params,
         )
 
-    return [
-        GraphHit(
-            chunk_id=r["chunk_id"],
-            doc_id=r["doc_id"],
-            doc_version=r["doc_version"],
-            source_system=r["source_system"],
-            source_url=r["source_url"],
-            title=r["title"],
-            content=r["content"],
-            created_at=r["created_at"],
-            updated_at=r["updated_at"],
-            score=1.0,
-            via_entity=r["via_entity"],
-            author_id=normalize_author_id(r["author_id"]),
+    hits: list[GraphHit] = []
+    for r in rows:
+        confidence = r["confidence"]
+        if not passes_confidence_filter(confidence, min_confidence):
+            continue
+        hits.append(
+            GraphHit(
+                chunk_id=r["chunk_id"],
+                doc_id=r["doc_id"],
+                doc_version=r["doc_version"],
+                source_system=r["source_system"],
+                source_url=r["source_url"],
+                title=r["title"],
+                content=r["content"],
+                created_at=r["created_at"],
+                updated_at=r["updated_at"],
+                score=1.0,
+                via_entity=r["via_entity"],
+                author_id=normalize_author_id(r["author_id"]),
+                edge_type=r["edge_type"],
+                confidence=confidence,
+                via_label=r["via_label"],
+            )
         )
-        for r in rows
-    ]
+    return hits

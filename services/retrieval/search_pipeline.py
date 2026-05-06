@@ -35,7 +35,11 @@ from services.retrieval.helpers import (
     embeddings_for_chunks,
 )
 from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search
-from services.retrieval.retrievers.graph import graph_search
+from services.retrieval.retrievers.graph import (
+    CODE_GRAPH_LABELS,
+    GraphHit,
+    graph_search,
+)
 from services.retrieval.retrievers.vector import vector_search
 from services.retrieval.router import RouterOutput
 from services.retrieval.temporal import build_predicate
@@ -43,6 +47,7 @@ from shared.constants import SourceSystem
 from shared.db import with_tenant
 from shared.logging import get_logger
 from shared.models import (
+    QueryBundle,
     QueryChunk,
     QueryRequest,
     QueryResponse,
@@ -214,6 +219,7 @@ async def run_search(
             [(e.entity_type, e.canonical_id) for e in routed.entities],
             doc_types=retriever_doc_types,
             temporal=spec,
+            min_confidence=req.min_confidence,
         )
 
     t_retrieve = time.perf_counter()
@@ -291,6 +297,8 @@ async def run_search(
         for i, h in enumerate(top)
     ]
 
+    bundles = _build_bundles(graph_hits) if graph_hits else None
+
     return QueryResponse(
         query=req.query,
         chunks=chunks,
@@ -301,8 +309,48 @@ async def run_search(
         applied_entity_filter=applied_entity_filter,
         applied_mode="search",
         applied_doc_types=doc_types,
+        applied_min_confidence=req.min_confidence,
         extracted_entities=extracted_entities,
         aggregation=None,
         timing_ms=timing,
         trace_id=trace_id,
+        bundles=bundles,
     )
+
+
+def _build_bundles(graph_hits: list[GraphHit]) -> list[QueryBundle] | None:
+    """Group graph_hits by seed entity, when the seed is a code-graph node.
+
+    Builds a `QueryBundle` per (via_entity, via_label) pair where via_label
+    is one of the code-graph labels (Function/Method/Class/Module/Symbol).
+    Returns None when no code-graph entities seeded the search — keeps the
+    response field unset so dashboard NL consumers don't see an empty list.
+    """
+    by_seed: dict[tuple[str, str], dict] = {}
+    for hit in graph_hits:
+        if not hit.via_label or hit.via_label not in CODE_GRAPH_LABELS:
+            continue
+        key = (hit.via_entity, hit.via_label)
+        slot = by_seed.setdefault(
+            key,
+            {
+                "chunk_ids": [],
+                "confidence_breakdown": {"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0},
+            },
+        )
+        slot["chunk_ids"].append(hit.chunk_id)
+        tier = hit.confidence or "EXTRACTED"
+        slot["confidence_breakdown"][tier] = slot["confidence_breakdown"].get(tier, 0) + 1
+
+    if not by_seed:
+        return None
+
+    return [
+        QueryBundle(
+            seed_entity=seed,
+            seed_label=label,
+            related_chunk_ids=slot["chunk_ids"],
+            confidence_breakdown=slot["confidence_breakdown"],
+        )
+        for (seed, label), slot in by_seed.items()
+    ]

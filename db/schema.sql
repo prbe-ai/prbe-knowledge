@@ -331,6 +331,27 @@ CREATE INDEX idx_backfill_state_running ON backfill_state (status, heartbeat_at)
     WHERE status = 'running';
 
 -- ---------------------------------------------------------------------------
+-- code_repo_state: per-(customer, repo, file) extraction cache for the
+-- code_graph connector. Push events short-circuit on content_hash match so
+-- steady-state pushes do zero re-embedding. Survives across worker restarts.
+-- ---------------------------------------------------------------------------
+CREATE TABLE code_repo_state (
+    customer_id            TEXT NOT NULL,
+    repo                   TEXT NOT NULL,
+    file_path              TEXT NOT NULL,
+    content_hash           TEXT NOT NULL,
+    language               TEXT NOT NULL,
+    symbol_count           INT  NOT NULL DEFAULT 0,
+    last_extracted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_extractor_version TEXT NOT NULL,
+    PRIMARY KEY (customer_id, repo, file_path)
+);
+ALTER TABLE code_repo_state ENABLE ROW LEVEL SECURITY;
+ALTER TABLE code_repo_state FORCE ROW LEVEL SECURITY;
+CREATE POLICY code_repo_state_tenant_isolation ON code_repo_state
+    USING (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
 -- integration_tokens: per-customer per-source credentials.
 --
 -- For non-device sources (slack/linear/github/notion/granola), one row per
@@ -458,12 +479,20 @@ CREATE TABLE graph_edges (
     valid_from    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     valid_to      TIMESTAMPTZ,
     source_system TEXT,
+    -- Three tiers: 'EXTRACTED' (deterministic AST), 'INFERRED' (PR-B
+    -- proposer/promoter), 'AMBIGUOUS' (unresolved call sites awaiting
+    -- promotion). Retrieval defaults to dropping AMBIGUOUS.
+    confidence    TEXT NOT NULL DEFAULT 'EXTRACTED'
+        CONSTRAINT graph_edges_confidence_check
+        CHECK (confidence IN ('EXTRACTED', 'INFERRED', 'AMBIGUOUS')),
     UNIQUE (customer_id, edge_type, from_node_id, to_node_id)
 );
 
 CREATE INDEX idx_graph_edges_customer_type ON graph_edges (customer_id, edge_type);
 CREATE INDEX idx_graph_edges_from ON graph_edges (customer_id, from_node_id, edge_type);
 CREATE INDEX idx_graph_edges_to ON graph_edges (customer_id, to_node_id, edge_type);
+CREATE INDEX idx_graph_edges_confidence
+    ON graph_edges (customer_id, edge_type, confidence);
 
 -- Per-node provenance: which source system(s) asserted this node. A node
 -- touched by multiple connectors must survive disconnection of any single

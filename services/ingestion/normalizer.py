@@ -223,6 +223,7 @@ class Normalizer:
             )
             await upsert_edges(conn, customer_id, result.graph_edges, node_ids, source_system.value)
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
+            await _upsert_code_repo_state(conn, customer_id, result.code_repo_state_updates)
 
             for idx, (doc, plan) in enumerate(zip(result.documents, plans, strict=True)):
                 # Per-doc SAVEPOINT: a deterministic-permanent error on one doc
@@ -268,10 +269,15 @@ class Normalizer:
         # behaves like the slow-moving knowledge base it's supposed to be.
         #
         # Skip when the source IS the wiki (cron's own COMPILED_WIKI
-        # writes must not feed back into its own queue). Also skip when
-        # the tenant has not opted into wiki generation.
+        # writes must not feed back into its own queue). Skip CODE_GRAPH
+        # too: code.symbol docs are deterministic AST extractions whose
+        # body is a function signature + docstring — wiki synthesis would
+        # burn LLM tokens trying to extract Decisions/Runbooks from them
+        # and produce nothing. Also skip when the tenant has not opted
+        # into wiki generation.
         if (
             source_system != SourceSystem.WIKI
+            and source_system != SourceSystem.CODE_GRAPH
             and doc_ids
             and await is_wiki_generation_enabled(customer_id)
         ):
@@ -596,6 +602,23 @@ class _ChunkPlan:
 # ---- SQL helpers (module-level so tests can unit-test them) ---------------
 
 
+# Bounded retry budget for the version-compute + INSERT loop. Five is high
+# enough to ride out the worst observed concurrent-writer storm against a
+# single doc_id (3-4 contenders) without spinning forever; an exhausted budget
+# raises a transient error so the worker requeues the row instead of DLQing.
+_UPSERT_DOC_MAX_RETRIES = 5
+
+
+class _UpsertDocumentRaceExhausted(NormalizationError):
+    """Concurrent writers kept winning the version race past the retry budget.
+
+    Marked transient so the worker re-queues the row (the next attempt will
+    see the latest version and slot in cleanly) rather than DLQing.
+    """
+
+    transient = True
+
+
 async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
     """Insert a new document version if content changed.
 
@@ -611,178 +634,193 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
     coalesce-eligible state (e.g. session_complete=False), we UPDATE the
     live row in place rather than opening a new SCD2 version. This kills
     the per-batch SCD2 amplification on long-running claude_code sessions.
+
+    Wrapped in a bounded retry loop because two concurrent writers can both
+    read `version=N`, both compute `N+1`, and one's INSERT silently no-ops
+    via `ON CONFLICT DO NOTHING` — losing the second writer's content. On
+    that conflict we re-read the live state inside the same `with_tenant`
+    txn and retry with the freshly-bumped version. Read-committed isolation
+    guarantees the conflicting writer's commit is visible to the next read.
     """
-    existing = await conn.fetchrow(
-        """
-        SELECT version, content_hash, metadata
-        FROM documents
-        WHERE doc_id = $1 AND customer_id = $2 AND valid_to IS NULL
-        LIMIT 1
-        """,
-        doc.doc_id,
-        doc.customer_id,
-    )
-
-    if existing and existing["content_hash"] == doc.content_hash and doc.deleted_at is None:
-        # Same content, not a delete → idempotent no-op.
-        # Preserve the live version on the in-memory doc so chunk writes
-        # (which use doc.version) target the existing row.
-        doc.version = existing["version"]
-        return False
-
-    # Coalesce-in-place path: while the live version is still in an
-    # incomplete state (e.g. session_complete=False) and the incoming doc
-    # asks for coalescing, UPDATE the live row in place. Same version,
-    # refreshed content_hash + metadata + body_preview + token counts.
-    # Chunk writes (called after this returns True) then diff against the
-    # same version, so reused chunks just bump last_seen_version.
-    if existing is not None and doc.coalesce_into_live and doc.deleted_at is None:
-        existing_meta = _coerce_jsonb(existing["metadata"])
-        prior_complete = bool(existing_meta.get("session_complete"))
-        if not prior_complete:
-            doc.version = existing["version"]
-            await conn.execute(
-                """
-                UPDATE documents
-                SET content_hash = $3,
-                    title = $4,
-                    body_preview = $5,
-                    body_size_bytes = $6,
-                    body_token_count = $7,
-                    updated_at = $8,
-                    valid_from = $9,
-                    metadata = $10::jsonb,
-                    entities = $11::jsonb,
-                    attachments = $12::jsonb,
-                    doc_references = $13::jsonb,
-                    ingested_at = $14
-                WHERE customer_id = $1 AND doc_id = $2 AND version = $15
-                  AND valid_to IS NULL
-                """,
-                doc.customer_id,
-                doc.doc_id,
-                doc.content_hash,
-                doc.title,
-                doc.body_preview,
-                doc.body_size_bytes,
-                doc.body_token_count,
-                doc.updated_at,
-                doc.valid_from,
-                _json(doc.metadata),
-                _json([e.model_dump() for e in doc.entities]),
-                _json([a.model_dump() for a in doc.attachments]),
-                _json([r.model_dump() for r in doc.doc_references]),
-                doc.ingested_at,
-                existing["version"],
-            )
-            # Returning True so the caller proceeds to chunk diff against the
-            # same version; the chunk diff handles add/reuse/remove correctly.
-            return True
-
-    if existing is not None:
-        # Close out the prior live version in the same transaction.
-        await conn.execute(
+    for attempt in range(_UPSERT_DOC_MAX_RETRIES):
+        existing = await conn.fetchrow(
             """
-            UPDATE documents
-            SET valid_to = NOW()
-            WHERE doc_id = $1 AND version = $2 AND valid_to IS NULL
-            """,
-            doc.doc_id,
-            existing["version"],
-        )
-        next_version = existing["version"] + 1
-        # Link the new version to the one it supersedes, if not already.
-        if doc.supersedes_doc_id is None:
-            doc.supersedes_doc_id = doc.doc_id
-    else:
-        # Take the MAX in case there are pre-existing non-live versions (e.g.
-        # from a previously tombstoned doc that's being re-created).
-        max_version = await conn.fetchval(
-            """
-            SELECT COALESCE(MAX(version), 0)
+            SELECT version, content_hash, metadata
             FROM documents
-            WHERE doc_id = $1 AND customer_id = $2
+            WHERE doc_id = $1 AND customer_id = $2 AND valid_to IS NULL
+            LIMIT 1
             """,
             doc.doc_id,
             doc.customer_id,
         )
-        next_version = int(max_version or 0) + 1
 
-    inserted = await conn.fetchval(
-        """
-        INSERT INTO documents (
-            doc_id, version, customer_id,
-            source_system, source_id, source_url,
-            doc_class, doc_type, content_type, language,
-            content_hash, title, body_preview, body_size_bytes, body_token_count,
-            author_id,
-            created_at, updated_at, valid_from, valid_to, deleted_at, ingested_at,
-            parent_doc_id, supersedes_doc_id,
-            acl, metadata, entities, attachments, doc_references,
-            normalizer_version
+        if existing and existing["content_hash"] == doc.content_hash and doc.deleted_at is None:
+            # Same content, not a delete → idempotent no-op. A retry can land
+            # here too: a concurrent writer wrote OUR exact content first.
+            # Preserve the live version on the in-memory doc so chunk writes
+            # (which use doc.version) target the existing row.
+            doc.version = existing["version"]
+            return False
+
+        # Coalesce-in-place path: while the live version is still in an
+        # incomplete state (e.g. session_complete=False) and the incoming doc
+        # asks for coalescing, UPDATE the live row in place. Same version,
+        # refreshed content_hash + metadata + body_preview + token counts.
+        # Chunk writes (called after this returns True) then diff against the
+        # same version, so reused chunks just bump last_seen_version.
+        if existing is not None and doc.coalesce_into_live and doc.deleted_at is None:
+            existing_meta = _coerce_jsonb(existing["metadata"])
+            prior_complete = bool(existing_meta.get("session_complete"))
+            if not prior_complete:
+                doc.version = existing["version"]
+                await conn.execute(
+                    """
+                    UPDATE documents
+                    SET content_hash = $3,
+                        title = $4,
+                        body_preview = $5,
+                        body_size_bytes = $6,
+                        body_token_count = $7,
+                        updated_at = $8,
+                        valid_from = $9,
+                        metadata = $10::jsonb,
+                        entities = $11::jsonb,
+                        attachments = $12::jsonb,
+                        doc_references = $13::jsonb,
+                        ingested_at = $14
+                    WHERE customer_id = $1 AND doc_id = $2 AND version = $15
+                      AND valid_to IS NULL
+                    """,
+                    doc.customer_id,
+                    doc.doc_id,
+                    doc.content_hash,
+                    doc.title,
+                    doc.body_preview,
+                    doc.body_size_bytes,
+                    doc.body_token_count,
+                    doc.updated_at,
+                    doc.valid_from,
+                    _json(doc.metadata),
+                    _json([e.model_dump() for e in doc.entities]),
+                    _json([a.model_dump() for a in doc.attachments]),
+                    _json([r.model_dump() for r in doc.doc_references]),
+                    doc.ingested_at,
+                    existing["version"],
+                )
+                # Returning True so the caller proceeds to chunk diff against
+                # the same version; chunk diff handles add/reuse/remove correctly.
+                return True
+
+        if existing is not None:
+            # Close out the prior live version in the same transaction. Idempotent
+            # under retry: a second pass against an already-closed row matches
+            # zero rows and is a silent no-op.
+            await conn.execute(
+                """
+                UPDATE documents
+                SET valid_to = NOW()
+                WHERE doc_id = $1 AND version = $2 AND valid_to IS NULL
+                """,
+                doc.doc_id,
+                existing["version"],
+            )
+            next_version = existing["version"] + 1
+            # Link the new version to the one it supersedes, if not already.
+            if doc.supersedes_doc_id is None:
+                doc.supersedes_doc_id = doc.doc_id
+        else:
+            # Take the MAX in case there are pre-existing non-live versions (e.g.
+            # from a previously tombstoned doc that's being re-created).
+            max_version = await conn.fetchval(
+                """
+                SELECT COALESCE(MAX(version), 0)
+                FROM documents
+                WHERE doc_id = $1 AND customer_id = $2
+                """,
+                doc.doc_id,
+                doc.customer_id,
+            )
+            next_version = int(max_version or 0) + 1
+
+        inserted = await conn.fetchval(
+            """
+            INSERT INTO documents (
+                doc_id, version, customer_id,
+                source_system, source_id, source_url,
+                doc_class, doc_type, content_type, language,
+                content_hash, title, body_preview, body_size_bytes, body_token_count,
+                author_id,
+                created_at, updated_at, valid_from, valid_to, deleted_at, ingested_at,
+                parent_doc_id, supersedes_doc_id,
+                acl, metadata, entities, attachments, doc_references,
+                normalizer_version
+            )
+            VALUES (
+                $1, $2, $3,
+                $4, $5, $6,
+                $7, $8, $9, $10,
+                $11, $12, $13, $14, $15,
+                $16,
+                $17, $18, $19, $20, $21, $22,
+                $23, $24,
+                $25::jsonb, $26::jsonb, $27::jsonb, $28::jsonb, $29::jsonb,
+                $30
+            )
+            ON CONFLICT (customer_id, doc_id, version) DO NOTHING
+            RETURNING 1
+            """,
+            doc.doc_id,
+            next_version,
+            doc.customer_id,
+            doc.source_system.value,
+            doc.source_id,
+            doc.source_url,
+            doc.doc_class.value,
+            doc.doc_type.value,
+            doc.content_type,
+            doc.language,
+            doc.content_hash,
+            doc.title,
+            doc.body_preview,
+            doc.body_size_bytes,
+            doc.body_token_count,
+            doc.author_id,
+            doc.created_at,
+            doc.updated_at,
+            doc.valid_from,
+            doc.valid_to,
+            doc.deleted_at,
+            doc.ingested_at,
+            doc.parent_doc_id,
+            doc.supersedes_doc_id,
+            _json(doc.acl.model_dump()),
+            _json(doc.metadata),
+            _json([e.model_dump() for e in doc.entities]),
+            _json([a.model_dump() for a in doc.attachments]),
+            _json([r.model_dump() for r in doc.doc_references]),
+            NORMALIZER_VERSION,
         )
-        VALUES (
-            $1, $2, $3,
-            $4, $5, $6,
-            $7, $8, $9, $10,
-            $11, $12, $13, $14, $15,
-            $16,
-            $17, $18, $19, $20, $21, $22,
-            $23, $24,
-            $25::jsonb, $26::jsonb, $27::jsonb, $28::jsonb, $29::jsonb,
-            $30
-        )
-        ON CONFLICT (customer_id, doc_id, version) DO NOTHING
-        RETURNING 1
-        """,
-        doc.doc_id,
-        next_version,
-        doc.customer_id,
-        doc.source_system.value,
-        doc.source_id,
-        doc.source_url,
-        doc.doc_class.value,
-        doc.doc_type.value,
-        doc.content_type,
-        doc.language,
-        doc.content_hash,
-        doc.title,
-        doc.body_preview,
-        doc.body_size_bytes,
-        doc.body_token_count,
-        doc.author_id,
-        doc.created_at,
-        doc.updated_at,
-        doc.valid_from,
-        doc.valid_to,
-        doc.deleted_at,
-        doc.ingested_at,
-        doc.parent_doc_id,
-        doc.supersedes_doc_id,
-        _json(doc.acl.model_dump()),
-        _json(doc.metadata),
-        _json([e.model_dump() for e in doc.entities]),
-        _json([a.model_dump() for a in doc.attachments]),
-        _json([r.model_dump() for r in doc.doc_references]),
-        NORMALIZER_VERSION,
-    )
-    if inserted is None:
-        # ON CONFLICT swallowed the write. We already proved above that no
-        # live version exists for (customer_id, doc_id), so a conflict here
-        # means a stale row at this exact (customer_id, doc_id, version) is
-        # blocking us — typically a prior run that closed out without
-        # bumping. Surfacing it loudly beats the previous silent-drop bug
-        # (where customer-B's writes vanished into customer-A's tenancy
-        # because the PK was global).
-        log.warning(
-            "upsert_document.silent_conflict",
+        if inserted is not None:
+            doc.version = next_version
+            return True
+
+        # ON CONFLICT swallowed the write — a concurrent writer claimed this
+        # (customer_id, doc_id, version) slot. Re-read on the next iteration
+        # so we land on top of their bumped version.
+        log.info(
+            "upsert_document.retry",
             customer=doc.customer_id,
             doc_id=doc.doc_id,
-            version=next_version,
+            attempted_version=next_version,
+            attempt=attempt + 1,
         )
-        return False
-    doc.version = next_version
-    return True
+
+    raise _UpsertDocumentRaceExhausted(
+        "exhausted retry budget computing next document version under contention",
+        customer=doc.customer_id,
+        doc_id=doc.doc_id,
+        retries=_UPSERT_DOC_MAX_RETRIES,
+    )
 
 
 async def _insert_chunk(
@@ -1021,6 +1059,44 @@ async def _insert_acl_snapshots(
             r.valid_from,
             r.valid_to,
             _json(r.metadata),
+        )
+
+
+async def _upsert_code_repo_state(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    rows: list,
+) -> None:
+    """Upsert code-graph per-file cache rows. No-op for non-code-graph runs.
+
+    `code_repo_state` is keyed (customer_id, repo, file_path). The cache
+    short-circuits re-extraction when content_hash + extractor_version match
+    the prior run, so this is the cumulative source of truth for "what
+    extraction state is current."
+    """
+    if not rows:
+        return
+    for r in rows:
+        await conn.execute(
+            """
+            INSERT INTO code_repo_state
+                (customer_id, repo, file_path, content_hash, language,
+                 symbol_count, last_extracted_at, last_extractor_version)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW(), $7)
+            ON CONFLICT (customer_id, repo, file_path) DO UPDATE SET
+                content_hash = EXCLUDED.content_hash,
+                language = EXCLUDED.language,
+                symbol_count = EXCLUDED.symbol_count,
+                last_extracted_at = NOW(),
+                last_extractor_version = EXCLUDED.last_extractor_version
+            """,
+            customer_id,
+            r.repo,
+            r.file_path,
+            r.content_hash,
+            r.language,
+            r.symbol_count,
+            r.extractor_version,
         )
 
 

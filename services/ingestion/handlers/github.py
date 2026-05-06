@@ -29,6 +29,7 @@ from datetime import UTC, datetime
 from typing import Any, ClassVar
 
 from services.ingestion.chunker import count_tokens
+from services.ingestion.code_graph import bridge as code_graph_bridge
 from services.ingestion.handlers.base import Connector
 from services.ingestion.handlers.registry import register_connector
 from shared.backend_client import fetch_github_installation_token
@@ -74,6 +75,10 @@ _EVENT_PULL_REQUEST = "pull_request"
 _EVENT_ISSUES = "issues"
 _EVENT_PUSH = "push"
 _EVENT_PR_REVIEW = "pull_request_review"
+# GitHub App lifecycle events — wired into the code-graph bridge so an
+# install/uninstall/repo-add/repo-remove keeps the symbol graph in sync.
+_EVENT_INSTALLATION = "installation"
+_EVENT_INSTALLATION_REPOSITORIES = "installation_repositories"
 
 # Actions we care about per event type. `deleted` produces a tombstone document.
 # GitHub also uses `transferred` when an issue moves repos — treat that as a delete
@@ -154,6 +159,13 @@ class GitHubConnector(Connector):
         event_type = _header(headers, "x-github-event")
         if event_type is None:
             raise InvalidWebhookPayload("github payload missing X-GitHub-Event header")
+
+        # Installation lifecycle events arrive without `repository` — handled
+        # before the repository-required check below.
+        if event_type == _EVENT_INSTALLATION:
+            return self._parse_installation(raw_payload)
+        if event_type == _EVENT_INSTALLATION_REPOSITORIES:
+            return self._parse_installation_repositories(raw_payload)
 
         repo = raw_payload.get("repository")
         if not isinstance(repo, dict):
@@ -303,6 +315,67 @@ class GitHubConnector(Connector):
                 "repo": full_name,
                 "pr_number": pr_number,
                 "review_id": review_id,
+            },
+        )
+
+    def _parse_installation(
+        self, raw_payload: Mapping[str, Any]
+    ) -> WebhookParseResult | None:
+        """Parse the GitHub App `installation` event.
+
+        Actions: created, deleted, suspend, unsuspend, new_permissions_accepted.
+        We act on `created` (initial backfill for every accessible repo) and
+        `deleted` (disconnect cascade for every repo). Other actions are
+        recorded as queue noise — `received_at` carries the event timestamp
+        so the row's idempotency key includes it.
+        """
+        action = raw_payload.get("action")
+        installation = raw_payload.get("installation") or {}
+        installation_id = installation.get("id")
+        if installation_id is None:
+            raise InvalidWebhookPayload("installation event missing installation.id")
+        # Time fields vary across actions; fall back to NOW so we always
+        # have a valid timestamp.
+        ts = installation.get("updated_at") or installation.get("created_at")
+        return WebhookParseResult(
+            source_event_id=f"installation:{installation_id}:{action}:{ts or _payload_fp(raw_payload)}",
+            received_at=_parse_iso8601(ts) if ts else datetime.now(UTC),
+            event_kind=IngestionEventType.WEBHOOK,
+            parse_hint={
+                "event_type": _EVENT_INSTALLATION,
+                "action": action,
+                "installation_id": installation_id,
+            },
+        )
+
+    def _parse_installation_repositories(
+        self, raw_payload: Mapping[str, Any]
+    ) -> WebhookParseResult | None:
+        """Parse `installation_repositories` (repos added/removed from an install).
+
+        Action is one of `added` / `removed`. Used to fan in
+        bridge.enqueue_initial_backfill or enqueue_disconnect for the
+        listed repos.
+        """
+        action = raw_payload.get("action")
+        installation = raw_payload.get("installation") or {}
+        installation_id = installation.get("id")
+        if installation_id is None:
+            raise InvalidWebhookPayload(
+                "installation_repositories event missing installation.id"
+            )
+        # No reliable timestamp on the payload — synthesize one.
+        ts = datetime.now(UTC).isoformat()
+        return WebhookParseResult(
+            source_event_id=(
+                f"installation_repositories:{installation_id}:{action}:{ts}:{_payload_fp(raw_payload)}"
+            ),
+            received_at=datetime.now(UTC),
+            event_kind=IngestionEventType.WEBHOOK,
+            parse_hint={
+                "event_type": _EVENT_INSTALLATION_REPOSITORIES,
+                "action": action,
+                "installation_id": installation_id,
             },
         )
 
@@ -663,9 +736,19 @@ class GitHubConnector(Connector):
         if event_type == _EVENT_ISSUES:
             return self._normalize_issue(event)
         if event_type == _EVENT_PUSH:
-            return self._normalize_push(event, hydrated)
+            result = self._normalize_push(event, hydrated)
+            # Forward push deltas to the code-graph bridge so symbol
+            # extraction stays in sync. Fire-and-await: a bridge failure
+            # shouldn't block the github.commit ingestion path, so
+            # exceptions are logged and swallowed.
+            await self._fire_codegraph_incremental(event)
+            return result
         if event_type == _EVENT_PR_REVIEW:
             return self._normalize_review(event)
+        if event_type == _EVENT_INSTALLATION:
+            return await self._normalize_installation(event)
+        if event_type == _EVENT_INSTALLATION_REPOSITORIES:
+            return await self._normalize_installation_repositories(event)
 
         return NormalizationResult(skipped_reason=f"unhandled github event {event_type}")
 
@@ -1110,6 +1193,175 @@ class GitHubConnector(Connector):
             graph_nodes=nodes,
             graph_edges=edges,
             acl_snapshots=[_repo_acl_row(repo, submitted_at)],
+        )
+
+    # ---- code-graph bridge fan-outs --------------------------------------
+
+    async def _fire_codegraph_incremental(self, event: WebhookEvent) -> None:
+        """After a verified push lands, forward the changed-files set to the
+        code-graph bridge for symbol-level diff extraction.
+
+        Failures are logged and swallowed — symbol extraction must never
+        block the github.commit ingestion path. The bridge writes a
+        separate ingestion_queue row keyed on (customer, code_graph,
+        repo:sha) so a transient failure here can be replayed via a
+        resync without re-ingesting commit Documents.
+        """
+        payload = event.raw_payload
+        repo = (payload.get("repository") or {}).get("full_name") or ""
+        head = payload.get("head_commit") or {}
+        sha = head.get("id") or payload.get("after") or ""
+        if not repo or not sha:
+            return
+        added: list[str] = []
+        modified: list[str] = []
+        removed: list[str] = []
+        for commit in payload.get("commits") or []:
+            if not isinstance(commit, dict):
+                continue
+            for path in commit.get("added") or []:
+                if isinstance(path, str):
+                    added.append(path)
+            for path in commit.get("modified") or []:
+                if isinstance(path, str):
+                    modified.append(path)
+            for path in commit.get("removed") or []:
+                if isinstance(path, str):
+                    removed.append(path)
+        # Dedup; per-commit lists overlap when several commits touched the
+        # same file in one push.
+        added = sorted(set(added))
+        modified = sorted(set(modified))
+        removed = sorted(set(removed))
+        if not (added or modified or removed):
+            return
+        try:
+            await code_graph_bridge.enqueue_incremental(
+                customer_id=event.customer_id,
+                repo=repo,
+                sha=sha,
+                files_added=added,
+                files_modified=modified,
+                files_removed=removed,
+                integration_token_id=None,
+                originating_source=SourceSystem.GITHUB,
+            )
+        except Exception as exc:
+            log.warning(
+                "code_graph.bridge.enqueue_incremental_failed",
+                customer=event.customer_id,
+                repo=repo,
+                sha=sha,
+                error=str(exc),
+            )
+
+    async def _normalize_installation(self, event: WebhookEvent) -> NormalizationResult:
+        """Handle GitHub App installation lifecycle.
+
+        On `created`: enumerate accessible repositories and fan in
+        bridge.enqueue_initial_backfill per repo.
+        On `deleted`: enumerate the installation's prior repos (from the
+        payload, since GitHub embeds them on uninstall) and fan in
+        bridge.enqueue_disconnect.
+        Other actions (suspend/unsuspend/permissions) are recorded as
+        idempotent no-ops.
+        """
+        payload = event.raw_payload
+        action = payload.get("action")
+        repositories = payload.get("repositories") or []
+        repo_full_names = [
+            r.get("full_name") for r in repositories if isinstance(r, dict)
+        ]
+        repo_full_names = [r for r in repo_full_names if r]
+
+        if action == "created":
+            for repo in repo_full_names:
+                try:
+                    await code_graph_bridge.enqueue_initial_backfill(
+                        customer_id=event.customer_id,
+                        repo=repo,
+                        head_sha="HEAD",
+                        integration_token_id=None,
+                        originating_source=SourceSystem.GITHUB,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "code_graph.bridge.enqueue_initial_backfill_failed",
+                        customer=event.customer_id,
+                        repo=repo,
+                        error=str(exc),
+                    )
+        elif action == "deleted" and repo_full_names:
+            try:
+                await code_graph_bridge.enqueue_disconnect(
+                    customer_id=event.customer_id,
+                    repos=repo_full_names,
+                    originating_source=SourceSystem.GITHUB,
+                )
+            except Exception as exc:
+                log.warning(
+                    "code_graph.bridge.enqueue_disconnect_failed",
+                    customer=event.customer_id,
+                    repos=repo_full_names,
+                    error=str(exc),
+                )
+        return NormalizationResult(
+            skipped_reason=f"installation.{action} processed (code_graph bridge fan-out)"
+        )
+
+    async def _normalize_installation_repositories(
+        self, event: WebhookEvent
+    ) -> NormalizationResult:
+        """Handle `installation_repositories` events.
+
+        Action 'added': bridge.enqueue_initial_backfill per repo.
+        Action 'removed': bridge.enqueue_disconnect for the listed repos.
+        """
+        payload = event.raw_payload
+        action = payload.get("action")
+        added = payload.get("repositories_added") or []
+        removed = payload.get("repositories_removed") or []
+        added_names = [r.get("full_name") for r in added if isinstance(r, dict)]
+        added_names = [r for r in added_names if r]
+        removed_names = [r.get("full_name") for r in removed if isinstance(r, dict)]
+        removed_names = [r for r in removed_names if r]
+
+        if action == "added":
+            for repo in added_names:
+                try:
+                    await code_graph_bridge.enqueue_initial_backfill(
+                        customer_id=event.customer_id,
+                        repo=repo,
+                        head_sha="HEAD",
+                        integration_token_id=None,
+                        originating_source=SourceSystem.GITHUB,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "code_graph.bridge.enqueue_initial_backfill_failed",
+                        customer=event.customer_id,
+                        repo=repo,
+                        error=str(exc),
+                    )
+        elif action == "removed" and removed_names:
+            try:
+                await code_graph_bridge.enqueue_disconnect(
+                    customer_id=event.customer_id,
+                    repos=removed_names,
+                    originating_source=SourceSystem.GITHUB,
+                )
+            except Exception as exc:
+                log.warning(
+                    "code_graph.bridge.enqueue_disconnect_failed",
+                    customer=event.customer_id,
+                    repos=removed_names,
+                    error=str(exc),
+                )
+        return NormalizationResult(
+            skipped_reason=(
+                f"installation_repositories.{action} processed "
+                f"(code_graph bridge fan-out: +{len(added_names)} -{len(removed_names)})"
+            )
         )
 
 

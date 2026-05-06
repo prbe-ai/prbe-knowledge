@@ -38,6 +38,16 @@ dependencies = [
     "orjson>=3.10.0",
     "pyyaml>=6.0",
     "tiktoken>=0.8.0",
+
+    # code-graph: tree-sitter AST extraction. Modern py-tree-sitter binding
+    # plus per-language parsers. NOT the older tree-sitter-languages wheel
+    # (unmaintained as of 2025; pins to old ABI versions).
+    "tree-sitter>=0.21.0",
+    "tree-sitter-python>=0.21.0",
+    "tree-sitter-typescript>=0.21.0",
+    "tree-sitter-javascript>=0.21.0",
+    "tree-sitter-go>=0.21.0",
+    "tree-sitter-java>=0.21.0",
 ]
 
 [project.optional-dependencies]
