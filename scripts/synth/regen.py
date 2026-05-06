@@ -16,7 +16,10 @@ Decisions (locked from 2026-05-05 handoff):
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from scripts.synth.llm.validator_pass2 import Pass2Result
+from scripts.synth.output.base import SynthDoc
 from scripts.synth.validator import Violation
 
 
@@ -49,3 +52,39 @@ def format_failure_context(
             lines.append(f"Pass 2 (consistency issue): {v.issue}")
 
     return "\n".join(lines)
+
+
+def splice_regenerated(
+    original_docs: tuple[SynthDoc, ...],
+    *,
+    regenerated_text_by_doc_id: dict[str, str],
+) -> tuple[SynthDoc, ...]:
+    """Return a new tuple where named docs have new `text`, everything else is identical.
+
+    Preserves doc order, count, and every SynthDoc field (id, source,
+    source_event_id, occurred_at, channel, page_id, thread_parent_id,
+    scenario_id, archetype, personas, services_mentioned, priority) — only
+    `text` changes for entries listed in `regenerated_text_by_doc_id`.
+
+    Raises:
+        ValueError: if `regenerated_text_by_doc_id` references a doc id
+            that is not present in `original_docs`.
+    """
+    if not regenerated_text_by_doc_id:
+        return original_docs
+
+    known_ids = {d.id for d in original_docs}
+    unknown = set(regenerated_text_by_doc_id.keys()) - known_ids
+    if unknown:
+        raise ValueError(
+            f"splice_regenerated: doc id(s) not in original scenario: {sorted(unknown)}"
+        )
+
+    out: list[SynthDoc] = []
+    for d in original_docs:
+        new_text = regenerated_text_by_doc_id.get(d.id)
+        if new_text is None:
+            out.append(d)
+        else:
+            out.append(replace(d, text=new_text))
+    return tuple(out)
