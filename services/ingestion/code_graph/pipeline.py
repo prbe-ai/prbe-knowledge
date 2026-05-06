@@ -67,6 +67,13 @@ log = get_logger(__name__)
 # file (10k locals from a code generator) shouldn't hang the batch.
 PER_FILE_EXTRACT_TIMEOUT_SECONDS = 10.0
 
+# Files larger than this skip extraction entirely. Most >256 KB source files
+# are machine-generated (vendored bundles, codegen output) and either timeout
+# in tree-sitter or produce useless symbol noise. asyncio.wait_for can't
+# cancel the parser thread, so a leaked thread holding a giant AST is the
+# real cost we're avoiding here, not the wall-clock time.
+_MAX_FILE_BYTES_FOR_EXTRACTION = 256 * 1024
+
 # Permission level for code-graph symbol Documents at the workspace level.
 # WORKSPACE / READ matches the GitHub connector's repo-level ACL convention.
 
@@ -122,6 +129,17 @@ async def extract_files_to_result(
     # Cross-file qualifier promotion.
     promote_single_match([r for _, r, _ in extractions])
 
+    # qualified_name → NodeLabel for accurate edge endpoint typing.
+    # graph_writer.upsert_edges keys node lookup on (label, canonical_id), so a
+    # CALLS edge with from_label=FUNCTION whose actual node was written as
+    # METHOD silently misses. Build the map once across all files so any
+    # in-repo edge endpoint resolves to the correct label.
+    qname_to_kind: dict[str, NodeLabel] = {}
+    for _, result, _ in extractions:
+        for symbol in result.symbols:
+            key = symbol.file_path if symbol.kind == NodeLabel.MODULE else symbol.qualified_name
+            qname_to_kind[key] = symbol.kind
+
     documents: list[Document] = []
     nodes: list[GraphNodeSpec] = []
     edges: list[GraphEdgeSpec] = []
@@ -174,7 +192,7 @@ async def extract_files_to_result(
                 )
             )
         for edge in result.edges:
-            mapped = _map_edge(repo, edge)
+            mapped = _map_edge(repo, edge, qname_to_kind)
             if mapped is not None:
                 edges.append(mapped)
 
@@ -245,6 +263,13 @@ def _prepare_files(
         if cached_state.get(rel) == ch:
             # Cache hit: file unchanged since last extraction. Don't extract.
             # Don't even record a state update (the existing row is current).
+            continue
+        if len(content) > _MAX_FILE_BYTES_FOR_EXTRACTION:
+            # Oversized: most likely generated. Skip extract, stamp the state
+            # row downstream so we don't re-attempt next push.
+            skipped_unsupported.append(
+                _PreparedFile(rel_path=rel, content=content, content_hash=ch)
+            )
             continue
         if looks_like_secret_dump(rel, content):
             skipped_secrets.append(
@@ -368,8 +393,10 @@ def _build_symbol_document(
             ],
             captured_at=now,
         ),
+        # Transient body for the chunker; never persisted into metadata
+        # (the storage guard at normalizer.py:191 raises on metadata['body']).
+        body=body,
         metadata={
-            "body": body,
             "symbol": {
                 "kind": symbol.kind.value,
                 "file_path": symbol.file_path,
@@ -403,22 +430,20 @@ def _symbol_node(repo: str, symbol: Symbol) -> GraphNodeSpec:
     )
 
 
-def _map_edge(repo: str, edge) -> GraphEdgeSpec | None:
+def _map_edge(
+    repo: str,
+    edge,
+    qname_to_kind: dict[str, NodeLabel],
+) -> GraphEdgeSpec | None:
     """Map a CodeEdge (qualified-name endpoints) to a GraphEdgeSpec.
 
-    Both endpoints must resolve to known node labels for the edge to be
-    persisted. We can't always tell which NodeLabel an edge target falls
-    under (a `to_qname` like `foo.bar.baz` could be a Function or a
-    Method); we approximate by walking down: Method > Function > Class >
-    Module. If the resolved target doesn't exist as a node yet, the edge
-    is silently dropped by graph_writer.upsert_edges.
+    Endpoint labels are looked up in qname_to_kind first (built from the
+    actual symbols this batch wrote), falling back to per-edge-type
+    heuristics for cross-repo / external targets the lookup doesn't know.
+    Right label matters: graph_writer.upsert_edges keys node lookup on
+    (label, canonical_id), so a label miss silently drops the edge.
     """
     from_canonical = f"{repo}:{edge.from_qname}"
-    # A safe default: target is a Symbol-shaped node. graph_writer accepts
-    # the (label, canonical_id) lookup; if it doesn't find the target, the
-    # edge is dropped. So we pick FUNCTION (the most common) and let the
-    # node lookup do its thing — better than guessing wrong with METHOD
-    # and missing matches.
     to_canonical = f"{repo}:{edge.to_qname}"
 
     confidence = "AMBIGUOUS" if edge.ambiguous else "EXTRACTED"
@@ -427,29 +452,28 @@ def _map_edge(repo: str, edge) -> GraphEdgeSpec | None:
     if edge.ambiguous and edge.target_candidates:
         properties["candidates"] = edge.target_candidates
 
-    # Endpoint labels: heuristic. Most edges in PR-A come from Python/TS/
-    # Go/Java extractors which emit FUNCTION/METHOD/CLASS targets. We
-    # default to FUNCTION; the upsert path silently drops if the
-    # (label, canonical_id) isn't a known node.
-    from_label = NodeLabel.FUNCTION
-    to_label = NodeLabel.FUNCTION
+    # Per-edge-type fallback labels for endpoints not in our extracted set
+    # (e.g. external imports, calls into stdlib).
+    fallback_from = NodeLabel.FUNCTION
+    fallback_to = NodeLabel.FUNCTION
     if edge.edge_type == EdgeType.IMPORTS:
-        from_label = NodeLabel.MODULE
-        to_label = NodeLabel.MODULE
+        fallback_from = NodeLabel.MODULE
+        fallback_to = NodeLabel.MODULE
     elif edge.edge_type == EdgeType.DEFINED_IN:
-        # Could be Module-defined-in-Repo, Class-defined-in-Module,
-        # Method-defined-in-Class. We approximate: if the to_qname is
-        # `<repo>` (i.e., from_qname is a module path), it's MODULE→REPO.
+        # Module-in-Repo case: to_qname matches the repo.
         if edge.to_qname == repo or edge.to_qname.endswith(repo.rsplit("/", 1)[-1]):
-            from_label = NodeLabel.MODULE
-            to_label = NodeLabel.REPO
+            fallback_from = NodeLabel.MODULE
+            fallback_to = NodeLabel.REPO
             to_canonical = repo
         else:
-            from_label = NodeLabel.FUNCTION
-            to_label = NodeLabel.MODULE
+            fallback_from = NodeLabel.FUNCTION
+            fallback_to = NodeLabel.MODULE
     elif edge.edge_type in (EdgeType.INHERITS, EdgeType.IMPLEMENTS):
-        from_label = NodeLabel.CLASS
-        to_label = NodeLabel.CLASS
+        fallback_from = NodeLabel.CLASS
+        fallback_to = NodeLabel.CLASS
+
+    from_label = qname_to_kind.get(edge.from_qname, fallback_from)
+    to_label = qname_to_kind.get(edge.to_qname, fallback_to)
 
     return GraphEdgeSpec(
         edge_type=edge.edge_type,
