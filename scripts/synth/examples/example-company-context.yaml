@@ -1,0 +1,104 @@
+# =============================================================================
+# example-company-context.yaml — every field a CompanyContext YAML can carry.
+#
+# Optional input that the LLM planner + writer use to ground synthetic docs
+# in a believable company. If a profile sets `company_context: <path>`,
+# this file is loaded directly. Otherwise `synth init` / `synth run` will
+# LLM-infer a draft from the repo READMEs and write it to
+# `<output-dir>/inferred-company.yaml` — you can copy that file here,
+# clean it up, and reference it from the profile in subsequent runs.
+#
+# Loaded by:    scripts/synth/company_context.py::load_company_context
+# Inferred by:  same file::infer_company_context (one LLM call)
+# Consumed by:  the planner prompt assembly + writer prompt assembly
+#
+# THIS FILE IS A TEMPLATE — values are illustrative, not real.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# REQUIRED FIELDS
+# -----------------------------------------------------------------------------
+
+# REQUIRED. Company name. Appears in writer prompts and scenario summaries.
+name: ExampleCo
+
+# -----------------------------------------------------------------------------
+# OPTIONAL FIELDS (with their defaults if omitted)
+# -----------------------------------------------------------------------------
+
+# OPTIONAL. Funding/maturity stage hint. Free-form string. Default: "unknown".
+# Examples used in the codebase: seed, series-a, series-b, growth, public, oss.
+stage: series-a
+
+# OPTIONAL. Headcount integer. Default: 0. Coerced to int via int(...).
+# Used by the inference prompt + scenario realism (e.g. cast sizes).
+headcount: 35
+
+# OPTIONAL. One-line market description. Default: null.
+# Used heavily in planner prompts to anchor scenarios.
+market: developer tools — synthetic eval data generation
+
+# OPTIONAL. List of competitor names. Default: ().
+# Used by writer to occasionally mention in launch / strategy docs.
+competitors:
+  - CompetitorA
+  - CompetitorB
+  - "Big Co Internal Tooling"
+
+# OPTIONAL. List of {name, type, plan?, stage?} mappings.
+# Each entry corresponds to a Customer dataclass:
+#   - name (REQUIRED): customer/account name as it would appear in docs
+#   - type (REQUIRED): one of design_partner, paying, trial, evaluator, ...
+#                      (free-form string; no enum validation)
+#   - plan (OPTIONAL): plan tier, e.g. enterprise, pro, free
+#   - stage (OPTIONAL): customer stage, e.g. live, onboarding, churned
+# Used to seed account names in incident / launch / refactor scenarios.
+customers:
+  - name: AcmeCorp
+    type: design_partner
+    plan: enterprise
+    stage: live
+  - name: BetaInc
+    type: paying
+    plan: pro
+  - name: GammaLLC
+    type: trial
+
+# OPTIONAL. List of {name, role, slack?} mappings for non-engineering staff.
+# Each entry is a NonEngPerson dataclass:
+#   - name  (REQUIRED): full name
+#   - role  (REQUIRED): free-form role string
+#   - slack (OPTIONAL): slack handle (without leading @)
+# Surfaced in scenarios that benefit from cross-functional cast (PMs, designers,
+# CSMs, legal) — the WorldModel only knows engineers from git history.
+non_eng_people:
+  - name: Riley Chen
+    role: Product Manager
+    slack: riley
+  - name: Sam Patel
+    role: Designer
+  - name: Jordan Reyes
+    role: CSM
+    slack: jordan-r
+
+# OPTIONAL. List of recent milestones. Free-form strings. Default: ().
+# Writer references these in scenarios to ground them in time.
+recent_milestones:
+  - "Public beta launch — 2026-03-15"
+  - "Series A close — 2026-01-09"
+  - "First enterprise design partner signed — 2025-12-01"
+
+# OPTIONAL. List of ongoing initiatives. Free-form strings. Default: ().
+# Used by planner to bias toward scenarios that intersect current work.
+ongoing_initiatives:
+  - "Migrate auth to OAuth 2.1"
+  - "Q2 enterprise readiness (SSO, audit log, SOC2)"
+  - "Cut p95 retrieval latency below 200ms"
+
+# OPTIONAL. Free-form mapping for cadence / org rituals. Default: {}.
+# Loaded but no consumer reads it today (forward-compat). Use for things
+# the planner might eventually understand:
+cadence:
+  standup: "Mon-Fri 09:30 PT, async on Slack"
+  sprint_length_weeks: 2
+  oncall_rotation: "weekly, Mondays at 10:00 PT"

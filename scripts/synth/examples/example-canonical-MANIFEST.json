@@ -1,0 +1,29 @@
+{
+  "_comment_purpose": "Hand-authored MANIFEST.json that lives at the root of a canonical corpus directory. Required by `synth seed` (scripts/synth/seed.py::seed_tenant) — the seeder reads it before walking <canonical_dir>/raw/<source>/*.json. Strip the `_comment_*` keys before use; the loader doesn't validate them but they're noise for tooling.",
+  "_comment_layout": "Expected directory layout: <canonical_dir>/MANIFEST.json + <canonical_dir>/raw/<slack|notion|github|linear|sentry>/<event_id>.json. The example below assumes the corpus was recorded by running `synth run --record-llm --output-dir <canonical_dir>` against a profile whose customer_id matches `canonical_customer_id` here.",
+
+  "canonical_customer_id": "cust-eval-canonical-v1",
+
+  "_comment_canonical_customer_id": "REQUIRED. The customer_id used when the corpus was recorded. Must be a non-empty string. The seeder uses this to detect tenant-id rewrites needed when seeding a different customer (see seed.py around line 205).",
+
+  "version": "v1",
+  "_comment_version": "OPTIONAL. Free-form string. Convention: bump when you re-record. Used by humans + tooling to know which canonical revision is active.",
+
+  "description": "Canonical corpus recorded from prbe-knowledge with tiny_test preset, seed=1, regen.max_rounds=3. Includes plot archetypes (incident, launch, big_refactor) post-regen-loop. Replaces the templated-only canonical-v1 that Plan 4 V1 had to ship.",
+  "_comment_description": "OPTIONAL. Free-form prose for the operator who finds this file in 6 months. No length limit; no consumer reads it.",
+
+  "envelope_counts": {
+    "slack": 24,
+    "notion": 6,
+    "github": 12,
+    "linear": 9,
+    "sentry": 3
+  },
+  "_comment_envelope_counts": "OPTIONAL. Per-source counts. Loaded but no consumer reads it today. Useful for sanity-checking that <canonical_dir>/raw/<source>/ contains what you expect.",
+
+  "recorded_at": "2026-05-05T22:00:00Z",
+  "_comment_recorded_at": "OPTIONAL. ISO-8601 UTC timestamp. Convention only; no consumer reads it.",
+
+  "recording_profile": "scripts/synth/profiles/canonical-v1.yaml",
+  "_comment_recording_profile": "OPTIONAL. Path to the profile that produced this corpus. Convention only; no consumer reads it. Useful for reproducing the recording."
+}

@@ -1,0 +1,82 @@
+# =============================================================================
+# example-preset.yaml — every field a preset YAML can carry.
+#
+# Presets supply default `archetypes` and `llm` blocks for profiles. They
+# live at scripts/synth/presets/<name>.yaml. A profile references a preset
+# by name (without the .yaml extension) in its `preset:` field.
+#
+# Loaded by:    scripts/synth/presets/loader.py::apply_preset
+# Merged into:  the profile's raw dict. Preset is the BASE; profile values
+#               WIN on conflict for the `archetypes` and `llm` blocks.
+# Other top-level keys here are silently IGNORED by the loader.
+#
+# THIS FILE IS A TEMPLATE — drop it into scripts/synth/presets/ and rename
+# (e.g. `my_team.yaml`) to use it. Counts shown are for illustration.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# OPTIONAL — `archetypes` block.
+#
+# Per-archetype config consumed by scripts/synth/scenarios.py. Today the
+# only sub-key read is `count: int`. Other sub-keys (e.g. flavor flags)
+# are loaded into raw but not yet consumed.
+#
+# count: 0 disables the archetype for this preset (still overridable in
+# a profile by setting count: N on the same archetype).
+#
+# Available archetype names (uppercase, exact match):
+#   STANDUP_UPDATE   — templated daily standup (Slack only)
+#   ON_CALL_HANDOFF  — templated weekly oncall handoff (Slack only)
+#   INCIDENT         — LLM plot scenario: bug → debug → fix (5 sources)
+#   LAUNCH           — LLM plot scenario: feature launch narrative (5 sources)
+#   BIG_REFACTOR     — LLM plot scenario: multi-week refactor (5 sources)
+#
+# Cost notes (real-LLM mode, claude-sonnet-4-6 writer):
+#   templated archetypes — free (no LLM calls)
+#   each plot scenario   — ~6-10 LLM calls (1 planner + 4-5 writer + 1 validator)
+#                          plus 0-3 regen rounds if validation fails
+# -----------------------------------------------------------------------------
+archetypes:
+  STANDUP_UPDATE:  { count: 1 }    # OPTIONAL. count: int >= 0.
+  ON_CALL_HANDOFF: { count: 1 }    # OPTIONAL. count: int >= 0.
+  INCIDENT:        { count: 2 }    # OPTIONAL. count: int >= 0.
+  LAUNCH:          { count: 1 }    # OPTIONAL. count: int >= 0.
+  BIG_REFACTOR:    { count: 1 }    # OPTIONAL. count: int >= 0.
+
+# -----------------------------------------------------------------------------
+# OPTIONAL — `llm` block.
+#
+# Model assignments per role. Profile `llm:` block overrides individual
+# keys; these are the preset-level defaults.
+#
+# All three keys are independent — you can mix providers across roles.
+# Provider is auto-derived from model prefix:
+#   claude-* -> Anthropic   (requires ANTHROPIC_API_KEY at runtime)
+#   gemini-* -> Google      (requires GOOGLE_API_KEY at runtime)
+# Any other prefix raises ValueError at startup.
+#
+# What each role does:
+#   planner_model    — generates ScenarioSpec for plot archetypes
+#                      (one call per scenario; structured tool_use output)
+#   writer_model     — generates each doc body inside a plot scenario
+#                      (4-5 calls per scenario; plain-text completion)
+#   validator_model  — Pass 2 LLM consistency check over a scenario's docs
+#                      (one call per plot scenario; structured tool_use output)
+#
+# Hard-coded fallback defaults if both preset and profile omit a key:
+#   planner_model:   claude-opus-4-7
+#   writer_model:    claude-sonnet-4-6
+#   validator_model: claude-haiku-4-5-20251001
+# -----------------------------------------------------------------------------
+llm:
+  planner_model:   claude-opus-4-7              # OPTIONAL
+  writer_model:    claude-sonnet-4-6            # OPTIONAL
+  validator_model: claude-haiku-4-5-20251001    # OPTIONAL
+
+# -----------------------------------------------------------------------------
+# IGNORED — any other top-level keys are dropped by apply_preset(). Don't
+# put profile fields (customer_id, repos, seed, etc.) here; they won't
+# take effect.
+# -----------------------------------------------------------------------------
+# customer_id: cust-eval-this-is-ignored-here   # IGNORED — belongs in profile
+# seed: 42                                       # IGNORED — belongs in profile
