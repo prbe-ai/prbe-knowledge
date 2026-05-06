@@ -407,11 +407,11 @@ def _stub_bootstrap_registry(monkeypatch) -> None:
 async def test_bootstrap_trigger_fires_pg_notify(
     client: httpx.AsyncClient, _stub_bootstrap_registry: None
 ) -> None:
-    """POSTing the trigger fires pg_notify on WIKI_BOOTSTRAP_CHANNEL with
-    a JSON-encoded payload carrying customer_id + sources + wipe_first +
-    pre-opened run_ids."""
+    """POSTing the trigger fires payload-less pg_notify on
+    WIKI_BOOTSTRAP_CHANNEL and inserts pending rows the worker will
+    claim. Body is now empty payload (workers claim via FOR UPDATE
+    SKIP LOCKED), so the listener no longer routes per-payload."""
     import asyncio
-    import json as _json
 
     import asyncpg
 
@@ -452,16 +452,12 @@ async def test_bootstrap_trigger_fires_pg_notify(
                 break
             await asyncio.sleep(0.05)
         assert notifications, "expected pg_notify on the bootstrap channel"
-        decoded = _json.loads(notifications[0])
-        assert decoded["customer_id"] == CUSTOMER
-        assert decoded["sources"] == ["github", "slack"]
-        assert decoded["wipe_first"] is True
-        assert decoded["reason"] == "first run"
-        # run_ids embedded so the listener doesn't re-create rows.
-        assert set(decoded["run_ids"].keys()) == {"github", "slack"}
-        assert all(isinstance(v, int) for v in decoded["run_ids"].values())
+        # Wake hint is empty payload — workers claim rows directly,
+        # no per-NOTIFY routing needed.
+        assert notifications[0] == ""
 
-        # The route pre-creates the wiki_synthesis_runs rows itself.
+        # The route inserts pending wiki_synthesis_runs rows; workers
+        # claim via FOR UPDATE SKIP LOCKED and flip them to running.
         async with raw_conn() as conn:
             rows = await conn.fetch(
                 """
@@ -474,7 +470,8 @@ async def test_bootstrap_trigger_fires_pg_notify(
         assert {r["source"] for r in rows} == {"github", "slack"}
         assert all(r["kind"] == "bootstrap" for r in rows)
         assert all(r["stage"] == "synthesis" for r in rows)
-        assert all(r["status"] == "running" for r in rows)
+        # New invariant: trigger inserts at 'pending', not 'running'.
+        assert all(r["status"] == "pending" for r in rows)
     finally:
         await listener_conn.close()
 
@@ -513,24 +510,162 @@ async def test_bootstrap_trigger_rejects_unknown_sources(
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_trigger_debounces_back_to_back(
+async def test_bootstrap_trigger_returns_409_on_in_flight(
     client: httpx.AsyncClient, _stub_bootstrap_registry: None
 ) -> None:
-    """Two triggers within 60s: first 202s, second 429s with Retry-After."""
-    first = await client.post(
+    """An in-flight (pending or running) row blocks a fresh trigger
+    unless ``force=true``. The 409 body carries the in-flight run_ids
+    + per-source status so the dashboard can render a structured
+    cancel-and-restart prompt."""
+    # Pre-insert a 'running' row for github.
+    async with raw_conn() as conn:
+        existing_id = int(
+            await conn.fetchval(
+                """
+                INSERT INTO wiki_synthesis_runs
+                    (customer_id, kind, stage, source, status)
+                VALUES ($1, 'bootstrap', 'synthesis', 'github', 'running')
+                RETURNING run_id
+                """,
+                CUSTOMER,
+            )
+        )
+
+    resp = await client.post(
         "/api/wiki/bootstrap/trigger",
-        json={"sources": ["github"]},
+        json={"sources": ["slack"]},
         headers=_hdr(),
     )
-    assert first.status_code == 202, first.text
-    second = await client.post(
-        "/api/wiki/bootstrap/trigger",
-        json={"sources": ["github"]},
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["status"] == "in_flight"
+    assert existing_id in detail["run_ids"]
+    assert detail["sources_running"] == ["github"]
+    assert detail["sources_pending"] == []
+    # No new pending rows were inserted (atomicity check).
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            "SELECT source, status FROM wiki_synthesis_runs "
+            "WHERE customer_id = $1 AND kind = 'bootstrap'",
+            CUSTOMER,
+        )
+    assert {(r["source"], r["status"]) for r in rows} == {("github", "running")}
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_force_proceeds_after_drain_timeout(
+    client: httpx.AsyncClient,
+    _stub_bootstrap_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``?force=true`` with an in-flight row + no worker registered:
+    trigger marks the old row 'cancelled', sleeps the drain window,
+    proceeds with wipe + new pending insert.
+
+    Drain timeout patched down so the test runs fast."""
+    from services.ingestion import wiki_routes as _wr
+
+    monkeypatch.setattr(_wr, "BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
+
+    async with raw_conn() as conn:
+        old_id = int(
+            await conn.fetchval(
+                """
+                INSERT INTO wiki_synthesis_runs
+                    (customer_id, kind, stage, source, status)
+                VALUES ($1, 'bootstrap', 'synthesis', 'github', 'running')
+                RETURNING run_id
+                """,
+                CUSTOMER,
+            )
+        )
+
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger?force=true",
+        json={"sources": ["github"], "wipe_first": False},
         headers=_hdr(),
     )
-    assert second.status_code == 429, second.text
-    assert "Retry-After" in second.headers
-    assert int(second.headers["Retry-After"]) >= 1
+    assert resp.status_code == 202, resp.text
+    new_run_ids = resp.json()["run_ids"]
+    assert len(new_run_ids) == 1
+    assert old_id not in new_run_ids
+
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            "SELECT run_id, status, error FROM wiki_synthesis_runs "
+            "WHERE customer_id = $1 AND kind = 'bootstrap' ORDER BY run_id",
+            CUSTOMER,
+        )
+    by_id = {int(r["run_id"]): r for r in rows}
+    assert by_id[old_id]["status"] == "cancelled"
+    assert "force-trigger" in (by_id[old_id]["error"] or "")
+    new_id = next(rid for rid in by_id if rid != old_id)
+    assert by_id[new_id]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_trigger_force_fires_cancel_notify(
+    client: httpx.AsyncClient,
+    _stub_bootstrap_registry: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``?force=true`` fires pg_notify on WIKI_BOOTSTRAP_CANCEL_CHANNEL
+    with a JSON payload carrying customer_id + cancelled run_ids so
+    workers can cancel matching tasks."""
+    import asyncio
+
+    import asyncpg
+
+    from services.ingestion import wiki_routes as _wr
+    from shared.config import get_settings as _get_settings
+    from shared.constants import WIKI_BOOTSTRAP_CANCEL_CHANNEL
+
+    monkeypatch.setattr(_wr, "BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
+
+    listen_dsn = _get_settings().database_url
+    listener_conn = await asyncpg.connect(listen_dsn)
+    cancel_payloads: list[str] = []
+
+    def _on_cancel(_c, _pid, _channel, payload) -> None:
+        cancel_payloads.append(payload)
+
+    try:
+        await listener_conn.add_listener(
+            WIKI_BOOTSTRAP_CANCEL_CHANNEL, _on_cancel
+        )
+
+        async with raw_conn() as conn:
+            old_id = int(
+                await conn.fetchval(
+                    """
+                    INSERT INTO wiki_synthesis_runs
+                        (customer_id, kind, stage, source, status)
+                    VALUES ($1, 'bootstrap', 'synthesis', 'slack', 'pending')
+                    RETURNING run_id
+                    """,
+                    CUSTOMER,
+                )
+            )
+
+        resp = await client.post(
+            "/api/wiki/bootstrap/trigger?force=true",
+            json={"sources": ["slack"], "wipe_first": False},
+            headers=_hdr(),
+        )
+        assert resp.status_code == 202, resp.text
+
+        for _ in range(20):
+            if cancel_payloads:
+                break
+            await asyncio.sleep(0.05)
+        assert cancel_payloads, "expected pg_notify on the cancel channel"
+        import orjson as _orjson
+
+        decoded = _orjson.loads(cancel_payloads[0])
+        assert decoded["customer_id"] == CUSTOMER
+        assert old_id in decoded["run_ids"]
+    finally:
+        await listener_conn.close()
 
 
 # ---------------------------------------------------------------------------

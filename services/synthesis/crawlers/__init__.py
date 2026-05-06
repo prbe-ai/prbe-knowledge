@@ -1,12 +1,13 @@
 """Per-source bootstrap crawler agents.
 
-The orchestrator (``services.synthesis.bootstrap_orchestrator``) fans out
-work across one ``BootstrapAgent`` subclass per source. Each subclass
+The ``BootstrapWorker`` (``services.synthesis.bootstrap_app``) claims
+``wiki_synthesis_runs`` rows at ``status='pending'`` and instantiates
+one ``BootstrapAgent`` per claim from this REGISTRY. Each subclass
 lives in its own module here (``github_agent.py``, ``slack_agent.py``,
 ...) and registers itself at import time via ``register_crawler``.
 
-Lane C ships the registry empty. Lane D adds GitHub. Subsequent lanes
-add Slack, Linear, Notion, Granola, Claude Code, codebase.
+Lane C shipped the registry empty. Lane D added GitHub. Subsequent
+lanes add Slack, Linear, Notion, Granola, Claude Code, codebase.
 """
 
 from __future__ import annotations

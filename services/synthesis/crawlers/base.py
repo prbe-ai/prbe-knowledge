@@ -59,11 +59,11 @@ BearerResolverCallable = Callable[[], Awaitable[str | None]]
 
 class BootstrapAgentResult(BaseModel):
     """One crawler's outcome. Written into ``wiki_synthesis_runs`` by
-    the orchestrator after the crawler returns or crashes.
+    the BootstrapWorker after the crawler returns or crashes.
 
     ``error`` is set if the crawler raised before completing; the
-    orchestrator catches the exception, fills this field, and surfaces
-    the failure in ``BootstrapResult.sources_failed``.
+    worker catches the exception, fills this field via ``empty_result``,
+    and the run row's status is set to 'failed' by ``_close_run``.
     """
 
     source: str

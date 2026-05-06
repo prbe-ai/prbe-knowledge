@@ -58,6 +58,7 @@ from shared.constants import (
 from shared.db import with_tenant
 from shared.embeddings import Embedder
 from shared.exceptions import ToolValidationError
+from shared.locks import advisory_lock_key
 from shared.logging import get_logger
 from shared.models import NormalizationResult, WebhookEvent
 from shared.storage import ObjectStore, get_store
@@ -507,77 +508,105 @@ class WikiAgentRuntime:
     # -----------------------------------------------------------------------
 
     async def _persist_update(self, update: _StagedUpdate) -> None:
-        # Re-fetch the existing page so MANUAL_ENTRY pages are skipped
-        # (we don't want the agent to clobber a human-authored page).
-        existing = await persistence.fetch_existing_page(
-            self.customer_id, update.wiki_type, update.slug
-        )
-        if existing is None:
-            log.warning(
-                "agent.update_target_missing",
-                customer=self.customer_id,
+        # Per-page advisory lock holds for the entire read-then-write so
+        # two cross-machine writers can't race on the same (customer,
+        # wiki_type, slug). Blocks (not try_) — the second writer waits
+        # for the first's commit, then sees the latest content. Note:
+        # Normalizer._persist opens its own with_tenant txn, so this
+        # lock-holder conn is a separate session whose only job is
+        # serialization across the cluster. The advisory lock is global,
+        # so it works regardless.
+        page_slug = f"{update.wiki_type}:{update.slug}"
+        lock_key = advisory_lock_key("page", self.customer_id, page_slug)
+        async with with_tenant(self.customer_id) as lock_conn:
+            await lock_conn.execute(
+                "SELECT pg_advisory_xact_lock($1)", lock_key
+            )
+            # Re-fetch the existing page so MANUAL_ENTRY pages are skipped
+            # (we don't want the agent to clobber a human-authored page).
+            # The fetch happens AFTER the lock so it sees the latest
+            # committed state.
+            existing = await persistence.fetch_existing_page(
+                self.customer_id, update.wiki_type, update.slug
+            )
+            if existing is None:
+                log.warning(
+                    "agent.update_target_missing",
+                    customer=self.customer_id,
+                    wiki_type=update.wiki_type,
+                    slug=update.slug,
+                )
+                return
+            if existing.get("doc_class") == DocClass.MANUAL_ENTRY.value:
+                log.info(
+                    "agent.skipped_manual_entry",
+                    customer=self.customer_id,
+                    wiki_type=update.wiki_type,
+                    slug=update.slug,
+                )
+                return
+            # Reuse the existing page's frontmatter for BOTH the page write
+            # and the link-graph extraction. _StagedUpdate has no frontmatter
+            # of its own; the prior page's frontmatter is what stays on disk
+            # and what the link writer must mirror, otherwise frontmatter-
+            # derived rows in wiki_links get wiped on every body-only update.
+            existing_frontmatter: dict[str, Any] = existing.get("frontmatter") or {}
+            event = self._build_wiki_event(
                 wiki_type=update.wiki_type,
                 slug=update.slug,
+                title=existing.get("title") or "",
+                body=update.body_markdown,
+                frontmatter=existing_frontmatter,
+                summary=update.summary,
+                commit_message=update.commit_message,
+                compiled_from_doc_ids=[],
+                doc_class=DocClass.COMPILED_WIKI,
             )
-            return
-        if existing.get("doc_class") == DocClass.MANUAL_ENTRY.value:
-            log.info(
-                "agent.skipped_manual_entry",
-                customer=self.customer_id,
+            norm: NormalizationResult = build_normalization_result(event)
+            await self._normalizer._persist(self.customer_id, SourceSystem.WIKI, norm)
+            # Lane B: extract typed links from the body + the (preserved)
+            # frontmatter and replace this page's markdown+frontmatter rows
+            # in wiki_links. Best-effort — page persist already committed.
+            await self._persist_links_safely(
                 wiki_type=update.wiki_type,
                 slug=update.slug,
+                body_markdown=update.body_markdown,
+                frontmatter=existing_frontmatter,
             )
-            return
-        # Reuse the existing page's frontmatter for BOTH the page write
-        # and the link-graph extraction. _StagedUpdate has no frontmatter
-        # of its own; the prior page's frontmatter is what stays on disk
-        # and what the link writer must mirror, otherwise frontmatter-
-        # derived rows in wiki_links get wiped on every body-only update.
-        existing_frontmatter: dict[str, Any] = existing.get("frontmatter") or {}
-        event = self._build_wiki_event(
-            wiki_type=update.wiki_type,
-            slug=update.slug,
-            title=existing.get("title") or "",
-            body=update.body_markdown,
-            frontmatter=existing_frontmatter,
-            summary=update.summary,
-            commit_message=update.commit_message,
-            compiled_from_doc_ids=[],  # filled in by the agent's applied_queue_ids translation
-            doc_class=DocClass.COMPILED_WIKI,
-        )
-        norm: NormalizationResult = build_normalization_result(event)
-        await self._normalizer._persist(self.customer_id, SourceSystem.WIKI, norm)
-        # Lane B: extract typed links from the body + the (preserved)
-        # frontmatter and replace this page's markdown+frontmatter rows
-        # in wiki_links. Best-effort — page persist already committed.
-        await self._persist_links_safely(
-            wiki_type=update.wiki_type,
-            slug=update.slug,
-            body_markdown=update.body_markdown,
-            frontmatter=existing_frontmatter,
-        )
+        # lock auto-releases on with_tenant's txn commit at scope exit.
 
     async def _persist_create(self, create: _StagedCreate) -> None:
-        event = self._build_wiki_event(
-            wiki_type=create.wiki_type,
-            slug=create.slug,
-            title=create.title,
-            body=create.body_markdown,
-            frontmatter=create.frontmatter,
-            summary=create.summary,
-            commit_message=create.commit_message,
-            compiled_from_doc_ids=[],
-            doc_class=DocClass.COMPILED_WIKI,
-        )
-        norm: NormalizationResult = build_normalization_result(event)
-        await self._normalizer._persist(self.customer_id, SourceSystem.WIKI, norm)
-        # Lane B: extract typed links from body + frontmatter. Best-effort.
-        await self._persist_links_safely(
-            wiki_type=create.wiki_type,
-            slug=create.slug,
-            body_markdown=create.body_markdown,
-            frontmatter=create.frontmatter,
-        )
+        # Same per-page lock as _persist_update. If a concurrent writer
+        # already created this slug (UNIQUE collision on the documents
+        # row), Normalizer._persist's INSERT-then-UPDATE shape handles
+        # the race; the lock just makes that path rare enough that
+        # logs stay quiet.
+        page_slug = f"{create.wiki_type}:{create.slug}"
+        lock_key = advisory_lock_key("page", self.customer_id, page_slug)
+        async with with_tenant(self.customer_id) as lock_conn:
+            await lock_conn.execute(
+                "SELECT pg_advisory_xact_lock($1)", lock_key
+            )
+            event = self._build_wiki_event(
+                wiki_type=create.wiki_type,
+                slug=create.slug,
+                title=create.title,
+                body=create.body_markdown,
+                frontmatter=create.frontmatter,
+                summary=create.summary,
+                commit_message=create.commit_message,
+                compiled_from_doc_ids=[],
+                doc_class=DocClass.COMPILED_WIKI,
+            )
+            norm: NormalizationResult = build_normalization_result(event)
+            await self._normalizer._persist(self.customer_id, SourceSystem.WIKI, norm)
+            # Lane B: extract typed links from body + frontmatter. Best-effort.
+            await self._persist_links_safely(
+                wiki_type=create.wiki_type,
+                slug=create.slug,
+                body_markdown=create.body_markdown,
+                frontmatter=create.frontmatter,
+            )
 
     async def _persist_links_safely(
         self,

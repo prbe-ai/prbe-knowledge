@@ -37,11 +37,12 @@ loosen this validator.
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import re
 from datetime import UTC, datetime
 from typing import Any
 
+import asyncpg
 import orjson
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator
@@ -60,10 +61,11 @@ from services.ingestion.normalizer import (
     fetch_live_body_from_chunks,
 )
 from services.ingestion.wiki_links import parse_page_links
-from services.synthesis.bootstrap_orchestrator import open_bootstrap_runs
 from services.synthesis.crawlers import REGISTRY as BOOTSTRAP_CRAWLER_REGISTRY
 from shared.constants import (
+    BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS,
     INDEXABLE_WIKI_DOC_TYPES,
+    WIKI_BOOTSTRAP_CANCEL_CHANNEL,
     WIKI_BOOTSTRAP_CHANNEL,
     WIKI_PENDING_CHANNEL,
     DocClass,
@@ -71,6 +73,7 @@ from shared.constants import (
 )
 from shared.db import raw_conn, with_tenant
 from shared.exceptions import InvalidWebhookPayload
+from shared.locks import advisory_lock_key
 from shared.logging import get_logger
 from shared.models import WebhookEvent
 
@@ -1099,10 +1102,10 @@ class BootstrapTriggerBody(BaseModel):
 class BootstrapTriggerResponse(BaseModel):
     """Shape consumed by the BFF ``POST /api/wiki/bootstrap/trigger`` proxy.
 
-    ``run_ids`` are the freshly-opened ``wiki_synthesis_runs`` row IDs
-    (one per source). The dashboard polls those rows for progress; the
-    listener uses them to close the rows on crawler completion instead
-    of opening a fresh set.
+    ``run_ids`` are the freshly-inserted ``wiki_synthesis_runs`` row IDs
+    (one per requested source) at status='pending'. A worker on any
+    machine claims them via ``FOR UPDATE SKIP LOCKED`` and runs each
+    crawler in parallel.
     """
 
     triggered: bool = True
@@ -1127,56 +1130,107 @@ class BootstrapStatusResponse(BaseModel):
     pages_updated: int
 
 
-def _bootstrap_lock_key(customer_id: str) -> int:
-    """Hash 'bootstrap:<customer_id>' to a 64-bit signed int.
+# In-flight states for the trigger route's pre-flight check.
+_IN_FLIGHT_STATUSES: tuple[str, ...] = ("pending", "running")
 
-    Distinct salt from the synthesize trigger so the two locks don't
-    collide. Mirrors `SynthesisWorker._lock_key` (sha256 → low 8 bytes
-    → signed bigint).
+
+async def _get_in_flight_runs(
+    conn: asyncpg.Connection, customer_id: str
+) -> list[dict[str, Any]]:
+    """Return every in-flight bootstrap run row for ``customer_id``.
+
+    "In-flight" = ``status IN ('pending','running')``. Used by the
+    trigger route to short-circuit with a 409 (or, when ``force=true``,
+    to mark the in-flight rows ``cancelled`` and notify workers).
     """
-    digest = hashlib.sha256(f"bootstrap:{customer_id}".encode()).digest()
-    return int.from_bytes(digest[:8], "big", signed=True)
+    rows = await conn.fetch(
+        """
+        SELECT run_id, source, status, started_at
+        FROM wiki_synthesis_runs
+        WHERE customer_id = $1
+          AND kind = 'bootstrap'
+          AND status = ANY($2::text[])
+        ORDER BY started_at ASC
+        """,
+        customer_id,
+        list(_IN_FLIGHT_STATUSES),
+    )
+    return [dict(r) for r in rows]
 
 
-# Per-customer debounce window for /api/wiki/bootstrap/trigger. Internal
-# callers (BFF, cron, scripts) authenticated by X-Internal-Knowledge-Key
-# can fire NOTIFYs back-to-back; without this the second wipes mid-run.
-_BOOTSTRAP_DEBOUNCE_SECONDS = 60
+async def _wipe_wiki_for_customer(
+    conn: asyncpg.Connection, customer_id: str
+) -> None:
+    """Drop the customer's compiled-wiki rows so re-bootstrap starts clean.
 
+    Operates on the passed-in connection (which the trigger route holds
+    inside its critical-section txn). Wipes:
 
-async def _check_wiki_bootstrap_rate_limit(customer_id: str) -> None:
-    """429 if a bootstrap was triggered for ``customer_id`` < 60s ago.
+      - ``wiki_links``                 (no RLS — explicit WHERE)
+      - ``wiki_timeline_entries``      (no RLS — explicit WHERE)
+      - ``wiki_raw_data``              (no RLS — explicit WHERE)
+      - ``documents`` rows with doc_class='compiled_wiki'
+        (RLS — but the trigger route binds ``app.current_customer_id``
+        on this conn before calling).
 
-    Wraps the lookup in `pg_advisory_xact_lock` so two simultaneous
-    triggers serialize on the same key — the second sees the row the
-    first just inserted and 429s instead of racing through. Reuses
-    `wiki_synthesis_runs.kind='bootstrap'` rows (which the trigger
-    pre-creates) as the lookback target.
+    NOT wiped:
+      - ``documents`` rows with doc_class='manual_entry' (human-authored).
+      - ``documents`` rows with doc_class='agent_artifact' (the auto-
+        generated wiki index — bootstrap regenerates this on first
+        commit; leaving the prior version in place keeps the dashboard
+        from flashing empty).
+      - ``wiki_synthesis_queue`` (untouched — daily replay handles it
+        via the bootstrap_absorbed marker; locked decision #3).
     """
-    lock_key = _bootstrap_lock_key(customer_id)
-    async with raw_conn() as conn, conn.transaction():
-        await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
-        row = await conn.fetchrow(
-            """
-            SELECT started_at FROM wiki_synthesis_runs
-            WHERE customer_id = $1
-              AND kind = 'bootstrap'
-              AND status IN ('running', 'partial', 'complete')
-              AND started_at > NOW() - make_interval(secs => $2)
-            ORDER BY started_at DESC
-            LIMIT 1
-            """,
-            customer_id,
-            _BOOTSTRAP_DEBOUNCE_SECONDS,
-        )
-        if row is not None:
-            elapsed = int((datetime.now(UTC) - row["started_at"]).total_seconds())
-            retry_after = max(_BOOTSTRAP_DEBOUNCE_SECONDS - elapsed, 1)
-            raise HTTPException(
-                status_code=429,
-                detail=f"bootstrap already triggered {elapsed}s ago",
-                headers={"Retry-After": str(retry_after)},
-            )
+    await conn.execute(
+        "DELETE FROM wiki_links WHERE customer_id = $1",
+        customer_id,
+    )
+    await conn.execute(
+        "DELETE FROM wiki_timeline_entries WHERE customer_id = $1",
+        customer_id,
+    )
+    await conn.execute(
+        "DELETE FROM wiki_raw_data WHERE customer_id = $1",
+        customer_id,
+    )
+    # documents has RLS — the GUC bound on this conn powers the policy.
+    # The explicit WHERE customer_id is defense-in-depth.
+    await conn.execute(
+        """
+        DELETE FROM documents
+        WHERE customer_id = $1
+          AND doc_class = 'compiled_wiki'
+        """,
+        customer_id,
+    )
+
+
+async def _insert_pending_runs(
+    conn: asyncpg.Connection,
+    *,
+    customer_id: str,
+    sources: list[str],
+) -> dict[str, int]:
+    """Insert one wiki_synthesis_runs row per source at status='pending'.
+
+    Single batched INSERT so a partial failure can't leak orphaned
+    rows. Returns ``{source: run_id}`` matching the input order.
+    """
+    if not sources:
+        return {}
+    rows = await conn.fetch(
+        """
+        INSERT INTO wiki_synthesis_runs
+            (customer_id, kind, stage, source, status)
+        SELECT $1, 'bootstrap', 'synthesis', s, 'pending'
+        FROM unnest($2::text[]) AS s
+        RETURNING run_id, source
+        """,
+        customer_id,
+        sources,
+    )
+    return {row["source"]: int(row["run_id"]) for row in rows}
 
 
 @router.post(
@@ -1188,28 +1242,39 @@ async def _check_wiki_bootstrap_rate_limit(customer_id: str) -> None:
 async def trigger_wiki_bootstrap(
     body: BootstrapTriggerBody,
     customer_id: str = Depends(_require_customer),
+    force: bool = Query(
+        default=False,
+        description=(
+            "Cancel any in-flight bootstrap for this customer and start a "
+            "fresh one. Without force, an in-flight run returns 409."
+        ),
+    ),
 ) -> BootstrapTriggerResponse:
-    """Fire a wiki bootstrap NOTIFY for ``customer_id``.
+    """Enqueue a wiki bootstrap for ``customer_id``.
 
-    The ``prbe-knowledge-wiki-bootstrap`` fly app's ``BootstrapListener``
-    LISTENs on ``WIKI_BOOTSTRAP_CHANNEL``, parses the JSON payload, and
-    runs the orchestrator. Per-source crawlers fan out in parallel.
+    Inserts one ``wiki_synthesis_runs`` row per requested source at
+    ``status='pending'`` and fires a payload-less ``pg_notify`` on
+    ``WIKI_BOOTSTRAP_CHANNEL`` as a wake hint. ``BootstrapWorker``s on
+    every wiki-bootstrap fly machine claim rows via
+    ``FOR UPDATE SKIP LOCKED`` and run crawlers in parallel.
 
-    The route pre-creates one ``wiki_synthesis_runs`` row per source
-    (``kind='bootstrap'``, ``status='running'``) and embeds the run_ids
-    in the NOTIFY payload, so the listener doesn't open a duplicate
-    set. The 202 response carries the run_ids back to the BFF — the
-    dashboard polls those rows for progress without round-tripping
-    through ``/status``.
+    Concurrency control:
+      - 409 on in-flight (pending or running) rows when ``force=false``.
+        Body carries the in-flight run_ids + per-source status so the
+        dashboard can render an informative "cancel and restart?" prompt.
+      - ``force=true`` marks the in-flight rows ``cancelled``, fires
+        ``WIKI_BOOTSTRAP_CANCEL_CHANNEL`` so workers can ``task.cancel()``
+        live crawlers, sleeps ``BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS``
+        for a coarse cooperative drain, then proceeds with the wipe +
+        new pending insert.
+
+    All three of (in-flight check, cancel, wipe + insert) run inside a
+    single transaction holding a per-customer advisory lock so two
+    concurrent triggers serialize.
 
     Body's ``sources`` is validated against the crawler registry
     (``REGISTRY.keys()``); unknown names 400 with a helpful error.
     Defaults to all registered crawlers when omitted.
-
-    Defense-in-depth: a 60-second per-customer advisory-lock + lookback
-    debounce prevents double-triggers from authenticated internal
-    callers (BFF, cron) from wiping mid-run. Distinct lock salt from
-    `/synthesize/trigger`.
 
     Auth: same internal-key + customer-header as the rest of the wiki
     routes.
@@ -1226,38 +1291,110 @@ async def trigger_wiki_bootstrap(
             )
         sources = list(requested)
 
-    # 60s debounce + advisory-lock. Runs BEFORE pre-creating the run rows
-    # so a 429 doesn't leave orphaned rows behind.
-    await _check_wiki_bootstrap_rate_limit(customer_id)
+    lock_key = advisory_lock_key("bootstrap-trigger", customer_id)
+    cancelled_ids: list[int] = []
 
-    run_ids = await open_bootstrap_runs(customer_id=customer_id, sources=sources)
+    # Critical section: hold the per-customer trigger lock for in-flight
+    # check + cancel UPDATE + wipe + new pending insert. Workers claim
+    # via FOR UPDATE SKIP LOCKED on the same table, so this lock has no
+    # contention with crawls already in flight.
+    async with with_tenant(customer_id) as conn:
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
 
-    payload = orjson.dumps(
-        {
-            "customer_id": customer_id,
-            "sources": sources,
-            "wipe_first": body.wipe_first,
-            "reason": body.reason or "bootstrap",
-            "run_ids": run_ids,
-        }
-    ).decode("utf-8")
-    async with raw_conn() as conn:
-        await conn.execute(
-            "SELECT pg_notify($1, $2)",
-            WIKI_BOOTSTRAP_CHANNEL,
-            payload,
+        in_flight = await _get_in_flight_runs(conn, customer_id)
+        if in_flight and not force:
+            running_sources = [
+                str(r["source"]) for r in in_flight if r["status"] == "running"
+            ]
+            pending_sources = [
+                str(r["source"]) for r in in_flight if r["status"] == "pending"
+            ]
+            run_ids = [int(r["run_id"]) for r in in_flight]
+            started_at = in_flight[0]["started_at"] if in_flight else None
+            log.info(
+                "wiki.bootstrap.trigger.in_flight",
+                customer=customer_id,
+                run_ids=run_ids,
+                running=running_sources,
+                pending=pending_sources,
+            )
+            # FastAPI/Pydantic doesn't natively serialize datetimes inside
+            # HTTPException.detail; coerce to isoformat for transport.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "in_flight",
+                    "run_ids": run_ids,
+                    "started_at": started_at.isoformat() if started_at else None,
+                    "sources_running": running_sources,
+                    "sources_pending": pending_sources,
+                },
+            )
+
+        if in_flight and force:
+            cancelled_ids = [int(r["run_id"]) for r in in_flight]
+            await conn.execute(
+                """
+                UPDATE wiki_synthesis_runs
+                   SET status = 'cancelled',
+                       finished_at = NOW(),
+                       error = COALESCE(error, '')
+                           || (CASE WHEN error IS NULL OR error = '' THEN ''
+                                    ELSE ' | ' END)
+                           || 'cancelled by force-trigger'
+                 WHERE run_id = ANY($1::bigint[])
+                """,
+                cancelled_ids,
+            )
+            cancel_payload = orjson.dumps(
+                {"customer_id": customer_id, "run_ids": cancelled_ids}
+            ).decode("utf-8")
+            await conn.execute(
+                "SELECT pg_notify($1, $2)",
+                WIKI_BOOTSTRAP_CANCEL_CHANNEL,
+                cancel_payload,
+            )
+            log.info(
+                "wiki.bootstrap.trigger.cancel_fired",
+                customer=customer_id,
+                cancelled_run_ids=cancelled_ids,
+            )
+            # Cooperative drain: sleep so workers have a chance to
+            # finish current API calls / commit in-flight pages. We
+            # don't need an ack channel — the per-page advisory lock
+            # in wiki_agent prevents post-wipe writes from a stuck
+            # worker from clobbering new bootstrap output.
+            await asyncio.sleep(BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS)
+
+        if body.wipe_first:
+            await _wipe_wiki_for_customer(conn, customer_id)
+
+        run_ids_map = await _insert_pending_runs(
+            conn,
+            customer_id=customer_id,
+            sources=sources,
         )
+        # Wake hint to any LISTENing worker. Empty payload — workers
+        # claim rows via FOR UPDATE SKIP LOCKED, no per-NOTIFY routing
+        # needed.
+        await conn.execute(
+            "SELECT pg_notify($1, '')",
+            WIKI_BOOTSTRAP_CHANNEL,
+        )
+
     log.info(
         "wiki.bootstrap.trigger",
         customer=customer_id,
         sources=sources,
         wipe_first=body.wipe_first,
         reason=body.reason,
-        run_ids=run_ids,
+        force=force,
+        run_ids=run_ids_map,
+        cancelled_run_ids=cancelled_ids or None,
     )
     return BootstrapTriggerResponse(
         triggered=True,
-        run_ids=[run_ids[s] for s in sources],
+        run_ids=[run_ids_map[s] for s in sources],
     )
 
 
@@ -1326,12 +1463,18 @@ async def get_wiki_bootstrap_status(
         source = row["source"] or ""
         status = row["status"]
         sources_attempted.append(source)
-        if status == "running":
+        # Both 'pending' (queued, not yet claimed) and 'running' (a
+        # worker is actively crawling) count as in-progress so the
+        # dashboard's "Bootstrapping..." pill stays up across the claim
+        # boundary.
+        if status in ("pending", "running"):
             in_progress = True
         if status in ("complete", "partial"):
             sources_succeeded.append(source)
         elif status == "failed":
             sources_failed[source] = row["error"] or "failed"
+        elif status == "cancelled":
+            sources_failed[source] = row["error"] or "cancelled"
         pages_created += int(row["pages_created"] or 0)
         pages_updated += int(row["pages_updated"] or 0)
 

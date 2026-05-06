@@ -1,20 +1,18 @@
 """Reclaim stale bootstrap runs.
 
 Bootstrap runs (`wiki_synthesis_runs.kind='bootstrap'`) open with
-`status='running'` and are flipped to a terminal state by the
-orchestrator on completion. If the bootstrap fly machine crashes
-mid-run (OOM, deploy mid-flight, infra blip), the row is orphaned
-in `running` indefinitely. The status endpoint
-`GET /api/wiki/bootstrap/status` then reports an in-flight bootstrap
-forever — the dashboard "Bootstrapping..." pill stays up until
-someone notices and manually fixes the row.
+`status='pending'`, are claimed by a ``BootstrapWorker`` (flips to
+`running`), and the worker writes a terminal state on completion. If
+the worker's fly machine crashes mid-run (OOM, deploy mid-flight,
+infra blip), the row is orphaned in `running` indefinitely.
 
 This module runs as a periodic asyncio task inside the bootstrap fly
-app (wiring lands as a follow-up to PR #118 once that branch merges
-— this module is purely additive on origin/main). Every 15 minutes
-it scans for `kind='bootstrap'` rows that have been `running` for
-> 6 hours and flips them to `failed` with an `error` marker so the
-audit trail captures what happened.
+app. Every 15 minutes it scans for `kind='bootstrap'` rows that have
+been `running` for > 6 hours and flips them back to `pending` with an
+`error` marker so the audit trail captures what happened, AND so a
+peer worker re-claims the row on its next tick. This is the
+self-healing path for machine death — without it, a stuck row would
+sit in `running` until manual intervention.
 
 Design notes
 ------------
@@ -27,6 +25,14 @@ Design notes
 - Loop interval: 15 minutes. This is cleanup, not heartbeat tracking
   — there's no point sweeping more often than the threshold's
   granularity warrants.
+- Reclaim flips `running` -> `pending` (NOT `failed`). Bounded retry
+  via an `attempts` cap is deferred to v2; in v1 a poison row that
+  fails repeatedly will loop here every 6h, which surfaces as wasted
+  compute (visible on the dashboard via the row's accumulated error
+  text) rather than corruption.
+- Scoping: `WHERE kind='bootstrap' AND status='running'`. v4
+  daily-replay runs use kind in ('wake','scheduled','onboarding') and
+  are untouched by this loop.
 - Mirrors the structural pattern of `services/synthesis/reclaim.py`
   (WikiReclaimLoop): asyncio.Event for shutdown, contextlib.suppress
   on the wait_for, exception swallow on the inner tick so a
@@ -52,27 +58,34 @@ BOOTSTRAP_RECLAIM_INTERVAL_SECONDS = 15 * 60.0
 
 
 # Marker appended to wiki_synthesis_runs.error so the audit trail
-# captures *why* a row was flipped to 'failed'. Tests grep for the
-# "reclaimed:" prefix.
-RECLAIM_ERROR_MARKER = "reclaimed: stale running row, machine likely crashed"
+# captures *why* a row was flipped back to 'pending'. Tests grep for
+# the "reclaimed:" prefix.
+RECLAIM_ERROR_MARKER = "reclaimed: stale running row released for retry"
 
 
 async def reclaim_stale_bootstrap_runs(
     *,
     threshold_hours: int = BOOTSTRAP_RECLAIM_THRESHOLD_HOURS,
 ) -> int:
-    """One pass: flip stale `running` bootstrap rows to `failed`.
+    """One pass: flip stale `running` bootstrap rows back to `pending`.
 
     Returns the number of rows reclaimed. Idempotent — running a
     second time immediately after returns 0 because the WHERE
-    clause filters on `status='running'`.
+    clause filters on `status='running'`. Once a row is back at
+    `pending`, the BootstrapWorker on any machine claims it via
+    ``FOR UPDATE SKIP LOCKED`` on the next tick.
+
+    `finished_at` is intentionally NOT set — the row is being requeued,
+    not finished. Only the per-(customer, source) advisory lock the
+    worker takes inside ``_run_one`` prevents a still-alive prior worker
+    from clobbering the new claim; if the prior worker is genuinely
+    dead, the lock is uncontended and the new claim runs cleanly.
     """
     async with raw_conn() as conn:
         rows = await conn.fetch(
             """
             UPDATE wiki_synthesis_runs
-               SET status = 'failed',
-                   finished_at = NOW(),
+               SET status = 'pending',
                    error = COALESCE(error, '')
                        || (CASE
                              WHEN error IS NULL OR error = ''
@@ -90,7 +103,7 @@ async def reclaim_stale_bootstrap_runs(
         )
     if rows:
         log.warning(
-            "bootstrap_reclaim.stale_runs_flipped",
+            "bootstrap_reclaim.stale_runs_requeued",
             count=len(rows),
             run_ids=[r["run_id"] for r in rows],
             customers=sorted({r["customer_id"] for r in rows}),

@@ -379,13 +379,33 @@ GRANOLA_REFRESH_DEBOUNCE_SECONDS = 30
 WIKI_PENDING_CHANNEL = "wiki_synthesize_pending"
 WIKI_TRIAGED_CHANNEL = "wiki_synthesize_triaged"
 
-# Bootstrap pipeline channel — fired by the /api/wiki/bootstrap/trigger
-# route and the OAuth-callback per-source hook. The bootstrap fly app's
-# listener wakes per NOTIFY, parses the payload (json: customer_id +
-# optional sources + wipe_first + reason), and calls the orchestrator.
-# Distinct from WIKI_PENDING_CHANNEL because the daily-replay path
-# operates on the v4 queue, while bootstrap reads from source APIs.
+# Bootstrap pipeline wake channel — fired by the
+# /api/wiki/bootstrap/trigger route after it inserts pending rows. Empty
+# payload; the BootstrapWorker treats this as a "drain pending rows now"
+# wake hint and claims rows via FOR UPDATE SKIP LOCKED. Distinct from
+# WIKI_PENDING_CHANNEL because the daily-replay path operates on the v4
+# queue, while bootstrap reads from source APIs.
 WIKI_BOOTSTRAP_CHANNEL = "wiki_bootstrap_pending"
+
+# Bootstrap cancel channel — fired by the trigger route's force-cancel
+# path. Payload is a JSON object ``{customer_id, run_ids: [int]}``;
+# every BootstrapWorker LISTENing on this channel cancels in-flight
+# tasks whose run_id matches. Coarse 10s drain window — see
+# BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS.
+WIKI_BOOTSTRAP_CANCEL_CHANNEL = "wiki_bootstrap_cancel"
+
+# Cooperative drain window the trigger route waits after firing the
+# cancel NOTIFY before proceeding to wipe + insert new pending rows.
+# Sized larger than the worker's per-tick cadence but small enough that
+# admin-initiated force-restart still feels interactive in the dashboard.
+BOOTSTRAP_CANCEL_DRAIN_TIMEOUT_SECONDS = 10.0
+
+# Per-machine cap on concurrent bootstrap crawler agents. Read at boot
+# from the BOOTSTRAP_PARALLELISM env var by ``BootstrapWorker``; the
+# constant here is the default. Sized at 6 against the 4 GB / 2 vCPU
+# fly machine envelope (idle ~150 MB, ~150-250 MB per active crawler ->
+# ~1.5 GB peak crawler load + headroom). Tune via env, not code.
+BOOTSTRAP_PARALLELISM = 6
 
 # How many wiki_synthesis_queue rows the cron claims per drain tick. Triage is
 # token-budget batched on top of this; this is just the upper bound on rows
