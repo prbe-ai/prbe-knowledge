@@ -1,0 +1,63 @@
+[
+  {
+    "number": 21,
+    "title": "feature: wiki bootstrap from historical sources",
+    "body": "Today the wiki is built from queued events going forward. New customers start empty; historical Slack/GitHub/Notion content never gets ingested.\n\nProposed: a per-source bootstrap crawler that walks the source API recency-first and writes wiki pages directly. Plan doc: docs/wiki-bootstrap-plan.md.\n\nRelated decision in #18.",
+    "state": "open",
+    "created_at": "2026-04-25T09:14:00Z",
+    "updated_at": "2026-04-29T16:02:11Z",
+    "closed_at": null,
+    "user": {"login": "richard", "id": 5001},
+    "labels": [
+      {"name": "area:wiki"},
+      {"name": "type:feature"}
+    ],
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/issues/21"
+  },
+  {
+    "number": 20,
+    "title": "Question: should we add Redis cache layer in front of pgvector?",
+    "body": "Wondering if a hot-path query cache would be worthwhile.",
+    "state": "closed",
+    "created_at": "2026-04-20T15:01:00Z",
+    "updated_at": "2026-04-21T08:00:42Z",
+    "closed_at": "2026-04-21T08:00:42Z",
+    "state_reason": "not_planned",
+    "user": {"login": "janedoe", "id": 5003},
+    "labels": [
+      {"name": "type:question"},
+      {"name": "wontfix"}
+    ],
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/issues/20"
+  },
+  {
+    "number": 19,
+    "title": "runbook: how to recover from a stuck ingestion drain",
+    "body": "We've now hit this twice in prod. Steps that worked:\n\n1. Check `wiki_synthesis_runs` for rows in `running` state older than 1 hour.\n2. Run the reclaim script (`scripts/reclaim_stuck_runs.py`) which flips them to `failed`.\n3. Drain restarts on next cron tick.\n4. If drain was wedged on a single bad event, mark that queue row `synthesis_skipped` with `synthesis_error='manual_skip'`.\n\nFiling this as an issue so the steps are captured. [[person:maison]] also saw this last week.",
+    "state": "closed",
+    "created_at": "2026-04-16T11:30:00Z",
+    "updated_at": "2026-04-17T09:45:00Z",
+    "closed_at": "2026-04-17T09:45:00Z",
+    "user": {"login": "maison", "id": 5002},
+    "labels": [
+      {"name": "area:ops"},
+      {"name": "type:runbook"}
+    ],
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/issues/19"
+  },
+  {
+    "number": 18,
+    "title": "Decision needed: vector store for Phase 0",
+    "body": "We need to commit to a vector store before retrieval ships. Options:\n\n1. pgvector inside our existing Neon Postgres\n2. Managed Pinecone cluster\n\nLet's discuss trade-offs and pick by EOW.",
+    "state": "closed",
+    "created_at": "2026-04-10T14:00:00Z",
+    "updated_at": "2026-04-15T10:00:00Z",
+    "closed_at": "2026-04-15T10:00:00Z",
+    "user": {"login": "richard", "id": 5001},
+    "labels": [
+      {"name": "area:retrieval"},
+      {"name": "type:decision"}
+    ],
+    "html_url": "https://github.com/prbe-ai/prbe-knowledge/issues/18"
+  }
+]

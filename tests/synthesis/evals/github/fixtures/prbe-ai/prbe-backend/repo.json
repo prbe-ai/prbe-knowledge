@@ -1,0 +1,13 @@
+{
+  "id": 901002,
+  "name": "prbe-backend",
+  "full_name": "prbe-ai/prbe-backend",
+  "private": true,
+  "description": "PRBE BFF + dashboard auth gateway",
+  "default_branch": "main",
+  "pushed_at": "2026-04-22T09:11:03Z",
+  "html_url": "https://github.com/prbe-ai/prbe-backend",
+  "topics": ["bff", "auth", "dashboard"],
+  "open_issues_count": 1,
+  "language": "TypeScript"
+}

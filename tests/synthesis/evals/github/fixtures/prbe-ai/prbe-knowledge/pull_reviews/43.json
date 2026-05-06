@@ -1,0 +1,10 @@
+[
+  {
+    "id": 700043,
+    "user": {"login": "richard", "id": 5001},
+    "state": "APPROVED",
+    "body": "LGTM. Tight diff, clear regression test. Merge when CI is green.",
+    "submitted_at": "2026-04-18T07:55:01Z",
+    "pull_request_url": "https://api.github.com/repos/prbe-ai/prbe-knowledge/pulls/43"
+  }
+]

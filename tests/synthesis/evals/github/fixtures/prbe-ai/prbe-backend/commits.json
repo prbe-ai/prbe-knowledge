@@ -1,0 +1,11 @@
+[
+  {
+    "sha": "11223344556677889900aabbccddeeff00112233",
+    "commit": {
+      "message": "feat(dashboard): wire wiki bootstrap admin button (#12)",
+      "author": {"name": "Richard", "date": "2026-04-22T09:11:03Z"}
+    },
+    "author": {"login": "richard", "id": 5001},
+    "html_url": "https://github.com/prbe-ai/prbe-backend/commit/11223344556677889900aabbccddeeff00112233"
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {
+    "id": 700042,
+    "user": {"login": "maison", "id": 5002},
+    "state": "APPROVED",
+    "body": "Strongly agree on pgvector. The 'one less moving part' argument is doing real work here — every additional managed service has been a 3-week tax for us historically. Ship it.",
+    "submitted_at": "2026-04-15T09:48:22Z",
+    "pull_request_url": "https://api.github.com/repos/prbe-ai/prbe-knowledge/pulls/42"
+  }
+]
