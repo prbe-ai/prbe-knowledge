@@ -332,3 +332,135 @@ async def test_write_logs_llm_call(tmp_path: Path) -> None:
         )
     # LLMWriter must emit at least one log record during a write call
     assert len(cap_logs) > 0
+
+
+@pytest.mark.asyncio
+async def test_regenerate_returns_text_and_uses_regen_template(tmp_path: Path) -> None:
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "writer_regen.txt").write_text(
+        "REGEN | scenario={scenario_summary} | full={full_scenario_view} | "
+        "target_doc_id={target_doc_id} | target_source={target_source} | "
+        "target_channel={target_channel} | target_personas={target_personas} | "
+        "original={original_text} | failure_context={failure_context} | "
+        "services={allowed_services} | people={allowed_people} | "
+        "channels={allowed_channels} | ts={instance_ts}"
+    )
+
+    captured: dict[str, str] = {}
+
+    async def _generate(req):
+        captured["prompt"] = req.prompt
+        return MagicMock(text="REGENERATED SLACK BODY")
+
+    mock_client = MagicMock()
+    mock_client.generate = AsyncMock(side_effect=_generate)
+
+    world = _make_world()
+    company_ctx = _make_company_ctx()
+    spec = _make_spec()
+    writer = LLMWriter(client=mock_client, model="claude-sonnet-4-6", prompts_dir=prompts_dir)
+
+    target = SynthDoc(
+        id="scn-incident-slack-0",
+        source=Source.SLACK,
+        source_event_id="scn-incident-slack-0",
+        text="ORIGINAL slack body that mentioned auto-scaling",
+        occurred_at=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+        channel="#incidents",
+        page_id=None,
+        thread_parent_id=None,
+        scenario_id=spec.id,
+        archetype="INCIDENT",
+        personas=("gh:bob",),
+        services_mentioned=("payments",),
+        priority=20,
+    )
+    other = _make_prior_doc(
+        "scn-incident-notion-0",
+        Source.NOTION,
+        datetime(2026, 4, 12, 14, 30, 0, tzinfo=UTC),
+        "gh:alice",
+    )
+
+    result = await writer.regenerate(
+        spec=spec,
+        target_doc=target,
+        prior_docs_full=(target, other),
+        failure_context="Pass 1 (out-of-world tokens): auto-scaling — replace.",
+        world=world,
+        company_ctx=company_ctx,
+    )
+
+    assert result == "REGENERATED SLACK BODY"
+    prompt = captured["prompt"]
+    assert "scn-incident-slack-0" in prompt
+    assert "slack" in prompt
+    assert "auto-scaling" in prompt
+    assert "ORIGINAL slack body" in prompt
+    assert "scn-incident-notion-0" in prompt  # full_scenario_view includes the other doc
+
+
+@pytest.mark.asyncio
+async def test_regenerate_full_scenario_view_is_not_persona_filtered(tmp_path: Path) -> None:
+    """Regen sees ALL docs in the scenario regardless of persona/timestamp.
+
+    This is intentionally different from write(), which persona-filters
+    prior_emitted_docs. Regen needs the full scenario to fix cross-doc
+    references.
+    """
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "writer_regen.txt").write_text(
+        "{full_scenario_view}|{target_doc_id}|{target_source}|{target_channel}|"
+        "{target_personas}|{original_text}|{failure_context}|{scenario_summary}|"
+        "{allowed_services}|{allowed_people}|{allowed_channels}|{instance_ts}"
+    )
+
+    captured: dict[str, str] = {}
+
+    async def _generate(req):
+        captured["prompt"] = req.prompt
+        return MagicMock(text="ok")
+
+    mock_client = MagicMock()
+    mock_client.generate = AsyncMock(side_effect=_generate)
+
+    spec = _make_spec()
+    target = SynthDoc(
+        id="scn-incident-slack-0",
+        source=Source.SLACK,
+        source_event_id="scn-incident-slack-0",
+        text="orig",
+        occurred_at=datetime(2026, 4, 12, 14, 0, 0, tzinfo=UTC),
+        channel="#incidents",
+        page_id=None,
+        thread_parent_id=None,
+        scenario_id=spec.id,
+        archetype="INCIDENT",
+        personas=("gh:bob",),
+        services_mentioned=("payments",),
+        priority=20,
+    )
+    # A doc whose timestamp is AFTER the target — write() would filter it
+    # out of the persona view; regenerate() must keep it.
+    later = _make_prior_doc(
+        "scn-incident-notion-0",
+        Source.NOTION,
+        datetime(2026, 4, 12, 15, 0, 0, tzinfo=UTC),
+        "gh:alice",
+    )
+    writer = LLMWriter(
+        client=mock_client, model="claude-sonnet-4-6", prompts_dir=prompts_dir
+    )
+
+    await writer.regenerate(
+        spec=spec,
+        target_doc=target,
+        prior_docs_full=(target, later),
+        failure_context="anything",
+        world=_make_world(),
+        company_ctx=_make_company_ctx(),
+    )
+
+    assert "scn-incident-notion-0" in captured["prompt"]
