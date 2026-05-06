@@ -70,7 +70,15 @@ async def test_generate_structured_passes_response_schema(mock_genai_client) -> 
     call_kwargs = mock_client.aio.models.generate_content.call_args.kwargs
     config = call_kwargs["config"]
     assert config.response_mime_type == "application/json"
-    assert config.response_schema is _MySchema
+    # The client passes a CLEANED dict (not the Pydantic class) so that
+    # Gemini-incompatible JSON-schema fields (additionalProperties) are
+    # stripped before request build. See _clean_schema_for_gemini.
+    assert isinstance(config.response_schema, dict)
+    assert config.response_schema["type"] == "object"
+    assert set(config.response_schema["properties"].keys()) == {"label", "confidence"}
+    assert config.response_schema["properties"]["label"]["type"] == "string"
+    assert config.response_schema["properties"]["confidence"]["type"] == "number"
+    assert "additionalProperties" not in config.response_schema
 
 
 @pytest.mark.asyncio
