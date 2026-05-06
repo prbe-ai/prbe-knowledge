@@ -62,7 +62,7 @@ _GITHUB_PAGE_SIZE = 100
 @dataclass(slots=True)
 class _Tenant:
     customer_id: str
-    integration_token_id: int
+    integration_token_id: int | None
     installation_id: str  # parsed from `scope = installation:<id>`
 
 
@@ -86,7 +86,7 @@ async def _list_tenants(customer_id: str | None) -> list[_Tenant]:
         params.append(customer_id)
         where.append(f"customer_id = ${len(params)}")
     sql = f"""
-        SELECT id, customer_id, scope
+        SELECT token_id, customer_id, scope
         FROM integration_tokens
         WHERE {" AND ".join(where)}
     """
@@ -108,7 +108,12 @@ async def _list_tenants(customer_id: str | None) -> list[_Tenant]:
         tenants.append(
             _Tenant(
                 customer_id=r["customer_id"],
-                integration_token_id=int(r["id"]),
+                # token_id is bigint and may exceed orjson's 64-bit cap when
+                # the bridge serializes the payload. Downstream connector mints
+                # a fresh installation token by customer_id (see codegraph.py
+                # _normalize_initial_backfill), so we don't actually need it
+                # in the payload — pass None and skip the serialization risk.
+                integration_token_id=None,
                 installation_id=installation_id,
             )
         )
