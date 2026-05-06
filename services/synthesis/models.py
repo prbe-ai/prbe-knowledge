@@ -49,13 +49,24 @@ class TriageVerdict(BaseModel):
     v4: score-only. The downstream wiki agent decides which page (if
     any) the event lands on after reading the day in time order; triage
     no longer picks (wiki_type, slug).
+
+    `reason` is hard-capped at 240 chars in the schema so the model
+    sees the constraint and doesn't write paragraph-length reasons
+    that overflow the per-batch output budget. A 50-event batch with
+    240-char reasons (~60 Anthropic tokens each + ~30 envelope) lands
+    around 4500 output tokens — well under the 8000 max_tokens cap,
+    leaving real headroom even when reasons run long.
     """
 
     important: bool
     score: float = Field(ge=0.0, le=10.0)
     reason: str | None = Field(
         default=None,
-        description="One sentence explaining the decision for the audit log.",
+        max_length=240,
+        description=(
+            "One short sentence (<= 240 chars) explaining the decision "
+            "for the audit log. Be terse."
+        ),
     )
 
 
