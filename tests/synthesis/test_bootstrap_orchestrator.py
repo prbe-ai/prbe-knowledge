@@ -23,10 +23,7 @@ import httpx
 import pytest
 import pytest_asyncio
 
-from services.synthesis.bootstrap_orchestrator import (
-    BootstrapOrchestrator,
-    BootstrapResult,
-)
+from services.synthesis.bootstrap_orchestrator import BootstrapOrchestrator
 from services.synthesis.crawlers.base import (
     BootstrapAgent,
     BootstrapAgentResult,
@@ -51,6 +48,7 @@ class _MockCrawler(BootstrapAgent):
     pages_created_value: int = 0
     pages_updated_value: int = 0
     items_processed_value: int = 0
+    halt_reason_value: str | None = None
     raise_on_run: BaseException | None = None
 
     def system_prompt(self) -> str:
@@ -75,6 +73,7 @@ class _MockCrawler(BootstrapAgent):
             pages_created=self.pages_created_value,
             pages_updated=self.pages_updated_value,
             items_processed=self.items_processed_value,
+            halt_reason=self.halt_reason_value,
             started_at=started,
             finished_at=datetime.now(UTC),
         )
@@ -86,6 +85,7 @@ def _make_factory(
     sleep_seconds: float = 0.0,
     pages_created: int = 0,
     pages_updated: int = 0,
+    halt_reason: str | None = None,
     raise_on_run: BaseException | None = None,
 ):
     """Build a factory closure that produces a fresh _MockCrawler with
@@ -100,6 +100,7 @@ def _make_factory(
                 "sleep_seconds": sleep_seconds,
                 "pages_created_value": pages_created,
                 "pages_updated_value": pages_updated,
+                "halt_reason_value": halt_reason,
                 "raise_on_run": raise_on_run,
             },
         )
@@ -386,22 +387,22 @@ async def test_orchestrator_creates_run_rows(
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_unknown_source_dropped_silently(
+async def test_orchestrator_unknown_source_raises(
     seeded_customer: None, http_client: httpx.AsyncClient
 ) -> None:
-    """Sources passed but not in the factory map are dropped with a
-    warning; they don't crash the run, they don't show up in
-    sources_attempted."""
+    """Unknown source names raise ValueError. The trigger route validates
+    against REGISTRY and 400s on unknowns; the orchestrator should never
+    see one in production, so failing loudly catches developer bugs in
+    direct callers."""
     factories = {"alpha": _make_factory(source="alpha")}
     orch = BootstrapOrchestrator(settings=_settings(), http=http_client)
-    result: BootstrapResult = await orch.bootstrap(
-        customer_id=CUSTOMER,
-        sources=["alpha", "ghost"],
-        wipe_first=False,
-        crawler_factories=factories,
-    )
-    assert result.sources_attempted == ["alpha"]
-    assert result.sources_succeeded == ["alpha"]
+    with pytest.raises(ValueError, match="ghost"):
+        await orch.bootstrap(
+            customer_id=CUSTOMER,
+            sources=["alpha", "ghost"],
+            wipe_first=False,
+            crawler_factories=factories,
+        )
 
 
 @pytest.mark.asyncio
@@ -423,3 +424,127 @@ async def test_orchestrator_no_sources_is_noop(
     assert result.wiped is True
     post = await _row_counts()
     assert post["wiki_links"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Partial status branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_partial_status_when_halted_with_pages(
+    seeded_customer: None, http_client: httpx.AsyncClient
+) -> None:
+    """Crawler returns halt_reason + non-zero pages -> status='partial'.
+
+    Three-way branch:
+      - error set                 -> 'failed'
+      - halted but produced pages -> 'partial'
+      - clean return              -> 'complete'
+    """
+    factories = {
+        "stalled": _make_factory(
+            source="stalled",
+            halt_reason="stall",
+            pages_created=2,
+            pages_updated=1,
+        ),
+    }
+    orch = BootstrapOrchestrator(settings=_settings(), http=http_client)
+    await orch.bootstrap(
+        customer_id=CUSTOMER,
+        sources=["stalled"],
+        wipe_first=False,
+        crawler_factories=factories,
+    )
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status, pages_created, pages_updated
+            FROM wiki_synthesis_runs
+            WHERE customer_id = $1 AND source = 'stalled'
+            """,
+            CUSTOMER,
+        )
+    assert row is not None
+    assert row["status"] == "partial"
+    assert row["pages_created"] == 2
+    assert row["pages_updated"] == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_complete_status_when_halted_with_no_pages(
+    seeded_customer: None, http_client: httpx.AsyncClient
+) -> None:
+    """halt_reason without pages = clean halt (e.g. auth.missing) =>
+    'complete'. The dashboard treats this as a successful no-op."""
+    factories = {
+        "auth_missing": _make_factory(
+            source="auth_missing",
+            halt_reason="auth.missing",
+        ),
+    }
+    orch = BootstrapOrchestrator(settings=_settings(), http=http_client)
+    await orch.bootstrap(
+        customer_id=CUSTOMER,
+        sources=["auth_missing"],
+        wipe_first=False,
+        crawler_factories=factories,
+    )
+
+    async with raw_conn() as conn:
+        status = await conn.fetchval(
+            """
+            SELECT status FROM wiki_synthesis_runs
+            WHERE customer_id = $1 AND source = 'auth_missing'
+            """,
+            CUSTOMER,
+        )
+    assert status == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Pre-opened run_ids (P1 #1: trigger route hands them in via NOTIFY payload)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_uses_pre_opened_run_ids(
+    seeded_customer: None, http_client: httpx.AsyncClient
+) -> None:
+    """When run_ids is provided, the orchestrator does NOT open new rows.
+
+    Mirrors what the trigger route does: pre-opens rows so the BFF can
+    return run_ids in its 202 response, then the listener hands them to
+    the orchestrator instead of opening duplicates.
+    """
+    from services.synthesis.bootstrap_orchestrator import open_bootstrap_runs
+
+    pre_opened = await open_bootstrap_runs(customer_id=CUSTOMER, sources=["alpha"])
+    assert "alpha" in pre_opened
+
+    factories = {"alpha": _make_factory(source="alpha", pages_updated=5)}
+    orch = BootstrapOrchestrator(settings=_settings(), http=http_client)
+    await orch.bootstrap(
+        customer_id=CUSTOMER,
+        sources=["alpha"],
+        wipe_first=False,
+        run_ids=pre_opened,
+        crawler_factories=factories,
+    )
+
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT run_id, status, pages_updated FROM wiki_synthesis_runs
+            WHERE customer_id = $1 AND kind = 'bootstrap'
+            """,
+            CUSTOMER,
+        )
+    # Exactly one row — the pre-opened one — and it's been closed to
+    # 'complete' with the crawler's counters.
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == pre_opened["alpha"]
+    assert rows[0]["status"] == "complete"
+    assert rows[0]["pages_updated"] == 5

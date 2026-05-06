@@ -37,6 +37,7 @@ loosen this validator.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -59,6 +60,8 @@ from services.ingestion.normalizer import (
     fetch_live_body_from_chunks,
 )
 from services.ingestion.wiki_links import parse_page_links
+from services.synthesis.bootstrap_orchestrator import open_bootstrap_runs
+from services.synthesis.crawlers import REGISTRY as BOOTSTRAP_CRAWLER_REGISTRY
 from shared.constants import (
     WIKI_BOOTSTRAP_CHANNEL,
     WIKI_PENDING_CHANNEL,
@@ -1099,10 +1102,86 @@ class BootstrapTriggerBody(BaseModel):
 
 
 class BootstrapTriggerResponse(BaseModel):
-    triggered: bool
-    customer_id: str
-    sources: list[str] | None
-    wipe_first: bool
+    """Shape consumed by the BFF ``POST /api/wiki/bootstrap/trigger`` proxy.
+
+    ``run_ids`` are the freshly-opened ``wiki_synthesis_runs`` row IDs
+    (one per source). The dashboard polls those rows for progress; the
+    listener uses them to close the rows on crawler completion instead
+    of opening a fresh set.
+    """
+
+    triggered: bool = True
+    run_ids: list[int]
+
+
+class BootstrapStatusResponse(BaseModel):
+    """Aggregate over the most recent bootstrap "burst" for the customer.
+
+    A burst = the runs opened by a single trigger (one per source). We
+    detect it by anchoring on the most recent ``kind='bootstrap'`` row's
+    ``started_at`` and including everything within 60 seconds before
+    that. Empty payload when the customer has never bootstrapped.
+    """
+
+    in_progress: bool
+    started_at: datetime | None
+    sources_attempted: list[str]
+    sources_succeeded: list[str]
+    sources_failed: dict[str, str]
+    pages_created: int
+    pages_updated: int
+
+
+def _bootstrap_lock_key(customer_id: str) -> int:
+    """Hash 'bootstrap:<customer_id>' to a 64-bit signed int.
+
+    Distinct salt from the synthesize trigger so the two locks don't
+    collide. Mirrors `SynthesisWorker._lock_key` (sha256 → low 8 bytes
+    → signed bigint).
+    """
+    digest = hashlib.sha256(f"bootstrap:{customer_id}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+# Per-customer debounce window for /api/wiki/bootstrap/trigger. Internal
+# callers (BFF, cron, scripts) authenticated by X-Internal-Knowledge-Key
+# can fire NOTIFYs back-to-back; without this the second wipes mid-run.
+_BOOTSTRAP_DEBOUNCE_SECONDS = 60
+
+
+async def _check_wiki_bootstrap_rate_limit(customer_id: str) -> None:
+    """429 if a bootstrap was triggered for ``customer_id`` < 60s ago.
+
+    Wraps the lookup in `pg_advisory_xact_lock` so two simultaneous
+    triggers serialize on the same key — the second sees the row the
+    first just inserted and 429s instead of racing through. Reuses
+    `wiki_synthesis_runs.kind='bootstrap'` rows (which the trigger
+    pre-creates) as the lookback target.
+    """
+    lock_key = _bootstrap_lock_key(customer_id)
+    async with raw_conn() as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
+        row = await conn.fetchrow(
+            """
+            SELECT started_at FROM wiki_synthesis_runs
+            WHERE customer_id = $1
+              AND kind = 'bootstrap'
+              AND status IN ('running', 'partial', 'complete')
+              AND started_at > NOW() - make_interval(secs => $2)
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            customer_id,
+            _BOOTSTRAP_DEBOUNCE_SECONDS,
+        )
+        if row is not None:
+            elapsed = int((datetime.now(UTC) - row["started_at"]).total_seconds())
+            retry_after = max(_BOOTSTRAP_DEBOUNCE_SECONDS - elapsed, 1)
+            raise HTTPException(
+                status_code=429,
+                detail=f"bootstrap already triggered {elapsed}s ago",
+                headers={"Retry-After": str(retry_after)},
+            )
 
 
 @router.post(
@@ -1119,24 +1198,52 @@ async def trigger_wiki_bootstrap(
 
     The ``prbe-knowledge-wiki-bootstrap`` fly app's ``BootstrapListener``
     LISTENs on ``WIKI_BOOTSTRAP_CHANNEL``, parses the JSON payload, and
-    runs the orchestrator. Per-source crawlers fan out in parallel; on
-    completion each writes its own ``wiki_synthesis_runs`` row. The
-    dashboard polls those for progress.
+    runs the orchestrator. Per-source crawlers fan out in parallel.
 
-    Returns 202 because work is asynchronous: the run rows are created
-    by the bootstrap app on receipt, not by this endpoint. Callers that
-    need the run IDs can hit the status endpoint shortly after the
-    NOTIFY lands.
+    The route pre-creates one ``wiki_synthesis_runs`` row per source
+    (``kind='bootstrap'``, ``status='running'``) and embeds the run_ids
+    in the NOTIFY payload, so the listener doesn't open a duplicate
+    set. The 202 response carries the run_ids back to the BFF — the
+    dashboard polls those rows for progress without round-tripping
+    through ``/status``.
+
+    Body's ``sources`` is validated against the crawler registry
+    (``REGISTRY.keys()``); unknown names 400 with a helpful error.
+    Defaults to all registered crawlers when omitted.
+
+    Defense-in-depth: a 60-second per-customer advisory-lock + lookback
+    debounce prevents double-triggers from authenticated internal
+    callers (BFF, cron) from wiping mid-run. Distinct lock salt from
+    `/synthesize/trigger`.
 
     Auth: same internal-key + customer-header as the rest of the wiki
-    routes. Rate-limit/admin gating is enforced upstream in the BFF.
+    routes.
     """
+    requested = body.sources
+    if requested is None:
+        sources = sorted(BOOTSTRAP_CRAWLER_REGISTRY.keys())
+    else:
+        unknown = [s for s in requested if s not in BOOTSTRAP_CRAWLER_REGISTRY]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"unknown sources: {sorted(unknown)}",
+            )
+        sources = list(requested)
+
+    # 60s debounce + advisory-lock. Runs BEFORE pre-creating the run rows
+    # so a 429 doesn't leave orphaned rows behind.
+    await _check_wiki_bootstrap_rate_limit(customer_id)
+
+    run_ids = await open_bootstrap_runs(customer_id=customer_id, sources=sources)
+
     payload = orjson.dumps(
         {
             "customer_id": customer_id,
-            "sources": body.sources,
+            "sources": sources,
             "wipe_first": body.wipe_first,
             "reason": body.reason or "bootstrap",
+            "run_ids": run_ids,
         }
     ).decode("utf-8")
     async with raw_conn() as conn:
@@ -1148,15 +1255,99 @@ async def trigger_wiki_bootstrap(
     log.info(
         "wiki.bootstrap.trigger",
         customer=customer_id,
-        sources=body.sources,
+        sources=sources,
         wipe_first=body.wipe_first,
         reason=body.reason,
+        run_ids=run_ids,
     )
     return BootstrapTriggerResponse(
         triggered=True,
-        customer_id=customer_id,
-        sources=body.sources,
-        wipe_first=body.wipe_first,
+        run_ids=[run_ids[s] for s in sources],
+    )
+
+
+@router.get(
+    "/bootstrap/status",
+    response_model=BootstrapStatusResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def get_wiki_bootstrap_status(
+    customer_id: str = Depends(_require_customer),
+) -> BootstrapStatusResponse:
+    """Aggregate over the most-recent bootstrap burst for ``customer_id``.
+
+    A "burst" = the per-source runs opened by a single trigger. We
+    anchor on the most recent ``kind='bootstrap'`` row's ``started_at``
+    and pull every bootstrap row in [T_anchor - 60s, NOW()] for this
+    customer. That window covers the slight skew between sources
+    inserted by the same batched INSERT.
+
+    Empty payload when the customer has never bootstrapped — the
+    dashboard renders "Bootstrap not yet run" instead of an error.
+    """
+    async with raw_conn() as conn:
+        anchor = await conn.fetchrow(
+            """
+            SELECT started_at FROM wiki_synthesis_runs
+            WHERE customer_id = $1 AND kind = 'bootstrap'
+            ORDER BY started_at DESC
+            LIMIT 1
+            """,
+            customer_id,
+        )
+        if anchor is None:
+            return BootstrapStatusResponse(
+                in_progress=False,
+                started_at=None,
+                sources_attempted=[],
+                sources_succeeded=[],
+                sources_failed={},
+                pages_created=0,
+                pages_updated=0,
+            )
+        rows = await conn.fetch(
+            """
+            SELECT source, status, error, pages_created, pages_updated,
+                   started_at
+            FROM wiki_synthesis_runs
+            WHERE customer_id = $1
+              AND kind = 'bootstrap'
+              AND started_at >= $2 - INTERVAL '60 seconds'
+              AND started_at <= NOW()
+            ORDER BY started_at ASC
+            """,
+            customer_id,
+            anchor["started_at"],
+        )
+
+    sources_attempted: list[str] = []
+    sources_succeeded: list[str] = []
+    sources_failed: dict[str, str] = {}
+    in_progress = False
+    pages_created = 0
+    pages_updated = 0
+    started_at = rows[0]["started_at"] if rows else None
+    for row in rows:
+        source = row["source"] or ""
+        status = row["status"]
+        sources_attempted.append(source)
+        if status == "running":
+            in_progress = True
+        if status in ("complete", "partial"):
+            sources_succeeded.append(source)
+        elif status == "failed":
+            sources_failed[source] = row["error"] or "failed"
+        pages_created += int(row["pages_created"] or 0)
+        pages_updated += int(row["pages_updated"] or 0)
+
+    return BootstrapStatusResponse(
+        in_progress=in_progress,
+        started_at=started_at,
+        sources_attempted=sources_attempted,
+        sources_succeeded=sources_succeeded,
+        sources_failed=sources_failed,
+        pages_created=pages_created,
+        pages_updated=pages_updated,
     )
 
 

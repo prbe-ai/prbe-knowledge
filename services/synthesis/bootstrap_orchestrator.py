@@ -38,7 +38,7 @@ from pydantic import BaseModel, Field
 from services.synthesis.crawlers import REGISTRY, BootstrapAgent, BootstrapAgentResult
 from services.synthesis.crawlers.base import BearerResolver, empty_result
 from shared.config import Settings
-from shared.db import raw_conn, with_tenant
+from shared.db import with_tenant
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -100,6 +100,7 @@ class BootstrapOrchestrator:
         sources: list[str] | None = None,
         wipe_first: bool = True,
         reason: str = "bootstrap",
+        run_ids: dict[str, int] | None = None,
         crawler_factories: dict[str, CrawlerFactory] | None = None,
     ) -> BootstrapResult:
         """Run bootstrap for ``customer_id`` across the requested sources.
@@ -107,6 +108,13 @@ class BootstrapOrchestrator:
         ``sources=None`` means "all registered crawlers". When tests pass
         ``crawler_factories``, the registry is bypassed and the requested
         sources are looked up there instead.
+
+        ``run_ids`` is an optional ``{source: run_id}`` map of pre-opened
+        ``wiki_synthesis_runs`` rows (used by the trigger route so the
+        BFF can return run_ids in its 202 response without waiting for
+        the listener). When omitted, the orchestrator opens its own
+        rows in a single batched INSERT — the back-compat path for
+        direct callers.
         """
         started_at = datetime.now(UTC)
         factories = self._resolve_factories(sources, crawler_factories)
@@ -125,11 +133,25 @@ class BootstrapOrchestrator:
             wiped = True
             log.info("bootstrap.wiped", customer=customer_id)
 
-        # Open one wiki_synthesis_runs row per source BEFORE launching the
+        # One wiki_synthesis_runs row per source BEFORE launching the
         # crawlers so a crashed crawler still has a row to mark failed.
-        run_ids: dict[str, int] = {}
-        for source in attempted:
-            run_ids[source] = await _open_bootstrap_run(customer_id=customer_id, source=source)
+        # Pre-opened rows (passed in by the trigger route) are used as-is;
+        # otherwise we batch-INSERT all rows in a single statement so a
+        # mid-loop failure can't leave orphaned 'running' rows.
+        if run_ids is None:
+            run_ids = await _open_bootstrap_runs(
+                customer_id=customer_id,
+                sources=attempted,
+            )
+        else:
+            # Defensive: the route should pass exactly the pre-opened set.
+            # If the listener handed us run_ids for sources that are no
+            # longer in the registry (registry change between trigger and
+            # dispatch), fall back to opening any missing ones.
+            missing = [s for s in attempted if s not in run_ids]
+            if missing:
+                run_ids = dict(run_ids)
+                run_ids.update(await _open_bootstrap_runs(customer_id=customer_id, sources=missing))
 
         # Build + launch crawlers in parallel.
         agents: dict[str, BootstrapAgent] = {}
@@ -204,13 +226,25 @@ class BootstrapOrchestrator:
                 else:
                     succeeded.append(source)
 
-        # Close every run row according to its outcome.
+        # Close every run row according to its outcome. Three-way status
+        # branch matches the wiki_synthesis_runs CHECK constraint:
+        #   - error set                 -> 'failed'
+        #   - halted but produced pages -> 'partial' (stalled but productive)
+        #   - clean return              -> 'complete'
         for result in per_source:
+            if result.error is not None:
+                status = "failed"
+            elif (
+                result.halt_reason is not None and (result.pages_created + result.pages_updated) > 0
+            ):
+                status = "partial"
+            else:
+                status = "complete"
             await _close_bootstrap_run(
                 run_id=result.run_id,
                 customer_id=customer_id,
                 source=result.source,
-                status="failed" if result.error else "complete",
+                status=status,
                 pages_updated=result.pages_updated,
                 pages_created=result.pages_created,
                 error=result.error,
@@ -250,22 +284,18 @@ class BootstrapOrchestrator:
 
         Tests pass ``override`` which wins. Production passes ``None`` and
         we read REGISTRY. ``sources`` filters whichever map we settled on;
-        unknown source names are dropped with a warning.
+        unknown sources raise — the trigger route validates upstream so
+        the orchestrator should never see one in production.
         """
         base: dict[str, CrawlerFactory] = dict(override) if override is not None else dict(REGISTRY)
         if sources is None:
             return base
-        out: dict[str, CrawlerFactory] = {}
-        for source in sources:
-            if source in base:
-                out[source] = base[source]
-            else:
-                log.warning(
-                    "bootstrap.unknown_source",
-                    source=source,
-                    available=sorted(base.keys()),
-                )
-        return out
+        unknown = [s for s in sources if s not in base]
+        if unknown:
+            raise ValueError(
+                f"unknown crawler sources: {sorted(unknown)}; registered: {sorted(base.keys())}"
+            )
+        return {source: base[source] for source in sources if source in base}
 
 
 # ---------------------------------------------------------------------------
@@ -273,24 +303,37 @@ class BootstrapOrchestrator:
 # ---------------------------------------------------------------------------
 
 
-async def _open_bootstrap_run(*, customer_id: str, source: str) -> int:
-    """Insert a ``wiki_synthesis_runs`` row at status='running'.
+async def open_bootstrap_runs(*, customer_id: str, sources: list[str]) -> dict[str, int]:
+    """Insert one ``wiki_synthesis_runs`` row per source at status='running'.
+
+    Returns ``{source: run_id}`` matching the input. Single batched
+    INSERT so a partial failure can't leak orphaned rows — either every
+    row lands or none do. Used by the trigger route so it can return
+    ``run_ids`` in its 202 response without waiting for the listener.
 
     Migration 0044 added kind='bootstrap' to the CHECK constraint and a
     nullable ``source`` column. Bootstrap rows fill both; daily replay
     rows leave ``source`` NULL (unchanged behaviour).
     """
+    return await _open_bootstrap_runs(customer_id=customer_id, sources=sources)
+
+
+async def _open_bootstrap_runs(*, customer_id: str, sources: list[str]) -> dict[str, int]:
+    if not sources:
+        return {}
     async with with_tenant(customer_id) as conn:
-        row = await conn.fetchrow(
+        rows = await conn.fetch(
             """
-            INSERT INTO wiki_synthesis_runs (customer_id, kind, stage, source, status)
-            VALUES ($1, 'bootstrap', 'synthesis', $2, 'running')
-            RETURNING run_id
+            INSERT INTO wiki_synthesis_runs
+                (customer_id, kind, stage, source, status)
+            SELECT $1, 'bootstrap', 'synthesis', s, 'running'
+            FROM unnest($2::text[]) AS s
+            RETURNING run_id, source
             """,
             customer_id,
-            source,
+            sources,
         )
-    return int(row["run_id"])
+    return {row["source"]: int(row["run_id"]) for row in rows}
 
 
 async def _close_bootstrap_run(
@@ -386,13 +429,6 @@ async def _wipe_wiki_for_customer(customer_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_no_bearer() -> str | None:
-    """Default bearer resolver — returns ``None``. Used when the
-    orchestrator is constructed without a real factory (Lane C: registry
-    is empty so this never fires in production)."""
-    return None
-
-
 def _no_bearer_factory(_customer_id: str, _source: str) -> BearerResolver:
     """Bearer factory used when the caller didn't pass one. Real
     crawlers (Lane D) will inject a factory that calls into
@@ -433,11 +469,23 @@ def parse_trigger_payload(raw: str | bytes | dict[str, Any]) -> dict[str, Any]:
             # bare string; fall back to that shape so the listener stays
             # forward/backward-compatible.
             data = {"customer_id": (raw_bytes.decode("utf-8") or "").strip()}
+    raw_run_ids = data.get("run_ids")
+    parsed_run_ids: dict[str, int] | None = None
+    if isinstance(raw_run_ids, dict):
+        parsed_run_ids = {}
+        for source, run_id in raw_run_ids.items():
+            try:
+                parsed_run_ids[str(source)] = int(run_id)
+            except (TypeError, ValueError):
+                # Drop unparseable entries; the orchestrator opens fresh
+                # rows for any source missing from the map.
+                continue
     return {
         "customer_id": str(data.get("customer_id") or ""),
         "sources": data.get("sources"),
         "wipe_first": bool(data.get("wipe_first", True)),
         "reason": str(data.get("reason") or "bootstrap"),
+        "run_ids": parsed_run_ids,
     }
 
 
@@ -445,11 +493,6 @@ __all__ = [
     "BootstrapOrchestrator",
     "BootstrapResult",
     "CrawlerFactory",
+    "open_bootstrap_runs",
     "parse_trigger_payload",
 ]
-
-
-# Touch raw_conn so our import surface is honest about what's reachable
-# without importing the listener module — keeps lint quiet on unused
-# imports during incremental refactors.
-_ = raw_conn
