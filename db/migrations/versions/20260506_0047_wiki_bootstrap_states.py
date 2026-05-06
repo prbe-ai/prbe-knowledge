@@ -1,6 +1,6 @@
 """wiki_synthesis_runs status: add 'pending' and 'cancelled'
 
-Revision ID: 0047_wiki_bootstrap_pending_cancelled_status
+Revision ID: 0047_wiki_bootstrap_states
 Revises: 0046_custom_ingest_tokens
 Create Date: 2026-05-06
 
@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0047_wiki_bootstrap_pending_cancelled_status"
+revision = "0047_wiki_bootstrap_states"
 down_revision = "0046_custom_ingest_tokens"
 branch_labels = None
 depends_on = None
