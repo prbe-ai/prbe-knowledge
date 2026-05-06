@@ -16,8 +16,6 @@ Decisions (locked from 2026-05-05 handoff):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from scripts.synth.llm.validator_pass2 import Pass2Result
 from scripts.synth.validator import Violation
 
