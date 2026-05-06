@@ -74,6 +74,29 @@ class DocType(StrEnum):
     WIKI_INDEX = "wiki.index"
 
 
+# DocTypes that count as "wiki pages" for index/listing purposes — the union
+# of the original 4 user-authored types and the 6 bootstrap-only entity types
+# (migration 0044). Mirrors the entries in
+# `services/ingestion/handlers/wiki.py::WIKI_TYPE_TO_DOC_TYPE` (minus the
+# singleton WIKI_INDEX itself). Single source of truth for:
+#   - GET /api/wiki/index (services/ingestion/wiki_routes.py)
+#   - fetch_wiki_index (services/synthesis/persistence.py), used by the
+#     wiki/bootstrap agent's _tool_list_wiki_pages
+#   - _regenerate_index (services/synthesis/wiki_agent.py)
+INDEXABLE_WIKI_DOC_TYPES: tuple[DocType, ...] = (
+    DocType.WIKI_SERVICE_CARD,
+    DocType.WIKI_DECISION,
+    DocType.WIKI_FEATURE,
+    DocType.WIKI_RUNBOOK,
+    DocType.WIKI_PERSON_PAGE,
+    DocType.WIKI_COMPANY,
+    DocType.WIKI_VENDOR,
+    DocType.WIKI_CUSTOMER,
+    DocType.WIKI_PROJECT,
+    DocType.WIKI_EVENT,
+)
+
+
 class NodeLabel(StrEnum):
     SERVICE = "Service"
     REPO = "Repo"

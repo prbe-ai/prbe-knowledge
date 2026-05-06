@@ -35,10 +35,10 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, ClassVar, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from services.synthesis.agent_harness import AgentLoop, new_agent_run_id
 from services.synthesis.agent_tools import (
@@ -129,6 +129,18 @@ class _RecordTimelineArgs(BaseModel):
     source_ref: str | None = None
     summary: str = Field(min_length=1, max_length=240)
     detail: str = ""
+
+    @field_validator("entry_date")
+    @classmethod
+    def _validate_entry_date(cls, value: str) -> str:
+        # Reject malformed dates here so the failure surfaces as a typed
+        # tool-validation error rather than a Postgres ::date cast error
+        # downstream (which would surface as tool_exception).
+        try:
+            date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(f"entry_date must be YYYY-MM-DD, got {value!r}") from exc
+        return value
 
 
 _SOURCE_TOOL_VALIDATORS: dict[str, type[BaseModel]] = {
@@ -336,18 +348,16 @@ def _bootstrap_wiki_tools() -> list[dict[str, Any]]:
 class _Cursor:
     """Opaque pagination cursor handed back to the agent.
 
-    Captures (full_name, offset_index, since_iso). The agent passes the
-    same string back via ``cursor=`` to continue iterating. Encoding is
-    base64-JSON so it round-trips through the LLM without escaping
-    surprises.
+    Captures (full_name, offset_index). The agent passes the same string
+    back via ``cursor=`` to continue iterating. Encoding is base64-JSON
+    so it round-trips through the LLM without escaping surprises.
     """
 
     full_name: str
     offset: int
-    since_iso: str | None = None
 
     def encode(self) -> str:
-        payload = {"full_name": self.full_name, "offset": self.offset, "since": self.since_iso}
+        payload = {"full_name": self.full_name, "offset": self.offset}
         return base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
 
     @classmethod
@@ -363,7 +373,6 @@ class _Cursor:
         return cls(
             full_name=str(data["full_name"]),
             offset=int(data.get("offset") or 0),
-            since_iso=data.get("since"),
         )
 
 
@@ -416,8 +425,8 @@ class BootstrapWikiRuntime(WikiAgentRuntime):
         Same per-page persist + link-extraction path as the parent runtime
         (so wiki_links rows show up exactly the same way), but skips the
         queue mark-done / mark-skipped / regenerate-index steps. Bootstrap
-        regenerates the index once at the end of run() instead — the
-        per-source crawler doesn't own the customer-wide index lifecycle.
+        regenerates the index at the end of run() instead — the per-source
+        crawler doesn't own the customer-wide index lifecycle.
         """
         for update in self._pending_updates.values():
             await self._persist_update(update)
@@ -669,6 +678,21 @@ class GitHubCrawlerAgent(BootstrapAgent):
                     error=str(exc),
                 )
                 halt_reason = halt_reason or "commit_failed"
+
+        # Regenerate the singleton wiki index now that this source's pages
+        # are persisted. Cross-source race is acceptable: multiple per-source
+        # crawlers each regen the index page in parallel; last writer wins,
+        # and since the index body is just a TOC of all live pages, all
+        # writers converge on the same content.
+        try:
+            await self._runtime._regenerate_index()
+        except Exception as exc:
+            log.warning(
+                "github_crawler.index_regen_failed",
+                customer=self.customer_id,
+                run_id=self.run_id,
+                error=str(exc),
+            )
 
         if self._counters.rate_limited and halt_reason is None:
             halt_reason = "rate_limited"

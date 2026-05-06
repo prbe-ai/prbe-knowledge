@@ -102,7 +102,7 @@ class _NoopRuntime(BootstrapWikiRuntime):
 
 
 def test_cursor_roundtrips_through_encode_decode() -> None:
-    cur = _Cursor(full_name="x/y", offset=50, since_iso="2026-04-01T00:00:00Z")
+    cur = _Cursor(full_name="x/y", offset=50)
     decoded = _Cursor.decode(cur.encode())
     assert decoded == cur
 
