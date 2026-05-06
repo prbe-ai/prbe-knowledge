@@ -77,6 +77,41 @@ def _backfill_run_lock_key(customer_id: str, source: str) -> int:
     return advisory_lock_key("backfill-run", customer_id, source)
 
 
+# Idle-pool eviction window. Neon kills pooled connections after roughly
+# 5 minutes idle; ping at 60s is well inside that with margin for clock
+# skew + a slow ping. Not configurable on purpose — single value, single
+# source of truth.
+_LOCK_HEARTBEAT_INTERVAL_SECONDS = 60.0
+
+
+async def _lock_conn_heartbeat(conn: asyncpg.Connection) -> None:
+    """Keep ``conn`` alive against Neon's idle-pool eviction.
+
+    The BackfillWorker holds a per-(customer, source) advisory lock on
+    ``conn`` for the full agent duration. Without a heartbeat, the
+    underlying connection idles past Neon's eviction window and the
+    transaction's ``__aexit__`` commit raises ``InterfaceError``. This
+    coroutine pings ``SELECT 1`` every 60s — well under the eviction
+    window — so the held connection stays live.
+
+    Designed to run as a fire-and-forget ``asyncio.Task`` cancelled in
+    the caller's ``finally`` clause before the transaction commits, so
+    a heartbeat ``SELECT`` is never racing the COMMIT on the same conn.
+    """
+    while True:
+        try:
+            await asyncio.sleep(_LOCK_HEARTBEAT_INTERVAL_SECONDS)
+            await conn.fetchval("SELECT 1")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # If the heartbeat itself fails (conn already closed, etc.)
+            # give up silently. The transaction's ``__aexit__`` will
+            # surface any underlying issue when it tries to commit.
+            log.warning("backfill_worker.heartbeat_failed", exc_info=True)
+            return
+
+
 # ---------------------------------------------------------------------------
 # Worker
 # ---------------------------------------------------------------------------
@@ -358,6 +393,13 @@ class BackfillWorker:
         """Run a single (customer, source) crawl under per-pair advisory
         lock. Idempotent on the row state machine — if the row was
         cancelled mid-flight, ``_close_run`` skips writing.
+
+        The advisory lock is held on ``lock_conn`` for the full agent
+        duration (multi-minute). Neon evicts idle pooled connections
+        after ~5min — without a heartbeat, the connection dies before
+        the agent finishes and the txn ``__aexit__`` raises
+        ``InterfaceError`` on commit. ``_lock_conn_heartbeat`` runs
+        ``SELECT 1`` every 60s on the held connection to keep it live.
         """
         lock_key = _backfill_run_lock_key(claim.customer_id, claim.source)
         try:
@@ -378,15 +420,24 @@ class BackfillWorker:
                     )
                     return
 
-                result = await self._invoke_agent(claim)
-                # Apply zero-page-halt -> error synthesis (mirrors PR #126).
-                if (
-                    result.error is None
-                    and result.halt_reason is not None
-                    and (result.pages_created + result.pages_updated) == 0
-                ):
-                    result = result.model_copy(update={"error": f"halt:{result.halt_reason}"})
-                await self._close_run(claim, result)
+                heartbeat_task = asyncio.create_task(_lock_conn_heartbeat(lock_conn))
+                try:
+                    result = await self._invoke_agent(claim)
+                    # Apply zero-page-halt -> error synthesis (mirrors PR #126).
+                    if (
+                        result.error is None
+                        and result.halt_reason is not None
+                        and (result.pages_created + result.pages_updated) == 0
+                    ):
+                        result = result.model_copy(update={"error": f"halt:{result.halt_reason}"})
+                    await self._close_run(claim, result)
+                finally:
+                    # Stop the heartbeat before the txn ``__aexit__``
+                    # commits, so the COMMIT doesn't race with an
+                    # in-flight ``SELECT 1``.
+                    heartbeat_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await heartbeat_task
         except asyncio.CancelledError:
             # Hard-cancel path: trigger route fired the cancel NOTIFY
             # and we cancelled this task. Mark the row 'cancelled'
