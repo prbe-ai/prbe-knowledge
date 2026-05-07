@@ -67,7 +67,7 @@ def _make_conn() -> AsyncMock:
     return conn
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_upsert_edges_null_extractor_id_by_default() -> None:
     """When extractor_id/extracted_at are not passed, they default to NULL.
 
@@ -93,7 +93,7 @@ async def test_upsert_edges_null_extractor_id_by_default() -> None:
     assert call_args[11] is None, f"extracted_at should be None, got {call_args[11]}"
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_upsert_edges_with_extractor_id_passed() -> None:
     """When extractor_id/extracted_at are passed, they are forwarded to INSERT."""
     conn = _make_conn()
@@ -121,7 +121,7 @@ async def test_upsert_edges_with_extractor_id_passed() -> None:
     assert call_args[11] == extracted_at
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_upsert_edges_empty_list_returns_zero() -> None:
     """Empty edge list returns 0 without calling execute or fetch."""
     conn = _make_conn()
@@ -133,7 +133,7 @@ async def test_upsert_edges_empty_list_returns_zero() -> None:
     conn.execute.assert_not_called()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_upsert_edges_skips_unknown_endpoints() -> None:
     """Edges whose endpoints are not in node_ids are silently skipped."""
     conn = _make_conn()
@@ -150,7 +150,7 @@ async def test_upsert_edges_skips_unknown_endpoints() -> None:
     conn.execute.assert_not_called()
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_upsert_edges_extracted_confidence_never_demoted() -> None:
     """REGRESSION: an existing EXTRACTED edge must not be demoted by a later
     INFERRED write. The SQL ON CONFLICT clause must preserve the higher tier.
