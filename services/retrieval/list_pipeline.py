@@ -20,6 +20,10 @@ from __future__ import annotations
 import time
 
 from services.retrieval.acl import filter_by_acl
+from services.retrieval.retrievers.related_entities import (
+    build_exclude_node_keys,
+    walk_result_doc_neighbors,
+)
 from services.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
 from services.retrieval.router import RouterOutput
 from shared.constants import SourceSystem
@@ -28,6 +32,7 @@ from shared.models import (
     QueryChunk,
     QueryRequest,
     QueryResponse,
+    RelatedEntity,
     TemporalSpec,
 )
 
@@ -220,6 +225,46 @@ async def run_list(
 
     timing["sql_ms"] = (time.perf_counter() - t_sql) * 1000
 
+    # `related_entities` walk: same shape as search_pipeline. Skip entirely
+    # when the response is an aggregation (count / group_by) -- there are no
+    # result docs to walk from (codex-B2). Three-state contract per codex-B4
+    # is preserved: None = not requested OR walk failed OR aggregation mode;
+    # [] = walked, no neighbors; [...] = walked, neighbors found.
+    related: list[RelatedEntity] | None = None
+    related_error: str | None = None
+    if aggregation is None and req.top_k_related > 0:
+        # Fuzzy exclusion (codex-P2): see search_pipeline.run_search for
+        # rationale. Threshold + normalized variants.
+        exclude_keys = build_exclude_node_keys(
+            routed.entities,
+            entity_match_threshold=req.entity_match_threshold,
+        )
+        # Dedupe doc_id, keep best (lowest) rank per doc -- list mode emits
+        # one chunk per doc by construction, but the dedupe is cheap insurance.
+        best_rank: dict[str, int] = {}
+        for i, c in enumerate(chunks, start=1):
+            best_rank.setdefault(c.doc_id, i)
+        ranked_docs = sorted(best_rank.items(), key=lambda kv: kv[1])
+        t_related = time.perf_counter()
+        try:
+            related = await walk_result_doc_neighbors(
+                customer_id,
+                ranked_result_docs=ranked_docs,
+                exclude_node_keys=exclude_keys,
+                min_confidence=req.min_confidence,
+                top_n=req.top_k_related,
+            )
+        except Exception as exc:
+            # Error name flows back via the dedicated `related_entities_error`
+            # response field. Do NOT inject a sentinel into timing_ms --
+            # dashboards parse that dict as stage durations.
+            log.warning(
+                "related_entities walk failed", exc_info=exc, trace_id=trace_id
+            )
+            related = None
+            related_error = type(exc).__name__
+        timing["related_entities_ms"] = (time.perf_counter() - t_related) * 1000
+
     return QueryResponse(
         query=req.query,
         chunks=chunks,
@@ -234,4 +279,6 @@ async def run_list(
         aggregation=aggregation,
         timing_ms=timing,
         trace_id=trace_id,
+        related_entities=related,
+        related_entities_error=related_error,
     )

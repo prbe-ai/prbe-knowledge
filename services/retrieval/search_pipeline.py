@@ -40,6 +40,10 @@ from services.retrieval.retrievers.graph import (
     GraphHit,
     graph_search,
 )
+from services.retrieval.retrievers.related_entities import (
+    build_exclude_node_keys,
+    walk_result_doc_neighbors,
+)
 from services.retrieval.retrievers.vector import vector_search
 from services.retrieval.router import RouterOutput
 from services.retrieval.temporal import build_predicate
@@ -51,6 +55,7 @@ from shared.models import (
     QueryChunk,
     QueryRequest,
     QueryResponse,
+    RelatedEntity,
     TemporalSpec,
     normalize_author_id,
 )
@@ -278,6 +283,48 @@ async def run_search(
     timing["acl_ms"] = (time.perf_counter() - t_acl) * 1000
 
     top = filtered[: req.top_k]
+
+    related: list[RelatedEntity] | None = None
+    related_error: str | None = None
+    if req.top_k_related > 0:
+        # Fuzzy exclusion (codex-P2): gate routed entities by
+        # entity_match_threshold so low-confidence router misfires don't
+        # suppress real entities, and emit normalized variants
+        # (lowered + namespace-stripped, canonical_id + display_name) so
+        # `Service:prbe-backend` (router) excludes `Service:prbe-ai/prbe-backend`
+        # (graph) without needing exact canonical_id alignment.
+        exclude_keys = build_exclude_node_keys(
+            routed.entities,
+            entity_match_threshold=req.entity_match_threshold,
+        )
+        # Dedupe doc_id, keep best (lowest) rank per doc -- multiple chunks
+        # per doc otherwise inflate doc_rank inputs to the SQL.
+        best_rank: dict[str, int] = {}
+        for i, h in enumerate(top, start=1):
+            best_rank.setdefault(h.doc_id, i)
+        ranked_docs = sorted(best_rank.items(), key=lambda kv: kv[1])
+        t_related = time.perf_counter()
+        try:
+            related = await walk_result_doc_neighbors(
+                customer_id,
+                ranked_result_docs=ranked_docs,
+                exclude_node_keys=exclude_keys,
+                min_confidence=req.min_confidence,
+                top_n=req.top_k_related,
+            )
+        except Exception as exc:
+            # Enrichment field -- never break host search response. Log +
+            # surface error on the response so MCP/LLM can distinguish
+            # "broken" from "no neighbors" (codex-B4). related stays None;
+            # error name flows back via the dedicated response field, NOT
+            # via timing_ms (which dashboards read as durations).
+            log.warning(
+                "related_entities walk failed", exc_info=exc, trace_id=trace_id
+            )
+            related = None
+            related_error = type(exc).__name__
+        timing["related_entities_ms"] = (time.perf_counter() - t_related) * 1000
+
     chunks = [
         QueryChunk(
             chunk_id=h.chunk_id,
@@ -315,6 +362,8 @@ async def run_search(
         timing_ms=timing,
         trace_id=trace_id,
         bundles=bundles,
+        related_entities=related,
+        related_entities_error=related_error,
     )
 
 
