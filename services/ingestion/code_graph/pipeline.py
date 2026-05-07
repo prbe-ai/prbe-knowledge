@@ -49,13 +49,16 @@ from shared.constants import (
 from shared.db import with_tenant
 from shared.logging import get_logger
 from shared.models import (
+    METADATA_CHUNK_INDEX,
     ACLPrincipal,
     ACLSnapshot,
+    ChunkPiece,
     CodeRepoStateUpdate,
     Document,
     GraphEdgeSpec,
     GraphNodeSpec,
     NormalizationResult,
+    PreChunkedDocument,
 )
 
 if TYPE_CHECKING:
@@ -140,10 +143,10 @@ async def extract_files_to_result(
             key = symbol.file_path if symbol.kind == NodeLabel.MODULE else symbol.qualified_name
             qname_to_kind[key] = symbol.kind
 
-    documents: list[Document] = []
     nodes: list[GraphNodeSpec] = []
     edges: list[GraphEdgeSpec] = []
     state_updates: list[CodeRepoStateUpdate] = []
+    pre_chunked_docs: list = []  # PreChunkedDocument list — typed below
 
     repo_node = GraphNodeSpec(
         label=NodeLabel.REPO,
@@ -151,9 +154,10 @@ async def extract_files_to_result(
         properties={"name": repo.rsplit("/", 1)[-1]},
     )
     nodes.append(repo_node)
-    owner_login = repo.split("/", 1)[0] if "/" in repo else _OWNER_FALLBACK
+    owner_login = _owner_for_repo(repo)
 
     now = datetime.now(UTC)
+    total_symbols = 0
 
     for rel_path, result, language in extractions:
         # Find the prepared file for this path to get its hash.
@@ -171,20 +175,50 @@ async def extract_files_to_result(
                 extractor_version=_extractor_version_for(rel_path),
             )
         )
-        for symbol in result.symbols:
-            documents.append(
-                _build_symbol_document(
-                    customer_id, repo, sha, owner_login, language, symbol, now
-                )
+        # Skip files with no extracted symbols — nothing to surface.
+        # (Empty .py files, parse errors that returned an empty result.)
+        if not result.symbols:
+            for edge in result.edges:
+                mapped = _map_edge(repo, edge, qname_to_kind)
+                if mapped is not None:
+                    edges.append(mapped)
+            continue
+
+        # Build the file Document + its pre-chunked pieces. One Document
+        # per file means search can return the whole file's symbols when
+        # an identity query (repo + file + symbol qname) hits the metadata
+        # chunk, even if the user wasn't searching for the symbol's body
+        # directly.
+        file_doc, file_chunks, file_metadata_chunk = _build_file_document_with_symbol_chunks(
+            customer_id=customer_id,
+            repo=repo,
+            sha=sha,
+            owner_login=owner_login,
+            language=language,
+            file_path=rel_path,
+            symbols=result.symbols,
+            now=now,
+        )
+        pre_chunked_docs.append(
+            PreChunkedDocument(
+                document=file_doc,
+                chunks=file_chunks,
+                metadata_chunk=file_metadata_chunk,
             )
+        )
+        total_symbols += len(result.symbols)
+
+        # Per-symbol graph nodes (unchanged from today — symbol nodes are
+        # how callers/tools/the qualifier lookup symbols by qualified name).
+        # COMPILED_FROM edges now go file Document → N Symbol nodes (1:N).
+        file_doc_id = file_doc.doc_id
+        for symbol in result.symbols:
             nodes.append(_symbol_node(repo, symbol))
-            # COMPILED_FROM: Document → Symbol-node so LIST queries can
-            # walk back from the symbol node to its Document. Spec §4.4.
             edges.append(
                 GraphEdgeSpec(
                     edge_type=EdgeType.COMPILED_FROM,
                     from_label=NodeLabel.DOCUMENT,
-                    from_canonical_id=_doc_id_for_symbol(repo, symbol),
+                    from_canonical_id=file_doc_id,
                     to_label=symbol.kind,
                     to_canonical_id=f"{repo}:{symbol.qualified_name}"
                     if symbol.kind != NodeLabel.MODULE
@@ -231,13 +265,14 @@ async def extract_files_to_result(
         files_skipped_cache=len(files) - len(prepared) - len(skipped_secrets) - len(skipped_unsupported),
         files_skipped_secrets=len(skipped_secrets),
         files_skipped_unsupported=len(skipped_unsupported),
-        symbols=len(documents),
+        file_documents=len(pre_chunked_docs),
+        symbols=total_symbols,
         nodes=len(nodes),
         edges=len(edges),
     )
 
     return NormalizationResult(
-        documents=documents,
+        documents_with_chunks=pre_chunked_docs,
         graph_nodes=nodes,
         graph_edges=edges,
         code_repo_state_updates=state_updates,
@@ -333,6 +368,68 @@ def _doc_id_for_symbol(repo: str, symbol: Symbol) -> str:
     return f"code_graph:{repo}:{symbol.file_path}:{symbol.qualified_name}:{symbol.def_line}"
 
 
+def _doc_id_for_file(repo: str, file_path: str) -> str:
+    """code.file Document id. Stable across re-extracts of the same file."""
+    return f"code_graph:{repo}:{file_path}"
+
+
+def _owner_for_repo(repo: str) -> str:
+    """Pull the GitHub owner login out of an `<owner>/<repo>` slug.
+
+    Falls back to a sentinel for malformed slugs so ACL construction
+    never explodes on bad input — the workspace ACL still applies, just
+    to the placeholder principal that no real user holds.
+    """
+    return repo.split("/", 1)[0] if "/" in repo else _OWNER_FALLBACK
+
+
+def _file_permalink(repo: str, sha: str, file_path: str) -> str:
+    """GitHub blob URL for the whole file (no line range). The dashboard
+    uses this as the Document-level "View on GitHub" link. Per-symbol
+    deep links (#L42-L58) live on chunks via a future schema addition;
+    until that lands, the file-level URL is the best the renderer has.
+    """
+    return f"https://github.com/{repo}/blob/{sha}/{file_path}"
+
+
+def _symbol_permalink(repo: str, sha: str, symbol: Symbol) -> str:
+    """GitHub blob URL with line range for a single symbol."""
+    return (
+        f"https://github.com/{repo}/blob/{sha}/{symbol.file_path}"
+        f"#L{symbol.def_line}-L{symbol.end_line}"
+    )
+
+
+def _codegraph_acl(owner_login: str, captured_at: datetime) -> ACLSnapshot:
+    """Workspace-level READ to the repo owner. Mirrors the GitHub
+    connector's repo ACL convention so existing ACL filters apply
+    transparently to code-graph Documents.
+    """
+    return ACLSnapshot(
+        principals=[
+            ACLPrincipal(
+                principal_type=PrincipalType.WORKSPACE,
+                principal_id=owner_login,
+                permission=Permission.READ,
+            )
+        ],
+        captured_at=captured_at,
+    )
+
+
+def _symbol_chunk_id_suffix(symbol: Symbol) -> str:
+    """Stable, collision-resistant chunk identity within a file Document.
+
+    Two stub functions can share an identical body (so `content_hash`
+    collides), but they always have distinct (qualified_name, def_line)
+    pairs. Sanitize qname for chunk_id safety: dots, slashes, and colons
+    get squashed so the chunk_id stays parseable as
+    `<doc_id>:c_<this_suffix>`.
+    """
+    safe_qname = symbol.qualified_name.replace(":", "_").replace("/", "_")
+    return f"{safe_qname}@{symbol.def_line}"
+
+
 def _build_symbol_document(
     customer_id: str,
     repo: str,
@@ -342,6 +439,14 @@ def _build_symbol_document(
     symbol: Symbol,
     now: datetime,
 ) -> Document:
+    """LEGACY per-symbol Document builder (`doc_type='code.symbol'`).
+
+    Retained for the transitional phase only — the file-as-Document
+    rewrite (Path 2) emits one `code.file` Document per file with
+    chunks per symbol. Migration 0050 hard-deletes data written by
+    this function. Slated for removal once the new path is verified
+    in prod.
+    """
     doc_id = _doc_id_for_symbol(repo, symbol)
     body = symbol.source_snippet or symbol.signature or symbol.qualified_name
     body_preview = symbol.docstring.splitlines()[0] if symbol.docstring else symbol.signature
@@ -358,17 +463,12 @@ def _build_symbol_document(
         ).encode("utf-8", errors="replace")
     ).hexdigest()
 
-    perma = (
-        f"https://github.com/{repo}/blob/{sha}/{symbol.file_path}"
-        f"#L{symbol.def_line}-L{symbol.end_line}"
-    )
-
     return Document(
         doc_id=doc_id,
         customer_id=customer_id,
         source_system=SourceSystem.CODE_GRAPH,
         source_id=f"symbol:{repo}:{symbol.file_path}:{symbol.qualified_name}:{symbol.def_line}",
-        source_url=perma,
+        source_url=_symbol_permalink(repo, sha, symbol),
         doc_class=DocClass.RAW_SOURCE,
         doc_type=DocType.CODE_SYMBOL,
         content_type="text/plain",
@@ -383,16 +483,7 @@ def _build_symbol_document(
         updated_at=now,
         valid_from=now,
         ingested_at=now,
-        acl=ACLSnapshot(
-            principals=[
-                ACLPrincipal(
-                    principal_type=PrincipalType.WORKSPACE,
-                    principal_id=owner_login,
-                    permission=Permission.READ,
-                )
-            ],
-            captured_at=now,
-        ),
+        acl=_codegraph_acl(owner_login, now),
         # Transient body for the chunker; never persisted into metadata
         # (the storage guard at normalizer.py:191 raises on metadata['body']).
         body=body,
@@ -411,6 +502,167 @@ def _build_symbol_document(
             },
         },
     )
+
+
+def _build_file_document_with_symbol_chunks(
+    *,
+    customer_id: str,
+    repo: str,
+    sha: str,
+    owner_login: str,
+    language: str,
+    file_path: str,
+    symbols: list[Symbol],
+    now: datetime,
+):
+    """Path 2: file becomes the Document, symbols become chunks.
+
+    Returns (Document, content_chunks, metadata_chunk):
+
+      - Document has body=None and doc_type='code.file'. Source URL points
+        to the file's GitHub blob (no line range; per-symbol deep-links
+        come in a follow-up that adds chunks.source_url).
+      - One ChunkPiece per symbol: chunk content is a synthetic header
+        (`# repo · file · qname (kind) · L<def>-<end>`) followed by the
+        source snippet. The header puts identifying text into the embedded
+        body so semantic search ranks repo-qualified queries correctly,
+        which is the whole point of this rewrite.
+      - One metadata ChunkPiece carrying repo + file path + language +
+        a list of every symbol qname in the file. Search hits on this
+        chunk surface the file Document for identity queries
+        ("IngestionToken in prbe-backend") even when no symbol body
+        embedding ranks high.
+
+    chunk identity:
+      - content chunks: chunk_id = `<doc_id>:c_<sanitized_qname>@<def_line>`
+        (handled downstream by `_apply_chunk_plan`; we set chunk_index
+        deterministically here so reuse semantics work)
+      - metadata chunk: chunk_index = METADATA_CHUNK_INDEX sentinel
+        (set by ChunkPiece consumer in normalizer)
+
+    Caller MUST NOT pass an empty symbols list — the orchestrator skips
+    files with zero extractions before calling.
+    """
+    if not symbols:
+        raise ValueError("file Document requires at least one symbol")
+
+    doc_id = _doc_id_for_file(repo, file_path)
+    title = file_path.rsplit("/", 1)[-1]  # filename, no path
+    permalink = _file_permalink(repo, sha, file_path)
+
+    # Per-symbol content chunks. Synthetic header (`# repo · file · qname …`)
+    # gets embedded with the body so a search for "IngestionToken in
+    # prbe-backend" naturally ranks this chunk above prbe-dashboard's
+    # same-named symbol — the header carries the repo name as searchable
+    # text that the symbol body itself never would.
+    content_chunks: list[ChunkPiece] = []
+    for chunk_idx, symbol in enumerate(symbols):
+        body = symbol.source_snippet or symbol.signature or symbol.qualified_name
+        header = (
+            f"# {repo} · {symbol.file_path} · "
+            f"{symbol.qualified_name} ({symbol.kind.value}) · "
+            f"L{symbol.def_line}-{symbol.end_line}\n"
+        )
+        chunk_content = header + body
+        content_chunks.append(
+            ChunkPiece(
+                chunk_index=chunk_idx,
+                content=chunk_content,
+                token_count=count_tokens(chunk_content),
+            )
+        )
+
+    # Metadata chunk: synthetic key:value text used for identity queries.
+    # The search layer hits this chunk for queries like "IngestionToken in
+    # prbe-backend" because all the identifying tokens (repo, file, every
+    # symbol's qname) live here as plain searchable text.
+    metadata_lines = [
+        f"Repo: {repo}",
+        f"File: {file_path}",
+        f"Language: {language}",
+        f"Symbols ({len(symbols)}):",
+    ]
+    for symbol in symbols:
+        metadata_lines.append(
+            f"  - {symbol.qualified_name} ({symbol.kind.value})"
+        )
+    metadata_content = "\n".join(metadata_lines)
+    metadata_chunk = ChunkPiece(
+        chunk_index=METADATA_CHUNK_INDEX,
+        content=metadata_content,
+        token_count=count_tokens(metadata_content),
+    )
+
+    # Document content_hash: sha256 over every symbol's identity tuple.
+    # Stable across re-extracts of the same file at the same commit; flips
+    # the moment any symbol changes (which is what we want for SCD2).
+    hash_input = "\x1f".join(
+        f"{s.qualified_name}|{s.def_line}|{s.end_line}|{s.source_snippet}"
+        for s in symbols
+    )
+    content_hash = hashlib.sha256(
+        hash_input.encode("utf-8", errors="replace")
+    ).hexdigest()
+
+    body_preview = f"{len(symbols)} symbols: " + ", ".join(
+        s.qualified_name for s in symbols[:5]
+    )
+    if len(symbols) > 5:
+        body_preview += f", … (+{len(symbols) - 5} more)"
+    if len(body_preview) > 200:
+        body_preview = body_preview[:200]
+
+    file_doc = Document(
+        doc_id=doc_id,
+        customer_id=customer_id,
+        source_system=SourceSystem.CODE_GRAPH,
+        source_id=f"file:{repo}:{file_path}",
+        source_url=permalink,
+        doc_class=DocClass.RAW_SOURCE,
+        doc_type=DocType.CODE_FILE,
+        content_type="text/plain",
+        language=language,
+        content_hash=content_hash,
+        title=title,
+        body_preview=body_preview,
+        # body_size_bytes / body_token_count reflect the metadata chunk —
+        # the connector owns chunking, the Document carries no body itself.
+        body_size_bytes=len(metadata_content.encode("utf-8")),
+        body_token_count=metadata_chunk.token_count,
+        author_id=None,
+        created_at=now,
+        updated_at=now,
+        valid_from=now,
+        ingested_at=now,
+        acl=_codegraph_acl(owner_login, now),
+        # CRITICAL: body=None for pre-chunked Documents. The normalizer's
+        # body-guard catches the `body is not None AND pre_chunked is not
+        # None` case and raises — keeping that contract clean here.
+        body=None,
+        metadata={
+            "file": {
+                "path": file_path,
+                "language": language,
+                "repo": repo,
+                "sha": sha,
+                "symbol_count": len(symbols),
+                # Per-symbol metadata for the dashboard renderer until the
+                # follow-up adds chunks.metadata. Each entry maps qname →
+                # (kind, def_line, end_line) so the renderer can compose
+                # per-symbol GitHub permalinks on the fly.
+                "symbols": {
+                    s.qualified_name: {
+                        "kind": s.kind.value,
+                        "def_line": s.def_line,
+                        "end_line": s.end_line,
+                    }
+                    for s in symbols
+                },
+            },
+        },
+    )
+
+    return file_doc, content_chunks, metadata_chunk
 
 
 def _symbol_node(repo: str, symbol: Symbol) -> GraphNodeSpec:

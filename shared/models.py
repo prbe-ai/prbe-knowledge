@@ -1,5 +1,6 @@
 """Canonical Pydantic schemas. The contract every handler produces."""
 
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
@@ -20,6 +21,29 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
+
+# Sentinel chunk_index for the synthetic per-Document metadata chunk
+# (the kind='metadata' chunk that carries identifying key:value text for
+# search anchoring). Negative so it can't collide with any real chunker
+# output index. Lives here so cross-module callers (chunker, normalizer,
+# code_graph pipeline) all reach for the same constant.
+METADATA_CHUNK_INDEX = -1
+
+
+@dataclass(slots=True)
+class ChunkPiece:
+    """One unit of embeddable text within a Document.
+
+    Lives here in `shared.models` (not chunker.py) so cross-module
+    contracts — like `NormalizationResult.documents_with_chunks` —
+    can reference it without dragging chunker's tiktoken dependency
+    or violating the shared/services layering. Re-exported from
+    `services.ingestion.chunker` for backwards-compatible imports.
+    """
+
+    chunk_index: int
+    content: str
+    token_count: int
 
 
 class EntityRef(BaseModel):
@@ -646,6 +670,33 @@ class CodeRepoStateUpdate(BaseModel):
     extractor_version: str
 
 
+class PreChunkedDocument(BaseModel):
+    """A Document the connector has already chunked itself.
+
+    Used by code-graph (Path 2 file-as-Document model) to emit one
+    Document per file with N pre-built ChunkPiece entries — one per
+    symbol body — bypassing the normalizer's default
+    `chunk_text(doc.body)` call. The token-window chunker would
+    otherwise split `def foo` from its docstring at arbitrary
+    boundaries; that's wrong for code where the symbol is the
+    natural chunk unit.
+
+    `document.body` MUST be None for pre-chunked Documents (the
+    body-guard in normalizer enforces this). The chunks list IS
+    the source of truth.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    document: Document
+    chunks: list[ChunkPiece]
+    # Optional metadata chunk for the Document — same role as
+    # `_metadata_piece` in normalizer (synthetic key:value text the
+    # search layer hits for identity queries). Omit when the Document's
+    # content chunks already contain identifying text.
+    metadata_chunk: ChunkPiece | None = None
+
+
 class NormalizationResult(BaseModel):
     """Uniform output shape produced by every connector's .normalize().
 
@@ -654,6 +705,10 @@ class NormalizationResult(BaseModel):
     """
 
     documents: list[Document] = Field(default_factory=list)
+    # Pre-chunked Documents the normalizer must NOT re-chunk. The
+    # connector owns chunking when symbol/structural granularity matters
+    # (today: code-graph). Default empty for everyone else.
+    documents_with_chunks: list[PreChunkedDocument] = Field(default_factory=list)
     graph_nodes: list[GraphNodeSpec] = Field(default_factory=list)
     graph_edges: list[GraphEdgeSpec] = Field(default_factory=list)
     acl_snapshots: list[ACLSnapshotRow] = Field(default_factory=list)
@@ -667,6 +722,7 @@ class NormalizationResult(BaseModel):
     def is_empty(self) -> bool:
         return not (
             self.documents
+            or self.documents_with_chunks
             or self.graph_nodes
             or self.graph_edges
             or self.acl_snapshots

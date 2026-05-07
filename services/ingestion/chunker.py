@@ -7,22 +7,19 @@ tokenizer (correct for OpenAI text-embedding-3-large). Structural chunking
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import tiktoken
 
 from shared.constants import CHUNKER_VERSION
 
+# ChunkPiece moved to shared.models so cross-module contracts
+# (NormalizationResult.documents_with_chunks) can reference it without
+# the shared→services layering violation. Re-exported here for
+# backwards-compatible imports.
+from shared.models import ChunkPiece
+
 DEFAULT_CHUNK_TOKENS = 512
 DEFAULT_CHUNK_OVERLAP = 64
 MAX_INPUT_TOKENS = 8191  # OpenAI embedding-3-large hard ceiling (8192 is exclusive)
-
-
-@dataclass(slots=True)
-class ChunkPiece:
-    chunk_index: int
-    content: str
-    token_count: int
 
 
 _encoding: tiktoken.Encoding | None = None

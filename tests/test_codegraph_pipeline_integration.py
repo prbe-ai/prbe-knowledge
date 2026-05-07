@@ -52,12 +52,14 @@ def main() -> None:
 
 
 @pytest.mark.asyncio
-async def test_documents_use_body_field_not_metadata_body() -> None:
-    """Storage guard at normalizer.py:191 raises on metadata['body'].
+async def test_file_documents_have_no_body_and_pre_emit_chunks() -> None:
+    """Path 2 contract: code.file Documents bypass the chunker.
 
-    pipeline must put the source body on the transient Document.body,
-    not into metadata jsonb. Regression test for the rebase-induced
-    body-field bug.
+    body MUST be None (chunks are authoritative and the connector
+    owns chunking). metadata['body'] is still forbidden by the
+    storage guard at normalizer.py. The PreChunkedDocument carries
+    one ChunkPiece per symbol + one metadata chunk with identifying
+    text.
     """
     files = [_FE(rel_path="greeter.py", content=_PYTHON_SAMPLE)]
     result = await extract_files_to_result(
@@ -67,13 +69,28 @@ async def test_documents_use_body_field_not_metadata_body() -> None:
         files=files,
         cached_state={},
     )
-    assert result.documents, "expected symbol Documents from greeter.py"
-    for doc in result.documents:
-        assert "body" not in doc.metadata, (
-            f"doc {doc.doc_id} put body into metadata jsonb — "
-            "normalizer storage guard will raise on persist"
+    # Per-symbol Documents are gone — code.file is the only shape.
+    assert not result.documents, "expected zero raw Documents under Path 2"
+    assert result.documents_with_chunks, "expected file Document via documents_with_chunks"
+
+    for prechunked in result.documents_with_chunks:
+        doc = prechunked.document
+        assert doc.body is None, (
+            f"file Document {doc.doc_id} must have body=None "
+            "(chunks are authoritative)"
         )
-        assert doc.body, f"doc {doc.doc_id} missing transient body"
+        assert "body" not in doc.metadata, (
+            f"file Document {doc.doc_id} put body into metadata jsonb — "
+            "normalizer storage guard will raise"
+        )
+        assert prechunked.chunks, "expected at least one symbol chunk"
+        assert prechunked.metadata_chunk is not None, (
+            "file Document must carry a metadata chunk for identity queries"
+        )
+        # Metadata chunk content must include the repo name — that's the
+        # whole point of the Path 2 rewrite.
+        assert "acme/app" in prechunked.metadata_chunk.content
+        assert "greeter.py" in prechunked.metadata_chunk.content
 
 
 @pytest.mark.asyncio

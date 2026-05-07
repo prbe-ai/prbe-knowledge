@@ -87,7 +87,18 @@ class DocType(StrEnum):
     # nothing prevents new ones). The auto-generated overview page is
     # written under `wiki.index`. Anywhere we need to filter for wiki
     # pages in SQL: `WHERE doc_type LIKE 'wiki.%'`.
+    # LEGACY (PR-A pre-Path-2): one Document per symbol. Migration 0050
+    # hard-deletes existing rows of this type when the file-as-Document
+    # rewrite (CODE_FILE below) ships. Keep the constant defined so the
+    # search pipeline + dashboard renderer can recognize stragglers
+    # (e.g. an old chunk that escaped DELETE) and still display them.
     CODE_SYMBOL = "code.symbol"
+    # Path 2: one Document per file. Body is None; chunks are pre-emitted
+    # by the pipeline (one ChunkPiece per symbol body + one metadata chunk
+    # carrying repo+file+symbol-list identifying text). The repo name
+    # lives in the embedded metadata chunk so semantic search ranks
+    # repo-qualified queries correctly.
+    CODE_FILE = "code.file"
 
 
 # SQL pattern matching every wiki page doc_type (excludes the singleton
