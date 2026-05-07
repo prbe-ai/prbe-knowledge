@@ -1,0 +1,24 @@
+A document in this scenario failed strict validation and must be regenerated. Replace the failing document while keeping every other document in the scenario UNCHANGED. Do not invent names not in the allowlists.
+
+Scenario: {scenario_summary}
+
+Full prior scenario (every doc, in chronological order):
+{full_scenario_view}
+
+Document to regenerate:
+- Doc id: {target_doc_id}
+- Source: {target_source}
+- Channel: {target_channel}
+- Personas: {target_personas}
+- Original text (for reference; this is what failed):
+{original_text}
+
+Validation feedback you MUST address:
+{failure_context}
+
+Allowed services: {allowed_services}
+Allowed people: {allowed_people}
+Allowed channels: {allowed_channels}
+Instance timestamp: {instance_ts}
+
+Generate a replacement {target_source} document. Preserve the same scenario thread (cast, services, root cause, decisions) so the doc still fits beside the others. Output ONLY the document body — no preface, no commentary, no JSON wrapping.

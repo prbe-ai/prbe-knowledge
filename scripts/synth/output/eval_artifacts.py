@@ -82,7 +82,16 @@ def write_manifest(
     started_at: datetime,
     finished_at: datetime,
 ) -> None:
-    """Write the run-level summary to `<out_dir>/manifest.json`."""
+    """Write the run-level summary to `<out_dir>/manifest.json`.
+
+    The manifest doubles as the canonical-corpus manifest that
+    `scripts/synth/seed.py::seed_tenant` reads when this directory is
+    later passed as `--canonical-dir`. To make that round-trip work
+    without the operator hand-editing anything, we emit
+    `canonical_customer_id` (alias for `customer_id`) — `synth seed`
+    looks for that field to identify the customer the corpus was
+    originally recorded against.
+    """
     manifest = {
         "run_id": run_id,
         "profile_name": profile.preset,
@@ -90,6 +99,7 @@ def write_manifest(
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
         "customer_id": profile.customer_id,
+        "canonical_customer_id": profile.customer_id,
         "mode": mode,
         "repos": [
             {

@@ -36,6 +36,7 @@ class Profile:
     archetypes: dict = field(default_factory=dict)
     llm: dict = field(default_factory=dict)
     company_context_path: Path | None = None
+    regen_max_rounds: int = 3
     raw: dict = field(default_factory=dict)  # full YAML for plan 3 to consume
 
 
@@ -99,6 +100,21 @@ def load_profile(path: Path) -> Profile:
     if not isinstance(seed, int):
         raise ProfileError(f"seed must be an integer, got {type(seed).__name__}")
 
+    regen_raw = raw.get("regen") or {}
+    if not isinstance(regen_raw, dict):
+        raise ProfileError(
+            f"regen must be a YAML mapping, got {type(regen_raw).__name__}"
+        )
+    regen_max_rounds = regen_raw.get("max_rounds", 3)
+    if isinstance(regen_max_rounds, bool) or not isinstance(regen_max_rounds, int):
+        raise ProfileError(
+            f"regen.max_rounds must be an integer, got {type(regen_max_rounds).__name__}: {regen_max_rounds!r}"
+        )
+    if regen_max_rounds < 1:
+        raise ProfileError(
+            f"regen.max_rounds must be >= 1, got {regen_max_rounds}"
+        )
+
     cc = raw.get("company_context")
     cc_path = Path(cc).expanduser() if isinstance(cc, str) else None
 
@@ -110,5 +126,6 @@ def load_profile(path: Path) -> Profile:
         archetypes=raw.get("archetypes", {}),
         llm=raw.get("llm", {}),
         company_context_path=cc_path,
+        regen_max_rounds=regen_max_rounds,
         raw=raw,
     )

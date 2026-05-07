@@ -140,6 +140,7 @@ async def validate(
     archetype: Archetype,
     pass2_client: LlmClientProtocol | None,
     pass2_model: str | None,
+    pass1_advisory: bool = False,
 ) -> CombinedValidatorResult:
     """Pass 1 (always) + Pass 2 (only when archetype.validator_level==STRICT and a pass2 client is
     provided).
@@ -149,13 +150,24 @@ async def validate(
       - Pass 2 ran and `passed` is False (validate_pass2 already enforces 30% threshold internally)
 
     failing_doc_ids = union of Pass 1 and Pass 2 violating doc ids.
+
+    pass1_advisory: when True AND archetype.validator_level == STRICT, demote
+        Pass 1 violations from drop-triggering to logging-only. The
+        `pass1_violations` field is still populated (callers can log them),
+        but they are excluded from `failing_doc_ids` and do not contribute
+        to `should_drop`. Templated archetypes (NAME_ONLY) are unaffected.
+        Use case: real-LLM plot generation where Pass 1's kebab regex hits
+        too many English-compound false positives (port-sync, follow-up,
+        health-check, etc.) to be a useful gate. Pass 2 (semantic
+        consistency) remains the gate.
     """
     from scripts.synth.archetypes.base import ValidatorLevel
     from scripts.synth.llm.validator_pass2 import validate_pass2
 
     pass1 = validate_name_only(docs, world)
     pass1_failing = tuple(v.doc_id for v in pass1)
-    pass1_drop = len(pass1_failing) > 0
+    pass1_demoted = pass1_advisory and archetype.validator_level == ValidatorLevel.STRICT
+    pass1_drop = len(pass1_failing) > 0 and not pass1_demoted
 
     pass2_result: Pass2Result | None = None
     pass2_failing: tuple[str, ...] = ()
@@ -178,7 +190,8 @@ async def validate(
         pass2_failing = tuple(v.doc_id for v in pass2_result.violations)
         pass2_drop = not pass2_result.passed
 
-    all_failing = tuple(sorted(set(pass1_failing) | set(pass2_failing)))
+    pass1_failing_for_routing: tuple[str, ...] = () if pass1_demoted else pass1_failing
+    all_failing = tuple(sorted(set(pass1_failing_for_routing) | set(pass2_failing)))
     return CombinedValidatorResult(
         pass1_violations=pass1,
         pass2_result=pass2_result,

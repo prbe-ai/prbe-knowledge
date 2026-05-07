@@ -1,0 +1,134 @@
+# =============================================================================
+# example-profile.yaml — every field a profile YAML can carry.
+#
+# The profile is the unit of "an eval dataset configuration". It points at
+# repos, names a preset, and sets the seed. A profile YAML lives wherever
+# you want; you pass its path to `synth init / extract / run` via --profile.
+#
+# Loaded by:    scripts/synth/profile.py::load_profile
+# Validated by: same file, raises ProfileError on bad input.
+# Merged with:  scripts/synth/presets/<preset>.yaml via apply_preset()
+#               (preset is the BASE; profile values WIN on conflict for
+#               the `archetypes` and `llm` blocks).
+#
+# THIS FILE IS A TEMPLATE — it will not run as-is. The customer_id
+# `cust-eval-EXAMPLE-DO-NOT-USE` is a placeholder; replace it. The repo
+# url + local_path are fake; replace them.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# REQUIRED FIELDS
+# -----------------------------------------------------------------------------
+
+# REQUIRED. Tenant id. MUST start with `cust-eval-` or `cust-synth-`.
+# The CLI refuses to operate on any other prefix (refusing to mutate
+# production-shaped tenants). Used as the customer_id throughout the
+# ingestion + retrieval stack.
+customer_id: cust-eval-EXAMPLE-DO-NOT-USE
+
+# REQUIRED. Name of a YAML file in scripts/synth/presets/. Loaded via
+# apply_preset(); the preset's `archetypes` and `llm` blocks become the
+# defaults that this profile overrides.
+# Shipped presets: tiny_test, incident_only, medium_holistic.
+preset: tiny_test
+
+# REQUIRED. Integer (NOT bool — YAML's `true`/`false` are booleans, not ints).
+# Determinism contract: same seed + same profile = byte-identical output
+# across runs. Threaded into archetype builders, LLM client cache keys,
+# and time-anchor selection.
+seed: 7
+
+# REQUIRED. Non-empty list of repo specs. Each entry can be either a bare
+# string (URL only, will be cloned via $GITHUB_TOKEN if no local path) OR
+# a mapping with explicit fields. Mix-and-match is allowed.
+repos:
+  # Form A — bare URL string. Extractor will clone via GITHUB_TOKEN env var.
+  - github.com/example/repo-cloned-on-the-fly
+
+  # Form B — mapping with optional local_path + branch.
+  - url: github.com/example/repo-from-disk            # REQUIRED inside the mapping
+    local_path: ~/checkouts/repo-from-disk            # OPTIONAL. Path to a git checkout. Avoids cloning. ~ is expanded.
+    branch: main                                      # OPTIONAL. Branch to read. If omitted, uses HEAD.
+
+# -----------------------------------------------------------------------------
+# OPTIONAL FIELDS
+# -----------------------------------------------------------------------------
+
+# OPTIONAL. Per-archetype config. Merged on top of the preset's archetypes
+# block. Key is the archetype name (uppercase, see scripts/synth/archetypes/).
+# Today the only consumed sub-key is `count: int`.
+#
+# Setting count: 0 turns the archetype OFF for this run.
+# Omitting an archetype here means "use whatever the preset said".
+#
+# Available archetype names:
+#   STANDUP_UPDATE   — templated daily standup messages (Slack)
+#   ON_CALL_HANDOFF  — templated weekly on-call handoffs (Slack)
+#   INCIDENT         — LLM-driven incident scenario (Sentry + Slack + Linear + Notion + GitHub)
+#   LAUNCH           — LLM-driven product launch scenario (multi-source)
+#   BIG_REFACTOR     — LLM-driven multi-week refactor narrative (multi-source)
+archetypes:
+  STANDUP_UPDATE: { count: 5 }   # OPTIONAL: override preset count
+  INCIDENT:       { count: 4 }   # OPTIONAL
+  LAUNCH:         { count: 0 }   # OPTIONAL: turn off
+  # Omitted archetypes (ON_CALL_HANDOFF, BIG_REFACTOR) inherit from preset.
+
+# OPTIONAL. LLM model overrides. Merged on top of the preset's `llm` block,
+# which itself sits on top of the hard-coded defaults below.
+#
+# Hard-coded defaults (scripts/synth/cli.py::_LLM_DEFAULTS):
+#   planner_model:   claude-opus-4-7
+#   writer_model:    claude-sonnet-4-6
+#   validator_model: claude-haiku-4-5-20251001
+#
+# Provider is auto-derived from model prefix:
+#   claude-* -> Anthropic   (requires ANTHROPIC_API_KEY)
+#   gemini-* -> Google      (requires GOOGLE_API_KEY)
+# Any other prefix raises at startup.
+#
+# Known quirks worth knowing:
+#   - claude-opus-4-7 occasionally returns empty tool_use input on the
+#     planner schema. If you hit `PlannerOutputSchema validation errors`,
+#     swap to claude-sonnet-4-6.
+#   - claude-haiku-4-5 occasionally wraps tool_use input in a
+#     {"parameter": {...}} envelope. If you hit `Pass2OutputSchema`
+#     validation errors, swap validator to claude-sonnet-4-6 OR add a
+#     defensive unwrap in validator_pass2.py.
+llm:
+  planner_model:   claude-sonnet-4-6
+  writer_model:    claude-sonnet-4-6
+  validator_model: claude-haiku-4-5-20251001
+
+# OPTIONAL. Path to a hand-authored CompanyContext YAML. If set, that file
+# is loaded. If unset, `synth init` / `synth run` LLM-infer one from the
+# repo READMEs and write it to `<output-dir>/inferred-company.yaml` for
+# the operator to inspect.
+# Path may be relative (resolved against cwd) or absolute. ~ is expanded.
+# See example-company-context.yaml for the shape.
+company_context: scripts/synth/company-context/openui-desktop.yaml
+
+# OPTIONAL. WorldModel extractor knobs. Defaults shown.
+world_model:
+  min_commits_per_persona: 2          # int. Persona must have ≥ N commits in lookback window to be included.
+  max_personas: 25                    # int. Cap on people in the WorldModel (top-N by activity).
+  topic_pool_lookback_days: 90        # int. Window for commit/topic extraction. Smaller = sparser world.
+
+# OPTIONAL. Time window for synthetic events. Defaults to 30 days.
+# CLI flag --time-window <Nd> overrides this on a per-run basis.
+time_window:
+  days: 30                            # int. Synth events are scattered across [now - days, now).
+
+# OPTIONAL. Validator regen-loop config. Default: max_rounds = 3.
+# When a plot-archetype scenario fails strict validation, the regen loop
+# retries up to N rounds before dropping. Each round: writer.regenerate()
+# fires per failing doc, validator re-runs. >= 1 required.
+# To disable for a single run, pass --no-regen on the CLI.
+regen:
+  max_rounds: 3
+
+# -----------------------------------------------------------------------------
+# IGNORED FIELDS — anything not listed above is loaded into Profile.raw
+# but not actively consumed by any code path today. Safe to drop comments,
+# notes, etc. here without breaking the loader.
+# -----------------------------------------------------------------------------
+# notes: "freeform notes for your future self"
