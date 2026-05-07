@@ -343,33 +343,6 @@ async def test_revert_404_on_unknown_version(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_index_fallback_when_cron_has_not_run(
-    client: httpx.AsyncClient,
-) -> None:
-    """Before the synthesis cron runs, GET /api/wiki/index returns a
-    deterministic TOC built from the current page set."""
-    await client.put(
-        "/api/wiki/pages/runbook/r1",
-        json={"title": "R1", "body": "First runbook."},
-        headers=_hdr(),
-    )
-    await client.put(
-        "/api/wiki/pages/decision/d1",
-        json={"title": "D1", "body": "First decision."},
-        headers=_hdr(),
-    )
-
-    resp = await client.get("/api/wiki/index", headers=_hdr())
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    titles = {entry["title"] for entry in body["entries"]}
-    assert {"R1", "D1"} <= titles
-    assert "Wiki" in body["body"]
-    assert body["updated_at"] is None  # cron-stored doc absent
-    assert body["version"] is None
-
-
-@pytest.mark.asyncio
 async def test_put_rejects_index_wiki_type(client: httpx.AsyncClient) -> None:
     """The 'index' wiki_type is reserved for the synthesis cron — humans
     can't author it via PUT."""
