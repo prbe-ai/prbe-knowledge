@@ -494,123 +494,23 @@ async def classify_with_llm(
 
 
 # ---------------------------------------------------------------------------
-# Per-edge re-verification (push webhook path)
+# Push webhook path: removed-files only
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class EvidenceEntry:
-    """One row of provenance attached to a stored DEPENDS_ON edge.
-
-    Mirrors the shape we persist in ``graph_edges.properties.evidence``.
-    Re-verification operates on these directly so the caller doesn't
-    have to redo the regex collection step.
-    """
-
-    target_repo: str
-    file_path: str
-    line: int
-    snippet: str
-
-
-async def reverify_evidence_with_llm(
-    *,
-    source_repo: str,
-    evidence: list[EvidenceEntry],
-    file_contents: dict[str, str],
-    client: Any | None = None,
-) -> set[int] | None:
-    """Decide which existing-edge evidence rows are still valid.
-
-    Built for the push-webhook path: when changed files overlap with
-    previously-recorded evidence, re-verify each affected entry against
-    the post-push file content. Returns the set of evidence indices
-    (0-based, into the input list) that the LLM keeps as REAL. Indices
-    not returned should be treated as dropped — the caller decides
-    whether to delete the whole edge (no remaining evidence) or update
-    the edge's properties (still has other surviving entries).
-
-    Evidence whose ``file_path`` is not in ``file_contents`` is skipped
-    entirely (returned as kept) — the caller chose to only verify a
-    subset; an entry pointing at an unchanged file remains trusted.
-
-    Returns ``None`` (NOT an empty set) when the LLM is unavailable.
-    Caller distinguishes this from "LLM ran and dropped everything"
-    so it can DLQ the push for later retry rather than persist
-    deletions based on a missing verifier.
-    """
-    if not evidence:
-        return set()
-
-    # Indices the caller wants verified (file in changed set) vs trusted.
-    to_verify_idx: list[int] = []
-    trusted_idx: set[int] = set()
-    for i, e in enumerate(evidence):
-        if e.file_path in file_contents:
-            to_verify_idx.append(i)
-        else:
-            trusted_idx.add(i)
-
-    if not to_verify_idx:
-        return trusted_idx
-
-    file_to_lines: dict[str, list[int]] = {}
-    for i in to_verify_idx:
-        e = evidence[i]
-        file_to_lines.setdefault(e.file_path, []).append(e.line)
-    file_context = _build_file_context_from_contents(file_contents, file_to_lines)
-
-    # 1-indexed numbering matches the existing classifier so the prompt
-    # template is reusable. The mapping back to evidence indices is
-    # stable order of `to_verify_idx`.
-    listing_lines: list[str] = []
-    for n, ev_idx in enumerate(to_verify_idx, start=1):
-        e = evidence[ev_idx]
-        prior_snippet = e.snippet.replace("\n", " ")[:160]
-        listing_lines.append(
-            f"{n}. file={e.file_path} line={e.line} target={e.target_repo}\n"
-            f"   prior_snippet: {prior_snippet}"
-        )
-    user_prompt = (
-        f"Source repo: {source_repo}\n\n"
-        "These are previously-verified architecture-graph edges. The "
-        "files below are the CURRENT (post-change) contents. For each "
-        "numbered evidence entry, decide if the cited line still "
-        "genuinely references the target repo. A line that was deleted, "
-        "moved, or changed to point elsewhere is COINCIDENCE; a line "
-        "still doing the same job (HTTP call, env var, import, doc "
-        "link, etc.) is REAL.\n\n"
-        "=== Files (post-change) ===\n\n"
-        f"{file_context}\n\n"
-        "=== Evidence to re-verify ===\n"
-        + "\n".join(listing_lines)
-    )
-
-    verdicts = await _call_classifier_llm(
-        source_repo=source_repo,
-        user_prompt=user_prompt,
-        client=client,
-        log_prefix="cross_repo_deps.reverify",
-    )
-    if verdicts is None:
-        # LLM unavailable / errored. Signal failure to the caller via
-        # None so the push can be DLQ'd for retry. The caller is
-        # responsible for the conservative "keep everything for now"
-        # behavior in the live edge state — we don't apply silent
-        # deletions based on a missing verifier.
-        return None
-
-    kept = set(trusted_idx)
-    for v in verdicts:
-        if not isinstance(v, dict):
-            continue
-        n = v.get("number")
-        if not isinstance(n, int) or n < 1 or n > len(to_verify_idx):
-            continue
-        if not v.get("real"):
-            continue
-        kept.add(to_verify_idx[n - 1])
-    return kept
+#
+# Push webhooks call ``update_edges_after_push`` with the list of files the
+# push removed. Edges whose evidence row points at a removed file lose that
+# row immediately; edges whose entire evidence list dies are deleted.
+#
+# We deliberately do NOT re-verify modified-file evidence on the webhook —
+# that requires an LLM call, and the value (faster downgrade of "this
+# specific line in this specific file no longer references B") is small
+# vs. the complexity (per-push LLM cost, DLQ-on-failure, etc.). The nightly
+# cross-repo refresh re-runs full extraction with content_hash caching, so
+# any modified-file edge change converges within 24h. New edges introduced
+# by a push are also nightly's job.
+#
+# Net behavior: removals from the webhook are immediate and free (no LLM),
+# additions/modifications come from the nightly pass.
 
 
 async def update_edges_after_push(
@@ -618,48 +518,30 @@ async def update_edges_after_push(
     customer_id: str,
     source_repo: str,
     removed_files: list[str],
-    modified_files: list[str],
-    file_contents: dict[str, str],
-    client: Any | None = None,
 ) -> dict[str, int]:
-    """Re-evaluate this repo's outbound edges after a push.
-
-    Finds evidence whose ``file_path`` is in ``removed_files`` (auto-
-    drop) or ``modified_files`` (LLM re-verify). Persists the result:
-    update ``properties.evidence`` when an edge survives, delete the
-    edge when no evidence remains. New edges introduced by the push
-    are NOT discovered here — that's the nightly cross-repo refresh
-    pass.
+    """Drop evidence rows pointing at removed files; delete now-empty edges.
 
     Returns counts for logging:
-      - ``edges_examined`` : edges read from DB before any change
-      - ``evidence_dropped``: rows removed across all edges
+      - ``edges_examined`` : outbound edges read from DB
+      - ``evidence_dropped``: evidence rows removed across all edges
       - ``edges_deleted``   : edges whose evidence list became empty
       - ``edges_updated``   : edges whose evidence shrank but survived
-      - ``verifier_failures``: edges whose LLM call failed; the caller
-        should DLQ the push when this is non-zero. Removal-only paths
-        (no LLM needed) NEVER bump this counter — they always succeed.
     """
     counts = {
         "edges_examined": 0,
         "evidence_dropped": 0,
         "edges_deleted": 0,
         "edges_updated": 0,
-        "verifier_failures": 0,
     }
-    if not removed_files and not modified_files:
+    if not removed_files:
         return counts
 
     removed_set = set(removed_files)
-    # Convert modified file paths to a content dict keyed identically.
-    # `file_contents` may also include added files — caller normalizes.
 
     async with with_tenant(customer_id) as conn:
-        # Pull existing outbound DEPENDS_ON edges + each edge's evidence.
         rows = await conn.fetch(
             """
             SELECT e.edge_id,
-                   n_to.canonical_id AS target_repo,
                    e.properties->'evidence' AS evidence
             FROM graph_edges e
             JOIN graph_nodes n_from
@@ -682,7 +564,6 @@ async def update_edges_after_push(
         return counts
 
     for row in rows:
-        target_repo = row["target_repo"]
         raw_evidence = row["evidence"]
         if isinstance(raw_evidence, (str, bytes, bytearray)):
             try:
@@ -692,56 +573,23 @@ async def update_edges_after_push(
         if not isinstance(raw_evidence, list):
             raw_evidence = []
 
-        # Build typed evidence list, dropping rows whose file was REMOVED.
-        evidence: list[EvidenceEntry] = []
-        dropped_for_removal = 0
+        kept: list[dict[str, Any]] = []
+        dropped = 0
         for e in raw_evidence:
             if not isinstance(e, dict):
                 continue
             file_path = str(e.get("file_path") or "")
-            if not file_path or file_path in removed_set:
-                if file_path in removed_set:
-                    dropped_for_removal += 1
+            if file_path and file_path in removed_set:
+                dropped += 1
                 continue
-            evidence.append(
-                EvidenceEntry(
-                    target_repo=target_repo,
-                    file_path=file_path,
-                    line=int(e.get("line") or 0),
-                    snippet=str(e.get("snippet") or ""),
-                )
-            )
+            kept.append(e)
 
-        # Re-verify against modified-file contents only when at least
-        # one evidence row needs the LLM. Pure removal-only paths skip
-        # the LLM entirely (no verifier_failures risk) — important so
-        # that pushes that delete a referencing file always make
-        # progress even when Gemini is down.
-        needs_llm = any(e.file_path in file_contents for e in evidence)
-        if needs_llm:
-            kept_indices = await reverify_evidence_with_llm(
-                source_repo=source_repo,
-                evidence=evidence,
-                file_contents=file_contents,
-                client=client,
-            )
-            if kept_indices is None:
-                # Verifier failed. Persist removal-only changes (we
-                # already filtered evidence above for files in
-                # removed_set), keep modified-file evidence as-is, bump
-                # the failure counter so the caller can DLQ the push.
-                counts["verifier_failures"] += 1
-                kept_evidence = list(evidence)
-            else:
-                kept_evidence = [evidence[i] for i in sorted(kept_indices)]
-        else:
-            kept_evidence = list(evidence)
+        if dropped == 0:
+            continue
 
-        new_dropped = (len(evidence) - len(kept_evidence)) + dropped_for_removal
-        counts["evidence_dropped"] += new_dropped
+        counts["evidence_dropped"] += dropped
 
-        if not kept_evidence:
-            # No evidence survives — drop the edge.
+        if not kept:
             async with with_tenant(customer_id) as conn:
                 await conn.execute(
                     "DELETE FROM graph_edges WHERE edge_id = $1 AND customer_id = $2",
@@ -749,18 +597,7 @@ async def update_edges_after_push(
                     customer_id,
                 )
             counts["edges_deleted"] += 1
-        elif new_dropped > 0:
-            # Edge survives with reduced evidence — refresh properties.
-            new_props = {
-                "evidence": [
-                    {
-                        "file_path": e.file_path,
-                        "line": e.line,
-                        "snippet": e.snippet,
-                    }
-                    for e in kept_evidence
-                ],
-            }
+        else:
             async with with_tenant(customer_id) as conn:
                 await conn.execute(
                     """
@@ -768,7 +605,7 @@ async def update_edges_after_push(
                     SET properties = $1
                     WHERE edge_id = $2 AND customer_id = $3
                     """,
-                    orjson.dumps(new_props).decode(),
+                    orjson.dumps({"evidence": kept}).decode(),
                     row["edge_id"],
                     customer_id,
                 )
@@ -1003,272 +840,17 @@ async def extract_cross_repo_deps(
     return aggregate_to_edges(source_repo, verified)
 
 
-# ---------------------------------------------------------------------------
-# DLQ (deferred verifier failures)
-# ---------------------------------------------------------------------------
-
-
-# Cap retry attempts so a permanently-broken token / sha doesn't loop
-# forever. Three nightly tries is a week of opportunity.
-_DLQ_MAX_ATTEMPTS = 3
-
-
-async def enqueue_reverify_dlq(
-    *,
-    customer_id: str,
-    source_repo: str,
-    sha: str,
-    removed_files: list[str],
-    modified_files: list[str],
-    integration_token_id: str | None,
-    error: str | None = None,
-) -> int:
-    """Park a failed verifier run for later retry. Returns the dlq_id.
-
-    Idempotency: do NOT collapse on (customer, repo, sha) — a single
-    sha may arrive via multiple webhooks (rebase, force-push) and each
-    one's file lists matter. Let the retry pass deduplicate by SHA in
-    its own SELECT if needed.
-    """
-    async with with_tenant(customer_id) as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO cross_repo_reverify_dlq
-                (customer_id, source_repo, sha, removed_files, modified_files,
-                 integration_token_id, status, last_error)
-            VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
-            RETURNING dlq_id
-            """,
-            customer_id,
-            source_repo,
-            sha,
-            orjson.dumps(removed_files).decode(),
-            orjson.dumps(modified_files).decode(),
-            integration_token_id,
-            error,
-        )
-    if row is None:
-        raise RuntimeError("DLQ insert returned no row")
-    log.info(
-        "cross_repo_deps.dlq_enqueued",
-        customer=customer_id,
-        source_repo=source_repo,
-        dlq_id=row["dlq_id"],
-        modified_count=len(modified_files),
-        removed_count=len(removed_files),
-    )
-    return int(row["dlq_id"])
-
-
-async def drain_reverify_dlq(
-    *,
-    fetch_files_at_sha: Any,
-    resolve_token: Any,
-    max_rows: int = 100,
-) -> dict[str, int]:
-    """Replay pending DLQ rows. Used by the nightly cron.
-
-    `fetch_files_at_sha` and `resolve_token` are passed as callables to
-    keep this module free of an ingestion-handlers import cycle. The
-    nightly cron module wires them up.
-
-    For each pending row:
-      1. Resolve the token (from integration_token_id) via `resolve_token`
-      2. Fetch modified file contents at the recorded sha via
-         `fetch_files_at_sha`
-      3. Re-run `update_edges_after_push`
-      4. Mark `done` on success, increment attempts on retry-able
-         failure, mark `failed` after _DLQ_MAX_ATTEMPTS strikes
-
-    Returns counts: ``processed``, ``done``, ``retry``, ``failed``.
-    """
-    summary = {"processed": 0, "done": 0, "retry": 0, "failed": 0}
-    # Read all pending rows up to the cap. We don't FOR UPDATE SKIP
-    # LOCKED here — only one cron machine drains the DLQ, contention
-    # is a non-issue.
-    pending: list[asyncpg.Record] = []
-    async with _raw_pool_conn() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT dlq_id, customer_id, source_repo, sha, removed_files,
-                   modified_files, integration_token_id, attempts
-            FROM cross_repo_reverify_dlq
-            WHERE status = 'pending'
-              AND attempts < $1
-            ORDER BY enqueued_at ASC
-            LIMIT $2
-            """,
-            _DLQ_MAX_ATTEMPTS,
-            max_rows,
-        )
-        pending = list(rows)
-
-    for row in pending:
-        summary["processed"] += 1
-        dlq_id = int(row["dlq_id"])
-        customer_id = row["customer_id"]
-        source_repo = row["source_repo"]
-        sha = row["sha"]
-        token_id = row["integration_token_id"]
-
-        await _mark_dlq_processing(dlq_id)
-
-        removed_raw = row["removed_files"]
-        modified_raw = row["modified_files"]
-        removed_files = (
-            orjson.loads(removed_raw)
-            if isinstance(removed_raw, (str, bytes, bytearray))
-            else (removed_raw or [])
-        )
-        modified_files = (
-            orjson.loads(modified_raw)
-            if isinstance(modified_raw, (str, bytes, bytearray))
-            else (modified_raw or [])
-        )
-
-        try:
-            token = await resolve_token(customer_id, token_id) if token_id else None
-            file_contents: dict[str, str] = {}
-            if modified_files:
-                fetched = await fetch_files_at_sha(
-                    repo=source_repo,
-                    sha=sha,
-                    paths=modified_files,
-                    token=token,
-                    customer_id=customer_id,
-                )
-                for f in fetched:
-                    if not getattr(f, "not_found", False):
-                        file_contents[f.rel_path] = f.content
-
-            counts = await update_edges_after_push(
-                customer_id=customer_id,
-                source_repo=source_repo,
-                removed_files=removed_files,
-                modified_files=list(file_contents.keys()),
-                file_contents=file_contents,
-            )
-
-            if counts["verifier_failures"] > 0:
-                # LLM still down — bump attempts, leave row pending.
-                await _bump_dlq_attempts(
-                    dlq_id, error="verifier_failures persisting"
-                )
-                summary["retry"] += 1
-            else:
-                await _mark_dlq_done(dlq_id)
-                summary["done"] += 1
-        except Exception as exc:
-            err = f"{type(exc).__name__}: {exc!s}"[:480]
-            await _bump_dlq_attempts(dlq_id, error=err)
-            log.warning(
-                "cross_repo_deps.dlq_retry_error",
-                customer=customer_id,
-                dlq_id=dlq_id,
-                error=err,
-            )
-            summary["retry"] += 1
-
-    # Promote attempts==MAX still-pending rows to 'failed' so they stop
-    # showing up in the next run's pending scan.
-    async with _raw_pool_conn() as conn:
-        promoted = await conn.execute(
-            """
-            UPDATE cross_repo_reverify_dlq
-            SET status = 'failed'
-            WHERE status = 'pending' AND attempts >= $1
-            """,
-            _DLQ_MAX_ATTEMPTS,
-        )
-        # promoted is "UPDATE n"; not strictly needed for caller
-        log.info(
-            "cross_repo_deps.dlq_drain_done",
-            promoted_to_failed=promoted,
-            **summary,
-        )
-        summary["failed"] = _parse_update_count(promoted)
-
-    return summary
-
-
-async def _mark_dlq_processing(dlq_id: int) -> None:
-    async with _raw_pool_conn() as conn:
-        await conn.execute(
-            """
-            UPDATE cross_repo_reverify_dlq
-            SET status = 'processing', last_attempt_at = NOW()
-            WHERE dlq_id = $1
-            """,
-            dlq_id,
-        )
-
-
-async def _mark_dlq_done(dlq_id: int) -> None:
-    async with _raw_pool_conn() as conn:
-        await conn.execute(
-            """
-            UPDATE cross_repo_reverify_dlq
-            SET status = 'done', last_attempt_at = NOW()
-            WHERE dlq_id = $1
-            """,
-            dlq_id,
-        )
-
-
-async def _bump_dlq_attempts(dlq_id: int, *, error: str) -> None:
-    async with _raw_pool_conn() as conn:
-        await conn.execute(
-            """
-            UPDATE cross_repo_reverify_dlq
-            SET status = 'pending',
-                attempts = attempts + 1,
-                last_error = $2,
-                last_attempt_at = NOW()
-            WHERE dlq_id = $1
-            """,
-            dlq_id,
-            error,
-        )
-
-
-async def _raw_pool_conn():
-    """Connection helper for the DLQ table. Uses the standard pool with
-    no tenant GUC because cross_repo_reverify_dlq has no RLS — it's
-    cross-customer admin data, same convention as ingestion_queue.
-    """
-    from shared.db import raw_conn
-
-    return raw_conn()
-
-
-def _parse_update_count(stmt_status: str | None) -> int:
-    """Extract the row-count from asyncpg's `UPDATE n` status string."""
-    if not stmt_status:
-        return 0
-    parts = stmt_status.split()
-    if len(parts) >= 2 and parts[0] == "UPDATE":
-        try:
-            return int(parts[1])
-        except ValueError:
-            return 0
-    return 0
-
-
 __all__ = [
     "CandidateMatch",
     "CrossRepoEdge",
-    "EvidenceEntry",
     "VerifiedMatch",
     "aggregate_to_edges",
     "classify_with_llm",
     "collect_candidates",
-    "drain_reverify_dlq",
-    "enqueue_reverify_dlq",
     "extract_cross_repo_deps",
     "list_other_known_repos",
     "list_tracked_files",
     "persist_cross_repo_edges",
     "repo_name_variants",
-    "reverify_evidence_with_llm",
     "update_edges_after_push",
 ]
