@@ -16,33 +16,21 @@ agent-facing shape, not a router output.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, Field
 
 # ---------------------------------------------------------------------------
 # WikiType — the page-kind discriminator.
 #
-# v1 had 4 topical types (service_card / decision / feature / runbook).
-# Bootstrap (migration 0043) extends with 6 entity types so crawlers can
-# emit person/company/vendor/customer/project/event pages alongside the
-# topical ones. The DB stores wiki_type as TEXT (no CHECK constraint), so
-# extending here is a pure code change. Single source of truth — both the
-# data-shape models below and the agent tool schemas in agent_tools.py
-# import this literal.
+# Free-form string. The wiki agent picks page-type slugs as it sees fit
+# (typically `repo`, `runbook`, `person`, but the LLM is free to invent
+# new ones for a given customer's corpus). Validation is purely a
+# URL-safety regex enforced at the ingestion route boundary
+# (services/ingestion/handlers/wiki.is_valid_wiki_type) — the model
+# layer treats it as opaque text.
 # ---------------------------------------------------------------------------
-WikiType = Literal[
-    "service_card",
-    "decision",
-    "feature",
-    "runbook",
-    "person",
-    "company",
-    "vendor",
-    "customer",
-    "project",
-    "event",
-]
+WikiType = str
 
 
 # ---------------------------------------------------------------------------

@@ -35,7 +35,7 @@ from services.ingestion.handlers.wiki import (
     build_normalization_result,
 )
 from services.ingestion.normalizer import Normalizer
-from services.synthesis import persistence
+from services.synthesis import index_renderer, persistence
 from services.synthesis.agent_tools import (
     TOOL_VALIDATORS,
     CreatePageArgs,
@@ -49,8 +49,9 @@ from services.synthesis.agent_tools import (
 )
 from services.synthesis.wiki_links import extract_links, persist_links_for_page
 from shared.constants import (
-    INDEXABLE_WIKI_DOC_TYPES,
     WIKI_AGENT_BATCH_SIZE,
+    WIKI_DOC_TYPE_PREFIX,
+    WIKI_INDEX_DOC_TYPE,
     CompileTrigger,
     DocClass,
     SourceSystem,
@@ -68,9 +69,6 @@ log = get_logger(__name__)
 
 # 6KB pages for get_event_body. Per the plan: pages are 6000 chars.
 _EVENT_BODY_PAGE_SIZE = 6000
-
-
-_INDEX_USER_DOC_TYPES: list[str] = [dt.value for dt in INDEXABLE_WIKI_DOC_TYPES]
 
 
 @dataclass(slots=True)
@@ -729,28 +727,30 @@ class WikiAgentRuntime:
                 FROM documents
                 WHERE customer_id = $1
                   AND source_system = $2
-                  AND doc_type = ANY($3::text[])
+                  AND doc_type LIKE $3
+                  AND doc_type <> $4
                   AND valid_to IS NULL
                   AND deleted_at IS NULL
                 ORDER BY updated_at DESC
                 """,
                 self.customer_id,
                 SourceSystem.WIKI.value,
-                _INDEX_USER_DOC_TYPES,
+                f"{WIKI_DOC_TYPE_PREFIX}%",
+                WIKI_INDEX_DOC_TYPE,
             )
-        body = persistence.render_index_markdown(rows)
+        body = await index_renderer.render_index_via_llm(rows)
         received_at = datetime.now(UTC)
         raw_payload: dict[str, Any] = {
             WIKI_PAYLOAD_KEY: {
                 "wiki_type": "index",
                 "slug": INDEX_SLUG,
-                "title": "Wiki - Table of Contents",
+                "title": "Wiki",
                 "body": body,
                 "frontmatter": {"page_count": len(rows)},
                 "doc_class": DocClass.AGENT_ARTIFACT.value,
                 "is_delete": False,
                 "updated_at": received_at.isoformat(),
-                "summary": f"Auto-generated table of contents ({len(rows)} pages).",
+                "summary": f"Wiki overview ({len(rows)} pages).",
                 "commit_message": (
                     f"Regenerate index ({len(rows)} pages) from agent run #{self._run_id}"
                 ),

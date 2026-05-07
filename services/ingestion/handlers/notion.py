@@ -745,7 +745,7 @@ class NotionConnector(Connector):
                 label=NodeLabel.DOCUMENT,
                 canonical_id=doc_id,
                 properties={
-                    "doc_type": doc.doc_type.value,
+                    "doc_type": doc.doc_type,
                     "workspace_id": workspace_id,
                 },
             ),

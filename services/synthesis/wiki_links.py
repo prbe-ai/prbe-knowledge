@@ -39,15 +39,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Literal, get_args
+from typing import Any, Literal
 
-from services.synthesis.models import WikiType
+from services.ingestion.handlers.wiki import is_valid_wiki_type
 from shared.logging import get_logger
 
 log = get_logger(__name__)
-
-# Allowed wiki_types — single source of truth lives in models.py.
-_WIKI_TYPES: frozenset[str] = frozenset(get_args(WikiType))
 
 # Markdown link grammar. The body uses `[[type:slug]]`, optionally with
 # one or two `|`-separated suffixes. Both `type` and `slug` use a
@@ -107,13 +104,14 @@ def _build_context(body: str, start: int, end: int) -> str:
 
 
 def _validate_type(dst_wiki_type: str, *, where: str, slug: str) -> bool:
-    """Return True iff `dst_wiki_type` is in the WikiType allowlist.
+    """Return True iff ``dst_wiki_type`` matches the URL-safe wiki_type shape.
 
-    Logs a warning for the caller (synthesis worker / writer) when an
-    agent emits a typo'd wiki_type. We never raise — the page is more
-    important than the link graph.
+    Wiki page kinds are free-form (the LLM picks them); the only
+    constraint is the same regex the ingestion route enforces, so a
+    `[[<script>:foo]]` injection attempt doesn't slip through. We never
+    raise — the page is more important than the link graph.
     """
-    if dst_wiki_type in _WIKI_TYPES:
+    if is_valid_wiki_type(dst_wiki_type):
         return True
     log.warning(
         "wiki_links.invalid_type",

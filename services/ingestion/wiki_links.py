@@ -6,14 +6,14 @@ Parses typed entity references inside wiki page bodies:
     [[Person: Mahit]]           kind="person", target="Mahit"
     [[Service: prbe-knowledge]] kind="service", target="prbe-knowledge"
     [[Repo: prbe-knowledge]]    kind="repo", target="prbe-knowledge"
-    [[Ticket: PRB-9]]           kind="ticket", target="PRB-9"
-    [[Feature: auth]]           kind="feature", target="auth"
-    [[Decision: pgvector]]      kind="decision", target="pgvector"
+    [[Anything: foo]]           kind="anything", target="foo"
 
-A token before the colon that we don't recognize collapses to `kind="plain"`
-(target keeps the full inner text) — so unknown forms don't silently drop
-references; the connector still emits an unresolved-link entry the future
-lint job can flag.
+The token before the colon is free-form (the LLM picks page kinds),
+matched against a URL-safe regex (lowercase letters/digits/underscore,
+1-32 chars). A token that doesn't match the shape collapses to
+``kind="plain"`` so unknown forms don't silently drop references — the
+connector still emits an unresolved-link entry the future lint job can
+flag.
 
 Sibling parser: `services/kg/links.py` (PR #47, debugging knowledge graph)
 parses a different `[[...]]` grammar — `[[ClassName/file/path]]` and
@@ -38,11 +38,9 @@ from pydantic import BaseModel
 # linear; `[[a [b] c]]` parses as a plain link with target `a [b] c`.
 _LINK_RE: Final = re.compile(r"\[\[([^\[\]\n]+?)\]\]")
 
-# Recognized type prefixes. The token before the colon is lower-cased + spaces
-# stripped before the lookup, so `[[ Person: x]]` matches.
-_KNOWN_KINDS: Final[frozenset[str]] = frozenset(
-    {"person", "service", "repo", "ticket", "feature", "decision"}
-)
+# Wiki types are free-form — anything matching this regex (URL-safe slug
+# shape) becomes a typed link. Other prefixes collapse to kind="plain".
+_KIND_RE: Final = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 
 class WikiPageLink(BaseModel):
@@ -95,7 +93,7 @@ def _split_kind(inner: str) -> tuple[str, str]:
         # Colon present but no target — treat the whole thing as plain so the
         # raw form survives into dangling-link surfacing.
         return "plain", inner
-    if head_norm in _KNOWN_KINDS:
+    if _KIND_RE.match(head_norm):
         return head_norm, target
     return "plain", inner
 

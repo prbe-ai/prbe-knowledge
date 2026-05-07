@@ -776,7 +776,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
             doc.source_id,
             doc.source_url,
             doc.doc_class.value,
-            doc.doc_type.value,
+            doc.doc_type,
             doc.content_type,
             doc.language,
             doc.content_hash,

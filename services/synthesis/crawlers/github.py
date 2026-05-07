@@ -36,7 +36,7 @@ import base64
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, ClassVar, get_args
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -81,9 +81,18 @@ _PAGE_SIZE = 50
 _REVIEW_PAGE_SIZE = 100
 _SOURCE_KIND = "github"
 
-# Wiki type literal — pulled from the Pydantic literal so adding a new
-# wiki_type in models.py automatically widens the validators.
-_WIKI_TYPES = list(get_args(WikiType))
+# Free-form wiki_type schema for the crawler's tool palette. Mirrors
+# `services.synthesis.agent_tools._WIKI_TYPE_SCHEMA` — the agent picks
+# slugs as it sees fit; URL-safety is enforced at persistence time.
+_WIKI_TYPE_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "The page-kind discriminator. Pick from `repo`, `runbook`, "
+        "`person`, `company`, `customer`, `project`, `event` — or "
+        "invent a new one if the corpus calls for it. Lowercase, "
+        "alphanumeric + underscore, <= 32 chars."
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +291,7 @@ def _wiki_raw_save_tool() -> dict[str, Any]:
             "type": "object",
             "properties": {
                 "source_ref": {"type": "string"},
-                "wiki_type": {"type": "string", "enum": _WIKI_TYPES},
+                "wiki_type": _WIKI_TYPE_SCHEMA,
                 "slug": {"type": "string"},
                 "payload": {"type": "object"},
             },
@@ -303,7 +312,7 @@ def _record_timeline_tool() -> dict[str, Any]:
         "parameters": {
             "type": "object",
             "properties": {
-                "wiki_type": {"type": "string", "enum": _WIKI_TYPES},
+                "wiki_type": _WIKI_TYPE_SCHEMA,
                 "slug": {"type": "string"},
                 "entry_date": {"type": "string"},
                 "source_ref": {"type": "string"},

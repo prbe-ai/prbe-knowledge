@@ -738,9 +738,12 @@ async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:
     Includes only user-authored types (no auto-index page); the agent
     can call read_page(...) for any individual body.
     """
-    from shared.constants import INDEXABLE_WIKI_DOC_TYPES, SourceSystem
+    from shared.constants import (
+        WIKI_DOC_TYPE_PREFIX,
+        WIKI_INDEX_DOC_TYPE,
+        SourceSystem,
+    )
 
-    wiki_doc_types = [dt.value for dt in INDEXABLE_WIKI_DOC_TYPES]
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(
             """
@@ -748,14 +751,16 @@ async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:
             FROM documents
             WHERE customer_id = $1
               AND source_system = $2
-              AND doc_type = ANY($3::text[])
+              AND doc_type LIKE $3
+              AND doc_type <> $4
               AND valid_to IS NULL
               AND deleted_at IS NULL
             ORDER BY updated_at DESC
             """,
             customer_id,
             SourceSystem.WIKI.value,
-            wiki_doc_types,
+            f"{WIKI_DOC_TYPE_PREFIX}%",
+            WIKI_INDEX_DOC_TYPE,
         )
     out: list[dict[str, Any]] = []
     for row in rows:

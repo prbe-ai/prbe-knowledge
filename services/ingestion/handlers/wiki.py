@@ -6,7 +6,8 @@ the route synthesizes a `WebhookEvent` whose `raw_payload[WIKI_PAYLOAD_KEY]`
 carries everything `normalize` needs:
 
     {"wiki_page": {
-        "wiki_type": "runbook" | "decision" | "feature" | "service_card",
+        "wiki_type": "repo" | "runbook" | "person" | "company"
+                     | "customer" | "project" | "event",
         "slug": "<a-z0-9->",
         "title": "...",
         "body": "<markdown>",                  # required, persisted via chunks
@@ -32,6 +33,7 @@ read every wiki page). Per-page ACLs are a Phase 2 concern.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
@@ -41,9 +43,9 @@ from services.ingestion.handlers.base import Connector
 from services.ingestion.handlers.registry import register_connector
 from services.ingestion.wiki_links import WikiPageLink, parse_page_links
 from shared.constants import (
+    WIKI_DOC_TYPE_PREFIX,
     CompileTrigger,
     DocClass,
-    DocType,
     EdgeType,
     IngestionEventType,
     NodeLabel,
@@ -70,32 +72,14 @@ log = get_logger(__name__)
 # The payload key inside `WebhookEvent.raw_payload` that carries the upload.
 WIKI_PAYLOAD_KEY = "wiki_page"
 
-# URL / payload `wiki_type` string -> DocType enum value.
-WIKI_TYPE_TO_DOC_TYPE: dict[str, DocType] = {
-    "service_card": DocType.WIKI_SERVICE_CARD,
-    "decision": DocType.WIKI_DECISION,
-    "feature": DocType.WIKI_FEATURE,
-    "runbook": DocType.WIKI_RUNBOOK,
-    # Bootstrap-only entity types (migration 0044). The synthesis cron is
-    # allowed to write these via build_normalization_result; the user-
-    # authored PUT/DELETE routes still reject them via USER_AUTHORED_WIKI_TYPES.
-    "person": DocType.WIKI_PERSON_PAGE,
-    "company": DocType.WIKI_COMPANY,
-    "vendor": DocType.WIKI_VENDOR,
-    "customer": DocType.WIKI_CUSTOMER,
-    "project": DocType.WIKI_PROJECT,
-    "event": DocType.WIKI_EVENT,
-    # The auto-generated table of contents. Singleton per customer.
-    # User-facing PUT/DELETE routes reject this type — only the synthesis
-    # cron writes it. GET /api/wiki/index reads it.
-    "index": DocType.WIKI_INDEX,
-}
+# wiki_type slugs are free-form (the LLM picks them) but must conform to
+# this shape so they're URL-safe and don't allow path/SQL/HTML weirdness.
+# Lowercase letters/digits/underscore, 1-32 chars, must start with a letter.
+_WIKI_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
-# Subset of wiki_types that humans can author through PUT/DELETE. The cron
-# is allowed to write any type via build_normalization_result directly.
-USER_AUTHORED_WIKI_TYPES: frozenset[str] = frozenset(
-    {"service_card", "decision", "feature", "runbook"}
-)
+
+def is_valid_wiki_type(wiki_type: object) -> bool:
+    return isinstance(wiki_type, str) and bool(_WIKI_TYPE_RE.match(wiki_type))
 
 # Singleton slug for the auto-generated index page. The cron always writes
 # `wiki:index:contents`; GET /api/wiki/index resolves to that doc_id.
@@ -116,8 +100,6 @@ _LINK_NODE_MAP: dict[str, tuple[NodeLabel, EdgeType]] = {
     "service": (NodeLabel.SERVICE, EdgeType.DESCRIBES),
     "repo": (NodeLabel.REPO, EdgeType.DESCRIBES),
     "ticket": (NodeLabel.TICKET, EdgeType.DESCRIBES),
-    "feature": (NodeLabel.FEATURE, EdgeType.DESCRIBES),
-    "decision": (NodeLabel.DECISION, EdgeType.DESCRIBES),
 }
 
 
@@ -148,10 +130,10 @@ class WikiConnector(Connector):
 
         wiki_type = wiki.get("wiki_type")
         slug = wiki.get("slug")
-        if wiki_type not in WIKI_TYPE_TO_DOC_TYPE:
+        if not is_valid_wiki_type(wiki_type):
             raise InvalidWebhookPayload(
-                f"unsupported wiki_type {wiki_type!r}; expected one of "
-                f"{sorted(WIKI_TYPE_TO_DOC_TYPE)}"
+                f"invalid wiki_type {wiki_type!r}; must match "
+                f"{_WIKI_TYPE_RE.pattern}"
             )
         if not isinstance(slug, str) or not slug:
             raise InvalidWebhookPayload("wiki payload missing string slug")
@@ -204,10 +186,10 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
 
     wiki_type = payload["wiki_type"]
     slug = payload["slug"]
-    if wiki_type not in WIKI_TYPE_TO_DOC_TYPE:
-        raise InvalidWebhookPayload(f"unsupported wiki_type {wiki_type!r}")
+    if not is_valid_wiki_type(wiki_type):
+        raise InvalidWebhookPayload(f"invalid wiki_type {wiki_type!r}")
 
-    doc_type = WIKI_TYPE_TO_DOC_TYPE[wiki_type]
+    doc_type = f"{WIKI_DOC_TYPE_PREFIX}{wiki_type}"
     doc_id = f"wiki:{wiki_type}:{slug}"
     source_id = f"{wiki_type}:{slug}"
     source_url = f"/wiki/{wiki_type}/{slug}"
@@ -357,7 +339,7 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
 
 def _build_graph(
     doc_id: str,
-    doc_type: DocType,
+    doc_type: str,
     links: list[WikiPageLink],
     valid_from: datetime,
 ) -> tuple[list[GraphNodeSpec], list[GraphEdgeSpec]]:
@@ -366,7 +348,7 @@ def _build_graph(
             label=NodeLabel.DOCUMENT,
             canonical_id=doc_id,
             properties={
-                "doc_type": doc_type.value,
+                "doc_type": doc_type,
                 "source_system": SourceSystem.WIKI.value,
             },
         ),

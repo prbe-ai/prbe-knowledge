@@ -50,10 +50,9 @@ from pydantic import BaseModel, Field, field_validator
 from services.ingestion.admin_routes import verify_internal_knowledge_key
 from services.ingestion.handlers.wiki import (
     INDEX_SLUG,
-    USER_AUTHORED_WIKI_TYPES,
     WIKI_PAYLOAD_KEY,
-    WIKI_TYPE_TO_DOC_TYPE,
     build_normalization_result,
+    is_valid_wiki_type,
 )
 from services.ingestion.normalizer import (
     Normalizer,
@@ -64,9 +63,10 @@ from services.ingestion.wiki_links import parse_page_links
 from services.synthesis.crawlers import REGISTRY as BACKFILL_CRAWLER_REGISTRY
 from shared.constants import (
     BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS,
-    INDEXABLE_WIKI_DOC_TYPES,
     WIKI_BACKFILL_CANCEL_CHANNEL,
     WIKI_BACKFILL_CHANNEL,
+    WIKI_DOC_TYPE_PREFIX,
+    WIKI_INDEX_DOC_TYPE,
     WIKI_PENDING_CHANNEL,
     DocClass,
     SourceSystem,
@@ -226,17 +226,21 @@ def _require_customer(
 def _validate_wiki_type(wiki_type: str) -> str:
     """Validate the path wiki_type for human-author routes (PUT/GET/DELETE).
 
-    The 'index' type is a singleton synthesized by the cron — never a valid
-    target for human upload, so we reject it here. The cron writes the
-    index by calling `build_normalization_result` directly.
+    wiki_type is free-form — the LLM picks slugs as it sees fit and we
+    don't gate that. We do reject the singleton 'index' type (cron-only)
+    plus any string that doesn't match the URL-safe shape `is_valid_wiki_type`
+    enforces, since human routes are admin-typed and a stray character
+    would store a permanent garbage row.
     """
-    if wiki_type not in USER_AUTHORED_WIKI_TYPES:
+    if wiki_type == "index":
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"unsupported wiki_type {wiki_type!r}; expected one of "
-                f"{sorted(USER_AUTHORED_WIKI_TYPES)}"
-            ),
+            detail="'index' is reserved for the auto-generated overview page",
+        )
+    if not is_valid_wiki_type(wiki_type):
+        raise HTTPException(
+            status_code=400,
+            detail="wiki_type must match ^[a-z][a-z0-9_]{0,31}$",
         )
     return wiki_type
 
@@ -507,7 +511,7 @@ async def list_wiki_pages(
     doc_type_filter: str | None = None
     if type is not None:
         _validate_wiki_type(type)
-        doc_type_filter = WIKI_TYPE_TO_DOC_TYPE[type].value
+        doc_type_filter = f"{WIKI_DOC_TYPE_PREFIX}{type}"
 
     async with with_tenant(customer_id) as conn:
         if doc_type_filter:
@@ -774,14 +778,16 @@ async def get_wiki_index(
             FROM documents
             WHERE customer_id = $1
               AND source_system = $2
-              AND doc_type = ANY($3::text[])
+              AND doc_type LIKE $3
+              AND doc_type <> $4
               AND valid_to IS NULL
               AND deleted_at IS NULL
             ORDER BY updated_at DESC
             """,
             customer_id,
             SourceSystem.WIKI.value,
-            [dt.value for dt in INDEXABLE_WIKI_DOC_TYPES],
+            f"{WIKI_DOC_TYPE_PREFIX}%",
+            WIKI_INDEX_DOC_TYPE,
         )
 
     entries: list[WikiIndexEntry] = []

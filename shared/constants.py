@@ -58,46 +58,22 @@ class DocType(StrEnum):
     MANUAL_UPLOAD_DOCX = "manual_upload.docx"
     MANUAL_UPLOAD_FILE = "manual_upload.file"
     CUSTOM_DOCUMENT = "custom.document"
-    WIKI_SERVICE_CARD = "wiki.service_card"
-    WIKI_DECISION = "wiki.decision"
-    WIKI_FEATURE = "wiki.feature"
-    WIKI_RUNBOOK = "wiki.runbook"
-    # Bootstrap-only entity types (migration 0044). Crawlers emit these to
-    # stitch the wiki's link graph; they aren't user-authored. Daily replay
-    # may also write them when it absorbs a crawler-seeded page.
-    WIKI_PERSON_PAGE = "wiki.person"
-    WIKI_COMPANY = "wiki.company"
-    WIKI_VENDOR = "wiki.vendor"
-    WIKI_CUSTOMER = "wiki.customer"
-    WIKI_PROJECT = "wiki.project"
-    WIKI_EVENT = "wiki.event"
-    # Auto-generated table of contents. Exactly one per customer; regenerated
-    # at the end of each synthesis run from the live set of wiki pages.
-    WIKI_INDEX = "wiki.index"
+    # Wiki pages use a free-form `wiki.<type>` doc_type stamped at write
+    # time from the LLM-emitted `wiki_type` slug — no enum, no validation
+    # gate. The synthesis agent decides what page kinds are useful for a
+    # given customer's corpus (typically `repo`, `runbook`, `person`, but
+    # nothing prevents new ones). The auto-generated overview page is
+    # written under `wiki.index`. Anywhere we need to filter for wiki
+    # pages in SQL: `WHERE doc_type LIKE 'wiki.%'`.
     CODE_SYMBOL = "code.symbol"
 
 
-# DocTypes that count as "wiki pages" for index/listing purposes — the union
-# of the original 4 user-authored types and the 6 bootstrap-only entity types
-# (migration 0044). Mirrors the entries in
-# `services/ingestion/handlers/wiki.py::WIKI_TYPE_TO_DOC_TYPE` (minus the
-# singleton WIKI_INDEX itself). Single source of truth for:
-#   - GET /api/wiki/index (services/ingestion/wiki_routes.py)
-#   - fetch_wiki_index (services/synthesis/persistence.py), used by the
-#     wiki/bootstrap agent's _tool_list_wiki_pages
-#   - _regenerate_index (services/synthesis/wiki_agent.py)
-INDEXABLE_WIKI_DOC_TYPES: tuple[DocType, ...] = (
-    DocType.WIKI_SERVICE_CARD,
-    DocType.WIKI_DECISION,
-    DocType.WIKI_FEATURE,
-    DocType.WIKI_RUNBOOK,
-    DocType.WIKI_PERSON_PAGE,
-    DocType.WIKI_COMPANY,
-    DocType.WIKI_VENDOR,
-    DocType.WIKI_CUSTOMER,
-    DocType.WIKI_PROJECT,
-    DocType.WIKI_EVENT,
-)
+# SQL pattern matching every wiki page doc_type (excludes the singleton
+# index page so listings don't show themselves). The schema stamps
+# wiki pages as `wiki.<wiki_type>` with no validation; this prefix +
+# the explicit `<> 'wiki.index'` exclusion is the canonical filter.
+WIKI_DOC_TYPE_PREFIX = "wiki."
+WIKI_INDEX_DOC_TYPE = "wiki.index"
 
 
 class NodeLabel(StrEnum):
