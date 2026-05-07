@@ -1,6 +1,6 @@
 """wipe all existing wiki data + drop decision/feature/vendor doc_types
 
-Revision ID: 0010_wipe_wiki_drop_decision_feature_vendor
+Revision ID: 0051_wipe_wiki_freeform_types
 Revises: 0050_add_target_to_wsr
 Create Date: 2026-05-07
 
@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0010_wipe_wiki_drop_decision_feature_vendor"
+revision = "0051_wipe_wiki_freeform_types"
 down_revision = "0050_add_target_to_wsr"
 branch_labels = None
 depends_on = None
