@@ -36,6 +36,12 @@ import httpx
 import pytest
 import respx
 
+from services.synthesis.crawlers.github import (
+    BackfillWikiRuntime,
+    GitHubCrawlerAgent,
+)
+from services.synthesis.wiki_links import extract_links
+
 # These snapshots encode the OLD wiki taxonomy (`service_card`,
 # `decision`, `feature` page kinds, plus `_KNOWN_KINDS`-gated link
 # parsing). Migration `0051_wipe_wiki_freeform_types` makes wiki_type
@@ -47,12 +53,6 @@ import respx
 pytestmark = pytest.mark.skip(
     reason="snapshots encode pre-0051 wiki taxonomy; re-baseline pending"
 )
-
-from services.synthesis.crawlers.github import (
-    BackfillWikiRuntime,
-    GitHubCrawlerAgent,
-)
-from services.synthesis.wiki_links import extract_links
 
 # ---------------------------------------------------------------------------
 # Paths
