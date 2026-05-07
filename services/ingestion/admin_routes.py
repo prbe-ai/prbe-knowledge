@@ -7,8 +7,9 @@ code-for-token exchange, because that calls connector classes that
 live in this service.
 
 Route layout:
-    POST   /api/oauth/{source}/exchange — token exchange + persist
-    POST   /api/queue/replay-dlq        — re-enqueue DLQ rows
+    POST   /api/oauth/{source}/exchange   — token exchange + persist
+    POST   /api/queue/replay-dlq          — re-enqueue DLQ rows
+    POST   /api/code-graph/reindex        — re-enqueue full backfill per repo
 """
 
 from __future__ import annotations
@@ -21,6 +22,11 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from services.ingestion.backfill_runner import enqueue_backfill
+from services.ingestion.code_graph.reindex import (
+    ReindexNotConnected,
+    ReindexResult,
+    reindex_customer,
+)
 from services.ingestion.handlers.registry import (
     build_connector,
     get_connector_class,
@@ -30,6 +36,7 @@ from shared.constants import QueueStatus, SourceSystem
 from shared.customer_mapping import record_mapping, resolve_customer
 from shared.db import raw_conn
 from shared.exceptions import (
+    GitHubAuthError,
     HandlerNotFound,
     NotSupportedByConnector,
     PrbeError,
@@ -348,3 +355,46 @@ async def replay_dlq(body: ReplayDLQRequest) -> ReplayDLQResponse:
         source=body.source_system,
     )
     return ReplayDLQResponse(requeued=len(queue_ids), queue_ids=queue_ids)
+
+
+# ---------------------------------------------------------------------------
+# Code-graph manual reindex.
+#
+# Re-enqueues an initial-backfill event per repo the customer's github
+# installation can see at HEAD. Idempotent on the same SHAs (the bridge's
+# UNIQUE on source_event_id dedupes), so re-clicking the dashboard's
+# "Reindex" cog without new commits is a no-op.
+# ---------------------------------------------------------------------------
+
+
+class ReindexCodeGraphRequest(BaseModel):
+    customer_id: str = Field(min_length=1, max_length=64)
+
+
+class ReindexCodeGraphResponse(BaseModel):
+    enqueued: int
+    skipped: int
+    repos: list[str]
+
+
+@router.post(
+    "/code-graph/reindex",
+    response_model=ReindexCodeGraphResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def code_graph_reindex(
+    body: ReindexCodeGraphRequest,
+) -> ReindexCodeGraphResponse:
+    try:
+        result: ReindexResult = await reindex_customer(body.customer_id)
+    except ReindexNotConnected as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubAuthError as exc:
+        # Backend installation-token endpoint is unhealthy or the install
+        # was uninstalled on the GitHub side. 502 — upstream auth dependency.
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return ReindexCodeGraphResponse(
+        enqueued=result.enqueued,
+        skipped=result.skipped,
+        repos=result.repos,
+    )
