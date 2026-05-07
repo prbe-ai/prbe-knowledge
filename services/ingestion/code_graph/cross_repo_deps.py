@@ -354,10 +354,13 @@ async def _call_classifier_llm(
             log.warning(f"{log_prefix}.google_genai_missing", error=str(exc))
             return None
 
-    # Hard-coded to Flash Lite. Versioned alias matters — the
-    # unversioned `gemini-flash-lite-preview` returns 404 (verified
-    # 2026-05-07).
-    model_name = "gemini-3.1-flash-lite-preview"
+    # Use Pro instead of Flash Lite for the classifier — Flash Lite reliably
+    # misclassifies wrong-direction evidence as REAL despite explicit prompt
+    # rules (see PRs #184 and #186). Pro follows directionality more
+    # reliably. The versioned `-preview` alias matches what
+    # services/synthesis/gemini_agent_client.py uses; the unversioned alias
+    # 404s.
+    model_name = "gemini-3.1-pro-preview"
 
     try:
         resp = await client.aio.models.generate_content(
@@ -465,6 +468,78 @@ _CLASSIFY_SYSTEM_PROMPT = (
 )
 
 
+# Belt-and-braces filter: even when the LLM classifies a candidate REAL,
+# regex-scan the evidence snippet for known wrong-direction phrasings.
+# When EVERY evidence snippet for a (source, target) pair matches a
+# wrong-direction pattern, the edge is in the wrong direction — the
+# reverse edge will be picked up when the target repo is scanned. We
+# rescue the pair if ANY snippet is forward-direction (the LLM may be
+# right that this code does call the target somewhere; one good cite
+# is enough).
+#
+# Patterns are repo-agnostic. Add new ones here as we learn about new
+# wrong-direction phrasings; over-strict is fine because the LLM
+# pre-filter has already kept the obvious REAL cases.
+_WRONG_DIRECTION_SNIPPET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "INTERNAL_<X>_API_KEY" — incoming auth key the OTHER repo presents
+    re.compile(r"\bINTERNAL_[A-Z_]+_API_KEY\b"),
+    # "<X> presents on/key/secret/value" — target presents a credential to source
+    re.compile(r"\bpresents\b\s+(?:on|the|key|secret|token|value)\b", re.IGNORECASE),
+    re.compile(r"\b\S+\s+presents\b", re.IGNORECASE),
+    # "used by the <X>" / "consumed by the <X>"
+    re.compile(r"\bused by the\b", re.IGNORECASE),
+    re.compile(r"\bconsumed by the\b", re.IGNORECASE),
+    # "for the <X> (watcher|daemon|consumer|caller)"
+    re.compile(r"\bfor the\b.{0,40}\b(?:watcher|daemon|consumer|caller)\b", re.IGNORECASE),
+    # "based on <X> callers" / "<X> caller identity"
+    re.compile(r"\bbased on\b.{0,40}\bcallers?\b", re.IGNORECASE),
+    re.compile(r"\bcaller identity\b", re.IGNORECASE),
+    # "<X> watcher calls /endpoint" — target component calls source's endpoint
+    re.compile(r"\b(?:watcher|daemon|consumer)\b\s+(?:calls?|hits?|fires?)\b", re.IGNORECASE),
+    # "Mirrors <X>'s pattern"
+    re.compile(r"\bmirrors\b.{0,40}\bpattern\b", re.IGNORECASE),
+    # "# Should be <X>'s ..." — env-var comment
+    re.compile(r"#\s*Should be\b\s+\S+'s\b", re.IGNORECASE),
+)
+
+
+def _is_wrong_direction_snippet(snippet: str) -> bool:
+    """True when ``snippet`` matches any known wrong-direction pattern."""
+    return any(p.search(snippet) for p in _WRONG_DIRECTION_SNIPPET_PATTERNS)
+
+
+def _filter_wrong_direction_evidence(
+    verified: list[VerifiedMatch],
+) -> list[VerifiedMatch]:
+    """Drop VerifiedMatches for any (source, target) pair whose evidence
+    is entirely wrong-direction phrasing.
+
+    Groups by ``target_repo`` so a single forward-direction cite rescues
+    the whole pair. When EVERY snippet for a target matches a
+    wrong-direction pattern, drop the group; the reverse edge will be
+    picked up when the target repo is scanned.
+    """
+    if not verified:
+        return verified
+
+    by_target: dict[str, list[VerifiedMatch]] = {}
+    for v in verified:
+        by_target.setdefault(v.target_repo, []).append(v)
+
+    kept: list[VerifiedMatch] = []
+    for target, group in by_target.items():
+        snippets = [m.snippet for m in group]
+        if all(_is_wrong_direction_snippet(s) for s in snippets):
+            log.info(
+                "cross_repo_deps.wrong_direction_filtered",
+                target=target,
+                snippet_count=len(snippets),
+            )
+            continue
+        kept.extend(group)
+    return kept
+
+
 async def classify_with_llm(
     *,
     source_repo: str,
@@ -533,7 +608,7 @@ async def classify_with_llm(
                 reason=reason,
             )
         )
-    return verified
+    return _filter_wrong_direction_evidence(verified)
 
 
 # ---------------------------------------------------------------------------
