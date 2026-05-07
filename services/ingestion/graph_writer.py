@@ -1,9 +1,11 @@
 """Upsert graph_nodes + graph_edges from connector output.
 
-Runs inside a with_tenant() transaction — RLS is set before this is called.
+Runs inside a with_tenant() transaction -- RLS is set before this is called.
 """
 
 from __future__ import annotations
+
+from datetime import datetime
 
 import asyncpg
 import orjson
@@ -102,17 +104,24 @@ async def upsert_edges(
     edges: list[GraphEdgeSpec],
     node_ids: dict[tuple[str, str], int],
     source_system: str,
+    extractor_id: str | None = None,
+    extracted_at: datetime | None = None,
 ) -> int:
     """Upsert edges. Returns count upserted.
 
-    Edges whose endpoints aren't in `node_ids` are silently skipped — the
+    Edges whose endpoints aren't in `node_ids` are silently skipped -- the
     normalizer is responsible for including the full node set in the same
     NormalizationResult.
 
     `source_system` is recorded on initial insert and preserved on conflict
     (first asserting source wins; edges are not multi-sourced today).
 
-    One INSERT regardless of edge count — same shape as upsert_nodes. The
+    `extractor_id` and `extracted_at` are optional provenance fields written
+    by the inferred-edges pipeline (Lane B). Both default to NULL for all
+    existing callers (back-compat). When set, they identify which prompt
+    version produced these edges and when.
+
+    One INSERT regardless of edge count -- same shape as upsert_nodes. The
     per-edge loop produced the same kind of row-lock-staircase contention
     on hot edges (every PR creates a `repo_contains_pr` edge anchored on
     the same repo node, etc.) that drove willow's DLQ flood.
@@ -181,10 +190,12 @@ async def upsert_edges(
         """
         INSERT INTO graph_edges (
             customer_id, edge_type, from_node_id, to_node_id,
-            properties, valid_from, valid_to, source_system, confidence
+            properties, valid_from, valid_to, source_system, confidence,
+            extractor_id, extracted_at
         )
         SELECT $1, edge_type, from_node_id, to_node_id,
-               properties::jsonb, COALESCE(valid_from, NOW()), valid_to, $2, confidence
+               properties::jsonb, COALESCE(valid_from, NOW()), valid_to, $2, confidence,
+               $10, $11
         FROM unnest(
             $3::text[], $4::bigint[], $5::bigint[],
             $6::text[], $7::timestamptz[], $8::timestamptz[], $9::text[]
@@ -199,7 +210,9 @@ async def upsert_edges(
                 WHEN EXCLUDED.confidence = 'EXTRACTED' THEN EXCLUDED.confidence
                 WHEN graph_edges.confidence = 'INFERRED' THEN graph_edges.confidence
                 ELSE EXCLUDED.confidence
-            END
+            END,
+            extractor_id  = COALESCE(EXCLUDED.extractor_id, graph_edges.extractor_id),
+            extracted_at  = COALESCE(EXCLUDED.extracted_at, graph_edges.extracted_at)
         RETURNING from_node_id, to_node_id, (xmax = 0) AS inserted
         """,
         customer_id,
@@ -211,6 +224,8 @@ async def upsert_edges(
         valid_from_list,
         valid_to_list,
         confidences,
+        extractor_id,
+        extracted_at,
     )
 
     # Collect all node_ids that are endpoints of genuinely-inserted edges.
