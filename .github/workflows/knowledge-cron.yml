@@ -1,0 +1,95 @@
+name: knowledge-cron
+
+# Nightly + scheduled one-shot jobs for the prbe-knowledge repo. Every
+# job here fires `flyctl machine run --command "..."` against the
+# prbe-knowledge-cron Fly app, which hosts a single image containing all
+# scheduled commands.
+#
+# Why one workflow with N jobs (instead of N workflow files):
+#   * Easy to see every scheduled job at a glance.
+#   * One place to bump the timeout / token / runner config.
+#   * GitHub Actions cron schedules are inexact within ~5 min; jobs that
+#     should NOT overlap (because they share DB locks or LLM rate limits)
+#     are spaced apart to keep them well-separated.
+
+on:
+  schedule:
+    # 02:00 UTC: wiki nightly trigger
+    - cron: "0 2 * * *"
+    # 03:00 UTC: leiden community-detection cron
+    - cron: "0 3 * * *"
+  # Manual trigger for ops + testing.
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which scheduled job to fire (wiki | leiden | all)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - wiki
+          - leiden
+
+jobs:
+  # -----------------------------------------------------------------------
+  # 02:00 UTC - wiki nightly trigger
+  #
+  # Connects, fires pg_notify per opted-in customer with pending rows,
+  # exits. The wiki-worker app's NotifyListener picks up the wake; the
+  # wiki-synthesis app picks up the triaged rows the worker produces.
+  # Decoupled so a long pebble drain doesn't hold the cron machine alive.
+  # -----------------------------------------------------------------------
+  wiki-nightly:
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.job == 'wiki' || inputs.job == 'all'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Run wiki nightly trigger
+        # `--rm` so the ephemeral machine cleans up after exit.
+        # `--command` overrides the toml's [processes].cron with the
+        # explicit module path — keeps the entry-point coupling local
+        # to this workflow.
+        run: |
+          flyctl machine run \
+            --app prbe-knowledge-cron \
+            --rm \
+            --command "python -m services.synthesis.nightly_trigger" \
+            --image registry.fly.io/prbe-knowledge-cron:latest
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  # -----------------------------------------------------------------------
+  # 03:00 UTC - leiden community-detection cron
+  #
+  # For each active customer with >=100 graph_edges, builds an igraph,
+  # runs Leiden, writes community_id back to graph_nodes. Used by the
+  # surprise_score() formula in the graph retriever (cross-community
+  # edges score higher).
+  #
+  # `scripts.leiden_one_shot --all-customers --yes` is the same script
+  # ops uses for manual runs; it loops every active customer with a
+  # per-customer advisory lock so concurrent fires never conflict.
+  # -----------------------------------------------------------------------
+  leiden-nightly:
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '0 3 * * *') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.job == 'leiden' || inputs.job == 'all'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60  # 1M-edge tenant Leiden takes ~3-5 min; bound at 60.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Run leiden community-detection
+        run: |
+          flyctl machine run \
+            --app prbe-knowledge-cron \
+            --rm \
+            --command "python -m scripts.leiden_one_shot --all-customers --yes" \
+            --image registry.fly.io/prbe-knowledge-cron:latest
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Sync .env to Fly secrets on the eight prbe-knowledge apps.
+# Sync .env to Fly secrets on the prbe-knowledge apps.
 #
 # Usage:
-#   scripts/fly-secrets-sync.sh                  # sync all eight apps
+#   scripts/fly-secrets-sync.sh                  # sync all apps
 #   scripts/fly-secrets-sync.sh ingestion        # sync a single app
 #   scripts/fly-secrets-sync.sh -f .env.staging  # use a different env file
 #
 # App shortcuts: ingestion | retrieval | worker | poller |
-#                wiki-worker | wiki-synthesis | wiki-cron | wiki-bootstrap |
-#                all (default)
+#                wiki-worker | wiki-synthesis | wiki-bootstrap |
+#                cron | side-worker | all (default)
 #
 # Requires: flyctl in PATH, logged in (`flyctl auth whoami`), and a .env file
 # at the repo root (override with -f). The file format is the standard KEY=VALUE
@@ -32,13 +32,13 @@ while [[ $# -gt 0 ]]; do
             awk '/^#!/{next} /^[^#]/{exit} {sub(/^# ?/,""); print}' "$0"
             exit 0
             ;;
-        ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-cron|wiki-bootstrap|all)
+        ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-bootstrap|cron|side-worker|all)
             TARGET="$1"
             shift
             ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 [ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-cron|wiki-bootstrap|all] [-f env-file]" >&2
+            echo "Usage: $0 [ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-bootstrap|cron|side-worker|all] [-f env-file]" >&2
             exit 1
             ;;
     esac
@@ -78,8 +78,9 @@ ALL_APPS=(
     "prbe-knowledge-poller"
     "prbe-knowledge-wiki-worker"
     "prbe-knowledge-wiki-synthesis"
-    "prbe-knowledge-wiki-cron"
     "prbe-knowledge-wiki-bootstrap"
+    "prbe-knowledge-cron"
+    "prbe-knowledge-side-worker"
 )
 
 case "$TARGET" in
@@ -90,8 +91,9 @@ case "$TARGET" in
     poller)          APPS=("prbe-knowledge-poller") ;;
     wiki-worker)     APPS=("prbe-knowledge-wiki-worker") ;;
     wiki-synthesis)  APPS=("prbe-knowledge-wiki-synthesis") ;;
-    wiki-cron)       APPS=("prbe-knowledge-wiki-cron") ;;
     wiki-bootstrap)  APPS=("prbe-knowledge-wiki-bootstrap") ;;
+    cron)            APPS=("prbe-knowledge-cron") ;;
+    side-worker)     APPS=("prbe-knowledge-side-worker") ;;
 esac
 
 # -- parse -------------------------------------------------------------------

@@ -1,7 +1,8 @@
 """Nightly trigger — refreshes cross-repo edges + wakes the wiki-worker.
 
-Runs as a fly machine schedule (the fly.wiki-cron.toml `[processes].cron`
-entry runs at 02:00 UTC daily). The script does two things in order:
+Scheduled by .github/workflows/knowledge-cron.yml (cron `0 2 * * *` UTC),
+which fires `flyctl machine run --command "python -m services.synthesis.nightly_trigger"`
+against the prbe-knowledge-cron Fly app. The script does two things in order:
 
   A. Refresh cross-repo dependency edges. Re-enqueue ``initial_backfill``
      events for every repo that has been code-graph-extracted before.
