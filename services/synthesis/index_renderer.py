@@ -49,24 +49,34 @@ _INDEX_SYSTEM_PROMPT = (
     "(title + 1-line summary + type). Produce a Markdown body that "
     "feels like a thoughtful overview, NOT a table of contents.\n\n"
     "**Do NOT emit a top-level `# Wiki` heading.** The dashboard "
-    "already renders the page title above your body — a `# Wiki` line "
-    "at the top would duplicate it. Start with the intro paragraph "
-    "directly, no heading.\n\n"
+    "already renders the page title above your body. That said, you "
+    "SHOULD lead with a `# {Company name}` heading where you infer the "
+    "company / product name from the corpus (typical signals: a repo "
+    "or service named `<name>-something`, a project page, recurring "
+    "mentions). One H1 per page.\n\n"
     "Required structure:\n\n"
-    "  1. **Intro** (~3-5 sentences). What is this company about, in "
-    "your own words, inferred from the page corpus? Mention the main "
-    "product / surface area / what's getting built. Do NOT list pages "
-    "here.\n\n"
+    "  1. **Intro** (~3-5 sentences) under that H1. What is this "
+    "company about? Mention the main product / surface area / what's "
+    "getting built. Do NOT list pages here.\n\n"
     "  2. **Architecture diagram** — a fenced ```mermaid block`` with "
-    "`graph TD` (top-down). Nodes = repos and services. Edges = "
-    "what-depends-on-what / what-talks-to-what, inferred from page "
-    "titles + summaries. Use the actual repo / service names as node "
-    "labels. Group related nodes with subgraphs when the structure is "
-    "obvious. Aim for 5-15 nodes; if the corpus is small, just emit "
-    "the nodes you can confidently relate. If you genuinely cannot "
-    "infer relationships, emit a tiny diagram with just the repos as "
-    "isolated nodes (still useful — shows the surface area). This "
-    "diagram is REQUIRED — even a 3-node graph beats no graph.\n\n"
+    "`graph TD` (top-down). Nodes = repos and services. Use the actual "
+    "repo / service names as node labels. Group related nodes with "
+    "subgraphs when the structure is obvious. Aim for 5-15 nodes.\n\n"
+    "    **Edge discipline (CRITICAL — read carefully):**\n"
+    "    Only emit an edge between two nodes when there is BIDIRECTIONAL "
+    "evidence in the corpus that the connection is real:\n"
+    "      - Page A's summary explicitly mentions B (e.g. 'depends on B', "
+    "'feeds B', 'reads from B'), AND\n"
+    "      - Page B's summary explicitly mentions A (or B is documented "
+    "as a thing A would talk to).\n\n"
+    "    Naming similarity (`prbe-foo` and `prbe-bar` share a prefix) "
+    "is NOT evidence. Past association (a repo that USED to be part of "
+    "the product but isn't referenced by current core services) is NOT "
+    "evidence — drop those edges. **Sparse accurate beats dense "
+    "speculative**: when in doubt, omit. A 5-node graph with 4 verified "
+    "edges is better than a 15-node graph where half the edges are "
+    "guesses. This diagram is REQUIRED — even a 3-node graph beats no "
+    "graph.\n\n"
     "  3. **Pages** — list every page with a wiki link. Organize them "
     "however makes sense for THIS corpus (group by product line, by "
     "team, by service, by type — your call). **Lead with the most "
@@ -74,11 +84,13 @@ _INDEX_SYSTEM_PROMPT = (
     "services come first (those are what the company actually builds), "
     "then runbooks, then people / customers / projects / events. Use "
     "`[[Title]]` syntax so the dashboard rewrites them into routed "
-    "links. Include the 1-line summary after each link.\n\n"
+    "links. Include the 1-line summary after each link. **Never emit "
+    "a bullet with no content** (`- ` on its own line) — every bullet "
+    "must have a page link AND a summary or be omitted.\n\n"
     "Tone: direct, builder-to-builder. No corporate language. Don't "
     "narrate ('Below you will find...'). Just write the page.\n\n"
-    "Output ONLY the Markdown body — no preamble, no top-level "
-    "`# Wiki` heading, no ```markdown fences around the whole thing."
+    "Output ONLY the Markdown body — no `# Wiki` heading at the top, "
+    "no ```markdown fences around the whole thing."
 )
 
 
@@ -204,6 +216,7 @@ async def render_index_via_llm(
         return _fallback_flat_list(pages)
 
     text = _strip_leading_wiki_heading(text)
+    text = _strip_empty_bullets(text)
     return text + "\n" if not text.endswith("\n") else text
 
 
@@ -213,6 +226,18 @@ async def render_index_via_llm(
 # beats trusting the model on every drain.
 _LEADING_WIKI_HEADING_RE = re.compile(r"^\s*#\s+Wiki\s*\n+", re.IGNORECASE)
 
+# Empty bullet lines — `- ` on its own with nothing after the dash, or
+# the same with a `[[]]` skeleton the model sometimes emits when it
+# loses track. Stripping these is preferable to rendering a phantom
+# bullet in the UI.
+_EMPTY_BULLET_RE = re.compile(
+    r"^[ \t]*[-*+][ \t]*(?:\[\[\s*\]\])?[ \t]*$\n?", re.MULTILINE
+)
+
 
 def _strip_leading_wiki_heading(text: str) -> str:
     return _LEADING_WIKI_HEADING_RE.sub("", text, count=1)
+
+
+def _strip_empty_bullets(text: str) -> str:
+    return _EMPTY_BULLET_RE.sub("", text)
