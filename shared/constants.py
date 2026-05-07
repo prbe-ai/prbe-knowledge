@@ -138,6 +138,54 @@ class NodeLabel(StrEnum):
     SYMBOL = "Symbol"
 
 
+# ---------------------------------------------------------------------------
+# Router entity_type -> graph_nodes.label mapping (single source of truth).
+#
+# The router (services/retrieval/router.py) emits typed entities like
+# {"entity_type": "pr", "canonical_id": "175"}. The graph retriever
+# (services/retrieval/retrievers/graph.py) needs to know which NodeLabel
+# corresponds to each router type to look those entities up. Historically
+# this dict lived inside the retriever, drifted from the router's enum
+# (services/retrieval/router.py:118-133), and silently dropped any
+# router-emitted type the retriever didn't recognise -- producing zero
+# graph hits with no error message.
+#
+# Keeping this in shared/ alongside NodeLabel guarantees the retriever
+# can't fall behind when the router adds a new entity type. mypy catches
+# any value that isn't a real NodeLabel; missing keys still need a human
+# to add them, but the graph retriever now logs + falls back gracefully
+# (see services/retrieval/retrievers/graph.py).
+# ---------------------------------------------------------------------------
+ROUTER_ENTITY_TO_LABEL: dict[str, NodeLabel] = {
+    # Router-emitted typed entities (kept in sync with the router prompt's
+    # entity_type enum at services/retrieval/router.py).
+    "service":     NodeLabel.SERVICE,
+    "repo":        NodeLabel.REPO,
+    "person":      NodeLabel.PERSON,
+    "ticket":      NodeLabel.TICKET,
+    "pr":          NodeLabel.PR,
+    "error_group": NodeLabel.ERROR_GROUP,
+    "channel":     NodeLabel.CHANNEL,
+    "feature":     NodeLabel.FEATURE,
+    "decision":    NodeLabel.DECISION,
+    # file_path is router-emitted but does not map 1:1 to a label -- file
+    # paths are sub-entities of a Repo, so we anchor on the repo node.
+    "file_path":   NodeLabel.REPO,
+    # session UUIDs are claude_code Document canonical_ids; anchoring lets
+    # the graph retriever follow inferred edges out of a session.
+    "session":     NodeLabel.DOCUMENT,
+
+    # Code-graph entities (extracted by tree-sitter at ingest, not by the
+    # router LLM, but the router can still emit these from queries that
+    # mention qualified symbol names like `Normalizer.process_queue_row`).
+    "function":    NodeLabel.FUNCTION,
+    "method":      NodeLabel.METHOD,
+    "class":       NodeLabel.CLASS,
+    "module":      NodeLabel.MODULE,
+    "symbol":      NodeLabel.SYMBOL,
+}
+
+
 class EdgeType(StrEnum):
     OWNS = "OWNS"
     MENTIONS = "MENTIONS"

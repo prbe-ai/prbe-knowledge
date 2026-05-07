@@ -13,9 +13,12 @@ from datetime import datetime
 
 from services.retrieval.surprise import surprise_score
 from services.retrieval.temporal import build_predicate
-from shared.constants import TOP_K_GRAPH
+from shared.constants import ROUTER_ENTITY_TO_LABEL, TOP_K_GRAPH
 from shared.db import with_tenant
+from shared.logging import get_logger
 from shared.models import TemporalSpec, normalize_author_id
+
+log = get_logger(__name__)
 
 # Feature flag: when true, graph hits receive a computed surprise score
 # instead of the flat 1.0. Default false so existing behaviour is unchanged
@@ -74,26 +77,11 @@ def passes_confidence_filter(confidence: str | None, min_confidence: str | None)
     return _CONFIDENCE_RANK.get(effective, 0) >= _CONFIDENCE_RANK.get(min_confidence, 0)
 
 
-_ENTITY_TO_LABEL = {
-    "service": "Service",
-    "repo": "Repo",
-    "person": "Person",
-    "ticket": "Ticket",
-    "pr": "PR",
-    "error_group": "ErrorGroup",
-    "channel": "Channel",
-    "feature": "Feature",
-    "decision": "Decision",
-    "file_path": "Repo",  # fall-back: file paths live under a repo node
-    # Code-graph PR-A: symbol entity types map to their respective NodeLabels.
-    # Router can extract these directly from entity-bag queries that include
-    # qualified names like `Normalizer.process_queue_row`.
-    "function": "Function",
-    "method": "Method",
-    "class": "Class",
-    "module": "Module",
-    "symbol": "Symbol",
-}
+# Backwards-compat alias. `_ENTITY_TO_LABEL` was the historical name; the
+# real source of truth now lives in shared.constants alongside NodeLabel.
+# Keep the alias so any out-of-tree caller importing the old symbol still
+# works, but every in-tree call uses ROUTER_ENTITY_TO_LABEL directly.
+_ENTITY_TO_LABEL = {k: v.value for k, v in ROUTER_ENTITY_TO_LABEL.items()}
 
 # Code-graph node labels — used by the bundle builder to detect when a
 # query seeded on a symbol so it can group results under that seed.
@@ -119,12 +107,39 @@ async def graph_search(
     if not entities:
         return []
 
-    resolved = []
+    # ---- Entity -> label resolution + unknown-type fallback ---------------
+    # Two paths:
+    #   1) Typed: router's entity_type IS in ROUTER_ENTITY_TO_LABEL ->
+    #      look up by (label, canonical_id). Same shape as before.
+    #   2) Fallback: entity_type is NOT in the map (router added a new
+    #      type, dict drift) -> log a warning AND look up by canonical_id
+    #      alone (any label) so the graph hit still surfaces. The first
+    #      time an unknown type queries, the warning makes the drift
+    #      visible in logs; previously the entity was silently dropped
+    #      and the graph retriever returned 0 hits with no signal.
+    resolved: list[tuple[str, str]] = []
+    fallback_cids: list[str] = []
+    unknown_types: set[str] = set()
     for etype, cid in entities:
-        label = _ENTITY_TO_LABEL.get(etype.lower())
-        if label:
-            resolved.append((label, cid))
-    if not resolved:
+        node_label = ROUTER_ENTITY_TO_LABEL.get(etype.lower())
+        if node_label is not None:
+            resolved.append((node_label.value, cid))
+        else:
+            fallback_cids.append(cid)
+            unknown_types.add(etype)
+
+    if unknown_types:
+        log.warning(
+            "graph.unknown_entity_types_fallback",
+            customer=customer_id,
+            unknown_types=sorted(unknown_types),
+            fallback_cid_count=len(fallback_cids),
+            fix_hint=(
+                "Add the type to ROUTER_ENTITY_TO_LABEL in shared/constants.py"
+            ),
+        )
+
+    if not resolved and not fallback_cids:
         return []
 
     spec = temporal or TemporalSpec()
@@ -132,7 +147,11 @@ async def graph_search(
     async with with_tenant(customer_id) as conn:
         labels = [r[0] for r in resolved]
         cids = [r[1] for r in resolved]
-        params: list = [customer_id, labels, cids, top_k]
+        # $2 = labels, $3 = typed cids, $4 = top_k, $5 = fallback cids.
+        # Empty arrays are valid -- the SQL ANY filters degenerate to
+        # "match nothing" for that branch, but the UNION's other branch
+        # still runs.
+        params: list = [customer_id, labels, cids, top_k, fallback_cids]
 
         doc_type_filter = ""
         if doc_types:
@@ -147,6 +166,8 @@ async def graph_search(
         rows = await conn.fetch(
             f"""
             WITH anchors AS (
+                -- Typed lookup: router resolved entity_type -> NodeLabel via
+                -- ROUTER_ENTITY_TO_LABEL. Match by (label, canonical_id).
                 SELECT a.node_id,
                        a.canonical_id,
                        a.label,
@@ -164,6 +185,24 @@ async def graph_search(
                 WHERE a.customer_id = $1
                   AND a.label = ANY($2::text[])
                   AND a.canonical_id = ANY($3::text[])
+                UNION
+                -- Fallback: entity_type was unknown to ROUTER_ENTITY_TO_LABEL
+                -- (router added a new type the graph retriever hasn't been
+                -- updated for). Match by canonical_id alone -- the DB tells
+                -- us the label. Empty $5 (no unknowns) makes this branch
+                -- match nothing. The UNION dedupes any node that matches
+                -- both branches.
+                SELECT a.node_id,
+                       a.canonical_id,
+                       a.label,
+                       a.degree        AS via_degree,
+                       a.community_id  AS via_community,
+                       (SELECT MIN(p.source_system)
+                        FROM graph_node_provenance p
+                        WHERE p.node_id = a.node_id) AS via_source_system
+                FROM graph_nodes a
+                WHERE a.customer_id = $1
+                  AND a.canonical_id = ANY($5::text[])
             ),
             neighbors AS (
                 SELECT DISTINCT n.node_id,
