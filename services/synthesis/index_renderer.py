@@ -66,19 +66,7 @@ _INDEX_SYSTEM_PROMPT = (
     "dashboard already shows the page title above your body. The "
     "intro: what is this company about, what's the main product, "
     "what's getting built? Do NOT list pages here.\n\n"
-    "  2. **Architecture diagram (CONDITIONAL)** — only emit a fenced "
-    "```mermaid ``` block when the user content includes a "
-    "`Verified architecture edges` block listing one or more edges. "
-    "Use `graph TD` (top-down) with the actual repo / service names "
-    "as node labels and group related nodes with subgraphs when the "
-    "structure is obvious. Render bidirectional edges with `-->` and "
-    "one-way edges as `A -->|one-way| B`. **Use ONLY the listed "
-    "edges** — never invent new ones from page summaries.\n\n"
-    "    When the verified edges block says NONE, **SKIP the diagram "
-    "entirely** and move directly to the **Pages** section. Do not "
-    "render isolated nodes; an empty graph is misleading. We'd rather "
-    "show no diagram than a fake one.\n\n"
-    "  3. **Pages** — list every page with a wiki link. Organize them "
+    "  2. **Pages** — list every page with a wiki link. Organize them "
     "however makes sense for THIS corpus (group by product line, by "
     "team, by service, by type — your call). **Lead with the most "
     "load-bearing pages first**: typically the company's repos / "
@@ -88,10 +76,18 @@ _INDEX_SYSTEM_PROMPT = (
     "links. Include the 1-line summary after each link. **Never emit "
     "a bullet with no content** (`- ` on its own line) — every bullet "
     "must have a page link AND a summary or be omitted.\n\n"
+    "**Do NOT emit a ```mermaid``` block.** The architecture diagram "
+    "is generated deterministically by the system from verified "
+    "code-graph edges and spliced into your output between the intro "
+    "and the Pages section. Anything you write inside a fenced "
+    "mermaid block will be replaced — and risks producing a "
+    "malformed diagram if the syntax doesn't parse. Just write the "
+    "intro, then go straight to the Pages section.\n\n"
     "Tone: direct, builder-to-builder. No corporate language. Don't "
     "narrate ('Below you will find...'). Just write the page.\n\n"
     "Output ONLY the Markdown body — no `# Wiki` heading at the top, "
-    "no ```markdown fences around the whole thing."
+    "no ```markdown fences around the whole thing, no ```mermaid "
+    "block (the system handles the diagram)."
 )
 
 
@@ -307,7 +303,12 @@ async def render_index_via_llm(
             contents=user_prompt,
             config={
                 "system_instruction": _INDEX_SYSTEM_PROMPT,
-                "max_output_tokens": 4096,
+                # 16k accommodates a 50-page index with summaries
+                # comfortably. Bumped from 4096 after a probe-founders
+                # run truncated mid-block — page list never landed in
+                # the body, leaving only the intro + a half-written
+                # Mermaid attempt.
+                "max_output_tokens": 16384,
             },
         )
     except Exception as exc:
@@ -326,6 +327,20 @@ async def render_index_via_llm(
 
     text = _strip_leading_wiki_heading(text)
     text = _strip_empty_bullets(text)
+
+    # Splice the deterministic Mermaid block in. Lazy import to avoid
+    # the circular `diagram_renderer ↔ index_renderer` reference at
+    # module-load time. The splice strips ANY mermaid blocks the LLM
+    # may have emitted (the prompt forbids them but defense in depth)
+    # and inserts exactly one good block after the intro paragraph.
+    from services.synthesis.diagram_renderer import (
+        _build_mermaid_block,
+        splice_mermaid_block,
+    )
+
+    new_block = _build_mermaid_block(edges)
+    text = splice_mermaid_block(text, new_block)
+
     return text + "\n" if not text.endswith("\n") else text
 
 

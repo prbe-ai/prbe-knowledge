@@ -110,20 +110,21 @@ def _node_id(repo_full_name: str) -> str:
 
 def splice_mermaid_block(body: str, new_block: str) -> str:
     """Replace, insert, or remove the Mermaid block per the matrix in the
-    module docstring. Returns the modified body. Idempotent: calling
+    module docstring. Strips ALL existing mermaid blocks first so a body
+    that somehow accumulated multiple (e.g. an older LLM-emitted block
+    plus a manual splice) collapses to exactly one. Idempotent: calling
     with the same `new_block` twice produces the same body the second
     time.
     """
-    has_existing = bool(_MERMAID_BLOCK_RE.search(body))
+    stripped = _MERMAID_BLOCK_RE.sub("\n\n", body)
+    # Collapse any 3+ consecutive newlines that the strip may have left
+    # behind so the "Architecture\n\n\n## Pages" case doesn't leave
+    # gappy whitespace if multiple blocks lived back-to-back.
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped)
 
-    if has_existing and new_block:
-        replacement = f"\n\n{new_block}\n\n"
-        return _MERMAID_BLOCK_RE.sub(replacement, body, count=1)
-    if has_existing and not new_block:
-        return _MERMAID_BLOCK_RE.sub("\n\n", body, count=1)
-    if not has_existing and new_block:
-        return _insert_mermaid_after_intro(body, new_block)
-    return body
+    if not new_block:
+        return stripped
+    return _insert_mermaid_after_intro(stripped, new_block)
 
 
 def _insert_mermaid_after_intro(body: str, new_block: str) -> str:
