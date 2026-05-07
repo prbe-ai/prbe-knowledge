@@ -40,6 +40,7 @@ from services.retrieval.retrievers.graph import (
     GraphHit,
     graph_search,
 )
+from services.retrieval.retrievers.id_lookup import id_lookup_search, is_lookup_candidate
 from services.retrieval.retrievers.related_entities import (
     build_exclude_node_keys,
     walk_result_doc_neighbors,
@@ -227,11 +228,27 @@ async def run_search(
             min_confidence=req.min_confidence,
         )
 
+    async def _id_lookup_runner() -> list:
+        # Pin docs whose source_id/doc_id matches a router-extracted stable
+        # identifier (UUID, ticket code, PR ref). Vector and BM25 both miss
+        # exact-id queries — see retrievers/id_lookup.py for the rationale.
+        ids = [
+            e.canonical_id for e in routed.entities if is_lookup_candidate(e.canonical_id)
+        ]
+        if not ids:
+            return []
+        return await id_lookup_search(customer_id, ids, temporal=spec)
+
     t_retrieve = time.perf_counter()
-    vec_hits, bm25_hits, graph_hits = await asyncio.gather(
-        _vec_runner(), _bm25_runner(), _graph_runner()
+    vec_hits, bm25_hits, graph_hits, id_hits = await asyncio.gather(
+        _vec_runner(), _bm25_runner(), _graph_runner(), _id_lookup_runner()
     )
-    ranked_lists = {"vector": vec_hits, "bm25": bm25_hits, "graph": graph_hits}
+    ranked_lists = {
+        "vector": vec_hits,
+        "bm25": bm25_hits,
+        "graph": graph_hits,
+        "id_lookup": id_hits,
+    }
     metadata_content_fallbacks = await _content_fallbacks_for_metadata_only_agent_hits(
         customer_id, ranked_lists, spec
     )

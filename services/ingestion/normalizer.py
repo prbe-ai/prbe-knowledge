@@ -1277,11 +1277,19 @@ def _metadata_text(doc: Document) -> str:
     waste embedding capacity and never match real queries. Stable across
     re-ingestion of the same document state, so the resulting chunk's
     content_hash is idempotent under retries.
+
+    Exception: `source_id` (the handler-supplied stable identifier — e.g.
+    a session UUID or `issue:<uuid>`) lands as its own line so a query
+    naming the full id can BM25-match the metadata chunk. Today's title
+    only carries a short prefix (8-char UUID slice), so without this line
+    the full id is not searchable lexically.
     """
     lines: list[str] = []
     if doc.title:
         lines.append(f"title: {doc.title}")
     lines.append(f"source: {doc.source_system.value}")
+    if doc.source_id:
+        lines.append(f"id: {doc.source_id}")
     if doc.author_id:
         lines.append(f"author: {doc.author_id}")
     # Co-authors (currently github commits via Co-authored-by trailers) get
