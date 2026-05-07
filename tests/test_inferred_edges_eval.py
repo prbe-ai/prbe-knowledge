@@ -77,7 +77,7 @@ def _mock_conn_from_fixture(fixture: dict) -> AsyncMock:
     return conn
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_eval_harness_recall_and_hallucination() -> None:
     """Eval CI gate: >=80% recall, <=5% hallucination on golden fixtures."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
