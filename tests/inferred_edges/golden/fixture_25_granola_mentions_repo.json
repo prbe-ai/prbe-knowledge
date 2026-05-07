@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "granola:meeting:architecture-20260505",
+    "docs": [
+      {
+        "doc_id": "granola:meeting:architecture-20260505",
+        "customer_id": "cust-eval",
+        "source_system": "granola",
+        "title": "Architecture sync 2026-05-05",
+        "content": "Architecture Sync 2026-05-05\n\nParticipants: alice, bob, carol\n\nalice: We're splitting the monolith. The wiki synthesis code moves from prbe-knowledge into a new prbe-wiki repo.\nbob: Makes sense. prbe-knowledge is getting big.\ncarol: Timeline?\nalice: Target is end of Q2. prbe-wiki will have its own Fly app.",
+        "token_count": 72
+      },
+      {
+        "doc_id": "linear:issue:ARCH-5",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "ARCH-5: Extract wiki synthesis into prbe-wiki repo",
+        "content": "Issue ARCH-5: Extract wiki synthesis into dedicated prbe-wiki repository\nStatus: Planned\nDescription: Move services/wiki/* from prbe-knowledge into a standalone prbe-wiki repo. Deploy as a separate Fly app to allow independent scaling.",
+        "token_count": 55
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "granola:meeting:architecture-20260505"},
+    {"label": "Document", "canonical_id": "linear:issue:ARCH-5"},
+    {"label": "Repo", "canonical_id": "prbe-knowledge"},
+    {"label": "Repo", "canonical_id": "prbe-wiki"},
+    {"label": "Ticket", "canonical_id": "ARCH-5"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "granola:meeting:architecture-20260505",
+      "to_canonical_id": "prbe-wiki",
+      "edge_type": "MENTIONS_ENTITY",
+      "note": "Meeting notes briefly mention the new prbe-wiki repo as the target for the wiki extraction migration"
+    }
+  ]
+}

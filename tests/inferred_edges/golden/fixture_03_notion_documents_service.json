@@ -1,0 +1,39 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "notion:page:auth-service-runbook",
+    "docs": [
+      {
+        "doc_id": "notion:page:auth-service-runbook",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Auth Service Runbook",
+        "content": "Auth Service Runbook\n\nThis document describes the auth-service, its configuration, and operational procedures.\n\nThe auth-service handles user sessions, token issuance, and OAuth callbacks. It is deployed at auth.prbe.internal.\n\nKey config: SESSION_TTL_SECONDS (default 3600), MAX_SESSIONS_PER_USER (default 10).\n\nOn-call: rotate secrets every 90 days using scripts/rotate_auth_secrets.py.",
+        "token_count": 90
+      },
+      {
+        "doc_id": "github:file:prbe-backend:auth/config.py",
+        "customer_id": "cust-eval",
+        "source_system": "code_graph",
+        "title": "prbe-backend/auth/config.py",
+        "content": "# auth/config.py\nSESSION_TTL_SECONDS = 3600\nMAX_SESSIONS_PER_USER = 10\nAUTH_SERVICE_URL = 'auth.prbe.internal'",
+        "token_count": 40
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "notion:page:auth-service-runbook"},
+    {"label": "Document", "canonical_id": "github:file:prbe-backend:auth/config.py"},
+    {"label": "Service", "canonical_id": "auth-service"},
+    {"label": "Repo", "canonical_id": "prbe-backend"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "notion:page:auth-service-runbook",
+      "to_canonical_id": "github:file:prbe-backend:auth/config.py",
+      "edge_type": "DOCUMENTS",
+      "note": "Notion runbook describes the auth service's config file"
+    }
+  ]
+}

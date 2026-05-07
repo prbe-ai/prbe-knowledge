@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "notion:page:tenant-isolation-design",
+    "docs": [
+      {
+        "doc_id": "notion:page:tenant-isolation-design",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Tenant Isolation Design Doc",
+        "content": "Tenant Isolation Design Doc\n\n## Row-Level Security\nAll multi-tenant tables enforce RLS using the GUC `app.current_customer_id`. The helper function `with_tenant(customer_id)` sets this GUC on the connection before any query, ensuring RLS policies activate correctly.\n\nThe implementation lives in `shared/db.py`. Key function: `with_tenant(conn, customer_id)` which executes `SET LOCAL app.current_customer_id = $1` on the asyncpg connection.\n\n## Important: wrong GUC name = empty results\nIf you use `app.tenant_id` instead of `app.current_customer_id`, RLS policies return empty rows silently. Always use the canonical GUC name.",
+        "token_count": 125
+      },
+      {
+        "doc_id": "code_graph:file:prbe-knowledge:shared/db.py",
+        "customer_id": "cust-eval",
+        "source_system": "code_graph",
+        "title": "shared/db.py",
+        "content": "# shared/db.py\n\nasync def with_tenant(conn: asyncpg.Connection, customer_id: str) -> None:\n    \"\"\"Set the RLS tenant GUC on this connection.\"\"\"\n    await conn.execute(\n        \"SET LOCAL app.current_customer_id = $1\",\n        customer_id,\n    )",
+        "token_count": 55
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "notion:page:tenant-isolation-design"},
+    {"label": "Document", "canonical_id": "code_graph:file:prbe-knowledge:shared/db.py"},
+    {"label": "Function", "canonical_id": "with_tenant"},
+    {"label": "Module", "canonical_id": "shared.db"},
+    {"label": "Feature", "canonical_id": "tenant-isolation"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "notion:page:tenant-isolation-design",
+      "to_canonical_id": "code_graph:file:prbe-knowledge:shared/db.py",
+      "edge_type": "DOCUMENTS",
+      "note": "Notion design doc explicitly documents the with_tenant function in shared/db.py, describing its role in RLS"
+    }
+  ]
+}

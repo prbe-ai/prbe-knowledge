@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "linear:comment:FEAT-44:comment-7821",
+    "docs": [
+      {
+        "doc_id": "linear:comment:FEAT-44:comment-7821",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "Comment on FEAT-44: Feature flags shipped",
+        "content": "Comment by nora on FEAT-44:\n\nShipped. The feature flag service is live in production as of today. All three rollout gates (canary 5%, rollout 20%, GA 100%) are working. Marking this ticket as Done and closing it out. The gradual rollout infra from FEAT-44 is now the standard pattern for all new features going forward.",
+        "token_count": 75
+      },
+      {
+        "doc_id": "linear:issue:FEAT-44",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "FEAT-44: Build feature flag service with gradual rollout",
+        "content": "Issue FEAT-44: Build feature flag service with gradual rollout\nStatus: Done\nAssignee: nora\nDescription: Implement a feature flag service supporting canary (5%), staged rollout (20%), and GA (100%) tiers. Flags stored in Postgres, evaluated per customer_id.",
+        "token_count": 65
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "linear:comment:FEAT-44:comment-7821"},
+    {"label": "Document", "canonical_id": "linear:issue:FEAT-44"},
+    {"label": "Ticket", "canonical_id": "FEAT-44"},
+    {"label": "Feature", "canonical_id": "feature-flags"},
+    {"label": "Service", "canonical_id": "flag-service"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "linear:comment:FEAT-44:comment-7821",
+      "to_canonical_id": "linear:issue:FEAT-44",
+      "edge_type": "RESOLVES",
+      "note": "Linear comment explicitly marks FEAT-44 as shipped and done, closing the feature flag ticket"
+    }
+  ]
+}

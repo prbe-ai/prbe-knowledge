@@ -1,0 +1,39 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "github:pr:prbe-backend:42",
+    "docs": [
+      {
+        "doc_id": "github:pr:prbe-backend:42",
+        "customer_id": "cust-eval",
+        "source_system": "github",
+        "title": "PR #42: Fix session token TTL",
+        "content": "PR #42 in prbe-backend: Fix session token TTL\nDescription: Fixes AUTH-456 - the session token TTL was set to 30 seconds instead of 3600. Updated auth/config.py to use the correct value. Also added unit tests in tests/test_auth_config.py.",
+        "token_count": 60
+      },
+      {
+        "doc_id": "linear:issue:AUTH-456",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "AUTH-456: Login timeout after 30 seconds",
+        "content": "Issue AUTH-456: Login timeout after 30 seconds\nStatus: Done\nFixed by PR #42 in prbe-backend.",
+        "token_count": 40
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "github:pr:prbe-backend:42"},
+    {"label": "Document", "canonical_id": "linear:issue:AUTH-456"},
+    {"label": "PR", "canonical_id": "prbe-backend:42"},
+    {"label": "Ticket", "canonical_id": "AUTH-456"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "github:pr:prbe-backend:42",
+      "to_canonical_id": "linear:issue:AUTH-456",
+      "edge_type": "RESOLVES",
+      "note": "PR explicitly says it fixes AUTH-456"
+    }
+  ]
+}

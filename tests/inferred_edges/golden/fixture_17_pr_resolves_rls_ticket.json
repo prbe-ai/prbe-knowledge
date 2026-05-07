@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "github:pr:prbe-knowledge:91",
+    "docs": [
+      {
+        "doc_id": "github:pr:prbe-knowledge:91",
+        "customer_id": "cust-eval",
+        "source_system": "github",
+        "title": "PR #91: Fix RLS GUC name in graph_nodes policies",
+        "content": "PR #91 in prbe-knowledge: Fix RLS GUC name in graph_nodes policies\nAuthor: kiran\nDescription: Fixes INFRA-33. The RLS policies on graph_nodes and graph_edges were checking app.tenant_id instead of the canonical app.current_customer_id. This caused all Alembic UPDATEs on those tables to silently zero-match.\n\nChanged:\n- migrations/versions/0048_fix_rls_guc_name.py: ALTER POLICY to use app.current_customer_id",
+        "token_count": 90
+      },
+      {
+        "doc_id": "linear:issue:INFRA-33",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "INFRA-33: graph_nodes RLS silently returns empty on Alembic updates",
+        "content": "Issue INFRA-33: graph_nodes RLS silently returns empty on Alembic updates\nStatus: Done\nAssignee: kiran\nDescription: Alembic UPDATE migrations on graph_nodes/graph_edges zero-match silently. Root cause: RLS policy checks app.tenant_id but the GUC is set as app.current_customer_id.",
+        "token_count": 72
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "github:pr:prbe-knowledge:91"},
+    {"label": "Document", "canonical_id": "linear:issue:INFRA-33"},
+    {"label": "PR", "canonical_id": "prbe-knowledge:91"},
+    {"label": "Ticket", "canonical_id": "INFRA-33"},
+    {"label": "Feature", "canonical_id": "tenant-isolation"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "github:pr:prbe-knowledge:91",
+      "to_canonical_id": "linear:issue:INFRA-33",
+      "edge_type": "RESOLVES",
+      "note": "PR #91 explicitly states it fixes INFRA-33 by correcting the RLS GUC name from app.tenant_id to app.current_customer_id"
+    }
+  ]
+}

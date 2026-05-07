@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "notion:page:ingestion-worker-runbook",
+    "docs": [
+      {
+        "doc_id": "notion:page:ingestion-worker-runbook",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Ingestion Worker Runbook",
+        "content": "Ingestion Worker Runbook\n\nThis page documents the ingestion worker pipeline and its key functions.\n\n## Claim loop\nThe main claim loop is implemented in `Worker._claim_one` in services/ingestion/worker.py. It uses PostgreSQL's FOR UPDATE SKIP LOCKED to safely claim queue rows without contention.\n\n## Dead-letter handling\nWhen a row exceeds MAX_ATTEMPTS, `Worker._move_to_dlq` parks it in the DLQ table. This function is the canonical place to add DLQ alerting.\n\n## On-call notes\nIf the DLQ grows unexpectedly, check for schema mismatches in the normalizer output — they are the #1 cause of DLQ spikes.",
+        "token_count": 130
+      },
+      {
+        "doc_id": "code_graph:file:prbe-knowledge:services/ingestion/worker.py",
+        "customer_id": "cust-eval",
+        "source_system": "code_graph",
+        "title": "services/ingestion/worker.py",
+        "content": "# services/ingestion/worker.py\n\nclass Worker:\n    async def _claim_one(self) -> QueueRow | None:\n        \"\"\"Claim one pending queue row using FOR UPDATE SKIP LOCKED.\"\"\"\n        ...\n\n    async def _move_to_dlq(self, row: QueueRow, reason: str) -> None:\n        \"\"\"Park a row in the dead-letter queue after max attempts.\"\"\"\n        ...",
+        "token_count": 70
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "notion:page:ingestion-worker-runbook"},
+    {"label": "Document", "canonical_id": "code_graph:file:prbe-knowledge:services/ingestion/worker.py"},
+    {"label": "Function", "canonical_id": "Worker._claim_one"},
+    {"label": "Function", "canonical_id": "Worker._move_to_dlq"},
+    {"label": "Service", "canonical_id": "ingestion-worker"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "notion:page:ingestion-worker-runbook",
+      "to_canonical_id": "code_graph:file:prbe-knowledge:services/ingestion/worker.py",
+      "edge_type": "DOCUMENTS",
+      "note": "Notion runbook explicitly documents the Worker class in worker.py, naming its key functions and their purpose"
+    }
+  ]
+}

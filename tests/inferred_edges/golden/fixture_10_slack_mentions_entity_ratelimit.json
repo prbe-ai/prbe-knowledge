@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0JKL012:1746300001.000001",
+    "docs": [
+      {
+        "doc_id": "slack:C0JKL012:1746300001.000001",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "#backend thread",
+        "content": "Thread in #backend:\nnora: quick heads-up, I started rate-limiting work (RATE-55). nothing blocking yet.\nowen: cool, let me know when you need a review.",
+        "token_count": 38
+      },
+      {
+        "doc_id": "linear:issue:RATE-55",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "RATE-55: Per-tenant API rate limiting",
+        "content": "Issue RATE-55: Implement per-tenant API rate limiting\nStatus: In Progress\nAssignee: nora\nDescription: Current global 100 rps limit unfairly throttles large enterprise tenants. Need Redis-backed token buckets per customer_id. Also add Retry-After header to 429 responses.",
+        "token_count": 65
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0JKL012:1746300001.000001"},
+    {"label": "Document", "canonical_id": "linear:issue:RATE-55"},
+    {"label": "Ticket", "canonical_id": "RATE-55"},
+    {"label": "Service", "canonical_id": "api-gateway"},
+    {"label": "Feature", "canonical_id": "rate-limiting"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0JKL012:1746300001.000001",
+      "to_canonical_id": "RATE-55",
+      "edge_type": "MENTIONS_ENTITY",
+      "note": "Slack message briefly names RATE-55 in passing as a status update, without analyzing or discussing the ticket's content"
+    }
+  ]
+}

@@ -1,0 +1,37 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "granola:meeting:standup-20260507",
+    "docs": [
+      {
+        "doc_id": "granola:meeting:standup-20260507",
+        "customer_id": "cust-eval",
+        "source_system": "granola",
+        "title": "Engineering standup 2026-05-07",
+        "content": "Engineering Standup 2026-05-07\n\nParticipants: alice, bob, carol, dave\n\nalice: Working on the auth token fix, should be done today. PR #42 is in review.\nbob: Noticed that the analytics dashboard is slow. Might be related to the database migration we did last week.\ncarol: I saw a Notion doc about the db migration - it mentioned we need to run ANALYZE after the migration.\ndave: Will add that to the runbook.",
+        "token_count": 90
+      },
+      {
+        "doc_id": "notion:page:db-migration-guide",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Database Migration Guide",
+        "content": "Database Migration Guide\n\nAfter any schema migration, run ANALYZE on affected tables. This updates statistics and helps the query planner. Failure to do so can cause 10-100x slowdowns on queries that previously used an index.\n\nSteps: 1. Run migration. 2. Run ANALYZE. 3. Monitor query latency for 1h.",
+        "token_count": 75
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "granola:meeting:standup-20260507"},
+    {"label": "Document", "canonical_id": "notion:page:db-migration-guide"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "granola:meeting:standup-20260507",
+      "to_canonical_id": "notion:page:db-migration-guide",
+      "edge_type": "RELATES_TO",
+      "note": "Meeting notes reference the database migration guide content"
+    }
+  ]
+}

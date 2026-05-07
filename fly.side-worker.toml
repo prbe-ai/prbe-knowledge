@@ -1,0 +1,58 @@
+app = "prbe-knowledge-side-worker"
+primary_region = "sjc"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "services/ingestion/inferred_edges/Dockerfile"
+
+[env]
+  ENVIRONMENT                = "main"
+  LOG_LEVEL                  = "INFO"
+  SERVICE_NAME               = "prbe-knowledge-side-worker"
+  # First (and currently only) drainer hosted on this side-worker app.
+  # Future side-queue drainers (other LLM-extraction stages, async
+  # post-processing) can land here as additional [processes] entries
+  # rather than spinning up another fly app per workload.
+  # Per-workload env vars stay workload-specific (each future drainer
+  # gets its own *_HEALTH_PORT / *_CONCURRENCY); only the fly app name
+  # is generic.
+  INFERRED_EDGES_HEALTH_PORT = "8083"
+  # 16 async tasks per machine.  4 machines => 64 concurrent drain slots.
+  # NOTE: count in [[vm]] does NOT auto-apply on deploy.
+  # After deploy run: flyctl scale count worker=4 -a prbe-knowledge-side-worker
+  INFERRED_EDGES_CONCURRENCY = "16"
+
+[processes]
+  # Add additional process names here as more side-queue drainers land.
+  worker = "python -m services.ingestion.inferred_edges.worker"
+
+[[restart]]
+  policy      = "always"
+  max_retries = 10
+
+# Health endpoint binds 0.0.0.0 (IPv4) inside the container so Fly's
+# http_service.checks IPv4 probe can reach it.
+# (feedback_fly_health_check_ipv4.md)
+[http_service]
+  internal_port        = 8083
+  force_https          = true
+  auto_stop_machines   = false
+  auto_start_machines  = true
+  min_machines_running = 1
+  processes            = ["worker"]
+
+  [[http_service.checks]]
+    grace_period = "15s"
+    interval     = "15s"
+    method       = "GET"
+    timeout      = "5s"
+    path         = "/health"
+
+[[vm]]
+  size   = "shared-cpu-1x"
+  memory = "1gb"
+  # count = 4 here is informational -- Fly ignores [[vm]].count on deploy.
+  # After first deploy run: flyctl scale count worker=4 -a prbe-knowledge-side-worker
+  count     = 1
+  processes = ["worker"]

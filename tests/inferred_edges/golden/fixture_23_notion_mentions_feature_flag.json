@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "notion:page:q2-roadmap",
+    "docs": [
+      {
+        "doc_id": "notion:page:q2-roadmap",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Q2 2026 Engineering Roadmap",
+        "content": "Q2 2026 Engineering Roadmap\n\n## Shipped\n- Hybrid search (pgvector + BM25)\n- Tenant RLS hardening\n\n## In Progress\n- Feature flags: gradual rollout infrastructure (see FEAT-44). Currently in canary.\n- Per-tenant rate limiting (RATE-55)\n\n## Planned\n- Code graph ingestion via tree-sitter\n- Wiki synthesis v2 with Gemini Pro",
+        "token_count": 80
+      },
+      {
+        "doc_id": "linear:issue:FEAT-44",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "FEAT-44: Build feature flag service with gradual rollout",
+        "content": "Issue FEAT-44: Build feature flag service with gradual rollout\nStatus: In Progress\nAssignee: nora\nDescription: Implement a feature flag service supporting canary (5%), staged rollout (20%), and GA (100%) tiers.",
+        "token_count": 55
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "notion:page:q2-roadmap"},
+    {"label": "Document", "canonical_id": "linear:issue:FEAT-44"},
+    {"label": "Feature", "canonical_id": "feature-flags"},
+    {"label": "Ticket", "canonical_id": "FEAT-44"},
+    {"label": "Feature", "canonical_id": "hybrid-search"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "notion:page:q2-roadmap",
+      "to_canonical_id": "feature-flags",
+      "edge_type": "MENTIONS_ENTITY",
+      "note": "Q2 roadmap briefly mentions the feature-flags work in passing, referencing FEAT-44 without deep discussion"
+    }
+  ]
+}

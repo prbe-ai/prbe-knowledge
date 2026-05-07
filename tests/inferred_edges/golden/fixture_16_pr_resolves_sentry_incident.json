@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "github:pr:prbe-backend:105",
+    "docs": [
+      {
+        "doc_id": "github:pr:prbe-backend:105",
+        "customer_id": "cust-eval",
+        "source_system": "github",
+        "title": "PR #105: Fix billing-service Stripe API version",
+        "content": "PR #105 in prbe-backend: Fix billing-service Stripe API version\nAuthor: alice\nDescription: Resolves SENTRY-1012. The Stripe webhook handler was expecting the old event field shape from API 2023-08-16. Updated to API 2024-04-10 format. The 'payment_method_details' field is now parsed correctly.\n\nFixes: Resolves SENTRY-1012\nTest plan: Added integration test with mocked Stripe events.",
+        "token_count": 85
+      },
+      {
+        "doc_id": "sentry:issue:SENTRY-1012",
+        "customer_id": "cust-eval",
+        "source_system": "sentry",
+        "title": "SENTRY-1012: billing-service 422 on Stripe webhook",
+        "content": "Error group SENTRY-1012\nProject: prbe-billing\nMessage: Unprocessable Entity: unexpected field 'payment_method_details' in stripe event\nOccurrences: 3,847\nStatus: Resolved",
+        "token_count": 55
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "github:pr:prbe-backend:105"},
+    {"label": "Document", "canonical_id": "sentry:issue:SENTRY-1012"},
+    {"label": "PR", "canonical_id": "prbe-backend:105"},
+    {"label": "ErrorGroup", "canonical_id": "SENTRY-1012"},
+    {"label": "Service", "canonical_id": "billing-service"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "github:pr:prbe-backend:105",
+      "to_canonical_id": "sentry:issue:SENTRY-1012",
+      "edge_type": "RESOLVES",
+      "note": "PR #105 explicitly states it resolves Sentry error group SENTRY-1012 by fixing the Stripe API version mismatch"
+    }
+  ]
+}

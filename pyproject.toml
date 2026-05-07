@@ -80,6 +80,9 @@ ignore = ["E501", "B008"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "eval: LLM-dependent eval harness; skipped without ANTHROPIC_API_KEY. Run with `-m eval`.",
+]
 
 [tool.mypy]
 python_version = "3.12"

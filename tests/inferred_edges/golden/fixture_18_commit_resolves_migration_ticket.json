@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "github:commit:prbe-knowledge:a3f9b12",
+    "docs": [
+      {
+        "doc_id": "github:commit:prbe-knowledge:a3f9b12",
+        "customer_id": "cust-eval",
+        "source_system": "github",
+        "title": "Commit a3f9b12: fix pgvector index after migration 0050",
+        "content": "Commit a3f9b12 in prbe-knowledge\nAuthor: grace\nMessage: fix(db): rebuild pgvector HNSW index after migration 0050 -- closes DB-19\n\nMigration 0050 dropped and recreated the embeddings table, but forgot to rebuild the HNSW index. This commit adds a post-migration step to CREATE INDEX CONCURRENTLY on the embedding column. Closes DB-19.",
+        "token_count": 75
+      },
+      {
+        "doc_id": "linear:issue:DB-19",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "DB-19: pgvector ANN queries fall back to seq-scan after migration 0050",
+        "content": "Issue DB-19: pgvector ANN queries fall back to sequential scan after migration 0050\nStatus: Done\nAssignee: grace\nDescription: After running migration 0050 in production, vector search latency jumped from 15ms to 4s. EXPLAIN shows seq-scan instead of HNSW. The index was not rebuilt after the table recreation.",
+        "token_count": 70
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "github:commit:prbe-knowledge:a3f9b12"},
+    {"label": "Document", "canonical_id": "linear:issue:DB-19"},
+    {"label": "Ticket", "canonical_id": "DB-19"},
+    {"label": "Repo", "canonical_id": "prbe-knowledge"},
+    {"label": "Service", "canonical_id": "retrieval-service"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "github:commit:prbe-knowledge:a3f9b12",
+      "to_canonical_id": "linear:issue:DB-19",
+      "edge_type": "RESOLVES",
+      "note": "Commit message explicitly says 'closes DB-19' and describes the fix for the missing HNSW index rebuild"
+    }
+  ]
+}
