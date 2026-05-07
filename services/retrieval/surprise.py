@@ -16,6 +16,20 @@ Components (in application order):
                           AND both not None -> 1.4
   4. Peripheral-to-hub bonus min(degrees) <= 2 AND max(degrees) >= 5 -> 1.3
   5. Final cap: min(score, 8.0)
+
+AMBIGUOUS gating
+----------------
+Components 2 (cross-source) and 3 (cross-community) are SKIPPED for
+AMBIGUOUS edges. Empirical analysis on probe-founders showed that
+AMBIGUOUS authorship edges between connectors (e.g. Granola Person ->
+Claude Code session) are *structurally guaranteed* to be cross-source
+and usually cross-community -- those signals fire automatically rather
+than carrying real surprise information. Stacking confidence (1.5) *
+cross-source (1.5) * cross-community (1.4) = 3.15 made the same low-
+quality edge win top-1 on three unrelated queries in a 30-query
+sample. INFERRED edges keep the full multiplier stack -- their
+cross-source bridges have explicit LLM justification (`why`) and are
+genuinely informative.
 """
 
 from __future__ import annotations
@@ -74,11 +88,23 @@ def surprise_score(
     if confidence is not None:
         score *= _CONFIDENCE_WEIGHT.get(confidence, 1.0)
 
+    # AMBIGUOUS edges DO NOT stack with the structural bonuses below.
+    # Reason: empirically, the AMBIGUOUS edges in our corpus that fire
+    # cross-source AND cross-community are mostly authorship edges
+    # between connectors (e.g. Granola Person -> Claude Code session).
+    # Those signals are structurally guaranteed by how connectors
+    # partition themselves, not real surprise. Without this gate,
+    # 5 such edges out of 555 systematically won top-1 across unrelated
+    # queries in production sampling.
+    is_ambiguous = confidence == "AMBIGUOUS"
+
     # --- Component 2: cross-source bonus ---
     # An edge crossing source boundaries (Slack -> code, Notion -> ticket)
     # is more unexpected than same-source edges (file -> its module).
+    # Skipped for AMBIGUOUS edges (see gate comment above).
     if (
-        anchor_source is not None
+        not is_ambiguous
+        and anchor_source is not None
         and target_source is not None
         and anchor_source != target_source
     ):
@@ -87,8 +113,10 @@ def surprise_score(
     # --- Component 3: cross-community bonus ---
     # An edge bridging two different Leiden communities is a structural
     # bridge -- more surprising than intra-community edges.
+    # Skipped for AMBIGUOUS edges (see gate comment above).
     if (
-        anchor_community is not None
+        not is_ambiguous
+        and anchor_community is not None
         and target_community is not None
         and anchor_community != target_community
     ):
@@ -98,6 +126,9 @@ def surprise_score(
     # An edge from a low-degree node (peripheral) to a high-degree hub is
     # noteworthy: the peripheral node has few connections, so each one
     # carries more signal. Threshold: one end <= 2 edges, other end >= 5.
+    # Applies regardless of confidence -- this signal IS independent of
+    # the confidence tier (a low-degree node connecting to a hub is a
+    # graph-shape property, not a connector-architecture artifact).
     min_deg = min(anchor_degree, target_degree)
     max_deg = max(anchor_degree, target_degree)
     if min_deg <= 2 and max_deg >= 5:

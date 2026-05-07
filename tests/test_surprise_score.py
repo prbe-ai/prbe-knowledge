@@ -211,14 +211,97 @@ def test_boundary_hub_below_threshold() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_ambiguous_plus_cross_source() -> None:
-    """AMBIGUOUS (1.5) * cross-source (1.5) = 2.25."""
+def test_ambiguous_does_not_stack_cross_source() -> None:
+    """AMBIGUOUS edges do NOT compound with cross-source bonus.
+
+    Reason (see surprise.py docstring): AMBIGUOUS authorship edges
+    between connectors are structurally guaranteed to be cross-source
+    (Granola Person -> Claude Code session is always cross-source).
+    Without this gate, 5 such edges out of 555 systematically won
+    top-1 across unrelated queries in production sampling. With it,
+    AMBIGUOUS edges score 1.5 from confidence weight only.
+    """
     s = _score(
         confidence="AMBIGUOUS",
         anchor_source="slack",
-        target_source="github",
+        target_source="github",  # would normally trigger cross-source 1.5x
     )
-    assert s == pytest.approx(1.5 * 1.5)
+    assert s == pytest.approx(1.5)
+
+
+def test_ambiguous_does_not_stack_cross_community() -> None:
+    """Same gate applies to cross-community: AMBIGUOUS edges don't
+    compound. Different connectors land in different Leiden communities
+    automatically; that signal is structural, not informative.
+    """
+    s = _score(
+        confidence="AMBIGUOUS",
+        anchor_community=0,
+        target_community=7,  # would normally trigger cross-community 1.4x
+    )
+    assert s == pytest.approx(1.5)
+
+
+def test_ambiguous_does_not_stack_either_structural_bonus() -> None:
+    """Combined gate: AMBIGUOUS doesn't compound with cross-source AND
+    cross-community simultaneously. Pre-fix this was 1.5 * 1.5 * 1.4 =
+    3.15 (the value that systematically won top-1 in production)."""
+    s = _score(
+        confidence="AMBIGUOUS",
+        anchor_source="granola",
+        target_source="claude_code",
+        anchor_community=7,
+        target_community=0,
+    )
+    # Both structural bonuses gated -> only confidence weight.
+    assert s == pytest.approx(1.5)
+
+
+def test_ambiguous_still_stacks_peripheral_to_hub() -> None:
+    """Peripheral-to-hub IS a graph-shape signal independent of
+    connector partitioning -- so it still compounds with AMBIGUOUS.
+    A low-degree node connecting to a hub carries information regardless
+    of confidence tier.
+    """
+    s = _score(
+        confidence="AMBIGUOUS",
+        anchor_degree=2,
+        target_degree=8,
+    )
+    # confidence (1.5) * peripheral-hub (1.3) = 1.95
+    assert s == pytest.approx(1.5 * 1.3)
+
+
+def test_inferred_keeps_full_stacking() -> None:
+    """Regression: the gate is AMBIGUOUS-only. INFERRED edges keep their
+    full multiplier stack (the formula's main value -- INFERRED edges
+    bridging sources/communities are exactly what we want to surface).
+    """
+    s = _score(
+        confidence="INFERRED",
+        anchor_source="slack",
+        target_source="code_graph",
+        anchor_community=0,
+        target_community=7,
+    )
+    # 1.25 * 1.5 * 1.4 = 2.625
+    assert s == pytest.approx(1.25 * 1.5 * 1.4)
+
+
+def test_extracted_keeps_full_stacking() -> None:
+    """Regression: EXTRACTED also keeps full stacking (its 1.0 confidence
+    just makes the structural multipliers visible). cross-source bridges
+    in deterministic edges are still surprising -- e.g. a CALLS edge
+    from a Slack-derived doc to a code function."""
+    s = _score(
+        confidence="EXTRACTED",
+        anchor_source="slack",
+        target_source="code_graph",
+        anchor_community=0,
+        target_community=7,
+    )
+    # 1.0 * 1.5 * 1.4 = 2.1
+    assert s == pytest.approx(1.5 * 1.4)
 
 
 def test_full_stack_without_cap() -> None:
@@ -241,21 +324,16 @@ def test_full_stack_without_cap() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cap_at_8() -> None:
-    """AMBIGUOUS * cross-source * cross-community * peripheral-hub exceeds 8.0 -> capped."""
-    # 1.5 * 1.5 * 1.4 * 1.3 = 4.095 -- under cap with these values
-    # Force over cap by using AMBIGUOUS confidence only: confidence keeps
-    # multiplying -- but the design doc says cap = 8.0.
-    # We verify the cap by calling with a deliberately pathological input
-    # that would exceed 8.0 if uncapped.
-    # 1.5 * 1.5 * 1.4 * 1.3 = 4.095 -- does NOT exceed 8.0.
-    # To guarantee cap triggers we call the function directly with monkeypatched
-    # internal constant -- instead just verify the cap enforces correctly by
-    # stacking maximum possible multipliers:
-    # 1.5 * 1.5 * 1.4 * 1.3 = 4.095 (under). So the cap is a safety net;
-    # we test it by verifying result never exceeds 8.0 when all bonuses fire.
+def test_cap_safety_net() -> None:
+    """The cap (8.0) is a safety net for any future stacking that exceeds
+    the natural maximum. Today the natural max is INFERRED * cross-source
+    * cross-community * peripheral-hub = 1.25 * 1.5 * 1.4 * 1.3 = 3.4125
+    -- well under the cap. Verifying the cap is in place + score never
+    exceeds it on normal inputs.
+    """
+    # Maximum-stacking case under current rules (INFERRED with all bonuses).
     s = _score(
-        confidence="AMBIGUOUS",
+        confidence="INFERRED",
         anchor_source="slack",
         target_source="code_graph",
         anchor_community=0,
@@ -264,11 +342,7 @@ def test_cap_at_8() -> None:
         target_degree=8,
     )
     assert s <= 8.0
-    # Also call surprise_score directly with a mocked internal value by
-    # testing the function's cap contract via a computed value.
-    # Full stack: 1.5*1.5*1.4*1.3 = 4.095 -- already shows cap doesn't
-    # interfere at normal values. Explicitly confirm cap with a direct call
-    # that passes through all bonuses.
+
     from services.retrieval.surprise import _CAP
 
     assert _CAP == 8.0
