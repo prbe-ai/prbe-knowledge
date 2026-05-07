@@ -54,7 +54,7 @@ async def _insert_doc(conn, customer_id: str, doc_id: str, source_system: str = 
             NULL, $4, $4, $4, $4,
             '{"principals": [], "captured_at": "2026-01-01T00:00:00Z"}'::jsonb
         )
-        ON CONFLICT (doc_id) DO NOTHING
+        ON CONFLICT (customer_id, doc_id, version) DO NOTHING
         """,
         doc_id,
         customer_id,
@@ -77,7 +77,7 @@ async def _insert_chunk(conn, customer_id: str, doc_id: str, content: str, idx: 
             'openai/text-embedding-3-large', 3072,
             'naive-v1', 1, 1, NOW()
         )
-        ON CONFLICT (chunk_id) DO NOTHING
+        ON CONFLICT (customer_id, chunk_id) DO NOTHING
         """,
         f"{doc_id}:chunk:{idx}",
         doc_id,
