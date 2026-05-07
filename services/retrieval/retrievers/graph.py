@@ -242,7 +242,26 @@ async def graph_search(
                   WHERE EXISTS (SELECT 1 FROM graph_nodes gn
                                 WHERE gn.node_id = anchors.node_id AND gn.label = 'Document')
             )
-            SELECT c.chunk_id, c.doc_id, d.version AS doc_version,
+            -- One row per neighbor doc, picking chunk_index=0 as the
+            -- representative chunk. Without this cap, a giant anchor doc
+            -- (e.g. a claude_code session with 200+ chunks) crowds out
+            -- every other neighbor: the LIMIT $4 fills with chunks of one
+            -- doc before a single chunk of any other neighbor makes it
+            -- through. The graph retriever's natural unit is "doc reachable
+            -- via this entity", not "best-matching chunk passage" -- that
+            -- semantic mismatch is what lets one doc swallow the budget.
+            -- ROW_NUMBER() PARTITION BY doc_id picks one chunk per doc;
+            -- ORDER BY chunk_index makes the choice deterministic
+            -- (chunk 0 is the doc's first content chunk, which carries the
+            -- title / opening summary across every source_system shape).
+            SELECT chunk_id, doc_id, doc_version,
+                   source_system, source_url, title, author_id,
+                   content, created_at, updated_at,
+                   via_entity, via_label, edge_type, confidence,
+                   via_degree, via_community, via_source_system,
+                   degree, community_id
+            FROM (
+              SELECT c.chunk_id, c.doc_id, d.version AS doc_version,
                    d.source_system, d.source_url, d.title, d.author_id,
                    c.content, d.created_at, d.updated_at,
                    MIN(n.via)               AS via_entity,
@@ -253,7 +272,11 @@ async def graph_search(
                    MIN(n.via_community)     AS via_community,
                    MIN(n.via_source_system) AS via_source_system,
                    MIN(n.degree)            AS degree,
-                   MIN(n.community_id)      AS community_id
+                   MIN(n.community_id)      AS community_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY c.doc_id
+                       ORDER BY c.chunk_index ASC, c.chunk_id ASC
+                   ) AS rn_in_doc
             FROM neighbors n
             JOIN graph_nodes gn ON gn.node_id = n.node_id
             JOIN documents d
@@ -268,9 +291,11 @@ async def graph_search(
               {pred.chunk_sql}
               {pred.doc_sql}
               {doc_type_filter}
-            GROUP BY c.chunk_id, c.doc_id, d.version,
+            GROUP BY c.chunk_id, c.doc_id, c.chunk_index, d.version,
                      d.source_system, d.source_url, d.title, d.author_id,
                      c.content, d.created_at, d.updated_at
+            ) AS chunks_with_rn
+            WHERE rn_in_doc = 1
             LIMIT $4
             """,
             *params,
