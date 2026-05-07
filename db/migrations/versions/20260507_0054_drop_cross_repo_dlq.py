@@ -1,6 +1,6 @@
 """drop cross_repo_reverify_dlq
 
-Revision ID: 0054_drop_cross_repo_reverify_dlq
+Revision ID: 0054_drop_cross_repo_dlq
 Revises: 0053_cross_repo_reverify_dlq
 Create Date: 2026-05-07
 
@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0054_drop_cross_repo_reverify_dlq"
+revision = "0054_drop_cross_repo_dlq"
 down_revision = "0053_cross_repo_reverify_dlq"
 branch_labels = None
 depends_on = None
