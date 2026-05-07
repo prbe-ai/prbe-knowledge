@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0DEF456:1746100001.000001",
+    "docs": [
+      {
+        "doc_id": "slack:C0DEF456:1746100001.000001",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "#search-team thread",
+        "content": "Thread in #search-team:\ngrace: pgvector recall is dropping on long queries. Filed SRCH-201 to track.\nhank: yeah i reproduced it. queries over 512 tokens get truncated before embedding, so the vector is basically garbage.\ngrace: SRCH-201 has the repro steps. we should bump the embedding model to text-embedding-3-large which handles up to 8192 tokens.\nhank: agreed. also affects the hybrid search fallback path since bm25 index doesn't have this limit.\ngrace: adding that context to SRCH-201 now.",
+        "token_count": 105
+      },
+      {
+        "doc_id": "linear:issue:SRCH-201",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "SRCH-201: Vector recall drops on queries >512 tokens",
+        "content": "Issue SRCH-201: Vector recall drops on queries longer than 512 tokens\nStatus: In Progress\nAssignee: grace\nDescription: Embedding model truncates input at 512 tokens. Long queries produce low-quality vectors, recall degrades ~40%. Fix: upgrade to text-embedding-3-large with 8192 token support.",
+        "token_count": 70
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0DEF456:1746100001.000001"},
+    {"label": "Document", "canonical_id": "linear:issue:SRCH-201"},
+    {"label": "Ticket", "canonical_id": "SRCH-201"},
+    {"label": "Service", "canonical_id": "search-service"},
+    {"label": "Feature", "canonical_id": "hybrid-search"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0DEF456:1746100001.000001",
+      "to_canonical_id": "linear:issue:SRCH-201",
+      "edge_type": "DISCUSSES",
+      "note": "Slack thread explicitly names and elaborates on SRCH-201, adding technical context about the 512-token truncation issue"
+    }
+  ]
+}

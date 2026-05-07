@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0PQR678:1746500001.000001",
+    "docs": [
+      {
+        "doc_id": "slack:C0PQR678:1746500001.000001",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "#eng-general thread",
+        "content": "Thread in #eng-general:\nhank: heads up - touching prbe-payments repo for the Stripe upgrade. the billing-service will need a restart after deploy.\nivan: got it. i'll monitor Sentry during the window.",
+        "token_count": 48
+      },
+      {
+        "doc_id": "notion:page:service-catalog",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Service Catalog",
+        "content": "Service Catalog\n\nbilling-service: Handles Stripe subscriptions, invoicing, and webhook events. Repo: prbe-payments.\n\npayment-service: Processes one-time charges and refunds. Repo: prbe-payments.\n\nauth-service: OAuth, session tokens, JWT issuance. Repo: prbe-backend.",
+        "token_count": 60
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0PQR678:1746500001.000001"},
+    {"label": "Document", "canonical_id": "notion:page:service-catalog"},
+    {"label": "Service", "canonical_id": "billing-service"},
+    {"label": "Repo", "canonical_id": "prbe-payments"},
+    {"label": "Service", "canonical_id": "auth-service"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0PQR678:1746500001.000001",
+      "to_canonical_id": "prbe-payments",
+      "edge_type": "MENTIONS_ENTITY",
+      "note": "Slack message briefly mentions the prbe-payments repo by name in the context of a deploy"
+    }
+  ]
+}

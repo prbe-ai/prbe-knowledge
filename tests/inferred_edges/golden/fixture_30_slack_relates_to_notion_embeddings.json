@@ -1,0 +1,39 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0YZA567:1746800001.000001",
+    "docs": [
+      {
+        "doc_id": "slack:C0YZA567:1746800001.000001",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "#search-team thread",
+        "content": "Thread in #search-team:\nsam: Is there a doc on the embedding pipeline? I need to understand how we handle long chunks before the vector store.\ntina: There's a Notion page on the retrieval architecture - it covers chunk sizing and the 8192 token limit.\nsam: Ah got it, I'll check that.",
+        "token_count": 60
+      },
+      {
+        "doc_id": "notion:page:retrieval-architecture",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Retrieval Architecture",
+        "content": "Retrieval Architecture\n\n## Embedding pipeline\nDocuments are chunked to ~512 tokens (target) with 50-token overlap. Each chunk is embedded using text-embedding-3-large (max 8192 tokens). Chunks exceeding 8192 tokens are truncated with a warning logged.\n\n## Vector store\nEmbeddings are stored in Neon Postgres using pgvector with an HNSW index (m=16, ef_construction=64).\n\n## Retrieval\nAt query time, the query is embedded and a cosine ANN search returns the top 50 candidates, which are then fused with BM25 via RRF.",
+        "token_count": 100
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0YZA567:1746800001.000001"},
+    {"label": "Document", "canonical_id": "notion:page:retrieval-architecture"},
+    {"label": "Service", "canonical_id": "retrieval-service"},
+    {"label": "Feature", "canonical_id": "hybrid-search"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0YZA567:1746800001.000001",
+      "to_canonical_id": "notion:page:retrieval-architecture",
+      "edge_type": "RELATES_TO",
+      "note": "Slack thread mentions the Notion retrieval architecture page in passing as a pointer, without analyzing or discussing its content"
+    }
+  ]
+}

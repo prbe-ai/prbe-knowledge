@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "notion:page:wiki-synthesis-architecture",
+    "docs": [
+      {
+        "doc_id": "notion:page:wiki-synthesis-architecture",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Wiki Synthesis Architecture",
+        "content": "Wiki Synthesis Architecture\n\nThe wiki synthesis pipeline converts raw source events into curated team knowledge pages.\n\n## Triage stage\nEvents arrive in wiki_synthesis_queue. The triage stage (WikiTriageAgent) batches events in token-budget packs of up to 150K tokens and scores them 0-10. Events scoring >= 7.0 advance to synthesis.\n\n## Synthesis stage\nThe wiki agent (WikiSynthesisAgent in services/wiki/agent.py) processes triaged events and writes or updates Notion-style wiki pages. It uses Gemini 3.1 Pro.\n\n## Nightly schedule\nThe wiki cron fires at 02:00 UTC, waking the worker via pg_notify on wiki_synthesize_pending.",
+        "token_count": 120
+      },
+      {
+        "doc_id": "code_graph:file:prbe-knowledge:services/wiki/agent.py",
+        "customer_id": "cust-eval",
+        "source_system": "code_graph",
+        "title": "services/wiki/agent.py",
+        "content": "# services/wiki/agent.py\n\nclass WikiSynthesisAgent:\n    \"\"\"Gemini 3.1 Pro agent for wiki page synthesis.\"\"\"\n    model = WIKI_AGENT_MODEL  # gemini-3.1-pro-preview\n\n    async def drain(self, customer_id: str) -> DrainResult:\n        \"\"\"Drain triaged wiki events for this customer.\"\"\"\n        ...",
+        "token_count": 60
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "notion:page:wiki-synthesis-architecture"},
+    {"label": "Document", "canonical_id": "code_graph:file:prbe-knowledge:services/wiki/agent.py"},
+    {"label": "Class", "canonical_id": "WikiSynthesisAgent"},
+    {"label": "Service", "canonical_id": "wiki-synthesis"},
+    {"label": "Feature", "canonical_id": "wiki-cron"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "notion:page:wiki-synthesis-architecture",
+      "to_canonical_id": "code_graph:file:prbe-knowledge:services/wiki/agent.py",
+      "edge_type": "DOCUMENTS",
+      "note": "Notion architecture doc explicitly documents WikiSynthesisAgent in agent.py, describing its triage and synthesis stages"
+    }
+  ]
+}

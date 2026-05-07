@@ -1,0 +1,56 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "granola:meeting:billing-incident-20260501",
+    "docs": [
+      {
+        "doc_id": "granola:meeting:billing-incident-20260501",
+        "customer_id": "cust-eval",
+        "source_system": "granola",
+        "title": "Billing incident review 2026-05-01",
+        "content": "Billing Incident Review 2026-05-01\n\nParticipants: alice, eve, frank\n\nalice: We had a spike of stripe webhook failures starting around 14:00 UTC. Sentry caught it as SENTRY-1012 - the billing-service was returning 422 on every webhook.\neve: I traced it to a Stripe API version mismatch. Our webhook handler expected the old event shape but Stripe rolled their API.\nfrank: SENTRY-1012 shows 3,200 occurrences in 2 hours. I've escalated it to P1.\nalice: The billing-service needs an emergency patch. Let's coordinate with the payments team.",
+        "token_count": 125
+      },
+      {
+        "doc_id": "sentry:issue:SENTRY-1012",
+        "customer_id": "cust-eval",
+        "source_system": "sentry",
+        "title": "SENTRY-1012: billing-service 422 on Stripe webhook",
+        "content": "Error group SENTRY-1012\nProject: prbe-billing\nMessage: Unprocessable Entity: unexpected field 'payment_method_details' in stripe event\nOccurrences: 3,847 in last 3h\nFirst seen: 2026-05-01 14:03:00 UTC\nStatus: Unresolved\nAssigned to: alice",
+        "token_count": 75
+      },
+      {
+        "doc_id": "linear:issue:BILL-88",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "BILL-88: Stripe API version upgrade",
+        "content": "Issue BILL-88: Upgrade Stripe API version to 2024-04-10\nStatus: Backlog\nDescription: Our webhook handlers need updating for the new Stripe event schema introduced in API version 2024-04-10.",
+        "token_count": 55
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "granola:meeting:billing-incident-20260501"},
+    {"label": "Document", "canonical_id": "sentry:issue:SENTRY-1012"},
+    {"label": "Document", "canonical_id": "linear:issue:BILL-88"},
+    {"label": "ErrorGroup", "canonical_id": "SENTRY-1012"},
+    {"label": "Service", "canonical_id": "billing-service"},
+    {"label": "Ticket", "canonical_id": "BILL-88"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "granola:meeting:billing-incident-20260501",
+      "to_canonical_id": "sentry:issue:SENTRY-1012",
+      "edge_type": "DISCUSSES",
+      "note": "Granola meeting explicitly reviews the SENTRY-1012 billing-service error group by name and discusses its impact"
+    },
+    {
+      "from_label": "Document",
+      "from_canonical_id": "granola:meeting:billing-incident-20260501",
+      "to_canonical_id": "linear:issue:BILL-88",
+      "edge_type": "RELATES_TO",
+      "note": "Meeting is loosely connected to BILL-88 (the Stripe API upgrade backlog item that caused the incident) without explicitly discussing its content"
+    }
+  ]
+}

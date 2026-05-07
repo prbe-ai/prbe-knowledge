@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0VWX234:1746700001.000001",
+    "docs": [
+      {
+        "doc_id": "slack:C0VWX234:1746700001.000001",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "#product thread",
+        "content": "Thread in #product:\npenny: Is the gradual rollout infrastructure ready? We want to turn on the new dashboard for 5% of users next week.\nrobin: It's live. PR #55 shipped the token-bucket gates. You can flip the flag in the admin panel.",
+        "token_count": 52
+      },
+      {
+        "doc_id": "github:pr:prbe-backend:55",
+        "customer_id": "cust-eval",
+        "source_system": "github",
+        "title": "PR #55: Gradual rollout token-bucket gates",
+        "content": "PR #55 in prbe-backend: Gradual rollout token-bucket gates\nAuthor: nora\nDescription: Adds Redis-backed token-bucket gates per feature flag. Supports canary (5%), staged (20%), and GA (100%) tiers. Admin API at /api/flags/{flag_id}/rollout.",
+        "token_count": 62
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0VWX234:1746700001.000001"},
+    {"label": "Document", "canonical_id": "github:pr:prbe-backend:55"},
+    {"label": "PR", "canonical_id": "prbe-backend:55"},
+    {"label": "Feature", "canonical_id": "feature-flags"},
+    {"label": "Repo", "canonical_id": "prbe-backend"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0VWX234:1746700001.000001",
+      "to_canonical_id": "github:pr:prbe-backend:55",
+      "edge_type": "RELATES_TO",
+      "note": "Slack thread tangentially references PR #55 as the delivery vehicle for gradual rollout, without deeply analyzing its contents"
+    }
+  ]
+}

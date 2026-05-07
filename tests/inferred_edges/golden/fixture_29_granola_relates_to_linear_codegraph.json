@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "granola:meeting:eng-planning-20260502",
+    "docs": [
+      {
+        "doc_id": "granola:meeting:eng-planning-20260502",
+        "customer_id": "cust-eval",
+        "source_system": "granola",
+        "title": "Engineering planning 2026-05-02",
+        "content": "Engineering Planning 2026-05-02\n\nParticipants: alice, bob, carol, dave\n\nalice: Big Q2 item is the code graph. tree-sitter ingestion, symbol extraction, HNSW index.\nbob: We should scope that properly. CGRPH-12 is the main ticket I think?\ncarol: Yeah. Also the retrieval side needs to know how to score code symbols vs prose.\ndave: Not blocking anything immediate, but it connects to the search relevance work.",
+        "token_count": 88
+      },
+      {
+        "doc_id": "linear:issue:CGRPH-12",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "CGRPH-12: tree-sitter Python symbol extractor",
+        "content": "Issue CGRPH-12: Implement tree-sitter Python symbol extractor\nStatus: In Progress\nAssignee: owen\nDescription: Extract function, class, and method symbols from Python files using tree-sitter.",
+        "token_count": 50
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "granola:meeting:eng-planning-20260502"},
+    {"label": "Document", "canonical_id": "linear:issue:CGRPH-12"},
+    {"label": "Ticket", "canonical_id": "CGRPH-12"},
+    {"label": "Feature", "canonical_id": "code-graph"},
+    {"label": "Feature", "canonical_id": "hybrid-search"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "granola:meeting:eng-planning-20260502",
+      "to_canonical_id": "linear:issue:CGRPH-12",
+      "edge_type": "RELATES_TO",
+      "note": "Planning meeting loosely references CGRPH-12 when scoping Q2 code-graph work, without detailed discussion of the ticket"
+    }
+  ]
+}

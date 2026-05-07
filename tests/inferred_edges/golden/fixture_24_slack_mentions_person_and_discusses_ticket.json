@@ -1,0 +1,49 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0STU901:1746600001.000001",
+    "docs": [
+      {
+        "doc_id": "slack:C0STU901:1746600001.000001",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "#code-graph thread",
+        "content": "Thread in #code-graph:\nowen: CGRPH-12 is the tree-sitter integration ticket. We need the symbol extractor to handle Python class methods.\npenny: yes - grace wrote the initial extractor. she should review the PR.\nowen: I'll ping grace. CGRPH-12 has the acceptance criteria in it - symbol resolution needs to handle nested classes too.",
+        "token_count": 75
+      },
+      {
+        "doc_id": "linear:issue:CGRPH-12",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "CGRPH-12: tree-sitter Python symbol extractor",
+        "content": "Issue CGRPH-12: Implement tree-sitter Python symbol extractor\nStatus: In Progress\nAssignee: owen\nDescription: Extract function, class, and method symbols from Python files using tree-sitter. Must handle nested class methods and decorated functions.",
+        "token_count": 58
+      },
+      {
+        "doc_id": "notion:page:code-graph-design",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Code Graph Design",
+        "content": "Code Graph Design\n\nThe code graph stores symbol-level nodes (Function, Class, Method) extracted from source files. tree-sitter is used to parse Python, TypeScript, and Go. Symbols are linked via CALLS, IMPORTS, and INHERITS edges.\n\nInitial owner: grace (systems team).",
+        "token_count": 60
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0STU901:1746600001.000001"},
+    {"label": "Document", "canonical_id": "linear:issue:CGRPH-12"},
+    {"label": "Document", "canonical_id": "notion:page:code-graph-design"},
+    {"label": "Ticket", "canonical_id": "CGRPH-12"},
+    {"label": "Person", "canonical_id": "grace"},
+    {"label": "Feature", "canonical_id": "code-graph"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0STU901:1746600001.000001",
+      "to_canonical_id": "grace",
+      "edge_type": "MENTIONS_ENTITY",
+      "note": "Thread briefly names grace as the author of the initial symbol extractor, a passing reference"
+    }
+  ]
+}

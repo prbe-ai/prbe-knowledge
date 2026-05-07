@@ -1,0 +1,39 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "notion:page:on-call-handbook",
+    "docs": [
+      {
+        "doc_id": "notion:page:on-call-handbook",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "On-Call Handbook",
+        "content": "On-Call Handbook\n\n## Escalation\nFor P1 incidents, page the on-call engineer immediately. Check the Sentry runbook for how to triage error spikes.\n\n## Tools\n- Sentry: primary error monitoring\n- Datadog: infrastructure metrics and APM traces\n\n## Common issues\n- Sudden 5xx spike: check Sentry for error group, then Datadog for CPU/memory\n- Slow queries: check Datadog APM for p99 latency",
+        "token_count": 85
+      },
+      {
+        "doc_id": "notion:page:sentry-triage-runbook",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Sentry Triage Runbook",
+        "content": "Sentry Triage Runbook\n\n## Workflow\n1. Open the Sentry project dashboard\n2. Filter by environment: production\n3. Sort by volume (occurrences desc)\n4. For any error group > 100 occ/hr: assign P1, page on-call\n5. For unknown regressions: check recent deploys in Sentry releases tab",
+        "token_count": 75
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "notion:page:on-call-handbook"},
+    {"label": "Document", "canonical_id": "notion:page:sentry-triage-runbook"},
+    {"label": "Service", "canonical_id": "sentry"},
+    {"label": "Feature", "canonical_id": "observability"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "notion:page:on-call-handbook",
+      "to_canonical_id": "notion:page:sentry-triage-runbook",
+      "edge_type": "RELATES_TO",
+      "note": "On-call handbook loosely points readers to the Sentry triage runbook, implying a related-doc relationship without formal discussion"
+    }
+  ]
+}

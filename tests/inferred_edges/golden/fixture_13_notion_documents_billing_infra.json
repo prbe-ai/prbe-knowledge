@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "notion:page:stripe-integration-guide",
+    "docs": [
+      {
+        "doc_id": "notion:page:stripe-integration-guide",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Stripe Integration Guide",
+        "content": "Stripe Integration Guide\n\nThis guide documents the billing-service Stripe integration.\n\n## Webhook handler\nAll Stripe events arrive at POST /webhooks/stripe. The handler is `StripeWebhookHandler` in services/billing/stripe_webhook.py. It validates the Stripe-Signature header using the STRIPE_WEBHOOK_SECRET env var before processing.\n\n## Idempotency\nUse the Stripe event ID as an idempotency key. Duplicate events are common during retries.\n\n## Supported events\n- invoice.paid → mark subscription active\n- invoice.payment_failed → trigger dunning flow\n- customer.subscription.deleted → suspend account",
+        "token_count": 120
+      },
+      {
+        "doc_id": "code_graph:file:prbe-backend:services/billing/stripe_webhook.py",
+        "customer_id": "cust-eval",
+        "source_system": "code_graph",
+        "title": "services/billing/stripe_webhook.py",
+        "content": "# services/billing/stripe_webhook.py\n\nclass StripeWebhookHandler:\n    \"\"\"Handles inbound Stripe webhook events.\"\"\"\n\n    async def handle(self, request: Request) -> Response:\n        sig = request.headers.get('Stripe-Signature')\n        # validate sig ...\n        event = stripe.Event.construct_from(await request.json())\n        await self._dispatch(event)\n\n    async def _dispatch(self, event: stripe.Event) -> None:\n        ...",
+        "token_count": 75
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "notion:page:stripe-integration-guide"},
+    {"label": "Document", "canonical_id": "code_graph:file:prbe-backend:services/billing/stripe_webhook.py"},
+    {"label": "Class", "canonical_id": "StripeWebhookHandler"},
+    {"label": "Service", "canonical_id": "billing-service"},
+    {"label": "Feature", "canonical_id": "stripe-webhooks"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "notion:page:stripe-integration-guide",
+      "to_canonical_id": "code_graph:file:prbe-backend:services/billing/stripe_webhook.py",
+      "edge_type": "DOCUMENTS",
+      "note": "Notion guide explicitly names and documents the StripeWebhookHandler class in stripe_webhook.py"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "granola:meeting:security-review-20260506",
+    "docs": [
+      {
+        "doc_id": "granola:meeting:security-review-20260506",
+        "customer_id": "cust-eval",
+        "source_system": "granola",
+        "title": "Security review 2026-05-06",
+        "content": "Security Review 2026-05-06\n\nParticipants: carol, dave, eve\n\ncarol: We reviewed the Postgres RLS setup for multi-tenant isolation. Looks solid overall.\ndave: The tenant isolation doc on Notion has the canonical GUC name. Worth cross-checking new migrations against it.\neve: Agreed. A few migration files we looked at today might be missing the FORCE RLS toggle for superuser queries.",
+        "token_count": 82
+      },
+      {
+        "doc_id": "notion:page:tenant-isolation-design",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Tenant Isolation Design Doc",
+        "content": "Tenant Isolation Design Doc\n\n## Row-Level Security\nAll multi-tenant tables enforce RLS using the GUC app.current_customer_id. The helper function with_tenant sets this GUC before any query.\n\n## Migration checklist\n- Wrap Alembic UPDATEs in FORCE/NO FORCE RLS toggle for tables with RLS\n- Always use app.current_customer_id (not app.tenant_id)",
+        "token_count": 75
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "granola:meeting:security-review-20260506"},
+    {"label": "Document", "canonical_id": "notion:page:tenant-isolation-design"},
+    {"label": "Feature", "canonical_id": "tenant-isolation"},
+    {"label": "Service", "canonical_id": "ingestion-worker"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "granola:meeting:security-review-20260506",
+      "to_canonical_id": "notion:page:tenant-isolation-design",
+      "edge_type": "RELATES_TO",
+      "note": "Security review meeting tangentially references the Notion tenant isolation doc as a cross-reference, without directly discussing it"
+    }
+  ]
+}

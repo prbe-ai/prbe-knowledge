@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0MNO345:1746400001.000001",
+    "docs": [
+      {
+        "doc_id": "slack:C0MNO345:1746400001.000001",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "#incidents channel",
+        "content": "Thread in #incidents:\nfrank: Update: the login failures tracked in AUTH-78 are now resolved. We deployed the fix 10 minutes ago and error rate is back to baseline.\neve: Confirmed. AUTH-78 is closed. Root cause was the OAuth callback URL having a trailing slash that the IdP rejected.\nfrank: PR #33 was the fix - stripped the trailing slash in the callback URL builder. No further action needed.",
+        "token_count": 82
+      },
+      {
+        "doc_id": "linear:issue:AUTH-78",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "AUTH-78: OAuth login failures - callback URL rejected by IdP",
+        "content": "Issue AUTH-78: OAuth login failures - callback URL rejected by IdP\nStatus: Done\nAssignee: frank\nDescription: Login attempts via OAuth are failing. IdP returns 'redirect_uri_mismatch'. The callback URL has a trailing slash that is not registered with the IdP.",
+        "token_count": 65
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0MNO345:1746400001.000001"},
+    {"label": "Document", "canonical_id": "linear:issue:AUTH-78"},
+    {"label": "Ticket", "canonical_id": "AUTH-78"},
+    {"label": "Service", "canonical_id": "auth-service"},
+    {"label": "PR", "canonical_id": "prbe-backend:33"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0MNO345:1746400001.000001",
+      "to_canonical_id": "linear:issue:AUTH-78",
+      "edge_type": "RESOLVES",
+      "note": "Slack message explicitly announces AUTH-78 is resolved after deploying the fix"
+    }
+  ]
+}

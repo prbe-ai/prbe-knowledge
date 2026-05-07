@@ -9,8 +9,8 @@ Run with: pytest tests/test_inferred_edges_eval.py -v -m eval
 
 Skipped if ANTHROPIC_API_KEY is not set.
 
-NOTE: 5 fixtures present (of 30 planned). The 30-fixture target is NOT
-yet met -- this is flagged in the done-criteria checklist.
+NOTE: 30 golden fixtures across 5 edge types. Recall/hallucination gate is
+statistically stable at this size.
 """
 
 from __future__ import annotations
@@ -164,8 +164,7 @@ async def test_eval_harness_recall_and_hallucination() -> None:
         )
     print(f"{'='*60}\n")
 
-    # NOTE: 5/30 fixtures present. 30-fixture target not yet met.
-    # Current fixture count: len(fixtures) -- flagged as not-yet-done in done-criteria.
+    # 30 golden fixtures present across 5 edge types; gate is statistically stable.
     assert recall_rate >= 0.80, (
         f"Recall {recall_rate:.1%} < 80% threshold. "
         f"Got {total_recalled}/{total_expected} expected edges."

@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0GHI789:1746200001.000001",
+    "docs": [
+      {
+        "doc_id": "slack:C0GHI789:1746200001.000001",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "#data-pipeline thread",
+        "content": "Thread in #data-pipeline:\nlena: PR #77 in prbe-knowledge adds batched queue claiming. Worth reviewing carefully.\nmike: I looked at it. The batch size is 200 but the DLQ logic didn't get updated for the new shape.\nlena: Yeah PR #77 is the right fix but we need a follow-up for DLQ handling.\nmike: Leaving a review comment on PR #77 now.\nlena: Also, does this affect the Granola sync? Granola has its own queue priority.",
+        "token_count": 95
+      },
+      {
+        "doc_id": "github:pr:prbe-knowledge:77",
+        "customer_id": "cust-eval",
+        "source_system": "github",
+        "title": "PR #77: Batch queue claim for ingestion worker",
+        "content": "PR #77 in prbe-knowledge: Batch queue claim for ingestion worker\nAuthor: lena\nDescription: Changes Worker._claim_one to claim up to 200 rows per tick using FOR UPDATE SKIP LOCKED. Reduces DB round-trips by 60x under high load. DLQ logic unchanged in this PR.",
+        "token_count": 65
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0GHI789:1746200001.000001"},
+    {"label": "Document", "canonical_id": "github:pr:prbe-knowledge:77"},
+    {"label": "PR", "canonical_id": "prbe-knowledge:77"},
+    {"label": "Service", "canonical_id": "ingestion-worker"},
+    {"label": "Repo", "canonical_id": "prbe-knowledge"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0GHI789:1746200001.000001",
+      "to_canonical_id": "github:pr:prbe-knowledge:77",
+      "edge_type": "DISCUSSES",
+      "note": "Slack thread specifically discusses PR #77 in prbe-knowledge by name, including technical critique of its DLQ handling"
+    }
+  ]
+}

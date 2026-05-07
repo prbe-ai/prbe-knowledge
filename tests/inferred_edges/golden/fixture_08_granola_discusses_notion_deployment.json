@@ -1,0 +1,39 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "granola:meeting:deploy-review-20260503",
+    "docs": [
+      {
+        "doc_id": "granola:meeting:deploy-review-20260503",
+        "customer_id": "cust-eval",
+        "source_system": "granola",
+        "title": "Deploy process review 2026-05-03",
+        "content": "Deploy Process Review 2026-05-03\n\nParticipants: ivan, jess, kiran\n\nivan: We need to revisit the Fly deployment runbook. The current doc on Notion doesn't cover IPv6 binding for 6PN calls.\njess: Right, the Notion 'Fly Deployment Guide' page says to bind on 0.0.0.0 but that breaks internal service calls over 6PN.\nkiran: I updated the page yesterday. We need to bind on :: for 6PN and use 0.0.0.0 for the health check endpoint.\nivan: Can someone verify the Notion doc reflects both bind addresses now?\njess: I'll do a pass after this meeting.",
+        "token_count": 108
+      },
+      {
+        "doc_id": "notion:page:fly-deployment-guide",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Fly Deployment Guide",
+        "content": "Fly Deployment Guide\n\nThis guide covers deploying services to Fly.io.\n\n## Network binding\n- Bind your HTTP server on '::' (dual-stack IPv6) for internal 6PN calls between Fly apps\n- For health check endpoints, bind uvicorn on '0.0.0.0' (IPv4) since Fly health probes are IPv4-only\n\n## fly.toml tips\n- Set [[vm]] count, then follow up with flyctl scale count N\n- CI deploys automatically on push to main",
+        "token_count": 90
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "granola:meeting:deploy-review-20260503"},
+    {"label": "Document", "canonical_id": "notion:page:fly-deployment-guide"},
+    {"label": "Service", "canonical_id": "ingestion-worker"},
+    {"label": "Repo", "canonical_id": "prbe-knowledge"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "granola:meeting:deploy-review-20260503",
+      "to_canonical_id": "notion:page:fly-deployment-guide",
+      "edge_type": "DISCUSSES",
+      "note": "Meeting explicitly references and discusses the Notion Fly Deployment Guide page's IPv6 binding guidance"
+    }
+  ]
+}

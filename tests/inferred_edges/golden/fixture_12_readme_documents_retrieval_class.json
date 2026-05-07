@@ -1,0 +1,47 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "code_graph:file:prbe-knowledge:services/retrieval/README.md",
+    "docs": [
+      {
+        "doc_id": "code_graph:file:prbe-knowledge:services/retrieval/README.md",
+        "customer_id": "cust-eval",
+        "source_system": "code_graph",
+        "title": "services/retrieval/README.md",
+        "content": "# Retrieval Service\n\nThis directory contains the hybrid search implementation.\n\n## HybridRetriever\n\n`HybridRetriever` in `retriever.py` is the main entry point. It fuses pgvector ANN results with BM25 keyword results using Reciprocal Rank Fusion (RRF). The class exposes one public method: `retrieve(query: str, customer_id: str, top_k: int) -> list[Chunk]`.\n\n## Configuration\n- `TOP_K_VECTOR = 50` — candidates fetched from pgvector before RRF\n- `TOP_K_BM25 = 50` — candidates fetched from BM25 before RRF\n- `RRF_K = 60` — RRF rank constant",
+        "token_count": 120
+      },
+      {
+        "doc_id": "code_graph:file:prbe-knowledge:services/retrieval/retriever.py",
+        "customer_id": "cust-eval",
+        "source_system": "code_graph",
+        "title": "services/retrieval/retriever.py",
+        "content": "# services/retrieval/retriever.py\n\nclass HybridRetriever:\n    \"\"\"Fuses pgvector ANN + BM25 results via RRF.\"\"\"\n\n    async def retrieve(\n        self,\n        query: str,\n        customer_id: str,\n        top_k: int = 20,\n    ) -> list[Chunk]:\n        ...",
+        "token_count": 60
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "code_graph:file:prbe-knowledge:services/retrieval/README.md"},
+    {"label": "Document", "canonical_id": "code_graph:file:prbe-knowledge:services/retrieval/retriever.py"},
+    {"label": "Class", "canonical_id": "HybridRetriever"},
+    {"label": "Service", "canonical_id": "retrieval-service"},
+    {"label": "Repo", "canonical_id": "prbe-knowledge"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "code_graph:file:prbe-knowledge:services/retrieval/README.md",
+      "to_canonical_id": "code_graph:file:prbe-knowledge:services/retrieval/retriever.py",
+      "edge_type": "DOCUMENTS",
+      "note": "README.md explicitly documents the HybridRetriever class in retriever.py, describing its API and configuration"
+    },
+    {
+      "from_label": "Document",
+      "from_canonical_id": "code_graph:file:prbe-knowledge:services/retrieval/README.md",
+      "to_canonical_id": "HybridRetriever",
+      "edge_type": "DOCUMENTS",
+      "note": "README explicitly names and documents the HybridRetriever class, its retrieve() method signature, and configuration constants"
+    }
+  ]
+}

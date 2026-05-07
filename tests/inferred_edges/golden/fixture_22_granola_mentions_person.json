@@ -1,0 +1,48 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "granola:meeting:oncall-handoff-20260504",
+    "docs": [
+      {
+        "doc_id": "granola:meeting:oncall-handoff-20260504",
+        "customer_id": "cust-eval",
+        "source_system": "granola",
+        "title": "On-call handoff 2026-05-04",
+        "content": "On-call Handoff 2026-05-04\n\nParticipants: lena, mike, nora\n\nlena: Handing off to mike for the week. Key items: SENTRY-1012 is resolved, but watch for Stripe webhook retries through Monday.\nmike: Got it. I'll keep an eye on the billing-service error rate.\nnora: Also reach out to alice if you see anything weird in auth - she owns that area.",
+        "token_count": 80
+      },
+      {
+        "doc_id": "linear:issue:BILL-90",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "BILL-90: Monitor Stripe webhook retry backlog",
+        "content": "Issue BILL-90: Monitor Stripe webhook retry backlog after SENTRY-1012 fix\nStatus: In Progress\nAssignee: mike\nDescription: After the Stripe API version fix, Stripe may replay up to 3 days of failed webhook events. Monitor billing-service event processing queue for spikes.",
+        "token_count": 65
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "granola:meeting:oncall-handoff-20260504"},
+    {"label": "Document", "canonical_id": "linear:issue:BILL-90"},
+    {"label": "Person", "canonical_id": "alice"},
+    {"label": "Person", "canonical_id": "mike"},
+    {"label": "Service", "canonical_id": "billing-service"},
+    {"label": "Ticket", "canonical_id": "BILL-90"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "granola:meeting:oncall-handoff-20260504",
+      "to_canonical_id": "alice",
+      "edge_type": "MENTIONS_ENTITY",
+      "note": "Meeting notes briefly mention alice as the owner of auth, a passing reference rather than a full discussion"
+    },
+    {
+      "from_label": "Document",
+      "from_canonical_id": "granola:meeting:oncall-handoff-20260504",
+      "to_canonical_id": "billing-service",
+      "edge_type": "MENTIONS_ENTITY",
+      "note": "Meeting briefly names billing-service when instructing the new on-call to watch its error rate"
+    }
+  ]
+}
