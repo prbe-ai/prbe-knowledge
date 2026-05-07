@@ -1,0 +1,41 @@
+app = "prbe-knowledge-community"
+primary_region = "sjc"
+kill_signal = "SIGINT"
+kill_timeout = "120s"
+
+[build]
+  dockerfile = "services/community/Dockerfile"
+
+[env]
+  ENVIRONMENT  = "main"
+  LOG_LEVEL    = "INFO"
+  SERVICE_NAME = "prbe-knowledge-community"
+
+# Nightly Leiden community-detection cron.
+# Connects to Postgres, partitions each tenant's graph with the Leiden
+# algorithm, writes community_id back to graph_nodes, then exits.
+# Runs at 03:00 UTC daily (after wiki-cron at 02:00).
+[processes]
+  cron = "python -m services.community.leiden"
+
+# Schedule: 03:00 UTC daily. [[crons]] fires a new machine run of the
+# cron process on this schedule. The machine exits after each run.
+#
+# NOTE: After first deploy, run:
+#   flyctl scale count cron=1 -a prbe-knowledge-community
+# The count in [[vm]] below sets the machine spec but Fly requires an
+# explicit flyctl scale count call to apply the desired machine count
+# (count in fly.toml [[vm]] is not auto-applied on deploy per Fly docs
+# and feedback_fly_count_needs_scale_cmd in project memory).
+[[crons]]
+  schedule = "0 3 * * *"
+  command  = "python -m services.community.leiden"
+
+# Memory: 1 GB. igraph + leidenalg are C extensions; Leiden handles
+# 1M+ edge graphs comfortably at this memory budget. Tenant-by-tenant
+# processing keeps peak = single largest tenant graph.
+[[vm]]
+  size      = "shared-cpu-1x"
+  memory    = "1gb"
+  count     = 1
+  processes = ["cron"]
