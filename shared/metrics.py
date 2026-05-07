@@ -1,7 +1,14 @@
-"""Metrics emission — structured counters + histograms.
+"""Metrics emission -- structured counters + histograms.
 
 Phase 0 emits via structlog; a later Tier 8 wiring plugs OTel here without
 touching call sites. Keeping a single facade means we change backends once.
+
+Lane B gauge:
+  inferred_edges_llm_cost_per_customer_per_day
+    -- emitted by the inferred-edges worker after each extraction call.
+    -- tags: customer_id, extractor_id
+    -- unit: USD (float)
+    -- no alert/cap (D4 decision): measure first, enforce later.
 """
 
 from __future__ import annotations
