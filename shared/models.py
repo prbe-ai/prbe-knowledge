@@ -331,6 +331,18 @@ class QueryRequest(BaseModel):
             "the graph (vector / BM25)."
         ),
     )
+    top_k_related: int = Field(
+        default=10,
+        ge=0,
+        le=50,
+        description=(
+            "How many `related_entities` to return on the response — "
+            "non-Document graph nodes attached to the result-set docs, "
+            "surfaced as crawl candidates for an LLM doing knowledge-"
+            "graph BFS. Set 0 to skip the post-fusion walk entirely "
+            "(token-sensitive flows). Default 10. Cap 50."
+        ),
+    )
 
 
 def normalize_author_id(value: str | None) -> str | None:
@@ -408,6 +420,34 @@ class QueryBundle(BaseModel):
     confidence_breakdown: dict[str, int] = Field(default_factory=dict)
 
 
+class RelatedEntity(BaseModel):
+    """A non-Document graph node attached to >=1 doc in the result set.
+
+    Surfaced to MCP consumers as crawl candidates: the LLM can drop the
+    canonical_id into the next search_knowledge query bag to BFS the
+    knowledge graph. Excludes any entity already in extracted_entities
+    (the LLM has those handles already).
+    """
+
+    canonical_id: str
+    label: str  # NodeLabel.value (Service, Repo, Person, Ticket, ...)
+    display_name: str | None = None  # from properties->>'name'
+    edge_types: list[str] = Field(default_factory=list)  # MENTIONS, AUTHORED, ...
+    max_confidence: str  # EXTRACTED | INFERRED | AMBIGUOUS
+    doc_count: int  # # of result-set docs adjacent to this entity (BFS priority)
+    # IDF-adjusted score used for ranking. score = doc_count / log(1 +
+    # global_doc_count). Generic high-degree entities (e.g.
+    # Channel:#engineering attached to 10k docs) get crushed; specific
+    # entities surface. Surfaced so LLMs can see the ranking signal.
+    score: float
+    # Up to 3 doc IDs the entity is attached to, ordered by result rank
+    # (strongest first). Caps at 3 even when doc_count > 3 -- the LLM uses
+    # these to ground/audit the doc_count claim against its visible chunks
+    # list, not to enumerate every attached doc. DISTINCT -- multi-edge
+    # docs do not duplicate.
+    associated_doc_ids: list[str] = Field(default_factory=list)
+
+
 class QueryResponse(BaseModel):
     query: str
     chunks: list[QueryChunk]
@@ -426,6 +466,17 @@ class QueryResponse(BaseModel):
     # Code-graph PR-A: entity-keyed groupings for MCP entity-bag queries.
     # Null on dashboard NL responses.
     bundles: list[QueryBundle] | None = None
+    # Three-state contract per codex-B4:
+    #   None        -> not requested (top_k_related == 0) OR walk failed
+    #                 (also see related_entities_error below). Also None
+    #                 when list_pipeline returns aggregation rows (no
+    #                 result docs to walk from).
+    #   []          -> requested, walked, no neighbors found (legitimate empty)
+    #   [item, ...] -> requested, walked, found neighbors
+    related_entities: list[RelatedEntity] | None = None
+    # Populated only on walk failure (set to type(exc).__name__). Lets MCP
+    # consumers and ops distinguish "feature broken" from "no neighbors".
+    related_entities_error: str | None = None
 
 
 class AnswerRequest(QueryRequest):
@@ -435,6 +486,19 @@ class AnswerRequest(QueryRequest):
     callers can use the same body shape and just toggle the endpoint.
     """
 
+    # AnswerResponse has no related_entities field; the walk would run and
+    # be discarded, costing one DB round-trip per /query for nothing.
+    # Caller can opt back in with top_k_related > 0 if needed for debug.
+    top_k_related: int = Field(
+        default=0,
+        ge=0,
+        le=50,
+        description=(
+            "Override of QueryRequest.top_k_related: defaults to 0 on the "
+            "synthesis path because AnswerResponse does not propagate "
+            "related_entities. Set explicitly to enable the walk."
+        ),
+    )
     model: str | None = Field(
         default=None,
         description=(

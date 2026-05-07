@@ -354,3 +354,39 @@ exchange the refresh_token for a new access_token via
 on `integration_tokens` and retry the original call once.
 
 Trigger to do this work: first observed 401 from Notion in production logs.
+
+---
+
+## related_entities follow-ups (from /review)
+
+### ACL-aware IDF denominator for `score`
+**Where:** `services/retrieval/retrievers/related_entities.py:172` (neighbor_global_freq CTE)
+
+`score = doc_count / ln(1 + global_doc_count)` divides by the count of all
+tenant docs the neighbor is attached to, regardless of `requesting_user_id`.
+Today ACL is a no-op for nearly all retrievals so this is latent. When ACL
+enforcement turns on, a low score becomes a side channel hinting "this entity
+is mentioned in private docs you can't see" for any caller with read access
+to even one related doc.
+
+**Fix:** thread `requesting_user_id` into `walk_result_doc_neighbors` and join
+`acl_snapshots` (or whatever ACL filter the rest of the pipeline uses) inside
+`neighbor_global_freq`. Cost: ~15 LOC + extra join cost on the hot path.
+
+**Trigger:** before flipping ACL enforcement on for any tenant.
+
+### Distinguish missing-graph_node from legitimate-empty
+**Where:** `services/retrieval/retrievers/related_entities.py:109` (doc_anchors CTE)
+
+`walk_result_doc_neighbors` anchors only through `graph_nodes(label='Document',
+canonical_id=doc_id)`. If a doc was ingested but graph_node creation failed (or
+a connector emitted no graph_node row), the response is `[]` -- which the
+three-state contract defines as "walked, no neighbors". That masks partial
+ingestion / data corruption as a clean empty result.
+
+**Fix:** count how many `ranked_result_docs` failed to resolve to a graph_node
+row and surface as a debug field (e.g. `unanchored_doc_count`) on the response,
+or emit a structlog warning at info level when the count is non-zero.
+
+**Trigger:** if related_entities ever appears suspiciously empty in production
+when the underlying docs clearly have graph relationships.
