@@ -396,11 +396,12 @@ async def classify_with_llm(
             return []
 
     # Cross-repo classification is a cheap pre-filter, not a triage call.
-    # Hard-coded to Flash Lite regardless of WIKI_TRIAGE_MODEL — flipping
-    # triage to Haiku/Anthropic should not bring this Anthropic-bill-flavored
-    # call along for the ride. Edit here if Flash Lite ever stops being
-    # the right tool.
-    model_name = "gemini-flash-lite-preview"
+    # Hard-coded to Gemini 3.1 Flash Lite regardless of WIKI_TRIAGE_MODEL —
+    # flipping triage to Haiku/Anthropic should not bring this Google-bill-
+    # flavored call along for the ride. The version-suffixed name is what
+    # `v1beta/generateContent` actually serves; the unversioned alias
+    # `gemini-flash-lite-preview` returns 404 (verified in prod 2026-05-07).
+    model_name = "gemini-3.1-flash-lite-preview"
 
     try:
         resp = await client.aio.models.generate_content(
