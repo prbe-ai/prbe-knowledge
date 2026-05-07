@@ -145,7 +145,19 @@ jobs:
       # until a distributed lock + rate limiter exist (see fly.poller.toml).
       # Re-asserting count=1 every deploy is idempotent and cheap insurance.
       - name: Pin poller to exactly 1 machine
-        run: flyctl scale count poller=1 -a prbe-knowledge-poller --yes
+        # Wrap in `timeout 120` because flyctl scale count regressed in late
+        # 2025 to spin indefinitely when the requested state matches current
+        # state (no-op scale). Observed in prod: stuck pin steps hang the
+        # workflow runner for hours, blocking every queued deploy on the
+        # concurrency lock. Exit 124 (timeout fired) is treated as success
+        # since the no-op case means current state is already target.
+        # See incident on 2026-05-07 (deploy 25470960356, wiki-bootstrap).
+        run: |
+          set +e
+          timeout 120 flyctl scale count poller=1 -a prbe-knowledge-poller --yes
+          rc=$?
+          if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then exit 0; fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -165,8 +177,15 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy —
       # follow up with explicit scale count to actually move the dial.
+      # Timeout wrapper: see "Pin poller" comment above for the no-op-hang
+      # regression rationale.
       - name: Pin wiki-worker to 4 machines
-        run: flyctl scale count worker=4 -a prbe-knowledge-wiki-worker --yes
+        run: |
+          set +e
+          timeout 120 flyctl scale count worker=4 -a prbe-knowledge-wiki-worker --yes
+          rc=$?
+          if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then exit 0; fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -184,8 +203,14 @@ jobs:
         run: flyctl deploy --remote-only -c fly.wiki-synthesis.toml
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      # Timeout wrapper: see "Pin poller" comment for the no-op-hang regression.
       - name: Pin wiki-synthesis to 2 machines
-        run: flyctl scale count worker=2 -a prbe-knowledge-wiki-synthesis --yes
+        run: |
+          set +e
+          timeout 120 flyctl scale count worker=2 -a prbe-knowledge-wiki-synthesis --yes
+          rc=$?
+          if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then exit 0; fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -220,7 +245,13 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy —
       # follow up with explicit scale count to actually move the dial.
+      # Timeout wrapper: see "Pin poller" comment for the no-op-hang regression.
       - name: Pin wiki-bootstrap to 4 machines
-        run: flyctl scale count worker=4 -a prbe-knowledge-wiki-bootstrap --yes
+        run: |
+          set +e
+          timeout 120 flyctl scale count worker=4 -a prbe-knowledge-wiki-bootstrap --yes
+          rc=$?
+          if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then exit 0; fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
