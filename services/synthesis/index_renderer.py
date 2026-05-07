@@ -229,11 +229,9 @@ def _format_edges_for_prompt(edges: list[_RepoEdge]) -> str:
         lines.append(f"  {edge.source} {marker} {edge.target}{note}")
     lines.append("")
     lines.append(
-        "When emitting the Mermaid diagram, use these edges only. Render "
-        "bidirectional edges with a normal arrow (`-->`); render one-way "
-        "edges with the same arrow style but add `|one-way|` as the edge "
-        "label so it reads, for example, `prbe-knowledge -->|one-way| "
-        "prbe-backend`."
+        "These are facts the page list / intro can reference. Do NOT "
+        "emit a Mermaid diagram yourself — the system splices one in "
+        "deterministically after your output."
     )
     return "\n".join(lines)
 
