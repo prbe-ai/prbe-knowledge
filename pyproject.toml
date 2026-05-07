@@ -39,6 +39,12 @@ dependencies = [
     "pyyaml>=6.0",
     "tiktoken>=0.8.0",
 
+    # community detection: Leiden algorithm for graph partitioning (nightly cron).
+    # leidenalg requires python-igraph as its graph backend.
+    # Only imported in services/community/; retrieval service does NOT import these.
+    "leidenalg>=0.10.2",
+    "python-igraph>=0.11.5",
+
     # code-graph: tree-sitter AST extraction. Modern py-tree-sitter binding
     # plus per-language parsers. NOT the older tree-sitter-languages wheel
     # (unmaintained as of 2025; pins to old ABI versions).
