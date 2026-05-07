@@ -172,7 +172,12 @@ async def upsert_edges(
     valid_to_list = [deduped[k]["valid_to"] for k in sorted_keys]
     confidences = [deduped[k]["confidence"] for k in sorted_keys]
 
-    await conn.execute(
+    # Use RETURNING to detect genuine INSERTs vs ON CONFLICT merges.
+    # xmax = 0 on the returning row means a fresh insert (no existing tuple
+    # was updated); xmax != 0 means an existing row was touched by ON CONFLICT
+    # DO UPDATE. We only bump degree for new edges -- a conflict on an
+    # already-existing edge must not double-count the endpoints.
+    inserted_rows = await conn.fetch(
         """
         INSERT INTO graph_edges (
             customer_id, edge_type, from_node_id, to_node_id,
@@ -195,6 +200,7 @@ async def upsert_edges(
                 WHEN graph_edges.confidence = 'INFERRED' THEN graph_edges.confidence
                 ELSE EXCLUDED.confidence
             END
+        RETURNING from_node_id, to_node_id, (xmax = 0) AS inserted
         """,
         customer_id,
         source_system,
@@ -206,6 +212,37 @@ async def upsert_edges(
         valid_to_list,
         confidences,
     )
+
+    # Collect all node_ids that are endpoints of genuinely-inserted edges.
+    # Each new edge increments both its from_node and to_node by 1.
+    # Build a counter mapping node_id -> increment_amount so we can update
+    # degree in a single UPDATE statement rather than N round-trips.
+    degree_increments: dict[int, int] = {}
+    for row in inserted_rows:
+        if row["inserted"]:
+            degree_increments[row["from_node_id"]] = (
+                degree_increments.get(row["from_node_id"], 0) + 1
+            )
+            degree_increments[row["to_node_id"]] = (
+                degree_increments.get(row["to_node_id"], 0) + 1
+            )
+
+    if degree_increments:
+        inc_node_ids = list(degree_increments.keys())
+        inc_amounts = [degree_increments[nid] for nid in inc_node_ids]
+        await conn.execute(
+            """
+            UPDATE graph_nodes
+            SET degree = graph_nodes.degree + delta
+            FROM unnest($1::bigint[], $2::int[]) AS t(node_id, delta)
+            WHERE graph_nodes.node_id = t.node_id
+              AND graph_nodes.customer_id = $3
+            """,
+            inc_node_ids,
+            inc_amounts,
+            customer_id,
+        )
+
     return len(deduped)
 
 

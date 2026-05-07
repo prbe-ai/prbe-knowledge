@@ -591,8 +591,31 @@ async def update_edges_after_push(
 
         if not kept:
             async with with_tenant(customer_id) as conn:
+                # Wrap DELETE in a data-modifying CTE so the same statement
+                # also decrements graph_nodes.degree for both endpoints. The
+                # ingestion-side INSERT bumps degree on real inserts (see
+                # graph_writer.upsert_edges); without this matching DECREMENT,
+                # degree drifts upward over time as cross-repo edges churn.
                 await conn.execute(
-                    "DELETE FROM graph_edges WHERE edge_id = $1 AND customer_id = $2",
+                    """
+                    WITH deleted AS (
+                        DELETE FROM graph_edges
+                        WHERE edge_id = $1 AND customer_id = $2
+                        RETURNING from_node_id, to_node_id
+                    ),
+                    endpoint_decs AS (
+                        SELECT node_id, COUNT(*) AS dec FROM (
+                            SELECT from_node_id AS node_id FROM deleted
+                            UNION ALL
+                            SELECT to_node_id FROM deleted
+                        ) e
+                        GROUP BY node_id
+                    )
+                    UPDATE graph_nodes gn
+                    SET degree = GREATEST(gn.degree - ed.dec, 0)
+                    FROM endpoint_decs ed
+                    WHERE gn.customer_id = $2 AND gn.node_id = ed.node_id
+                    """,
                     row["edge_id"],
                     customer_id,
                 )
@@ -714,13 +737,31 @@ async def persist_cross_repo_edges(
         source_node_id = await _get_or_create_repo_node(
             conn, customer_id, source_repo
         )
+        # Wrap DELETE in a data-modifying CTE so the same statement also
+        # decrements graph_nodes.degree for both endpoints of every removed
+        # edge. See update_edges_after_push for the same pattern + rationale.
         await conn.execute(
             """
+            WITH deleted AS (
                 DELETE FROM graph_edges
                 WHERE customer_id = $1
                   AND edge_type = 'DEPENDS_ON'
                   AND from_node_id = $2
-                """,
+                RETURNING from_node_id, to_node_id
+            ),
+            endpoint_decs AS (
+                SELECT node_id, COUNT(*) AS dec FROM (
+                    SELECT from_node_id AS node_id FROM deleted
+                    UNION ALL
+                    SELECT to_node_id FROM deleted
+                ) e
+                GROUP BY node_id
+            )
+            UPDATE graph_nodes gn
+            SET degree = GREATEST(gn.degree - ed.dec, 0)
+            FROM endpoint_decs ed
+            WHERE gn.customer_id = $1 AND gn.node_id = ed.node_id
+            """,
             customer_id,
             source_node_id,
         )

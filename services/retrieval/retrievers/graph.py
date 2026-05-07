@@ -1,4 +1,4 @@
-"""Graph retriever: entity → 1-hop neighbor documents.
+"""Graph retriever: entity -> 1-hop neighbor documents.
 
 Takes router-extracted entities (typed by label + canonical_id) and returns
 chunks from documents attached to nodes within 1 hop. Uses the relational
@@ -7,13 +7,20 @@ graph tables + RLS tenant isolation.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime
 
+from services.retrieval.surprise import surprise_score
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_GRAPH
 from shared.db import with_tenant
 from shared.models import TemporalSpec, normalize_author_id
+
+# Feature flag: when true, graph hits receive a computed surprise score
+# instead of the flat 1.0. Default false so existing behaviour is unchanged
+# until staging A/B confirms no regression.
+SURPRISE_SCORE_ENABLED: bool = os.getenv("SURPRISE_SCORE_ENABLED", "false").lower() == "true"
 
 
 @dataclass(slots=True)
@@ -40,6 +47,9 @@ class GraphHit:
     edge_type: str | None = None
     confidence: str | None = None
     via_label: str | None = None
+    # Surprise-score telemetry. Always set (even when flag=false) so we can
+    # compare would-be scores via logs without flipping the flag in prod.
+    retriever_scores: dict[str, float] | None = None
 
 
 # Confidence tier ordering — higher rank = stronger. Mirrors graph_writer.
@@ -137,18 +147,35 @@ async def graph_search(
         rows = await conn.fetch(
             f"""
             WITH anchors AS (
-                SELECT node_id, canonical_id, label
-                FROM graph_nodes
-                WHERE customer_id = $1
-                  AND label = ANY($2::text[])
-                  AND canonical_id = ANY($3::text[])
+                SELECT a.node_id,
+                       a.canonical_id,
+                       a.label,
+                       a.degree        AS via_degree,
+                       a.community_id  AS via_community,
+                       -- Best-effort source_system for the anchor. Anchors are
+                       -- non-document nodes (Service, Repo, Person, etc.) whose
+                       -- provenance is tracked in graph_node_provenance. Take
+                       -- MIN to get a deterministic value when a node has been
+                       -- asserted by multiple connectors.
+                       (SELECT MIN(p.source_system)
+                        FROM graph_node_provenance p
+                        WHERE p.node_id = a.node_id) AS via_source_system
+                FROM graph_nodes a
+                WHERE a.customer_id = $1
+                  AND a.label = ANY($2::text[])
+                  AND a.canonical_id = ANY($3::text[])
             ),
             neighbors AS (
                 SELECT DISTINCT n.node_id,
-                                a.canonical_id AS via,
-                                a.label        AS via_label,
-                                e.edge_type    AS edge_type,
-                                e.confidence   AS confidence
+                                a.canonical_id       AS via,
+                                a.label              AS via_label,
+                                e.edge_type          AS edge_type,
+                                e.confidence         AS confidence,
+                                a.via_degree         AS via_degree,
+                                a.via_community      AS via_community,
+                                a.via_source_system  AS via_source_system,
+                                n.degree             AS degree,
+                                n.community_id       AS community_id
                 FROM anchors a
                 JOIN graph_edges e
                   ON e.customer_id = $1
@@ -159,10 +186,15 @@ async def graph_search(
                  AND n.label = 'Document'
                 UNION
                 SELECT node_id,
-                       canonical_id AS via,
-                       label        AS via_label,
-                       NULL         AS edge_type,
-                       NULL         AS confidence
+                       canonical_id    AS via,
+                       label           AS via_label,
+                       NULL            AS edge_type,
+                       NULL            AS confidence,
+                       via_degree,
+                       via_community,
+                       via_source_system,
+                       degree          AS degree,
+                       community_id
                 FROM anchors
                   WHERE EXISTS (SELECT 1 FROM graph_nodes gn
                                 WHERE gn.node_id = anchors.node_id AND gn.label = 'Document')
@@ -170,10 +202,15 @@ async def graph_search(
             SELECT c.chunk_id, c.doc_id, d.version AS doc_version,
                    d.source_system, d.source_url, d.title, d.author_id,
                    c.content, d.created_at, d.updated_at,
-                   MIN(n.via)        AS via_entity,
-                   MIN(n.via_label)  AS via_label,
-                   MIN(n.edge_type)  AS edge_type,
-                   MIN(n.confidence) AS confidence
+                   MIN(n.via)               AS via_entity,
+                   MIN(n.via_label)         AS via_label,
+                   MIN(n.edge_type)         AS edge_type,
+                   MIN(n.confidence)        AS confidence,
+                   MIN(n.via_degree)        AS via_degree,
+                   MIN(n.via_community)     AS via_community,
+                   MIN(n.via_source_system) AS via_source_system,
+                   MIN(n.degree)            AS degree,
+                   MIN(n.community_id)      AS community_id
             FROM neighbors n
             JOIN graph_nodes gn ON gn.node_id = n.node_id
             JOIN documents d
@@ -201,6 +238,23 @@ async def graph_search(
         confidence = r["confidence"]
         if not passes_confidence_filter(confidence, min_confidence):
             continue
+
+        # Always compute the would-be surprise score for telemetry, even when
+        # the flag is off. This lets operators compare distributions via logs
+        # without touching SURPRISE_SCORE_ENABLED in prod.
+        would_be_score = surprise_score(
+            edge_type=r["edge_type"],
+            confidence=confidence,
+            anchor_label=r["via_label"],
+            target_label="Document",
+            anchor_source=r["via_source_system"],
+            target_source=r["source_system"],
+            anchor_community=r["via_community"],
+            target_community=r["community_id"],
+            anchor_degree=r["via_degree"] or 0,
+            target_degree=r["degree"] or 0,
+        )
+
         hits.append(
             GraphHit(
                 chunk_id=r["chunk_id"],
@@ -212,12 +266,13 @@ async def graph_search(
                 content=r["content"],
                 created_at=r["created_at"],
                 updated_at=r["updated_at"],
-                score=1.0,
+                score=would_be_score if SURPRISE_SCORE_ENABLED else 1.0,
                 via_entity=r["via_entity"],
                 author_id=normalize_author_id(r["author_id"]),
                 edge_type=r["edge_type"],
                 confidence=confidence,
                 via_label=r["via_label"],
+                retriever_scores={"surprise": would_be_score},
             )
         )
     return hits
