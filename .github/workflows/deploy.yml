@@ -83,6 +83,11 @@ jobs:
               - 'shared/**'
               - 'fly.wiki-backfill.toml'
               - 'pyproject.toml'
+            community:
+              - 'services/community/**'
+              - 'shared/**'
+              - 'fly.community.toml'
+              - 'pyproject.toml'
 
   deploy-ingestion:
     needs: changes
@@ -326,6 +331,30 @@ jobs:
           timeout 120 flyctl scale count worker=4 -a prbe-knowledge-wiki-bootstrap --yes
           rc=$?
           if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then exit 0; fi
+          exit $rc
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+  deploy-community:
+    needs: [changes, deploy-ingestion]
+    if: |
+      always() &&
+      needs.changes.outputs.community == 'true' &&
+      (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Deploy community
+        # Nightly Leiden community-detection cron. See "Deploy ingestion"
+        # for timeout rationale.
+        run: |
+          set +e
+          timeout 1500 flyctl deploy --remote-only -c fly.community.toml
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-community'"
+          fi
           exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
