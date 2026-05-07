@@ -738,7 +738,9 @@ class WikiAgentRuntime:
                 f"{WIKI_DOC_TYPE_PREFIX}%",
                 WIKI_INDEX_DOC_TYPE,
             )
-        body = await index_renderer.render_index_via_llm(rows)
+        body = await index_renderer.render_index_via_llm(
+            rows, customer_id=self.customer_id
+        )
         received_at = datetime.now(UTC)
         raw_payload: dict[str, Any] = {
             WIKI_PAYLOAD_KEY: {
