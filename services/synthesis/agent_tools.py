@@ -29,7 +29,7 @@ Tools (BOOKKEEPING):
 
 from __future__ import annotations
 
-from typing import Any, get_args
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -39,9 +39,19 @@ from services.synthesis.models import WikiType
 # Tool schemas (Gemini function-call format)
 # ---------------------------------------------------------------------------
 
-# Pulled from the WikiType literal so adding a new wiki_type in models.py
-# automatically widens the tool schema's enum without a second edit.
-_WIKI_TYPES = list(get_args(WikiType))
+# wiki_type is free-form — the agent picks slugs as it sees fit. The
+# schema description below names common ones as guidance but the field
+# itself accepts any string. URL-safety regex is enforced when the page
+# is persisted, not at the tool boundary.
+_WIKI_TYPE_SCHEMA: dict[str, Any] = {
+    "type": "string",
+    "description": (
+        "The page-kind discriminator. You typically pick from `repo`, "
+        "`runbook`, `person`, `company`, `customer`, `project`, `event`, "
+        "but you may invent new types if the corpus calls for it. Keep "
+        "the slug lowercase, alphanumeric + underscore, <= 32 chars."
+    ),
+}
 
 
 # Note on schema shape:
@@ -90,7 +100,7 @@ READ_PAGE_TOOL: dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
-            "wiki_type": {"type": "string", "enum": _WIKI_TYPES},
+            "wiki_type": _WIKI_TYPE_SCHEMA,
             "slug": {"type": "string"},
         },
         "required": ["wiki_type", "slug"],
@@ -124,7 +134,7 @@ UPDATE_PAGE_TOOL: dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
-            "wiki_type": {"type": "string", "enum": _WIKI_TYPES},
+            "wiki_type": _WIKI_TYPE_SCHEMA,
             "slug": {"type": "string"},
             "body_markdown": {"type": "string"},
             "summary": {"type": "string"},
@@ -155,7 +165,7 @@ CREATE_PAGE_TOOL: dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
-            "wiki_type": {"type": "string", "enum": _WIKI_TYPES},
+            "wiki_type": _WIKI_TYPE_SCHEMA,
             "slug": {"type": "string"},
             "title": {"type": "string"},
             "body_markdown": {"type": "string"},

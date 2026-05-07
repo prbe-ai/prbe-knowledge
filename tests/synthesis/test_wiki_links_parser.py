@@ -82,7 +82,12 @@ def test_slug_with_underscore_extracts() -> None:
 
 
 def test_invalid_wiki_type_dropped_with_warning(capsys: pytest.CaptureFixture[str]) -> None:
-    body = "see [[bogus:foo]] and [[person:maison]]"
+    # wiki_type is free-form, but must match the URL-safe slug shape
+    # (lead with a letter). `_bogus` parses through the markdown link
+    # grammar's `[a-z_]+` prefix yet fails the slug-shape validator
+    # because slugs must start with a letter — exactly the case we want
+    # to assert lives between the two layers.
+    body = "see [[_bogus:foo]] and [[person:maison]]"
     links = extract_links_from_markdown(body)
     assert len(links) == 1
     assert links[0].dst_wiki_type == "person"
@@ -145,7 +150,10 @@ def test_frontmatter_non_string_or_dict_ignored() -> None:
 
 
 def test_frontmatter_invalid_wiki_type_dropped(capsys: pytest.CaptureFixture[str]) -> None:
-    fm = {"works_at": "bogus:foo"}
+    # `_bogus` (leading underscore) violates the URL-safe slug regex
+    # which requires a leading letter, but matches the frontmatter
+    # parser's `[a-z_]+:` prefix so it reaches the validator.
+    fm = {"works_at": "_bogus:foo"}
     links = extract_links_from_frontmatter(fm)
     assert links == []
     assert "wiki_links.invalid_type" in capsys.readouterr().out

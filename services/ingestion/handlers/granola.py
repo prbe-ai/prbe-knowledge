@@ -248,7 +248,7 @@ class GranolaConnector(Connector):
             GraphNodeSpec(
                 label=NodeLabel.DOCUMENT,
                 canonical_id=doc_id,
-                properties={"doc_type": doc.doc_type.value},
+                properties={"doc_type": doc.doc_type},
             ),
             GraphNodeSpec(
                 label=NodeLabel.PERSON,

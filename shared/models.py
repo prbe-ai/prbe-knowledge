@@ -10,7 +10,7 @@ from shared.constants import (
     AttachmentKind,
     CompileTrigger,
     DocClass,
-    DocType,
+    DocType,  # noqa: F401  (re-exported; other modules import via shared.models)
     EdgeType,
     EntityType,
     IngestionEventType,
@@ -76,7 +76,12 @@ class Document(BaseModel):
     source_url: str
 
     doc_class: DocClass = DocClass.RAW_SOURCE
-    doc_type: DocType
+    # doc_type is a free-form string at the model level so connectors that
+    # mint dynamic types (e.g. wiki pages, where the LLM picks `wiki.repo`,
+    # `wiki.runbook`, etc.) can pass them through. Closed-set sources still
+    # pass `DocType.<MEMBER>` enum values — StrEnum members are str
+    # subclasses so the existing call sites keep working unchanged.
+    doc_type: str
     content_type: str = "text/plain"
     language: str | None = None
 

@@ -27,7 +27,6 @@ from shared.config import Settings
 from shared.constants import (
     CompileTrigger,
     DocClass,
-    DocType,
     EdgeType,
     IngestionEventType,
     NodeLabel,
@@ -90,14 +89,24 @@ def test_parse_page_links_typed_kinds() -> None:
     assert ("feature", "auth") in by_kind
 
 
-def test_parse_page_links_unknown_kind_is_plain() -> None:
+def test_parse_page_links_typed_kind_is_free_form() -> None:
+    # wiki kinds are free-form — anything matching the URL-safe slug
+    # regex parses as a typed link with that lowercased kind.
     body = "[[Sentinel: alpha]] but [[plain target]]."
     links = parse_page_links(body)
-    assert links[0].kind == "plain"
-    # Unknown prefix preserves the full inner text so the dangling-link surfacer
-    # can still flag it.
-    assert links[0].target == "Sentinel: alpha"
+    assert links[0].kind == "sentinel"
+    assert links[0].target == "alpha"
     assert links[1].kind == "plain"
+
+
+def test_parse_page_links_invalid_kind_collapses_to_plain() -> None:
+    # A prefix that doesn't match the slug shape (e.g. contains spaces or
+    # uppercase only on its own) collapses to plain so the dangling-link
+    # surfacer can still flag it.
+    body = "[[Two Words: alpha]]."
+    links = parse_page_links(body)
+    assert links[0].kind == "plain"
+    assert links[0].target == "Two Words: alpha"
 
 
 def test_parse_page_links_empty_and_unicode() -> None:
@@ -172,13 +181,15 @@ def test_parse_webhook_event_delete() -> None:
     assert parsed.parse_hint["is_delete"] is True
 
 
-def test_parse_webhook_event_unknown_type_raises() -> None:
+def test_parse_webhook_event_invalid_type_raises() -> None:
     connector = build_connector(SourceSystem.WIKI, _make_ctx())
+    # wiki_type is free-form but must match the URL-safe slug shape;
+    # uppercase / spaces / leading digits are rejected.
     with pytest.raises(InvalidWebhookPayload):
         connector.parse_webhook_event(
             "cust-1",
             {},
-            {WIKI_PAYLOAD_KEY: {"wiki_type": "bogus", "slug": "x"}},
+            {WIKI_PAYLOAD_KEY: {"wiki_type": "Bogus Kind", "slug": "x"}},
         )
 
 
@@ -202,7 +213,7 @@ def test_verify_signature_returns_false() -> None:
 def test_build_normalization_result_runbook_with_typed_links() -> None:
     body = (
         "When the Slack backfill stalls, ping [[Person: mahit]] and check "
-        "[[Service: prbe-knowledge]]. See [[Decision: serialize-cc-claims]] "
+        "[[Service: prbe-knowledge]]. See [[Repo: prbe-knowledge]] "
         "and the [[plain runbook]] for the full sequence."
     )
     event = _make_event(
@@ -223,7 +234,7 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     assert doc.source_system == SourceSystem.WIKI
     assert doc.source_id == "runbook:slack-backfill-stuck"
     assert doc.source_url == "/wiki/runbook/slack-backfill-stuck"
-    assert doc.doc_type == DocType.WIKI_RUNBOOK
+    assert doc.doc_type == "wiki.runbook"
     assert doc.doc_class == DocClass.MANUAL_ENTRY
     assert doc.title == "Slack backfill stuck"
     assert doc.body == body
@@ -248,7 +259,7 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     assert (NodeLabel.WIKI_PERSON, "mahit") in labels
     assert (NodeLabel.PERSON, "mahit") not in labels
     assert (NodeLabel.SERVICE, "prbe-knowledge") in labels
-    assert (NodeLabel.DECISION, "serialize-cc-claims") in labels
+    assert (NodeLabel.REPO, "prbe-knowledge") in labels
 
     edge_keys = {
         (e.edge_type, e.from_canonical_id, e.to_label, e.to_canonical_id)
@@ -269,8 +280,8 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     assert (
         EdgeType.DESCRIBES,
         doc.doc_id,
-        NodeLabel.DECISION,
-        "serialize-cc-claims",
+        NodeLabel.REPO,
+        "prbe-knowledge",
     ) in edge_keys
 
     # ACL snapshot row.
@@ -322,9 +333,9 @@ def test_build_delete_emits_tombstone() -> None:
 def test_build_compiled_wiki_sets_compile_trigger() -> None:
     event = _make_event(
         {
-            "wiki_type": "service_card",
+            "wiki_type": "repo",
             "slug": "prbe-knowledge",
-            "title": "prbe-knowledge service card",
+            "title": "prbe-knowledge repo",
             "body": "Owns retrieval + ingestion for [[Repo: prbe-knowledge]].",
             "doc_class": DocClass.COMPILED_WIKI.value,
             "compiled_from_doc_ids": ["github:commit:abc"],
@@ -358,7 +369,7 @@ def test_build_invalid_doc_class_raises() -> None:
 def test_build_dedupes_repeated_typed_links() -> None:
     event = _make_event(
         {
-            "wiki_type": "feature",
+            "wiki_type": "runbook",
             "slug": "auth",
             "title": "Auth",
             "body": "[[Person: mahit]] [[Person: mahit]] [[Person: mahit]]",

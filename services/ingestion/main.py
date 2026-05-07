@@ -262,7 +262,7 @@ async def create_manual_uploads(
             "original_object_key": staging_key,
             "extracted_text": parsed.text,
             "parse_engine": parsed.parse_engine,
-            "doc_type": parsed.doc_type.value,
+            "doc_type": parsed.doc_type,
             "doc_id": doc_id,
         }
         safe_headers = {
