@@ -67,7 +67,7 @@ async def reset_db_opt_out(live_db: None, settings: Settings) -> AsyncIterator[N
     yield None
 
 
-def _doc(doc_id: str, *, source_system: SourceSystem, doc_type: DocType) -> Document:
+def _doc(doc_id: str, *, source_system: SourceSystem, doc_type: DocType | str) -> Document:
     now = datetime.now(UTC)
     body = "Body content for synthesis triage."
     return Document(
@@ -163,7 +163,7 @@ async def test_persist_does_not_enqueue_wiki_self_writes(
     doc = _doc(
         "wiki:runbook:auth",
         source_system=SourceSystem.WIKI,
-        doc_type=DocType.WIKI_RUNBOOK,
+        doc_type="wiki.runbook",
     )
     await normalizer._persist(CUSTOMER, SourceSystem.WIKI, _result(doc))
 
