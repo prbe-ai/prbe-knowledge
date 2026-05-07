@@ -166,7 +166,7 @@ async def test_unknown_entity_type_falls_back_and_logs() -> None:
 
 
 @pytest.mark.asyncio
-async def test_all_known_types_no_warning(caplog) -> None:
+async def test_all_known_types_no_warning() -> None:
     """When every entity_type is in the mapping, no warning fires and
     fallback_cids is empty.
     """
@@ -188,7 +188,7 @@ async def test_all_known_types_no_warning(caplog) -> None:
 
     with (
         patch.object(graph_module, "with_tenant", lambda _cid: _FakeContextManager()),
-        caplog.at_level(logging.WARNING, logger="services.retrieval.retrievers.graph"),
+        patch.object(graph_module.log, "warning") as mock_warning,
     ):
         await graph_module.graph_search(
             customer_id="cust-test",
@@ -199,10 +199,9 @@ async def test_all_known_types_no_warning(caplog) -> None:
     fallback_cids = captured_params[0][4]
     assert fallback_cids == []
 
-    # No unknown_entity_types_fallback warning should be present.
-    assert not any(
-        "unknown_entity_types_fallback" in r.getMessage() for r in caplog.records
-    )
+    # No unknown_entity_types_fallback warning should fire when every type
+    # resolves cleanly.
+    mock_warning.assert_not_called()
 
 
 @pytest.mark.asyncio
