@@ -92,7 +92,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy ingestion
-        run: flyctl deploy --remote-only -c fly.ingestion.toml --release-command-timeout 15m
+        # Timeout-wrap flyctl deploy: the CLI has been observed to hang
+        # indefinitely (incident 2026-05-07, run 25478908763 wiki-cron
+        # wedged 70+ min after Fly-side rollout already completed). Without
+        # a wall-clock cap one bad deploy locks the entire concurrency
+        # group and supersedes every queued deploy. 25min covers slow
+        # paths; exit 124 is treated as a real failure (NOT pretend-
+        # success) because the deploy may be mid-rollout -- operator
+        # checks `flyctl status -a <app>` before retrying.
+        run: |
+          set +e
+          timeout 1500 flyctl deploy --remote-only -c fly.ingestion.toml --release-command-timeout 15m
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-ingestion'"
+          fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -107,7 +122,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy retrieval
-        run: flyctl deploy --remote-only -c fly.retrieval.toml
+        # See "Deploy ingestion" for timeout rationale.
+        run: |
+          set +e
+          timeout 1500 flyctl deploy --remote-only -c fly.retrieval.toml
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-retrieval'"
+          fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -122,7 +145,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy worker
-        run: flyctl deploy --remote-only -c fly.worker.toml
+        # See "Deploy ingestion" for timeout rationale.
+        run: |
+          set +e
+          timeout 1500 flyctl deploy --remote-only -c fly.worker.toml
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-worker'"
+          fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -137,7 +168,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy poller
-        run: flyctl deploy --remote-only -c fly.poller.toml
+        # See "Deploy ingestion" for timeout rationale.
+        run: |
+          set +e
+          timeout 1500 flyctl deploy --remote-only -c fly.poller.toml
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-poller'"
+          fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # min_machines_running = 1 in fly.poller.toml is a floor, not a cap —
@@ -172,7 +211,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy wiki-worker
-        run: flyctl deploy --remote-only -c fly.wiki-worker.toml
+        # See "Deploy ingestion" for timeout rationale.
+        run: |
+          set +e
+          timeout 1500 flyctl deploy --remote-only -c fly.wiki-worker.toml
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-wiki-worker'"
+          fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy —
@@ -200,7 +247,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy wiki-synthesis
-        run: flyctl deploy --remote-only -c fly.wiki-synthesis.toml
+        # See "Deploy ingestion" for timeout rationale.
+        run: |
+          set +e
+          timeout 1500 flyctl deploy --remote-only -c fly.wiki-synthesis.toml
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-wiki-synthesis'"
+          fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # Timeout wrapper: see "Pin poller" comment for the no-op-hang regression.
@@ -225,7 +280,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy wiki-cron
-        run: flyctl deploy --remote-only -c fly.wiki-cron.toml
+        # See "Deploy ingestion" for timeout rationale. wiki-cron is the
+        # service that triggered the original incident -- the flyctl CLI
+        # hung after Fly-side rollout completed (v44 was healthy while
+        # the GH Actions step stayed in_progress for 70+ min).
+        run: |
+          set +e
+          timeout 1500 flyctl deploy --remote-only -c fly.wiki-cron.toml
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-wiki-cron'"
+          fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -240,7 +306,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Deploy wiki-bootstrap
-        run: flyctl deploy --remote-only -c fly.wiki-backfill.toml
+        # See "Deploy ingestion" for timeout rationale.
+        run: |
+          set +e
+          timeout 1500 flyctl deploy --remote-only -c fly.wiki-backfill.toml
+          rc=$?
+          if [ $rc -eq 124 ]; then
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-wiki-backfill'"
+          fi
+          exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy —
