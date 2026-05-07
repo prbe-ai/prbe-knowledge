@@ -66,20 +66,18 @@ _INDEX_SYSTEM_PROMPT = (
     "dashboard already shows the page title above your body. The "
     "intro: what is this company about, what's the main product, "
     "what's getting built? Do NOT list pages here.\n\n"
-    "  2. **Architecture diagram** — a fenced ```mermaid block`` with "
-    "`graph TD` (top-down). Nodes = repos and services. Use the actual "
-    "repo / service names as node labels. Group related nodes with "
-    "subgraphs when the structure is obvious.\n\n"
-    "    **Edge source of truth.** The user content below contains a "
-    "`Verified architecture edges` block produced by static analysis "
-    "of the customer's actual code (file imports, service hostnames, "
-    "CI workflow refs). When that block lists edges, use ONLY those "
-    "edges in your diagram — do not invent additional ones from page "
-    "summaries. Render bidirectional edges with `-->`; render one-way "
-    "edges as `A -->|one-way| B`. When the block says NONE, emit a "
-    "tiny diagram with the repos as isolated nodes (no edges); do NOT "
-    "fall back to inferring edges from summaries. This diagram is "
-    "REQUIRED — even a 3-node no-edge graph beats no graph.\n\n"
+    "  2. **Architecture diagram (CONDITIONAL)** — only emit a fenced "
+    "```mermaid ``` block when the user content includes a "
+    "`Verified architecture edges` block listing one or more edges. "
+    "Use `graph TD` (top-down) with the actual repo / service names "
+    "as node labels and group related nodes with subgraphs when the "
+    "structure is obvious. Render bidirectional edges with `-->` and "
+    "one-way edges as `A -->|one-way| B`. **Use ONLY the listed "
+    "edges** — never invent new ones from page summaries.\n\n"
+    "    When the verified edges block says NONE, **SKIP the diagram "
+    "entirely** and move directly to the **Pages** section. Do not "
+    "render isolated nodes; an empty graph is misleading. We'd rather "
+    "show no diagram than a fake one.\n\n"
     "  3. **Pages** — list every page with a wiki link. Organize them "
     "however makes sense for THIS corpus (group by product line, by "
     "team, by service, by type — your call). **Lead with the most "
@@ -204,15 +202,26 @@ async def fetch_verified_repo_edges(customer_id: str) -> list[_RepoEdge]:
 
 
 def _format_edges_for_prompt(edges: list[_RepoEdge]) -> str:
-    """Render the verified edges block. Empty when no edges exist."""
+    """Render the verified edges block.
+
+    Empty edge set → a directive to SKIP the architecture diagram
+    entirely. We'd rather show no diagram than a misleading "isolated
+    nodes" placeholder that suggests we know the repos don't relate
+    when in reality the code-graph extraction may simply not have run
+    yet.
+    """
     if not edges:
         return (
             "Verified architecture edges: NONE.\n"
-            "Code-graph extraction has not yet produced cross-repo edges "
-            "for this customer (either the first repo is still backfilling, "
-            "or no inter-repo references have been verified). Emit a "
-            "minimal Mermaid diagram with the repos as isolated nodes — "
-            "do NOT invent edges from page summaries."
+            "Code-graph extraction has not produced any cross-repo edges "
+            "for this customer (either it has not run yet, or no inter-"
+            "repo references have been verified in the corpus).\n\n"
+            "**SKIP the architecture diagram entirely.** Do NOT emit the "
+            "```mermaid ``` block from step 2 of the structure. Move "
+            "directly from the intro to the **Pages** section. Do NOT "
+            "invent edges from page summaries; do NOT render isolated "
+            "nodes as a placeholder. Showing no diagram is honest; "
+            "showing a fake one is misleading."
         )
     lines = [
         "Verified architecture edges (USE ONLY THESE — do NOT invent more):",
