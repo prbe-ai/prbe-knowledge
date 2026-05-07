@@ -21,14 +21,19 @@ This migration:
      under the old taxonomy).
   3. Wipes wiki-specific side tables (``wiki_links``,
      ``wiki_raw_data``, ``wiki_timeline_entries``).
-  4. Deletes graph nodes whose label corresponds to a dropped or
-     renamed wiki type. Wraps in NO FORCE / FORCE per the
-     ``feedback_graph_nodes_rls_force`` precedent — without it, the
-     ``tenant_isolation`` policy reduces to ``customer_id = ''`` for
-     the migration owner and silently zero-matches.
-  5. Deletes any ``failed_chunks`` rows referencing wiki doc_ids.
+  4. Deletes any ``failed_chunks`` rows referencing wiki doc_ids.
 
 ``wiki_synthesis_runs`` is preserved for audit history.
+
+The orphan ``graph_nodes`` rows whose ``label`` was a wiki taxonomy
+member (``ServiceCard`` / ``Decision`` / ``Feature`` / ``Runbook`` /
+``WikiPerson``) are NOT touched here. The first attempt held an
+``ALTER TABLE graph_nodes NO FORCE ROW LEVEL SECURITY`` waiting for
+``AccessExclusiveLock`` against live ingestion traffic and timed out
+the 15-minute ``release_command`` window. Since the wiki documents
+themselves are gone, those graph nodes are inaccessible orphans — a
+follow-up out-of-band cleanup (or a future migration that takes the
+lock when ingestion is paused) can drop them safely.
 
 Downgrade is a no-op — the wipe is one-way, and re-running this
 migration after a fresh bootstrap would just delete the new pages.
@@ -68,26 +73,12 @@ def upgrade() -> None:
     op.execute("DELETE FROM wiki_raw_data")
     op.execute("DELETE FROM wiki_timeline_entries")
 
-    # 5. Graph nodes for dropped + renamed wiki labels. graph_edges
-    #    cascade-delete from graph_nodes via the FK declared in
-    #    schema.sql, so we only need to touch nodes.
-    #
-    #    Labels matching old NodeLabel members:
-    #      - ServiceCard  (was emitted by wiki=service_card pages)
-    #      - Decision     (dropped)
-    #      - Feature      (dropped)
-    #      - Runbook      (kept as a wiki_type, but old nodes may have
-    #                      been emitted under different page bodies and
-    #                      are easier to wipe + re-emit cleanly)
-    #      - WikiPerson   (kept as a wiki_type, same reasoning)
-    op.execute("ALTER TABLE graph_nodes NO FORCE ROW LEVEL SECURITY")
-    op.execute(
-        """
-        DELETE FROM graph_nodes
-        WHERE label IN ('ServiceCard', 'Decision', 'Feature', 'Runbook', 'WikiPerson')
-        """
-    )
-    op.execute("ALTER TABLE graph_nodes FORCE ROW LEVEL SECURITY")
+    # graph_nodes cleanup intentionally omitted — see module docstring.
+    # The previous attempt blocked on `ALTER TABLE NO FORCE ROW LEVEL
+    # SECURITY` waiting for an AccessExclusiveLock against live
+    # ingestion traffic and exceeded the release_command timeout.
+    # Orphan wiki-labeled nodes are inaccessible without their
+    # documents and can be cleaned up out-of-band.
 
 
 def downgrade() -> None:
