@@ -26,6 +26,28 @@ class SourceSystem(StrEnum):
     CODE_GRAPH = "code_graph"
 
 
+# Canonical display labels for each SourceSystem. Exposed to the
+# dashboard via /api/sources (TODO) and mirrored verbatim in
+# prbe-dashboard/src/lib/sources.ts. The connector classes also carry
+# `display_name: ClassVar[str]` for the same string at handler-instance
+# scope; these are kept aligned by code review (a future cleanup can
+# derive one from the other through the connector registry).
+SOURCE_DISPLAY_NAMES: dict[SourceSystem, str] = {
+    SourceSystem.SLACK: "Slack",
+    SourceSystem.LINEAR: "Linear",
+    SourceSystem.GITHUB: "GitHub",
+    SourceSystem.NOTION: "Notion",
+    SourceSystem.SENTRY: "Sentry",
+    SourceSystem.GRANOLA: "Granola",
+    SourceSystem.CLAUDE_CODE: "Claude Code",
+    SourceSystem.CODEX: "Codex",
+    SourceSystem.MANUAL_UPLOAD: "Manual upload",
+    SourceSystem.CUSTOM_INGEST: "Custom Ingest",
+    SourceSystem.WIKI: "Wiki",
+    SourceSystem.CODE_GRAPH: "Code",
+}
+
+
 class DocClass(StrEnum):
     RAW_SOURCE = "raw_source"
     COMPILED_WIKI = "compiled_wiki"
