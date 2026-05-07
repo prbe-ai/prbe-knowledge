@@ -719,60 +719,21 @@ class WikiAgentRuntime:
             )
 
     async def _regenerate_index(self) -> None:
-        async with with_tenant(self.customer_id) as conn:
-            rows = await conn.fetch(
-                """
-                SELECT title, body_preview, source_id, version, updated_at,
-                       metadata
-                FROM documents
-                WHERE customer_id = $1
-                  AND source_system = $2
-                  AND doc_type LIKE $3
-                  AND doc_type <> $4
-                  AND valid_to IS NULL
-                  AND deleted_at IS NULL
-                ORDER BY updated_at DESC
-                """,
-                self.customer_id,
-                SourceSystem.WIKI.value,
-                f"{WIKI_DOC_TYPE_PREFIX}%",
-                WIKI_INDEX_DOC_TYPE,
-            )
-        body = await index_renderer.render_index_via_llm(
-            rows, customer_id=self.customer_id
-        )
-        received_at = datetime.now(UTC)
-        raw_payload: dict[str, Any] = {
-            WIKI_PAYLOAD_KEY: {
-                "wiki_type": "index",
-                "slug": INDEX_SLUG,
-                "title": "Wiki",
-                "body": body,
-                "frontmatter": {"page_count": len(rows)},
-                "doc_class": DocClass.AGENT_ARTIFACT.value,
-                "is_delete": False,
-                "updated_at": received_at.isoformat(),
-                "summary": f"Wiki overview ({len(rows)} pages).",
-                "commit_message": (
-                    f"Regenerate index ({len(rows)} pages) from agent run #{self._run_id}"
-                ),
-                "commit_author": "agent:wiki-synthesis-cron",
-                "commit_run_id": self._run_id,
-                "author_id": "agent:wiki-synthesis-cron",
-            }
-        }
-        event = WebhookEvent(
+        """Delegate to the standalone regenerator (see `regenerate_wiki_index`).
+
+        Kept as an instance method so existing call sites
+        (commit() + crawlers/github.py) compile unchanged. The
+        standalone version is what gets called from non-runtime
+        paths: the periodic cross-repo refresh and any future admin
+        endpoint that wants a fresh index without rerunning the
+        whole agent loop.
+        """
+        await regenerate_wiki_index(
             customer_id=self.customer_id,
-            source_system=SourceSystem.WIKI,
-            source_event_id=f"index:{INDEX_SLUG}:edit:{received_at.isoformat()}",
-            received_at=received_at,
-            payload_s3_key="",
-            payload_s3_keys=[],
-            raw_payload=raw_payload,
-            headers={},
+            run_id=self._run_id,
+            commit_author="agent:wiki-synthesis-cron",
+            normalizer=self._normalizer,
         )
-        norm: NormalizationResult = build_normalization_result(event)
-        await self._normalizer._persist(self.customer_id, SourceSystem.WIKI, norm)
 
     # -----------------------------------------------------------------------
     # Snapshot / restore
@@ -804,7 +765,94 @@ def default_batch_size() -> int:
     return WIKI_AGENT_BATCH_SIZE
 
 
+async def regenerate_wiki_index(
+    *,
+    customer_id: str,
+    run_id: int | None = None,
+    commit_author: str = "system:wiki-index-regen",
+    normalizer: Normalizer | None = None,
+) -> None:
+    """Regenerate the wiki index page for a customer.
+
+    Reusable entry point — callable from anywhere (the wiki agent
+    runtime, the periodic cross-repo refresh, an admin endpoint, etc.)
+    Reads live wiki pages, asks the LLM to produce a markdown body
+    using verified cross-repo edges as the architecture-diagram
+    source-of-truth, and persists the result through the standard
+    Normalizer pipeline.
+
+    `run_id` is optional and only used as audit metadata
+    (`commit_run_id`). When omitted the commit message reads as a
+    standalone refresh rather than a tail of an agent run.
+
+    `normalizer` allows callers to supply a pre-built instance (the
+    agent runtime does this so the embedder + R2 client are reused
+    across an entire drain). Standalone callers can omit it and the
+    function constructs a fresh default.
+    """
+    if normalizer is None:
+        ctx = make_default_context()
+        normalizer = Normalizer(ctx, store=get_store(), embedder=Embedder())
+
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT title, body_preview, source_id, version, updated_at,
+                   metadata
+            FROM documents
+            WHERE customer_id = $1
+              AND source_system = $2
+              AND doc_type LIKE $3
+              AND doc_type <> $4
+              AND valid_to IS NULL
+              AND deleted_at IS NULL
+            ORDER BY updated_at DESC
+            """,
+            customer_id,
+            SourceSystem.WIKI.value,
+            f"{WIKI_DOC_TYPE_PREFIX}%",
+            WIKI_INDEX_DOC_TYPE,
+        )
+    body = await index_renderer.render_index_via_llm(
+        rows, customer_id=customer_id
+    )
+    received_at = datetime.now(UTC)
+    run_id_suffix = f" #{run_id}" if run_id is not None else ""
+    raw_payload: dict[str, Any] = {
+        WIKI_PAYLOAD_KEY: {
+            "wiki_type": "index",
+            "slug": INDEX_SLUG,
+            "title": "Wiki",
+            "body": body,
+            "frontmatter": {"page_count": len(rows)},
+            "doc_class": DocClass.AGENT_ARTIFACT.value,
+            "is_delete": False,
+            "updated_at": received_at.isoformat(),
+            "summary": f"Wiki overview ({len(rows)} pages).",
+            "commit_message": (
+                f"Regenerate index ({len(rows)} pages){run_id_suffix}"
+            ),
+            "commit_author": commit_author,
+            "commit_run_id": run_id,
+            "author_id": commit_author,
+        }
+    }
+    event = WebhookEvent(
+        customer_id=customer_id,
+        source_system=SourceSystem.WIKI,
+        source_event_id=f"index:{INDEX_SLUG}:edit:{received_at.isoformat()}",
+        received_at=received_at,
+        payload_s3_key="",
+        payload_s3_keys=[],
+        raw_payload=raw_payload,
+        headers={},
+    )
+    norm: NormalizationResult = build_normalization_result(event)
+    await normalizer._persist(customer_id, SourceSystem.WIKI, norm)
+
+
 __all__ = [
     "WikiAgentRuntime",
     "default_batch_size",
+    "regenerate_wiki_index",
 ]
