@@ -82,9 +82,12 @@ log = get_logger(__name__)
 router = APIRouter(prefix="/api/wiki", tags=["wiki"])
 
 # Slugs are URL components plus the source_id segment after the type prefix.
-# Keep them lowercase + dash-only so /wiki/runbook/Foo and /wiki/runbook/foo
-# can't both exist.
-_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$")
+# Lowercase + alphanumeric + hyphen + underscore: the LLM mints page
+# slugs from real repo / file names which routinely contain underscores
+# (`prbe_knowledge_mcp`, `auth_runbook`). Strict dash-only would reject
+# every page the agent creates from such a name. Case stays lowercase
+# so /wiki/runbook/Foo and /wiki/runbook/foo can't both exist.
+_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
 _MAX_BODY_BYTES = 1_048_576  # 1 MiB hard cap; bigger uploads must split into pages
 
 
@@ -249,7 +252,7 @@ def _validate_slug(slug: str) -> str:
     if not _SLUG_RE.match(slug):
         raise HTTPException(
             status_code=400,
-            detail="slug must match ^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$",
+            detail="slug must match ^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
         )
     return slug
 
