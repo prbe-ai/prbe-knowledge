@@ -164,11 +164,20 @@ async def extract_edges(
         client = _anthropic_module.AsyncAnthropic(api_key=api_key)
         user_message = _bundle_to_user_message(bundle)
 
+        # Prefill the assistant message with `[` so Haiku is forced to start
+        # its response inside a JSON array. Without prefill the model is free
+        # to emit a preamble ("Here are the edges I found:") or markdown
+        # fences, both of which break json.loads. With prefill,
+        # response.content[0].text is the body of the array; we re-prepend
+        # `[` before parsing.
         response = await client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=_MAX_OUTPUT_TOKENS,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
+            messages=[
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": "["},
+            ],
         )
 
         input_tokens = response.usage.input_tokens if response.usage else 0
@@ -187,9 +196,29 @@ async def extract_edges(
         result.bundle_fail_reason = f"llm_call_failed: {type(exc).__name__}"
         return result
 
-    # ---- Parse JSON ---------------------------------------------------------
+    # ---- Reconstruct + parse the JSON array --------------------------------
+    # The assistant prefill `[` was sent to the model but is NOT included in
+    # raw_text -- raw_text is just what the model continued with. The model
+    # has three sensible behaviours:
+    #   1. "no edges" -> raw_text is empty / whitespace / just `]`. Treat
+    #      as the empty array `[]` and return zero edges; this is the
+    #      common case on bundles with nothing inferable.
+    #   2. "edges" -> raw_text starts with `{...}, {...}, ..., {...}]`.
+    #      Re-prepend `[` and parse.
+    #   3. "edges, truncated by max_tokens" -> ends mid-element with no
+    #      closing `]`. Best-effort: drop a trailing `,`, append `]`,
+    #      try to parse. JSONDecodeError on a truncated-mid-element will
+    #      fall through to the failure branch.
+    stripped = raw_text.strip()
+    if not stripped or stripped == "]":
+        return result  # No edges; valid outcome.
+
+    candidate = "[" + stripped
+    if not candidate.endswith("]"):
+        candidate = candidate.rstrip(",") + "]"
+
     try:
-        raw_edges = json.loads(raw_text)
+        raw_edges = json.loads(candidate)
         if not isinstance(raw_edges, list):
             log.warning(
                 "inferred_edges.extractor.non_list_response",
@@ -205,6 +234,7 @@ async def extract_edges(
             customer=bundle.customer_id,
             anchor=bundle.anchor_doc_id,
             error=str(exc),
+            raw_text_preview=raw_text[:200],
         )
         result.bundle_failed = True
         result.bundle_fail_reason = f"json_parse_failed: {exc}"
