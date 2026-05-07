@@ -810,8 +810,19 @@ async def get_wiki_index(
         )
 
     if index_row is not None:
-        index_meta = _coerce_metadata(index_row["metadata"])
-        body_text = index_meta.get("body") or _render_index_body(entries)
+        # The wiki agent persists the LLM-generated index body via the
+        # standard Normalizer path: body lives in `chunks.content`, not
+        # `documents.metadata`. Reading from chunks pulls whatever the
+        # latest agent run produced (intro paragraph + Mermaid diagram +
+        # LLM-organized sections). Fall back to the deterministic
+        # _render_index_body only when chunks are empty (race during a
+        # delete + recreate, etc.) so the dashboard always renders.
+        async with with_tenant(customer_id) as conn:
+            body_text = await fetch_live_body_from_chunks(
+                conn, customer_id, index_doc_id
+            )
+        if not body_text.strip():
+            body_text = _render_index_body(entries)
         return WikiIndexResponse(
             body=body_text,
             entries=entries,
