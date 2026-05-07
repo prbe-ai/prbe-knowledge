@@ -7,10 +7,14 @@ entry runs at 02:00 UTC daily). The script does TWO things in order:
      events for every repo that has been code-graph-extracted before.
      The downstream worker re-runs the cross_repo_deps pass for each
      repo, picking up new mentions / removed deps. We then poll the
-     queue for drain and call ``regenerate_wiki_index`` per customer
+     queue for drain and call ``regenerate_wiki_diagram`` per customer
      so the architecture diagram in the wiki index reflects the fresh
-     edges. Cost: ~$0.005/repo, content_hash cache makes the symbol
-     extraction itself a ~no-op on unchanged files.
+     edges. Important: this surgically replaces only the
+     ```mermaid block``` in the index page — the intro paragraph and
+     page list stay byte-identical. The full index is rewritten only
+     when the wiki agent runs (i.e. when wiki content actually
+     changes). Cost: ~$0.005/repo, content_hash cache makes the
+     symbol extraction itself a ~no-op on unchanged files.
 
   B. Trigger nightly wiki synthesis. SELECT customer_ids with at least
      one pending wiki_synthesis_queue row AND
@@ -36,7 +40,7 @@ from datetime import UTC, datetime
 import asyncpg
 
 from services.ingestion.code_graph.bridge import enqueue_initial_backfill
-from services.synthesis.wiki_agent import regenerate_wiki_index
+from services.synthesis.diagram_renderer import regenerate_wiki_diagram
 from shared.config import get_settings
 from shared.constants import WIKI_PENDING_CHANNEL, SourceSystem
 from shared.logging import configure_logging, get_logger
@@ -171,14 +175,12 @@ async def refresh_cross_repo_edges(dsn: str) -> dict[str, int]:
             continue
 
         try:
-            await regenerate_wiki_index(
-                customer_id=customer_id,
-                commit_author="system:cross_repo_refresh",
-            )
-            summary["index_regens"] += 1
+            wrote = await regenerate_wiki_diagram(customer_id=customer_id)
+            if wrote:
+                summary["index_regens"] += 1
         except Exception as exc:
             log.warning(
-                "cross_repo_refresh.regen_failed",
+                "cross_repo_refresh.diagram_regen_failed",
                 customer=customer_id,
                 error=str(exc),
                 error_class=type(exc).__name__,
