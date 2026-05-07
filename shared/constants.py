@@ -166,6 +166,14 @@ class EdgeType(StrEnum):
     REFERENCES = "REFERENCES"
     DEFINED_IN = "DEFINED_IN"
 
+    # LLM-inferred edge types (Lane B). These are emitted only by the
+    # inferred_edges extractor and carry INFERRED or AMBIGUOUS confidence.
+    DISCUSSES = "DISCUSSES"
+    DOCUMENTS = "DOCUMENTS"
+    RESOLVES = "RESOLVES"
+    MENTIONS_ENTITY = "MENTIONS_ENTITY"
+    RELATES_TO = "RELATES_TO"
+
 
 class PrincipalType(StrEnum):
     USER = "user"
