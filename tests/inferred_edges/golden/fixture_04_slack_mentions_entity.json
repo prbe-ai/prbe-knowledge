@@ -1,0 +1,39 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0ABC999:1746000100.000100",
+    "docs": [
+      {
+        "doc_id": "slack:C0ABC999:1746000100.000100",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "#incidents channel",
+        "content": "Thread in #incidents:\ncarol: Seeing elevated error rates in Sentry. The payment-service is throwing 500s.\ndave: Same. I see SENTRY-789 is the main error group. The payment-service seems to be hitting a timeout talking to the billing API.\ncarol: I'll page the on-call. payment-service is in prbe-payments repo.",
+        "token_count": 75
+      },
+      {
+        "doc_id": "sentry:issue:SENTRY-789",
+        "customer_id": "cust-eval",
+        "source_system": "sentry",
+        "title": "SENTRY-789: PaymentService timeout on billing API",
+        "content": "Error group SENTRY-789\nProject: prbe-payments\nMessage: Timeout connecting to billing-service after 5000ms\nOccurrences: 4523 in last 24h\nFirst seen: 2026-05-07 08:12:00 UTC",
+        "token_count": 55
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0ABC999:1746000100.000100"},
+    {"label": "Document", "canonical_id": "sentry:issue:SENTRY-789"},
+    {"label": "ErrorGroup", "canonical_id": "SENTRY-789"},
+    {"label": "Service", "canonical_id": "payment-service"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0ABC999:1746000100.000100",
+      "to_canonical_id": "sentry:issue:SENTRY-789",
+      "edge_type": "DISCUSSES",
+      "note": "Slack incident thread explicitly discusses the Sentry error group SENTRY-789"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "slack:C0ABC123:1746000001.000001",
+    "docs": [
+      {
+        "doc_id": "slack:C0ABC123:1746000001.000001",
+        "customer_id": "cust-eval",
+        "source_system": "slack",
+        "title": "Auth service thread #engineering",
+        "content": "Thread in #engineering:\nalice: Hey, I think the login timeout issue we have is related to AUTH-456. The auth service keeps dropping connections after 30s.\nbob: Yeah I filed that as AUTH-456 in Linear. The root cause is the session token expiry being misconfigured.\nalice: Let me PR a fix. The auth service is in prbe-backend/auth.",
+        "token_count": 80
+      },
+      {
+        "doc_id": "linear:issue:AUTH-456",
+        "customer_id": "cust-eval",
+        "source_system": "linear",
+        "title": "AUTH-456: Login timeout after 30 seconds",
+        "content": "Issue AUTH-456: Login timeout after 30 seconds\nStatus: In Progress\nAssignee: bob\nDescription: Users report being logged out after 30 seconds of inactivity. Root cause: auth service session token TTL misconfigured to 30s instead of 3600s.",
+        "token_count": 70
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "slack:C0ABC123:1746000001.000001"},
+    {"label": "Document", "canonical_id": "linear:issue:AUTH-456"},
+    {"label": "Ticket", "canonical_id": "AUTH-456"},
+    {"label": "Service", "canonical_id": "auth-service"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "slack:C0ABC123:1746000001.000001",
+      "to_canonical_id": "linear:issue:AUTH-456",
+      "edge_type": "DISCUSSES",
+      "note": "Slack thread explicitly discusses the Linear issue AUTH-456"
+    }
+  ]
+}
