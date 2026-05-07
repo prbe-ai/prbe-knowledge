@@ -69,11 +69,10 @@ _MERMAID_BLOCK_RE = re.compile(
 def _build_mermaid_block(edges: list[_RepoEdge]) -> str:
     """Render verified edges as a Mermaid `graph TD` fenced block.
 
-    Bidirectional pairs render with `<-->` (two-headed) so direction
-    is clear without a label. One-way edges render with `-->`. The
-    arrowhead carries the direction; no `|one-way|` text annotation
-    is added. Node labels strip the `owner/` prefix so the diagram
-    is readable.
+    Bidirectional pairs render with `<-->` (two-headed). One-way edges
+    render with `-->|one-way|` so the directionality is explicit
+    alongside the arrowhead. Node labels strip the `owner/` prefix so
+    the diagram is readable.
     """
     if not edges:
         return ""
@@ -97,7 +96,9 @@ def _build_mermaid_block(edges: list[_RepoEdge]) -> str:
             seen_pairs.add(key)
             lines.append(f"  {_node_id(edge.source)} <--> {_node_id(edge.target)}")
         else:
-            lines.append(f"  {_node_id(edge.source)} --> {_node_id(edge.target)}")
+            lines.append(
+                f"  {_node_id(edge.source)} -->|one-way| {_node_id(edge.target)}"
+            )
     lines.append("```")
     return "\n".join(lines)
 

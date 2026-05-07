@@ -1363,6 +1363,32 @@ def ensure_tenant_bound(customer_id: str) -> None:
         raise TenantIsolationError("customer_id required for normalize")
 
 
+# Cap on overlap to detect/remove. Chunker default is 64 tokens (~250 chars
+# for ASCII); 600 gives generous headroom for non-ASCII / dense token
+# decoding while bounding incidental matches in genuinely-repeated content.
+_MAX_CHUNK_OVERLAP_CHARS = 600
+# Floor — don't strip a 1-char incidental match (e.g. trailing newline).
+_MIN_CHUNK_OVERLAP_CHARS = 10
+
+
+def _dedupe_chunk_overlap(prev: str, curr: str) -> str:
+    """Return ``curr`` with its leading overlap with ``prev`` stripped.
+
+    The chunker creates 512-token windows with 64-token overlap, so adjacent
+    chunks share a tail/head region. Reassembling via raw concatenation
+    leaves that region duplicated in the body; this finds the longest suffix
+    of ``prev`` (within ``[_MIN_CHUNK_OVERLAP_CHARS, _MAX_CHUNK_OVERLAP_CHARS]``)
+    that matches a prefix of ``curr`` and returns ``curr`` with that prefix
+    removed. Returns ``curr`` unchanged when no overlap of sufficient length
+    is found.
+    """
+    upper = min(len(prev), len(curr), _MAX_CHUNK_OVERLAP_CHARS)
+    for n in range(upper, _MIN_CHUNK_OVERLAP_CHARS - 1, -1):
+        if prev[-n:] == curr[:n]:
+            return curr[n:]
+    return curr
+
+
 async def fetch_live_body_from_chunks(
     conn: asyncpg.Connection,
     customer_id: str,
@@ -1376,24 +1402,30 @@ async def fetch_live_body_from_chunks(
     Returns an empty string when no live content chunks exist (e.g. deleted
     or never-chunked doc).
 
-    Note: chunker overlap means string_agg can include some duplicated text
-    between adjacent chunks (typically 10-15% inflation). That's harmless for
-    LLM synthesis input but callers comparing exact byte equality vs the
-    original source body need to keep that in mind.
+    Adjacent chunks share an overlap region (chunker writes 512-token windows
+    with 64-token overlap); rows are folded with ``_dedupe_chunk_overlap`` so
+    the reassembled body is exact within the overlap-detection bounds
+    (``[_MIN_CHUNK_OVERLAP_CHARS, _MAX_CHUNK_OVERLAP_CHARS]``).
     """
-    body = await conn.fetchval(
+    rows = await conn.fetch(
         """
-        SELECT string_agg(content, '' ORDER BY chunk_index)
+        SELECT content
         FROM chunks
         WHERE customer_id = $1
           AND doc_id = $2
           AND kind = 'content'
           AND valid_to IS NULL
+        ORDER BY chunk_index
         """,
         customer_id,
         doc_id,
     )
-    return body or ""
+    if not rows:
+        return ""
+    parts: list[str] = [rows[0]["content"]]
+    for row in rows[1:]:
+        parts.append(_dedupe_chunk_overlap(parts[-1], row["content"]))
+    return "".join(parts)
 
 
 async def fetch_body_from_chunks_for_version(
@@ -1408,19 +1440,30 @@ async def fetch_body_from_chunks_for_version(
     is part of version V if first_seen_version <= V <= last_seen_version.
     Used by wiki history/revert flows where any prior version may need to
     be read back.
+
+    Adjacent chunks share an overlap region (chunker writes 512-token windows
+    with 64-token overlap); rows are folded with ``_dedupe_chunk_overlap`` so
+    the reassembled body is exact within the overlap-detection bounds
+    (``[_MIN_CHUNK_OVERLAP_CHARS, _MAX_CHUNK_OVERLAP_CHARS]``).
     """
-    body = await conn.fetchval(
+    rows = await conn.fetch(
         """
-        SELECT string_agg(content, '' ORDER BY chunk_index)
+        SELECT content
         FROM chunks
         WHERE customer_id = $1
           AND doc_id = $2
           AND kind = 'content'
           AND first_seen_version <= $3
           AND last_seen_version >= $3
+        ORDER BY chunk_index
         """,
         customer_id,
         doc_id,
         version,
     )
-    return body or ""
+    if not rows:
+        return ""
+    parts: list[str] = [rows[0]["content"]]
+    for row in rows[1:]:
+        parts.append(_dedupe_chunk_overlap(parts[-1], row["content"]))
+    return "".join(parts)

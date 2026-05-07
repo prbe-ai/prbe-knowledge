@@ -10,7 +10,7 @@ def test_build_mermaid_block_empty_returns_empty_string() -> None:
     assert _build_mermaid_block([]) == ""
 
 
-def test_build_mermaid_block_one_way_uses_plain_arrow_no_label() -> None:
+def test_build_mermaid_block_one_way_uses_labeled_arrow() -> None:
     edges = [
         _RepoEdge(
             source="prbe-ai/repo-a",
@@ -19,8 +19,7 @@ def test_build_mermaid_block_one_way_uses_plain_arrow_no_label() -> None:
         )
     ]
     out = _build_mermaid_block(edges)
-    assert "repo_a --> repo_b" in out
-    assert "|one-way|" not in out
+    assert "repo_a -->|one-way| repo_b" in out
     assert " --- " not in out
 
 
@@ -84,4 +83,4 @@ def test_build_mermaid_block_node_id_strips_owner_prefix_and_sanitizes() -> None
     # Node ids are sanitized (hyphens -> underscores), labels keep hyphens.
     assert "  prbe_knowledge[prbe-knowledge]" in out
     assert "  prbe_backend[prbe-backend]" in out
-    assert "prbe_knowledge --> prbe_backend" in out
+    assert "prbe_knowledge -->|one-way| prbe_backend" in out
