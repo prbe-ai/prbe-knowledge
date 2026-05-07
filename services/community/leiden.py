@@ -4,8 +4,10 @@ Runs per-tenant: builds an igraph.Graph from graph_edges, partitions it
 with the Leiden algorithm (ModularityVertexPartition), and writes the
 resulting community_id back to graph_nodes.
 
-Invoked by fly.community.toml at 03:00 UTC. Can also be run one-shot via
-scripts/leiden_one_shot.py.
+Scheduled by .github/workflows/knowledge-cron.yml (cron `0 3 * * *` UTC),
+which fires `flyctl machine run --command "python -m scripts.leiden_one_shot --all-customers --yes"`
+against the prbe-knowledge-cron Fly app. Can also be run one-shot
+manually via the same script with --customer-id.
 
 Design decisions:
   D1 -- Leiden (full algorithm, not source_system proxy): accuracy > speed.
