@@ -55,6 +55,7 @@ from shared.exceptions import (
 )
 from shared.logging import get_logger
 from shared.models import (
+    METADATA_CHUNK_INDEX,
     Document,
     IntegrationToken,
     NormalizationResult,
@@ -184,17 +185,39 @@ class Normalizer:
         total_removed = 0
         total_failed = 0
 
+        # ---- Flatten standard + pre-chunked Documents into a single
+        # ordered list of (doc, pre_chunked, pre_chunked_metadata) tuples.
+        # Standard Documents go through chunk_text(doc.body); pre-chunked
+        # Documents bypass the chunker — the connector owns chunking when
+        # symbol/structural granularity matters (today only code-graph).
+        all_docs: list[tuple[Document, list[ChunkPiece] | None, ChunkPiece | None]] = [
+            (doc, None, None) for doc in result.documents
+        ]
+        for prechunked in result.documents_with_chunks:
+            all_docs.append(
+                (prechunked.document, prechunked.chunks, prechunked.metadata_chunk)
+            )
+
         # ---- Storage guard: handlers must NOT stuff body into metadata.
         # body lives on the transient Document.body field; persisting it into
         # metadata jsonb doubles storage on every doc (the original
         # documents.metadata["body"] duplication bug). See migration 0035.
-        for doc in result.documents:
+        for doc, pre_chunked, _ in all_docs:
             if "body" in doc.metadata:
                 raise NormalizationError(
                     f"connector {source_system.value} set metadata['body'] on "
                     f"doc {doc.doc_id} — body must be passed via Document.body "
                     "(transient field). See services/ingestion/normalizer.py "
                     "_stringify_body."
+                )
+            # Pre-chunked Documents must NOT carry a body — the chunks list
+            # is authoritative. Body + pre_chunked together is ambiguous and
+            # likely a connector bug.
+            if pre_chunked is not None and doc.body is not None:
+                raise NormalizationError(
+                    f"connector {source_system.value} provided both Document.body "
+                    f"and pre-chunked pieces for doc {doc.doc_id}; pre-chunked "
+                    "Documents must set body=None"
                 )
 
         # ---- Phase A: pre-compute chunk plans WITHOUT holding a write txn.
@@ -211,8 +234,12 @@ class Normalizer:
         # two batches of the same session would compute overlapping chunk
         # sets here and pay OpenAI twice for identical content_hashes.
         plans: list[_ChunkPlan] = []
-        for doc in result.documents:
-            plans.append(await self._plan_chunks(customer_id, doc))
+        for doc, pre_chunked, pre_chunked_metadata in all_docs:
+            plans.append(
+                await self._plan_chunks(
+                    customer_id, doc, pre_chunked, pre_chunked_metadata
+                )
+            )
 
         # ---- Phase B: ONE short write transaction. No external I/O between
         # BEGIN and COMMIT, so every lock held here is millisecond-scale.
@@ -225,7 +252,9 @@ class Normalizer:
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
             await _upsert_code_repo_state(conn, customer_id, result.code_repo_state_updates)
 
-            for idx, (doc, plan) in enumerate(zip(result.documents, plans, strict=True)):
+            for idx, ((doc, _, _), plan) in enumerate(
+                zip(all_docs, plans, strict=True)
+            ):
                 # Per-doc SAVEPOINT: a deterministic-permanent error on one doc
                 # (e.g. a malformed body) must not roll back already-good
                 # siblings, otherwise the queue row stays poisoned forever.
@@ -383,7 +412,13 @@ class Normalizer:
             )
         _ = doc_ids  # retained for potential future logging
 
-    async def _plan_chunks(self, customer_id: str, doc: Document) -> _ChunkPlan:
+    async def _plan_chunks(
+        self,
+        customer_id: str,
+        doc: Document,
+        pre_chunked: list[ChunkPiece] | None = None,
+        pre_chunked_metadata: ChunkPiece | None = None,
+    ) -> _ChunkPlan:
         """Phase A: build a `_ChunkPlan` for one document — without holding
         a write transaction across the embed_many call.
 
@@ -394,6 +429,13 @@ class Normalizer:
 
         The whole point: don't re-embed what hasn't changed, AND don't hold
         graph_nodes/chunks row locks during the long OpenAI round trip.
+
+        `pre_chunked` is the connector-controlled chunking path (today only
+        code-graph file Documents). When provided, `chunk_text(doc.body)` is
+        bypassed and these pieces are treated as authoritative; downstream
+        diff/reuse semantics are unchanged. `pre_chunked_metadata` plays the
+        same role as `_metadata_piece(doc)` for the metadata chunk slot.
+        Both default to the standard chunker path for backwards compat.
         """
         # Deleted docs: no body → chunks is empty → every live chunk gets closed out.
         # The metadata chunk also disappears for deleted docs (joins the removed
@@ -401,6 +443,9 @@ class Normalizer:
         if doc.deleted_at is not None:
             new_pieces: list[ChunkPiece] = []
             metadata_piece: ChunkPiece | None = None
+        elif pre_chunked is not None:
+            new_pieces = pre_chunked
+            metadata_piece = pre_chunked_metadata
         else:
             new_pieces = chunk_text(_stringify_body(doc))
             metadata_piece = _metadata_piece(doc)
@@ -1148,11 +1193,9 @@ def _chunk_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-# Index of the metadata chunk within a doc. Sentinel value chosen so it
-# sorts before any content chunk's index — readers filter by `kind` to
-# skip it; this index just keeps the (content_hash unique within doc)
-# invariant from colliding with content chunks at index 0.
-METADATA_CHUNK_INDEX = -1
+# METADATA_CHUNK_INDEX moved to shared.models so cross-module callers
+# (code_graph pipeline) can reach for the same constant. Re-imported
+# at module top for back-compat with existing references in this file.
 
 
 # Strip opaque commit SHAs from github URLs before embedding — they
