@@ -866,6 +866,41 @@ END $$;
 REVOKE ALL ON FUNCTION verify_and_touch_custom_ingest_token(text) FROM PUBLIC;
 
 -- ---------------------------------------------------------------------------
+-- cross_repo_reverify_dlq
+--
+-- Push webhooks call `update_edges_after_push` to re-verify outbound
+-- DEPENDS_ON edges whose evidence files were modified or removed.
+-- When the LLM classifier is unavailable (Gemini down, rate limited,
+-- malformed response) the function falls back to "keep all evidence"
+-- so we don't incorrectly delete edges. The deferred verification work
+-- is parked here for the nightly cron's drain pass to retry. We don't
+-- store post-push file contents — at retry time we re-fetch from
+-- GitHub at the recorded sha. State machine: pending → processing →
+-- done | failed.
+-- ---------------------------------------------------------------------------
+CREATE TABLE cross_repo_reverify_dlq (
+    dlq_id              BIGSERIAL PRIMARY KEY,
+    customer_id         TEXT NOT NULL
+                        REFERENCES customers(customer_id) ON DELETE CASCADE,
+    source_repo         TEXT NOT NULL,
+    sha                 TEXT NOT NULL,
+    removed_files       JSONB NOT NULL DEFAULT '[]',
+    modified_files      JSONB NOT NULL DEFAULT '[]',
+    integration_token_id UUID,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending','processing','done','failed')),
+    attempts            INT  NOT NULL DEFAULT 0,
+    last_error          TEXT,
+    last_attempt_at     TIMESTAMPTZ,
+    enqueued_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_cross_repo_reverify_dlq_pending
+    ON cross_repo_reverify_dlq (customer_id, enqueued_at)
+    WHERE status = 'pending';
+
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents
