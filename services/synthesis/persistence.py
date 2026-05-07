@@ -64,7 +64,6 @@ __all__ = [
     "mark_verifier_rejected",
     "open_run",
     "reclaim_stuck_rows",
-    "render_index_markdown",
 ]
 
 
@@ -681,48 +680,6 @@ async def fetch_existing_page(
         "frontmatter": metadata.get("frontmatter") or {},
         "summary": metadata.get("summary"),
     }
-
-
-# ---------------------------------------------------------------------------
-# Index regeneration
-# ---------------------------------------------------------------------------
-
-
-def render_index_markdown(rows: list[asyncpg.Record]) -> str:
-    """Deterministic markdown TOC. One entry per live wiki page.
-
-    Falls back to body_preview when the cron-stored summary is absent
-    (manual uploads can omit it). Sections grouped by wiki_type.
-    """
-    if not rows:
-        return "# Wiki\n\nNo pages yet.\n"
-    by_type: dict[str, list[asyncpg.Record]] = {}
-    metas: dict[int, dict[str, Any]] = {}
-    for idx, row in enumerate(rows):
-        meta = row["metadata"] or {}
-        if isinstance(meta, (str, bytes, bytearray)):
-            import orjson
-
-            meta = orjson.loads(meta)
-        if not isinstance(meta, dict):
-            meta = {}
-        metas[idx] = meta
-        wiki_type = meta.get("wiki_type") or row["source_id"].split(":", 1)[0]
-        by_type.setdefault(wiki_type, []).append(row)
-    parts = ["# Wiki", ""]
-    for wiki_type in sorted(by_type):
-        parts.append(f"## {wiki_type.replace('_', ' ').title()}")
-        for row in by_type[wiki_type]:
-            idx = rows.index(row)
-            meta = metas[idx]
-            slug = meta.get("slug") or row["source_id"].split(":", 1)[-1]
-            title = row["title"] or slug
-            summary = meta.get("summary") or row["body_preview"] or ""
-            summary = summary.strip().splitlines()[0] if summary else ""
-            line = f"- [[{title}]] — {summary}" if summary else f"- [[{title}]]"
-            parts.append(line)
-        parts.append("")
-    return "\n".join(parts).rstrip() + "\n"
 
 
 # ---------------------------------------------------------------------------
