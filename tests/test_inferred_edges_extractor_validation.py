@@ -73,9 +73,21 @@ def _make_mock_conn(existing_nodes: set[tuple[str, str]] | None = None) -> Async
 
 
 def _mock_llm_response(edges: list[dict]) -> MagicMock:
-    """Create a mock Anthropic response returning `edges` as JSON."""
+    """Create a mock Anthropic response simulating the prefilled response.
+
+    The extractor sends an assistant prefill `[` so Haiku's response only
+    contains what comes AFTER `[`. Real example for 1 edge:
+        prefill: `[`
+        response.content[0].text: `{"from": ..., "to": ...}]`
+
+    So we strip the leading `[` from json.dumps(edges) to match real
+    behavior. The empty-edges case (`[]`) becomes `]` after stripping --
+    the extractor recognises that as the empty-array sentinel.
+    """
     response = MagicMock()
-    response.content = [MagicMock(text=json.dumps(edges))]
+    full_json = json.dumps(edges)
+    body = full_json[1:] if full_json.startswith("[") else full_json
+    response.content = [MagicMock(text=body)]
     response.usage = MagicMock(input_tokens=1000, output_tokens=200)
     return response
 
@@ -494,3 +506,76 @@ async def test_empty_llm_response_array() -> None:
 
     assert result.edges == []
     assert not result.bundle_failed
+
+
+# ---------------------------------------------------------------------------
+# Tests: prefill empty-text behaviour (REGRESSION GUARD)
+# ---------------------------------------------------------------------------
+# In production we saw the LLM return an empty assistant message body
+# (queue_ids 120-127, 100% bundle_fail rate). Without the empty-text
+# fallback the extractor crashed with "json_parse_failed: Expecting
+# value: line 1 column 1 (char 0)". With the fallback an empty body
+# means "no edges" and the call succeeds with zero edges.
+#
+# Real Anthropic responses we have to handle gracefully (because of
+# the assistant prefill `[`):
+#   1. Empty body: "" -> []
+#   2. Just the closing bracket: "]" -> []
+#   3. Whitespace: "   \n" -> []
+#   4. Whitespace + `]`: " ]" -> []
+
+
+def _mock_response_with_text(text: str) -> MagicMock:
+    response = MagicMock()
+    response.content = [MagicMock(text=text)]
+    response.usage = MagicMock(input_tokens=1000, output_tokens=0)
+    return response
+
+
+def _patch_llm_text(text: str):
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=_mock_response_with_text(text))
+    return patch(
+        "services.ingestion.inferred_edges.extractor._anthropic_module.AsyncAnthropic",
+        lambda api_key=None: mock_client,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_body", ["", " ", "\n", "]", " ]\n"])
+async def test_empty_response_body_is_treated_as_zero_edges(response_body: str) -> None:
+    """Regression: an empty-or-just-]-after-prefill response means no edges,
+    not a JSON parse failure. Was the production crash on queue_ids 120-127.
+    """
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm_text(response_body),
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert not result.bundle_failed, f"empty body {response_body!r} should not fail"
+    assert result.edges == []
+    assert not result.dropped
+
+
+@pytest.mark.asyncio
+async def test_truncated_response_falls_through_to_parse_failure() -> None:
+    """If the model truncates mid-element (e.g. max_tokens hit), the
+    salvage-by-appending-`]` doesn't produce valid JSON; the failure
+    branch records it without crashing.
+    """
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+    truncated = '{"from": {"label": "Document", "canonical_id": "doc1"'
+
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm_text(truncated),
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert result.bundle_failed
+    assert "json_parse_failed" in (result.bundle_fail_reason or "")
