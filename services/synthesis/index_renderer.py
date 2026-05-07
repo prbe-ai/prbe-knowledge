@@ -23,6 +23,7 @@ Falls back to a flat alphabetical list when the LLM call fails or the
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +48,10 @@ _INDEX_SYSTEM_PROMPT = (
     "covers one company; you have the full list of pages it contains "
     "(title + 1-line summary + type). Produce a Markdown body that "
     "feels like a thoughtful overview, NOT a table of contents.\n\n"
+    "**Do NOT emit a top-level `# Wiki` heading.** The dashboard "
+    "already renders the page title above your body — a `# Wiki` line "
+    "at the top would duplicate it. Start with the intro paragraph "
+    "directly, no heading.\n\n"
     "Required structure:\n\n"
     "  1. **Intro** (~3-5 sentences). What is this company about, in "
     "your own words, inferred from the page corpus? Mention the main "
@@ -60,16 +65,20 @@ _INDEX_SYSTEM_PROMPT = (
     "obvious. Aim for 5-15 nodes; if the corpus is small, just emit "
     "the nodes you can confidently relate. If you genuinely cannot "
     "infer relationships, emit a tiny diagram with just the repos as "
-    "isolated nodes (still useful — shows the surface area).\n\n"
+    "isolated nodes (still useful — shows the surface area). This "
+    "diagram is REQUIRED — even a 3-node graph beats no graph.\n\n"
     "  3. **Pages** — list every page with a wiki link. Organize them "
     "however makes sense for THIS corpus (group by product line, by "
-    "team, by service, by type — your call). Use `[[Title]]` syntax "
-    "so the dashboard rewrites them into routed links. Include the "
-    "1-line summary after each link.\n\n"
+    "team, by service, by type — your call). **Lead with the most "
+    "load-bearing pages first**: typically the company's repos / "
+    "services come first (those are what the company actually builds), "
+    "then runbooks, then people / customers / projects / events. Use "
+    "`[[Title]]` syntax so the dashboard rewrites them into routed "
+    "links. Include the 1-line summary after each link.\n\n"
     "Tone: direct, builder-to-builder. No corporate language. Don't "
     "narrate ('Below you will find...'). Just write the page.\n\n"
-    "Output ONLY the Markdown body — no preamble, no ```markdown "
-    "fences around the whole thing."
+    "Output ONLY the Markdown body — no preamble, no top-level "
+    "`# Wiki` heading, no ```markdown fences around the whole thing."
 )
 
 
@@ -194,4 +203,16 @@ async def render_index_via_llm(
         log.warning("index_renderer.empty_response_falling_back", page_count=len(pages))
         return _fallback_flat_list(pages)
 
+    text = _strip_leading_wiki_heading(text)
     return text + "\n" if not text.endswith("\n") else text
+
+
+# The dashboard renders its own page title above the body, so a leading
+# `# Wiki` line in the LLM output produces a duplicate "Wiki / Wiki"
+# stack. The system prompt forbids it but cheap belt-and-braces defence
+# beats trusting the model on every drain.
+_LEADING_WIKI_HEADING_RE = re.compile(r"^\s*#\s+Wiki\s*\n+", re.IGNORECASE)
+
+
+def _strip_leading_wiki_heading(text: str) -> str:
+    return _LEADING_WIKI_HEADING_RE.sub("", text, count=1)
