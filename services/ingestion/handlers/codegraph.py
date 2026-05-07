@@ -28,6 +28,10 @@ from services.ingestion.code_graph.clone import (
     shallow_clone,
     walk_files,
 )
+from services.ingestion.code_graph.cross_repo_deps import (
+    extract_cross_repo_deps,
+    persist_cross_repo_edges,
+)
 from services.ingestion.code_graph.fetch import fetch_files_at_sha
 from services.ingestion.code_graph.pipeline import extract_files_to_result
 from services.ingestion.handlers.base import Connector
@@ -182,6 +186,34 @@ class CodeGraphConnector(Connector):
             sha=sha,
             files=files,
         )
+
+        # Cross-repo dependency edges. Runs after symbol extraction so
+        # the repo's tracked files are still on disk, but BEFORE
+        # prune_scratch. Persisted via a separate transaction (its own
+        # idempotent delete-then-insert) so a failure in this advisory
+        # path does not roll back the symbol-graph work above. Skips
+        # the call entirely when no other repos exist yet for this
+        # customer (first-ever code-graph backfill).
+        try:
+            cross_repo_edges = await extract_cross_repo_deps(
+                customer_id=event.customer_id,
+                source_repo=repo,
+                target_dir=target_dir,
+            )
+            if cross_repo_edges:
+                await persist_cross_repo_edges(
+                    customer_id=event.customer_id,
+                    source_repo=repo,
+                    edges=cross_repo_edges,
+                )
+        except Exception as exc:
+            log.warning(
+                "code_graph.cross_repo_deps_failed",
+                customer=event.customer_id,
+                repo=repo,
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
 
         # Backfill is a single-shot in PR-A. Prune the clone scratch dir
         # now that extraction is complete; incremental updates fetch via

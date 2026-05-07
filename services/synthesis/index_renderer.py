@@ -30,6 +30,7 @@ from typing import Any
 import asyncpg
 
 from shared.constants import WIKI_AGENT_MODEL
+from shared.db import with_tenant
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -41,6 +42,15 @@ class _PageRow:
     slug: str
     title: str
     summary: str
+
+
+@dataclass(frozen=True)
+class _RepoEdge:
+    """Verified cross-repo edge for the architecture diagram."""
+
+    source: str  # owner/name
+    target: str  # owner/name
+    bidirectional: bool
 
 
 _INDEX_SYSTEM_PROMPT = (
@@ -59,22 +69,17 @@ _INDEX_SYSTEM_PROMPT = (
     "  2. **Architecture diagram** — a fenced ```mermaid block`` with "
     "`graph TD` (top-down). Nodes = repos and services. Use the actual "
     "repo / service names as node labels. Group related nodes with "
-    "subgraphs when the structure is obvious. Aim for 5-15 nodes.\n\n"
-    "    **Edge discipline (CRITICAL — read carefully):**\n"
-    "    Only emit an edge between two nodes when there is BIDIRECTIONAL "
-    "evidence in the corpus that the connection is real:\n"
-    "      - Page A's summary explicitly mentions B (e.g. 'depends on B', "
-    "'feeds B', 'reads from B'), AND\n"
-    "      - Page B's summary explicitly mentions A (or B is documented "
-    "as a thing A would talk to).\n\n"
-    "    Naming similarity (`prbe-foo` and `prbe-bar` share a prefix) "
-    "is NOT evidence. Past association (a repo that USED to be part of "
-    "the product but isn't referenced by current core services) is NOT "
-    "evidence — drop those edges. **Sparse accurate beats dense "
-    "speculative**: when in doubt, omit. A 5-node graph with 4 verified "
-    "edges is better than a 15-node graph where half the edges are "
-    "guesses. This diagram is REQUIRED — even a 3-node graph beats no "
-    "graph.\n\n"
+    "subgraphs when the structure is obvious.\n\n"
+    "    **Edge source of truth.** The user content below contains a "
+    "`Verified architecture edges` block produced by static analysis "
+    "of the customer's actual code (file imports, service hostnames, "
+    "CI workflow refs). When that block lists edges, use ONLY those "
+    "edges in your diagram — do not invent additional ones from page "
+    "summaries. Render bidirectional edges with `-->`; render one-way "
+    "edges as `A -->|one-way| B`. When the block says NONE, emit a "
+    "tiny diagram with the repos as isolated nodes (no edges); do NOT "
+    "fall back to inferring edges from summaries. This diagram is "
+    "REQUIRED — even a 3-node no-edge graph beats no graph.\n\n"
     "  3. **Pages** — list every page with a wiki link. Organize them "
     "however makes sense for THIS corpus (group by product line, by "
     "team, by service, by type — your call). **Lead with the most "
@@ -152,9 +157,86 @@ def _format_pages_for_prompt(pages: list[_PageRow]) -> str:
     return "\n".join(lines)
 
 
+async def fetch_verified_repo_edges(customer_id: str) -> list[_RepoEdge]:
+    """Read code-graph-extracted DEPENDS_ON edges for the customer's repos.
+
+    Bidirectionality is computed at READ time: an edge is bidirectional
+    iff the reverse edge (``B → A``) also exists in the result set. The
+    extractor side (services/ingestion/code_graph/cross_repo_deps.py)
+    persists each direction independently as repos finish their backfill,
+    so the read derives the pairing without needing a "wait for all
+    repos" coordinator.
+    """
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT n_from.canonical_id AS source,
+                   n_to.canonical_id   AS target
+            FROM graph_edges e
+            JOIN graph_nodes n_from
+                 ON n_from.node_id = e.from_node_id
+                AND n_from.customer_id = e.customer_id
+            JOIN graph_nodes n_to
+                 ON n_to.node_id = e.to_node_id
+                AND n_to.customer_id = e.customer_id
+            WHERE e.customer_id = $1
+              AND e.edge_type = 'DEPENDS_ON'
+              AND n_from.label = 'Repo'
+              AND n_to.label = 'Repo'
+              AND e.valid_to IS NULL
+            """,
+            customer_id,
+        )
+    pairs: set[tuple[str, str]] = {(r["source"], r["target"]) for r in rows}
+    edges: list[_RepoEdge] = []
+    seen: set[frozenset[str]] = set()
+    for source, target in pairs:
+        key = frozenset((source, target))
+        if key in seen:
+            continue
+        seen.add(key)
+        bidirectional = (target, source) in pairs
+        edges.append(_RepoEdge(source=source, target=target, bidirectional=bidirectional))
+    # Stable ordering: bidirectional first, then alpha by source then target,
+    # so prompt input is deterministic and re-renders are diff-friendly.
+    edges.sort(key=lambda e: (not e.bidirectional, e.source, e.target))
+    return edges
+
+
+def _format_edges_for_prompt(edges: list[_RepoEdge]) -> str:
+    """Render the verified edges block. Empty when no edges exist."""
+    if not edges:
+        return (
+            "Verified architecture edges: NONE.\n"
+            "Code-graph extraction has not yet produced cross-repo edges "
+            "for this customer (either the first repo is still backfilling, "
+            "or no inter-repo references have been verified). Emit a "
+            "minimal Mermaid diagram with the repos as isolated nodes — "
+            "do NOT invent edges from page summaries."
+        )
+    lines = [
+        "Verified architecture edges (USE ONLY THESE — do NOT invent more):",
+        "",
+    ]
+    for edge in edges:
+        marker = "<-->" if edge.bidirectional else "--->"
+        note = "" if edge.bidirectional else "  (one-way; only the source side has evidence)"
+        lines.append(f"  {edge.source} {marker} {edge.target}{note}")
+    lines.append("")
+    lines.append(
+        "When emitting the Mermaid diagram, use these edges only. Render "
+        "bidirectional edges with a normal arrow (`-->`); render one-way "
+        "edges with the same arrow style but add `|one-way|` as the edge "
+        "label so it reads, for example, `prbe-knowledge -->|one-way| "
+        "prbe-backend`."
+    )
+    return "\n".join(lines)
+
+
 async def render_index_via_llm(
     rows: list[asyncpg.Record],
     *,
+    customer_id: str | None = None,
     client: Any | None = None,
     model: str = WIKI_AGENT_MODEL,
 ) -> str:
@@ -163,6 +245,13 @@ async def render_index_via_llm(
     Returns the markdown body verbatim. Falls back to ``_fallback_flat_list``
     when the LLM call fails or ``GOOGLE_API_KEY`` is unset — the index
     page must always render.
+
+    When ``customer_id`` is supplied the function fetches the verified
+    cross-repo edges for that customer (extracted by the code-graph
+    pipeline) and passes them to the LLM as facts. The prompt then
+    requires the architecture diagram to use ONLY these edges. Without
+    a customer_id (older callers / tests) the LLM falls back to the
+    looser "infer from page summaries" path.
     """
     pages = _rows_to_pages(rows)
     if not pages:
@@ -185,9 +274,22 @@ async def render_index_via_llm(
             )
             return _fallback_flat_list(pages)
 
+    edges: list[_RepoEdge] = []
+    if customer_id:
+        try:
+            edges = await fetch_verified_repo_edges(customer_id)
+        except Exception as exc:
+            log.warning(
+                "index_renderer.edge_fetch_failed",
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
+    edges_block = _format_edges_for_prompt(edges)
+
     user_prompt = (
         f"Wiki page corpus ({len(pages)} pages):\n\n"
-        f"{_format_pages_for_prompt(pages)}\n"
+        f"{_format_pages_for_prompt(pages)}\n\n"
+        f"{edges_block}"
     )
 
     try:
