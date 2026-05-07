@@ -182,13 +182,15 @@ def _bm25_hit(doc_id: str) -> BM25Hit:
 def _patch_retrievers(*, bm25_hits: list[BM25Hit] | None = None,
                       vec_hits: list[VectorHit] | None = None,
                       graph_hits: list[GraphHit] | None = None,
+                      id_hits: list | None = None,
                       embeddings: dict | None = None,
                       acl_passthrough: bool = True):
-    """Patch the three retrievers + embeddings + ACL so run_search becomes
+    """Patch the four retrievers + embeddings + ACL so run_search becomes
     deterministic. The walk runs against the live DB."""
     bm25 = bm25_hits or []
     vec = vec_hits or []
     graph = graph_hits or []
+    ids = id_hits or []
     embeds = embeddings or {}
 
     return {
@@ -203,6 +205,10 @@ def _patch_retrievers(*, bm25_hits: list[BM25Hit] | None = None,
         "graph": patch(
             "services.retrieval.search_pipeline.graph_search",
             new=AsyncMock(return_value=graph),
+        ),
+        "id_lookup": patch(
+            "services.retrieval.search_pipeline.id_lookup_search",
+            new=AsyncMock(return_value=ids),
         ),
         "embeddings": patch(
             "services.retrieval.search_pipeline.embeddings_for_chunks",
@@ -273,7 +279,7 @@ async def test_related_entities_populated_and_excludes_routed_entity(
         bm25_hits=[_bm25_hit("doc:1"), _bm25_hit("doc:2")],
     )
     with patches["vector"], patches["bm25"], patches["graph"], \
-            patches["embeddings"], patches["acl"]:
+            patches["id_lookup"], patches["embeddings"], patches["acl"]:
         resp = await run_search(
             req=req,
             customer_id=cust,
@@ -468,7 +474,7 @@ async def test_walk_legitimate_empty_returns_empty_list(live_db) -> None:
     patches = _patch_retrievers(bm25_hits=[_bm25_hit("doc:1")])
 
     with patches["vector"], patches["bm25"], patches["graph"], \
-            patches["embeddings"], patches["acl"]:
+            patches["id_lookup"], patches["embeddings"], patches["acl"]:
         resp = await run_search(
             req=req,
             customer_id=cust,

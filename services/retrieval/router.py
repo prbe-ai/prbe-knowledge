@@ -68,6 +68,7 @@ NARROWING_ENTITY_TYPES: frozenset[str] = frozenset(
         "channel",
         "source",
         "doc_type",
+        "session",
     }
 )
 
@@ -128,6 +129,7 @@ _ROUTE_QUERY_TOOL: dict[str, Any] = {
                                 "decision",
                                 "file_path",
                                 "channel",
+                                "session",
                             ],
                         },
                         "canonical_id": {"type": "string"},
@@ -255,8 +257,11 @@ ENTITY EXTRACTION
 - canonical_id: the most likely stable identifier (service slug, repo name,
   user id, ticket code).
 - Bucket: NARROWING entities (service, repo, person, ticket, pr, file_path,
-  channel) further qualify a list. TOPIC entities (feature, decision,
-  error_group) ask a question about a concept.
+  channel, session) further qualify a list. TOPIC entities (feature,
+  decision, error_group) ask a question about a concept.
+- Use entity_type="session" when the user names a specific Claude Code or
+  Codex agent session by id — typically a UUID. canonical_id is the bare
+  UUID; display_name is the user's phrasing (e.g. "session 3c325e11").
 
 EXPANSIONS
 - 2-4 alternate phrasings preserving intent. Vary synonyms and specificity.
@@ -332,6 +337,9 @@ EXAMPLES (today is {today_iso})
 - "show me PR #49 in prbe-backend" → mode=search (no sort or temporal),
   entities=[{{pr, "prbe-backend#49", "PR #49", 0.95}},
             {{repo, "prbe-backend", "prbe-backend", 0.95}}]
+- "agent session 3c325e11-2008-46a9-83f7-fc40d11eaf82" → mode=search,
+  entities=[{{session, "3c325e11-2008-46a9-83f7-fc40d11eaf82",
+             "session 3c325e11", 0.95}}], doc_type="session"
 
 Always emit the tool call. Never reply with prose.
 """

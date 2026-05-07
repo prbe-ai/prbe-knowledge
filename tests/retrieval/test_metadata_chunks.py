@@ -36,6 +36,7 @@ _NOW = datetime(2026, 4, 28, tzinfo=UTC)
 def _doc(
     *,
     doc_id: str = "github:prbe-ai/prbe-backend:commit:abc",
+    source_id: str = "x",
     title: str | None = "fix(consent): rebrand error-page strings",
     source_system: SourceSystem = SourceSystem.GITHUB,
     source_url: str = "https://github.com/prbe-ai/prbe-backend/commit/abc1234567890abcdef1234567890abcdef12345",
@@ -48,7 +49,7 @@ def _doc(
         customer_id="cust-A",
         version=1,
         source_system=source_system,
-        source_id="x",
+        source_id=source_id,
         source_url=source_url,
         doc_class=DocClass.RAW_SOURCE,
         doc_type=DocType.GITHUB_COMMIT,
@@ -105,10 +106,28 @@ def test_metadata_text_structured_key_value() -> None:
     lines = text.split("\n")
     assert "title: fix(consent): rebrand error-page strings" in lines
     assert "source: github" in lines
+    # `id:` carries the handler-supplied source_id verbatim — needed so
+    # BM25 can match a query that names the full identifier (UUID, ticket
+    # code, etc.). Title alone often only carries an 8-char prefix.
+    assert "id: x" in lines
     assert "author: alice" in lines
     # URL with SHA stripped.
     assert "url: https://github.com/prbe-ai/prbe-backend/commit/" in lines
     assert "summary: Three branding fixes on the OAuth consent page" in lines
+
+
+def test_metadata_text_includes_full_session_uuid() -> None:
+    """A claude_code session doc keeps the full UUID searchable via the
+    `id:` line — title only carries the 8-char prefix, so without this
+    line a query naming the full UUID would have no lexical anchor."""
+    doc = _doc(
+        doc_id="claude_code:probe-founders:3c325e11-2008-46a9-83f7-fc40d11eaf82",
+        source_id="3c325e11-2008-46a9-83f7-fc40d11eaf82",
+        title="Richard Wei's Claude Code session 3c325e11",
+        source_url="https://prbe.ai/dashboard/agent-sessions/3c325e11-2008-46a9-83f7-fc40d11eaf82",
+    )
+    text = _metadata_text(doc)
+    assert "id: 3c325e11-2008-46a9-83f7-fc40d11eaf82" in text
 
 
 def test_metadata_text_excludes_doc_id() -> None:

@@ -140,6 +140,12 @@ CREATE INDEX idx_documents_fts_title_preview ON documents
     USING GIN (to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body_preview,'')));
 CREATE INDEX idx_documents_entities ON documents USING GIN (entities jsonb_path_ops);
 CREATE INDEX idx_documents_metadata ON documents USING GIN (metadata jsonb_path_ops);
+-- Trigram GIN for the id_lookup retriever's leading-wildcard LIKE arms
+-- (`source_id LIKE '%:<id>'`, `doc_id LIKE '%:<id>'`). Btree can't help
+-- here; without these the planner seq-scans documents filtered only by
+-- customer_id. See migration 0055.
+CREATE INDEX idx_documents_source_id_trgm ON documents USING GIN (source_id gin_trgm_ops);
+CREATE INDEX idx_documents_doc_id_trgm ON documents USING GIN (doc_id gin_trgm_ops);
 
 -- ---------------------------------------------------------------------------
 -- chunks: content-addressable retrieval units.
