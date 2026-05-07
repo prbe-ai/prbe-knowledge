@@ -64,6 +64,9 @@ async def _insert_doc(conn, customer_id: str, doc_id: str, source_system: str = 
 
 
 async def _insert_chunk(conn, customer_id: str, doc_id: str, content: str, idx: int = 0) -> None:
+    # chunks.embedding is NOT NULL halfvec(3072); use a zero-vector
+    # placeholder. Test doesn't exercise vector similarity so values
+    # don't matter — only the fact that the INSERT satisfies the schema.
     await conn.execute(
         """
         INSERT INTO chunks (
@@ -73,7 +76,7 @@ async def _insert_chunk(conn, customer_id: str, doc_id: str, content: str, idx: 
         ) VALUES (
             $1, $2, $3, $4, $5, md5($5),
             length($5) / 4,
-            NULL,
+            array_fill(0::real, ARRAY[3072])::halfvec,
             'openai/text-embedding-3-large', 3072,
             'naive-v1', 1, 1, NOW()
         )
