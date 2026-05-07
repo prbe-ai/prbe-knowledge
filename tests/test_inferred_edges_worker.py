@@ -235,3 +235,110 @@ async def test_worker_shutdown_stops_claim_loop() -> None:
 def test_max_attempts_constant() -> None:
     """MAX_ATTEMPTS is 3 per the design doc."""
     assert _MAX_ATTEMPTS == 3
+
+
+# ---------------------------------------------------------------------------
+# Tests: GraphEdgeSpec.properties carries the LLM `why` justification
+# ---------------------------------------------------------------------------
+# Production bug from the probe-founders backfill: 0 of 3,817 inferred
+# edges had a `why` field persisted because _upsert_inferred_edges built
+# GraphEdgeSpec without populating `properties`. Without `why`, edges
+# land in graph_edges with empty properties and no audit trail.
+
+
+@pytest.mark.asyncio
+async def test_upsert_inferred_edges_passes_why_in_properties() -> None:
+    """Confirm worker._upsert_inferred_edges builds GraphEdgeSpec
+    instances with `properties={"why": <justification>}` so the LLM's
+    reasoning is persisted in graph_edges.properties.
+    """
+    from datetime import UTC, datetime
+
+    from services.ingestion.inferred_edges.extractor import InferredEdge
+    from services.ingestion.inferred_edges.worker import _upsert_inferred_edges
+
+    edge = InferredEdge(
+        from_label="Document",
+        from_canonical_id="doc1",
+        to_label="Ticket",
+        to_canonical_id="AUTH-123",
+        edge_type="DISCUSSES",
+        confidence="INFERRED",
+        why="Slack thread debugs the AUTH-123 outage",
+        extractor_id="inferred_edges:v1",
+        extracted_at=datetime.now(UTC),
+    )
+
+    captured_specs: list = []
+
+    async def fake_upsert_nodes(conn, customer_id, nodes, source_system):
+        # Return a node_ids dict so upsert_edges can resolve endpoints.
+        return {(n.label.value, n.canonical_id): i + 1 for i, n in enumerate(nodes)}
+
+    async def fake_upsert_edges(conn, customer_id, edge_specs, node_ids, source, **kw):
+        captured_specs.extend(edge_specs)
+        return len(edge_specs)
+
+    with (
+        patch(
+            "services.ingestion.inferred_edges.worker.upsert_nodes",
+            side_effect=fake_upsert_nodes,
+        ),
+        patch(
+            "services.ingestion.inferred_edges.worker.upsert_edges",
+            side_effect=fake_upsert_edges,
+        ),
+    ):
+        await _upsert_inferred_edges(MagicMock(), "cust-test", [edge])
+
+    assert len(captured_specs) == 1
+    spec = captured_specs[0]
+    assert spec.properties == {"why": "Slack thread debugs the AUTH-123 outage"}
+
+
+@pytest.mark.asyncio
+async def test_upsert_inferred_edges_omits_empty_why() -> None:
+    """If for some reason `why` is empty (shouldn't happen post-validation,
+    defensive), don't write the empty key to properties -- keep the
+    JSONB compact.
+    """
+    from datetime import UTC, datetime
+
+    from services.ingestion.inferred_edges.extractor import InferredEdge
+    from services.ingestion.inferred_edges.worker import _upsert_inferred_edges
+
+    edge = InferredEdge(
+        from_label="Document",
+        from_canonical_id="doc1",
+        to_label="Ticket",
+        to_canonical_id="AUTH-123",
+        edge_type="DISCUSSES",
+        confidence="INFERRED",
+        why="",  # extractor would normally drop this; defensive
+        extractor_id="inferred_edges:v1",
+        extracted_at=datetime.now(UTC),
+    )
+
+    captured_specs: list = []
+
+    async def fake_upsert_nodes(conn, customer_id, nodes, source_system):
+        return {(n.label.value, n.canonical_id): i + 1 for i, n in enumerate(nodes)}
+
+    async def fake_upsert_edges(conn, customer_id, edge_specs, node_ids, source, **kw):
+        captured_specs.extend(edge_specs)
+        return len(edge_specs)
+
+    with (
+        patch(
+            "services.ingestion.inferred_edges.worker.upsert_nodes",
+            side_effect=fake_upsert_nodes,
+        ),
+        patch(
+            "services.ingestion.inferred_edges.worker.upsert_edges",
+            side_effect=fake_upsert_edges,
+        ),
+    ):
+        await _upsert_inferred_edges(MagicMock(), "cust-test", [edge])
+
+    assert len(captured_specs) == 1
+    assert captured_specs[0].properties == {}

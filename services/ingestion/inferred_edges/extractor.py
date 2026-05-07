@@ -16,8 +16,10 @@ bundle (probable bad LLM run -- do not pollute the graph).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import random
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -42,6 +44,17 @@ _HAIKU_OUTPUT_COST_PER_1M = 4.00
 
 # Maximum output tokens from the LLM for the edge-extraction call.
 _MAX_OUTPUT_TOKENS = 4096
+
+# Rate-limit backoff. The first backfill on probe-founders dropped 1383/3257
+# bundles (42%) when 64 concurrent extractors blew through Haiku's per-minute
+# rate limit. Without backoff, a single attempt fails -> bundle marked failed
+# -> queue worker retries on next claim, but the rate-limit window persists
+# longer than the inter-claim interval, so all 3 attempts eat the same wall.
+# With exponential backoff inside a single attempt, the call rides out the
+# transient rate-limit window before giving up.
+_RATE_LIMIT_MAX_RETRIES = 4
+_RATE_LIMIT_BACKOFF_BASE_SECONDS = 5.0
+_RATE_LIMIT_BACKOFF_CAP_SECONDS = 60.0
 
 # Valid confidence values the LLM may emit.
 _VALID_CONFIDENCES = {"INFERRED", "AMBIGUOUS"}
@@ -125,6 +138,77 @@ def _bundle_to_user_message(bundle: Bundle) -> str:
     return "\n".join(lines)
 
 
+# ---- LLM call wrapper (rate-limit backoff) --------------------------------
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Recognise an Anthropic rate-limit error.
+
+    We avoid an `isinstance` check against `anthropic.RateLimitError` so the
+    caller doesn't have to import-and-handle if the anthropic package is
+    missing (already guarded in the outer try). Class-name match is enough
+    here -- the anthropic SDK reliably uses `RateLimitError` for 429s.
+    """
+    return type(exc).__name__ == "RateLimitError"
+
+
+async def _call_llm_with_rate_limit_backoff(
+    client: object,
+    *,
+    customer_id: str,
+    anchor_doc_id: str,
+    user_message: str,
+):
+    """Call Anthropic with exponential backoff on rate limits.
+
+    A burst of 64 concurrent extractors blows through Haiku's per-minute
+    rate limit; without backoff each bundle dies on the first
+    RateLimitError, the worker retries on next claim, and the rate-limit
+    window outlasts all 3 attempts. With backoff the call rides out the
+    transient window inside a single attempt.
+
+    Non-rate-limit errors propagate immediately (no backoff for genuine
+    failures). After _RATE_LIMIT_MAX_RETRIES on rate limits, the last
+    error propagates and the bundle fails for that attempt.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES):
+        try:
+            return await client.messages.create(  # type: ignore[attr-defined]
+                model=HAIKU_MODEL,
+                max_tokens=_MAX_OUTPUT_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=[
+                    {"role": "user", "content": user_message},
+                    {"role": "assistant", "content": "["},
+                ],
+            )
+        except Exception as exc:
+            if not _is_rate_limit_error(exc):
+                raise
+            last_exc = exc
+            # Exponential backoff with jitter: 5, 10, 20, 40 seconds (cap 60).
+            backoff = min(
+                _RATE_LIMIT_BACKOFF_BASE_SECONDS * (2**attempt),
+                _RATE_LIMIT_BACKOFF_CAP_SECONDS,
+            )
+            backoff += random.uniform(0, 1.0)
+            log.warning(
+                "inferred_edges.extractor.rate_limited",
+                customer=customer_id,
+                anchor=anchor_doc_id,
+                attempt=attempt + 1,
+                max_attempts=_RATE_LIMIT_MAX_RETRIES,
+                backoff_seconds=round(backoff, 2),
+            )
+            await asyncio.sleep(backoff)
+
+    # All retries exhausted; surface the last rate-limit error so the
+    # outer try/except records bundle_failed with the right reason.
+    assert last_exc is not None
+    raise last_exc
+
+
 # ---- main extraction function ---------------------------------------------
 
 
@@ -170,14 +254,11 @@ async def extract_edges(
         # fences, both of which break json.loads. With prefill,
         # response.content[0].text is the body of the array; we re-prepend
         # `[` before parsing.
-        response = await client.messages.create(
-            model=HAIKU_MODEL,
-            max_tokens=_MAX_OUTPUT_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": user_message},
-                {"role": "assistant", "content": "["},
-            ],
+        response = await _call_llm_with_rate_limit_backoff(
+            client,
+            customer_id=bundle.customer_id,
+            anchor_doc_id=bundle.anchor_doc_id,
+            user_message=user_message,
         )
 
         input_tokens = response.usage.input_tokens if response.usage else 0
@@ -200,9 +281,11 @@ async def extract_edges(
     # The assistant prefill `[` was sent to the model but is NOT included in
     # raw_text -- raw_text is just what the model continued with. The model
     # has three sensible behaviours:
-    #   1. "no edges" -> raw_text is empty / whitespace / just `]`. Treat
-    #      as the empty array `[]` and return zero edges; this is the
-    #      common case on bundles with nothing inferable.
+    #   1. "no edges" -> raw_text starts with `]` (model immediately closed
+    #      the array) optionally followed by garbage commentary. ANY leading
+    #      `]` after the prefill means the array is empty -- return zero
+    #      edges. Trailing commentary is discarded. Also treats whitespace-
+    #      only or fully empty raw_text as empty.
     #   2. "edges" -> raw_text starts with `{...}, {...}, ..., {...}]`.
     #      Re-prepend `[` and parse.
     #   3. "edges, truncated by max_tokens" -> ends mid-element with no
@@ -210,7 +293,7 @@ async def extract_edges(
     #      try to parse. JSONDecodeError on a truncated-mid-element will
     #      fall through to the failure branch.
     stripped = raw_text.strip()
-    if not stripped or stripped == "]":
+    if not stripped or stripped.startswith("]"):
         return result  # No edges; valid outcome.
 
     candidate = "[" + stripped
