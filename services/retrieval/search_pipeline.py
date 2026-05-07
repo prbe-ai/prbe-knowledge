@@ -29,7 +29,7 @@ from datetime import UTC, datetime
 
 from services.retrieval.acl import filter_by_acl
 from services.retrieval.dedup import dedupe
-from services.retrieval.fusion import fuse
+from services.retrieval.fusion import FusedHit, fuse
 from services.retrieval.helpers import (
     apply_entity_filter,
     embeddings_for_chunks,
@@ -154,6 +154,80 @@ async def _content_fallbacks_for_metadata_only_agent_hits(
         )
         for r in rows
     ]
+
+
+def _inject_id_lookup_hits(fused: list[FusedHit], id_hits: list) -> list[FusedHit]:
+    """Append synthetic FusedHits for any id_lookup-matched doc that didn't
+    survive `fuse()`'s top_k cap.
+
+    Why this exists: at MCP defaults (top_k=5), the fused pool is
+    5 * pool_multiplier = 10. The fusion pipeline applies a per-source
+    multiplier (claude_code/codex = 0.5x) and recency decay (7-day
+    half-life), which routinely buries an exact-id match below 10 — so a
+    pure pin-after-fusion would have nothing to pin. Injecting these hits
+    here puts them into the dedupe/ACL/pin path with the rest, and the
+    pin pass downstream guarantees they end up at rank 1.
+
+    Synthetic hits carry `score=1.0` and `retriever_scores={"id_lookup": 1.0}`
+    so response telemetry still reflects which retriever surfaced them.
+    """
+    if not id_hits:
+        return fused
+    fused_doc_ids = {f.doc_id for f in fused}
+    extras: list[FusedHit] = []
+    for h in id_hits:
+        if h.doc_id in fused_doc_ids:
+            continue
+        fused_doc_ids.add(h.doc_id)
+        extras.append(
+            FusedHit(
+                chunk_id=h.chunk_id,
+                doc_id=h.doc_id,
+                doc_version=h.doc_version,
+                source_system=h.source_system,
+                source_url=h.source_url,
+                title=h.title,
+                content=h.content,
+                created_at=h.created_at,
+                updated_at=h.updated_at,
+                score=1.0,
+                author_id=h.author_id,
+                retriever_scores={"id_lookup": 1.0},
+                kind="content",
+            )
+        )
+    return fused + extras
+
+
+def _pin_id_lookup_matches(fused: list[FusedHit], id_hits: list) -> list[FusedHit]:
+    """Float docs whose source_id was an exact match by `id_lookup_search`
+    to the top of the fused list, preserving id_lookup's original order.
+
+    Why: a UUID-precise query like "session 3c325e11-..." should land the
+    matching doc at rank 1. Fusion's per-source multiplier (claude_code /
+    codex are 0.5x) and short half-life (7 days) can demote a session
+    below code_graph BM25 hits even when `id_lookup` nailed an exact
+    match — observed live: target session at rank 36 with id_lookup score
+    1.0 still buried under code_graph chunks at BM25 ranks 1-35. This
+    pin guarantees exact-id matches sit on top regardless of the discount
+    factors, without changing the ranking of unmatched docs below.
+
+    Pairs with `_inject_id_lookup_hits`: injection ensures the doc is in
+    the candidate pool when top_k is small (MCP default 5); pin then
+    floats it to position 0.
+    """
+    if not id_hits:
+        return fused
+    seen: set[str] = set()
+    id_order: list[str] = []
+    for h in id_hits:
+        if h.doc_id not in seen:
+            seen.add(h.doc_id)
+            id_order.append(h.doc_id)
+    by_doc = {f.doc_id: f for f in fused}
+    pinned = [by_doc[did] for did in id_order if did in by_doc]
+    rest = [f for f in fused if f.doc_id not in seen]
+    return pinned + rest
 
 
 async def run_search(
@@ -281,6 +355,12 @@ async def run_search(
     )
     timing["fusion_ms"] = (time.perf_counter() - t_fuse) * 1000
 
+    # Inject id_lookup-matched docs that didn't survive fuse()'s top_k cap
+    # so they reach dedupe/ACL/pin even at MCP defaults (top_k=5 → pool 10).
+    # Without this, the source-multiplier-discounted exact-id match can land
+    # at rank 36+ pre-cap and never enter the candidate set the pin sees.
+    fused = _inject_id_lookup_hits(fused, id_hits)
+
     applied_entity_filter: dict[str, object] | None = None
     if req.entity_must_match:
         pre_count = len(fused)
@@ -298,6 +378,13 @@ async def run_search(
     t_acl = time.perf_counter()
     filtered = await filter_by_acl(customer_id, req.requesting_user_id, deduped)
     timing["acl_ms"] = (time.perf_counter() - t_acl) * 1000
+
+    # Pin exact-id matches on top of the ACL-filtered list so an extracted
+    # canonical_id (UUID, ticket code, PR ref) always wins rank 1 — the
+    # fusion source-multiplier + recency decay otherwise demote sessions
+    # below code_graph noise. Must run AFTER ACL so we don't surface a
+    # doc the requesting user can't see.
+    filtered = _pin_id_lookup_matches(filtered, id_hits)
 
     top = filtered[: req.top_k]
 
