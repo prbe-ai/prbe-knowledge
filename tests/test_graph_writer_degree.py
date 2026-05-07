@@ -13,13 +13,12 @@ verifies that:
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from services.ingestion.graph_writer import upsert_edges
-from shared.models import GraphEdgeSpec, GraphNodeSpec
-
+from shared.models import GraphEdgeSpec
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -97,7 +96,7 @@ async def test_insert_increments_degree_for_both_endpoints() -> None:
     inc_amounts = update_args[2]
     assert set(inc_node_ids) == {10, 20}
     # Each endpoint appears once (one new edge)
-    for nid, amt in zip(inc_node_ids, inc_amounts):
+    for _nid, amt in zip(inc_node_ids, inc_amounts, strict=True):
         assert amt == 1
 
 
@@ -175,11 +174,6 @@ async def test_shared_node_degree_incremented_by_correct_sum() -> None:
         ("Service", "b", 30),
         ("Service", "c", 40),
     )
-    edges = [
-        _edge(from_cid="hub", to_cid="a"),
-        _edge(from_cid="hub", to_cid="b"),
-        _edge(from_cid="hub", to_cid="c"),
-    ]
     # Need distinct edge_types to avoid dedup collision in upsert_edges
     from shared.models import EdgeType, NodeLabel
 
@@ -215,7 +209,7 @@ async def test_shared_node_degree_incremented_by_correct_sum() -> None:
     update_args = conn.execute.call_args[0]
     inc_node_ids = update_args[1]
     inc_amounts = update_args[2]
-    degree_map = dict(zip(inc_node_ids, inc_amounts))
+    degree_map = dict(zip(inc_node_ids, inc_amounts, strict=True))
 
     # Hub node 10 is endpoint of 3 new edges
     assert degree_map[10] == 3
