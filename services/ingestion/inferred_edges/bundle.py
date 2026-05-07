@@ -397,7 +397,15 @@ async def _fetch_vector_similar_cross_source(
     Uses pgvector cosine similarity against the anchor's first chunk embedding.
     Falls back to an empty list if no embedding is available or pgvector is
     not installed (the query will raise; we swallow it and return []).
+
+    Wraps the query in a SAVEPOINT so that on failure (pgvector missing,
+    zero-vector cosine NaN, halfvec cast error, etc.) we ROLLBACK to the
+    savepoint instead of poisoning the outer transaction. Without this,
+    a swallowed Python exception still leaves Postgres with an aborted
+    transaction, and every subsequent query dies with
+    InFailedSQLTransactionError.
     """
+    await conn.execute("SAVEPOINT vector_similar")
     try:
         rows = await conn.fetch(
             """
@@ -435,8 +443,11 @@ async def _fetch_vector_similar_cross_source(
             anchor_source,
             _MAX_VECTOR_SIMILAR,
         )
+        await conn.execute("RELEASE SAVEPOINT vector_similar")
         return [r["doc_id"] for r in rows if r["doc_id"] not in exclude]
-    except Exception as exc:  # pgvector unavailable or no embedding
+    except Exception as exc:  # pgvector unavailable, zero-vec, or no embedding
+        await conn.execute("ROLLBACK TO SAVEPOINT vector_similar")
+        await conn.execute("RELEASE SAVEPOINT vector_similar")
         log.debug(
             "inferred_edges.bundle.vector_similar_failed",
             customer=customer_id,
