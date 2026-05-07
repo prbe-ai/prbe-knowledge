@@ -332,6 +332,27 @@ class Normalizer:
                     error_class=type(exc).__name__,
                 )
 
+        # ---- Inferred-edges enqueue (best-effort) ---------------------------
+        # After Phase B commits, append one row per persisted doc into
+        # inferred_edges_queue. The side-queue worker drains this table
+        # asynchronously: builds a bundle -> one LLM call -> upserts
+        # INFERRED/AMBIGUOUS edges. Insert failure MUST NOT block main
+        # ingestion -- wrap in try/except, log on failure, continue.
+        #
+        # Skip wiki source (no cross-source inference on compiled pages)
+        # and skip if no docs were persisted this cycle.
+        if source_system != SourceSystem.WIKI and doc_ids:
+            try:
+                await self._enqueue_inferred_edges(customer_id, doc_ids)
+            except Exception as exc:
+                log.warning(
+                    "inferred_edges.enqueue_failed",
+                    customer=customer_id,
+                    doc_count=len(doc_ids),
+                    error=str(exc),
+                    error_class=type(exc).__name__,
+                )
+
         log.info(
             "normalizer.done",
             customer=customer_id,
@@ -411,6 +432,39 @@ class Normalizer:
                 ts_values,
             )
         _ = doc_ids  # retained for potential future logging
+
+    async def _enqueue_inferred_edges(
+        self,
+        customer_id: str,
+        doc_ids: list[str],
+    ) -> None:
+        """Insert one inferred_edges_queue row per persisted doc_id.
+
+        Uses ON CONFLICT DO NOTHING so re-delivers of the same doc are
+        deduplicated at the (customer_id, anchor_doc_id, extractor_id) level.
+        The queue has no UNIQUE constraint on those three columns by default
+        (the design intentionally allows re-extraction on prompt version bumps)
+        -- idempotence here is soft: we just avoid flooding the queue with
+        identical rows from the same ingest run.
+
+        CRITICAL: any exception from this method is caught by the caller
+        (_persist) which logs it and continues. This must never block ingestion.
+        """
+        from services.ingestion.inferred_edges.prompts.v1 import PROMPT_VERSION
+
+        if not doc_ids:
+            return
+
+        async with with_tenant(customer_id) as conn:
+            await conn.executemany(
+                """
+                INSERT INTO inferred_edges_queue
+                    (customer_id, anchor_doc_id, extractor_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT DO NOTHING
+                """,
+                [(customer_id, doc_id, PROMPT_VERSION) for doc_id in doc_ids],
+            )
 
     async def _plan_chunks(
         self,
