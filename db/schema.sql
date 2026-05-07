@@ -449,6 +449,14 @@ CREATE TABLE graph_nodes (
     properties    JSONB NOT NULL DEFAULT '{}',
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Lane A (surprise-score, migration 0054_graph_node_degree_community):
+    -- materialized degree maintained on edge insert/delete in
+    -- graph_writer.upsert_edges and cross_repo_deps deletes; community_id
+    -- populated by the nightly Leiden cron in services/community/leiden.py.
+    -- Both feed the surprise_score() boost in the graph retriever
+    -- (services/retrieval/surprise.py).
+    degree        INT NOT NULL DEFAULT 0,
+    community_id  INT,
     UNIQUE (customer_id, label, canonical_id)
 );
 
@@ -468,6 +476,9 @@ CREATE INDEX idx_graph_nodes_alnum_canonical
     ON graph_nodes (customer_id, label, regexp_replace(LOWER(canonical_id), '[^a-z0-9]+', '', 'g'));
 CREATE INDEX idx_graph_nodes_alnum_props_name
     ON graph_nodes (customer_id, label, regexp_replace(LOWER(properties ->> 'name'), '[^a-z0-9]+', '', 'g'));
+-- Lane A: partial index on community_id for cross-community surprise-score lookups.
+CREATE INDEX idx_graph_nodes_customer_community
+    ON graph_nodes (customer_id, community_id) WHERE community_id IS NOT NULL;
 
 CREATE TABLE graph_edges (
     edge_id       BIGSERIAL PRIMARY KEY,
@@ -485,6 +496,14 @@ CREATE TABLE graph_edges (
     confidence    TEXT NOT NULL DEFAULT 'EXTRACTED'
         CONSTRAINT graph_edges_confidence_check
         CHECK (confidence IN ('EXTRACTED', 'INFERRED', 'AMBIGUOUS')),
+    -- Lane B (inferred-edges, migration 0055_inferred_edge_metadata):
+    -- provenance for LLM-inferred edges. Both NULL for deterministically-
+    -- extracted edges (back-compat with all existing call sites). When set,
+    -- identify which prompt version produced this edge and when, so future
+    -- prompt v2 can DELETE rows with extractor_id = 'inferred_edges:v1' and
+    -- re-extract via the backfill script.
+    extractor_id  TEXT,
+    extracted_at  TIMESTAMPTZ,
     UNIQUE (customer_id, edge_type, from_node_id, to_node_id)
 );
 
@@ -493,6 +512,9 @@ CREATE INDEX idx_graph_edges_from ON graph_edges (customer_id, from_node_id, edg
 CREATE INDEX idx_graph_edges_to ON graph_edges (customer_id, to_node_id, edge_type);
 CREATE INDEX idx_graph_edges_confidence
     ON graph_edges (customer_id, edge_type, confidence);
+-- Lane B: partial index for prompt-version invalidation queries.
+CREATE INDEX idx_graph_edges_customer_extractor
+    ON graph_edges (customer_id, extractor_id) WHERE extractor_id IS NOT NULL;
 
 -- Per-node provenance: which source system(s) asserted this node. A node
 -- touched by multiple connectors must survive disconnection of any single
@@ -864,6 +886,41 @@ BEGIN
 END $$;
 
 REVOKE ALL ON FUNCTION verify_and_touch_custom_ingest_token(text) FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------
+-- inferred_edges_queue (Lane B, migration 0055_inferred_edge_metadata):
+-- side-queue worker drains this. One row per (customer, anchor_doc_id) is
+-- enqueued by the main worker after successful normalize+write. The
+-- side-worker claims via FOR UPDATE SKIP LOCKED, builds a bundle of related
+-- content, calls the LLM extractor, and upserts INFERRED/AMBIGUOUS edges
+-- into graph_edges (stamped with extractor_id + extracted_at).
+-- ---------------------------------------------------------------------------
+CREATE TABLE inferred_edges_queue (
+    id                      BIGSERIAL PRIMARY KEY,
+    customer_id             TEXT NOT NULL
+                            REFERENCES customers(customer_id) ON DELETE CASCADE,
+    anchor_doc_id           TEXT NOT NULL,
+    enqueued_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    processing_started_at   TIMESTAMPTZ,
+    processing_worker_id    TEXT,
+    attempts                INT NOT NULL DEFAULT 0,
+    extractor_id            TEXT NOT NULL,
+    done_at                 TIMESTAMPTZ,
+    error                   TEXT
+);
+
+-- Partial index: drain queries filter on pending rows only. As done/failed
+-- rows accumulate the tail stays outside this index.
+CREATE INDEX idx_inferred_edges_queue_pending
+    ON inferred_edges_queue (enqueued_at)
+    WHERE processing_started_at IS NULL AND done_at IS NULL;
+
+ALTER TABLE inferred_edges_queue ENABLE ROW LEVEL SECURITY;
+ALTER TABLE inferred_edges_queue FORCE ROW LEVEL SECURITY;
+CREATE POLICY inferred_edges_queue_tenant_isolation
+    ON inferred_edges_queue
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.

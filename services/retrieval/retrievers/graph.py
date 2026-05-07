@@ -185,6 +185,10 @@ async def graph_search(
                                       THEN e.to_node_id ELSE e.from_node_id END
                  AND n.label = 'Document'
                 UNION
+                -- When the anchor IS itself a Document node, the "neighbor"
+                -- and the anchor are the same row. Both via_degree/community
+                -- and degree/community_id come from the same node, so reuse
+                -- the anchors CTE's pre-aliased values for both sides.
                 SELECT node_id,
                        canonical_id    AS via,
                        label           AS via_label,
@@ -193,8 +197,8 @@ async def graph_search(
                        via_degree,
                        via_community,
                        via_source_system,
-                       degree          AS degree,
-                       community_id
+                       via_degree      AS degree,
+                       via_community   AS community_id
                 FROM anchors
                   WHERE EXISTS (SELECT 1 FROM graph_nodes gn
                                 WHERE gn.node_id = anchors.node_id AND gn.label = 'Document')

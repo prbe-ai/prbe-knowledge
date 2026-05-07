@@ -102,7 +102,7 @@ def _patch_llm(edges: list[dict]):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_valid_edge_parsed() -> None:
     """A well-formed INFERRED edge passes all validation."""
     edges = [
@@ -138,7 +138,7 @@ async def test_valid_edge_parsed() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_drop_unknown_endpoint() -> None:
     """Edges whose endpoint does not exist in graph_nodes are dropped."""
     edges = [
@@ -163,7 +163,7 @@ async def test_drop_unknown_endpoint() -> None:
     assert len(result.edges) == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_drop_unknown_type() -> None:
     """Edges with an unknown edge_type are dropped."""
     edges = [
@@ -188,7 +188,7 @@ async def test_drop_unknown_type() -> None:
     assert len(result.edges) == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_drop_self_edge() -> None:
     """Self-edges (from == to) are dropped."""
     edges = [
@@ -213,7 +213,7 @@ async def test_drop_self_edge() -> None:
     assert len(result.edges) == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_drop_bad_justification_empty() -> None:
     """Edges with an empty `why` field are dropped."""
     edges = [
@@ -238,7 +238,7 @@ async def test_drop_bad_justification_empty() -> None:
     assert len(result.edges) == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_drop_bad_justification_too_long() -> None:
     """Edges with a `why` > 200 chars are dropped."""
     edges = [
@@ -263,7 +263,7 @@ async def test_drop_bad_justification_too_long() -> None:
     assert len(result.edges) == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_drop_unknown_confidence() -> None:
     """Edges with an unrecognized confidence value are dropped."""
     edges = [
@@ -288,7 +288,7 @@ async def test_drop_unknown_confidence() -> None:
     assert len(result.edges) == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_force_demote_extracted_to_ambiguous() -> None:
     """EXTRACTED confidence is force-demoted to AMBIGUOUS, edge is kept."""
     edges = [
@@ -316,7 +316,7 @@ async def test_force_demote_extracted_to_ambiguous() -> None:
     assert result.dropped.get("forced_confidence_demoted", 0) == 1
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_drop_bad_format_non_dict() -> None:
     """Non-dict items in the array are dropped with bad_format."""
     edges = ["not a dict", 42, None]
@@ -338,7 +338,7 @@ async def test_drop_bad_format_non_dict() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_bundle_kill_switch_unknown_endpoint_majority() -> None:
     """When >50% of edges have unknown_endpoint, the bundle is failed entirely."""
     # Build N edges with unknown endpoints to trigger the kill-switch.
@@ -377,7 +377,7 @@ async def test_bundle_kill_switch_unknown_endpoint_majority() -> None:
     assert result.edges == []
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_bundle_kill_switch_not_triggered_below_threshold() -> None:
     """Kill-switch does NOT fire when unknown_endpoint <= 50% of total."""
     # 1 unknown + 1 valid = 50% unknown, which is not > 50%. Edge passes.
@@ -417,7 +417,7 @@ async def test_bundle_kill_switch_not_triggered_below_threshold() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_no_api_key_returns_empty() -> None:
     """Without ANTHROPIC_API_KEY, return empty result (don't crash)."""
     bundle = _make_bundle()
@@ -460,7 +460,7 @@ def test_estimate_cost_typical_call() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_empty_bundle_returns_empty_result() -> None:
     """An empty bundle (no docs) returns an empty ExtractionResult."""
     bundle = Bundle(customer_id="cust-x", anchor_doc_id="doc1")
@@ -480,7 +480,7 @@ async def test_empty_bundle_returns_empty_result() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_empty_llm_response_array() -> None:
     """When the LLM returns [], ExtractionResult has no edges."""
     bundle = _make_bundle()

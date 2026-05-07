@@ -26,10 +26,12 @@ from shared.db import with_tenant
 
 
 async def _insert_customer(conn, customer_id: str) -> None:
+    # api_key_hash is NOT NULL on customers; pass an arbitrary placeholder
+    # for tests (matches the pattern in test_idempotency.py / test_chunk_diff.py).
     await conn.execute(
         """
-        INSERT INTO customers (customer_id, display_name, status)
-        VALUES ($1, $1, 'active')
+        INSERT INTO customers (customer_id, display_name, api_key_hash, status)
+        VALUES ($1, $1, 'test-' || $1, 'active')
         ON CONFLICT (customer_id) DO NOTHING
         """,
         customer_id,
@@ -52,7 +54,7 @@ async def _insert_doc(conn, customer_id: str, doc_id: str, source_system: str = 
             NULL, $4, $4, $4, $4,
             '{"principals": [], "captured_at": "2026-01-01T00:00:00Z"}'::jsonb
         )
-        ON CONFLICT (doc_id) DO NOTHING
+        ON CONFLICT (customer_id, doc_id, version) DO NOTHING
         """,
         doc_id,
         customer_id,
@@ -62,6 +64,9 @@ async def _insert_doc(conn, customer_id: str, doc_id: str, source_system: str = 
 
 
 async def _insert_chunk(conn, customer_id: str, doc_id: str, content: str, idx: int = 0) -> None:
+    # chunks.embedding is NOT NULL halfvec(3072); use a zero-vector
+    # placeholder. Test doesn't exercise vector similarity so values
+    # don't matter — only the fact that the INSERT satisfies the schema.
     await conn.execute(
         """
         INSERT INTO chunks (
@@ -71,11 +76,11 @@ async def _insert_chunk(conn, customer_id: str, doc_id: str, content: str, idx: 
         ) VALUES (
             $1, $2, $3, $4, $5, md5($5),
             length($5) / 4,
-            NULL,
+            array_fill(0::real, ARRAY[3072])::halfvec,
             'openai/text-embedding-3-large', 3072,
             'naive-v1', 1, 1, NOW()
         )
-        ON CONFLICT (chunk_id) DO NOTHING
+        ON CONFLICT (customer_id, chunk_id) DO NOTHING
         """,
         f"{doc_id}:chunk:{idx}",
         doc_id,
@@ -124,7 +129,7 @@ async def db_with_tenants(live_db):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_bundle_anchor_only(live_db) -> None:
     """An anchor doc with no neighbors produces a bundle with just the anchor."""
     from shared.db import raw_conn
@@ -144,7 +149,7 @@ async def test_bundle_anchor_only(live_db) -> None:
     assert bundle.total_tokens > 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_bundle_missing_anchor_returns_empty(live_db) -> None:
     """If the anchor doc doesn't exist, return an empty bundle (don't crash)."""
     from shared.db import raw_conn
@@ -159,7 +164,7 @@ async def test_bundle_missing_anchor_returns_empty(live_db) -> None:
     assert bundle.total_tokens == 0
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_bundle_token_budget_enforced(live_db) -> None:
     """Bundle content is trimmed to fit within the token budget."""
     from shared.db import raw_conn
@@ -189,7 +194,7 @@ async def test_bundle_token_budget_enforced(live_db) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_bundle_never_returns_cross_tenant_docs(db_with_tenants) -> None:
     """CRITICAL: build_bundle for tenant A must never return a tenant B doc.
 
@@ -219,7 +224,7 @@ async def test_bundle_never_returns_cross_tenant_docs(db_with_tenants) -> None:
     assert "docA1" in doc_ids
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_bundle_tenant_b_does_not_see_tenant_a(db_with_tenants) -> None:
     """Mirror of the cross-tenant test: tenant B's bundle must not leak tenant A."""
     _tenant_a, tenant_b = db_with_tenants
@@ -238,7 +243,7 @@ async def test_bundle_tenant_b_does_not_see_tenant_a(db_with_tenants) -> None:
         )
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_bundle_customer_id_on_bundle_object(live_db) -> None:
     """bundle.customer_id always equals the requested customer_id."""
     from shared.db import raw_conn

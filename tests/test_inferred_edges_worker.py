@@ -70,7 +70,7 @@ def _make_mock_pool(fetchrow_return=None) -> MagicMock:
     return mock_pool
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_claim_one_returns_none_on_empty_queue() -> None:
     """_claim_one returns None when no pending rows exist."""
     worker = InferredEdgesWorker(concurrency=1)
@@ -82,7 +82,7 @@ async def test_claim_one_returns_none_on_empty_queue() -> None:
     assert result is None
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_claim_one_marks_processing() -> None:
     """_claim_one marks the claimed row with processing_started_at."""
     worker = InferredEdgesWorker(concurrency=1)
@@ -105,7 +105,7 @@ async def test_claim_one_marks_processing() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_process_success_marks_done() -> None:
     """On successful extraction, _process marks the row done_at."""
     worker = InferredEdgesWorker(concurrency=1)
@@ -138,7 +138,7 @@ async def test_process_success_marks_done() -> None:
     mock_mark_done.assert_called_once_with(1)
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_process_failure_marks_error() -> None:
     """On exception, _process marks error but does NOT mark done."""
     worker = InferredEdgesWorker(concurrency=1)
@@ -166,7 +166,7 @@ async def test_process_failure_marks_error() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_process_bundle_failed_marks_error_not_done() -> None:
     """When extraction.bundle_failed is True, row is marked error, not done."""
     worker = InferredEdgesWorker(concurrency=1)
@@ -206,7 +206,7 @@ async def test_process_bundle_failed_marks_error_not_done() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.anyio
+@pytest.mark.asyncio
 async def test_worker_shutdown_stops_claim_loop() -> None:
     """After shutdown(), the claim loop terminates without claiming rows."""
     worker = InferredEdgesWorker(concurrency=1)
