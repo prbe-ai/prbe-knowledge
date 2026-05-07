@@ -52,13 +52,18 @@ jobs:
       - name: Run wiki nightly trigger
         # `--rm` so the ephemeral machine cleans up after exit.
         # Image is positional in modern flyctl (machine run <image> [command]);
-        # the `--image` flag was removed. The command after the image
-        # overrides the Dockerfile CMD / fly.cron.toml [processes].cron
-        # with the explicit module path -- keeps the entry-point coupling
-        # local to this workflow.
+        # `--image` and `:latest` are both gone. Fly tags deploys with
+        # `deployment-<hash>`; resolve the current tag from the app
+        # status before firing. The command after `--` overrides the
+        # Dockerfile CMD / fly.cron.toml [processes].cron with the
+        # explicit module path -- keeps the entry-point coupling local
+        # to this workflow.
         run: |
+          IMAGE=$(flyctl image show -a prbe-knowledge-cron --json \
+            | jq -r '.[0] | "\(.Registry)/\(.Repository):\(.Tag)"')
+          echo "Using image: $IMAGE"
           flyctl machine run \
-            registry.fly.io/prbe-knowledge-cron:latest \
+            "$IMAGE" \
             --app prbe-knowledge-cron \
             --rm \
             -- python -m services.synthesis.nightly_trigger
@@ -87,11 +92,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Run leiden community-detection
-        # Same syntax notes as wiki-nightly above: image is positional;
-        # `--` then the command + args.
+        # Same image-resolution + invocation pattern as wiki-nightly.
         run: |
+          IMAGE=$(flyctl image show -a prbe-knowledge-cron --json \
+            | jq -r '.[0] | "\(.Registry)/\(.Repository):\(.Tag)"')
+          echo "Using image: $IMAGE"
           flyctl machine run \
-            registry.fly.io/prbe-knowledge-cron:latest \
+            "$IMAGE" \
             --app prbe-knowledge-cron \
             --rm \
             -- python -m scripts.leiden_one_shot --all-customers --yes
