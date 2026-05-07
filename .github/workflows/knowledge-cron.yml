@@ -51,15 +51,17 @@ jobs:
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Run wiki nightly trigger
         # `--rm` so the ephemeral machine cleans up after exit.
-        # `--command` overrides the toml's [processes].cron with the
-        # explicit module path — keeps the entry-point coupling local
-        # to this workflow.
+        # Image is positional in modern flyctl (machine run <image> [command]);
+        # the `--image` flag was removed. The command after the image
+        # overrides the Dockerfile CMD / fly.cron.toml [processes].cron
+        # with the explicit module path -- keeps the entry-point coupling
+        # local to this workflow.
         run: |
           flyctl machine run \
+            registry.fly.io/prbe-knowledge-cron:latest \
             --app prbe-knowledge-cron \
             --rm \
-            --command "python -m services.synthesis.nightly_trigger" \
-            --image registry.fly.io/prbe-knowledge-cron:latest
+            -- python -m services.synthesis.nightly_trigger
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
@@ -85,11 +87,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Run leiden community-detection
+        # Same syntax notes as wiki-nightly above: image is positional;
+        # `--` then the command + args.
         run: |
           flyctl machine run \
+            registry.fly.io/prbe-knowledge-cron:latest \
             --app prbe-knowledge-cron \
             --rm \
-            --command "python -m scripts.leiden_one_shot --all-customers --yes" \
-            --image registry.fly.io/prbe-knowledge-cron:latest
+            -- python -m scripts.leiden_one_shot --all-customers --yes
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
