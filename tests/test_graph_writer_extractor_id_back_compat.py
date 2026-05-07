@@ -53,14 +53,27 @@ def _node_ids(*pairs: tuple[str, str, int]) -> dict[tuple[str, str], int]:
 # ---------------------------------------------------------------------------
 
 
+# NOTE: After Lane A merged, upsert_edges issues the INSERT via conn.fetch
+# (to capture RETURNING (xmax = 0) AS inserted for degree maintenance) and
+# only uses conn.execute for the follow-up degree UPDATE. So these tests
+# inspect conn.fetch.call_args, not conn.execute.call_args.
+
+
+def _make_conn() -> AsyncMock:
+    """Build a conn that returns [] from fetch (no rows -> no degree UPDATE)."""
+    conn = AsyncMock()
+    conn.fetch = AsyncMock(return_value=[])
+    conn.execute = AsyncMock()
+    return conn
+
+
 @pytest.mark.anyio
 async def test_upsert_edges_null_extractor_id_by_default() -> None:
     """When extractor_id/extracted_at are not passed, they default to NULL.
 
     The INSERT must be called with $10=None and $11=None.
     """
-    conn = AsyncMock()
-    conn.execute = AsyncMock()
+    conn = _make_conn()
 
     edges = [_edge()]
     node_ids = _node_ids(
@@ -70,8 +83,8 @@ async def test_upsert_edges_null_extractor_id_by_default() -> None:
 
     await upsert_edges(conn, "cust-test", edges, node_ids, "slack")
 
-    conn.execute.assert_called_once()
-    call_args = conn.execute.call_args[0]
+    conn.fetch.assert_called_once()
+    call_args = conn.fetch.call_args[0]
     # Positional args: (sql, customer_id, source_system, edge_types, from_ids,
     #   to_ids, properties_json, valid_from_list, valid_to_list, confidences,
     #   extractor_id, extracted_at)
@@ -83,8 +96,7 @@ async def test_upsert_edges_null_extractor_id_by_default() -> None:
 @pytest.mark.anyio
 async def test_upsert_edges_with_extractor_id_passed() -> None:
     """When extractor_id/extracted_at are passed, they are forwarded to INSERT."""
-    conn = AsyncMock()
-    conn.execute = AsyncMock()
+    conn = _make_conn()
 
     edges = [_edge(confidence="INFERRED")]
     node_ids = _node_ids(
@@ -103,29 +115,28 @@ async def test_upsert_edges_with_extractor_id_passed() -> None:
         extracted_at=extracted_at,
     )
 
-    conn.execute.assert_called_once()
-    call_args = conn.execute.call_args[0]
+    conn.fetch.assert_called_once()
+    call_args = conn.fetch.call_args[0]
     assert call_args[10] == "inferred_edges:v1"
     assert call_args[11] == extracted_at
 
 
 @pytest.mark.anyio
 async def test_upsert_edges_empty_list_returns_zero() -> None:
-    """Empty edge list returns 0 without calling execute."""
-    conn = AsyncMock()
-    conn.execute = AsyncMock()
+    """Empty edge list returns 0 without calling execute or fetch."""
+    conn = _make_conn()
 
     result = await upsert_edges(conn, "cust-test", [], {}, "slack")
 
     assert result == 0
+    conn.fetch.assert_not_called()
     conn.execute.assert_not_called()
 
 
 @pytest.mark.anyio
 async def test_upsert_edges_skips_unknown_endpoints() -> None:
     """Edges whose endpoints are not in node_ids are silently skipped."""
-    conn = AsyncMock()
-    conn.execute = AsyncMock()
+    conn = _make_conn()
 
     edges = [_edge(from_cid="unknown-doc", to_cid="AUTH-123")]
     node_ids = _node_ids(("Ticket", "AUTH-123", 2))
@@ -135,6 +146,7 @@ async def test_upsert_edges_skips_unknown_endpoints() -> None:
 
     # All edges dropped (endpoint not found)
     assert result == 0
+    conn.fetch.assert_not_called()
     conn.execute.assert_not_called()
 
 
@@ -147,8 +159,7 @@ async def test_upsert_edges_extracted_confidence_never_demoted() -> None:
     confidence value passed to the INSERT matches the edge's confidence
     (so the DB-level CASE expression has the right input).
     """
-    conn = AsyncMock()
-    conn.execute = AsyncMock()
+    conn = _make_conn()
 
     edges = [_edge(confidence="EXTRACTED")]
     node_ids = _node_ids(
@@ -158,8 +169,8 @@ async def test_upsert_edges_extracted_confidence_never_demoted() -> None:
 
     await upsert_edges(conn, "cust-test", edges, node_ids, "slack")
 
-    conn.execute.assert_called_once()
-    call_args = conn.execute.call_args[0]
+    conn.fetch.assert_called_once()
+    call_args = conn.fetch.call_args[0]
     # Positional args (0=sql, then $1..$11 at indices 1..11):
     #   0=sql, 1=customer_id, 2=source_system, 3=edge_types, 4=from_ids,
     #   5=to_ids, 6=properties, 7=valid_from, 8=valid_to, 9=confidences,

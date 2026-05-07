@@ -1,7 +1,7 @@
 """inferred_edge_metadata: extractor tracking on graph_edges + inferred_edges_queue
 
-Revision ID: 0054_inferred_edge_metadata
-Revises: 0053_cross_repo_reverify_dlq
+Revision ID: 0055_inferred_edge_metadata
+Revises: 0054_drop_cross_repo_dlq, 0054_graph_node_degree_community
 Create Date: 2026-05-07
 
 Lane B (Cross-source LLM-inferred edges):
@@ -15,6 +15,12 @@ Lane B (Cross-source LLM-inferred edges):
    - Side-queue worker drains it: builds bundle -> LLM call -> upsert edges
    - RLS mirrors other customer-scoped tables in this codebase
 
+This is also an alembic MERGE migration: it chains both 0054_drop_cross_repo_dlq
+(landed via PR #166) and 0054_graph_node_degree_community (landed via PR #168)
+into a single linear head. Both 0054 revs branched off 0053; main currently has
+two heads, which alembic refuses to upgrade. After this migration applies, head
+is single again at 0055_inferred_edge_metadata.
+
 Forward-only. No downgrade (we do not undeploy migrations in this codebase).
 """
 
@@ -22,8 +28,8 @@ from __future__ import annotations
 
 from alembic import op
 
-revision = "0054_inferred_edge_metadata"
-down_revision = "0053_cross_repo_reverify_dlq"
+revision = "0055_inferred_edge_metadata"
+down_revision = ("0054_drop_cross_repo_dlq", "0054_graph_node_degree_community")
 branch_labels = None
 depends_on = None
 
