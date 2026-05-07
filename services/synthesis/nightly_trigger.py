@@ -40,6 +40,7 @@ from datetime import UTC, datetime
 import asyncpg
 
 from services.ingestion.code_graph.bridge import enqueue_initial_backfill
+from services.ingestion.code_graph.cross_repo_deps import drain_reverify_dlq
 from services.synthesis.diagram_renderer import regenerate_wiki_diagram
 from shared.config import get_settings
 from shared.constants import WIKI_PENDING_CHANNEL, SourceSystem
@@ -246,10 +247,65 @@ async def _wait_for_code_graph_drain(dsn: str, customer_id: str) -> bool:
     return False
 
 
+async def _drain_dlq() -> None:
+    """Replay verifier-failed pushes that were parked for retry.
+
+    Lazy-imports the ingestion-layer file fetcher and token resolver so
+    nightly_trigger keeps a tight import surface for the cron container.
+    """
+    import httpx
+
+    from services.ingestion.code_graph.fetch import fetch_files_at_sha
+    from shared.backend_client import fetch_github_installation_token
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as http:
+
+        async def resolve_token(
+            customer_id: str, token_id: str | None
+        ) -> str | None:
+            # `token_id` was recorded at DLQ enqueue time but the backend
+            # mints fresh installation tokens by customer_id; the id
+            # serves only as a "do we have an installation at all"
+            # marker. We mint a fresh token here so a stale one parked
+            # in the DLQ doesn't fail the whole retry.
+            del token_id
+            try:
+                token, _expires = await fetch_github_installation_token(
+                    http, customer_id=customer_id
+                )
+                return token
+            except Exception as exc:
+                log.warning(
+                    "nightly_trigger.dlq_token_resolve_failed",
+                    customer=customer_id,
+                    error=str(exc),
+                )
+                return None
+
+        summary = await drain_reverify_dlq(
+            fetch_files_at_sha=fetch_files_at_sha,
+            resolve_token=resolve_token,
+        )
+    log.info("nightly_trigger.dlq_drain_summary", **summary)
+
+
 async def main() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     log.info("nightly_trigger.start", environment=settings.environment)
+
+    # Step 0: drain the cross-repo DLQ first. If Gemini is back up,
+    # parked verifications get re-run before today's refresh adds new
+    # edges, so the diagram reflects the correct edge state when step
+    # A regenerates it.
+    try:
+        await _drain_dlq()
+    except Exception as exc:
+        log.warning(
+            "nightly_trigger.dlq_drain_failed",
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
 
     # Step A: refresh cross-repo edges first so that step B's wiki drain
     # ends with a regenerate_wiki_index call against an up-to-date edge

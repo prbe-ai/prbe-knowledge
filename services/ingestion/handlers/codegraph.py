@@ -29,6 +29,7 @@ from services.ingestion.code_graph.clone import (
     walk_files,
 )
 from services.ingestion.code_graph.cross_repo_deps import (
+    enqueue_reverify_dlq,
     extract_cross_repo_deps,
     persist_cross_repo_edges,
     update_edges_after_push,
@@ -290,13 +291,28 @@ class CodeGraphConnector(Connector):
             file_contents_for_reverify: dict[str, str] = {
                 f.rel_path: f.content for f in files
             }
-            await update_edges_after_push(
+            counts = await update_edges_after_push(
                 customer_id=event.customer_id,
                 source_repo=repo,
                 removed_files=removed,
-                modified_files=list(file_contents_for_reverify.keys()),
+                modified_files=list(file_contents_for_reverify),
                 file_contents=file_contents_for_reverify,
             )
+            # Verifier outage → park the work for the nightly retry
+            # pass. We persist what we COULD apply (removal-only edges
+            # already updated) and let the DLQ pick up the modified-
+            # file re-verifications when Gemini comes back.
+            if counts.get("verifier_failures", 0) > 0:
+                token_id = self._extract_token_id_for_dlq(hydrated)
+                await enqueue_reverify_dlq(
+                    customer_id=event.customer_id,
+                    source_repo=repo,
+                    sha=sha,
+                    removed_files=list(removed),
+                    modified_files=list(file_contents_for_reverify),
+                    integration_token_id=token_id,
+                    error=f"{counts['verifier_failures']} edge verifier(s) failed",
+                )
         except Exception as exc:
             log.warning(
                 "code_graph.cross_repo_reverify_failed",
@@ -307,6 +323,16 @@ class CodeGraphConnector(Connector):
             )
 
         return result
+
+    @staticmethod
+    def _extract_token_id_for_dlq(hydrated: Mapping[str, Any]) -> str | None:
+        """Pull the integration_token_id off the hydrated payload so the
+        DLQ retry can re-resolve a token by id later. Older payloads
+        may not include it; in that case the retry falls back to the
+        most-recent installation row for the customer.
+        """
+        raw = hydrated.get("integration_token_id")
+        return str(raw) if raw is not None else None
 
     async def _build_removed_documents(
         self,
