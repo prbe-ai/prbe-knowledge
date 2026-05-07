@@ -1,77 +1,67 @@
-"""Unit tests for the chunk-overlap dedup helper used to reassemble
-document bodies from the chunks table.
+"""Unit tests for the token-based chunk overlap dedup helper.
 
-The chunker emits 512-token windows with 64-token overlap, so adjacent
-chunks share a tail/head region. ``_dedupe_chunk_overlap`` strips that
-overlap so reassembled bodies (used by wiki render + diagram refresh)
-don't render duplicated text — most visibly Mermaid edge lines that
-appear twice when a chunk seam lands inside a code block.
+Note: ``_skip_chunk_overlap_tokens`` is exercised against the real
+chunker (`chunk_text`) to prove that reassembly recovers the original
+body for multi-chunk inputs. That's the test that matters; the unit
+cases below are scaffolding.
 """
 
 from __future__ import annotations
 
-from services.ingestion.normalizer import (
-    _MAX_CHUNK_OVERLAP_CHARS,
-    _MIN_CHUNK_OVERLAP_CHARS,
-    _dedupe_chunk_overlap,
-)
+from services.ingestion.chunker import _enc, chunk_text
+from services.ingestion.normalizer import _skip_chunk_overlap_tokens
 
 
-def test_dedupe_no_overlap() -> None:
-    prev = "hello world"
-    curr = "goodnight moon"
-    assert _dedupe_chunk_overlap(prev, curr) == "goodnight moon"
-
-
-def test_dedupe_strips_real_overlap() -> None:
-    prev = "abcdefghij1234567890"
-    curr = "1234567890wxyz"
-    assert _dedupe_chunk_overlap(prev, curr) == "wxyz"
-
-
-def test_dedupe_below_min_keeps_curr() -> None:
-    # 5-char shared region — below _MIN_CHUNK_OVERLAP_CHARS (=10).
-    # The function must NOT strip it; small incidental matches are
-    # likely to be coincidence (e.g. trailing newline + heading
-    # repeat across unrelated chunks), not real chunker overlap.
-    assert _MIN_CHUNK_OVERLAP_CHARS == 10
-    prev = "aaa12345"
-    curr = "12345bbb"
-    assert _dedupe_chunk_overlap(prev, curr) == "12345bbb"
-
-
-def test_dedupe_above_max_caps_search() -> None:
-    # The shared region is 700 chars but the function only searches
-    # up to _MAX_CHUNK_OVERLAP_CHARS (=600). Construct prev so its
-    # last 700 chars equal the first 700 of curr; the function must
-    # find a match at exactly 600 chars (the cap) and strip that
-    # many — no more.
-    assert _MAX_CHUNK_OVERLAP_CHARS == 600
-    tail = "x" * 700
-    prev = "PREFIX" + tail
-    curr = tail + "SUFFIX"
-    result = _dedupe_chunk_overlap(prev, curr)
-    # Cap is enforced: at most 600 chars stripped.
-    stripped = len(curr) - len(result)
-    assert stripped <= _MAX_CHUNK_OVERLAP_CHARS
-    assert stripped >= _MIN_CHUNK_OVERLAP_CHARS
-    # Result still contains the unique tail of curr.
-    assert result.endswith("SUFFIX")
-    # And, concretely, the function strips exactly 600 (the cap)
-    # because curr[:600] == prev[-600:] holds.
-    assert stripped == _MAX_CHUNK_OVERLAP_CHARS
-
-
-def test_dedupe_realistic_chunker_overlap() -> None:
-    # Production shape: prev ENDS with the overlap region, curr
-    # BEGINS with the same overlap region. This is exactly the
-    # pattern that caused duplicate Mermaid arrows in the wiki
-    # architecture diagram before the fix.
-    overlap = (
-        "  prbe_dashboard --> prbe_orchestrator\n"
-        "  prbe_knowledge --> prbe_backend\n"
+def test_no_token_overlap_returns_curr_unchanged() -> None:
+    out = _skip_chunk_overlap_tokens(
+        "completely unrelated text one",
+        "completely unrelated text two",
     )
-    prev = "earlier content\n" + overlap
-    curr = overlap + "later content"
-    result = _dedupe_chunk_overlap(prev, curr)
-    assert result == "later content"
+    assert out == "completely unrelated text two"
+
+
+def test_real_chunker_pair_strips_overlap_exactly() -> None:
+    """The end-to-end test: chunk a multi-chunk body, reassemble with the
+    helper, confirm it equals the original (modulo tokenizer round-trip)."""
+    enc = _enc()
+    edges = [f"  node_{i:03d} --> node_{i + 1:03d}" for i in range(200)]
+    original = "header line\n" + "\n".join(edges) + "\nfooter line\n"
+
+    pieces = chunk_text(original)
+    assert len(pieces) >= 2, f"expected multi-chunk text, got {len(pieces)}"
+
+    reassembled = pieces[0].content
+    for piece in pieces[1:]:
+        reassembled += _skip_chunk_overlap_tokens(reassembled, piece.content)
+
+    expected = enc.decode(enc.encode(original, disallowed_special=()))
+    assert reassembled == expected
+
+
+def test_production_shape_seam_no_crash() -> None:
+    """The exact strings that broke the character-based dedup. These two
+    weren't produced by the same chunker run, so token overlap may be 0.
+    Just verify the function returns a sane string and doesn't crash."""
+    prev = "prbe_knowledge -->|one-way|"
+    curr = "be_cc_tap_plugin\n  prbe_dashboard -->|one-way| prbe_codex_tap_plugin"
+    out = _skip_chunk_overlap_tokens(prev, curr)
+    # Output must be a suffix of curr (possibly equal to curr).
+    assert curr.endswith(out)
+
+
+def test_synthesized_token_overlap_strips() -> None:
+    """Construct a clear N-token overlap and prove it's stripped."""
+    enc = _enc()
+    full = (
+        "alpha bravo charlie delta echo foxtrot golf hotel india juliet "
+        "kilo lima mike november oscar papa quebec romeo sierra tango"
+    )
+    tokens = enc.encode(full, disallowed_special=())
+    assert len(tokens) >= 8
+    overlap_n = 4
+    mid = len(tokens) // 2
+    prev = enc.decode(tokens[: mid + overlap_n])
+    curr = enc.decode(tokens[mid:])
+    out = _skip_chunk_overlap_tokens(prev, curr)
+    expected = enc.decode(tokens[mid + overlap_n:])
+    assert out == expected
