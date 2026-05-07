@@ -812,17 +812,13 @@ async def get_wiki_index(
     if index_row is not None:
         # The wiki agent persists the LLM-generated index body via the
         # standard Normalizer path: body lives in `chunks.content`, not
-        # `documents.metadata`. Reading from chunks pulls whatever the
-        # latest agent run produced (intro paragraph + Mermaid diagram +
-        # LLM-organized sections). Fall back to the deterministic
-        # _render_index_body only when chunks are empty (race during a
-        # delete + recreate, etc.) so the dashboard always renders.
+        # `documents.metadata`. Read from chunks to surface whatever the
+        # latest agent run produced (intro + Mermaid diagram + LLM-
+        # organized sections).
         async with with_tenant(customer_id) as conn:
             body_text = await fetch_live_body_from_chunks(
                 conn, customer_id, index_doc_id
             )
-        if not body_text.strip():
-            body_text = _render_index_body(entries)
         return WikiIndexResponse(
             body=body_text,
             entries=entries,
@@ -830,9 +826,12 @@ async def get_wiki_index(
             version=index_row["version"],
         )
 
-    # Fallback: cron has not produced an index yet. Render deterministically.
+    # No index doc yet (the agent has never run for this customer). Hand
+    # back an empty body — the dashboard already renders an empty-state
+    # message and the entry list, so a stale deterministic TOC would be
+    # worse than nothing.
     return WikiIndexResponse(
-        body=_render_index_body(entries),
+        body="",
         entries=entries,
         updated_at=None,
         version=None,
@@ -1549,20 +1548,3 @@ async def get_wiki_bootstrap_status(
     return await _do_get_wiki_backfill_status(customer_id)
 
 
-def _render_index_body(entries: list[WikiIndexEntry]) -> str:
-    """Plain markdown TOC. Used when the cron-generated index is missing."""
-    if not entries:
-        return "# Wiki\n\nNo pages yet.\n"
-    by_type: dict[str, list[WikiIndexEntry]] = {}
-    for entry in entries:
-        by_type.setdefault(entry.wiki_type, []).append(entry)
-    parts = ["# Wiki", ""]
-    for wiki_type in sorted(by_type):
-        parts.append(f"## {wiki_type.replace('_', ' ').title()}")
-        for entry in by_type[wiki_type]:
-            title = entry.title or entry.slug
-            summary = entry.summary or ""
-            line = f"- [[{title}]] — {summary}" if summary else f"- [[{title}]]"
-            parts.append(line)
-        parts.append("")
-    return "\n".join(parts).rstrip() + "\n"
