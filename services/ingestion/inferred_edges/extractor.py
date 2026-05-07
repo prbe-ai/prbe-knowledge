@@ -295,6 +295,11 @@ async def extract_edges(
         )
 
     # ---- Kill-switch: >50% unknown_endpoint -> fail bundle -----------------
+    # `total` is the count of ALL proposed edges (including non-unknown_endpoint
+    # drops like self_edge / bad_justification). This dilutes the ratio
+    # intentionally — the spec is "fraction of total proposals that hallucinate
+    # endpoints," not "fraction of validation failures." Don't change without
+    # updating the spec.
     unknown_count = result.dropped.get("unknown_endpoint", 0)
     if total > 0 and unknown_count / total > _UNKNOWN_ENDPOINT_FAIL_RATIO:
         log.warning(

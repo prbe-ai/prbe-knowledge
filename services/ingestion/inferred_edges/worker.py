@@ -1,18 +1,22 @@
 """Side-queue worker for LLM-inferred edge extraction.
 
 Drain loop:
-  1. Claim one inferred_edges_queue row via FOR UPDATE SKIP LOCKED.
-  2. Mark processing_started_at / processing_worker_id.
-  3. Build bundle -> extract -> upsert edges.
-  4. Mark done_at on success; attempts++ + clear processing_started_at on
-     failure. Drop after 3 attempts.
+  1. Claim one inferred_edges_queue row via FOR UPDATE SKIP LOCKED, atomically
+     incrementing attempts and stamping processing_started_at /
+     processing_worker_id in the same UPDATE.
+  2. Build bundle -> extract -> upsert edges.
+  3. On success: mark done_at. On failure: clear processing_started_at so the
+     row becomes re-claimable; attempts is NOT bumped here because it was
+     already bumped at claim time (step 1). The WHERE attempts < MAX gate at
+     claim time naturally drops rows that have been claimed too many times.
 
 Concurrency: 16 async tasks per worker process (INFERRED_EDGES_CONCURRENCY
 env var). Each task independently claims via SKIP LOCKED.
 
 Fly notes (from memory):
-  - Internal API binds on :: (dual-stack IPv6) for 6PN compatibility.
   - Health endpoint binds on 0.0.0.0 (IPv4) for Fly health checks.
+  - This worker has no internal API server; it's a pure drain-loop process
+    with one health endpoint. No 6PN/IPv6 binding required.
   - count in fly.toml needs a follow-up: flyctl scale count 4 -a prbe-knowledge-inferred-edges
 """
 

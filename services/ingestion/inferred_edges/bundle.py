@@ -72,11 +72,15 @@ class Bundle:
     docs: list[BundleDoc] = field(default_factory=list)
     total_tokens: int = 0
 
-    def _add(self, doc: BundleDoc) -> bool:
-        """Add doc if it fits in the remaining budget. Returns True if added."""
+    def _append(self, doc: BundleDoc) -> None:
+        """Append doc unconditionally and update the running token total.
+
+        Callers MUST check token_budget before calling — there is no internal
+        guard. The earlier name `_add` returned `bool`, implying a conditional
+        add; that was misleading since it always returned True.
+        """
         self.docs.append(doc)
         self.total_tokens += doc.token_count
-        return True
 
     @property
     def doc_ids(self) -> set[str]:
@@ -140,7 +144,7 @@ async def build_bundle(
             content=anchor_content,
             token_count=_estimate_tokens(anchor_content),
         )
-        bundle._add(anchor_doc)
+        bundle._append(anchor_doc)
 
     # ------------------------------------------------------------------ #
     # Step 2: 1-hop graph neighbors                                        #
@@ -170,7 +174,7 @@ async def build_bundle(
                 conn, customer_id, doc_id, token_budget - bundle.total_tokens
             )
             if content:
-                bundle._add(
+                bundle._append(
                     BundleDoc(
                         doc_id=doc_id,
                         customer_id=doc_row["customer_id"],
@@ -208,7 +212,7 @@ async def build_bundle(
                 conn, customer_id, doc_id, token_budget - bundle.total_tokens
             )
             if content:
-                bundle._add(
+                bundle._append(
                     BundleDoc(
                         doc_id=doc_id,
                         customer_id=doc_row["customer_id"],
@@ -246,7 +250,7 @@ async def build_bundle(
                 conn, customer_id, doc_id, token_budget - bundle.total_tokens
             )
             if content:
-                bundle._add(
+                bundle._append(
                     BundleDoc(
                         doc_id=doc_id,
                         customer_id=doc_row["customer_id"],
