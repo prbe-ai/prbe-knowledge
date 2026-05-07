@@ -17,7 +17,11 @@ Fly notes (from memory):
   - Health endpoint binds on 0.0.0.0 (IPv4) for Fly health checks.
   - This worker has no internal API server; it's a pure drain-loop process
     with one health endpoint. No 6PN/IPv6 binding required.
-  - count in fly.toml needs a follow-up: flyctl scale count 4 -a prbe-knowledge-inferred-edges
+  - count in fly.toml needs a follow-up:
+        flyctl scale count worker=4 -a prbe-knowledge-side-worker
+    (this drainer lives on the generic side-worker fly app; future
+     side-queue drainers can land on the same app as additional
+     [processes] entries instead of separate fly apps)
 """
 
 from __future__ import annotations

@@ -88,11 +88,11 @@ jobs:
               - 'shared/**'
               - 'fly.community.toml'
               - 'pyproject.toml'
-            inferred_edges:
+            side_worker:
               - 'services/ingestion/inferred_edges/**'
               - 'services/ingestion/normalizer.py'
               - 'shared/**'
-              - 'fly.inferred-edges.toml'
+              - 'fly.side-worker.toml'
               - 'pyproject.toml'
 
   deploy-ingestion:
@@ -365,36 +365,37 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
-  deploy-inferred-edges:
+  deploy-side-worker:
     needs: [changes, deploy-ingestion]
     if: |
       always() &&
-      needs.changes.outputs.inferred_edges == 'true' &&
+      needs.changes.outputs.side_worker == 'true' &&
       (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Deploy inferred-edges
-        # Side-queue worker that drains inferred_edges_queue, builds
-        # bundles, calls the LLM, and upserts INFERRED/AMBIGUOUS edges.
-        # See "Deploy ingestion" for timeout rationale.
+      - name: Deploy side-worker
+        # Generic side-queue worker app. Currently hosts the inferred-edges
+        # drainer (services/ingestion/inferred_edges/worker.py); future
+        # side-queue drainers land on the same app as additional [processes]
+        # entries. See "Deploy ingestion" for timeout rationale.
         run: |
           set +e
-          timeout 1500 flyctl deploy --remote-only -c fly.inferred-edges.toml
+          timeout 1500 flyctl deploy --remote-only -c fly.side-worker.toml
           rc=$?
           if [ $rc -eq 124 ]; then
-            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-inferred-edges'"
+            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-side-worker'"
           fi
           exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy —
       # follow up with explicit scale count. See "Pin poller" comment.
-      - name: Pin inferred-edges to 4 machines
+      - name: Pin side-worker to 4 machines
         run: |
           set +e
-          timeout 120 flyctl scale count worker=4 -a prbe-knowledge-inferred-edges --yes
+          timeout 120 flyctl scale count worker=4 -a prbe-knowledge-side-worker --yes
           rc=$?
           if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then exit 0; fi
           exit $rc
