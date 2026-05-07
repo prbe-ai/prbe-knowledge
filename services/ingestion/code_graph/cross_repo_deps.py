@@ -266,23 +266,24 @@ def collect_candidates(
 # ---------------------------------------------------------------------------
 
 
-def _build_file_context(
-    target_dir: Path,
+def _build_file_context_from_contents(
+    file_contents: dict[str, str],
     file_to_match_lines: dict[str, list[int]],
 ) -> str:
-    """Render the file-context block fed to the LLM.
+    """Content-dict-based variant of the file-context block builder.
 
-    For each file with matches: full file if small, else windowed slices
-    around each match line. Files appear in the same order as the
-    candidate list so line references stay stable.
+    Used by both the initial-backfill path (which preloads files from
+    a cloned working tree) and the webhook re-verification path (which
+    receives post-push contents from the GitHub Contents API). Same
+    windowing logic for files larger than the single-file threshold;
+    same total-bytes cap so the LLM input stays bounded.
     """
     parts: list[str] = []
     used_bytes = 0
     for rel_path, match_lines in file_to_match_lines.items():
         if used_bytes >= _MAX_PROMPT_CONTENT_BYTES:
             break
-        full_path = target_dir / rel_path
-        body = _read_file_safely(full_path)
+        body = file_contents.get(rel_path)
         if body is None:
             continue
         if len(body.encode("utf-8")) <= _FULL_FILE_THRESHOLD_BYTES:
@@ -306,8 +307,6 @@ def _build_file_context(
             block = f"=== {rel_path} (windowed) ===\n" + "\n[...]\n".join(slices) + "\n"
         block_bytes = len(block.encode("utf-8"))
         if used_bytes + block_bytes > _MAX_PROMPT_CONTENT_BYTES:
-            # Truncate this block to fit the budget; better to give partial
-            # context than to drop the file entirely.
             allowed = _MAX_PROMPT_CONTENT_BYTES - used_bytes
             block = block.encode("utf-8")[:allowed].decode("utf-8", errors="ignore")
             parts.append(block)
@@ -316,6 +315,88 @@ def _build_file_context(
         parts.append(block)
         used_bytes += block_bytes
     return "\n".join(parts)
+
+
+def _build_file_context(
+    target_dir: Path,
+    file_to_match_lines: dict[str, list[int]],
+) -> str:
+    """Disk-backed variant — reads each requested file from `target_dir`."""
+    contents: dict[str, str] = {}
+    for rel_path in file_to_match_lines:
+        body = _read_file_safely(target_dir / rel_path)
+        if body is not None:
+            contents[rel_path] = body
+    return _build_file_context_from_contents(contents, file_to_match_lines)
+
+
+async def _call_classifier_llm(
+    *,
+    source_repo: str,
+    user_prompt: str,
+    client: Any | None = None,
+    log_prefix: str = "cross_repo_deps",
+) -> list[dict[str, Any]] | None:
+    """Shared Flash Lite call. Returns the parsed `verdicts` list, or
+    None on any failure (caller decides fallback semantics)."""
+    if client is None:
+        try:
+            from google import genai
+
+            from shared.config import get_settings
+
+            api_key = get_settings().google_api_key.get_secret_value()
+            if not api_key:
+                log.warning(f"{log_prefix}.no_google_api_key", source_repo=source_repo)
+                return None
+            client = genai.Client(api_key=api_key)
+        except ImportError as exc:
+            log.warning(f"{log_prefix}.google_genai_missing", error=str(exc))
+            return None
+
+    # Hard-coded to Flash Lite. Versioned alias matters — the
+    # unversioned `gemini-flash-lite-preview` returns 404 (verified
+    # 2026-05-07).
+    model_name = "gemini-3.1-flash-lite-preview"
+
+    try:
+        resp = await client.aio.models.generate_content(
+            model=model_name,
+            contents=user_prompt,
+            config={
+                "system_instruction": _CLASSIFY_SYSTEM_PROMPT,
+                "max_output_tokens": 8192,
+                "response_mime_type": "application/json",
+            },
+        )
+    except Exception as exc:
+        log.warning(
+            f"{log_prefix}.gemini_failed",
+            source_repo=source_repo,
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
+        return None
+
+    text = (getattr(resp, "text", None) or "").strip()
+    if not text:
+        log.warning(f"{log_prefix}.empty_response", source_repo=source_repo)
+        return None
+
+    try:
+        payload = orjson.loads(text)
+    except orjson.JSONDecodeError:
+        log.warning(
+            f"{log_prefix}.malformed_response",
+            source_repo=source_repo,
+            preview=text[:200],
+        )
+        return None
+
+    verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
+    if not isinstance(verdicts, list):
+        return None
+    return verdicts
 
 
 _CLASSIFY_SYSTEM_PROMPT = (
@@ -380,65 +461,13 @@ async def classify_with_llm(
         + "\n".join(candidate_lines)
     )
 
-    if client is None:
-        try:
-            from google import genai
-
-            from shared.config import get_settings
-
-            api_key = get_settings().google_api_key.get_secret_value()
-            if not api_key:
-                log.warning("cross_repo_deps.no_google_api_key", source_repo=source_repo)
-                return []
-            client = genai.Client(api_key=api_key)
-        except ImportError as exc:
-            log.warning("cross_repo_deps.google_genai_missing", error=str(exc))
-            return []
-
-    # Cross-repo classification is a cheap pre-filter, not a triage call.
-    # Hard-coded to Gemini 3.1 Flash Lite regardless of WIKI_TRIAGE_MODEL —
-    # flipping triage to Haiku/Anthropic should not bring this Google-bill-
-    # flavored call along for the ride. The version-suffixed name is what
-    # `v1beta/generateContent` actually serves; the unversioned alias
-    # `gemini-flash-lite-preview` returns 404 (verified in prod 2026-05-07).
-    model_name = "gemini-3.1-flash-lite-preview"
-
-    try:
-        resp = await client.aio.models.generate_content(
-            model=model_name,
-            contents=user_prompt,
-            config={
-                "system_instruction": _CLASSIFY_SYSTEM_PROMPT,
-                "max_output_tokens": 8192,
-                "response_mime_type": "application/json",
-            },
-        )
-    except Exception as exc:
-        log.warning(
-            "cross_repo_deps.gemini_failed",
-            source_repo=source_repo,
-            error=str(exc),
-            error_class=type(exc).__name__,
-        )
-        return []
-
-    text = (getattr(resp, "text", None) or "").strip()
-    if not text:
-        log.warning("cross_repo_deps.empty_response", source_repo=source_repo)
-        return []
-
-    try:
-        payload = orjson.loads(text)
-    except orjson.JSONDecodeError:
-        log.warning(
-            "cross_repo_deps.malformed_response",
-            source_repo=source_repo,
-            preview=text[:200],
-        )
-        return []
-
-    verdicts = payload.get("verdicts") if isinstance(payload, dict) else None
-    if not isinstance(verdicts, list):
+    verdicts = await _call_classifier_llm(
+        source_repo=source_repo,
+        user_prompt=user_prompt,
+        client=client,
+        log_prefix="cross_repo_deps",
+    )
+    if verdicts is None:
         return []
 
     verified: list[VerifiedMatch] = []
@@ -462,6 +491,269 @@ async def classify_with_llm(
             )
         )
     return verified
+
+
+# ---------------------------------------------------------------------------
+# Per-edge re-verification (push webhook path)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class EvidenceEntry:
+    """One row of provenance attached to a stored DEPENDS_ON edge.
+
+    Mirrors the shape we persist in ``graph_edges.properties.evidence``.
+    Re-verification operates on these directly so the caller doesn't
+    have to redo the regex collection step.
+    """
+
+    target_repo: str
+    file_path: str
+    line: int
+    snippet: str
+
+
+async def reverify_evidence_with_llm(
+    *,
+    source_repo: str,
+    evidence: list[EvidenceEntry],
+    file_contents: dict[str, str],
+    client: Any | None = None,
+) -> set[int]:
+    """Decide which existing-edge evidence rows are still valid.
+
+    Built for the push-webhook path: when changed files overlap with
+    previously-recorded evidence, re-verify each affected entry against
+    the post-push file content. Returns the set of evidence indices
+    (0-based, into the input list) that the LLM keeps as REAL. Indices
+    not returned should be treated as dropped — the caller decides
+    whether to delete the whole edge (no remaining evidence) or update
+    the edge's properties (still has other surviving entries).
+
+    Evidence whose ``file_path`` is not in ``file_contents`` is skipped
+    entirely (returned as kept) — the caller chose to only verify a
+    subset; an entry pointing at an unchanged file remains trusted.
+    """
+    if not evidence:
+        return set()
+
+    # Indices the caller wants verified (file in changed set) vs trusted.
+    to_verify_idx: list[int] = []
+    trusted_idx: set[int] = set()
+    for i, e in enumerate(evidence):
+        if e.file_path in file_contents:
+            to_verify_idx.append(i)
+        else:
+            trusted_idx.add(i)
+
+    if not to_verify_idx:
+        return trusted_idx
+
+    file_to_lines: dict[str, list[int]] = {}
+    for i in to_verify_idx:
+        e = evidence[i]
+        file_to_lines.setdefault(e.file_path, []).append(e.line)
+    file_context = _build_file_context_from_contents(file_contents, file_to_lines)
+
+    # 1-indexed numbering matches the existing classifier so the prompt
+    # template is reusable. The mapping back to evidence indices is
+    # stable order of `to_verify_idx`.
+    listing_lines: list[str] = []
+    for n, ev_idx in enumerate(to_verify_idx, start=1):
+        e = evidence[ev_idx]
+        prior_snippet = e.snippet.replace("\n", " ")[:160]
+        listing_lines.append(
+            f"{n}. file={e.file_path} line={e.line} target={e.target_repo}\n"
+            f"   prior_snippet: {prior_snippet}"
+        )
+    user_prompt = (
+        f"Source repo: {source_repo}\n\n"
+        "These are previously-verified architecture-graph edges. The "
+        "files below are the CURRENT (post-change) contents. For each "
+        "numbered evidence entry, decide if the cited line still "
+        "genuinely references the target repo. A line that was deleted, "
+        "moved, or changed to point elsewhere is COINCIDENCE; a line "
+        "still doing the same job (HTTP call, env var, import, doc "
+        "link, etc.) is REAL.\n\n"
+        "=== Files (post-change) ===\n\n"
+        f"{file_context}\n\n"
+        "=== Evidence to re-verify ===\n"
+        + "\n".join(listing_lines)
+    )
+
+    verdicts = await _call_classifier_llm(
+        source_repo=source_repo,
+        user_prompt=user_prompt,
+        client=client,
+        log_prefix="cross_repo_deps.reverify",
+    )
+    if verdicts is None:
+        # LLM unavailable / errored. Conservative default: keep
+        # everything (don't delete edges based on a missing verifier).
+        return set(range(len(evidence)))
+
+    kept = set(trusted_idx)
+    for v in verdicts:
+        if not isinstance(v, dict):
+            continue
+        n = v.get("number")
+        if not isinstance(n, int) or n < 1 or n > len(to_verify_idx):
+            continue
+        if not v.get("real"):
+            continue
+        kept.add(to_verify_idx[n - 1])
+    return kept
+
+
+async def update_edges_after_push(
+    *,
+    customer_id: str,
+    source_repo: str,
+    removed_files: list[str],
+    modified_files: list[str],
+    file_contents: dict[str, str],
+    client: Any | None = None,
+) -> dict[str, int]:
+    """Re-evaluate this repo's outbound edges after a push.
+
+    Finds evidence whose ``file_path`` is in ``removed_files`` (auto-
+    drop) or ``modified_files`` (LLM re-verify). Persists the result:
+    update ``properties.evidence`` when an edge survives, delete the
+    edge when no evidence remains. New edges introduced by the push
+    are NOT discovered here — that's the nightly cross-repo refresh
+    pass.
+
+    Returns counts for logging:
+      - ``edges_examined`` : edges read from DB before any change
+      - ``evidence_dropped``: rows removed across all edges
+      - ``edges_deleted``   : edges whose evidence list became empty
+      - ``edges_updated``   : edges whose evidence shrank but survived
+    """
+    counts = {
+        "edges_examined": 0,
+        "evidence_dropped": 0,
+        "edges_deleted": 0,
+        "edges_updated": 0,
+    }
+    if not removed_files and not modified_files:
+        return counts
+
+    removed_set = set(removed_files)
+    # Convert modified file paths to a content dict keyed identically.
+    # `file_contents` may also include added files — caller normalizes.
+
+    async with with_tenant(customer_id) as conn:
+        # Pull existing outbound DEPENDS_ON edges + each edge's evidence.
+        rows = await conn.fetch(
+            """
+            SELECT e.edge_id,
+                   n_to.canonical_id AS target_repo,
+                   e.properties->'evidence' AS evidence
+            FROM graph_edges e
+            JOIN graph_nodes n_from
+                 ON n_from.node_id = e.from_node_id AND n_from.customer_id = e.customer_id
+            JOIN graph_nodes n_to
+                 ON n_to.node_id = e.to_node_id AND n_to.customer_id = e.customer_id
+            WHERE e.customer_id = $1
+              AND e.edge_type = 'DEPENDS_ON'
+              AND n_from.label = 'Repo'
+              AND n_from.canonical_id = $2
+              AND n_to.label = 'Repo'
+              AND e.valid_to IS NULL
+            """,
+            customer_id,
+            source_repo,
+        )
+
+    counts["edges_examined"] = len(rows)
+    if not rows:
+        return counts
+
+    for row in rows:
+        target_repo = row["target_repo"]
+        raw_evidence = row["evidence"]
+        if isinstance(raw_evidence, (str, bytes, bytearray)):
+            try:
+                raw_evidence = orjson.loads(raw_evidence)
+            except orjson.JSONDecodeError:
+                raw_evidence = []
+        if not isinstance(raw_evidence, list):
+            raw_evidence = []
+
+        # Build typed evidence list, dropping rows whose file was REMOVED.
+        evidence: list[EvidenceEntry] = []
+        dropped_for_removal = 0
+        for e in raw_evidence:
+            if not isinstance(e, dict):
+                continue
+            file_path = str(e.get("file_path") or "")
+            if not file_path or file_path in removed_set:
+                if file_path in removed_set:
+                    dropped_for_removal += 1
+                continue
+            evidence.append(
+                EvidenceEntry(
+                    target_repo=target_repo,
+                    file_path=file_path,
+                    line=int(e.get("line") or 0),
+                    snippet=str(e.get("snippet") or ""),
+                )
+            )
+
+        # Re-verify against modified-file contents. Evidence whose file
+        # is NOT in the change set is preserved unchanged.
+        kept_indices = await reverify_evidence_with_llm(
+            source_repo=source_repo,
+            evidence=evidence,
+            file_contents=file_contents,
+            client=client,
+        )
+        kept_evidence = [evidence[i] for i in sorted(kept_indices)]
+
+        new_dropped = (len(evidence) - len(kept_evidence)) + dropped_for_removal
+        counts["evidence_dropped"] += new_dropped
+
+        if not kept_evidence:
+            # No evidence survives — drop the edge.
+            async with with_tenant(customer_id) as conn:
+                await conn.execute(
+                    "DELETE FROM graph_edges WHERE edge_id = $1 AND customer_id = $2",
+                    row["edge_id"],
+                    customer_id,
+                )
+            counts["edges_deleted"] += 1
+        elif new_dropped > 0:
+            # Edge survives with reduced evidence — refresh properties.
+            new_props = {
+                "evidence": [
+                    {
+                        "file_path": e.file_path,
+                        "line": e.line,
+                        "snippet": e.snippet,
+                    }
+                    for e in kept_evidence
+                ],
+            }
+            async with with_tenant(customer_id) as conn:
+                await conn.execute(
+                    """
+                    UPDATE graph_edges
+                    SET properties = $1
+                    WHERE edge_id = $2 AND customer_id = $3
+                    """,
+                    orjson.dumps(new_props).decode(),
+                    row["edge_id"],
+                    customer_id,
+                )
+            counts["edges_updated"] += 1
+
+    log.info(
+        "cross_repo_deps.post_push_update",
+        customer=customer_id,
+        source_repo=source_repo,
+        **counts,
+    )
+    return counts
 
 
 def _cap_candidates(
@@ -687,6 +979,7 @@ async def extract_cross_repo_deps(
 __all__ = [
     "CandidateMatch",
     "CrossRepoEdge",
+    "EvidenceEntry",
     "VerifiedMatch",
     "aggregate_to_edges",
     "classify_with_llm",
@@ -696,4 +989,6 @@ __all__ = [
     "list_tracked_files",
     "persist_cross_repo_edges",
     "repo_name_variants",
+    "reverify_evidence_with_llm",
+    "update_edges_after_push",
 ]

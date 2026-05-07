@@ -31,6 +31,7 @@ from services.ingestion.code_graph.clone import (
 from services.ingestion.code_graph.cross_repo_deps import (
     extract_cross_repo_deps,
     persist_cross_repo_edges,
+    update_edges_after_push,
 )
 from services.ingestion.code_graph.fetch import fetch_files_at_sha
 from services.ingestion.code_graph.pipeline import extract_files_to_result
@@ -277,6 +278,34 @@ class CodeGraphConnector(Connector):
                 event.customer_id, repo, removed
             )
             result.documents.extend(tombstones)
+
+        # Re-verify cross-repo edges whose evidence sits in any of the
+        # files this push touched. The function is a no-op when nothing
+        # overlaps existing evidence — typical pushes that don't touch
+        # imports / configs / READMEs cost zero LLM calls. When evidence
+        # IS implicated, we either keep / shrink / delete the affected
+        # edges. New edges from the push are NOT discovered here; that's
+        # the nightly cross-repo refresh path's job.
+        try:
+            file_contents_for_reverify: dict[str, str] = {
+                f.rel_path: f.content for f in files
+            }
+            await update_edges_after_push(
+                customer_id=event.customer_id,
+                source_repo=repo,
+                removed_files=removed,
+                modified_files=list(file_contents_for_reverify.keys()),
+                file_contents=file_contents_for_reverify,
+            )
+        except Exception as exc:
+            log.warning(
+                "code_graph.cross_repo_reverify_failed",
+                customer=event.customer_id,
+                repo=repo,
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
+
         return result
 
     async def _build_removed_documents(
