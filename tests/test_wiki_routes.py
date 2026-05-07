@@ -171,9 +171,20 @@ async def test_put_requires_internal_key(client: httpx.AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_put_rejects_unknown_wiki_type(client: httpx.AsyncClient) -> None:
+async def test_put_rejects_invalid_wiki_type(client: httpx.AsyncClient) -> None:
+    # wiki_type is free-form (the LLM picks slugs as it sees fit), so
+    # `/api/wiki/pages/incident/x` is now valid. The route still rejects
+    # the singleton 'index' type (cron-only) and any string that
+    # violates the URL-safe regex `^[a-z][a-z0-9_]{0,31}$`.
     resp = await client.put(
-        "/api/wiki/pages/incident/x",
+        "/api/wiki/pages/index/x",
+        json={"title": "X", "body": ""},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 400
+
+    resp = await client.put(
+        "/api/wiki/pages/Has-Hyphen/x",
         json={"title": "X", "body": ""},
         headers=_hdr(),
     )
