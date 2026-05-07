@@ -579,3 +579,211 @@ async def test_truncated_response_falls_through_to_parse_failure() -> None:
 
     assert result.bundle_failed
     assert "json_parse_failed" in (result.bundle_fail_reason or "")
+
+
+# ---------------------------------------------------------------------------
+# Tests: leading-`]` empty-array regression (post-PR175 follow-up)
+# ---------------------------------------------------------------------------
+# In production after PR #175 we still saw 142 json_parse_failed drops on
+# the probe-founders backfill. Root cause: model emits `]\n\n(no edges
+# found)` -- our `stripped == "]"` check was too strict. The candidate
+# became `[]\n\n(no edges found)` which fails parse. Generalised to
+# `stripped.startswith("]")`: any leading `]` after the prefill means
+# the array is empty; trailing commentary is discarded.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_body",
+    [
+        "]\n\n(no edges found)",
+        "]\n\nNo significant cross-source relationships in this bundle.",
+        "]\n",
+        "] // empty",
+        "]    ",
+    ],
+)
+async def test_leading_close_bracket_with_garbage_is_empty_array(
+    response_body: str,
+) -> None:
+    """Regression: any leading `]` after the prefill `[` means empty array.
+    Trailing model commentary must be discarded, not parsed.
+    """
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm_text(response_body),
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert not result.bundle_failed, f"body {response_body!r} should not fail"
+    assert result.edges == []
+    assert not result.dropped
+
+
+# ---------------------------------------------------------------------------
+# Tests: `why` justification flows through to ExtractionResult
+# ---------------------------------------------------------------------------
+# Worker-side bug found in production: 0 of 3,817 inferred edges had a
+# `why` field persisted because worker.py built GraphEdgeSpec without
+# properties. The worker fix is tested separately in
+# test_inferred_edges_worker.py; this confirms the extractor itself
+# carries the field through.
+
+
+@pytest.mark.asyncio
+async def test_why_field_preserved_on_extracted_edge() -> None:
+    """Confirm the LLM's `why` justification ends up on InferredEdge.why
+    so the worker has something to persist into graph_edges.properties.
+    """
+    edges = [
+        {
+            "from": {"label": "Document", "canonical_id": "doc1"},
+            "to": {"label": "Ticket", "canonical_id": "AUTH-123"},
+            "edge_type": "DISCUSSES",
+            "confidence": "INFERRED",
+            "why": "Slack thread debugging the AUTH-123 outage",
+        }
+    ]
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm(edges),
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert not result.bundle_failed
+    assert len(result.edges) == 1
+    assert result.edges[0].why == "Slack thread debugging the AUTH-123 outage"
+
+
+# ---------------------------------------------------------------------------
+# Tests: rate-limit backoff (PR-B follow-up)
+# ---------------------------------------------------------------------------
+# 1383 of 3257 bundles (42%) failed on `RateLimitError` during the
+# probe-founders backfill burst. The fix wraps the LLM call in
+# exponential backoff inside a single attempt -- a transient rate-limit
+# window no longer kills the bundle. Non-rate-limit errors propagate
+# immediately (no slow failure modes for genuine errors).
+
+
+def _make_rate_limit_error() -> Exception:
+    """Build something the extractor will recognise as a rate-limit error.
+
+    The extractor matches by class name (`RateLimitError`) to avoid pulling
+    the anthropic package into the type system. So a plain Exception
+    subclass with that name does the job.
+    """
+
+    class RateLimitError(Exception):
+        pass
+
+    return RateLimitError("rate limited")
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_then_success_does_not_fail_bundle() -> None:
+    """First call raises RateLimitError; backoff fires; second call succeeds.
+    Bundle is processed normally, not marked failed.
+    """
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    successful_response = _mock_llm_response([])  # empty -> no edges
+    rate_limit_then_success = AsyncMock(
+        side_effect=[_make_rate_limit_error(), successful_response]
+    )
+    mock_client = MagicMock()
+    mock_client.messages.create = rate_limit_then_success
+
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        patch(
+            "services.ingestion.inferred_edges.extractor._anthropic_module.AsyncAnthropic",
+            lambda api_key=None: mock_client,
+        ),
+        # Patch sleep to avoid wall-clock waits in tests.
+        patch(
+            "services.ingestion.inferred_edges.extractor.asyncio.sleep",
+            new_callable=AsyncMock,
+        ),
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert not result.bundle_failed
+    assert result.edges == []
+    # Two attempts: one rate-limited, one success.
+    assert rate_limit_then_success.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_exhausted_marks_bundle_failed() -> None:
+    """If every retry hits a rate limit, the bundle is marked failed
+    with llm_call_failed: RateLimitError (so the queue worker can
+    retry on next claim, when the rate window has likely passed).
+    """
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    always_rate_limited = AsyncMock(side_effect=_make_rate_limit_error())
+    mock_client = MagicMock()
+    mock_client.messages.create = always_rate_limited
+
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        patch(
+            "services.ingestion.inferred_edges.extractor._anthropic_module.AsyncAnthropic",
+            lambda api_key=None: mock_client,
+        ),
+        patch(
+            "services.ingestion.inferred_edges.extractor.asyncio.sleep",
+            new_callable=AsyncMock,
+        ),
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert result.bundle_failed
+    assert "RateLimitError" in (result.bundle_fail_reason or "")
+    # Per-attempt retries (matches _RATE_LIMIT_MAX_RETRIES = 4).
+    assert always_rate_limited.call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_non_rate_limit_error_does_not_retry() -> None:
+    """A non-rate-limit error (e.g. APIConnectionError, AuthenticationError)
+    propagates immediately. We do NOT want exponential backoff burning
+    minutes on a genuine API/auth failure.
+    """
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    class APIConnectionError(Exception):
+        pass
+
+    once_then_dies = AsyncMock(side_effect=APIConnectionError("connection refused"))
+    mock_client = MagicMock()
+    mock_client.messages.create = once_then_dies
+
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        patch(
+            "services.ingestion.inferred_edges.extractor._anthropic_module.AsyncAnthropic",
+            lambda api_key=None: mock_client,
+        ),
+        patch(
+            "services.ingestion.inferred_edges.extractor.asyncio.sleep",
+            new_callable=AsyncMock,
+        ) as mock_sleep,
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert result.bundle_failed
+    assert "APIConnectionError" in (result.bundle_fail_reason or "")
+    # Exactly one call -- no retry on non-rate-limit errors.
+    assert once_then_dies.call_count == 1
+    # No sleep -- we did NOT enter the backoff loop.
+    mock_sleep.assert_not_awaited()

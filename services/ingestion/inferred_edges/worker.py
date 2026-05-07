@@ -244,6 +244,14 @@ async def _upsert_inferred_edges(
         except ValueError:
             continue
 
+        # Persist the LLM's justification on the edge. Without this the
+        # `why` field is validated by the extractor and then dropped on the
+        # write path -- inferred edges land in graph_edges with empty
+        # properties and no audit trail. Stored under `properties.why`;
+        # consumed by /knowledge/insights and the dashboard inferred-edges UI.
+        edge_props: dict[str, str] = {}
+        if edge.why:
+            edge_props["why"] = edge.why
         edge_specs.append(
             GraphEdgeSpec(
                 edge_type=edge_type_enum,
@@ -252,6 +260,7 @@ async def _upsert_inferred_edges(
                 to_label=to_lbl,
                 to_canonical_id=edge.to_canonical_id,
                 confidence=edge.confidence,
+                properties=edge_props,
             )
         )
 
