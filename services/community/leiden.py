@@ -131,14 +131,19 @@ async def run_leiden_for_tenant(
     update_community_ids = [community_by_node[nid] for nid in update_node_ids]
 
     await conn.execute("ALTER TABLE graph_nodes NO FORCE ROW LEVEL SECURITY")
+    # RETURNING emits per-row column values, not aggregates — wrap in a CTE
+    # so we can COUNT(*) over the rows that actually got updated.
     updated = await conn.fetchval(
         """
-        UPDATE graph_nodes
-        SET community_id = t.community_id
-        FROM unnest($1::bigint[], $2::int[]) AS t(node_id, community_id)
-        WHERE graph_nodes.node_id = t.node_id
-          AND graph_nodes.customer_id = $3
-        RETURNING COUNT(*)
+        WITH updated AS (
+            UPDATE graph_nodes
+            SET community_id = t.community_id
+            FROM unnest($1::bigint[], $2::int[]) AS t(node_id, community_id)
+            WHERE graph_nodes.node_id = t.node_id
+              AND graph_nodes.customer_id = $3
+            RETURNING 1
+        )
+        SELECT COUNT(*) FROM updated
         """,
         update_node_ids,
         update_community_ids,

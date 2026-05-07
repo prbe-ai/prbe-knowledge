@@ -247,7 +247,7 @@ async def test_leiden_update_contains_correct_node_ids() -> None:
 
     await run_leiden_for_tenant(conn, "cust-update-test")
 
-    # Find the fetchval call (UPDATE ... RETURNING COUNT(*))
+    # Find the fetchval call (UPDATE wrapped in a CTE so we can COUNT the rows).
     fetchval_calls = conn.fetchval.call_args_list
     assert len(fetchval_calls) >= 1, "Expected at least one fetchval call for UPDATE"
 
@@ -255,3 +255,16 @@ async def test_leiden_update_contains_correct_node_ids() -> None:
     update_sql = fetchval_calls[0][0][0]
     assert "UPDATE" in update_sql.upper()
     assert "community_id" in update_sql.lower()
+
+    # Regression guard: RETURNING COUNT(*) is invalid Postgres SQL — RETURNING
+    # emits per-row column values, not aggregates. The CTE form below is the
+    # supported pattern. AsyncMock can't catch invalid SQL, so guard with a
+    # static string check.
+    upper = update_sql.upper()
+    assert "RETURNING COUNT(" not in upper, (
+        "RETURNING COUNT(*) is invalid SQL; use a CTE wrapping the UPDATE."
+    )
+    assert "WITH " in upper and "RETURNING 1" in upper, (
+        "UPDATE must be wrapped in a CTE that RETURNs 1 per row, then "
+        "SELECT COUNT(*) over the CTE."
+    )
