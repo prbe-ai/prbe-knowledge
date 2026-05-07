@@ -21,6 +21,8 @@ jobs:
       wiki_synthesis: ${{ steps.filter.outputs.wiki_synthesis == 'true' || github.event_name == 'workflow_dispatch' }}
       wiki_cron:      ${{ steps.filter.outputs.wiki_cron      == 'true' || github.event_name == 'workflow_dispatch' }}
       wiki_bootstrap: ${{ steps.filter.outputs.wiki_bootstrap == 'true' || github.event_name == 'workflow_dispatch' }}
+      community:      ${{ steps.filter.outputs.community      == 'true' || github.event_name == 'workflow_dispatch' }}
+      side_worker:    ${{ steps.filter.outputs.side_worker    == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
