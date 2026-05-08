@@ -32,6 +32,8 @@ from anthropic import BadRequestError
 from services.synthesis.models import TriageInput, TriageOutput
 from services.synthesis.triage import (
     OVERSIZED_AT_CALL_TIME_REASON,
+    TRIAGE_FINAL_MILE_SYNTHESIS_REASON,
+    TRIAGE_RECURSION_FAILED_REASON,
     call_triage_with_split_retry,
     is_anthropic_oversize_error,
 )
@@ -456,3 +458,162 @@ async def test_dict_type_pydantic_error_triggers_split() -> None:
     out = await call_triage_with_split_retry(client, events, now=NOW)
     assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
     assert client.messages.create.await_count == 3
+
+
+# ---------------------------------------------------------------------------
+# Hardening: every input qid must have a verdict on every successful return.
+# ---------------------------------------------------------------------------
+#
+# Production hot bug (probe-founders, May 7-8): 54 GitHub PRs/issues stuck
+# in `failed` with reason "no verdict from triage batch". Despite the
+# May 6 partial-response fix, two holes remained:
+#
+#   1) Recursive calls weren't wrapped — a non-overflow exception in one
+#      sub-call (transient 5xx, network blip, unclassified parse error)
+#      bubbled up and discarded the sibling sub-call's verdicts.
+#   2) No final-mile guard — if recovery still left a qid uncovered for
+#      any reason (model echoes wrong key, downstream gap), the row fell
+#      into mark_for_retry and dead-lettered as 'failed'.
+#
+# These tests pin the new branches.
+
+
+@pytest.mark.asyncio
+async def test_recursive_split_half_exception_preserves_sibling_verdicts() -> None:
+    """4 events: full batch overflows, left half succeeds, right half
+    raises a generic RuntimeError (e.g. transient 500). Expected: 4
+    verdicts — 2 real from left, 2 synthesized rejections for right
+    tagged TRIAGE_RECURSION_FAILED_REASON. The exception MUST NOT
+    bubble and discard the left half's progress."""
+    events = [_ev(i) for i in range(4)]
+    overflow = _bad_request("prompt is too long: 211739 tokens > 200000 maximum")
+    client = _make_client_with_responses(
+        [
+            overflow,                          # full batch [0..3]
+            _success_response(events[:2]),     # left half [0,1] ok
+            RuntimeError("transient 500"),     # right half [2,3] dies
+        ]
+    )
+
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+
+    # All 4 input qids must be covered — no exception, no missing keys.
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    # Left half: real verdicts.
+    assert out.verdicts["0"].important is True
+    assert out.verdicts["1"].important is True
+    # Right half: synthesized rejections.
+    assert out.verdicts["2"].important is False
+    assert out.verdicts["2"].score == 0.0
+    assert out.verdicts["2"].reason == TRIAGE_RECURSION_FAILED_REASON
+    assert out.verdicts["3"].important is False
+    assert out.verdicts["3"].score == 0.0
+    assert out.verdicts["3"].reason == TRIAGE_RECURSION_FAILED_REASON
+
+
+@pytest.mark.asyncio
+async def test_partial_response_recursion_exception_preserves_parent_verdicts() -> None:
+    """4 events: parent call returns verdicts for events 0,1 (partial).
+    Recursive call on the missing subset [2,3] raises a generic
+    exception. Expected: 4 verdicts — 2 real for 0,1 plus 2 synthesized
+    rejections for 2,3 tagged TRIAGE_RECURSION_FAILED_REASON. Parent's
+    progress MUST be preserved — that was the production failure mode."""
+    events = [_ev(i) for i in range(4)]
+    client = _make_client_with_responses(
+        [
+            # Parent call: scored 0,1 only (truncation cut off 2,3).
+            _partial_success_response([events[0], events[1]]),
+            # Recursive call on [2,3] dies.
+            ConnectionError("network blip"),
+        ]
+    )
+
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    # Parent verdicts kept.
+    assert out.verdicts["0"].important is True
+    assert out.verdicts["1"].important is True
+    # Synthesized rejections for the failed recursion.
+    assert out.verdicts["2"].reason == TRIAGE_RECURSION_FAILED_REASON
+    assert out.verdicts["3"].reason == TRIAGE_RECURSION_FAILED_REASON
+    assert out.verdicts["2"].important is False
+    assert out.verdicts["3"].important is False
+
+
+@pytest.mark.asyncio
+async def test_final_mile_guard_fires_when_recurse_returns_wrong_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Force the final-mile guard to fire. Patch `_safe_recurse` to
+    return a TriageOutput whose verdicts are keyed on something OTHER
+    than the input qids — simulating an unforeseen downstream bug.
+    Without the final-mile guard, the missing input qid would leak out
+    of the function uncovered and dead-letter as 'failed' with the
+    misleading 'no verdict from triage batch' tombstone.
+
+    Expected: the orphaned input qid gets a synthesized rejection
+    tagged TRIAGE_FINAL_MILE_SYNTHESIS_REASON; the wrong-keyed verdicts
+    from the recurse may still be in the merged output (the worker
+    filters by input qid downstream).
+    """
+    from services.synthesis import triage as triage_module
+    from services.synthesis.models import TriageOutput as TO
+    from services.synthesis.models import TriageVerdict as TV
+
+    events = [_ev(i) for i in range(3)]
+    # Parent call_triage returns partial: verdicts for 0,1; missing 2.
+    client = _make_client_with_responses(
+        [_partial_success_response([events[0], events[1]])]
+    )
+
+    async def _broken_recurse(
+        client: object, sub_events: list[TriageInput], *, now: object
+    ) -> TO:
+        # Simulate a downstream gap: returns a verdict keyed on
+        # something that doesn't match the input qid. The wrapper's
+        # final-mile guard is the ONLY thing standing between this
+        # output and a 'failed' row in production.
+        return TO(
+            verdicts={
+                "WRONG_KEY": TV(important=True, score=7.0, reason="bug")
+            }
+        )
+
+    monkeypatch.setattr(triage_module, "_safe_recurse", _broken_recurse)
+
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+
+    # All three input qids covered.
+    assert "0" in out.verdicts
+    assert "1" in out.verdicts
+    assert "2" in out.verdicts
+    # qid 2 is the orphan — only the final-mile guard could have
+    # rescued it.
+    assert out.verdicts["2"].reason == TRIAGE_FINAL_MILE_SYNTHESIS_REASON
+    assert out.verdicts["2"].important is False
+    assert out.verdicts["2"].score == 0.0
+    # Real verdicts kept.
+    assert out.verdicts["0"].important is True
+    assert out.verdicts["1"].important is True
+
+
+@pytest.mark.asyncio
+async def test_final_mile_guard_no_op_on_happy_path() -> None:
+    """Sanity: a fully-covered single-call success returns unchanged.
+    No synthesized rows, no extra log spam."""
+    events = [_ev(i) for i in range(3)]
+    client = _make_client_with_responses([_success_response(events)])
+
+    out = await call_triage_with_split_retry(client, events, now=NOW)
+
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2"]
+    # All real success verdicts — no synthesized rejections.
+    for qid in ["0", "1", "2"]:
+        assert out.verdicts[qid].important is True
+        assert out.verdicts[qid].reason not in (
+            TRIAGE_FINAL_MILE_SYNTHESIS_REASON,
+            TRIAGE_RECURSION_FAILED_REASON,
+            OVERSIZED_AT_CALL_TIME_REASON,
+        )
+    assert client.messages.create.await_count == 1
