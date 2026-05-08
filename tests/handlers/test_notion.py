@@ -510,6 +510,101 @@ async def test_fetch_all_blocks_recurses_into_has_children() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _fetch_entity — 2026-03-11 endpoint dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_dispatches_data_source_to_new_endpoint() -> None:
+    """In 2026-03-11, `data_source.*` events must hit /v1/data_sources/{id},
+    not the legacy /v1/databases/{id}. The schema/properties live on the
+    data source record now, not on the parent database."""
+    from shared.models import IntegrationToken
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        calls.append(path)
+        if path == "/v1/data_sources/ds_42":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "data_source",
+                    "id": "ds_42",
+                    "properties": {
+                        "Name": {"id": "name", "type": "title"},
+                        "Status": {"id": "status", "type": "select"},
+                    },
+                    "parent": {"type": "database_id", "database_id": "db_99"},
+                },
+            )
+        return httpx.Response(404, json={"error": f"unmocked {path}"})
+
+    settings = Settings(environment="local")
+    ctx = ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = IntegrationToken(
+        customer_id="c", source_system=SourceSystem.NOTION, access_token="x"
+    )
+
+    entity = await notion._fetch_entity("data_source", "ds_42", token)
+    assert entity is not None
+    assert entity["object"] == "data_source"
+    assert entity["properties"]["Name"]["type"] == "title"
+    # Critically: the call goes to /v1/data_sources/{id}, not /v1/databases/{id}.
+    assert calls == ["/v1/data_sources/ds_42"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_database_uses_databases_endpoint() -> None:
+    """Sanity: database events still hit /v1/databases/{id}; only the
+    response shape (now a container with data_sources) changed."""
+    from shared.models import IntegrationToken
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        calls.append(path)
+        if path == "/v1/databases/db_99":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "database",
+                    "id": "db_99",
+                    "title": [{"type": "text", "plain_text": "Engineering tasks",
+                               "text": {"content": "Engineering tasks"}}],
+                    "data_sources": [
+                        {"id": "ds_42", "name": "Default"},
+                        {"id": "ds_43", "name": "Archive"},
+                    ],
+                },
+            )
+        return httpx.Response(404, json={"error": f"unmocked {path}"})
+
+    settings = Settings(environment="local")
+    ctx = ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = IntegrationToken(
+        customer_id="c", source_system=SourceSystem.NOTION, access_token="x"
+    )
+
+    entity = await notion._fetch_entity("database", "db_99", token)
+    assert entity is not None
+    assert calls == ["/v1/databases/db_99"]
+    # New 2026-03-11 container shape — data_sources, no top-level properties.
+    assert [ds["id"] for ds in entity["data_sources"]] == ["ds_42", "ds_43"]
+    assert "properties" not in entity
+
+
+# ---------------------------------------------------------------------------
 # normalize
 # ---------------------------------------------------------------------------
 
@@ -652,6 +747,72 @@ async def test_normalize_with_hydrated_content() -> None:
     # Parent chain captured in metadata so Phase 1 enforcement can walk it.
     assert all(r.metadata.get("inherits") is True for r in rows)
     assert all(r.metadata.get("parent_id") == "page_parent_999" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_normalize_propagates_in_trash_field() -> None:
+    """2026-03-11 renamed `archived` → `in_trash`. Metadata key follows
+    the new spec; legacy `archived` payloads still flow through via the
+    fallback so cached / replayed envelopes don't lose the bit."""
+    ctx = _make_ctx()
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    event = _webhook_event(_load("page_properties_updated.json"))
+
+    # Spec-compliant 2026-03-11 entity uses in_trash.
+    entity_new = {"in_trash": True, "properties": {}}
+    result_new = await notion.normalize(event, {"entity": entity_new})
+    assert result_new.documents[0].metadata["in_trash"] is True
+
+    # Legacy entity uses archived. Fallback must catch it.
+    entity_legacy = {"archived": True, "properties": {}}
+    result_legacy = await notion.normalize(event, {"entity": entity_legacy})
+    assert result_legacy.documents[0].metadata["in_trash"] is True
+
+    # Default (neither field set) is False.
+    result_default = await notion.normalize(event, {"entity": {"properties": {}}})
+    assert result_default.documents[0].metadata["in_trash"] is False
+
+
+def test_database_schema_summary_renders_2026_container_shape() -> None:
+    """`GET /v1/databases/{id}` in 2026-03-11 returns a container with
+    `data_sources: [...]` (no top-level properties). The summary must
+    include the data_sources list rather than fall back to an empty body."""
+    from services.ingestion.handlers.notion import _database_schema_summary
+
+    container_entity = {
+        "object": "database",
+        "id": "db_99",
+        "description": [{"plain_text": "Engineering tickets"}],
+        "data_sources": [
+            {"id": "ds_42", "name": "Default"},
+            {"id": "ds_43", "name": "Archive"},
+        ],
+    }
+    summary = _database_schema_summary(container_entity)
+    assert "Engineering tickets" in summary
+    assert "Data sources:" in summary
+    assert "- Default" in summary
+    assert "- Archive" in summary
+
+
+def test_database_schema_summary_renders_data_source_properties() -> None:
+    """A data_source record (or a legacy database) carries `properties`
+    directly — summarize them as before."""
+    from services.ingestion.handlers.notion import _database_schema_summary
+
+    ds_entity = {
+        "object": "data_source",
+        "id": "ds_42",
+        "properties": {
+            "Name": {"id": "name", "type": "title"},
+            "Status": {"id": "status", "type": "select"},
+        },
+    }
+    summary = _database_schema_summary(ds_entity)
+    assert "Properties:" in summary
+    assert "- Name (title)" in summary
+    assert "- Status (select)" in summary
 
 
 # ---------------------------------------------------------------------------
