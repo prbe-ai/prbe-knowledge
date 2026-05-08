@@ -201,12 +201,18 @@ class CodeGraphConnector(Connector):
                 source_repo=repo,
                 target_dir=target_dir,
             )
-            if cross_repo_edges:
-                await persist_cross_repo_edges(
-                    customer_id=event.customer_id,
-                    source_repo=repo,
-                    edges=cross_repo_edges,
-                )
+            # Always call persist — even with an empty list. The classifier
+            # legitimately returning zero edges means this source repo has no
+            # cross-repo deps; persist's delete-then-insert correctly removes
+            # any stale edges from prior runs. We only skip persist when
+            # extract_cross_repo_deps RAISES (LLM unavailable, transient
+            # failure) — the except clause below catches that and leaves
+            # existing edges untouched.
+            await persist_cross_repo_edges(
+                customer_id=event.customer_id,
+                source_repo=repo,
+                edges=cross_repo_edges,
+            )
         except Exception as exc:
             log.warning(
                 "code_graph.cross_repo_deps_failed",

@@ -44,6 +44,14 @@ from shared.logging import get_logger
 log = get_logger(__name__)
 
 
+class ClassifierUnavailable(RuntimeError):
+    """Raised when the classifier LLM call failed (API error, no key, or
+    malformed/truncated response). Callers should treat this as 'no signal,
+    don't touch persisted edges' rather than 'all candidates are
+    coincidence'.
+    """
+
+
 # Bound the prompt size + cost of the Flash Lite classification call. A
 # 30-repo customer with ~150 candidates per repo lands well below this.
 _MAX_CANDIDATES_PER_SOURCE_REPO = 500
@@ -368,7 +376,7 @@ async def _call_classifier_llm(
             contents=user_prompt,
             config={
                 "system_instruction": _CLASSIFY_SYSTEM_PROMPT,
-                "max_output_tokens": 8192,
+                "max_output_tokens": 32768,
                 "response_mime_type": "application/json",
             },
         )
@@ -393,6 +401,7 @@ async def _call_classifier_llm(
             f"{log_prefix}.malformed_response",
             source_repo=source_repo,
             preview=text[:200],
+            response_length=len(text),
         )
         return None
 
@@ -547,12 +556,12 @@ async def classify_with_llm(
     target_dir: Path,
     client: Any | None = None,
 ) -> list[VerifiedMatch]:
-    """One Flash Lite call classifies every candidate as REAL or COINCIDENCE.
+    """One classifier call rules every candidate as REAL or COINCIDENCE.
 
-    Returns the kept (REAL) verifications. On any failure (no API key,
-    Gemini error, malformed response) returns an empty list and logs the
-    fall-through; the caller proceeds without cross-repo edges for this
-    source repo rather than persisting unverified matches.
+    Returns the kept (REAL) verifications. Raises ``ClassifierUnavailable``
+    on LLM failure (no API key, Gemini error, malformed/truncated
+    response). Returns ``[]`` only when all candidates were genuinely
+    classified as COINCIDENCE (or when the candidate list was empty).
     """
     if not candidates:
         return []
@@ -586,7 +595,9 @@ async def classify_with_llm(
         log_prefix="cross_repo_deps",
     )
     if verdicts is None:
-        return []
+        raise ClassifierUnavailable(
+            f"classifier LLM unavailable for {source_repo}; see preceding warning logs"
+        )
 
     verified: list[VerifiedMatch] = []
     for v in verdicts:
@@ -1001,6 +1012,7 @@ async def extract_cross_repo_deps(
 
 __all__ = [
     "CandidateMatch",
+    "ClassifierUnavailable",
     "CrossRepoEdge",
     "VerifiedMatch",
     "aggregate_to_edges",
