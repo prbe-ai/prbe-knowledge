@@ -252,17 +252,23 @@ async def main() -> None:
     configure_logging(settings.log_level)
     log.info("nightly_trigger.start", environment=settings.environment)
 
-    # Step A: refresh cross-repo edges first so that step B's wiki drain
-    # ends with a regenerate_wiki_index call against an up-to-date edge
-    # set. Failures here are advisory — log + continue to step B.
-    try:
-        await refresh_cross_repo_edges(settings.database_url)
-    except Exception as exc:
-        log.warning(
-            "nightly_trigger.cross_repo_refresh_failed",
-            error=str(exc),
-            error_class=type(exc).__name__,
-        )
+    # CROSS-REPO DEPS DISABLED — paused 2026-05-08. Step A (cross-repo
+    # edge refresh) is shelved while we evaluate a deterministic
+    # signal-based replacement for the LLM classifier. Existing edges
+    # in graph_edges stay frozen at their last-good state; the wiki
+    # architecture diagram renders that snapshot until something else
+    # regenerates the wiki index. See `services/ingestion/handlers/
+    # codegraph.py` for the matching disable site.
+    #
+    # To revive: uncomment the try/except block below.
+    # try:
+    #     await refresh_cross_repo_edges(settings.database_url)
+    # except Exception as exc:
+    #     log.warning(
+    #         "nightly_trigger.cross_repo_refresh_failed",
+    #         error=str(exc),
+    #         error_class=type(exc).__name__,
+    #     )
 
     # Step B: existing nightly synthesis trigger.
     notified = await trigger_nightly_synthesis(settings.database_url)

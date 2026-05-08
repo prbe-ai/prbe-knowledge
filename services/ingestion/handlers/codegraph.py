@@ -29,8 +29,8 @@ from services.ingestion.code_graph.clone import (
     walk_files,
 )
 from services.ingestion.code_graph.cross_repo_deps import (
-    extract_cross_repo_deps,
-    persist_cross_repo_edges,
+    extract_cross_repo_deps,  # noqa: F401  # Re-imported when CROSS-REPO DEPS DISABLED block is revived
+    persist_cross_repo_edges,  # noqa: F401  # Re-imported when CROSS-REPO DEPS DISABLED block is revived
     update_edges_after_push,
 )
 from services.ingestion.code_graph.fetch import fetch_files_at_sha
@@ -188,39 +188,43 @@ class CodeGraphConnector(Connector):
             files=files,
         )
 
-        # Cross-repo dependency edges. Runs after symbol extraction so
-        # the repo's tracked files are still on disk, but BEFORE
-        # prune_scratch. Persisted via a separate transaction (its own
-        # idempotent delete-then-insert) so a failure in this advisory
-        # path does not roll back the symbol-graph work above. Skips
-        # the call entirely when no other repos exist yet for this
-        # customer (first-ever code-graph backfill).
-        try:
-            cross_repo_edges = await extract_cross_repo_deps(
-                customer_id=event.customer_id,
-                source_repo=repo,
-                target_dir=target_dir,
-            )
-            # Always call persist — even with an empty list. The classifier
-            # legitimately returning zero edges means this source repo has no
-            # cross-repo deps; persist's delete-then-insert correctly removes
-            # any stale edges from prior runs. We only skip persist when
-            # extract_cross_repo_deps RAISES (LLM unavailable, transient
-            # failure) — the except clause below catches that and leaves
-            # existing edges untouched.
-            await persist_cross_repo_edges(
-                customer_id=event.customer_id,
-                source_repo=repo,
-                edges=cross_repo_edges,
-            )
-        except Exception as exc:
-            log.warning(
-                "code_graph.cross_repo_deps_failed",
-                customer=event.customer_id,
-                repo=repo,
-                error=str(exc),
-                error_class=type(exc).__name__,
-            )
+        # CROSS-REPO DEPS DISABLED — paused 2026-05-08 after 4 PRs of LLM
+        # reliability work (PRs #184, #186, #189, #190). The classifier-based
+        # extraction had unfixable directionality + verbosity issues. Existing
+        # edges in graph_edges (DEPENDS_ON, label=Repo) stay frozen at the
+        # PR #190 state; the wiki architecture diagram renders that snapshot.
+        #
+        # To revive: uncomment the block below. The cross_repo_deps module,
+        # tests, and persistence helpers are all intact. Consider replacing
+        # the LLM classifier with a deterministic signal-based extractor
+        # before reviving (URL hostnames + import lines + GitHub Actions
+        # uses + Dockerfile FROM, etc).
+        # try:
+        #     cross_repo_edges = await extract_cross_repo_deps(
+        #         customer_id=event.customer_id,
+        #         source_repo=repo,
+        #         target_dir=target_dir,
+        #     )
+        #     # Always call persist — even with an empty list. The classifier
+        #     # legitimately returning zero edges means this source repo has no
+        #     # cross-repo deps; persist's delete-then-insert correctly removes
+        #     # any stale edges from prior runs. We only skip persist when
+        #     # extract_cross_repo_deps RAISES (LLM unavailable, transient
+        #     # failure) — the except clause below catches that and leaves
+        #     # existing edges untouched.
+        #     await persist_cross_repo_edges(
+        #         customer_id=event.customer_id,
+        #         source_repo=repo,
+        #         edges=cross_repo_edges,
+        #     )
+        # except Exception as exc:
+        #     log.warning(
+        #         "code_graph.cross_repo_deps_failed",
+        #         customer=event.customer_id,
+        #         repo=repo,
+        #         error=str(exc),
+        #         error_class=type(exc).__name__,
+        #     )
 
         # Backfill is a single-shot in PR-A. Prune the clone scratch dir
         # now that extraction is complete; incremental updates fetch via
