@@ -434,6 +434,18 @@ async def webhook(
     raw_body = await request.body()
     connector = build_connector(source_enum, request.app.state.ctx)
 
+    # Receipt log fires once we know the source is valid and the body has
+    # been fully read. Pairs with the gateway's `webhooks.<source>.forwarded`
+    # log via `body_sha256_prefix` so an operator can join the two sides.
+    log.info(
+        "ingestion.received",
+        source=source,
+        customer=x_prbe_customer,
+        body_size=len(raw_body),
+        body_sha256_prefix=hashlib.sha256(raw_body).hexdigest()[:8],
+        trace_id=trace_id,
+    )
+
     try:
         payload = orjson.loads(raw_body) if raw_body else {}
     except orjson.JSONDecodeError as exc:
@@ -458,6 +470,18 @@ async def webhook(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if parsed is None:
+        # Connector recognized the payload but doesn't ingest this event
+        # type yet (e.g. notion comment.*, slack non-message events,
+        # github events the connector filters out). Log so silent drops
+        # are visible — pre-fix we returned a 200 with no log line and
+        # operators couldn't tell signal from noise.
+        log.info(
+            "ingestion.ignored",
+            source=source,
+            customer=customer_id,
+            event_type=payload.get("type") if isinstance(payload, dict) else None,
+            trace_id=trace_id,
+        )
         return JSONResponse({"status": "ignored", "trace_id": trace_id})
 
     # Headers are persisted with the raw payload for replayability. Strip
