@@ -45,7 +45,6 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-
 revision = "0057_fix_run_columns_a"
 down_revision = "0056_documents_id_trgm_idx"
 branch_labels = None
