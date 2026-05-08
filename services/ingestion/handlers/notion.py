@@ -2,9 +2,15 @@
 
 Covers two inbound shapes (Phase 0 treats them uniformly):
 
-1. Notion's official webhook payload (beta as of 2025): top-level `type`
-   like `"page.updated"` + an `entity` dict with `{type, id}` and a `data`
-   dict carrying `last_edited_time` / `last_edited_by`.
+1. Notion's official webhook payload (2025-09-03 API version): top-level
+   `type` like `"page.content_updated"` / `"page.properties_updated"` /
+   `"data_source.schema_updated"` + an `entity` dict `{type, id}` + a
+   `data` dict whose shape varies per event type. Real Notion never puts
+   `last_edited_time` in `data` — that field comes from the hydrated
+   REST entity (`/v1/pages/{id}` / `/v1/databases/{id}`).
+
+   See https://developers.notion.com/reference/webhooks-events-delivery
+   for the canonical schema.
 
 2. A synthetic push from our lightweight polling worker for customers whose
    Notion workspace doesn't yet have webhooks. Shape:
@@ -69,22 +75,85 @@ log = get_logger(__name__)
 _NOTION_API = "https://api.notion.com/v1"
 _NOTION_VERSION = "2022-06-28"
 
-# Webhook event types we persist.
-_ACCEPTED_EVENT_TYPES: frozenset[str] = frozenset(
+# Webhook event types we persist. Mirrors the 2025-09-03 Notion webhook
+# spec — see https://developers.notion.com/reference/webhooks-events-delivery.
+#
+# `_DEFERRED_EVENT_TYPES` below names events Notion *does* emit but we
+# don't ingest yet; keeping them in a named set (rather than letting them
+# fall through to "unknown") makes the next maintainer's life easier when
+# Notion adds another event type and "why is X being silently dropped"
+# starts as a question instead of a bug.
+_PAGE_EVENT_TYPES: frozenset[str] = frozenset(
     {
-        "page.updated",
         "page.created",
-        "database.updated",
-        "database.created",
-        # Deletes produce a tombstone document with deleted_at set; the chunk
-        # diff in the normalizer marks all previously-live chunks stale.
+        "page.content_updated",
+        "page.properties_updated",
+        "page.moved",
+        "page.locked",
+        "page.unlocked",
         "page.deleted",
+        "page.undeleted",
+    }
+)
+
+_DATABASE_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "database.created",
         "database.deleted",
+        "database.moved",
+        "database.undeleted",
+        # Deprecated in 2025-09-03 in favor of data_source.* — still emitted
+        # to subscriptions configured on older API versions, so we keep them.
+        "database.content_updated",
+        "database.schema_updated",
+    }
+)
+
+# data_source.* events were introduced in API version 2025-09-03 to replace
+# the database.content_updated / database.schema_updated event surface.
+# Subscriptions on the new API version emit these instead of (not in
+# addition to) the deprecated database events. Hydration via
+# /v1/data_sources/{id} requires bumping `_NOTION_VERSION`; until that
+# follow-up lands, hydration falls through to the database codepath, which
+# returns valid bodies for legacy single-source databases and returns
+# None (worker logs + skips) for new multi-source ones.
+_DATA_SOURCE_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "data_source.created",
+        "data_source.content_updated",
+        "data_source.schema_updated",
+        "data_source.moved",
+        "data_source.deleted",
+        "data_source.undeleted",
+    }
+)
+
+_ACCEPTED_EVENT_TYPES: frozenset[str] = (
+    _PAGE_EVENT_TYPES | _DATABASE_EVENT_TYPES | _DATA_SOURCE_EVENT_TYPES
+)
+
+# Events Notion emits that we explicitly recognize but choose not to ingest
+# yet. parse_webhook_event returns None for these; the ingestion entry
+# point logs the receipt with `status: ignored`. Listed by name so a
+# future spec change shows up as "added event type X" rather than as
+# silent traffic that disappears.
+_DEFERRED_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        # Comments require a separate fetch model (/v1/comments?block_id=)
+        # and a different document shape; out of scope for the connector
+        # as it stands today.
+        "comment.created",
+        "comment.updated",
+        "comment.deleted",
     }
 )
 
 _DELETE_EVENT_TYPES: frozenset[str] = frozenset(
-    {"page.deleted", "database.deleted"}
+    {
+        "page.deleted",
+        "database.deleted",
+        "data_source.deleted",
+    }
 )
 
 _DEFAULT_WORKSPACE_PRINCIPAL = "notion-default"
@@ -363,8 +432,21 @@ class NotionConnector(Connector):
         raw_payload: Mapping[str, Any],
     ) -> WebhookParseResult | None:
         event_type = raw_payload.get("type")
+        if event_type in _DEFERRED_EVENT_TYPES:
+            # Recognized event type we haven't wired up yet (comments today).
+            # Single info log so operators can see drops are intentional, not
+            # a bug, and so a future "why isn't this ingesting" question
+            # answers itself in `fly logs`.
+            log.info(
+                "notion.webhook_deferred",
+                event_type=event_type,
+                entity_id=(raw_payload.get("entity") or {}).get("id"),
+            )
+            return None
         if event_type not in _ACCEPTED_EVENT_TYPES:
-            # Unknown / ignored (deletes, user.*, workspace.*, verification ping).
+            # Truly unknown event type. Skip silently — Notion may add new
+            # event types without deprecation, and a noisy log on every
+            # delivery is worse than a missed signal.
             return None
 
         entity = raw_payload.get("entity")
@@ -373,7 +455,7 @@ class NotionConnector(Connector):
 
         entity_type = entity.get("type")
         entity_id = entity.get("id")
-        if entity_type not in {"page", "database"} or not entity_id:
+        if entity_type not in {"page", "database", "data_source"} or not entity_id:
             raise InvalidWebhookPayload(
                 f"notion webhook has unsupported entity: type={entity_type!r} id={entity_id!r}"
             )
@@ -926,15 +1008,19 @@ class NotionConnector(Connector):
         token,
         cursor: str | None = None,
     ):
-        """Paginated `/search` → synthetic page.updated / database.updated events.
+        """Paginated `/search` → synthetic page.created / database.created events.
 
         Emits events shaped like real Notion webhooks. The normalizer's
         `fetch_supplementary` path will hit Notion again for full block
         content, so we don't need to fully hydrate here — just enqueue
         the entity reference.
 
+        Picked `*.created` (rather than the more semantically precise
+        `*.content_updated`) because the latter requires `data.updated_blocks`
+        per the spec; backfill doesn't have that list.
+
         For each database we encounter, we additionally page through
-        `databases/{id}/query` and yield a `page.updated` event per row.
+        `databases/{id}/query` and yield a `page.created` event per row.
         Rows in Notion are pages with their own block trees; they're not
         returned by `/search` unless individually shared with the integration,
         so without this enumeration every database's contents are invisible.
@@ -971,7 +1057,7 @@ class NotionConnector(Connector):
                 eid = result.get("id") or ""
                 last_edited = result.get("last_edited_time") or ""
                 payload = {
-                    "type": f"{entity_type}.updated",
+                    "type": f"{entity_type}.created",
                     "entity": {
                         "type": entity_type,
                         "id": eid,
@@ -999,7 +1085,7 @@ class NotionConnector(Connector):
                             continue
                         row_last_edited = row.get("last_edited_time") or ""
                         row_payload = {
-                            "type": "page.updated",
+                            "type": "page.created",
                             "entity": {
                                 "type": "page",
                                 "id": row_id,

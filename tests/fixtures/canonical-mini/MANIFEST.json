@@ -1,7 +1,7 @@
 {
   "canonical_customer_id": "cust-eval-canonical-v1",
   "version": "mini",
-  "description": "Tiny canonical corpus used by Plan 4 seed_tenant integration tests. Hand-written; not produced by the synth recording pipeline. Two slack envelopes (standup, oncall handoff) + one notion page.updated webhook. Real corpus lives at scripts/synth/canonical/v1/raw/ once recorded.",
+  "description": "Tiny canonical corpus used by Plan 4 seed_tenant integration tests. Hand-written; not produced by the synth recording pipeline. Two slack envelopes (standup, oncall handoff) + one notion page.content_updated webhook. Real corpus lives at scripts/synth/canonical/v1/raw/ once recorded.",
   "envelope_counts": {
     "slack": 2,
     "notion": 1

@@ -1,0 +1,24 @@
+{
+  "id": "evt_01HXYZ",
+  "type": "page.properties_updated",
+  "timestamp": "2026-04-22T12:00:00.000Z",
+  "workspace_id": "ws_TEST",
+  "workspace_name": "PRBE",
+  "subscription_id": "sub_01HXYZ_TEST",
+  "integration_id": "int_01HXYZ_TEST",
+  "authors": [
+    {"id": "user_alice", "type": "person"}
+  ],
+  "attempt_number": 1,
+  "entity": {
+    "id": "page_abc123",
+    "type": "page"
+  },
+  "data": {
+    "parent": {
+      "id": "page_parent_999",
+      "type": "page"
+    },
+    "updated_properties": ["%3F%5Eo%7B", "%5BgVS"]
+  }
+}

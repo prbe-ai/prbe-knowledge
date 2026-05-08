@@ -71,7 +71,7 @@ async def test_local_writes_notion_envelope_to_disk(tmp_path: Path) -> None:
     path = tmp_path / "raw" / "notion" / "page-1.json"
     assert path.exists()
     payload = orjson.loads(path.read_bytes())
-    assert payload["type"] == "page.updated"
+    assert payload["type"] == "page.content_updated"
 
 
 @pytest.mark.asyncio
