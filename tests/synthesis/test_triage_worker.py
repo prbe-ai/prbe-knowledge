@@ -6,6 +6,10 @@ Covers:
 - Customer opt-out gate (preferences.wiki_generation_enabled).
 - The post-commit NOTIFY pattern: a listener on wiki_synthesize_triaged
   must see the triaged rows the moment the notify fires.
+- Orphan-rejection path: rows whose body fetch returns nothing (doc
+  version superseded by valid_to or soft-deleted between enqueue and
+  drain) are routed straight to 'rejected', NOT churned through
+  mark_for_retry's 3-attempt loop.
 """
 
 from __future__ import annotations
@@ -23,7 +27,11 @@ import pytest_asyncio
 
 from services.ingestion.handlers.base import make_default_context
 from services.ingestion.normalizer import Normalizer
-from services.synthesis.triage_worker import TriageWorker
+from services.synthesis.models import TriageInput
+from services.synthesis.triage_worker import (
+    TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON,
+    TriageWorker,
+)
 from shared.config import Settings
 from shared.constants import (
     WIKI_TRIAGED_CHANNEL,
@@ -309,3 +317,297 @@ async def test_triage_worker_fires_notify_after_commit(reset_db: None, settings:
         with contextlib.suppress(Exception):
             await listener.remove_listener(WIKI_TRIAGED_CHANNEL, _on_notify)
         await listener.close()
+
+
+# ---------------------------------------------------------------------------
+# Orphan-rejection path — DB-free unit tests
+# ---------------------------------------------------------------------------
+#
+# fetch_bodies INNER JOINs `documents` filtered by valid_to IS NULL AND
+# deleted_at IS NULL. When a queued doc_version was superseded between
+# enqueue and drain (e.g. a GitHub PR gets a new commit before triage
+# runs), the queue row drops out of triage_inputs. Without dedicated
+# handling, the row falls through to mark_for_retry, churns 3 attempts,
+# then dead-letters as 'failed' with the misleading "no verdict from
+# triage batch" tombstone. The worker now intercepts those rows after
+# fetch_bodies and routes them straight to 'rejected' via
+# mark_orphans_rejected, with a categorized reason.
+
+
+def _ti(qid: int) -> TriageInput:
+    """Minimal TriageInput stub for batch-packing assertions."""
+    return TriageInput(
+        queue_id=qid,
+        doc_id=f"doc:{qid}",
+        doc_type="github.commit",
+        source_system="github",
+        title=f"Doc {qid}",
+        author_id="alice",
+        body="x",
+        body_token_count=10,
+    )
+
+
+def _qrow(qid: int, doc_id: str | None = None, version: int = 1) -> dict:
+    """Fake claim_pending_batch row. dict-shaped is enough — the worker
+    only reads via row['queue_id'] / row['doc_id'] etc."""
+    return {
+        "queue_id": qid,
+        "doc_id": doc_id or f"doc:{qid}",
+        "doc_version": version,
+        "source_system": "github",
+        "doc_type": "github.commit",
+        "attempts": 1,
+        "triage_score": None,
+        "source_ts": datetime.now(UTC),
+    }
+
+
+@pytest.mark.asyncio
+async def test_orphan_superseded_row_marked_rejected_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """3 queued rows; fetch_bodies returns 2 (third's doc was
+    superseded). Assert: mark_orphans_rejected is called for the third
+    qid; mark_for_retry is NEVER called for it; _apply_verdicts only
+    sees the 2 non-orphan rows."""
+    from services.synthesis import triage_worker as tw_mod
+    from services.synthesis.models import TriageVerdict
+
+    customer = "cust-orphan-1"
+    queue_rows = [_qrow(1), _qrow(2), _qrow(3)]
+    # fetch_bodies returns inputs only for qid 1 and 2; qid 3 was
+    # superseded so its body fetch returned nothing.
+    inputs = [_ti(1), _ti(2)]
+
+    # First claim returns rows; second claim returns [] so the drain loop exits.
+    claim_calls: list[int] = []
+
+    async def fake_claim(cid: str, *, limit: int) -> list[dict]:
+        claim_calls.append(limit)
+        if len(claim_calls) == 1:
+            return queue_rows
+        return []
+
+    fake_fetch_bodies = AsyncMock(return_value=inputs)
+    fake_open_run = AsyncMock(return_value=42)
+    fake_close_run = AsyncMock(return_value=None)
+    fake_mark_orphans = AsyncMock(return_value=None)
+    fake_mark_for_retry = AsyncMock(return_value=None)
+    fake_mark_rejected = AsyncMock(return_value=None)
+    fake_mark_batch_triaged = AsyncMock(return_value=None)
+    fake_dlq_customer = AsyncMock(return_value=0)
+
+    monkeypatch.setattr(tw_mod.persistence, "claim_pending_batch", fake_claim)
+    monkeypatch.setattr(tw_mod.persistence, "fetch_bodies", fake_fetch_bodies)
+    monkeypatch.setattr(tw_mod.persistence, "open_run", fake_open_run)
+    monkeypatch.setattr(tw_mod.persistence, "close_run", fake_close_run)
+    monkeypatch.setattr(
+        tw_mod.persistence, "mark_orphans_rejected", fake_mark_orphans
+    )
+    monkeypatch.setattr(tw_mod.persistence, "mark_for_retry", fake_mark_for_retry)
+    monkeypatch.setattr(tw_mod.persistence, "mark_rejected", fake_mark_rejected)
+    monkeypatch.setattr(
+        tw_mod.persistence,
+        "mark_batch_triaged_and_notify",
+        fake_mark_batch_triaged,
+    )
+    monkeypatch.setattr(
+        tw_mod.persistence,
+        "dlq_customer_for_triage_failure",
+        fake_dlq_customer,
+    )
+
+    # Stub out the triage call so each input gets a high-score verdict.
+    async def fake_call_batches(self, client, batches, customer_id):
+        out: dict[int, TriageVerdict] = {}
+        for batch in batches:
+            for ev in batch:
+                out[ev.queue_id] = TriageVerdict(
+                    important=True, score=8.0, reason="ok"
+                )
+        return out
+
+    monkeypatch.setattr(TriageWorker, "_call_triage_batches", fake_call_batches)
+
+    worker = TriageWorker(asyncio.Event(), anthropic_client=SimpleNamespace())
+    await worker._drain_customer(customer, SimpleNamespace(), run_kind="wake")
+
+    # mark_orphans_rejected was called exactly once with qid 3 and the
+    # categorized reason; qid 3 never went through mark_for_retry.
+    assert fake_mark_orphans.await_count == 1
+    args, kwargs = fake_mark_orphans.await_args
+    assert args[0] == customer
+    assert args[1] == [3]
+    assert kwargs["reason"] == TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON
+    fake_mark_for_retry.assert_not_called()
+
+    # The 2 non-orphan rows were marked triaged in a single batch call.
+    assert fake_mark_batch_triaged.await_count == 1
+    triaged_args, _ = fake_mark_batch_triaged.await_args
+    triaged_qids = sorted(qid for qid, _ in triaged_args[1])
+    assert triaged_qids == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_oversized_rows_not_misclassified_as_orphans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An event that goes through pack_into_batches `oversized` MUST be
+    routed via _reject_oversized (the existing path) — NOT misclassified
+    as an orphan. Otherwise a giant body would yield a generic
+    'doc_superseded_or_deleted' tag instead of the precise oversized
+    diagnostic."""
+    from services.synthesis import triage_worker as tw_mod
+
+    customer = "cust-oversized-1"
+    queue_rows = [_qrow(1), _qrow(2)]
+    # Both inputs come back from fetch_bodies — but pack_into_batches
+    # will move qid 1 to oversized.
+    inputs = [_ti(1), _ti(2)]
+
+    claim_calls: list[int] = []
+
+    async def fake_claim(cid: str, *, limit: int) -> list[dict]:
+        claim_calls.append(limit)
+        if len(claim_calls) == 1:
+            return queue_rows
+        return []
+
+    # Stub pack_into_batches: qid 1 -> oversized, qid 2 -> normal batch.
+    def fake_pack(events):
+        oversized = [ev for ev in events if ev.queue_id == 1]
+        normal = [ev for ev in events if ev.queue_id != 1]
+        batches = [normal] if normal else []
+        return batches, oversized
+
+    monkeypatch.setattr(tw_mod, "pack_into_batches", fake_pack)
+    monkeypatch.setattr(tw_mod.persistence, "claim_pending_batch", fake_claim)
+    monkeypatch.setattr(
+        tw_mod.persistence, "fetch_bodies", AsyncMock(return_value=inputs)
+    )
+    monkeypatch.setattr(tw_mod.persistence, "open_run", AsyncMock(return_value=7))
+    monkeypatch.setattr(tw_mod.persistence, "close_run", AsyncMock(return_value=None))
+    fake_mark_orphans = AsyncMock(return_value=None)
+    fake_mark_rejected = AsyncMock(return_value=None)
+    fake_mark_for_retry = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        tw_mod.persistence, "mark_orphans_rejected", fake_mark_orphans
+    )
+    monkeypatch.setattr(tw_mod.persistence, "mark_rejected", fake_mark_rejected)
+    monkeypatch.setattr(tw_mod.persistence, "mark_for_retry", fake_mark_for_retry)
+    monkeypatch.setattr(
+        tw_mod.persistence,
+        "mark_batch_triaged_and_notify",
+        AsyncMock(return_value=None),
+    )
+
+    async def fake_call_batches(self, client, batches, customer_id):
+        from services.synthesis.models import TriageVerdict
+
+        return {
+            ev.queue_id: TriageVerdict(important=True, score=9.0, reason="ok")
+            for batch in batches
+            for ev in batch
+        }
+
+    monkeypatch.setattr(TriageWorker, "_call_triage_batches", fake_call_batches)
+
+    worker = TriageWorker(asyncio.Event(), anthropic_client=SimpleNamespace())
+    await worker._drain_customer(customer, SimpleNamespace(), run_kind="wake")
+
+    # The oversized event went to mark_rejected (via _reject_oversized),
+    # NOT to mark_orphans_rejected.
+    fake_mark_orphans.assert_not_called()
+    assert fake_mark_rejected.await_count == 1
+    rejected_args, _ = fake_mark_rejected.await_args
+    assert rejected_args[1] == 1  # queue_id
+    fake_mark_for_retry.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_mark_orphans_rejected_sets_status_and_reason(
+    reset_db: None,
+) -> None:
+    """Persistence-level test: a row at status='triaging' becomes
+    'rejected' with the reason set; a row at status='pending' is left
+    alone (defensive WHERE clause guards against racing with reclaim or
+    a concurrent path that already moved the row)."""
+    from services.synthesis import persistence
+
+    async with raw_conn() as conn:
+        # Two rows: one currently 'triaging' (the normal post-claim
+        # state) and one still 'pending' (a row a sibling worker hasn't
+        # claimed yet).
+        triaging_qid = await conn.fetchval(
+            """
+            INSERT INTO wiki_synthesis_queue
+                (customer_id, doc_id, doc_version, source_system,
+                 doc_type, status, enqueued_at, attempts)
+            VALUES ($1, 'github:commit:orph-triaging', 1, 'github',
+                    'github.commit', 'triaging', NOW(), 1)
+            RETURNING queue_id
+            """,
+            CUSTOMER,
+        )
+        pending_qid = await conn.fetchval(
+            """
+            INSERT INTO wiki_synthesis_queue
+                (customer_id, doc_id, doc_version, source_system,
+                 doc_type, status, enqueued_at, attempts)
+            VALUES ($1, 'github:commit:orph-pending', 1, 'github',
+                    'github.commit', 'pending', NOW(), 0)
+            RETURNING queue_id
+            """,
+            CUSTOMER,
+        )
+
+    await persistence.mark_orphans_rejected(
+        CUSTOMER,
+        [int(triaging_qid), int(pending_qid)],
+        reason=TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON,
+    )
+
+    async with raw_conn() as conn:
+        triaging_after = await conn.fetchrow(
+            "SELECT status, triage_score, triage_error, triage_completed_at "
+            "FROM wiki_synthesis_queue WHERE queue_id = $1",
+            int(triaging_qid),
+        )
+        pending_after = await conn.fetchrow(
+            "SELECT status, triage_score, triage_error, triage_completed_at "
+            "FROM wiki_synthesis_queue WHERE queue_id = $1",
+            int(pending_qid),
+        )
+
+    # The 'triaging' row flipped to 'rejected' with the categorized
+    # reason and a zero score (presents like a normal score-rejected
+    # row in the dashboard).
+    assert triaging_after["status"] == "rejected"
+    assert triaging_after["triage_score"] == 0.0
+    assert triaging_after["triage_error"] == TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON
+    assert triaging_after["triage_completed_at"] is not None
+
+    # The 'pending' row was NOT touched — defensive WHERE clause is
+    # working. (If we removed the `AND status = 'triaging'` guard, this
+    # would clobber a sibling worker's still-claimable row.)
+    assert pending_after["status"] == "pending"
+    assert pending_after["triage_score"] is None
+    assert pending_after["triage_error"] is None
+    assert pending_after["triage_completed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_mark_orphans_rejected_empty_list_is_noop() -> None:
+    """Empty input -> no SQL fired (the function returns immediately).
+    Cheap regression guard: don't accidentally fire an UPDATE that
+    matches every customer row."""
+    from services.synthesis import persistence
+
+    # No DB needed — empty queue_ids returns before opening a tenant
+    # connection. Just confirm it doesn't raise.
+    await persistence.mark_orphans_rejected(
+        "cust-noop",
+        [],
+        reason=TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON,
+    )
