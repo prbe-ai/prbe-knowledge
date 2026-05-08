@@ -5,7 +5,7 @@
   "last_edited_time": "2026-04-22T12:00:00.000Z",
   "created_by": {"object": "user", "id": "user_alice"},
   "last_edited_by": {"object": "user", "id": "user_alice"},
-  "archived": false,
+  "in_trash": false,
   "url": "https://www.notion.so/Payments-runbook-abc123",
   "parent": {
     "type": "page_id",

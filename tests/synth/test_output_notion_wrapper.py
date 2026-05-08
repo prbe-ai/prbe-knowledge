@@ -10,7 +10,12 @@ from scripts.synth.archetypes.base import Source
 from scripts.synth.output.base import SynthDoc
 from scripts.synth.output.notion import wrap
 
-_FIXTURE = Path(__file__).parent.parent.parent / "fixtures" / "notion" / "page_updated.json"
+_FIXTURE = (
+    Path(__file__).parent.parent.parent
+    / "fixtures"
+    / "notion"
+    / "page_properties_updated.json"
+)
 
 
 def _make_notion_doc(
@@ -41,7 +46,7 @@ def test_wrap_produces_valid_json() -> None:
     doc = _make_notion_doc()
     raw = wrap(doc)
     payload = json.loads(raw)
-    assert payload["type"] == "page.updated"
+    assert payload["type"] == "page.content_updated"
 
 
 def test_wrap_entity_shape() -> None:

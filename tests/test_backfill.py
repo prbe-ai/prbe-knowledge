@@ -1185,7 +1185,7 @@ async def test_notion_backfill_paginates_search() -> None:
 @pytest.mark.asyncio
 async def test_notion_backfill_enumerates_database_rows() -> None:
     """Each database discovered in /search must have its rows pulled via
-    databases/{id}/query and yielded as page.updated events.
+    databases/{id}/query and yielded as page.created events.
 
     Without this, every Notion database's contents are invisible: rows are
     pages that /search does not list unless individually shared with the

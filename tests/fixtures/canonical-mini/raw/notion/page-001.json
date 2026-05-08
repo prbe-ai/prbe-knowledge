@@ -1,6 +1,6 @@
 {
   "id": "page-synth-notion-001",
-  "type": "page.updated",
+  "type": "page.content_updated",
   "timestamp": "2026-04-25T12:00:00.000Z",
   "workspace_id": "ws-synth",
   "workspace_name": "Synth",

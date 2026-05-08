@@ -1,9 +1,15 @@
-"""NotionWrapper — serialize a SynthDoc to a Notion page.updated webhook envelope.
+"""NotionWrapper — serialize a SynthDoc to a Notion page.content_updated webhook envelope.
 
 The output must round-trip through NotionConnector._parse_notion_webhook.
 _is_notion_webhook() checks: isinstance(entity, dict) and isinstance(type, str).
-_parse_notion_webhook reads: type, entity.type, entity.id, data.last_edited_time,
-workspace_id.
+_parse_notion_webhook reads: type, entity.type, entity.id, workspace_id; it
+falls back to top-level `timestamp` for the source-event-id derivation when
+data lacks last_edited_time (real Notion never sets it on data).
+
+Picked `page.content_updated` over the more event-specific
+`page.properties_updated` because synth output is whole-page replay — the
+content-updated event is the closest single-event spec for "this page's
+body changed".
 
 Synth-only inlining (the notion-handler bypass):
     Real Notion webhooks notify-only — content lives behind a Notion API call
@@ -91,7 +97,7 @@ def _blocks_from_text(text: str) -> list[dict]:
 
 
 def wrap(doc: SynthDoc) -> bytes:
-    """Produce a Notion page.updated webhook envelope as JSON bytes.
+    """Produce a Notion page.content_updated webhook envelope as JSON bytes.
 
     Inlines properties + pre-rendered body_markdown on `entity` so the prod
     handler can ingest synth content without a live OAuth fetch (see module
@@ -115,7 +121,7 @@ def wrap(doc: SynthDoc) -> bytes:
 
     payload = {
         "id": doc.source_event_id,
-        "type": "page.updated",
+        "type": "page.content_updated",
         "timestamp": iso_ts,
         "workspace_id": _SYNTH_WORKSPACE_ID,
         "workspace_name": _SYNTH_WORKSPACE_NAME,

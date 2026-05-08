@@ -1,10 +1,18 @@
-"""Notion connector — page + database ingestion.
+"""Notion connector — page + database + data_source ingestion.
 
 Covers two inbound shapes (Phase 0 treats them uniformly):
 
-1. Notion's official webhook payload (beta as of 2025): top-level `type`
-   like `"page.updated"` + an `entity` dict with `{type, id}` and a `data`
-   dict carrying `last_edited_time` / `last_edited_by`.
+1. Notion's official webhook payload (2026-03-11 API version): top-level
+   `type` like `"page.content_updated"` / `"page.properties_updated"` /
+   `"data_source.schema_updated"` + an `entity` dict `{type, id}` + a
+   `data` dict whose shape varies per event type. Real Notion never puts
+   `last_edited_time` in `data` — that field comes from the hydrated
+   REST entity (`/v1/pages/{id}` / `/v1/databases/{id}` /
+   `/v1/data_sources/{id}`).
+
+   See https://developers.notion.com/reference/webhooks-events-delivery
+   for the canonical event schema and ../reference/versioning for the
+   API version semantics.
 
 2. A synthetic push from our lightweight polling worker for customers whose
    Notion workspace doesn't yet have webhooks. Shape:
@@ -67,24 +75,104 @@ from shared.models import (
 log = get_logger(__name__)
 
 _NOTION_API = "https://api.notion.com/v1"
-_NOTION_VERSION = "2022-06-28"
 
-# Webhook event types we persist.
-_ACCEPTED_EVENT_TYPES: frozenset[str] = frozenset(
+# Pinned to 2026-03-11 — the Notion API version our webhook subscriptions
+# are configured against. See https://developers.notion.com/reference/versioning
+# for the version semantics. Practical implications for this connector:
+#
+#   • Pages: GET /v1/pages/{id} unchanged.
+#   • Databases: GET /v1/databases/{id} now returns a container shape
+#     {title, icon, cover, data_sources: [...]} — NO `properties`. The
+#     row-schema moved to per-data-source records.
+#   • Data sources: NEW endpoint GET /v1/data_sources/{id} carrying
+#     {object: "data_source", id, properties, parent: {database_id, ...},
+#     database_parent}. We hit this for `data_source.*` webhook events.
+#   • Querying: POST /v1/databases/{id}/query is REMOVED. Row enumeration
+#     for backfill must use POST /v1/data_sources/{id}/query instead —
+#     see the TODO in `_iter_database_rows`.
+#   • Field rename: `archived` → `in_trash` across pages/databases/blocks/
+#     data sources.
+#   • Block rename: `transcription` → `meeting_notes` (we render unknowns
+#     as `[block:<type>]` placeholders so the rename is benign).
+_NOTION_VERSION = "2026-03-11"
+
+# Webhook event types we persist. Mirrors the 2025-09-03 Notion webhook
+# spec — see https://developers.notion.com/reference/webhooks-events-delivery.
+#
+# `_DEFERRED_EVENT_TYPES` below names events Notion *does* emit but we
+# don't ingest yet; keeping them in a named set (rather than letting them
+# fall through to "unknown") makes the next maintainer's life easier when
+# Notion adds another event type and "why is X being silently dropped"
+# starts as a question instead of a bug.
+_PAGE_EVENT_TYPES: frozenset[str] = frozenset(
     {
-        "page.updated",
         "page.created",
-        "database.updated",
-        "database.created",
-        # Deletes produce a tombstone document with deleted_at set; the chunk
-        # diff in the normalizer marks all previously-live chunks stale.
+        "page.content_updated",
+        "page.properties_updated",
+        "page.moved",
+        "page.locked",
+        "page.unlocked",
         "page.deleted",
+        "page.undeleted",
+    }
+)
+
+_DATABASE_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "database.created",
         "database.deleted",
+        "database.moved",
+        "database.undeleted",
+        # Deprecated in 2025-09-03 in favor of data_source.* — still emitted
+        # to subscriptions configured on older API versions, so we keep them.
+        "database.content_updated",
+        "database.schema_updated",
+    }
+)
+
+# data_source.* events were introduced in API version 2025-09-03 to replace
+# the database.content_updated / database.schema_updated event surface.
+# Subscriptions on the new API version emit these instead of (not in
+# addition to) the deprecated database events. With `_NOTION_VERSION`
+# bumped to 2026-03-11, hydration calls /v1/data_sources/{id} for these
+# events and gets back the schema/properties directly.
+_DATA_SOURCE_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        "data_source.created",
+        "data_source.content_updated",
+        "data_source.schema_updated",
+        "data_source.moved",
+        "data_source.deleted",
+        "data_source.undeleted",
+    }
+)
+
+_ACCEPTED_EVENT_TYPES: frozenset[str] = (
+    _PAGE_EVENT_TYPES | _DATABASE_EVENT_TYPES | _DATA_SOURCE_EVENT_TYPES
+)
+
+# Events Notion emits that we explicitly recognize but choose not to ingest
+# yet. parse_webhook_event returns None for these; the ingestion entry
+# point logs the receipt with `status: ignored`. Listed by name so a
+# future spec change shows up as "added event type X" rather than as
+# silent traffic that disappears.
+_DEFERRED_EVENT_TYPES: frozenset[str] = frozenset(
+    {
+        # Comments require a separate fetch model (/v1/comments?block_id=)
+        # and a different document shape; out of scope for the connector
+        # as it stands today.
+        "comment.created",
+        "comment.updated",
+        "comment.deleted",
     }
 )
 
 _DELETE_EVENT_TYPES: frozenset[str] = frozenset(
-    {"page.deleted", "database.deleted"}
+    {
+        "page.deleted",
+        "database.deleted",
+        "data_source.deleted",
+    }
 )
 
 _DEFAULT_WORKSPACE_PRINCIPAL = "notion-default"
@@ -363,8 +451,21 @@ class NotionConnector(Connector):
         raw_payload: Mapping[str, Any],
     ) -> WebhookParseResult | None:
         event_type = raw_payload.get("type")
+        if event_type in _DEFERRED_EVENT_TYPES:
+            # Recognized event type we haven't wired up yet (comments today).
+            # Single info log so operators can see drops are intentional, not
+            # a bug, and so a future "why isn't this ingesting" question
+            # answers itself in `fly logs`.
+            log.info(
+                "notion.webhook_deferred",
+                event_type=event_type,
+                entity_id=(raw_payload.get("entity") or {}).get("id"),
+            )
+            return None
         if event_type not in _ACCEPTED_EVENT_TYPES:
-            # Unknown / ignored (deletes, user.*, workspace.*, verification ping).
+            # Truly unknown event type. Skip silently — Notion may add new
+            # event types without deprecation, and a noisy log on every
+            # delivery is worse than a missed signal.
             return None
 
         entity = raw_payload.get("entity")
@@ -373,7 +474,7 @@ class NotionConnector(Connector):
 
         entity_type = entity.get("type")
         entity_id = entity.get("id")
-        if entity_type not in {"page", "database"} or not entity_id:
+        if entity_type not in {"page", "database", "data_source"} or not entity_id:
             raise InvalidWebhookPayload(
                 f"notion webhook has unsupported entity: type={entity_type!r} id={entity_id!r}"
             )
@@ -465,7 +566,9 @@ class NotionConnector(Connector):
             return {}
 
         blocks: list[dict[str, Any]] = []
-        # Pages carry content blocks. Databases carry schema only — no block tree.
+        # Pages carry content blocks. Databases (containers) and data
+        # sources (schema records) don't have a block tree — skip the
+        # block-fetch path for both.
         if resource_type == "page":
             blocks = await self._fetch_all_blocks(resource_id, token)
 
@@ -487,7 +590,24 @@ class NotionConnector(Connector):
         resource_id: str,
         token: IntegrationToken,
     ) -> dict[str, Any] | None:
-        path = "pages" if resource_type == "page" else "databases"
+        # 2026-03-11 splits the legacy "database" resource into two: a
+        # container at /v1/databases/{id} (carries title/icon/cover +
+        # `data_sources: [...]`) and per-data-source records at
+        # /v1/data_sources/{id} (carry the row schema as `properties`).
+        # Each event type ends up at the corresponding endpoint.
+        path_map = {
+            "page": "pages",
+            "database": "databases",
+            "data_source": "data_sources",
+        }
+        path = path_map.get(resource_type)
+        if path is None:
+            log.warning(
+                "notion.fetch_entity_unknown_type",
+                resource_type=resource_type,
+                id=resource_id,
+            )
+            return None
         url = f"{_NOTION_API}/{path}/{resource_id}"
         try:
             resp = await self.http.get(url, headers=_auth_headers(token))
@@ -499,6 +619,7 @@ class NotionConnector(Connector):
             log.warning(
                 "notion.fetch_entity_non_200",
                 status=resp.status_code,
+                resource_type=resource_type,
                 id=resource_id,
             )
             return None
@@ -726,7 +847,14 @@ class NotionConnector(Connector):
                 "resource_type": resource_type,
                 "properties": properties,
                 "parent": parent,
-                "archived": entity.get("archived", False),
+                # Notion renamed `archived` → `in_trash` in 2026-03-11.
+                # Read `in_trash` first; fall back to `archived` for any
+                # legacy webhook envelopes captured before the upgrade.
+                "in_trash": (
+                    entity.get("in_trash")
+                    if entity.get("in_trash") is not None
+                    else entity.get("archived", False)
+                ),
                 "mentioned_user_ids": mentioned_user_ids,
                 "last_edited_time": last_edited_time,
                 # `hydrated` reflects whether fetch_supplementary returned data —
@@ -926,15 +1054,19 @@ class NotionConnector(Connector):
         token,
         cursor: str | None = None,
     ):
-        """Paginated `/search` → synthetic page.updated / database.updated events.
+        """Paginated `/search` → synthetic page.created / database.created events.
 
         Emits events shaped like real Notion webhooks. The normalizer's
         `fetch_supplementary` path will hit Notion again for full block
         content, so we don't need to fully hydrate here — just enqueue
         the entity reference.
 
+        Picked `*.created` (rather than the more semantically precise
+        `*.content_updated`) because the latter requires `data.updated_blocks`
+        per the spec; backfill doesn't have that list.
+
         For each database we encounter, we additionally page through
-        `databases/{id}/query` and yield a `page.updated` event per row.
+        `databases/{id}/query` and yield a `page.created` event per row.
         Rows in Notion are pages with their own block trees; they're not
         returned by `/search` unless individually shared with the integration,
         so without this enumeration every database's contents are invisible.
@@ -971,7 +1103,7 @@ class NotionConnector(Connector):
                 eid = result.get("id") or ""
                 last_edited = result.get("last_edited_time") or ""
                 payload = {
-                    "type": f"{entity_type}.updated",
+                    "type": f"{entity_type}.created",
                     "entity": {
                         "type": entity_type,
                         "id": eid,
@@ -999,7 +1131,7 @@ class NotionConnector(Connector):
                             continue
                         row_last_edited = row.get("last_edited_time") or ""
                         row_payload = {
-                            "type": "page.updated",
+                            "type": "page.created",
                             "entity": {
                                 "type": "page",
                                 "id": row_id,
@@ -1036,6 +1168,17 @@ class NotionConnector(Connector):
         Read-only POST with no filter/sort body returns all rows the integration
         can see. Rate-limit / 4xx responses end the iteration cleanly so a single
         bad database doesn't abort the entire backfill.
+
+        TODO(2026-03-11): /v1/databases/{id}/query is removed in this API
+        version. The replacement is a two-step lookup:
+
+            1. GET /v1/databases/{id} → read `data_sources: [{id, name}]`
+            2. POST /v1/data_sources/{ds_id}/query for each source
+
+        Backfill is initial-sync only and isn't on the hot path for
+        webhook ingestion; deferring this change until backfill is next
+        run on a 2026-03-11-bound integration. Today, calling this
+        method against the live API will return 404.
         """
         next_cursor: str | None = None
         while True:
@@ -1317,13 +1460,36 @@ def _title_from_database(entity: Mapping[str, Any]) -> str | None:
 
 
 def _database_schema_summary(entity: Mapping[str, Any]) -> str:
-    """Flatten a database description + property schema into a plain-text blob."""
+    """Flatten a database description + property schema into a plain-text blob.
+
+    In 2026-03-11, GET /v1/databases/{id} returns a *container* shape:
+    `{title, icon, cover, data_sources: [...]}` with NO top-level
+    `properties`. The schema moved to each entry under `data_sources`.
+    For data_source events the entity comes back from /v1/data_sources/{id}
+    and DOES carry `properties` directly.
+
+    We summarize what's available — description plus either the per-source
+    list (database container shape) or the property schema (data source
+    or legacy database shape).
+    """
     parts: list[str] = []
     description = entity.get("description")
     if isinstance(description, list):
         desc_text = _rich_text_to_plain(description).strip()
         if desc_text:
             parts.append(desc_text)
+
+    # Database container (2026-03-11): list nested data_sources by name.
+    data_sources = entity.get("data_sources")
+    if isinstance(data_sources, list) and data_sources:
+        parts.append("Data sources:")
+        for ds in data_sources:
+            if not isinstance(ds, dict):
+                continue
+            ds_name = ds.get("name") or ds.get("id") or "(unnamed)"
+            parts.append(f"- {ds_name}")
+
+    # Data source (2026-03-11) or legacy database (≤2025-09-03): row schema.
     properties = entity.get("properties") or {}
     if isinstance(properties, dict) and properties:
         parts.append("Properties:")

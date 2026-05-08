@@ -1,7 +1,10 @@
 """Unit tests for the Notion connector.
 
 Covers:
-- parse_webhook_event on a realistic page.updated payload
+- parse_webhook_event on real Notion 2025-09-03 events: page.properties_updated,
+  page.content_updated, page.deleted, database.schema_updated,
+  data_source.content_updated, data_source.deleted
+- parse_webhook_event returns None for deferred (comment.*) and unknown event types
 - blocks_to_markdown on a mix of block types
 - normalize without hydration (no token) → workspace ACL only, empty body
 - normalize with hydrated content → body populated, mentions → PERSON nodes,
@@ -53,26 +56,110 @@ def _make_ctx(env: str = "local") -> ConnectorContext:
 # ---------------------------------------------------------------------------
 
 
-def test_parse_webhook_event_page_updated() -> None:
+def test_parse_webhook_event_page_properties_updated() -> None:
     ctx = _make_ctx()
     notion = build_connector(SourceSystem.NOTION, ctx)
 
-    payload = _load("page_updated.json")
+    payload = _load("page_properties_updated.json")
     result = notion.parse_webhook_event("cust-1", {}, payload)
 
     assert result is not None
-    # Trailing :<16-hex> is a stable payload fingerprint disambiguating rapid
-    # same-second edits (Notion last_edited_time is per-second).
+    # Notion's documented `data` shape for page.properties_updated does NOT
+    # include `last_edited_time` — the parser falls back to the top-level
+    # `timestamp`. Same value here, asserted to lock that fallback in.
     assert result.source_event_id.startswith(
         "page:page_abc123:edit:2026-04-22T12:00:00.000Z:"
     )
+    # Trailing :<16-hex> is a stable payload fingerprint disambiguating rapid
+    # same-second edits.
     assert len(result.source_event_id.rsplit(":", 1)[-1]) == 16
     assert result.event_kind == IngestionEventType.WEBHOOK
     assert result.parse_hint["resource_type"] == "page"
     assert result.parse_hint["resource_id"] == "page_abc123"
     assert result.parse_hint["workspace_id"] == "ws_TEST"
+    assert result.parse_hint["event_type"] == "page.properties_updated"
     assert result.parse_hint["is_delete"] is False
     assert result.received_at.tzinfo is not None
+
+
+def test_parse_webhook_event_page_content_updated() -> None:
+    """page.content_updated is the high-frequency edit event — every block
+    edit on a page funnels through here. Pre-fix, this fell into the unknown
+    bucket and was silently dropped."""
+    ctx = _make_ctx()
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    result = notion.parse_webhook_event(
+        "cust-1",
+        {},
+        {
+            "type": "page.content_updated",
+            "timestamp": "2026-04-22T12:00:00.000Z",
+            "workspace_id": "ws_TEST",
+            "entity": {"type": "page", "id": "page_abc123"},
+            "data": {
+                "parent": {"id": "page_parent_999", "type": "page"},
+                "updated_blocks": [
+                    {"id": "blk_1", "type": "block"},
+                    {"id": "blk_2", "type": "block"},
+                ],
+            },
+        },
+    )
+    assert result is not None
+    assert result.parse_hint["event_type"] == "page.content_updated"
+    assert result.parse_hint["resource_type"] == "page"
+    assert result.parse_hint["is_delete"] is False
+
+
+def test_parse_webhook_event_database_schema_updated() -> None:
+    """database.schema_updated is deprecated in 2025-09-03 but still emitted
+    to subscriptions on older API versions, so we keep it accepted."""
+    ctx = _make_ctx()
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    result = notion.parse_webhook_event(
+        "cust-1",
+        {},
+        {
+            "type": "database.schema_updated",
+            "timestamp": "2026-04-22T12:00:00.000Z",
+            "workspace_id": "ws_TEST",
+            "entity": {"type": "database", "id": "db_abc"},
+            "data": {
+                "parent": {"id": "page_p", "type": "page"},
+                "updated_properties": [
+                    {"id": "prop_1", "name": "Status", "action": "created"}
+                ],
+            },
+        },
+    )
+    assert result is not None
+    assert result.parse_hint["resource_type"] == "database"
+    assert result.parse_hint["is_delete"] is False
+
+
+def test_parse_webhook_event_data_source_content_updated() -> None:
+    """data_source.* events are the 2025-09-03 replacement for the
+    deprecated database.content_updated / database.schema_updated. Must be
+    accepted (not dropped) even though hydration support is a follow-up."""
+    ctx = _make_ctx()
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    result = notion.parse_webhook_event(
+        "cust-1",
+        {},
+        {
+            "type": "data_source.content_updated",
+            "timestamp": "2026-04-22T12:00:00.000Z",
+            "workspace_id": "ws_TEST",
+            "entity": {"type": "data_source", "id": "ds_abc"},
+            "data": {
+                "parent": {"id": "page_p", "type": "page"},
+                "updated_blocks": [{"id": "blk_1", "type": "block"}],
+            },
+        },
+    )
+    assert result is not None
+    assert result.parse_hint["resource_type"] == "data_source"
+    assert result.parse_hint["is_delete"] is False
 
 
 def test_parse_webhook_event_page_deleted_produces_tombstone() -> None:
@@ -90,6 +177,50 @@ def test_parse_webhook_event_page_deleted_produces_tombstone() -> None:
     assert result is not None
     assert result.source_event_id.startswith("page:x:delete:")
     assert result.parse_hint["is_delete"] is True
+
+
+def test_parse_webhook_event_data_source_deleted_produces_tombstone() -> None:
+    """data_source.deleted is the new-API analogue of database.deleted +
+    must produce a tombstone too, otherwise deletes leak."""
+    ctx = _make_ctx()
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    result = notion.parse_webhook_event(
+        "cust-1",
+        {},
+        {
+            "type": "data_source.deleted",
+            "entity": {"type": "data_source", "id": "ds_x"},
+            "timestamp": "2026-04-22T12:00:00.000Z",
+        },
+    )
+    assert result is not None
+    assert result.source_event_id.startswith("data_source:ds_x:delete:")
+    assert result.parse_hint["is_delete"] is True
+
+
+def test_parse_webhook_event_comment_events_deferred() -> None:
+    """Comment events are recognized but not yet ingested — parse must
+    return None (skipped), not raise. Locks in the deferred-events
+    behavior so a future spec change shows up as a failing test rather
+    than as silent drops in prod."""
+    ctx = _make_ctx()
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    for event_type in ("comment.created", "comment.updated", "comment.deleted"):
+        result = notion.parse_webhook_event(
+            "cust-1",
+            {},
+            {
+                "type": event_type,
+                "timestamp": "2026-04-22T12:00:00.000Z",
+                "workspace_id": "ws_TEST",
+                "entity": {"type": "comment", "id": "cmt_x"},
+                "data": {
+                    "page_id": "page_abc123",
+                    "parent": {"id": "page_abc123", "type": "page"},
+                },
+            },
+        )
+        assert result is None, f"{event_type} must be deferred (returned None)"
 
 
 def test_parse_webhook_event_ignores_unknown_type() -> None:
@@ -379,6 +510,101 @@ async def test_fetch_all_blocks_recurses_into_has_children() -> None:
 
 
 # ---------------------------------------------------------------------------
+# _fetch_entity — 2026-03-11 endpoint dispatch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_dispatches_data_source_to_new_endpoint() -> None:
+    """In 2026-03-11, `data_source.*` events must hit /v1/data_sources/{id},
+    not the legacy /v1/databases/{id}. The schema/properties live on the
+    data source record now, not on the parent database."""
+    from shared.models import IntegrationToken
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        calls.append(path)
+        if path == "/v1/data_sources/ds_42":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "data_source",
+                    "id": "ds_42",
+                    "properties": {
+                        "Name": {"id": "name", "type": "title"},
+                        "Status": {"id": "status", "type": "select"},
+                    },
+                    "parent": {"type": "database_id", "database_id": "db_99"},
+                },
+            )
+        return httpx.Response(404, json={"error": f"unmocked {path}"})
+
+    settings = Settings(environment="local")
+    ctx = ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = IntegrationToken(
+        customer_id="c", source_system=SourceSystem.NOTION, access_token="x"
+    )
+
+    entity = await notion._fetch_entity("data_source", "ds_42", token)
+    assert entity is not None
+    assert entity["object"] == "data_source"
+    assert entity["properties"]["Name"]["type"] == "title"
+    # Critically: the call goes to /v1/data_sources/{id}, not /v1/databases/{id}.
+    assert calls == ["/v1/data_sources/ds_42"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_entity_database_uses_databases_endpoint() -> None:
+    """Sanity: database events still hit /v1/databases/{id}; only the
+    response shape (now a container with data_sources) changed."""
+    from shared.models import IntegrationToken
+
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        calls.append(path)
+        if path == "/v1/databases/db_99":
+            return httpx.Response(
+                200,
+                json={
+                    "object": "database",
+                    "id": "db_99",
+                    "title": [{"type": "text", "plain_text": "Engineering tasks",
+                               "text": {"content": "Engineering tasks"}}],
+                    "data_sources": [
+                        {"id": "ds_42", "name": "Default"},
+                        {"id": "ds_43", "name": "Archive"},
+                    ],
+                },
+            )
+        return httpx.Response(404, json={"error": f"unmocked {path}"})
+
+    settings = Settings(environment="local")
+    ctx = ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = IntegrationToken(
+        customer_id="c", source_system=SourceSystem.NOTION, access_token="x"
+    )
+
+    entity = await notion._fetch_entity("database", "db_99", token)
+    assert entity is not None
+    assert calls == ["/v1/databases/db_99"]
+    # New 2026-03-11 container shape — data_sources, no top-level properties.
+    assert [ds["id"] for ds in entity["data_sources"]] == ["ds_42", "ds_43"]
+    assert "properties" not in entity
+
+
+# ---------------------------------------------------------------------------
 # normalize
 # ---------------------------------------------------------------------------
 
@@ -400,7 +626,7 @@ async def test_normalize_without_token_empty_body() -> None:
     ctx = _make_ctx()
     notion = build_connector(SourceSystem.NOTION, ctx)
 
-    event = _webhook_event(_load("page_updated.json"))
+    event = _webhook_event(_load("page_properties_updated.json"))
     result = await notion.normalize(event, {})
 
     assert not result.is_empty
@@ -420,7 +646,7 @@ async def test_normalize_reads_entity_body_markdown_synth_bypass() -> None:
     instead of the empty hydrated dict. Real Notion webhooks never set
     entity.body_markdown, so this fallback is a no-op on prod traffic.
     """
-    payload = _load("page_updated.json")
+    payload = _load("page_properties_updated.json")
     # scripts/synth/output/notion.py inlines these fields on entity.
     payload["entity"]["body_markdown"] = "# Synth page\n\nBody content from synth corpus."
     payload["entity"]["properties"] = {
@@ -466,7 +692,7 @@ async def test_normalize_with_hydrated_content() -> None:
     ctx = _make_ctx()
     notion = build_connector(SourceSystem.NOTION, ctx)
 
-    event = _webhook_event(_load("page_updated.json"))
+    event = _webhook_event(_load("page_properties_updated.json"))
     entity = _load("page_metadata.json")
     blocks = _load("blocks.json")["results"]
 
@@ -521,6 +747,72 @@ async def test_normalize_with_hydrated_content() -> None:
     # Parent chain captured in metadata so Phase 1 enforcement can walk it.
     assert all(r.metadata.get("inherits") is True for r in rows)
     assert all(r.metadata.get("parent_id") == "page_parent_999" for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_normalize_propagates_in_trash_field() -> None:
+    """2026-03-11 renamed `archived` → `in_trash`. Metadata key follows
+    the new spec; legacy `archived` payloads still flow through via the
+    fallback so cached / replayed envelopes don't lose the bit."""
+    ctx = _make_ctx()
+    notion = build_connector(SourceSystem.NOTION, ctx)
+
+    event = _webhook_event(_load("page_properties_updated.json"))
+
+    # Spec-compliant 2026-03-11 entity uses in_trash.
+    entity_new = {"in_trash": True, "properties": {}}
+    result_new = await notion.normalize(event, {"entity": entity_new})
+    assert result_new.documents[0].metadata["in_trash"] is True
+
+    # Legacy entity uses archived. Fallback must catch it.
+    entity_legacy = {"archived": True, "properties": {}}
+    result_legacy = await notion.normalize(event, {"entity": entity_legacy})
+    assert result_legacy.documents[0].metadata["in_trash"] is True
+
+    # Default (neither field set) is False.
+    result_default = await notion.normalize(event, {"entity": {"properties": {}}})
+    assert result_default.documents[0].metadata["in_trash"] is False
+
+
+def test_database_schema_summary_renders_2026_container_shape() -> None:
+    """`GET /v1/databases/{id}` in 2026-03-11 returns a container with
+    `data_sources: [...]` (no top-level properties). The summary must
+    include the data_sources list rather than fall back to an empty body."""
+    from services.ingestion.handlers.notion import _database_schema_summary
+
+    container_entity = {
+        "object": "database",
+        "id": "db_99",
+        "description": [{"plain_text": "Engineering tickets"}],
+        "data_sources": [
+            {"id": "ds_42", "name": "Default"},
+            {"id": "ds_43", "name": "Archive"},
+        ],
+    }
+    summary = _database_schema_summary(container_entity)
+    assert "Engineering tickets" in summary
+    assert "Data sources:" in summary
+    assert "- Default" in summary
+    assert "- Archive" in summary
+
+
+def test_database_schema_summary_renders_data_source_properties() -> None:
+    """A data_source record (or a legacy database) carries `properties`
+    directly — summarize them as before."""
+    from services.ingestion.handlers.notion import _database_schema_summary
+
+    ds_entity = {
+        "object": "data_source",
+        "id": "ds_42",
+        "properties": {
+            "Name": {"id": "name", "type": "title"},
+            "Status": {"id": "status", "type": "select"},
+        },
+    }
+    summary = _database_schema_summary(ds_entity)
+    assert "Properties:" in summary
+    assert "- Name (title)" in summary
+    assert "- Status (select)" in summary
 
 
 # ---------------------------------------------------------------------------
