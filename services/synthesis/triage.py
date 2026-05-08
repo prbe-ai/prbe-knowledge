@@ -523,12 +523,19 @@ async def _safe_recurse(
     try:
         return await call_triage_with_split_retry(client, events, now=now)
     except Exception as exc:
-        log.exception(
+        # WARNING (not ERROR): this is an EXPECTED defensive branch — the
+        # whole point is to swallow exceptions gracefully so the parent
+        # batch keeps making progress. Logging at ERROR would alert on
+        # every transient 5xx during a triage drain, which is exactly the
+        # noise pattern this fix is meant to suppress. Match the level
+        # used by every other split_retry log in this module.
+        log.warning(
             "triage.split_retry.recursion_failed",
             sub_batch_size=len(events),
             queue_ids=[ev.queue_id for ev in events],
             cause=type(exc).__name__,
             error=str(exc),
+            exc_info=True,
         )
         return _synthesize_rejections(events, TRIAGE_RECURSION_FAILED_REASON)
 
