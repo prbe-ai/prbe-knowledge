@@ -140,6 +140,13 @@ def _insert_mermaid_after_intro(body: str, new_block: str) -> str:
     return body[:insertion_point] + f"\n\n{new_block}\n" + body[insertion_point:]
 
 
+# DIAGRAM DISABLED — paused 2026-05-08. No active code path calls this
+# function: PR #192 paused refresh_cross_repo_edges (its sole nightly
+# caller in nightly_trigger.py), and the rendering-side disable in
+# index_renderer.py means new wiki bodies don't include a mermaid block.
+# Function body is intentionally left intact for one-off cleanup runs
+# (`flyctl machine run ... regenerate_wiki_diagram(customer_id=...)`)
+# and for revival when the cross-repo edge pipeline returns.
 async def regenerate_wiki_diagram(
     *,
     customer_id: str,

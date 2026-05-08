@@ -277,22 +277,24 @@ async def render_index_via_llm(
             )
             return _fallback_flat_list(pages)
 
-    edges: list[_RepoEdge] = []
-    if customer_id:
-        try:
-            edges = await fetch_verified_repo_edges(customer_id)
-        except Exception as exc:
-            log.warning(
-                "index_renderer.edge_fetch_failed",
-                error=str(exc),
-                error_class=type(exc).__name__,
-            )
-    edges_block = _format_edges_for_prompt(edges)
+    # DIAGRAM DISABLED — edges are no longer fetched or fed to the LLM
+    # since the wiki index doesn't render an architecture diagram.
+    # See the splice block at the end of this function.
+    # edges: list[_RepoEdge] = []
+    # if customer_id:
+    #     try:
+    #         edges = await fetch_verified_repo_edges(customer_id)
+    #     except Exception as exc:
+    #         log.warning(
+    #             "index_renderer.edge_fetch_failed",
+    #             error=str(exc),
+    #             error_class=type(exc).__name__,
+    #         )
+    # edges_block = _format_edges_for_prompt(edges)
 
     user_prompt = (
         f"Wiki page corpus ({len(pages)} pages):\n\n"
-        f"{_format_pages_for_prompt(pages)}\n\n"
-        f"{edges_block}"
+        f"{_format_pages_for_prompt(pages)}"
     )
 
     try:
@@ -326,18 +328,24 @@ async def render_index_via_llm(
     text = _strip_leading_wiki_heading(text)
     text = _strip_empty_bullets(text)
 
-    # Splice the deterministic Mermaid block in. Lazy import to avoid
-    # the circular `diagram_renderer ↔ index_renderer` reference at
-    # module-load time. The splice strips ANY mermaid blocks the LLM
-    # may have emitted (the prompt forbids them but defense in depth)
-    # and inserts exactly one good block after the intro paragraph.
-    from services.synthesis.diagram_renderer import (
-        _build_mermaid_block,
-        splice_mermaid_block,
-    )
-
-    new_block = _build_mermaid_block(edges)
-    text = splice_mermaid_block(text, new_block)
+    # DIAGRAM DISABLED — paused 2026-05-08 (PR #192 paused cross-repo
+    # edge extraction; this commit pauses the rendering side). The
+    # wiki index no longer includes a mermaid architecture diagram.
+    # We still strip any pre-existing mermaid block the LLM might
+    # accidentally emit despite the system-prompt forbid (defense in
+    # depth) — but we no longer rebuild and splice in a new one.
+    #
+    # To revive: uncomment the _build_mermaid_block + splice insertion
+    # below, and re-enable cross-repo edge extraction (see CROSS-REPO
+    # DEPS DISABLED markers in codegraph.py and nightly_trigger.py).
+    from services.synthesis.diagram_renderer import splice_mermaid_block
+    text = splice_mermaid_block(text, "")
+    # from services.synthesis.diagram_renderer import (
+    #     _build_mermaid_block,
+    #     splice_mermaid_block,
+    # )
+    # new_block = _build_mermaid_block(edges)
+    # text = splice_mermaid_block(text, new_block)
 
     return text + "\n" if not text.endswith("\n") else text
 
