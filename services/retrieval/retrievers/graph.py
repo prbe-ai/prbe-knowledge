@@ -343,4 +343,14 @@ async def graph_search(
                 retriever_scores={"surprise": would_be_score},
             )
         )
+
+    # Flag-gated sort: when SURPRISE_SCORE_ENABLED, the highest-surprise
+    # edge lands at rank 1 so fusion's RRF (1/(k+rank)) gives it the
+    # biggest graph-side contribution. Without this sort, hits arrive in
+    # the SQL's heap-scan order -- which means fusion weights an arbitrary
+    # neighbor highest, not the most informative one. Tie-break by chunk_id
+    # so the rank order is deterministic across runs.
+    # Flag-off path is unchanged: returns hits in DB order, score=1.0.
+    if SURPRISE_SCORE_ENABLED:
+        hits.sort(key=lambda h: (-h.score, h.chunk_id))
     return hits
