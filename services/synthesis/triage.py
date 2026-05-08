@@ -71,6 +71,8 @@ __all__ = [
     "OVERSIZED_AT_CALL_TIME_REASON",
     "OVERSIZED_EVENT_TOKENS",
     "PROMPT_OVERHEAD_TOKENS",
+    "TRIAGE_FINAL_MILE_SYNTHESIS_REASON",
+    "TRIAGE_RECURSION_FAILED_REASON",
     "TriageParseError",
     "call_triage",
     "call_triage_with_split_retry",
@@ -234,6 +236,22 @@ async def call_triage(
 # from regular score-rejected rows.
 OVERSIZED_AT_CALL_TIME_REASON = "triage.oversized_event_at_call_time"
 
+# Reason tag for events whose recursive split-retry sub-call raised a
+# non-overflow exception (transient 5xx, network blip, unclassified
+# parse error). Synthesizing rejection verdicts for these — instead of
+# letting the exception bubble — preserves any sibling sub-call's
+# verdicts and stops the whole batch from churning through
+# mark_for_retry into status='failed'.
+TRIAGE_RECURSION_FAILED_REASON = "triage.recursion_failed"
+
+# Reason tag for events that survived all recovery (split-retry,
+# partial-response retry) but are STILL missing from the merged
+# output dict at the very last moment. The final-mile guard
+# synthesizes a rejection rather than letting the row dead-letter
+# as 'failed' with the misleading "no verdict from triage batch"
+# tombstone (production hot bug, probe-founders).
+TRIAGE_FINAL_MILE_SYNTHESIS_REASON = "triage.final_mile_synthesis"
+
 
 # Anthropic's BadRequestError message for an oversized prompt looks like:
 #   "prompt is too long: 211739 tokens > 200000 maximum"
@@ -290,6 +308,23 @@ def _rejected_output_for_single_oversize(event: TriageInput) -> TriageOutput:
         reason=OVERSIZED_AT_CALL_TIME_REASON,
     )
     return TriageOutput(verdicts={str(event.queue_id): verdict})
+
+
+def _synthesize_rejections(
+    events: list[TriageInput], reason: str
+) -> TriageOutput:
+    """Build a TriageOutput full of (important=False, score=0.0, reason=...)
+    verdicts — one per event. Used by the recursion-failed and final-mile
+    guards so missing qids route to mark_rejected instead of leaking out
+    of the function uncovered."""
+    verdicts: dict[str, TriageVerdict] = {}
+    for ev in events:
+        verdicts[str(ev.queue_id)] = TriageVerdict(
+            important=False,
+            score=0.0,
+            reason=reason,
+        )
+    return TriageOutput(verdicts=verdicts)
 
 
 def _merge_outputs(a: TriageOutput, b: TriageOutput) -> TriageOutput:
@@ -356,6 +391,7 @@ async def call_triage_with_split_retry(
          the missing subset only (the events that DID get verdicts
          keep them, no double work).
     """
+    output: TriageOutput
     try:
         output = await call_triage(client, events, now=now)
     except (BadRequestError, TriageParseError) as exc:
@@ -376,55 +412,132 @@ async def call_triage_with_split_retry(
                 # Defensive: shouldn't happen — call_triage short-circuits
                 # on empty input — but if it does, surface it.
                 raise
-            return _rejected_output_for_single_oversize(events[0])
-        midpoint = len(events) // 2
-        left = events[:midpoint]
-        right = events[midpoint:]
-        log.warning(
-            "triage.split_retry.splitting",
-            batch_size=len(events),
-            left_size=len(left),
-            right_size=len(right),
-            cause=type(exc).__name__,
-            error=_overflow_error_message(exc),
-        )
-        left_out = await call_triage_with_split_retry(client, left, now=now)
-        right_out = await call_triage_with_split_retry(client, right, now=now)
-        return _merge_outputs(left_out, right_out)
+            output = _rejected_output_for_single_oversize(events[0])
+        else:
+            midpoint = len(events) // 2
+            left = events[:midpoint]
+            right = events[midpoint:]
+            log.warning(
+                "triage.split_retry.splitting",
+                batch_size=len(events),
+                left_size=len(left),
+                right_size=len(right),
+                cause=type(exc).__name__,
+                error=_overflow_error_message(exc),
+            )
+            # Wrap each recursive call. A non-overflow exception in one
+            # branch (transient 5xx, network blip, unclassified parse
+            # error) MUST NOT poison the sibling branch's verdicts or
+            # bubble up — that's exactly the production failure mode
+            # this hardening targets (probe-founders, "no verdict from
+            # triage batch").
+            left_out = await _safe_recurse(client, left, now=now)
+            right_out = await _safe_recurse(client, right, now=now)
+            output = _merge_outputs(left_out, right_out)
+    else:
+        # Successful parse — but did Haiku cover every input event?
+        # Output keys are stringified queue_ids per the schema.
+        input_qids = {str(ev.queue_id) for ev in events}
+        output_qids = set(output.verdicts.keys())
+        missing_qids = input_qids - output_qids
+        if missing_qids:
+            if len(events) <= 1:
+                # Single-event batch with no verdict — same recovery as the
+                # exception path leaf. Mark it rejected with the oversize
+                # reason so the worker's apply-verdicts path moves it out of
+                # the pending pool deterministically.
+                log.warning(
+                    "triage.split_retry.single_event_no_verdict",
+                    queue_id=events[0].queue_id,
+                    doc_id=events[0].doc_id,
+                )
+                output = _rejected_output_for_single_oversize(events[0])
+            else:
+                # Partial response: keep the verdicts we got, recurse on
+                # just the events Haiku skipped. Splitting the skipped
+                # subset (not the full batch) avoids redoing successful
+                # work and converges quickly on the truncation tail.
+                missing_events = [
+                    ev for ev in events if str(ev.queue_id) in missing_qids
+                ]
+                log.warning(
+                    "triage.split_retry.partial_response",
+                    batch_size=len(events),
+                    verdicts_returned=len(output_qids),
+                    missing=len(missing_qids),
+                )
+                # Same recursion-wrap rationale as the exception path: a
+                # non-overflow exception here would otherwise discard the
+                # parent call's already-collected verdicts.
+                missing_out = await _safe_recurse(
+                    client, missing_events, now=now
+                )
+                output = _merge_outputs(output, missing_out)
 
-    # Successful parse — but did Haiku cover every input event?
-    # Output keys are stringified queue_ids per the schema.
-    input_qids = {str(ev.queue_id) for ev in events}
-    output_qids = set(output.verdicts.keys())
-    missing_qids = input_qids - output_qids
-    if not missing_qids:
-        return output
-    if len(events) <= 1:
-        # Single-event batch with no verdict — same recovery as the
-        # exception path leaf. Mark it rejected with the oversize
-        # reason so the worker's apply-verdicts path moves it out of
-        # the pending pool deterministically.
+    # Last-mile defense (production: probe-founders).
+    # Even after split-retry + partial-response recovery, if any input
+    # qid is somehow STILL missing from output.verdicts (e.g. a
+    # recursive call returned an output keyed on the wrong qid, a
+    # downstream logic gap, anything unexpected), synthesize a rejection
+    # verdict here. Without this, those rows fall into _apply_verdicts
+    # → mark_for_retry → ... → status='failed' with the misleading
+    # tombstone "no verdict from triage batch". A synthesized rejection
+    # routes to mark_rejected instead — visible in the 'rejected'
+    # bucket with a clear reason, and the queue stops bleeding.
+    final_input_qids = {str(ev.queue_id) for ev in events}
+    final_missing = final_input_qids - set(output.verdicts.keys())
+    if final_missing:
+        missing_events = [
+            ev for ev in events if str(ev.queue_id) in final_missing
+        ]
         log.warning(
-            "triage.split_retry.single_event_no_verdict",
-            queue_id=events[0].queue_id,
-            doc_id=events[0].doc_id,
+            "triage.split_retry.final_mile_synthesis",
+            batch_size=len(events),
+            verdicts_returned=len(output.verdicts),
+            missing=len(final_missing),
+            missing_qids=sorted(final_missing),
         )
-        return _rejected_output_for_single_oversize(events[0])
-    # Partial response: keep the verdicts we got, recurse on just
-    # the events Haiku skipped. Splitting the skipped subset further
-    # (rather than the full batch) avoids redoing successful work
-    # and converges quickly on the truncation tail.
-    missing_events = [ev for ev in events if str(ev.queue_id) in missing_qids]
-    log.warning(
-        "triage.split_retry.partial_response",
-        batch_size=len(events),
-        verdicts_returned=len(output_qids),
-        missing=len(missing_qids),
-    )
-    missing_out = await call_triage_with_split_retry(
-        client, missing_events, now=now
-    )
-    return _merge_outputs(output, missing_out)
+        fill = _synthesize_rejections(
+            missing_events, TRIAGE_FINAL_MILE_SYNTHESIS_REASON
+        )
+        output = _merge_outputs(output, fill)
+    return output
+
+
+async def _safe_recurse(
+    client: AsyncAnthropic,
+    events: list[TriageInput],
+    *,
+    now: datetime,
+) -> TriageOutput:
+    """Run `call_triage_with_split_retry` on a sub-batch, swallowing any
+    unexpected exception by synthesizing rejection verdicts for every
+    event the sub-call was supposed to cover.
+
+    Critical for probe-founders: a single recursive branch raising
+    a transient 5xx or network error MUST NOT bubble up and discard
+    the sibling branch's already-collected verdicts. Instead we tag
+    those events with `TRIAGE_RECURSION_FAILED_REASON` and let the
+    worker mark them rejected — the rest of the batch makes progress.
+    """
+    try:
+        return await call_triage_with_split_retry(client, events, now=now)
+    except Exception as exc:
+        # WARNING (not ERROR): this is an EXPECTED defensive branch — the
+        # whole point is to swallow exceptions gracefully so the parent
+        # batch keeps making progress. Logging at ERROR would alert on
+        # every transient 5xx during a triage drain, which is exactly the
+        # noise pattern this fix is meant to suppress. Match the level
+        # used by every other split_retry log in this module.
+        log.warning(
+            "triage.split_retry.recursion_failed",
+            sub_batch_size=len(events),
+            queue_ids=[ev.queue_id for ev in events],
+            cause=type(exc).__name__,
+            error=str(exc),
+            exc_info=True,
+        )
+        return _synthesize_rejections(events, TRIAGE_RECURSION_FAILED_REASON)
 
 
 # Output-side overflow signature on TriageParseError: the parser's
