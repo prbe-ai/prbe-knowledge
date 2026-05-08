@@ -557,6 +557,15 @@ _PARSE_OVERFLOW_REGEXES = (
     # recovery applies.
     re.compile(r"type=dict_type", re.IGNORECASE),
     re.compile(r"valid dictionary", re.IGNORECASE),
+    # Belt-and-suspenders for TriageVerdict.reason length: the model
+    # has a `field_validator(mode="before")` that truncates 240+ char
+    # reasons before the constraint runs, so this regex should never
+    # actually fire in steady state. But if anyone ever removes that
+    # validator (refactor, accidental revert), Haiku-overlong-reason
+    # errors would otherwise hard-fail the batch — match them as
+    # overflow-shaped so the wrapper at least split-retries.
+    re.compile(r"type=string_too_long", re.IGNORECASE),
+    re.compile(r"String should have at most", re.IGNORECASE),
 )
 
 
