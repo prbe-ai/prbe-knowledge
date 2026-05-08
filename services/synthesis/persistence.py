@@ -56,6 +56,7 @@ __all__ = [
     "mark_batch_triage_error",
     "mark_batch_triaged_and_notify",
     "mark_for_retry",
+    "mark_orphans_rejected",
     "mark_rejected",
     "mark_synthesis_done",
     "mark_synthesis_error",
@@ -311,8 +312,11 @@ async def fetch_bodies(
             key = (info["doc_id"], info["doc_version"])
             doc_row = meta_lookup.get(key)
             if doc_row is None:
-                # Doc was deleted between enqueue and drain. Skip — the
-                # queue row's missing-verdict path will mark it.
+                # Doc was superseded by valid_to or soft-deleted between
+                # enqueue and drain. Skip here; the worker handles these
+                # via mark_orphans_rejected (status='rejected' with a
+                # categorized reason) instead of letting them fall through
+                # to mark_for_retry's 3-attempt churn.
                 continue
             body = await fetch_body_from_chunks_for_version(
                 conn,
@@ -403,6 +407,49 @@ async def mark_rejected(
             customer_id,
             verdict.score,
             queue_id,
+        )
+
+
+async def mark_orphans_rejected(
+    customer_id: str,
+    queue_ids: list[int],
+    *,
+    reason: str,
+) -> None:
+    """Mark queue rows whose document body could not be fetched (version
+    superseded by valid_to, or soft-deleted) as 'rejected' immediately.
+
+    These rows would otherwise loop through `mark_for_retry` for 3
+    attempts before dead-lettering as 'failed' with the misleading
+    "no verdict from triage batch" tombstone — and that retry is
+    pointless because the doc body is GONE for that version. The
+    superseding doc version (if any) has its own queue row.
+
+    Sets `triage_score=0.0` and stamps `triage_completed_at=NOW()` so
+    the row presents identically to a normal score-rejected row in the
+    dashboard. `triage_error` carries the categorized reason.
+
+    Defensive WHERE: only updates rows still in their claimed
+    'triaging' state. Avoids racing if some other path moved the row
+    (e.g. reclaim_stuck_rows after a worker SIGKILL).
+    """
+    if not queue_ids:
+        return
+    async with with_tenant(customer_id) as conn:
+        await conn.execute(
+            """
+            UPDATE wiki_synthesis_queue
+            SET status = 'rejected',
+                triage_score = 0.0,
+                triage_completed_at = NOW(),
+                triage_error = $2
+            WHERE customer_id = $1
+              AND queue_id = ANY($3::bigint[])
+              AND status = 'triaging'
+            """,
+            customer_id,
+            reason,
+            queue_ids,
         )
 
 

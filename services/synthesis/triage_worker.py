@@ -53,6 +53,17 @@ from shared.logging import get_logger
 log = get_logger(__name__)
 
 
+# Reason tag for queue rows whose doc version was superseded (valid_to set)
+# or soft-deleted (deleted_at set) between enqueue and drain. fetch_bodies
+# joins documents on `valid_to IS NULL AND deleted_at IS NULL`, so those
+# rows drop out of triage_inputs and would otherwise be churned by
+# mark_for_retry for 3 attempts before dead-lettering as 'failed' with
+# the misleading "no verdict from triage batch" tombstone — wasted work,
+# because the body is GONE for that version. The superseding version has
+# its own queue row covering the content.
+TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON = "triage.doc_superseded_or_deleted"
+
+
 class TriageWorker:
     """Drain pending wiki_synthesis_queue rows through triage.
 
@@ -182,6 +193,37 @@ class TriageWorker:
                 # transition the queue rows.
                 if oversized:
                     await self._reject_oversized(customer_id, oversized)
+
+                # Detect rows whose body fetch returned nothing (doc
+                # version superseded by valid_to, or soft-deleted between
+                # enqueue and drain). Without this, _apply_verdicts would
+                # see no verdict for them and call mark_for_retry, which
+                # churns through 3 attempts before dead-lettering as
+                # 'failed' with the misleading "no verdict from triage
+                # batch" tombstone (production hot bug, probe-founders
+                # 2026-05-08). The superseding version has its own queue
+                # row; this one is just stale.
+                input_qids = {ti.queue_id for ti in triage_inputs}
+                oversized_qids = {ev.queue_id for ev in oversized}
+                orphan_queue_ids = [
+                    row["queue_id"]
+                    for row in queue_rows
+                    if row["queue_id"] not in input_qids
+                    and row["queue_id"] not in oversized_qids
+                ]
+                if orphan_queue_ids:
+                    log.warning(
+                        "triage_worker.orphan_queue_rows_rejected",
+                        customer=customer_id,
+                        count=len(orphan_queue_ids),
+                        queue_ids=orphan_queue_ids,
+                    )
+                    await persistence.mark_orphans_rejected(
+                        customer_id,
+                        orphan_queue_ids,
+                        reason=TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON,
+                    )
+
                 verdicts = await self._call_triage_batches(client, batches, customer_id)
                 events_triaged += len(verdicts)
 
@@ -206,9 +248,22 @@ class TriageWorker:
                     run_error = reason
                     return
 
+                # Pass only non-orphan, non-oversized queue_rows to
+                # _apply_verdicts. Orphans were already marked 'rejected'
+                # above; oversized were marked in _reject_oversized.
+                # mark_for_retry has no status filter in its WHERE clause,
+                # so without this filter it would clobber those rows back
+                # to 'pending' (or 'failed') on the next drain.
+                orphan_qids_set = set(orphan_queue_ids)
+                to_apply_rows = [
+                    row
+                    for row in queue_rows
+                    if row["queue_id"] not in orphan_qids_set
+                    and row["queue_id"] not in oversized_qids
+                ]
                 events_kept += await self._apply_verdicts(
                     customer_id,
-                    queue_rows,
+                    to_apply_rows,
                     verdicts,
                 )
         except Exception as exc:
@@ -394,4 +449,4 @@ class TriageWorker:
         )
 
 
-__all__ = ["TriageWorker"]
+__all__ = ["TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON", "TriageWorker"]
