@@ -18,7 +18,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # WikiType — the page-kind discriminator.
@@ -80,6 +80,29 @@ class TriageVerdict(BaseModel):
             "One short sentence (<= 240 chars) explaining the decision for the audit log. Be terse."
         ),
     )
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _truncate_overlong_reason(cls, v: object) -> object:
+        # Haiku occasionally writes longer reasons than the schema asks
+        # for. Production hot bug (probe-founders, 2026-05-08): one
+        # verdict's reason was 300+ chars, Pydantic raised
+        # string_too_long on the batch-wide TriageOutput parse, the
+        # provider wrapped it as TriageParseError, the split-retry
+        # wrapper's overflow regexes didn't match, the batch was
+        # marked triage_error on every row, and the worker's
+        # "no verdicts this iteration" branch DLQ'd every pending row
+        # for the customer.
+        #
+        # Truncate to the schema cap BEFORE the length validator runs;
+        # `mode="before"` is the explicit Pydantic v2 spelling for
+        # pre-constraint validators. The schema constraint still ships
+        # to Haiku in the tool input_schema (nudging it toward terse
+        # reasons), but enforcement no longer poisons sibling verdicts
+        # when Haiku ignores the hint.
+        if isinstance(v, str) and len(v) > 240:
+            return v[:240]
+        return v
 
 
 class TriageOutput(BaseModel):

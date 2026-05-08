@@ -461,6 +461,57 @@ async def test_dict_type_pydantic_error_triggers_split() -> None:
 
 
 # ---------------------------------------------------------------------------
+# string_too_long: defense-in-depth in case the model field_validator is
+# ever removed. The TriageVerdict.reason field has a
+# field_validator(mode="before") that truncates to 240 chars before the
+# constraint runs, so in steady state this overflow shape is unreachable.
+# But if a refactor strips that validator, Haiku-overlong-reason failures
+# should at least split-retry instead of poisoning the batch.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_overflow_matches_string_too_long_type_tag() -> None:
+    """The literal `type=string_too_long` tag in a Pydantic v2 error
+    message is recognized as overflow-shaped."""
+    from services.synthesis.providers import TriageParseError
+    from services.synthesis.triage import _is_parse_overflow_error
+
+    msg = (
+        "triage tool input failed validation: 1 validation error for "
+        "TriageOutput verdicts.10471.reason\n  String should have at "
+        "most 240 characters [type=string_too_long, "
+        "input_value='Detailed architectural d...n and system "
+        "ownership.', input_type=str]"
+    )
+    err = TriageParseError(msg)
+    assert _is_parse_overflow_error(err) is True
+
+
+def test_parse_overflow_matches_string_should_have_at_most_phrasing() -> None:
+    """Match the human-readable phrasing too — Pydantic occasionally
+    surfaces the constraint message without the `type=` tag depending on
+    surrounding context."""
+    from services.synthesis.providers import TriageParseError
+    from services.synthesis.triage import _is_parse_overflow_error
+
+    err = TriageParseError(
+        "validation failed: String should have at most 240 characters"
+    )
+    assert _is_parse_overflow_error(err) is True
+
+
+def test_parse_overflow_skips_unrelated_parse_error() -> None:
+    """Sanity: an unrelated TriageParseError (e.g. wrong tool name) MUST
+    NOT be classified as overflow-shaped — those errors should propagate
+    instead of triggering a wasteful split-retry."""
+    from services.synthesis.providers import TriageParseError
+    from services.synthesis.triage import _is_parse_overflow_error
+
+    err = TriageParseError("response had unexpected tool name 'foo'")
+    assert _is_parse_overflow_error(err) is False
+
+
+# ---------------------------------------------------------------------------
 # Hardening: every input qid must have a verdict on every successful return.
 # ---------------------------------------------------------------------------
 #
