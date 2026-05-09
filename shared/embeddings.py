@@ -332,15 +332,18 @@ class GeminiEmbedder(_BaseEmbedder):
     # this turns into ~30 sequential HTTP round trips that bottleneck on
     # network latency, not API throughput. Splitting our batch into smaller
     # sub-batches and asyncio.gather'ing them gives the SDK no choice but
-    # to issue them concurrently. Empirically pushes the backfill from
-    # ~85 chunks/min to ~700+ chunks/min on prbe-knowledge-worker.
+    # to issue them concurrently.
     #
-    # GROUP_SIZE = 8 keeps each sub-call well under Gemini's per-request
-    # limits and makes any context-length-exceeded splits cheap.
-    # MAX_PARALLEL = 16 caps concurrent in-flight calls to stay under
-    # Gemini's per-minute quota at our scale.
-    _SUBBATCH_GROUP_SIZE = 8
-    _SUBBATCH_MAX_PARALLEL = 16
+    # GROUP_SIZE = 4 keeps each sub-call close to one HTTP round trip
+    # (the SDK splits larger inputs internally). MAX_PARALLEL = 64 lets a
+    # single process saturate per-host network I/O at ~250ms per round
+    # trip = ~250 RPM per process. Across 4 partitioned workers that's
+    # ~1000 RPM total, well under the 20k-RPM Tier 3 ceiling for
+    # Gemini Embedding 2. Earlier values (8/16) left the project at ~1.3k
+    # RPM (6% utilization) and finished a 91k-chunk backfill in ~7-8h
+    # instead of <1h.
+    _SUBBATCH_GROUP_SIZE = 4
+    _SUBBATCH_MAX_PARALLEL = 64
 
     async def _embed_once(self, batch: list[str]) -> list[list[float]]:
         client = self._ensure_client()

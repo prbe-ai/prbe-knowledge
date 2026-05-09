@@ -225,7 +225,7 @@ class _FakeEmbedResponse:
 
 @pytest.mark.asyncio
 async def test_gemini_embed_once_splits_into_subbatches_in_order(monkeypatch) -> None:
-    """A 24-item batch with GROUP_SIZE=8 must issue exactly 3 sub-calls and
+    """A batch must split into exactly ceil(N / GROUP_SIZE) sub-calls and
     return vectors in original input order. asyncio.gather completion order
     is non-deterministic; without explicit reassembly the vectors would
     scramble against their inputs.
@@ -248,14 +248,15 @@ async def test_gemini_embed_once_splits_into_subbatches_in_order(monkeypatch) ->
 
     monkeypatch.setattr(embedder, "_ensure_client", lambda: _FakeClient())
 
-    inputs = [f"item:{i}" for i in range(24)]
+    n_items = 24
+    inputs = [f"item:{i}" for i in range(n_items)]
     vectors = await embedder._embed_once(inputs)
 
-    # 24 inputs / GROUP_SIZE=8 = exactly 3 sub-calls.
-    assert len(captured_inputs) == 3
-    assert sum(len(g) for g in captured_inputs) == 24
+    expected_calls = (n_items + embedder._SUBBATCH_GROUP_SIZE - 1) // embedder._SUBBATCH_GROUP_SIZE
+    assert len(captured_inputs) == expected_calls
+    assert sum(len(g) for g in captured_inputs) == n_items
     # Vector at index i must encode i in dim 0 -- proves no scramble.
-    assert [int(v[0]) for v in vectors] == list(range(24))
+    assert [int(v[0]) for v in vectors] == list(range(n_items))
 
 
 @pytest.mark.asyncio
