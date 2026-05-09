@@ -46,7 +46,6 @@ from shared.logging import configure_logging, get_logger
 from shared.models import (
     AnswerRequest,
     AnswerResponse,
-    QueryDocumentResult,
     QueryRequest,
     QueryResponse,
     SourceResponse,
@@ -108,9 +107,6 @@ def _log_query_handled(
 ) -> None:
     """Structured per-query log. Captures everything an operator needs to
     debug a misroute or empty result without re-running the query."""
-    chunks_total = sum(
-        len(r.chunks) for r in resp.results if isinstance(r, QueryDocumentResult)
-    )
     payload: dict[str, object] = {
         "trace_id": resp.trace_id,
         "endpoint": endpoint,
@@ -121,7 +117,6 @@ def _log_query_handled(
         "applied_sort_field": (resp.applied_sort or {}).get("field"),
         "extracted_entity_types": [e.get("entity_type") for e in resp.extracted_entities],
         "results_count": len(resp.results),
-        "chunks_count": chunks_total,
         "aggregation_present": resp.aggregation is not None,
         "total_candidates": resp.total_candidates,
         "total_ms": total_ms,
@@ -406,11 +401,6 @@ async def query_stream(
                     "applied_mode": rresp.applied_mode,
                     "applied_doc_types": rresp.applied_doc_types,
                     "results_count": len(rresp.results),
-                    "chunks_count": sum(
-                        len(r.chunks)
-                        for r in rresp.results
-                        if isinstance(r, QueryDocumentResult)
-                    ),
                     "total_candidates": rresp.total_candidates,
                     "total_ms": timing["total_ms"],
                     "stage_ms": timing,
