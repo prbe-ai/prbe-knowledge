@@ -14,12 +14,33 @@ Multiplicative model: each component contributes a multiplier; all default
 to 1.0 when the relevant input is None or unknown.
 
 Components (in application order):
-  1. Confidence weight  AMBIGUOUS=1.5, INFERRED=1.25, EXTRACTED=1.0
-  2. Cross-source bonus anchor_source != target_source -> 1.5
-  3. Cross-community bonus anchor_community != target_community
-                          AND both not None -> 1.4
+  1. Confidence weight       AMBIGUOUS=1.5, INFERRED=1.25, EXTRACTED=1.0
+  2. Cross-source bonus      anchor_source != target_source -> 1.5
+  3. Cross-community bonus   anchor_community != target_community
+                             AND both not None -> 1.4
   4. Peripheral-to-hub bonus min(degrees) <= 2 AND max(degrees) >= 5 -> 1.3
-  5. Final cap: min(score, 8.0)
+  5. Hub-to-hub anti-bonus   min(degrees) >= 3 -> log-decay penalty
+                             (1.0 at min=2, 0.5 floor at high min)
+  6. Final cap: min(score, 8.0)
+
+Hub-to-hub anti-bonus
+---------------------
+Mirror of Component 4 on the penalty side. When BOTH endpoints have
+degree >= 3, the edge connects two hubs -- a structural connector,
+not an informative bridge. Common case: a wiki:index page (degree
+100+) connecting to a busy repo (degree 50+); the edge exists because
+both ends are popular, not because the link carries signal.
+
+Empirical motivation: with discovery=true on a query like
+"prbe-knowledge-mcp lane A scoped JWT", graph hits anchored on the
+prbe-knowledge-mcp Repo entity surfaced wiki summary pages above the
+canonical lane-A commit. Both wiki page and commit are graph-anchored
+to the repo, but the wiki page's edge is hub-to-hub while the
+commit's edge is peripheral-to-hub.
+
+Penalty grows logarithmically with min(degrees) so a degree-100 hub
+edge is penalised more than a degree-5 mild-hub edge. Floored at 0.5
+so even extreme hubs aren't completely flattened.
 
 AMBIGUOUS gating
 ----------------
@@ -38,6 +59,8 @@ genuinely informative.
 
 from __future__ import annotations
 
+import math
+
 _CONFIDENCE_WEIGHT: dict[str, float] = {
     "AMBIGUOUS": 1.5,
     "INFERRED": 1.25,
@@ -45,6 +68,18 @@ _CONFIDENCE_WEIGHT: dict[str, float] = {
 }
 
 _CAP = 8.0
+
+# Hub-to-hub anti-bonus knobs.
+# Penalty fires when min(degrees) >= _HUB_PENALTY_MIN_DEG.
+# Curve: 1.0 - _HUB_PENALTY_SLOPE * log2(min_deg / 2.0), floored at _HUB_PENALTY_FLOOR.
+# Sample values with current settings:
+#   min_deg = 3:  ~0.94
+#   min_deg = 5:  ~0.80
+#   min_deg = 10: ~0.66
+#   min_deg = 50: 0.50 (floor)
+_HUB_PENALTY_MIN_DEG = 3
+_HUB_PENALTY_SLOPE = 0.15
+_HUB_PENALTY_FLOOR = 0.5
 
 
 def surprise_score(
@@ -137,6 +172,18 @@ def surprise_score(
     max_deg = max(anchor_degree, target_degree)
     if min_deg <= 2 and max_deg >= 5:
         score *= 1.3
+
+    # --- Component 5: hub-to-hub anti-bonus ---
+    # Mirror of Component 4 on the penalty side. When BOTH endpoints have
+    # degree >= 3, the edge is a structural connector between two hubs
+    # rather than an informative bridge. Common case: wiki:index pages
+    # (degree 100+) connecting to busy repos (degree 50+) -- the edge
+    # exists because both ends are popular, not because the link carries
+    # signal. Penalty scales with log2(min_deg) so a degree-100 hub edge
+    # is demoted more than a degree-5 mild-hub edge.
+    if min_deg >= _HUB_PENALTY_MIN_DEG:
+        decay = 1.0 - _HUB_PENALTY_SLOPE * math.log2(min_deg / 2.0)
+        score *= max(decay, _HUB_PENALTY_FLOOR)
 
     # --- Cap ---
     return min(score, _CAP)
