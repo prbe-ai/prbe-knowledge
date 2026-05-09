@@ -440,7 +440,7 @@ async def run_search(
         edge_type = gh.edge_type or ""
         confidence = gh.confidence or "EXTRACTED"
         via_entity = gh.via_entity
-        key = (edge_type, confidence, via_entity, gh.via_label)
+        key = (edge_type, confidence, via_entity)
         if not edge_type:
             continue
         seen = seen_evidence_keys.setdefault(gh.chunk_id, set())
