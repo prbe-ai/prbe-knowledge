@@ -78,6 +78,8 @@ async def _fetch_batch(
     conn: asyncpg.Connection,
     customer: str | None,
     batch_size: int,
+    workers: int = 1,
+    worker_id: int = 0,
 ) -> list[dict[str, Any]]:
     """Pull the next batch of NULL embedding_v2 rows joined with their doc title.
 
@@ -91,6 +93,14 @@ async def _fetch_batch(
 
     ORDER BY chunk_id gives stable iteration so a re-run after a crash hits
     the same rows in the same order.
+
+    workers/worker_id partition: when running multiple processes in
+    parallel, each process owns rows where
+    `mod(abs(hashtext(chunk_id)), workers) = worker_id`. With
+    workers=1 (default) the modulo is always 0 and the predicate matches
+    every row, preserving single-process behavior. abs() is needed because
+    Postgres' hashtext returns a signed int4 and `mod(-N, M)` is negative,
+    which would never equal a non-negative worker_id.
     """
     rows = await conn.fetch(
         """
@@ -106,11 +116,14 @@ async def _fetch_batch(
         ) d ON TRUE
         WHERE c.embedding_v2 IS NULL
           AND ($1::text IS NULL OR c.customer_id = $1)
+          AND mod(abs(hashtext(c.chunk_id)), $3::int) = $4::int
         ORDER BY c.chunk_id
         LIMIT $2
         """,
         customer,
         batch_size,
+        workers,
+        worker_id,
     )
     return [dict(r) for r in rows]
 
@@ -219,7 +232,31 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
         action="store_true",
         help="Estimate cost only on the first batch; do not embed or write",
     )
+    ap.add_argument(
+        "--workers",
+        type=_positive_int,
+        default=1,
+        help=(
+            "Total number of parallel worker processes (default: 1). "
+            "Each process must be launched with a distinct --worker-id "
+            "in [0, workers). Partitioning is by hashtext(chunk_id) MOD "
+            "workers, so processes never embed the same row."
+        ),
+    )
+    ap.add_argument(
+        "--worker-id",
+        type=int,
+        default=0,
+        help=(
+            "0-indexed id of THIS process within --workers (default: 0). "
+            "Must be in [0, workers)."
+        ),
+    )
     args = ap.parse_args(argv)
+    if not 0 <= args.worker_id < args.workers:
+        ap.error(
+            f"--worker-id must be in [0, {args.workers}); got {args.worker_id}"
+        )
 
     configure_logging()
     await init_pool()
@@ -245,6 +282,8 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
         customer=args.customer,
         batch_size=batch_size,
         dry_run=args.dry_run,
+        workers=args.workers,
+        worker_id=args.worker_id,
     )
 
     cost = 0.0
@@ -267,7 +306,13 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
                 break
 
             async with raw_conn() as conn:
-                rows = await _fetch_batch(conn, args.customer, batch_size)
+                rows = await _fetch_batch(
+                    conn,
+                    args.customer,
+                    batch_size,
+                    workers=args.workers,
+                    worker_id=args.worker_id,
+                )
 
             if not rows:
                 log.info("backfill_v2.no_more_chunks")
@@ -351,7 +396,10 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
             )
 
         # If we stopped early (cap / max-batches / signal), check whether
-        # NULL rows remain so the operator knows to re-run before Stage 3.
+        # NULL rows remain in THIS worker's partition so the operator
+        # knows to re-run before Stage 3. Each worker only owns its
+        # partition; the combined "fully drained" check is the operator's
+        # responsibility (run all workers + count globally).
         remaining = 0
         if cap_hit and not args.dry_run:
             async with raw_conn() as conn:
@@ -360,8 +408,11 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
                     SELECT COUNT(*) FROM chunks
                     WHERE embedding_v2 IS NULL
                       AND ($1::text IS NULL OR customer_id = $1)
+                      AND mod(abs(hashtext(chunk_id)), $2::int) = $3::int
                     """,
                     args.customer,
+                    args.workers,
+                    args.worker_id,
                 )
             log.info("backfill_v2.remaining_nulls", remaining=remaining)
     finally:
