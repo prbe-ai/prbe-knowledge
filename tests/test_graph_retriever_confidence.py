@@ -13,7 +13,6 @@ from services.retrieval.retrievers.graph import (
     passes_confidence_filter,
 )
 
-
 # ---- confidence filter ----------------------------------------------------
 
 
