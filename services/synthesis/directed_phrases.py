@@ -33,7 +33,9 @@ from shared.config import get_settings
 from shared.constants import (
     DIRECTED_DEDUPE_COSINE_THRESHOLD,
     HAIKU_MODEL,
+    MAX_DIRECTED_PHRASE_CHARS,
     MAX_DIRECTED_VECTORS_PER_DOC,
+    MAX_HUMAN_DIRECTED_PER_DOC,
 )
 from shared.db import with_tenant
 from shared.embeddings import Embedder
@@ -62,7 +64,15 @@ def parse_directed_frontmatter(frontmatter: dict[str, Any] | None) -> list[str]:
     Accepts the already-parsed dict that wiki pages carry in their
     `metadata.frontmatter` slot. Returns the list of trigger phrases as
     plain strings; on missing / malformed input, returns [] and logs a
-    warning. Empty / whitespace-only entries are dropped.
+    warning.
+
+    Trust-boundary enforcement (frontmatter is authored input):
+      * Empty / whitespace-only entries are dropped.
+      * Phrases longer than MAX_DIRECTED_PHRASE_CHARS are dropped (logged
+        as oversize). Reject rather than truncate so the operator sees
+        the rejected phrase and fixes it upstream.
+      * The list is capped at MAX_HUMAN_DIRECTED_PER_DOC entries; overage
+        is logged once and dropped silently after that.
     """
     if not isinstance(frontmatter, dict):
         return []
@@ -76,16 +86,34 @@ def parse_directed_frontmatter(frontmatter: dict[str, Any] | None) -> list[str]:
         )
         return []
     out: list[str] = []
+    overage_logged = False
     for item in raw:
-        if isinstance(item, str):
-            stripped = item.strip()
-            if stripped:
-                out.append(stripped)
-        else:
+        if not isinstance(item, str):
             log.warning(
                 "directed.frontmatter_non_string_item",
                 type=type(item).__name__,
             )
+            continue
+        stripped = item.strip()
+        if not stripped:
+            continue
+        if len(stripped) > MAX_DIRECTED_PHRASE_CHARS:
+            log.warning(
+                "directed.frontmatter_phrase_too_long",
+                length=len(stripped),
+                limit=MAX_DIRECTED_PHRASE_CHARS,
+            )
+            continue
+        if len(out) >= MAX_HUMAN_DIRECTED_PER_DOC:
+            if not overage_logged:
+                log.warning(
+                    "directed.frontmatter_count_capped",
+                    cap=MAX_HUMAN_DIRECTED_PER_DOC,
+                    seen=len(raw),
+                )
+                overage_logged = True
+            continue
+        out.append(stripped)
     return out
 
 
@@ -157,8 +185,22 @@ async def generate_directed_phrases(
                 )
             cleaned: list[str] = []
             for p in phrases_raw:
-                if isinstance(p, str) and p.strip():
-                    cleaned.append(p.strip())
+                if not isinstance(p, str):
+                    continue
+                s = p.strip()
+                if not s:
+                    continue
+                # LLM-provider-side guidance is "5-12 tokens"; LLMs ignore
+                # length instructions ~10% of the time. Hard cap here so a
+                # runaway response doesn't bloat embedding cost / storage.
+                if len(s) > MAX_DIRECTED_PHRASE_CHARS:
+                    log.warning(
+                        "directed.llm_phrase_too_long",
+                        length=len(s),
+                        limit=MAX_DIRECTED_PHRASE_CHARS,
+                    )
+                    continue
+                cleaned.append(s)
             return cleaned[:MAX_DIRECTED_VECTORS_PER_DOC]
     raise RuntimeError(f"directed response had no {expected} tool_use block")
 
@@ -270,8 +312,10 @@ async def persist_directed_vectors(
     candidate_phrases = human_phrases + llm_phrases
     if not candidate_phrases:
         # Nothing to write; still need to reconcile (e.g. all pins removed).
+        # LLM reconcile is gated on llm_failed for the same reason as the
+        # main path: a transient LLM error must not wipe last-known-good.
         await _reconcile_human(customer_id, doc_id, set(), {}, result)
-        if synthesis_run_id is not None:
+        if synthesis_run_id is not None and not result.llm_failed:
             await _reconcile_llm(customer_id, doc_id, [], synthesis_run_id, result)
         return result
 
@@ -341,8 +385,13 @@ async def persist_directed_vectors(
         customer_id, doc_id, set(human_payload.keys()), human_payload, result
     )
 
-    # Reconcile LLM rows (only when this run actually produced any).
-    if synthesis_run_id is not None:
+    # Reconcile LLM rows ONLY when LLM generation actually succeeded.
+    # On llm_failed=True, llm_keep is [] and calling _reconcile_llm would
+    # DELETE the previous run's rows and replace them with nothing —
+    # turning a transient LLM hiccup into permanent loss of the doc's
+    # LLM-generated trigger phrases. Skipping leaves the last-known-good
+    # set in place; the next successful synthesis run reconciles them.
+    if synthesis_run_id is not None and not result.llm_failed:
         await _reconcile_llm(
             customer_id, doc_id, llm_keep, synthesis_run_id, result
         )

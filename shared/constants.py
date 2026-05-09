@@ -393,8 +393,20 @@ DEDUP_COSINE_THRESHOLD = 0.95
 DIRECTED_RETRIEVAL_WEIGHT: float = 1.0
 
 # Cap on LLM-generated directed phrases per wiki document. Engineer-pinned
-# phrases are not subject to this cap.
+# phrases get their own cap (MAX_HUMAN_DIRECTED_PER_DOC) so a runaway LLM
+# can't bury legitimate pins.
 MAX_DIRECTED_VECTORS_PER_DOC: int = 16
+
+# Cap on engineer-pinned directed phrases per wiki document. Higher than
+# the LLM cap because explicit pins are intentional, but bounded so a
+# malicious / typo'd frontmatter can't balloon the table.
+MAX_HUMAN_DIRECTED_PER_DOC: int = 32
+
+# Per-phrase character cap. Trigger phrases are short by design (5-12
+# tokens per the prompt); 256 chars is generous slack against natural
+# English while still rejecting megabyte-long pathological inputs that
+# would bloat embedding cost / storage / log noise.
+MAX_DIRECTED_PHRASE_CHARS: int = 256
 
 # Cosine distance threshold below which two candidate trigger phrases are
 # considered near-duplicates and one is dropped (humans always win on

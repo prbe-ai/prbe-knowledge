@@ -217,3 +217,54 @@ async def test_directed_search_score_is_cosine_similarity(live_db) -> None:
     hits = await directed_search(cust, "exact match phrase", top_k=10)
     assert len(hits) == 1
     assert hits[0].score >= 0.99
+
+
+@pytest.mark.asyncio
+async def test_directed_search_returns_globally_closest_not_lex_first(
+    live_db,
+) -> None:
+    """REGRESSION for the DISTINCT ON + LIMIT P1 ordering bug.
+
+    With more docs than top_k, the retriever must return the docs whose
+    best phrase is closest to the query — NOT the first top_k doc_ids in
+    lexicographic order. The naive single-pass
+    `DISTINCT ON (doc_id) ... ORDER BY doc_id, dist LIMIT k` returned the
+    lex-first top_k, silently wrong. The fix uses a subquery that does
+    DISTINCT ON inner, then re-orders by dist outer.
+
+    Setup deliberately conflicts lex-order with distance-order:
+      - 'wiki:runbook:aaa' has phrase "completely unrelated topic"
+        (far from query)
+      - 'wiki:runbook:bbb' has phrase "another unrelated thing"
+        (far from query)
+      - 'wiki:runbook:zzz' has phrase "deploy keeps timing out"
+        (matches query exactly)
+    Query is "deploy keeps timing out", top_k=2. Correct behavior: zzz
+    must be in the result. Old buggy behavior: zzz dropped (lex order
+    keeps aaa, bbb, never reaches zzz).
+    """
+    cust = "cust-dir-ordering"
+    docs = [
+        ("wiki:runbook:aaa", "completely unrelated topic about cats"),
+        ("wiki:runbook:bbb", "another unrelated thing about weather"),
+        ("wiki:runbook:zzz", "deploy keeps timing out"),
+    ]
+    for doc_id, phrase in docs:
+        await _seed_doc(customer_id=cust, doc_id=doc_id, title=doc_id)
+        await _seed_directed_phrase(
+            customer_id=cust, doc_id=doc_id, phrase=phrase
+        )
+
+    # top_k=2: with 3 docs, we MUST drop one. Correct behavior drops the
+    # FARTHEST from the query (one of aaa/bbb), keeping zzz (exact match).
+    hits = await directed_search(cust, "deploy keeps timing out", top_k=2)
+    assert len(hits) == 2
+    returned_ids = {h.doc_id for h in hits}
+    assert "wiki:runbook:zzz" in returned_ids, (
+        f"expected closest doc to be returned; got {returned_ids}. "
+        "If this fails, the DISTINCT ON + LIMIT ordering bug regressed: "
+        "the retriever is returning lex-first top_k instead of "
+        "globally-closest top_k."
+    )
+    # And the closest one ranks first.
+    assert hits[0].doc_id == "wiki:runbook:zzz"

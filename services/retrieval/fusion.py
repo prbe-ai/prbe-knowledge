@@ -231,21 +231,28 @@ def fuse(
 
         content_chunks_for_doc[doc_id].append((chunk_id, rrf_score))
 
-    # Directed-vector contributions: best (highest similarity) hit per doc
-    # contributes a doc-level booster scaled by DIRECTED_RETRIEVAL_WEIGHT.
+    # Directed-vector contributions: convert rank-in-list to RRF so the
+    # signal lives on the same scale as vector/bm25/graph contributions
+    # (rank-1 ≈ 1/61 ≈ 0.016, not raw cosine similarity ≈ 0.8). Without
+    # this conversion, DIRECTED_RETRIEVAL_WEIGHT=1.0 would dominate the
+    # ranking by ~50x — every doc with any directed hit would outrank
+    # every doc without. The retriever guarantees DISTINCT ON (doc_id)
+    # and orders by distance ASC, so list position == similarity rank;
+    # first occurrence per doc wins (RRF convention).
+    #
     # A directed hit for a doc that has no content chunk in the pool is
     # silently lost — fusion only builds FusedDocuments that have at
-    # least one content chunk (or a content_fallback). That matches the
-    # existing rule: ranking signals don't get to bring in a doc on their
-    # own; only retrievers that surface body text do.
+    # least one content chunk (or a content_fallback). Same rule as
+    # graph/metadata signals: ranking boosters don't bring in a doc on
+    # their own; only body-text retrievers do.
     directed_score_for_doc: dict[str, float] = defaultdict(float)
     if directed_hits:
-        # Multiple hits per doc shouldn't happen (directed_search uses
-        # DISTINCT ON), but be defensive: keep the best score per doc.
-        for d in directed_hits:
-            cur = directed_score_for_doc.get(d.doc_id, 0.0)
-            if d.score > cur:
-                directed_score_for_doc[d.doc_id] = float(d.score)
+        seen_doc_ids: set[str] = set()
+        for rank, d in enumerate(directed_hits, start=1):
+            if d.doc_id in seen_doc_ids:
+                continue
+            seen_doc_ids.add(d.doc_id)
+            directed_score_for_doc[d.doc_id] = 1.0 / (k + rank)
 
     # Build FusedDocuments. Drop docs with NO content chunk in the candidate
     # pool unless a content_fallback exists.

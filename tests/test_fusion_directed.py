@@ -133,18 +133,24 @@ def test_fuse_directed_boosts_matching_doc() -> None:
 
 
 def test_fuse_directed_score_in_retriever_breakdown() -> None:
-    """When directed contributes, doc.retriever_scores['directed'] is set
-    to the per-doc score so callers can see why this doc surfaced.
+    """When directed contributes, doc.retriever_scores['directed'] carries
+    the RRF contribution (1 / (k + rank)), NOT raw similarity. This is the
+    same scale as vector/bm25/graph contributions so that
+    DIRECTED_RETRIEVAL_WEIGHT=1.0 is a peer-of-other-retrievers, not a
+    50x dominator.
     """
+    from shared.constants import RRF_K
+
     hits = [FakeHit(chunk_id="c1", doc_id="d1")]
     fused = fuse(
         {"vector": hits},
         top_k=10,
         now=_NOW,
-        directed_hits=[FakeDirectedHit("d1", score=0.7)],
+        directed_hits=[FakeDirectedHit("d1", score=0.7)],  # rank 1
     )
     assert "directed" in fused[0].retriever_scores
-    assert fused[0].retriever_scores["directed"] == pytest.approx(0.7)
+    expected = 1.0 / (RRF_K + 1)
+    assert fused[0].retriever_scores["directed"] == pytest.approx(expected)
 
 
 def test_fuse_directed_only_doc_dropped() -> None:
@@ -162,29 +168,72 @@ def test_fuse_directed_only_doc_dropped() -> None:
     assert fused == []
 
 
-def test_fuse_directed_keeps_best_score_when_dup_doc_id() -> None:
+def test_fuse_directed_first_occurrence_wins_per_doc() -> None:
     """Defensive: if directed_hits contains multiple entries for one doc
-    (shouldn't happen — directed_search uses DISTINCT ON), we keep the
-    highest score.
+    (shouldn't happen — directed_search uses DISTINCT ON), we honor RRF
+    convention and keep the FIRST occurrence's rank, ignoring later ones.
+    The retriever guarantees list order = similarity-rank, so first
+    occurrence == best similarity by construction.
     """
+    from shared.constants import RRF_K
+
     hits = [FakeHit(chunk_id="c1", doc_id="d1")]
     fused = fuse(
         {"vector": hits},
         top_k=10,
         now=_NOW,
         directed_hits=[
-            FakeDirectedHit("d1", score=0.3),
-            FakeDirectedHit("d1", score=0.95),
-            FakeDirectedHit("d1", score=0.6),
+            FakeDirectedHit("d1", score=0.95),  # rank 1 -> 1/(60+1)
+            FakeDirectedHit("d1", score=0.6),   # ignored
+            FakeDirectedHit("d1", score=0.3),   # ignored
         ],
     )
-    assert fused[0].retriever_scores["directed"] == pytest.approx(0.95)
+    expected = 1.0 / (RRF_K + 1)
+    assert fused[0].retriever_scores["directed"] == pytest.approx(expected)
 
 
-def test_fuse_directed_zero_score_skipped() -> None:
-    """A directed hit with score=0 should NOT appear in retriever_scores
-    (gating clause is `directed_score > 0`).
+def test_fuse_directed_rank_2_smaller_than_rank_1() -> None:
+    """REGRESSION for the score-scale-mismatch P1: doc at rank 1 in the
+    directed list contributes more than doc at rank 2, AND both are on
+    RRF magnitude (~0.016 + 0.0163), NOT raw similarity (~0.7 - 1.0).
+    Without RRF conversion, DIRECTED_RETRIEVAL_WEIGHT=1.0 dominated
+    ranking by 50x; this pins the magnitude contract.
     """
+    from shared.constants import RRF_K
+
+    hits = [
+        FakeHit(chunk_id="c1", doc_id="d1"),
+        FakeHit(chunk_id="c2", doc_id="d2"),
+    ]
+    fused = fuse(
+        {"vector": hits},
+        top_k=10,
+        now=_NOW,
+        directed_hits=[
+            FakeDirectedHit("d1", score=0.95),  # rank 1
+            FakeDirectedHit("d2", score=0.93),  # rank 2
+        ],
+    )
+    by_id = {d.doc_id: d for d in fused}
+    rank1 = 1.0 / (RRF_K + 1)
+    rank2 = 1.0 / (RRF_K + 2)
+    assert by_id["d1"].retriever_scores["directed"] == pytest.approx(rank1)
+    assert by_id["d2"].retriever_scores["directed"] == pytest.approx(rank2)
+    # And the directed contribution is RRF-scale (~0.016), NOT similarity-
+    # scale (~0.95). Pin this ceiling so future drift is loud.
+    assert by_id["d1"].retriever_scores["directed"] < 0.05
+
+
+def test_fuse_directed_zero_similarity_still_contributes_when_listed() -> None:
+    """A directed_hit with score=0.0 still gets ranked: presence in the
+    directed list IS the signal, similarity is informational. This is
+    different from the old similarity-scale behavior where score=0 meant
+    "no contribution"; under RRF, only NOT being in the list means no
+    contribution. The retriever's DISTINCT ON + dist ASC ordering ensures
+    list membership only includes actual matches.
+    """
+    from shared.constants import RRF_K
+
     hits = [FakeHit(chunk_id="c1", doc_id="d1")]
     fused = fuse(
         {"vector": hits},
@@ -192,4 +241,5 @@ def test_fuse_directed_zero_score_skipped() -> None:
         now=_NOW,
         directed_hits=[FakeDirectedHit("d1", score=0.0)],
     )
-    assert "directed" not in fused[0].retriever_scores
+    expected = 1.0 / (RRF_K + 1)
+    assert fused[0].retriever_scores["directed"] == pytest.approx(expected)

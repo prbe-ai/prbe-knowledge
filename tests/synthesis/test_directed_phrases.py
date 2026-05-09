@@ -277,6 +277,71 @@ async def test_persist_llm_failure_skips_llm_keeps_humans(live_db) -> None:
 
 
 @pytest.mark.asyncio
+async def test_persist_llm_failure_preserves_prior_llm_rows(live_db) -> None:
+    """REGRESSION for the LLM-purge P2: a transient LLM failure must NOT
+    delete previous runs' LLM rows. The pre-fix behavior was: catch the
+    LLM exception, set llm_phrases=[], then call _reconcile_llm anyway —
+    which DELETEs all rows whose synthesis_run_id != current_run, leaving
+    nothing. One bad run permanently wiped the page's LLM-generated
+    triggers until the next successful run.
+
+    Setup: run-100 succeeds and writes 2 LLM rows. Run-200 fails the
+    LLM call. Expectation: run-100's rows remain visible (last-known-good
+    is preserved).
+    """
+    cust = "cust-dp-llm-purge"
+    doc_id = "wiki:runbook:purge"
+    await _seed_customer_and_doc(cust, doc_id)
+
+    # Run 100: succeeds, writes 2 llm rows.
+    ok_client = _make_anthropic_client(["good phrase one", "good phrase two"])
+    res1 = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter=None,
+        synthesis_run_id=100,
+        anthropic_client=ok_client,
+    )
+    assert res1.llm_added == 2
+    assert res1.llm_failed is False
+
+    # Run 200: LLM fails. Must NOT delete run 100's rows.
+    failing_client = MagicMock()
+    failing_client.messages.create = AsyncMock(
+        side_effect=RuntimeError("provider 5xx")
+    )
+    res2 = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter=None,
+        synthesis_run_id=200,
+        anthropic_client=failing_client,
+    )
+    assert res2.llm_failed is True
+    assert res2.llm_removed == 0, (
+        "LLM-failure path must NOT call _reconcile_llm; if it did, "
+        "previous run's rows would be deleted (P2 regression)."
+    )
+
+    async with with_tenant(cust) as conn:
+        rows = await conn.fetch(
+            "SELECT source_text, synthesis_run_id FROM directed_vectors "
+            "WHERE customer_id=$1 AND doc_id=$2 AND source='llm' "
+            "ORDER BY source_text",
+            cust,
+            doc_id,
+        )
+    assert [r["source_text"] for r in rows] == ["good phrase one", "good phrase two"]
+    assert all(r["synthesis_run_id"] == 100 for r in rows), (
+        "Run 100's rows must remain unchanged after run 200's LLM failure."
+    )
+
+
+@pytest.mark.asyncio
 async def test_persist_llm_dup_of_human_pin_is_dropped(live_db) -> None:
     """When the LLM emits a phrase identical to a human pin, the embedder
     stub assigns the SAME vector (deterministic hash). The dedupe pass

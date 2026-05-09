@@ -91,27 +91,36 @@ async def directed_search(
         )
         params.extend(pred.params)
 
+        # Two-stage query: inner DISTINCT ON collapses to one row per doc
+        # (the best phrase for that doc), outer ORDER BY dist + LIMIT picks
+        # the top_k closest documents globally. The naive single-stage
+        # `DISTINCT ON (doc_id) ... ORDER BY doc_id, dist LIMIT k` returns
+        # the first top_k DOC_IDS lexicographically, not the closest docs —
+        # silently wrong once the table has more than top_k docs.
         rows = await conn.fetch(
             f"""
-            SELECT DISTINCT ON (dv.doc_id)
-                   dv.vector_id,
-                   dv.doc_id,
-                   dv.source_text,
-                   dv.embedding <=> $2::halfvec AS dist,
-                   d.version AS doc_version,
-                   d.source_system,
-                   d.source_url,
-                   d.title,
-                   d.author_id,
-                   d.created_at,
-                   d.updated_at
-            FROM directed_vectors dv
-            JOIN documents d
-              ON dv.customer_id = d.customer_id
-             AND dv.doc_id      = d.doc_id
-            WHERE dv.customer_id = $1
-              {pred.doc_sql}
-            ORDER BY dv.doc_id, dv.embedding <=> $2::halfvec ASC
+            SELECT * FROM (
+                SELECT DISTINCT ON (dv.doc_id)
+                       dv.vector_id,
+                       dv.doc_id,
+                       dv.source_text,
+                       dv.embedding <=> $2::halfvec AS dist,
+                       d.version AS doc_version,
+                       d.source_system,
+                       d.source_url,
+                       d.title,
+                       d.author_id,
+                       d.created_at,
+                       d.updated_at
+                FROM directed_vectors dv
+                JOIN documents d
+                  ON dv.customer_id = d.customer_id
+                 AND dv.doc_id      = d.doc_id
+                WHERE dv.customer_id = $1
+                  {pred.doc_sql}
+                ORDER BY dv.doc_id, dv.embedding <=> $2::halfvec ASC
+            ) per_doc_best
+            ORDER BY dist ASC
             LIMIT $3
             """,
             *params,
