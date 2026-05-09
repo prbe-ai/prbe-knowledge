@@ -210,6 +210,75 @@ def test_translate_gemini_error(exc: BaseException, expected_cls: type) -> None:
     assert isinstance(translated, expected_cls)
 
 
+# ---- Gemini sub-batch parallelization ----------------------------------
+
+
+class _FakeEmbedding:
+    def __init__(self, values: list[float]) -> None:
+        self.values = values
+
+
+class _FakeEmbedResponse:
+    def __init__(self, vectors: list[list[float]]) -> None:
+        self.embeddings = [_FakeEmbedding(v) for v in vectors]
+
+
+@pytest.mark.asyncio
+async def test_gemini_embed_once_splits_into_subbatches_in_order(monkeypatch) -> None:
+    """A 24-item batch with GROUP_SIZE=8 must issue exactly 3 sub-calls and
+    return vectors in original input order. asyncio.gather completion order
+    is non-deterministic; without explicit reassembly the vectors would
+    scramble against their inputs.
+    """
+    reset_embedder()
+    embedder = GeminiEmbedder()
+
+    captured_inputs: list[list[str]] = []
+
+    async def fake_embed_content(*, model: str, contents: list[str]) -> _FakeEmbedResponse:
+        captured_inputs.append(list(contents))
+        # Encode item index in dim 0 so the test can verify ordering survives.
+        vectors = [[float(c.split(":")[1]), 0.0, 0.0] for c in contents]
+        return _FakeEmbedResponse(vectors)
+
+    class _FakeClient:
+        class aio:
+            class models:
+                embed_content = staticmethod(fake_embed_content)
+
+    monkeypatch.setattr(embedder, "_ensure_client", lambda: _FakeClient())
+
+    inputs = [f"item:{i}" for i in range(24)]
+    vectors = await embedder._embed_once(inputs)
+
+    # 24 inputs / GROUP_SIZE=8 = exactly 3 sub-calls.
+    assert len(captured_inputs) == 3
+    assert sum(len(g) for g in captured_inputs) == 24
+    # Vector at index i must encode i in dim 0 -- proves no scramble.
+    assert [int(v[0]) for v in vectors] == list(range(24))
+
+
+@pytest.mark.asyncio
+async def test_gemini_embed_once_propagates_subbatch_failure(monkeypatch) -> None:
+    """If any sub-call raises after retries, the whole batch fails so the
+    upstream recursive half-split halves the input and retries. A partial
+    return would silently drop inputs.
+    """
+    reset_embedder()
+    embedder = GeminiEmbedder()
+
+    async def boom_subbatch(client, batch):
+        raise EmbeddingBatchRejected("synthetic")
+
+    monkeypatch.setattr(embedder, "_embed_subbatch", boom_subbatch)
+    monkeypatch.setattr(
+        embedder, "_ensure_client", lambda: object()  # any non-None
+    )
+
+    with pytest.raises(EmbeddingBatchRejected):
+        await embedder._embed_once([f"item:{i}" for i in range(24)])
+
+
 # ---- Recursive half-split (base-class contract) -------------------------
 
 
