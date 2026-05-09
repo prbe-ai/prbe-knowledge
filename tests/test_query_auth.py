@@ -109,7 +109,7 @@ async def test_query_accepts_valid_bearer(live_db, settings) -> None:
     )
     await init_pool(settings)
     assert resp.status_code == 200, resp.text
-    assert "documents" in resp.json()
+    assert "results" in resp.json()
 
 
 @pytest.mark.asyncio
