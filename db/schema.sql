@@ -216,6 +216,12 @@ CREATE TABLE chunks (
 
 -- halfvec_cosine_ops: pgvector HNSW indexes halfvec up to 4000 dims.
 CREATE INDEX idx_chunks_embedding_hnsw ON chunks USING hnsw (embedding halfvec_cosine_ops);
+-- Stage 3 of the Gemini embedding migration: parallel HNSW over the
+-- gemini-embedding-2-preview vectors, used by the query path after the
+-- Stage 4 cutover. Same m/ef_construction as the v1 index above so any
+-- retrieval tuning translates 1:1.
+CREATE INDEX idx_chunks_embedding_v2_hnsw ON chunks USING hnsw (embedding_v2 halfvec_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
 CREATE INDEX idx_chunks_customer       ON chunks (customer_id);
 CREATE INDEX idx_chunks_doc            ON chunks (doc_id);
 CREATE INDEX idx_chunks_doc_live       ON chunks (doc_id) WHERE valid_to IS NULL;
