@@ -33,8 +33,8 @@ from services.retrieval.pipeline import (
 from services.retrieval.synthesis import (
     StreamDelta,
     StreamFinal,
-    SynthesisChunk,
     SynthesisError,
+    flatten_documents_for_synthesis,
     synthesize,
     synthesize_stream,
 )
@@ -46,6 +46,7 @@ from shared.logging import configure_logging, get_logger
 from shared.models import (
     AnswerRequest,
     AnswerResponse,
+    QueryDocumentResult,
     QueryRequest,
     QueryResponse,
     SourceResponse,
@@ -107,7 +108,9 @@ def _log_query_handled(
 ) -> None:
     """Structured per-query log. Captures everything an operator needs to
     debug a misroute or empty result without re-running the query."""
-    chunks_total = sum(len(d.chunks) for d in resp.documents)
+    chunks_total = sum(
+        len(r.chunks) for r in resp.results if isinstance(r, QueryDocumentResult)
+    )
     payload: dict[str, object] = {
         "trace_id": resp.trace_id,
         "endpoint": endpoint,
@@ -117,7 +120,7 @@ def _log_query_handled(
         "applied_temporal_mode": (resp.applied_temporal or {}).get("mode"),
         "applied_sort_field": (resp.applied_sort or {}).get("field"),
         "extracted_entity_types": [e.get("entity_type") for e in resp.extracted_entities],
-        "documents_count": len(resp.documents),
+        "results_count": len(resp.results),
         "chunks_count": chunks_total,
         "aggregation_present": resp.aggregation is not None,
         "total_candidates": resp.total_candidates,
@@ -153,7 +156,7 @@ async def retrieve(
     request.state.usage_request_payload = req
     t_total = time.perf_counter()
     resp = await run_retrieval(req, customer_id)
-    request.state.result_count = len(resp.documents)
+    request.state.result_count = len(resp.results)
     request.state.usage_response_payload = resp
     total_ms = (time.perf_counter() - t_total) * 1000
     _log_query_handled(
@@ -186,10 +189,12 @@ async def query(
     t_total = time.perf_counter()
     base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
     rresp = await run_retrieval(base_req, customer_id)
-    request.state.result_count = len(rresp.documents)
+    request.state.result_count = len(rresp.results)
 
     model = req.model or DEFAULT_SYNTHESIS_MODEL
-    syn_chunks = _flatten_chunks_for_synthesis(rresp)
+    # Flatten Document.chunks into a flat list the synthesizer cites by
+    # 1-indexed position. Entity results have no content and are skipped.
+    syn_chunks = flatten_documents_for_synthesis(rresp.results)
 
     t_syn = time.perf_counter()
     try:
@@ -206,7 +211,7 @@ async def query(
         citations=result.citations,
         insufficient_context=result.insufficient_context,
         model=result.model,
-        documents=rresp.documents,
+        results=rresp.results,
         total_candidates=rresp.total_candidates,
         confidence_breakdown=rresp.confidence_breakdown,
         applied_temporal=rresp.applied_temporal,
@@ -274,7 +279,9 @@ async def query_stream(
         step:refining     → router (Haiku) is running
         entities          → router done; entities + temporal/sort/mode resolved
         step:searching    → vec/bm25/graph/list pipeline starts
-        chunks            → retrieval done; chunks + applied_* fields ready
+        results           → retrieval done; polymorphic results +
+                            applied_* fields ready. Replaces the old
+                            `chunks` event (PR feat/polymorphic-search-results).
         step:synthesizing → answer LLM starts
         delta(*)          → 1+ text chunks of the answer
         done              → final {answer, citations, insufficient_context,
@@ -314,14 +321,15 @@ async def query_stream(
 
             yield _sse("step", {"step": "searching"})
             rresp = await run_search_phase(base_req, customer_id, phase)
-            request.state.result_count = len(rresp.documents)
-            # SSE event name stays `chunks` for backward compat with the
-            # dashboard's KnowledgeStreamEvent contract; the payload moved
-            # to the doc-grouped shape.
+            request.state.result_count = len(rresp.results)
             yield _sse(
-                "chunks",
+                "results",
                 {
-                    "documents": [d.model_dump(mode="json") for d in rresp.documents],
+                    # Pydantic v2 dumps discriminated unions cleanly with
+                    # `mode='json'` -- `node_type` survives, datetimes
+                    # serialize to ISO strings, and Entity vs Document
+                    # variants are distinguishable on the wire.
+                    "results": [r.model_dump(mode="json") for r in rresp.results],
                     "total_candidates": rresp.total_candidates,
                     "confidence_breakdown": rresp.confidence_breakdown,
                     "applied_entity_filter": rresp.applied_entity_filter,
@@ -332,7 +340,9 @@ async def query_stream(
             )
 
             yield _sse("step", {"step": "synthesizing"})
-            syn_chunks = _flatten_chunks_for_synthesis(rresp)
+            # Flatten the polymorphic results into a flat synthesis-chunk
+            # list. Entity results are skipped (no body content to cite).
+            syn_chunks = flatten_documents_for_synthesis(rresp.results)
             t_syn = time.perf_counter()
             final: StreamFinal | None = None
             async for evt in synthesize_stream(
@@ -373,7 +383,7 @@ async def query_stream(
                 citations=final.citations,
                 insufficient_context=final.insufficient_context,
                 model=final.model,
-                documents=rresp.documents,
+                results=rresp.results,
                 total_candidates=rresp.total_candidates,
                 confidence_breakdown=rresp.confidence_breakdown,
                 applied_temporal=rresp.applied_temporal,
@@ -395,8 +405,12 @@ async def query_stream(
                     "query": req.query,
                     "applied_mode": rresp.applied_mode,
                     "applied_doc_types": rresp.applied_doc_types,
-                    "documents_count": len(rresp.documents),
-                    "chunks_count": sum(len(d.chunks) for d in rresp.documents),
+                    "results_count": len(rresp.results),
+                    "chunks_count": sum(
+                        len(r.chunks)
+                        for r in rresp.results
+                        if isinstance(r, QueryDocumentResult)
+                    ),
                     "total_candidates": rresp.total_candidates,
                     "total_ms": timing["total_ms"],
                     "stage_ms": timing,
