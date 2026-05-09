@@ -75,8 +75,17 @@ def test_chunks_within_doc_carry_monotonic_rank_in_doc() -> None:
     assert [c.rank_in_doc for c in chunks] == [1, 2, 3]
 
 
-def test_top_k_applies_to_documents_not_chunks() -> None:
-    """top_k=2 returns 2 distinct documents even if each has multiple chunks."""
+def test_top_k_is_global_chunk_budget() -> None:
+    """top_k is the GLOBAL content-chunk budget, not a doc count cap.
+
+    Restoring pre-cf87b66 semantics: at top_k=2 we keep at most 2 content
+    chunks across all surviving docs. Doc count is naturally bounded by
+    surviving-chunk count.
+
+    Keeps the response payload bounded — the prior "max docs, every chunk
+    kept" behavior produced 12-16 chunks per response (worst case 32)
+    vs. the historical ~5, doubling production P50 latency.
+    """
     vec = []
     for doc_idx in range(5):
         for chunk_idx in range(3):
@@ -87,8 +96,47 @@ def test_top_k_applies_to_documents_not_chunks() -> None:
                 )
             )
     fused = fuse({"vector": vec}, top_k=2, now=_NOW)
-    assert len(fused) == 2
+    total_chunks = sum(len(d.chunks) for d in fused)
+    assert total_chunks == 2
+    assert len(fused) <= 2
     assert all(len(d.chunks) >= 1 for d in fused)
+
+
+def test_top_k_global_cap_concentrates_on_high_rrf_doc() -> None:
+    """Global cap behavior: one doc with 4 high-RRF chunks plus 4 other
+    docs with 1 chunk each. top_k=5 should keep the 4 chunks from the
+    top doc + 1 chunk from one other doc — total 2 docs, 5 chunks.
+
+    Pins the new semantic: chunks are picked by RRF, not by per-doc
+    quota. The "top doc" earns extra slots from its high-rank chunks.
+    """
+    # `top` doc: 4 chunks at the highest ranks (1..4) in vector.
+    top_doc_chunks = [
+        FakeHit(chunk_id=f"top-c{i}", doc_id="top") for i in range(4)
+    ]
+    # 4 other docs with 1 chunk each at lower ranks (5..8).
+    other_chunks = [
+        FakeHit(chunk_id=f"other-{i}-c", doc_id=f"other-{i}") for i in range(4)
+    ]
+    vec = top_doc_chunks + other_chunks  # ranks: top1..4, then other-0..3
+
+    fused = fuse({"vector": vec}, top_k=5, now=_NOW)
+    by_doc = {d.doc_id: d for d in fused}
+
+    # `top` doc keeps all 4 chunks (highest RRF). One other doc keeps its
+    # single chunk. Three other docs are dropped — their chunks didn't
+    # make the cap.
+    assert "top" in by_doc
+    assert len(by_doc["top"].chunks) == 4
+
+    # Exactly one of the 4 `other-*` docs should be present.
+    others_kept = [d for d in fused if d.doc_id != "top"]
+    assert len(others_kept) == 1
+    assert len(others_kept[0].chunks) == 1
+
+    total_chunks = sum(len(d.chunks) for d in fused)
+    assert total_chunks == 5
+    assert len(fused) == 2
 
 
 def test_chunk_count_reflects_surviving_content_chunks() -> None:

@@ -13,10 +13,13 @@ Two kinds of chunks compete for ranking:
                       ingestion (title, repo, author, source URL).
                       Searchable but never returned to the agent.
 
-We fuse at the chunk level, then collapse per doc into a `FusedDocument`
-that keeps EVERY surviving content chunk for the doc — `top_k` applies to
-documents, not chunks. The doc's metadata-chunk RRF folds into the doc
-score as a booster.
+We fuse at the chunk level, then collapse per doc into a `FusedDocument`.
+`top_k` is the GLOBAL chunk budget: we sort all content chunks by RRF and
+keep the top `top_k`. A doc that has any surviving content chunk produces
+one FusedDocument carrying just those survivors; doc count is naturally
+<= top_k. Metadata chunks and content_fallback chunks DO NOT count
+against the budget — they're never returned to the agent — but metadata
+RRF still folds into the doc score as a booster.
 
 Doc score:
     score = max(content_chunk_rrfs)
@@ -163,9 +166,14 @@ def fuse(
     pages always carry content chunks so directed-only-misses don't
     happen; the design is to amplify ranking, not to be a sole source.
 
-    Returns up to top_k FusedDocuments. Each doc's `chunks` list contains
-    EVERY content chunk from the candidate pool that belongs to it,
-    sorted by RRF descending, with `rank_in_doc` assigned.
+    Returns FusedDocuments whose chunk count totals at most `top_k`
+    content chunks across all docs (the global chunk-budget cap). Each
+    doc's `chunks` list contains the surviving content chunks for that
+    doc, sorted by RRF descending, with `rank_in_doc` assigned. Doc
+    count is naturally <= top_k. Metadata-only docs that pick up a
+    `content_fallback` chunk also surface; the fallback chunk does NOT
+    count against the budget (it's not part of any retriever's hit list,
+    just a hydrated displayable body).
     """
     per_chunk_rrf: dict[str, float] = defaultdict(float)
     per_chunk_breakdown: dict[str, dict[str, float]] = defaultdict(dict)
@@ -230,6 +238,31 @@ def fuse(
             continue
 
         content_chunks_for_doc[doc_id].append((chunk_id, rrf_score))
+
+    # Global chunk-budget cap: sort all content chunks by RRF desc, keep
+    # the top `top_k`. Doc-grouped wire format is preserved (we still
+    # build one FusedDocument per surviving doc), but doc count is now
+    # naturally bounded by surviving-chunk count rather than by a doc-level
+    # slice at the end. Restoring this pre-cf87b66 semantic keeps the
+    # response payload bounded — the prior "max docs, every chunk kept"
+    # behavior produced 12-16 chunks per response (worst case 32) vs the
+    # historical ~5, doubling production P50 latency end-to-end.
+    #
+    # Tie-break on chunk_id asc keeps the cap deterministic when many
+    # chunks share an RRF (common at the boundary). Cross-doc ordering is
+    # otherwise irrelevant here — final doc ranking happens via doc.score
+    # below.
+    all_content: list[tuple[str, str, float]] = [
+        (doc_id, chunk_id, rrf)
+        for doc_id, chunks in content_chunks_for_doc.items()
+        for chunk_id, rrf in chunks
+    ]
+    all_content.sort(key=lambda t: (-t[2], t[1]))
+    surviving = all_content[:top_k]
+    surviving_by_doc: dict[str, list[tuple[str, float]]] = defaultdict(list)
+    for doc_id, chunk_id, rrf in surviving:
+        surviving_by_doc[doc_id].append((chunk_id, rrf))
+    content_chunks_for_doc = surviving_by_doc
 
     # Directed-vector contributions: convert rank-in-list to RRF so the
     # signal lives on the same scale as vector/bm25/graph contributions
@@ -396,4 +429,6 @@ def fuse(
             fused.sort(key=lambda d: (sign * d.updated_at.timestamp(), d.doc_id))
     else:
         fused.sort(key=lambda d: (-d.score, -d.updated_at.timestamp(), d.doc_id))
-    return fused[:top_k]
+    # No final doc-level slice: top_k is the chunk budget, applied above
+    # via the surviving-chunk cap. Doc count is naturally <= top_k.
+    return fused
