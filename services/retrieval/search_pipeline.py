@@ -34,7 +34,7 @@ from services.retrieval.helpers import (
     apply_entity_filter,
     embeddings_for_chunks,
 )
-from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search
+from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search, residualize_for_bm25
 from services.retrieval.retrievers.graph import graph_search
 from services.retrieval.retrievers.id_lookup import id_lookup_search, is_lookup_candidate
 from services.retrieval.retrievers.related_entities import (
@@ -278,6 +278,33 @@ async def run_search(
         # collapses to the slowest single call instead of summing N round
         # trips. The per-chunk dedup keeps the highest-scoring hit when an
         # expansion surfaces a chunk the original query already matched.
+        #
+        # When the router extracts a stable identifier (UUID/ticket/PR ref)
+        # id_lookup already pins the doc — strip identifier tokens and
+        # identifier-frame descriptors from each BM25 query and skip the
+        # SQL pass when nothing topical remains. See residualize_for_bm25
+        # for the rationale (low-IDF descriptors otherwise drag 10k+
+        # unrelated chunks through the heap recheck + ts_rank_cd).
+        identifier_canonical_ids = [
+            e.canonical_id
+            for e in routed.entities
+            if is_lookup_candidate(e.canonical_id)
+        ]
+        bm25_queries: list[str]
+        if identifier_canonical_ids:
+            bm25_queries = [
+                r
+                for r in (
+                    residualize_for_bm25(q, identifier_canonical_ids) for q in queries
+                )
+                if r is not None
+            ]
+        else:
+            bm25_queries = list(queries)
+
+        if not bm25_queries:
+            return []
+
         per_query_hits = await asyncio.gather(
             *(
                 bm25_search(
@@ -288,7 +315,7 @@ async def run_search(
                     doc_types=retriever_doc_types,
                     temporal=spec,
                 )
-                for q in queries
+                for q in bm25_queries
             )
         )
         hits_by_chunk: dict = {}
