@@ -1092,8 +1092,12 @@ async def _insert_chunks_batch(
             embedding::halfvec, $9, $10, $11,
             $12, $12, kind,
             embedding_v2::halfvec,
-            CASE WHEN embedding_v2 IS NULL THEN NULL ELSE $15 END,
-            CASE WHEN embedding_v2 IS NULL THEN NULL ELSE $16 END
+            -- Cast the bound params explicitly. Without the casts, the CASE
+            -- expression unifies the NULL branch to the parameter's wire type
+            -- (text), and Postgres rejects the INSERT against the INT column
+            -- with DatatypeMismatchError.
+            CASE WHEN embedding_v2 IS NULL THEN NULL ELSE $15::text END,
+            CASE WHEN embedding_v2 IS NULL THEN NULL ELSE $16::int END
         FROM unnest(
             $1::text[], $4::int[], $5::text[], $6::text[], $7::int[],
             $8::text[], $13::text[], $14::text[]
