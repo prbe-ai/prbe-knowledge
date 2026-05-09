@@ -1005,7 +1005,14 @@ async def _insert_chunk(
         )
         ON CONFLICT (doc_id, content_hash) DO UPDATE
             SET last_seen_version = EXCLUDED.last_seen_version,
-                valid_to = NULL
+                valid_to = NULL,
+                -- Fill in embedding_v2 only when the existing row has none
+                -- (Stage 1 dual-write window). Once Stage 2 backfill or a
+                -- prior write has populated v2, keep it -- no churn writes
+                -- and no clobbering with NULL when Gemini fails on a re-ingest.
+                embedding_v2 = COALESCE(chunks.embedding_v2, EXCLUDED.embedding_v2),
+                embedding_v2_model = COALESCE(chunks.embedding_v2_model, EXCLUDED.embedding_v2_model),
+                embedding_v2_dim = COALESCE(chunks.embedding_v2_dim, EXCLUDED.embedding_v2_dim)
         """,
         chunk_id,
         doc.doc_id,
@@ -1105,7 +1112,13 @@ async def _insert_chunks_batch(
                embedding, kind, embedding_v2)
         ON CONFLICT (doc_id, content_hash) DO UPDATE
             SET last_seen_version = EXCLUDED.last_seen_version,
-                valid_to = NULL
+                valid_to = NULL,
+                -- COALESCE: backfill NULL v2 slots from this insert, but
+                -- never clobber a populated v2 with a fresh NULL (Gemini
+                -- failed this round) or with another fresh value (no churn).
+                embedding_v2 = COALESCE(chunks.embedding_v2, EXCLUDED.embedding_v2),
+                embedding_v2_model = COALESCE(chunks.embedding_v2_model, EXCLUDED.embedding_v2_model),
+                embedding_v2_dim = COALESCE(chunks.embedding_v2_dim, EXCLUDED.embedding_v2_dim)
         """,
         chunk_ids,
         doc.doc_id,

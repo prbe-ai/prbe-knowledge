@@ -305,7 +305,13 @@ async def _process_doc(
                 )
                 ON CONFLICT (doc_id, content_hash) DO UPDATE
                     SET last_seen_version = EXCLUDED.last_seen_version,
-                        valid_to = NULL
+                        valid_to = NULL,
+                        -- Fill v2 slots from this insert when the existing
+                        -- row has none. See _insert_chunks_batch for full
+                        -- rationale; same dual-write contract applies here.
+                        embedding_v2 = COALESCE(chunks.embedding_v2, EXCLUDED.embedding_v2),
+                        embedding_v2_model = COALESCE(chunks.embedding_v2_model, EXCLUDED.embedding_v2_model),
+                        embedding_v2_dim = COALESCE(chunks.embedding_v2_dim, EXCLUDED.embedding_v2_dim)
                 """,
                 new_chunk_id,
                 doc_id,

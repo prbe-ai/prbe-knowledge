@@ -376,7 +376,15 @@ class GeminiEmbedder(_BaseEmbedder):
 
 
 def _format_gemini_document(item: DocItem) -> str:
-    title = (item.title or "").strip()
+    # Cap title length so a long title can't push the prefixed input past
+    # Gemini's per-request token ceiling (~2048). The chunker already caps
+    # raw content; the title is the only other variable in the prefix.
+    # 200 chars ~= 50 tokens worst case, leaving headroom.
+    title = (item.title or "").strip()[:200]
+    # Strip the prefix's own separator so a title containing "| text:" can't
+    # shift content boundaries when the formatted string is later parsed by
+    # any downstream tooling.
+    title = title.replace("| text:", "").strip()
     if title:
         return _GEMINI_DOC_PREFIX_WITH_TITLE.format(title=title, content=item.content)
     return _GEMINI_DOC_PREFIX_NO_TITLE.format(content=item.content)
