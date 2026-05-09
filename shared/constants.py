@@ -322,6 +322,18 @@ class EntityType(StrEnum):
 
 EMBEDDING_MODEL = "openai/text-embedding-3-large"
 EMBEDDING_DIM = 3072
+# Stage 1 of the Gemini embedding migration: every newly-ingested chunk is
+# embedded by both providers concurrently and persisted to two halfvec
+# columns. The query path still reads the v1 column until Stage 4 cuts over.
+# Treat as the single source of truth for the "what's the new embedder?"
+# question -- swapping providers later means flipping these two consts and
+# the dispatch in shared/embeddings.py, not chasing string literals.
+EMBEDDING_V2_MODEL = "google/gemini-embedding-2-preview"
+EMBEDDING_V2_DIM = 3072
+# Gemini-2's input ceiling is much lower than OpenAI's 8191. Used by the
+# chunker as an absolute upper bound on chunk_tokens so dual-write can't
+# silently truncate the Gemini-side input.
+EMBEDDING_V2_MAX_INPUT_TOKENS = 2048
 CHUNKER_VERSION = "naive-v1"
 NORMALIZER_VERSION = "v1"
 
