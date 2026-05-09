@@ -1,0 +1,219 @@
+"""Live-DB tests for the directed-vector retriever.
+
+The retriever runs an HNSW lookup against `directed_vectors` and joins
+to `documents`. The Embedder stub-mode (no OpenAI key) emits
+deterministic hash-based vectors, so the same string always embeds the
+same way — these tests rely on that to seed phrases that will / will
+not match a query.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import UTC, datetime
+
+import pytest
+
+from services.retrieval.retrievers.directed import directed_search
+from shared.db import raw_conn, with_tenant
+from shared.embeddings import get_embedder, reset_embedder
+
+_NOW = datetime(2026, 5, 8, tzinfo=UTC)
+
+
+def _vec_literal(vec: list[float]) -> str:
+    return "[" + ",".join(f"{x:.7f}" for x in vec) + "]"
+
+
+def _hash(s: str) -> bytes:
+    return hashlib.sha256(s.encode("utf-8")).digest()
+
+
+async def _seed_customer(conn, customer_id: str) -> None:
+    await conn.execute(
+        "INSERT INTO customers (customer_id, display_name, api_key_hash) "
+        "VALUES ($1, 'test', 'h-' || $1) ON CONFLICT DO NOTHING",
+        customer_id,
+    )
+
+
+async def _seed_doc(
+    *,
+    customer_id: str,
+    doc_id: str,
+    title: str,
+    source_system: str = "wiki",
+    doc_type: str = "wiki.runbook",
+) -> None:
+    async with raw_conn() as conn:
+        await _seed_customer(conn, customer_id)
+        await conn.execute(
+            """
+            INSERT INTO documents (
+                doc_id, version, customer_id,
+                source_system, source_id, source_url,
+                doc_class, doc_type, content_type,
+                content_hash, title, body_size_bytes, body_token_count,
+                created_at, updated_at, valid_from, ingested_at, acl
+            ) VALUES (
+                $1, 1, $2,
+                $3, $1, 'https://wiki.example/' || $1,
+                'compiled_wiki', $4, 'text/markdown',
+                'h-' || $1, $5, 100, 0,
+                $6, $6, $6, $6, '{}'::jsonb
+            )
+            """,
+            doc_id,
+            customer_id,
+            source_system,
+            doc_type,
+            title,
+            _NOW,
+        )
+
+
+async def _seed_directed_phrase(
+    *,
+    customer_id: str,
+    doc_id: str,
+    phrase: str,
+    source: str = "human",
+    synthesis_run_id: int | None = None,
+) -> None:
+    """Insert one directed_vector row using the embedder's stub vector."""
+    embedder = get_embedder()
+    [vec] = (await embedder.embed_many([phrase])).embedded[:]  # one item
+    async with with_tenant(customer_id) as conn:
+        await conn.execute(
+            """
+            INSERT INTO directed_vectors
+              (customer_id, doc_id, embedding, source_text, source,
+               synthesis_run_id, content_hash)
+            VALUES ($1, $2, $3::halfvec, $4, $5, $6, $7)
+            """,
+            customer_id,
+            doc_id,
+            _vec_literal(vec.embedding),
+            phrase,
+            source,
+            synthesis_run_id,
+            _hash(phrase),
+        )
+
+
+@pytest.fixture(autouse=True)
+def _reset_embedder() -> None:
+    """Ensure each test gets a fresh embedder bound to the test event loop."""
+    reset_embedder()
+    yield
+    reset_embedder()
+
+
+@pytest.mark.asyncio
+async def test_directed_search_returns_one_hit_per_doc(live_db) -> None:
+    """Multiple directed_vectors rows for one doc collapse to a single
+    DirectedHit via DISTINCT ON. Best (highest similarity) wins.
+    """
+    cust = "cust-dir-1"
+    doc_id = "wiki:runbook:deploys"
+    await _seed_doc(customer_id=cust, doc_id=doc_id, title="Deploy runbook")
+    # Two phrases for the same doc; the query matches one closely.
+    await _seed_directed_phrase(
+        customer_id=cust, doc_id=doc_id, phrase="deploy keeps timing out"
+    )
+    await _seed_directed_phrase(
+        customer_id=cust, doc_id=doc_id, phrase="how to release patches"
+    )
+
+    hits = await directed_search(cust, "deploy keeps timing out", top_k=10)
+
+    assert len(hits) == 1
+    assert hits[0].doc_id == doc_id
+    # The matched_text is one of the two seeded phrases.
+    assert hits[0].matched_text in (
+        "deploy keeps timing out",
+        "how to release patches",
+    )
+
+
+@pytest.mark.asyncio
+async def test_directed_search_multitenant_isolation(live_db) -> None:
+    """A query under tenant A's GUC must not surface tenant B's directed
+    rows. This is the same FORCE-RLS guarantee `with_tenant` provides for
+    every other retriever; the test pins it for directed too.
+    """
+    cust_a = "cust-dir-a"
+    cust_b = "cust-dir-b"
+    await _seed_doc(customer_id=cust_a, doc_id="wiki:runbook:a", title="A")
+    await _seed_doc(customer_id=cust_b, doc_id="wiki:runbook:b", title="B")
+    await _seed_directed_phrase(
+        customer_id=cust_a, doc_id="wiki:runbook:a", phrase="shared phrase text"
+    )
+    await _seed_directed_phrase(
+        customer_id=cust_b, doc_id="wiki:runbook:b", phrase="shared phrase text"
+    )
+
+    # We rely on the test environment's prbe role being a superuser — that
+    # bypasses RLS, BUT directed_search adds an explicit
+    # `WHERE dv.customer_id = $1` predicate so even with RLS bypassed the
+    # query is correctly scoped. Verify that explicit scoping works.
+    hits_a = await directed_search(cust_a, "shared phrase text", top_k=10)
+    hits_b = await directed_search(cust_b, "shared phrase text", top_k=10)
+    assert all(h.doc_id == "wiki:runbook:a" for h in hits_a)
+    assert all(h.doc_id == "wiki:runbook:b" for h in hits_b)
+
+
+@pytest.mark.asyncio
+async def test_directed_search_empty_for_customer_with_no_phrases(live_db) -> None:
+    """Customer with directed_vectors empty -> retriever returns []."""
+    cust = "cust-dir-empty"
+    await _seed_doc(customer_id=cust, doc_id="wiki:runbook:x", title="x")
+
+    hits = await directed_search(cust, "anything", top_k=10)
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_directed_search_temporal_filters_to_live_docs_by_default(
+    live_db,
+) -> None:
+    """Default temporal is latest-live: a doc whose `valid_to` is set
+    (superseded version) does not surface.
+    """
+    cust = "cust-dir-temporal"
+    doc_id = "wiki:runbook:retired"
+    await _seed_doc(customer_id=cust, doc_id=doc_id, title="Retired")
+    await _seed_directed_phrase(
+        customer_id=cust, doc_id=doc_id, phrase="legacy procedure"
+    )
+    # Mark the doc's row as superseded by setting valid_to.
+    async with raw_conn() as conn:
+        await conn.execute(
+            "UPDATE documents SET valid_to = $1 WHERE customer_id = $2 AND doc_id = $3",
+            _NOW,
+            cust,
+            doc_id,
+        )
+
+    hits = await directed_search(cust, "legacy procedure", top_k=10)
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_directed_search_score_is_cosine_similarity(live_db) -> None:
+    """`score` is converted from cosine distance to similarity (1 - dist)
+    and clamped at 0 — same convention as VectorHit so fusion can fold
+    it without flipping the sign.
+    """
+    cust = "cust-dir-score"
+    doc_id = "wiki:runbook:s"
+    await _seed_doc(customer_id=cust, doc_id=doc_id, title="S")
+    # Embedder stub gives the same vector for the same string -> identical
+    # phrase / query yields cosine similarity ~ 1.0.
+    await _seed_directed_phrase(
+        customer_id=cust, doc_id=doc_id, phrase="exact match phrase"
+    )
+
+    hits = await directed_search(cust, "exact match phrase", top_k=10)
+    assert len(hits) == 1
+    assert hits[0].score >= 0.99

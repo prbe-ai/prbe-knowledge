@@ -1,0 +1,313 @@
+"""Unit + live-DB tests for services/synthesis/directed_phrases.py.
+
+Covers:
+  - parse_directed_frontmatter: empty / missing / malformed / valid.
+  - persist_directed_vectors:
+      * human-pin add: row appears with source='human', NULL run_id.
+      * human-pin remove: row deletes when frontmatter no longer lists it.
+      * llm regen: rows from older synthesis_run_id are deleted, new
+        rows persist with current run_id.
+      * dedupe: an LLM phrase matching a human pin (under stub-embedder
+        identity) is suppressed.
+      * partial state on LLM failure: human pins still reconcile; the
+        result.llm_failed flag flips; no exception bubbles up.
+
+The Anthropic LLM is mocked to avoid hitting a real API.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import UTC, datetime
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from services.synthesis.directed_phrases import (
+    parse_directed_frontmatter,
+    persist_directed_vectors,
+)
+from shared.db import raw_conn, with_tenant
+from shared.embeddings import reset_embedder
+
+_NOW = datetime(2026, 5, 8, tzinfo=UTC)
+
+
+def _hash(s: str) -> bytes:
+    return hashlib.sha256(" ".join(s.lower().split()).encode("utf-8")).digest()
+
+
+# ---- frontmatter parsing -------------------------------------------------
+
+
+def test_parse_frontmatter_missing() -> None:
+    assert parse_directed_frontmatter(None) == []
+    assert parse_directed_frontmatter({}) == []
+
+
+def test_parse_frontmatter_present() -> None:
+    assert parse_directed_frontmatter(
+        {"directed": ["phrase one", "phrase two"]}
+    ) == ["phrase one", "phrase two"]
+
+
+def test_parse_frontmatter_strips_whitespace_and_drops_empty() -> None:
+    assert parse_directed_frontmatter(
+        {"directed": ["  phrase one  ", "", "  ", "phrase two"]}
+    ) == ["phrase one", "phrase two"]
+
+
+def test_parse_frontmatter_malformed_not_a_list_returns_empty() -> None:
+    # When `directed:` is misauthored as a string (or dict) we silently
+    # drop it; logging makes it discoverable, the page still persists.
+    assert parse_directed_frontmatter({"directed": "not a list"}) == []
+    assert parse_directed_frontmatter({"directed": {"foo": "bar"}}) == []
+
+
+def test_parse_frontmatter_drops_non_string_items() -> None:
+    assert parse_directed_frontmatter(
+        {"directed": ["good", 42, None, "also good"]}
+    ) == ["good", "also good"]
+
+
+# ---- persist orchestrator (live DB) --------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_embedder_around() -> None:
+    reset_embedder()
+    yield
+    reset_embedder()
+
+
+async def _seed_customer_and_doc(
+    customer_id: str, doc_id: str, title: str = "page"
+) -> None:
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO customers (customer_id, display_name, api_key_hash) "
+            "VALUES ($1, 'test', 'h-' || $1) ON CONFLICT DO NOTHING",
+            customer_id,
+        )
+        await conn.execute(
+            """
+            INSERT INTO documents (
+                doc_id, version, customer_id,
+                source_system, source_id, source_url,
+                doc_class, doc_type, content_type,
+                content_hash, title, body_size_bytes, body_token_count,
+                created_at, updated_at, valid_from, ingested_at, acl
+            ) VALUES (
+                $1, 1, $2,
+                'wiki', $1, 'https://wiki.example/' || $1,
+                'compiled_wiki', 'wiki.runbook', 'text/markdown',
+                'h-' || $1, $3, 100, 0,
+                $4, $4, $4, $4, '{}'::jsonb
+            )
+            ON CONFLICT DO NOTHING
+            """,
+            doc_id,
+            customer_id,
+            title,
+            _NOW,
+        )
+
+
+def _make_anthropic_client(phrases: list[str]) -> Any:
+    """Build a mock AsyncAnthropic-ish client whose messages.create returns
+    a tool_use block with the given phrases.
+    """
+    block = MagicMock()
+    block.type = "tool_use"
+    block.name = "record_directed_phrases"
+    block.input = {"phrases": phrases}
+    response = MagicMock()
+    response.content = [block]
+    client = MagicMock()
+    client.messages.create = AsyncMock(return_value=response)
+    return client
+
+
+@pytest.mark.asyncio
+async def test_persist_adds_human_pins_no_llm(live_db) -> None:
+    cust = "cust-dp-1"
+    doc_id = "wiki:runbook:dp1"
+    await _seed_customer_and_doc(cust, doc_id)
+    # synthesis_run_id=None disables the LLM step entirely.
+    res = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="Runbook",
+        page_body="body text",
+        frontmatter={"directed": ["alpha phrase", "beta phrase"]},
+        synthesis_run_id=None,
+    )
+    assert res.human_added == 2
+    assert res.human_removed == 0
+    assert res.llm_added == 0
+    assert res.llm_removed == 0
+    assert res.llm_failed is False
+
+    async with with_tenant(cust) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT source, source_text, synthesis_run_id
+            FROM directed_vectors
+            WHERE customer_id = $1 AND doc_id = $2
+            ORDER BY source_text
+            """,
+            cust,
+            doc_id,
+        )
+    assert [r["source_text"] for r in rows] == ["alpha phrase", "beta phrase"]
+    assert all(r["source"] == "human" for r in rows)
+    assert all(r["synthesis_run_id"] is None for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_persist_removes_human_pins_when_frontmatter_drops_them(live_db) -> None:
+    cust = "cust-dp-2"
+    doc_id = "wiki:runbook:dp2"
+    await _seed_customer_and_doc(cust, doc_id)
+    await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter={"directed": ["alpha", "beta", "gamma"]},
+        synthesis_run_id=None,
+    )
+    # Now re-run with one pin removed.
+    res = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter={"directed": ["alpha", "gamma"]},
+        synthesis_run_id=None,
+    )
+    assert res.human_removed == 1
+    assert res.human_added == 0  # alpha + gamma already exist (idempotent)
+    async with with_tenant(cust) as conn:
+        rows = await conn.fetch(
+            "SELECT source_text FROM directed_vectors WHERE customer_id=$1 AND doc_id=$2 ORDER BY source_text",
+            cust,
+            doc_id,
+        )
+    assert [r["source_text"] for r in rows] == ["alpha", "gamma"]
+
+
+@pytest.mark.asyncio
+async def test_persist_llm_regen_replaces_old_run_rows(live_db) -> None:
+    cust = "cust-dp-3"
+    doc_id = "wiki:runbook:dp3"
+    await _seed_customer_and_doc(cust, doc_id)
+
+    # First run: LLM emits two phrases under run_id 100.
+    client_v1 = _make_anthropic_client(["llm one", "llm two"])
+    res1 = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter={},
+        synthesis_run_id=100,
+        anthropic_client=client_v1,
+    )
+    assert res1.llm_added == 2
+    assert res1.llm_removed == 0
+
+    # Second run: LLM emits a different set under run_id 200 -> old rows
+    # for this doc are deleted, new ones inserted.
+    client_v2 = _make_anthropic_client(["llm three", "llm four"])
+    res2 = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter={},
+        synthesis_run_id=200,
+        anthropic_client=client_v2,
+    )
+    assert res2.llm_removed == 2
+    assert res2.llm_added == 2
+
+    async with with_tenant(cust) as conn:
+        rows = await conn.fetch(
+            "SELECT source_text, synthesis_run_id FROM directed_vectors WHERE customer_id=$1 AND doc_id=$2 ORDER BY source_text",
+            cust,
+            doc_id,
+        )
+    assert [r["source_text"] for r in rows] == ["llm four", "llm three"]
+    assert all(r["synthesis_run_id"] == 200 for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_persist_llm_failure_skips_llm_keeps_humans(live_db) -> None:
+    cust = "cust-dp-4"
+    doc_id = "wiki:runbook:dp4"
+    await _seed_customer_and_doc(cust, doc_id)
+
+    failing_client = MagicMock()
+    failing_client.messages.create = AsyncMock(side_effect=RuntimeError("api down"))
+
+    res = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter={"directed": ["pinned phrase"]},
+        synthesis_run_id=42,
+        anthropic_client=failing_client,
+    )
+    assert res.llm_failed is True
+    assert res.human_added == 1
+    assert res.llm_added == 0
+
+    async with with_tenant(cust) as conn:
+        rows = await conn.fetch(
+            "SELECT source, source_text FROM directed_vectors WHERE customer_id=$1 AND doc_id=$2",
+            cust,
+            doc_id,
+        )
+    assert len(rows) == 1
+    assert rows[0]["source"] == "human"
+    assert rows[0]["source_text"] == "pinned phrase"
+
+
+@pytest.mark.asyncio
+async def test_persist_llm_dup_of_human_pin_is_dropped(live_db) -> None:
+    """When the LLM emits a phrase identical to a human pin, the embedder
+    stub assigns the SAME vector (deterministic hash). The dedupe pass
+    drops it so we don't insert two source-distinct rows for the same
+    phrase. Pins always win.
+    """
+    cust = "cust-dp-5"
+    doc_id = "wiki:runbook:dp5"
+    await _seed_customer_and_doc(cust, doc_id)
+
+    client = _make_anthropic_client(["pinned phrase", "novel llm phrase"])
+    res = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter={"directed": ["pinned phrase"]},
+        synthesis_run_id=7,
+        anthropic_client=client,
+    )
+    # Human pin added, LLM contributes only the non-dup phrase.
+    assert res.human_added == 1
+    assert res.llm_added == 1
+
+    async with with_tenant(cust) as conn:
+        rows = await conn.fetch(
+            "SELECT source, source_text FROM directed_vectors WHERE customer_id=$1 AND doc_id=$2 ORDER BY source, source_text",
+            cust,
+            doc_id,
+        )
+    sources = sorted({r["source"] for r in rows})
+    assert sources == ["human", "llm"]
+    texts = sorted(r["source_text"] for r in rows)
+    assert texts == ["novel llm phrase", "pinned phrase"]

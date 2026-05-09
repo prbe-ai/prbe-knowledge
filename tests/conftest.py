@@ -66,6 +66,7 @@ TRUNCATE_SQL = """
         ingestion_queue,
         acl_snapshots,
         chunks,
+        directed_vectors,
         wiki_links,
         wiki_timeline_entries,
         wiki_raw_data,
