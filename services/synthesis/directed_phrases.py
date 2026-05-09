@@ -51,6 +51,13 @@ class DirectedPersistResult:
     llm_added: int = 0
     llm_removed: int = 0
     llm_failed: bool = False
+    # Drop counts from the cosine-distance dedup pass. Tracked separately
+    # so we can see whether DIRECTED_DEDUPE_COSINE_THRESHOLD is too tight
+    # (high drop rate -> losing legitimate distinct phrasings) or too
+    # loose (zero drops -> storing near-duplicate embeddings). Tuning is
+    # eval-driven; these counters are the input.
+    llm_dropped_vs_human: int = 0   # LLM phrase too close to a human pin
+    llm_dropped_internal: int = 0   # LLM phrase too close to one already kept
 
 
 # ---------------------------------------------------------------------------
@@ -353,12 +360,16 @@ async def persist_directed_vectors(
             candidate_llm_vecs.append(vec)
             candidate_llm_phrases.append(phrase)
         # Dedupe LLM candidates against human pins (humans win) AND against
-        # already-kept LLM candidates (no internal duplicates).
+        # already-kept LLM candidates (no internal duplicates). Drop counts
+        # are tracked on `result` so operators can see whether the
+        # threshold is over-pruning legitimate distinct phrasings.
         keep_mask = _dedupe_against_anchors(
             candidate_llm_vecs,
             human_vecs,
             threshold=DIRECTED_DEDUPE_COSINE_THRESHOLD,
         )
+        result.llm_dropped_vs_human = sum(1 for k in keep_mask if not k)
+
         kept_vecs: list[list[float]] = []
         for phrase, vec, keep in zip(
             candidate_llm_phrases, candidate_llm_vecs, keep_mask, strict=True
@@ -370,6 +381,7 @@ async def persist_directed_vectors(
                 [vec], kept_vecs, threshold=DIRECTED_DEDUPE_COSINE_THRESHOLD
             )[0]
             if not internal_keep:
+                result.llm_dropped_internal += 1
                 continue
             kept_vecs.append(vec)
             llm_keep.append((phrase, vec))

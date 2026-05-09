@@ -713,6 +713,11 @@ class WikiAgentRuntime:
                 llm_added=res.llm_added,
                 llm_removed=res.llm_removed,
                 llm_failed=res.llm_failed,
+                # Threshold tuning signal: high drop rates (especially
+                # llm_dropped_internal) suggest DIRECTED_DEDUPE_COSINE_THRESHOLD
+                # is over-pruning legitimate distinct phrasings.
+                llm_dropped_vs_human=res.llm_dropped_vs_human,
+                llm_dropped_internal=res.llm_dropped_internal,
             )
         except Exception as exc:
             log.warning(

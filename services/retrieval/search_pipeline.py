@@ -903,6 +903,22 @@ async def run_search(
         # see retrievers/directed.py + fusion.py. Always-on; the
         # DIRECTED_RETRIEVAL_WEIGHT constant (or an empty
         # directed_vectors table) is the kill switch.
+        #
+        # Cheap pre-check: skip the embed + HNSW round-trip entirely for
+        # tenants with zero rows in directed_vectors. The full retriever
+        # is dominated by the embedding API call (~50-100ms); the
+        # existence check is one tenant-scoped SELECT (~1-2ms). Net win
+        # for tenants who haven't enabled the feature, ~1ms penalty for
+        # tenants who have. As soon as the first row lands, the gate
+        # opens.
+        async with with_tenant(customer_id) as conn:
+            has_any = await conn.fetchval(
+                "SELECT 1 FROM directed_vectors "
+                "WHERE customer_id = $1 LIMIT 1",
+                customer_id,
+            )
+        if not has_any:
+            return []
         return await directed_search(
             customer_id,
             req.query,

@@ -459,3 +459,41 @@ async def test_persist_llm_dup_of_human_pin_is_dropped(live_db) -> None:
     assert sources == ["human", "llm"]
     texts = sorted(r["source_text"] for r in rows)
     assert texts == ["novel llm phrase", "pinned phrase"]
+    # Drop telemetry: the LLM-vs-human dedup pass should have dropped
+    # the duplicate ("pinned phrase") and kept the novel one. Pin this
+    # so threshold-tuning regressions are visible in test output.
+    assert res.llm_dropped_vs_human == 1
+    assert res.llm_dropped_internal == 0
+
+
+@pytest.mark.asyncio
+async def test_persist_dedup_telemetry_counts_internal_drops(live_db) -> None:
+    """When the LLM emits two phrases that hash to identical embeddings
+    (the stub-mode embedder is deterministic per string, so two distinct
+    strings can only share a vector if they normalize to the same hash —
+    but the dedup pass also runs on cosine-distance < threshold, which
+    triggers when DIFFERENT strings happen to produce nearby vectors).
+
+    This test pins the internal-LLM-dedup counter by feeding TWO
+    duplicate strings; the embedder gives them identical vectors, so the
+    second one trips the internal-dedup branch.
+    """
+    cust = "cust-dp-dedup-telemetry"
+    doc_id = "wiki:runbook:dedup-tel"
+    await _seed_customer_and_doc(cust, doc_id)
+
+    # Two duplicates of the same phrase + one novel one.
+    client = _make_anthropic_client(["alpha phrase", "alpha phrase", "beta phrase"])
+    res = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter=None,
+        synthesis_run_id=42,
+        anthropic_client=client,
+    )
+    assert res.llm_added == 2  # alpha (first occurrence) + beta
+    assert res.llm_dropped_vs_human == 0
+    # The duplicate "alpha phrase" trips internal-dedup.
+    assert res.llm_dropped_internal == 1

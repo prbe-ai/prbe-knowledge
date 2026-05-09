@@ -26,7 +26,7 @@ from services.retrieval.search_pipeline import run_search
 from shared.config import Settings, get_settings
 from shared.db import raw_conn, with_tenant
 from shared.embeddings import get_embedder, reset_embedder
-from shared.models import QueryRequest, TemporalSpec
+from shared.models import QueryDocumentResult, QueryRequest, TemporalSpec
 from shared.storage import reset_store
 
 pytestmark = pytest.mark.asyncio
@@ -201,9 +201,11 @@ async def test_directed_signal_flows_end_to_end_to_query_response(
             timing={},
         )
 
-    # Doc surfaced.
-    assert len(resp.documents) == 1
-    doc = resp.documents[0]
+    # Doc surfaced. The polymorphic response shape carries documents in
+    # `results` discriminated by type — filter to QueryDocumentResult.
+    docs = [r for r in resp.results if isinstance(r, QueryDocumentResult)]
+    assert len(docs) == 1
+    doc = docs[0]
     assert doc.doc_id == doc_id
 
     # directed in retriever_scores breakdown — proves the signal flowed
@@ -222,3 +224,95 @@ async def test_directed_signal_flows_end_to_end_to_query_response(
     # Response chunks carry the page CONTENT, never the directed phrase.
     assert any("runbook body" in c.content for c in doc.chunks)
     assert all("deploy keeps timing out" not in c.content for c in doc.chunks)
+
+
+async def test_directed_runner_skips_directed_search_when_tenant_has_no_rows(
+    live_db,
+) -> None:
+    """Pre-check optimization: the _directed_runner short-circuits before
+    calling directed_search (and the embedding API) when the tenant has
+    zero rows in directed_vectors. Saves the embed round-trip for the
+    common case where a tenant hasn't enabled the feature.
+
+    Setup: seed a tenant with a doc + a content chunk for bm25 to surface,
+    but NO directed_vectors. Run search and patch directed_search to
+    raise — proving it was never called.
+    """
+    cust = "cust-search-no-directed"
+    await _seed_customer(cust)
+    doc_id = "wiki:runbook:no-directed"
+    await _seed_doc(cust, doc_id=doc_id, title="Empty directed page")
+    # Note: deliberately NOT seeding directed_vectors — the runner's
+    # pre-check should skip the call entirely.
+
+    routed = RouterOutput(entities=[])
+    req = QueryRequest(query="anything", top_k=5, top_k_related=0)
+
+    # If the pre-check fails, directed_search runs and trips this assertion.
+    directed_search_called = False
+
+    async def _boom(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal directed_search_called
+        directed_search_called = True
+        raise AssertionError(
+            "directed_search must not be called for tenants with zero "
+            "directed_vectors rows; the _directed_runner pre-check should "
+            "have short-circuited."
+        )
+
+    patches = {
+        "vector": patch(
+            "services.retrieval.search_pipeline.vector_search",
+            new=AsyncMock(return_value=[]),
+        ),
+        "bm25": patch(
+            "services.retrieval.search_pipeline.bm25_search",
+            new=AsyncMock(return_value=[_bm25_hit(doc_id, f"runbook body for {doc_id}")]),
+        ),
+        "graph": patch(
+            "services.retrieval.search_pipeline.graph_search",
+            new=AsyncMock(return_value=[]),
+        ),
+        "id_lookup": patch(
+            "services.retrieval.search_pipeline.id_lookup_search",
+            new=AsyncMock(return_value=[]),
+        ),
+        "directed": patch(
+            "services.retrieval.search_pipeline.directed_search",
+            new=AsyncMock(side_effect=_boom),
+        ),
+        "embeddings": patch(
+            "services.retrieval.search_pipeline.embeddings_for_chunks",
+            new=AsyncMock(return_value={}),
+        ),
+        "acl": patch(
+            "services.retrieval.search_pipeline.filter_by_acl",
+            new=AsyncMock(side_effect=lambda _c, _u, hits: hits),
+        ),
+    }
+    with patches["vector"], patches["bm25"], patches["graph"], patches[
+        "id_lookup"
+    ], patches["directed"], patches["embeddings"], patches["acl"]:
+        resp = await run_search(
+            req=req,
+            customer_id=cust,
+            routed=routed,
+            spec=TemporalSpec(),
+            temporal_meta={},
+            sort_meta=None,
+            extracted_entities=[],
+            doc_types=None,
+            trace_id="t-no-directed",
+            timing={},
+        )
+
+    assert directed_search_called is False, (
+        "Pre-check failed: directed_search was called for a tenant with "
+        "zero directed_vectors rows."
+    )
+    # Sanity: the rest of the pipeline still works.
+    docs = [r for r in resp.results if isinstance(r, QueryDocumentResult)]
+    assert len(docs) == 1
+    assert docs[0].doc_id == doc_id
+    # No 'directed' key in retriever_scores because the signal didn't run.
+    assert "directed" not in docs[0].retriever_scores
