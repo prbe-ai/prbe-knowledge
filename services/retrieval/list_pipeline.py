@@ -29,10 +29,12 @@ from services.retrieval.router import RouterOutput
 from shared.constants import SourceSystem
 from shared.logging import get_logger
 from shared.models import (
+    MatchProvenance,
     QueryChunk,
-    QueryDocument,
+    QueryDocumentResult,
     QueryRequest,
     QueryResponse,
+    QueryResult,
     RelatedEntity,
     TemporalSpec,
 )
@@ -152,7 +154,7 @@ async def run_list(
         operation = "list"
 
     aggregation: dict[str, object] | None = None
-    documents: list[QueryDocument] = []
+    document_results: list[QueryDocumentResult] = []
     total_candidates = 0
 
     t_sql = time.perf_counter()
@@ -205,8 +207,12 @@ async def run_list(
         timing["acl_ms"] = (time.perf_counter() - t_acl) * 1000
 
         total_candidates = len(hits)
-        documents = [
-            QueryDocument(
+        # SQL list emits one chunk per doc by construction. Wrap each into
+        # a QueryDocumentResult with a single QueryChunk under it -- the
+        # per-doc shape matches the polymorphic search-path output.
+        document_results = [
+            QueryDocumentResult(
+                canonical_id=h.doc_id,
                 doc_id=h.doc_id,
                 doc_version=h.doc_version,
                 source_system=SourceSystem(h.source_system),
@@ -217,14 +223,21 @@ async def run_list(
                 updated_at=h.updated_at,
                 score=h.score,
                 rank=i + 1,
+                matched_via=[
+                    MatchProvenance(
+                        channel="bm25",  # SQL list path is closest to BM25
+                        rank=i + 1,
+                        score=h.score,
+                    )
+                ],
                 chunk_count=1,
                 retriever_scores={"sql": h.score},
                 chunks=[
                     QueryChunk(
                         chunk_id=h.chunk_id,
+                        content=h.content,
                         score=h.score,
                         rank_in_doc=1,
-                        content=h.content,
                         retriever_scores={"sql": h.score},
                         graph_evidence=[],
                     )
@@ -249,9 +262,12 @@ async def run_list(
             routed.entities,
             entity_match_threshold=req.entity_match_threshold,
         )
-        # List mode emits one chunk per doc by construction, so the rank
-        # is simply the doc's index in the documents list.
-        ranked_docs = [(d.doc_id, i) for i, d in enumerate(documents, start=1)]
+        # Dedupe doc_id, keep best (lowest) rank per doc -- list mode emits
+        # one doc per result by construction, but the dedupe is cheap insurance.
+        best_rank: dict[str, int] = {}
+        for i, d in enumerate(document_results, start=1):
+            best_rank.setdefault(d.doc_id, i)
+        ranked_docs = sorted(best_rank.items(), key=lambda kv: kv[1])
         t_related = time.perf_counter()
         try:
             related = await walk_result_doc_neighbors(
@@ -272,9 +288,14 @@ async def run_list(
             related_error = type(exc).__name__
         timing["related_entities_ms"] = (time.perf_counter() - t_related) * 1000
 
+    # results: list[QueryResult] -- list pipeline only emits Documents
+    # today. Entity surfacing is a search-path feature; list path stays
+    # narrow on purpose (deterministic SQL window/aggregate semantics).
+    results: list[QueryResult] = list(document_results)
+
     return QueryResponse(
         query=req.query,
-        documents=documents,
+        results=results,
         total_candidates=total_candidates,
         router_hit_cache=False,
         confidence_breakdown={"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0},

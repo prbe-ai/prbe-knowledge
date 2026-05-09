@@ -19,13 +19,27 @@ list-mode split). Two behavior changes vs. before:
    instead of the old `pool_multiplier=5 + post-fusion sort` behavior —
    that was the original bug we're fixing. Pure relevance ranking is
    preserved; new items get a stronger nudge.
+
+Polymorphic output
+──────────────────
+The pipeline emits `QueryResponse.results: list[QueryResult]` where each
+result is a discriminated union of `QueryDocumentResult` (body chunks
+nested) and `QueryEntityResult` (graph entities the router asked about).
+Each result carries a `matched_via: list[MatchProvenance]` trace so MCP
+consumers can see which channel(s) surfaced it. A 4th channel
+(`inferred_edge`) walks LLM-derived Doc-Doc edges from the top primary
+results and surfaces linked docs as primary Document results with `why`
+justifications attached.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import time
+from collections import defaultdict
 from datetime import UTC, datetime
+from typing import Any
 
 from services.retrieval.acl import filter_by_acl
 from services.retrieval.dedup import dedupe
@@ -35,24 +49,31 @@ from services.retrieval.helpers import (
     embeddings_for_chunks,
 )
 from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search, residualize_for_bm25
-from services.retrieval.retrievers.graph import graph_search
+from services.retrieval.retrievers.graph import GraphHit, graph_search
 from services.retrieval.retrievers.id_lookup import id_lookup_search, is_lookup_candidate
+from services.retrieval.retrievers.inferred_edges import (
+    InferredEdgeHit,
+    inferred_edge_search,
+)
 from services.retrieval.retrievers.related_entities import (
     build_exclude_node_keys,
     walk_result_doc_neighbors,
 )
 from services.retrieval.retrievers.vector import vector_search
-from services.retrieval.router import RouterOutput
+from services.retrieval.router import RouterEntity, RouterOutput
 from services.retrieval.temporal import build_predicate
-from shared.constants import SourceSystem
+from shared.constants import ROUTER_ENTITY_TO_LABEL, SourceSystem
 from shared.db import with_tenant
 from shared.logging import get_logger
 from shared.models import (
     GraphEvidence,
+    MatchProvenance,
     QueryChunk,
-    QueryDocument,
+    QueryDocumentResult,
+    QueryEntityResult,
     QueryRequest,
     QueryResponse,
+    QueryResult,
     RelatedEntity,
     TemporalSpec,
     normalize_author_id,
@@ -69,6 +90,17 @@ _CODING_AGENT_SOURCES = {
     SourceSystem.CLAUDE_CODE.value,
     SourceSystem.CODEX.value,
 }
+
+# Inferred-edge channel parameters. The retriever score is dampened relative
+# to primary results so a linked doc can never out-rank the doc that anchored
+# its surfacing -- it's enrichment, not a primary ranking signal.
+_INFERRED_EDGE_TOP_K = 5
+_INFERRED_EDGE_DAMPENING = 0.5
+
+# How many attached docs to surface on each QueryEntityResult. The cap keeps
+# the response shape bounded for chatty entities; `doc_count` carries the
+# uncapped total so consumers can audit completeness.
+_ENTITY_ATTACHED_DOC_CAP = 5
 
 
 async def _content_fallbacks_for_metadata_only_agent_hits(
@@ -236,6 +268,400 @@ def _pin_id_lookup_matches(
     pinned = [by_doc[did] for did in id_order if did in by_doc]
     rest = [f for f in fused if f.doc_id not in seen]
     return pinned + rest
+
+
+def _per_channel_doc_ranks(
+    ranked_lists: dict[str, list[Any]],
+) -> dict[str, dict[str, tuple[int, float]]]:
+    """For each channel, build {doc_id -> (best_rank, best_score)}.
+
+    A channel can return multiple chunks of the same doc; we keep the
+    BEST (lowest) rank and its score. Used downstream to populate
+    `MatchProvenance` entries on the surviving QueryDocumentResults so
+    the response carries a per-channel trace.
+    """
+    out: dict[str, dict[str, tuple[int, float]]] = {}
+    for channel, hits in ranked_lists.items():
+        per_doc: dict[str, tuple[int, float]] = {}
+        for rank, hit in enumerate(hits, start=1):
+            kind = getattr(hit, "kind", "content")
+            if kind == "content_fallback":
+                # Fallback hits don't represent a real channel match -- they
+                # exist only to provide displayable content for metadata-only
+                # agent hits. Don't claim provenance.
+                continue
+            doc_id = hit.doc_id
+            score = float(getattr(hit, "score", 0.0))
+            existing = per_doc.get(doc_id)
+            if existing is None or rank < existing[0]:
+                per_doc[doc_id] = (rank, score)
+        out[channel] = per_doc
+    return out
+
+
+def _graph_evidence_by_doc(graph_hits: list[GraphHit]) -> dict[str, list[GraphEvidence]]:
+    """Collapse GraphHits into per-doc lists of GraphEvidence entries.
+
+    A single doc reachable via multiple seed entities accumulates one
+    evidence entry per seed. Entries are deduped on (edge_type, via_entity)
+    so a doc reached twice by the same seed-edge combo doesn't repeat.
+    """
+    out: dict[str, list[GraphEvidence]] = defaultdict(list)
+    seen: dict[str, set[tuple[str | None, str]]] = defaultdict(set)
+    for hit in graph_hits:
+        key = (hit.edge_type, hit.via_entity)
+        if key in seen[hit.doc_id]:
+            continue
+        seen[hit.doc_id].add(key)
+        out[hit.doc_id].append(
+            GraphEvidence(
+                edge_type=hit.edge_type or "",
+                confidence=hit.confidence or "EXTRACTED",
+                via_entity=hit.via_entity,
+                reason=None,
+            )
+        )
+    return out
+
+
+def _build_document_results_from_fused(
+    fused_top: list[FusedDocument],
+    ranked_lists: dict[str, list[Any]],
+    graph_hits: list[GraphHit],
+) -> list[QueryDocumentResult]:
+    """Convert each FusedDocument to a QueryDocumentResult.
+
+    Doc grouping + RRF_BREADTH_ALPHA scoring already happened in
+    `fusion.fuse()`; FusedDocument arrives doc-keyed with `chunks` nested
+    and `score` aggregated. This helper just wraps each into the
+    polymorphic shape and populates per-channel `matched_via`.
+
+    Within a doc, chunks are emitted in their FusedDocument order
+    (fusion already sorted by score desc). `matched_via` is built from
+    `ranked_lists` so every channel that surfaced the doc contributes a
+    MatchProvenance entry.
+    """
+    per_channel = _per_channel_doc_ranks(ranked_lists)
+    graph_evidence = _graph_evidence_by_doc(graph_hits)
+
+    results: list[QueryDocumentResult] = []
+    for doc in fused_top:
+        chunk_models: list[QueryChunk] = [
+            QueryChunk(
+                chunk_id=c.chunk_id,
+                content=c.content,
+                score=c.score,
+                rank_in_doc=c.rank_in_doc or (i + 1),
+                retriever_scores=dict(c.retriever_scores),
+                graph_evidence=list(graph_evidence.get(doc.doc_id, [])),
+            )
+            for i, c in enumerate(doc.chunks)
+        ]
+
+        # Per-channel matched_via: only channels that surfaced this doc.
+        # Score = the channel's best score for this doc; rank = the
+        # channel's best (lowest) rank for this doc.
+        provenances: list[MatchProvenance] = []
+        for channel in ("vector", "bm25", "graph", "id_lookup"):
+            entry = per_channel.get(channel, {}).get(doc.doc_id)
+            if entry is None:
+                continue
+            rank, score = entry
+            provenances.append(
+                MatchProvenance(channel=channel, rank=rank, score=score)
+            )
+
+        results.append(
+            QueryDocumentResult(
+                canonical_id=doc.doc_id,
+                doc_id=doc.doc_id,
+                doc_version=doc.doc_version,
+                source_system=SourceSystem(doc.source_system),
+                source_url=doc.source_url,
+                title=doc.title,
+                author_id=doc.author_id,
+                created_at=doc.created_at,
+                updated_at=doc.updated_at,
+                score=doc.score,
+                rank=0,  # filled in by the caller after final sort
+                matched_via=provenances,
+                chunks=chunk_models,
+                chunk_count=len(chunk_models),
+                retriever_scores=dict(doc.retriever_scores),
+            )
+        )
+    return results
+
+
+async def _build_inferred_edge_results(
+    customer_id: str,
+    document_results: list[QueryDocumentResult],
+    requesting_user_id: str | None,
+    timing: dict[str, float],
+) -> list[QueryDocumentResult]:
+    """Walk inferred Doc-Doc edges from the primary docs and wrap the hits
+    as QueryDocumentResults with the inferred-edge channel populated.
+
+    Returns documents that are NOT already in the primary set (the SQL
+    excludes self-anchors). Each result carries a single MatchProvenance
+    entry with channel='inferred_edge', the anchor info, and the LLM `why`.
+    """
+    if not document_results:
+        return []
+
+    top_doc_ids = [d.doc_id for d in document_results]
+    t_inferred = time.perf_counter()
+    try:
+        hits = await inferred_edge_search(
+            customer_id,
+            top_doc_ids,
+            top_k=_INFERRED_EDGE_TOP_K,
+            dampening=_INFERRED_EDGE_DAMPENING,
+        )
+    except Exception as exc:
+        # Enrichment channel: never break host search response. Log the
+        # failure and return [] so the primary results still flow through.
+        log.warning("inferred_edge_search.failed", exc_info=exc)
+        timing["inferred_edge_ms"] = (time.perf_counter() - t_inferred) * 1000
+        return []
+    timing["inferred_edge_ms"] = (time.perf_counter() - t_inferred) * 1000
+
+    if not hits:
+        return []
+
+    # ACL filter the inferred-edge hits the same way the primary path does.
+    # filter_by_acl is a no-op until ENFORCE_ACL flips on, but the call
+    # site keeps the contract honest.
+    filtered: list[InferredEdgeHit] = await filter_by_acl(
+        customer_id, requesting_user_id, hits
+    )
+
+    out: list[QueryDocumentResult] = []
+    for h in filtered:
+        prov = MatchProvenance(
+            channel="inferred_edge",
+            rank=h.anchor_rank,
+            score=h.score,
+            anchor_doc_id=h.anchor_doc_id,
+            edge_type=h.edge_type,
+            confidence=h.confidence,
+            why=h.why or None,
+        )
+        out.append(
+            QueryDocumentResult(
+                canonical_id=h.doc_id,
+                doc_id=h.doc_id,
+                doc_version=h.doc_version,
+                source_system=SourceSystem(h.source_system),
+                source_url=h.source_url,
+                title=h.title,
+                author_id=h.author_id,
+                created_at=h.created_at,
+                updated_at=h.updated_at,
+                score=h.score,
+                rank=0,  # filled in by the caller after final sort
+                matched_via=[prov],
+                chunks=[],  # inferred-edge hits don't carry body chunks
+                chunk_count=0,
+                retriever_scores={"inferred_edge": h.score},
+            )
+        )
+    return out
+
+
+async def _build_entity_results(
+    customer_id: str,
+    routed_entities: list[RouterEntity],
+    timing: dict[str, float],
+) -> list[QueryEntityResult]:
+    """Look up routed entities in graph_nodes and build QueryEntityResults.
+
+    Each routed entity that resolves to a (label, canonical_id) graph node
+    becomes one QueryEntityResult. We also collect 1-hop attached docs
+    (capped at `_ENTITY_ATTACHED_DOC_CAP` ordered by recency) and the total
+    1-hop Document count.
+
+    Score is `confidence * log(1 + doc_count)` -- a high-confidence entity
+    with many attached docs ranks above a low-confidence entity with few.
+    The score scale is tuned to be comparable to QueryDocumentResult.score
+    so the final concat-and-sort interleaves the two reasonably.
+    """
+    if not routed_entities:
+        return []
+
+    # Resolve each routed entity to a (label, canonical_id) tuple. Drop
+    # entities whose entity_type doesn't map to a NodeLabel -- those have
+    # no graph_nodes row to surface.
+    resolved: list[tuple[str, str, RouterEntity]] = []
+    for e in routed_entities:
+        node_label = ROUTER_ENTITY_TO_LABEL.get(e.entity_type.lower())
+        if node_label is None:
+            continue
+        # Skip 'session' entities -- they map to NodeLabel.DOCUMENT and
+        # already surface as Document results via id_lookup.
+        if node_label.value == "Document":
+            continue
+        resolved.append((node_label.value, e.canonical_id, e))
+
+    if not resolved:
+        return []
+
+    labels = [r[0] for r in resolved]
+    canonical_ids = [r[1] for r in resolved]
+
+    t_entity = time.perf_counter()
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            WITH wanted AS (
+                SELECT * FROM unnest($2::text[], $3::text[]) AS t(label, canonical_id)
+            ),
+            entity_nodes AS (
+                SELECT gn.node_id, gn.label, gn.canonical_id, gn.properties
+                FROM graph_nodes gn
+                JOIN wanted w ON w.label = gn.label
+                              AND w.canonical_id = gn.canonical_id
+                WHERE gn.customer_id = $1
+            ),
+            attached_from AS (
+                SELECT en.node_id AS entity_node_id,
+                       ge.edge_type,
+                       ge.to_node_id AS doc_node_id
+                FROM entity_nodes en
+                JOIN graph_edges ge
+                  ON ge.customer_id = $1
+                 AND ge.from_node_id = en.node_id
+                 AND (ge.valid_to IS NULL OR ge.valid_to > now())
+            ),
+            attached_to AS (
+                SELECT en.node_id AS entity_node_id,
+                       ge.edge_type,
+                       ge.from_node_id AS doc_node_id
+                FROM entity_nodes en
+                JOIN graph_edges ge
+                  ON ge.customer_id = $1
+                 AND ge.to_node_id = en.node_id
+                 AND (ge.valid_to IS NULL OR ge.valid_to > now())
+            ),
+            attached_edges AS (
+                SELECT * FROM attached_from
+                UNION ALL
+                SELECT * FROM attached_to
+            ),
+            entity_doc_attachments AS (
+                SELECT ae.entity_node_id,
+                       ae.edge_type,
+                       gn.canonical_id AS doc_id,
+                       d.updated_at
+                FROM attached_edges ae
+                JOIN graph_nodes gn
+                  ON gn.customer_id = $1
+                 AND gn.node_id = ae.doc_node_id
+                 AND gn.label = 'Document'
+                JOIN documents d
+                  ON d.customer_id = $1
+                 AND d.doc_id = gn.canonical_id
+                 AND d.valid_to IS NULL
+            ),
+            ranked_attachments AS (
+                SELECT entity_node_id, doc_id, updated_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY entity_node_id
+                           ORDER BY updated_at DESC, doc_id ASC
+                       ) AS rn
+                FROM (
+                    SELECT DISTINCT entity_node_id, doc_id, updated_at
+                    FROM entity_doc_attachments
+                ) AS distinct_attachments
+            )
+            SELECT en.node_id, en.label, en.canonical_id, en.properties,
+                   (SELECT array_agg(DISTINCT eda.edge_type)
+                          FILTER (WHERE eda.edge_type IS NOT NULL)
+                    FROM entity_doc_attachments eda
+                    WHERE eda.entity_node_id = en.node_id) AS edge_types,
+                   (SELECT COUNT(DISTINCT eda.doc_id)
+                    FROM entity_doc_attachments eda
+                    WHERE eda.entity_node_id = en.node_id) AS doc_count,
+                   (SELECT array_agg(ra.doc_id ORDER BY ra.rn)
+                    FROM ranked_attachments ra
+                    WHERE ra.entity_node_id = en.node_id
+                      AND ra.rn <= $4) AS attached_doc_pool
+            FROM entity_nodes en
+            ORDER BY en.label, en.canonical_id
+            """,
+            customer_id, labels, canonical_ids, _ENTITY_ATTACHED_DOC_CAP,
+        )
+    timing["entity_result_ms"] = (time.perf_counter() - t_entity) * 1000
+
+    # Map (label, canonical_id) -> RouterEntity for confidence lookup.
+    confidence_by_key: dict[tuple[str, str], float] = {}
+    for label, cid, entity in resolved:
+        key = (label, cid)
+        # If the same (label, cid) shows up under multiple routed entities,
+        # take the highest confidence.
+        confidence_by_key[key] = max(
+            confidence_by_key.get(key, 0.0), float(entity.confidence)
+        )
+
+    out: list[QueryEntityResult] = []
+    for r in rows:
+        label = r["label"]
+        canonical_id = r["canonical_id"]
+        key = (label, canonical_id)
+        confidence = confidence_by_key.get(key, 1.0)
+        properties = r["properties"]
+        if isinstance(properties, str):
+            # asyncpg sometimes returns JSONB as a string when no codec is
+            # registered. Decode best-effort.
+            import json
+            try:
+                properties = json.loads(properties)
+            except (TypeError, ValueError):
+                properties = {}
+        if not isinstance(properties, dict):
+            properties = {}
+        display_name = properties.get("name") if isinstance(properties.get("name"), str) else None
+
+        edge_types = list(r["edge_types"] or [])
+        doc_count = int(r["doc_count"] or 0)
+        attached = list(r["attached_doc_pool"] or [])
+
+        # Score: confidence * log(1 + doc_count). The log keeps high-degree
+        # entities from completely dominating; the confidence factor lets
+        # the router signal trickle through.
+        score = confidence * math.log1p(doc_count) if doc_count > 0 else confidence * 0.5
+
+        out.append(
+            QueryEntityResult(
+                canonical_id=canonical_id,
+                label=label,
+                display_name=display_name,
+                properties=properties,
+                attached_doc_ids=attached,
+                edge_types=edge_types,
+                doc_count=doc_count,
+                score=score,
+                rank=0,  # filled in by the caller after final sort
+                matched_via=[
+                    MatchProvenance(channel="graph", rank=1, score=confidence)
+                ],
+            )
+        )
+    return out
+
+
+def _final_rank(results: list[QueryResult]) -> list[QueryResult]:
+    """Sort by score desc with tie-break, then assign 1-indexed `rank`."""
+
+    def _sort_key(r: QueryResult) -> tuple[float, str]:
+        return (-r.score, r.canonical_id)
+
+    sorted_results = sorted(results, key=_sort_key)
+    # Pydantic models: assigning to `.rank` mutates in place via Pydantic
+    # v2's standard attribute setter. The discriminator fields stay intact.
+    for i, r in enumerate(sorted_results, start=1):
+        r.rank = i
+    return sorted_results
 
 
 async def run_search(
@@ -428,6 +854,32 @@ async def run_search(
 
     top: list[FusedDocument] = filtered[: req.top_k]
 
+    # Group fused chunks into per-doc results. The doc-grouping branch
+    # (feat/doc-grouped-retrieval) enriches the chunk-list aggregation;
+    # for now we group chunks already present in the fused output.
+    document_results = _build_document_results_from_fused(
+        top, ranked_lists, graph_hits
+    )
+
+    # Primary docs feed the inferred-edge channel anchors. document_results
+    # is already <= top_k since `top` was capped above.
+    primary_documents = document_results
+
+    # Inferred-edge channel: walk Doc-Doc INFERRED edges from the top
+    # primary docs. Returns Documents not already in primary_documents.
+    inferred_documents = await _build_inferred_edge_results(
+        customer_id, primary_documents, req.requesting_user_id, timing
+    )
+
+    # Entity results: surface routed entities as primary results so the
+    # consumer can see "the user asked about Service:foo" alongside the
+    # docs about it.
+    entity_results = await _build_entity_results(
+        customer_id, list(routed.entities), timing
+    )
+
+    # related_entities walk (post-fusion crawl candidates) -- separate
+    # field from the primary results. Same shape as before.
     related: list[RelatedEntity] | None = None
     related_error: str | None = None
     if req.top_k_related > 0:
@@ -458,70 +910,28 @@ async def run_search(
             related_error = type(exc).__name__
         timing["related_entities_ms"] = (time.perf_counter() - t_related) * 1000
 
-    # Build (chunk_id -> list[GraphEvidence]) from the raw graph_hits list.
-    # One chunk reached via N seeds carries N entries — preserve the M:N
-    # relationship the response contract requires.
-    graph_evidence_by_chunk: dict[str, list[GraphEvidence]] = {}
-    seen_evidence_keys: dict[str, set[tuple]] = {}
-    for gh in graph_hits:
-        edge_type = gh.edge_type or ""
-        confidence = gh.confidence or "EXTRACTED"
-        via_entity = gh.via_entity
-        key = (edge_type, confidence, via_entity)
-        if not edge_type:
-            continue
-        seen = seen_evidence_keys.setdefault(gh.chunk_id, set())
-        if key in seen:
-            continue
-        seen.add(key)
-        graph_evidence_by_chunk.setdefault(gh.chunk_id, []).append(
-            GraphEvidence(
-                edge_type=edge_type,
-                confidence=confidence,
-                via_entity=via_entity,
-                reason=None,
-            )
-        )
-
-    documents = [
-        QueryDocument(
-            doc_id=d.doc_id,
-            doc_version=d.doc_version,
-            source_system=SourceSystem(d.source_system),
-            source_url=d.source_url,
-            title=d.title,
-            author_id=d.author_id,
-            created_at=d.created_at,
-            updated_at=d.updated_at,
-            score=d.score,
-            rank=i + 1,
-            chunk_count=len(d.chunks),
-            retriever_scores=d.retriever_scores,
-            chunks=[
-                QueryChunk(
-                    chunk_id=c.chunk_id,
-                    score=c.score,
-                    rank_in_doc=c.rank_in_doc,
-                    content=c.content,
-                    retriever_scores=c.retriever_scores,
-                    graph_evidence=graph_evidence_by_chunk.get(c.chunk_id, []),
-                )
-                for c in d.chunks
-            ],
-        )
-        for i, d in enumerate(top)
+    # Concat primary docs + inferred-edge docs + entities, sort by score.
+    all_results: list[QueryResult] = [
+        *primary_documents,
+        *inferred_documents,
+        *entity_results,
     ]
+    final_results = _final_rank(all_results)
 
+    # Aggregate graph_evidence confidence tiers across every chunk in every
+    # Document result. Entity results have no chunks so contribute nothing.
     confidence_breakdown = {"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0}
-    for doc in documents:
-        for chunk in doc.chunks:
+    for r in final_results:
+        if not isinstance(r, QueryDocumentResult):
+            continue
+        for chunk in r.chunks:
             for ev in chunk.graph_evidence:
                 tier = ev.confidence
                 confidence_breakdown[tier] = confidence_breakdown.get(tier, 0) + 1
 
     return QueryResponse(
         query=req.query,
-        documents=documents,
+        results=final_results,
         total_candidates=len(fused),
         router_hit_cache=False,
         confidence_breakdown=confidence_breakdown,
