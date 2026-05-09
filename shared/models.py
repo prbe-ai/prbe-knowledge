@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -365,7 +365,8 @@ class GraphEvidence(BaseModel):
 
     A chunk reached via N distinct seed entities carries N GraphEvidence
     entries on QueryChunk.graph_evidence. Empty list when the chunk
-    surfaced via vector / BM25 / id_lookup alone.
+    surfaced via vector / BM25 / id_lookup alone. Lets MCP / dashboard
+    consumers filter on confidence tier without re-running the retrieval.
     """
 
     edge_type: str
@@ -375,45 +376,27 @@ class GraphEvidence(BaseModel):
 
 
 class QueryChunk(BaseModel):
-    chunk_id: str
-    score: float
-    # Position within the parent QueryDocument.chunks list (1-indexed,
-    # monotonic). Doc-level fields (doc_id, source_url, title, ...) live
-    # on the parent QueryDocument — not duplicated here.
-    rank_in_doc: int
-    content: str
-    retriever_scores: dict[str, float] = Field(default_factory=dict)
-    graph_evidence: list[GraphEvidence] = Field(default_factory=list)
+    """One body chunk inside a `QueryDocumentResult`.
 
-
-class QueryDocument(BaseModel):
-    """Doc-grouped retrieval result. Each matching content chunk for the
-    document is nested under `chunks`; `score` aggregates breadth + depth
-    of the match across those chunks (see fusion.py for the formula).
+    Doc-level fields (doc_id, source_system, title, source_url, author_id,
+    created_at, updated_at, doc_version) live on the parent
+    `QueryDocumentResult`, NOT on the chunk -- they are identical for every
+    chunk of a given document. The chunk only carries identity + content +
+    rank-within-doc + per-retriever scores + graph-walk provenance.
     """
 
-    doc_id: str
-    # Which document version the chunks' content came from when first seen.
-    # Under content-addressable chunks the same chunk can span many versions;
-    # the `first_seen_version` is the stable provenance value we return.
-    doc_version: int
-    source_system: SourceSystem
-    source_url: str
-    title: str | None
-    # Raw author identifier from the source system: GitHub login (`mahit`),
-    # commit-author email when no GitHub login resolved (`mahit@prbe.ai`),
-    # Slack user id (`U07ABC123`), Linear user id (`user_a3f9`), etc.
-    # NOT canonicalized across sources — same human can appear under
-    # multiple values. Null when the source had no author or when the
-    # ingestion-time sentinel was `"unknown"`.
-    author_id: str | None = None
-    created_at: datetime
-    updated_at: datetime
+    chunk_id: str
+    content: str
     score: float
-    rank: int
-    chunk_count: int
+    # 1-indexed position within its parent document's `chunks` list
+    # (chunks are sorted by score desc per doc).
+    rank_in_doc: int
     retriever_scores: dict[str, float] = Field(default_factory=dict)
-    chunks: list[QueryChunk] = Field(default_factory=list)
+    # Multiple seeding entities can produce multiple GraphEvidence entries
+    # for the same chunk -- e.g. the chunk reached via Repo:foo AND Person:bar
+    # carries two entries. Empty list when the chunk surfaced via vector /
+    # BM25 alone.
+    graph_evidence: list[GraphEvidence] = Field(default_factory=list)
 
 
 class RelatedEntity(BaseModel):
@@ -444,9 +427,91 @@ class RelatedEntity(BaseModel):
     associated_doc_ids: list[str] = Field(default_factory=list)
 
 
+class MatchProvenance(BaseModel):
+    """Per-result trace of which retrieval channel surfaced this node.
+
+    A single QueryResult can have multiple entries -- e.g. a Document
+    reached via vector AND graph walks carries two MatchProvenance rows.
+    """
+
+    channel: Literal["vector", "bm25", "graph", "inferred_edge", "id_lookup"]
+    rank: int
+    score: float
+    # Populated only when channel == "inferred_edge":
+    anchor_doc_id: str | None = None
+    edge_type: str | None = None
+    confidence: str | None = None
+    why: str | None = None  # LLM justification from properties.why
+
+
+class QueryResultBase(BaseModel):
+    """Common shape across all polymorphic QueryResult variants.
+
+    Subclasses set `node_type` to a literal -- Pydantic uses that as the
+    discriminator when parsing `list[QueryResult]`.
+    """
+
+    canonical_id: str
+    score: float
+    rank: int  # 1-indexed final rank in QueryResponse.results
+    matched_via: list[MatchProvenance] = Field(default_factory=list)
+
+
+class QueryDocumentResult(QueryResultBase):
+    """A Document surfaced by retrieval, with its body chunks nested.
+
+    `chunks` is forward-compatible with the doc-grouped retrieval branch
+    (feat/doc-grouped-retrieval): when their PR lands first, their list
+    of QueryChunks per Document slots directly into this field.
+    """
+
+    node_type: Literal["Document"] = "Document"
+    doc_id: str  # equals canonical_id
+    doc_version: int
+    source_system: SourceSystem
+    source_url: str
+    title: str | None = None
+    author_id: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    chunks: list[QueryChunk] = Field(default_factory=list)
+    chunk_count: int = 0
+    retriever_scores: dict[str, float] = Field(default_factory=dict)
+
+
+class QueryEntityResult(QueryResultBase):
+    """A non-Document graph node returned as a primary search result.
+
+    Distinct from `RelatedEntity` (which is a post-fusion crawl-candidate
+    enrichment): an EntityResult appears in `QueryResponse.results`
+    alongside Documents because the user's query asked about it.
+    """
+
+    node_type: Literal["Entity"] = "Entity"
+    label: str  # NodeLabel value
+    display_name: str | None = None
+    properties: dict[str, object] = Field(default_factory=dict)
+    # Up to 5 doc_ids the entity is attached to, ordered by recency.
+    attached_doc_ids: list[str] = Field(default_factory=list)
+    # Distinct edge_types observed on the 1-hop neighborhood.
+    edge_types: list[str] = Field(default_factory=list)
+    # Total 1-hop Document count, NOT capped at len(attached_doc_ids).
+    doc_count: int = 0
+
+
+# Discriminated union: Pydantic v2 routes parsing to the right subclass
+# by inspecting `node_type` literally.
+QueryResult = Annotated[
+    Union[QueryDocumentResult, QueryEntityResult],
+    Field(discriminator="node_type"),
+]
+
+
 class QueryResponse(BaseModel):
     query: str
-    documents: list[QueryDocument]
+    # Polymorphic per-node results -- Document or Entity, discriminated on
+    # `node_type`. Documents carry their body chunks nested under `chunks`.
+    results: list[QueryResult] = Field(default_factory=list)
     total_candidates: int
     router_hit_cache: bool
     # Flat aggregate over GraphEvidence entries on every chunk in the
@@ -519,7 +584,9 @@ class AnswerResponse(BaseModel):
     citations: list[dict[str, object]] = Field(default_factory=list)
     insufficient_context: bool = False
     model: str
-    documents: list[QueryDocument]
+    # Mirrors QueryResponse.results -- polymorphic Document/Entity.
+    # Documents carry their cited chunks nested under `chunks`.
+    results: list[QueryResult] = Field(default_factory=list)
     total_candidates: int
     confidence_breakdown: dict[str, int] = Field(
         default_factory=lambda: {"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0}

@@ -17,10 +17,18 @@ from shared.models import AnswerRequest, QueryRequest, QueryResponse, RelatedEnt
 
 
 def _base_payload() -> dict:
-    """Minimal valid QueryResponse JSON without the new fields."""
+    """Minimal valid QueryResponse JSON without the new fields.
+
+    Polymorphic shape (PR feat/polymorphic-search-results): the wire
+    format uses `results: list[QueryResult]` (discriminated Document /
+    Entity), not the old `chunks: list[QueryChunk]`. An old client
+    sending `chunks=[]` is silently dropped by Pydantic's default
+    extra-field handling -- callers that need the chunk data must
+    upgrade.
+    """
     return {
         "query": "anything",
-        "documents": [],
+        "results": [],
         "total_candidates": 0,
         "router_hit_cache": False,
         "trace_id": "t-1",
@@ -98,7 +106,7 @@ def test_round_trip_serialize_then_parse() -> None:
     )
     resp = QueryResponse(
         query="q",
-        documents=[],
+        results=[],
         total_candidates=0,
         router_hit_cache=False,
         trace_id="t",

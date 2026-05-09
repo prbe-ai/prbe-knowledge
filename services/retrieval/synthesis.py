@@ -33,6 +33,7 @@ from shared.config import get_settings
 from shared.constants import SYNTHESIS_MODELS
 from shared.exceptions import PrbeError
 from shared.logging import get_logger
+from shared.models import QueryDocumentResult, QueryResult
 
 log = get_logger(__name__)
 
@@ -160,6 +161,42 @@ Hard rules:
 
 
 _INSUFFICIENT_SENTINEL = "<<INSUFFICIENT>>"
+
+
+# ---------------------------------------------------------------------------
+# Polymorphic-results adapter
+# ---------------------------------------------------------------------------
+
+
+def flatten_documents_for_synthesis(
+    results: list[QueryResult],
+) -> list[SynthesisChunk]:
+    """Flatten the polymorphic `QueryResponse.results` into a flat chunk
+    list the synthesizer can cite.
+
+    Skips Entity results -- entities have no body content to cite. Each
+    Document's chunks expand into one SynthesisChunk per chunk in
+    `chunk_index`-style order (already sorted by score desc within doc by
+    the search pipeline). Citation indices into this flattened list use
+    `[chunk:N]` referring to the 1-indexed position; that's what the
+    synthesis prompt asks for and what `_extract_citations` interprets.
+    """
+    out: list[SynthesisChunk] = []
+    for r in results:
+        if not isinstance(r, QueryDocumentResult):
+            continue  # Entity results carry no content -- skip
+        for c in r.chunks:
+            out.append(
+                SynthesisChunk(
+                    chunk_id=c.chunk_id,
+                    title=r.title,
+                    content=c.content,
+                    source_system=r.source_system.value,
+                    source_url=r.source_url,
+                    updated_at=r.updated_at.isoformat(),
+                )
+            )
+    return out
 
 
 # ---------------------------------------------------------------------------

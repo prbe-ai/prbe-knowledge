@@ -23,7 +23,7 @@ from services.retrieval.router import RouterOutput
 from services.retrieval.synthesis import StreamDelta, StreamFinal, SynthesisError
 from shared.models import (
     QueryChunk,
-    QueryDocument,
+    QueryDocumentResult,
     QueryRequest,
     QueryResponse,
     SourceSystem,
@@ -74,12 +74,13 @@ def _phase_result() -> RouterPhaseResult:
 def _query_response() -> QueryResponse:
     chunk = QueryChunk(
         chunk_id="chunk-1",
+        content="hello world",
         score=0.9,
         rank_in_doc=1,
-        content="hello world",
         retriever_scores={"vector": 0.9},
     )
-    document = QueryDocument(
+    doc = QueryDocumentResult(
+        canonical_id="github:prbe-ai/x:pr:1",
         doc_id="github:prbe-ai/x:pr:1",
         doc_version=1,
         source_system=SourceSystem.GITHUB,
@@ -90,13 +91,13 @@ def _query_response() -> QueryResponse:
         updated_at=datetime(2026, 4, 2, tzinfo=UTC),
         score=0.9,
         rank=1,
+        chunks=[chunk],
         chunk_count=1,
         retriever_scores={"vector": 0.9},
-        chunks=[chunk],
     )
     return QueryResponse(
         query="q",
-        documents=[document],
+        results=[doc],
         total_candidates=1,
         router_hit_cache=False,
         applied_temporal={"mode": "latest", "source": "default", "raw_phrase": None, "error": None},
@@ -161,13 +162,11 @@ async def test_query_stream_emits_full_event_sequence(monkeypatch) -> None:
 
     events = _parse_sse(resp.text)
     names = [e for e, _ in events]
-    # SSE event name stays `chunks` for dashboard back-compat; payload
-    # carries the doc-grouped `documents` list.
     assert names == [
         "step",
         "entities",
         "step",
-        "chunks",
+        "results",
         "step",
         "delta",
         "delta",
@@ -185,13 +184,15 @@ async def test_query_stream_emits_full_event_sequence(monkeypatch) -> None:
     assert entities_payload["applied_mode"] == "search"
     assert entities_payload["trace_id"] == "q-test-1"
 
-    # `chunks` event payload is the doc-grouped `documents` list (dumped
-    # as JSON-ready dicts).
-    docs_payload = next(d for n, d in events if n == "chunks")
-    assert len(docs_payload["documents"]) == 1
-    assert docs_payload["documents"][0]["doc_id"] == "github:prbe-ai/x:pr:1"
-    assert docs_payload["documents"][0]["chunks"][0]["chunk_id"] == "chunk-1"
-    assert docs_payload["total_candidates"] == 1
+    # Results event is the polymorphic dump (PR feat/polymorphic-search-results).
+    # Each entry carries `node_type` so consumers route on the discriminator.
+    results_payload = next(d for n, d in events if n == "results")
+    assert len(results_payload["results"]) == 1
+    first = results_payload["results"][0]
+    assert first["node_type"] == "Document"
+    assert first["doc_id"] == "github:prbe-ai/x:pr:1"
+    assert first["chunks"][0]["chunk_id"] == "chunk-1"
+    assert results_payload["total_candidates"] == 1
 
     # Deltas preserve order and content.
     deltas = [d["text"] for n, d in events if n == "delta"]
@@ -209,7 +210,7 @@ async def test_query_stream_emits_full_event_sequence(monkeypatch) -> None:
 async def test_query_stream_emits_error_event_on_synthesis_failure(monkeypatch) -> None:
     """Synthesis blow-up surfaces as a single SSE `error` frame mid-stream
     rather than tearing the HTTP response down with a 5xx. The frames that
-    succeeded before the failure (refining, entities, searching, chunks,
+    succeeded before the failure (refining, entities, searching, results,
     synthesizing) still reach the client.
     """
     monkeypatch.setattr(
@@ -235,7 +236,7 @@ async def test_query_stream_emits_error_event_on_synthesis_failure(monkeypatch) 
     names = [e for e, _ in events]
     # Earlier phases still arrive; only the synthesis stream itself is replaced
     # with the error event.
-    assert names[:5] == ["step", "entities", "step", "chunks", "step"]
+    assert names[:5] == ["step", "entities", "step", "results", "step"]
     assert names[-1] == "error"
     err = events[-1][1]
     assert err["status"] == 502

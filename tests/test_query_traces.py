@@ -40,7 +40,7 @@ from shared.db import raw_conn, with_tenant
 from shared.models import (
     AnswerResponse,
     QueryChunk,
-    QueryDocument,
+    QueryDocumentResult,
     QueryRequest,
     QueryResponse,
     SourceResponse,
@@ -65,9 +65,16 @@ async def _seed_customer(customer_id: str) -> str:
 
 
 def _make_query_response(chunk_count: int = 3, content_size: int = 100) -> QueryResponse:
+    """Build a polymorphic QueryResponse with `chunk_count` doc results.
+
+    One QueryDocumentResult per index, each carrying a single QueryChunk.
+    The size-gating tests interpret `chunk_count` as TOTAL chunks, which
+    matches `_total_chunk_count` in the polymorphic usage path.
+    """
     now = datetime.now(UTC)
-    documents = [
-        QueryDocument(
+    docs = [
+        QueryDocumentResult(
+            canonical_id=f"doc-{i}",
             doc_id=f"doc-{i}",
             doc_version=1,
             source_system=SourceSystem.SLACK,
@@ -76,22 +83,22 @@ def _make_query_response(chunk_count: int = 3, content_size: int = 100) -> Query
             created_at=now,
             updated_at=now,
             score=1.0 - i * 0.01,
-            rank=i,
-            chunk_count=1,
+            rank=i + 1,
             chunks=[
                 QueryChunk(
                     chunk_id=f"c{i}",
+                    content="x" * content_size,
                     score=1.0 - i * 0.01,
                     rank_in_doc=1,
-                    content="x" * content_size,
                 )
             ],
+            chunk_count=1,
         )
         for i in range(chunk_count)
     ]
     return QueryResponse(
         query="test query",
-        documents=documents,
+        results=list(docs),
         total_candidates=chunk_count,
         router_hit_cache=False,
         timing_ms={"router_ms": 1.0},
@@ -162,11 +169,12 @@ async def test_write_query_trace_persists_row(live_db) -> None:
     assert request is not None
     assert request["query"] == "how does Pebble battery life work?"
     assert request["top_k"] == 5
-    # The response column carries the doc-grouped documents list.
+    # The response column carries the polymorphic results list with each
+    # Document's body chunks nested under it (PR feat/polymorphic-search-results).
     response = _jsonb(row["response"])
     assert response is not None
-    assert len(response["documents"]) == 3
-    assert response["documents"][0]["doc_id"] == "doc-0"
+    assert len(response["results"]) == 3
+    assert response["results"][0]["doc_id"] == "doc-0"
 
 
 @pytest.mark.asyncio
@@ -275,10 +283,10 @@ async def test_write_query_trace_truncates_oversized_response(live_db) -> None:
     assert row["response_truncated"] is True
     response = _jsonb(row["response"])
     assert response is not None
-    # Marker shape: size_bytes + chunk_count, no `documents` array.
+    # Marker shape: size_bytes + chunk_count, no `chunks` array.
     assert "size_bytes" in response
     assert response.get("chunk_count") == 10
-    assert "documents" not in response
+    assert "chunks" not in response
     # Request stays intact even when response is truncated.
     request = _jsonb(row["request"])
     assert request is not None
@@ -312,7 +320,7 @@ async def test_write_query_trace_truncates_excess_chunk_count(live_db) -> None:
     response = _jsonb(row["response"])
     assert response is not None
     assert response.get("chunk_count") == 250
-    assert "documents" not in response
+    assert "chunks" not in response
 
 
 @pytest.mark.asyncio
@@ -403,7 +411,7 @@ async def test_query_traces_rls_blocks_cross_tenant(live_db) -> None:
             event_type=EVENT_TYPE_RETRIEVE,
             request_payload={"query": "tenant a secret"},
             response_payload=QueryResponse(
-                query="x", documents=[], total_candidates=0,
+                query="x", results=[], total_candidates=0,
                 router_hit_cache=False, timing_ms={}, trace_id="t",
             ),
         )
@@ -467,14 +475,14 @@ async def test_query_traces_force_rls_active_after_migration(live_db) -> None:
 @pytest.mark.asyncio
 async def test_write_query_trace_persists_answer_response(live_db) -> None:
     await _seed_customer("cust-trace-answer")
-    documents = _make_query_response(chunk_count=2).documents
+    results = _make_query_response(chunk_count=2).results
     answer = AnswerResponse(
         query="why?",
         answer="because.",
         citations=[{"chunk_id": "c0", "page": 1}],
         insufficient_context=False,
         model="anthropic/claude-sonnet-4-6",
-        documents=documents,
+        results=results,
         total_candidates=2,
         timing_ms={"synthesis_ms": 50.0},
         trace_id="trace-answer",

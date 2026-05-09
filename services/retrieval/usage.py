@@ -264,26 +264,45 @@ def _truncated_marker(size_bytes: int, chunk_count: int | None) -> dict[str, Any
     return marker
 
 
+def _total_chunk_count(response: BaseModel | dict[str, Any] | None) -> int | None:
+    """Sum chunks across all Document results in a polymorphic response.
+
+    Returns None when the response has no `results` attribute (e.g.
+    SourceResponse uses a flat `chunk_count` int). Entity results
+    contribute zero -- they carry no body chunks. The doc-grouped
+    structure means a single Document can contribute many chunks; we
+    sum them so the truncation gate triggers on TOTAL chunks, not on
+    distinct documents.
+    """
+    results = getattr(response, "results", None)
+    if results is None:
+        return None
+    total = 0
+    for r in results:
+        chunks = getattr(r, "chunks", None)
+        if chunks is not None:
+            total += len(chunks)
+    return total
+
+
 def _build_response_payload(
     response: BaseModel | dict[str, Any] | None,
 ) -> tuple[dict[str, Any], int, bool]:
     """Return (payload_dict, size_bytes, truncated).
 
     Three-stage gate:
-      1. Pre-check chunk count to short-circuit pathological responses
-         before we pay for serialization.
+      1. Pre-check total chunk count across all Document results to
+         short-circuit pathological responses before we pay for
+         serialization.
       2. Serialize, measure size.
       3. If serialized > RESPONSE_MAX_BYTES, replace with truncation marker.
 
-    The chunk-count pre-check sums `len(d.chunks)` across `.documents`
-    (QueryResponse, AnswerResponse) — SourceResponse uses `chunk_count`
-    instead and returns reassembled `content`, which is bounded by the
-    chunker.
+    The chunk-count pre-check sums `chunks` across `QueryResponse.results`
+    / `AnswerResponse.results` (polymorphic Document/Entity). SourceResponse
+    uses `chunk_count` instead and returns reassembled `content`, which is
+    bounded by the chunker.
     """
-    docs_attr = getattr(response, "documents", None)
-    chunk_count = (
-        sum(len(d.chunks) for d in docs_attr) if docs_attr is not None else None
-    )
+    chunk_count = _total_chunk_count(response)
     if chunk_count is not None and chunk_count > MAX_CHUNK_COUNT_BEFORE_TRUNCATE:
         marker = _truncated_marker(size_bytes=0, chunk_count=chunk_count)
         # size_bytes=0 here means "not measured" — the gate fired before

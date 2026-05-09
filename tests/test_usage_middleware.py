@@ -55,16 +55,21 @@ async def _seed_customer(customer_id: str) -> str:
 
 
 def _stub_pipeline(monkeypatch, *, chunk_count: int = 3) -> None:
-    """Replace run_retrieval with a deterministic stub returning N chunks."""
+    """Replace run_retrieval with a deterministic stub returning N Document
+    results (PR feat/polymorphic-search-results: `results` replaced
+    `chunks` on QueryResponse). `chunk_count` here is the count of
+    distinct Documents -- the middleware records `result_count` from
+    `len(resp.results)`."""
     from datetime import UTC, datetime
 
     from shared.constants import SourceSystem
-    from shared.models import QueryChunk, QueryDocument, QueryResponse
+    from shared.models import QueryChunk, QueryDocumentResult, QueryResponse
 
     async def fake_run_retrieval(req, customer_id):
         now = datetime.now(UTC)
-        documents = [
-            QueryDocument(
+        docs = [
+            QueryDocumentResult(
+                canonical_id=f"doc-{i}",
                 doc_id=f"doc-{i}",
                 doc_version=1,
                 source_system=SourceSystem.SLACK,
@@ -73,22 +78,22 @@ def _stub_pipeline(monkeypatch, *, chunk_count: int = 3) -> None:
                 created_at=now,
                 updated_at=now,
                 score=1.0 - i * 0.1,
-                rank=i,
-                chunk_count=1,
+                rank=i + 1,
                 chunks=[
                     QueryChunk(
                         chunk_id=f"c{i}",
+                        content=f"content {i}",
                         score=1.0 - i * 0.1,
                         rank_in_doc=1,
-                        content=f"content {i}",
                     )
                 ],
+                chunk_count=1,
             )
             for i in range(chunk_count)
         ]
         return QueryResponse(
             query=req.query,
-            documents=documents,
+            results=list(docs),
             total_candidates=chunk_count,
             router_hit_cache=False,
             timing_ms={"router_ms": 1.0},

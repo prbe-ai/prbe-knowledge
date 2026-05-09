@@ -451,8 +451,12 @@ async def test_walk_failure_isolation_chunks_still_return(live_db) -> None:
             timing=timing,
         )
 
-    assert resp.documents  # docs still flow through
-    assert resp.documents[0].doc_id == "doc:1"
+    # Polymorphic shape (PR feat/polymorphic-search-results): primary
+    # results carry one Document with the chunk nested under it.
+    from shared.models import QueryDocumentResult
+    docs = [r for r in resp.results if isinstance(r, QueryDocumentResult)]
+    assert docs  # docs still flow through
+    assert docs[0].doc_id == "doc:1"
     assert resp.related_entities is None
     assert resp.related_entities_error == "FakeWalkError"
     assert "related_entities_ms" in timing
