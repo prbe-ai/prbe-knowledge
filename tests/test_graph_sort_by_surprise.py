@@ -30,8 +30,10 @@ def _make_row(
     via_source_system: str | None = "slack",
     community_id: int | None = None,
     via_community: int | None = None,
-    degree: int = 3,
-    via_degree: int = 3,
+    # Defaults stay below the hub-to-hub anti-bonus threshold (min_deg >= 3)
+    # so the sort-order tests don't pick up Component 5's penalty.
+    degree: int = 2,
+    via_degree: int = 2,
     via_label: str = "Service",
     edge_type: str = "REFERENCES",
 ) -> MagicMock:
