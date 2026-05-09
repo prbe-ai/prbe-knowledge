@@ -27,13 +27,20 @@ minutes. Concurrent build keeps writes flowing at the cost of a slower
 build wall-clock and a second internal scan.
 
 m=16, ef_construction=64 are pgvector's defaults and match the existing
-idx_chunks_embedding_hnsw (see db/schema.sql line ~203). Keeping them
-identical so any retrieval tuning that lands on the v1 index translates
-1:1 to the v2 path after cutover.
+idx_chunks_embedding_hnsw. Keeping them identical so any retrieval
+tuning that lands on the v1 index translates 1:1 to the v2 path after
+cutover.
+
+INVALID index recovery: if a prior CONCURRENTLY build failed (timeout,
+OOM, conflicting write), pg_class still has the index but with
+indisvalid=false. A plain `CREATE INDEX ... IF NOT EXISTS` would skip
+the rebuild and report success while queries still seq-scan. We
+explicitly drop INVALID indexes first, then re-create.
 """
 
 from __future__ import annotations
 
+import sqlalchemy as sa
 from alembic import op
 
 revision = "0061_embedding_v2_hnsw"
@@ -50,6 +57,30 @@ def upgrade() -> None:
     # transaction. Same pattern as 0056_documents_id_trgm_idx and
     # 0019_graph_nodes_loose_match_indexes.
     with op.get_context().autocommit_block():
+        # Pre-flight: drop any prior INVALID build so IF NOT EXISTS doesn't
+        # mask it. A failed CONCURRENTLY build leaves the row in pg_class
+        # with indisvalid=false; rerunning the migration would silently
+        # accept the broken index and Stage 4 cutover would seq-scan.
+        invalid_exists = (
+            op.get_bind()
+            .execute(
+                sa.text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_class c
+                        JOIN pg_index i ON c.oid = i.indexrelid
+                        WHERE c.relname = :name AND NOT i.indisvalid
+                    )
+                    """
+                ),
+                {"name": INDEX_NAME},
+            )
+            .scalar()
+        )
+        if invalid_exists:
+            op.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {INDEX_NAME}")
+
         op.execute(
             f"""
             CREATE INDEX CONCURRENTLY IF NOT EXISTS {INDEX_NAME}

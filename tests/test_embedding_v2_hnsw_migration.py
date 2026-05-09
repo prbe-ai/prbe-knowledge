@@ -71,3 +71,14 @@ def test_schema_sql_carries_the_v2_index() -> None:
     ).read_text()
     assert "idx_chunks_embedding_v2_hnsw" in schema
     assert "embedding_v2 halfvec_cosine_ops" in schema
+
+
+def test_invalid_index_recovery_logic_present() -> None:
+    """A failed CONCURRENTLY build leaves an INVALID index in pg_class.
+    Without an explicit pre-flight DROP, IF NOT EXISTS would silently
+    accept the broken index and Stage 4 cutover would seq-scan. The
+    migration must check pg_index.indisvalid and drop on retry.
+    """
+    src = _MIGRATION_PATH.read_text()
+    assert "indisvalid" in src
+    assert "DROP INDEX CONCURRENTLY IF EXISTS" in src
