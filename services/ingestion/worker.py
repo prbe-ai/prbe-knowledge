@@ -693,10 +693,9 @@ class ReclaimLoop:
             threshold_seconds=self._threshold,
             interval_seconds=self._interval,
         )
-        # Brief initial delay so the loop doesn't fire mid-boot before the
-        # ingestion worker has had a chance to claim its first row.
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(self._shutdown.wait(), timeout=self._interval)
+        # Sweep immediately on boot to catch rows stranded by a non-graceful
+        # shutdown (OOM/SIGKILL); 5-min reclaim threshold > 30s heartbeat so a
+        # freshly-claimed live row has ample margin and won't be stolen.
         while not self._shutdown.is_set():
             try:
                 queue_n, backfill_n = await self._reclaim_once()

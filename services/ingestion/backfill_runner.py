@@ -314,8 +314,11 @@ async def run_backfill(
         )
         counter("backfill.released_on_cancel", 1, source=source.value)
         try:
-            await _release_for_resume(customer_id, source, claim_token)
-        except Exception:
+            # Shielded so a cascading cancel can't abort the UPDATE roundtrip mid-flight.
+            await asyncio.shield(
+                _release_for_resume(customer_id, source, claim_token)
+            )
+        except (Exception, asyncio.CancelledError):
             log.exception(
                 "backfill.release_on_cancel_failed",
                 customer=customer_id,

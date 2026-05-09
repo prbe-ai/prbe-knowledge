@@ -690,3 +690,60 @@ async def test_release_for_resume_no_op_when_status_not_running(live_db) -> None
             "WHERE customer_id='cust-release-done'"
         )
     assert row["status"] == BackfillStatus.COMPLETE.value
+
+
+@pytest.mark.asyncio
+async def test_release_survives_cascading_cancel_of_outer_task(live_db) -> None:
+    """SIGTERM during deploy: the outer task awaiting the release gets cancelled
+    a second time before the asyncpg roundtrip completes. With asyncio.shield,
+    the UPDATE still lands and the row flips to 'pending'. Without shield, the
+    row stayed stuck in 'running' until the 5-min reclaim cron swept it."""
+    await _insert_customer("cust-cascade-cancel")
+    started_at = await _insert_backfill_state(
+        customer_id="cust-cascade-cancel",
+        source=SourceSystem.LINEAR,
+        status=BackfillStatus.RUNNING.value,
+        heartbeat_offset_seconds=10,
+        last_cursor="cursor-mid-flight",
+        events_enqueued=420,
+    )
+
+    async def cancel_handler() -> None:
+        # Mirrors the except asyncio.CancelledError: block in run_backfill.
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.shield(
+                _release_for_resume(
+                    "cust-cascade-cancel", SourceSystem.LINEAR, started_at
+                )
+            )
+
+    task = asyncio.create_task(cancel_handler())
+    # Yield once so the task enters the await on shield, then cancel — this
+    # reproduces the production timing where asyncio.gather tears the runner
+    # task down before the asyncpg UPDATE roundtrip completes.
+    await asyncio.sleep(0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    # The shielded UPDATE may still be running on the loop after task is done;
+    # poll briefly for the row flip rather than assuming sync completion.
+    deadline = asyncio.get_event_loop().time() + 2.0
+    while asyncio.get_event_loop().time() < deadline:
+        async with raw_conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT status FROM backfill_state "
+                "WHERE customer_id='cust-cascade-cancel'"
+            )
+        if row["status"] == BackfillStatus.PENDING.value:
+            break
+        await asyncio.sleep(0.05)
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, last_cursor, events_enqueued FROM backfill_state "
+            "WHERE customer_id='cust-cascade-cancel'"
+        )
+    assert row["status"] == BackfillStatus.PENDING.value
+    assert row["last_cursor"] == "cursor-mid-flight"
+    assert row["events_enqueued"] == 420
