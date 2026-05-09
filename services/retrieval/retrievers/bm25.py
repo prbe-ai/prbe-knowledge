@@ -1,9 +1,16 @@
 """BM25-ish retriever via Postgres `ts_rank_cd`.
 
 Postgres doesn't have true BM25 out of the box — `ts_rank_cd` (cover-density
-ranking) is a reasonable stand-in and runs on the `idx_chunks_fts_content`
-GIN index we built in schema.sql. For Phase 1 we can swap this to pg_bm25
-or a real BM25 lib if ranking quality matters enough.
+ranking) is a reasonable stand-in and runs on the `idx_chunks_content_tsv`
+GIN index over the stored `chunks.content_tsv` column (migration 0062).
+The column is `GENERATED ALWAYS AS (to_tsvector('english', content)) STORED`,
+so the bitmap-heap recheck and `ts_rank_cd` both read the precomputed
+lexeme array off the heap instead of re-tokenizing `content` on every one
+of the ~10k+ candidate rows. EXPLAIN ANALYZE on probe-founders showed the
+old expression-based path spent ~5.7s of a 5.9s query in per-row
+tokenization; the materialized column reduces that to score math + heap
+reads. For Phase 1 we can still swap this to pg_bm25 or a real BM25 lib
+if ranking quality matters enough.
 
 Query parsing: we OR the user's tokens via `to_tsquery` (built from a
 simple word-split) instead of relying on `plainto_tsquery`'s implicit
@@ -164,7 +171,7 @@ async def bm25_search(
                    c.kind,
                    d.created_at,
                    d.updated_at,
-                   ts_rank_cd(to_tsvector('english', c.content),
+                   ts_rank_cd(c.content_tsv,
                               to_tsquery('english', $2)) AS score
             FROM chunks c
             JOIN documents d
@@ -172,7 +179,7 @@ async def bm25_search(
              AND d.customer_id = c.customer_id
              AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
             WHERE c.customer_id = $1
-              AND to_tsvector('english', c.content) @@ to_tsquery('english', $2)
+              AND c.content_tsv @@ to_tsquery('english', $2)
               {pred.chunk_sql}
               {pred.doc_sql}
               {source_filter}
