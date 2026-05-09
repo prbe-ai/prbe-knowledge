@@ -928,11 +928,11 @@ async def run_search(
         customer_id, ranked_lists, spec
     )
     timing["vector_ms"] = (time.perf_counter() - t_retrieve) * 1000
-    # Directed shares the same gather batch so the wall time is bounded
-    # by the slowest single retriever; this metric is the same span as
-    # vector_ms (kept as a separate key so dashboards can split it out
-    # later without renaming history).
-    timing["directed_ms"] = timing["vector_ms"]
+    # No separate directed_ms metric: all retrievers share one
+    # asyncio.gather span, so any per-retriever number reported here
+    # would be byte-identical to vector_ms. Aliasing is misleading
+    # telemetry. If per-retriever timing becomes necessary, wrap each
+    # runner in its own time.perf_counter and emit real spans.
 
     # Recency half-life: caller's explicit value always wins. Otherwise
     # amplify when Haiku detected sort intent (the "most recent X about Y"

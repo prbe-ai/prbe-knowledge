@@ -49,9 +49,13 @@ _LOOKUP_INDEX = "idx_directed_vectors_customer_doc"
 
 
 def upgrade() -> None:
+    # IF NOT EXISTS on the table + indexes makes manual `alembic upgrade
+    # 0060_directed_vectors` re-runs idempotent (helps after a partial
+    # rollback / heads-fix). Alembic's normal flow doesn't need this but
+    # the cost is zero.
     op.execute(
         """
-        CREATE TABLE directed_vectors (
+        CREATE TABLE IF NOT EXISTS directed_vectors (
             vector_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             customer_id      TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
             doc_id           TEXT NOT NULL,
@@ -76,7 +80,7 @@ def upgrade() -> None:
     # the same query embedding across both retrievers.
     op.execute(
         f"""
-        CREATE INDEX {_HNSW_INDEX}
+        CREATE INDEX IF NOT EXISTS {_HNSW_INDEX}
             ON directed_vectors USING hnsw (embedding halfvec_cosine_ops)
         """
     )
@@ -85,13 +89,18 @@ def upgrade() -> None:
     # 'find all directed_vectors for this doc to delete on regen').
     op.execute(
         f"""
-        CREATE INDEX {_LOOKUP_INDEX}
+        CREATE INDEX IF NOT EXISTS {_LOOKUP_INDEX}
             ON directed_vectors (customer_id, doc_id)
         """
     )
 
     op.execute("ALTER TABLE directed_vectors ENABLE ROW LEVEL SECURITY")
     op.execute("ALTER TABLE directed_vectors FORCE ROW LEVEL SECURITY")
+    # Postgres CREATE POLICY has no IF NOT EXISTS as of 16; drop-then-
+    # create is the safe idempotent pattern.
+    op.execute(
+        "DROP POLICY IF EXISTS directed_vectors_tenant_isolation ON directed_vectors"
+    )
     op.execute(
         """
         CREATE POLICY directed_vectors_tenant_isolation ON directed_vectors
@@ -102,4 +111,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Explicit DROP order — policy, indexes, then table — so a partial
+    # downgrade (rare) leaves the DB in a recognizable state. CASCADE on
+    # the table drop is intentional: a downgrade nukes the table; any
+    # future cross-table view/FK pointing at it should fail loudly here
+    # rather than silently leaving a dangling reference.
+    op.execute(
+        "DROP POLICY IF EXISTS directed_vectors_tenant_isolation ON directed_vectors"
+    )
+    op.execute(f"DROP INDEX IF EXISTS {_HNSW_INDEX}")
+    op.execute(f"DROP INDEX IF EXISTS {_LOOKUP_INDEX}")
     op.execute("DROP TABLE IF EXISTS directed_vectors CASCADE")

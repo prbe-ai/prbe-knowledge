@@ -277,6 +277,89 @@ async def test_persist_llm_failure_skips_llm_keeps_humans(live_db) -> None:
 
 
 @pytest.mark.asyncio
+async def test_persist_human_pin_preserved_when_embed_fails(live_db) -> None:
+    """REGRESSION for the P1 human-pin embed-failure deletion bug.
+
+    Setup: pin "alpha phrase" via frontmatter on run 1 (succeeds, row in
+    DB). On run 2, the embedder partially fails for that pin. Pre-fix:
+    `human_payload` is rebuilt only from successfully-embedded phrases,
+    `desired_hashes = human_payload.keys()` excludes the failed pin,
+    `_reconcile_human` computes `to_delete = existing - desired` which
+    INCLUDES the still-valid pin → DELETE wipes the row. The docstring
+    promised "authoritative; never overwritten" — a transient embed
+    error broke the contract.
+
+    Post-fix: `desired_hashes` is built from ALL human phrases regardless
+    of embed success; the failed pin's existing row is preserved.
+
+    The fixture stub-mode embedder doesn't fail naturally — we patch
+    `embed_many` for run 2 to simulate a partial-batch failure that
+    omits the human pin's index.
+    """
+    cust = "cust-dp-human-embed-fail"
+    doc_id = "wiki:runbook:embed-fail"
+    await _seed_customer_and_doc(cust, doc_id)
+
+    # Run 1: pin succeeds and row appears.
+    res1 = await persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter={"directed": ["alpha phrase"]},
+        synthesis_run_id=None,  # human-only path, no LLM
+    )
+    assert res1.human_added == 1
+    assert res1.human_removed == 0
+
+    # Run 2: same frontmatter, but the embedder claims partial failure
+    # for index 0 (the human pin). Pre-fix this DELETED the row.
+    from services.synthesis import directed_phrases as mod
+
+    class _BrokenEmbedder:
+        async def embed_many(self, phrases: list[str]):
+            # Return an EmbedResult-shaped object: nothing embedded,
+            # everything failed — simulating an OpenAI 5xx mid-batch.
+            from shared.embeddings import EmbedResult
+
+            return EmbedResult(
+                embedded=[],
+                failed=[
+                    type(
+                        "FailedEmbedding",
+                        (),
+                        {"chunk_index": 0, "error": "simulated"},
+                    )()
+                ],
+            )
+
+    res2 = await mod.persist_directed_vectors(
+        customer_id=cust,
+        doc_id=doc_id,
+        page_title="t",
+        page_body="b",
+        frontmatter={"directed": ["alpha phrase"]},
+        synthesis_run_id=None,
+        embedder=_BrokenEmbedder(),  # type: ignore[arg-type]
+    )
+    assert res2.human_removed == 0, (
+        "Human pin must NOT be deleted when its embed fails "
+        "(transient error must not violate the never-overwritten contract)."
+    )
+
+    async with with_tenant(cust) as conn:
+        rows = await conn.fetch(
+            "SELECT source_text FROM directed_vectors "
+            "WHERE customer_id=$1 AND doc_id=$2 AND source='human'",
+            cust,
+            doc_id,
+        )
+    assert [r["source_text"] for r in rows] == ["alpha phrase"], (
+        "Run 1's pin must survive run 2's embed failure."
+    )
+
+
+@pytest.mark.asyncio
 async def test_persist_llm_failure_preserves_prior_llm_rows(live_db) -> None:
     """REGRESSION for the LLM-purge P2: a transient LLM failure must NOT
     delete previous runs' LLM rows. The pre-fix behavior was: catch the

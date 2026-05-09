@@ -570,16 +570,22 @@ class WikiAgentRuntime:
                 body_markdown=update.body_markdown,
                 frontmatter=existing_frontmatter,
             )
-            # Directed-vector trigger phrases (engineer-pinned + LLM).
-            # Best-effort, never blocks the page write.
-            await self._persist_directed_safely(
-                wiki_type=update.wiki_type,
-                slug=update.slug,
-                title=existing.get("title") or "",
-                body_markdown=update.body_markdown,
-                frontmatter=existing_frontmatter,
-            )
         # lock auto-releases on with_tenant's txn commit at scope exit.
+
+        # Directed-vector trigger phrases run OUTSIDE the page-write lock.
+        # The persist call hits the LLM (Anthropic round-trip + retries)
+        # and we don't want concurrent agents on the same page slug
+        # serialized for that multi-second window — the page already
+        # committed, the lock has done its job. The directed reconcile
+        # uses idempotent ON CONFLICT semantics on (customer, doc, hash),
+        # so any racing run lands cleanly.
+        await self._persist_directed_safely(
+            wiki_type=update.wiki_type,
+            slug=update.slug,
+            title=existing.get("title") or "",
+            body_markdown=update.body_markdown,
+            frontmatter=existing_frontmatter,
+        )
 
     async def _persist_create(self, create: _StagedCreate) -> None:
         # Same per-page lock as _persist_update. If a concurrent writer
@@ -611,15 +617,18 @@ class WikiAgentRuntime:
                 body_markdown=create.body_markdown,
                 frontmatter=create.frontmatter,
             )
-            # Directed-vector trigger phrases (engineer-pinned + LLM).
-            # Best-effort, never blocks the page write.
-            await self._persist_directed_safely(
-                wiki_type=create.wiki_type,
-                slug=create.slug,
-                title=create.title,
-                body_markdown=create.body_markdown,
-                frontmatter=create.frontmatter,
-            )
+
+        # Directed-vector trigger phrases run OUTSIDE the page-write lock
+        # so the multi-second LLM call doesn't serialize concurrent
+        # agents on the same slug. Reconcile is idempotent on
+        # (customer, doc, hash); a racing run lands cleanly.
+        await self._persist_directed_safely(
+            wiki_type=create.wiki_type,
+            slug=create.slug,
+            title=create.title,
+            body_markdown=create.body_markdown,
+            frontmatter=create.frontmatter,
+        )
 
     async def _persist_links_safely(
         self,

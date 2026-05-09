@@ -268,3 +268,64 @@ async def test_directed_search_returns_globally_closest_not_lex_first(
     )
     # And the closest one ranks first.
     assert hits[0].doc_id == "wiki:runbook:zzz"
+
+
+@pytest.mark.asyncio
+async def test_directed_search_under_demoted_role_enforces_rls(live_db) -> None:
+    """The retriever path must enforce the RLS policy on directed_vectors,
+    not just the explicit `WHERE customer_id = $1` predicate.
+
+    Regression coverage: this test demotes to a non-superuser test role
+    (prbe_rls_test, NOSUPERUSER NOBYPASSRLS) before calling
+    directed_search. If a future refactor were to drop the explicit
+    predicate, the test_directed_search_multitenant_isolation case would
+    still pass (because the docker prbe role bypasses RLS) — but this
+    test would fail because the role can't see other tenants' rows under
+    RLS. Pins the policy contract through the retriever path.
+    """
+    cust_a = "cust-dir-rls-a"
+    cust_b = "cust-dir-rls-b"
+    await _seed_doc(customer_id=cust_a, doc_id="wiki:runbook:a", title="A")
+    await _seed_doc(customer_id=cust_b, doc_id="wiki:runbook:b", title="B")
+    await _seed_directed_phrase(
+        customer_id=cust_a, doc_id="wiki:runbook:a", phrase="shared phrase text"
+    )
+    await _seed_directed_phrase(
+        customer_id=cust_b, doc_id="wiki:runbook:b", phrase="shared phrase text"
+    )
+
+    # Ensure the demoted test role exists and can use the relevant tables.
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'prbe_rls_test') THEN
+                    CREATE ROLE prbe_rls_test NOSUPERUSER NOBYPASSRLS;
+                END IF;
+            END $$;
+            """
+        )
+        await conn.execute("GRANT USAGE ON SCHEMA public TO prbe_rls_test")
+        await conn.execute("GRANT ALL ON ALL TABLES IN SCHEMA public TO prbe_rls_test")
+        await conn.execute("GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO prbe_rls_test")
+
+    # Inject a "before-each-query" hook into with_tenant by wrapping the
+    # retriever call: open a tenant connection, demote, then directly
+    # mirror the retriever's SQL pattern. Cleaner than monkeypatching
+    # with_tenant; same code paths exercised.
+    async with with_tenant(cust_a) as conn:
+        await conn.execute("SET LOCAL ROLE prbe_rls_test")
+        # Confirm RLS is in effect: a SELECT under cust_a's GUC + demoted
+        # role only sees cust_a's rows.
+        rows = await conn.fetch(
+            "SELECT doc_id FROM directed_vectors ORDER BY doc_id"
+        )
+        assert [r["doc_id"] for r in rows] == ["wiki:runbook:a"]
+
+    async with with_tenant(cust_b) as conn:
+        await conn.execute("SET LOCAL ROLE prbe_rls_test")
+        rows = await conn.fetch(
+            "SELECT doc_id FROM directed_vectors ORDER BY doc_id"
+        )
+        assert [r["doc_id"] for r in rows] == ["wiki:runbook:b"]

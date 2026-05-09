@@ -377,12 +377,25 @@ async def persist_directed_vectors(
                 break
 
     # Reconcile human rows against this run's pin set.
+    #
+    # CRITICAL: build `desired_hashes` from ALL human phrases (regardless
+    # of embed success), but `payload` only from successfully-embedded
+    # phrases. A transient embedder failure on one human pin must NOT
+    # delete that pin's existing row. Pre-fix behavior: pins that failed
+    # to embed were missing from human_payload, so desired_hashes excluded
+    # them, so to_delete = existing - desired DELETED the still-valid
+    # row. The docstring promises pins are authoritative — preserve them
+    # across embed flakiness. New rows still need a vector to insert, so
+    # _reconcile_human filters to_insert by payload presence.
+    desired_human_hashes: set[bytes] = {
+        _content_hash(p) for p in human_phrases
+    }
     human_payload: dict[bytes, tuple[str, list[float]]] = {}
     for phrase, vec in zip(human_ok_phrases, human_vecs, strict=True):
         h = _content_hash(phrase)
         human_payload.setdefault(h, (phrase, vec))
     await _reconcile_human(
-        customer_id, doc_id, set(human_payload.keys()), human_payload, result
+        customer_id, doc_id, desired_human_hashes, human_payload, result
     )
 
     # Reconcile LLM rows ONLY when LLM generation actually succeeded.
@@ -408,9 +421,16 @@ async def _reconcile_human(
 ) -> None:
     """Diff existing human rows for the doc against the desired set.
 
-    Deletes rows whose content_hash is no longer in the pin set; inserts
-    new rows. Uses ON CONFLICT DO NOTHING so duplicate inserts are
-    silent — the unique index uq_dv_doc_hash already enforces idempotency.
+    `desired_hashes`: hashes that must EXIST after this call (= every
+        phrase the engineer pinned, regardless of embed success).
+    `payload`: subset of `desired_hashes` for which we have a vector
+        ready to insert.
+
+    Inserts rows for hashes in `desired_hashes` that aren't yet stored
+    AND have a vector in `payload`. Pins whose embed failed pass through
+    desired_hashes but NOT payload — the existing row (if any) is
+    preserved; nothing is inserted. Uses ON CONFLICT DO NOTHING so
+    duplicate inserts are silent (uq_dv_doc_hash enforces idempotency).
     """
     async with with_tenant(customer_id) as conn:
         existing = await conn.fetch(
@@ -425,7 +445,10 @@ async def _reconcile_human(
         existing_hashes = {bytes(r["content_hash"]) for r in existing}
 
         to_delete = existing_hashes - desired_hashes
-        to_insert = desired_hashes - existing_hashes
+        # Insert-set is filtered by payload presence: an embed-failed pin
+        # passes through desired_hashes (preserving existing row) but
+        # cannot be inserted as a new row without a vector.
+        to_insert = (desired_hashes - existing_hashes) & set(payload.keys())
 
         if to_delete:
             await conn.execute(
@@ -476,18 +499,25 @@ async def _reconcile_llm(
     current run id.
     """
     async with with_tenant(customer_id) as conn:
+        # Defensive: delete ALL existing llm rows for (cust, doc) before
+        # inserting the new run's set. Filtering by `synthesis_run_id <> $3`
+        # was technically correct under guaranteed run_id uniqueness, but
+        # the same run_id reused for the same doc (e.g. a retry path that
+        # doesn't bump run_id, or a future test that reuses ids) would
+        # leave the previous call's rows behind alongside the new ones —
+        # ON CONFLICT DO NOTHING would silently skip and stale phrases
+        # would accumulate. Always-delete is one extra row touch and
+        # eliminates the failure mode entirely.
         deleted = await conn.fetch(
             """
             DELETE FROM directed_vectors
             WHERE customer_id = $1
               AND doc_id = $2
               AND source = 'llm'
-              AND (synthesis_run_id IS NULL OR synthesis_run_id <> $3)
             RETURNING vector_id
             """,
             customer_id,
             doc_id,
-            synthesis_run_id,
         )
         result.llm_removed = len(deleted)
 
