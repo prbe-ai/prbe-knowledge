@@ -83,11 +83,13 @@ ANSWER_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "Cited prose answer. 1-3 short paragraphs. Every factual claim "
-                "ends with one or more inline citations of the form [chunk:N], "
-                "where N is the 1-indexed chunk number. Use ONLY information "
-                "present in the chunks. Do not invent dates, names, PR numbers, "
-                "decisions, or relationships. Do not restate the question. No "
-                "preamble. Use markdown for emphasis when helpful."
+                "ends with one or more inline citations. Each citation is its "
+                "own bracketed tag: write [chunk:1][chunk:5] or [chunk:1] and "
+                "[chunk:5], NOT [chunk:1, 5]. N is the 1-indexed chunk number. "
+                "Use ONLY information present in the chunks. Do not invent "
+                "dates, names, PR numbers, decisions, or relationships. Do not "
+                "restate the question. No preamble. Use markdown for emphasis "
+                "when helpful."
             ),
         },
         "citations_used": {
@@ -676,11 +678,25 @@ def _fallback_parse_text(text: str) -> dict[str, Any]:
 # drop the brackets despite the prompt; we accept both and normalize on render.
 _CITATION_RE = re.compile(r"\[?chunk:(\d+)\]?")
 
+# Some models (notably Gemini) read "one or more inline citations of the form
+# [chunk:N]" as permission to write a comma list inside one bracket pair, e.g.
+# `[chunk:1, 5, 7]`. Split those into separate `[chunk:N]` tags before the
+# single-citation normalizer runs, otherwise `_CITATION_RE` greedily consumes
+# `[chunk:1` and leaves `, 5, 7]` dangling in the rendered output.
+_MULTI_CITATION_RE = re.compile(r"\[chunk:\s*(\d+(?:\s*,\s*\d+)+)\s*\]")
+
 
 def normalize_citations_in_answer(answer: str) -> str:
-    """Wrap bare `chunk:N` into `[chunk:N]` so downstream renderers see a
-    single canonical format.
+    """Wrap bare `chunk:N` into `[chunk:N]` and split multi-chunk citations
+    like `[chunk:1, 5, 7]` so downstream renderers see a single canonical
+    format.
     """
+
+    def _split_multi(m: re.Match[str]) -> str:
+        nums = [n.strip() for n in m.group(1).split(",")]
+        return "".join(f"[chunk:{n}]" for n in nums if n)
+
+    answer = _MULTI_CITATION_RE.sub(_split_multi, answer)
 
     def _repl(m: re.Match[str]) -> str:
         return f"[chunk:{m.group(1)}]"

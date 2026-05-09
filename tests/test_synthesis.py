@@ -198,6 +198,31 @@ def test_normalize_citations_idempotent_on_already_bracketed() -> None:
     assert normalize_citations_in_answer(text) == "Already done [chunk:1]."
 
 
+def test_normalize_citations_splits_multi_chunk_brackets() -> None:
+    # Gemini in particular emits `[chunk:1, 5, 7]` when the prompt asks for
+    # "one or more inline citations". Without splitting, _CITATION_RE eats
+    # `[chunk:1` and leaves `, 5, 7]` dangling in the rendered answer.
+    text = "Granola is shipped [chunk:1, 5, 7] and on prod [chunk:2, 4]."
+    assert normalize_citations_in_answer(text) == (
+        "Granola is shipped [chunk:1][chunk:5][chunk:7] and on prod "
+        "[chunk:2][chunk:4]."
+    )
+
+
+def test_normalize_citations_handles_multi_chunk_with_whitespace() -> None:
+    text = "Spaced [chunk: 1 ,  5 , 7 ]."
+    assert normalize_citations_in_answer(text) == (
+        "Spaced [chunk:1][chunk:5][chunk:7]."
+    )
+
+
+def test_extract_citations_finds_all_in_multi_chunk() -> None:
+    chunks = [_chunk(1), _chunk(2), _chunk(3), _chunk(4), _chunk(5)]
+    answer = normalize_citations_in_answer("fact [chunk:1, 3, 5].")
+    out = _extract_citations(answer, chunks)
+    assert {c["index"] for c in out} == {1, 3, 5}
+
+
 # ---------------------------------------------------------------------------
 # Synthesize end-to-end with mocked _dispatch (returns dict now, not str)
 # ---------------------------------------------------------------------------
