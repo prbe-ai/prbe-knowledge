@@ -153,7 +153,7 @@ async def retrieve(
     request.state.usage_request_payload = req
     t_total = time.perf_counter()
     resp = await run_retrieval(req, customer_id)
-    request.state.result_count = sum(len(d.chunks) for d in resp.documents)
+    request.state.result_count = len(resp.documents)
     request.state.usage_response_payload = resp
     total_ms = (time.perf_counter() - t_total) * 1000
     _log_query_handled(
@@ -186,7 +186,7 @@ async def query(
     t_total = time.perf_counter()
     base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
     rresp = await run_retrieval(base_req, customer_id)
-    request.state.result_count = sum(len(d.chunks) for d in rresp.documents)
+    request.state.result_count = len(rresp.documents)
 
     model = req.model or DEFAULT_SYNTHESIS_MODEL
     syn_chunks = _flatten_chunks_for_synthesis(rresp)
@@ -314,7 +314,7 @@ async def query_stream(
 
             yield _sse("step", {"step": "searching"})
             rresp = await run_search_phase(base_req, customer_id, phase)
-            request.state.result_count = sum(len(d.chunks) for d in rresp.documents)
+            request.state.result_count = len(rresp.documents)
             # SSE event name stays `chunks` for backward compat with the
             # dashboard's KnowledgeStreamEvent contract; the payload moved
             # to the doc-grouped shape.

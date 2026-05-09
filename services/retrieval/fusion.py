@@ -100,6 +100,32 @@ class FusedDocument:
         return "\n".join(c.content for c in self.chunks)
 
 
+_LN2 = math.log(2)
+
+
+def _apply_source_decay(
+    score: float,
+    source_system: str,
+    updated_at: datetime,
+    baseline_half_life: float,
+    ref_now: datetime,
+) -> float:
+    """Per-source multiplier + recency decay, applied at the doc level.
+
+    Multiplier first so a brand-new claude_code doc still gets demoted;
+    otherwise zero-decay at age=0 would bypass it. Half-life resolves via
+    per-source override > caller-supplied baseline > universal default.
+    """
+    multiplier = SOURCE_SCORE_MULTIPLIERS.get(source_system, 1.0)
+    if multiplier != 1.0:
+        score *= multiplier
+    half_life = SOURCE_HALF_LIFE_DAYS.get(source_system, baseline_half_life)
+    age_days = (ref_now - updated_at).total_seconds() / 86400.0
+    if age_days >= 0:
+        score *= math.exp(-_LN2 * age_days / half_life)
+    return score
+
+
 def fuse(
     ranked_lists: dict[str, list[Any]],
     top_k: int = 50,
@@ -167,7 +193,6 @@ def fuse(
     # pool unless a content_fallback exists.
     docs: dict[str, FusedDocument] = {}
     ref_now = now or datetime.now(UTC)
-    ln2 = math.log(2)
     baseline_half_life = (
         recency_half_life_days
         if recency_half_life_days is not None
@@ -202,23 +227,19 @@ def fuse(
         else:
             doc_score = metadata_score
 
-        # Source multiplier + recency decay applied at doc level. Use the
-        # first (highest-RRF) chunk's hit for source_system + updated_at —
-        # all chunks of a doc share both per the existing comment.
+        # All chunks of a doc share source_system + updated_at, so the
+        # first (highest-RRF) chunk's hit anchors the per-doc decay.
         anchor_chunk_id = ranked_chunks[0][0] if ranked_chunks else (
             fallback_content_for_doc[doc_id]
         )
         anchor_hit = per_chunk_meta[anchor_chunk_id]
-        source_system = anchor_hit.source_system
-
-        multiplier = SOURCE_SCORE_MULTIPLIERS.get(source_system, 1.0)
-        if multiplier != 1.0:
-            doc_score *= multiplier
-
-        half_life = SOURCE_HALF_LIFE_DAYS.get(source_system, baseline_half_life)
-        age_days = (ref_now - anchor_hit.updated_at).total_seconds() / 86400.0
-        if age_days >= 0:
-            doc_score *= math.exp(-ln2 * age_days / half_life)
+        doc_score = _apply_source_decay(
+            doc_score,
+            anchor_hit.source_system,
+            anchor_hit.updated_at,
+            baseline_half_life,
+            ref_now,
+        )
 
         # Doc-level retriever_scores: aggregate of best chunk's breakdown +
         # any metadata-chunk contribution (visible on the doc, not duplicated
@@ -267,15 +288,13 @@ def fuse(
                 rank_in_doc=1,
             )
         ]
-        doc_score = metadata_score
-        source_system = fallback_hit.source_system
-        multiplier = SOURCE_SCORE_MULTIPLIERS.get(source_system, 1.0)
-        if multiplier != 1.0:
-            doc_score *= multiplier
-        half_life = SOURCE_HALF_LIFE_DAYS.get(source_system, baseline_half_life)
-        age_days = (ref_now - fallback_hit.updated_at).total_seconds() / 86400.0
-        if age_days >= 0:
-            doc_score *= math.exp(-ln2 * age_days / half_life)
+        doc_score = _apply_source_decay(
+            metadata_score,
+            fallback_hit.source_system,
+            fallback_hit.updated_at,
+            baseline_half_life,
+            ref_now,
+        )
         docs[doc_id] = FusedDocument(
             doc_id=doc_id,
             doc_version=fallback_hit.doc_version,
