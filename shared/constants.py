@@ -428,11 +428,25 @@ RRF_BREADTH_ALPHA = 0.3
 # so we down-weight them to keep authored content surfacing first.
 SOURCE_SCORE_MULTIPLIERS: dict[SourceSystem, float] = {
     SourceSystem.CLAUDE_CODE: 0.5,
-    # CODEX docs are the same shape and signal density as CLAUDE_CODE —
+    # CODEX docs are the same shape and signal density as CLAUDE_CODE --
     # both are agent transcripts, not authored team artifacts. Apply the
     # same demotion so they rank consistently with each other below
     # Slack/Linear/PR docs at equal vector relevance.
     SourceSystem.CODEX: 0.5,
+    # CODE_GRAPH chunks are over-represented in top-K relative to their
+    # signal strength: production query_traces (7d, probe-founders) show
+    # code_graph at 36.5% of top-5 results despite an avg post-fusion score
+    # ~3.4x lower than github and ~4.1x lower than claude_code. BM25 fires
+    # on common identifier tokens ("session", "tenant", "customer"),
+    # surfacing weak code matches above genuine non-code answers (e.g. a
+    # "lindy.ai onboarding pilot" query returning triage_worker.py at rank 1).
+    # 0.3 ~= inverse of the avg-score ratio: a code_graph chunk now needs to
+    # be ~3x stronger than the code_graph average to compete with an average
+    # non-code hit, so genuinely strong vector matches still survive while
+    # keyword-noise chunks fall out of top-K. Validated via offline replay
+    # at multipliers [1.0, 0.7, 0.5, 0.3, 0.2]: knee at 0.3 (top-5 share
+    # 36.5% -> 24.4%); 0.2 only buys 1.3pp more.
+    SourceSystem.CODE_GRAPH: 0.3,
 }
 
 # Baseline recency half-life (days) applied to every source. Smaller = faster
