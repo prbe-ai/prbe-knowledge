@@ -56,6 +56,7 @@ from typing import Any
 
 from shared.constants import (
     DEFAULT_RECENCY_HALF_LIFE_DAYS,
+    DIRECTED_RETRIEVAL_WEIGHT,
     RRF_BREADTH_ALPHA,
     RRF_K,
     SOURCE_HALF_LIFE_DAYS,
@@ -144,6 +145,7 @@ def fuse(
     now: datetime | None = None,
     sort: dict[str, str] | None = None,
     discovery: bool = False,
+    directed_hits: list[Any] | None = None,
 ) -> list[FusedDocument]:
     """Combine ranked lists from multiple retrievers into doc-grouped output.
 
@@ -151,6 +153,15 @@ def fuse(
     Each hit object must expose: chunk_id, doc_id, doc_version,
     source_system, source_url, title, content, created_at, updated_at,
     score, kind. `author_id` is optional and propagated when present.
+
+    `directed_hits` is the optional list of DirectedHit objects from the
+    directed-vector retriever. Directed signal contributes a doc-level
+    booster (analogous to metadata_score_for_doc) — it does NOT inject
+    its own chunk into the candidate pool. A doc that is ONLY surfaced
+    via directed (no content chunk from any other retriever) is dropped:
+    we never return a directed-only doc as a result. In practice wiki
+    pages always carry content chunks so directed-only-misses don't
+    happen; the design is to amplify ranking, not to be a sole source.
 
     Returns up to top_k FusedDocuments. Each doc's `chunks` list contains
     EVERY content chunk from the candidate pool that belongs to it,
@@ -220,6 +231,29 @@ def fuse(
 
         content_chunks_for_doc[doc_id].append((chunk_id, rrf_score))
 
+    # Directed-vector contributions: convert rank-in-list to RRF so the
+    # signal lives on the same scale as vector/bm25/graph contributions
+    # (rank-1 ≈ 1/61 ≈ 0.016, not raw cosine similarity ≈ 0.8). Without
+    # this conversion, DIRECTED_RETRIEVAL_WEIGHT=1.0 would dominate the
+    # ranking by ~50x — every doc with any directed hit would outrank
+    # every doc without. The retriever guarantees DISTINCT ON (doc_id)
+    # and orders by distance ASC, so list position == similarity rank;
+    # first occurrence per doc wins (RRF convention).
+    #
+    # A directed hit for a doc that has no content chunk in the pool is
+    # silently lost — fusion only builds FusedDocuments that have at
+    # least one content chunk (or a content_fallback). Same rule as
+    # graph/metadata signals: ranking boosters don't bring in a doc on
+    # their own; only body-text retrievers do.
+    directed_score_for_doc: dict[str, float] = defaultdict(float)
+    if directed_hits:
+        seen_doc_ids: set[str] = set()
+        for rank, d in enumerate(directed_hits, start=1):
+            if d.doc_id in seen_doc_ids:
+                continue
+            seen_doc_ids.add(d.doc_id)
+            directed_score_for_doc[d.doc_id] = 1.0 / (k + rank)
+
     # Build FusedDocuments. Drop docs with NO content chunk in the candidate
     # pool unless a content_fallback exists.
     docs: dict[str, FusedDocument] = {}
@@ -258,6 +292,14 @@ def fuse(
         else:
             doc_score = metadata_score
 
+        # Directed-vector booster: doc-level signal contributed by per-doc
+        # trigger phrases. Adds AFTER metadata_score so it stacks. Scaled
+        # by DIRECTED_RETRIEVAL_WEIGHT (0.0 disables); see services/
+        # retrieval/retrievers/directed.py for the source signal.
+        directed_score = directed_score_for_doc.get(doc_id, 0.0)
+        if directed_score > 0:
+            doc_score += DIRECTED_RETRIEVAL_WEIGHT * directed_score
+
         # All chunks of a doc share source_system + updated_at, so the
         # first (highest-RRF) chunk's hit anchors the per-doc decay.
         anchor_chunk_id = ranked_chunks[0][0] if ranked_chunks else (
@@ -279,6 +321,8 @@ def fuse(
         if ranked_chunks:
             doc_retriever_scores.update(per_chunk_breakdown[ranked_chunks[0][0]])
         doc_retriever_scores.update(metadata_breakdown_for_doc.get(doc_id, {}))
+        if directed_score > 0:
+            doc_retriever_scores["directed"] = directed_score
 
         return FusedDocument(
             doc_id=doc_id,

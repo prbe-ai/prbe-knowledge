@@ -219,6 +219,51 @@ CREATE INDEX idx_chunks_fts_content    ON chunks USING GIN (to_tsvector('english
 CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kind = 'metadata';
 
 -- ---------------------------------------------------------------------------
+-- directed_vectors: per-document trigger phrases used as a doc-level
+-- retrieval booster. Engineer-pinned (source='human') phrases are authored
+-- via wiki frontmatter `directed:` blocks; LLM-generated (source='llm')
+-- phrases come from synthesis. The retriever (services/retrieval/retrievers/
+-- directed.py) HNSW-searches `embedding` and reports one hit per matched
+-- doc; fusion folds the cosine-distance signal into the doc score
+-- (services/retrieval/fusion.py). Phrase text NEVER reaches the agent —
+-- only the owning doc's content chunks are returned.
+--
+-- No FK to documents — same rationale chunks uses (PK includes version,
+-- but a directed_vector is doc-level not version-level). Tenant cascade
+-- flows through customer_id REFERENCES customers ON DELETE CASCADE.
+-- ---------------------------------------------------------------------------
+CREATE TABLE directed_vectors (
+    vector_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id      TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    doc_id           TEXT NOT NULL,
+    embedding        halfvec(3072) NOT NULL,
+    source_text      TEXT NOT NULL,
+    source           TEXT NOT NULL,
+    -- LLM-generated rows carry the run that produced them; older runs'
+    -- rows are deleted on regen. Human pins set this to NULL.
+    synthesis_run_id BIGINT NULL,
+    content_hash     BYTEA NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT ck_dv_source CHECK (source IN ('human','llm')),
+    CONSTRAINT ck_dv_run_for_llm CHECK (
+        (source = 'llm'   AND synthesis_run_id IS NOT NULL) OR
+        (source = 'human' AND synthesis_run_id IS NULL)
+    ),
+    CONSTRAINT uq_dv_doc_hash UNIQUE (customer_id, doc_id, content_hash)
+);
+
+CREATE INDEX idx_directed_vectors_embedding_hnsw
+    ON directed_vectors USING hnsw (embedding halfvec_cosine_ops);
+CREATE INDEX idx_directed_vectors_customer_doc
+    ON directed_vectors (customer_id, doc_id);
+
+ALTER TABLE directed_vectors ENABLE ROW LEVEL SECURITY;
+ALTER TABLE directed_vectors FORCE ROW LEVEL SECURITY;
+CREATE POLICY directed_vectors_tenant_isolation ON directed_vectors
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
 -- acl_snapshots: temporal ACL truth.
 -- Phase 0 INGESTS + MAINTAINS this. Phase 0 does NOT enforce at query time.
 -- Phase 1 flips enforcement on with no backfill required.

@@ -382,8 +382,36 @@ SOURCE_INGESTION_PRIORITY: dict[SourceSystem, int] = {
 TOP_K_VECTOR = 50
 TOP_K_BM25 = 50
 TOP_K_GRAPH = 20
+TOP_K_DIRECTED = 20
 RRF_K = 60
 DEDUP_COSINE_THRESHOLD = 0.95
+
+# Directed-vectors feature: doc-level retrieval signal contributed by
+# per-document trigger phrases stored in the directed_vectors table.
+# Eval-tuned; commits in the same change that bumps it. Set to 0.0 to
+# disable contribution without removing the retriever from the fan-out.
+DIRECTED_RETRIEVAL_WEIGHT: float = 1.0
+
+# Cap on LLM-generated directed phrases per wiki document. Engineer-pinned
+# phrases get their own cap (MAX_HUMAN_DIRECTED_PER_DOC) so a runaway LLM
+# can't bury legitimate pins.
+MAX_DIRECTED_VECTORS_PER_DOC: int = 16
+
+# Cap on engineer-pinned directed phrases per wiki document. Higher than
+# the LLM cap because explicit pins are intentional, but bounded so a
+# malicious / typo'd frontmatter can't balloon the table.
+MAX_HUMAN_DIRECTED_PER_DOC: int = 32
+
+# Per-phrase character cap. Trigger phrases are short by design (5-12
+# tokens per the prompt); 256 chars is generous slack against natural
+# English while still rejecting megabyte-long pathological inputs that
+# would bloat embedding cost / storage / log noise.
+MAX_DIRECTED_PHRASE_CHARS: int = 256
+
+# Cosine distance threshold below which two candidate trigger phrases are
+# considered near-duplicates and one is dropped (humans always win on
+# collision; LLM duplicates of human pins are suppressed).
+DIRECTED_DEDUPE_COSINE_THRESHOLD: float = 0.05
 
 # Doc-grouped fusion: weight applied to the sum of NON-best content-chunk RRF
 # scores when collapsing per-doc. doc_score = max(rrfs) + alpha * sum(others) +

@@ -49,6 +49,7 @@ from services.retrieval.helpers import (
     embeddings_for_chunks,
 )
 from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search, residualize_for_bm25
+from services.retrieval.retrievers.directed import directed_search
 from services.retrieval.retrievers.graph import GraphHit, graph_search
 from services.retrieval.retrievers.id_lookup import id_lookup_search, is_lookup_candidate
 from services.retrieval.retrievers.inferred_edges import (
@@ -895,9 +896,43 @@ async def run_search(
             return []
         return await id_lookup_search(customer_id, ids, temporal=spec)
 
+    async def _directed_runner() -> list:
+        # Per-doc trigger phrases: surfaces wiki pages whose engineer-pinned
+        # or LLM-generated phrase matches the user's query, even when the
+        # page body itself doesn't. Doc-level booster (no chunk injected) —
+        # see retrievers/directed.py + fusion.py. Always-on; the
+        # DIRECTED_RETRIEVAL_WEIGHT constant (or an empty
+        # directed_vectors table) is the kill switch.
+        #
+        # Cheap pre-check: skip the embed + HNSW round-trip entirely for
+        # tenants with zero rows in directed_vectors. The full retriever
+        # is dominated by the embedding API call (~50-100ms); the
+        # existence check is one tenant-scoped SELECT (~1-2ms). Net win
+        # for tenants who haven't enabled the feature, ~1ms penalty for
+        # tenants who have. As soon as the first row lands, the gate
+        # opens.
+        async with with_tenant(customer_id) as conn:
+            has_any = await conn.fetchval(
+                "SELECT 1 FROM directed_vectors "
+                "WHERE customer_id = $1 LIMIT 1",
+                customer_id,
+            )
+        if not has_any:
+            return []
+        return await directed_search(
+            customer_id,
+            req.query,
+            top_k=req.top_k * pool_multiplier,
+            temporal=spec,
+        )
+
     t_retrieve = time.perf_counter()
-    vec_hits, bm25_hits, graph_hits, id_hits = await asyncio.gather(
-        _vec_runner(), _bm25_runner(), _graph_runner(), _id_lookup_runner()
+    vec_hits, bm25_hits, graph_hits, id_hits, directed_hits = await asyncio.gather(
+        _vec_runner(),
+        _bm25_runner(),
+        _graph_runner(),
+        _id_lookup_runner(),
+        _directed_runner(),
     )
     ranked_lists = {
         "vector": vec_hits,
@@ -909,6 +944,11 @@ async def run_search(
         customer_id, ranked_lists, spec
     )
     timing["vector_ms"] = (time.perf_counter() - t_retrieve) * 1000
+    # No separate directed_ms metric: all retrievers share one
+    # asyncio.gather span, so any per-retriever number reported here
+    # would be byte-identical to vector_ms. Aliasing is misleading
+    # telemetry. If per-retriever timing becomes necessary, wrap each
+    # runner in its own time.perf_counter and emit real spans.
 
     # Recency half-life: caller's explicit value always wins. Otherwise
     # amplify when Haiku detected sort intent (the "most recent X about Y"
@@ -935,6 +975,7 @@ async def run_search(
         sort=None,  # Hard post-fusion sort removed from search path — see
         # module docstring. Recency boost above is the right tool.
         discovery=req.discovery,
+        directed_hits=directed_hits,
     )
     timing["fusion_ms"] = (time.perf_counter() - t_fuse) * 1000
 
