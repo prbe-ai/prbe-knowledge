@@ -232,27 +232,6 @@ async def query(
     return answer
 
 
-def _flatten_chunks_for_synthesis(rresp: QueryResponse) -> list[SynthesisChunk]:
-    """Flatten doc-grouped chunks into the chunk-keyed shape the synthesizer
-    consumes. Doc-level fields (title, source_system, source_url, updated_at)
-    are re-attached per chunk so citations stay chunk-keyed.
-    """
-    out: list[SynthesisChunk] = []
-    for doc in rresp.documents:
-        for chunk in doc.chunks:
-            out.append(
-                SynthesisChunk(
-                    chunk_id=chunk.chunk_id,
-                    title=doc.title,
-                    content=chunk.content,
-                    source_system=doc.source_system.value,
-                    source_url=doc.source_url,
-                    updated_at=doc.updated_at.isoformat(),
-                )
-            )
-    return out
-
-
 def _sse(event: str, data: dict[str, object]) -> bytes:
     """Format one Server-Sent Event frame.
 

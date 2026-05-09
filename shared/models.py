@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal, Union
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -502,7 +502,7 @@ class QueryEntityResult(QueryResultBase):
 # Discriminated union: Pydantic v2 routes parsing to the right subclass
 # by inspecting `node_type` literally.
 QueryResult = Annotated[
-    Union[QueryDocumentResult, QueryEntityResult],
+    QueryDocumentResult | QueryEntityResult,
     Field(discriminator="node_type"),
 ]
 
