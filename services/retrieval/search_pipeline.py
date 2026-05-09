@@ -62,7 +62,14 @@ from services.retrieval.retrievers.related_entities import (
 from services.retrieval.retrievers.vector import vector_search
 from services.retrieval.router import RouterEntity, RouterOutput
 from services.retrieval.temporal import build_predicate
-from shared.constants import ROUTER_ENTITY_TO_LABEL, SourceSystem
+from shared.constants import (
+    INFERRED_EDGE_DAMPENING,
+    INFERRED_EDGE_HYDRATION_CHUNKS,
+    INFERRED_EDGE_TOP_K,
+    ROUTER_ENTITY_TO_LABEL,
+    SOURCE_SCORE_MULTIPLIERS,
+    SourceSystem,
+)
 from shared.db import with_tenant
 from shared.logging import get_logger
 from shared.models import (
@@ -90,12 +97,6 @@ _CODING_AGENT_SOURCES = {
     SourceSystem.CLAUDE_CODE.value,
     SourceSystem.CODEX.value,
 }
-
-# Inferred-edge channel parameters. The retriever score is dampened relative
-# to primary results so a linked doc can never out-rank the doc that anchored
-# its surfacing -- it's enrichment, not a primary ranking signal.
-_INFERRED_EDGE_TOP_K = 5
-_INFERRED_EDGE_DAMPENING = 0.5
 
 # How many attached docs to surface on each QueryEntityResult. The cap keeps
 # the response shape bounded for chatty entities; `doc_count` carries the
@@ -393,6 +394,86 @@ def _build_document_results_from_fused(
     return results
 
 
+def _inferred_edge_final_score(
+    raw_score: float, source_system: str, linked_edge_count: int
+) -> float:
+    """Layer the cross-channel scoring policy on top of the retriever's
+    raw dampened score.
+
+    raw_score arrives as `dampening * 1/(1 + anchor_rank)`; this function
+    multiplies in the per-source demotion (so an inferred-edge codex hit
+    gets the same 0.5x as a vector codex hit) and divides by a fan-out
+    penalty (so a high-degree hub doc gets crushed while a specific
+    1-edge doc is barely affected).
+
+    Fan-out divisor: 1 + ln(linked_edge_count). At 1 edge the divisor is
+    1.0 (no penalty). At 30 edges it's ~4.4 (the codex-session-#1 case
+    seen in production). linked_edge_count is clamped to >=1 in the
+    retriever; the max() here is belt-and-suspenders against a stale
+    dataclass instance.
+    """
+    src_mult = SOURCE_SCORE_MULTIPLIERS.get(SourceSystem(source_system), 1.0)
+    fanout_div = 1.0 + math.log(max(1, linked_edge_count))
+    return raw_score * src_mult / fanout_div
+
+
+async def _hydrate_inferred_edge_chunks(
+    customer_id: str, doc_ids: list[str], per_doc_cap: int
+) -> dict[str, list[QueryChunk]]:
+    """Fetch top-N body chunks for each inferred-edge-derived doc.
+
+    Without this the chunks list is empty -- the dashboard renders
+    "0 matched" and the synthesizer can't cite the doc. The caller
+    attaches the returned chunks to each QueryDocumentResult so an
+    inferred-edge result is first-class evidence, not a navigation stub.
+
+    Ordering is `chunk_index ASC` -- the first chunks of a doc are
+    usually the most identity-bearing (title + opening body for prose;
+    metadata sentinel + symbol head for code-graph). The metadata
+    sentinel chunk (chunk_index = -1) is excluded so we don't waste a
+    slot on the synthetic header.
+    """
+    if not doc_ids or per_doc_cap <= 0:
+        return {}
+    sql = """
+        WITH ranked AS (
+            SELECT c.doc_id, c.chunk_id, c.content, c.chunk_index,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY c.doc_id ORDER BY c.chunk_index ASC
+                   ) AS rn
+            FROM chunks c
+            WHERE c.customer_id = $1
+              AND c.doc_id = ANY($2::text[])
+              AND c.valid_to IS NULL
+              AND c.chunk_index >= 0
+        )
+        SELECT doc_id, chunk_id, content, chunk_index, rn
+        FROM ranked
+        WHERE rn <= $3
+        ORDER BY doc_id, rn
+    """
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(sql, customer_id, doc_ids, per_doc_cap)
+
+    out: dict[str, list[QueryChunk]] = defaultdict(list)
+    for row in rows:
+        out[row["doc_id"]].append(
+            QueryChunk(
+                chunk_id=row["chunk_id"],
+                content=row["content"],
+                # Inferred-edge chunks didn't participate in retrieval, so
+                # there's no per-channel chunk score; tag them with the
+                # parent doc's score so downstream consumers (synthesis,
+                # dashboard rendering) see consistent ordering.
+                score=0.0,  # caller overwrites with parent doc score
+                rank_in_doc=int(row["rn"]),
+                retriever_scores={"inferred_edge": 0.0},
+                graph_evidence=[],
+            )
+        )
+    return out
+
+
 async def _build_inferred_edge_results(
     customer_id: str,
     document_results: list[QueryDocumentResult],
@@ -405,6 +486,15 @@ async def _build_inferred_edge_results(
     Returns documents that are NOT already in the primary set (the SQL
     excludes self-anchors). Each result carries a single MatchProvenance
     entry with channel='inferred_edge', the anchor info, and the LLM `why`.
+
+    Score policy applied here (not in the retriever) so all cross-channel
+    scoring lives in one place: `dampening * 1/(1+anchor_rank)` from the
+    retriever, then per-source multiplier (codex/CC: 0.5x), then divided
+    by `1 + ln(linked_edge_count)` to crush fan-out hubs.
+
+    Body chunks are hydrated post-walk -- without this the dashboard
+    renders "0 matched" on every inferred-edge result and the
+    synthesizer can't cite from the doc.
     """
     if not document_results:
         return []
@@ -415,8 +505,8 @@ async def _build_inferred_edge_results(
         hits = await inferred_edge_search(
             customer_id,
             top_doc_ids,
-            top_k=_INFERRED_EDGE_TOP_K,
-            dampening=_INFERRED_EDGE_DAMPENING,
+            top_k=INFERRED_EDGE_TOP_K,
+            dampening=INFERRED_EDGE_DAMPENING,
         )
     except Exception as exc:
         # Enrichment channel: never break host search response. Log the
@@ -435,18 +525,49 @@ async def _build_inferred_edge_results(
     filtered: list[InferredEdgeHit] = await filter_by_acl(
         customer_id, requesting_user_id, hits
     )
+    if not filtered:
+        return []
+
+    # Hydrate body chunks for the surviving (post-ACL) doc_ids only --
+    # don't waste a SQL round-trip fetching content for docs the caller
+    # can't see anyway.
+    t_hydrate = time.perf_counter()
+    chunks_by_doc = await _hydrate_inferred_edge_chunks(
+        customer_id,
+        [h.doc_id for h in filtered],
+        INFERRED_EDGE_HYDRATION_CHUNKS,
+    )
+    timing["inferred_edge_hydrate_ms"] = (time.perf_counter() - t_hydrate) * 1000
 
     out: list[QueryDocumentResult] = []
     for h in filtered:
+        final_score = _inferred_edge_final_score(
+            raw_score=h.score,
+            source_system=h.source_system,
+            linked_edge_count=h.linked_edge_count,
+        )
         prov = MatchProvenance(
             channel="inferred_edge",
             rank=h.anchor_rank,
-            score=h.score,
+            score=final_score,
             anchor_doc_id=h.anchor_doc_id,
             edge_type=h.edge_type,
             confidence=h.confidence,
             why=h.why or None,
         )
+        # Stamp each hydrated chunk's score with the parent doc's final
+        # score so per-chunk scoring stays consistent with the doc.
+        doc_chunks = [
+            QueryChunk(
+                chunk_id=c.chunk_id,
+                content=c.content,
+                score=final_score,
+                rank_in_doc=c.rank_in_doc,
+                retriever_scores={"inferred_edge": final_score},
+                graph_evidence=c.graph_evidence,
+            )
+            for c in chunks_by_doc.get(h.doc_id, [])
+        ]
         out.append(
             QueryDocumentResult(
                 canonical_id=h.doc_id,
@@ -458,12 +579,12 @@ async def _build_inferred_edge_results(
                 author_id=h.author_id,
                 created_at=h.created_at,
                 updated_at=h.updated_at,
-                score=h.score,
+                score=final_score,
                 rank=0,  # filled in by the caller after final sort
                 matched_via=[prov],
-                chunks=[],  # inferred-edge hits don't carry body chunks
-                chunk_count=0,
-                retriever_scores={"inferred_edge": h.score},
+                chunks=doc_chunks,
+                chunk_count=len(doc_chunks),
+                retriever_scores={"inferred_edge": final_score},
             )
         )
     return out

@@ -427,12 +427,40 @@ DEFAULT_RECENCY_HALF_LIFE_DAYS = 120.0
 SOURCE_HALF_LIFE_DAYS: dict[SourceSystem, float] = {
     SourceSystem.CLAUDE_CODE: 7.0,
     # CODEX transcripts are scratchpads with the same staleness curve as
-    # CLAUDE_CODE — both lose relevance fast as authored docs catch up.
+    # CLAUDE_CODE -- both lose relevance fast as authored docs catch up.
     SourceSystem.CODEX: 7.0,
     # Code symbols decay slower than CC/Codex transcripts (a function still
     # exists weeks later) but faster than authored docs (refactors happen).
     SourceSystem.CODE_GRAPH: 30.0,
 }
+
+# Inferred-edge retrieval channel tuning. The channel walks INFERRED Doc-Doc
+# edges from top-K primary docs and surfaces the linked docs as additional
+# results with `matched_via.channel = "inferred_edge"`. Knobs live here so
+# eval sweeps + per-tenant overrides can adjust without code edits, per the
+# RRF_K / RRF_BREADTH_ALPHA precedent (feedback_prbe_knowledge_tuning_consts).
+
+# Cap on linked docs returned by `inferred_edge_search`. 5 keeps the result
+# set predictable; the inferred-edge channel is supplementary, not primary.
+INFERRED_EDGE_TOP_K = 5
+
+# Per-hop dampening applied to inferred-edge results. The final score is:
+#   dampening * 1/(1 + anchor_rank) * SOURCE_SCORE_MULTIPLIERS[src]
+#                                  / (1 + ln(linked_edge_count))
+# 0.2 keeps a 2-hop result (anchor at rank 1) at base score 0.10 -- well
+# below direct vector hits but still surfacing above weakly-matched primary
+# docs. Was 0.5 in v1; lowered after observing inferred-edge results
+# outranking the primary doc that surfaced them (the codex session #1
+# case where a 2-hop chained inference dominated rank 1 for a query the
+# linked doc didn't actually contain).
+INFERRED_EDGE_DAMPENING = 0.2
+
+# Max chunks per inferred-edge-derived QueryDocumentResult. Hydrated from
+# the chunks table by `chunk_index ASC` (first chunks are usually the most
+# identity-bearing -- title metadata + opening body). Without hydration the
+# chunks list is empty and the dashboard renders "0 matched"; the
+# synthesizer also can't cite the doc -- both regressions of the v1 design.
+INFERRED_EDGE_HYDRATION_CHUNKS = 3
 
 # Prefix used in `integration_tokens.scope` to signal the row represents a
 # GitHub App installation rather than an OAuth access_token. The installation
