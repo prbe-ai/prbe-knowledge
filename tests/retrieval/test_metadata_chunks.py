@@ -269,8 +269,7 @@ def test_fuse_metadata_only_doc_can_use_content_fallback() -> None:
     )
     assert len(fused) == 1
     assert fused[0].doc_id == "docA"
-    assert fused[0].kind == "content"
-    assert fused[0].content == "real transcript text"
+    assert fused[0].chunks[0].content == "real transcript text"
     assert "metadata_bm25" in fused[0].retriever_scores
     assert "bm25" not in fused[0].retriever_scores
 
@@ -314,9 +313,10 @@ def test_fuse_response_always_returns_content_chunk() -> None:
         top_k=10,
     )
     assert len(fused) == 1
-    assert fused[0].kind == "content"
-    assert fused[0].content == "real body text"
-    assert "title:" not in fused[0].content
+    assert len(fused[0].chunks) == 1
+    assert fused[0].chunks[0].chunk_id == "c1"
+    assert fused[0].chunks[0].content == "real body text"
+    assert "title:" not in fused[0].chunks[0].content
 
 
 def test_fuse_metadata_breakdown_visible_in_retriever_scores() -> None:
@@ -357,4 +357,4 @@ def test_fuse_no_metadata_unchanged_behavior() -> None:
     assert len(fused) == 2
     # docA wins — surfaces in both vector and bm25.
     assert fused[0].doc_id == "docA"
-    assert fused[0].kind == "content"
+    assert len(fused[0].chunks) == 1

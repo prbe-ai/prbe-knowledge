@@ -451,8 +451,8 @@ async def test_walk_failure_isolation_chunks_still_return(live_db) -> None:
             timing=timing,
         )
 
-    assert resp.chunks  # chunks still flow through
-    assert resp.chunks[0].doc_id == "doc:1"
+    assert resp.documents  # docs still flow through
+    assert resp.documents[0].doc_id == "doc:1"
     assert resp.related_entities is None
     assert resp.related_entities_error == "FakeWalkError"
     assert "related_entities_ms" in timing

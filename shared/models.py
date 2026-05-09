@@ -363,10 +363,9 @@ def normalize_author_id(value: str | None) -> str | None:
 class GraphEvidence(BaseModel):
     """Per-chunk hint that a graph traversal anchored this chunk's surfacing.
 
-    Populated only when a chunk reached the result set via the graph
-    retriever; left null on chunks that surfaced via vector / BM25 alone.
-    Lets MCP / dashboard consumers filter on confidence tier without
-    re-running the retrieval.
+    A chunk reached via N distinct seed entities carries N GraphEvidence
+    entries on QueryChunk.graph_evidence. Empty list when the chunk
+    surfaced via vector / BM25 / id_lookup alone.
     """
 
     edge_type: str
@@ -377,16 +376,30 @@ class GraphEvidence(BaseModel):
 
 class QueryChunk(BaseModel):
     chunk_id: str
+    score: float
+    # Position within the parent QueryDocument.chunks list (1-indexed,
+    # monotonic). Doc-level fields (doc_id, source_url, title, ...) live
+    # on the parent QueryDocument — not duplicated here.
+    rank_in_doc: int
+    content: str
+    retriever_scores: dict[str, float] = Field(default_factory=dict)
+    graph_evidence: list[GraphEvidence] = Field(default_factory=list)
+
+
+class QueryDocument(BaseModel):
+    """Doc-grouped retrieval result. Each matching content chunk for the
+    document is nested under `chunks`; `score` aggregates breadth + depth
+    of the match across those chunks (see fusion.py for the formula).
+    """
+
     doc_id: str
-    # Which document version this chunk's content came from when first seen.
+    # Which document version the chunks' content came from when first seen.
     # Under content-addressable chunks the same chunk can span many versions;
     # the `first_seen_version` is the stable provenance value we return.
     doc_version: int
     source_system: SourceSystem
     source_url: str
     title: str | None
-    content: str
-    graph_evidence: GraphEvidence | None = None
     # Raw author identifier from the source system: GitHub login (`mahit`),
     # commit-author email when no GitHub login resolved (`mahit@prbe.ai`),
     # Slack user id (`U07ABC123`), Linear user id (`user_a3f9`), etc.
@@ -398,26 +411,9 @@ class QueryChunk(BaseModel):
     updated_at: datetime
     score: float
     rank: int
+    chunk_count: int
     retriever_scores: dict[str, float] = Field(default_factory=dict)
-
-
-class QueryBundle(BaseModel):
-    """Entity-keyed grouping of related chunks. New in code-graph PR-A.
-
-    For multi-entity / entity-bag queries (the dominant MCP access pattern
-    per `project_mcp_entity_bag_queries.md`), the graph retriever can
-    return chunks grouped by their seeding entity instead of flat top-k.
-    Dashboard NL consumers can ignore this field; MCP consumers prefer it.
-
-    `confidence_breakdown` is a count of edges per tier, so consumers can
-    decide whether the bundle is worth surfacing without re-walking the
-    chunks themselves.
-    """
-
-    seed_entity: str  # canonical_id of the seeding node (e.g., "prbe-ai/prbe-knowledge:Normalizer.process_queue_row")
-    seed_label: str   # NodeLabel for the seed (e.g., "Method")
-    related_chunk_ids: list[str] = Field(default_factory=list)
-    confidence_breakdown: dict[str, int] = Field(default_factory=dict)
+    chunks: list[QueryChunk] = Field(default_factory=list)
 
 
 class RelatedEntity(BaseModel):
@@ -450,9 +446,14 @@ class RelatedEntity(BaseModel):
 
 class QueryResponse(BaseModel):
     query: str
-    chunks: list[QueryChunk]
+    documents: list[QueryDocument]
     total_candidates: int
     router_hit_cache: bool
+    # Flat aggregate over GraphEvidence entries on every chunk in the
+    # response. Keys always present; zeros when no graph hits surfaced.
+    confidence_breakdown: dict[str, int] = Field(
+        default_factory=lambda: {"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0}
+    )
     applied_temporal: dict[str, object] | None = None
     applied_sort: dict[str, object] | None = None
     applied_entity_filter: dict[str, object] | None = None
@@ -463,9 +464,6 @@ class QueryResponse(BaseModel):
     aggregation: dict[str, object] | None = None
     timing_ms: dict[str, float] = Field(default_factory=dict)
     trace_id: str
-    # Code-graph PR-A: entity-keyed groupings for MCP entity-bag queries.
-    # Null on dashboard NL responses.
-    bundles: list[QueryBundle] | None = None
     # Three-state contract per codex-B4:
     #   None        -> not requested (top_k_related == 0) OR walk failed
     #                 (also see related_entities_error below). Also None
@@ -521,8 +519,11 @@ class AnswerResponse(BaseModel):
     citations: list[dict[str, object]] = Field(default_factory=list)
     insufficient_context: bool = False
     model: str
-    chunks: list[QueryChunk]
+    documents: list[QueryDocument]
     total_candidates: int
+    confidence_breakdown: dict[str, int] = Field(
+        default_factory=lambda: {"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0}
+    )
     applied_temporal: dict[str, object] | None = None
     applied_sort: dict[str, object] | None = None
     applied_entity_filter: dict[str, object] | None = None

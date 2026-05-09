@@ -199,13 +199,17 @@ async def test_three_most_recent_commits_returns_only_commits_sorted(live_db) ->
     body = resp.json()
     assert body["applied_mode"] == "list"
     assert body["applied_doc_types"] == ["github.commit"]
-    chunks = body["chunks"]
-    assert len(chunks) == 3
+    documents = body["documents"]
+    assert len(documents) == 3
     # Newest first, all commits, no PR leakage.
-    titles = [c["title"] for c in chunks]
+    titles = [d["title"] for d in documents]
     assert titles == ["commit 0", "commit 1", "commit 2"]
-    for c in chunks:
-        assert "PR" not in (c["title"] or "")
+    for d in documents:
+        assert "PR" not in (d["title"] or "")
+        # List mode emits one chunk per doc.
+        assert d["chunk_count"] == 1
+        assert len(d["chunks"]) == 1
+        assert d["chunks"][0]["rank_in_doc"] == 1
 
 
 async def test_haiku_misclassifies_topic_query_as_list_dispatcher_falls_back(
@@ -300,8 +304,8 @@ async def test_router_fallback_routes_to_search(live_db) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["applied_mode"] == "search"
-    # Semantic chunks list shape is the same as before the PR.
-    assert isinstance(body["chunks"], list)
+    # Doc-grouped shape on the search path.
+    assert isinstance(body["documents"], list)
     assert body["aggregation"] is None
 
 
@@ -354,7 +358,7 @@ async def test_author_id_surfaces_on_list_chunks(live_db) -> None:
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    by_doc = {c["doc_id"]: c for c in body["chunks"]}
+    by_doc = {d["doc_id"]: d for d in body["documents"]}
     assert by_doc["github:repo:commit:by-mahit"]["author_id"] == "mahit"
     assert by_doc["github:repo:commit:no-author"]["author_id"] is None
 
@@ -399,9 +403,9 @@ async def test_author_id_surfaces_on_search_chunks(live_db) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["applied_mode"] == "search"
-    assert len(body["chunks"]) >= 1
+    assert len(body["documents"]) >= 1
     target = next(
-        (c for c in body["chunks"] if c["doc_id"] == "github:repo:commit:mahit-search"),
+        (d for d in body["documents"] if d["doc_id"] == "github:repo:commit:mahit-search"),
         None,
     )
     assert target is not None, "seeded commit did not surface in search results"
@@ -443,5 +447,5 @@ async def test_count_query_returns_aggregation(live_db) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["applied_mode"] == "list"
-    assert body["chunks"] == []  # count query, no chunks
+    assert body["documents"] == []  # count query, no docs
     assert body["aggregation"] == {"count": 3}

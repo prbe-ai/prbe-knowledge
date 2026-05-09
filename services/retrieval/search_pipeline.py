@@ -29,17 +29,13 @@ from datetime import UTC, datetime
 
 from services.retrieval.acl import filter_by_acl
 from services.retrieval.dedup import dedupe
-from services.retrieval.fusion import FusedHit, fuse
+from services.retrieval.fusion import FusedChunk, FusedDocument, fuse
 from services.retrieval.helpers import (
     apply_entity_filter,
     embeddings_for_chunks,
 )
 from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search
-from services.retrieval.retrievers.graph import (
-    CODE_GRAPH_LABELS,
-    GraphHit,
-    graph_search,
-)
+from services.retrieval.retrievers.graph import graph_search
 from services.retrieval.retrievers.id_lookup import id_lookup_search, is_lookup_candidate
 from services.retrieval.retrievers.related_entities import (
     build_exclude_node_keys,
@@ -52,8 +48,9 @@ from shared.constants import SourceSystem
 from shared.db import with_tenant
 from shared.logging import get_logger
 from shared.models import (
-    QueryBundle,
+    GraphEvidence,
     QueryChunk,
+    QueryDocument,
     QueryRequest,
     QueryResponse,
     RelatedEntity,
@@ -156,50 +153,61 @@ async def _content_fallbacks_for_metadata_only_agent_hits(
     ]
 
 
-def _inject_id_lookup_hits(fused: list[FusedHit], id_hits: list) -> list[FusedHit]:
-    """Append synthetic FusedHits for any id_lookup-matched doc that didn't
-    survive `fuse()`'s top_k cap.
+def _inject_id_lookup_hits(
+    fused: list[FusedDocument], id_hits: list
+) -> list[FusedDocument]:
+    """Append synthetic FusedDocuments for any id_lookup-matched doc that
+    didn't survive `fuse()`'s top_k cap.
 
     Why this exists: at MCP defaults (top_k=5), the fused pool is
     5 * pool_multiplier = 10. The fusion pipeline applies a per-source
     multiplier (claude_code/codex = 0.5x) and recency decay (7-day
     half-life), which routinely buries an exact-id match below 10 — so a
-    pure pin-after-fusion would have nothing to pin. Injecting these hits
+    pure pin-after-fusion would have nothing to pin. Injecting these docs
     here puts them into the dedupe/ACL/pin path with the rest, and the
     pin pass downstream guarantees they end up at rank 1.
 
-    Synthetic hits carry `score=1.0` and `retriever_scores={"id_lookup": 1.0}`
-    so response telemetry still reflects which retriever surfaced them.
+    Synthetic docs carry `score=1.0` and one chunk with
+    `retriever_scores={"id_lookup": 1.0}` so response telemetry still
+    reflects which retriever surfaced them.
     """
     if not id_hits:
         return fused
     fused_doc_ids = {f.doc_id for f in fused}
-    extras: list[FusedHit] = []
+    extras: list[FusedDocument] = []
     for h in id_hits:
         if h.doc_id in fused_doc_ids:
             continue
         fused_doc_ids.add(h.doc_id)
         extras.append(
-            FusedHit(
-                chunk_id=h.chunk_id,
+            FusedDocument(
                 doc_id=h.doc_id,
                 doc_version=h.doc_version,
                 source_system=h.source_system,
                 source_url=h.source_url,
                 title=h.title,
-                content=h.content,
                 created_at=h.created_at,
                 updated_at=h.updated_at,
                 score=1.0,
                 author_id=h.author_id,
                 retriever_scores={"id_lookup": 1.0},
-                kind="content",
+                chunks=[
+                    FusedChunk(
+                        chunk_id=h.chunk_id,
+                        content=h.content,
+                        score=1.0,
+                        retriever_scores={"id_lookup": 1.0},
+                        rank_in_doc=1,
+                    )
+                ],
             )
         )
     return fused + extras
 
 
-def _pin_id_lookup_matches(fused: list[FusedHit], id_hits: list) -> list[FusedHit]:
+def _pin_id_lookup_matches(
+    fused: list[FusedDocument], id_hits: list
+) -> list[FusedDocument]:
     """Float docs whose source_id was an exact match by `id_lookup_search`
     to the top of the fused list, preserving id_lookup's original order.
 
@@ -371,7 +379,12 @@ async def run_search(
         applied_entity_filter["candidates_after"] = len(fused)
 
     t_dedup = time.perf_counter()
-    embeddings = await embeddings_for_chunks(customer_id, [h.chunk_id for h in fused])
+    # Dedup keys on the doc's representative chunk_id (best chunk by RRF).
+    # Two docs whose top chunks are near-duplicate embeddings collapse to
+    # the higher-ranked doc — same semantics as before, just at doc level.
+    embeddings = await embeddings_for_chunks(
+        customer_id, [d.chunk_id for d in fused if d.chunk_id]
+    )
     deduped = dedupe(fused, embeddings)
     timing["dedup_ms"] = (time.perf_counter() - t_dedup) * 1000
 
@@ -386,27 +399,16 @@ async def run_search(
     # doc the requesting user can't see.
     filtered = _pin_id_lookup_matches(filtered, id_hits)
 
-    top = filtered[: req.top_k]
+    top: list[FusedDocument] = filtered[: req.top_k]
 
     related: list[RelatedEntity] | None = None
     related_error: str | None = None
     if req.top_k_related > 0:
-        # Fuzzy exclusion (codex-P2): gate routed entities by
-        # entity_match_threshold so low-confidence router misfires don't
-        # suppress real entities, and emit normalized variants
-        # (lowered + namespace-stripped, canonical_id + display_name) so
-        # `Service:prbe-backend` (router) excludes `Service:prbe-ai/prbe-backend`
-        # (graph) without needing exact canonical_id alignment.
         exclude_keys = build_exclude_node_keys(
             routed.entities,
             entity_match_threshold=req.entity_match_threshold,
         )
-        # Dedupe doc_id, keep best (lowest) rank per doc -- multiple chunks
-        # per doc otherwise inflate doc_rank inputs to the SQL.
-        best_rank: dict[str, int] = {}
-        for i, h in enumerate(top, start=1):
-            best_rank.setdefault(h.doc_id, i)
-        ranked_docs = sorted(best_rank.items(), key=lambda kv: kv[1])
+        ranked_docs = [(d.doc_id, i) for i, d in enumerate(top, start=1)]
         t_related = time.perf_counter()
         try:
             related = await walk_result_doc_neighbors(
@@ -429,32 +431,73 @@ async def run_search(
             related_error = type(exc).__name__
         timing["related_entities_ms"] = (time.perf_counter() - t_related) * 1000
 
-    chunks = [
-        QueryChunk(
-            chunk_id=h.chunk_id,
-            doc_id=h.doc_id,
-            doc_version=h.doc_version,
-            source_system=SourceSystem(h.source_system),
-            source_url=h.source_url,
-            title=h.title,
-            content=h.content,
-            author_id=h.author_id,
-            created_at=h.created_at,
-            updated_at=h.updated_at,
-            score=h.score,
-            rank=i + 1,
-            retriever_scores=h.retriever_scores,
+    # Build (chunk_id -> list[GraphEvidence]) from the raw graph_hits list.
+    # One chunk reached via N seeds carries N entries — preserve the M:N
+    # relationship the response contract requires.
+    graph_evidence_by_chunk: dict[str, list[GraphEvidence]] = {}
+    seen_evidence_keys: dict[str, set[tuple]] = {}
+    for gh in graph_hits:
+        edge_type = gh.edge_type or ""
+        confidence = gh.confidence or "EXTRACTED"
+        via_entity = gh.via_entity
+        key = (edge_type, confidence, via_entity, gh.via_label)
+        if not edge_type:
+            continue
+        seen = seen_evidence_keys.setdefault(gh.chunk_id, set())
+        if key in seen:
+            continue
+        seen.add(key)
+        graph_evidence_by_chunk.setdefault(gh.chunk_id, []).append(
+            GraphEvidence(
+                edge_type=edge_type,
+                confidence=confidence,
+                via_entity=via_entity,
+                reason=None,
+            )
         )
-        for i, h in enumerate(top)
+
+    documents = [
+        QueryDocument(
+            doc_id=d.doc_id,
+            doc_version=d.doc_version,
+            source_system=SourceSystem(d.source_system),
+            source_url=d.source_url,
+            title=d.title,
+            author_id=d.author_id,
+            created_at=d.created_at,
+            updated_at=d.updated_at,
+            score=d.score,
+            rank=i + 1,
+            chunk_count=len(d.chunks),
+            retriever_scores=d.retriever_scores,
+            chunks=[
+                QueryChunk(
+                    chunk_id=c.chunk_id,
+                    score=c.score,
+                    rank_in_doc=c.rank_in_doc,
+                    content=c.content,
+                    retriever_scores=c.retriever_scores,
+                    graph_evidence=graph_evidence_by_chunk.get(c.chunk_id, []),
+                )
+                for c in d.chunks
+            ],
+        )
+        for i, d in enumerate(top)
     ]
 
-    bundles = _build_bundles(graph_hits) if graph_hits else None
+    confidence_breakdown = {"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0}
+    for doc in documents:
+        for chunk in doc.chunks:
+            for ev in chunk.graph_evidence:
+                tier = ev.confidence
+                confidence_breakdown[tier] = confidence_breakdown.get(tier, 0) + 1
 
     return QueryResponse(
         query=req.query,
-        chunks=chunks,
+        documents=documents,
         total_candidates=len(fused),
         router_hit_cache=False,
+        confidence_breakdown=confidence_breakdown,
         applied_temporal=temporal_meta,
         applied_sort=sort_meta,
         applied_entity_filter=applied_entity_filter,
@@ -465,45 +508,6 @@ async def run_search(
         aggregation=None,
         timing_ms=timing,
         trace_id=trace_id,
-        bundles=bundles,
         related_entities=related,
         related_entities_error=related_error,
     )
-
-
-def _build_bundles(graph_hits: list[GraphHit]) -> list[QueryBundle] | None:
-    """Group graph_hits by seed entity, when the seed is a code-graph node.
-
-    Builds a `QueryBundle` per (via_entity, via_label) pair where via_label
-    is one of the code-graph labels (Function/Method/Class/Module/Symbol).
-    Returns None when no code-graph entities seeded the search — keeps the
-    response field unset so dashboard NL consumers don't see an empty list.
-    """
-    by_seed: dict[tuple[str, str], dict] = {}
-    for hit in graph_hits:
-        if not hit.via_label or hit.via_label not in CODE_GRAPH_LABELS:
-            continue
-        key = (hit.via_entity, hit.via_label)
-        slot = by_seed.setdefault(
-            key,
-            {
-                "chunk_ids": [],
-                "confidence_breakdown": {"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0},
-            },
-        )
-        slot["chunk_ids"].append(hit.chunk_id)
-        tier = hit.confidence or "EXTRACTED"
-        slot["confidence_breakdown"][tier] = slot["confidence_breakdown"].get(tier, 0) + 1
-
-    if not by_seed:
-        return None
-
-    return [
-        QueryBundle(
-            seed_entity=seed,
-            seed_label=label,
-            related_chunk_ids=slot["chunk_ids"],
-            confidence_breakdown=slot["confidence_breakdown"],
-        )
-        for (seed, label), slot in by_seed.items()
-    ]

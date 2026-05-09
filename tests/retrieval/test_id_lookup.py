@@ -353,7 +353,10 @@ def test_inject_appends_missing_id_hit_as_synthetic_fused() -> None:
     target = next(f for f in out if f.doc_id == "d-target")
     assert target.score == 1.0
     assert target.retriever_scores == {"id_lookup": 1.0}
-    assert target.kind == "content"
+    # Synthetic doc carries one chunk with the same retriever signal.
+    assert len(target.chunks) == 1
+    assert target.chunks[0].chunk_id == "c-target"
+    assert target.chunks[0].retriever_scores == {"id_lookup": 1.0}
 
 
 def test_inject_skips_id_hit_already_in_fused() -> None:

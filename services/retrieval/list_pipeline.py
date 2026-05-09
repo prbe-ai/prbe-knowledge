@@ -30,6 +30,7 @@ from shared.constants import SourceSystem
 from shared.logging import get_logger
 from shared.models import (
     QueryChunk,
+    QueryDocument,
     QueryRequest,
     QueryResponse,
     RelatedEntity,
@@ -151,7 +152,7 @@ async def run_list(
         operation = "list"
 
     aggregation: dict[str, object] | None = None
-    chunks: list[QueryChunk] = []
+    documents: list[QueryDocument] = []
     total_candidates = 0
 
     t_sql = time.perf_counter()
@@ -204,21 +205,30 @@ async def run_list(
         timing["acl_ms"] = (time.perf_counter() - t_acl) * 1000
 
         total_candidates = len(hits)
-        chunks = [
-            QueryChunk(
-                chunk_id=h.chunk_id,
+        documents = [
+            QueryDocument(
                 doc_id=h.doc_id,
                 doc_version=h.doc_version,
                 source_system=SourceSystem(h.source_system),
                 source_url=h.source_url,
                 title=h.title,
-                content=h.content,
                 author_id=h.author_id,
                 created_at=h.created_at,
                 updated_at=h.updated_at,
                 score=h.score,
                 rank=i + 1,
+                chunk_count=1,
                 retriever_scores={"sql": h.score},
+                chunks=[
+                    QueryChunk(
+                        chunk_id=h.chunk_id,
+                        score=h.score,
+                        rank_in_doc=1,
+                        content=h.content,
+                        retriever_scores={"sql": h.score},
+                        graph_evidence=[],
+                    )
+                ],
             )
             for i, h in enumerate(hits[: req.top_k])
         ]
@@ -239,12 +249,9 @@ async def run_list(
             routed.entities,
             entity_match_threshold=req.entity_match_threshold,
         )
-        # Dedupe doc_id, keep best (lowest) rank per doc -- list mode emits
-        # one chunk per doc by construction, but the dedupe is cheap insurance.
-        best_rank: dict[str, int] = {}
-        for i, c in enumerate(chunks, start=1):
-            best_rank.setdefault(c.doc_id, i)
-        ranked_docs = sorted(best_rank.items(), key=lambda kv: kv[1])
+        # List mode emits one chunk per doc by construction, so the rank
+        # is simply the doc's index in the documents list.
+        ranked_docs = [(d.doc_id, i) for i, d in enumerate(documents, start=1)]
         t_related = time.perf_counter()
         try:
             related = await walk_result_doc_neighbors(
@@ -267,9 +274,10 @@ async def run_list(
 
     return QueryResponse(
         query=req.query,
-        chunks=chunks,
+        documents=documents,
         total_candidates=total_candidates,
         router_hit_cache=False,
+        confidence_breakdown={"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0},
         applied_temporal=temporal_meta,
         applied_sort=sort_meta,
         applied_entity_filter=None,

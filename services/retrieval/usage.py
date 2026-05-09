@@ -275,16 +275,17 @@ def _build_response_payload(
       2. Serialize, measure size.
       3. If serialized > RESPONSE_MAX_BYTES, replace with truncation marker.
 
-    The chunk-count pre-check looks at `.chunks` (QueryResponse,
-    AnswerResponse) — SourceResponse uses `chunk_count` instead and
-    returns reassembled `content`, which is bounded by the chunker.
+    The chunk-count pre-check sums `len(d.chunks)` across `.documents`
+    (QueryResponse, AnswerResponse) — SourceResponse uses `chunk_count`
+    instead and returns reassembled `content`, which is bounded by the
+    chunker.
     """
-    chunks_attr = getattr(response, "chunks", None)
-    if (
-        chunks_attr is not None
-        and len(chunks_attr) > MAX_CHUNK_COUNT_BEFORE_TRUNCATE
-    ):
-        marker = _truncated_marker(size_bytes=0, chunk_count=len(chunks_attr))
+    docs_attr = getattr(response, "documents", None)
+    chunk_count = (
+        sum(len(d.chunks) for d in docs_attr) if docs_attr is not None else None
+    )
+    if chunk_count is not None and chunk_count > MAX_CHUNK_COUNT_BEFORE_TRUNCATE:
+        marker = _truncated_marker(size_bytes=0, chunk_count=chunk_count)
         # size_bytes=0 here means "not measured" — the gate fired before
         # serialization. Distinguishable from a real 0 only via the
         # response_truncated boolean.
@@ -295,7 +296,6 @@ def _build_response_payload(
     serialized = json.dumps(payload).encode("utf-8")
     size_bytes = len(serialized)
     if size_bytes > RESPONSE_MAX_BYTES:
-        chunk_count = len(chunks_attr) if chunks_attr is not None else None
         marker = _truncated_marker(size_bytes=size_bytes, chunk_count=chunk_count)
         return marker, size_bytes, True
     return payload, size_bytes, False

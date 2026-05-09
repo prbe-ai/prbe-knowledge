@@ -34,13 +34,15 @@ def test_fuse_combines_ranked_lists() -> None:
             FakeHit(chunk_id="c3", doc_id="d3", score=0.6)]
 
     fused = fuse({"vector": vec, "bm25": bm25}, top_k=10)
-    # c2 appears in both → highest combined RRF score
-    assert fused[0].chunk_id == "c2"
-    assert fused[0].retriever_scores == {"vector": 0.8, "bm25": 0.7}
+    # d2 ranks first because c2 surfaced in both retrievers (higher chunk RRF).
+    assert fused[0].doc_id == "d2"
+    assert fused[0].chunks[0].chunk_id == "c2"
+    assert fused[0].chunks[0].retriever_scores == {"vector": 0.8, "bm25": 0.7}
 
 
-def test_fuse_doc_collapse() -> None:
-    # Two chunks from the same doc — only the higher-combined one survives.
+def test_fuse_doc_collapse_keeps_all_content_chunks() -> None:
+    # Two content chunks from the same doc — both kept under one
+    # FusedDocument; chunks ranked within the doc by their own RRF.
     vec = [
         FakeHit(chunk_id="c1a", doc_id="dup", score=0.1),
         FakeHit(chunk_id="c1b", doc_id="dup", score=0.9),
@@ -49,6 +51,12 @@ def test_fuse_doc_collapse() -> None:
     fused = fuse({"vector": vec, "bm25": bm25}, top_k=10)
     docs = {h.doc_id for h in fused}
     assert docs == {"dup"}
+    assert len(fused) == 1
+    chunk_ids = [c.chunk_id for c in fused[0].chunks]
+    # c1b appeared in both retrievers → highest RRF → rank_in_doc=1.
+    assert chunk_ids == ["c1b", "c1a"]
+    assert fused[0].chunks[0].rank_in_doc == 1
+    assert fused[0].chunks[1].rank_in_doc == 2
 
 
 def test_cosine_identity() -> None:

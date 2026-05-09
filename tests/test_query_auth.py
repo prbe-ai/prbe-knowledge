@@ -109,7 +109,7 @@ async def test_query_accepts_valid_bearer(live_db, settings) -> None:
     )
     await init_pool(settings)
     assert resp.status_code == 200, resp.text
-    assert "chunks" in resp.json()
+    assert "documents" in resp.json()
 
 
 @pytest.mark.asyncio

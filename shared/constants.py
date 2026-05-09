@@ -373,6 +373,12 @@ TOP_K_GRAPH = 20
 RRF_K = 60
 DEDUP_COSINE_THRESHOLD = 0.95
 
+# Doc-grouped fusion: weight applied to the sum of NON-best content-chunk RRF
+# scores when collapsing per-doc. doc_score = max(rrfs) + alpha * sum(others) +
+# metadata_sum. Prevents long docs from drowning shorter ones; preserves
+# best-chunk-wins-ties; rewards docs whose multiple chunks all matched.
+RRF_BREADTH_ALPHA = 0.3
+
 # Per-source-system score multiplier applied AFTER RRF fusion. Values < 1.0
 # demote a source's docs so they rank below other sources at equal vector
 # relevance. Defaults to 1.0 (no change) for any source not listed.

@@ -23,6 +23,7 @@ from services.retrieval.router import RouterOutput
 from services.retrieval.synthesis import StreamDelta, StreamFinal, SynthesisError
 from shared.models import (
     QueryChunk,
+    QueryDocument,
     QueryRequest,
     QueryResponse,
     SourceSystem,
@@ -73,22 +74,29 @@ def _phase_result() -> RouterPhaseResult:
 def _query_response() -> QueryResponse:
     chunk = QueryChunk(
         chunk_id="chunk-1",
+        score=0.9,
+        rank_in_doc=1,
+        content="hello world",
+        retriever_scores={"vector": 0.9},
+    )
+    document = QueryDocument(
         doc_id="github:prbe-ai/x:pr:1",
         doc_version=1,
         source_system=SourceSystem.GITHUB,
         source_url="https://example.com/x/pr/1",
         title="example",
-        content="hello world",
         author_id="alice",
         created_at=datetime(2026, 4, 1, tzinfo=UTC),
         updated_at=datetime(2026, 4, 2, tzinfo=UTC),
         score=0.9,
         rank=1,
+        chunk_count=1,
         retriever_scores={"vector": 0.9},
+        chunks=[chunk],
     )
     return QueryResponse(
         query="q",
-        chunks=[chunk],
+        documents=[document],
         total_candidates=1,
         router_hit_cache=False,
         applied_temporal={"mode": "latest", "source": "default", "raw_phrase": None, "error": None},
@@ -153,6 +161,8 @@ async def test_query_stream_emits_full_event_sequence(monkeypatch) -> None:
 
     events = _parse_sse(resp.text)
     names = [e for e, _ in events]
+    # SSE event name stays `chunks` for dashboard back-compat; payload
+    # carries the doc-grouped `documents` list.
     assert names == [
         "step",
         "entities",
@@ -175,11 +185,13 @@ async def test_query_stream_emits_full_event_sequence(monkeypatch) -> None:
     assert entities_payload["applied_mode"] == "search"
     assert entities_payload["trace_id"] == "q-test-1"
 
-    # Chunks event is dumped as JSON-ready dicts.
-    chunks_payload = next(d for n, d in events if n == "chunks")
-    assert len(chunks_payload["chunks"]) == 1
-    assert chunks_payload["chunks"][0]["chunk_id"] == "chunk-1"
-    assert chunks_payload["total_candidates"] == 1
+    # `chunks` event payload is the doc-grouped `documents` list (dumped
+    # as JSON-ready dicts).
+    docs_payload = next(d for n, d in events if n == "chunks")
+    assert len(docs_payload["documents"]) == 1
+    assert docs_payload["documents"][0]["doc_id"] == "github:prbe-ai/x:pr:1"
+    assert docs_payload["documents"][0]["chunks"][0]["chunk_id"] == "chunk-1"
+    assert docs_payload["total_candidates"] == 1
 
     # Deltas preserve order and content.
     deltas = [d["text"] for n, d in events if n == "delta"]

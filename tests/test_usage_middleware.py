@@ -59,29 +59,36 @@ def _stub_pipeline(monkeypatch, *, chunk_count: int = 3) -> None:
     from datetime import UTC, datetime
 
     from shared.constants import SourceSystem
-    from shared.models import QueryChunk, QueryResponse
+    from shared.models import QueryChunk, QueryDocument, QueryResponse
 
     async def fake_run_retrieval(req, customer_id):
         now = datetime.now(UTC)
-        chunks = [
-            QueryChunk(
-                chunk_id=f"c{i}",
+        documents = [
+            QueryDocument(
                 doc_id=f"doc-{i}",
                 doc_version=1,
                 source_system=SourceSystem.SLACK,
                 source_url=f"https://example/{i}",
                 title=f"chunk {i}",
-                content=f"content {i}",
                 created_at=now,
                 updated_at=now,
                 score=1.0 - i * 0.1,
                 rank=i,
+                chunk_count=1,
+                chunks=[
+                    QueryChunk(
+                        chunk_id=f"c{i}",
+                        score=1.0 - i * 0.1,
+                        rank_in_doc=1,
+                        content=f"content {i}",
+                    )
+                ],
             )
             for i in range(chunk_count)
         ]
         return QueryResponse(
             query=req.query,
-            chunks=chunks,
+            documents=documents,
             total_candidates=chunk_count,
             router_hit_cache=False,
             timing_ms={"router_ms": 1.0},

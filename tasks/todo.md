@@ -1,96 +1,175 @@
-# fix: launch-readiness — capacity bump + same-session coalescing + CC deprioritize
+# Document-grouped retrieval
 
-**Status:** in progress (started 2026-04-29).
+Switch `/retrieve` and `/query` (+ `/query/stream`) from flat-chunks-per-doc to documents-with-their-matched-chunks. Hard cutover, no flag. Ranking incorporates how many chunks of a doc actually matched. Drop `QueryBundle`; lift its info onto per-chunk `graph_evidence` and a top-level confidence aggregate.
 
-## What ships in this PR
+## Why
 
-### A. Worker capacity bump (fly.worker.toml)
+- Fusion already groups per-doc for scoring (`fusion.py:117–155`) but collapses to ONE best content chunk per doc at output (`fusion.py:196–219`). Multi-chunk hits in the same doc lose visibility.
+- Consumers (MCP `search_knowledge`/`query_knowledge`, dashboard search + chat console) want a doc-shaped view: one entry per source with its matched chunks nested.
+- `QueryBundle` was a side-channel that worked around an unpopulated `QueryChunk.graph_evidence` field. Wiring up `graph_evidence` per chunk (as `list[GraphEvidence]` for M:N) makes bundles redundant. Confidence breakdown moves to a flat top-level aggregate.
+- `/query` and `/query/stream` both call `run_retrieval()` internally — fixing fusion + response shape once propagates to both endpoints.
 
-- count: 9 → 18
-- WORKER_MAX_CONCURRENT: 2 → 4
-- memory: 2gb → 3gb
-- Net: 72 in-flight slots, ~360 batches/min ceiling, ~300+ concurrent CC sessions handled.
+## Out of scope
 
-### B. Same-session enqueue coalescing for claude_code
+- No full-doc body in responses. `chunks[]` under each doc carries ONLY the content chunks that surfaced from the retrievers. No new IO, no `documents.body` joins.
+- No doc-fetching helper, no on-demand drill-down — `SourceViewResponse` already exists for that.
+- Keep `/query` and `/query/stream` (dashboard chat console depends on them). Just reshape their response.
 
-Today's bug discovered during eng review: live CC batches land at date-partitioned R2 keys
-(`raw/claude_code/<cust>/YYYY/MM/DD/<sess>:<batch>.json`) but `fetch_supplementary` only
-merges from per-session prefix (`raw/claude_code/<cust>/<sess>/`) — different paths.
-Result: each batch's processing only sees ITS OWN events. Session document gets
-overwritten per batch with that 30s window. Chunk diff expires prior batch's chunks.
-Net effect: only the latest batch is searchable per session. Silent data loss.
+## Response shape (hard cutover, `/retrieve` + `/query` + `/query/stream`)
 
-Fix:
+```jsonc
+{
+  "query": "...",
+  "documents": [
+    {
+      "doc_id": "issue:8bcb...",
+      "doc_version": 4,
+      "source_system": "linear",
+      "source_url": "...",
+      "title": "...",
+      "author_id": "...",
+      "created_at": "...",
+      "updated_at": "...",
+      "score": 0.84,
+      "rank": 1,
+      "chunk_count": 3,
+      "retriever_scores": { "vector": ..., "bm25": ..., "metadata_vector": ... },
+      "chunks": [
+        {
+          "chunk_id": "...",
+          "score": 0.42,
+          "rank_in_doc": 1,
+          "content": "...",
+          "graph_evidence": [                     // list, was scalar; usually empty
+            { "edge_type": "MENTIONS", "confidence": "EXTRACTED",
+              "via_entity": "prbe-ai/prbe-knowledge:Normalizer.process_queue_row",
+              "reason": null }
+          ]
+        },
+        { "chunk_id": "...", "score": 0.28, "rank_in_doc": 2,
+          "content": "...", "graph_evidence": [] }
+      ]
+    },
+    { "doc_id": "...", ... }
+  ],
+  "total_candidates": 42,
+  "confidence_breakdown": { "EXTRACTED": 12, "INFERRED": 3, "AMBIGUOUS": 1 },  // flat aggregate over all graph-retrieved chunks; absent/zeroed when no graph hits
+  "applied_temporal": {...},
+  "applied_sort": {...},
+  "applied_entity_filter": {...},
+  "applied_mode": "...",
+  "applied_doc_types": [...],
+  "applied_min_confidence": "...",
+  "extracted_entities": [...],
+  "aggregation": null,
+  "timing_ms": {...},
+  "trace_id": "...",
+  "related_entities": [...] | null,
+  "related_entities_error": null
+  // bundles: REMOVED
+}
+```
 
-1. **Migration** — ADD `payload_s3_keys text[] NOT NULL DEFAULT '{}'`,
-   ADD `version int NOT NULL DEFAULT 0`, backfill existing rows with
-   `payload_s3_keys = ARRAY[payload_s3_key]`. Do NOT drop `payload_s3_key`
-   in this migration (avoids rolling-deploy race) — defer to follow-up.
-2. **Ingestion enqueue** — claude_code uses UPSERT on
-   (customer_id, source_system, session_id), appending key to array,
-   bumping version. source_event_id becomes bare session_id (no :batch_seq).
-   Other connectors INSERT with payload_s3_keys=ARRAY[$key],
-   ON CONFLICT DO NOTHING. All connectors use the array column going forward.
-3. **Worker** — `_claim_one` returns `version`. After Phase B commits,
-   atomic UPDATE … SET status='done' WHERE queue_id=$1 AND version=$captured.
-   Mismatch → row stays 'pending' for re-claim with extended array.
-   Same-session NOT EXISTS clause from PR #33 deleted (dead code post-coalescing).
-4. **CC connector** — `fetch_supplementary` reads payload_s3_keys, parallel-fetches
-   via asyncio.Semaphore(16). Detects session_complete via either session_end event
-   OR finalize.marker key in array.
-5. **Session-completer cron** — UPSERTs into the live session row (appending
-   finalize.marker to array, bumping version). Removes the legacy
-   :finalize source_event_id flow for new triggers; legacy in-flight rows still drain.
+`AnswerResponse` (`/query`) gets the same `documents` reshape; citations stay chunk-keyed so the answer-side joins still work. `/query/stream` SSE events that carry chunk/doc payloads switch to the doc-grouped frames.
 
-### C. Per-source priority deprioritization
+## Doc score formula
 
-SOURCE_PRIORITY map (shared/constants.py):
-- claude_code: 75
-- other live (github/slack/notion/linear/granola/sentry): 100
-- backfill: 50 (unchanged)
+Replace `combined_for_doc[doc] = best_content_rrf + metadata_rrf_sum` with:
 
-Tier order: live(100) > CC(75) > backfill(50).
-Worker._claim_one already orders by priority DESC — no claim-side change.
+```
+doc_score = max(content_chunk_rrfs)
+          + alpha * sum(other_content_chunk_rrfs)
+          + metadata_rrf_sum
+```
 
-## Out of scope (deferred)
+with `alpha = 0.3` (constants.py — `RRF_BREADTH_ALPHA`). Source multiplier + recency decay still applied to the final number, same as today.
 
-- Drop payload_s3_key column (follow-up after this deploy stabilizes)
-- Phase A intra-process version-check (handle burst thrash)
-- Backfill fairness / max-wait priority bump
-- Multi-region redundancy
-- Killswitch (user implementing in separate session)
+Why these choices:
+- `max + alpha*sum_of_others` instead of plain `sum`: prevents long docs from drowning shorter, more relevant ones; preserves "best chunk wins ties" semantics.
+- Not raw `count`: a doc with 5 weak chunks shouldn't beat a doc with 1 strong + 1 medium chunk.
+- 0.3 is a starting alpha — tunable via constant if eval shifts.
 
-## Tests
+## Files to change
 
-- Coalescing happy path (3 batches → 1 row, array length 3, version 3)
-- Phase B + CAS commit (version unchanged → done)
-- CAS race (mid-process batch → version advances → CAS misses → row stays pending)
-- Session resurrection (done → new batch → reopens to pending)
-- Other connector regression (slack still works, single-element array)
-- Priority claim ordering (github 100 beats CC 75 when both pending)
-- Data-loss regression (full session body has events from ALL batches)
-- Finalize via marker (cron upserts marker → worker detects → unit docs extracted)
-- Migration backfill safety (existing rows get correct array)
-- Worker crash between Phase B commit and CAS (reclaim recovers)
+### prbe-knowledge (core — most of the work)
 
-## Affected files
+- [ ] `shared/constants.py` — add `RRF_BREADTH_ALPHA = 0.3`
+- [ ] `shared/models.py`
+  - [ ] New `QueryDocument` model (doc-level fields + `chunks: list[QueryChunk]` + `chunk_count`)
+  - [ ] `QueryChunk` — add `rank_in_doc: int`; drop the doc-level redundant fields (`doc_id`, `doc_version`, `source_system`, `source_url`, `title`, `author_id`, `created_at`, `updated_at`) since they live on the parent now. Keep `chunk_id`, `content`, `score`, `retriever_scores`.
+  - [ ] `QueryChunk.graph_evidence` → `list[GraphEvidence]` (was `GraphEvidence | None`, never populated). Default empty list. Populated only for chunks that surfaced via graph retriever.
+  - [ ] `QueryResponse`: `chunks` → `documents: list[QueryDocument]`; add `confidence_breakdown: dict[str, int]` (flat aggregate); REMOVE `bundles`.
+  - [ ] `AnswerResponse`: `chunks` → `documents: list[QueryDocument]`; add `confidence_breakdown` to match.
+  - [ ] DELETE `QueryBundle` model entirely.
+- [ ] `services/retrieval/fusion.py`
+  - [ ] `FusedHit` → `FusedDocument` carrying `chunks: list[FusedChunk]` (or a parallel `FusedChunk` dataclass — pick whichever causes less churn in callers)
+  - [ ] In `fuse()`: stop selecting `best_content_for_doc`; keep ALL content chunks per doc (`content_chunks_for_doc: dict[doc_id, list[(chunk_id, rrf_score)]]`)
+  - [ ] Apply new formula at line ~155 (`max + alpha*sum_other + metadata_sum`)
+  - [ ] Source multiplier + recency decay applied at doc-level (use the doc's `updated_at` from any chunk — they share it per the existing comment)
+  - [ ] Sort chunks within each doc by their RRF descending; assign `rank_in_doc`
+  - [ ] Top-level `top_k` now applies to documents, not chunks
+- [ ] `services/retrieval/search_pipeline.py`
+  - [ ] Callers of `fuse()` consume new return shape; emit `QueryDocument`s
+  - [ ] DELETE `_build_bundles` and the `bundles=...` wiring on QueryResponse
+  - [ ] Populate per-chunk `graph_evidence` from the `graph_hits` list — for each chunk_id surviving fusion/dedup/ACL, attach a `GraphEvidence` for every distinct `(via_entity, via_label, edge_type, confidence)` graph hit on that chunk_id (M:N — multiple seeds per chunk OK)
+  - [ ] Compute top-level `confidence_breakdown`: count distinct `confidence` tiers across all `graph_evidence` entries on the surviving chunks
+- [ ] `services/retrieval/pipeline.py` — `run_retrieval()` wires `documents` + `confidence_breakdown` into `QueryResponse`
+- [ ] `services/retrieval/list_pipeline.py` — list mode emits one chunk per doc via the LATERAL join; wrap each in a single-chunk `QueryDocument` so the response shape is uniform across modes (doc score = chunk score, `chunk_count = 1`, `rank_in_doc = 1`, `graph_evidence = []`, `confidence_breakdown = {}`)
+- [ ] `services/retrieval/main.py`
+  - [ ] `/retrieve` and `/query` handlers — pass through new response model
+  - [ ] `/query/stream` SSE — update event payload shapes that today emit chunks (the synthetic `AnswerResponse` at `main.py:362` and any phase events that include chunks/docs) to emit doc-grouped frames
+- [ ] `services/retrieval/synthesis.py` — synthesizer iterates over flattened chunks for prompt construction (`[c for d in qr.documents for c in d.chunks]`), re-attaching doc-level fields (title, source_url, source_system) per chunk for the citation/grounding format. Same for streaming variant.
+- [ ] `services/retrieval/retrievers/related_entities.py` — input set is now `documents`; walk semantics don't change (was already de-duping by `doc_id`)
+- [ ] Tests:
+  - [ ] `tests/services/retrieval/test_fusion.py`
+  - [ ] `tests/services/retrieval/test_search_pipeline.py`
+  - [ ] `tests/services/retrieval/test_pipeline.py`
+  - [ ] `tests/services/retrieval/test_list_pipeline.py`
+  - [ ] integration tests asserting `response.chunks` shape
+  - [ ] add: doc with 3 matched chunks ranks above doc with 1 strong-only chunk
+  - [ ] add: chunk-level scores preserved within each doc; `rank_in_doc` monotonic
+  - [ ] add: `top_k=5` returns 5 documents, not 5 chunks
+  - [ ] add: chunk surfaced via 2 graph seeds carries 2 `graph_evidence` entries
+  - [ ] add: top-level `confidence_breakdown` aggregates correctly across docs
+  - [ ] DELETE `tests/services/retrieval/test_bundles*` (or equivalent) — bundles are gone
 
-- alembic migration (new)
-- fly.worker.toml
-- shared/constants.py (SOURCE_PRIORITY)
-- services/ingestion/main.py (_enqueue)
-- services/ingestion/handlers/claude_code.py (parse_webhook_event, fetch_supplementary)
-- services/ingestion/worker.py (_claim_one, _process)
-- services/ingestion/normalizer.py (process_queue_row signature)
-- services/ingestion/session_completer.py (rework finalize)
-- tests/ (new test files)
+### prbe-knowledge-mcp
 
-## Eng-review findings (resolved)
+- [ ] `app/clients/knowledge.py` — typed response model update to match new shape (both `/retrieve` and `/query` paths)
+- [ ] `app/clients/_responses.py` — `compact_search()` and any other reshape: emit doc-grouped output to MCP callers. Keep `verbose=False` compaction; operate on `documents` instead of `chunks`. Drop bundle-related compaction.
+- [ ] `app/server.py`
+  - [ ] `search_knowledge` tool docstring: describe new shape (LLMs reading this need to know what they're getting); remove `bundles` mention
+  - [ ] `query_knowledge` tool docstring: same — describe doc-grouped citation/answer shape
+- [ ] Update any fixture asserting `chunks` at top level or `bundles` field
 
-- A1 migration backfill — auto-applied
-- A2 watermark monotonicity — chose integer counter over timestamp
-- A3 schema shape — chose unify-on-array over keep-both-columns
-- B1 dead NOT EXISTS clause — removed in this PR
-- D1 R2 fan-out memory — semaphore(16) cap
-- Outside-voice T1 migration drop-column race — defer drop to follow-up
-- Outside-voice T2 finalize clobber — UPSERT into live row
+### prbe-dashboard
+
+- [ ] `src/lib/api/knowledge.ts` — TS types for `QueryDocument`, `GraphEvidence` as list, updated `KnowledgeQueryResponse`/answer response; remove `QueryBundle` type
+- [ ] `KnowledgeStreamEvent` (SSE event names + payloads) — update frames that carry chunk/doc payloads to the new shape
+- [ ] Search/results renderer — group rendering by document; show matched chunks under each doc with their per-chunk scores. (Find call site via `retrieveKnowledge` import sites.)
+- [ ] `QueryConsole` (chat console on `/overview`) — consumes `/query/stream` SSE; update to render doc-grouped chunks + citations
+- [ ] Any other consumer of `chunks` (history, debug views, etc.)
+
+### Drive-by sweep (check, only change if needed)
+
+- [ ] `prbe-orchestrator` — anything calling `/retrieve` or `/query` directly?
+- [ ] `prbe-backend` — BFF proxy is pass-through; confirm no payload-shape introspection
+
+## Rollout (hard cutover)
+
+1. Land prbe-knowledge change first — both endpoints emit new shape (auto-deploys on push to main per `feedback_ci_autodeploys_on_push.md`).
+2. **Same day**: land prbe-knowledge-mcp + prbe-dashboard updates against the new shape.
+
+If knowledge ships and MCP/dashboard lag, MCP search results break and dashboard search renders empty until they catch up. Window should be minutes, not hours.
+
+## Verification
+
+- [ ] Unit tests above
+- [ ] Local: hit `/retrieve` with a query known to surface ≥3 chunks from the same doc; verify all 3 nested
+- [ ] Verify ranking: doc-with-3-chunks out-ranks single-chunk doc with similar top score
+- [ ] MCP: invoke `search_knowledge` from dev, verify Claude can parse new shape
+- [ ] Dashboard: search bar returns grouped results; chunk drill-down still works
+
+## Review
+
+(filled in after implementation)

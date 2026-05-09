@@ -1,45 +1,49 @@
 """Reciprocal Rank Fusion — combines ranked lists from vector/BM25/graph retrievers.
 
-RRF formula:   score(doc) = Σ retriever 1 / (k + rank_in_retriever)
+RRF formula:   score(chunk) = Σ retriever 1 / (k + rank_in_retriever)
 
 k=60 is standard per Cormack et al. 2009.
 
-Doc-level collapse + kind-aware scoring
+Doc-grouped fusion + kind-aware scoring
 ───────────────────────────────────────
 Two kinds of chunks compete for ranking:
 
-  - kind='content' — body text. Always what an agent actually wants to
-                     see in the response.
+  - kind='content' — body text. What an agent actually consumes.
   - kind='metadata' — synthetic per-document key:value text generated at
                       ingestion (title, repo, author, source URL).
                       Searchable but never returned to the agent.
 
-We fuse at the chunk level (so a doc that surfaces via either or both
-kinds gets the right combined signal), then collapse per doc into the
-best CONTENT chunk for that doc, with the doc's metadata-chunk score
-folded into the per-doc score as a booster.
+We fuse at the chunk level, then collapse per doc into a `FusedDocument`
+that keeps EVERY surviving content chunk for the doc — `top_k` applies to
+documents, not chunks. The doc's metadata-chunk RRF folds into the doc
+score as a booster.
+
+Doc score:
+    score = max(content_chunk_rrfs)
+          + alpha * sum(other_content_chunk_rrfs)
+          + sum(metadata_rrfs)
+
+Where alpha = RRF_BREADTH_ALPHA. `max + alpha*sum_of_others` keeps
+"best chunk wins ties" while still rewarding docs whose multiple
+chunks all matched.
 
 A doc whose only candidate-pool entry is its metadata chunk (no content
 chunk surfaced from any retriever) is dropped unless the caller supplies a
-`content_fallback` hit for the same doc. Fallback hits let metadata select
-the doc while preserving the response contract: agents still see only real
-content chunks, never synthetic key:value metadata text.
+`content_fallback` hit for the same doc.
 
 Recency decay is always-on: every doc is multiplied by
 exp(-ln2 * age_days / half_life). Half-life resolution order:
 
-  1. Per-source override in SOURCE_HALF_LIFE_DAYS (e.g. claude_code/codex
-     at 7d for noisy transcript sources).
+  1. Per-source override in SOURCE_HALF_LIFE_DAYS.
   2. Caller-supplied `recency_half_life_days` if not None.
-  3. DEFAULT_RECENCY_HALF_LIFE_DAYS — universal baseline so backfilled
-     tenants don't surface stale year-old content at parity with fresh docs.
+  3. DEFAULT_RECENCY_HALF_LIFE_DAYS.
 
 All chunks of a doc share `updated_at`, so decay shifts between-doc ranking
 only.
 
 `sort` (deterministic time sort) is supported but the search pipeline no
 longer uses it — sort intent on the search path becomes amplified
-recency boost via half_life. Kept for callers that want explicit control.
+recency boost via half_life.
 """
 
 from __future__ import annotations
@@ -52,6 +56,7 @@ from typing import Any
 
 from shared.constants import (
     DEFAULT_RECENCY_HALF_LIFE_DAYS,
+    RRF_BREADTH_ALPHA,
     RRF_K,
     SOURCE_HALF_LIFE_DAYS,
     SOURCE_SCORE_MULTIPLIERS,
@@ -59,22 +64,40 @@ from shared.constants import (
 
 
 @dataclass(slots=True)
-class FusedHit:
+class FusedChunk:
     chunk_id: str
+    content: str
+    score: float  # post-RRF chunk-level score (no source-mult / decay)
+    retriever_scores: dict[str, float] = field(default_factory=dict)
+    rank_in_doc: int = 0
+
+
+@dataclass(slots=True)
+class FusedDocument:
     doc_id: str
     doc_version: int
     source_system: str
     source_url: str
     title: str | None
-    content: str
     created_at: datetime
     updated_at: datetime
-    score: float
+    score: float  # doc-level (post-multiplier + decay)
     author_id: str | None = None
     retriever_scores: dict[str, float] = field(default_factory=dict)
-    # Always 'content' on FusedHit — fusion's contract is "synthetic
-    # metadata text never escapes." Caller sees only body chunks.
-    kind: str = "content"
+    chunks: list[FusedChunk] = field(default_factory=list)
+
+    @property
+    def chunk_id(self) -> str:
+        # The doc's representative chunk_id (best chunk). Used by dedup
+        # (keys on chunk embeddings) and id_lookup pin (was already
+        # doc-keyed). Empty string if the doc somehow has no chunks.
+        return self.chunks[0].chunk_id if self.chunks else ""
+
+    @property
+    def content(self) -> str:
+        # Joined content across the doc's chunks. Used by the post-fusion
+        # entity_filter — passing any chunk's text qualifies the doc.
+        return "\n".join(c.content for c in self.chunks)
 
 
 def fuse(
@@ -84,16 +107,17 @@ def fuse(
     recency_half_life_days: float | None = None,
     now: datetime | None = None,
     sort: dict[str, str] | None = None,
-) -> list[FusedHit]:
-    """Combine ranked lists from multiple retrievers.
+) -> list[FusedDocument]:
+    """Combine ranked lists from multiple retrievers into doc-grouped output.
 
     `ranked_lists` is `{"vector": [VectorHit, ...], "bm25": [...], "graph": [...]}`.
     Each hit object must expose: chunk_id, doc_id, doc_version,
     source_system, source_url, title, content, created_at, updated_at,
     score, kind. `author_id` is optional and propagated when present.
 
-    Returns up to top_k FusedHits, each one a CONTENT chunk (metadata
-    chunks contribute scoring signal but never appear in the response).
+    Returns up to top_k FusedDocuments. Each doc's `chunks` list contains
+    EVERY content chunk from the candidate pool that belongs to it,
+    sorted by RRF descending, with `rank_in_doc` assigned.
     """
     per_chunk_rrf: dict[str, float] = defaultdict(float)
     per_chunk_breakdown: dict[str, dict[str, float]] = defaultdict(dict)
@@ -114,15 +138,13 @@ def fuse(
             per_chunk_meta[hit.chunk_id] = hit
 
     # Per-doc accounting:
-    #   best_content[doc_id] = chunk_id of highest-RRF content chunk
-    #   content_score[doc_id] = the RRF score of that content chunk
-    #   metadata_score[doc_id] = sum of metadata-chunk RRF scores for that doc
-    #     (typically one per doc, but defensive against future cardinality)
-    best_content_for_doc: dict[str, str] = {}
-    content_score_for_doc: dict[str, float] = {}
-    fallback_content_for_doc: dict[str, str] = {}
+    #   content_chunks_for_doc[doc_id] = list of (chunk_id, rrf_score) for content chunks
+    #   metadata_score_for_doc[doc_id] = sum of metadata-chunk RRF scores
+    #   fallback_content_for_doc[doc_id] = chunk_id of fallback content chunk (if any)
+    content_chunks_for_doc: dict[str, list[tuple[str, float]]] = defaultdict(list)
     metadata_score_for_doc: dict[str, float] = defaultdict(float)
     metadata_breakdown_for_doc: dict[str, dict[str, float]] = defaultdict(dict)
+    fallback_content_for_doc: dict[str, str] = {}
 
     for chunk_id, hit in per_chunk_meta.items():
         if getattr(hit, "kind", "content") == "content_fallback":
@@ -135,41 +157,15 @@ def fuse(
 
         if kind == "metadata":
             metadata_score_for_doc[doc_id] += rrf_score
-            # Capture metadata's per-retriever signal for response telemetry —
-            # merged into the surviving content chunk's breakdown so callers
-            # can see "the metadata chunk also matched".
             for retriever_name, score in per_chunk_breakdown[chunk_id].items():
                 metadata_breakdown_for_doc[doc_id][f"metadata_{retriever_name}"] = score
             continue
 
-        # Content chunk — track the highest-scoring one per doc.
-        prior_score = content_score_for_doc.get(doc_id)
-        if prior_score is None or rrf_score > prior_score:
-            best_content_for_doc[doc_id] = chunk_id
-            content_score_for_doc[doc_id] = rrf_score
+        content_chunks_for_doc[doc_id].append((chunk_id, rrf_score))
 
-    # Combine: doc score = best content RRF + metadata RRF.
-    # Drop docs with NO content chunk in the candidate pool.
-    combined_for_doc: dict[str, float] = {}
-    for doc_id, content_score in content_score_for_doc.items():
-        combined_for_doc[doc_id] = content_score + metadata_score_for_doc.get(doc_id, 0.0)
-    for doc_id, metadata_score in metadata_score_for_doc.items():
-        if doc_id in combined_for_doc:
-            continue
-        fallback_chunk_id = fallback_content_for_doc.get(doc_id)
-        if fallback_chunk_id is None:
-            continue
-        best_content_for_doc[doc_id] = fallback_chunk_id
-        content_score_for_doc[doc_id] = 0.0
-        combined_for_doc[doc_id] = metadata_score
-
-    # Per-source-system score multiplier (Change A) and recency decay
-    # (Change C). Multiplier first so a brand-new claude_code doc still gets
-    # demoted; otherwise zero-decay at age=0 would bypass it.
-    #
-    # Half-life resolution: per-source override > caller global > universal
-    # baseline. The baseline is always-on so backfilled tenants don't surface
-    # 8-12 month old docs ranked equally with fresh ones.
+    # Build FusedDocuments. Drop docs with NO content chunk in the candidate
+    # pool unless a content_fallback exists.
+    docs: dict[str, FusedDocument] = {}
     ref_now = now or datetime.now(UTC)
     ln2 = math.log(2)
     baseline_half_life = (
@@ -177,57 +173,133 @@ def fuse(
         if recency_half_life_days is not None
         else DEFAULT_RECENCY_HALF_LIFE_DAYS
     )
-    for doc_id, combined in list(combined_for_doc.items()):
-        chunk_id = best_content_for_doc[doc_id]
-        hit = per_chunk_meta[chunk_id]
-        source_system = hit.source_system
+
+    def _build_doc(
+        doc_id: str,
+        ranked_chunks: list[tuple[str, float]],
+        metadata_score: float,
+    ) -> FusedDocument:
+        # Sort content chunks within doc by RRF desc; assign rank_in_doc.
+        ranked_chunks.sort(key=lambda t: -t[1])
+        chunks: list[FusedChunk] = []
+        for i, (chunk_id, rrf_score) in enumerate(ranked_chunks, start=1):
+            hit = per_chunk_meta[chunk_id]
+            chunks.append(
+                FusedChunk(
+                    chunk_id=chunk_id,
+                    content=hit.content,
+                    score=rrf_score,
+                    retriever_scores=dict(per_chunk_breakdown[chunk_id]),
+                    rank_in_doc=i,
+                )
+            )
+
+        rrfs = [s for _, s in ranked_chunks]
+        if rrfs:
+            best = rrfs[0]
+            other_sum = sum(rrfs[1:])
+            doc_score = best + RRF_BREADTH_ALPHA * other_sum + metadata_score
+        else:
+            doc_score = metadata_score
+
+        # Source multiplier + recency decay applied at doc level. Use the
+        # first (highest-RRF) chunk's hit for source_system + updated_at —
+        # all chunks of a doc share both per the existing comment.
+        anchor_chunk_id = ranked_chunks[0][0] if ranked_chunks else (
+            fallback_content_for_doc[doc_id]
+        )
+        anchor_hit = per_chunk_meta[anchor_chunk_id]
+        source_system = anchor_hit.source_system
 
         multiplier = SOURCE_SCORE_MULTIPLIERS.get(source_system, 1.0)
         if multiplier != 1.0:
-            combined *= multiplier
+            doc_score *= multiplier
 
         half_life = SOURCE_HALF_LIFE_DAYS.get(source_system, baseline_half_life)
-        age_days = (ref_now - hit.updated_at).total_seconds() / 86400.0
+        age_days = (ref_now - anchor_hit.updated_at).total_seconds() / 86400.0
         if age_days >= 0:
-            combined *= math.exp(-ln2 * age_days / half_life)
+            doc_score *= math.exp(-ln2 * age_days / half_life)
 
-        combined_for_doc[doc_id] = combined
+        # Doc-level retriever_scores: aggregate of best chunk's breakdown +
+        # any metadata-chunk contribution (visible on the doc, not duplicated
+        # per chunk).
+        doc_retriever_scores: dict[str, float] = {}
+        if ranked_chunks:
+            doc_retriever_scores.update(per_chunk_breakdown[ranked_chunks[0][0]])
+        doc_retriever_scores.update(metadata_breakdown_for_doc.get(doc_id, {}))
 
-    fused: list[FusedHit] = []
-    for doc_id, combined in combined_for_doc.items():
-        chunk_id = best_content_for_doc[doc_id]
-        hit = per_chunk_meta[chunk_id]
-        retriever_scores = dict(per_chunk_breakdown[chunk_id])
-        # Fold any metadata-chunk contribution into the breakdown for visibility.
-        retriever_scores.update(metadata_breakdown_for_doc.get(doc_id, {}))
-        fused.append(
-            FusedHit(
-                chunk_id=chunk_id,
-                doc_id=doc_id,
-                doc_version=hit.doc_version,
-                source_system=hit.source_system,
-                source_url=hit.source_url,
-                title=hit.title,
-                content=hit.content,
-                created_at=hit.created_at,
-                updated_at=hit.updated_at,
-                score=combined,
-                author_id=getattr(hit, "author_id", None),
-                retriever_scores=retriever_scores,
-                kind="content",
-            )
+        return FusedDocument(
+            doc_id=doc_id,
+            doc_version=anchor_hit.doc_version,
+            source_system=anchor_hit.source_system,
+            source_url=anchor_hit.source_url,
+            title=anchor_hit.title,
+            created_at=anchor_hit.created_at,
+            updated_at=anchor_hit.updated_at,
+            score=doc_score,
+            author_id=getattr(anchor_hit, "author_id", None),
+            retriever_scores=doc_retriever_scores,
+            chunks=chunks,
         )
 
+    for doc_id, ranked_chunks in content_chunks_for_doc.items():
+        docs[doc_id] = _build_doc(
+            doc_id,
+            ranked_chunks,
+            metadata_score_for_doc.get(doc_id, 0.0),
+        )
+
+    # Metadata-only docs with a fallback: synthesize one synthetic chunk so
+    # the response carries real content, not synthetic key:value text.
+    for doc_id, metadata_score in metadata_score_for_doc.items():
+        if doc_id in docs:
+            continue
+        fallback_chunk_id = fallback_content_for_doc.get(doc_id)
+        if fallback_chunk_id is None:
+            continue
+        fallback_hit = per_chunk_meta[fallback_chunk_id]
+        chunks = [
+            FusedChunk(
+                chunk_id=fallback_chunk_id,
+                content=fallback_hit.content,
+                score=0.0,
+                retriever_scores={},
+                rank_in_doc=1,
+            )
+        ]
+        doc_score = metadata_score
+        source_system = fallback_hit.source_system
+        multiplier = SOURCE_SCORE_MULTIPLIERS.get(source_system, 1.0)
+        if multiplier != 1.0:
+            doc_score *= multiplier
+        half_life = SOURCE_HALF_LIFE_DAYS.get(source_system, baseline_half_life)
+        age_days = (ref_now - fallback_hit.updated_at).total_seconds() / 86400.0
+        if age_days >= 0:
+            doc_score *= math.exp(-ln2 * age_days / half_life)
+        docs[doc_id] = FusedDocument(
+            doc_id=doc_id,
+            doc_version=fallback_hit.doc_version,
+            source_system=fallback_hit.source_system,
+            source_url=fallback_hit.source_url,
+            title=fallback_hit.title,
+            created_at=fallback_hit.created_at,
+            updated_at=fallback_hit.updated_at,
+            score=doc_score,
+            author_id=getattr(fallback_hit, "author_id", None),
+            retriever_scores=dict(metadata_breakdown_for_doc.get(doc_id, {})),
+            chunks=chunks,
+        )
+
+    fused = list(docs.values())
+
     if sort:
-        # Caller asked for a deterministic time sort. Score still gated which
-        # docs made it here; this just orders the survivors.
         field_name = sort.get("field", "updated_at")
         direction = sort.get("direction", "desc")
         sign = -1 if direction == "desc" else 1
         if field_name == "created_at":
-            fused.sort(key=lambda h: (sign * h.created_at.timestamp(), h.chunk_id))
+            fused.sort(key=lambda d: (sign * d.created_at.timestamp(), d.doc_id))
         else:
-            fused.sort(key=lambda h: (sign * h.updated_at.timestamp(), h.chunk_id))
+            fused.sort(key=lambda d: (sign * d.updated_at.timestamp(), d.doc_id))
     else:
-        fused.sort(key=lambda h: (-h.score, -h.updated_at.timestamp(), h.chunk_id))
+        fused.sort(key=lambda d: (-d.score, -d.updated_at.timestamp(), d.doc_id))
     return fused[:top_k]

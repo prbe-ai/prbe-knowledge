@@ -20,7 +20,7 @@ def _base_payload() -> dict:
     """Minimal valid QueryResponse JSON without the new fields."""
     return {
         "query": "anything",
-        "chunks": [],
+        "documents": [],
         "total_candidates": 0,
         "router_hit_cache": False,
         "trace_id": "t-1",
@@ -98,7 +98,7 @@ def test_round_trip_serialize_then_parse() -> None:
     )
     resp = QueryResponse(
         query="q",
-        chunks=[],
+        documents=[],
         total_candidates=0,
         router_hit_cache=False,
         trace_id="t",

@@ -107,6 +107,7 @@ def _log_query_handled(
 ) -> None:
     """Structured per-query log. Captures everything an operator needs to
     debug a misroute or empty result without re-running the query."""
+    chunks_total = sum(len(d.chunks) for d in resp.documents)
     payload: dict[str, object] = {
         "trace_id": resp.trace_id,
         "endpoint": endpoint,
@@ -116,7 +117,8 @@ def _log_query_handled(
         "applied_temporal_mode": (resp.applied_temporal or {}).get("mode"),
         "applied_sort_field": (resp.applied_sort or {}).get("field"),
         "extracted_entity_types": [e.get("entity_type") for e in resp.extracted_entities],
-        "chunks_count": len(resp.chunks),
+        "documents_count": len(resp.documents),
+        "chunks_count": chunks_total,
         "aggregation_present": resp.aggregation is not None,
         "total_candidates": resp.total_candidates,
         "total_ms": total_ms,
@@ -151,7 +153,7 @@ async def retrieve(
     request.state.usage_request_payload = req
     t_total = time.perf_counter()
     resp = await run_retrieval(req, customer_id)
-    request.state.result_count = len(resp.chunks)
+    request.state.result_count = sum(len(d.chunks) for d in resp.documents)
     request.state.usage_response_payload = resp
     total_ms = (time.perf_counter() - t_total) * 1000
     _log_query_handled(
@@ -184,20 +186,10 @@ async def query(
     t_total = time.perf_counter()
     base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
     rresp = await run_retrieval(base_req, customer_id)
-    request.state.result_count = len(rresp.chunks)
+    request.state.result_count = sum(len(d.chunks) for d in rresp.documents)
 
     model = req.model or DEFAULT_SYNTHESIS_MODEL
-    syn_chunks = [
-        SynthesisChunk(
-            chunk_id=c.chunk_id,
-            title=c.title,
-            content=c.content,
-            source_system=c.source_system.value,
-            source_url=c.source_url,
-            updated_at=c.updated_at.isoformat(),
-        )
-        for c in rresp.chunks
-    ]
+    syn_chunks = _flatten_chunks_for_synthesis(rresp)
 
     t_syn = time.perf_counter()
     try:
@@ -214,8 +206,9 @@ async def query(
         citations=result.citations,
         insufficient_context=result.insufficient_context,
         model=result.model,
-        chunks=rresp.chunks,
+        documents=rresp.documents,
         total_candidates=rresp.total_candidates,
+        confidence_breakdown=rresp.confidence_breakdown,
         applied_temporal=rresp.applied_temporal,
         applied_sort=rresp.applied_sort,
         applied_entity_filter=rresp.applied_entity_filter,
@@ -237,6 +230,27 @@ async def query(
         extra={"model": result.model, "insufficient_context": answer.insufficient_context},
     )
     return answer
+
+
+def _flatten_chunks_for_synthesis(rresp: QueryResponse) -> list[SynthesisChunk]:
+    """Flatten doc-grouped chunks into the chunk-keyed shape the synthesizer
+    consumes. Doc-level fields (title, source_system, source_url, updated_at)
+    are re-attached per chunk so citations stay chunk-keyed.
+    """
+    out: list[SynthesisChunk] = []
+    for doc in rresp.documents:
+        for chunk in doc.chunks:
+            out.append(
+                SynthesisChunk(
+                    chunk_id=chunk.chunk_id,
+                    title=doc.title,
+                    content=chunk.content,
+                    source_system=doc.source_system.value,
+                    source_url=doc.source_url,
+                    updated_at=doc.updated_at.isoformat(),
+                )
+            )
+    return out
 
 
 def _sse(event: str, data: dict[str, object]) -> bytes:
@@ -300,12 +314,16 @@ async def query_stream(
 
             yield _sse("step", {"step": "searching"})
             rresp = await run_search_phase(base_req, customer_id, phase)
-            request.state.result_count = len(rresp.chunks)
+            request.state.result_count = sum(len(d.chunks) for d in rresp.documents)
+            # SSE event name stays `chunks` for backward compat with the
+            # dashboard's KnowledgeStreamEvent contract; the payload moved
+            # to the doc-grouped shape.
             yield _sse(
                 "chunks",
                 {
-                    "chunks": [c.model_dump(mode="json") for c in rresp.chunks],
+                    "documents": [d.model_dump(mode="json") for d in rresp.documents],
                     "total_candidates": rresp.total_candidates,
+                    "confidence_breakdown": rresp.confidence_breakdown,
                     "applied_entity_filter": rresp.applied_entity_filter,
                     "applied_mode": rresp.applied_mode,
                     "applied_doc_types": rresp.applied_doc_types,
@@ -314,17 +332,7 @@ async def query_stream(
             )
 
             yield _sse("step", {"step": "synthesizing"})
-            syn_chunks = [
-                SynthesisChunk(
-                    chunk_id=c.chunk_id,
-                    title=c.title,
-                    content=c.content,
-                    source_system=c.source_system.value,
-                    source_url=c.source_url,
-                    updated_at=c.updated_at.isoformat(),
-                )
-                for c in rresp.chunks
-            ]
+            syn_chunks = _flatten_chunks_for_synthesis(rresp)
             t_syn = time.perf_counter()
             final: StreamFinal | None = None
             async for evt in synthesize_stream(
@@ -365,8 +373,9 @@ async def query_stream(
                 citations=final.citations,
                 insufficient_context=final.insufficient_context,
                 model=final.model,
-                chunks=rresp.chunks,
+                documents=rresp.documents,
                 total_candidates=rresp.total_candidates,
+                confidence_breakdown=rresp.confidence_breakdown,
                 applied_temporal=rresp.applied_temporal,
                 applied_sort=rresp.applied_sort,
                 applied_entity_filter=rresp.applied_entity_filter,
@@ -386,7 +395,8 @@ async def query_stream(
                     "query": req.query,
                     "applied_mode": rresp.applied_mode,
                     "applied_doc_types": rresp.applied_doc_types,
-                    "chunks_count": len(rresp.chunks),
+                    "documents_count": len(rresp.documents),
+                    "chunks_count": sum(len(d.chunks) for d in rresp.documents),
                     "total_candidates": rresp.total_candidates,
                     "total_ms": timing["total_ms"],
                     "stage_ms": timing,
