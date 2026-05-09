@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from shared.constants import NodeLabel
+from shared.constants import INFERRED_EDGE_DAMPENING, INFERRED_EDGE_TOP_K, NodeLabel
 from shared.db import with_tenant
 from shared.models import normalize_author_id
 
@@ -45,6 +45,12 @@ class InferredEdgeHit:
     flow into the resulting `QueryDocumentResult.matched_via` so the LLM
     consumer can see WHY the doc surfaced (the inferred-edge channel is
     the only one with a free-form justification).
+
+    `linked_edge_count` is the total INFERRED edge count on the linked
+    document (any direction). High counts signal a fan-out hub (e.g. an
+    agent-session transcript that "discusses" 30+ unrelated PRs); the
+    score caller divides by `1 + ln(linked_edge_count)` so hubs get
+    crushed while specific docs (1-2 edges) are barely affected.
     """
 
     doc_id: str
@@ -60,15 +66,18 @@ class InferredEdgeHit:
     edge_type: str
     confidence: str  # always 'INFERRED' in v1
     why: str
-    score: float  # dampened RRF-style score
+    linked_edge_count: int  # for fan-out penalty in score
+    score: float  # raw dampened score before source-mult / fan-out (those
+                  # apply in the wrapper so policy lives next to other
+                  # channel scoring)
 
 
 async def inferred_edge_search(
     customer_id: str,
     top_doc_ids: list[str],
     *,
-    top_k: int = 5,
-    dampening: float = 0.5,
+    top_k: int = INFERRED_EDGE_TOP_K,
+    dampening: float = INFERRED_EDGE_DAMPENING,
 ) -> list[InferredEdgeHit]:
     """Walk INFERRED Doc-Doc edges from `top_doc_ids` and return up to
     `top_k` linked documents.
@@ -128,7 +137,7 @@ async def inferred_edge_search(
             -- non-Document neighbors fall out (this retriever is Doc-Doc only).
             SELECT ce.anchor_doc_id, ce.anchor_rank, ce.edge_type,
                    ce.confidence, ce.why,
-                   gn.canonical_id AS doc_id
+                   gn.canonical_id AS doc_id, gn.node_id AS neighbor_node_id
             FROM candidate_edges ce
             JOIN graph_nodes gn
               ON gn.customer_id = $1
@@ -139,7 +148,32 @@ async def inferred_edge_search(
                nd.edge_type, nd.confidence, nd.why,
                d.version AS doc_version, d.source_system, d.source_url,
                d.title, d.author_id,
-               d.created_at, d.updated_at
+               d.created_at, d.updated_at,
+               -- Fan-out: total INFERRED edges on this neighbor (bidirectional
+               -- via UNION ALL per feedback_postgres_bidirectional_or_to_union;
+               -- a single OR'd query won't reliably BitmapOr two single-column
+               -- indexes). Correlated subquery -- evaluated for every row in
+               -- neighbor_docs that passes the WHERE clause (LIMIT applies
+               -- *after* the SELECT projection in standard Postgres plans, so
+               -- it doesn't bound this evaluation). Cost is bounded by the
+               -- upstream walk: top_doc_ids x ~30 INFERRED edges per anchor =
+               -- low hundreds of subquery executions worst-case, each hitting
+               -- idx_graph_edges_from / idx_graph_edges_to.
+               COALESCE((
+                   SELECT COUNT(*) FROM (
+                       SELECT 1 FROM graph_edges ge_f
+                         WHERE ge_f.customer_id = $1
+                           AND ge_f.from_node_id = nd.neighbor_node_id
+                           AND ge_f.extractor_id = '{INFERRED_EDGES_EXTRACTOR_ID}'
+                           AND ge_f.confidence = 'INFERRED'
+                       UNION ALL
+                       SELECT 1 FROM graph_edges ge_t
+                         WHERE ge_t.customer_id = $1
+                           AND ge_t.to_node_id = nd.neighbor_node_id
+                           AND ge_t.extractor_id = '{INFERRED_EDGES_EXTRACTOR_ID}'
+                           AND ge_t.confidence = 'INFERRED'
+                   ) sub
+               ), 1) AS linked_edge_count
         FROM neighbor_docs nd
         JOIN documents d
           ON d.customer_id = $1
@@ -171,7 +205,9 @@ async def inferred_edge_search(
     for r in rows:
         doc_id = r["doc_id"]
         anchor_rank = int(r["anchor_rank"])
-        # Score: dampened reciprocal of anchor_rank.
+        # Raw score: dampened reciprocal of anchor_rank. The wrapper layers
+        # SOURCE_SCORE_MULTIPLIERS and the fan-out penalty on top so all
+        # cross-channel score policy lives in one place (search_pipeline).
         score = dampening * (1.0 / (1.0 + anchor_rank))
         candidate = InferredEdgeHit(
             doc_id=doc_id,
@@ -187,6 +223,7 @@ async def inferred_edge_search(
             edge_type=r["edge_type"],
             confidence=r["confidence"],
             why=r["why"] or "",
+            linked_edge_count=max(1, int(r["linked_edge_count"] or 1)),
             score=score,
         )
         existing = by_doc.get(doc_id)

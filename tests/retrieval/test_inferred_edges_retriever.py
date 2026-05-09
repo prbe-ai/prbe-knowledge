@@ -326,7 +326,11 @@ async def test_multi_anchor_neighbor_keeps_best_anchor(live_db) -> None:
 
 
 async def test_dampened_score_for_rank_one_anchor(live_db) -> None:
-    """default dampening=0.5, anchor_rank=1 -> score = 0.5 * 1/(1+1) = 0.25."""
+    """Retriever returns the *raw* dampened score (no source-mult, no
+    fan-out penalty -- those are layered in the search-pipeline wrapper).
+    Default dampening = INFERRED_EDGE_DAMPENING (0.2), anchor_rank = 1
+    -> raw score = 0.2 * 1/(1+1) = 0.10. linked_edge_count = 1 because
+    only one INFERRED edge touches the neighbor."""
     cust = "cust-inferred-score"
     await _seed_customer(cust)
     await _seed_doc_with_node(cust, doc_id="anchor:1")
@@ -337,7 +341,8 @@ async def test_dampened_score_for_rank_one_anchor(live_db) -> None:
     )
     out = await inferred_edge_search(cust, top_doc_ids=["anchor:1"])
     assert len(out) == 1
-    assert out[0].score == pytest.approx(0.25, rel=0.001)
+    assert out[0].score == pytest.approx(0.10, rel=0.001)
+    assert out[0].linked_edge_count == 1
 
 
 async def test_bidirectional_walk_uses_to_node_branch(live_db) -> None:
@@ -357,3 +362,80 @@ async def test_bidirectional_walk_uses_to_node_branch(live_db) -> None:
     assert len(out) == 1
     assert out[0].doc_id == "upstream-link"
     assert out[0].edge_type == EdgeType.DOCUMENTS.value
+
+
+async def test_linked_edge_count_reflects_total_inferred_fan_out(live_db) -> None:
+    """`linked_edge_count` is the *total* INFERRED edge count on the linked
+    neighbor (any direction), not just the edges from this query's anchors.
+    A high count signals a fan-out hub (e.g. an agent-session transcript
+    that "discusses" 30+ unrelated PRs); the score-policy wrapper divides
+    by `1 + ln(linked_edge_count)` so hubs get crushed.
+
+    Setup: linked:hub has 4 INFERRED edges fanning in/out to other docs.
+    Walking from anchor:1 -> linked:hub returns linked_edge_count = 4."""
+    cust = "cust-inferred-fanout"
+    await _seed_customer(cust)
+    await _seed_doc_with_node(cust, doc_id="anchor:1")
+    await _seed_doc_with_node(cust, doc_id="linked:hub")
+    # Four other docs that pile additional INFERRED edges onto linked:hub
+    # (none of these are anchors in our walk -- they exist purely to
+    # inflate the hub's edge count).
+    for i in range(4):
+        await _seed_doc_with_node(cust, doc_id=f"sibling:{i}")
+        await _seed_inferred_edge(
+            cust,
+            from_doc_id="linked:hub",
+            to_doc_id=f"sibling:{i}",
+            edge_type=EdgeType.RELATES_TO.value,
+            why=f"sibling fan-out {i}",
+        )
+    # The walk-anchor -> hub edge that brings linked:hub into the result.
+    await _seed_inferred_edge(
+        cust, from_doc_id="anchor:1", to_doc_id="linked:hub",
+        edge_type=EdgeType.DISCUSSES.value, why="hub reason",
+    )
+
+    out = await inferred_edge_search(cust, top_doc_ids=["anchor:1"])
+    [hit] = [h for h in out if h.doc_id == "linked:hub"]
+    # 4 sibling edges + 1 anchor edge = 5 total INFERRED edges on linked:hub.
+    assert hit.linked_edge_count == 5
+    # The retriever's raw score is unchanged by fan-out (policy is layered
+    # in the wrapper); pin it to confirm the dampening half is intact.
+    assert hit.score == pytest.approx(0.10, rel=0.001)
+
+
+async def test_ambiguous_edges_excluded_from_fan_out_count(live_db) -> None:
+    """Fan-out only counts INFERRED edges -- AMBIGUOUS edges and
+    non-Lane-B edges are ignored. The wrapper's penalty must reflect the
+    same confidence/extractor gate as the walk itself, otherwise a doc
+    with mostly AMBIGUOUS or deterministic edges would be wrongly
+    penalised."""
+    cust = "cust-inferred-fanout-conf"
+    await _seed_customer(cust)
+    await _seed_doc_with_node(cust, doc_id="anchor:1")
+    await _seed_doc_with_node(cust, doc_id="linked:1")
+    await _seed_doc_with_node(cust, doc_id="other:ambiguous")
+    await _seed_doc_with_node(cust, doc_id="other:deterministic")
+    # The walked edge.
+    await _seed_inferred_edge(
+        cust, from_doc_id="anchor:1", to_doc_id="linked:1",
+        edge_type=EdgeType.DISCUSSES.value, why="reason",
+    )
+    # An AMBIGUOUS edge on the same neighbor -- must NOT count.
+    await _seed_inferred_edge(
+        cust, from_doc_id="linked:1", to_doc_id="other:ambiguous",
+        edge_type=EdgeType.RELATES_TO.value, why="ambig",
+        confidence="AMBIGUOUS",
+    )
+    # An edge from a different extractor (deterministic) -- must NOT count.
+    await _seed_inferred_edge(
+        cust, from_doc_id="linked:1", to_doc_id="other:deterministic",
+        edge_type=EdgeType.AUTHORED.value, why="determ",
+        confidence="EXTRACTED",
+        extractor_id="github_authored:v1",
+    )
+
+    out = await inferred_edge_search(cust, top_doc_ids=["anchor:1"])
+    [hit] = [h for h in out if h.doc_id == "linked:1"]
+    # Only the one INFERRED edge counts.
+    assert hit.linked_edge_count == 1

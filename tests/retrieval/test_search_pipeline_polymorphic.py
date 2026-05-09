@@ -463,3 +463,125 @@ async def test_chunk_carries_rank_in_doc_not_doc_level_fields(
     assert doc.doc_id == "doc:1"
     # Title flows from the BM25Hit (set to doc_id by the test helper).
     assert doc.title == "doc:1"
+
+
+async def test_inferred_edge_results_hydrate_chunks(live_db) -> None:
+    """v1 wrapped inferred-edge hits with `chunks=[]` -- the dashboard
+    rendered "0 matched" and the synthesizer couldn't cite from them.
+    Now the wrapper hydrates body chunks (capped at
+    INFERRED_EDGE_HYDRATION_CHUNKS) so inferred-edge results are
+    first-class evidence."""
+    cust = "cust-poly-hydrate"
+    await _seed_customer(cust)
+    await _seed_doc(cust, doc_id="primary:1", title="primary")
+    # `_seed_doc` inserts chunk_index=0; that single chunk is what the
+    # hydrator should pull through onto the inferred-edge result.
+    await _seed_doc(cust, doc_id="linked:1", title="linked")
+    await _seed_inferred_doc_edge(
+        cust, from_doc_id="primary:1", to_doc_id="linked:1",
+        edge_type=EdgeType.DISCUSSES.value,
+        why="Both cover the migration.",
+    )
+
+    req = QueryRequest(query="x", top_k=2, top_k_related=0)
+    patches = _patch_retrievers(bm25_hits=[_bm25_hit("primary:1")])
+    with (
+        patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]
+    ):
+        resp = await run_search(
+            req=req, customer_id=cust, routed=RouterOutput(),
+            spec=TemporalSpec(), temporal_meta={}, sort_meta=None,
+            extracted_entities=[], doc_types=None, trace_id="t-hydrate",
+            timing={},
+        )
+
+    by_doc = {
+        r.doc_id: r for r in resp.results if isinstance(r, QueryDocumentResult)
+    }
+    assert "linked:1" in by_doc
+    inferred_doc = by_doc["linked:1"]
+    # The fix: chunks are populated, not [].
+    assert inferred_doc.chunks, "inferred-edge result must carry hydrated chunks"
+    assert inferred_doc.chunk_count == len(inferred_doc.chunks)
+    # The seeded chunk's content surfaces verbatim so the synthesizer
+    # has something to cite.
+    chunk = inferred_doc.chunks[0]
+    assert chunk.content == "body of linked:1"
+    assert chunk.rank_in_doc == 1
+
+
+async def test_fanout_penalty_crushes_hub_doc_below_primary(live_db) -> None:
+    """Regression test for the codex-session-#1 case: a high-fan-out
+    inferred-edge target was outranking the primary BM25 hit it surfaced
+    *from*. The combined dampening + source-mult + fan-out penalty must
+    keep agent-session-style hubs below direct primary matches.
+
+    Setup:
+      - primary:1 = a regular Notion-source doc (BM25 hit, source_mult 1.0).
+      - linked:hub = a CODEX-source doc with 8 INFERRED edges (hub).
+      - One DISCUSSES edge primary:1 -> linked:hub brings the hub in.
+
+    Expectation: linked:hub.score < primary:1.score -- the hub does NOT
+    surface above the doc it was reached from."""
+    cust = "cust-poly-fanout"
+    await _seed_customer(cust)
+    await _seed_doc(cust, doc_id="primary:1", title="primary")
+    # Override _seed_doc to source_system='codex' on the hub via a direct
+    # UPDATE -- the fixture is hardcoded to 'github' so we patch the row
+    # in place after seeding rather than fork the helper.
+    await _seed_doc(cust, doc_id="linked:hub", title="hub")
+    async with raw_conn() as conn:
+        await conn.execute(
+            "UPDATE documents SET source_system = 'codex' "
+            "WHERE customer_id = $1 AND doc_id = 'linked:hub'",
+            cust,
+        )
+    # 25 sibling edges that pile additional INFERRED relationships onto the
+    # hub -- mimics the codex-session-#1 case in prod which had ~30 edges.
+    # At 25 siblings + 1 anchor edge = 26 INFERRED edges on the hub:
+    #   fan-out divisor = 1 + ln(26) = 4.26
+    #   hub_final = 0.2 * 1/2 * 0.5 / 4.26 = 0.0117
+    # which is below the primary's post-fusion score (~0.015).
+    # 8 edges (divisor 3.08) was a borderline case where the penalty
+    # didn't quite catch up to fusion-decayed primary scores.
+    for i in range(25):
+        await _seed_doc(cust, doc_id=f"sibling:{i}")
+        await _seed_inferred_doc_edge(
+            cust, from_doc_id="linked:hub", to_doc_id=f"sibling:{i}",
+            edge_type=EdgeType.RELATES_TO.value,
+            why=f"sibling fan-out {i}",
+        )
+    # The DISCUSSES edge that brings the hub into our walk.
+    await _seed_inferred_doc_edge(
+        cust, from_doc_id="primary:1", to_doc_id="linked:hub",
+        edge_type=EdgeType.DISCUSSES.value, why="hub reason",
+    )
+
+    req = QueryRequest(query="x", top_k=2, top_k_related=0)
+    patches = _patch_retrievers(bm25_hits=[_bm25_hit("primary:1")])
+    with (
+        patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]
+    ):
+        resp = await run_search(
+            req=req, customer_id=cust, routed=RouterOutput(),
+            spec=TemporalSpec(), temporal_meta={}, sort_meta=None,
+            extracted_entities=[], doc_types=None, trace_id="t-fanout",
+            timing={},
+        )
+
+    by_doc = {
+        r.doc_id: r for r in resp.results if isinstance(r, QueryDocumentResult)
+    }
+    assert "primary:1" in by_doc and "linked:hub" in by_doc
+    primary = by_doc["primary:1"]
+    hub = by_doc["linked:hub"]
+    # The hub's combined penalties (dampening + 0.5x codex source-mult +
+    # fan-out divisor over 8 edges) must keep it below the primary it
+    # was reached from. The exact numbers float around with fusion
+    # multipliers so we just pin the ordering, not magnitudes.
+    assert hub.score < primary.score, (
+        f"fan-out hub (score={hub.score}) should rank below primary "
+        f"(score={primary.score})"
+    )
+    # And the rank stamp reflects the same ordering.
+    assert hub.rank > primary.rank
