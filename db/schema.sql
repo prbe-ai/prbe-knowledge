@@ -196,6 +196,12 @@ CREATE TABLE chunks (
     --   chunk filters to kind='content' so list responses always show body.
     kind                 TEXT NOT NULL DEFAULT 'content',
 
+    -- Materialized to_tsvector so BM25 (`ts_rank_cd` + bitmap recheck) reads
+    -- the precomputed lexeme array instead of re-tokenizing `content` on
+    -- every candidate row. See migration 0062 + services/retrieval/retrievers/
+    -- bm25.py for the perf rationale.
+    content_tsv          tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+
     -- PK includes customer_id so tenants ingesting overlapping source content
     -- can't collide on chunk_id (which is derived from doc_id + content_hash).
     PRIMARY KEY (customer_id, chunk_id),
@@ -215,6 +221,11 @@ CREATE INDEX idx_chunks_doc            ON chunks (doc_id);
 CREATE INDEX idx_chunks_doc_live       ON chunks (doc_id) WHERE valid_to IS NULL;
 CREATE INDEX idx_chunks_doc_hash       ON chunks (doc_id, content_hash);
 CREATE INDEX idx_chunks_fts_content    ON chunks USING GIN (to_tsvector('english', content));
+-- New BM25 index over the stored content_tsv column (migration 0062). Coexists
+-- with idx_chunks_fts_content for the EXPAND phase of expand/contract; the
+-- follow-up cleanup PR drops the expression-based index after deploy is
+-- verified.
+CREATE INDEX idx_chunks_content_tsv    ON chunks USING GIN (content_tsv);
 -- One metadata chunk per doc; partial index serves backfill idempotency check.
 CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kind = 'metadata';
 

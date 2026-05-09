@@ -109,16 +109,25 @@ jobs:
         # indefinitely (incident 2026-05-07, run 25478908763 wiki-cron
         # wedged 70+ min after Fly-side rollout already completed). Without
         # a wall-clock cap one bad deploy locks the entire concurrency
-        # group and supersedes every queued deploy. 25min covers slow
-        # paths; exit 124 is treated as a real failure (NOT pretend-
-        # success) because the deploy may be mid-rollout -- operator
-        # checks `flyctl status -a <app>` before retrying.
+        # group and supersedes every queued deploy.
+        #
+        # Bumped from 1500s/15m to 2700s/30m for migration 0062 -- it ADDs
+        # a STORED generated tsvector column on `chunks` (~444MB heap, full
+        # rewrite + AccessExclusiveLock for the duration) and CREATEs a GIN
+        # index CONCURRENTLY on the new column. Combined window is ~8-15min
+        # in prod and the inner `--release-command-timeout` must cover the
+        # tail; the outer wrapper must sit above both with margin so the
+        # wrapper doesn't kill a deploy that's still mid-rewrite.
+        #
+        # Exit 124 is treated as a real failure (NOT pretend-success)
+        # because the deploy may be mid-rollout -- operator checks
+        # `flyctl status -a <app>` before retrying.
         run: |
           set +e
-          timeout 1500 flyctl deploy --remote-only -c fly.ingestion.toml --release-command-timeout 15m
+          timeout 2700 flyctl deploy --remote-only -c fly.ingestion.toml --release-command-timeout 30m
           rc=$?
           if [ $rc -eq 124 ]; then
-            echo "::error::flyctl deploy timed out after 1500s; investigate Fly state via 'flyctl status -a prbe-knowledge-ingestion'"
+            echo "::error::flyctl deploy timed out after 2700s; investigate Fly state via 'flyctl status -a prbe-knowledge-ingestion'"
           fi
           exit $rc
         env:
