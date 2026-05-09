@@ -225,6 +225,27 @@ async def test_directed_signal_flows_end_to_end_to_query_response(
     assert any("runbook body" in c.content for c in doc.chunks)
     assert all("deploy keeps timing out" not in c.content for c in doc.chunks)
 
+    # MCP-visible signal: matched_via must include a 'directed' provenance.
+    # retriever_scores is dropped by the MCP serializer; matched_via is
+    # the ONLY user-visible trace. Without this entry, agents and dashboards
+    # have no way to tell directed surfaced this doc.
+    channels = [m.channel for m in doc.matched_via]
+    assert "directed" in channels, (
+        f"matched_via must include a 'directed' MatchProvenance entry, "
+        f"got channels={channels}. retriever_scores is invisible to MCP "
+        f"clients; matched_via is the canonical trace."
+    )
+    directed_prov = next(m for m in doc.matched_via if m.channel == "directed")
+    assert directed_prov.rank == 1, "single hit -> rank 1 in directed list"
+    # MatchProvenance.score on directed carries the cosine SIMILARITY
+    # (DirectedHit.score), NOT the RRF contribution. The RRF value is in
+    # retriever_scores; matched_via shows the raw signal strength so
+    # consumers can judge how good the match was.
+    assert directed_prov.score >= 0.99, (
+        f"identical phrase + stub embedder -> similarity ~1.0, "
+        f"got {directed_prov.score}"
+    )
+
 
 async def test_directed_runner_skips_directed_search_when_tenant_has_no_rows(
     live_db,
@@ -316,3 +337,6 @@ async def test_directed_runner_skips_directed_search_when_tenant_has_no_rows(
     assert docs[0].doc_id == doc_id
     # No 'directed' key in retriever_scores because the signal didn't run.
     assert "directed" not in docs[0].retriever_scores
+    # And no 'directed' provenance in matched_via either (the canonical
+    # MCP-visible trace).
+    assert all(m.channel != "directed" for m in docs[0].matched_via)
