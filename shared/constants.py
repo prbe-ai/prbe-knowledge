@@ -382,8 +382,24 @@ SOURCE_INGESTION_PRIORITY: dict[SourceSystem, int] = {
 TOP_K_VECTOR = 50
 TOP_K_BM25 = 50
 TOP_K_GRAPH = 20
+TOP_K_DIRECTED = 20
 RRF_K = 60
 DEDUP_COSINE_THRESHOLD = 0.95
+
+# Directed-vectors feature: doc-level retrieval signal contributed by
+# per-document trigger phrases stored in the directed_vectors table.
+# Eval-tuned; commits in the same change that bumps it. Set to 0.0 to
+# disable contribution without removing the retriever from the fan-out.
+DIRECTED_RETRIEVAL_WEIGHT: float = 1.0
+
+# Cap on LLM-generated directed phrases per wiki document. Engineer-pinned
+# phrases are not subject to this cap.
+MAX_DIRECTED_VECTORS_PER_DOC: int = 16
+
+# Cosine distance threshold below which two candidate trigger phrases are
+# considered near-duplicates and one is dropped (humans always win on
+# collision; LLM duplicates of human pins are suppressed).
+DIRECTED_DEDUPE_COSINE_THRESHOLD: float = 0.05
 
 # Doc-grouped fusion: weight applied to the sum of NON-best content-chunk RRF
 # scores when collapsing per-doc. doc_score = max(rrfs) + alpha * sum(others) +
