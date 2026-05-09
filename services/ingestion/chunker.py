@@ -1,15 +1,19 @@
 """Naive token-based chunker.
 
 Phase 0 strategy: fixed token window with overlap, using the cl100k_base
-tokenizer (correct for OpenAI text-embedding-3-large). Structural chunking
-(respect headings, code blocks, thread boundaries) is Phase 1+.
+tokenizer. Sized for OpenAI text-embedding-3-large originally; the Gemini
+migration adds dual-write to gemini-embedding-2-preview, which has a
+much lower input ceiling (~2048 tokens). The hard cap below picks the
+smaller of the two so a chunk can never overflow the Gemini side.
+Structural chunking (respect headings, code blocks, thread boundaries)
+is Phase 1+.
 """
 
 from __future__ import annotations
 
 import tiktoken
 
-from shared.constants import CHUNKER_VERSION
+from shared.constants import CHUNKER_VERSION, EMBEDDING_V2_MAX_INPUT_TOKENS
 
 # ChunkPiece moved to shared.models so cross-module contracts
 # (NormalizationResult.documents_with_chunks) can reference it without
@@ -19,7 +23,11 @@ from shared.models import ChunkPiece
 
 DEFAULT_CHUNK_TOKENS = 512
 DEFAULT_CHUNK_OVERLAP = 64
-MAX_INPUT_TOKENS = 8191  # OpenAI embedding-3-large hard ceiling (8192 is exclusive)
+# Conservative input ceiling: OpenAI text-embedding-3-large allows 8191,
+# but during the Gemini migration both providers must accept the same
+# chunks. Take the smaller bound to prevent silent overflow at the
+# Gemini-side embed call.
+MAX_INPUT_TOKENS = min(8191, EMBEDDING_V2_MAX_INPUT_TOKENS)
 
 
 _encoding: tiktoken.Encoding | None = None

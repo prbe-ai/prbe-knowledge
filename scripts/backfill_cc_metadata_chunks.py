@@ -45,12 +45,20 @@ from shared.constants import (
     CHUNKER_VERSION,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
+    EMBEDDING_V2_DIM,
+    EMBEDDING_V2_MODEL,
     DocClass,
     DocType,
     SourceSystem,
 )
 from shared.db import close_pool, init_pool, raw_conn, with_tenant
-from shared.embeddings import Embedder, get_embedder
+from shared.embeddings import (
+    DocItem,
+    Embedder,
+    GeminiEmbedder,
+    get_embedder,
+    get_embedder_v2,
+)
 from shared.logging import configure_logging, get_logger
 from shared.models import (
     ACLPrincipal,
@@ -173,6 +181,7 @@ async def _list_live_cc_docs(customer: str | None) -> list[dict[str, Any]]:
 async def _process_doc(
     sem: asyncio.Semaphore,
     embedder: Embedder,
+    embedder_v2: GeminiEmbedder,
     doc_row: dict[str, Any],
     dry_run: bool,
 ) -> str:
@@ -223,20 +232,47 @@ async def _process_doc(
 
         # Embed outside any transaction (the long I/O). One semaphore slot
         # per concurrent call so we don't blast the provider with N
-        # parallel requests.
+        # parallel requests. Dual-write to embedding_v2 in the same call --
+        # a Gemini failure leaves v2 NULL and gets swept by the Stage 2
+        # backfill_embedding_v2 script later.
         async with sem:
-            embeds = await embedder.embed_many([new_text])
+            v1_task = embedder.embed_many([new_text])
+            v2_task = embedder_v2.embed_documents(
+                [DocItem(content=new_text, title=doc.title)]
+            )
+            v1_outcome, v2_outcome = await asyncio.gather(
+                v1_task, v2_task, return_exceptions=True
+            )
 
-        if not embeds.embedded:
+        if isinstance(v1_outcome, BaseException):
+            log.warning(
+                "backfill_cc_metadata.v1_embed_failed",
+                customer=customer_id,
+                doc_id=doc_id,
+                error=str(v1_outcome),
+            )
+            return "errored"
+        if not v1_outcome.embedded:
             log.warning(
                 "backfill_cc_metadata.embed_no_result",
                 customer=customer_id,
                 doc_id=doc_id,
-                failed=[f.error for f in embeds.failed],
+                failed=[f.error for f in v1_outcome.failed],
             )
             return "errored"
 
-        embedding = embeds.embedded[0].embedding
+        embedding = v1_outcome.embedded[0].embedding
+
+        embedding_v2: list[float] | None = None
+        if isinstance(v2_outcome, BaseException):
+            log.warning(
+                "backfill_cc_metadata.v2_embed_failed",
+                customer=customer_id,
+                doc_id=doc_id,
+                error=str(v2_outcome),
+            )
+        elif v2_outcome.embedded:
+            embedding_v2 = v2_outcome.embedded[0].embedding
 
         # Atomic close+insert inside one txn under the tenant GUC.
         async with with_tenant(customer_id) as conn:
@@ -244,6 +280,9 @@ async def _process_doc(
             # Insert new row first; identity is (doc_id, content_hash)
             # so a redelivery with the same text is a no-op via ON CONFLICT.
             new_chunk_id = f"{doc_id}:m_{new_hash[:16]}"
+            v2_pg = _pg_vector(embedding_v2) if embedding_v2 is not None else None
+            v2_model = EMBEDDING_V2_MODEL if embedding_v2 is not None else None
+            v2_dim = EMBEDDING_V2_DIM if embedding_v2 is not None else None
             await conn.execute(
                 """
                 INSERT INTO chunks (
@@ -252,7 +291,8 @@ async def _process_doc(
                     embedding, embedding_model, embedding_dim,
                     chunker_version,
                     first_seen_version, last_seen_version, kind,
-                    valid_from
+                    valid_from,
+                    embedding_v2, embedding_v2_model, embedding_v2_dim
                 )
                 VALUES (
                     $1, $2, $3,
@@ -260,11 +300,18 @@ async def _process_doc(
                     $8::halfvec, $9, $10,
                     $11,
                     $12, $12, 'metadata',
-                    $13
+                    $13,
+                    $14::halfvec, $15, $16
                 )
                 ON CONFLICT (doc_id, content_hash) DO UPDATE
                     SET last_seen_version = EXCLUDED.last_seen_version,
-                        valid_to = NULL
+                        valid_to = NULL,
+                        -- Fill v2 slots from this insert when the existing
+                        -- row has none. See _insert_chunks_batch for full
+                        -- rationale; same dual-write contract applies here.
+                        embedding_v2 = COALESCE(chunks.embedding_v2, EXCLUDED.embedding_v2),
+                        embedding_v2_model = COALESCE(chunks.embedding_v2_model, EXCLUDED.embedding_v2_model),
+                        embedding_v2_dim = COALESCE(chunks.embedding_v2_dim, EXCLUDED.embedding_v2_dim)
                 """,
                 new_chunk_id,
                 doc_id,
@@ -279,6 +326,9 @@ async def _process_doc(
                 CHUNKER_VERSION,
                 doc_row["version"],
                 now,
+                v2_pg,
+                v2_model,
+                v2_dim,
             )
             # Close out the prior live metadata row, if it exists and
             # differs from the one we just inserted.
@@ -355,12 +405,15 @@ async def _amain() -> int:
         )
 
         embedder = get_embedder()
+        embedder_v2 = get_embedder_v2()
         sem = asyncio.Semaphore(max(1, args.concurrency))
 
         # Run with bounded concurrency. asyncio.gather schedules them all
-        # concurrently; the semaphore caps live OpenAI calls.
+        # concurrently; the semaphore caps live provider calls (each slot
+        # spends one OpenAI + one Gemini request via asyncio.gather inside
+        # _process_doc).
         tasks = [
-            asyncio.create_task(_process_doc(sem, embedder, d, args.dry_run))
+            asyncio.create_task(_process_doc(sem, embedder, embedder_v2, d, args.dry_run))
             for d in docs
         ]
         for i, task in enumerate(asyncio.as_completed(tasks), start=1):

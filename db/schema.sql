@@ -172,6 +172,15 @@ CREATE TABLE chunks (
     embedding            halfvec(3072) NOT NULL,
     embedding_model      TEXT NOT NULL DEFAULT 'openai/text-embedding-3-large',
     embedding_dim        INT  NOT NULL DEFAULT 3072,
+    -- Stage 1 of the Gemini embedding migration: every newly-ingested
+    -- chunk also gets a gemini-embedding-2-preview vector written here
+    -- alongside the OpenAI vector above. NULLABLE -- a Gemini API outage
+    -- during dual-write leaves these NULL for affected rows; the Stage 2
+    -- backfill sweeps them up. The query path keeps reading `embedding`
+    -- until Stage 4 cuts over.
+    embedding_v2         halfvec(3072) NULL,
+    embedding_v2_model   TEXT NULL,
+    embedding_v2_dim     INT  NULL,
     chunker_version      TEXT NOT NULL DEFAULT 'naive-v1',
 
     first_seen_version   INT  NOT NULL,
