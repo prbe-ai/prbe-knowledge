@@ -340,6 +340,40 @@ NORMALIZER_VERSION = "v1"
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 SONNET_MODEL = "claude-sonnet-4-6"
 
+# Inferred-edges (Lane B) extractor configuration. Lives here per the
+# RRF_K / RRF_BREADTH_ALPHA tuning-knob convention so eval sweeps and
+# per-tenant overrides don't require code edits.
+#
+# Model selection: picked Gemini 3.1 Flash Lite over Claude Haiku 4.5
+# after a real-prod eval showed Flash Lite + wider bundle produces
+# better edge quality (65% specificity vs 49%, 0% vs 8% hallucination
+# rate) at the same cost as Haiku-current. See
+# scripts/eval_inferred_edges_widebundle.py.
+#
+# Provider dispatch is by prefix in services.ingestion.inferred_edges.
+# extractor: "claude-*" -> anthropic SDK; "gemini-*" -> google-genai.
+INFERRED_EDGES_MODEL = "gemini-3.1-flash-lite"
+
+# Pricing per 1M tokens, as of 2026-05. Used only for the cost_usd
+# telemetry gauge; pipeline correctness is unaffected by drift here.
+INFERRED_EDGES_MODEL_PRICES: dict[str, tuple[float, float]] = {
+    # (input_per_1M, output_per_1M) USD
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
+    "gemini-3.1-flash-lite": (0.25, 1.50),
+}
+
+# Bundle caps. Wider than v1 (60K / 20 / 5 / 10) because Flash Lite's
+# 1M context window plus its better specificity at higher candidate
+# counts means the LLM picks more specific edge_types when given more
+# evidence. Real-prod eval: at v1 caps Flash Lite was 37% specific
+# (worse than Haiku); at these caps it's 65% specific (best of all
+# tested combos). Wider bundle ate Flash Lite's cost advantage --
+# net cost is ~the same as Haiku-v1 -- but quality is higher.
+INFERRED_EDGES_BUNDLE_TOKEN_BUDGET = 300_000
+INFERRED_EDGES_BUNDLE_MAX_1HOP = 50
+INFERRED_EDGES_BUNDLE_MAX_VECTOR_SIMILAR = 20
+INFERRED_EDGES_BUNDLE_MAX_TIME_WINDOW = 30
+
 # Models supported by the /query synthesis layer. Keys are the
 # "<provider>/<model>" identifier callers pass; values are provider names
 # the synthesis dispatcher uses to pick a client.

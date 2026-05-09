@@ -6,6 +6,11 @@ bad_justification, unknown_confidence, forced_confidence_demoted,
 bad_format.
 
 The >50% unknown_endpoint kill-switch is also tested.
+
+Tests pin to Haiku because `_patch_llm` mocks the anthropic SDK. Production
+default is Gemini Flash Lite (see shared.constants.INFERRED_EDGES_MODEL);
+the validation pipeline is model-agnostic so testing through the
+Anthropic adapter still exercises every code path.
 """
 
 from __future__ import annotations
@@ -20,6 +25,18 @@ from services.ingestion.inferred_edges.extractor import (
     _estimate_cost,
     extract_edges,
 )
+from shared.constants import HAIKU_MODEL
+
+
+@pytest.fixture(autouse=True)
+def _pin_to_haiku(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin every test in this file to the Haiku model so `_patch_llm`'s
+    Anthropic SDK mock is the right path. Without this, calls fall
+    through to the Gemini path where the mock doesn't apply."""
+    monkeypatch.setattr(
+        "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
+        HAIKU_MODEL,
+    )
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -449,22 +466,33 @@ async def test_no_api_key_returns_empty() -> None:
 
 
 def test_estimate_cost_zero_tokens() -> None:
-    cost = _estimate_cost(0, 0)
+    cost = _estimate_cost(HAIKU_MODEL, 0, 0)
     assert cost == 0.0
 
 
-def test_estimate_cost_positive() -> None:
-    # 1M input + 1M output at standard Haiku pricing
-    cost = _estimate_cost(1_000_000, 1_000_000)
-    assert cost > 0.0
-    # ~$4.80 total
-    assert 4.0 < cost < 6.0
+def test_estimate_cost_positive_haiku() -> None:
+    # 1M input + 1M output at Haiku pricing ($1.00 in / $5.00 out = $6).
+    cost = _estimate_cost(HAIKU_MODEL, 1_000_000, 1_000_000)
+    assert cost == pytest.approx(6.0, abs=0.01)
+
+
+def test_estimate_cost_positive_flash_lite() -> None:
+    # 1M input + 1M output at Flash Lite pricing ($0.25 in / $1.50 out = $1.75).
+    cost = _estimate_cost("gemini-3.1-flash-lite", 1_000_000, 1_000_000)
+    assert cost == pytest.approx(1.75, abs=0.01)
 
 
 def test_estimate_cost_typical_call() -> None:
-    # Typical call: ~60k input tokens, ~2k output tokens
-    cost = _estimate_cost(60_000, 2_000)
-    assert cost < 0.10  # Should be well under $0.10
+    # Typical call at Haiku pricing: ~60k input + ~2k output tokens.
+    cost = _estimate_cost(HAIKU_MODEL, 60_000, 2_000)
+    assert cost < 0.10
+
+
+def test_estimate_cost_unknown_model_returns_zero() -> None:
+    """Unknown models cost 0 -- this is telemetry-only, pipeline correctness
+    is unaffected. Better to return 0 than crash on the metric path."""
+    cost = _estimate_cost("some-unknown-model", 1_000_000, 1_000_000)
+    assert cost == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -787,3 +815,148 @@ async def test_non_rate_limit_error_does_not_retry() -> None:
     assert once_then_dies.call_count == 1
     # No sleep -- we did NOT enter the backoff loop.
     mock_sleep.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Tests: Gemini dispatch path (model-based provider routing)
+# ---------------------------------------------------------------------------
+
+
+def _mock_gemini_response(edges: list[dict]) -> MagicMock:
+    """Mock a google-genai GenerateContentResponse.
+
+    Gemini's structured-output path returns a complete JSON array
+    (`[{...}, {...}]`) on `resp.text`. usage_metadata exposes
+    `prompt_token_count` and `candidates_token_count`.
+    """
+    response = MagicMock()
+    response.text = json.dumps(edges)
+    response.usage_metadata = MagicMock(
+        prompt_token_count=1000, candidates_token_count=200,
+    )
+    return response
+
+
+def _patch_gemini(edges: list[dict]):
+    """Patch the google-genai client used by the extractor's Gemini path."""
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock(
+        return_value=_mock_gemini_response(edges),
+    )
+
+    def _fake_client_class(api_key=None):
+        return mock_client
+
+    return patch(
+        "services.ingestion.inferred_edges.extractor._genai_module.Client",
+        _fake_client_class,
+    )
+
+
+@pytest.mark.asyncio
+async def test_gemini_path_extracts_valid_edge(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the configured model has a `gemini-` prefix, the extractor
+    routes through the Google SDK and consumes its full-array JSON
+    response (no `[` prefill). The validation pipeline runs the same
+    way -- the model ends up tagged on the InferredEdge."""
+    # Override the autouse fixture's HAIKU pin -- this test exercises
+    # the Gemini path explicitly.
+    monkeypatch.setattr(
+        "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
+        "gemini-3.1-flash-lite",
+    )
+    edges = [
+        {
+            "from": {"label": "Document", "canonical_id": "doc1"},
+            "to": {"label": "Ticket", "canonical_id": "AUTH-123"},
+            "edge_type": "DISCUSSES",
+            "confidence": "INFERRED",
+            "why": "Slack thread explicitly mentions AUTH-123 as the root cause",
+        }
+    ]
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    with (
+        patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}, clear=False),
+        _patch_gemini(edges),
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert not result.bundle_failed
+    assert len(result.edges) == 1
+    edge = result.edges[0]
+    assert edge.edge_type == "DISCUSSES"
+    assert edge.confidence == "INFERRED"
+    assert edge.from_canonical_id == "doc1"
+    assert edge.to_canonical_id == "AUTH-123"
+    # `model` field tags every edge with its source LLM.
+    assert edge.model == "gemini-3.1-flash-lite"
+
+
+@pytest.mark.asyncio
+async def test_gemini_path_skips_when_google_api_key_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No GOOGLE_API_KEY -> empty result, no SDK call. Mirrors the
+    Haiku-no-ANTHROPIC-key safety hatch so the worker doesn't crash
+    in credential-less environments."""
+    monkeypatch.setattr(
+        "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
+        "gemini-3.1-flash-lite",
+    )
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock()
+
+    with (
+        patch.dict("os.environ", {}, clear=True),  # nuke all keys
+        patch(
+            "services.ingestion.inferred_edges.extractor._genai_module.Client",
+            lambda api_key=None: mock_client,
+        ),
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert not result.bundle_failed
+    assert result.edges == []
+    # SDK was never called.
+    mock_client.aio.models.generate_content.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_explicit_model_override_wins_over_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Caller can pass `model=` explicitly to force a specific provider,
+    overriding INFERRED_EDGES_MODEL. Useful for A/B comparisons and the
+    eval harness."""
+    # Default to Gemini, but force Haiku for this call.
+    monkeypatch.setattr(
+        "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
+        "gemini-3.1-flash-lite",
+    )
+    edges = [
+        {
+            "from": {"label": "Document", "canonical_id": "doc1"},
+            "to": {"label": "Ticket", "canonical_id": "AUTH-123"},
+            "edge_type": "DISCUSSES",
+            "confidence": "INFERRED",
+            "why": "explicit model override test",
+        }
+    ]
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm(edges),
+    ):
+        result = await extract_edges(bundle, conn, model=HAIKU_MODEL)
+
+    assert not result.bundle_failed
+    assert len(result.edges) == 1
+    # Edge tagged with the override, not the default.
+    assert result.edges[0].model == HAIKU_MODEL

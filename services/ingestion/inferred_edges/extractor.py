@@ -1,9 +1,13 @@
 """LLM-based inferred-edge extractor.
 
-Sends one structured call to Claude Haiku and validates the output.
+Sends one structured call to the configured LLM and validates the output.
 Every validation drop reason has a counter in ExtractionResult.dropped.
 
-Validation pipeline per edge:
+Model dispatch is by prefix on `INFERRED_EDGES_MODEL`:
+  - "claude-*"  -> anthropic SDK with assistant-prefill JSON-array trick
+  - "gemini-*"  -> google-genai with response_schema structured output
+
+Validation pipeline per edge (model-agnostic):
   1. Both endpoints resolve to existing graph_nodes for bundle.customer_id.
   2. edge_type is in the extended EdgeType enum.
   3. confidence in {INFERRED, AMBIGUOUS}; EXTRACTED -> forced to AMBIGUOUS.
@@ -27,7 +31,11 @@ import asyncpg
 
 from services.ingestion.inferred_edges.bundle import Bundle
 from services.ingestion.inferred_edges.prompts.v1 import PROMPT_VERSION, SYSTEM_PROMPT
-from shared.constants import HAIKU_MODEL, EdgeType
+from shared.constants import (
+    INFERRED_EDGES_MODEL,
+    INFERRED_EDGES_MODEL_PRICES,
+    EdgeType,
+)
 from shared.logging import get_logger
 
 try:
@@ -35,12 +43,14 @@ try:
 except ImportError:
     _anthropic_module = None  # type: ignore[assignment]
 
-log = get_logger(__name__)
+try:
+    from google import genai as _genai_module  # type: ignore
+    from google.genai import types as _genai_types  # type: ignore
+except ImportError:
+    _genai_module = None  # type: ignore[assignment]
+    _genai_types = None  # type: ignore[assignment]
 
-# Haiku input/output token pricing (USD per 1M tokens), as of 2026-05.
-# Update if Anthropic changes pricing. Used for cost_usd metric only.
-_HAIKU_INPUT_COST_PER_1M = 0.80
-_HAIKU_OUTPUT_COST_PER_1M = 4.00
+log = get_logger(__name__)
 
 # Maximum output tokens from the LLM for the edge-extraction call.
 _MAX_OUTPUT_TOKENS = 4096
@@ -77,6 +87,11 @@ class InferredEdge:
     why: str
     extractor_id: str
     extracted_at: datetime
+    # Which LLM produced this edge. Stored on graph_edges.properties.model
+    # for audit (which model wrote which edges) and for A/B comparison
+    # without bumping extractor_id (the prompt+pipeline is unchanged; only
+    # the model changed in the v1 -> Flash Lite cutover).
+    model: str = ""
 
 
 @dataclass
@@ -97,11 +112,27 @@ def _inc(dropped: dict[str, int], reason: str) -> None:
     dropped[reason] = dropped.get(reason, 0) + 1
 
 
-def _estimate_cost(input_tokens: int, output_tokens: int) -> float:
+def _estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Per-1M USD pricing lookup. Unknown models cost $0 (telemetry-only;
+    pipeline correctness doesn't depend on this)."""
+    in_per_1m, out_per_1m = INFERRED_EDGES_MODEL_PRICES.get(model, (0.0, 0.0))
     return (
-        input_tokens / 1_000_000 * _HAIKU_INPUT_COST_PER_1M
-        + output_tokens / 1_000_000 * _HAIKU_OUTPUT_COST_PER_1M
+        input_tokens / 1_000_000 * in_per_1m
+        + output_tokens / 1_000_000 * out_per_1m
     )
+
+
+def _provider_for(model: str) -> str:
+    """Map a model id to its SDK provider key by prefix.
+
+    Centralised here so extract_edges and tests both use the same rule.
+    Unknown prefixes raise -- there's no sensible default.
+    """
+    if model.startswith("claude-"):
+        return "anthropic"
+    if model.startswith("gemini-"):
+        return "google"
+    raise ValueError(f"unsupported INFERRED_EDGES_MODEL prefix: {model!r}")
 
 
 # ---- valid edge types set (extended with Lane B types) ---------------------
@@ -152,30 +183,51 @@ def _is_rate_limit_error(exc: BaseException) -> bool:
     return type(exc).__name__ == "RateLimitError"
 
 
-async def _call_llm_with_rate_limit_backoff(
-    client: object,
+async def _backoff_sleep(attempt: int) -> None:
+    """Exponential backoff with jitter: 5, 10, 20, 40 seconds (cap 60)."""
+    backoff = min(
+        _RATE_LIMIT_BACKOFF_BASE_SECONDS * (2**attempt),
+        _RATE_LIMIT_BACKOFF_CAP_SECONDS,
+    )
+    backoff += random.uniform(0, 1.0)
+    await asyncio.sleep(backoff)
+
+
+@dataclass(slots=True)
+class _LLMResponse:
+    """Provider-agnostic response shape for the extractor wrapper."""
+
+    raw_text: str
+    input_tokens: int
+    output_tokens: int
+
+
+async def _call_anthropic_with_backoff(
     *,
+    model: str,
     customer_id: str,
     anchor_doc_id: str,
     user_message: str,
-):
-    """Call Anthropic with exponential backoff on rate limits.
+) -> _LLMResponse:
+    """Anthropic call with exponential backoff on RateLimitError.
 
-    A burst of 64 concurrent extractors blows through Haiku's per-minute
-    rate limit; without backoff each bundle dies on the first
-    RateLimitError, the worker retries on next claim, and the rate-limit
-    window outlasts all 3 attempts. With backoff the call rides out the
-    transient window inside a single attempt.
-
-    Non-rate-limit errors propagate immediately (no backoff for genuine
-    failures). After _RATE_LIMIT_MAX_RETRIES on rate limits, the last
-    error propagates and the bundle fails for that attempt.
+    Uses the assistant-prefill `[` trick to force JSON-array output --
+    Claude reliably continues from `[` instead of emitting a preamble or
+    markdown fence. The `[` is NOT included in the returned raw_text;
+    the caller re-prepends it before json.loads.
     """
+    if _anthropic_module is None:
+        raise ImportError("anthropic package not installed")
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    client = _anthropic_module.AsyncAnthropic(api_key=api_key)
+
     last_exc: Exception | None = None
     for attempt in range(_RATE_LIMIT_MAX_RETRIES):
         try:
-            return await client.messages.create(  # type: ignore[attr-defined]
-                model=HAIKU_MODEL,
+            response = await client.messages.create(
+                model=model,
                 max_tokens=_MAX_OUTPUT_TOKENS,
                 system=SYSTEM_PROMPT,
                 messages=[
@@ -183,30 +235,170 @@ async def _call_llm_with_rate_limit_backoff(
                     {"role": "assistant", "content": "["},
                 ],
             )
+            in_tok = response.usage.input_tokens if response.usage else 0
+            out_tok = response.usage.output_tokens if response.usage else 0
+            text = response.content[0].text if response.content else ""
+            return _LLMResponse(raw_text=text, input_tokens=in_tok, output_tokens=out_tok)
         except Exception as exc:
             if not _is_rate_limit_error(exc):
                 raise
             last_exc = exc
-            # Exponential backoff with jitter: 5, 10, 20, 40 seconds (cap 60).
-            backoff = min(
-                _RATE_LIMIT_BACKOFF_BASE_SECONDS * (2**attempt),
-                _RATE_LIMIT_BACKOFF_CAP_SECONDS,
-            )
-            backoff += random.uniform(0, 1.0)
             log.warning(
                 "inferred_edges.extractor.rate_limited",
                 customer=customer_id,
                 anchor=anchor_doc_id,
+                provider="anthropic",
                 attempt=attempt + 1,
                 max_attempts=_RATE_LIMIT_MAX_RETRIES,
-                backoff_seconds=round(backoff, 2),
             )
-            await asyncio.sleep(backoff)
+            await _backoff_sleep(attempt)
 
-    # All retries exhausted; surface the last rate-limit error so the
-    # outer try/except records bundle_failed with the right reason.
     assert last_exc is not None
     raise last_exc
+
+
+def _gemini_edge_schema():  # type: ignore[no-untyped-def]
+    """Build the JSON schema for Gemini's structured-output mode.
+
+    Mirrors the prompt's edge object shape. Gemini constrains generation
+    to fit this schema, so `edge_type` and `confidence` enums get
+    enforced at generation time -- the validator's per-edge enum
+    check still runs as defense-in-depth (e.g. EXTRACTED -> AMBIGUOUS
+    demotion still happens; we just won't see the LLM emit something
+    outside the closed sets).
+    """
+    if _genai_types is None:
+        raise ImportError("google-genai package not installed")
+    types = _genai_types
+    edge = types.Schema(
+        type="OBJECT",
+        properties={
+            "from": types.Schema(
+                type="OBJECT",
+                properties={
+                    "label": types.Schema(type="STRING"),
+                    "canonical_id": types.Schema(type="STRING"),
+                },
+                required=["label", "canonical_id"],
+            ),
+            "to": types.Schema(
+                type="OBJECT",
+                properties={
+                    "label": types.Schema(type="STRING"),
+                    "canonical_id": types.Schema(type="STRING"),
+                },
+                required=["label", "canonical_id"],
+            ),
+            "edge_type": types.Schema(
+                type="STRING",
+                enum=[
+                    "DISCUSSES", "DOCUMENTS", "RESOLVES",
+                    "MENTIONS_ENTITY", "RELATES_TO", "REFERENCES",
+                ],
+            ),
+            "confidence": types.Schema(
+                type="STRING", enum=["INFERRED", "AMBIGUOUS"],
+            ),
+            "why": types.Schema(type="STRING"),
+        },
+        required=["from", "to", "edge_type", "confidence", "why"],
+    )
+    return types.Schema(type="ARRAY", items=edge)
+
+
+def _is_gemini_rate_limit_error(exc: BaseException) -> bool:
+    """Recognise a Gemini quota / 429 error.
+
+    google-genai raises a `ClientError` for HTTP errors with `code` /
+    `status` fields; quotas typically surface as RESOURCE_EXHAUSTED
+    or HTTP 429. We look at the string form (which includes the
+    status) since the SDK's exception class hierarchy is narrow.
+    """
+    name = type(exc).__name__
+    msg = str(exc)
+    return (
+        name in ("ResourceExhausted", "TooManyRequests", "ClientError")
+        and ("429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower())
+    )
+
+
+async def _call_gemini_with_backoff(
+    *,
+    model: str,
+    customer_id: str,
+    anchor_doc_id: str,
+    user_message: str,
+) -> _LLMResponse:
+    """Gemini call with structured-output + exponential backoff on quota.
+
+    Uses `response_schema` to constrain the model to emit a JSON array
+    of edges conforming to the closed enums. The structured-output mode
+    typically returns valid JSON; we still run the parser+validator
+    downstream as defense-in-depth (handles the rare empty-array case
+    and any edge-type drift).
+    """
+    if _genai_module is None:
+        raise ImportError("google-genai package not installed")
+    api_key = os.environ.get("GOOGLE_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY not set")
+    client = _genai_module.Client(api_key=api_key)
+    config = _genai_types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        response_schema=_gemini_edge_schema(),
+        max_output_tokens=_MAX_OUTPUT_TOKENS,
+    )
+
+    last_exc: Exception | None = None
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES):
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model, contents=user_message, config=config,
+            )
+            text = resp.text or ""
+            usage = getattr(resp, "usage_metadata", None)
+            in_tok = usage.prompt_token_count if usage else 0
+            out_tok = usage.candidates_token_count if usage else 0
+            return _LLMResponse(raw_text=text, input_tokens=in_tok, output_tokens=out_tok)
+        except Exception as exc:
+            if not _is_gemini_rate_limit_error(exc):
+                raise
+            last_exc = exc
+            log.warning(
+                "inferred_edges.extractor.rate_limited",
+                customer=customer_id,
+                anchor=anchor_doc_id,
+                provider="google",
+                attempt=attempt + 1,
+                max_attempts=_RATE_LIMIT_MAX_RETRIES,
+            )
+            await _backoff_sleep(attempt)
+
+    assert last_exc is not None
+    raise last_exc
+
+
+async def _call_llm(
+    *,
+    model: str,
+    customer_id: str,
+    anchor_doc_id: str,
+    user_message: str,
+) -> _LLMResponse:
+    """Provider-dispatched LLM call. Picks Anthropic or Gemini by prefix."""
+    provider = _provider_for(model)
+    if provider == "anthropic":
+        return await _call_anthropic_with_backoff(
+            model=model, customer_id=customer_id,
+            anchor_doc_id=anchor_doc_id, user_message=user_message,
+        )
+    if provider == "google":
+        return await _call_gemini_with_backoff(
+            model=model, customer_id=customer_id,
+            anchor_doc_id=anchor_doc_id, user_message=user_message,
+        )
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 # ---- main extraction function ---------------------------------------------
@@ -215,88 +407,96 @@ async def _call_llm_with_rate_limit_backoff(
 async def extract_edges(
     bundle: Bundle,
     conn: asyncpg.Connection,
+    *,
+    model: str | None = None,
 ) -> ExtractionResult:
     """Call the LLM and return validated inferred edges.
 
     `conn` must be a tenant-scoped connection (with_tenant already called)
     for the endpoint existence checks in validation.
 
-    The LLM call itself is skipped if ANTHROPIC_API_KEY is not set (returns
-    an empty ExtractionResult). This keeps the worker from crashing in
-    environments without credentials.
+    `model` defaults to `INFERRED_EDGES_MODEL` from shared.constants. Tests
+    can override per-call (e.g. force Haiku for a regression case). The
+    provider SDK is picked by prefix -- "claude-*" -> anthropic,
+    "gemini-*" -> google-genai.
+
+    Returns an empty result if the relevant API key isn't set so the worker
+    doesn't crash in credential-less environments.
     """
     result = ExtractionResult()
+    model_id = model or INFERRED_EDGES_MODEL
 
     if not bundle.docs:
         log.debug("inferred_edges.extractor.empty_bundle", customer=bundle.customer_id)
         return result
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
+    # Per-provider key check up front. Anthropic and Google have different
+    # secret names; bail early so we don't pay the bundle work cost only
+    # to crash on the SDK call.
+    provider = _provider_for(model_id)
+    expected_env = (
+        "ANTHROPIC_API_KEY" if provider == "anthropic" else "GOOGLE_API_KEY"
+    )
+    if not os.environ.get(expected_env):
         log.warning(
             "inferred_edges.extractor.no_api_key",
             customer=bundle.customer_id,
             anchor=bundle.anchor_doc_id,
+            model=model_id,
+            missing_env=expected_env,
         )
         return result
 
     # ---- LLM call ----------------------------------------------------------
+    user_message = _bundle_to_user_message(bundle)
     try:
-        if _anthropic_module is None:
-            raise ImportError("anthropic package not installed")
-
-        client = _anthropic_module.AsyncAnthropic(api_key=api_key)
-        user_message = _bundle_to_user_message(bundle)
-
-        # Prefill the assistant message with `[` so Haiku is forced to start
-        # its response inside a JSON array. Without prefill the model is free
-        # to emit a preamble ("Here are the edges I found:") or markdown
-        # fences, both of which break json.loads. With prefill,
-        # response.content[0].text is the body of the array; we re-prepend
-        # `[` before parsing.
-        response = await _call_llm_with_rate_limit_backoff(
-            client,
+        response = await _call_llm(
+            model=model_id,
             customer_id=bundle.customer_id,
             anchor_doc_id=bundle.anchor_doc_id,
             user_message=user_message,
         )
-
-        input_tokens = response.usage.input_tokens if response.usage else 0
-        output_tokens = response.usage.output_tokens if response.usage else 0
-        result.cost_usd = _estimate_cost(input_tokens, output_tokens)
-
-        raw_text = response.content[0].text if response.content else ""
     except Exception as exc:
         log.error(
             "inferred_edges.extractor.llm_call_failed",
             customer=bundle.customer_id,
             anchor=bundle.anchor_doc_id,
+            model=model_id,
             error=str(exc),
         )
         result.bundle_failed = True
         result.bundle_fail_reason = f"llm_call_failed: {type(exc).__name__}"
         return result
 
-    # ---- Reconstruct + parse the JSON array --------------------------------
-    # The assistant prefill `[` was sent to the model but is NOT included in
-    # raw_text -- raw_text is just what the model continued with. The model
-    # has three sensible behaviours:
-    #   1. "no edges" -> raw_text starts with `]` (model immediately closed
-    #      the array) optionally followed by garbage commentary. ANY leading
-    #      `]` after the prefill means the array is empty -- return zero
-    #      edges. Trailing commentary is discarded. Also treats whitespace-
-    #      only or fully empty raw_text as empty.
-    #   2. "edges" -> raw_text starts with `{...}, {...}, ..., {...}]`.
-    #      Re-prepend `[` and parse.
-    #   3. "edges, truncated by max_tokens" -> ends mid-element with no
-    #      closing `]`. Best-effort: drop a trailing `,`, append `]`,
-    #      try to parse. JSONDecodeError on a truncated-mid-element will
-    #      fall through to the failure branch.
-    stripped = raw_text.strip()
-    if not stripped or stripped.startswith("]"):
-        return result  # No edges; valid outcome.
+    result.cost_usd = _estimate_cost(
+        model_id, response.input_tokens, response.output_tokens,
+    )
+    raw_text = response.raw_text
 
-    candidate = "[" + stripped
+    # ---- Reconstruct + parse the JSON array --------------------------------
+    # Two response shapes converge here:
+    #   - Anthropic: assistant prefilled with `[`, raw_text is the body
+    #     CONTINUATION (starts with edges or `]`). We re-prepend `[`.
+    #   - Gemini: structured output, raw_text is a complete JSON array
+    #     starting with `[` on its own.
+    # We normalize: strip, optionally prepend `[`, optionally append `]`
+    # for truncated-mid-element recovery. Then json.loads.
+    stripped = raw_text.strip()
+    # Strip markdown code fences if a model added them (Gemini occasionally
+    # wraps with ```json despite response_mime_type).
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        first_nl = stripped.find("\n")
+        if first_nl != -1:
+            stripped = stripped[first_nl + 1 :]
+        if stripped.endswith("```"):
+            stripped = stripped[:-3]
+        stripped = stripped.strip()
+    # Empty or close-bracket-first means "no edges" -- valid.
+    if not stripped or stripped.startswith("]"):
+        return result
+
+    candidate = stripped if stripped.startswith("[") else "[" + stripped
     if not candidate.endswith("]"):
         candidate = candidate.rstrip(",") + "]"
 
@@ -404,6 +604,7 @@ async def extract_edges(
                 why=why,
                 extractor_id=PROMPT_VERSION,
                 extracted_at=now,
+                model=model_id,
             )
         )
 

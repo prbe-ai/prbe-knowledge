@@ -249,9 +249,15 @@ async def _upsert_inferred_edges(
         # write path -- inferred edges land in graph_edges with empty
         # properties and no audit trail. Stored under `properties.why`;
         # consumed by /knowledge/insights and the dashboard inferred-edges UI.
+        # `properties.model` records which LLM produced this edge so we can
+        # audit cutover correctness without bumping extractor_id (the prompt
+        # + validator pipeline is unchanged across the Haiku -> Flash Lite
+        # cutover; only the model differs).
         edge_props: dict[str, str] = {}
         if edge.why:
             edge_props["why"] = edge.why
+        if edge.model:
+            edge_props["model"] = edge.model
         edge_specs.append(
             GraphEdgeSpec(
                 edge_type=edge_type_enum,

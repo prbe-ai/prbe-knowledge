@@ -20,26 +20,28 @@ from dataclasses import dataclass, field
 
 import asyncpg
 
+from shared.constants import (
+    INFERRED_EDGES_BUNDLE_MAX_1HOP,
+    INFERRED_EDGES_BUNDLE_MAX_TIME_WINDOW,
+    INFERRED_EDGES_BUNDLE_MAX_VECTOR_SIMILAR,
+    INFERRED_EDGES_BUNDLE_TOKEN_BUDGET,
+)
 from shared.db import with_tenant
 from shared.logging import get_logger
 
 log = get_logger(__name__)
 
-# Default token budget per bundle (approx. cl100k tokens).
-DEFAULT_TOKEN_BUDGET = 60_000
+# Re-exported under module-private aliases so existing tests that
+# monkeypatch `bundle._MAX_1HOP` etc keep working. The values live in
+# shared/constants.py; import them here.
+DEFAULT_TOKEN_BUDGET = INFERRED_EDGES_BUNDLE_TOKEN_BUDGET
+_MAX_1HOP = INFERRED_EDGES_BUNDLE_MAX_1HOP
+_MAX_VECTOR_SIMILAR = INFERRED_EDGES_BUNDLE_MAX_VECTOR_SIMILAR
+_MAX_TIME_WINDOW = INFERRED_EDGES_BUNDLE_MAX_TIME_WINDOW
 
 # Chars-per-token estimate for cheap pre-LLM budget accounting.
 # cl100k averages ~4 chars per token on English prose; 3.5 is conservative.
 _CHARS_PER_TOKEN = 3.5
-
-# Maximum 1-hop neighbors fetched per anchor.
-_MAX_1HOP = 20
-
-# Maximum vector-similar cross-source chunks fetched.
-_MAX_VECTOR_SIMILAR = 5
-
-# Maximum same-window chunks fetched.
-_MAX_TIME_WINDOW = 10
 
 # Time window in hours for "same-window" gather step.
 _TIME_WINDOW_HOURS = 24
