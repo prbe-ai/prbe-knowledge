@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import signal
 import sys
 import time
 from typing import Any
@@ -79,18 +81,29 @@ async def _fetch_batch(
 ) -> list[dict[str, Any]]:
     """Pull the next batch of NULL embedding_v2 rows joined with their doc title.
 
-    LEFT JOIN: orphan chunks (live doc deleted) get NULL title and fall back
-    to the no-title prefix in the embedder. ORDER BY chunk_id gives stable
-    iteration so a re-run after a crash hits the same rows in the same order.
+    LATERAL with LIMIT 1: there's no UNIQUE constraint that documents has
+    exactly one live (valid_to IS NULL) row per (customer_id, doc_id) -- a
+    bad write race or manual data repair could leave two. A plain LEFT JOIN
+    in that case duplicates the chunk row, double-billing Gemini for it.
+    LATERAL pins the join to a single title pick so each chunk shows up
+    exactly once. Orphan chunks (live doc deleted) still get NULL title and
+    fall back to the no-title prefix in the embedder.
+
+    ORDER BY chunk_id gives stable iteration so a re-run after a crash hits
+    the same rows in the same order.
     """
     rows = await conn.fetch(
         """
         SELECT c.chunk_id, c.customer_id, c.content, d.title
         FROM chunks c
-        LEFT JOIN documents d
-          ON c.customer_id = d.customer_id
-         AND c.doc_id = d.doc_id
-         AND d.valid_to IS NULL
+        LEFT JOIN LATERAL (
+            SELECT title
+            FROM documents
+            WHERE customer_id = c.customer_id
+              AND doc_id = c.doc_id
+              AND valid_to IS NULL
+            LIMIT 1
+        ) d ON TRUE
         WHERE c.embedding_v2 IS NULL
           AND ($1::text IS NULL OR c.customer_id = $1)
         ORDER BY c.chunk_id
@@ -110,10 +123,12 @@ async def _write_batch(
 ) -> int:
     """Atomically write a batch of v2 vectors. Returns the row count actually updated.
 
-    The WHERE embedding_v2 IS NULL guard prevents a race where a concurrent
-    Stage 1 dual-write populated the same chunk between fetch and write --
-    we wouldn't want to clobber a fresh ingest-time vector with our backfill
-    one (they should be identical, but defensive).
+    The WHERE embedding_v2 IS NULL guard handles a race where a concurrent
+    Stage 1 dual-write populated the same chunk between our fetch and our
+    UPDATE -- we'd skip clobbering it. NOTE this guard is on the WRITE only;
+    by the time we reach it the Gemini API call has already happened, so it
+    prevents data inconsistency, not duplicate spend. Cost accounting in
+    main() compensates by billing only against successful rows.
     """
     result = await conn.execute(
         """
@@ -144,18 +159,43 @@ async def _write_batch(
         return 0
 
 
+def _positive_float(s: str) -> float:
+    v = float(s)
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {v}")
+    return v
+
+
+def _positive_int(s: str) -> int:
+    v = int(s)
+    if v <= 0:
+        raise argparse.ArgumentTypeError(f"must be > 0, got {v}")
+    return v
+
+
+# Exit codes.
+RC_CLEAN = 0
+RC_FAILURES = 1  # poison chunks or other per-row failures
+RC_CAP_HIT_REMAINING = 2  # cost cap or max-batches hit while NULL rows remain
+
+
 async def main(argv: list[str] | None = None, *, close_pool_after: bool = False) -> int:
     """Entry point.
 
     `close_pool_after` defaults to False so tests that share a pool fixture
     don't get their pool yanked. The CLI wrapper at the bottom passes True.
+
+    Exit codes are operator-meaningful: 0 = done (no NULL rows left, no
+    failures), 1 = some chunks failed Gemini and stayed NULL (re-run may
+    clear them), 2 = the run stopped early on cost cap or max-batches with
+    NULL rows still in the table (operator MUST re-run before Stage 3).
     """
     ap = argparse.ArgumentParser(description="Backfill embedding_v2 column.")
     ap.add_argument(
         "--cost-cap",
-        type=float,
+        type=_positive_float,
         default=100.0,
-        help="Max estimated USD spend before stopping (default: 100)",
+        help="Max estimated USD spend before stopping (default: 100, must be > 0)",
     )
     ap.add_argument(
         "--customer",
@@ -164,13 +204,13 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
     )
     ap.add_argument(
         "--batch-size",
-        type=int,
+        type=_positive_int,
         default=None,
-        help="Override settings.embedding_batch_size (default: 256)",
+        help="Override settings.embedding_batch_size (default: 256, must be > 0)",
     )
     ap.add_argument(
         "--max-batches",
-        type=int,
+        type=_positive_int,
         default=None,
         help="Stop after N batches (for staged dry-runs against prod)",
     )
@@ -187,6 +227,18 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
     batch_size = args.batch_size or settings.embedding_batch_size
     embedder = get_embedder_v2()
 
+    # Co-operative shutdown: Fly machines stop with SIGTERM. Set a flag the
+    # main loop checks at batch boundaries so an in-flight batch finishes
+    # cleanly (UPDATE commits) before the loop exits. Without this, SIGTERM
+    # would tear down asyncio mid-Gemini-call and leak that batch's tokens.
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        # Windows / restricted env may not support add_signal_handler --
+        # proceed without graceful shutdown rather than refusing to start.
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, stop.set)
+
     log.info(
         "backfill_v2.start",
         cost_cap=args.cost_cap,
@@ -199,12 +251,19 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
     total_updated = 0
     total_failed = 0
     batches = 0
+    cap_hit = False
+    remaining = 0
     started = time.monotonic()
 
     try:
         while True:
+            if stop.is_set():
+                log.warning("backfill_v2.signal_received_stopping_clean")
+                cap_hit = True  # treat as "didn't finish" for rc semantics
+                break
             if args.max_batches is not None and batches >= args.max_batches:
                 log.info("backfill_v2.max_batches_hit", batches=batches)
+                cap_hit = True
                 break
 
             async with raw_conn() as conn:
@@ -224,6 +283,7 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
                     next_batch_usd=round(est_cost, 4),
                     cap_usd=args.cost_cap,
                 )
+                cap_hit = True
                 break
 
             if args.dry_run:
@@ -237,6 +297,7 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
                 )
                 # Dry-run exits after the first batch to avoid pointlessly
                 # iterating against the same NULL rows -- nothing was written.
+                cap_hit = True  # rc semantics: didn't finish (intentional)
                 break
 
             items = [DocItem(content=r["content"], title=r["title"]) for r in rows]
@@ -269,7 +330,15 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
                     )
                 total_updated += updated
 
-            cost += est_cost
+            # Bill cost only against rows that produced a vector. A 100%
+            # API-error batch (Gemini outage) charges 0 against the cap so a
+            # transient outage doesn't consume the entire budget on failed
+            # calls. Real Gemini billing varies by error type; this errs
+            # toward letting the operator keep retrying.
+            success_ratio = (
+                len(success_chunk_ids) / len(rows) if rows else 0.0
+            )
+            cost += est_cost * success_ratio
             batches += 1
 
             log.info(
@@ -280,6 +349,21 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
                 failed=failed_count,
                 cum_cost_usd=round(cost, 4),
             )
+
+        # If we stopped early (cap / max-batches / signal), check whether
+        # NULL rows remain so the operator knows to re-run before Stage 3.
+        remaining = 0
+        if cap_hit and not args.dry_run:
+            async with raw_conn() as conn:
+                remaining = await conn.fetchval(
+                    """
+                    SELECT COUNT(*) FROM chunks
+                    WHERE embedding_v2 IS NULL
+                      AND ($1::text IS NULL OR customer_id = $1)
+                    """,
+                    args.customer,
+                )
+            log.info("backfill_v2.remaining_nulls", remaining=remaining)
     finally:
         if close_pool_after:
             await close_pool()
@@ -292,8 +376,14 @@ async def main(argv: list[str] | None = None, *, close_pool_after: bool = False)
         chunks_failed=total_failed,
         est_cost_usd=round(cost, 2),
         elapsed_s=round(elapsed, 1),
+        cap_hit=cap_hit,
     )
-    return 0 if total_failed == 0 else 1
+
+    if cap_hit and not args.dry_run and remaining > 0:
+        return RC_CAP_HIT_REMAINING
+    if total_failed > 0:
+        return RC_FAILURES
+    return RC_CLEAN
 
 
 if __name__ == "__main__":

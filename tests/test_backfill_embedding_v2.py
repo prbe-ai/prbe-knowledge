@@ -24,7 +24,12 @@ from datetime import UTC, datetime
 import pytest
 import pytest_asyncio  # noqa: F401  # required for live_db fixture
 
-from scripts.backfill_embedding_v2 import _estimate_tokens, main
+from scripts.backfill_embedding_v2 import (
+    RC_CAP_HIT_REMAINING,
+    RC_CLEAN,
+    _estimate_tokens,
+    main,
+)
 from shared.db import raw_conn
 from shared.embeddings import reset_embedder
 
@@ -56,6 +61,30 @@ def test_estimate_tokens_caps_title_at_200_chars() -> None:
     assert _estimate_tokens("body", huge_title) == _estimate_tokens(
         "body", short_title
     )
+
+
+# ---- argparse validators reject nonsense values ------------------------
+
+
+@pytest.mark.asyncio
+async def test_argparse_rejects_negative_cost_cap(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        await main(["--cost-cap", "-1"])
+    assert exc_info.value.code == 2  # argparse uses 2 for usage errors
+
+
+@pytest.mark.asyncio
+async def test_argparse_rejects_zero_batch_size(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        await main(["--batch-size", "0"])
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_argparse_rejects_negative_max_batches(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        await main(["--max-batches", "-5"])
+    assert exc_info.value.code == 2
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +242,36 @@ async def test_backfill_dry_run_writes_nothing(live_db) -> None:
             )
             # Dry-run must not mutate the column.
             assert row["embedding_v2"] is None
+    finally:
+        await _cleanup(cust)
+
+
+@pytest.mark.asyncio
+async def test_backfill_returns_rc_2_when_cap_hit_with_rows_remaining(live_db) -> None:
+    """The operator-meaningful rc contract: cap-hit with NULL rows still
+    in the table returns 2, NOT 0. Without this, an operator sees rc=0
+    and assumes Stage 3 (HNSW build) is safe — but it would build over a
+    NULL-heavy column. The contract is the gate.
+    """
+    cust = "cust-bf-v2-cap"
+    try:
+        async with raw_conn() as conn:
+            await _insert_customer(conn, cust)
+            await _insert_doc(conn, cust, "doc-1", "T")
+            # Insert two chunks; --max-batches=1 + batch-size=1 stops after
+            # processing only the first one, leaving one NULL row behind.
+            await _insert_chunk_no_v2(conn, cust, "doc-1", 0, "first content")
+            await _insert_chunk_no_v2(conn, cust, "doc-1", 1, "second content")
+
+        rc = await main(
+            ["--customer", cust, "--max-batches", "1", "--batch-size", "1"]
+        )
+        assert rc == RC_CAP_HIT_REMAINING
+
+        # Sanity: a follow-up run drains the remaining NULLs and returns
+        # RC_CLEAN, proving the rc=2 was about NULL rows specifically.
+        rc = await main(["--customer", cust])
+        assert rc == RC_CLEAN
     finally:
         await _cleanup(cust)
 
