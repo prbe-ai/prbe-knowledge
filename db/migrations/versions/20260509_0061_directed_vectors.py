@@ -1,8 +1,14 @@
 """directed_vectors: per-doc trigger phrases for retrieval booster
 
-Revision ID: 0060_directed_vectors
-Revises: 0059_agent_runs_model_col
+Revision ID: 0061_directed_vectors
+Revises: 0060_add_embedding_v2_cols
 Create Date: 2026-05-08
+
+Originally cut as 0060_directed_vectors pointing at 0059, BEFORE
+0060_add_embedding_v2_cols (Gemini-2 dual-write Stage-0) merged. Both
+ended up sharing the same parent -> alembic "Multiple heads are
+present" -> deploy upgrade-head exited 255. Re-stitching under
+0060_add_embedding_v2_cols restores a single-head chain.
 
 Wiki pages need to be retrievable by semantic match against engineer-pinned
 or LLM-generated *trigger phrases* — short strings describing problems /
@@ -31,15 +37,15 @@ on doc-delete (rare) is handled by the synthesis path that owns the
 doc, not by FK cascade.
 
 Lessons reminder: revision string MUST be <=32 chars (alembic_version
-column is varchar(32)); '0060_directed_vectors' is 21 chars - fine.
+column is varchar(32)); '0061_directed_vectors' is 21 chars - fine.
 """
 
 from __future__ import annotations
 
 from alembic import op
 
-revision = "0060_directed_vectors"
-down_revision = "0059_agent_runs_model_col"
+revision = "0061_directed_vectors"
+down_revision = "0060_add_embedding_v2_cols"
 branch_labels = None
 depends_on = None
 
@@ -50,7 +56,7 @@ _LOOKUP_INDEX = "idx_directed_vectors_customer_doc"
 
 def upgrade() -> None:
     # IF NOT EXISTS on the table + indexes makes manual `alembic upgrade
-    # 0060_directed_vectors` re-runs idempotent (helps after a partial
+    # 0061_directed_vectors` re-runs idempotent (helps after a partial
     # rollback / heads-fix). Alembic's normal flow doesn't need this but
     # the cost is zero.
     op.execute(
