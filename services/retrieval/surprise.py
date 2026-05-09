@@ -1,7 +1,11 @@
 """Surprise-score for graph retriever edges.
 
-Pure function, no I/O. Called from services/retrieval/retrievers/graph.py
-when SURPRISE_SCORE_ENABLED=true.
+Pure function, no I/O. Called unconditionally from
+services/retrieval/retrievers/graph.py for every graph hit. The score is
+used in two places: (1) graph.py sorts hits by score before returning so
+the highest-surprise edge lands at rank 1, and (2) services/retrieval/
+fusion.py multiplies graph hits' RRF by min(score, 2.0) when the request's
+discovery flag is true (out of fusion's flat-RRF default).
 
 Score targets range [0.5, 4.0] in normal use; hard cap at 8.0 to prevent
 runaway when multiple bonuses stack on a single edge.

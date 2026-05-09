@@ -1,9 +1,17 @@
 """Integration tests for the surprise-score wiring in graph.py.
 
-Uses mock DB rows to verify:
-- Flag on -> cross-source hits score higher than same-source hits
-- Tenant isolation: retriever_scores uses only per-row data (no cross-tenant leak)
-- All rows get retriever_scores['surprise'] regardless of flag state
+The surprise score is computed unconditionally for every graph hit and
+written to both hit.score (for fusion's RRF input) and
+retriever_scores['surprise'] (for telemetry round-trip). Earlier
+versions of this file patched a feature flag (SURPRISE_SCORE_ENABLED);
+the flag was deleted along with its branches, so these tests now run
+the always-on path directly.
+
+Covers:
+- Cross-source hits score higher than same-source hits
+- Cross-community adds bonus on top of cross-source
+- Tenant isolation: scores use per-row data only, no shared state
+- Every hit carries retriever_scores['surprise']
 """
 
 from __future__ import annotations
@@ -55,42 +63,43 @@ def _make_row(
     return row
 
 
+def _patched_conn(rows: list) -> MagicMock:
+    mock_conn = AsyncMock()
+    mock_conn.fetch = AsyncMock(return_value=rows)
+    mock_ctx = MagicMock()
+    mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
+    mock_ctx.__aexit__ = AsyncMock(return_value=False)
+    return mock_ctx
+
+
 @pytest.mark.asyncio
-async def test_flag_on_cross_source_hits_rank_above_same_source() -> None:
-    """Flag=true: cross-source edge ranks higher than same-source edge."""
+async def test_cross_source_hits_rank_above_same_source() -> None:
+    """Cross-source edge ranks higher than same-source edge."""
     import services.retrieval.retrievers.graph as graph_mod
 
-    with patch.object(graph_mod, "SURPRISE_SCORE_ENABLED", True):
-        # Same-source (slack -> slack): INFERRED, same community
-        same_source_row = _make_row(
-            chunk_id="same_source",
-            source_system="slack",
-            confidence="INFERRED",
-            via_source_system="slack",
-            community_id=1,
-            via_community=1,
-        )
-        # Cross-source (github -> slack): INFERRED, same community
-        cross_source_row = _make_row(
-            chunk_id="cross_source",
-            source_system="github",
-            confidence="INFERRED",
-            via_source_system="slack",
-            community_id=1,
-            via_community=1,
-        )
+    same_source_row = _make_row(
+        chunk_id="same_source",
+        source_system="slack",
+        confidence="INFERRED",
+        via_source_system="slack",
+        community_id=1,
+        via_community=1,
+    )
+    cross_source_row = _make_row(
+        chunk_id="cross_source",
+        source_system="github",
+        confidence="INFERRED",
+        via_source_system="slack",
+        community_id=1,
+        via_community=1,
+    )
 
-        mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[same_source_row, cross_source_row])
-        mock_ctx = MagicMock()
-        mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
-        mock_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("services.retrieval.retrievers.graph.with_tenant", return_value=mock_ctx):
-            hits = await graph_mod.graph_search(
-                customer_id="cust-test",
-                entities=[("service", "svc-a")],
-            )
+    ctx = _patched_conn([same_source_row, cross_source_row])
+    with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+        hits = await graph_mod.graph_search(
+            customer_id="cust-test",
+            entities=[("service", "svc-a")],
+        )
 
     assert len(hits) == 2
     by_id = {h.chunk_id: h for h in hits}
@@ -98,95 +107,83 @@ async def test_flag_on_cross_source_hits_rank_above_same_source() -> None:
     same = by_id["same_source"]
     cross = by_id["cross_source"]
 
-    # Cross-source hit must score higher
+    # Cross-source must score higher.
     assert cross.score > same.score
-    # Same-source with INFERRED, same community: only INFERRED weight = 1.25
+    # Same-source INFERRED, same community: only INFERRED weight = 1.25.
     assert same.score == pytest.approx(1.25)
-    # Cross-source: INFERRED * cross-source = 1.25 * 1.5 = 1.875
+    # Cross-source: INFERRED * cross-source = 1.25 * 1.5 = 1.875.
     assert cross.score == pytest.approx(1.875)
 
 
 @pytest.mark.asyncio
 async def test_all_hits_have_retriever_scores_set() -> None:
-    """Every hit (regardless of flag state) has retriever_scores['surprise'] set."""
+    """Every hit carries retriever_scores['surprise'] for telemetry."""
     import services.retrieval.retrievers.graph as graph_mod
 
-    for flag_value in (True, False):
-        with patch.object(graph_mod, "SURPRISE_SCORE_ENABLED", flag_value):
-            rows = [
-                _make_row(chunk_id="c1", confidence="INFERRED"),
-                _make_row(chunk_id="c2", confidence="EXTRACTED"),
-            ]
+    rows = [
+        _make_row(chunk_id="c1", confidence="INFERRED"),
+        _make_row(chunk_id="c2", confidence="EXTRACTED"),
+    ]
 
-            mock_conn = AsyncMock()
-            mock_conn.fetch = AsyncMock(return_value=rows)
-            mock_ctx = MagicMock()
-            mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
-            mock_ctx.__aexit__ = AsyncMock(return_value=False)
+    ctx = _patched_conn(rows)
+    with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+        hits = await graph_mod.graph_search(
+            customer_id="cust-test",
+            entities=[("service", "svc-a")],
+        )
 
-            with patch("services.retrieval.retrievers.graph.with_tenant", return_value=mock_ctx):
-                hits = await graph_mod.graph_search(
-                    customer_id="cust-test",
-                    entities=[("service", "svc-a")],
-                )
-
-        assert len(hits) == 2, f"Expected 2 hits with flag={flag_value}"
-        for hit in hits:
-            assert hit.retriever_scores is not None
-            assert "surprise" in hit.retriever_scores
-            assert isinstance(hit.retriever_scores["surprise"], float)
+    assert len(hits) == 2
+    for hit in hits:
+        assert hit.retriever_scores is not None
+        assert "surprise" in hit.retriever_scores
+        assert isinstance(hit.retriever_scores["surprise"], float)
+        # surprise telemetry equals the rank-driving score.
+        assert hit.retriever_scores["surprise"] == pytest.approx(hit.score)
 
 
 @pytest.mark.asyncio
 async def test_tenant_isolation_retriever_scores_use_row_data_only() -> None:
-    """retriever_scores are computed purely from per-row data; no shared global state."""
+    """Scores are computed purely from per-row data; no shared global state."""
     import services.retrieval.retrievers.graph as graph_mod
 
-    with patch.object(graph_mod, "SURPRISE_SCORE_ENABLED", True):
-        # Tenant A: cross-source, cross-community row
-        tenant_a_row = _make_row(
-            chunk_id="a1",
-            source_system="github",
-            confidence="INFERRED",
-            via_source_system="slack",
-            community_id=1,
-            via_community=99,
-        )
-        # Tenant B: same-source, same-community row (as if from another tenant)
-        tenant_b_row = _make_row(
-            chunk_id="b1",
-            source_system="slack",
-            confidence="INFERRED",
-            via_source_system="slack",
-            community_id=5,
-            via_community=5,
-        )
+    # Tenant A: cross-source, cross-community.
+    tenant_a_row = _make_row(
+        chunk_id="a1",
+        source_system="github",
+        confidence="INFERRED",
+        via_source_system="slack",
+        community_id=1,
+        via_community=99,
+    )
+    # Tenant B: same-source, same-community.
+    tenant_b_row = _make_row(
+        chunk_id="b1",
+        source_system="slack",
+        confidence="INFERRED",
+        via_source_system="slack",
+        community_id=5,
+        via_community=5,
+    )
 
-        # Each call uses separate mock conn (simulates separate tenant contexts)
-        for customer_id, row, expected_bonus in [
-            ("cust-a", tenant_a_row, True),   # cross-source + cross-community
-            ("cust-b", tenant_b_row, False),  # same-source + same-community
-        ]:
-            mock_conn = AsyncMock()
-            mock_conn.fetch = AsyncMock(return_value=[row])
-            mock_ctx = MagicMock()
-            mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
-            mock_ctx.__aexit__ = AsyncMock(return_value=False)
+    for customer_id, row, expected_bonus in [
+        ("cust-a", tenant_a_row, True),
+        ("cust-b", tenant_b_row, False),
+    ]:
+        ctx = _patched_conn([row])
+        with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+            hits = await graph_mod.graph_search(
+                customer_id=customer_id,
+                entities=[("service", "svc-a")],
+            )
 
-            with patch("services.retrieval.retrievers.graph.with_tenant", return_value=mock_ctx):
-                hits = await graph_mod.graph_search(
-                    customer_id=customer_id,
-                    entities=[("service", "svc-a")],
-                )
-
-            assert len(hits) == 1
-            hit = hits[0]
-            if expected_bonus:
-                assert hit.score > 1.0, f"Expected surprise bonus for {customer_id}"
-            else:
-                assert hit.score == pytest.approx(1.25), (
-                    f"Expected INFERRED-only score=1.25 for {customer_id}, got {hit.score}"
-                )
+        assert len(hits) == 1
+        hit = hits[0]
+        if expected_bonus:
+            assert hit.score > 1.0, f"Expected surprise bonus for {customer_id}"
+        else:
+            assert hit.score == pytest.approx(1.25), (
+                f"Expected INFERRED-only score=1.25 for {customer_id}, got {hit.score}"
+            )
 
 
 @pytest.mark.asyncio
@@ -194,37 +191,29 @@ async def test_cross_community_adds_bonus_on_top_of_cross_source() -> None:
     """Cross-community adds 1.4x on top of cross-source bonus."""
     import services.retrieval.retrievers.graph as graph_mod
 
-    with patch.object(graph_mod, "SURPRISE_SCORE_ENABLED", True):
-        # Same community
-        no_community_row = _make_row(
-            chunk_id="same_comm",
-            source_system="github",
-            confidence="INFERRED",
-            via_source_system="slack",
-            community_id=1,
-            via_community=1,
-        )
-        # Different community
-        cross_community_row = _make_row(
-            chunk_id="cross_comm",
-            source_system="github",
-            confidence="INFERRED",
-            via_source_system="slack",
-            community_id=1,
-            via_community=99,
-        )
+    no_community_row = _make_row(
+        chunk_id="same_comm",
+        source_system="github",
+        confidence="INFERRED",
+        via_source_system="slack",
+        community_id=1,
+        via_community=1,
+    )
+    cross_community_row = _make_row(
+        chunk_id="cross_comm",
+        source_system="github",
+        confidence="INFERRED",
+        via_source_system="slack",
+        community_id=1,
+        via_community=99,
+    )
 
-        mock_conn = AsyncMock()
-        mock_conn.fetch = AsyncMock(return_value=[no_community_row, cross_community_row])
-        mock_ctx = MagicMock()
-        mock_ctx.__aenter__ = AsyncMock(return_value=mock_conn)
-        mock_ctx.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("services.retrieval.retrievers.graph.with_tenant", return_value=mock_ctx):
-            hits = await graph_mod.graph_search(
-                customer_id="cust-test",
-                entities=[("service", "svc-a")],
-            )
+    ctx = _patched_conn([no_community_row, cross_community_row])
+    with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+        hits = await graph_mod.graph_search(
+            customer_id="cust-test",
+            entities=[("service", "svc-a")],
+        )
 
     assert len(hits) == 2
     by_id = {h.chunk_id: h for h in hits}
@@ -232,8 +221,8 @@ async def test_cross_community_adds_bonus_on_top_of_cross_source() -> None:
     same = by_id["same_comm"]
     cross = by_id["cross_comm"]
 
-    # INFERRED * cross-source = 1.25 * 1.5 = 1.875
+    # INFERRED * cross-source = 1.25 * 1.5 = 1.875.
     assert same.score == pytest.approx(1.25 * 1.5)
-    # INFERRED * cross-source * cross-community = 1.25 * 1.5 * 1.4 = 2.625
+    # INFERRED * cross-source * cross-community = 1.25 * 1.5 * 1.4 = 2.625.
     assert cross.score == pytest.approx(1.25 * 1.5 * 1.4)
     assert cross.score > same.score

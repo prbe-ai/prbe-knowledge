@@ -343,6 +343,20 @@ class QueryRequest(BaseModel):
             "(token-sensitive flows). Default 10. Cap 50."
         ),
     )
+    discovery: bool = Field(
+        default=False,
+        description=(
+            "When true, weight graph-retriever hits by their surprise score "
+            "in fusion's RRF math (multiplier capped at 2.0). Surfaces "
+            "cross-source / cross-community / inferred-edge neighbors that "
+            "default focus mode buries beneath dominant vector/BM25 hits. "
+            "Use for conceptual queries ('how should we approach X', "
+            "'anything else I should know about Y') where the agent wants "
+            "less-obvious connections. Skip for direct lookups (PR#, ticket, "
+            "error message) where the canonical answer is wanted. "
+            "When false (default), graph hits contribute flat 1/(k+rank) RRF."
+        ),
+    )
 
 
 def normalize_author_id(value: str | None) -> str | None:

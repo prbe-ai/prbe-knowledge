@@ -7,7 +7,6 @@ graph tables + RLS tenant isolation.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -20,10 +19,16 @@ from shared.models import TemporalSpec, normalize_author_id
 
 log = get_logger(__name__)
 
-# Feature flag: when true, graph hits receive a computed surprise score
-# instead of the flat 1.0. Default false so existing behaviour is unchanged
-# until staging A/B confirms no regression.
-SURPRISE_SCORE_ENABLED: bool = os.getenv("SURPRISE_SCORE_ENABLED", "false").lower() == "true"
+# Surprise score on graph hits is now unconditional. Empirical 4-run A/B on
+# probe-founders (3 flag-off baselines + 1 flag-on) showed flipping
+# SURPRISE_SCORE_ENABLED produced zero ranking change beyond +/-0.001 jitter,
+# because graph's RRF contribution is bounded (1/(60+rank)) and flat
+# score=1.0 made the rank order arbitrary heap-scan order anyway.
+# Always computing + sorting by surprise score is strictly better than
+# heap-scan order regardless of how callers consume the score downstream.
+# Discovery mode (QueryRequest.discovery) controls whether fusion uses the
+# score in RRF math; this module just guarantees deterministic, signal-driven
+# rank ordering for any consumer.
 
 
 @dataclass(slots=True)
@@ -307,10 +312,12 @@ async def graph_search(
         if not passes_confidence_filter(confidence, min_confidence):
             continue
 
-        # Always compute the would-be surprise score for telemetry, even when
-        # the flag is off. This lets operators compare distributions via logs
-        # without touching SURPRISE_SCORE_ENABLED in prod.
-        would_be_score = surprise_score(
+        # Surprise score is always computed and used as hit.score so the
+        # rank order returned to fusion is deterministic + signal-driven
+        # (highest-surprise edge at rank 1). Whether fusion AMPLIFIES this
+        # contribution in RRF math is gated by QueryRequest.discovery; this
+        # retriever just guarantees a consistent input order.
+        surprise = surprise_score(
             edge_type=r["edge_type"],
             confidence=confidence,
             anchor_label=r["via_label"],
@@ -334,23 +341,20 @@ async def graph_search(
                 content=r["content"],
                 created_at=r["created_at"],
                 updated_at=r["updated_at"],
-                score=would_be_score if SURPRISE_SCORE_ENABLED else 1.0,
+                score=surprise,
                 via_entity=r["via_entity"],
                 author_id=normalize_author_id(r["author_id"]),
                 edge_type=r["edge_type"],
                 confidence=confidence,
                 via_label=r["via_label"],
-                retriever_scores={"surprise": would_be_score},
+                retriever_scores={"surprise": surprise},
             )
         )
 
-    # Flag-gated sort: when SURPRISE_SCORE_ENABLED, the highest-surprise
-    # edge lands at rank 1 so fusion's RRF (1/(k+rank)) gives it the
-    # biggest graph-side contribution. Without this sort, hits arrive in
-    # the SQL's heap-scan order -- which means fusion weights an arbitrary
-    # neighbor highest, not the most informative one. Tie-break by chunk_id
-    # so the rank order is deterministic across runs.
-    # Flag-off path is unchanged: returns hits in DB order, score=1.0.
-    if SURPRISE_SCORE_ENABLED:
-        hits.sort(key=lambda h: (-h.score, h.chunk_id))
+    # Sort by surprise score so the highest-surprise edge lands at rank 1
+    # and gets the biggest graph-side RRF contribution (1/61) in fusion.
+    # Without this sort, hits would arrive in arbitrary heap-scan order.
+    # Tie-break by chunk_id so the order is deterministic across runs and
+    # MCP retriever_scores telemetry doesn't jitter on identical queries.
+    hits.sort(key=lambda h: (-h.score, h.chunk_id))
     return hits

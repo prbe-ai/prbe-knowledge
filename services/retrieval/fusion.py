@@ -103,6 +103,16 @@ class FusedDocument:
 _LN2 = math.log(2)
 
 
+# Multiplier cap applied to graph hits' RRF when discovery=True. Graph
+# surprise scores are bounded [0.5, 4.0] (see services/retrieval/surprise.py).
+# Uncapped, a top graph hit at rank 1 with surprise=4.0 would contribute
+# (1/61) * 4 = 0.066 -- bigger than ANY vector hit (max 1/61 = 0.0164),
+# which would over-dominate fusion. Cap at 2.0 lets the most-surprising
+# graph hit compete with strong vector hits without flattening them: top
+# graph contribution is at most 0.033 vs vector's 0.016, ~2x lift.
+DISCOVERY_GRAPH_MULTIPLIER_CAP = 2.0
+
+
 def _apply_source_decay(
     score: float,
     source_system: str,
@@ -133,6 +143,7 @@ def fuse(
     recency_half_life_days: float | None = None,
     now: datetime | None = None,
     sort: dict[str, str] | None = None,
+    discovery: bool = False,
 ) -> list[FusedDocument]:
     """Combine ranked lists from multiple retrievers into doc-grouped output.
 
@@ -159,8 +170,28 @@ def fuse(
                 per_chunk_meta.setdefault(hit.chunk_id, hit)
                 continue
             rrf = 1.0 / (k + rank)
+            # Discovery mode: amplify graph contribution by surprise score
+            # (capped) so cross-source / cross-community / inferred-edge
+            # neighbors actually compete with vector/BM25 dominance. Only
+            # graph CONTENT chunks carry meaningful surprise; metadata
+            # chunks are synthetic key:value text and shouldn't be
+            # amplified even if a future change has graph return them.
+            # vector/BM25 hit.score is a similarity/relevance number on a
+            # different scale and would need normalisation to participate
+            # -- out of scope for v1. The multiplier compounds with
+            # same-chunk vector/BM25 RRF: a chunk that's both surprising
+            # AND semantically relevant gets both contributions.
+            if discovery and retriever_name == "graph" and kind != "metadata":
+                # hit.score may be None on legacy / synthetic paths -- default
+                # to 1.0 (neutral) instead of crashing on `None * float`.
+                surprise = hit.score if hit.score is not None else 1.0
+                rrf *= min(surprise, DISCOVERY_GRAPH_MULTIPLIER_CAP)
             per_chunk_rrf[hit.chunk_id] += rrf
-            per_chunk_breakdown[hit.chunk_id][retriever_name] = float(hit.score)
+            # hit.score may be None on legacy/synthetic paths; coerce
+            # to 0.0 in telemetry rather than crash on float(None).
+            per_chunk_breakdown[hit.chunk_id][retriever_name] = (
+                float(hit.score) if hit.score is not None else 0.0
+            )
             per_chunk_meta[hit.chunk_id] = hit
 
     # Per-doc accounting:

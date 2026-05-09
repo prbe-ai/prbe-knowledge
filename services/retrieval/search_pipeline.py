@@ -813,6 +813,7 @@ async def run_search(
         now=datetime.now(UTC),
         sort=None,  # Hard post-fusion sort removed from search path — see
         # module docstring. Recency boost above is the right tool.
+        discovery=req.discovery,
     )
     timing["fusion_ms"] = (time.perf_counter() - t_fuse) * 1000
 
