@@ -448,7 +448,9 @@ class MatchProvenance(BaseModel):
     reached via vector AND graph walks carries two MatchProvenance rows.
     """
 
-    channel: Literal["vector", "bm25", "graph", "inferred_edge", "id_lookup"]
+    channel: Literal[
+        "vector", "bm25", "graph", "inferred_edge", "id_lookup", "directed"
+    ]
     rank: int
     score: float
     # Populated only when channel == "inferred_edge":

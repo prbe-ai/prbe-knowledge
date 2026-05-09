@@ -330,6 +330,7 @@ def _build_document_results_from_fused(
     fused_top: list[FusedDocument],
     ranked_lists: dict[str, list[Any]],
     graph_hits: list[GraphHit],
+    directed_hits: list[Any] | None = None,
 ) -> list[QueryDocumentResult]:
     """Convert each FusedDocument to a QueryDocumentResult.
 
@@ -340,10 +341,24 @@ def _build_document_results_from_fused(
 
     Within a doc, chunks are emitted in their FusedDocument order
     (fusion already sorted by score desc). `matched_via` is built from
-    `ranked_lists` so every channel that surfaced the doc contributes a
-    MatchProvenance entry.
+    `ranked_lists` (chunk-level channels) plus `directed_hits` (the
+    doc-level directed channel) so every channel that surfaced the doc
+    contributes a MatchProvenance entry.
     """
     per_channel = _per_channel_doc_ranks(ranked_lists)
+    # Directed is a doc-level signal — DirectedHits aren't chunks, so they
+    # bypass `ranked_lists` (which fuse() consumes as chunk-level RRF
+    # contributors). Build the per-doc rank map directly from the hits;
+    # the retriever already DISTINCT-ON's to one row per doc and orders
+    # by distance ASC, so list position == similarity rank.
+    directed_per_doc: dict[str, tuple[int, float]] = {}
+    for rank, hit in enumerate(directed_hits or [], start=1):
+        # First occurrence per doc wins (DistanceASC + DISTINCT ON
+        # guarantees this anyway, but be defensive).
+        if hit.doc_id not in directed_per_doc:
+            directed_per_doc[hit.doc_id] = (rank, float(getattr(hit, "score", 0.0)))
+    per_channel["directed"] = directed_per_doc
+
     graph_evidence = _graph_evidence_by_doc(graph_hits)
 
     results: list[QueryDocumentResult] = []
@@ -364,7 +379,7 @@ def _build_document_results_from_fused(
         # Score = the channel's best score for this doc; rank = the
         # channel's best (lowest) rank for this doc.
         provenances: list[MatchProvenance] = []
-        for channel in ("vector", "bm25", "graph", "id_lookup"):
+        for channel in ("vector", "bm25", "graph", "id_lookup", "directed"):
             entry = per_channel.get(channel, {}).get(doc.doc_id)
             if entry is None:
                 continue
@@ -1027,7 +1042,7 @@ async def run_search(
     # (feat/doc-grouped-retrieval) enriches the chunk-list aggregation;
     # for now we group chunks already present in the fused output.
     document_results = _build_document_results_from_fused(
-        top, ranked_lists, graph_hits
+        top, ranked_lists, graph_hits, directed_hits=directed_hits
     )
 
     # Primary docs feed the inferred-edge channel anchors. document_results
