@@ -199,17 +199,16 @@ async def test_three_most_recent_commits_returns_only_commits_sorted(live_db) ->
     body = resp.json()
     assert body["applied_mode"] == "list"
     assert body["applied_doc_types"] == ["github.commit"]
-    documents = body["documents"]
-    assert len(documents) == 3
+    # Polymorphic shape: list pipeline returns Document results; the title
+    # lives on the Document itself, not on the nested chunk
+    # (PR feat/polymorphic-search-results).
+    docs = [r for r in body["results"] if r["node_type"] == "Document"]
+    assert len(docs) == 3
     # Newest first, all commits, no PR leakage.
-    titles = [d["title"] for d in documents]
+    titles = [d["title"] for d in docs]
     assert titles == ["commit 0", "commit 1", "commit 2"]
-    for d in documents:
+    for d in docs:
         assert "PR" not in (d["title"] or "")
-        # List mode emits one chunk per doc.
-        assert d["chunk_count"] == 1
-        assert len(d["chunks"]) == 1
-        assert d["chunks"][0]["rank_in_doc"] == 1
 
 
 async def test_haiku_misclassifies_topic_query_as_list_dispatcher_falls_back(
@@ -304,8 +303,8 @@ async def test_router_fallback_routes_to_search(live_db) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["applied_mode"] == "search"
-    # Doc-grouped shape on the search path.
-    assert isinstance(body["documents"], list)
+    # Polymorphic results list shape (PR feat/polymorphic-search-results).
+    assert isinstance(body["results"], list)
     assert body["aggregation"] is None
 
 
@@ -358,7 +357,13 @@ async def test_author_id_surfaces_on_list_chunks(live_db) -> None:
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    by_doc = {d["doc_id"]: d for d in body["documents"]}
+    # author_id moved from chunk-level (old QueryChunk) to doc-level
+    # (QueryDocumentResult) per the polymorphic shape.
+    by_doc = {
+        d["doc_id"]: d
+        for d in body["results"]
+        if d["node_type"] == "Document"
+    }
     assert by_doc["github:repo:commit:by-mahit"]["author_id"] == "mahit"
     assert by_doc["github:repo:commit:no-author"]["author_id"] is None
 
@@ -403,9 +408,10 @@ async def test_author_id_surfaces_on_search_chunks(live_db) -> None:
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["applied_mode"] == "search"
-    assert len(body["documents"]) >= 1
+    docs = [r for r in body["results"] if r["node_type"] == "Document"]
+    assert len(docs) >= 1
     target = next(
-        (d for d in body["documents"] if d["doc_id"] == "github:repo:commit:mahit-search"),
+        (d for d in docs if d["doc_id"] == "github:repo:commit:mahit-search"),
         None,
     )
     assert target is not None, "seeded commit did not surface in search results"
@@ -447,5 +453,5 @@ async def test_count_query_returns_aggregation(live_db) -> None:
     assert resp.status_code == 200
     body = resp.json()
     assert body["applied_mode"] == "list"
-    assert body["documents"] == []  # count query, no docs
+    assert body["results"] == []  # count query, no per-doc results
     assert body["aggregation"] == {"count": 3}

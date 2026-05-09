@@ -1,8 +1,9 @@
 """Unit tests for graph-retriever confidence filtering.
 
-Bundle-construction tests deleted in the doc-grouped retrieval refactor.
-Per-chunk graph_evidence + top-level confidence_breakdown are now covered
-by tests/retrieval/test_doc_grouped_retrieval.py.
+The bundle-construction tests that previously lived here were removed when
+QueryBundle was dropped from QueryResponse (the polymorphic search-result
+shape replaced bundles with `QueryDocumentResult.matched_via` provenance
+on per-doc results -- see PR feat/polymorphic-search-results).
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from services.retrieval.retrievers.graph import (
     CODE_GRAPH_LABELS,
     passes_confidence_filter,
 )
+
 
 # ---- confidence filter ----------------------------------------------------
 

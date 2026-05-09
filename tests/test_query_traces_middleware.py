@@ -29,7 +29,7 @@ from httpx import ASGITransport
 from shared.config import Settings, get_settings
 from shared.constants import SourceSystem
 from shared.db import close_pool, init_pool, raw_conn
-from shared.models import QueryChunk, QueryDocument, QueryResponse
+from shared.models import QueryChunk, QueryResponse
 
 INTERNAL_KEY = "test-internal-knowledge-key"
 
@@ -73,10 +73,20 @@ async def _seed_customer(customer_id: str) -> str:
 
 
 def _stub_pipeline(monkeypatch, *, chunk_count: int = 2) -> None:
+    """Replace run_retrieval with a stub returning N Document results.
+
+    Polymorphic shape (PR feat/polymorphic-search-results): the response
+    carries `results: list[QueryResult]` instead of `chunks`. Each
+    Document in this stub has a single QueryChunk so the trace-row size
+    test still gets a representative payload.
+    """
+    from shared.models import QueryDocumentResult
+
     async def fake_run_retrieval(req, customer_id):
         now = datetime.now(UTC)
-        documents = [
-            QueryDocument(
+        docs = [
+            QueryDocumentResult(
+                canonical_id=f"doc-{i}",
                 doc_id=f"doc-{i}",
                 doc_version=1,
                 source_system=SourceSystem.SLACK,
@@ -85,22 +95,22 @@ def _stub_pipeline(monkeypatch, *, chunk_count: int = 2) -> None:
                 created_at=now,
                 updated_at=now,
                 score=1.0 - i * 0.1,
-                rank=i,
-                chunk_count=1,
+                rank=i + 1,
                 chunks=[
                     QueryChunk(
                         chunk_id=f"c{i}",
+                        content=f"content {i}",
                         score=1.0 - i * 0.1,
                         rank_in_doc=1,
-                        content=f"content {i}",
                     )
                 ],
+                chunk_count=1,
             )
             for i in range(chunk_count)
         ]
         return QueryResponse(
             query=req.query,
-            documents=documents,
+            results=list(docs),
             total_candidates=chunk_count,
             router_hit_cache=False,
             timing_ms={"router_ms": 1.0},
@@ -197,7 +207,7 @@ async def test_middleware_writes_both_usage_event_and_trace(
     assert trace["response_truncated"] is False
     response = _jsonb(trace["response"])
     assert response is not None
-    assert len(response["documents"]) == 2
+    assert len(response["results"]) == 2
 
     # request_id continuity: both writes used the same uuid.
     async with raw_conn() as conn:
@@ -241,8 +251,10 @@ async def test_middleware_query_trace_write_failure_does_not_affect_response(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["query"] == "hello"
-    assert len(body["documents"]) == 1
-    assert body["documents"][0]["chunks"][0]["chunk_id"] == "c0"
+    # Polymorphic shape: chunks live under results[0].chunks
+    # (PR feat/polymorphic-search-results).
+    assert len(body["results"]) == 1
+    assert body["results"][0]["chunks"][0]["chunk_id"] == "c0"
 
     # No trace row written (the patched write raised). usage_events row
     # still present — it's an independent BackgroundTask in the chain.
@@ -326,13 +338,16 @@ async def test_middleware_query_stream_captures_response(
         timing={"router_ms": 5.0},
         dispatch_mode="search",
     )
+    from shared.models import QueryDocumentResult
+
     chunk = QueryChunk(
         chunk_id="c0",
+        content="hello",
         score=0.9,
         rank_in_doc=1,
-        content="hello",
     )
-    document = QueryDocument(
+    doc = QueryDocumentResult(
+        canonical_id="github:foo/bar:pr:1",
         doc_id="github:foo/bar:pr:1",
         doc_version=1,
         source_system=SourceSystem.GITHUB,
@@ -341,13 +356,13 @@ async def test_middleware_query_stream_captures_response(
         created_at=_dt.now(UTC),
         updated_at=_dt.now(UTC),
         score=0.9,
-        rank=0,
-        chunk_count=1,
+        rank=1,
         chunks=[chunk],
+        chunk_count=1,
     )
     rresp = QueryResponse(
         query="streamed?",
-        documents=[document],
+        results=[doc],
         total_candidates=1,
         router_hit_cache=False,
         applied_mode="search",
@@ -408,8 +423,8 @@ async def test_middleware_query_stream_captures_response(
     # Response is the full AnswerResponse shape, not an empty stub.
     assert response["answer"] == "Hello world."
     assert response["query"] == "streamed?"
-    assert len(response["documents"]) == 1
-    assert response["documents"][0]["chunks"][0]["chunk_id"] == "c0"
+    assert len(response["results"]) == 1
+    assert response["results"][0]["chunks"][0]["chunk_id"] == "c0"
     assert response["citations"][0]["chunk_id"] == "c0"
     assert response["insufficient_context"] is False
     assert response["model"] == "anthropic/claude-sonnet-4-6"
