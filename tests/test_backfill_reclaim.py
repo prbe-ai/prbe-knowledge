@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from services.ingestion import backfill_runner
 from services.ingestion.backfill_runner import (
     BackfillReclaimedError,
     _heartbeat_loop,
@@ -31,6 +32,7 @@ from services.ingestion.backfill_runner import (
     _mark_failed,
     _release_for_resume,
     _update_progress,
+    drain_pending_release_tasks,
     enqueue_slack_channel_backfill,
 )
 from services.ingestion.worker import ReclaimLoop
@@ -743,6 +745,74 @@ async def test_release_survives_cascading_cancel_of_outer_task(live_db) -> None:
         row = await conn.fetchrow(
             "SELECT status, last_cursor, events_enqueued FROM backfill_state "
             "WHERE customer_id='cust-cascade-cancel'"
+        )
+    assert row["status"] == BackfillStatus.PENDING.value
+    assert row["last_cursor"] == "cursor-mid-flight"
+    assert row["events_enqueued"] == 420
+
+
+@pytest.mark.asyncio
+async def test_drain_pending_release_tasks_completes_orphaned_release(
+    live_db,
+) -> None:
+    """Production failure mode reproduced (2026-05-09 07:36:14Z): the outer
+    task re-raises CancelledError while the release UPDATE is still mid-flight.
+    The release task is now orphaned on the loop; without drain, asyncio.run's
+    teardown sweep cancels it and the row stays 'running'. With drain, the
+    UPDATE lands and the row flips to 'pending'."""
+    await _insert_customer("cust-drain-orphan")
+    started_at = await _insert_backfill_state(
+        customer_id="cust-drain-orphan",
+        source=SourceSystem.LINEAR,
+        status=BackfillStatus.RUNNING.value,
+        heartbeat_offset_seconds=10,
+        last_cursor="cursor-mid-flight",
+        events_enqueued=420,
+    )
+
+    captured_release_task: asyncio.Task[bool] | None = None
+
+    async def cancel_handler() -> None:
+        # Mirrors the except asyncio.CancelledError: block in run_backfill.
+        nonlocal captured_release_task
+        try:
+            release_task = asyncio.create_task(
+                _release_for_resume(
+                    "cust-drain-orphan", SourceSystem.LINEAR, started_at
+                )
+            )
+            backfill_runner._PENDING_RELEASE_TASKS.add(release_task)
+            release_task.add_done_callback(
+                backfill_runner._PENDING_RELEASE_TASKS.discard
+            )
+            captured_release_task = release_task
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(release_task)
+            raise asyncio.CancelledError
+        except asyncio.CancelledError:
+            raise
+
+    task = asyncio.create_task(cancel_handler())
+    # Yield once so the task creates the release task and enters the shield.
+    await asyncio.sleep(0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    # The handler re-raised CancelledError. The release task should now be
+    # orphaned and tracked in _PENDING_RELEASE_TASKS.
+    assert captured_release_task is not None
+    assert captured_release_task in backfill_runner._PENDING_RELEASE_TASKS
+
+    drained = await drain_pending_release_tasks()
+    assert drained == 1
+    assert captured_release_task.done()
+    assert captured_release_task.result() is True
+
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, last_cursor, events_enqueued FROM backfill_state "
+            "WHERE customer_id='cust-drain-orphan'"
         )
     assert row["status"] == BackfillStatus.PENDING.value
     assert row["last_cursor"] == "cursor-mid-flight"

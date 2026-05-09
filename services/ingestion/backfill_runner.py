@@ -36,6 +36,11 @@ from shared.storage import get_store
 
 log = get_logger(__name__)
 
+# Tracks release Tasks spawned from run_backfill's CancelledError handler so
+# the worker can drain them before asyncio.run cancels everything else (which
+# would interrupt the asyncpg UPDATE roundtrip mid-flight). See PR #210.
+_PENDING_RELEASE_TASKS: set[asyncio.Task[bool]] = set()
+
 PROGRESS_EVERY_N_EVENTS = 25
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
 # How often to re-check `integration_tokens.status='active'` mid-backfill.
@@ -300,12 +305,10 @@ async def run_backfill(
         )
         counter("backfill.preempted", 1, source=source.value)
     except asyncio.CancelledError:
-        # Process is shutting down (SIGTERM during a deploy) mid-backfill.
-        # Release the claim now so the next worker resumes from `last_cursor`
-        # within seconds, rather than waiting for the 5-min stale-heartbeat
-        # reclaim cron. The asyncpg call inside the handler runs to completion
-        # because asyncio.gather hasn't torn down yet — it's still waiting on
-        # this task to exit.
+        # SIGTERM during deploy. Spawn release as a tracked top-level task so
+        # it survives the re-raise; drain_pending_release_tasks() (called from
+        # the worker's outer finally) awaits it before asyncio.run teardown
+        # cancels everything.
         log.warning(
             "backfill.released_on_cancel",
             customer=customer_id,
@@ -313,11 +316,13 @@ async def run_backfill(
             enqueued=enqueued,
         )
         counter("backfill.released_on_cancel", 1, source=source.value)
+        release_task = asyncio.create_task(
+            _release_for_resume(customer_id, source, claim_token)
+        )
+        _PENDING_RELEASE_TASKS.add(release_task)
+        release_task.add_done_callback(_PENDING_RELEASE_TASKS.discard)
         try:
-            # Shielded so a cascading cancel can't abort the UPDATE roundtrip mid-flight.
-            await asyncio.shield(
-                _release_for_resume(customer_id, source, claim_token)
-            )
+            await asyncio.shield(release_task)
         except (Exception, asyncio.CancelledError):
             log.exception(
                 "backfill.release_on_cancel_failed",
@@ -939,6 +944,32 @@ async def claim_pending_backfill() -> tuple[str, SourceSystem] | None:
             row["source_system"],
         )
     return row["customer_id"], SourceSystem(row["source_system"])
+
+
+async def drain_pending_release_tasks(timeout_seconds: float = 20.0) -> int:
+    """Await any in-flight release tasks before loop teardown. Called from
+    the worker's outer finally so asyncio.run's task-cancel sweep can't
+    abort the asyncpg UPDATE mid-roundtrip.
+
+    Returns the number of tasks drained. Tasks that don't finish within
+    timeout_seconds are abandoned (they'll be cancelled by asyncio.run,
+    same as today).
+    """
+    if not _PENDING_RELEASE_TASKS:
+        return 0
+    pending = list(_PENDING_RELEASE_TASKS)
+    log.info("backfill.draining_release_tasks", count=len(pending))
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        log.warning(
+            "backfill.drain_release_timeout",
+            count=len(_PENDING_RELEASE_TASKS),
+        )
+    return len(pending)
 
 
 # Date/time helpers used in tests.

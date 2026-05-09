@@ -905,6 +905,10 @@ async def run_worker_forever() -> None:
         except asyncio.CancelledError:
             log.info("worker.shutdown_complete")
     finally:
+        # Drain in-flight release tasks before asyncio.run's task-cancel sweep
+        # interrupts their asyncpg UPDATE mid-roundtrip. See PR #210.
+        from services.ingestion.backfill_runner import drain_pending_release_tasks
+        await drain_pending_release_tasks()
         await ctx.http.aclose()
 
 
