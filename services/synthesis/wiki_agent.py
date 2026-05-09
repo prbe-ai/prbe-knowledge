@@ -47,6 +47,7 @@ from services.synthesis.agent_tools import (
     SkipEventsArgs,
     UpdatePageArgs,
 )
+from services.synthesis.directed_phrases import persist_directed_vectors
 from services.synthesis.wiki_links import extract_links, persist_links_for_page
 from shared.constants import (
     WIKI_AGENT_BATCH_SIZE,
@@ -569,6 +570,15 @@ class WikiAgentRuntime:
                 body_markdown=update.body_markdown,
                 frontmatter=existing_frontmatter,
             )
+            # Directed-vector trigger phrases (engineer-pinned + LLM).
+            # Best-effort, never blocks the page write.
+            await self._persist_directed_safely(
+                wiki_type=update.wiki_type,
+                slug=update.slug,
+                title=existing.get("title") or "",
+                body_markdown=update.body_markdown,
+                frontmatter=existing_frontmatter,
+            )
         # lock auto-releases on with_tenant's txn commit at scope exit.
 
     async def _persist_create(self, create: _StagedCreate) -> None:
@@ -598,6 +608,15 @@ class WikiAgentRuntime:
             await self._persist_links_safely(
                 wiki_type=create.wiki_type,
                 slug=create.slug,
+                body_markdown=create.body_markdown,
+                frontmatter=create.frontmatter,
+            )
+            # Directed-vector trigger phrases (engineer-pinned + LLM).
+            # Best-effort, never blocks the page write.
+            await self._persist_directed_safely(
+                wiki_type=create.wiki_type,
+                slug=create.slug,
+                title=create.title,
                 body_markdown=create.body_markdown,
                 frontmatter=create.frontmatter,
             )
@@ -640,6 +659,55 @@ class WikiAgentRuntime:
         except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
             log.warning(
                 "agent.link_persist_failed",
+                customer=self.customer_id,
+                wiki_type=wiki_type,
+                slug=slug,
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
+
+    async def _persist_directed_safely(
+        self,
+        *,
+        wiki_type: str,
+        slug: str,
+        title: str,
+        body_markdown: str,
+        frontmatter: dict[str, Any],
+    ) -> None:
+        """Reconcile directed_vectors rows for a freshly-written wiki page.
+
+        Calls services.synthesis.directed_phrases.persist_directed_vectors
+        with the page's frontmatter pins + an LLM-generated phrase set.
+        Best-effort: any failure logs and is swallowed so the page write
+        path stays bulletproof. The directed retriever silently treats a
+        missing-rows page as "no booster signal" — same outcome as a
+        page with no phrases at all.
+        """
+        doc_id = f"wiki:{wiki_type}:{slug}"
+        try:
+            res = await persist_directed_vectors(
+                customer_id=self.customer_id,
+                doc_id=doc_id,
+                page_title=title,
+                page_body=body_markdown,
+                frontmatter=frontmatter,
+                synthesis_run_id=self._run_id,
+            )
+            log.info(
+                "agent.directed_persisted",
+                customer=self.customer_id,
+                wiki_type=wiki_type,
+                slug=slug,
+                human_added=res.human_added,
+                human_removed=res.human_removed,
+                llm_added=res.llm_added,
+                llm_removed=res.llm_removed,
+                llm_failed=res.llm_failed,
+            )
+        except Exception as exc:
+            log.warning(
+                "agent.directed_persist_failed",
                 customer=self.customer_id,
                 wiki_type=wiki_type,
                 slug=slug,

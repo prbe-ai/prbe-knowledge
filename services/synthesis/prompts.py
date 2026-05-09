@@ -183,6 +183,109 @@ def triage_tool_name() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Directed-vector phrase generation (Anthropic-shaped tool_use prompt)
+# ---------------------------------------------------------------------------
+#
+# Emits short trigger phrases describing what a wiki page should be
+# retrieved for. Phrases are embedded and stored in `directed_vectors`;
+# the directed retriever ANN-matches user queries against them and
+# fusion folds the best per-doc match into the doc score.
+#
+# Hybrid authoring: engineer-pinned phrases (from the page's frontmatter
+# `directed:` block) coexist with these LLM-generated ones; humans always
+# win on collision (see services/synthesis/directed_phrases.py).
+#
+# Provider-agnostic shape: the helper in services/synthesis/providers.py
+# accepts the same Anthropic kwargs and translates to Gemini structured
+# output when the model name resolves to a Gemini variant.
+
+_DIRECTED_TOOL_NAME = "record_directed_phrases"
+
+_DIRECTED_TOOL: dict[str, Any] = {
+    "name": _DIRECTED_TOOL_NAME,
+    "description": (
+        "Emit 5-10 short trigger phrases the page should be retrievable for. "
+        "Phrases describe SPECIFIC SYMPTOMS or SITUATIONS, not generic IT terms. "
+        "5-12 tokens each. Do NOT include phrases that would match unrelated "
+        "runbooks; prefer the specific failure mode this page exists to address."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "phrases": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "List of trigger phrases. Each phrase is a short natural-"
+                    "language description (5-12 tokens) of a problem, symptom, "
+                    "or situation this page should be retrieved for. Specific > "
+                    "generic. Do not include the page title verbatim."
+                ),
+            }
+        },
+        "required": ["phrases"],
+    },
+}
+
+
+def _directed_system() -> str:
+    return (
+        "You write retrieval trigger phrases for a wiki page. The phrases will "
+        "be embedded and matched against future user queries; a semantic match "
+        "boosts this page in retrieval ranking.\n\n"
+        "Goal: when an engineer asks about the SPECIFIC problem this page "
+        "addresses (in their own words, phrased as a symptom or situation), "
+        "the page should surface — even if their query doesn't share words "
+        "with the page body.\n\n"
+        "Rules:\n"
+        "  - 5-10 phrases. Each 5-12 tokens.\n"
+        "  - Specific symptoms over generic IT terms ('deploy timeout on "
+        "    fly machine after 5 minutes' beats 'deployment problem').\n"
+        "  - Phrase the situation as a user would describe it.\n"
+        "  - Do not include the page title verbatim.\n"
+        "  - Do not include phrases that would match unrelated runbooks.\n"
+        "  - Cover the page's distinct retrieval angles (different symptoms "
+        "    or situations the page addresses).\n"
+    )
+
+
+def build_directed_phrases_prompt(
+    *, page_title: str, page_body: str, max_tokens: int = 1024
+) -> dict[str, Any]:
+    """Construct kwargs for `AsyncAnthropic.messages.create` to generate
+    directed-vector trigger phrases for a wiki page.
+
+    Caller adds `model=<id>` and reads the tool_use block named
+    `record_directed_phrases` to pull the `phrases` list out.
+    """
+    user = (
+        "Page title:\n"
+        f"{page_title}\n\n"
+        "Page body:\n"
+        "<body>\n"
+        f"{page_body}\n"
+        "</body>\n"
+    )
+    return {
+        "max_tokens": max_tokens,
+        "system": [
+            {
+                "type": "text",
+                "text": _directed_system(),
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+        "tools": [_DIRECTED_TOOL],
+        "tool_choice": {"type": "tool", "name": _DIRECTED_TOOL_NAME},
+        "messages": [{"role": "user", "content": user}],
+    }
+
+
+def directed_tool_name() -> str:
+    return _DIRECTED_TOOL_NAME
+
+
+# ---------------------------------------------------------------------------
 # Wiki agent (v4 Gemini Pro loop) + compactor system prompts
 # ---------------------------------------------------------------------------
 
