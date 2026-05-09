@@ -60,6 +60,67 @@ def _build_or_tsquery_string(query_text: str) -> str:
     return " | ".join(tokens)
 
 
+# Identifier-frame descriptor words. These accompany a stable identifier
+# in queries like "agent session <uuid>", "ticket PRB-17", "pr <repo>#49"
+# to tell the reader what kind of thing the id refers to. When at least
+# one stable identifier is in the query they add zero topical signal and
+# balloon BM25 selectivity — every claude_code transcript chunk contains
+# "agent" and "session", so OR'ing them in drags 10k+ unrelated chunks
+# through the heap recheck + ts_rank_cd. Stripped only when an identifier
+# is present; a bare "session timeout" remains a valid topical query.
+_BM25_IDENTIFIER_DESCRIPTORS: frozenset[str] = frozenset(
+    {
+        "agent",
+        "session",
+        "ticket",
+        "issue",
+        "pr",
+        "prs",
+        "pull",
+        "commit",
+        "sha",
+    }
+)
+
+
+def residualize_for_bm25(
+    query_text: str, identifier_canonical_ids: list[str]
+) -> str | None:
+    """Return the topical residual of `query_text` once identifier tokens and
+    identifier-frame descriptors are stripped, or None when nothing useful
+    remains.
+
+    id_lookup pins docs by exact identifier match; for queries that consist
+    entirely of "<descriptor> <identifier>" (e.g. "agent session
+    3c325e11-2008-46a9-83f7-fc40d11eaf82" or "ticket PRB-17"), BM25 has no
+    recall to add — every token left in the OR'd tsquery is either the
+    identifier itself (id_lookup already handles it) or a high-DF
+    descriptor that matches tens of thousands of unrelated chunks. Skipping
+    BM25 in that case removes seconds of pure noise work without losing
+    recall (vector + graph still run, id_lookup pins the doc).
+
+    When the user adds genuine topical tokens (e.g. "<uuid> auth refactor"),
+    the residual "auth refactor" is returned so BM25 still contributes —
+    now selective enough to be cheap.
+    """
+    if not identifier_canonical_ids:
+        return query_text or None
+
+    stops: set[str] = set(_BM25_IDENTIFIER_DESCRIPTORS)
+    for cid in identifier_canonical_ids:
+        for tok in _TOKEN_RE.findall(cid):
+            stops.add(tok.lower())
+
+    residual = [
+        tok
+        for tok in _TOKEN_RE.findall(query_text)
+        if len(tok) >= 2 and tok.lower() not in stops
+    ]
+    if not residual:
+        return None
+    return " ".join(residual)
+
+
 async def bm25_search(
     customer_id: str,
     query_text: str,
