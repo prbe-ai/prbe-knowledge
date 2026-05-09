@@ -413,16 +413,18 @@ class GitHubConnector(Connector):
         if release_id is None:
             raise InvalidWebhookPayload("release missing id")
 
-        # Pick the freshest timestamp available — releases evolve through
-        # draft -> published and we want each transition to land as a
-        # distinct source_event_id row.
+        # GitHub's release schema doesn't define `updated_at`, but check
+        # for it defensively in case a future API version adds one.
+        # `published_at` is the canonical signal of state change for an
+        # action=published event; `created_at` is the fallback for
+        # drafts and other actions where published_at is null.
         ts = (
             release.get("updated_at")
             or release.get("published_at")
             or release.get("created_at")
         )
         if not ts:
-            raise InvalidWebhookPayload("release missing updated_at/published_at/created_at")
+            raise InvalidWebhookPayload("release missing published_at/created_at")
 
         source_event_id = (
             f"release:{full_name}:{release_id}:{action}:{ts}:{_payload_fp(release)}"
@@ -1676,11 +1678,15 @@ class GitHubConnector(Connector):
                 "repo_full_name": full_name,
                 "comment_id": comment_id,
                 "commit_id": commit_sha,
-                # Inline commit-comments on the diff carry path/position;
-                # top-level commit comments (Files Changed view) leave
-                # them null.
+                # Inline commit-comments on the diff carry path/position/line;
+                # top-level commit comments (Files Changed view) leave them
+                # null. `position` is the line index within the diff hunk;
+                # `line` is the line number in the file's blob — distinct
+                # signals, both useful for retrieval that surfaces "comment
+                # on line N of file X" vs "comment at diff offset Y".
                 "path": comment.get("path"),
                 "position": comment.get("position"),
+                "line": comment.get("line"),
                 "visibility": _repo_visibility(repo),
                 "body_truncated": body_truncated,
             },

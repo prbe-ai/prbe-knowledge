@@ -797,6 +797,7 @@ async def test_normalize_commit_comment_produces_document_and_graph() -> None:
     assert doc.metadata["commit_id"] == "deadbeefcafe1234567890abcdef0011223344"
     assert doc.metadata["path"] == "services/payments/retry.py"
     assert doc.metadata["position"] == 42
+    assert doc.metadata["line"] == 117
     assert doc.body.startswith("Did we mean to remove")
 
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
@@ -983,10 +984,13 @@ def test_parse_repository_unarchived_returns_none() -> None:
 
 
 def test_parse_repository_transferred_with_rename() -> None:
-    """GitHub can transfer-and-rename in one event (admin moves
-    old-org/foo to new-org/bar atomically). The OLD path uses
-    changes.repository.name.from for the trailing segment, not
-    repository.name (which holds the new name)."""
+    """Octokit's published `repository.transferred` schema is strict
+    (`additionalProperties: false` on changes) and does NOT include
+    `repository.name.from` — so transfer+rename in one event isn't
+    something GitHub actually emits today. We still cover the fallback
+    path defensively because the docs are incomplete and real-world
+    webhook payloads have historically drifted from the published
+    schema."""
     connector = _build()
     payload = _load("repository_transferred.json")
     payload["changes"]["repository"] = {"name": {"from": "payments-old"}}
