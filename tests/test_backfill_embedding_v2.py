@@ -87,6 +87,30 @@ async def test_argparse_rejects_negative_max_batches(capsys) -> None:
     assert exc_info.value.code == 2
 
 
+@pytest.mark.asyncio
+async def test_argparse_rejects_worker_id_out_of_range(capsys) -> None:
+    # --worker-id >= --workers catches typos like `--workers 4 --worker-id 4`
+    # before they silently fetch zero rows and exit looking like success.
+    with pytest.raises(SystemExit) as exc_info:
+        await main(["--workers", "4", "--worker-id", "4"])
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_argparse_rejects_negative_worker_id(capsys) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        await main(["--workers", "4", "--worker-id", "-1"])
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.asyncio
+async def test_argparse_rejects_zero_workers(capsys) -> None:
+    # --workers must be > 0; mod(_, 0) is a Postgres error.
+    with pytest.raises(SystemExit) as exc_info:
+        await main(["--workers", "0"])
+    assert exc_info.value.code == 2
+
+
 # ---------------------------------------------------------------------------
 # Live-DB tests
 # ---------------------------------------------------------------------------
@@ -200,6 +224,65 @@ async def test_backfill_populates_null_chunk(live_db) -> None:
             assert row["embedding_v2"] is not None
             assert row["embedding_v2_model"] == "google/gemini-embedding-2-preview"
             assert row["embedding_v2_dim"] == 3072
+    finally:
+        await _cleanup(cust)
+
+
+@pytest.mark.asyncio
+async def test_backfill_partitions_are_disjoint_and_complete(live_db) -> None:
+    """Two parallel workers split the rows by hashtext modulo. Together they
+    cover every NULL row in the customer; neither one alone covers all.
+    Without disjoint partitioning, multi-process runs would either
+    double-bill (overlap) or skip rows (gap).
+    """
+    cust = "cust-bf-v2-part"
+    try:
+        async with raw_conn() as conn:
+            await _insert_customer(conn, cust)
+            await _insert_doc(conn, cust, "doc-1", "T")
+            # 20 chunks gives both partitions a non-trivial slice with high
+            # probability under hashtext's even distribution.
+            for i in range(20):
+                await _insert_chunk_no_v2(conn, cust, "doc-1", i, f"content {i}")
+
+        # Worker 0 only.
+        rc0 = await main(
+            ["--customer", cust, "--workers", "2", "--worker-id", "0", "--cost-cap", "1.0"]
+        )
+        assert rc0 == 0
+
+        # Some rows remain (partition 1 unfilled). Verify both:
+        #   - Worker 0 is fully drained (no NULL rows in its partition).
+        #   - Customer-level NULL count is > 0 (worker 1 still owns some).
+        async with raw_conn() as conn:
+            null_after_w0 = await conn.fetchval(
+                "SELECT COUNT(*) FROM chunks WHERE customer_id=$1 AND embedding_v2 IS NULL",
+                cust,
+            )
+            null_in_w0_partition = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM chunks
+                WHERE customer_id=$1 AND embedding_v2 IS NULL
+                  AND mod(abs(hashtext(chunk_id)), 2) = 0
+                """,
+                cust,
+            )
+        assert null_in_w0_partition == 0, "worker 0 left NULLs in its own partition"
+        assert null_after_w0 > 0, "if worker 0 covered everything, partitioning is broken"
+        assert null_after_w0 < 20, "worker 0 covered nothing — partition predicate broken"
+
+        # Worker 1 finishes the rest.
+        rc1 = await main(
+            ["--customer", cust, "--workers", "2", "--worker-id", "1", "--cost-cap", "1.0"]
+        )
+        assert rc1 == 0
+
+        async with raw_conn() as conn:
+            final_null = await conn.fetchval(
+                "SELECT COUNT(*) FROM chunks WHERE customer_id=$1 AND embedding_v2 IS NULL",
+                cust,
+            )
+        assert final_null == 0, "two workers together left NULLs — partitions don't tile"
     finally:
         await _cleanup(cust)
 
