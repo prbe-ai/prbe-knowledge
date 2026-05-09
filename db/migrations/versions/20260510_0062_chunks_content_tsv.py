@@ -37,22 +37,52 @@ depends_on = None
 
 def upgrade() -> None:
     # ADD COLUMN GENERATED triggers a full table rewrite. AccessExclusiveLock
-    # held for the duration (chunks: ~444 MB heap, 90k rows; expect 3-7 min
-    # in prod). Reads keep working through the cutover -- the existing GIN
-    # index covers BM25 traffic until the new index is online and code cuts
-    # over.
+    # is held on `chunks` for the duration (chunks: ~444 MB heap, 90k rows;
+    # expect 3-7 min in prod). Reads on `chunks` block for that window --
+    # BM25, vector, dedup, and ingestion all queue. Other tables unaffected.
+    # The follow-up cleanup PR's DROP INDEX is metadata-only and does not
+    # repeat this stall.
+    #
+    # IF NOT EXISTS only helps the narrow case where ADD COLUMN already
+    # committed and CREATE INDEX CONCURRENTLY (below) failed afterward; a
+    # mid-rewrite kill rolls back via alembic's transaction wrapper and the
+    # next run re-rewrites from scratch.
     op.execute(
         """
         ALTER TABLE chunks
-        ADD COLUMN content_tsv tsvector
+        ADD COLUMN IF NOT EXISTS content_tsv tsvector
         GENERATED ALWAYS AS (to_tsvector('english', content)) STORED
         """
     )
 
     # CREATE INDEX CONCURRENTLY cannot run inside a transaction. autocommit_block
-    # breaks alembic's wrapper for this statement only. IF NOT EXISTS makes the
-    # migration restart-safe if the build is interrupted (e.g. timeout, OOM).
+    # breaks alembic's wrapper for these statements only.
     with op.get_context().autocommit_block():
+        # Recover from a prior partial run: a CREATE INDEX CONCURRENTLY that
+        # was interrupted (timeout, OOM, killed by Fly's release-command
+        # deadline) leaves an INVALID index on disk. Plain `IF NOT EXISTS`
+        # below would skip by name alone and never rebuild, leaving the
+        # INVALID index in place -- queries hit it but the planner ignores
+        # it for read serving, so BM25 silently falls back to seq scan.
+        # Drop any INVALID-marked instance first so the recreate below
+        # actually rebuilds.
+        op.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (
+                    SELECT 1
+                    FROM pg_class c
+                    JOIN pg_index i ON i.indexrelid = c.oid
+                    WHERE c.relname = 'idx_chunks_content_tsv'
+                      AND NOT i.indisvalid
+                ) THEN
+                    EXECUTE 'DROP INDEX idx_chunks_content_tsv';
+                END IF;
+            END
+            $$;
+            """
+        )
         op.execute(
             """
             CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_content_tsv
@@ -62,6 +92,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # WARNING: this downgrade hard-breaks BM25 retrieval the moment DROP
+    # COLUMN runs. Any retrieval pod still serving the new code references
+    # `c.content_tsv` and will start raising `column "content_tsv" does
+    # not exist` until the pod is restarted on the rolled-back binary.
+    # Recovery sequence in an emergency:
+    #   1. Roll back the retrieval / mcp / cron app images first.
+    #   2. Confirm no live process references content_tsv.
+    #   3. Then run alembic downgrade.
     with op.get_context().autocommit_block():
         op.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_content_tsv")
     op.execute("ALTER TABLE chunks DROP COLUMN IF EXISTS content_tsv")

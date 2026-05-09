@@ -220,11 +220,15 @@ CREATE INDEX idx_chunks_customer       ON chunks (customer_id);
 CREATE INDEX idx_chunks_doc            ON chunks (doc_id);
 CREATE INDEX idx_chunks_doc_live       ON chunks (doc_id) WHERE valid_to IS NULL;
 CREATE INDEX idx_chunks_doc_hash       ON chunks (doc_id, content_hash);
+-- TEMPORARY: scheduled for removal in the contract-phase migration that
+-- follows 0062. Kept during the EXPAND window so old retrieval pods
+-- running pre-0062 binaries (which BM25 against `to_tsvector('english',
+-- content)`) still hit a real index during the rolling deploy. Once the
+-- new code is fully rolled out, the cleanup PR drops this.
 CREATE INDEX idx_chunks_fts_content    ON chunks USING GIN (to_tsvector('english', content));
--- New BM25 index over the stored content_tsv column (migration 0062). Coexists
--- with idx_chunks_fts_content for the EXPAND phase of expand/contract; the
--- follow-up cleanup PR drops the expression-based index after deploy is
--- verified.
+-- New BM25 index over the stored content_tsv column (migration 0062).
+-- Becomes the sole BM25 index after the contract-phase cleanup PR drops
+-- the expression-based one above.
 CREATE INDEX idx_chunks_content_tsv    ON chunks USING GIN (content_tsv);
 -- One metadata chunk per doc; partial index serves backfill idempotency check.
 CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kind = 'metadata';

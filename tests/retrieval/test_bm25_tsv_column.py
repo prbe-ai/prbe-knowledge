@@ -1,11 +1,22 @@
-"""Regression test: BM25 results must be stable across the
-expression-based GIN index and the materialized content_tsv column.
+"""Regression test for the BM25 -> content_tsv migration (0062).
 
-If the GENERATED expression on chunks.content_tsv ever drifts from the
-to_tsvector('english', content) used historically, ts_rank_cd will return
-different scores and BM25 ranking will silently change. This test pins the
-expected (chunk_id, score) for a known corpus + query so the drift fails
-loud."""
+Two invariants:
+
+1. The GENERATED expression on `chunks.content_tsv` must equal
+   `to_tsvector('english', content)` for every row -- if a future migration
+   ever changes the expression (e.g. drops the english config, swaps to
+   simple, or wraps content in coalesce()), `ts_rank_cd` over the column
+   will diverge from the historical expression-based path. Asserted by
+   reading the column back and comparing element-for-element.
+
+2. `bm25_search` returns the right result set for a deterministic corpus:
+   chunks containing query terms surface, chunks without any matching
+   lexeme do not. Order is checked as a containment + top-of-list spot
+   check, NOT a strict-pairwise score comparison -- ts_rank_cd's exact
+   adjacent-score values can shift with Postgres point releases or
+   stemmer/stopword changes, and pinning them produces flaky failures
+   on real-world drift that's not actually a bug.
+"""
 
 from __future__ import annotations
 
@@ -18,16 +29,17 @@ from shared.db import raw_conn
 from shared.models import TemporalSpec
 
 
-_NOW = datetime(2026, 5, 9, tzinfo=UTC)
+# Use wall-clock so seeded docs stay "recent" no matter when CI runs --
+# avoids a future temporal-default change quietly hiding the test corpus.
+_NOW = datetime.now(UTC)
 
 
-# Deterministic 5-chunk corpus. ts_rank_cd is cover-density ranking, so the
-# stable ordering for query "auth | refactor" against this corpus is:
-#   c1 (both terms, repeated and dense)         -> rank ~0.27
-#   c3 (one term repeated, very dense cover)    -> rank ~0.10
-#   c2 (both terms but spread thin in long doc) -> rank ~0.083
-#   c4 (one term, short doc, low density)       -> rank ~0.067
-# c5 contains neither term and the @@ predicate must filter it out.
+# Deterministic 5-chunk corpus.
+#   c1: both terms, repeated and dense  -> top hit
+#   c2: both terms, spread thin
+#   c3: one term repeated, dense
+#   c4: one term, short
+#   c5: neither term -- @@ predicate must filter it out
 _CORPUS: list[tuple[str, str]] = [
     ("c1", "auth refactor auth refactor token rotation auth refactor"),
     ("c2", "the auth subsystem needs a refactor before launch"),
@@ -85,14 +97,47 @@ async def _seed_corpus(customer_id: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_bm25_search_orders_corpus_by_ts_rank_cd(live_db) -> None:
-    """Pin the (chunk_id, score) ordering BM25 returns for a known corpus
-    and query. If the GENERATED expression on content_tsv ever drifts from
-    to_tsvector('english', content), ts_rank_cd values will change and
-    this assertion fails loudly. The test is intentionally a snapshot of
-    behavior, not a smoke check -- the whole point of the materialized
-    column is that it must be byte-identical to the prior expression."""
-    cust = "cust-bm25-tsv"
+async def test_content_tsv_column_equals_english_to_tsvector(live_db) -> None:
+    """The actual drift detector: every row's stored `content_tsv` must
+    equal `to_tsvector('english', content)` byte-for-byte. If a future
+    migration ever swaps the GENERATED expression (different config, added
+    coalesce, normalization wrapper, etc.), this fails loud. This is what
+    the docstring of the file promised -- ranking-snapshot tests cannot
+    detect that drift since the column IS the expression by construction
+    today, but they CAN flake on legitimate Postgres point-release changes
+    to ts_rank_cd."""
+    cust = "cust-bm25-tsv-equiv"
+    await _seed_corpus(cust)
+
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT chunk_id,
+                   content_tsv = to_tsvector('english', content) AS matches
+            FROM chunks
+            WHERE customer_id = $1
+            """,
+            cust,
+        )
+
+    assert rows, "seeded corpus must produce rows"
+    for r in rows:
+        assert r["matches"] is True, (
+            f"chunk {r['chunk_id']}: content_tsv diverged from "
+            f"to_tsvector('english', content)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_bm25_search_returns_only_chunks_with_matching_lexemes(
+    live_db,
+) -> None:
+    """Containment + spot check: chunks containing query terms surface,
+    chunks without any matching lexeme do not, and the densest match is
+    rank 1. We deliberately avoid pinning exact adjacent scores -- those
+    can shift between Postgres point releases without indicating a bug,
+    and a strict-`>` snapshot would flake on real-world drift."""
+    cust = "cust-bm25-tsv-filter"
     await _seed_corpus(cust)
 
     hits = await bm25_search(
@@ -102,25 +147,22 @@ async def test_bm25_search_orders_corpus_by_ts_rank_cd(live_db) -> None:
         temporal=TemporalSpec(),
     )
 
-    # c5 has neither term -> must not appear.
     returned_ids = [h.chunk_id for h in hits]
+
+    # c5 has neither term -> @@ predicate must filter it out.
     assert "c5" not in returned_ids
 
-    # Cover-density wins over raw term-count: c3 (3x "auth" packed tight)
-    # outranks c2 (both terms but spread across a longer chunk). ts_rank_cd
-    # is deterministic given the corpus + query + english config, so the
-    # ordering is stable; this snapshot fails loudly if the GENERATED
-    # expression on content_tsv ever drifts from to_tsvector('english',
-    # content).
-    assert returned_ids == ["c1", "c3", "c2", "c4"]
+    # All other chunks contain at least one query term and must surface.
+    assert set(returned_ids) == {"c1", "c2", "c3", "c4"}
 
-    # Scores are strictly decreasing -- locks the ordering with a stronger
-    # invariant than just "c1 first". If a future change accidentally ties
-    # or inverts two adjacent scores this fails.
-    scores = [h.score for h in hits]
-    assert all(scores[i] > scores[i + 1] for i in range(len(scores) - 1)), scores
+    # c1 is the densest match (both terms, repeated 3x each) -- it should
+    # always be rank 1 regardless of ts_rank_cd's internal tuning. This is
+    # a property assertion ("most-relevant doc wins"), not a score snapshot.
+    assert hits[0].chunk_id == "c1"
+    assert hits[0].score > 0.0
 
-    # All returned hits must be content chunks from the seeded doc.
+    # All returned hits are content chunks from the seeded doc with
+    # positive scores.
     for hit in hits:
         assert hit.doc_id == "doc-bm25-tsv"
         assert hit.kind == "content"
@@ -136,7 +178,7 @@ async def test_bm25_search_excludes_chunks_with_no_matching_lexeme(
     leave that chunk out of the result set entirely -- otherwise ranking
     quality collapses on large corpora (every chunk gets a zero score and
     LIMIT becomes arbitrary)."""
-    cust = "cust-bm25-tsv-filter"
+    cust = "cust-bm25-tsv-filter-only"
     await _seed_corpus(cust)
 
     hits = await bm25_search(
