@@ -1,0 +1,27 @@
+{
+  "action": "edited",
+  "changes": {
+    "default_branch": {
+      "from": "master"
+    }
+  },
+  "repository": {
+    "id": 9001,
+    "name": "payments",
+    "full_name": "prbe/payments",
+    "private": false,
+    "default_branch": "main",
+    "html_url": "https://github.com/prbe/payments",
+    "owner": {
+      "login": "prbe",
+      "id": 1
+    }
+  },
+  "installation": {
+    "id": 12345
+  },
+  "sender": {
+    "login": "alice",
+    "id": 501
+  }
+}

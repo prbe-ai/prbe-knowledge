@@ -100,13 +100,15 @@ _ISSUE_ACTIONS = frozenset(
 _REVIEW_ACTIONS = frozenset({"submitted"})
 _DELETE_ACTIONS = frozenset({"deleted", "transferred"})
 
-# Release actions. `published`/`released`/`created`/`edited`/`prereleased`
-# all carry useful state that should land as an upsert. `deleted` and
-# `unpublished` produce a tombstone (mirrors PR/issue delete pattern so
-# downstream retrieval consistently soft-deletes withdrawn content).
+# Release actions. `released` is excluded because GitHub fires it
+# alongside `published` for the same publish event (it tags the latest
+# non-prerelease) — including both would write the same release twice
+# with different actions in the source_event_id, neither deduping.
+# `created` is excluded because it fires on draft save; drafts are
+# filtered at normalize via release.draft anyway, but dropping at parse
+# avoids burning ingestion_queue rows for ephemeral draft state.
 _RELEASE_ACTIONS = frozenset(
-    {"published", "released", "created", "edited", "prereleased",
-     "deleted", "unpublished"}
+    {"published", "edited", "prereleased", "deleted", "unpublished"}
 )
 _RELEASE_DELETE_ACTIONS = frozenset({"deleted", "unpublished"})
 
@@ -115,19 +117,39 @@ _RELEASE_DELETE_ACTIONS = frozenset({"deleted", "unpublished"})
 # so a future API change doesn't silently let new actions through.
 _COMMIT_COMMENT_ACTIONS = frozenset({"created"})
 
+# Max body bytes we store on release/commit_comment Documents. Auto-
+# generated changelogs and copy-paste log dumps can hit MB+; capping at
+# 256 KiB keeps Document rows from blowing up and keeps count_tokens
+# from spending real time on multi-MB inputs. Truncated docs land with
+# `body_truncated: True` in metadata so retrieval can flag them.
+_MAX_DOCUMENT_BODY_BYTES = 256 * 1024
+
 # Repository event actions. These drive the code-graph bridge, not
 # Document creation. Mirror the `installation_repositories` fan-out:
-# bring code-graph state up on add/unarchive, take it down on
-# remove/archive/transfer. `renamed` does both (old name out, new in).
-# Other actions (edited, publicized, privatized) don't change which
-# repos exist or which content needs reindexing — parse drops them.
-_REPOSITORY_BACKFILL_ACTIONS = frozenset({"created", "unarchived"})
-_REPOSITORY_DISCONNECT_ACTIONS = frozenset({"deleted", "archived", "transferred"})
+# bring code-graph state up on create, take it down on delete/transfer.
+# `renamed` does both (old name out, new in).
+#
+# `archived`/`unarchived` are deliberately NOT in disconnect/backfill:
+# the bridge's enqueue_initial_backfill dedupes on (customer, repo, sha)
+# with sha="HEAD", so an archive→disconnect→unarchive cycle would tomb-
+# stone code-graph data the second backfill never re-fires. Treating
+# both as no-ops keeps archived repos searchable (consistent with
+# archive being read-only, not deleted) and avoids the dedupe trap.
+#
+# `edited` is handled ONLY when changes.default_branch is set. The
+# default branch flip means our prior code-graph state (keyed on the
+# old branch's symbols) is now stale; we disconnect to clear it and
+# rely on the next push to the new default branch to re-establish
+# state via _fire_codegraph_incremental. Parse drops other `edited`
+# events. publicized/privatized don't affect indexing.
+_REPOSITORY_BACKFILL_ACTIONS = frozenset({"created"})
+_REPOSITORY_DISCONNECT_ACTIONS = frozenset({"deleted", "transferred"})
 _REPOSITORY_RENAME_ACTION = "renamed"
+_REPOSITORY_DEFAULT_BRANCH_CHANGE_ACTION = "edited"
 _REPOSITORY_HANDLED_ACTIONS = (
     _REPOSITORY_BACKFILL_ACTIONS
     | _REPOSITORY_DISCONNECT_ACTIONS
-    | {_REPOSITORY_RENAME_ACTION}
+    | {_REPOSITORY_RENAME_ACTION, _REPOSITORY_DEFAULT_BRANCH_CHANGE_ACTION}
 )
 
 # Paths that trigger CODEOWNERS reparse. GitHub checks these in order.
@@ -367,11 +389,23 @@ class GitHubConnector(Connector):
     ) -> WebhookParseResult | None:
         action = raw_payload.get("action")
         if action not in _RELEASE_ACTIONS:
+            log.info(
+                "github.unhandled_action",
+                event_type=_EVENT_RELEASE,
+                action=action,
+                repo=full_name,
+            )
             return None
 
         release = raw_payload.get("release")
         if not isinstance(release, dict):
             raise InvalidWebhookPayload("release event missing release object")
+
+        # Drafts are created/edited via webhooks before publication. Skip
+        # them so unpublished release notes don't appear in search; the
+        # follow-up `published` event re-fires with the same release.id.
+        if release.get("draft") is True and action not in _RELEASE_DELETE_ACTIONS:
+            return None
 
         # `id` is the durable identity. `tag_name` can be reused after a
         # delete-and-recreate so we never key on it for source_event_id.
@@ -410,6 +444,12 @@ class GitHubConnector(Connector):
     ) -> WebhookParseResult | None:
         action = raw_payload.get("action")
         if action not in _COMMIT_COMMENT_ACTIONS:
+            log.info(
+                "github.unhandled_action",
+                event_type=_EVENT_COMMIT_COMMENT,
+                action=action,
+                repo=full_name,
+            )
             return None
 
         comment = raw_payload.get("comment")
@@ -457,7 +497,22 @@ class GitHubConnector(Connector):
         """
         action = raw_payload.get("action")
         if action not in _REPOSITORY_HANDLED_ACTIONS:
+            log.info(
+                "github.unhandled_action",
+                event_type=_EVENT_REPOSITORY,
+                action=action,
+                repo=full_name,
+            )
             return None
+
+        # `edited` fires for many sub-changes (description, homepage,
+        # topics, default_branch, ...). Only default_branch is a
+        # code-graph signal — drop the rest at parse so we don't burn
+        # ingestion_queue rows for cosmetic metadata edits.
+        if action == _REPOSITORY_DEFAULT_BRANCH_CHANGE_ACTION:
+            changes = raw_payload.get("changes") or {}
+            if "default_branch" not in changes:
+                return None
 
         repo = raw_payload.get("repository") or {}
         old_full_name: str | None = None
@@ -495,19 +550,32 @@ class GitHubConnector(Connector):
                 raise InvalidWebhookPayload(
                     "repository.transferred missing changes.owner.from.<user|organization>.login"
                 )
-            repo_name = repo.get("name")
-            if not isinstance(repo_name, str) or not repo_name:
-                raise InvalidWebhookPayload(
-                    "repository.transferred missing repository.name"
-                )
-            old_full_name = f"{old_owner_login}/{repo_name}"
+            # GitHub can transfer-and-rename in a single event (admin
+            # moves old-org/foo to new-org/bar in one step). When that
+            # happens, changes.repository.name.from carries the prior
+            # repo name; without it, the prior name equals the current
+            # repository.name (transfer only, no rename).
+            prior_name_from = (
+                ((changes.get("repository") or {}).get("name") or {}).get("from")
+            )
+            if isinstance(prior_name_from, str) and prior_name_from:
+                old_repo_name = prior_name_from
+            else:
+                candidate = repo.get("name")
+                if not isinstance(candidate, str) or not candidate:
+                    raise InvalidWebhookPayload(
+                        "repository.transferred missing repository.name"
+                    )
+                old_repo_name = candidate
+            old_full_name = f"{old_owner_login}/{old_repo_name}"
 
-        # GitHub doesn't include a per-event timestamp here; synthesize
-        # one. The payload fingerprint keeps true webhook retries
-        # collapsing to a single ingestion_queue row.
-        ts = datetime.now(UTC).isoformat()
+        # No `ts` segment: GitHub redelivers retries with identical bytes
+        # so _payload_fp(raw_payload) is stable across retries and the
+        # ingestion_queue UNIQUE constraint catches duplicates. Including
+        # a wall-clock timestamp would break that guarantee — every retry
+        # would produce a new source_event_id and re-fire the bridge.
         source_event_id = (
-            f"repository:{full_name}:{action}:{ts}:{_payload_fp(raw_payload)}"
+            f"repository:{full_name}:{action}:{_payload_fp(raw_payload)}"
         )
         parse_hint: dict[str, Any] = {
             "event_type": _EVENT_REPOSITORY,
@@ -1420,13 +1488,32 @@ class GitHubConnector(Connector):
         action = payload.get("action")
         is_delete = action in _RELEASE_DELETE_ACTIONS
 
-        author = (release.get("author") or {}).get("login") or "unknown"
+        # release.author can be None (releases by GitHub Actions or the
+        # GraphQL API sometimes carry null). Don't collapse all
+        # null-author releases under a single bogus PERSON node — leave
+        # author_id null and skip the PERSON node + AUTHORED edge.
+        author_login = (release.get("author") or {}).get("login")
+        author_id: str | None = author_login if isinstance(author_login, str) and author_login else None
+
         tag_name = release.get("tag_name") or ""
         # Releases can have both a `name` (display title) and `tag_name`
         # (vcs ref). Prefer name; tag is the fallback so an unnamed
         # release still has something searchable as a title.
         title = release.get("name") or tag_name or ""
         body = release.get("body") or ""
+        body_bytes = body.encode("utf-8")
+        body_truncated = False
+        if len(body_bytes) > _MAX_DOCUMENT_BODY_BYTES:
+            # Truncate at the byte cap then back off to the nearest valid
+            # utf-8 boundary so we don't store a half-character at the
+            # end. body_size_bytes records the truncated size; the
+            # `body_truncated` metadata flag tells retrieval the row
+            # represents a partial document.
+            body = body_bytes[:_MAX_DOCUMENT_BODY_BYTES].decode(
+                "utf-8", errors="ignore"
+            )
+            body_bytes = body.encode("utf-8")
+            body_truncated = True
         html_url = release.get("html_url") or ""
         created = _parse_iso8601(release.get("created_at"))
         # `updated_at` isn't always present on releases — `published_at`
@@ -1442,6 +1529,7 @@ class GitHubConnector(Connector):
         deleted_at = event.received_at if is_delete else None
         if is_delete:
             body = ""
+            body_bytes = b""
             content_hash = _sha256(
                 f"{doc_id}|__deleted__|{event.received_at.isoformat()}"
             )
@@ -1460,9 +1548,9 @@ class GitHubConnector(Connector):
             content_hash=content_hash,
             title=title[:240] if title else None,
             body_preview=body[:280] if body else None,
-            body_size_bytes=len(body.encode("utf-8")),
+            body_size_bytes=len(body_bytes),
             body_token_count=count_tokens(body),
-            author_id=author,
+            author_id=author_id,
             created_at=created,
             updated_at=updated,
             valid_from=created,
@@ -1477,32 +1565,20 @@ class GitHubConnector(Connector):
                 "prerelease": bool(release.get("prerelease")),
                 "draft": bool(release.get("draft")),
                 "visibility": _repo_visibility(repo),
+                "body_truncated": body_truncated,
             },
             body=body,
         )
 
-        nodes = [
+        nodes: list[GraphNodeSpec] = [
             _repo_node(repo),
-            GraphNodeSpec(
-                label=NodeLabel.PERSON,
-                canonical_id=author,
-                properties={"source_system": SourceSystem.GITHUB.value},
-            ),
             GraphNodeSpec(
                 label=NodeLabel.DOCUMENT,
                 canonical_id=doc_id,
                 properties={"doc_type": DocType.GITHUB_RELEASE.value},
             ),
         ]
-        edges = [
-            GraphEdgeSpec(
-                edge_type=EdgeType.AUTHORED,
-                from_label=NodeLabel.PERSON,
-                from_canonical_id=author,
-                to_label=NodeLabel.DOCUMENT,
-                to_canonical_id=doc_id,
-                valid_from=created,
-            ),
+        edges: list[GraphEdgeSpec] = [
             GraphEdgeSpec(
                 edge_type=EdgeType.TOUCHES,
                 from_label=NodeLabel.DOCUMENT,
@@ -1512,6 +1588,24 @@ class GitHubConnector(Connector):
                 valid_from=created,
             ),
         ]
+        if author_id is not None:
+            nodes.append(
+                GraphNodeSpec(
+                    label=NodeLabel.PERSON,
+                    canonical_id=author_id,
+                    properties={"source_system": SourceSystem.GITHUB.value},
+                )
+            )
+            edges.append(
+                GraphEdgeSpec(
+                    edge_type=EdgeType.AUTHORED,
+                    from_label=NodeLabel.PERSON,
+                    from_canonical_id=author_id,
+                    to_label=NodeLabel.DOCUMENT,
+                    to_canonical_id=doc_id,
+                    valid_from=created,
+                )
+            )
 
         return NormalizationResult(
             documents=[doc],
@@ -1532,8 +1626,19 @@ class GitHubConnector(Connector):
             return NormalizationResult(skipped_reason="commit_comment missing repo/id")
 
         action = payload.get("action")
-        author = (comment.get("user") or {}).get("login") or "unknown"
+        # Same null-author handling as _normalize_release: don't collapse
+        # bot/anonymous commit comments under a bogus PERSON node.
+        author_login = (comment.get("user") or {}).get("login")
+        author_id: str | None = author_login if isinstance(author_login, str) and author_login else None
         body = comment.get("body") or ""
+        body_bytes = body.encode("utf-8")
+        body_truncated = False
+        if len(body_bytes) > _MAX_DOCUMENT_BODY_BYTES:
+            body = body_bytes[:_MAX_DOCUMENT_BODY_BYTES].decode(
+                "utf-8", errors="ignore"
+            )
+            body_bytes = body.encode("utf-8")
+            body_truncated = True
         html_url = comment.get("html_url") or ""
         created = _parse_iso8601(comment.get("created_at"))
         updated = _parse_iso8601(comment.get("updated_at") or comment.get("created_at"))
@@ -1557,9 +1662,9 @@ class GitHubConnector(Connector):
             content_hash=content_hash,
             title=_derive_title(body),
             body_preview=body[:280] if body else None,
-            body_size_bytes=len(body.encode("utf-8")),
+            body_size_bytes=len(body_bytes),
             body_token_count=count_tokens(body),
-            author_id=author,
+            author_id=author_id,
             created_at=created,
             updated_at=updated,
             valid_from=created,
@@ -1577,17 +1682,13 @@ class GitHubConnector(Connector):
                 "path": comment.get("path"),
                 "position": comment.get("position"),
                 "visibility": _repo_visibility(repo),
+                "body_truncated": body_truncated,
             },
             body=body,
         )
 
-        nodes = [
+        nodes: list[GraphNodeSpec] = [
             _repo_node(repo),
-            GraphNodeSpec(
-                label=NodeLabel.PERSON,
-                canonical_id=author,
-                properties={"source_system": SourceSystem.GITHUB.value},
-            ),
             GraphNodeSpec(
                 label=NodeLabel.DOCUMENT,
                 canonical_id=doc_id,
@@ -1597,15 +1698,7 @@ class GitHubConnector(Connector):
         # No typed Commit node label exists today; a commit_comment
         # edges to the Repo only. Cross-doc retrieval that needs to
         # group comments to a commit can join on metadata.commit_id.
-        edges = [
-            GraphEdgeSpec(
-                edge_type=EdgeType.AUTHORED,
-                from_label=NodeLabel.PERSON,
-                from_canonical_id=author,
-                to_label=NodeLabel.DOCUMENT,
-                to_canonical_id=doc_id,
-                valid_from=created,
-            ),
+        edges: list[GraphEdgeSpec] = [
             GraphEdgeSpec(
                 edge_type=EdgeType.TOUCHES,
                 from_label=NodeLabel.DOCUMENT,
@@ -1615,6 +1708,24 @@ class GitHubConnector(Connector):
                 valid_from=created,
             ),
         ]
+        if author_id is not None:
+            nodes.append(
+                GraphNodeSpec(
+                    label=NodeLabel.PERSON,
+                    canonical_id=author_id,
+                    properties={"source_system": SourceSystem.GITHUB.value},
+                )
+            )
+            edges.append(
+                GraphEdgeSpec(
+                    edge_type=EdgeType.AUTHORED,
+                    from_label=NodeLabel.PERSON,
+                    from_canonical_id=author_id,
+                    to_label=NodeLabel.DOCUMENT,
+                    to_canonical_id=doc_id,
+                    valid_from=created,
+                )
+            )
 
         return NormalizationResult(
             documents=[doc],
@@ -1704,18 +1815,34 @@ class GitHubConnector(Connector):
                         if isinstance(candidate, str) and candidate:
                             old_owner_login = candidate
                             break
-                repo_name = repo.get("name")
-                if old_owner_login and isinstance(repo_name, str) and repo_name:
-                    await _disconnect([f"{old_owner_login}/{repo_name}"])
+                # Same transfer-and-rename combo handling as parse: if
+                # changes.repository.name.from is set, the prior repo
+                # name differs from repository.name.
+                prior_name_from = (
+                    ((changes.get("repository") or {}).get("name") or {}).get("from")
+                )
+                if isinstance(prior_name_from, str) and prior_name_from:
+                    old_repo_name: str | None = prior_name_from
+                else:
+                    cand = repo.get("name")
+                    old_repo_name = cand if isinstance(cand, str) and cand else None
+                if old_owner_login and old_repo_name:
+                    await _disconnect([f"{old_owner_login}/{old_repo_name}"])
                 else:
                     log.warning(
-                        "github.repository.transferred_old_owner_unresolved",
+                        "github.repository.transferred_old_path_unresolved",
                         customer=event.customer_id,
                         repo=full_name,
                     )
             else:
                 await _disconnect([full_name])
         elif action == _REPOSITORY_RENAME_ACTION:
+            # Backfill the NEW name first, then disconnect the OLD. If
+            # the disconnect fails the customer is left with stale rows
+            # under the old path (recoverable via dedup); if backfill
+            # failed after disconnect they'd be left with no code-graph
+            # state at all and no signal to recover.
+            await _backfill(full_name)
             changes = payload.get("changes") or {}
             old_name = (
                 ((changes.get("repository") or {}).get("name") or {}).get("from")
@@ -1734,7 +1861,28 @@ class GitHubConnector(Connector):
                     customer=event.customer_id,
                     repo=full_name,
                 )
-            await _backfill(full_name)
+        elif action == _REPOSITORY_DEFAULT_BRANCH_CHANGE_ACTION:
+            # Default-branch flip: prior code-graph state was extracted
+            # from the old branch's tree and is now stale relative to
+            # what `_fire_codegraph_incremental` will index on the next
+            # push. Disconnect clears the old state; the next push to
+            # the new default branch repopulates it. We don't enqueue a
+            # fresh backfill because the bridge dedupes on
+            # (customer, repo, "HEAD") — a prior backfill would block
+            # the re-fire. Push-driven re-establishment is the
+            # incremental path that does work today.
+            changes = payload.get("changes") or {}
+            db_change = changes.get("default_branch") or {}
+            old_default = db_change.get("from") if isinstance(db_change, dict) else None
+            new_default = repo.get("default_branch")
+            log.info(
+                "github.repository.default_branch_changed",
+                customer=event.customer_id,
+                repo=full_name,
+                old_default=old_default,
+                new_default=new_default,
+            )
+            await _disconnect([full_name])
         else:
             return NormalizationResult(
                 skipped_reason=f"repository.{action} no-op"
