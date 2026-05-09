@@ -926,13 +926,25 @@ async def run_search(
             temporal=spec,
         )
 
+    async def _timed(name: str, coro):
+        # Wrap one retriever leg with its own perf_counter span. The
+        # gather's wall-clock is dominated by the slowest leg, so a
+        # single shared timer (the old `vector_ms` key) couldn't tell us
+        # which retriever is the tall pole. Re-raises any exception via
+        # try/finally; the timing key still lands.
+        t = time.perf_counter()
+        try:
+            return await coro
+        finally:
+            timing[f"{name}_ms"] = (time.perf_counter() - t) * 1000
+
     t_retrieve = time.perf_counter()
     vec_hits, bm25_hits, graph_hits, id_hits, directed_hits = await asyncio.gather(
-        _vec_runner(),
-        _bm25_runner(),
-        _graph_runner(),
-        _id_lookup_runner(),
-        _directed_runner(),
+        _timed("vector", _vec_runner()),
+        _timed("bm25", _bm25_runner()),
+        _timed("graph", _graph_runner()),
+        _timed("id_lookup", _id_lookup_runner()),
+        _timed("directed", _directed_runner()),
     )
     ranked_lists = {
         "vector": vec_hits,
@@ -943,12 +955,7 @@ async def run_search(
     metadata_content_fallbacks = await _content_fallbacks_for_metadata_only_agent_hits(
         customer_id, ranked_lists, spec
     )
-    timing["vector_ms"] = (time.perf_counter() - t_retrieve) * 1000
-    # No separate directed_ms metric: all retrievers share one
-    # asyncio.gather span, so any per-retriever number reported here
-    # would be byte-identical to vector_ms. Aliasing is misleading
-    # telemetry. If per-retriever timing becomes necessary, wrap each
-    # runner in its own time.perf_counter and emit real spans.
+    timing["retrieve_ms"] = (time.perf_counter() - t_retrieve) * 1000
 
     # Recency half-life: caller's explicit value always wins. Otherwise
     # amplify when Haiku detected sort intent (the "most recent X about Y"
@@ -1028,24 +1035,19 @@ async def run_search(
     # is already <= top_k since `top` was capped above.
     primary_documents = document_results
 
-    # Inferred-edge channel: walk Doc-Doc INFERRED edges from the top
-    # primary docs. Returns Documents not already in primary_documents.
-    inferred_documents = await _build_inferred_edge_results(
-        customer_id, primary_documents, req.requesting_user_id, timing
-    )
-
-    # Entity results: surface routed entities as primary results so the
-    # consumer can see "the user asked about Service:foo" alongside the
-    # docs about it.
-    entity_results = await _build_entity_results(
-        customer_id, list(routed.entities), timing
-    )
-
-    # related_entities walk (post-fusion crawl candidates) -- separate
-    # field from the primary results. Same shape as before.
-    related: list[RelatedEntity] | None = None
-    related_error: str | None = None
-    if req.top_k_related > 0:
+    # Post-fusion enrichment trio runs in parallel: inferred-edge walk,
+    # entity result hydration, and the related_entities crawl are all
+    # independent (each only reads primary_documents / routed.entities /
+    # `top`), so sequential awaits cost ~1.7s of wall-time we don't need.
+    # Total enrichment block now collapses to wall-time of the slowest leg.
+    async def _related_runner() -> tuple[list[RelatedEntity] | None, str | None]:
+        # related_entities walk (post-fusion crawl candidates) -- separate
+        # field from the primary results. Same shape as before. Wrapped in
+        # try/except so a graph-walk failure never breaks the host search
+        # response; error name flows back via the dedicated response
+        # field, NOT via timing_ms (which dashboards read as durations).
+        if req.top_k_related <= 0:
+            return None, None
         exclude_keys = build_exclude_node_keys(
             routed.entities,
             entity_match_threshold=req.entity_match_threshold,
@@ -1053,25 +1055,38 @@ async def run_search(
         ranked_docs = [(d.doc_id, i) for i, d in enumerate(top, start=1)]
         t_related = time.perf_counter()
         try:
-            related = await walk_result_doc_neighbors(
-                customer_id,
-                ranked_result_docs=ranked_docs,
-                exclude_node_keys=exclude_keys,
-                min_confidence=req.min_confidence,
-                top_n=req.top_k_related,
+            return (
+                await walk_result_doc_neighbors(
+                    customer_id,
+                    ranked_result_docs=ranked_docs,
+                    exclude_node_keys=exclude_keys,
+                    min_confidence=req.min_confidence,
+                    top_n=req.top_k_related,
+                ),
+                None,
             )
         except Exception as exc:
-            # Enrichment field -- never break host search response. Log +
-            # surface error on the response so MCP/LLM can distinguish
-            # "broken" from "no neighbors" (codex-B4). related stays None;
-            # error name flows back via the dedicated response field, NOT
-            # via timing_ms (which dashboards read as durations).
             log.warning(
                 "related_entities walk failed", exc_info=exc, trace_id=trace_id
             )
-            related = None
-            related_error = type(exc).__name__
-        timing["related_entities_ms"] = (time.perf_counter() - t_related) * 1000
+            return None, type(exc).__name__
+        finally:
+            timing["related_entities_ms"] = (time.perf_counter() - t_related) * 1000
+
+    t_enrichment = time.perf_counter()
+    inferred_documents, entity_results, (related, related_error) = await asyncio.gather(
+        # Inferred-edge channel: walk Doc-Doc INFERRED edges from the top
+        # primary docs. Returns Documents not already in primary_documents.
+        _build_inferred_edge_results(
+            customer_id, primary_documents, req.requesting_user_id, timing
+        ),
+        # Entity results: surface routed entities as primary results so the
+        # consumer can see "the user asked about Service:foo" alongside the
+        # docs about it.
+        _build_entity_results(customer_id, list(routed.entities), timing),
+        _related_runner(),
+    )
+    timing["enrichment_ms"] = (time.perf_counter() - t_enrichment) * 1000
 
     # Concat primary docs + inferred-edge docs + entities, sort by score.
     all_results: list[QueryResult] = [
