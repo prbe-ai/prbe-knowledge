@@ -20,12 +20,15 @@ _TOKEN_TO_DOC_TYPES: dict[str, tuple[DocType, ...]] = {
     "pr": (DocType.GITHUB_PULL_REQUEST,),
     "issue": (DocType.LINEAR_ISSUE, DocType.GITHUB_ISSUE, DocType.SENTRY_ISSUE),
     "review": (DocType.GITHUB_REVIEW,),
+    "release": (DocType.GITHUB_RELEASE,),
     "message": (DocType.SLACK_MESSAGE,),
     "thread": (DocType.SLACK_THREAD,),
     "page": (DocType.NOTION_PAGE,),
     # "ticket" is what users say for Linear issues colloquially.
     "ticket": (DocType.LINEAR_ISSUE,),
-    "comment": (DocType.LINEAR_COMMENT,),
+    # "comment" maps both kinds — Linear ticket comments and GitHub
+    # commit comments. Users say "comment" without qualifying which.
+    "comment": (DocType.LINEAR_COMMENT, DocType.GITHUB_COMMIT_COMMENT),
     "session": (DocType.CLAUDE_CODE_SESSION,),
     "meeting": (DocType.GRANOLA_MEETING,),
 }

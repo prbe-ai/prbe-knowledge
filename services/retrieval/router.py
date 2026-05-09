@@ -83,6 +83,7 @@ DOC_TYPE_TOKENS: tuple[str, ...] = (
     "pr",
     "issue",
     "review",
+    "release",
     "message",
     "thread",
     "page",

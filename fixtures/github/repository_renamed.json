@@ -1,0 +1,28 @@
+{
+  "action": "renamed",
+  "changes": {
+    "repository": {
+      "name": {
+        "from": "payments-old"
+      }
+    }
+  },
+  "repository": {
+    "id": 9001,
+    "name": "payments",
+    "full_name": "prbe/payments",
+    "private": false,
+    "html_url": "https://github.com/prbe/payments",
+    "owner": {
+      "login": "prbe",
+      "id": 1
+    }
+  },
+  "installation": {
+    "id": 12345
+  },
+  "sender": {
+    "login": "alice",
+    "id": 501
+  }
+}

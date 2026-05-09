@@ -12,6 +12,7 @@ import hmac
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -567,3 +568,367 @@ async def test_identify_workspaces_returns_installation_id() -> None:
     assert ref.external_id == installation_id
     assert ref.external_name is None
     assert ref.metadata["installation_id"] == installation_id
+
+
+# ---------------------------------------------------------------------------
+# parse — release / commit_comment / repository
+# ---------------------------------------------------------------------------
+
+
+def test_parse_release_published() -> None:
+    connector = _build()
+    payload = _load("release_published.json")
+    result = connector.parse_webhook_event(
+        "cust-1", {"X-GitHub-Event": "release"}, payload
+    )
+    assert result is not None
+    assert result.source_event_id.startswith(
+        "release:prbe/payments:7001:published:2026-04-22T11:05:00Z:"
+    )
+    # Trailing :<16-hex> is the payload fingerprint.
+    assert len(result.source_event_id.rsplit(":", 1)[-1]) == 16
+    assert result.parse_hint["repo"] == "prbe/payments"
+    assert result.parse_hint["release_id"] == 7001
+    assert result.parse_hint["action"] == "published"
+
+
+def test_parse_release_deleted_passes_through_action() -> None:
+    connector = _build()
+    payload = _load("release_deleted.json")
+    result = connector.parse_webhook_event(
+        "cust-1", {"X-GitHub-Event": "release"}, payload
+    )
+    assert result is not None
+    assert result.parse_hint["action"] == "deleted"
+
+
+def test_parse_release_unhandled_action_returns_none() -> None:
+    connector = _build()
+    payload = _load("release_published.json")
+    payload["action"] = "assigned"
+    assert (
+        connector.parse_webhook_event(
+            "cust-1", {"X-GitHub-Event": "release"}, payload
+        )
+        is None
+    )
+
+
+def test_parse_commit_comment_created() -> None:
+    connector = _build()
+    payload = _load("commit_comment_created.json")
+    result = connector.parse_webhook_event(
+        "cust-1", {"X-GitHub-Event": "commit_comment"}, payload
+    )
+    assert result is not None
+    assert result.source_event_id.startswith(
+        "commit_comment:prbe/payments:8001:created:2026-04-22T13:00:00Z:"
+    )
+    assert result.parse_hint["comment_id"] == 8001
+    assert result.parse_hint["commit_id"] == "deadbeefcafe1234567890abcdef0011223344"
+
+
+def test_parse_repository_created_passes_through() -> None:
+    connector = _build()
+    payload = _load("repository_created.json")
+    result = connector.parse_webhook_event(
+        "cust-1", {"X-GitHub-Event": "repository"}, payload
+    )
+    assert result is not None
+    assert result.parse_hint["action"] == "created"
+    assert result.parse_hint["repo"] == "prbe/billing"
+    assert "old_full_name" not in result.parse_hint
+
+
+def test_parse_repository_renamed_extracts_old_name() -> None:
+    connector = _build()
+    payload = _load("repository_renamed.json")
+    result = connector.parse_webhook_event(
+        "cust-1", {"X-GitHub-Event": "repository"}, payload
+    )
+    assert result is not None
+    assert result.parse_hint["action"] == "renamed"
+    assert result.parse_hint["repo"] == "prbe/payments"
+    assert result.parse_hint["old_full_name"] == "prbe/payments-old"
+
+
+def test_parse_repository_transferred_extracts_old_owner() -> None:
+    connector = _build()
+    payload = _load("repository_transferred.json")
+    result = connector.parse_webhook_event(
+        "cust-1", {"X-GitHub-Event": "repository"}, payload
+    )
+    assert result is not None
+    assert result.parse_hint["action"] == "transferred"
+    assert result.parse_hint["old_full_name"] == "prbe-old/payments"
+
+
+def test_parse_repository_edited_returns_none() -> None:
+    """`edited`, `publicized`, `privatized` don't change the repo registry —
+    drop them at parse so they don't burn an ingestion_queue row."""
+    connector = _build()
+    payload = _load("repository_created.json")
+    payload["action"] = "edited"
+    assert (
+        connector.parse_webhook_event(
+            "cust-1", {"X-GitHub-Event": "repository"}, payload
+        )
+        is None
+    )
+
+
+def test_parse_repository_renamed_missing_changes_raises() -> None:
+    connector = _build()
+    payload = _load("repository_renamed.json")
+    payload["changes"] = {}
+    with pytest.raises(InvalidWebhookPayload):
+        connector.parse_webhook_event(
+            "cust-1", {"X-GitHub-Event": "repository"}, payload
+        )
+
+
+# ---------------------------------------------------------------------------
+# normalize — release
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_normalize_release_produces_document_and_graph() -> None:
+    connector = _build()
+    payload = _load("release_published.json")
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        source_event_id="release:prbe/payments:7001:published:2026-04-22T11:05:00Z",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/github/cust-1/release.json",
+        raw_payload=payload,
+        headers={"X-GitHub-Event": "release"},
+    )
+
+    result = await connector.normalize(event, {})
+    assert not result.is_empty
+    assert len(result.documents) == 1
+
+    doc = result.documents[0]
+    assert doc.doc_type == DocType.GITHUB_RELEASE
+    assert doc.author_id == "alice"
+    assert doc.doc_id == "github:prbe/payments:release:7001"
+    assert doc.source_url == "https://github.com/prbe/payments/releases/tag/v1.4.0"
+    assert doc.title is not None and doc.title.startswith("v1.4.0")
+    assert doc.deleted_at is None
+    assert doc.metadata["tag_name"] == "v1.4.0"
+    assert doc.metadata["prerelease"] is False
+    assert doc.metadata["draft"] is False
+    assert doc.metadata["release_id"] == 7001
+
+    labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
+    assert (NodeLabel.REPO, "prbe/payments") in labels
+    assert (NodeLabel.PERSON, "alice") in labels
+    assert (NodeLabel.DOCUMENT, doc.doc_id) in labels
+
+    edge_types = {e.edge_type for e in result.graph_edges}
+    assert EdgeType.AUTHORED in edge_types
+    assert EdgeType.TOUCHES in edge_types
+
+    assert result.acl_snapshots
+    acl = result.acl_snapshots[0]
+    assert acl.principal_type == PrincipalType.WORKSPACE
+    assert acl.permission == Permission.READ
+
+
+@pytest.mark.asyncio
+async def test_normalize_release_deleted_produces_tombstone() -> None:
+    connector = _build()
+    payload = _load("release_deleted.json")
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        source_event_id="release:prbe/payments:7001:deleted:2026-04-22T12:00:00Z",
+        received_at=datetime(2026, 4, 22, 12, 0, 0, tzinfo=UTC),
+        payload_s3_key="raw/github/cust-1/release.json",
+        raw_payload=payload,
+        headers={"X-GitHub-Event": "release"},
+    )
+
+    result = await connector.normalize(event, {})
+    assert len(result.documents) == 1
+    doc = result.documents[0]
+    assert doc.deleted_at is not None
+    assert doc.body == ""
+    assert "__deleted__" in doc.content_hash or doc.content_hash != ""
+    # Confirms tombstone hash path was taken (mirrors PR/issue tombstone test).
+    expected_hash = hashlib.sha256(
+        f"{doc.doc_id}|__deleted__|{event.received_at.isoformat()}".encode()
+    ).hexdigest()
+    assert doc.content_hash == expected_hash
+
+
+# ---------------------------------------------------------------------------
+# normalize — commit_comment
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_normalize_commit_comment_produces_document_and_graph() -> None:
+    connector = _build()
+    payload = _load("commit_comment_created.json")
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        source_event_id="commit_comment:prbe/payments:8001:created:2026-04-22T13:00:00Z",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/github/cust-1/commit_comment.json",
+        raw_payload=payload,
+        headers={"X-GitHub-Event": "commit_comment"},
+    )
+
+    result = await connector.normalize(event, {})
+    assert not result.is_empty
+    assert len(result.documents) == 1
+
+    doc = result.documents[0]
+    assert doc.doc_type == DocType.GITHUB_COMMIT_COMMENT
+    assert doc.author_id == "alice"
+    assert doc.doc_id == "github:prbe/payments:commit_comment:8001"
+    assert doc.metadata["commit_id"] == "deadbeefcafe1234567890abcdef0011223344"
+    assert doc.metadata["path"] == "services/payments/retry.py"
+    assert doc.metadata["position"] == 42
+    assert doc.body.startswith("Did we mean to remove")
+
+    labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
+    assert (NodeLabel.REPO, "prbe/payments") in labels
+    assert (NodeLabel.PERSON, "alice") in labels
+    assert (NodeLabel.DOCUMENT, doc.doc_id) in labels
+
+    edge_types = {e.edge_type for e in result.graph_edges}
+    assert EdgeType.AUTHORED in edge_types
+    assert EdgeType.TOUCHES in edge_types
+
+
+# ---------------------------------------------------------------------------
+# normalize — repository (codegraph bridge fan-out)
+# ---------------------------------------------------------------------------
+
+
+def _make_bridge_mocks(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
+    """Patch the code-graph bridge functions on the github handler module
+    so we can assert they were called without a real DB / R2 / queue."""
+    from unittest.mock import AsyncMock
+
+    backfill = AsyncMock(return_value=True)
+    disconnect = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "services.ingestion.handlers.github.code_graph_bridge.enqueue_initial_backfill",
+        backfill,
+    )
+    monkeypatch.setattr(
+        "services.ingestion.handlers.github.code_graph_bridge.enqueue_disconnect",
+        disconnect,
+    )
+    return backfill, disconnect
+
+
+@pytest.mark.asyncio
+async def test_normalize_repository_created_calls_backfill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backfill, disconnect = _make_bridge_mocks(monkeypatch)
+    connector = _build()
+    payload = _load("repository_created.json")
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        source_event_id="repository:prbe/billing:created:2026-04-22T14:00:00Z",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/github/cust-1/repository.json",
+        raw_payload=payload,
+        headers={"X-GitHub-Event": "repository"},
+    )
+
+    result = await connector.normalize(event, {})
+    assert result.documents == []  # registry signal, no Document
+    assert backfill.await_count == 1
+    kwargs = backfill.await_args.kwargs
+    assert kwargs["repo"] == "prbe/billing"
+    assert kwargs["head_sha"] == "HEAD"
+    assert kwargs["originating_source"] == SourceSystem.GITHUB
+    assert disconnect.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_normalize_repository_deleted_calls_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backfill, disconnect = _make_bridge_mocks(monkeypatch)
+    connector = _build()
+    payload = _load("repository_deleted.json")
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        source_event_id="repository:prbe/billing:deleted:2026-04-22T15:00:00Z",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/github/cust-1/repository.json",
+        raw_payload=payload,
+        headers={"X-GitHub-Event": "repository"},
+    )
+
+    await connector.normalize(event, {})
+    assert backfill.await_count == 0
+    assert disconnect.await_count == 1
+    assert disconnect.await_args.kwargs["repos"] == ["prbe/billing"]
+
+
+@pytest.mark.asyncio
+async def test_normalize_repository_renamed_disconnects_old_and_backfills_new(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backfill, disconnect = _make_bridge_mocks(monkeypatch)
+    connector = _build()
+    payload = _load("repository_renamed.json")
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        source_event_id="repository:prbe/payments:renamed:2026-04-22T16:00:00Z",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/github/cust-1/repository.json",
+        raw_payload=payload,
+        headers={"X-GitHub-Event": "repository"},
+    )
+
+    await connector.normalize(event, {})
+    assert disconnect.await_count == 1
+    assert disconnect.await_args.kwargs["repos"] == ["prbe/payments-old"]
+    assert backfill.await_count == 1
+    assert backfill.await_args.kwargs["repo"] == "prbe/payments"
+
+
+@pytest.mark.asyncio
+async def test_normalize_repository_transferred_disconnects_old_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backfill, disconnect = _make_bridge_mocks(monkeypatch)
+    connector = _build()
+    payload = _load("repository_transferred.json")
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        source_event_id="repository:prbe/payments:transferred:2026-04-22T17:00:00Z",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/github/cust-1/repository.json",
+        raw_payload=payload,
+        headers={"X-GitHub-Event": "repository"},
+    )
+
+    await connector.normalize(event, {})
+    assert backfill.await_count == 0
+    assert disconnect.await_count == 1
+    # Pre-transfer org was prbe-old; current full_name is prbe/payments.
+    assert disconnect.await_args.kwargs["repos"] == ["prbe-old/payments"]

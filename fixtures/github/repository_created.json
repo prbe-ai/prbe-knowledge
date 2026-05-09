@@ -1,0 +1,21 @@
+{
+  "action": "created",
+  "repository": {
+    "id": 9100,
+    "name": "billing",
+    "full_name": "prbe/billing",
+    "private": true,
+    "html_url": "https://github.com/prbe/billing",
+    "owner": {
+      "login": "prbe",
+      "id": 1
+    }
+  },
+  "installation": {
+    "id": 12345
+  },
+  "sender": {
+    "login": "alice",
+    "id": 501
+  }
+}

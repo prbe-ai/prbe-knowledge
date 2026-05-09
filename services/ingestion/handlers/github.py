@@ -76,6 +76,13 @@ _EVENT_PULL_REQUEST = "pull_request"
 _EVENT_ISSUES = "issues"
 _EVENT_PUSH = "push"
 _EVENT_PR_REVIEW = "pull_request_review"
+_EVENT_RELEASE = "release"
+_EVENT_COMMIT_COMMENT = "commit_comment"
+# `repository` events drive the code-graph bridge alongside the
+# installation lifecycle events — they're the per-repo signal for
+# create/delete/archive/rename/transfer that keeps the symbol graph
+# in sync with what repos actually exist.
+_EVENT_REPOSITORY = "repository"
 # GitHub App lifecycle events — wired into the code-graph bridge so an
 # install/uninstall/repo-add/repo-remove keeps the symbol graph in sync.
 _EVENT_INSTALLATION = "installation"
@@ -92,6 +99,36 @@ _ISSUE_ACTIONS = frozenset(
 )
 _REVIEW_ACTIONS = frozenset({"submitted"})
 _DELETE_ACTIONS = frozenset({"deleted", "transferred"})
+
+# Release actions. `published`/`released`/`created`/`edited`/`prereleased`
+# all carry useful state that should land as an upsert. `deleted` and
+# `unpublished` produce a tombstone (mirrors PR/issue delete pattern so
+# downstream retrieval consistently soft-deletes withdrawn content).
+_RELEASE_ACTIONS = frozenset(
+    {"published", "released", "created", "edited", "prereleased",
+     "deleted", "unpublished"}
+)
+_RELEASE_DELETE_ACTIONS = frozenset({"deleted", "unpublished"})
+
+# `created` is the only action GitHub fires for commit_comment — there
+# are no edit/delete webhooks for this event type. Filter explicitly
+# so a future API change doesn't silently let new actions through.
+_COMMIT_COMMENT_ACTIONS = frozenset({"created"})
+
+# Repository event actions. These drive the code-graph bridge, not
+# Document creation. Mirror the `installation_repositories` fan-out:
+# bring code-graph state up on add/unarchive, take it down on
+# remove/archive/transfer. `renamed` does both (old name out, new in).
+# Other actions (edited, publicized, privatized) don't change which
+# repos exist or which content needs reindexing — parse drops them.
+_REPOSITORY_BACKFILL_ACTIONS = frozenset({"created", "unarchived"})
+_REPOSITORY_DISCONNECT_ACTIONS = frozenset({"deleted", "archived", "transferred"})
+_REPOSITORY_RENAME_ACTION = "renamed"
+_REPOSITORY_HANDLED_ACTIONS = (
+    _REPOSITORY_BACKFILL_ACTIONS
+    | _REPOSITORY_DISCONNECT_ACTIONS
+    | {_REPOSITORY_RENAME_ACTION}
+)
 
 # Paths that trigger CODEOWNERS reparse. GitHub checks these in order.
 _CODEOWNERS_PATHS = (".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS")
@@ -184,6 +221,12 @@ class GitHubConnector(Connector):
             return self._parse_push(full_name, raw_payload)
         if event_type == _EVENT_PR_REVIEW:
             return self._parse_review(full_name, raw_payload)
+        if event_type == _EVENT_RELEASE:
+            return self._parse_release(full_name, raw_payload)
+        if event_type == _EVENT_COMMIT_COMMENT:
+            return self._parse_commit_comment(full_name, raw_payload)
+        if event_type == _EVENT_REPOSITORY:
+            return self._parse_repository(full_name, raw_payload)
 
         # Everything else (watch, star, fork, check_run, ...) is Phase 0 noise.
         return None
@@ -317,6 +360,167 @@ class GitHubConnector(Connector):
                 "pr_number": pr_number,
                 "review_id": review_id,
             },
+        )
+
+    def _parse_release(
+        self, full_name: str, raw_payload: Mapping[str, Any]
+    ) -> WebhookParseResult | None:
+        action = raw_payload.get("action")
+        if action not in _RELEASE_ACTIONS:
+            return None
+
+        release = raw_payload.get("release")
+        if not isinstance(release, dict):
+            raise InvalidWebhookPayload("release event missing release object")
+
+        # `id` is the durable identity. `tag_name` can be reused after a
+        # delete-and-recreate so we never key on it for source_event_id.
+        release_id = release.get("id")
+        if release_id is None:
+            raise InvalidWebhookPayload("release missing id")
+
+        # Pick the freshest timestamp available — releases evolve through
+        # draft -> published and we want each transition to land as a
+        # distinct source_event_id row.
+        ts = (
+            release.get("updated_at")
+            or release.get("published_at")
+            or release.get("created_at")
+        )
+        if not ts:
+            raise InvalidWebhookPayload("release missing updated_at/published_at/created_at")
+
+        source_event_id = (
+            f"release:{full_name}:{release_id}:{action}:{ts}:{_payload_fp(release)}"
+        )
+        return WebhookParseResult(
+            source_event_id=source_event_id,
+            received_at=_parse_iso8601(ts),
+            event_kind=IngestionEventType.WEBHOOK,
+            parse_hint={
+                "event_type": _EVENT_RELEASE,
+                "action": action,
+                "repo": full_name,
+                "release_id": release_id,
+            },
+        )
+
+    def _parse_commit_comment(
+        self, full_name: str, raw_payload: Mapping[str, Any]
+    ) -> WebhookParseResult | None:
+        action = raw_payload.get("action")
+        if action not in _COMMIT_COMMENT_ACTIONS:
+            return None
+
+        comment = raw_payload.get("comment")
+        if not isinstance(comment, dict):
+            raise InvalidWebhookPayload("commit_comment event missing comment object")
+
+        comment_id = comment.get("id")
+        if comment_id is None:
+            raise InvalidWebhookPayload("commit_comment missing id")
+
+        ts = comment.get("updated_at") or comment.get("created_at")
+        if not ts:
+            raise InvalidWebhookPayload("commit_comment missing updated_at/created_at")
+
+        source_event_id = (
+            f"commit_comment:{full_name}:{comment_id}:{action}:{ts}:{_payload_fp(comment)}"
+        )
+        return WebhookParseResult(
+            source_event_id=source_event_id,
+            received_at=_parse_iso8601(ts),
+            event_kind=IngestionEventType.WEBHOOK,
+            parse_hint={
+                "event_type": _EVENT_COMMIT_COMMENT,
+                "action": action,
+                "repo": full_name,
+                "comment_id": comment_id,
+                "commit_id": comment.get("commit_id"),
+            },
+        )
+
+    def _parse_repository(
+        self, full_name: str, raw_payload: Mapping[str, Any]
+    ) -> WebhookParseResult | None:
+        """Parse the `repository` event.
+
+        Drives `code_graph_bridge` fan-out for create/delete/archive/
+        rename/transfer. `edited`, `publicized`, and `privatized` don't
+        change which repos exist — drop them at parse so we don't burn
+        an `ingestion_queue` row for an action we won't act on.
+
+        For `renamed`, the OLD path is `{owner}/{changes.repository.name.from}`.
+        For `transferred`, the OLD path is `{changes.owner.from.<user|org>.login}/{repository.name}`.
+        We extract these here so `_normalize_repository` doesn't have to
+        re-walk the changes object.
+        """
+        action = raw_payload.get("action")
+        if action not in _REPOSITORY_HANDLED_ACTIONS:
+            return None
+
+        repo = raw_payload.get("repository") or {}
+        old_full_name: str | None = None
+
+        if action == _REPOSITORY_RENAME_ACTION:
+            changes = raw_payload.get("changes") or {}
+            old_name = (
+                ((changes.get("repository") or {}).get("name") or {}).get("from")
+            )
+            if not isinstance(old_name, str) or not old_name:
+                raise InvalidWebhookPayload(
+                    "repository.renamed missing changes.repository.name.from"
+                )
+            owner_login = (repo.get("owner") or {}).get("login")
+            if not isinstance(owner_login, str) or not owner_login:
+                raise InvalidWebhookPayload(
+                    "repository.renamed missing repository.owner.login"
+                )
+            old_full_name = f"{owner_login}/{old_name}"
+        elif action == "transferred":
+            changes = raw_payload.get("changes") or {}
+            from_owner = (changes.get("owner") or {}).get("from") or {}
+            # GitHub puts the prior owner under either `user` or
+            # `organization`, never both. Prefer organization (matches
+            # how installations are scoped) but accept either.
+            old_owner_login: str | None = None
+            for key in ("organization", "user"):
+                container = from_owner.get(key)
+                if isinstance(container, dict):
+                    candidate = container.get("login")
+                    if isinstance(candidate, str) and candidate:
+                        old_owner_login = candidate
+                        break
+            if old_owner_login is None:
+                raise InvalidWebhookPayload(
+                    "repository.transferred missing changes.owner.from.<user|organization>.login"
+                )
+            repo_name = repo.get("name")
+            if not isinstance(repo_name, str) or not repo_name:
+                raise InvalidWebhookPayload(
+                    "repository.transferred missing repository.name"
+                )
+            old_full_name = f"{old_owner_login}/{repo_name}"
+
+        # GitHub doesn't include a per-event timestamp here; synthesize
+        # one. The payload fingerprint keeps true webhook retries
+        # collapsing to a single ingestion_queue row.
+        ts = datetime.now(UTC).isoformat()
+        source_event_id = (
+            f"repository:{full_name}:{action}:{ts}:{_payload_fp(raw_payload)}"
+        )
+        parse_hint: dict[str, Any] = {
+            "event_type": _EVENT_REPOSITORY,
+            "action": action,
+            "repo": full_name,
+        }
+        if old_full_name is not None:
+            parse_hint["old_full_name"] = old_full_name
+        return WebhookParseResult(
+            source_event_id=source_event_id,
+            received_at=datetime.now(UTC),
+            event_kind=IngestionEventType.WEBHOOK,
+            parse_hint=parse_hint,
         )
 
     def _parse_installation(
@@ -746,6 +950,12 @@ class GitHubConnector(Connector):
             return result
         if event_type == _EVENT_PR_REVIEW:
             return self._normalize_review(event)
+        if event_type == _EVENT_RELEASE:
+            return self._normalize_release(event)
+        if event_type == _EVENT_COMMIT_COMMENT:
+            return self._normalize_commit_comment(event)
+        if event_type == _EVENT_REPOSITORY:
+            return await self._normalize_repository(event)
         if event_type == _EVENT_INSTALLATION:
             return await self._normalize_installation(event)
         if event_type == _EVENT_INSTALLATION_REPOSITORIES:
@@ -1194,6 +1404,347 @@ class GitHubConnector(Connector):
             graph_nodes=nodes,
             graph_edges=edges,
             acl_snapshots=[_repo_acl_row(repo, submitted_at)],
+        )
+
+    # ---- Release ------------------------------------------------------
+
+    def _normalize_release(self, event: WebhookEvent) -> NormalizationResult:
+        payload = event.raw_payload
+        repo = payload.get("repository") or {}
+        release = payload.get("release") or {}
+        full_name = repo.get("full_name") or ""
+        release_id = release.get("id")
+        if not full_name or release_id is None:
+            return NormalizationResult(skipped_reason="release missing repo/id")
+
+        action = payload.get("action")
+        is_delete = action in _RELEASE_DELETE_ACTIONS
+
+        author = (release.get("author") or {}).get("login") or "unknown"
+        tag_name = release.get("tag_name") or ""
+        # Releases can have both a `name` (display title) and `tag_name`
+        # (vcs ref). Prefer name; tag is the fallback so an unnamed
+        # release still has something searchable as a title.
+        title = release.get("name") or tag_name or ""
+        body = release.get("body") or ""
+        html_url = release.get("html_url") or ""
+        created = _parse_iso8601(release.get("created_at"))
+        # `updated_at` isn't always present on releases — `published_at`
+        # is the closest analog and is set on the publish transition.
+        updated = _parse_iso8601(
+            release.get("updated_at")
+            or release.get("published_at")
+            or release.get("created_at")
+        )
+
+        doc_id = f"github:{full_name}:release:{release_id}"
+        source_id = f"{full_name}#release-{release_id}"
+        deleted_at = event.received_at if is_delete else None
+        if is_delete:
+            body = ""
+            content_hash = _sha256(
+                f"{doc_id}|__deleted__|{event.received_at.isoformat()}"
+            )
+        else:
+            content_hash = _sha256(f"{doc_id}|{title}|{body}")
+
+        doc = Document(
+            doc_id=doc_id,
+            customer_id=event.customer_id,
+            source_system=SourceSystem.GITHUB,
+            source_id=source_id,
+            source_url=html_url,
+            doc_class=DocClass.RAW_SOURCE,
+            doc_type=DocType.GITHUB_RELEASE,
+            content_type="text/markdown",
+            content_hash=content_hash,
+            title=title[:240] if title else None,
+            body_preview=body[:280] if body else None,
+            body_size_bytes=len(body.encode("utf-8")),
+            body_token_count=count_tokens(body),
+            author_id=author,
+            created_at=created,
+            updated_at=updated,
+            valid_from=created,
+            deleted_at=deleted_at,
+            ingested_at=datetime.now(UTC),
+            acl=_repo_acl_snapshot(repo, event.received_at),
+            metadata={
+                "action": action,
+                "repo_full_name": full_name,
+                "release_id": release_id,
+                "tag_name": tag_name,
+                "prerelease": bool(release.get("prerelease")),
+                "draft": bool(release.get("draft")),
+                "visibility": _repo_visibility(repo),
+            },
+            body=body,
+        )
+
+        nodes = [
+            _repo_node(repo),
+            GraphNodeSpec(
+                label=NodeLabel.PERSON,
+                canonical_id=author,
+                properties={"source_system": SourceSystem.GITHUB.value},
+            ),
+            GraphNodeSpec(
+                label=NodeLabel.DOCUMENT,
+                canonical_id=doc_id,
+                properties={"doc_type": DocType.GITHUB_RELEASE.value},
+            ),
+        ]
+        edges = [
+            GraphEdgeSpec(
+                edge_type=EdgeType.AUTHORED,
+                from_label=NodeLabel.PERSON,
+                from_canonical_id=author,
+                to_label=NodeLabel.DOCUMENT,
+                to_canonical_id=doc_id,
+                valid_from=created,
+            ),
+            GraphEdgeSpec(
+                edge_type=EdgeType.TOUCHES,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.REPO,
+                to_canonical_id=full_name,
+                valid_from=created,
+            ),
+        ]
+
+        return NormalizationResult(
+            documents=[doc],
+            graph_nodes=nodes,
+            graph_edges=edges,
+            acl_snapshots=[_repo_acl_row(repo, created)],
+        )
+
+    # ---- Commit comment ----------------------------------------------
+
+    def _normalize_commit_comment(self, event: WebhookEvent) -> NormalizationResult:
+        payload = event.raw_payload
+        repo = payload.get("repository") or {}
+        comment = payload.get("comment") or {}
+        full_name = repo.get("full_name") or ""
+        comment_id = comment.get("id")
+        if not full_name or comment_id is None:
+            return NormalizationResult(skipped_reason="commit_comment missing repo/id")
+
+        action = payload.get("action")
+        author = (comment.get("user") or {}).get("login") or "unknown"
+        body = comment.get("body") or ""
+        html_url = comment.get("html_url") or ""
+        created = _parse_iso8601(comment.get("created_at"))
+        updated = _parse_iso8601(comment.get("updated_at") or comment.get("created_at"))
+        commit_sha = comment.get("commit_id")
+
+        doc_id = f"github:{full_name}:commit_comment:{comment_id}"
+        # Anchor the source_id to the commit so dashboards that key on
+        # commit context can find the comment without a graph walk.
+        source_id = f"{full_name}@{commit_sha}#comment-{comment_id}" if commit_sha else f"{full_name}#comment-{comment_id}"
+        content_hash = _sha256(f"{doc_id}|{body}")
+
+        doc = Document(
+            doc_id=doc_id,
+            customer_id=event.customer_id,
+            source_system=SourceSystem.GITHUB,
+            source_id=source_id,
+            source_url=html_url,
+            doc_class=DocClass.RAW_SOURCE,
+            doc_type=DocType.GITHUB_COMMIT_COMMENT,
+            content_type="text/markdown",
+            content_hash=content_hash,
+            title=_derive_title(body),
+            body_preview=body[:280] if body else None,
+            body_size_bytes=len(body.encode("utf-8")),
+            body_token_count=count_tokens(body),
+            author_id=author,
+            created_at=created,
+            updated_at=updated,
+            valid_from=created,
+            deleted_at=None,
+            ingested_at=datetime.now(UTC),
+            acl=_repo_acl_snapshot(repo, event.received_at),
+            metadata={
+                "action": action,
+                "repo_full_name": full_name,
+                "comment_id": comment_id,
+                "commit_id": commit_sha,
+                # Inline commit-comments on the diff carry path/position;
+                # top-level commit comments (Files Changed view) leave
+                # them null.
+                "path": comment.get("path"),
+                "position": comment.get("position"),
+                "visibility": _repo_visibility(repo),
+            },
+            body=body,
+        )
+
+        nodes = [
+            _repo_node(repo),
+            GraphNodeSpec(
+                label=NodeLabel.PERSON,
+                canonical_id=author,
+                properties={"source_system": SourceSystem.GITHUB.value},
+            ),
+            GraphNodeSpec(
+                label=NodeLabel.DOCUMENT,
+                canonical_id=doc_id,
+                properties={"doc_type": DocType.GITHUB_COMMIT_COMMENT.value},
+            ),
+        ]
+        # No typed Commit node label exists today; a commit_comment
+        # edges to the Repo only. Cross-doc retrieval that needs to
+        # group comments to a commit can join on metadata.commit_id.
+        edges = [
+            GraphEdgeSpec(
+                edge_type=EdgeType.AUTHORED,
+                from_label=NodeLabel.PERSON,
+                from_canonical_id=author,
+                to_label=NodeLabel.DOCUMENT,
+                to_canonical_id=doc_id,
+                valid_from=created,
+            ),
+            GraphEdgeSpec(
+                edge_type=EdgeType.TOUCHES,
+                from_label=NodeLabel.DOCUMENT,
+                from_canonical_id=doc_id,
+                to_label=NodeLabel.REPO,
+                to_canonical_id=full_name,
+                valid_from=created,
+            ),
+        ]
+
+        return NormalizationResult(
+            documents=[doc],
+            graph_nodes=nodes,
+            graph_edges=edges,
+            acl_snapshots=[_repo_acl_row(repo, created)],
+        )
+
+    # ---- Repository (registry + codegraph signal) --------------------
+
+    async def _normalize_repository(self, event: WebhookEvent) -> NormalizationResult:
+        """Handle the `repository` event.
+
+        Mirrors `_normalize_installation_repositories`: this event is the
+        per-repo signal that drives the code-graph bridge so the symbol
+        index reflects what repos actually exist for the customer. No
+        Documents are emitted — `repository` carries no content body.
+
+        Renames disconnect the OLD path and backfill the NEW path so
+        symbol rows keyed on the prior `full_name` are soft-deleted and
+        a fresh tree gets walked under the new name. Transfers
+        disconnect only — the receiving installation will fire its own
+        `repository.created` (or `installation_repositories.added`) on
+        the new side if the App is installed there.
+        """
+        payload = event.raw_payload
+        action = payload.get("action")
+        repo = payload.get("repository") or {}
+        full_name = repo.get("full_name") or ""
+        if not full_name:
+            return NormalizationResult(
+                skipped_reason="repository event missing repository.full_name"
+            )
+
+        backfilled: list[str] = []
+        disconnected: list[str] = []
+
+        async def _backfill(repo_name: str) -> None:
+            try:
+                await code_graph_bridge.enqueue_initial_backfill(
+                    customer_id=event.customer_id,
+                    repo=repo_name,
+                    head_sha="HEAD",
+                    integration_token_id=None,
+                    originating_source=SourceSystem.GITHUB,
+                )
+                backfilled.append(repo_name)
+            except Exception as exc:
+                log.warning(
+                    "code_graph.bridge.enqueue_initial_backfill_failed",
+                    customer=event.customer_id,
+                    repo=repo_name,
+                    error=str(exc),
+                )
+
+        async def _disconnect(repo_names: list[str]) -> None:
+            try:
+                await code_graph_bridge.enqueue_disconnect(
+                    customer_id=event.customer_id,
+                    repos=repo_names,
+                    originating_source=SourceSystem.GITHUB,
+                )
+                disconnected.extend(repo_names)
+            except Exception as exc:
+                log.warning(
+                    "code_graph.bridge.enqueue_disconnect_failed",
+                    customer=event.customer_id,
+                    repos=repo_names,
+                    error=str(exc),
+                )
+
+        if action in _REPOSITORY_BACKFILL_ACTIONS:
+            await _backfill(full_name)
+        elif action in _REPOSITORY_DISCONNECT_ACTIONS:
+            # `transferred` carries the NEW path in repository.full_name;
+            # disconnect should target the OLD path. Parse extracted it
+            # into parse_hint, but parse_hint isn't carried on the
+            # WebhookEvent — recompute from the payload changes here.
+            if action == "transferred":
+                changes = payload.get("changes") or {}
+                from_owner = (changes.get("owner") or {}).get("from") or {}
+                old_owner_login: str | None = None
+                for key in ("organization", "user"):
+                    container = from_owner.get(key)
+                    if isinstance(container, dict):
+                        candidate = container.get("login")
+                        if isinstance(candidate, str) and candidate:
+                            old_owner_login = candidate
+                            break
+                repo_name = repo.get("name")
+                if old_owner_login and isinstance(repo_name, str) and repo_name:
+                    await _disconnect([f"{old_owner_login}/{repo_name}"])
+                else:
+                    log.warning(
+                        "github.repository.transferred_old_owner_unresolved",
+                        customer=event.customer_id,
+                        repo=full_name,
+                    )
+            else:
+                await _disconnect([full_name])
+        elif action == _REPOSITORY_RENAME_ACTION:
+            changes = payload.get("changes") or {}
+            old_name = (
+                ((changes.get("repository") or {}).get("name") or {}).get("from")
+            )
+            owner_login = (repo.get("owner") or {}).get("login")
+            if (
+                isinstance(old_name, str)
+                and old_name
+                and isinstance(owner_login, str)
+                and owner_login
+            ):
+                await _disconnect([f"{owner_login}/{old_name}"])
+            else:
+                log.warning(
+                    "github.repository.renamed_old_name_unresolved",
+                    customer=event.customer_id,
+                    repo=full_name,
+                )
+            await _backfill(full_name)
+        else:
+            return NormalizationResult(
+                skipped_reason=f"repository.{action} no-op"
+            )
+
+        return NormalizationResult(
+            skipped_reason=(
+                f"repository.{action} processed "
+                f"(code_graph bridge fan-out: +{len(backfilled)} -{len(disconnected)})"
+            )
         )
 
     # ---- code-graph bridge fan-outs --------------------------------------

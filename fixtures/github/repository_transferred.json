@@ -1,0 +1,31 @@
+{
+  "action": "transferred",
+  "changes": {
+    "owner": {
+      "from": {
+        "organization": {
+          "login": "prbe-old",
+          "id": 99
+        }
+      }
+    }
+  },
+  "repository": {
+    "id": 9001,
+    "name": "payments",
+    "full_name": "prbe/payments",
+    "private": false,
+    "html_url": "https://github.com/prbe/payments",
+    "owner": {
+      "login": "prbe",
+      "id": 1
+    }
+  },
+  "installation": {
+    "id": 12345
+  },
+  "sender": {
+    "login": "alice",
+    "id": 501
+  }
+}
