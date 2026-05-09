@@ -28,7 +28,6 @@ from __future__ import annotations
 
 from alembic import op
 
-
 revision = "0062_chunks_content_tsv"
 down_revision = "0061_directed_vectors"
 branch_labels = None

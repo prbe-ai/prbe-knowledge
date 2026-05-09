@@ -28,7 +28,6 @@ from services.retrieval.retrievers.bm25 import bm25_search
 from shared.db import raw_conn
 from shared.models import TemporalSpec
 
-
 # Use wall-clock so seeded docs stay "recent" no matter when CI runs --
 # avoids a future temporal-default change quietly hiding the test corpus.
 _NOW = datetime.now(UTC)
