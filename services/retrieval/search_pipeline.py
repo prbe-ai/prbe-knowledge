@@ -927,11 +927,10 @@ async def run_search(
         )
 
     async def _timed(name: str, coro):
-        # Wrap one retriever leg with its own perf_counter span. The
-        # gather's wall-clock is dominated by the slowest leg, so a
-        # single shared timer (the old `vector_ms` key) couldn't tell us
-        # which retriever is the tall pole. Re-raises any exception via
-        # try/finally; the timing key still lands.
+        # Wrap one retriever leg with its own perf_counter span so we can
+        # see which leg of the asyncio.gather is the tall pole instead of
+        # attributing the whole wall-clock to one bucket. Re-raises via
+        # try/finally; the timing key always lands.
         t = time.perf_counter()
         try:
             return await coro
@@ -1073,6 +1072,19 @@ async def run_search(
         finally:
             timing["related_entities_ms"] = (time.perf_counter() - t_related) * 1000
 
+    async def _safe_entity_results() -> list[QueryEntityResult]:
+        # _build_inferred_edge_results and _related_runner already isolate
+        # their own exceptions; mirror the pattern here so an entity-hydration
+        # failure can't take down the whole gather (which would discard
+        # already-computed inferred docs and the related-entities walk).
+        try:
+            return await _build_entity_results(
+                customer_id, list(routed.entities), timing
+            )
+        except Exception as exc:
+            log.warning("entity_results failed", exc_info=exc, trace_id=trace_id)
+            return []
+
     t_enrichment = time.perf_counter()
     inferred_documents, entity_results, (related, related_error) = await asyncio.gather(
         # Inferred-edge channel: walk Doc-Doc INFERRED edges from the top
@@ -1083,7 +1095,7 @@ async def run_search(
         # Entity results: surface routed entities as primary results so the
         # consumer can see "the user asked about Service:foo" alongside the
         # docs about it.
-        _build_entity_results(customer_id, list(routed.entities), timing),
+        _safe_entity_results(),
         _related_runner(),
     )
     timing["enrichment_ms"] = (time.perf_counter() - t_enrichment) * 1000
