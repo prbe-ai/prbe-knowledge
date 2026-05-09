@@ -49,6 +49,7 @@ from services.retrieval.helpers import (
     embeddings_for_chunks,
 )
 from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search, residualize_for_bm25
+from services.retrieval.retrievers.directed import directed_search
 from services.retrieval.retrievers.graph import GraphHit, graph_search
 from services.retrieval.retrievers.id_lookup import id_lookup_search, is_lookup_candidate
 from services.retrieval.retrievers.inferred_edges import (
@@ -895,9 +896,27 @@ async def run_search(
             return []
         return await id_lookup_search(customer_id, ids, temporal=spec)
 
+    async def _directed_runner() -> list:
+        # Per-doc trigger phrases: surfaces wiki pages whose engineer-pinned
+        # or LLM-generated phrase matches the user's query, even when the
+        # page body itself doesn't. Doc-level booster (no chunk injected) —
+        # see retrievers/directed.py + fusion.py. Always-on; the
+        # DIRECTED_RETRIEVAL_WEIGHT constant (or an empty
+        # directed_vectors table) is the kill switch.
+        return await directed_search(
+            customer_id,
+            req.query,
+            top_k=req.top_k * pool_multiplier,
+            temporal=spec,
+        )
+
     t_retrieve = time.perf_counter()
-    vec_hits, bm25_hits, graph_hits, id_hits = await asyncio.gather(
-        _vec_runner(), _bm25_runner(), _graph_runner(), _id_lookup_runner()
+    vec_hits, bm25_hits, graph_hits, id_hits, directed_hits = await asyncio.gather(
+        _vec_runner(),
+        _bm25_runner(),
+        _graph_runner(),
+        _id_lookup_runner(),
+        _directed_runner(),
     )
     ranked_lists = {
         "vector": vec_hits,
@@ -909,6 +928,11 @@ async def run_search(
         customer_id, ranked_lists, spec
     )
     timing["vector_ms"] = (time.perf_counter() - t_retrieve) * 1000
+    # Directed shares the same gather batch so the wall time is bounded
+    # by the slowest single retriever; this metric is the same span as
+    # vector_ms (kept as a separate key so dashboards can split it out
+    # later without renaming history).
+    timing["directed_ms"] = timing["vector_ms"]
 
     # Recency half-life: caller's explicit value always wins. Otherwise
     # amplify when Haiku detected sort intent (the "most recent X about Y"
@@ -935,6 +959,7 @@ async def run_search(
         sort=None,  # Hard post-fusion sort removed from search path — see
         # module docstring. Recency boost above is the right tool.
         discovery=req.discovery,
+        directed_hits=directed_hits,
     )
     timing["fusion_ms"] = (time.perf_counter() - t_fuse) * 1000
 
