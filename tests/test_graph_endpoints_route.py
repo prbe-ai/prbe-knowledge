@@ -123,16 +123,30 @@ async def _post(
     body: dict,
     headers: dict[str, str] | None = None,
 ) -> httpx.Response:
-    """Spin up an ASGI client + lifespan context, post once, return response."""
+    """Spin up an ASGI client + lifespan context, post once, return response.
+
+    The lifespan context init/closes the shared pool, so live_db's truncate
+    teardown would fail with "pool is closed" without a re-init afterward.
+    Mirrors the close_pool/init_pool dance in tests/test_query_auth.py.
+    """
     from services.retrieval.main import app as retrieval_app
 
     await close_pool()
     transport = ASGITransport(app=retrieval_app)
-    async with (
-        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
-        retrieval_app.router.lifespan_context(retrieval_app),
-    ):
-        return await client.post(path, json=body, headers=headers or {})
+    try:
+        async with (
+            httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+            retrieval_app.router.lifespan_context(retrieval_app),
+        ):
+            return await client.post(path, json=body, headers=headers or {})
+    finally:
+        # Re-init unconditionally so the live_db fixture's truncate at
+        # teardown finds a live pool. Without this, the next test's
+        # live_db.acquire() call sees a closed pool and the failure
+        # surfaces in the *next* test (which makes the actual cause
+        # invisible).
+        from shared.config import get_settings as _get_settings
+        await init_pool(_get_settings())
 
 
 # ---- /graph/explore happy paths ------------------------------------------
