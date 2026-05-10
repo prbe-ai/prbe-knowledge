@@ -20,7 +20,7 @@ _MIGRATION_PATH = (
     / "db"
     / "migrations"
     / "versions"
-    / "20260509_0061_embedding_v2_hnsw.py"
+    / "20260510_0063_embedding_v2_hnsw.py"
 )
 
 
@@ -34,8 +34,8 @@ def _load_migration():
 
 def test_revision_chain() -> None:
     m = _load_migration()
-    assert m.revision == "0061_embedding_v2_hnsw"
-    assert m.down_revision == "0060_add_embedding_v2_cols"
+    assert m.revision == "0063_embedding_v2_hnsw"
+    assert m.down_revision == "0062_chunks_content_tsv"
 
 
 def test_revision_id_fits_alembic_version_column() -> None:

@@ -1,8 +1,12 @@
 """chunks: HNSW index on embedding_v2 (Stage 3 of Gemini migration)
 
-Revision ID: 0061_embedding_v2_hnsw
-Revises: 0060_add_embedding_v2_cols
-Create Date: 2026-05-09
+Revision ID: 0063_embedding_v2_hnsw
+Revises: 0062_chunks_content_tsv
+Create Date: 2026-05-10
+
+Renumbered from the original 0061 because two siblings of 0060 landed
+on main in parallel (0061_directed_vectors, then 0062_chunks_content_tsv).
+This migration now chains after the linear head 0062.
 
 Stage 3 of the OpenAI -> Gemini embedding migration. Builds the HNSW
 index over the embedding_v2 column so the Stage 4 cutover (vector.py
@@ -43,8 +47,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0061_embedding_v2_hnsw"
-down_revision = "0060_add_embedding_v2_cols"
+revision = "0063_embedding_v2_hnsw"
+down_revision = "0062_chunks_content_tsv"
 branch_labels = None
 depends_on = None
 
