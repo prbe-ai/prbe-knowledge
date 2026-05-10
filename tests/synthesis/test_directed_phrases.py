@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -114,19 +112,42 @@ async def _seed_customer_and_doc(
         )
 
 
-def _make_anthropic_client(phrases: list[str]) -> Any:
-    """Build a mock AsyncAnthropic-ish client whose messages.create returns
-    a tool_use block with the given phrases.
+class _FakeProvider:
+    """Protocol-conforming fake DirectedPhrasesProvider. Defined as a
+    real class (not a MagicMock) so attribute typos in the orchestrator
+    (e.g. `provider.run(...)` instead of `provider.generate(...)`) raise
+    AttributeError loudly instead of auto-creating a passing-but-fake
+    coroutine.
     """
-    block = MagicMock()
-    block.type = "tool_use"
-    block.name = "record_directed_phrases"
-    block.input = {"phrases": phrases}
-    response = MagicMock()
-    response.content = [block]
-    client = MagicMock()
-    client.messages.create = AsyncMock(return_value=response)
-    return client
+
+    def __init__(
+        self, phrases: list[str], *, exc: Exception | None = None
+    ) -> None:
+        self._phrases = list(phrases)
+        self._exc = exc
+        self.calls: list[tuple[str, str]] = []
+
+    async def generate(self, *, page_title: str, page_body: str) -> list[str]:
+        self.calls.append((page_title, page_body))
+        if self._exc is not None:
+            raise self._exc
+        return list(self._phrases)
+
+
+def _make_provider(phrases: list[str]) -> _FakeProvider:
+    """Build a fake DirectedPhrasesProvider whose `generate()` returns
+    the given phrases. Tests inject this where they used to inject
+    `anthropic_client=`.
+    """
+    return _FakeProvider(phrases)
+
+
+def _make_failing_provider(exc: Exception) -> _FakeProvider:
+    """Like `_make_provider`, but raises on `.generate()`. Mirrors the
+    'LLM 5xx mid-batch' failure mode the persist orchestrator handles by
+    flipping `result.llm_failed=True` and skipping `_reconcile_llm`.
+    """
+    return _FakeProvider([], exc=exc)
 
 
 @pytest.mark.asyncio
@@ -205,7 +226,7 @@ async def test_persist_llm_regen_replaces_old_run_rows(live_db) -> None:
     await _seed_customer_and_doc(cust, doc_id)
 
     # First run: LLM emits two phrases under run_id 100.
-    client_v1 = _make_anthropic_client(["llm one", "llm two"])
+    client_v1 = _make_provider(["llm one", "llm two"])
     res1 = await persist_directed_vectors(
         customer_id=cust,
         doc_id=doc_id,
@@ -213,14 +234,14 @@ async def test_persist_llm_regen_replaces_old_run_rows(live_db) -> None:
         page_body="b",
         frontmatter={},
         synthesis_run_id=100,
-        anthropic_client=client_v1,
+        provider=client_v1,
     )
     assert res1.llm_added == 2
     assert res1.llm_removed == 0
 
     # Second run: LLM emits a different set under run_id 200 -> old rows
     # for this doc are deleted, new ones inserted.
-    client_v2 = _make_anthropic_client(["llm three", "llm four"])
+    client_v2 = _make_provider(["llm three", "llm four"])
     res2 = await persist_directed_vectors(
         customer_id=cust,
         doc_id=doc_id,
@@ -228,7 +249,7 @@ async def test_persist_llm_regen_replaces_old_run_rows(live_db) -> None:
         page_body="b",
         frontmatter={},
         synthesis_run_id=200,
-        anthropic_client=client_v2,
+        provider=client_v2,
     )
     assert res2.llm_removed == 2
     assert res2.llm_added == 2
@@ -249,8 +270,7 @@ async def test_persist_llm_failure_skips_llm_keeps_humans(live_db) -> None:
     doc_id = "wiki:runbook:dp4"
     await _seed_customer_and_doc(cust, doc_id)
 
-    failing_client = MagicMock()
-    failing_client.messages.create = AsyncMock(side_effect=RuntimeError("api down"))
+    failing_client = _make_failing_provider(RuntimeError("api down"))
 
     res = await persist_directed_vectors(
         customer_id=cust,
@@ -259,7 +279,7 @@ async def test_persist_llm_failure_skips_llm_keeps_humans(live_db) -> None:
         page_body="b",
         frontmatter={"directed": ["pinned phrase"]},
         synthesis_run_id=42,
-        anthropic_client=failing_client,
+        provider=failing_client,
     )
     assert res.llm_failed is True
     assert res.human_added == 1
@@ -377,7 +397,7 @@ async def test_persist_llm_failure_preserves_prior_llm_rows(live_db) -> None:
     await _seed_customer_and_doc(cust, doc_id)
 
     # Run 100: succeeds, writes 2 llm rows.
-    ok_client = _make_anthropic_client(["good phrase one", "good phrase two"])
+    ok_client = _make_provider(["good phrase one", "good phrase two"])
     res1 = await persist_directed_vectors(
         customer_id=cust,
         doc_id=doc_id,
@@ -385,16 +405,13 @@ async def test_persist_llm_failure_preserves_prior_llm_rows(live_db) -> None:
         page_body="b",
         frontmatter=None,
         synthesis_run_id=100,
-        anthropic_client=ok_client,
+        provider=ok_client,
     )
     assert res1.llm_added == 2
     assert res1.llm_failed is False
 
     # Run 200: LLM fails. Must NOT delete run 100's rows.
-    failing_client = MagicMock()
-    failing_client.messages.create = AsyncMock(
-        side_effect=RuntimeError("provider 5xx")
-    )
+    failing_client = _make_failing_provider(RuntimeError("provider 5xx"))
     res2 = await persist_directed_vectors(
         customer_id=cust,
         doc_id=doc_id,
@@ -402,7 +419,7 @@ async def test_persist_llm_failure_preserves_prior_llm_rows(live_db) -> None:
         page_body="b",
         frontmatter=None,
         synthesis_run_id=200,
-        anthropic_client=failing_client,
+        provider=failing_client,
     )
     assert res2.llm_failed is True
     assert res2.llm_removed == 0, (
@@ -435,7 +452,7 @@ async def test_persist_llm_dup_of_human_pin_is_dropped(live_db) -> None:
     doc_id = "wiki:runbook:dp5"
     await _seed_customer_and_doc(cust, doc_id)
 
-    client = _make_anthropic_client(["pinned phrase", "novel llm phrase"])
+    client = _make_provider(["pinned phrase", "novel llm phrase"])
     res = await persist_directed_vectors(
         customer_id=cust,
         doc_id=doc_id,
@@ -443,7 +460,7 @@ async def test_persist_llm_dup_of_human_pin_is_dropped(live_db) -> None:
         page_body="b",
         frontmatter={"directed": ["pinned phrase"]},
         synthesis_run_id=7,
-        anthropic_client=client,
+        provider=client,
     )
     # Human pin added, LLM contributes only the non-dup phrase.
     assert res.human_added == 1
@@ -483,7 +500,7 @@ async def test_persist_dedup_telemetry_counts_internal_drops(live_db) -> None:
     await _seed_customer_and_doc(cust, doc_id)
 
     # Two duplicates of the same phrase + one novel one.
-    client = _make_anthropic_client(["alpha phrase", "alpha phrase", "beta phrase"])
+    client = _make_provider(["alpha phrase", "alpha phrase", "beta phrase"])
     res = await persist_directed_vectors(
         customer_id=cust,
         doc_id=doc_id,
@@ -491,7 +508,7 @@ async def test_persist_dedup_telemetry_counts_internal_drops(live_db) -> None:
         page_body="b",
         frontmatter=None,
         synthesis_run_id=42,
-        anthropic_client=client,
+        provider=client,
     )
     assert res.llm_added == 2  # alpha (first occurrence) + beta
     assert res.llm_dropped_vs_human == 0
