@@ -420,6 +420,26 @@ TOP_K_DIRECTED = 20
 RRF_K = 60
 DEDUP_COSINE_THRESHOLD = 0.95
 
+# Graph-explore endpoint (POST /graph/explore + /graph/search) caps. These
+# bound the visualization payload that the dashboard renders client-side --
+# force-directed layout starts to crawl above a few thousand nodes, and the
+# wire payload itself dwarfs everything else above 5k edges. Lives here per
+# the RRF_K / RRF_BREADTH_ALPHA tuning-knob convention so tuning doesn't
+# require an env-var deploy.
+#
+# Default mode: top-N nodes by graph_nodes.degree DESC, 1-hop edges among
+# the selected set. Anchor mode: tiered BFS centered on a node, hop1 cap +
+# hop2 cap (total = hop1 + hop2). Edge cap is enforced regardless of node
+# count; if hit, truncated=True flips in the response. WHY_MAX_CHARS caps
+# per-edge LLM-generated rationale at serialization time.
+GRAPH_EXPLORE_NODE_CAP = 2000
+GRAPH_EXPLORE_EDGE_CAP = 5000
+GRAPH_EXPLORE_HOP1_CAP = 500
+GRAPH_EXPLORE_HOP2_CAP = 1500
+GRAPH_EXPLORE_WHY_MAX_CHARS = 200
+GRAPH_SEARCH_DEFAULT_LIMIT = 10
+GRAPH_SEARCH_MAX_LIMIT = 25
+
 # Directed-vectors feature: doc-level retrieval signal contributed by
 # per-document trigger phrases stored in the directed_vectors table.
 # Eval-tuned; commits in the same change that bumps it. Set to 0.0 to

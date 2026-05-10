@@ -1,9 +1,22 @@
 """Retrieval service — FastAPI app + endpoints.
 
+Endpoints exposed:
+    POST /retrieve         raw chunks pipeline (vector + BM25 + graph fusion)
+    POST /query            /retrieve + LLM synthesis (cited answer)
+    POST /query/stream     /query as SSE stream
+    POST /graph/explore    knowledge-graph viz: default mode (top-N by degree)
+                           or anchor mode (tiered BFS centered on a node)
+    POST /graph/search     prefix typeahead for the /graph/explore anchor picker
+    GET  /source-view/...  hydrated document/chunk view
+    GET  /sources/...      raw document fetch
+    GET  /health           liveness + DB ping
+    /usage/...             read endpoints for usage_events (mounted via router)
+
 The pipeline itself lives in:
     pipeline.py         dispatcher (mode=list vs mode=search)
     list_pipeline.py    deterministic SQL window/aggregate path
     search_pipeline.py  vector + BM25 + graph + RRF + dedup + ACL path
+    graph_explore.py    /graph/explore + /graph/search SQL-only paths
     auth.py             auth resolution helpers
     helpers.py          shared utilities (entity filter, embedding fetch)
     retrievers/         retriever implementations
@@ -19,11 +32,22 @@ import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, model_validator
 
 from services.retrieval.auth import authenticate_query
+from services.retrieval.graph_explore import (
+    EXPLORE_CONFIDENCES,
+    EXPLORE_EDGE_TYPES,
+    ExploreFilters,
+    anchor_exists,
+    anchor_graph_query,
+    default_graph_query,
+    graph_search_query,
+)
 from services.retrieval.middleware import UsageLoggingMiddleware
 from services.retrieval.pipeline import (
     run_retrieval,
@@ -40,7 +64,12 @@ from services.retrieval.synthesis import (
 )
 from services.retrieval.usage import usage_router
 from shared.config import get_settings
-from shared.constants import DEFAULT_SYNTHESIS_MODEL, SourceSystem
+from shared.constants import (
+    DEFAULT_SYNTHESIS_MODEL,
+    GRAPH_SEARCH_DEFAULT_LIMIT,
+    GRAPH_SEARCH_MAX_LIMIT,
+    SourceSystem,
+)
 from shared.db import health_check, init_pool, with_tenant
 from shared.logging import configure_logging, get_logger
 from shared.models import (
@@ -406,6 +435,240 @@ async def query_stream(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# /graph/explore + /graph/search: knowledge-graph visualization endpoints.
+#
+# Powers the dashboard graph page. Default mode renders the top-N nodes by
+# degree; anchor mode renders a tiered BFS centered on a single node.
+# Both run SQL-only queries against graph_nodes / graph_edges (no LLM hop)
+# inside with_tenant() so RLS enforces tenant isolation.
+# ---------------------------------------------------------------------------
+
+
+class GraphExploreFilters(BaseModel):
+    """Filters applied to the /graph/explore query.
+
+    Subset of EdgeType / confidence / SourceSystem enums. The validator
+    rejects unknown enum values with a 422 (versus silently dropping
+    them, which would mask a frontend typo).
+    """
+
+    edge_types: list[str] | None = None
+    confidences: list[str] | None = None
+    source_systems: list[str] | None = None
+    since: datetime | None = None
+
+    @model_validator(mode="after")
+    def _validate_enum_values(self) -> GraphExploreFilters:
+        # Each list must be a non-empty subset of the matching allowlist.
+        # An empty list is treated as "no filter" -- coerce to None so
+        # downstream SQL builds skip the WHERE clause entirely.
+        if self.edge_types is not None:
+            unknown = sorted(set(self.edge_types) - EXPLORE_EDGE_TYPES)
+            if unknown:
+                raise ValueError(f"unknown edge_types: {unknown}")
+            if not self.edge_types:
+                self.edge_types = None
+        if self.confidences is not None:
+            unknown = sorted(set(self.confidences) - EXPLORE_CONFIDENCES)
+            if unknown:
+                raise ValueError(f"unknown confidences: {unknown}")
+            if not self.confidences:
+                self.confidences = None
+        if self.source_systems is not None:
+            valid = {s.value for s in SourceSystem}
+            unknown = sorted(set(self.source_systems) - valid)
+            if unknown:
+                raise ValueError(f"unknown source_systems: {unknown}")
+            if not self.source_systems:
+                self.source_systems = None
+        return self
+
+    def to_dataclass(self) -> ExploreFilters:
+        return ExploreFilters(
+            edge_types=self.edge_types,
+            confidences=self.confidences,
+            source_systems=self.source_systems,
+            since=self.since,
+        )
+
+
+class GraphExploreRequest(BaseModel):
+    """Body for POST /graph/explore.
+
+    `mode='default'` ignores anchor_node_id; `mode='anchor'` requires it
+    (validator enforces this -- a missing anchor in anchor mode is a 422,
+    not a 404).
+    """
+
+    mode: Literal["default", "anchor"]
+    anchor_node_id: str | None = None
+    filters: GraphExploreFilters | None = None
+
+    @model_validator(mode="after")
+    def _validate_mode_anchor(self) -> GraphExploreRequest:
+        if self.mode == "anchor" and not self.anchor_node_id:
+            raise ValueError("anchor_node_id is required when mode='anchor'")
+        return self
+
+
+class GraphExploreNode(BaseModel):
+    id: str
+    label: str
+    title: str | None = None
+    source_system: str | None = None
+    community_id: int | None = None
+    degree: int
+
+
+class GraphExploreEdge(BaseModel):
+    """Vendor-neutral graph-viz field naming: source / target (not from_/to_).
+
+    `why` is capped to GRAPH_EXPLORE_WHY_MAX_CHARS at serialization time
+    in graph_explore._truncate_why -- the cap lives there so the
+    truncation is enforced regardless of which call path produced the
+    edge row.
+    """
+
+    source: str
+    target: str
+    edge_type: str
+    confidence: str
+    why: str | None = None
+
+
+class GraphExploreResponse(BaseModel):
+    nodes: list[GraphExploreNode]
+    edges: list[GraphExploreEdge]
+    truncated: bool
+    total_nodes_available: int
+    total_edges_available: int
+
+
+class GraphSearchRequest(BaseModel):
+    q: str
+    limit: int = Field(default=GRAPH_SEARCH_DEFAULT_LIMIT, ge=1, le=GRAPH_SEARCH_MAX_LIMIT)
+
+
+class GraphSearchMatch(BaseModel):
+    id: str
+    label: str
+    title: str | None = None
+    source_system: str | None = None
+    degree: int
+
+
+class GraphSearchResponse(BaseModel):
+    matches: list[GraphSearchMatch]
+
+
+@app.post("/graph/explore", response_model=GraphExploreResponse)
+async def graph_explore(
+    req: GraphExploreRequest,
+    request: Request,
+    customer_id: str = Depends(authenticate_query),
+) -> GraphExploreResponse:
+    """Knowledge-graph visualization query.
+
+    Two modes:
+      default  - top GRAPH_EXPLORE_NODE_CAP nodes by graph_nodes.degree DESC,
+                 plus 1-hop edges among the selected set.
+      anchor   - tiered BFS centered on `anchor_node_id`. Hop 1 caps at
+                 GRAPH_EXPLORE_HOP1_CAP, Hop 2 fills up to NODE_CAP.
+
+    The endpoint is intentionally not logged via UsageLoggingMiddleware
+    (no usage_summary set) -- graph viz is a UI-only path, not a search
+    intent worth recording. If we later want graph-page audit trails,
+    set request.state.usage_summary here.
+    """
+    request.state.customer_id = customer_id
+
+    if req.mode == "anchor":
+        # Cheap RLS-filtered existence check before the expensive BFS.
+        # Translates a missing-anchor case to 404 (rather than returning
+        # 200 with empty nodes/edges, which the frontend can't
+        # distinguish from "exists but no edges").
+        # `anchor_node_id` is guaranteed non-None by the request
+        # validator above; assert for type narrowing.
+        assert req.anchor_node_id is not None
+        if not await anchor_exists(
+            customer_id=customer_id, anchor_canonical_id=req.anchor_node_id
+        ):
+            raise HTTPException(status_code=404, detail="anchor_node_id not found")
+        result = await anchor_graph_query(
+            customer_id=customer_id,
+            anchor_canonical_id=req.anchor_node_id,
+            filters=req.filters.to_dataclass() if req.filters else None,
+        )
+    else:
+        result = await default_graph_query(
+            customer_id=customer_id,
+            filters=req.filters.to_dataclass() if req.filters else None,
+        )
+
+    truncated = (
+        len(result.nodes) < result.total_nodes_available
+        or len(result.edges) < result.total_edges_available
+    )
+    return GraphExploreResponse(
+        nodes=[
+            GraphExploreNode(
+                id=n.id,
+                label=n.label,
+                title=n.title,
+                source_system=n.source_system,
+                community_id=n.community_id,
+                degree=n.degree,
+            )
+            for n in result.nodes
+        ],
+        edges=[
+            GraphExploreEdge(
+                source=e.source,
+                target=e.target,
+                edge_type=e.edge_type,
+                confidence=e.confidence,
+                why=e.why,
+            )
+            for e in result.edges
+        ],
+        truncated=truncated,
+        total_nodes_available=result.total_nodes_available,
+        total_edges_available=result.total_edges_available,
+    )
+
+
+@app.post("/graph/search", response_model=GraphSearchResponse)
+async def graph_search(
+    req: GraphSearchRequest,
+    request: Request,
+    customer_id: str = Depends(authenticate_query),
+) -> GraphSearchResponse:
+    """Prefix typeahead for the /graph/explore anchor picker.
+
+    Matches `q` (lowercased, prefix only -- no leading wildcard so the
+    LOWER()-functional indexes are usable) against canonical_id,
+    properties->>'name', and properties->>'title'. Ordered by degree
+    DESC so high-signal entities surface first.
+    """
+    request.state.customer_id = customer_id
+    hits = await graph_search_query(
+        customer_id=customer_id, q=req.q, limit=req.limit
+    )
+    return GraphSearchResponse(
+        matches=[
+            GraphSearchMatch(
+                id=h.id,
+                label=h.label,
+                title=h.title,
+                source_system=h.source_system,
+                degree=h.degree,
+            )
+            for h in hits
+        ]
     )
 
 
