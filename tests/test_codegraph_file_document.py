@@ -192,6 +192,90 @@ def test_empty_symbols_raises() -> None:
         )
 
 
+def test_oversized_symbol_splits_into_multiple_chunks() -> None:
+    """Symbols whose body exceeds MAX_SYMBOL_CHUNK_TOKENS must split.
+    Pre-fix, a 30KB module-scope class landed as one giant chunk and
+    blew Probe MCP 25KB tool-result caps. Post-fix, every emitted
+    chunk fits the budget, window 0 keeps the full identifying header,
+    and the chunk_index is globally contiguous (not per-symbol).
+    """
+    from datetime import UTC, datetime
+
+    from services.ingestion.chunker import count_tokens
+    from shared.constants import MAX_SYMBOL_CHUNK_TOKENS
+
+    method = (
+        "    def {name}(self, x):\n"
+        "        result = self.process(x)\n"
+        "        if result is None:\n"
+        "            raise ValueError('no result')\n"
+        "        return result\n"
+    )
+    big_body = "class GiantClass:\n" + "\n".join(
+        method.format(name=f"method_{i}") for i in range(80)
+    )
+    assert count_tokens(big_body) > MAX_SYMBOL_CHUNK_TOKENS
+
+    syms = [
+        _make_symbol(
+            qualified_name="GiantClass",
+            kind=NodeLabel.CLASS,
+            file_path="src/giant.py",
+            source_snippet=big_body,
+            def_line=1,
+            end_line=400,
+        ),
+        _make_symbol(
+            qualified_name="small_helper",
+            kind=NodeLabel.FUNCTION,
+            file_path="src/giant.py",
+            source_snippet="def small_helper(): return 1",
+            def_line=410,
+            end_line=411,
+        ),
+    ]
+    _doc, chunks, _meta = _build_file_document_with_symbol_chunks(
+        customer_id="c1",
+        repo="acme/api",
+        sha="abc",
+        owner_login="acme",
+        language="python",
+        file_path="src/giant.py",
+        symbols=syms,
+        now=datetime.now(UTC),
+    )
+
+    # GiantClass alone produces multiple windows; small_helper is one chunk.
+    assert len(chunks) > 2
+
+    # Every chunk fits the budget (small slack for header rounding).
+    for c in chunks:
+        assert c.token_count <= MAX_SYMBOL_CHUNK_TOKENS + 16
+
+    # chunk_index is globally contiguous starting at 0 — chunks plumbing
+    # downstream (`_apply_chunk_plan`) relies on stable per-doc ordering.
+    for i, c in enumerate(chunks):
+        assert c.chunk_index == i
+
+    # Window 0 of GiantClass keeps the full repo/file/qname header so
+    # repo-qualified queries still rank correctly.
+    giantclass_chunks = [c for c in chunks if "GiantClass" in c.content]
+    assert giantclass_chunks
+    assert "acme/api" in giantclass_chunks[0].content
+    assert "src/giant.py" in giantclass_chunks[0].content
+
+    # Continuation windows must NOT carry repo/file path tokens — that's
+    # the BM25 over-fire mitigation. Find the continuation chunks (the
+    # ones starting with the lighter "(cont.)" header).
+    cont_chunks = [c for c in chunks if "(cont.)" in c.content[:80]]
+    assert cont_chunks, "expected at least one continuation window"
+    for c in cont_chunks:
+        assert "acme/api" not in c.content, (
+            "continuation header must not include repo (BM25 over-fire risk)"
+        )
+        assert "src/giant.py" not in c.content
+
+
 def test_metadata_jsonb_carries_per_symbol_lookup() -> None:
     """Until per-chunk source_url lands in a follow-up, the dashboard
     renderer composes per-symbol GitHub permalinks from the file

@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING
 import asyncpg
 
 from services.ingestion.chunker import count_tokens
+from services.ingestion.code_graph.chunking import split_symbol_body
 from services.ingestion.code_graph.extractors import get_extractor_for_file
 from services.ingestion.code_graph.qualifier import promote_single_match
 from services.ingestion.code_graph.secrets import (
@@ -38,6 +39,7 @@ from services.ingestion.code_graph.secrets import (
 )
 from services.ingestion.code_graph.types import ExtractResult, Symbol
 from shared.constants import (
+    MAX_SYMBOL_CHUNK_TOKENS,
     DocClass,
     DocType,
     EdgeType,
@@ -534,11 +536,21 @@ def _build_file_document_with_symbol_chunks(
         embedding ranks high.
 
     chunk identity:
-      - content chunks: chunk_id = `<doc_id>:c_<sanitized_qname>@<def_line>`
-        (handled downstream by `_apply_chunk_plan`; we set chunk_index
-        deterministically here so reuse semantics work)
+      - content chunks: chunk_id = `<doc_id>:c_<content_hash[:16]>` (built
+        downstream in `normalizer.py:_persist_chunks`). Each window has
+        distinct content (header differs, body slice differs) so
+        content_hash is unique per window — no collision risk.
       - metadata chunk: chunk_index = METADATA_CHUNK_INDEX sentinel
         (set by ChunkPiece consumer in normalizer)
+
+    Per-symbol size cap:
+      Each emitted chunk is bounded at MAX_SYMBOL_CHUNK_TOKENS. Symbols
+      that fit emit one ChunkPiece (current behavior). Symbols that
+      exceed the cap are split into windows by `split_symbol_body`:
+      window 0 carries the full header; windows 1+ carry a lighter
+      `# {qname} (cont.)` continuation marker (avoids inflating BM25
+      firing on identifier tokens — see services/ingestion/code_graph/
+      chunking.py docstring for rationale).
 
     Caller MUST NOT pass an empty symbols list — the orchestrator skips
     files with zero extractions before calling.
@@ -556,21 +568,31 @@ def _build_file_document_with_symbol_chunks(
     # same-named symbol — the header carries the repo name as searchable
     # text that the symbol body itself never would.
     content_chunks: list[ChunkPiece] = []
-    for chunk_idx, symbol in enumerate(symbols):
+    for symbol in symbols:
         body = symbol.source_snippet or symbol.signature or symbol.qualified_name
-        header = (
+        primary_header = (
             f"# {repo} · {symbol.file_path} · "
             f"{symbol.qualified_name} ({symbol.kind.value}) · "
             f"L{symbol.def_line}-{symbol.end_line}\n"
         )
-        chunk_content = header + body
-        content_chunks.append(
-            ChunkPiece(
-                chunk_index=chunk_idx,
-                content=chunk_content,
-                token_count=count_tokens(chunk_content),
+        # Lighter header for split-symbol continuation windows. Drops
+        # repo/file/path tokens to avoid amplifying BM25 firing across
+        # N copies of the same identifying text. Window 0 always uses
+        # primary_header; windows 1+ use this one.
+        continuation_header = f"# {symbol.qualified_name} (cont.)\n"
+        for window_content in split_symbol_body(
+            body,
+            primary_header=primary_header,
+            continuation_header=continuation_header,
+            max_tokens=MAX_SYMBOL_CHUNK_TOKENS,
+        ):
+            content_chunks.append(
+                ChunkPiece(
+                    chunk_index=len(content_chunks),
+                    content=window_content,
+                    token_count=count_tokens(window_content),
+                )
             )
-        )
 
     # Metadata chunk: synthetic key:value text used for identity queries.
     # The search layer hits this chunk for queries like "IngestionToken in
