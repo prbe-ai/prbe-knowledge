@@ -19,8 +19,6 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -114,28 +112,42 @@ async def _seed_customer_and_doc(
         )
 
 
-def _make_provider(phrases: list[str]) -> Any:
-    """Build a fake DirectedPhrasesProvider whose `generate()` returns the
-    given phrases.
-
-    Tests inject this where they used to inject `provider=`.
-    Replaces the SDK-shaped MagicMock with a real Protocol-conforming
-    fake so the provider abstraction is what's exercised, not the
-    AsyncAnthropic surface.
+class _FakeProvider:
+    """Protocol-conforming fake DirectedPhrasesProvider. Defined as a
+    real class (not a MagicMock) so attribute typos in the orchestrator
+    (e.g. `provider.run(...)` instead of `provider.generate(...)`) raise
+    AttributeError loudly instead of auto-creating a passing-but-fake
+    coroutine.
     """
-    provider = MagicMock()
-    provider.generate = AsyncMock(return_value=list(phrases))
-    return provider
+
+    def __init__(
+        self, phrases: list[str], *, exc: Exception | None = None
+    ) -> None:
+        self._phrases = list(phrases)
+        self._exc = exc
+        self.calls: list[tuple[str, str]] = []
+
+    async def generate(self, *, page_title: str, page_body: str) -> list[str]:
+        self.calls.append((page_title, page_body))
+        if self._exc is not None:
+            raise self._exc
+        return list(self._phrases)
 
 
-def _make_failing_provider(exc: Exception) -> Any:
+def _make_provider(phrases: list[str]) -> _FakeProvider:
+    """Build a fake DirectedPhrasesProvider whose `generate()` returns
+    the given phrases. Tests inject this where they used to inject
+    `anthropic_client=`.
+    """
+    return _FakeProvider(phrases)
+
+
+def _make_failing_provider(exc: Exception) -> _FakeProvider:
     """Like `_make_provider`, but raises on `.generate()`. Mirrors the
     'LLM 5xx mid-batch' failure mode the persist orchestrator handles by
     flipping `result.llm_failed=True` and skipping `_reconcile_llm`.
     """
-    provider = MagicMock()
-    provider.generate = AsyncMock(side_effect=exc)
-    return provider
+    return _FakeProvider([], exc=exc)
 
 
 @pytest.mark.asyncio

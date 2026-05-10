@@ -198,28 +198,42 @@ async def _gemini_call_json(
     schema: dict[str, Any],
     max_tokens: int,
 ) -> dict[str, Any]:
-    """Issue one Gemini structured-output call. Returns the parsed dict."""
+    """Issue one Gemini structured-output call. Returns the parsed dict.
+
+    Call shape rationale (post-2026-05-09 model-shootout eval):
+      * `system_instruction=system` instead of concatenating system+user
+        into `contents`. Gemini's first-class system slot is processed
+        differently from user prompts (instruction-following is stronger)
+        and matches the eval harness's call shape, so the eval's quality
+        numbers actually predict production quality.
+      * `temperature=0.0` for determinism. Default Gemini temperature
+        (~1.0) adds run-to-run variance that hurts the deterministic
+        regen contract for directed-vector phrases.
+      * `response_schema=sanitized` enforces structured output via the
+        SDK's response-schema slot.
+    """
     client = _gemini_client()
-    contents = f"{system}\n\n---\n\n{user}"
     sanitized = _strip_keys_recursive(schema, _GEMINI_REJECTED_SCHEMA_KEYS)
     # Build the config via the typed objects so thinking_config lands
     # correctly across SDK versions (the dict-shaped config did not always
     # propagate thinking_config through google-genai's coercion path).
-    from google.genai import types as genai_types  # local import: same lazy
+    # Local import: same lazy pattern as `_gemini_client()` so a missing
+    # google-genai install only bites Gemini callers.
+    from google.genai import types as genai_types
 
-    # pattern as `_gemini_client()` so a missing google-genai install only
-    # bites Gemini callers, not Anthropic-only paths.
     config = genai_types.GenerateContentConfig(
+        system_instruction=system,
         max_output_tokens=max_tokens,
         response_mime_type="application/json",
         response_schema=sanitized,
+        temperature=0.0,
         thinking_config=genai_types.ThinkingConfig(
             thinking_budget=_thinking_budget_for(model)
         ),
     )
     resp = await client.aio.models.generate_content(
         model=model,
-        contents=contents,
+        contents=user,
         config=config,
     )
     text = getattr(resp, "text", None) or ""
@@ -340,11 +354,38 @@ class DirectedPhrasesProvider(Protocol):
 
 
 _ANTHROPIC_DIRECTED_NAMES = {"haiku", "claude-haiku", HAIKU_MODEL}
-_GEMINI_FLASH_NAMES = {
-    "gemini-flash",
-    "gemini-3-flash",
-    "gemini-3-flash-preview",
+
+# Alias -> canonical model id sent to the Google API. Aliases let
+# operators set DIRECTED_PHRASES_MODEL to a friendly name; the canonical
+# value is what the SDK actually uses.
+#
+# IMPORTANT: a canonical id MUST also map to itself, so flipping
+# DIRECTED_PHRASES_MODEL to either the alias or the canonical value
+# both resolve correctly.
+_GEMINI_FLASH_CANONICAL = {
+    "gemini-flash":            "gemini-3-flash-preview",
+    "gemini-3-flash":          "gemini-3-flash-preview",
+    "gemini-3-flash-preview":  "gemini-3-flash-preview",
 }
+
+# Directed-phrases-specific Flash-Lite registry. Intentionally distinct
+# from the triage-side `_GEMINI_FLASH_LITE_NAMES` so a future PR adding a
+# triage-only Flash-Lite alias doesn't silently route directed-phrase
+# traffic through an unevaluated model.
+_GEMINI_FLASH_LITE_CANONICAL = {
+    "gemini-flash-lite":              "gemini-flash-lite-preview",
+    "gemini-flash-lite-preview":      "gemini-flash-lite-preview",
+    "gemini-3.1-flash-lite-preview":  "gemini-3.1-flash-lite-preview",
+    "gemini-2.5-flash-lite":          "gemini-2.5-flash-lite",
+}
+
+
+def _resolve_alias(name: str, registry: dict[str, str]) -> str | None:
+    """Return the canonical model id for `name`, or None if `name` is not
+    a registered alias. Uses lookup, not substring matching, so a typoed
+    constant fails loud rather than silently routing somewhere unintended.
+    """
+    return registry.get(name)
 
 
 def _coerce_phrases(raw: Any) -> list[str]:
@@ -401,7 +442,15 @@ class _AnthropicDirectedPhrases:
                     raise DirectedPhrasesParseError(
                         f"directed tool input was not a dict: {type(payload).__name__}"
                     )
-                return _coerce_phrases(payload.get("phrases", []))
+                # Same rule as the Gemini path: missing-key is a parse
+                # failure, NOT a successful zero-phrase result, so the
+                # orchestrator preserves prior LLM rows.
+                if "phrases" not in payload:
+                    raise DirectedPhrasesParseError(
+                        "anthropic tool input missing 'phrases' key (got: "
+                        f"{sorted(payload.keys()) or 'empty object'})"
+                    )
+                return _coerce_phrases(payload["phrases"])
         raise DirectedPhrasesParseError(
             f"directed response had no {expected} tool_use block"
         )
@@ -432,7 +481,18 @@ class _GeminiDirectedPhrases:
             raise DirectedPhrasesParseError(
                 f"gemini directed-phrase call failed: {exc}"
             ) from exc
-        return _coerce_phrases(payload.get("phrases", []))
+        # Treat "phrases key missing entirely" as a parse failure, NOT as
+        # "successfully returned zero phrases". The orchestrator's
+        # `result.llm_failed` branch preserves prior LLM rows on parse
+        # failure but DELETES them on a successful empty result -- so a
+        # prompt drift to e.g. {"trigger_phrases": [...]} would otherwise
+        # silently wipe every doc's directed_vectors on the next regen.
+        if "phrases" not in payload:
+            raise DirectedPhrasesParseError(
+                "gemini response missing 'phrases' key (got: "
+                f"{sorted(payload.keys()) or 'empty object'})"
+            )
+        return _coerce_phrases(payload["phrases"])
 
 
 def get_directed_phrases_provider(
@@ -449,20 +509,33 @@ def get_directed_phrases_provider(
     `model_override` lets tests pin the choice without touching constants.
     """
     name = (model_override or DIRECTED_PHRASES_MODEL).lower()
-    if name in _GEMINI_FLASH_NAMES:
-        return _GeminiDirectedPhrases(
-            model=name if name.startswith("gemini") else "gemini-3-flash-preview"
-        )
-    if name in _GEMINI_FLASH_LITE_NAMES:
-        # Reuse the Flash-Lite alias set so a future flip Flash -> Flash Lite
-        # is a one-line constants.py change with no provider edit needed.
-        return _GeminiDirectedPhrases(
-            model=name if name.startswith("gemini") else "gemini-flash-lite-preview"
-        )
+    # Alias -> canonical Google model id. Reviewing reviewers caught that
+    # the previous `name if name.startswith("gemini") else <fallback>`
+    # ternary had a dead else-branch (every alias starts with "gemini"),
+    # which would have shipped the alias string verbatim as the API model
+    # id and 4xx'd. Keep the resolution explicit + auditable.
+    flash_canonical = _resolve_alias(name, _GEMINI_FLASH_CANONICAL)
+    if flash_canonical is not None:
+        return _GeminiDirectedPhrases(model=flash_canonical)
+    flash_lite_canonical = _resolve_alias(name, _GEMINI_FLASH_LITE_CANONICAL)
+    if flash_lite_canonical is not None:
+        return _GeminiDirectedPhrases(model=flash_lite_canonical)
     if name in _ANTHROPIC_DIRECTED_NAMES:
+        # Lazy-construct an AsyncAnthropic from settings if the caller
+        # didn't supply one. Mirrors `_gemini_client()`'s lazy pattern so
+        # flipping `DIRECTED_PHRASES_MODEL = "haiku"` for rollback
+        # actually works end-to-end without threading a client through
+        # `wiki_agent` -> `persist_directed_vectors`. The triage path's
+        # caller (services/synthesis/triage.py:224) owns its own client
+        # for the worker's lifetime; the directed path has no such
+        # owner, hence the lazy fallback here.
         if anthropic_client is None:
-            raise ValueError(
-                "Anthropic directed-phrases provider requires an AsyncAnthropic client"
-            )
+            api_key = get_settings().anthropic_api_key.get_secret_value()
+            if not api_key:
+                raise RuntimeError(
+                    "ANTHROPIC_API_KEY not configured; cannot use Anthropic "
+                    "directed-phrases provider"
+                )
+            anthropic_client = AsyncAnthropic(api_key=api_key)
         return _AnthropicDirectedPhrases(anthropic_client, model=HAIKU_MODEL)
     raise ValueError(f"unknown DIRECTED_PHRASES_MODEL: {name}")

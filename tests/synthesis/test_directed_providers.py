@@ -197,6 +197,28 @@ async def test_gemini_directed_underlying_failure_wraps_as_parse_error() -> None
 def test_factory_dispatch_gemini_flash() -> None:
     provider = get_directed_phrases_provider(model_override="gemini-3-flash-preview")
     assert isinstance(provider, _GeminiDirectedPhrases)
+    # The canonical id is what gets sent to the API. Pin it so a future
+    # alias-table edit doesn't silently route flash traffic elsewhere.
+    assert provider._model == "gemini-3-flash-preview"
+
+
+def test_factory_resolves_short_aliases_to_canonical_ids() -> None:
+    """REGRESSION for the dead-branch alias bug.
+    Before fix: factory used `name if name.startswith("gemini") else <fallback>`
+    which sent the alias string verbatim as the API model id (4xx in prod).
+    """
+    # Flash short aliases:
+    for alias in ("gemini-flash", "gemini-3-flash"):
+        provider = get_directed_phrases_provider(model_override=alias)
+        assert isinstance(provider, _GeminiDirectedPhrases)
+        assert provider._model == "gemini-3-flash-preview", (
+            f"alias {alias!r} must resolve to canonical id"
+        )
+    # Flash-Lite short aliases:
+    for alias in ("gemini-flash-lite",):
+        provider = get_directed_phrases_provider(model_override=alias)
+        assert isinstance(provider, _GeminiDirectedPhrases)
+        assert provider._model == "gemini-flash-lite-preview"
 
 
 def test_factory_dispatch_gemini_flash_lite_alias() -> None:
@@ -206,22 +228,57 @@ def test_factory_dispatch_gemini_flash_lite_alias() -> None:
         model_override="gemini-3.1-flash-lite-preview"
     )
     assert isinstance(provider, _GeminiDirectedPhrases)
+    assert provider._model == "gemini-3.1-flash-lite-preview"
 
 
-def test_factory_dispatch_anthropic_requires_client() -> None:
-    """When the configured model is Anthropic, the factory must require
-    an AsyncAnthropic client. Passing none raises rather than building
-    a half-configured provider."""
-    with pytest.raises(ValueError, match="requires an AsyncAnthropic client"):
+def test_factory_dispatch_anthropic_lazy_constructs_client(monkeypatch) -> None:
+    """REGRESSION for the rollback footgun.
+    Before fix: factory raised ValueError when Anthropic was selected
+    without a caller-supplied client. The wiki_agent caller passes none,
+    so flipping DIRECTED_PHRASES_MODEL='haiku' silently disabled the
+    feature instead of switching providers. Factory now mirrors
+    _gemini_client()'s lazy pattern.
+    """
+    # Stub out AsyncAnthropic so we don't actually hit Anthropic.
+    fake_client_cls = MagicMock()
+    monkeypatch.setattr(
+        "services.synthesis.providers.AsyncAnthropic", fake_client_cls
+    )
+    # Stub get_settings so we don't depend on real env config.
+    fake_settings = MagicMock()
+    fake_settings.anthropic_api_key.get_secret_value.return_value = "sk-test"
+    monkeypatch.setattr(
+        "services.synthesis.providers.get_settings", lambda: fake_settings
+    )
+    provider = get_directed_phrases_provider(model_override="haiku")
+    assert isinstance(provider, _AnthropicDirectedPhrases)
+    fake_client_cls.assert_called_once_with(api_key="sk-test")
+
+
+def test_factory_dispatch_anthropic_raises_when_no_api_key(monkeypatch) -> None:
+    """If ANTHROPIC_API_KEY isn't configured, lazy construction must
+    raise loudly. Better deploy-time crash than silent llm_failed=True
+    on every page synthesis.
+    """
+    fake_settings = MagicMock()
+    fake_settings.anthropic_api_key.get_secret_value.return_value = ""
+    monkeypatch.setattr(
+        "services.synthesis.providers.get_settings", lambda: fake_settings
+    )
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY not configured"):
         get_directed_phrases_provider(model_override="haiku")
 
 
-def test_factory_dispatch_anthropic_with_client() -> None:
+def test_factory_dispatch_anthropic_with_client_skips_lazy_construct() -> None:
+    """When the caller supplies a client (e.g. tests, future workers
+    that own one), use it directly rather than building a fresh one.
+    """
     client = MagicMock()
     provider = get_directed_phrases_provider(
         anthropic_client=client, model_override="haiku"
     )
     assert isinstance(provider, _AnthropicDirectedPhrases)
+    assert provider._client is client
 
 
 def test_factory_dispatch_unknown_model_raises_loudly() -> None:
@@ -229,3 +286,49 @@ def test_factory_dispatch_unknown_model_raises_loudly() -> None:
     the wrong provider for weeks unnoticed."""
     with pytest.raises(ValueError, match="unknown DIRECTED_PHRASES_MODEL"):
         get_directed_phrases_provider(model_override="some-unreleased-model")
+
+
+# ---- Regression tests for missing-key + parse failures ------------------
+
+
+@pytest.mark.asyncio
+async def test_gemini_directed_missing_phrases_key_raises_not_silent_empty(
+    monkeypatch,
+) -> None:
+    """REGRESSION for the silent-prior-row-purge bug.
+    Before fix: payload.get("phrases", []) returned [] on key drift, the
+    orchestrator treated this as "successful zero phrases" and called
+    _reconcile_llm with keep=[], DELETING all prior LLM rows. A prompt
+    drift to {"trigger_phrases": ...} would silently wipe every doc's
+    directed_vectors with no warning.
+
+    After fix: missing key raises DirectedPhrasesParseError, which the
+    orchestrator catches and flips llm_failed=True, preserving prior rows.
+    """
+    # Simulate Gemini returning a different key (prompt/schema drift).
+    with patch(
+        "services.synthesis.providers._gemini_call_json",
+        new=AsyncMock(return_value={"trigger_phrases": ["a", "b"]}),
+    ):
+        provider = _GeminiDirectedPhrases(model="gemini-3-flash-preview")
+        with pytest.raises(DirectedPhrasesParseError, match=r"missing 'phrases' key"):
+            await provider.generate(page_title="t", page_body="b")
+
+
+@pytest.mark.asyncio
+async def test_anthropic_directed_missing_phrases_key_raises_not_silent_empty() -> None:
+    """Symmetric to the Gemini missing-key test. Anthropic providers go
+    through the same _coerce_phrases path and should also raise rather
+    than silently return [].
+    """
+    block = MagicMock()
+    block.type = "tool_use"
+    block.name = "record_directed_phrases"
+    block.input = {"some_other_key": ["a"]}  # missing 'phrases'
+    response = MagicMock()
+    response.content = [block]
+    client = MagicMock()
+    client.messages.create = AsyncMock(return_value=response)
+    provider = _AnthropicDirectedPhrases(client, model=HAIKU_MODEL)
+    with pytest.raises(DirectedPhrasesParseError, match=r"missing 'phrases' key"):
+        await provider.generate(page_title="t", page_body="b")
