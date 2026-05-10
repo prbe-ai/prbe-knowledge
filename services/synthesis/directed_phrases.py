@@ -23,16 +23,12 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-from anthropic import AsyncAnthropic
-
-from services.synthesis.prompts import (
-    build_directed_phrases_prompt,
-    directed_tool_name,
+from services.synthesis.providers import (
+    DirectedPhrasesProvider,
+    get_directed_phrases_provider,
 )
-from shared.config import get_settings
 from shared.constants import (
     DIRECTED_DEDUPE_COSINE_THRESHOLD,
-    HAIKU_MODEL,
     MAX_DIRECTED_PHRASE_CHARS,
     MAX_DIRECTED_VECTORS_PER_DOC,
     MAX_HUMAN_DIRECTED_PER_DOC,
@@ -145,7 +141,19 @@ def _content_hash(phrase: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# LLM phrase generation
+# LLM phrase generation — provider-routed
+# ---------------------------------------------------------------------------
+#
+# `generate_directed_phrases` was historically an Anthropic-only call with
+# its own response-parsing logic. The 2026-05-09 model shootout (eval at
+# scripts/eval_directed_phrases.py, judged by Opus 4.7) picked Gemini 3
+# Flash as the new default: same latency as Haiku, ~1/4 the cost,
+# specificity 8.6 vs 7.8 across 5 fixtures.
+#
+# Generation now goes through services/synthesis/providers.py:
+# `DirectedPhrasesProvider` Protocol with Anthropic + Gemini impls and a
+# factory that dispatches on `shared.constants.DIRECTED_PHRASES_MODEL`.
+# Tests inject a fake provider; production reads the constant.
 # ---------------------------------------------------------------------------
 
 
@@ -153,63 +161,21 @@ async def generate_directed_phrases(
     *,
     page_title: str,
     page_body: str,
-    client: AsyncAnthropic | None = None,
-    model: str = HAIKU_MODEL,
+    provider: DirectedPhrasesProvider | None = None,
 ) -> list[str]:
-    """Ask the LLM for 5-10 trigger phrases describing this page's retrieval
-    intent. Returns at most MAX_DIRECTED_VECTORS_PER_DOC phrases; raises
-    on provider errors so the caller can decide between log-and-skip
-    (default) and harder failure handling.
+    """Ask the configured provider for 5-10 trigger phrases describing
+    this page's retrieval intent.
 
-    `client` is injectable for tests; default is a fresh AsyncAnthropic
-    bound to the configured key.
+    Returns at most MAX_DIRECTED_VECTORS_PER_DOC phrases. Raises on
+    provider errors so the caller can decide between log-and-skip
+    (default in `persist_directed_vectors`) and harder failure handling.
+
+    `provider` is injectable for tests; default is the configured
+    `DIRECTED_PHRASES_MODEL` (Gemini 3 Flash today).
     """
-    if client is None:
-        api_key = get_settings().anthropic_api_key.get_secret_value()
-        if not api_key:
-            raise RuntimeError("ANTHROPIC_API_KEY not configured")
-        client = AsyncAnthropic(api_key=api_key)
-
-    kwargs = build_directed_phrases_prompt(
-        page_title=page_title, page_body=page_body
-    )
-    resp = await client.messages.create(model=model, **kwargs)
-    expected = directed_tool_name()
-    for block in resp.content:
-        if (
-            getattr(block, "type", "") == "tool_use"
-            and getattr(block, "name", "") == expected
-        ):
-            payload = getattr(block, "input", None)
-            if not isinstance(payload, dict):
-                raise RuntimeError(
-                    f"directed tool input was not a dict: {type(payload).__name__}"
-                )
-            phrases_raw = payload.get("phrases", [])
-            if not isinstance(phrases_raw, list):
-                raise RuntimeError(
-                    f"directed.phrases was not a list: {type(phrases_raw).__name__}"
-                )
-            cleaned: list[str] = []
-            for p in phrases_raw:
-                if not isinstance(p, str):
-                    continue
-                s = p.strip()
-                if not s:
-                    continue
-                # LLM-provider-side guidance is "5-12 tokens"; LLMs ignore
-                # length instructions ~10% of the time. Hard cap here so a
-                # runaway response doesn't bloat embedding cost / storage.
-                if len(s) > MAX_DIRECTED_PHRASE_CHARS:
-                    log.warning(
-                        "directed.llm_phrase_too_long",
-                        length=len(s),
-                        limit=MAX_DIRECTED_PHRASE_CHARS,
-                    )
-                    continue
-                cleaned.append(s)
-            return cleaned[:MAX_DIRECTED_VECTORS_PER_DOC]
-    raise RuntimeError(f"directed response had no {expected} tool_use block")
+    if provider is None:
+        provider = get_directed_phrases_provider()
+    return await provider.generate(page_title=page_title, page_body=page_body)
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +233,7 @@ async def persist_directed_vectors(
     frontmatter: dict[str, Any] | None,
     synthesis_run_id: int | None,
     embedder: Embedder | None = None,
-    anthropic_client: AsyncAnthropic | None = None,
+    provider: DirectedPhrasesProvider | None = None,
 ) -> DirectedPersistResult:
     """End-to-end: parse frontmatter pins, generate LLM phrases, dedupe,
     embed, and reconcile rows in directed_vectors for `(customer_id,
@@ -301,7 +267,7 @@ async def persist_directed_vectors(
             llm_phrases = await generate_directed_phrases(
                 page_title=page_title,
                 page_body=page_body,
-                client=anthropic_client,
+                provider=provider,
             )
         except Exception as exc:
             log.warning(

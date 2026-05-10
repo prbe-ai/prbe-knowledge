@@ -691,6 +691,15 @@ WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
 # silently inert. Constants-only is honest.
 WIKI_TRIAGE_MODEL = "haiku"
 
+# Directed-phrase generation runs once per wiki page during synthesis to
+# emit 5-10 trigger phrases that boost retrieval ranking when an engineer's
+# symptom-style query semantically matches them. The 2026-05-09 model
+# shootout (scripts/eval_directed_phrases.py, judged by Opus 4.7) picked
+# Gemini 3 Flash: specificity 8.6/retrieval-fit 8.2 vs Haiku 7.8/7.8, at
+# ~1/4 the cost ($0.0005 vs $0.0022 per call). Flip to "haiku" or
+# "gemini-3.1-flash-lite-preview" via this constant + redeploy.
+DIRECTED_PHRASES_MODEL = "gemini-3-flash-preview"
+
 # Concurrency caps. The wiki-worker fans out customers, then triage
 # batches per customer. (The v4 wiki agent uses
 # WIKI_AGENT_GLOBAL_CONCURRENCY for synthesis-side fan-out plus a

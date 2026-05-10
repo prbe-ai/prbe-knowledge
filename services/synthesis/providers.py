@@ -1,23 +1,20 @@
-"""Provider Protocol for the triage stage only.
+"""Provider Protocols for cheap-model synthesis stages.
 
-v4 collapses the synthesis pipeline to:
+Two abstractions live here:
 
-  TRIAGE (cheap model) -> WIKI AGENT (Gemini 3.1 Pro)
+  TRIAGE              -> shared.constants.WIKI_TRIAGE_MODEL
+  DIRECTED PHRASES    -> shared.constants.DIRECTED_PHRASES_MODEL
 
-The triage provider abstraction stays — Anthropic Haiku and Gemini
-Flash Lite are still both viable for the binary-ish triage call. The
-agent uses Gemini directly via `services.synthesis.gemini_agent_client`;
-no provider abstraction there because the agent harness's surface
-(CachedContent + cached generate calls) doesn't translate to
-Anthropic's prompt-cache model.
+Both stages support Anthropic Haiku and Gemini variants. The wiki agent
+itself goes through `services.synthesis.gemini_agent_client` and does
+not use this module — its surface (CachedContent + cached generate
+calls) doesn't translate to Anthropic's prompt-cache model.
 
-Selection: the model name is read from `shared.constants.WIKI_TRIAGE_MODEL`.
-To flip a stage from Haiku -> Flash Lite (or back), edit the constant
-and redeploy. There is no env-var override path; the prior
-`getattr(settings, ...)` plumbing referenced fields that didn't exist
-on Settings, so the env var was silently inert.
-
-Default: Anthropic Haiku.
+Selection: the model name is read from the constants above. To flip a
+stage from Haiku -> a Gemini variant (or back), edit the constant and
+redeploy. There is no env-var override path; per-stage tuning lives in
+shared/constants.py alongside RRF_K, source half-lives, and the rest of
+the LLM-id registry.
 """
 
 from __future__ import annotations
@@ -33,12 +30,17 @@ from services.synthesis.models import (
     TriageOutput,
 )
 from services.synthesis.prompts import (
+    build_directed_phrases_prompt,
     build_triage_prompt,
+    directed_tool_name,
     triage_tool_name,
 )
 from shared.config import get_settings
 from shared.constants import (
+    DIRECTED_PHRASES_MODEL,
     HAIKU_MODEL,
+    MAX_DIRECTED_PHRASE_CHARS,
+    MAX_DIRECTED_VECTORS_PER_DOC,
     WIKI_TRIAGE_MODEL,
 )
 from shared.logging import get_logger
@@ -155,6 +157,23 @@ _GEMINI_REJECTED_SCHEMA_KEYS = (
 )
 
 
+# Gemini 3.x defaults to thinking-on. Reasoning tokens are deducted from
+# `max_output_tokens` and silently truncate the structured-output JSON when
+# the answer + reasoning exceed the budget. The eval at
+# scripts/eval_directed_phrases.py surfaced this for Pro and Flash on
+# 2026-05-09 (reproducible: same prompt, identical model except family).
+#   - Pro:        rejects budget=0; needs explicit non-zero.
+#   - Flash:      tolerates budget=0 and produces the same answer faster.
+#   - Flash Lite: tolerates budget=0; default already minimal.
+def _thinking_budget_for(model: str) -> int:
+    name = model.lower()
+    if "pro" in name:
+        # Pro can't disable thinking. Give it slack so the JSON answer
+        # always fits even after reasoning consumes part of the budget.
+        return 4096
+    return 0
+
+
 def _gemini_client() -> Any:
     """Build a Gemini client. Raises a tagged error if google-genai isn't
     importable or the API key isn't configured.
@@ -183,14 +202,25 @@ async def _gemini_call_json(
     client = _gemini_client()
     contents = f"{system}\n\n---\n\n{user}"
     sanitized = _strip_keys_recursive(schema, _GEMINI_REJECTED_SCHEMA_KEYS)
+    # Build the config via the typed objects so thinking_config lands
+    # correctly across SDK versions (the dict-shaped config did not always
+    # propagate thinking_config through google-genai's coercion path).
+    from google.genai import types as genai_types  # local import: same lazy
+
+    # pattern as `_gemini_client()` so a missing google-genai install only
+    # bites Gemini callers, not Anthropic-only paths.
+    config = genai_types.GenerateContentConfig(
+        max_output_tokens=max_tokens,
+        response_mime_type="application/json",
+        response_schema=sanitized,
+        thinking_config=genai_types.ThinkingConfig(
+            thinking_budget=_thinking_budget_for(model)
+        ),
+    )
     resp = await client.aio.models.generate_content(
         model=model,
         contents=contents,
-        config={
-            "max_output_tokens": max_tokens,
-            "response_mime_type": "application/json",
-            "response_schema": sanitized,
-        },
+        config=config,
     )
     text = getattr(resp, "text", None) or ""
     if not text:
@@ -283,3 +313,156 @@ def get_triage_provider(
             raise ValueError("Anthropic triage requires an AsyncAnthropic client")
         return _AnthropicTriage(anthropic_client, model=HAIKU_MODEL)
     raise ValueError(f"unknown WIKI_TRIAGE_MODEL: {name}")
+
+
+# ===========================================================================
+# Directed-phrase generation provider
+# ===========================================================================
+#
+# Mirrors the triage abstraction. One Gemini call per wiki page during
+# synthesis emits 5-10 trigger phrases that boost retrieval ranking when
+# an engineer's symptom-style query semantically matches them. The eval
+# at scripts/eval_directed_phrases.py (2026-05-09) showed Gemini 3 Flash
+# beats Haiku 4.5 on every quality metric (specificity 8.6 vs 7.8,
+# retrieval-fit 8.2 vs 7.8) at a quarter of the cost.
+#
+# Same routing pattern as triage: model name -> impl. Add a new alias to
+# the relevant set if a future Gemini variant should be selectable.
+# ---------------------------------------------------------------------------
+
+
+class DirectedPhrasesParseError(RuntimeError):
+    """Provider returned output we couldn't coerce into list[str]."""
+
+
+class DirectedPhrasesProvider(Protocol):
+    async def generate(self, *, page_title: str, page_body: str) -> list[str]: ...
+
+
+_ANTHROPIC_DIRECTED_NAMES = {"haiku", "claude-haiku", HAIKU_MODEL}
+_GEMINI_FLASH_NAMES = {
+    "gemini-flash",
+    "gemini-3-flash",
+    "gemini-3-flash-preview",
+}
+
+
+def _coerce_phrases(raw: Any) -> list[str]:
+    """Normalize a 'phrases' payload into a clean list[str].
+
+    Both providers route through this so the post-call rules (length cap,
+    whitespace strip, MAX_DIRECTED_VECTORS_PER_DOC truncation) live in
+    one place.
+    """
+    if not isinstance(raw, list):
+        raise DirectedPhrasesParseError(
+            f"phrases payload was not a list: {type(raw).__name__}"
+        )
+    cleaned: list[str] = []
+    for p in raw:
+        if not isinstance(p, str):
+            continue
+        s = p.strip()
+        if not s:
+            continue
+        if len(s) > MAX_DIRECTED_PHRASE_CHARS:
+            log.warning(
+                "directed.llm_phrase_too_long",
+                length=len(s),
+                limit=MAX_DIRECTED_PHRASE_CHARS,
+            )
+            continue
+        cleaned.append(s)
+    return cleaned[:MAX_DIRECTED_VECTORS_PER_DOC]
+
+
+class _AnthropicDirectedPhrases:
+    """Anthropic Haiku via tool_use (legacy default; kept for fallback /
+    A-B comparison if Gemini regresses).
+    """
+
+    def __init__(self, client: AsyncAnthropic, *, model: str = HAIKU_MODEL) -> None:
+        self._client = client
+        self._model = model
+
+    async def generate(self, *, page_title: str, page_body: str) -> list[str]:
+        kwargs = build_directed_phrases_prompt(
+            page_title=page_title, page_body=page_body
+        )
+        resp = await self._client.messages.create(model=self._model, **kwargs)
+        expected = directed_tool_name()
+        for block in resp.content:
+            if (
+                getattr(block, "type", "") == "tool_use"
+                and getattr(block, "name", "") == expected
+            ):
+                payload = getattr(block, "input", None)
+                if not isinstance(payload, dict):
+                    raise DirectedPhrasesParseError(
+                        f"directed tool input was not a dict: {type(payload).__name__}"
+                    )
+                return _coerce_phrases(payload.get("phrases", []))
+        raise DirectedPhrasesParseError(
+            f"directed response had no {expected} tool_use block"
+        )
+
+
+class _GeminiDirectedPhrases:
+    """Gemini structured output via response_schema. Default impl for new
+    deploys per the 2026-05-09 model-shootout eval.
+    """
+
+    def __init__(self, *, model: str = "gemini-3-flash-preview") -> None:
+        self._model = model
+
+    async def generate(self, *, page_title: str, page_body: str) -> list[str]:
+        kwargs = build_directed_phrases_prompt(
+            page_title=page_title, page_body=page_body
+        )
+        system, user, schema, max_tokens = _flatten_anthropic_kwargs(kwargs)
+        try:
+            payload = await _gemini_call_json(
+                model=self._model,
+                system=system,
+                user=user,
+                schema=schema,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            raise DirectedPhrasesParseError(
+                f"gemini directed-phrase call failed: {exc}"
+            ) from exc
+        return _coerce_phrases(payload.get("phrases", []))
+
+
+def get_directed_phrases_provider(
+    anthropic_client: AsyncAnthropic | None = None,
+    *,
+    model_override: str | None = None,
+) -> DirectedPhrasesProvider:
+    """Return the configured directed-phrases provider.
+
+    `anthropic_client` is required only when the configured model resolves
+    to an Anthropic alias (today: HAIKU_MODEL). For Gemini variants,
+    the helper builds its own client internally.
+
+    `model_override` lets tests pin the choice without touching constants.
+    """
+    name = (model_override or DIRECTED_PHRASES_MODEL).lower()
+    if name in _GEMINI_FLASH_NAMES:
+        return _GeminiDirectedPhrases(
+            model=name if name.startswith("gemini") else "gemini-3-flash-preview"
+        )
+    if name in _GEMINI_FLASH_LITE_NAMES:
+        # Reuse the Flash-Lite alias set so a future flip Flash -> Flash Lite
+        # is a one-line constants.py change with no provider edit needed.
+        return _GeminiDirectedPhrases(
+            model=name if name.startswith("gemini") else "gemini-flash-lite-preview"
+        )
+    if name in _ANTHROPIC_DIRECTED_NAMES:
+        if anthropic_client is None:
+            raise ValueError(
+                "Anthropic directed-phrases provider requires an AsyncAnthropic client"
+            )
+        return _AnthropicDirectedPhrases(anthropic_client, model=HAIKU_MODEL)
+    raise ValueError(f"unknown DIRECTED_PHRASES_MODEL: {name}")
