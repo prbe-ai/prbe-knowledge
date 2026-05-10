@@ -1,7 +1,7 @@
 """graph_nodes: index on (customer_id, degree DESC) for /graph/explore.
 
-Revision ID: 0063_graph_nodes_degree_idx
-Revises: 0062_chunks_content_tsv
+Revision ID: 0064_graph_nodes_degree_idx
+Revises: 0063_embedding_v2_hnsw
 Create Date: 2026-05-10
 
 POST /graph/explore (default mode) selects the top-N graph_nodes per tenant
@@ -24,15 +24,15 @@ feedback_graph_nodes_rls_force) does not apply -- no UPDATE/DELETE on
 graph_nodes is performed.
 
 Lessons reminder: revision string MUST be <=32 chars (alembic_version
-column is varchar(32)); '0063_graph_nodes_degree_idx' is 27 chars - fine.
+column is varchar(32)); '0064_graph_nodes_degree_idx' is 27 chars - fine.
 """
 
 from __future__ import annotations
 
 from alembic import op
 
-revision = "0063_graph_nodes_degree_idx"
-down_revision = "0062_chunks_content_tsv"
+revision = "0064_graph_nodes_degree_idx"
+down_revision = "0063_embedding_v2_hnsw"
 branch_labels = None
 depends_on = None
 
