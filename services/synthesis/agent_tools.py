@@ -137,7 +137,18 @@ UPDATE_PAGE_TOOL: dict[str, Any] = {
             "wiki_type": _WIKI_TYPE_SCHEMA,
             "slug": {"type": "string"},
             "body_markdown": {"type": "string"},
-            "summary": {"type": "string"},
+            "summary": {
+                "type": "string",
+                "description": (
+                    "One-sentence stable overview of what this page IS "
+                    "(the repo's / runbook's / person's enduring "
+                    "purpose). Shown as the wiki-index blurb; pass the "
+                    "existing summary verbatim unless the page's "
+                    "fundamental purpose has changed. Never rewrite it "
+                    "to describe the latest change — the index would "
+                    "read like a changelog."
+                ),
+            },
             "commit_message": {"type": "string"},
             "applied_queue_ids": {
                 "type": "array",
@@ -169,7 +180,16 @@ CREATE_PAGE_TOOL: dict[str, Any] = {
             "slug": {"type": "string"},
             "title": {"type": "string"},
             "body_markdown": {"type": "string"},
-            "summary": {"type": "string"},
+            "summary": {
+                "type": "string",
+                "description": (
+                    "One-sentence stable overview of what this page IS "
+                    "(the repo's / runbook's / person's enduring "
+                    "purpose). Shown as the wiki-index blurb; should "
+                    "read the same in 6 months as today. Not what "
+                    "triggered creating it."
+                ),
+            },
             "frontmatter": {"type": "object"},
             "commit_message": {"type": "string"},
             "applied_queue_ids": {
