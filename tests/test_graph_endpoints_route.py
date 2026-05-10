@@ -318,3 +318,45 @@ async def test_retrieve_still_responds_after_graph_routes_added(live_db, setting
     await init_pool(settings)
     assert resp.status_code == 200, resp.text
     assert "results" in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_query_route_still_registered(live_db, settings) -> None:
+    """Adding /graph/* routes must not break /query. We send an empty
+    body and assert 422 (validation error) -- this proves the POST
+    handler is still mounted; a missing route would return 404.
+
+    We deliberately do NOT exercise the synthesis pipeline (would need
+    LLM stubbing). The route-existence signal is what we care about.
+    """
+    customer_id = "cust-query-route-regression"
+    api_key = await _seed_customer_with_key(customer_id)
+    resp = await _post(
+        "/query",
+        body={},
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    await init_pool(settings)
+    # 422 = body validation failed (route exists, parsed). 404 would mean
+    # the route registration broke when /graph/* was added.
+    assert resp.status_code == 422, (
+        f"Expected 422 (validation error from empty body, proves route "
+        f"is registered); got {resp.status_code}. Body: {resp.text!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_stream_route_still_registered(live_db, settings) -> None:
+    """Same as test_query_route_still_registered but for /query/stream."""
+    customer_id = "cust-query-stream-route-regression"
+    api_key = await _seed_customer_with_key(customer_id)
+    resp = await _post(
+        "/query/stream",
+        body={},
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    await init_pool(settings)
+    assert resp.status_code == 422, (
+        f"Expected 422 (validation error from empty body, proves route "
+        f"is registered); got {resp.status_code}. Body: {resp.text!r}"
+    )

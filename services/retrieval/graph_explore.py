@@ -433,18 +433,33 @@ async def anchor_graph_query(
     a missing anchor, indistinguishable from "anchor exists with 0
     edges". The endpoint translates the missing-anchor case to 404.
     """
-    edge_filter_hop1, edge_filter_hop1_params = _build_edge_filter_sql(
-        filters,
-        edge_alias="ge",
-        # $1=customer_id, $2=anchor_canonical_id, $3=hop1_cap, $4=hop2_cap,
-        # $5=node_cap, $6=edge_cap, then hop1 filters, then hop2 filters.
-        next_param_idx=7,
+    # The edge filter is identical across all six insertion points (hop1
+    # both directions, hop2 both directions, all_edges both directions),
+    # but each occurrence needs its own positional-param indices because
+    # asyncpg has no named-param support. We append the same filter
+    # params to the params list six times and bump next_param_idx by the
+    # filter-param count between each call.
+    #
+    # $1=customer_id, $2=anchor_canonical_id, $3=hop1_cap, $4=hop2_cap,
+    # $5=node_cap, $6=edge_cap, then six identical filter-param blocks.
+    edge_filter_hop1_dir1, edge_filter_params_block = _build_edge_filter_sql(
+        filters, edge_alias="ge", next_param_idx=7,
     )
-    next_idx_after_hop1 = 7 + len(edge_filter_hop1_params)
-    edge_filter_hop2, edge_filter_hop2_params = _build_edge_filter_sql(
-        filters,
-        edge_alias="ge",
-        next_param_idx=next_idx_after_hop1,
+    n_filter_params = len(edge_filter_params_block)
+    edge_filter_hop1_dir2, _ = _build_edge_filter_sql(
+        filters, edge_alias="ge", next_param_idx=7 + n_filter_params,
+    )
+    edge_filter_hop2_dir1, _ = _build_edge_filter_sql(
+        filters, edge_alias="ge", next_param_idx=7 + 2 * n_filter_params,
+    )
+    edge_filter_hop2_dir2, _ = _build_edge_filter_sql(
+        filters, edge_alias="ge", next_param_idx=7 + 3 * n_filter_params,
+    )
+    edge_filter_all_dir1, _ = _build_edge_filter_sql(
+        filters, edge_alias="ge", next_param_idx=7 + 4 * n_filter_params,
+    )
+    edge_filter_all_dir2, _ = _build_edge_filter_sql(
+        filters, edge_alias="ge", next_param_idx=7 + 5 * n_filter_params,
     )
 
     sql = f"""
@@ -474,7 +489,7 @@ async def anchor_graph_query(
               ON ge.customer_id = $1
              AND ge.from_node_id = a.node_id
              AND (ge.valid_to IS NULL OR ge.valid_to > now())
-              {edge_filter_hop1}
+              {edge_filter_hop1_dir1}
             UNION ALL
             -- Direction 2: anchor as to_node (uses idx_graph_edges_to).
             SELECT a.node_id AS anchor_node_id,
@@ -487,7 +502,7 @@ async def anchor_graph_query(
               ON ge.customer_id = $1
              AND ge.to_node_id = a.node_id
              AND (ge.valid_to IS NULL OR ge.valid_to > now())
-              {edge_filter_hop2}
+              {edge_filter_hop1_dir2}
         ),
         hop1_neighbors_ranked AS (
             -- One row per neighbor (collapse direction-doubled edges).
@@ -535,7 +550,10 @@ async def anchor_graph_query(
         hop2_edges AS (
             -- Same UNION ALL pattern. Filter to edges NOT touching
             -- already-included nodes via NOT IN against hop2_seed in
-            -- the hop2 select.
+            -- the hop2 select. Edge-type/confidence/source/since filters
+            -- apply HERE so the BFS frontier respects the user's filter
+            -- (otherwise hop2 nodes reachable only via filtered-out
+            -- edges would still get included).
             SELECT s.node_id AS seed_node_id,
                    ge.to_node_id AS neighbor_node_id,
                    ge.edge_type, ge.confidence,
@@ -546,6 +564,7 @@ async def anchor_graph_query(
               ON ge.customer_id = $1
              AND ge.from_node_id = s.node_id
              AND (ge.valid_to IS NULL OR ge.valid_to > now())
+              {edge_filter_hop2_dir1}
             UNION ALL
             SELECT s.node_id AS seed_node_id,
                    ge.from_node_id AS neighbor_node_id,
@@ -557,6 +576,7 @@ async def anchor_graph_query(
               ON ge.customer_id = $1
              AND ge.to_node_id = s.node_id
              AND (ge.valid_to IS NULL OR ge.valid_to > now())
+              {edge_filter_hop2_dir2}
         ),
         hop2_neighbors_ranked AS (
             SELECT he.neighbor_node_id,
@@ -599,7 +619,11 @@ async def anchor_graph_query(
             -- Re-fetch ALL edges among the selected node set so the
             -- final response includes hop1<->hop2 cross edges (which
             -- the BFS proper missed). UNION ALL halves to use the
-            -- single-column edge indexes.
+            -- single-column edge indexes. Edge filters apply HERE too
+            -- so the response edges match what the user asked for --
+            -- otherwise the BFS would respect filters but the response
+            -- shape would still surface filtered-out edge types between
+            -- the selected nodes.
             SELECT ge.from_node_id, ge.to_node_id,
                    ge.edge_type, ge.confidence,
                    ge.properties->>'why' AS why
@@ -608,6 +632,7 @@ async def anchor_graph_query(
               ON ge.customer_id = $1
              AND ge.from_node_id = a.node_id
              AND (ge.valid_to IS NULL OR ge.valid_to > now())
+              {edge_filter_all_dir1}
             JOIN all_node_ids a2 ON a2.node_id = ge.to_node_id
             UNION ALL
             SELECT ge.from_node_id, ge.to_node_id,
@@ -618,6 +643,7 @@ async def anchor_graph_query(
               ON ge.customer_id = $1
              AND ge.to_node_id = a.node_id
              AND (ge.valid_to IS NULL OR ge.valid_to > now())
+              {edge_filter_all_dir2}
             JOIN all_node_ids a2 ON a2.node_id = ge.from_node_id
         ),
         edge_count AS (
@@ -704,8 +730,12 @@ async def anchor_graph_query(
         GRAPH_EXPLORE_NODE_CAP,
         GRAPH_EXPLORE_EDGE_CAP,
     ]
-    params.extend(edge_filter_hop1_params)
-    params.extend(edge_filter_hop2_params)
+    # Append the same filter param block six times -- once per insertion
+    # point in the SQL above. asyncpg has no named-param support, so each
+    # `${idx}` reference needs its own positional value; they all happen
+    # to be the same value because the filter is identical at every site.
+    for _ in range(6):
+        params.extend(edge_filter_params_block)
 
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(sql, *params)
@@ -828,6 +858,13 @@ async def graph_search_query(
     indexes. Search-by-substring is intentionally out of scope for the
     typeahead; callers wanting fuzzy-match should use the main /retrieve
     pipeline.
+
+    Match surfaces: canonical_id (covers Document nodes -- doc titles
+    are embedded in the canonical_id for our doc kinds, e.g.
+    `github:org/repo:pr:123`, `linear:LIN-456`) and properties->>'name'
+    (covers Person/Service/Concept entities). Document `properties.title`
+    is not searched directly; there's no functional index on it and it
+    would seq-scan. This matches the /retrieve precedent.
     """
     q_clean = q.strip().lower()
     if not q_clean:
@@ -849,7 +886,6 @@ async def graph_search_query(
           AND (
               LOWER(canonical_id) LIKE $2
               OR LOWER(properties->>'name') LIKE $2
-              OR LOWER(properties->>'title') LIKE $2
           )
         ORDER BY degree DESC, canonical_id ASC
         LIMIT $3

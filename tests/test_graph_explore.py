@@ -467,6 +467,93 @@ async def test_anchor_graph_two_hop_fills(live_db) -> None:
     assert node_ids == {"anchor", "hop1-a", "hop2-b"}
 
 
+async def test_anchor_graph_filter_applies_to_hop2(live_db) -> None:
+    """Regression: edge_types filter must constrain the hop2 BFS frontier
+    AND the response edges, not just hop1.
+
+    Setup:
+        anchor A
+          -[DISCUSSES]-> B  (hop1)
+          -[DISCUSSES]-> C  (hop1)
+        B -[DISCUSSES]-> D  (hop2 via DISCUSSES, should appear)
+        C -[RELATES_TO]-> E (hop2 via RELATES_TO, should be filtered out)
+
+    Query with filters=ExploreFilters(edge_types=[DISCUSSES]) must:
+      - include D (reachable via filtered edge type)
+      - exclude E (only reachable via filtered-out edge type)
+      - return only DISCUSSES edges in the response, no RELATES_TO
+
+    Before the P0 fix, hop2_edges and all_edges ignored the edge filter
+    and E + the A-...-E RELATES_TO edge would surface.
+    """
+    await _seed_customer("cust-hop2-filter")
+    for canonical_id, degree in [
+        ("A", 0), ("B", 1), ("C", 1), ("D", 1), ("E", 1),
+    ]:
+        await _seed_node(
+            "cust-hop2-filter", label=NodeLabel.SERVICE.value,
+            canonical_id=canonical_id, degree=degree,
+        )
+    # hop1: A -> B, A -> C (both DISCUSSES)
+    await _seed_edge(
+        "cust-hop2-filter",
+        from_label=NodeLabel.SERVICE.value, from_canonical_id="A",
+        to_label=NodeLabel.SERVICE.value,   to_canonical_id="B",
+        edge_type=EdgeType.DISCUSSES.value,
+    )
+    await _seed_edge(
+        "cust-hop2-filter",
+        from_label=NodeLabel.SERVICE.value, from_canonical_id="A",
+        to_label=NodeLabel.SERVICE.value,   to_canonical_id="C",
+        edge_type=EdgeType.DISCUSSES.value,
+    )
+    # hop2: B -> D via DISCUSSES (in-filter)
+    await _seed_edge(
+        "cust-hop2-filter",
+        from_label=NodeLabel.SERVICE.value, from_canonical_id="B",
+        to_label=NodeLabel.SERVICE.value,   to_canonical_id="D",
+        edge_type=EdgeType.DISCUSSES.value,
+    )
+    # hop2: C -> E via RELATES_TO (out-of-filter)
+    await _seed_edge(
+        "cust-hop2-filter",
+        from_label=NodeLabel.SERVICE.value, from_canonical_id="C",
+        to_label=NodeLabel.SERVICE.value,   to_canonical_id="E",
+        edge_type=EdgeType.RELATES_TO.value,
+    )
+
+    result = await anchor_graph_query(
+        customer_id="cust-hop2-filter",
+        anchor_canonical_id="A",
+        filters=ExploreFilters(edge_types=[EdgeType.DISCUSSES.value]),
+    )
+    node_ids = {n.id for n in result.nodes}
+    # D is reachable via the DISCUSSES path -> must appear.
+    assert "D" in node_ids, (
+        f"hop2 BFS dropped D (reachable via DISCUSSES); got {node_ids}. "
+        "This means the edge_types filter isn't wired into hop2_edges."
+    )
+    # E is only reachable via RELATES_TO -> must NOT appear.
+    assert "E" not in node_ids, (
+        f"hop2 BFS included E (only reachable via RELATES_TO) despite "
+        f"edge_types=[DISCUSSES] filter; got {node_ids}. "
+        "This means the edge_types filter isn't wired into hop2_edges."
+    )
+    edge_types = {e.edge_type for e in result.edges}
+    assert edge_types == {EdgeType.DISCUSSES.value}, (
+        f"Response edges include non-DISCUSSES types: {edge_types}. "
+        "This means the edge_types filter isn't wired into all_edges."
+    )
+    # A->B, A->C, B->D should all surface (D is reachable). After dedup
+    # of the bidirectional UNION ALL there should be exactly 3 edges.
+    edge_pairs = {(e.source, e.target, e.edge_type) for e in result.edges}
+    assert edge_pairs == {
+        ("A", "B", EdgeType.DISCUSSES.value),
+        ("A", "C", EdgeType.DISCUSSES.value),
+        ("B", "D", EdgeType.DISCUSSES.value),
+    }, f"Unexpected edge set: {edge_pairs}"
+
+
 async def test_anchor_graph_cross_tenant_no_leak(live_db) -> None:
     """Anchor seeded in tenant A, query under tenant B -> empty graph.
 
