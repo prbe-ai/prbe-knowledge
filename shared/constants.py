@@ -335,6 +335,16 @@ EMBEDDING_V2_DIM = 3072
 # silently truncate the Gemini-side input.
 EMBEDDING_V2_MAX_INPUT_TOKENS = 2048
 CHUNKER_VERSION = "naive-v1"
+
+# Per-symbol cap for code_graph chunks. Matches DEFAULT_CHUNK_TOKENS so code
+# and prose live on the same retrieval scale: a unified retriever ranks
+# candidates across sources and assumes chunks are roughly comparable units.
+# Pre-cap, individual code symbols could land as 6000+ token chunks, which
+# (a) made BM25 fire harder on identifier tokens than a 512-token prose
+# chunk and (b) blew Anthropic 25KB tool-result caps on Probe MCP responses
+# (one symbol = 30KB). 0.3x demote (commit 7745043c) was a band-aid for the
+# ranking side; this constant attacks the size mismatch at the source.
+MAX_SYMBOL_CHUNK_TOKENS = 512
 NORMALIZER_VERSION = "v1"
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
