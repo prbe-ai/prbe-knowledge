@@ -11,7 +11,7 @@
 #   scripts/fly-secrets-sync.sh --no-create cron # fail (don't create) if app missing
 #
 # App shortcuts: ingestion | retrieval | worker | poller |
-#                wiki-worker | wiki-synthesis | wiki-bootstrap |
+#                wiki-worker | wiki-synthesis | wiki-backfill |
 #                cron | side-worker | all (default)
 #
 # Requires: flyctl in PATH, logged in (`flyctl auth whoami`), and a .env file
@@ -53,13 +53,13 @@ while [[ $# -gt 0 ]]; do
             awk '/^#!/{next} /^[^#]/{exit} {sub(/^# ?/,""); print}' "$0"
             exit 0
             ;;
-        ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-bootstrap|cron|side-worker|all)
+        ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-backfill|cron|side-worker|all)
             TARGET="$1"
             shift
             ;;
         *)
             echo "Unknown argument: $1" >&2
-            echo "Usage: $0 [ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-bootstrap|cron|side-worker|all] [-f env-file] [--org name] [--no-create]" >&2
+            echo "Usage: $0 [ingestion|retrieval|worker|poller|wiki-worker|wiki-synthesis|wiki-backfill|cron|side-worker|all] [-f env-file] [--org name] [--no-create]" >&2
             exit 1
             ;;
     esac
@@ -99,7 +99,7 @@ ALL_APPS=(
     "prbe-knowledge-poller"
     "prbe-knowledge-wiki-worker"
     "prbe-knowledge-wiki-synthesis"
-    "prbe-knowledge-wiki-bootstrap"
+    "prbe-knowledge-wiki-backfill"
     "prbe-knowledge-cron"
     "prbe-knowledge-side-worker"
 )
@@ -112,7 +112,7 @@ case "$TARGET" in
     poller)          APPS=("prbe-knowledge-poller") ;;
     wiki-worker)     APPS=("prbe-knowledge-wiki-worker") ;;
     wiki-synthesis)  APPS=("prbe-knowledge-wiki-synthesis") ;;
-    wiki-bootstrap)  APPS=("prbe-knowledge-wiki-bootstrap") ;;
+    wiki-backfill)   APPS=("prbe-knowledge-wiki-backfill") ;;
     cron)            APPS=("prbe-knowledge-cron") ;;
     side-worker)     APPS=("prbe-knowledge-side-worker") ;;
 esac

@@ -1,4 +1,4 @@
-"""Entry point for the prbe-knowledge-wiki-bootstrap fly app.
+"""Entry point for the prbe-knowledge-wiki-backfill fly app.
 
 Per-machine ``BackfillWorker`` that LISTENs on ``WIKI_BACKFILL_CHANNEL``
 (wake hint) and ``WIKI_BACKFILL_CANCEL_CHANNEL`` (force-cancel), claims

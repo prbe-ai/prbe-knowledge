@@ -19,7 +19,7 @@ jobs:
       poller:         ${{ steps.filter.outputs.poller         == 'true' || github.event_name == 'workflow_dispatch' }}
       wiki_worker:    ${{ steps.filter.outputs.wiki_worker    == 'true' || github.event_name == 'workflow_dispatch' }}
       wiki_synthesis: ${{ steps.filter.outputs.wiki_synthesis == 'true' || github.event_name == 'workflow_dispatch' }}
-      wiki_bootstrap: ${{ steps.filter.outputs.wiki_bootstrap == 'true' || github.event_name == 'workflow_dispatch' }}
+      wiki_backfill:  ${{ steps.filter.outputs.wiki_backfill  == 'true' || github.event_name == 'workflow_dispatch' }}
       cron:           ${{ steps.filter.outputs.cron           == 'true' || github.event_name == 'workflow_dispatch' }}
       side_worker:    ${{ steps.filter.outputs.side_worker    == 'true' || github.event_name == 'workflow_dispatch' }}
     steps:
@@ -70,7 +70,7 @@ jobs:
               - 'shared/**'
               - 'fly.wiki-synthesis.toml'
               - 'pyproject.toml'
-            wiki_bootstrap:
+            wiki_backfill:
               - 'services/synthesis/**'
               - 'services/ingestion/normalizer.py'
               - 'services/ingestion/handlers/**'
@@ -318,17 +318,17 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
-  deploy-wiki-bootstrap:
+  deploy-wiki-backfill:
     needs: [changes, deploy-ingestion]
     if: |
       always() &&
-      needs.changes.outputs.wiki_bootstrap == 'true' &&
+      needs.changes.outputs.wiki_backfill == 'true' &&
       (needs.deploy-ingestion.result == 'success' || needs.deploy-ingestion.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Deploy wiki-bootstrap
+      - name: Deploy wiki-backfill
         # See "Deploy ingestion" for timeout rationale.
         run: |
           set +e
@@ -340,13 +340,13 @@ jobs:
           exit $rc
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-      # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy —
+      # `count = N` in fly.toml [[vm]] doesn't auto-scale on deploy --
       # follow up with explicit scale count to actually move the dial.
       # Timeout wrapper: see "Pin poller" comment for the no-op-hang regression.
-      - name: Pin wiki-bootstrap to 4 machines
+      - name: Pin wiki-backfill to 4 machines
         run: |
           set +e
-          timeout 120 flyctl scale count worker=4 -a prbe-knowledge-wiki-bootstrap --yes
+          timeout 120 flyctl scale count worker=4 -a prbe-knowledge-wiki-backfill --yes
           rc=$?
           if [ $rc -eq 0 ] || [ $rc -eq 124 ]; then exit 0; fi
           exit $rc
