@@ -9,6 +9,39 @@ This module wraps the production Gemini SDK with that contract. Stays
 out of the unit-test path (tests pass their own stub client into
 SynthesisWorker via llm_client=...).
 
+Phase-0b carve-out (managed-isolated / self-host)
+-------------------------------------------------
+This call site is the **one production call site that does NOT migrate
+to `shared.llm.acompletion`** in Phase 0b. Two reasons:
+
+  1. **LiteLLM does not expose Gemini's `CachedContent` API.** The agent
+     loop relies on a per-drain cache (system prompt + wiki index +
+     manifest seed, ~10K-100K tokens) that's re-used across up to 200
+     turns. Dropping the cache and re-sending the seed every turn would
+     multiply Gemini input-cost by ~200x — material at fleet scale.
+  2. **Gemini 3.x request shape is not OpenAI-compatible.** The harness
+     round-trips Gemini-native `function_call` / `function_response`
+     parts AND the opaque `thought_signature` bytes the API requires on
+     every echoed function_call. LiteLLM normalizes tools to OpenAI's
+     `tool_calls` shape — `thought_signature` has no slot in that shape,
+     so multi-turn agent runs would 400 on turn 2 (this is the same
+     bug `agent.gemini_persistent_error` flagged before AFC was
+     disabled, but with no clean workaround inside LiteLLM).
+
+So `GeminiAgentClient` keeps the direct google-genai SDK. The
+trade-off: **on managed tenants (where LLM_GATEWAY_URL is set), the
+data-plane pod has no GOOGLE_API_KEY**, so wiki-agent runs cannot
+execute. Constructing this client in gateway mode raises a clear
+RuntimeError — surfaces loudly, doesn't silently downgrade to a
+broken request.
+
+TODO(phase-0b-cached-content): re-enable on managed tenants when
+either (a) LiteLLM exposes Gemini's `caches.create` / `cached_content`
+lifecycle plus `thought_signature` passthrough, or (b) the central
+LiteLLM proxy gets per-customer GCP credentials so the call can route
+through the proxy with provider-native shape. Until then, wiki-agent
+is a direct-keys-only feature.
+
 Critical Gemini constraint (caused v4 first-turn halt):
 
     When a request sets `cached_content`, it MUST NOT also set
@@ -49,6 +82,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from shared import llm as shared_llm
 from shared.config import get_settings
 from shared.constants import WIKI_AGENT_CACHE_TTL, WIKI_AGENT_MODEL
 from shared.logging import get_logger
@@ -107,6 +141,23 @@ class GeminiAgentClient:
     def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
+        # Phase-0b carve-out gate: in managed-isolated / self-host mode
+        # the data plane has no GOOGLE_API_KEY (provider creds live in
+        # the central LiteLLM proxy). Since CachedContent + thought-
+        # signature round-tripping don't migrate through LiteLLM today
+        # (see module docstring), refuse to construct the client rather
+        # than emit a misleading "GOOGLE_API_KEY not configured" — that
+        # error implies a config fix exists. The carve-out doesn't.
+        if shared_llm.gateway_url():
+            raise RuntimeError(
+                "GeminiAgentClient is not available in LLM_GATEWAY_URL "
+                "(managed-isolated / self-host) mode — Gemini CachedContent "
+                "and thought_signature round-tripping have no LiteLLM "
+                "equivalent. The wiki-agent loop is direct-keys-only "
+                "until either LiteLLM exposes Gemini caches or the proxy "
+                "gets GCP credentials. See module docstring for the full "
+                "rationale + TODO(phase-0b-cached-content)."
+            )
         try:
             from google import genai
         except ImportError as exc:
