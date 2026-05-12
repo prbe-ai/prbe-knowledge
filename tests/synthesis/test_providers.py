@@ -70,7 +70,7 @@ def test_default_triage_provider_is_anthropic() -> None:
 def test_triage_provider_dispatches_to_gemini_on_override() -> None:
     from services.synthesis.providers import _GeminiTriage
 
-    provider = get_triage_provider(model_override="gemini-flash-lite-preview")
+    provider = get_triage_provider(model_override="gemini-3.1-flash-lite")
     assert isinstance(provider, _GeminiTriage)
 
 

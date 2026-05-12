@@ -74,7 +74,7 @@ def test_thinking_budget_zero_for_flash_and_flash_lite() -> None:
     # The eval at scripts/eval_directed_phrases.py confirmed Flash and
     # Flash Lite both work with budget=0; pin that contract.
     assert _thinking_budget_for("gemini-3-flash-preview") == 0
-    assert _thinking_budget_for("gemini-3.1-flash-lite-preview") == 0
+    assert _thinking_budget_for("gemini-3.1-flash-lite") == 0
     assert _thinking_budget_for("gemini-flash-lite") == 0
 
 
@@ -218,17 +218,17 @@ def test_factory_resolves_short_aliases_to_canonical_ids() -> None:
     for alias in ("gemini-flash-lite",):
         provider = get_directed_phrases_provider(model_override=alias)
         assert isinstance(provider, _GeminiDirectedPhrases)
-        assert provider._model == "gemini-flash-lite-preview"
+        assert provider._model == "gemini-3.1-flash-lite"
 
 
 def test_factory_dispatch_gemini_flash_lite_alias() -> None:
     # Explicit alias lets a future Flash -> Flash Lite flip be a one-line
     # constants.py change with no provider edit.
     provider = get_directed_phrases_provider(
-        model_override="gemini-3.1-flash-lite-preview"
+        model_override="gemini-3.1-flash-lite"
     )
     assert isinstance(provider, _GeminiDirectedPhrases)
-    assert provider._model == "gemini-3.1-flash-lite-preview"
+    assert provider._model == "gemini-3.1-flash-lite"
 
 
 def test_factory_dispatch_anthropic_lazy_constructs_client(monkeypatch) -> None:
