@@ -632,6 +632,11 @@ CREATE POLICY tenant_isolation ON graph_edges
 -- read by the dashboard's /query/usage page via /usage/feed, /usage/stats,
 -- /usage/search. RLS-isolated like graph_nodes / graph_edges.
 -- ---------------------------------------------------------------------------
+-- uploaded_at / counters / ix_usage_events_pending: outbox shape for the
+-- data-plane telemetry uploader (migration 0065, option A — one table).
+-- uploaded_at NULL = "needs flushing"; counters holds token/usage counts
+-- ({} until a follow-up threads real counts); the partial index is the
+-- uploader's drain query.
 CREATE TABLE usage_events (
     event_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
@@ -646,7 +651,9 @@ CREATE TABLE usage_events (
     error_class     TEXT,
     latency_ms      INT,
     result_count    INT,
-    metadata        JSONB NOT NULL DEFAULT '{}'
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    uploaded_at     TIMESTAMPTZ,
+    counters        JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 CREATE INDEX idx_usage_events_customer_time
@@ -656,6 +663,9 @@ CREATE INDEX idx_usage_events_customer_type_time
 -- 'simple' (not 'english') so user search terms aren't stemmed/stop-worded.
 CREATE INDEX idx_usage_events_search
     ON usage_events USING gin (to_tsvector('simple', summary));
+CREATE INDEX ix_usage_events_pending
+    ON usage_events (customer_id, occurred_at)
+    WHERE uploaded_at IS NULL;
 
 ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_events FORCE ROW LEVEL SECURITY;
