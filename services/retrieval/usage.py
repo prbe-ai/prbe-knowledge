@@ -85,6 +85,12 @@ class UsageEvent:
     latency_ms: int | None = None
     result_count: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Outbox counters drained by the data-plane telemetry uploader
+    # (occurred_at + uploaded_at + counters form the outbox shape — see
+    # migration 0065_usage_events_outbox). Empty for now; a separate task
+    # threads real LLM token counts in from the call sites. `uploaded_at`
+    # is left NULL on insert (= "needs flushing") by omitting it.
+    counters: dict[str, Any] = field(default_factory=dict)
 
 
 def event_type_for(endpoint: str, body: BaseModel | None = None) -> str:
@@ -156,16 +162,21 @@ async def write_usage_event(event: UsageEvent) -> None:
     try:
         summary = _truncate_summary(event.summary)
         metadata_json = json.dumps(event.metadata or {})
+        counters_json = json.dumps(event.counters or {})
         async with with_tenant(event.customer_id) as conn:
             await conn.execute(
+                # uploaded_at is intentionally omitted -> stays NULL ("needs
+                # flushing" for the data-plane telemetry uploader's drain
+                # query). counters defaults to {} when no token counts were
+                # threaded in.
                 """
                 INSERT INTO usage_events (
                     customer_id, occurred_at, caller_kind, caller_subject,
                     event_type, request_id, endpoint, summary, status,
-                    error_class, latency_ms, result_count, metadata
+                    error_class, latency_ms, result_count, metadata, counters
                 ) VALUES (
                     $1, $2, $3, $4, $5, $6::uuid, $7, $8, $9,
-                    $10, $11, $12, $13::jsonb
+                    $10, $11, $12, $13::jsonb, $14::jsonb
                 )
                 """,
                 event.customer_id,
@@ -181,6 +192,7 @@ async def write_usage_event(event: UsageEvent) -> None:
                 event.latency_ms,
                 event.result_count,
                 metadata_json,
+                counters_json,
             )
     except Exception as exc:
         log.warning(
