@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from shared import llm as shared_llm
 from shared.config import get_settings
 from shared.constants import SYNTHESIS_MODELS
 from shared.exceptions import PrbeError
@@ -302,9 +303,15 @@ async def synthesize_stream(
     Yields StreamDelta(...) for each token chunk, then exactly one
     StreamFinal(...) with the parsed answer + citations.
 
-    Anthropic only today — streaming through OpenAI/Google can be added
-    later if we expose those models in the synthesis dropdown. The
-    `synthesize` (non-streaming) path still supports all three.
+    Routes through `shared.llm.acompletion(stream=True)` so managed-
+    isolated and self-host tenants (no local provider keys; only an
+    `LLM_GATEWAY_URL` pointing at the central LiteLLM proxy) can use it
+    transparently. LiteLLM normalizes Anthropic + Google streaming into
+    a single OpenAI-shaped chunk iterator.
+
+    Anthropic + Google supported today; OpenAI streaming could be added
+    by extending SYNTHESIS_MODELS without further code change. The
+    non-streaming `synthesize` path covers all three providers.
     """
     if not chunks:
         yield StreamFinal(
@@ -329,69 +336,80 @@ async def synthesize_stream(
     user_prompt = _format_user_prompt(query, chunks)
     system_prompt = _build_streaming_system_prompt(datetime.now(UTC))
 
+    # Route through `shared.llm.acompletion(..., stream=True)` so the
+    # call automatically forwards to the customer's LiteLLM proxy when
+    # `LLM_GATEWAY_URL` is set (managed-isolated / self-host tenants
+    # have no provider keys locally). LiteLLM normalizes Anthropic's
+    # `messages.stream` and Google's `generate_content_stream` into
+    # one OpenAI-shaped chunk iterator: each chunk exposes
+    # `chunk.choices[0].delta.content`; final usage rides on the last
+    # chunk's `chunk.usage`. See `docs/llm-migration-inventory.md`
+    # rows for `synthesize_stream`.
+    #
+    # SYNTHESIS_MODELS keys use `google/` as the internal provider tag
+    # but LiteLLM routes Gemini (AI Studio, API-key auth) via the
+    # `gemini/` prefix. Bare ids and `google/` route to Vertex AI which
+    # needs full GCP service-account creds we don't ship. Translate
+    # here; Anthropic's prefix is already canonical.
+    litellm_provider = "gemini" if provider_name == "google" else provider_name
+    litellm_model = f"{litellm_provider}/{model_id}"
+    completion_kwargs: dict[str, Any] = {
+        "max_tokens": max_tokens,
+        "timeout": SYNTHESIS_TIMEOUT_SECONDS,
+    }
+    if provider_name == "google":
+        # Gemini 3 Flash thinks by default. Thinking tokens are billed
+        # against `max_output_tokens` and produce no visible output;
+        # for retrieval-grounded synthesis the answer must come from the
+        # chunks, so extended reasoning is pure latency + wasted budget.
+        # The legacy call used `thinking_config: {thinking_budget: 0}`.
+        # LiteLLM normalizes this to `reasoning_effort="none"`; for
+        # Gemini 2.x that maps to budget=0, but for **Gemini 3+** it
+        # maps to `thinking_level="minimal"` because Google removed the
+        # ability to fully disable thinking on the 3.x line. "Minimal"
+        # is the closest available approximation — managed-tenant
+        # streaming may incur a small thinking-token overhead the old
+        # direct-SDK path did not, but correctness (cited prose grounded
+        # in the chunks) is unchanged. The optimization was about
+        # latency, not correctness.
+        # TODO(phase-0b-thinking-config): revisit when LiteLLM exposes
+        # a passthrough for Gemini 3's `thinking_level` budget knob, or
+        # when Google re-enables true budget=0 on 3.x.
+        completion_kwargs["reasoning_effort"] = "none"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
     accumulated = ""
-    if provider_name == "anthropic":
-        from anthropic import APIError, AsyncAnthropic
-
-        api_key = get_settings().anthropic_api_key.get_secret_value()
-        if not api_key:
-            raise SynthesisError("ANTHROPIC_API_KEY not configured")
-        client = AsyncAnthropic(api_key=api_key, timeout=SYNTHESIS_TIMEOUT_SECONDS)
-        try:
-            async with client.messages.stream(
-                model=model_id,
-                max_tokens=max_tokens,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
-            ) as stream:
-                async for text in stream.text_stream:
-                    if not text:
-                        continue
-                    accumulated += text
-                    yield StreamDelta(text=text)
-        except APIError as exc:
-            raise SynthesisError(f"anthropic api error: {exc}") from exc
-    else:
-        # Google: plain-text streaming via google-genai's async generator.
-        # No response_schema — same reason as the Anthropic streaming
-        # branch (incremental structured-output parsing is fragile).
-        try:
-            from google import genai
-        except ImportError as exc:
-            raise SynthesisError(
-                "google-genai not installed; run pip install -e '.[dev]'"
-            ) from exc
-
-        api_key = get_settings().google_api_key.get_secret_value()
-        if not api_key:
-            raise SynthesisError("GOOGLE_API_KEY not configured")
-        client = genai.Client(api_key=api_key)
-        # Google has no separate system slot — prepend.
-        contents = f"{system_prompt}\n\n---\n\n{user_prompt}"
-        try:
-            stream = await client.aio.models.generate_content_stream(
-                model=model_id,
-                contents=contents,
-                config={
-                    "max_output_tokens": max_tokens,
-                    # Gemini 3 Flash thinks by default; thinking tokens are
-                    # billed against `max_output_tokens` and produce no
-                    # visible output. For retrieval-grounded synthesis the
-                    # answer must come from the chunks, so extended reasoning
-                    # adds latency + truncates the user-visible answer for
-                    # zero benefit. Forcing budget=0 keeps the full token
-                    # allowance available for the cited prose.
-                    "thinking_config": {"thinking_budget": 0},
-                },
-            )
-            async for resp in stream:
-                text = getattr(resp, "text", None) or ""
-                if not text:
-                    continue
-                accumulated += text
-                yield StreamDelta(text=text)
-        except Exception as exc:
-            raise SynthesisError(f"google api error: {exc}") from exc
+    try:
+        resp = await shared_llm.acompletion(
+            model=litellm_model,
+            messages=messages,
+            stream=True,
+            **completion_kwargs,
+        )
+        async for chunk in resp:
+            # OpenAI-shape: each chunk has `.choices[0].delta.content`
+            # (string or None). Final chunk may carry `.usage` for
+            # token accounting (Phase D15 metering); we accept it
+            # silently today — wire-format hasn't grown a usage slot
+            # on `StreamFinal`, so we don't surface it. Recorded here
+            # for the eventual metering pass.
+            choices = getattr(chunk, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            text = getattr(delta, "content", None) if delta is not None else None
+            if not text:
+                continue
+            accumulated += text
+            yield StreamDelta(text=text)
+    except shared_llm.LLMError as exc:
+        raise SynthesisError(
+            f"{provider_name} streaming api error: {exc}"
+        ) from exc
 
     # Detect the insufficient-context sentinel and strip it before parsing
     # citations. Models occasionally emit it lowercased or with surrounding

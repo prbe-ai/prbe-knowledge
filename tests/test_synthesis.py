@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
-
 import pytest
 
 from services.retrieval.synthesis import (
@@ -344,64 +342,70 @@ async def test_synthesize_normalizes_bare_citations(monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# synthesize_stream — Anthropic streaming path
+# synthesize_stream — LiteLLM-routed streaming path (Phase-0b chunk D)
 # ---------------------------------------------------------------------------
+#
+# `synthesize_stream` now routes through `shared.llm.acompletion(stream=True)`
+# regardless of provider. LiteLLM normalizes Anthropic + Google streaming into
+# one OpenAI-shaped async-iterator of chunks: each chunk exposes
+# `chunk.choices[0].delta.content` (string or None) and the final chunk may
+# carry `chunk.usage`. The test fakes that contract.
 
 
-class _FakeStream:
-    """Mimics the async-context-manager returned by AsyncAnthropic.messages.stream.
+class _FakeDelta:
+    def __init__(self, content: str | None) -> None:
+        self.content = content
 
-    Yields each entry of `texts` as a separate text-stream chunk so we can
-    verify synthesize_stream emits one StreamDelta per chunk.
+
+class _FakeChoice:
+    def __init__(self, content: str | None) -> None:
+        self.delta = _FakeDelta(content)
+
+
+class _FakeChunk:
+    def __init__(self, content: str | None, usage: object | None = None) -> None:
+        self.choices = [_FakeChoice(content)]
+        if usage is not None:
+            self.usage = usage
+
+
+class _FakeUsage:
+    def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+async def _fake_chunk_iter(texts: list[str], with_final_usage: bool = True):
+    """Yield one OpenAI-shaped chunk per text, then optionally one trailing
+    empty-delta chunk carrying `.usage` (matches LiteLLM's wire shape — the
+    last chunk has no content delta but does carry token accounting).
+    """
+    for t in texts:
+        yield _FakeChunk(content=t)
+    if with_final_usage:
+        yield _FakeChunk(
+            content=None,
+            usage=_FakeUsage(prompt_tokens=10, completion_tokens=20),
+        )
+
+
+class _AcompletionRecorder:
+    """Stand-in for `shared.llm.acompletion` that records call kwargs and
+    returns a controllable async-chunk iterator on each invocation.
     """
 
     def __init__(self, texts: list[str]) -> None:
-        self._texts = texts
+        self.texts = texts
+        self.calls: list[dict[str, object]] = []
 
-    async def __aenter__(self) -> _FakeStream:
-        return self
-
-    async def __aexit__(self, *_args: object) -> None:
-        return None
-
-    @property
-    def text_stream(self):
-        async def _gen():
-            for t in self._texts:
-                yield t
-
-        return _gen()
-
-
-class _FakeMessages:
-    def __init__(self, texts: list[str]) -> None:
-        self._texts = texts
-        self.stream_calls: list[dict] = []
-
-    def stream(self, **kwargs: object) -> _FakeStream:
-        self.stream_calls.append(kwargs)
-        return _FakeStream(self._texts)
-
-
-class _FakeAsyncAnthropic:
-    """Stand-in for anthropic.AsyncAnthropic. Captures construction kwargs and
-    proxies messages.stream to a controllable fake.
-    """
-
-    last_instance: _FakeAsyncAnthropic | None = None
-
-    def __init__(self, *args: object, **kwargs: object) -> None:
-        self.init_args = args
-        self.init_kwargs = kwargs
-        # texts is patched in by the test via `_FakeAsyncAnthropic.next_texts`.
-        texts = getattr(_FakeAsyncAnthropic, "next_texts", [""])
-        self.messages = _FakeMessages(texts)
-        _FakeAsyncAnthropic.last_instance = self
+    async def __call__(self, **kwargs: object):
+        self.calls.append(kwargs)
+        return _fake_chunk_iter(self.texts)
 
 
 @pytest.mark.asyncio
 async def test_synthesize_stream_short_circuits_on_empty_chunks() -> None:
-    """No chunks → no model call → single StreamFinal flagged insufficient."""
+    """No chunks -> no model call -> single StreamFinal flagged insufficient."""
     events = []
     async for evt in synthesize_stream(
         "anything", [], model="anthropic/claude-sonnet-4-6"
@@ -448,40 +452,41 @@ async def test_synthesize_stream_rejects_unsupported_provider(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
-async def test_synthesize_stream_yields_deltas_then_final(monkeypatch) -> None:
-    """Happy path: streaming chunks arrive as StreamDelta events; the
-    accumulated text is parsed for citations and emitted as StreamFinal.
+async def test_synthesize_stream_yields_deltas_then_final_anthropic(
+    monkeypatch,
+) -> None:
+    """Happy path on the Anthropic provider: streaming chunks arrive as
+    StreamDelta events; the accumulated text is parsed for citations and
+    emitted as StreamFinal. Verifies the LiteLLM call is invoked with the
+    right model prefix and messages shape.
     """
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    from shared.config import get_settings
-
-    get_settings.cache_clear()  # type: ignore[attr-defined]
-
-    _FakeAsyncAnthropic.next_texts = [
-        "Klavis ",
-        "shipped Tuesday [chunk:1]. ",
-        "It uses MCP [chunk:2].",
-    ]
+    fake = _AcompletionRecorder(
+        texts=[
+            "Klavis ",
+            "shipped Tuesday [chunk:1]. ",
+            "It uses MCP [chunk:2].",
+        ]
+    )
+    monkeypatch.setattr("services.retrieval.synthesis.shared_llm.acompletion", fake)
 
     chunks = [
         _chunk(1, content="Klavis went live Tuesday"),
         _chunk(2, content="Built on top of MCP"),
     ]
 
-    with patch("anthropic.AsyncAnthropic", _FakeAsyncAnthropic):
-        events = []
-        async for evt in synthesize_stream(
-            "what is klavis?",
-            chunks,
-            model="anthropic/claude-sonnet-4-6",
-            max_tokens=200,
-        ):
-            events.append(evt)
+    events = []
+    async for evt in synthesize_stream(
+        "what is klavis?",
+        chunks,
+        model="anthropic/claude-sonnet-4-6",
+        max_tokens=200,
+    ):
+        events.append(evt)
 
     deltas = [e for e in events if isinstance(e, StreamDelta)]
     finals = [e for e in events if isinstance(e, StreamFinal)]
     assert len(deltas) == 3
-    assert [d.text for d in deltas] == _FakeAsyncAnthropic.next_texts
+    assert [d.text for d in deltas] == fake.texts
     assert len(finals) == 1
     final = finals[0]
     assert final.insufficient_context is False
@@ -489,11 +494,63 @@ async def test_synthesize_stream_yields_deltas_then_final(monkeypatch) -> None:
     assert {c["chunk_id"] for c in final.citations} == {"chunk-1", "chunk-2"}
     assert "[chunk:1]" in final.answer
 
-    # Verify max_tokens + system prompt routed to the SDK.
-    assert _FakeAsyncAnthropic.last_instance is not None
-    call_kwargs = _FakeAsyncAnthropic.last_instance.messages.stream_calls[0]
-    assert call_kwargs["model"] == "claude-sonnet-4-6"
-    assert call_kwargs["max_tokens"] == 200
+    # LiteLLM call shape: provider-prefixed model id (split from the
+    # SYNTHESIS_MODELS key), OpenAI-style messages, stream=True,
+    # max_tokens forwarded. No reasoning_effort on Anthropic.
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["model"] == "anthropic/claude-sonnet-4-6"
+    assert call["stream"] is True
+    assert call["max_tokens"] == 200
+    assert "reasoning_effort" not in call
+    messages = call["messages"]
+    assert isinstance(messages, list) and len(messages) == 2
+    assert messages[0]["role"] == "system"
+    assert messages[1]["role"] == "user"
+    assert "what is klavis?" in messages[1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_yields_deltas_then_final_google(
+    monkeypatch,
+) -> None:
+    """Google streaming path goes through the same LiteLLM call, with the
+    Gemini-specific `reasoning_effort="none"` knob (the chunk-D replacement
+    for the legacy `thinking_config: {thinking_budget: 0}`).
+    """
+    fake = _AcompletionRecorder(
+        texts=["Gemini ", "answered [chunk:1]."]
+    )
+    monkeypatch.setattr("services.retrieval.synthesis.shared_llm.acompletion", fake)
+
+    chunks = [_chunk(1, content="some context")]
+
+    events = []
+    async for evt in synthesize_stream(
+        "q?",
+        chunks,
+        model="google/gemini-3-flash-preview",
+        max_tokens=150,
+    ):
+        events.append(evt)
+
+    deltas = [e for e in events if isinstance(e, StreamDelta)]
+    assert [d.text for d in deltas] == ["Gemini ", "answered [chunk:1]."]
+
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    # SYNTHESIS_MODELS keys use `google/` (internal dispatch tag) but
+    # the LiteLLM model id translates to `gemini/<id>` — that's the
+    # only prefix LiteLLM routes via AI Studio API-key auth. `google/`
+    # and bare ids both go to Vertex AI (full GCP creds required), so
+    # the translation in synthesize_stream is load-bearing.
+    assert call["model"] == "gemini/gemini-3-flash-preview"
+    assert call["stream"] is True
+    assert call["max_tokens"] == 150
+    # reasoning_effort="none" is the LiteLLM-canonical replacement for
+    # `thinking_config: {thinking_budget: 0}`. On Gemini 3+ it maps to
+    # `thinking_level="minimal"` (true budget=0 is unavailable on 3.x).
+    assert call["reasoning_effort"] == "none"
 
 
 @pytest.mark.asyncio
@@ -501,26 +558,74 @@ async def test_synthesize_stream_strips_insufficient_sentinel(monkeypatch) -> No
     """Model-emitted <<INSUFFICIENT>> sentinel sets the flag and is stripped
     from the final answer text.
     """
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    from shared.config import get_settings
+    fake = _AcompletionRecorder(
+        texts=[
+            "<<INSUFFICIENT>>\n",
+            "The chunks don't mention Klavis at all.",
+        ]
+    )
+    monkeypatch.setattr("services.retrieval.synthesis.shared_llm.acompletion", fake)
 
-    get_settings.cache_clear()  # type: ignore[attr-defined]
-
-    _FakeAsyncAnthropic.next_texts = [
-        "<<INSUFFICIENT>>\n",
-        "The chunks don't mention Klavis at all.",
-    ]
-
-    with patch("anthropic.AsyncAnthropic", _FakeAsyncAnthropic):
-        events = []
-        async for evt in synthesize_stream(
-            "what is klavis?",
-            [_chunk(1, content="totally unrelated")],
-            model="anthropic/claude-sonnet-4-6",
-        ):
-            events.append(evt)
+    events = []
+    async for evt in synthesize_stream(
+        "what is klavis?",
+        [_chunk(1, content="totally unrelated")],
+        model="anthropic/claude-sonnet-4-6",
+    ):
+        events.append(evt)
 
     final = next(e for e in events if isinstance(e, StreamFinal))
     assert final.insufficient_context is True
     assert "<<INSUFFICIENT>>" not in final.answer
     assert final.answer.startswith("The chunks don't mention")
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_wraps_litellm_error(monkeypatch) -> None:
+    """`shared.llm.LLMError` raised during streaming surfaces as
+    SynthesisError so the retrieval route handler can convert to 502.
+    """
+    from shared.llm import LLMError
+
+    async def raising_acompletion(**_kwargs: object):
+        raise LLMError("upstream 429", status_code=429, provider="anthropic")
+
+    monkeypatch.setattr(
+        "services.retrieval.synthesis.shared_llm.acompletion",
+        raising_acompletion,
+    )
+
+    with pytest.raises(SynthesisError) as exc_info:
+        async for _ in synthesize_stream(
+            "q",
+            [_chunk(1)],
+            model="anthropic/claude-sonnet-4-6",
+        ):
+            pass
+    assert "streaming api error" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_synthesize_stream_tolerates_none_content_chunks(
+    monkeypatch,
+) -> None:
+    """LiteLLM yields a trailing chunk with `delta.content=None` carrying
+    `.usage` for the final accounting. The streamer must skip it (no empty
+    StreamDelta) and still emit exactly one StreamFinal.
+    """
+    fake = _AcompletionRecorder(texts=["Only ", "two ", "real ", "deltas."])
+    monkeypatch.setattr("services.retrieval.synthesis.shared_llm.acompletion", fake)
+
+    events = []
+    async for evt in synthesize_stream(
+        "q",
+        [_chunk(1, content="x")],
+        model="anthropic/claude-sonnet-4-6",
+    ):
+        events.append(evt)
+
+    deltas = [e for e in events if isinstance(e, StreamDelta)]
+    finals = [e for e in events if isinstance(e, StreamFinal)]
+    # Four real text chunks + one usage-only chunk -> still 4 deltas + 1 final.
+    assert len(deltas) == 4
+    assert len(finals) == 1

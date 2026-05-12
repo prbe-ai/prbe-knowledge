@@ -661,3 +661,40 @@ async def test_client_is_loop_compatible(
     cfg = fake_genai.generate_calls[0]["config"]
     assert cfg.cached_content == "cachedContents/fake-1"
     assert cfg.tools is None
+
+
+# ---------------------------------------------------------------------------
+# Phase-0b carve-out: gateway-mode gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gateway_mode_blocks_client_construction(
+    fake_genai: SimpleNamespace,
+    patched_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In LLM_GATEWAY_URL (managed-isolated / self-host) mode the
+    GeminiAgentClient must refuse to make a real call. LiteLLM doesn't
+    expose Gemini CachedContent or thought_signature round-tripping, so
+    routing this call site through the proxy is not viable today —
+    surface the carve-out loudly rather than emit a confusing
+    "GOOGLE_API_KEY not configured" that suggests a fixable config gap.
+
+    Construction stays cheap; the gate fires on first `_ensure_client`
+    (i.e. when create_cache / generate_with_cache is actually invoked).
+    """
+    monkeypatch.setenv("LLM_GATEWAY_URL", "https://litellm.example/v1")
+
+    from services.synthesis.gemini_agent_client import GeminiAgentClient
+
+    client = GeminiAgentClient()  # construction itself is fine
+    with pytest.raises(RuntimeError) as exc_info:
+        await client.create_cache(
+            system_instruction="sys",
+            tools=[_tool("done")],
+            seed_contents=[],
+        )
+    msg = str(exc_info.value)
+    assert "LLM_GATEWAY_URL" in msg
+    assert "CachedContent" in msg or "carve-out" in msg.lower()
