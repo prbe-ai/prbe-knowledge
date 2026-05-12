@@ -346,22 +346,16 @@ async def _call_classifier_llm(
     log_prefix: str = "cross_repo_deps",
 ) -> list[dict[str, Any]] | None:
     """Shared Flash Lite call. Returns the parsed `verdicts` list, or
-    None on any failure (caller decides fallback semantics)."""
-    if client is None:
-        try:
-            from google import genai
+    None on any failure (caller decides fallback semantics).
 
-            from shared.config import get_settings
-
-            api_key = get_settings().google_api_key.get_secret_value()
-            if not api_key:
-                log.warning(f"{log_prefix}.no_google_api_key", source_repo=source_repo)
-                return None
-            client = genai.Client(api_key=api_key)
-        except ImportError as exc:
-            log.warning(f"{log_prefix}.google_genai_missing", error=str(exc))
-            return None
-
+    Phase-0b chunk B: the production call routes through
+    `shared.llm.acompletion` so it honors `LLM_GATEWAY_URL` on managed-
+    isolated tenants. The ``client`` kwarg is preserved for tests that
+    inject a stub mimicking the google-genai
+    `.aio.models.generate_content` surface — when supplied we drive
+    that legacy path verbatim, including its `response_mime_type:
+    application/json` hint.
+    """
     # Use Pro instead of Flash Lite for the classifier — Flash Lite reliably
     # misclassifies wrong-direction evidence as REAL despite explicit prompt
     # rules (see PRs #184 and #186). Pro follows directionality more
@@ -370,26 +364,72 @@ async def _call_classifier_llm(
     # 404s.
     model_name = "gemini-3.1-pro-preview"
 
-    try:
-        resp = await client.aio.models.generate_content(
-            model=model_name,
-            contents=user_prompt,
-            config={
-                "system_instruction": _CLASSIFY_SYSTEM_PROMPT,
-                "max_output_tokens": 32768,
-                "response_mime_type": "application/json",
-            },
-        )
-    except Exception as exc:
-        log.warning(
-            f"{log_prefix}.gemini_failed",
-            source_repo=source_repo,
-            error=str(exc),
-            error_class=type(exc).__name__,
-        )
-        return None
+    if client is not None:
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model_name,
+                contents=user_prompt,
+                config={
+                    "system_instruction": _CLASSIFY_SYSTEM_PROMPT,
+                    "max_output_tokens": 32768,
+                    "response_mime_type": "application/json",
+                },
+            )
+        except Exception as exc:
+            log.warning(
+                f"{log_prefix}.gemini_failed",
+                source_repo=source_repo,
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
+            return None
+        text = (getattr(resp, "text", None) or "").strip()
+    else:
+        from shared import llm as shared_llm
+        from shared.config import get_settings
 
-    text = (getattr(resp, "text", None) or "").strip()
+        if not (
+            shared_llm.gateway_url()
+            or get_settings().google_api_key.get_secret_value()
+        ):
+            log.warning(f"{log_prefix}.no_google_api_key", source_repo=source_repo)
+            return None
+
+        try:
+            resp = await shared_llm.acompletion(
+                model=f"gemini/{model_name}",
+                messages=[
+                    {"role": "system", "content": _CLASSIFY_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=32768,
+                # LiteLLM forwards `response_format={"type": "json_object"}`
+                # to Gemini as the equivalent `response_mime_type:
+                # application/json` hint — same intent as the legacy
+                # direct-SDK call (free-text JSON, no response_schema).
+                response_format={"type": "json_object"},
+            )
+        except shared_llm.LLMError as exc:
+            log.warning(
+                f"{log_prefix}.gemini_failed",
+                source_repo=source_repo,
+                error=str(exc),
+                error_class=type(exc).__name__,
+                status_code=exc.status_code,
+                provider=exc.provider,
+            )
+            return None
+
+        try:
+            text = (resp.choices[0].message.content or "").strip()
+        except (AttributeError, IndexError) as exc:
+            log.warning(
+                f"{log_prefix}.malformed_response",
+                source_repo=source_repo,
+                error=str(exc),
+            )
+            return None
+
     if not text:
         log.warning(f"{log_prefix}.empty_response", source_repo=source_repo)
         return None

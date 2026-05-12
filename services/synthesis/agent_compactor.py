@@ -94,24 +94,19 @@ async def call_summarizer(
     Raises `AgentCompactionError` on any failure. The harness re-raises
     as `AgentHaltError('agent.compaction_failed')` so the drain DLQs
     cleanly.
+
+    Phase-0b chunk B: the production call routes through
+    `shared.llm.acompletion`. When `LLM_GATEWAY_URL` is set (managed-
+    isolated tenant) the wrapper forwards to the central LiteLLM proxy;
+    without it LiteLLM falls back to the direct provider call using the
+    `GOOGLE_API_KEY` env var (self-host / dev). The ``client`` kwarg is
+    preserved for tests that inject a stub mimicking the google-genai
+    surface (``client.aio.models.generate_content``) — when supplied we
+    drive that path verbatim instead of the wrapper, so existing test
+    fixtures keep working.
     """
     state_block = extract_state_for_summary(runtime_state)
     convo_text = _serialize_messages(messages)
-
-    if client is None:
-        try:
-            from google import genai
-
-            from shared.config import get_settings
-
-            api_key = get_settings().google_api_key.get_secret_value()
-            if not api_key:
-                raise AgentCompactionError("GOOGLE_API_KEY not set; compactor unavailable")
-            client = genai.Client(api_key=api_key)
-        except ImportError as exc:
-            raise AgentCompactionError(
-                f"google-genai not installed: {exc}"
-            ) from exc
 
     user_prompt = (
         "Conversation so far:\n\n"
@@ -120,24 +115,75 @@ async def call_summarizer(
         f"{state_block}\n"
     )
 
-    try:
-        resp = await client.aio.models.generate_content(
-            model=model,
-            contents=user_prompt,
-            config={
-                "system_instruction": _COMPACTOR_SYSTEM,
-                "max_output_tokens": 2048,
-            },
-        )
-    except Exception as exc:
-        log.warning(
-            "agent_compactor.gemini_failed",
-            error=str(exc),
-            error_class=type(exc).__name__,
-        )
-        raise AgentCompactionError(f"gemini summarize failed: {exc}") from exc
+    if client is not None:
+        # Legacy / test-injected client path — keeps the google-genai
+        # call shape so fixtures using AsyncMock'd
+        # `.aio.models.generate_content` still work unchanged.
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model,
+                contents=user_prompt,
+                config={
+                    "system_instruction": _COMPACTOR_SYSTEM,
+                    "max_output_tokens": 2048,
+                },
+            )
+        except Exception as exc:
+            log.warning(
+                "agent_compactor.gemini_failed",
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
+            raise AgentCompactionError(f"gemini summarize failed: {exc}") from exc
+        text = getattr(resp, "text", None) or ""
+    else:
+        # Production path: route through shared.llm so the call honors
+        # LLM_GATEWAY_URL on managed-isolated tenants. The wrapper
+        # auto-injects api_base (and, post-chunk-A, api_key) when the
+        # gateway env var is set; otherwise litellm uses GOOGLE_API_KEY.
+        from shared import llm as shared_llm
+        from shared.config import get_settings
 
-    text = getattr(resp, "text", None) or ""
+        # Gate on either a configured gateway URL or a direct provider
+        # key — without one of these, the compactor cannot reach a model.
+        if not (
+            shared_llm.gateway_url()
+            or get_settings().google_api_key.get_secret_value()
+        ):
+            raise AgentCompactionError(
+                "Neither LLM_GATEWAY_URL nor GOOGLE_API_KEY set; compactor unavailable"
+            )
+
+        try:
+            resp = await shared_llm.acompletion(
+                model=f"gemini/{model}",
+                messages=[
+                    {"role": "system", "content": _COMPACTOR_SYSTEM},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=2048,
+            )
+        except shared_llm.LLMError as exc:
+            log.warning(
+                "agent_compactor.gemini_failed",
+                error=str(exc),
+                error_class=type(exc).__name__,
+                status_code=exc.status_code,
+                provider=exc.provider,
+            )
+            raise AgentCompactionError(f"gemini summarize failed: {exc}") from exc
+
+        try:
+            text = resp.choices[0].message.content or ""
+        except (AttributeError, IndexError) as exc:
+            log.warning(
+                "agent_compactor.gemini_malformed_response",
+                error=str(exc),
+            )
+            raise AgentCompactionError(
+                f"gemini returned malformed response: {exc}"
+            ) from exc
+
     if not text.strip():
         raise AgentCompactionError("gemini returned empty summary")
     # Make sure the state block round-trips even if the model decided to
