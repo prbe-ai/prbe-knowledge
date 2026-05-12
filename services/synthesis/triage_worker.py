@@ -21,6 +21,15 @@ Per tick:
 
 Triage reads FULL document bodies via `persistence.fetch_bodies` (joins
 chunks). Synthesis is in a separate fly app and wakes on NOTIFY.
+
+Phase-0b note: Pre-migration this worker owned an `AsyncAnthropic`
+client for its lifetime and threaded it through to `call_triage`.
+After the LiteLLM migration the call sites route through
+`shared.llm.acompletion` directly; the worker no longer owns or
+threads a client. The `_anthropic_client` constructor parameter and
+`_resolve_client` are preserved as inert pass-throughs for
+existing tests / call-site shape, but they return a sentinel value
+that downstream `call_triage_with_split_retry` accepts and ignores.
 """
 
 from __future__ import annotations
@@ -28,9 +37,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from datetime import UTC, datetime
+from typing import Any
 
 import asyncpg
-from anthropic import AsyncAnthropic
 
 from services.synthesis import persistence
 from services.synthesis.models import TriageInput, TriageVerdict
@@ -38,7 +47,6 @@ from services.synthesis.triage import (
     call_triage_with_split_retry,
     pack_into_batches,
 )
-from shared.config import get_settings
 from shared.constants import (
     WIKI_SYNTHESIS_CLAIM_BATCH,
     WIKI_SYNTHESIS_CUSTOMER_CONCURRENCY,
@@ -51,6 +59,17 @@ from shared.db import raw_conn
 from shared.logging import get_logger
 
 log = get_logger(__name__)
+
+
+# Sentinel passed through `call_triage` -> `get_triage_provider`. The
+# Phase-0b LiteLLM migration moved transport ownership to
+# `shared.llm.acompletion`, but the provider Protocol still threads
+# a `client` argument through for API stability. Using a sentinel
+# (rather than `None`) keeps any future bug-checking on a `None`
+# client crisp: `None` would mean "this code path forgot to pass a
+# client", while the sentinel means "no client needed, this is the
+# managed/LiteLLM path".
+_LITELLM_CLIENT_SENTINEL: Any = object()
 
 
 # Reason tag for queue rows whose doc version was superseded (valid_to set)
@@ -75,13 +94,18 @@ class TriageWorker:
         self,
         wake_event: asyncio.Event,
         *,
-        anthropic_client: AsyncAnthropic | None = None,
+        anthropic_client: Any | None = None,
         periodic_wake_seconds: float = WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
         notify_channel: str = WIKI_TRIAGED_CHANNEL,
         customer_concurrency: int = WIKI_SYNTHESIS_CUSTOMER_CONCURRENCY,
         batch_concurrency: int = WIKI_TRIAGE_BATCH_CONCURRENCY,
     ) -> None:
         self._wake = wake_event
+        # `anthropic_client` is accepted for backwards-compat with the
+        # pre-LiteLLM constructor signature; the worker no longer owns
+        # transport. Tests that pass a mock client through still work —
+        # `_resolve_client` returns it, `call_triage_with_split_retry`
+        # forwards it to the provider, and the provider ignores it.
         self._anthropic_client = anthropic_client
         self._periodic = periodic_wake_seconds
         self._notify_channel = notify_channel
@@ -129,12 +153,6 @@ class TriageWorker:
         if not customer_ids:
             return
         client = self._resolve_client()
-        if client is None:
-            log.warning(
-                "triage_worker.no_anthropic_key",
-                pending_customers=len(customer_ids),
-            )
-            return
         kind = "wake" if woken_by_notify else "scheduled"
 
         async def _drain(cid: str) -> None:
@@ -146,22 +164,26 @@ class TriageWorker:
 
         await asyncio.gather(*[_drain(cid) for cid in customer_ids])
 
-    def _resolve_client(self) -> AsyncAnthropic | None:
+    def _resolve_client(self) -> Any:
+        """Return the transport handle threaded through to `call_triage`.
+
+        Pre-Phase-0b this constructed an `AsyncAnthropic` from
+        `settings.anthropic_api_key`. After the LiteLLM migration the
+        worker no longer owns transport — every provider call goes
+        through `shared.llm.acompletion`. If a test (or future caller)
+        injected an `anthropic_client`, pass it through unchanged so
+        legacy assertions can still inspect a mock; otherwise return a
+        sentinel value that the provider Protocol's `client` parameter
+        accepts and ignores.
+        """
         if self._anthropic_client is not None:
             return self._anthropic_client
-        settings = get_settings()
-        secret = settings.anthropic_api_key
-        if secret is None:
-            return None
-        key = secret.get_secret_value()
-        if not key:
-            return None
-        return AsyncAnthropic(api_key=key)
+        return _LITELLM_CLIENT_SENTINEL
 
     async def _drain_customer(
         self,
         customer_id: str,
-        client: AsyncAnthropic,
+        client: Any,
         *,
         run_kind: str,
     ) -> None:
@@ -334,7 +356,7 @@ class TriageWorker:
 
     async def _call_triage_batches(
         self,
-        client: AsyncAnthropic,
+        client: Any,
         batches: list[list[TriageInput]],
         customer_id: str,
     ) -> dict[int, TriageVerdict]:

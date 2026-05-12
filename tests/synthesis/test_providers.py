@@ -1,15 +1,10 @@
 """Provider Protocol dispatch tests for the triage stage.
 
-The triage stage selects a provider via the constant `WIKI_TRIAGE_MODEL`.
-v4 dropped the verifier + synthesis providers (the wiki agent uses
-Gemini directly via `services.synthesis.gemini_agent_client`); only
-the triage provider abstraction remains.
-
-These tests verify:
-  - default model name resolves to the Anthropic implementation.
-  - explicit `model_override` flips dispatch to Gemini Flash Lite.
-  - unknown model names raise.
-  - Anthropic round-trip works with a mocked AsyncAnthropic client.
+Phase-0b: provider impls now route through `shared.llm.acompletion`.
+The `client` parameter to `_AnthropicTriage` / `get_triage_provider`
+is preserved for API compatibility but unused — `shared.llm`
+owns transport. Tests mock the wrapper instead of a fake
+`AsyncAnthropic`.
 """
 
 from __future__ import annotations
@@ -18,6 +13,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import orjson
 import pytest
 
 from services.synthesis.models import TriageInput
@@ -41,19 +37,16 @@ def _ev(qid: int, doc_id: str = "doc:1") -> TriageInput:
     )
 
 
-def _tool_use(name: str, payload: dict) -> SimpleNamespace:
-    block = SimpleNamespace(type="tool_use", name=name, input=payload)
-    return SimpleNamespace(content=[block])
-
-
-def _mock_anthropic(payload_by_tool: dict[str, dict]) -> SimpleNamespace:
-    async def create(*, model: str, **kwargs):
-        tool_name = (kwargs.get("tools") or [{}])[0].get("name", "")
-        return _tool_use(tool_name, payload_by_tool[tool_name])
-
-    client = SimpleNamespace()
-    client.messages = SimpleNamespace(create=AsyncMock(side_effect=create))
-    return client
+def _tool_response(tool_name: str, payload: dict) -> SimpleNamespace:
+    """LiteLLM-shaped response carrying a single forced tool call."""
+    func = SimpleNamespace(
+        name=tool_name,
+        arguments=orjson.dumps(payload).decode("utf-8"),
+    )
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=None)
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +55,7 @@ def _mock_anthropic(payload_by_tool: dict[str, dict]) -> SimpleNamespace:
 
 
 def test_default_triage_provider_is_anthropic() -> None:
-    client = _mock_anthropic({})
-    provider = get_triage_provider(client)
+    provider = get_triage_provider()
     assert isinstance(provider, _AnthropicTriage)
 
 
@@ -79,9 +71,13 @@ def test_unknown_triage_model_raises() -> None:
         get_triage_provider(model_override="not-a-real-model")
 
 
-def test_anthropic_provider_requires_client() -> None:
-    with pytest.raises(ValueError, match="requires an AsyncAnthropic client"):
-        get_triage_provider(anthropic_client=None, model_override="haiku")
+def test_anthropic_provider_accepts_no_client_post_litellm_migration() -> None:
+    """Pre-Phase-0b this raised ValueError when no `anthropic_client` was
+    passed. After the LiteLLM migration the worker doesn't own transport
+    — `shared.llm.acompletion` owns it — so the constructor accepts
+    None. Pin the new contract."""
+    provider = get_triage_provider(anthropic_client=None, model_override="haiku")
+    assert isinstance(provider, _AnthropicTriage)
 
 
 # ---------------------------------------------------------------------------
@@ -90,9 +86,16 @@ def test_anthropic_provider_requires_client() -> None:
 
 
 @pytest.mark.asyncio
-async def test_anthropic_triage_raises_on_validation_error() -> None:
+async def test_anthropic_triage_raises_on_validation_error(monkeypatch) -> None:
     """Provider parses tool input through Pydantic; missing fields raise."""
-    client = _mock_anthropic({"record_triage": {"verdicts": {"1": {"important": True}}}})
-    provider = get_triage_provider(client)
+    # Verdict missing required `score` — Pydantic will reject.
+    fake = AsyncMock(
+        return_value=_tool_response(
+            "record_triage",
+            {"verdicts": {"1": {"important": True}}},
+        )
+    )
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    provider = get_triage_provider()
     with pytest.raises(TriageParseError):
         await provider.triage([_ev(1)], now=datetime.now(UTC))

@@ -7,10 +7,15 @@ could still push a wire request past Anthropic's 200K hard limit. When
 that happens we want to halve-and-retry instead of DLQ'ing the whole
 batch.
 
+Phase-0b: the call sites route through `shared.llm.acompletion`, which
+wraps every LiteLLM exception in `shared.llm.LLMError`. The split-retry
+detector lives in `shared.llm_tools.is_context_overflow` and matches
+the same Anthropic 400 phrasings the SDK-shape detector did.
+
 These tests pin the wrapper behavior:
 
   1. A single oversize 400 on the full batch → split into halves, both
-     halves succeed → all verdicts returned, exactly 3 Anthropic calls.
+     halves succeed → all verdicts returned, exactly 3 LLM calls.
   2. Repeated overflows recursing all the way down to single events →
      every event's verdict still surfaces (some as success, some as
      rejected).
@@ -25,9 +30,8 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-import httpx
+import orjson
 import pytest
-from anthropic import BadRequestError
 
 from services.synthesis.models import TriageInput, TriageOutput
 from services.synthesis.triage import (
@@ -37,6 +41,7 @@ from services.synthesis.triage import (
     call_triage_with_split_retry,
     is_anthropic_oversize_error,
 )
+from shared.llm import LLMError
 
 NOW = datetime(2026, 5, 5, tzinfo=UTC)
 
@@ -59,24 +64,22 @@ def _ev(qid: int) -> TriageInput:
     )
 
 
-def _bad_request(message: str) -> BadRequestError:
-    """Build a BadRequestError that mirrors what the Anthropic SDK
-    raises on a real 400 from the wire."""
-    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-    return BadRequestError(
-        message,
-        response=httpx.Response(400, request=req),
-        body={
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": message},
-        },
-    )
+def _overflow_error(message: str) -> LLMError:
+    """Build the LiteLLM-wrapped 400 the split-retry path keys off.
+    Same overflow phrasings the legacy Anthropic SDK used.
+    """
+    return LLMError(message, status_code=400, provider="anthropic")
+
+
+def _bad_request(message: str) -> LLMError:
+    """Backwards-compat alias used by the existing tests; same shape."""
+    return _overflow_error(message)
 
 
 def _success_response(events: list[TriageInput]) -> SimpleNamespace:
-    """Build an Anthropic tool_use response that scores every event in
-    `events`. The shape matches what `_extract_tool_use_input` consumes
-    in `services/synthesis/providers.py`."""
+    """LiteLLM-shaped response carrying a tool_call that scores every
+    event in `events`.
+    """
     payload = {
         "verdicts": {
             str(ev.queue_id): {
@@ -87,25 +90,97 @@ def _success_response(events: list[TriageInput]) -> SimpleNamespace:
             for ev in events
         }
     }
-    block = SimpleNamespace(type="tool_use", name="record_triage", input=payload)
-    return SimpleNamespace(content=[block])
+    func = SimpleNamespace(
+        name="record_triage",
+        arguments=orjson.dumps(payload).decode("utf-8"),
+    )
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=None)
 
 
-def _make_client_with_responses(responses: list[object]) -> object:
-    """Build a fake AsyncAnthropic whose `messages.create` returns (or
-    raises) `responses` in order. Each entry is either a response object
-    (returned) or an Exception subclass instance (raised)."""
+def _empty_tool_call_response() -> SimpleNamespace:
+    """Forced tool call with empty `{}` arguments → Pydantic surfaces
+    `verdicts: Field required`. Mirrors Haiku stopping at max_tokens
+    mid tool-use payload."""
+    func = SimpleNamespace(name="record_triage", arguments="{}")
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _no_tool_call_response() -> SimpleNamespace:
+    """Model returned text only, no tool_calls — Haiku stopped at
+    max_tokens before opening the tool_use at all."""
+    message = SimpleNamespace(content="...", tool_calls=None)
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _partial_success_response(
+    events_to_score: list[TriageInput],
+) -> SimpleNamespace:
+    """LiteLLM-shaped response that scores ONLY `events_to_score` —
+    a partial response that omits whichever input events aren't in
+    this list. Mirrors what Haiku does when max_tokens cuts it off."""
+    payload = {
+        "verdicts": {
+            str(ev.queue_id): {
+                "important": True,
+                "score": 7.0,
+                "reason": "ok",
+            }
+            for ev in events_to_score
+        }
+    }
+    func = SimpleNamespace(
+        name="record_triage",
+        arguments=orjson.dumps(payload).decode("utf-8"),
+    )
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _dict_type_error_response() -> SimpleNamespace:
+    """Tool call whose arguments are valid JSON but the `verdicts`
+    field is a JSON-STRING instead of a dict — Pydantic raises
+    type=dict_type with input_type=str. Same overflow-shaped recovery
+    applies."""
+    args = orjson.dumps(
+        {
+            "verdicts": (
+                '{"1": {"important": false, "score": 0, "reason": "n/a"}}'
+            )
+        }
+    ).decode("utf-8")
+    func = SimpleNamespace(name="record_triage", arguments=args)
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _patch_acompletion(monkeypatch, responses: list[object]) -> AsyncMock:
+    """Patch `shared.llm_tools.acompletion` to return / raise the given
+    sequence of responses. Each entry is either a response object
+    (returned) or an Exception subclass instance (raised). Returns the
+    AsyncMock so the test can assert call counts.
+    """
     iterator = iter(responses)
 
-    async def _create(**kwargs: object) -> object:
+    async def _create(**kwargs):
         item = next(iterator)
         if isinstance(item, BaseException):
             raise item
         return item
 
-    client = SimpleNamespace()
-    client.messages = SimpleNamespace(create=AsyncMock(side_effect=_create))
-    return client
+    fake = AsyncMock(side_effect=_create)
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    return fake
 
 
 # ---------------------------------------------------------------------------
@@ -114,17 +189,17 @@ def _make_client_with_responses(responses: list[object]) -> object:
 
 
 def test_detector_matches_prompt_too_long() -> None:
-    err = _bad_request("prompt is too long: 211739 tokens > 200000 maximum")
+    err = _overflow_error("prompt is too long: 211739 tokens > 200000 maximum")
     assert is_anthropic_oversize_error(err) is True
 
 
 def test_detector_matches_tokens_maximum_phrasing() -> None:
-    err = _bad_request("input has 250000 tokens > 200000 maximum context window")
+    err = _overflow_error("input has 250000 tokens > 200000 maximum context window")
     assert is_anthropic_oversize_error(err) is True
 
 
 def test_detector_skips_unrelated_400() -> None:
-    err = _bad_request("invalid api key")
+    err = _overflow_error("invalid api key")
     assert is_anthropic_oversize_error(err) is False
 
 
@@ -138,61 +213,50 @@ def test_detector_skips_non_bad_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_full_batch_splits_into_two_successful_halves() -> None:
+async def test_full_batch_splits_into_two_successful_halves(monkeypatch) -> None:
     """4 events: full batch overflows once, both halves succeed."""
     events = [_ev(i) for i in range(4)]
-    overflow = _bad_request("prompt is too long: 211739 tokens > 200000 maximum")
-    # Order: full batch raises, then left half (events 0,1) succeeds,
-    # then right half (events 2,3) succeeds.
-    client = _make_client_with_responses(
+    overflow = _overflow_error("prompt is too long: 211739 tokens > 200000 maximum")
+    fake = _patch_acompletion(
+        monkeypatch,
         [
             overflow,
             _success_response(events[:2]),
             _success_response(events[2:]),
-        ]
+        ],
     )
 
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
 
     assert isinstance(out, TriageOutput)
     assert sorted(int(k) for k in out.verdicts) == [0, 1, 2, 3]
     # 1 failed call + 2 successful calls = 3 wire calls total.
-    assert client.messages.create.await_count == 3
+    assert fake.await_count == 3
 
 
 @pytest.mark.asyncio
-async def test_repeated_overflows_recurse_to_single_events() -> None:
+async def test_repeated_overflows_recurse_to_single_events(monkeypatch) -> None:
     """8 events: full batch overflows, first half overflows, first
     quarter overflows. Eventually every leaf either succeeds or gets
     surfaced as a rejected single-event verdict.
-
-    Recursion tree (• = call attempt):
-        • [0..7]            -> overflow -> split
-          • [0..3]          -> overflow -> split
-            • [0,1]         -> overflow -> split
-              • [0]         -> overflow -> rejected (no further recursion)
-              • [1]         -> success
-            • [2,3]         -> success
-          • [4..7]          -> success
     """
     events = [_ev(i) for i in range(8)]
-    overflow = _bad_request("prompt is too long: 250000 tokens > 200000 maximum")
+    overflow = _overflow_error("prompt is too long: 250000 tokens > 200000 maximum")
 
-    # Each entry corresponds to one call to `messages.create` in the
-    # order the wrapper makes them. Pre-order DFS: full -> left -> ...
-    client = _make_client_with_responses(
+    fake = _patch_acompletion(
+        monkeypatch,
         [
-            overflow,                     # [0..7]
-            overflow,                     # [0..3]
-            overflow,                     # [0,1]
-            overflow,                     # [0] alone -> rejected, no call beyond this
+            overflow,                          # [0..7]
+            overflow,                          # [0..3]
+            overflow,                          # [0,1]
+            overflow,                          # [0] alone -> rejected, no further call
             _success_response([events[1]]),    # [1]
             _success_response(events[2:4]),    # [2,3]
             _success_response(events[4:8]),    # [4..7]
-        ]
+        ],
     )
 
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
 
     # All 8 queue_ids must appear in the merged output.
     assert sorted(int(k) for k in out.verdicts) == list(range(8))
@@ -203,18 +267,19 @@ async def test_repeated_overflows_recurse_to_single_events() -> None:
     # The other 7 came back as scored success verdicts.
     for qid in range(1, 8):
         assert out.verdicts[str(qid)].important is True
+    assert fake is not None
 
 
 @pytest.mark.asyncio
-async def test_single_event_overflow_marked_rejected() -> None:
+async def test_single_event_overflow_marked_rejected(monkeypatch) -> None:
     """A single-event batch that overflows is returned as a rejected
     verdict tagged with the call-time-oversize reason; no recursion
     happens beyond this leaf."""
     events = [_ev(42)]
-    overflow = _bad_request("prompt is too long: 220000 tokens > 200000 maximum")
-    client = _make_client_with_responses([overflow])
+    overflow = _overflow_error("prompt is too long: 220000 tokens > 200000 maximum")
+    fake = _patch_acompletion(monkeypatch, [overflow])
 
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
 
     assert list(out.verdicts.keys()) == ["42"]
     verdict = out.verdicts["42"]
@@ -222,251 +287,180 @@ async def test_single_event_overflow_marked_rejected() -> None:
     assert verdict.score == 0.0
     assert verdict.reason == OVERSIZED_AT_CALL_TIME_REASON
     # Exactly one wire call — no retry on single-event leaf.
-    assert client.messages.create.await_count == 1
+    assert fake.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_non_oversize_400_propagates() -> None:
+async def test_non_oversize_400_propagates(monkeypatch) -> None:
     """A 400 that is NOT the oversize-prompt variant (e.g. bad api key)
     must propagate unchanged. We must not split-retry on it — that would
     just multiply the failures."""
     events = [_ev(1), _ev(2), _ev(3)]
-    other_400 = _bad_request("authentication_error: invalid x-api-key header")
-    client = _make_client_with_responses([other_400])
+    other_400 = _overflow_error("authentication_error: invalid x-api-key header")
+    fake = _patch_acompletion(monkeypatch, [other_400])
 
-    with pytest.raises(BadRequestError) as exc_info:
-        await call_triage_with_split_retry(client, events, now=NOW)
+    with pytest.raises(LLMError) as exc_info:
+        await call_triage_with_split_retry(object(), events, now=NOW)
     assert "invalid x-api-key" in str(exc_info.value)
     # No retry: the wrapper saw a non-oversize 400 and re-raised.
-    assert client.messages.create.await_count == 1
+    assert fake.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_non_anthropic_exception_propagates() -> None:
-    """Non-Anthropic exceptions (network, 5xx) must not trigger
-    split-retry either. (Note: a TriageParseError whose message matches
-    the overflow signature DOES trigger a split — see the parse-overflow
-    section below.)"""
+async def test_non_llm_error_exception_propagates(monkeypatch) -> None:
+    """Non-LLMError exceptions (network, 5xx that escaped wrapping) must
+    not trigger split-retry either. (Note: a TriageParseError whose
+    message matches the overflow signature DOES trigger a split — see
+    the parse-overflow section below.)"""
     events = [_ev(1), _ev(2)]
-    client = _make_client_with_responses([RuntimeError("kaboom")])
+    fake = _patch_acompletion(monkeypatch, [RuntimeError("kaboom")])
 
     with pytest.raises(RuntimeError, match="kaboom"):
-        await call_triage_with_split_retry(client, events, now=NOW)
-    assert client.messages.create.await_count == 1
+        await call_triage_with_split_retry(object(), events, now=NOW)
+    assert fake.await_count == 1
 
 
 # ---------------------------------------------------------------------------
 # Output-side overflow: max_tokens-truncated response triggers split too
 # ---------------------------------------------------------------------------
-#
-# When Haiku stops at max_tokens before finishing the tool_use block,
-# the SDK returns a successful 200. Two surfaces:
-#   1. tool_use block exists but its input is `{}` -> Pydantic raises
-#      "Field required" on `verdicts` -> wrapped as TriageParseError.
-#   2. No tool_use block at all (model produced text only) -> parser
-#      raises "response had no record_triage tool_use block" ->
-#      TriageParseError.
-# Both indicate the model ran out of output budget for the batch size.
-# call_triage_with_split_retry must treat these as overflow-shaped and
-# halve the batch — same recovery as a 400 oversize.
-
-
-def _empty_tool_use_response() -> SimpleNamespace:
-    """SDK shape for a tool_use response whose input is `{}` (Haiku
-    started the tool_use, hit max_tokens before finishing the JSON)."""
-    block = SimpleNamespace(type="tool_use", name="record_triage", input={})
-    return SimpleNamespace(content=[block])
-
-
-def _no_tool_use_response() -> SimpleNamespace:
-    """SDK shape when Haiku produced ONLY text content (no tool_use
-    block). Hit max_tokens before opening the tool_use at all."""
-    text_block = SimpleNamespace(type="text", text="...")
-    return SimpleNamespace(content=[text_block])
 
 
 @pytest.mark.asyncio
-async def test_parse_failure_empty_input_triggers_split() -> None:
-    """Anthropic returns a 200 with an empty {} tool_use input — that
-    means max_tokens cut Haiku off mid-output. Same recovery as a 400:
-    halve and retry."""
+async def test_parse_failure_empty_input_triggers_split(monkeypatch) -> None:
+    """LiteLLM returns a 200 with an empty `{}` tool_call arguments —
+    that means max_tokens cut Haiku off mid-output. Same recovery as a
+    400: halve and retry."""
     events = [_ev(i) for i in range(4)]
-    client = _make_client_with_responses(
+    fake = _patch_acompletion(
+        monkeypatch,
         [
-            _empty_tool_use_response(),     # full batch fails Pydantic
+            _empty_tool_call_response(),    # full batch fails Pydantic
             _success_response(events[:2]),  # left half: ok
             _success_response(events[2:]),  # right half: ok
-        ]
+        ],
     )
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
     assert isinstance(out, TriageOutput)
     assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
-    assert client.messages.create.await_count == 3
+    assert fake.await_count == 3
 
 
 @pytest.mark.asyncio
-async def test_parse_failure_no_tool_use_triggers_split() -> None:
-    """Same overflow shape, different SDK surface: no tool_use block
-    at all. The parser raises 'response had no record_triage tool_use
+async def test_parse_failure_no_tool_use_triggers_split(monkeypatch) -> None:
+    """Same overflow shape, different SDK surface: no tool_calls at
+    all. The parser raises 'response had no record_triage tool_use
     block', which the wrapper recognizes as overflow."""
     events = [_ev(i) for i in range(4)]
-    client = _make_client_with_responses(
+    fake = _patch_acompletion(
+        monkeypatch,
         [
-            _no_tool_use_response(),
+            _no_tool_call_response(),
             _success_response(events[:2]),
             _success_response(events[2:]),
-        ]
+        ],
     )
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
     assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    assert fake.await_count == 3
 
 
 @pytest.mark.asyncio
-async def test_single_event_parse_overflow_marked_rejected() -> None:
+async def test_single_event_parse_overflow_marked_rejected(monkeypatch) -> None:
     """Bottom-out: 1 event whose response is empty/truncated gets the
     same call-time-oversize rejection as a 400 single-event leaf."""
     events = [_ev(99)]
-    client = _make_client_with_responses([_empty_tool_use_response()])
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    fake = _patch_acompletion(monkeypatch, [_empty_tool_call_response()])
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
     assert list(out.verdicts.keys()) == ["99"]
     assert out.verdicts["99"].reason == OVERSIZED_AT_CALL_TIME_REASON
-    assert client.messages.create.await_count == 1
+    assert fake.await_count == 1
 
 
 # ---------------------------------------------------------------------------
 # Partial response: parse succeeds but verdicts cover only some events
 # ---------------------------------------------------------------------------
-#
-# Production observation on probe-founders post-#100/#104: 379 events
-# stuck in `failed` with reason "no verdict from triage batch". Haiku
-# returned a structurally-valid tool_use but the dict only covered SOME
-# of the input queue_ids — late events were silently missing because
-# max_tokens clipped output mid-list. The exception path didn't trigger
-# (parse succeeded), so split-retry didn't run, and the worker fell
-# through to mark_for_retry which exhausts at attempts=3.
-
-
-def _partial_success_response(
-    events_to_score: list[TriageInput],
-) -> SimpleNamespace:
-    """Build a response that scores ONLY `events_to_score` — i.e. a
-    partial response that omits whichever input events aren't in this
-    list. Mirrors what Haiku does when max_tokens cuts it off."""
-    payload = {
-        "verdicts": {
-            str(ev.queue_id): {
-                "important": True,
-                "score": 7.0,
-                "reason": "ok",
-            }
-            for ev in events_to_score
-        }
-    }
-    block = SimpleNamespace(type="tool_use", name="record_triage", input=payload)
-    return SimpleNamespace(content=[block])
 
 
 @pytest.mark.asyncio
-async def test_partial_response_recurses_on_missing_only() -> None:
+async def test_partial_response_recurses_on_missing_only(monkeypatch) -> None:
     """4 events sent. Haiku scored only events 0,1 (truncation cut off
     2,3). Wrapper detects the 2 missing qids and recurses on JUST those
     two (not the full batch — the verdicts we got are kept).
     """
     events = [_ev(i) for i in range(4)]
-    # Order: full batch returns partial (0,1), then missing-subset
-    # call returns the rest.
-    client = _make_client_with_responses(
+    fake = _patch_acompletion(
+        monkeypatch,
         [
             _partial_success_response([events[0], events[1]]),
             _success_response([events[2], events[3]]),
-        ]
+        ],
     )
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
     assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
     # 2 calls only: the original + 1 recurse on the missing subset.
-    # The 0,1 verdicts from the first call are kept, not redone.
-    assert client.messages.create.await_count == 2
+    assert fake.await_count == 2
 
 
 @pytest.mark.asyncio
-async def test_partial_response_single_missing_marked_rejected() -> None:
+async def test_partial_response_single_missing_marked_rejected(monkeypatch) -> None:
     """Bottom-out for partial path: 1 event in the recurse subset and
     Haiku again returns no verdict for it -> mark rejected with the
     same call-time-oversize reason. Same recovery as the 400 leaf."""
     events = [_ev(99)]
     # Haiku returns a verdicts dict with NOTHING (skipped the 1 input).
-    empty_verdicts = SimpleNamespace(
-        type="tool_use", name="record_triage", input={"verdicts": {}}
-    )
-    client = _make_client_with_responses(
-        [SimpleNamespace(content=[empty_verdicts])]
-    )
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    fake = _patch_acompletion(monkeypatch, [_partial_success_response([])])
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
     assert list(out.verdicts.keys()) == ["99"]
     assert out.verdicts["99"].reason == OVERSIZED_AT_CALL_TIME_REASON
-    assert client.messages.create.await_count == 1
+    assert fake.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_partial_response_with_recurse_into_further_partial() -> None:
+async def test_partial_response_with_recurse_into_further_partial(monkeypatch) -> None:
     """Recurse can itself produce partial responses. 8 events; first
     call scores 3, recurse on missing 5 scores 2, recurse on missing 3
     scores all 3. Final output covers all 8."""
     events = [_ev(i) for i in range(8)]
-    client = _make_client_with_responses(
+    fake = _patch_acompletion(
+        monkeypatch,
         [
             _partial_success_response(events[:3]),  # 0,1,2
-            _partial_success_response([events[3], events[4]]),  # 3,4 of missing 3-7
+            _partial_success_response([events[3], events[4]]),  # 3,4
             _success_response(events[5:]),  # 5,6,7
-        ]
+        ],
     )
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
     assert sorted(out.verdicts.keys(), key=int) == [str(i) for i in range(8)]
-    assert client.messages.create.await_count == 3
+    assert fake.await_count == 3
 
 
 # ---------------------------------------------------------------------------
 # dict-type Pydantic error: Haiku returned `verdicts` as a JSON-string
-# rather than a dict. Same overflow recovery shape.
 # ---------------------------------------------------------------------------
 
 
-def _dict_type_error_response() -> SimpleNamespace:
-    """SDK shape when Haiku returned the verdicts FIELD as a string
-    containing JSON instead of a dict. Pydantic raises type=dict_type."""
-    block = SimpleNamespace(
-        type="tool_use",
-        name="record_triage",
-        input={"verdicts": '{"1": {"important": false, "score": 0, "reason": "n/a"}}'},
-    )
-    return SimpleNamespace(content=[block])
-
-
 @pytest.mark.asyncio
-async def test_dict_type_pydantic_error_triggers_split() -> None:
+async def test_dict_type_pydantic_error_triggers_split(monkeypatch) -> None:
     """When verdicts arrives as str instead of dict, Pydantic raises
     type=dict_type. Wrapper now treats this as overflow-shaped and
     halves the batch."""
     events = [_ev(i) for i in range(4)]
-    client = _make_client_with_responses(
+    fake = _patch_acompletion(
+        monkeypatch,
         [
             _dict_type_error_response(),     # full batch fails Pydantic
             _success_response(events[:2]),   # left half ok
             _success_response(events[2:]),   # right half ok
-        ]
+        ],
     )
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
     assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
-    assert client.messages.create.await_count == 3
+    assert fake.await_count == 3
 
 
 # ---------------------------------------------------------------------------
 # string_too_long: defense-in-depth in case the model field_validator is
-# ever removed. The TriageVerdict.reason field has a
-# field_validator(mode="before") that truncates to 240 chars before the
-# constraint runs, so in steady state this overflow shape is unreachable.
-# But if a refactor strips that validator, Haiku-overlong-reason failures
-# should at least split-retry instead of poisoning the batch.
+# ever removed.
 # ---------------------------------------------------------------------------
 
 
@@ -514,39 +508,29 @@ def test_parse_overflow_skips_unrelated_parse_error() -> None:
 # ---------------------------------------------------------------------------
 # Hardening: every input qid must have a verdict on every successful return.
 # ---------------------------------------------------------------------------
-#
-# Production hot bug (probe-founders, May 7-8): 54 GitHub PRs/issues stuck
-# in `failed` with reason "no verdict from triage batch". Despite the
-# May 6 partial-response fix, two holes remained:
-#
-#   1) Recursive calls weren't wrapped — a non-overflow exception in one
-#      sub-call (transient 5xx, network blip, unclassified parse error)
-#      bubbled up and discarded the sibling sub-call's verdicts.
-#   2) No final-mile guard — if recovery still left a qid uncovered for
-#      any reason (model echoes wrong key, downstream gap), the row fell
-#      into mark_for_retry and dead-lettered as 'failed'.
-#
-# These tests pin the new branches.
 
 
 @pytest.mark.asyncio
-async def test_recursive_split_half_exception_preserves_sibling_verdicts() -> None:
+async def test_recursive_split_half_exception_preserves_sibling_verdicts(
+    monkeypatch,
+) -> None:
     """4 events: full batch overflows, left half succeeds, right half
-    raises a generic RuntimeError (e.g. transient 500). Expected: 4
-    verdicts — 2 real from left, 2 synthesized rejections for right
-    tagged TRIAGE_RECURSION_FAILED_REASON. The exception MUST NOT
-    bubble and discard the left half's progress."""
+    raises a generic RuntimeError. Expected: 4 verdicts — 2 real from
+    left, 2 synthesized rejections for right tagged
+    TRIAGE_RECURSION_FAILED_REASON. The exception MUST NOT bubble and
+    discard the left half's progress."""
     events = [_ev(i) for i in range(4)]
-    overflow = _bad_request("prompt is too long: 211739 tokens > 200000 maximum")
-    client = _make_client_with_responses(
+    overflow = _overflow_error("prompt is too long: 211739 tokens > 200000 maximum")
+    _patch_acompletion(
+        monkeypatch,
         [
             overflow,                          # full batch [0..3]
             _success_response(events[:2]),     # left half [0,1] ok
             RuntimeError("transient 500"),     # right half [2,3] dies
-        ]
+        ],
     )
 
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
 
     # All 4 input qids must be covered — no exception, no missing keys.
     assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
@@ -563,23 +547,25 @@ async def test_recursive_split_half_exception_preserves_sibling_verdicts() -> No
 
 
 @pytest.mark.asyncio
-async def test_partial_response_recursion_exception_preserves_parent_verdicts() -> None:
+async def test_partial_response_recursion_exception_preserves_parent_verdicts(
+    monkeypatch,
+) -> None:
     """4 events: parent call returns verdicts for events 0,1 (partial).
     Recursive call on the missing subset [2,3] raises a generic
     exception. Expected: 4 verdicts — 2 real for 0,1 plus 2 synthesized
-    rejections for 2,3 tagged TRIAGE_RECURSION_FAILED_REASON. Parent's
-    progress MUST be preserved — that was the production failure mode."""
+    rejections for 2,3 tagged TRIAGE_RECURSION_FAILED_REASON."""
     events = [_ev(i) for i in range(4)]
-    client = _make_client_with_responses(
+    _patch_acompletion(
+        monkeypatch,
         [
             # Parent call: scored 0,1 only (truncation cut off 2,3).
             _partial_success_response([events[0], events[1]]),
             # Recursive call on [2,3] dies.
             ConnectionError("network blip"),
-        ]
+        ],
     )
 
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
 
     assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
     # Parent verdicts kept.
@@ -594,14 +580,11 @@ async def test_partial_response_recursion_exception_preserves_parent_verdicts() 
 
 @pytest.mark.asyncio
 async def test_final_mile_guard_fires_when_recurse_returns_wrong_keys(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch,
 ) -> None:
     """Force the final-mile guard to fire. Patch `_safe_recurse` to
     return a TriageOutput whose verdicts are keyed on something OTHER
     than the input qids — simulating an unforeseen downstream bug.
-    Without the final-mile guard, the missing input qid would leak out
-    of the function uncovered and dead-letter as 'failed' with the
-    misleading 'no verdict from triage batch' tombstone.
 
     Expected: the orphaned input qid gets a synthesized rejection
     tagged TRIAGE_FINAL_MILE_SYNTHESIS_REASON; the wrong-keyed verdicts
@@ -614,17 +597,14 @@ async def test_final_mile_guard_fires_when_recurse_returns_wrong_keys(
 
     events = [_ev(i) for i in range(3)]
     # Parent call_triage returns partial: verdicts for 0,1; missing 2.
-    client = _make_client_with_responses(
-        [_partial_success_response([events[0], events[1]])]
+    _patch_acompletion(
+        monkeypatch,
+        [_partial_success_response([events[0], events[1]])],
     )
 
     async def _broken_recurse(
         client: object, sub_events: list[TriageInput], *, now: object
     ) -> TO:
-        # Simulate a downstream gap: returns a verdict keyed on
-        # something that doesn't match the input qid. The wrapper's
-        # final-mile guard is the ONLY thing standing between this
-        # output and a 'failed' row in production.
         return TO(
             verdicts={
                 "WRONG_KEY": TV(important=True, score=7.0, reason="bug")
@@ -633,7 +613,7 @@ async def test_final_mile_guard_fires_when_recurse_returns_wrong_keys(
 
     monkeypatch.setattr(triage_module, "_safe_recurse", _broken_recurse)
 
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
 
     # All three input qids covered.
     assert "0" in out.verdicts
@@ -650,13 +630,13 @@ async def test_final_mile_guard_fires_when_recurse_returns_wrong_keys(
 
 
 @pytest.mark.asyncio
-async def test_final_mile_guard_no_op_on_happy_path() -> None:
+async def test_final_mile_guard_no_op_on_happy_path(monkeypatch) -> None:
     """Sanity: a fully-covered single-call success returns unchanged.
     No synthesized rows, no extra log spam."""
     events = [_ev(i) for i in range(3)]
-    client = _make_client_with_responses([_success_response(events)])
+    fake = _patch_acompletion(monkeypatch, [_success_response(events)])
 
-    out = await call_triage_with_split_retry(client, events, now=NOW)
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
 
     assert sorted(out.verdicts.keys()) == ["0", "1", "2"]
     # All real success verdicts — no synthesized rejections.
@@ -667,4 +647,4 @@ async def test_final_mile_guard_no_op_on_happy_path() -> None:
             TRIAGE_RECURSION_FAILED_REASON,
             OVERSIZED_AT_CALL_TIME_REASON,
         )
-    assert client.messages.create.await_count == 1
+    assert fake.await_count == 1

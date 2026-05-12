@@ -1,21 +1,22 @@
 """Unit tests for the inferred-edges extractor validation pipeline.
 
-All tests mock the LLM call -- we test the validation logic, not the model.
-Each drop reason is exercised: unknown_endpoint, unknown_type, self_edge,
-bad_justification, unknown_confidence, forced_confidence_demoted,
-bad_format.
+Phase-0b: Both Anthropic and Gemini paths now route through
+`shared.llm.acompletion`. Tests patch the wrapper (referenced via
+`services.ingestion.inferred_edges.extractor.acompletion`) rather than
+the provider SDKs.
+
+All tests mock the LLM call -- we test the validation logic, not the
+model. Each drop reason is exercised: unknown_endpoint, unknown_type,
+self_edge, bad_justification, unknown_confidence,
+forced_confidence_demoted, bad_format.
 
 The >50% unknown_endpoint kill-switch is also tested.
-
-Tests pin to Haiku because `_patch_llm` mocks the anthropic SDK. Production
-default is Gemini Flash Lite (see shared.constants.INFERRED_EDGES_MODEL);
-the validation pipeline is model-agnostic so testing through the
-Anthropic adapter still exercises every code path.
 """
 
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,9 +31,9 @@ from shared.constants import HAIKU_MODEL
 
 @pytest.fixture(autouse=True)
 def _pin_to_haiku(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Pin every test in this file to the Haiku model so `_patch_llm`'s
-    Anthropic SDK mock is the right path. Without this, calls fall
-    through to the Gemini path where the mock doesn't apply."""
+    """Pin every test in this file to the Haiku model so the Anthropic
+    code path runs. Tests that need the Gemini path override this
+    fixture's setattr with their own."""
     monkeypatch.setattr(
         "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
         HAIKU_MODEL,
@@ -89,40 +90,50 @@ def _make_mock_conn(existing_nodes: set[tuple[str, str]] | None = None) -> Async
     return conn
 
 
-def _mock_llm_response(edges: list[dict]) -> MagicMock:
-    """Create a mock Anthropic response simulating the prefilled response.
+def _litellm_text_response(text: str, *, in_tok: int = 1000, out_tok: int = 200) -> SimpleNamespace:
+    """LiteLLM-shaped ChatCompletion response carrying plain text.
 
-    The extractor sends an assistant prefill `[` so Haiku's response only
-    contains what comes AFTER `[`. Real example for 1 edge:
-        prefill: `[`
-        response.content[0].text: `{"from": ..., "to": ...}]`
-
-    So we strip the leading `[` from json.dumps(edges) to match real
-    behavior. The empty-edges case (`[]`) becomes `]` after stripping --
-    the extractor recognises that as the empty-array sentinel.
+    The inferred-edges extractor reads
+    `choices[0].message.content` as the model's body. Token counts
+    surface via `usage.prompt_tokens` / `usage.completion_tokens`
+    which `shared.llm_tools.usage_tokens` extracts.
     """
-    response = MagicMock()
+    message = SimpleNamespace(content=text, tool_calls=None)
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    usage = SimpleNamespace(
+        prompt_tokens=in_tok,
+        completion_tokens=out_tok,
+        total_tokens=in_tok + out_tok,
+        prompt_tokens_details=None,
+    )
+    return SimpleNamespace(choices=[choice], usage=usage)
+
+
+def _mock_anthropic_response(edges: list[dict]) -> SimpleNamespace:
+    """Anthropic path: the assistant-prefill `[` trick means the
+    response body is the CONTINUATION (starts with edges or `]`).
+    Strip the leading `[` from json.dumps(edges) to match real
+    behavior. Empty edges array -> `]` after stripping; the
+    extractor recognises that as the empty-array sentinel.
+    """
     full_json = json.dumps(edges)
     body = full_json[1:] if full_json.startswith("[") else full_json
-    response.content = [MagicMock(text=body)]
-    response.usage = MagicMock(input_tokens=1000, output_tokens=200)
-    return response
+    return _litellm_text_response(body)
+
+
+def _patch_acompletion(side_effect):
+    """Patch the `acompletion` symbol imported by the extractor module."""
+    return patch(
+        "services.ingestion.inferred_edges.extractor.acompletion",
+        side_effect=side_effect,
+    )
 
 
 def _patch_llm(edges: list[dict]):
-    """Context manager that patches the Anthropic client to return `edges`."""
-    mock_client = MagicMock()
-    mock_client.messages.create = AsyncMock(return_value=_mock_llm_response(edges))
-
-    def _fake_client_class(api_key=None):
-        return mock_client
-
-    # _anthropic_module is the module-level reference set at import time.
-    # We patch the AsyncAnthropic class on it so the extractor function
-    # picks up our mock when it does: _anthropic_module.AsyncAnthropic(api_key=...)
-    return patch(
-        "services.ingestion.inferred_edges.extractor._anthropic_module.AsyncAnthropic",
-        _fake_client_class,
+    """Patch the LLM wrapper to return a fixed Anthropic-shaped
+    edges list (prefilled `[` already stripped)."""
+    return _patch_acompletion(
+        AsyncMock(return_value=_mock_anthropic_response(edges))
     )
 
 
@@ -370,8 +381,6 @@ async def test_drop_bad_format_non_dict() -> None:
 @pytest.mark.asyncio
 async def test_bundle_kill_switch_unknown_endpoint_majority() -> None:
     """When >50% of edges have unknown_endpoint, the bundle is failed entirely."""
-    # Build N edges with unknown endpoints to trigger the kill-switch.
-    # 4 unknown + 1 valid = 80% unknown > 50% threshold.
     edges = [
         {
             "from": {"label": "Document", "canonical_id": "doc1"},
@@ -402,14 +411,12 @@ async def test_bundle_kill_switch_unknown_endpoint_majority() -> None:
 
     assert result.bundle_failed is True
     assert "unknown_endpoint" in result.bundle_fail_reason
-    # All extracted edges should be wiped by the kill-switch
     assert result.edges == []
 
 
 @pytest.mark.asyncio
 async def test_bundle_kill_switch_not_triggered_below_threshold() -> None:
     """Kill-switch does NOT fire when unknown_endpoint <= 50% of total."""
-    # 1 unknown + 1 valid = 50% unknown, which is not > 50%. Edge passes.
     edges = [
         {
             "from": {"label": "Document", "canonical_id": "doc1"},
@@ -437,7 +444,6 @@ async def test_bundle_kill_switch_not_triggered_below_threshold() -> None:
         result = await extract_edges(bundle, conn)
 
     assert result.bundle_failed is False
-    # 1 valid edge survives
     assert len(result.edges) == 1
 
 
@@ -448,15 +454,18 @@ async def test_bundle_kill_switch_not_triggered_below_threshold() -> None:
 
 @pytest.mark.asyncio
 async def test_no_api_key_returns_empty() -> None:
-    """Without ANTHROPIC_API_KEY, return empty result (don't crash)."""
+    """Without ANTHROPIC_API_KEY (and no LLM_GATEWAY_URL), return empty
+    result (don't crash)."""
     bundle = _make_bundle()
     conn = _make_mock_conn()
 
-    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": ""}, clear=False):
+    # Wipe both — the gateway check is the new fall-through that
+    # allows managed-isolated tenants to operate without provider keys.
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "", "LLM_GATEWAY_URL": ""}, clear=False):
         result = await extract_edges(bundle, conn)
 
     assert result.edges == []
-    assert result.bundle_failed is False  # Not a failure, just no-op
+    assert result.bundle_failed is False
     assert result.cost_usd == 0.0
 
 
@@ -489,8 +498,6 @@ def test_estimate_cost_typical_call() -> None:
 
 
 def test_estimate_cost_unknown_model_returns_zero() -> None:
-    """Unknown models cost 0 -- this is telemetry-only, pipeline correctness
-    is unaffected. Better to return 0 than crash on the metric path."""
     cost = _estimate_cost("some-unknown-model", 1_000_000, 1_000_000)
     assert cost == 0.0
 
@@ -504,7 +511,6 @@ def test_estimate_cost_unknown_model_returns_zero() -> None:
 async def test_empty_bundle_returns_empty_result() -> None:
     """An empty bundle (no docs) returns an empty ExtractionResult."""
     bundle = Bundle(customer_id="cust-x", anchor_doc_id="doc1")
-    # docs is empty by default
     conn = _make_mock_conn()
 
     with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}):
@@ -539,33 +545,12 @@ async def test_empty_llm_response_array() -> None:
 # ---------------------------------------------------------------------------
 # Tests: prefill empty-text behaviour (REGRESSION GUARD)
 # ---------------------------------------------------------------------------
-# In production we saw the LLM return an empty assistant message body
-# (queue_ids 120-127, 100% bundle_fail rate). Without the empty-text
-# fallback the extractor crashed with "json_parse_failed: Expecting
-# value: line 1 column 1 (char 0)". With the fallback an empty body
-# means "no edges" and the call succeeds with zero edges.
-#
-# Real Anthropic responses we have to handle gracefully (because of
-# the assistant prefill `[`):
-#   1. Empty body: "" -> []
-#   2. Just the closing bracket: "]" -> []
-#   3. Whitespace: "   \n" -> []
-#   4. Whitespace + `]`: " ]" -> []
-
-
-def _mock_response_with_text(text: str) -> MagicMock:
-    response = MagicMock()
-    response.content = [MagicMock(text=text)]
-    response.usage = MagicMock(input_tokens=1000, output_tokens=0)
-    return response
 
 
 def _patch_llm_text(text: str):
-    mock_client = MagicMock()
-    mock_client.messages.create = AsyncMock(return_value=_mock_response_with_text(text))
-    return patch(
-        "services.ingestion.inferred_edges.extractor._anthropic_module.AsyncAnthropic",
-        lambda api_key=None: mock_client,
+    """Patch acompletion to return a LiteLLM response with `text` content."""
+    return _patch_acompletion(
+        AsyncMock(return_value=_litellm_text_response(text, out_tok=0))
     )
 
 
@@ -573,7 +558,7 @@ def _patch_llm_text(text: str):
 @pytest.mark.parametrize("response_body", ["", " ", "\n", "]", " ]\n"])
 async def test_empty_response_body_is_treated_as_zero_edges(response_body: str) -> None:
     """Regression: an empty-or-just-]-after-prefill response means no edges,
-    not a JSON parse failure. Was the production crash on queue_ids 120-127.
+    not a JSON parse failure.
     """
     bundle = _make_bundle()
     conn = _make_mock_conn()
@@ -612,12 +597,6 @@ async def test_truncated_response_falls_through_to_parse_failure() -> None:
 # ---------------------------------------------------------------------------
 # Tests: leading-`]` empty-array regression (post-PR175 follow-up)
 # ---------------------------------------------------------------------------
-# In production after PR #175 we still saw 142 json_parse_failed drops on
-# the probe-founders backfill. Root cause: model emits `]\n\n(no edges
-# found)` -- our `stripped == "]"` check was too strict. The candidate
-# became `[]\n\n(no edges found)` which fails parse. Generalised to
-# `stripped.startswith("]")`: any leading `]` after the prefill means
-# the array is empty; trailing commentary is discarded.
 
 
 @pytest.mark.asyncio
@@ -654,18 +633,10 @@ async def test_leading_close_bracket_with_garbage_is_empty_array(
 # ---------------------------------------------------------------------------
 # Tests: `why` justification flows through to ExtractionResult
 # ---------------------------------------------------------------------------
-# Worker-side bug found in production: 0 of 3,817 inferred edges had a
-# `why` field persisted because worker.py built GraphEdgeSpec without
-# properties. The worker fix is tested separately in
-# test_inferred_edges_worker.py; this confirms the extractor itself
-# carries the field through.
 
 
 @pytest.mark.asyncio
 async def test_why_field_preserved_on_extracted_edge() -> None:
-    """Confirm the LLM's `why` justification ends up on InferredEdge.why
-    so the worker has something to persist into graph_edges.properties.
-    """
     edges = [
         {
             "from": {"label": "Document", "canonical_id": "doc1"},
@@ -690,22 +661,13 @@ async def test_why_field_preserved_on_extracted_edge() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Tests: rate-limit backoff (PR-B follow-up)
+# Tests: rate-limit backoff
 # ---------------------------------------------------------------------------
-# 1383 of 3257 bundles (42%) failed on `RateLimitError` during the
-# probe-founders backfill burst. The fix wraps the LLM call in
-# exponential backoff inside a single attempt -- a transient rate-limit
-# window no longer kills the bundle. Non-rate-limit errors propagate
-# immediately (no slow failure modes for genuine errors).
 
 
 def _make_rate_limit_error() -> Exception:
-    """Build something the extractor will recognise as a rate-limit error.
-
-    The extractor matches by class name (`RateLimitError`) to avoid pulling
-    the anthropic package into the type system. So a plain Exception
-    subclass with that name does the job.
-    """
+    """Build something the extractor will recognise as a rate-limit error
+    by class name (legacy SDK shape). Used to exercise the backoff path."""
 
     class RateLimitError(Exception):
         pass
@@ -715,26 +677,18 @@ def _make_rate_limit_error() -> Exception:
 
 @pytest.mark.asyncio
 async def test_rate_limit_then_success_does_not_fail_bundle() -> None:
-    """First call raises RateLimitError; backoff fires; second call succeeds.
-    Bundle is processed normally, not marked failed.
-    """
+    """First call raises RateLimitError; backoff fires; second call succeeds."""
     bundle = _make_bundle()
     conn = _make_mock_conn()
 
-    successful_response = _mock_llm_response([])  # empty -> no edges
+    successful_response = _mock_anthropic_response([])  # empty -> no edges
     rate_limit_then_success = AsyncMock(
         side_effect=[_make_rate_limit_error(), successful_response]
     )
-    mock_client = MagicMock()
-    mock_client.messages.create = rate_limit_then_success
 
     with (
         patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
-        patch(
-            "services.ingestion.inferred_edges.extractor._anthropic_module.AsyncAnthropic",
-            lambda api_key=None: mock_client,
-        ),
-        # Patch sleep to avoid wall-clock waits in tests.
+        _patch_acompletion(rate_limit_then_success),
         patch(
             "services.ingestion.inferred_edges.extractor.asyncio.sleep",
             new_callable=AsyncMock,
@@ -744,29 +698,20 @@ async def test_rate_limit_then_success_does_not_fail_bundle() -> None:
 
     assert not result.bundle_failed
     assert result.edges == []
-    # Two attempts: one rate-limited, one success.
     assert rate_limit_then_success.call_count == 2
 
 
 @pytest.mark.asyncio
 async def test_rate_limit_exhausted_marks_bundle_failed() -> None:
-    """If every retry hits a rate limit, the bundle is marked failed
-    with llm_call_failed: RateLimitError (so the queue worker can
-    retry on next claim, when the rate window has likely passed).
-    """
+    """If every retry hits a rate limit, the bundle is marked failed."""
     bundle = _make_bundle()
     conn = _make_mock_conn()
 
     always_rate_limited = AsyncMock(side_effect=_make_rate_limit_error())
-    mock_client = MagicMock()
-    mock_client.messages.create = always_rate_limited
 
     with (
         patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
-        patch(
-            "services.ingestion.inferred_edges.extractor._anthropic_module.AsyncAnthropic",
-            lambda api_key=None: mock_client,
-        ),
+        _patch_acompletion(always_rate_limited),
         patch(
             "services.ingestion.inferred_edges.extractor.asyncio.sleep",
             new_callable=AsyncMock,
@@ -782,10 +727,7 @@ async def test_rate_limit_exhausted_marks_bundle_failed() -> None:
 
 @pytest.mark.asyncio
 async def test_non_rate_limit_error_does_not_retry() -> None:
-    """A non-rate-limit error (e.g. APIConnectionError, AuthenticationError)
-    propagates immediately. We do NOT want exponential backoff burning
-    minutes on a genuine API/auth failure.
-    """
+    """A non-rate-limit error propagates immediately."""
     bundle = _make_bundle()
     conn = _make_mock_conn()
 
@@ -793,15 +735,10 @@ async def test_non_rate_limit_error_does_not_retry() -> None:
         pass
 
     once_then_dies = AsyncMock(side_effect=APIConnectionError("connection refused"))
-    mock_client = MagicMock()
-    mock_client.messages.create = once_then_dies
 
     with (
         patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
-        patch(
-            "services.ingestion.inferred_edges.extractor._anthropic_module.AsyncAnthropic",
-            lambda api_key=None: mock_client,
-        ),
+        _patch_acompletion(once_then_dies),
         patch(
             "services.ingestion.inferred_edges.extractor.asyncio.sleep",
             new_callable=AsyncMock,
@@ -811,9 +748,7 @@ async def test_non_rate_limit_error_does_not_retry() -> None:
 
     assert result.bundle_failed
     assert "APIConnectionError" in (result.bundle_fail_reason or "")
-    # Exactly one call -- no retry on non-rate-limit errors.
     assert once_then_dies.call_count == 1
-    # No sleep -- we did NOT enter the backoff loop.
     mock_sleep.assert_not_awaited()
 
 
@@ -822,45 +757,19 @@ async def test_non_rate_limit_error_does_not_retry() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _mock_gemini_response(edges: list[dict]) -> MagicMock:
-    """Mock a google-genai GenerateContentResponse.
-
-    Gemini's structured-output path returns a complete JSON array
-    (`[{...}, {...}]`) on `resp.text`. usage_metadata exposes
-    `prompt_token_count` and `candidates_token_count`.
-    """
-    response = MagicMock()
-    response.text = json.dumps(edges)
-    response.usage_metadata = MagicMock(
-        prompt_token_count=1000, candidates_token_count=200,
-    )
-    return response
-
-
-def _patch_gemini(edges: list[dict]):
-    """Patch the google-genai client used by the extractor's Gemini path."""
-    mock_client = MagicMock()
-    mock_client.aio.models.generate_content = AsyncMock(
-        return_value=_mock_gemini_response(edges),
-    )
-
-    def _fake_client_class(api_key=None):
-        return mock_client
-
-    return patch(
-        "services.ingestion.inferred_edges.extractor._genai_module.Client",
-        _fake_client_class,
-    )
+def _mock_gemini_response(edges: list[dict]) -> SimpleNamespace:
+    """Gemini path: full JSON array on `choices[0].message.content`
+    (no `[` prefill trick — structured-output mode returns a complete
+    array)."""
+    return _litellm_text_response(json.dumps(edges))
 
 
 @pytest.mark.asyncio
 async def test_gemini_path_extracts_valid_edge(monkeypatch: pytest.MonkeyPatch) -> None:
     """When the configured model has a `gemini-` prefix, the extractor
-    routes through the Google SDK and consumes its full-array JSON
-    response (no `[` prefill). The validation pipeline runs the same
-    way -- the model ends up tagged on the InferredEdge."""
-    # Override the autouse fixture's HAIKU pin -- this test exercises
-    # the Gemini path explicitly.
+    routes through the LiteLLM Gemini provider and consumes its
+    full-array JSON response (no `[` prefill). The validation pipeline
+    runs the same way -- the model ends up tagged on the InferredEdge."""
     monkeypatch.setattr(
         "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
         "gemini-3.1-flash-lite",
@@ -877,9 +786,10 @@ async def test_gemini_path_extracts_valid_edge(monkeypatch: pytest.MonkeyPatch) 
     bundle = _make_bundle()
     conn = _make_mock_conn()
 
+    fake = AsyncMock(return_value=_mock_gemini_response(edges))
     with (
         patch.dict("os.environ", {"GOOGLE_API_KEY": "test-key"}, clear=False),
-        _patch_gemini(edges),
+        _patch_acompletion(fake),
     ):
         result = await extract_edges(bundle, conn)
 
@@ -892,15 +802,19 @@ async def test_gemini_path_extracts_valid_edge(monkeypatch: pytest.MonkeyPatch) 
     assert edge.to_canonical_id == "AUTH-123"
     # `model` field tags every edge with its source LLM.
     assert edge.model == "gemini-3.1-flash-lite"
+    # Sanity: the call routed through the gemini/ LiteLLM prefix.
+    assert fake.await_count == 1
+    kwargs = fake.await_args.kwargs
+    assert kwargs["model"].startswith("gemini/")
 
 
 @pytest.mark.asyncio
 async def test_gemini_path_skips_when_google_api_key_unset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No GOOGLE_API_KEY -> empty result, no SDK call. Mirrors the
-    Haiku-no-ANTHROPIC-key safety hatch so the worker doesn't crash
-    in credential-less environments."""
+    """No GOOGLE_API_KEY AND no LLM_GATEWAY_URL -> empty result, no
+    LLM call. Mirrors the Haiku-no-ANTHROPIC-key safety hatch so the
+    worker doesn't crash in credential-less environments."""
     monkeypatch.setattr(
         "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
         "gemini-3.1-flash-lite",
@@ -908,22 +822,17 @@ async def test_gemini_path_skips_when_google_api_key_unset(
     bundle = _make_bundle()
     conn = _make_mock_conn()
 
-    mock_client = MagicMock()
-    mock_client.aio.models.generate_content = AsyncMock()
-
+    fake = AsyncMock()
     with (
         patch.dict("os.environ", {}, clear=True),  # nuke all keys
-        patch(
-            "services.ingestion.inferred_edges.extractor._genai_module.Client",
-            lambda api_key=None: mock_client,
-        ),
+        _patch_acompletion(fake),
     ):
         result = await extract_edges(bundle, conn)
 
     assert not result.bundle_failed
     assert result.edges == []
-    # SDK was never called.
-    mock_client.aio.models.generate_content.assert_not_called()
+    # The wrapper was never called.
+    fake.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -931,9 +840,7 @@ async def test_explicit_model_override_wins_over_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Caller can pass `model=` explicitly to force a specific provider,
-    overriding INFERRED_EDGES_MODEL. Useful for A/B comparisons and the
-    eval harness."""
-    # Default to Gemini, but force Haiku for this call.
+    overriding INFERRED_EDGES_MODEL."""
     monkeypatch.setattr(
         "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
         "gemini-3.1-flash-lite",
@@ -960,3 +867,12 @@ async def test_explicit_model_override_wins_over_default(
     assert len(result.edges) == 1
     # Edge tagged with the override, not the default.
     assert result.edges[0].model == HAIKU_MODEL
+
+
+# Note: `_anthropic_module` (the legacy Anthropic SDK import) is no
+# longer used by the production call path, but the module retains the
+# import for the `RateLimitError` class-name match. The module-level
+# `MagicMock` reference below is intentionally unused — it exists to
+# silence flake-8 "unused import" should the import-time fallback path
+# ever surface a None.
+_ = MagicMock

@@ -1,7 +1,11 @@
 """Unit tests for the triage stage.
 
 - pack_into_batches: token-budget bin-packing.
-- call_triage: round-trip via mocked AsyncAnthropic, validates against TriageOutput.
+- call_triage: round-trip via mocked `shared.llm.acompletion`,
+  validates against TriageOutput.
+
+Phase-0b: tests mock `shared.llm_tools.acompletion` (the wrapper
+referenced by the call-site path) rather than a fake `AsyncAnthropic`.
 """
 
 from __future__ import annotations
@@ -10,6 +14,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import orjson
 import pytest
 
 from services.synthesis.models import TriageInput, TriageOutput
@@ -33,9 +38,23 @@ def _ev(qid: int, body_tokens: int, *, body: str = "x") -> TriageInput:
     )
 
 
-def _tool_use_response(payload: dict) -> SimpleNamespace:
-    block = SimpleNamespace(type="tool_use", name="record_triage", input=payload)
-    return SimpleNamespace(content=[block])
+def _tool_response(payload: dict, *, tool_name: str = "record_triage") -> SimpleNamespace:
+    """LiteLLM-shaped response carrying a single forced tool call."""
+    func = SimpleNamespace(
+        name=tool_name,
+        arguments=orjson.dumps(payload).decode("utf-8"),
+    )
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _no_tool_call_response() -> SimpleNamespace:
+    """Model returned text only, no tool_calls."""
+    message = SimpleNamespace(content="hi", tool_calls=None)
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None)
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +115,7 @@ def test_pack_minimum_per_event_charge() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_triage_round_trip() -> None:
+async def test_call_triage_round_trip(monkeypatch) -> None:
     events = [_ev(1, 100), _ev(2, 100)]
     # v4: triage produces score-only verdicts. No targets / wiki_type /
     # slug — the wiki agent decides downstream.
@@ -114,9 +133,10 @@ async def test_call_triage_round_trip() -> None:
             },
         }
     }
-    client = SimpleNamespace()
-    client.messages = SimpleNamespace(create=AsyncMock(return_value=_tool_use_response(payload)))
-    out = await call_triage(client, events, now=datetime(2026, 5, 2, tzinfo=UTC))
+    fake = AsyncMock(return_value=_tool_response(payload))
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    # `client` is unused post-Phase-0b; pass any sentinel.
+    out = await call_triage(object(), events, now=datetime(2026, 5, 2, tzinfo=UTC))
     assert isinstance(out, TriageOutput)
     assert out.verdicts["1"].important is True
     assert out.verdicts["1"].score == pytest.approx(7.5)
@@ -127,26 +147,25 @@ async def test_call_triage_round_trip() -> None:
 
 
 @pytest.mark.asyncio
-async def test_call_triage_empty_input_short_circuits() -> None:
-    client = SimpleNamespace()
+async def test_call_triage_empty_input_short_circuits(monkeypatch) -> None:
     # No call should be made; verify by pre-failing the mock.
-    client.messages = SimpleNamespace(create=AsyncMock(side_effect=AssertionError("must not call")))
-    out = await call_triage(client, [], now=datetime(2026, 5, 2, tzinfo=UTC))
+    fake = AsyncMock(side_effect=AssertionError("must not call"))
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    out = await call_triage(object(), [], now=datetime(2026, 5, 2, tzinfo=UTC))
     assert out.verdicts == {}
 
 
 @pytest.mark.asyncio
-async def test_call_triage_raises_on_missing_tool_block() -> None:
+async def test_call_triage_raises_on_missing_tool_block(monkeypatch) -> None:
     events = [_ev(1, 10)]
-    text_only = SimpleNamespace(content=[SimpleNamespace(type="text", text="hi")])
-    client = SimpleNamespace()
-    client.messages = SimpleNamespace(create=AsyncMock(return_value=text_only))
+    fake = AsyncMock(return_value=_no_tool_call_response())
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
     with pytest.raises(TriageParseError):
-        await call_triage(client, events, now=datetime(2026, 5, 2, tzinfo=UTC))
+        await call_triage(object(), events, now=datetime(2026, 5, 2, tzinfo=UTC))
 
 
 @pytest.mark.asyncio
-async def test_call_triage_raises_on_validation_failure() -> None:
+async def test_call_triage_raises_on_validation_failure(monkeypatch) -> None:
     events = [_ev(1, 10)]
     bad = {
         "verdicts": {
@@ -156,7 +175,7 @@ async def test_call_triage_raises_on_validation_failure() -> None:
             }
         }
     }
-    client = SimpleNamespace()
-    client.messages = SimpleNamespace(create=AsyncMock(return_value=_tool_use_response(bad)))
+    fake = AsyncMock(return_value=_tool_response(bad))
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
     with pytest.raises(TriageParseError):
-        await call_triage(client, events, now=datetime(2026, 5, 2, tzinfo=UTC))
+        await call_triage(object(), events, now=datetime(2026, 5, 2, tzinfo=UTC))
