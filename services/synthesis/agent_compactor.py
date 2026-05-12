@@ -8,7 +8,7 @@ verbatim in the summary text — only conversational fluff (model
 commentary, intermediate read_page / get_event_body responses) is
 dropped.
 
-The summarizer model is gemini-flash-lite-preview, chosen for cost
+The summarizer model is gemini-3.1-flash-lite, chosen for cost
 (<$0.001 per compaction call) and latency (~2s). Preserves enough
 context for the agent to continue making decisions without hallucinating
 about already-staged updates.

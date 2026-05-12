@@ -56,7 +56,7 @@ from scripts.eval_data.fixtures import FIXTURES, Fixture
 
 HAIKU = "claude-haiku-4-5-20251001"
 GEMINI_PRO = "gemini-3.1-pro-preview"
-GEMINI_FLASH_LITE = "gemini-3.1-flash-lite-preview"
+GEMINI_FLASH_LITE = "gemini-3.1-flash-lite"
 GEMINI_FLASH = "gemini-3-flash-preview"
 
 JUDGE_MODEL = "claude-opus-4-7"  # user-selected: Opus 4.7 as judge

@@ -391,7 +391,7 @@ SYNTHESIS_MODELS: dict[str, str] = {
     "anthropic/claude-haiku-4-5-20251001": "anthropic",
     "anthropic/claude-sonnet-4-6": "anthropic",
     "google/gemini-3-flash-preview": "google",
-    "google/gemini-3.1-flash-lite-preview": "google",
+    "google/gemini-3.1-flash-lite": "google",
 }
 DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-6"
 
@@ -715,7 +715,7 @@ WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
 # to Anthropic.
 # Recognized values:
 #   "haiku" | "claude-haiku"           -> Anthropic Haiku 4.5
-#   "gemini-flash-lite" | "gemini-flash-lite-preview" -> Gemini Flash Lite
+#   "gemini-flash-lite" | "gemini-3.1-flash-lite" -> Gemini 3.1 Flash Lite
 # No env-var override path — the prior `getattr(settings, ...)` plumbing
 # referenced fields that didn't exist on Settings, so the env var was
 # silently inert. Constants-only is honest.
@@ -727,7 +727,7 @@ WIKI_TRIAGE_MODEL = "haiku"
 # shootout (scripts/eval_directed_phrases.py, judged by Opus 4.7) picked
 # Gemini 3 Flash: specificity 8.6/retrieval-fit 8.2 vs Haiku 7.8/7.8, at
 # ~1/4 the cost ($0.0005 vs $0.0022 per call). Flip to "haiku" or
-# "gemini-3.1-flash-lite-preview" via this constant + redeploy.
+# "gemini-3.1-flash-lite" via this constant + redeploy.
 DIRECTED_PHRASES_MODEL = "gemini-3-flash-preview"
 
 # Concurrency caps. The wiki-worker fans out customers, then triage
@@ -804,7 +804,7 @@ WIKI_AGENT_MODEL = "gemini-3.1-pro-preview"
 
 # Compactor model. Cheaper Flash variant since it only summarizes the
 # conversation; preserves the structured runtime state untouched.
-WIKI_AGENT_COMPACTOR_MODEL = "gemini-flash-lite-preview"
+WIKI_AGENT_COMPACTOR_MODEL = "gemini-3.1-flash-lite"
 
 # Per-source backfill crawler models. Default to the same Pro model the
 # daily-replay agent uses; per-source knobs let us swap a cheaper /

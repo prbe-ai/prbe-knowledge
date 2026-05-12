@@ -74,8 +74,7 @@ class TriageProvider(Protocol):
 _ANTHROPIC_TRIAGE_NAMES = {"haiku", "claude-haiku", HAIKU_MODEL}
 _GEMINI_FLASH_LITE_NAMES = {
     "gemini-flash-lite",
-    "gemini-flash-lite-preview",
-    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-lite",
     "gemini-2.5-flash-lite",
 }
 
@@ -275,7 +274,7 @@ def _flatten_anthropic_kwargs(
 class _GeminiTriage:
     """Gemini Flash Lite via response_schema."""
 
-    def __init__(self, *, model: str = "gemini-flash-lite-preview") -> None:
+    def __init__(self, *, model: str = "gemini-3.1-flash-lite") -> None:
         self._model = model
 
     async def triage(self, events: list[TriageInput], *, now: datetime) -> TriageOutput:
@@ -319,8 +318,11 @@ def get_triage_provider(
     """
     name = (model_override or WIKI_TRIAGE_MODEL).lower()
     if name in _GEMINI_FLASH_LITE_NAMES:
+        # "gemini-flash-lite" is the friendly alias for the GA 3.1 model;
+        # versioned ids ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite")
+        # are sent to the Google API unchanged.
         return _GeminiTriage(
-            model=name if name.startswith("gemini") else "gemini-flash-lite-preview"
+            model="gemini-3.1-flash-lite" if name == "gemini-flash-lite" else name
         )
     if name in _ANTHROPIC_TRIAGE_NAMES:
         if anthropic_client is None:
@@ -373,10 +375,9 @@ _GEMINI_FLASH_CANONICAL = {
 # triage-only Flash-Lite alias doesn't silently route directed-phrase
 # traffic through an unevaluated model.
 _GEMINI_FLASH_LITE_CANONICAL = {
-    "gemini-flash-lite":              "gemini-flash-lite-preview",
-    "gemini-flash-lite-preview":      "gemini-flash-lite-preview",
-    "gemini-3.1-flash-lite-preview":  "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-flash-lite":          "gemini-2.5-flash-lite",
+    "gemini-flash-lite":          "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite":      "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite":      "gemini-2.5-flash-lite",
 }
 
 
