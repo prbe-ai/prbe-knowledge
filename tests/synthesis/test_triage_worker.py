@@ -22,6 +22,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import asyncpg
+import orjson
 import pytest
 import pytest_asyncio
 
@@ -123,17 +124,57 @@ def _result(*docs: Document) -> NormalizationResult:
 
 
 def _tool_use_response(name: str, payload: dict) -> SimpleNamespace:
-    block = SimpleNamespace(type="tool_use", name=name, input=payload)
-    return SimpleNamespace(content=[block])
+    """LiteLLM-shaped response carrying one forced tool call.
+
+    Post-Phase-0b, ``shared.llm_tools.forced_tool_call`` reads
+    ``resp.choices[0].message.tool_calls[0].function.{name, arguments}``
+    where ``arguments`` is a JSON-encoded string. (Pre-migration this
+    returned the Anthropic-native ``content=[{type:'tool_use',...}]``
+    shape; the new shape matches what LiteLLM normalizes Anthropic +
+    OpenAI + Gemini tool-call responses into.)
+    """
+    func = SimpleNamespace(name=name, arguments=orjson.dumps(payload).decode("utf-8"))
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+# Per-test triage payload, set inside the test body and read by the
+# autouse `_patch_acompletion` fixture's fake `acompletion`. Default is
+# the empty-verdicts dict — safe for tests that expect zero LLM calls.
+_TRIAGE_PAYLOAD: dict = {"verdicts": {}}
 
 
 def _make_triage_client(triage_payload: dict) -> SimpleNamespace:
-    async def create(*, model: str, **kwargs):
-        return _tool_use_response("record_triage", triage_payload)
+    """Stash the per-test triage payload and return an inert sentinel.
 
-    client = SimpleNamespace()
-    client.messages = SimpleNamespace(create=AsyncMock(side_effect=create))
-    return client
+    The ``TriageWorker(anthropic_client=...)`` parameter is unused
+    post-Phase-0b (kept for caller compat). The real mocking happens at
+    ``shared.llm_tools.acompletion`` via the ``_patch_acompletion``
+    autouse fixture below, which reads ``_TRIAGE_PAYLOAD`` on every call.
+    """
+    global _TRIAGE_PAYLOAD
+    _TRIAGE_PAYLOAD = triage_payload
+    return SimpleNamespace()
+
+
+@pytest.fixture(autouse=True)
+def _patch_acompletion(monkeypatch) -> None:
+    """Route every ``shared.llm_tools.acompletion`` call to the
+    LiteLLM-shaped response that wraps the current ``_TRIAGE_PAYLOAD``.
+    Reset the payload to the empty default between tests so a stale
+    payload from a prior test can't leak in.
+    """
+    global _TRIAGE_PAYLOAD
+    _TRIAGE_PAYLOAD = {"verdicts": {}}
+
+    async def _fake(**kwargs):
+        return _tool_use_response("record_triage", _TRIAGE_PAYLOAD)
+
+    monkeypatch.setattr("shared.llm_tools.acompletion", _fake)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
 
 
 async def _read_queue_ids(customer_id: str) -> list[int]:
