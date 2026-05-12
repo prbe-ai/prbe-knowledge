@@ -12,6 +12,12 @@ from typing import Literal
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from shared.constants import (
+    DB_INIT_RETRY_ATTEMPTS,
+    DB_INIT_RETRY_BACKOFF_CAP_SECONDS,
+    DB_INIT_RETRY_BASE_SECONDS,
+)
+
 Environment = Literal["local", "dev", "staging", "main"]
 
 
@@ -53,8 +59,13 @@ class Settings(BaseSettings):
     # Stuck workers are still caught by cron_stuck_queue_reclaim.py via the
     # heartbeat (30s).
     db_statement_timeout_ms: int = 300_000
-    db_init_retry_attempts: int = 6
-    db_init_retry_base_seconds: float = 1.0
+    # init_pool connect-with-backoff. Defaults tracked in shared.constants
+    # (DB_INIT_RETRY_*) so the boot-retry ceiling is one explicit knob;
+    # tightened for the post-migrate-sentinel world where retries only cover
+    # transient blips. Override per-env via DB_INIT_RETRY_* env vars.
+    db_init_retry_attempts: int = DB_INIT_RETRY_ATTEMPTS
+    db_init_retry_base_seconds: float = DB_INIT_RETRY_BASE_SECONDS
+    db_init_retry_backoff_cap_seconds: float = DB_INIT_RETRY_BACKOFF_CAP_SECONDS
     db_connect_timeout_seconds: float = 10.0
     # Heartbeat is liveness, NOT progress. The runner spawns a background task
     # that pings heartbeat_at every N seconds regardless of whether events are

@@ -32,8 +32,11 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
     settings = settings or get_settings()
     attempts = max(1, settings.db_init_retry_attempts)
     base = settings.db_init_retry_base_seconds
+    backoff_cap = settings.db_init_retry_backoff_cap_seconds
     last_exc: BaseException | None = None
-    # Retry tolerates Neon cold-wake on first connect after scale-to-zero.
+    # Short bounded retry: covers transient boot blips (NetworkPolicy
+    # settling, DNS, pool limits, a credential race). The ceiling lives in
+    # shared.constants (DB_INIT_RETRY_*) so it stays one explicit knob.
     for attempt in range(1, attempts + 1):
         try:
             _pool = await asyncpg.create_pool(
@@ -49,7 +52,7 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
             last_exc = exc
             if attempt >= attempts:
                 break
-            backoff = base * (2 ** (attempt - 1))
+            backoff = min(base * (2 ** (attempt - 1)), backoff_cap)
             log.warning(
                 "db.init_pool.retry",
                 attempt=attempt,
@@ -58,7 +61,10 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
                 backoff_seconds=backoff,
             )
             await asyncio.sleep(backoff)
-    raise DatabaseUnavailable(str(last_exc)) from last_exc
+    raise DatabaseUnavailable(
+        f"could not connect to Postgres after {attempts} attempt(s): "
+        f"{type(last_exc).__name__}: {last_exc}"
+    ) from last_exc
 
 
 async def close_pool() -> None:

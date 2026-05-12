@@ -834,3 +834,26 @@ BACKFILL_MAX_TARGETS_PER_SOURCE = int(os.environ.get("BACKFILL_MAX_TARGETS_PER_S
 
 # Agent's CachedContent TTL. Re-create on miss; alert if hit_rate < 80%.
 WIKI_AGENT_CACHE_TTL = "3600s"
+
+
+# --- DB pool init backoff ---------------------------------------------------
+# Connect-with-backoff knobs for shared.db.init_pool, kept here per the
+# RRF_K / RRF_BREADTH_ALPHA tuning-knob convention (feedback_prbe_knowledge_
+# tuning_consts) so the ceiling is one explicit number, not buried in db.py.
+#
+# Sizing: in the k8s data-plane, app pods only start after the migrate
+# sentinel exists (prbe-data-plane-image / chart change), so Postgres is up
+# and migrated by the time init_pool runs. The remaining retries cover only
+# transient boot blips -- NetworkPolicy settling, DNS, pool limits, a
+# credential race -- which clear in a second or two, not a minute. So the
+# old 6-attempt / base-1s / x2 schedule (1+2+4+8+16 = 31s of pure sleep,
+# ~90s worst case with connect timeouts) is far longer than needed.
+#
+# New ceiling: 4 attempts, base 0.5s, x2, capped per-attempt at 5s ->
+# backoffs of 0.5 + 1 + 2 = 3.5s of sleep across 3 retries; worst case
+# (connect timeout fully consumed each attempt) ~3.5s + 4 * connect_timeout.
+# A real transient blip recovers in single-digit seconds; genuine outages
+# still surface a readable DatabaseUnavailable rather than a silent hang.
+DB_INIT_RETRY_ATTEMPTS = 4
+DB_INIT_RETRY_BASE_SECONDS = 0.5
+DB_INIT_RETRY_BACKOFF_CAP_SECONDS = 5.0
