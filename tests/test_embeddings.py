@@ -328,3 +328,161 @@ def test_dataclass_re_exports_unchanged() -> None:
     assert EmbeddedChunk.__name__ == "EmbeddedChunk"
     assert FailedChunk.__name__ == "FailedChunk"
     assert EmbedResult.__name__ == "EmbedResult"
+
+
+# ---- Gateway-aware embedding (plan D1, managed-isolated / self-host) -----
+#
+# When `llm_gateway_url` is set, both embedders route through the LiteLLM
+# proxy: OpenAIEmbedder by pointing its AsyncOpenAI SDK at the gateway via
+# `base_url` (no wrapper hop), GeminiEmbedder by going through
+# `shared.llm.aembedding` (the google-genai SDK has no `base_url` knob).
+# These tests are SDK-shape only — no network — but they nail down which
+# transport each embedder uses and that the gateway credentials reach it.
+
+
+def test_openai_embedder_uses_gateway_base_url_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway mode: AsyncOpenAI is constructed with `base_url=<gw>` and
+    `api_key=<LLM_GATEWAY_KEY>` — not the direct openai_api_key."""
+
+    from shared.config import get_settings
+
+    monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.litellm.svc:4000")
+    monkeypatch.setenv("LLM_GATEWAY_KEY", "sk-virtual-customer-x")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-direct-must-not-be-used")
+    get_settings.cache_clear()
+    s = get_settings()
+    # sanity: pydantic-settings picked the gateway value up
+    assert s.llm_gateway_url == "http://litellm.litellm.svc:4000"
+    assert s.llm_gateway_key.get_secret_value() == "sk-virtual-customer-x"
+
+    captured: dict[str, object] = {}
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.embeddings = None  # never called in this test
+
+    monkeypatch.setattr("shared.embeddings.AsyncOpenAI", _FakeAsyncOpenAI)
+
+    OpenAIEmbedder(settings=s)
+
+    assert captured["base_url"] == "http://litellm.litellm.svc:4000"
+    assert captured["api_key"] == "sk-virtual-customer-x"
+    get_settings.cache_clear()
+
+
+def test_openai_embedder_falls_back_to_direct_key_when_no_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without LLM_GATEWAY_URL the embedder uses the direct openai_api_key
+    and no `base_url` — the existing dev / self-host-with-own-keys path."""
+    from shared.config import get_settings
+
+    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-direct")
+    get_settings.cache_clear()
+    s = get_settings()
+
+    captured: dict[str, object] = {}
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.embeddings = None
+
+    monkeypatch.setattr("shared.embeddings.AsyncOpenAI", _FakeAsyncOpenAI)
+
+    OpenAIEmbedder(settings=s)
+    assert captured == {"api_key": "sk-direct"}
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_gemini_embedder_routes_through_shared_llm_aembedding_in_gateway_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gateway mode for Gemini goes through shared.llm.aembedding (no
+    base_url knob on google-genai). Model id is sent with the `gemini/`
+    prefix so LiteLLM's glob routes it to Gemini."""
+
+    from shared.config import get_settings
+
+    monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.litellm.svc:4000")
+    monkeypatch.setenv("LLM_GATEWAY_KEY", "sk-virtual")
+    monkeypatch.setenv("GOOGLE_API_KEY", "must-not-be-used")
+    get_settings.cache_clear()
+    s = get_settings()
+
+    embedder = GeminiEmbedder(settings=s, model="gemini-embedding-2-preview")
+    assert embedder._gateway_url == "http://litellm.litellm.svc:4000"
+
+    captured: dict[str, object] = {}
+
+    class _Row:
+        def __init__(self, v: list[float]) -> None:
+            self.embedding = v
+
+    class _Resp:
+        def __init__(self, n: int) -> None:
+            self.data = [_Row([0.11, 0.22, 0.33]) for _ in range(n)]
+
+    async def fake_aembedding(*, model: str, input: list[str], **kwargs: object) -> object:
+        captured["model"] = model
+        captured["input"] = list(input)
+        return _Resp(len(input))
+
+    import shared.llm as shared_llm
+
+    monkeypatch.setattr(shared_llm, "aembedding", fake_aembedding)
+
+    out = await embedder._embed_once(["doc-one", "doc-two", "doc-three"])
+
+    # Gateway transport was hit — direct client never constructed.
+    assert embedder._client is None
+    # Model id carries the `gemini/` prefix for the proxy glob.
+    assert captured["model"] == "gemini/gemini-embedding-2-preview"
+    # All inputs went through; vectors round-trip.
+    assert len(out) == 3
+    assert all(vec == [0.11, 0.22, 0.33] for vec in out)
+    get_settings.cache_clear()
+
+
+def test_gateway_embedding_error_translation_covers_taxonomy() -> None:
+    """LLMError → embedding error taxonomy mapping. Mirrors the direct-SDK
+    translations so the recursive half-split treats both transports the same.
+    """
+    from shared.embeddings import _translate_gateway_embedding_error
+    from shared.llm import LLMError
+
+    # status-code-driven
+    assert isinstance(
+        _translate_gateway_embedding_error(LLMError("rl", status_code=429)),
+        EmbeddingRateLimited,
+    )
+    assert isinstance(
+        _translate_gateway_embedding_error(LLMError("oops", status_code=503)),
+        EmbeddingProviderUnavailable,
+    )
+    # message-driven (no status)
+    assert isinstance(
+        _translate_gateway_embedding_error(LLMError("rate limit exceeded")),
+        EmbeddingRateLimited,
+    )
+    assert isinstance(
+        _translate_gateway_embedding_error(LLMError("upstream unavailable")),
+        EmbeddingProviderUnavailable,
+    )
+    assert isinstance(
+        _translate_gateway_embedding_error(
+            LLMError("input is too long for max tokens")
+        ),
+        EmbeddingContextLengthExceeded,
+    )
+    # Anything else → BatchRejected (caller's half-split isolates the bad chunk).
+    assert isinstance(
+        _translate_gateway_embedding_error(LLMError("malformed request")),
+        EmbeddingBatchRejected,
+    )

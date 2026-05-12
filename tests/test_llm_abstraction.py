@@ -252,7 +252,13 @@ def test_gateway_url_reads_env_each_call(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_module_public_surface() -> None:
     """Lock the public surface so accidental additions show up in review."""
-    assert set(llm.__all__) == {"LLMError", "acompletion", "aembedding", "gateway_url"}
+    assert set(llm.__all__) == {
+        "LLMError",
+        "acompletion",
+        "aembedding",
+        "gateway_key",
+        "gateway_url",
+    }
 
 
 def test_llmerror_default_attrs() -> None:

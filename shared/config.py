@@ -80,6 +80,20 @@ class Settings(BaseSettings):
     google_api_key: SecretStr = SecretStr("")
     claude_code_extraction_model: str = Field(default="claude-sonnet-4-6")
 
+    # --- LLM gateway (managed-isolated / self-host: route LLM + embedding
+    #     calls through a central LiteLLM proxy instead of direct provider
+    #     SDKs — plan D1, `shared/llm.py`) ------------------------------------
+    # When `llm_gateway_url` is set, callers that go through `shared.llm`
+    # forward to it (LiteLLM's `api_base`) with `llm_gateway_key` as the
+    # bearer (`api_key`). Empty `llm_gateway_url` => direct provider calls
+    # using the `*_api_key` fields above (the self-host-with-own-keys path,
+    # and dev). A key without a URL is ignored. (`shared.llm` reads these
+    # from the environment, not this Settings object — these fields exist so
+    # the values appear in one inventory + so non-`shared.llm` code can read
+    # them too; the env var names are `LLM_GATEWAY_URL` / `LLM_GATEWAY_KEY`.)
+    llm_gateway_url: str = ""
+    llm_gateway_key: SecretStr = SecretStr("")
+
     # --- Token encryption (Fernet key, 32 url-safe base64 bytes) -----------
     token_encryption_key: SecretStr = SecretStr("")
 

@@ -55,12 +55,22 @@ that could silently downgrade the model.
 Gateway routing
 ---------------
 If the env var ``LLM_GATEWAY_URL`` is set, every call (completion AND
-embedding) is forwarded to that URL via LiteLLM's ``api_base`` parameter.
-This is the self-host pattern: customer runs their own LiteLLM proxy
-(or an OpenAI-compatible gateway) and we point at it. Without the env
-var, LiteLLM uses each provider's default endpoint and picks credentials
-out of the standard env vars (``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``,
-``GOOGLE_API_KEY`` / ``GEMINI_API_KEY``).
+embedding) is forwarded to that URL via LiteLLM's ``api_base`` parameter,
+authenticated with ``LLM_GATEWAY_KEY`` (LiteLLM's ``api_key``) when that
+env var is also set. Two modes use this:
+
+  - **managed-isolated**: the central LiteLLM proxy on the cluster, with
+    ``LLM_GATEWAY_KEY`` the tenant's per-customer virtual key (the proxy
+    holds the real provider keys; data planes never see them).
+  - **self-host**: the customer runs their own LiteLLM / OpenAI-compatible
+    gateway and we point at it with whatever key they configure.
+
+Without ``LLM_GATEWAY_URL``, LiteLLM uses each provider's default
+endpoint and picks credentials out of the standard env vars
+(``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``, ``GOOGLE_API_KEY`` /
+``GEMINI_API_KEY``) — the dev / self-host-with-own-keys path. A
+``LLM_GATEWAY_KEY`` without a ``LLM_GATEWAY_URL`` is ignored. A per-call
+``api_base`` / ``api_key`` kwarg always wins over the env.
 """
 
 from __future__ import annotations
@@ -91,13 +101,15 @@ __all__ = [
     "LLMError",
     "acompletion",
     "aembedding",
+    "gateway_key",
     "gateway_url",
 ]
 
 
-# Env var read at every call (NOT cached at import) so a test or the
-# self-host installer can flip it after the module is imported.
+# Env vars read at every call (NOT cached at import) so a test or the
+# self-host installer can flip them after the module is imported.
 _GATEWAY_URL_ENV = "LLM_GATEWAY_URL"
+_GATEWAY_KEY_ENV = "LLM_GATEWAY_KEY"
 
 
 def gateway_url() -> str | None:
@@ -109,6 +121,15 @@ def gateway_url() -> str | None:
     process restart.
     """
     val = os.environ.get(_GATEWAY_URL_ENV)
+    return val if val else None
+
+
+def gateway_key() -> str | None:
+    """Return the bearer key for the LLM gateway (``LLM_GATEWAY_KEY``),
+    or None. Read fresh every call, like :func:`gateway_url`. Only
+    meaningful when :func:`gateway_url` is also set — a key without a
+    gateway URL is ignored (there's nothing to send it to)."""
+    val = os.environ.get(_GATEWAY_KEY_ENV)
     return val if val else None
 
 
@@ -163,15 +184,27 @@ def _wrap_litellm_error(exc: BaseException) -> LLMError:
 
 def _maybe_inject_gateway(kwargs: dict[str, Any]) -> dict[str, Any]:
     """If ``LLM_GATEWAY_URL`` is set and the caller didn't override
-    ``api_base``, inject it. Caller-supplied ``api_base`` always wins
-    so per-call overrides remain possible (e.g. the eval harness can
-    point at a staging gateway without unsetting the global env var).
+    ``api_base``, inject it; and inject ``api_key`` from
+    ``LLM_GATEWAY_KEY`` when both are set and the caller didn't override
+    ``api_key``. Caller-supplied ``api_base`` / ``api_key`` always win,
+    so per-call overrides remain possible (the eval harness pointing at
+    a staging gateway, or an explicit direct provider call).
+
+    ``LLM_GATEWAY_KEY`` is only forwarded when ``LLM_GATEWAY_URL`` is
+    set — a stray key with no URL would otherwise override the direct-
+    provider credentials LiteLLM picks up from ``ANTHROPIC_API_KEY`` /
+    ``OPENAI_API_KEY`` / ``GOOGLE_API_KEY`` and break the dev path.
     """
-    if kwargs.get("api_base"):
-        return kwargs
-    url = gateway_url()
-    if url:
-        kwargs["api_base"] = url
+    url_already_set = bool(kwargs.get("api_base"))
+    if not url_already_set:
+        url = gateway_url()
+        if url:
+            kwargs["api_base"] = url
+            url_already_set = True
+    if url_already_set and not kwargs.get("api_key"):
+        key = gateway_key()
+        if key:
+            kwargs["api_key"] = key
     return kwargs
 
 

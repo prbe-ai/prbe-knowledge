@@ -199,7 +199,17 @@ class _BaseEmbedder:
 
 
 class OpenAIEmbedder(_BaseEmbedder):
-    """text-embedding-3-large via the AsyncOpenAI SDK."""
+    """text-embedding-3-large via the AsyncOpenAI SDK.
+
+    Gateway-aware (managed-isolated / self-host, plan D1): when
+    ``llm_gateway_url`` is set we point AsyncOpenAI at the central LiteLLM
+    proxy with ``llm_gateway_key`` as the bearer. LiteLLM exposes
+    OpenAI-compatible ``/v1/embeddings``, so the SDK + all of its
+    retry / timeout / error machinery work unchanged through the gateway —
+    we don't pay a wrapper hop on the hot embedding path. Without the
+    gateway var we keep the direct-provider path (``openai_api_key``) for
+    dev, self-host-with-own-keys, and the eval harness.
+    """
 
     def __init__(
         self,
@@ -212,9 +222,20 @@ class OpenAIEmbedder(_BaseEmbedder):
             dim=EMBEDDING_DIM,
             batch_size=settings.embedding_batch_size,
         )
-        key = settings.openai_api_key.get_secret_value()
-        self._client = AsyncOpenAI(api_key=key) if key else None
+        gw_url = settings.llm_gateway_url.strip()
+        if gw_url:
+            # `api_key=""` makes the SDK omit the Authorization header
+            # entirely, which a no-auth proxy would reject; pass a literal
+            # space so the header is always present (LiteLLM ignores the
+            # value when `master_key` isn't enforced).
+            gw_key = settings.llm_gateway_key.get_secret_value() or " "
+            self._client = AsyncOpenAI(api_key=gw_key, base_url=gw_url)
+        else:
+            key = settings.openai_api_key.get_secret_value()
+            self._client = AsyncOpenAI(api_key=key) if key else None
         # Strip `openai/` prefix from the canonical model constant for the SDK call.
+        # Through the LiteLLM gateway the raw id is fine — the proxy's
+        # `*` catch-all glob routes it to OpenAI.
         self._sdk_model = model.split("/", 1)[-1] if "/" in model else model
 
     async def _embed_once(self, batch: list[str]) -> list[list[float]]:
@@ -278,11 +299,29 @@ _GEMINI_QUERY_PREFIX = "task: search result | query: {query}"
 
 
 class GeminiEmbedder(_BaseEmbedder):
-    """gemini-embedding-2-preview via google-genai's async client.
+    """gemini-embedding-2-preview, two transports.
 
     Asymmetric retrieval: documents and queries are formatted differently
     before being sent to the model so the same vector space encodes
     "this is a chunk to retrieve" vs "this is a question to match".
+
+    Transport (plan D1, managed-isolated):
+
+      - **Gateway mode** (``llm_gateway_url`` set): call via
+        ``shared.llm.aembedding`` so the LiteLLM proxy holds the Google
+        credentials. The google-genai SDK has no ``base_url`` knob (unlike
+        AsyncOpenAI), so we can't point the SDK at the proxy directly —
+        the wrapper is the only way through. LiteLLM's ``gemini-*`` model
+        route covers ``gemini-embedding-2-preview`` as long as the proxy
+        config lists it on the embeddings side (a managed-tenant
+        precondition).
+      - **Direct mode** (no gateway): the original google-genai async path
+        (concurrent sub-batches, native error translation). Dev,
+        self-host-with-own-keys, eval harness.
+
+    Both transports share the recursive half-split poison isolation +
+    asymmetric prefixing in ``_BaseEmbedder`` / ``embed_documents`` /
+    ``embed_query`` above.
     """
 
     def __init__(
@@ -300,7 +339,13 @@ class GeminiEmbedder(_BaseEmbedder):
         api_key = secret.get_secret_value() if secret is not None else ""
         self._api_key = api_key
         self._client: Any | None = None
+        # Gateway transport: set when llm_gateway_url is configured. The
+        # gateway env vars are read fresh in `shared.llm` per call, so we
+        # just need to know which branch to enter on the embedding call.
+        self._gateway_url = settings.llm_gateway_url.strip()
         # Strip `google/` prefix from the canonical constant for the SDK call.
+        # In gateway mode the wrapper takes the bare id and prepends
+        # `gemini/` so LiteLLM's glob routes it to the Gemini provider.
         self._sdk_model = model.split("/", 1)[-1] if "/" in model else model
 
     def _ensure_client(self) -> Any:
@@ -346,6 +391,13 @@ class GeminiEmbedder(_BaseEmbedder):
     _SUBBATCH_MAX_PARALLEL = 64
 
     async def _embed_once(self, batch: list[str]) -> list[list[float]]:
+        # Gateway transport: route through shared.llm.aembedding (LiteLLM
+        # proxy holds the Google credentials). The same sub-group concurrency
+        # pattern applies — the proxy fans these out to Google for us — so
+        # we keep the grouping for I/O parallelism even on the gateway path.
+        if self._gateway_url:
+            return await self._embed_once_gateway(batch)
+
         client = self._ensure_client()
         if client is None:
             # Stub mode -- match OpenAI's behavior so dev/local without
@@ -427,6 +479,120 @@ class GeminiEmbedder(_BaseEmbedder):
                     )
                 vectors.append(list(vec))
             return vectors
+
+    # ---- gateway transport (LiteLLM proxy) ---------------------------------
+
+    async def _embed_once_gateway(self, batch: list[str]) -> list[list[float]]:
+        """Embed via ``shared.llm.aembedding`` (the LiteLLM proxy).
+
+        Same sub-group fan-out as the direct path — even though the proxy
+        could serialize internally, splitting maximizes I/O concurrency
+        (and matches the throughput numbers the direct path was tuned to).
+        Errors from the wrapper come back as ``LLMError`` and are
+        re-translated into the embedding taxonomy so the upstream recursive
+        half-split treats them identically to the direct-SDK path.
+        """
+        groups: list[list[str]] = [
+            batch[i : i + self._SUBBATCH_GROUP_SIZE]
+            for i in range(0, len(batch), self._SUBBATCH_GROUP_SIZE)
+        ]
+        if not groups:
+            return []
+
+        sem = asyncio.Semaphore(self._SUBBATCH_MAX_PARALLEL)
+
+        async def call_one(group: list[str]) -> list[list[float]]:
+            async with sem:
+                return await self._embed_subbatch_gateway(group)
+
+        results = await asyncio.gather(
+            *[call_one(g) for g in groups], return_exceptions=True
+        )
+
+        vectors: list[list[float]] = []
+        for r in results:
+            if isinstance(r, BaseException):
+                raise r
+            vectors.extend(r)
+        return vectors
+
+    async def _embed_subbatch_gateway(
+        self, batch: list[str]
+    ) -> list[list[float]]:
+        # Lazy import: keeps the module-load cost down for callers that
+        # never touch the gateway path (eval scripts, etc).
+        from shared import llm as shared_llm
+
+        # LiteLLM glob-routes `gemini-*` to the Gemini provider; pass the
+        # explicit prefix so the proxy config doesn't have to alias the
+        # bare id (and to keep parity with shared/llm.py's convention).
+        model_id = (
+            self._sdk_model
+            if "/" in self._sdk_model
+            else f"gemini/{self._sdk_model}"
+        )
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                resp = await shared_llm.aembedding(model=model_id, input=batch)
+            except shared_llm.LLMError as exc:
+                translated = _translate_gateway_embedding_error(exc)
+                if isinstance(translated, EmbeddingProviderUnavailable):
+                    if attempt >= 3:
+                        raise translated from exc
+                    await asyncio.sleep(1 * attempt)
+                    continue
+                if isinstance(translated, EmbeddingRateLimited):
+                    if attempt >= 5:
+                        raise translated from exc
+                    await asyncio.sleep(min(2**attempt, 30))
+                    continue
+                raise translated from exc
+
+            # LiteLLM normalizes embedding responses into OpenAI's shape:
+            # `.data[i].embedding` is the vector (dict-style on some
+            # provider/version combos, hence the dual lookup below).
+            data = getattr(resp, "data", None)
+            if data is None and isinstance(resp, dict):
+                data = resp.get("data")
+            data = data or []
+            vectors: list[list[float]] = []
+            for row in data:
+                vec = getattr(row, "embedding", None)
+                if vec is None and isinstance(row, dict):
+                    vec = row.get("embedding")
+                if vec is None:
+                    raise EmbeddingBatchRejected(
+                        "gateway response missing embedding values"
+                    )
+                vectors.append(list(vec))
+            return vectors
+
+
+def _translate_gateway_embedding_error(exc: Any) -> Exception:
+    """Map ``shared.llm.LLMError`` (which wraps any LiteLLM exception)
+    into our embedding error taxonomy, mirroring the direct-SDK paths
+    (``_translate_gemini_error`` + the OpenAI inline branches above)."""
+    status = getattr(exc, "status_code", None)
+    msg = str(exc).lower()
+    if isinstance(status, int):
+        if status == 429:
+            return EmbeddingRateLimited(str(exc))
+        if status >= 500:
+            return EmbeddingProviderUnavailable(f"gateway {status}: {exc}")
+    if "rate" in msg and "limit" in msg:
+        return EmbeddingRateLimited(str(exc))
+    if "timeout" in msg or "deadline" in msg or "unavailable" in msg:
+        return EmbeddingProviderUnavailable(str(exc))
+    if (
+        "context" in msg
+        or "input is too long" in msg
+        or ("exceed" in msg and "token" in msg)
+        or "maximum context length" in msg
+    ):
+        return EmbeddingContextLengthExceeded(str(exc))
+    return EmbeddingBatchRejected(str(exc))
 
 
 def _format_gemini_document(item: DocItem) -> str:
