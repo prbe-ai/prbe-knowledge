@@ -5,8 +5,11 @@ mixed with commits and the actually-newest commits are missing") and
 verifies the fix: with mode=list dispatched, the result is exactly the
 N newest commits, sorted by date, no PR leakage.
 
-Mocks Haiku at the AsyncAnthropic boundary so no network call is made;
-the SQL path itself runs against the real test DB.
+Mocks Haiku at the ``shared.llm_tools.acompletion`` boundary so no
+network call is made; the SQL path itself runs against the real test DB.
+(Pre-Phase-0b this mocked ``services.retrieval.router.AsyncAnthropic``;
+that import is gone now — the router goes through ``shared.llm`` via the
+``forced_tool_call`` helper.)
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import orjson
 import pytest
 from httpx import ASGITransport
 
@@ -34,15 +38,28 @@ def _patch_settings(monkeypatch, settings: Settings) -> None:
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", settings.token_encryption_key.get_secret_value())
     monkeypatch.setenv("ENVIRONMENT", "local")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
     reset_embedder()
     reset_store()
     get_settings.cache_clear()  # type: ignore[attr-defined]
 
 
 def _tool_use_resp(payload: dict) -> SimpleNamespace:
-    return SimpleNamespace(
-        content=[SimpleNamespace(type="tool_use", name="route_query", input=payload)]
+    """LiteLLM-shaped response carrying a single forced tool call.
+
+    Matches what ``shared.llm.acompletion`` returns to
+    ``shared.llm_tools.forced_tool_call`` after the Phase-0b migration:
+    ``choices[0].message.tool_calls[0].function.{name, arguments}`` where
+    ``arguments`` is a JSON string.
+    """
+    func = SimpleNamespace(
+        name="route_query",
+        arguments=orjson.dumps(payload).decode("utf-8"),
     )
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=None)
 
 
 async def _seed_customer(customer_id: str) -> str:
@@ -186,10 +203,11 @@ async def test_three_most_recent_commits_returns_only_commits_sorted(live_db) ->
         "group_by_key": None,
     }
 
-    with patch("services.retrieval.router.AsyncAnthropic") as mock_client_cls:
-        mock_client_cls.return_value.messages.create = AsyncMock(
-            return_value=_tool_use_resp(haiku_payload)
-        )
+    # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
+    with patch(
+        "shared.llm_tools.acompletion",
+        AsyncMock(return_value=_tool_use_resp(haiku_payload)),
+    ):
         resp = await _post(
             {"query": "3 most recent github commits", "top_k": 3},
             {"Authorization": f"Bearer {api_key}"},
@@ -249,10 +267,11 @@ async def test_haiku_misclassifies_topic_query_as_list_dispatcher_falls_back(
         "group_by_key": None,
     }
 
-    with patch("services.retrieval.router.AsyncAnthropic") as mock_client_cls:
-        mock_client_cls.return_value.messages.create = AsyncMock(
-            return_value=_tool_use_resp(haiku_payload)
-        )
+    # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
+    with patch(
+        "shared.llm_tools.acompletion",
+        AsyncMock(return_value=_tool_use_resp(haiku_payload)),
+    ):
         resp = await _post(
             {"query": "most recent commits about auth", "top_k": 3},
             {"Authorization": f"Bearer {api_key}"},
@@ -291,10 +310,11 @@ async def test_router_fallback_routes_to_search(live_db) -> None:
         "operation": None,
         "group_by_key": None,
     }
-    with patch("services.retrieval.router.AsyncAnthropic") as mock_client_cls:
-        mock_client_cls.return_value.messages.create = AsyncMock(
-            return_value=_tool_use_resp(haiku_payload)
-        )
+    # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
+    with patch(
+        "shared.llm_tools.acompletion",
+        AsyncMock(return_value=_tool_use_resp(haiku_payload)),
+    ):
         resp = await _post(
             {"query": "what is the auth middleware", "top_k": 5},
             {"Authorization": f"Bearer {api_key}"},
@@ -346,10 +366,11 @@ async def test_author_id_surfaces_on_list_chunks(live_db) -> None:
         "operation": "list",
         "group_by_key": None,
     }
-    with patch("services.retrieval.router.AsyncAnthropic") as mock_client_cls:
-        mock_client_cls.return_value.messages.create = AsyncMock(
-            return_value=_tool_use_resp(haiku_payload)
-        )
+    # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
+    with patch(
+        "shared.llm_tools.acompletion",
+        AsyncMock(return_value=_tool_use_resp(haiku_payload)),
+    ):
         resp = await _post(
             {"query": "recent commits", "top_k": 10},
             {"Authorization": f"Bearer {api_key}"},
@@ -396,10 +417,11 @@ async def test_author_id_surfaces_on_search_chunks(live_db) -> None:
         "operation": None,
         "group_by_key": None,
     }
-    with patch("services.retrieval.router.AsyncAnthropic") as mock_client_cls:
-        mock_client_cls.return_value.messages.create = AsyncMock(
-            return_value=_tool_use_resp(haiku_payload)
-        )
+    # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
+    with patch(
+        "shared.llm_tools.acompletion",
+        AsyncMock(return_value=_tool_use_resp(haiku_payload)),
+    ):
         resp = await _post(
             {"query": "auth fix", "top_k": 5},
             {"Authorization": f"Bearer {api_key}"},
@@ -441,10 +463,11 @@ async def test_count_query_returns_aggregation(live_db) -> None:
         "operation": "count",
         "group_by_key": None,
     }
-    with patch("services.retrieval.router.AsyncAnthropic") as mock_client_cls:
-        mock_client_cls.return_value.messages.create = AsyncMock(
-            return_value=_tool_use_resp(haiku_payload)
-        )
+    # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
+    with patch(
+        "shared.llm_tools.acompletion",
+        AsyncMock(return_value=_tool_use_resp(haiku_payload)),
+    ):
         resp = await _post(
             {"query": "how many commits this week", "top_k": 10},
             {"Authorization": f"Bearer {api_key}"},
