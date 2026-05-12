@@ -260,23 +260,6 @@ async def render_index_via_llm(
     if not pages:
         return "# Wiki\n\nNo pages yet.\n"
 
-    if client is None:
-        try:
-            from google import genai
-
-            from shared.config import get_settings
-
-            api_key = get_settings().google_api_key.get_secret_value()
-            if not api_key:
-                log.warning("index_renderer.no_google_api_key_falling_back")
-                return _fallback_flat_list(pages)
-            client = genai.Client(api_key=api_key)
-        except ImportError as exc:
-            log.warning(
-                "index_renderer.google_genai_missing_falling_back", error=str(exc)
-            )
-            return _fallback_flat_list(pages)
-
     # DIAGRAM DISABLED — edges are no longer fetched or fed to the LLM
     # since the wiki index doesn't render an architecture diagram.
     # See the splice block at the end of this function.
@@ -297,30 +280,88 @@ async def render_index_via_llm(
         f"{_format_pages_for_prompt(pages)}"
     )
 
-    try:
-        resp = await client.aio.models.generate_content(
-            model=model,
-            contents=user_prompt,
-            config={
-                "system_instruction": _INDEX_SYSTEM_PROMPT,
+    # Phase-0b chunk B: the production call routes through
+    # shared.llm.acompletion so the call honors LLM_GATEWAY_URL on
+    # managed-isolated tenants (the central LiteLLM proxy supplies the
+    # provider key). Without the gateway, LiteLLM falls back to the
+    # direct provider call using GOOGLE_API_KEY. The ``client`` kwarg
+    # is preserved for tests that inject a stub mimicking the google-
+    # genai surface (`client.aio.models.generate_content`) — when
+    # supplied we drive that legacy path verbatim so existing fixtures
+    # keep working. The deterministic-fallback codepath (no gateway AND
+    # no key → flat alphabetical list) is preserved verbatim.
+    if client is not None:
+        try:
+            resp = await client.aio.models.generate_content(
+                model=model,
+                contents=user_prompt,
+                config={
+                    "system_instruction": _INDEX_SYSTEM_PROMPT,
+                    # 16k accommodates a 50-page index with summaries
+                    # comfortably. Bumped from 4096 after a probe-founders
+                    # run truncated mid-block — page list never landed in
+                    # the body, leaving only the intro + a half-written
+                    # Mermaid attempt.
+                    "max_output_tokens": 16384,
+                },
+            )
+        except Exception as exc:
+            log.warning(
+                "index_renderer.gemini_failed_falling_back",
+                error=str(exc),
+                error_class=type(exc).__name__,
+                page_count=len(pages),
+            )
+            return _fallback_flat_list(pages)
+        text = (getattr(resp, "text", None) or "").strip()
+    else:
+        from shared import llm as shared_llm
+        from shared.config import get_settings
+
+        # Preserve the "no key + no gateway → deterministic fallback"
+        # contract: the index page must always render.
+        if not (
+            shared_llm.gateway_url()
+            or get_settings().google_api_key.get_secret_value()
+        ):
+            log.warning("index_renderer.no_google_api_key_falling_back")
+            return _fallback_flat_list(pages)
+
+        try:
+            resp = await shared_llm.acompletion(
+                model=f"gemini/{model}",
+                messages=[
+                    {"role": "system", "content": _INDEX_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
                 # 16k accommodates a 50-page index with summaries
                 # comfortably. Bumped from 4096 after a probe-founders
                 # run truncated mid-block — page list never landed in
                 # the body, leaving only the intro + a half-written
                 # Mermaid attempt.
-                "max_output_tokens": 16384,
-            },
-        )
-    except Exception as exc:
-        log.warning(
-            "index_renderer.gemini_failed_falling_back",
-            error=str(exc),
-            error_class=type(exc).__name__,
-            page_count=len(pages),
-        )
-        return _fallback_flat_list(pages)
+                max_tokens=16384,
+            )
+        except shared_llm.LLMError as exc:
+            log.warning(
+                "index_renderer.gemini_failed_falling_back",
+                error=str(exc),
+                error_class=type(exc).__name__,
+                status_code=exc.status_code,
+                provider=exc.provider,
+                page_count=len(pages),
+            )
+            return _fallback_flat_list(pages)
 
-    text = (getattr(resp, "text", None) or "").strip()
+        try:
+            text = (resp.choices[0].message.content or "").strip()
+        except (AttributeError, IndexError) as exc:
+            log.warning(
+                "index_renderer.malformed_response_falling_back",
+                error=str(exc),
+                page_count=len(pages),
+            )
+            return _fallback_flat_list(pages)
+
     if not text:
         log.warning("index_renderer.empty_response_falling_back", page_count=len(pages))
         return _fallback_flat_list(pages)
