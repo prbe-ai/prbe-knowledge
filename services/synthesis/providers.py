@@ -15,6 +15,11 @@ stage from Haiku -> a Gemini variant (or back), edit the constant and
 redeploy. There is no env-var override path; per-stage tuning lives in
 shared/constants.py alongside RRF_K, source half-lives, and the rest of
 the LLM-id registry.
+
+Phase-0b: every provider call goes through `shared.llm.acompletion` so
+managed-isolated tenants without provider API keys route through the
+central LiteLLM gateway. Prompt caching (cache_control: ephemeral)
+survives — LiteLLM forwards it on Anthropic provider calls.
 """
 
 from __future__ import annotations
@@ -22,8 +27,6 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import Any, Protocol
-
-from anthropic import AsyncAnthropic
 
 from services.synthesis.models import (
     TriageInput,
@@ -33,9 +36,7 @@ from services.synthesis.prompts import (
     build_directed_phrases_prompt,
     build_triage_prompt,
     directed_tool_name,
-    triage_tool_name,
 )
-from shared.config import get_settings
 from shared.constants import (
     DIRECTED_PHRASES_MODEL,
     HAIKU_MODEL,
@@ -43,6 +44,8 @@ from shared.constants import (
     MAX_DIRECTED_VECTORS_PER_DOC,
     WIKI_TRIAGE_MODEL,
 )
+from shared.llm import LLMError
+from shared.llm_tools import ToolCallParseError, forced_tool_call
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -80,46 +83,172 @@ _GEMINI_FLASH_LITE_NAMES = {
 
 
 # ---------------------------------------------------------------------------
-# Anthropic implementation (tool_use blocks)
+# Anthropic-shape -> LiteLLM/OpenAI-shape kwargs adapter
 # ---------------------------------------------------------------------------
 
 
-def _extract_tool_use_input(
-    blocks: list[Any], *, expected_name: str, error_cls: type[RuntimeError]
-) -> dict[str, Any]:
-    for block in blocks:
-        if (
-            getattr(block, "type", "") == "tool_use"
-            and getattr(block, "name", "") == expected_name
-        ):
-            payload = getattr(block, "input", None)
-            if isinstance(payload, dict):
-                return payload
-            raise error_cls(
-                f"tool_use input was not a dict: {type(payload).__name__}"
+def _anthropic_kwargs_to_messages_and_schema(
+    kwargs: dict[str, Any],
+) -> tuple[
+    list[dict[str, Any]],  # messages
+    str,                    # tool_name
+    str,                    # tool_description
+    dict[str, Any],         # tool_schema (OpenAI-shaped parameters; same JSON Schema)
+    int,                    # max_tokens
+]:
+    """Translate the Anthropic-`messages.create` kwargs dict (produced by
+    `services.synthesis.prompts.build_*_prompt`) into LiteLLM-compatible
+    arguments for `shared.llm_tools.forced_tool_call`.
+
+    The translation:
+
+      * Anthropic `system=[{"type":"text","text":..., "cache_control":{...}}]`
+        -> OpenAI-shaped system message whose `content` is a list of
+        content blocks. LiteLLM preserves the `cache_control` field
+        on Anthropic provider calls (see
+        litellm/llms/anthropic/chat/transformation.py::is_cache_control_set
+        and the surrounding system-message handler).
+
+      * Anthropic `tools=[{"name":..., "description":..., "input_schema":...}]`
+        -> OpenAI-shaped `{"type":"function","function":{...}}` is built
+        by `forced_tool_call`. Here we just pull the name, description,
+        and JSON Schema (which is identical between Anthropic
+        `input_schema` and OpenAI `parameters`).
+
+      * Anthropic `tool_choice={"type":"tool","name":...}` -> we always
+        force the named call inside `forced_tool_call`, so this is
+        implicit (we assert the names match).
+    """
+    # System block + cache_control survives — LiteLLM forwards it to
+    # Anthropic verbatim and ignores it for OpenAI/Gemini.
+    system_blocks = kwargs.get("system") or []
+    system_message: dict[str, Any] | None
+    if isinstance(system_blocks, list) and system_blocks:
+        # Preserve content-block shape AND cache_control. Build typed
+        # text blocks so LiteLLM's Anthropic transformer recognizes the
+        # cache_control hint.
+        content_blocks = []
+        for block in system_blocks:
+            if not isinstance(block, dict):
+                continue
+            content_blocks.append(
+                {
+                    "type": "text",
+                    "text": block.get("text", ""),
+                    **(
+                        {"cache_control": block["cache_control"]}
+                        if "cache_control" in block
+                        else {}
+                    ),
+                }
             )
-    raise error_cls(f"response had no {expected_name} tool_use block")
+        system_message = {"role": "system", "content": content_blocks}
+    elif isinstance(system_blocks, str) and system_blocks:
+        system_message = {"role": "system", "content": system_blocks}
+    else:
+        system_message = None
+
+    # User/assistant messages pass through (the prompt builders only
+    # produce a single-user message, no assistant turns).
+    user_messages = kwargs.get("messages") or []
+
+    messages: list[dict[str, Any]] = []
+    if system_message is not None:
+        messages.append(system_message)
+    messages.extend(user_messages)
+
+    tools = kwargs.get("tools") or []
+    if not tools:
+        raise RuntimeError("anthropic prompt kwargs missing tools list")
+    tool = tools[0]
+    tool_name = tool.get("name") or ""
+    tool_description = tool.get("description") or ""
+    tool_schema = tool.get("input_schema") or {}
+
+    # Sanity-check the prompt builder agreed with the caller on the tool
+    # name we'll force.
+    tool_choice = kwargs.get("tool_choice") or {}
+    declared_name = tool_choice.get("name") if isinstance(tool_choice, dict) else None
+    if declared_name and declared_name != tool_name:
+        raise RuntimeError(
+            f"tool_choice name {declared_name!r} disagrees with tools[0].name "
+            f"{tool_name!r}; refusing to migrate ambiguous prompt"
+        )
+
+    max_tokens = int(kwargs.get("max_tokens") or 2048)
+    return messages, tool_name, tool_description, tool_schema, max_tokens
+
+
+def _anthropic_litellm_model(model: str) -> str:
+    """Return a LiteLLM-prefixed Anthropic model id. Idempotent — a
+    model id that's already prefixed (e.g. ``anthropic/<id>``) passes
+    through unchanged.
+    """
+    if "/" in model:
+        return model
+    return f"anthropic/{model}"
+
+
+def _gemini_litellm_model(model: str) -> str:
+    """Return a LiteLLM-prefixed Gemini model id. Per the Google
+    convention LiteLLM uses ``gemini/<id>`` (NOT ``google/<id>``); see
+    shared/llm.py docstring for the routing rules.
+    """
+    if "/" in model:
+        return model
+    return f"gemini/{model}"
+
+
+# ---------------------------------------------------------------------------
+# Anthropic implementation (forced tool-call via LiteLLM)
+# ---------------------------------------------------------------------------
 
 
 class _AnthropicTriage:
-    """Anthropic Haiku via tool_use forced output."""
+    """Anthropic Haiku via forced tool-call (LiteLLM-routed)."""
 
-    def __init__(self, client: AsyncAnthropic, *, model: str = HAIKU_MODEL) -> None:
-        self._client = client
+    def __init__(self, client: Any | None = None, *, model: str = HAIKU_MODEL) -> None:
+        # `client` is kept for backward-compat with the constructor
+        # signature `get_triage_provider` passes in (the triage worker
+        # used to own an AsyncAnthropic); after the LiteLLM migration
+        # we don't own a client — every call goes through
+        # `shared.llm.acompletion`. Tests pass a sentinel value here.
+        self._client = client  # unused; kept so test mocks construct cleanly
         self._model = model
 
     async def triage(self, events: list[TriageInput], *, now: datetime) -> TriageOutput:
         if not events:
             return TriageOutput(verdicts={})
         kwargs = build_triage_prompt(events, now=now)
-        resp = await self._client.messages.create(model=self._model, **kwargs)
-        payload = _extract_tool_use_input(
-            resp.content,
-            expected_name=triage_tool_name(),
-            error_cls=TriageParseError,
-        )
+        (
+            messages,
+            tool_name,
+            tool_description,
+            tool_schema,
+            max_tokens,
+        ) = _anthropic_kwargs_to_messages_and_schema(kwargs)
         try:
-            return TriageOutput(**payload)
+            args, _resp = await forced_tool_call(
+                model=_anthropic_litellm_model(self._model),
+                messages=messages,
+                tool_name=tool_name,
+                tool_description=tool_description,
+                tool_schema=tool_schema,
+                max_tokens=max_tokens,
+            )
+        except ToolCallParseError as exc:
+            # Same failure mode as the old "no record_triage tool_use
+            # block" path. Preserve the message phrasing so the
+            # split-retry parse-overflow regex
+            # `services.synthesis.triage._PARSE_OVERFLOW_REGEXES`
+            # ("no <name> tool_use block") still matches.
+            raise TriageParseError(
+                f"response had no {tool_name} tool_use block: {exc}"
+            ) from exc
+        # Pydantic validation of the verdicts payload — same shape and
+        # same error type as before.
+        try:
+            return TriageOutput(**args)
         except Exception as exc:
             raise TriageParseError(
                 f"triage tool input failed validation: {exc}"
@@ -127,7 +256,8 @@ class _AnthropicTriage:
 
 
 # ---------------------------------------------------------------------------
-# Gemini implementation (response_schema + application/json)
+# Gemini implementation — response_schema via google-genai pre-Phase-0b;
+# now goes through `shared.llm.acompletion` with native passthrough.
 # ---------------------------------------------------------------------------
 
 
@@ -173,22 +303,6 @@ def _thinking_budget_for(model: str) -> int:
     return 0
 
 
-def _gemini_client() -> Any:
-    """Build a Gemini client. Raises a tagged error if google-genai isn't
-    importable or the API key isn't configured.
-    """
-    try:
-        from google import genai
-    except ImportError as exc:
-        raise RuntimeError(
-            "google-genai not installed; cannot use Gemini provider"
-        ) from exc
-    api_key = get_settings().google_api_key.get_secret_value()
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY not configured for Gemini provider")
-    return genai.Client(api_key=api_key)
-
-
 async def _gemini_call_json(
     *,
     model: str,
@@ -197,45 +311,75 @@ async def _gemini_call_json(
     schema: dict[str, Any],
     max_tokens: int,
 ) -> dict[str, Any]:
-    """Issue one Gemini structured-output call. Returns the parsed dict.
+    """Issue one Gemini structured-output call via LiteLLM. Returns the
+    parsed dict.
 
-    Call shape rationale (post-2026-05-09 model-shootout eval):
-      * `system_instruction=system` instead of concatenating system+user
-        into `contents`. Gemini's first-class system slot is processed
-        differently from user prompts (instruction-following is stronger)
-        and matches the eval harness's call shape, so the eval's quality
-        numbers actually predict production quality.
+    Call shape rationale (post-2026-05-09 model-shootout eval +
+    Phase-0b LiteLLM migration):
+
+      * `system` is sent as a separate OpenAI-shaped system message;
+        LiteLLM forwards it to Gemini's `system_instruction` slot.
+        Gemini's first-class system slot is processed differently from
+        user prompts (instruction-following is stronger) and matches
+        the eval harness's call shape, so the eval's quality numbers
+        actually predict production quality.
+
       * `temperature=0.0` for determinism. Default Gemini temperature
         (~1.0) adds run-to-run variance that hurts the deterministic
         regen contract for directed-vector phrases.
-      * `response_schema=sanitized` enforces structured output via the
-        SDK's response-schema slot.
-    """
-    client = _gemini_client()
-    sanitized = _strip_keys_recursive(schema, _GEMINI_REJECTED_SCHEMA_KEYS)
-    # Build the config via the typed objects so thinking_config lands
-    # correctly across SDK versions (the dict-shaped config did not always
-    # propagate thinking_config through google-genai's coercion path).
-    # Local import: same lazy pattern as `_gemini_client()` so a missing
-    # google-genai install only bites Gemini callers.
-    from google.genai import types as genai_types
 
-    config = genai_types.GenerateContentConfig(
-        system_instruction=system,
-        max_output_tokens=max_tokens,
-        response_mime_type="application/json",
-        response_schema=sanitized,
-        temperature=0.0,
-        thinking_config=genai_types.ThinkingConfig(
-            thinking_budget=_thinking_budget_for(model)
-        ),
-    )
-    resp = await client.aio.models.generate_content(
-        model=model,
-        contents=user,
-        config=config,
-    )
-    text = getattr(resp, "text", None) or ""
+      * `response_schema=<sanitized JSON Schema>` is forwarded to
+        Gemini as the structured-output spec via LiteLLM's
+        provider-passthrough kwarg. We prefer the provider-native
+        kwarg here over OpenAI's `response_format=json_schema` because
+        (a) the existing call site already uses Gemini's schema
+        sanitization rules (strips `additionalProperties` etc) and
+        (b) the eval was calibrated against the native schema slot,
+        so deviating would invalidate the model-shootout numbers.
+
+      * `thinking_config={"thinking_budget": N}` — Phase-0b passes
+        through to Gemini via LiteLLM's `thinking` kwarg
+        (provider-specific extra). See `_thinking_budget_for` for the
+        per-model rule.
+    """
+    sanitized = _strip_keys_recursive(schema, _GEMINI_REJECTED_SCHEMA_KEYS)
+    messages: list[dict[str, Any]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": user})
+
+    # Provider-native passthrough. LiteLLM forwards unknown kwargs to
+    # the provider so `response_schema` and `thinking_config` land in
+    # Gemini's GenerateContentConfig unchanged. `response_mime_type`
+    # is the JSON-output hint Gemini wants when a schema is supplied.
+    extra_kwargs: dict[str, Any] = {
+        "response_schema": sanitized,
+        "response_mime_type": "application/json",
+        "thinking_config": {"thinking_budget": _thinking_budget_for(model)},
+    }
+
+    from shared.llm import acompletion
+
+    try:
+        resp = await acompletion(
+            model=_gemini_litellm_model(model),
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            **extra_kwargs,
+        )
+    except LLMError as exc:
+        # Preserve the pre-migration exception shape callers expect
+        # (the call sites wrap this in a domain-specific *ParseError).
+        raise RuntimeError(f"gemini call failed: {exc}") from exc
+
+    # Gemini structured-output content surfaces as JSON text on
+    # `choices[0].message.content`. LiteLLM doesn't pre-parse it.
+    choices = getattr(resp, "choices", None) or []
+    if not choices:
+        raise RuntimeError("gemini response was empty (no choices)")
+    message = getattr(choices[0], "message", None)
+    text = getattr(message, "content", None) or ""
     if not text:
         raise RuntimeError("gemini response was empty")
     try:
@@ -306,15 +450,18 @@ class _GeminiTriage:
 
 
 def get_triage_provider(
-    anthropic_client: AsyncAnthropic | None = None,
+    anthropic_client: Any | None = None,
     *,
     model_override: str | None = None,
 ) -> TriageProvider:
     """Return the configured triage provider.
 
-    `anthropic_client` is required only if the configured model is
-    Anthropic; the caller already owns one. `model_override` lets tests
-    pin the choice without env vars.
+    `anthropic_client` is accepted (and ignored after the Phase-0b
+    migration) for call-site compatibility — the triage_worker still
+    passes a sentinel value through. Both Anthropic and Gemini paths
+    route through `shared.llm.acompletion` now.
+
+    `model_override` lets tests pin the choice without env vars.
     """
     name = (model_override or WIKI_TRIAGE_MODEL).lower()
     if name in _GEMINI_FLASH_LITE_NAMES:
@@ -325,8 +472,11 @@ def get_triage_provider(
             model="gemini-3.1-flash-lite" if name == "gemini-flash-lite" else name
         )
     if name in _ANTHROPIC_TRIAGE_NAMES:
-        if anthropic_client is None:
-            raise ValueError("Anthropic triage requires an AsyncAnthropic client")
+        # Pre-migration this raised when no client was supplied; after
+        # the migration we don't need a client (LiteLLM owns the
+        # transport). Test fixtures that rely on the constructor
+        # receiving a client still work — the parameter passes through
+        # to `_AnthropicTriage.__init__` and is stored but unused.
         return _AnthropicTriage(anthropic_client, model=HAIKU_MODEL)
     raise ValueError(f"unknown WIKI_TRIAGE_MODEL: {name}")
 
@@ -419,42 +569,66 @@ def _coerce_phrases(raw: Any) -> list[str]:
 
 
 class _AnthropicDirectedPhrases:
-    """Anthropic Haiku via tool_use (legacy default; kept for fallback /
-    A-B comparison if Gemini regresses).
+    """Anthropic Haiku via forced tool-call (legacy default; kept for
+    fallback / A-B comparison if Gemini regresses).
     """
 
-    def __init__(self, client: AsyncAnthropic, *, model: str = HAIKU_MODEL) -> None:
-        self._client = client
+    def __init__(self, client: Any | None = None, *, model: str = HAIKU_MODEL) -> None:
+        # `client` is accepted for call-site compatibility; the LiteLLM
+        # migration removed the dependency on a caller-supplied
+        # AsyncAnthropic — every call goes through
+        # `shared.llm.acompletion`.
+        self._client = client  # unused; kept so test mocks pass through
         self._model = model
 
     async def generate(self, *, page_title: str, page_body: str) -> list[str]:
         kwargs = build_directed_phrases_prompt(
             page_title=page_title, page_body=page_body
         )
-        resp = await self._client.messages.create(model=self._model, **kwargs)
+        (
+            messages,
+            tool_name,
+            tool_description,
+            tool_schema,
+            max_tokens,
+        ) = _anthropic_kwargs_to_messages_and_schema(kwargs)
         expected = directed_tool_name()
-        for block in resp.content:
-            if (
-                getattr(block, "type", "") == "tool_use"
-                and getattr(block, "name", "") == expected
-            ):
-                payload = getattr(block, "input", None)
-                if not isinstance(payload, dict):
-                    raise DirectedPhrasesParseError(
-                        f"directed tool input was not a dict: {type(payload).__name__}"
-                    )
-                # Same rule as the Gemini path: missing-key is a parse
-                # failure, NOT a successful zero-phrase result, so the
-                # orchestrator preserves prior LLM rows.
-                if "phrases" not in payload:
-                    raise DirectedPhrasesParseError(
-                        "anthropic tool input missing 'phrases' key (got: "
-                        f"{sorted(payload.keys()) or 'empty object'})"
-                    )
-                return _coerce_phrases(payload["phrases"])
-        raise DirectedPhrasesParseError(
-            f"directed response had no {expected} tool_use block"
-        )
+        if tool_name != expected:
+            # Defensive: would only fire if `build_directed_phrases_prompt`
+            # drifted from `directed_tool_name()`. Surface the mismatch
+            # loud rather than letting tests pass with a wrong-tool
+            # forced call.
+            raise DirectedPhrasesParseError(
+                f"prompt tool name {tool_name!r} disagrees with "
+                f"directed_tool_name() {expected!r}"
+            )
+        try:
+            args, _resp = await forced_tool_call(
+                model=_anthropic_litellm_model(self._model),
+                messages=messages,
+                tool_name=tool_name,
+                tool_description=tool_description,
+                tool_schema=tool_schema,
+                max_tokens=max_tokens,
+            )
+        except ToolCallParseError as exc:
+            # Preserve "no <name> tool_use block" phrasing so consumers
+            # that match on that string (none today, but the symmetry
+            # with the triage error message is a regression guard)
+            # keep matching.
+            raise DirectedPhrasesParseError(
+                f"directed response had no {tool_name} tool_use block: {exc}"
+            ) from exc
+
+        # Same rule as the Gemini path: missing-key is a parse failure,
+        # NOT a successful zero-phrase result, so the orchestrator
+        # preserves prior LLM rows.
+        if "phrases" not in args:
+            raise DirectedPhrasesParseError(
+                "anthropic tool input missing 'phrases' key (got: "
+                f"{sorted(args.keys()) or 'empty object'})"
+            )
+        return _coerce_phrases(args["phrases"])
 
 
 class _GeminiDirectedPhrases:
@@ -497,15 +671,18 @@ class _GeminiDirectedPhrases:
 
 
 def get_directed_phrases_provider(
-    anthropic_client: AsyncAnthropic | None = None,
+    anthropic_client: Any | None = None,
     *,
     model_override: str | None = None,
 ) -> DirectedPhrasesProvider:
     """Return the configured directed-phrases provider.
 
-    `anthropic_client` is required only when the configured model resolves
-    to an Anthropic alias (today: HAIKU_MODEL). For Gemini variants,
-    the helper builds its own client internally.
+    `anthropic_client` is accepted for call-site compatibility. After
+    Phase-0b, neither the Anthropic nor the Gemini path needs a
+    caller-supplied SDK client — both route through
+    `shared.llm.acompletion`. Tests may still pass a client to assert
+    against; the parameter passes through to
+    `_AnthropicDirectedPhrases.__init__` and is stored but unused.
 
     `model_override` lets tests pin the choice without touching constants.
     """
@@ -522,21 +699,12 @@ def get_directed_phrases_provider(
     if flash_lite_canonical is not None:
         return _GeminiDirectedPhrases(model=flash_lite_canonical)
     if name in _ANTHROPIC_DIRECTED_NAMES:
-        # Lazy-construct an AsyncAnthropic from settings if the caller
-        # didn't supply one. Mirrors `_gemini_client()`'s lazy pattern so
-        # flipping `DIRECTED_PHRASES_MODEL = "haiku"` for rollback
-        # actually works end-to-end without threading a client through
-        # `wiki_agent` -> `persist_directed_vectors`. The triage path's
-        # caller (services/synthesis/triage.py:224) owns its own client
-        # for the worker's lifetime; the directed path has no such
-        # owner, hence the lazy fallback here.
-        if anthropic_client is None:
-            api_key = get_settings().anthropic_api_key.get_secret_value()
-            if not api_key:
-                raise RuntimeError(
-                    "ANTHROPIC_API_KEY not configured; cannot use Anthropic "
-                    "directed-phrases provider"
-                )
-            anthropic_client = AsyncAnthropic(api_key=api_key)
+        # Pre-Phase-0b this lazy-constructed an AsyncAnthropic from
+        # settings.anthropic_api_key when no client was supplied, so the
+        # wiki_agent caller (which passes none) could roll back to
+        # Anthropic via a one-line constant flip. After the migration
+        # there's nothing to construct — every call goes through
+        # `shared.llm.acompletion` which picks up the API key from the
+        # env (`ANTHROPIC_API_KEY`) or routes via `LLM_GATEWAY_URL`.
         return _AnthropicDirectedPhrases(anthropic_client, model=HAIKU_MODEL)
     raise ValueError(f"unknown DIRECTED_PHRASES_MODEL: {name}")

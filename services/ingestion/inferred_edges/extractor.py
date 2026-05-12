@@ -4,8 +4,13 @@ Sends one structured call to the configured LLM and validates the output.
 Every validation drop reason has a counter in ExtractionResult.dropped.
 
 Model dispatch is by prefix on `INFERRED_EDGES_MODEL`:
-  - "claude-*"  -> anthropic SDK with assistant-prefill JSON-array trick
-  - "gemini-*"  -> google-genai with response_schema structured output
+  - "claude-*"  -> Anthropic, assistant-prefill JSON-array trick
+  - "gemini-*"  -> Google, response_schema-constrained JSON output
+
+Both providers route through `shared.llm.acompletion` (Phase-0b chunk C
+LiteLLM migration). Managed-isolated tenants without provider keys
+get the gateway URL via `LLM_GATEWAY_URL`; everyone else uses the
+provider env vars (`ANTHROPIC_API_KEY` / `GOOGLE_API_KEY`).
 
 Validation pipeline per edge (model-agnostic):
   1. Both endpoints resolve to existing graph_nodes for bundle.customer_id.
@@ -36,19 +41,16 @@ from shared.constants import (
     INFERRED_EDGES_MODEL_PRICES,
     EdgeType,
 )
+from shared.llm import LLMError, acompletion, gateway_url
+from shared.llm_tools import usage_tokens
 from shared.logging import get_logger
 
-try:
-    import anthropic as _anthropic_module
-except ImportError:
-    _anthropic_module = None  # type: ignore[assignment]
-
-try:
-    from google import genai as _genai_module  # type: ignore
-    from google.genai import types as _genai_types  # type: ignore
-except ImportError:
-    _genai_module = None  # type: ignore[assignment]
-    _genai_types = None  # type: ignore[assignment]
+# Pre-migration this module imported `anthropic` and `google.genai` at
+# load time. After Phase-0b chunk C the production path goes through
+# `shared.llm.acompletion`, so neither SDK is required for the
+# extractor to function. Rate-limit detection uses class-name matching
+# (see `_is_rate_limit_error`), which doesn't need the SDK class
+# itself.
 
 log = get_logger(__name__)
 
@@ -209,36 +211,43 @@ async def _call_anthropic_with_backoff(
     anchor_doc_id: str,
     user_message: str,
 ) -> _LLMResponse:
-    """Anthropic call with exponential backoff on RateLimitError.
+    """Anthropic call (LiteLLM-routed) with exponential backoff on rate limit.
 
-    Uses the assistant-prefill `[` trick to force JSON-array output --
-    Claude reliably continues from `[` instead of emitting a preamble or
-    markdown fence. The `[` is NOT included in the returned raw_text;
-    the caller re-prepends it before json.loads.
+    Uses the assistant-prefill `[` trick to force JSON-array output —
+    Claude reliably continues from `[` instead of emitting a preamble
+    or markdown fence. The `[` is NOT included in the returned
+    raw_text; the caller re-prepends it before json.loads.
+
+    Phase-0b: routes through `shared.llm.acompletion`. The Anthropic
+    assistant-prefill trick survives the migration because LiteLLM
+    accepts a trailing `{"role": "assistant", "content": "..."}` and
+    forwards it to Anthropic's `messages` API verbatim (Anthropic
+    treats it as the start of the model's reply, which is exactly
+    what the prefill trick relies on).
     """
-    if _anthropic_module is None:
-        raise ImportError("anthropic package not installed")
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set")
-    client = _anthropic_module.AsyncAnthropic(api_key=api_key)
-
     last_exc: Exception | None = None
     for attempt in range(_RATE_LIMIT_MAX_RETRIES):
         try:
-            response = await client.messages.create(
-                model=model,
-                max_tokens=_MAX_OUTPUT_TOKENS,
-                system=SYSTEM_PROMPT,
+            response = await acompletion(
+                model=_anthropic_litellm_model(model),
                 messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_message},
                     {"role": "assistant", "content": "["},
                 ],
+                max_tokens=_MAX_OUTPUT_TOKENS,
             )
-            in_tok = response.usage.input_tokens if response.usage else 0
-            out_tok = response.usage.output_tokens if response.usage else 0
-            text = response.content[0].text if response.content else ""
-            return _LLMResponse(raw_text=text, input_tokens=in_tok, output_tokens=out_tok)
+            choices = getattr(response, "choices", None) or []
+            text = ""
+            if choices:
+                message = getattr(choices[0], "message", None)
+                text = getattr(message, "content", None) or ""
+            tokens = usage_tokens(response)
+            return _LLMResponse(
+                raw_text=text,
+                input_tokens=tokens["prompt_tokens"],
+                output_tokens=tokens["completion_tokens"],
+            )
         except Exception as exc:
             if not _is_rate_limit_error(exc):
                 raise
@@ -257,63 +266,66 @@ async def _call_anthropic_with_backoff(
     raise last_exc
 
 
-def _gemini_edge_schema():  # type: ignore[no-untyped-def]
-    """Build the JSON schema for Gemini's structured-output mode.
-
-    Mirrors the prompt's edge object shape. Gemini constrains generation
-    to fit this schema, so `edge_type` and `confidence` enums get
-    enforced at generation time -- the validator's per-edge enum
-    check still runs as defense-in-depth (e.g. EXTRACTED -> AMBIGUOUS
-    demotion still happens; we just won't see the LLM emit something
-    outside the closed sets).
-    """
-    if _genai_types is None:
-        raise ImportError("google-genai package not installed")
-    types = _genai_types
-    edge = types.Schema(
-        type="OBJECT",
-        properties={
-            "from": types.Schema(
-                type="OBJECT",
-                properties={
-                    "label": types.Schema(type="STRING"),
-                    "canonical_id": types.Schema(type="STRING"),
+# Edge-extraction JSON Schema for the structured-output call. Mirrors the
+# prompt's edge object shape. Gemini constrains generation to fit this
+# schema, so `edge_type` and `confidence` enums get enforced at
+# generation time — the validator's per-edge enum check still runs as
+# defense-in-depth (e.g. EXTRACTED -> AMBIGUOUS demotion still happens;
+# we just won't see the LLM emit something outside the closed sets).
+#
+# Plain dict (not `google.genai.types.Schema`): LiteLLM accepts both,
+# but the dict form is portable across LiteLLM versions and doesn't
+# require the google-genai SDK at module load time.
+_GEMINI_EDGE_SCHEMA: dict[str, object] = {
+    "type": "ARRAY",
+    "items": {
+        "type": "OBJECT",
+        "properties": {
+            "from": {
+                "type": "OBJECT",
+                "properties": {
+                    "label": {"type": "STRING"},
+                    "canonical_id": {"type": "STRING"},
                 },
-                required=["label", "canonical_id"],
-            ),
-            "to": types.Schema(
-                type="OBJECT",
-                properties={
-                    "label": types.Schema(type="STRING"),
-                    "canonical_id": types.Schema(type="STRING"),
+                "required": ["label", "canonical_id"],
+            },
+            "to": {
+                "type": "OBJECT",
+                "properties": {
+                    "label": {"type": "STRING"},
+                    "canonical_id": {"type": "STRING"},
                 },
-                required=["label", "canonical_id"],
-            ),
-            "edge_type": types.Schema(
-                type="STRING",
-                enum=[
+                "required": ["label", "canonical_id"],
+            },
+            "edge_type": {
+                "type": "STRING",
+                "enum": [
                     "DISCUSSES", "DOCUMENTS", "RESOLVES",
                     "MENTIONS_ENTITY", "RELATES_TO", "REFERENCES",
                 ],
-            ),
-            "confidence": types.Schema(
-                type="STRING", enum=["INFERRED", "AMBIGUOUS"],
-            ),
-            "why": types.Schema(type="STRING"),
+            },
+            "confidence": {
+                "type": "STRING",
+                "enum": ["INFERRED", "AMBIGUOUS"],
+            },
+            "why": {"type": "STRING"},
         },
-        required=["from", "to", "edge_type", "confidence", "why"],
-    )
-    return types.Schema(type="ARRAY", items=edge)
+        "required": ["from", "to", "edge_type", "confidence", "why"],
+    },
+}
 
 
 def _is_gemini_rate_limit_error(exc: BaseException) -> bool:
     """Recognise a Gemini quota / 429 error.
 
-    google-genai raises a `ClientError` for HTTP errors with `code` /
-    `status` fields; quotas typically surface as RESOURCE_EXHAUSTED
-    or HTTP 429. We look at the string form (which includes the
-    status) since the SDK's exception class hierarchy is narrow.
+    Post-Phase-0b the underlying call goes through LiteLLM, which
+    raises `LLMError(status_code=429)` on quota / rate-limit errors.
+    We also keep the legacy class-name match so test suites that
+    still raise a fake google-genai `ClientError` (or any class
+    named like one of these) continue to trigger the backoff path.
     """
+    if isinstance(exc, LLMError) and exc.status_code == 429:
+        return True
     name = type(exc).__name__
     msg = str(exc)
     return (
@@ -329,38 +341,41 @@ async def _call_gemini_with_backoff(
     anchor_doc_id: str,
     user_message: str,
 ) -> _LLMResponse:
-    """Gemini call with structured-output + exponential backoff on quota.
+    """Gemini call (LiteLLM-routed) with structured-output + backoff on quota.
 
-    Uses `response_schema` to constrain the model to emit a JSON array
-    of edges conforming to the closed enums. The structured-output mode
-    typically returns valid JSON; we still run the parser+validator
-    downstream as defense-in-depth (handles the rare empty-array case
-    and any edge-type drift).
+    Uses `response_schema` (forwarded as a Gemini-native kwarg via
+    LiteLLM's provider passthrough) to constrain the model to emit a
+    JSON array of edges conforming to the closed enums. The
+    structured-output mode typically returns valid JSON; we still run
+    the parser+validator downstream as defense-in-depth (handles the
+    rare empty-array case and any edge-type drift).
     """
-    if _genai_module is None:
-        raise ImportError("google-genai package not installed")
-    api_key = os.environ.get("GOOGLE_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("GOOGLE_API_KEY not set")
-    client = _genai_module.Client(api_key=api_key)
-    config = _genai_types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        response_mime_type="application/json",
-        response_schema=_gemini_edge_schema(),
-        max_output_tokens=_MAX_OUTPUT_TOKENS,
-    )
-
     last_exc: Exception | None = None
     for attempt in range(_RATE_LIMIT_MAX_RETRIES):
         try:
-            resp = await client.aio.models.generate_content(
-                model=model, contents=user_message, config=config,
+            resp = await acompletion(
+                model=_gemini_litellm_model(model),
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_message},
+                ],
+                max_tokens=_MAX_OUTPUT_TOKENS,
+                # Provider-native passthrough — LiteLLM forwards
+                # these to Gemini's GenerateContentConfig unchanged.
+                response_schema=_GEMINI_EDGE_SCHEMA,
+                response_mime_type="application/json",
             )
-            text = resp.text or ""
-            usage = getattr(resp, "usage_metadata", None)
-            in_tok = usage.prompt_token_count if usage else 0
-            out_tok = usage.candidates_token_count if usage else 0
-            return _LLMResponse(raw_text=text, input_tokens=in_tok, output_tokens=out_tok)
+            choices = getattr(resp, "choices", None) or []
+            text = ""
+            if choices:
+                message = getattr(choices[0], "message", None)
+                text = getattr(message, "content", None) or ""
+            tokens = usage_tokens(resp)
+            return _LLMResponse(
+                raw_text=text,
+                input_tokens=tokens["prompt_tokens"],
+                output_tokens=tokens["completion_tokens"],
+            )
         except Exception as exc:
             if not _is_gemini_rate_limit_error(exc):
                 raise
@@ -377,6 +392,20 @@ async def _call_gemini_with_backoff(
 
     assert last_exc is not None
     raise last_exc
+
+
+def _anthropic_litellm_model(model: str) -> str:
+    """Return a LiteLLM-prefixed Anthropic model id. Idempotent."""
+    if "/" in model:
+        return model
+    return f"anthropic/{model}"
+
+
+def _gemini_litellm_model(model: str) -> str:
+    """Return a LiteLLM-prefixed Gemini model id. Idempotent."""
+    if "/" in model:
+        return model
+    return f"gemini/{model}"
 
 
 async def _call_llm(
@@ -430,14 +459,16 @@ async def extract_edges(
         log.debug("inferred_edges.extractor.empty_bundle", customer=bundle.customer_id)
         return result
 
-    # Per-provider key check up front. Anthropic and Google have different
-    # secret names; bail early so we don't pay the bundle work cost only
-    # to crash on the SDK call.
+    # Per-provider key check up front. Anthropic and Google have
+    # different secret names; bail early so we don't pay the bundle
+    # work cost only to crash on the LiteLLM call. Managed-isolated
+    # tenants ride `LLM_GATEWAY_URL` instead of provider env vars —
+    # in that case the gateway holds the credential and we proceed.
     provider = _provider_for(model_id)
     expected_env = (
         "ANTHROPIC_API_KEY" if provider == "anthropic" else "GOOGLE_API_KEY"
     )
-    if not os.environ.get(expected_env):
+    if not os.environ.get(expected_env) and not gateway_url():
         log.warning(
             "inferred_edges.extractor.no_api_key",
             customer=bundle.customer_id,

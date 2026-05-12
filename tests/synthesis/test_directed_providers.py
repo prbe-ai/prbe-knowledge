@@ -3,7 +3,8 @@
 
 Covers:
   - factory dispatch by model name (Anthropic vs Gemini, unknown raises)
-  - _AnthropicDirectedPhrases parsing (happy + 3 error paths)
+  - _AnthropicDirectedPhrases parsing (happy + 3 error paths) — via
+    LiteLLM-shaped response mocking after Phase-0b chunk C
   - _GeminiDirectedPhrases parsing (delegates to _gemini_call_json)
   - _coerce_phrases (length cap, max-count cap, type coercion)
   - _thinking_budget_for (per-model rule)
@@ -15,9 +16,10 @@ tests/retrieval/test_search_pipeline_directed.py (retrieval e2e).
 
 from __future__ import annotations
 
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+import orjson
 import pytest
 
 from services.synthesis.providers import (
@@ -88,67 +90,79 @@ def test_thinking_budget_nonzero_for_pro() -> None:
 # ---- _AnthropicDirectedPhrases ------------------------------------------
 
 
-def _anthropic_response(phrases: list[str]) -> Any:
-    """Mimic the AsyncAnthropic Message shape: .content is a list of blocks
-    with .type and .name. _AnthropicDirectedPhrases.generate looks for
-    `type == "tool_use"` and `name == "record_directed_phrases"`.
-    """
-    block = MagicMock()
-    block.type = "tool_use"
-    block.name = "record_directed_phrases"
-    block.input = {"phrases": phrases}
-    response = MagicMock()
-    response.content = [block]
-    return response
+def _litellm_tool_response(tool_name: str, payload: dict) -> SimpleNamespace:
+    """LiteLLM-shaped response with one forced tool call."""
+    func = SimpleNamespace(
+        name=tool_name,
+        arguments=orjson.dumps(payload).decode("utf-8"),
+    )
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    return SimpleNamespace(choices=[choice], usage=None)
 
 
-def _anthropic_client_returning(response: Any) -> Any:
-    client = MagicMock()
-    client.messages.create = AsyncMock(return_value=response)
-    return client
+def _litellm_no_tool_call_response() -> SimpleNamespace:
+    """LiteLLM-shaped response with no tool_calls (model emitted text only)."""
+    message = SimpleNamespace(content="oops, no tool call", tool_calls=None)
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None)
 
 
 @pytest.mark.asyncio
-async def test_anthropic_directed_happy_path() -> None:
-    client = _anthropic_client_returning(
-        _anthropic_response(["alpha", "beta", "gamma"])
+async def test_anthropic_directed_happy_path(monkeypatch) -> None:
+    fake = AsyncMock(
+        return_value=_litellm_tool_response(
+            "record_directed_phrases",
+            {"phrases": ["alpha", "beta", "gamma"]},
+        )
     )
-    provider = _AnthropicDirectedPhrases(client, model=HAIKU_MODEL)
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
     out = await provider.generate(page_title="t", page_body="b")
     assert out == ["alpha", "beta", "gamma"]
 
 
 @pytest.mark.asyncio
-async def test_anthropic_directed_no_tool_use_block_raises() -> None:
-    response = MagicMock()
-    response.content = []  # no tool_use block at all
-    client = _anthropic_client_returning(response)
-    provider = _AnthropicDirectedPhrases(client, model=HAIKU_MODEL)
+async def test_anthropic_directed_no_tool_use_block_raises(monkeypatch) -> None:
+    fake = AsyncMock(return_value=_litellm_no_tool_call_response())
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
     with pytest.raises(DirectedPhrasesParseError, match=r"no .* tool_use block"):
         await provider.generate(page_title="t", page_body="b")
 
 
 @pytest.mark.asyncio
-async def test_anthropic_directed_input_not_a_dict_raises() -> None:
-    block = MagicMock()
-    block.type = "tool_use"
-    block.name = "record_directed_phrases"
-    block.input = "not a dict"  # provider returned a malformed payload
-    response = MagicMock()
-    response.content = [block]
-    client = _anthropic_client_returning(response)
-    provider = _AnthropicDirectedPhrases(client, model=HAIKU_MODEL)
-    with pytest.raises(DirectedPhrasesParseError, match="not a dict"):
+async def test_anthropic_directed_input_not_a_dict_raises(monkeypatch) -> None:
+    """LiteLLM's `function.arguments` is required to be a JSON-string
+    representing an object. A non-object payload should raise the
+    same parse error as the SDK-shaped path."""
+    func = SimpleNamespace(
+        name="record_directed_phrases",
+        arguments=orjson.dumps(["not", "a", "dict"]).decode("utf-8"),
+    )
+    call = SimpleNamespace(type="function", function=func)
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    choice = SimpleNamespace(message=message, finish_reason="tool_calls")
+    response = SimpleNamespace(choices=[choice], usage=None)
+    fake = AsyncMock(return_value=response)
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
+    with pytest.raises(DirectedPhrasesParseError):
         await provider.generate(page_title="t", page_body="b")
 
 
 @pytest.mark.asyncio
-async def test_anthropic_directed_phrases_not_a_list_raises() -> None:
+async def test_anthropic_directed_phrases_not_a_list_raises(monkeypatch) -> None:
     # _coerce_phrases rejects non-list payloads with the same exception.
-    response = _anthropic_response(["alpha"])
-    response.content[0].input = {"phrases": "not a list"}
-    client = _anthropic_client_returning(response)
-    provider = _AnthropicDirectedPhrases(client, model=HAIKU_MODEL)
+    fake = AsyncMock(
+        return_value=_litellm_tool_response(
+            "record_directed_phrases",
+            {"phrases": "not a list"},
+        )
+    )
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
     with pytest.raises(DirectedPhrasesParseError, match="not a list"):
         await provider.generate(page_title="t", page_body="b")
 
@@ -231,54 +245,29 @@ def test_factory_dispatch_gemini_flash_lite_alias() -> None:
     assert provider._model == "gemini-3.1-flash-lite"
 
 
-def test_factory_dispatch_anthropic_lazy_constructs_client(monkeypatch) -> None:
-    """REGRESSION for the rollback footgun.
-    Before fix: factory raised ValueError when Anthropic was selected
-    without a caller-supplied client. The wiki_agent caller passes none,
-    so flipping DIRECTED_PHRASES_MODEL='haiku' silently disabled the
-    feature instead of switching providers. Factory now mirrors
-    _gemini_client()'s lazy pattern.
+def test_factory_dispatch_anthropic_constructs_provider_without_client() -> None:
+    """Post-Phase-0b: the Anthropic directed provider no longer needs a
+    caller-supplied AsyncAnthropic. Every call routes through
+    `shared.llm.acompletion`, which picks up `ANTHROPIC_API_KEY` from
+    the env or `LLM_GATEWAY_URL`. The factory just returns a provider
+    instance — no lazy client construction, no api-key check at
+    factory time.
     """
-    # Stub out AsyncAnthropic so we don't actually hit Anthropic.
-    fake_client_cls = MagicMock()
-    monkeypatch.setattr(
-        "services.synthesis.providers.AsyncAnthropic", fake_client_cls
-    )
-    # Stub get_settings so we don't depend on real env config.
-    fake_settings = MagicMock()
-    fake_settings.anthropic_api_key.get_secret_value.return_value = "sk-test"
-    monkeypatch.setattr(
-        "services.synthesis.providers.get_settings", lambda: fake_settings
-    )
     provider = get_directed_phrases_provider(model_override="haiku")
     assert isinstance(provider, _AnthropicDirectedPhrases)
-    fake_client_cls.assert_called_once_with(api_key="sk-test")
 
 
-def test_factory_dispatch_anthropic_raises_when_no_api_key(monkeypatch) -> None:
-    """If ANTHROPIC_API_KEY isn't configured, lazy construction must
-    raise loudly. Better deploy-time crash than silent llm_failed=True
-    on every page synthesis.
+def test_factory_dispatch_anthropic_with_client_passes_through() -> None:
+    """A caller-supplied `anthropic_client` is accepted (legacy shape)
+    and stored on the provider for any future inspection — but it's
+    no longer consumed. Pins the call-site backward-compat contract.
     """
-    fake_settings = MagicMock()
-    fake_settings.anthropic_api_key.get_secret_value.return_value = ""
-    monkeypatch.setattr(
-        "services.synthesis.providers.get_settings", lambda: fake_settings
-    )
-    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY not configured"):
-        get_directed_phrases_provider(model_override="haiku")
-
-
-def test_factory_dispatch_anthropic_with_client_skips_lazy_construct() -> None:
-    """When the caller supplies a client (e.g. tests, future workers
-    that own one), use it directly rather than building a fresh one.
-    """
-    client = MagicMock()
+    sentinel = object()
     provider = get_directed_phrases_provider(
-        anthropic_client=client, model_override="haiku"
+        anthropic_client=sentinel, model_override="haiku"
     )
     assert isinstance(provider, _AnthropicDirectedPhrases)
-    assert provider._client is client
+    assert provider._client is sentinel
 
 
 def test_factory_dispatch_unknown_model_raises_loudly() -> None:
@@ -316,19 +305,20 @@ async def test_gemini_directed_missing_phrases_key_raises_not_silent_empty(
 
 
 @pytest.mark.asyncio
-async def test_anthropic_directed_missing_phrases_key_raises_not_silent_empty() -> None:
+async def test_anthropic_directed_missing_phrases_key_raises_not_silent_empty(
+    monkeypatch,
+) -> None:
     """Symmetric to the Gemini missing-key test. Anthropic providers go
     through the same _coerce_phrases path and should also raise rather
     than silently return [].
     """
-    block = MagicMock()
-    block.type = "tool_use"
-    block.name = "record_directed_phrases"
-    block.input = {"some_other_key": ["a"]}  # missing 'phrases'
-    response = MagicMock()
-    response.content = [block]
-    client = MagicMock()
-    client.messages.create = AsyncMock(return_value=response)
-    provider = _AnthropicDirectedPhrases(client, model=HAIKU_MODEL)
+    fake = AsyncMock(
+        return_value=_litellm_tool_response(
+            "record_directed_phrases",
+            {"some_other_key": ["a"]},  # missing 'phrases'
+        )
+    )
+    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
     with pytest.raises(DirectedPhrasesParseError, match=r"missing 'phrases' key"):
         await provider.generate(page_title="t", page_body="b")

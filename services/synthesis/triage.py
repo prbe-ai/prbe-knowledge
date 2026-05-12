@@ -11,9 +11,10 @@ Public surface:
   cannot be triaged in one call regardless of batching).
 - `call_triage(client, events, *, now)` — fires one batch via the
   configured provider (Anthropic Haiku by default, Gemini Flash Lite if
-  `WIKI_TRIAGE_MODEL` env var flips it). The function signature stays
-  Anthropic-shaped (takes `client`) for call-site compatibility — when
-  the provider is Gemini, `client` is unused.
+  `WIKI_TRIAGE_MODEL` env var flips it). The function signature keeps
+  the `client` parameter for call-site compatibility — after the
+  Phase-0b LiteLLM migration it's unused (every provider call goes
+  through `shared.llm.acompletion`).
 - `call_triage_with_split_retry(client, events, *, now)` — defense in
   depth on top of the upfront packer. If the wire request still trips
   Anthropic's 200K hard limit (because of tokenizer drift, prompt
@@ -45,14 +46,21 @@ body count. We:
 4. Drop any event whose own estimated cost exceeds
    `OVERSIZED_EVENT_TOKENS` — these can never fit even alone, so the
    caller DLQ's them rather than letting them poison a batch.
+
+Phase-0b note on the split-retry signal:
+The pre-migration code matched against `anthropic.BadRequestError` with
+a "prompt is too long" regex. Under LiteLLM the same 400 surfaces as
+`shared.llm.LLMError(status_code=400)` (sometimes wrapping a
+`litellm.exceptions.ContextWindowExceededError`). The
+`shared.llm_tools.is_context_overflow` predicate is the LiteLLM-shaped
+equivalent — same overflow phrasings, same semantics.
 """
 
 from __future__ import annotations
 
 import re
 from datetime import datetime
-
-from anthropic import AsyncAnthropic, BadRequestError
+from typing import Any
 
 from services.synthesis.models import TriageInput, TriageOutput, TriageVerdict
 from services.synthesis.providers import (
@@ -63,6 +71,8 @@ from shared.constants import (
     WIKI_TRIAGE_MAX_EVENTS_PER_BATCH,
     WIKI_TRIAGE_TOKEN_BUDGET,
 )
+from shared.llm import LLMError
+from shared.llm_tools import is_context_overflow
 from shared.logging import get_logger
 
 __all__ = [
@@ -207,7 +217,7 @@ def pack_into_batches(
 
 
 async def call_triage(
-    client: AsyncAnthropic,
+    client: Any,
     events: list[TriageInput],
     *,
     now: datetime,
@@ -215,8 +225,10 @@ async def call_triage(
     """Fire one triage call for one batch and return the validated output.
 
     Dispatches to the configured provider (Anthropic Haiku or Gemini
-    Flash Lite). The Anthropic `client` is only used when the configured
-    provider is Anthropic; passed through for caller compatibility.
+    Flash Lite). After the Phase-0b LiteLLM migration the `client`
+    parameter is unused; the provider calls go through
+    `shared.llm.acompletion`. The parameter is kept for caller
+    compatibility (the worker passes a sentinel through).
 
     Raises `TriageParseError` if the model didn't return the expected
     structured output.
@@ -257,20 +269,52 @@ TRIAGE_FINAL_MILE_SYNTHESIS_REASON = "triage.final_mile_synthesis"
 #   "prompt is too long: 211739 tokens > 200000 maximum"
 # Match either the literal "prompt is too long" prefix OR the more
 # generic "<N> tokens > <M> maximum" suffix; the SDK has occasionally
-# shifted wording across versions.
+# shifted wording across versions. Same set used by
+# `shared.llm_tools.is_context_overflow` for the LiteLLM-shaped path —
+# kept here as a synonym so the legacy detector still works for any
+# pre-migration code that imports it.
 _OVERSIZE_REGEXES = (
     re.compile(r"prompt is too long", re.IGNORECASE),
     re.compile(r"\btokens?\s*>\s*\d+\s*maximum\b", re.IGNORECASE),
 )
 
 
-def _bad_request_message(exc: BadRequestError) -> str:
-    """Pull the human-readable message out of a BadRequestError.
+def is_anthropic_oversize_error(exc: BaseException) -> bool:
+    """True iff `exc` is the LiteLLM/Anthropic 400 for an oversized prompt.
 
-    Tries `.message` (set by APIStatusError.__init__) first, then falls
-    back to `.body['error']['message']` for SDK versions that didn't
-    populate `.message`, then `str(exc)`.
+    Post-Phase-0b, this delegates to `shared.llm_tools.is_context_overflow`
+    so the predicate handles both the legacy Anthropic-SDK
+    `BadRequestError` path (in case any caller still raises one in
+    tests) and the LiteLLM-shaped `LLMError(status_code=400)` path.
+    The name and signature are preserved for backward-compat with the
+    public `__all__` export and existing call sites.
     """
+    if is_context_overflow(exc):
+        return True
+    # Legacy/test-only path: an exception that quacks like the Anthropic
+    # SDK's BadRequestError (has a `.message` attr or body with the
+    # canonical overflow phrasing). Allows the test suite's
+    # `_bad_request()` helper to keep producing the same error shape it
+    # always has without depending on LLMError.
+    msg = _legacy_bad_request_message(exc)
+    if msg is None:
+        return False
+    return any(rx.search(msg) for rx in _OVERSIZE_REGEXES)
+
+
+def _legacy_bad_request_message(exc: BaseException) -> str | None:
+    """Best-effort message extractor for the pre-migration
+    BadRequestError shape. Returns None when `exc` doesn't carry an
+    Anthropic-SDK-ish status_code=400 surface.
+
+    Recognises:
+      - `exc.message` (set by APIStatusError.__init__).
+      - `exc.body["error"]["message"]` (older SDK paths).
+      - `exc.status_code == 400` AND a non-empty `str(exc)`.
+    """
+    status = getattr(exc, "status_code", None)
+    if status not in (400, "400"):
+        return None
     msg = getattr(exc, "message", None)
     if isinstance(msg, str) and msg:
         return msg
@@ -281,19 +325,8 @@ def _bad_request_message(exc: BadRequestError) -> str:
             inner = err.get("message")
             if isinstance(inner, str) and inner:
                 return inner
-    return str(exc)
-
-
-def is_anthropic_oversize_error(exc: BaseException) -> bool:
-    """True iff `exc` is the Anthropic 400 for an oversized prompt.
-
-    Other 400s (bad API key, bad model name, malformed schema) MUST
-    return False so the caller propagates them instead of split-retrying.
-    """
-    if not isinstance(exc, BadRequestError):
-        return False
-    msg = _bad_request_message(exc)
-    return any(rx.search(msg) for rx in _OVERSIZE_REGEXES)
+    s = str(exc)
+    return s if s else None
 
 
 def _rejected_output_for_single_oversize(event: TriageInput) -> TriageOutput:
@@ -334,7 +367,7 @@ def _merge_outputs(a: TriageOutput, b: TriageOutput) -> TriageOutput:
 
 
 async def call_triage_with_split_retry(
-    client: AsyncAnthropic,
+    client: Any,
     events: list[TriageInput],
     *,
     now: datetime,
@@ -344,14 +377,18 @@ async def call_triage_with_split_retry(
     Two failure modes both signal "the batch was too big":
 
       A) Input-side overflow — Anthropic 400 with "prompt is too long".
-         Caught via `BadRequestError` matching the oversize signature.
+         Post-Phase-0b: surfaces as `LLMError(status_code=400)` wrapped
+         by `shared.llm.acompletion`. Detected by
+         `shared.llm_tools.is_context_overflow` (and the legacy
+         `is_anthropic_oversize_error` for backward compatibility).
 
       B) Output-side overflow — Haiku stops at `max_tokens` before
-         finishing the tool_use. The SDK returns a successful 200 with
-         either no tool_use block or a partial `{}` payload, and the
-         downstream parser raises `TriageParseError`. We use this as a
-         signal that the batch produced more verdicts than fit in the
-         output budget — same shape as input overflow, same recovery.
+         finishing the tool_use. LiteLLM returns the response with
+         either no tool_calls or a malformed function.arguments JSON,
+         and the downstream parser raises `TriageParseError`. We use
+         this as a signal that the batch produced more verdicts than
+         fit in the output budget — same shape as input overflow,
+         same recovery.
 
     The upfront packer caps both axes (input tokens via
     `WIKI_TRIAGE_TOKEN_BUDGET`, output verdicts via
@@ -394,7 +431,7 @@ async def call_triage_with_split_retry(
     output: TriageOutput
     try:
         output = await call_triage(client, events, now=now)
-    except (BadRequestError, TriageParseError) as exc:
+    except (LLMError, TriageParseError) as exc:
         if not _is_overflow_shaped(exc):
             raise
         if len(events) <= 1:
@@ -505,7 +542,7 @@ async def call_triage_with_split_retry(
 
 
 async def _safe_recurse(
-    client: AsyncAnthropic,
+    client: Any,
     events: list[TriageInput],
     *,
     now: datetime,
@@ -580,16 +617,23 @@ def _is_parse_overflow_error(exc: TriageParseError) -> bool:
 
 
 def _is_overflow_shaped(exc: BaseException) -> bool:
-    """Combined predicate: input-side BadRequestError OR output-side parse-fail."""
-    if isinstance(exc, BadRequestError):
-        return is_anthropic_oversize_error(exc)
+    """Combined predicate: input-side LLMError/BadRequestError OR
+    output-side parse-fail. Catches both the LiteLLM-shaped path
+    (`shared.llm.LLMError(status_code=400)`) and the legacy
+    Anthropic-SDK `BadRequestError` test path."""
+    if isinstance(exc, LLMError):
+        return is_context_overflow(exc) or is_anthropic_oversize_error(exc)
     if isinstance(exc, TriageParseError):
         return _is_parse_overflow_error(exc)
-    return False
+    # Legacy shape: anything else that quacks like the Anthropic SDK
+    # BadRequestError (used by the existing test suite). Delegating to
+    # `is_anthropic_oversize_error` handles it uniformly.
+    return is_anthropic_oversize_error(exc)
 
 
 def _overflow_error_message(exc: BaseException) -> str:
     """Best-effort human-readable message for either overflow shape."""
-    if isinstance(exc, BadRequestError):
-        return _bad_request_message(exc)
+    msg = _legacy_bad_request_message(exc)
+    if msg is not None:
+        return msg
     return str(exc)

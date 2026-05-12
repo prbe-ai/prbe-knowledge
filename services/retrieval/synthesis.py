@@ -7,9 +7,14 @@ Three providers (Anthropic, OpenAI, Google) behind one async function:
 Each provider uses its native structured-output mechanism so the wrapper
 shape is enforced at the API level, not by asking the model nicely:
 
-    Anthropic — tool use with a forced `render_answer` tool call
+    Anthropic — forced tool call with a `render_answer` function
     OpenAI    — response_format = json_schema strict mode
     Google    — config.response_schema
+
+Phase-0b: the non-streaming paths route through `shared.llm.acompletion`
+so managed-isolated tenants without provider keys can use them via the
+central LiteLLM gateway. The streaming path (`synthesize_stream`) still
+uses the provider SDKs directly — chunk D handles that migration.
 
 This avoids the "did the model wrap in JSON or return prose?" guessing
 game that the old prompt-only approach hit on every provider.
@@ -32,6 +37,8 @@ from typing import Any
 from shared.config import get_settings
 from shared.constants import SYNTHESIS_MODELS
 from shared.exceptions import PrbeError
+from shared.llm import LLMError
+from shared.llm_tools import ToolCallParseError, forced_tool_call
 from shared.logging import get_logger
 from shared.models import QueryDocumentResult, QueryResult
 
@@ -461,65 +468,62 @@ async def _dispatch(
 async def _call_anthropic(
     system: str, user: str, model: str, max_tokens: int
 ) -> dict[str, Any]:
-    from anthropic import APIError, AsyncAnthropic
+    """Forced `render_answer` tool call via LiteLLM (Phase-0b chunk C).
 
-    api_key = get_settings().anthropic_api_key.get_secret_value()
-    if not api_key:
-        raise SynthesisError("ANTHROPIC_API_KEY not configured")
-    client = AsyncAnthropic(api_key=api_key, timeout=SYNTHESIS_TIMEOUT_SECONDS)
+    Mirrors the pre-migration Anthropic-shape forced tool-use: same
+    JSON Schema (`ANSWER_SCHEMA`), same tool name (`render_answer`),
+    same forced `tool_choice`. LiteLLM normalises Anthropic's
+    `tool_use` block into the OpenAI-shaped `tool_calls[0].function`
+    that `forced_tool_call` reads.
+    """
+    _check_provider_credentials(provider="anthropic", env_name="ANTHROPIC_API_KEY")
     try:
-        resp = await client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-            tools=[
-                {
-                    "name": "render_answer",
-                    "description": (
-                        "Output the answer in the required structured format. "
-                        "Always invoke this tool — never reply in plain text."
-                    ),
-                    "input_schema": ANSWER_SCHEMA,
-                }
+        args, _resp = await forced_tool_call(
+            model=_litellm_model(provider="anthropic", model_id=model),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
-            tool_choice={"type": "tool", "name": "render_answer"},
+            tool_name="render_answer",
+            tool_description=(
+                "Output the answer in the required structured format. "
+                "Always invoke this tool — never reply in plain text."
+            ),
+            tool_schema=ANSWER_SCHEMA,
+            max_tokens=max_tokens,
+            timeout=SYNTHESIS_TIMEOUT_SECONDS,
         )
-    except APIError as exc:
+    except ToolCallParseError:
+        # Model declined to call the tool — best-effort fall back to
+        # text content. Same fallback the SDK-shaped path used.
+        return _fallback_parse_text("")
+    except LLMError as exc:
         raise SynthesisError(f"anthropic api error: {exc}") from exc
-
-    for block in resp.content:
-        if (
-            getattr(block, "type", "") == "tool_use"
-            and getattr(block, "name", "") == "render_answer"
-        ):
-            payload = getattr(block, "input", None)
-            if isinstance(payload, dict):
-                return payload
-    # Model declined to call the tool — best-effort fall back to text content.
-    text = "".join(
-        getattr(b, "text", "") for b in resp.content if getattr(b, "type", "") == "text"
-    )
-    return _fallback_parse_text(text)
+    return args
 
 
 async def _call_openai(
     system: str, user: str, model: str, max_tokens: int
 ) -> dict[str, Any]:
-    from openai import APIError, AsyncOpenAI
+    """OpenAI strict JSON-schema response via LiteLLM (Phase-0b chunk C).
 
-    api_key = get_settings().openai_api_key.get_secret_value()
-    if not api_key:
-        raise SynthesisError("OPENAI_API_KEY not configured")
-    client = AsyncOpenAI(api_key=api_key, timeout=SYNTHESIS_TIMEOUT_SECONDS)
+    Uses `response_format={"type": "json_schema", ..., "strict": True}`
+    — LiteLLM forwards this verbatim to OpenAI; OpenAI's strict mode
+    constrains generation to the schema. The strict-mode contract
+    (`additionalProperties: false`, every property in `required`)
+    is enforced upstream in `ANSWER_SCHEMA`.
+    """
+    from shared.llm import acompletion
+
+    _check_provider_credentials(provider="openai", env_name="OPENAI_API_KEY")
     try:
-        resp = await client.chat.completions.create(
-            model=model,
-            max_completion_tokens=max_tokens,
+        resp = await acompletion(
+            model=_litellm_model(provider="openai", model_id=model),
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            max_tokens=max_tokens,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -528,11 +532,16 @@ async def _call_openai(
                     "strict": True,
                 },
             },
+            timeout=SYNTHESIS_TIMEOUT_SECONDS,
         )
-    except APIError as exc:
+    except LLMError as exc:
         raise SynthesisError(f"openai api error: {exc}") from exc
 
-    content = resp.choices[0].message.content or ""
+    choices = getattr(resp, "choices", None) or []
+    content = ""
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None) or ""
     if not content:
         return _fallback_parse_text("")
     try:
@@ -565,41 +574,48 @@ def _strip_keys_recursive(
 async def _call_google(
     system: str, user: str, model: str, max_tokens: int
 ) -> dict[str, Any]:
-    try:
-        from google import genai
-    except ImportError as exc:
-        raise SynthesisError(
-            "google-genai not installed; run pip install -e '.[dev]'"
-        ) from exc
+    """Google response_schema-constrained JSON via LiteLLM (Phase-0b chunk C).
 
-    api_key = get_settings().google_api_key.get_secret_value()
-    if not api_key:
-        raise SynthesisError("GOOGLE_API_KEY not configured")
-    client = genai.Client(api_key=api_key)
-    # Google has no separate system slot; prepend the system message.
-    contents = f"{system}\n\n---\n\n{user}"
-    # Google's response_schema is a strict JSON-Schema subset that rejects
-    # `additionalProperties` outright (OpenAI strict mode REQUIRES it). Strip
-    # the key for the Google call only; the schema is otherwise identical.
+    Uses LiteLLM's provider-passthrough kwargs to forward
+    `response_schema` (Gemini's native structured-output spec),
+    `response_mime_type`, and `thinking_config` straight to Gemini.
+    The schema is sanitised first — Google rejects
+    `additionalProperties` outright while OpenAI strict mode requires
+    it, so the schema is identical to `ANSWER_SCHEMA` minus that key.
+    """
+    from shared.llm import acompletion
+
+    _check_provider_credentials(provider="google", env_name="GOOGLE_API_KEY")
+    # Google has no separate system slot; LiteLLM merges system into the
+    # contents when routing to Gemini. Send the OpenAI-shaped messages
+    # list and let LiteLLM do the join.
     google_schema = _strip_keys_recursive(ANSWER_SCHEMA, ("additionalProperties",))
     try:
-        resp = await client.aio.models.generate_content(
-            model=model,
-            contents=contents,
-            config={
-                "max_output_tokens": max_tokens,
-                "response_mime_type": "application/json",
-                "response_schema": google_schema,
-                # Disable Gemini 3 thinking so the full token budget is
-                # available for structured JSON output (see streaming
-                # branch for full rationale).
-                "thinking_config": {"thinking_budget": 0},
-            },
+        resp = await acompletion(
+            model=_litellm_model(provider="google", model_id=model),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=max_tokens,
+            # Provider-passthrough — LiteLLM forwards these unchanged
+            # to google-genai's GenerateContentConfig.
+            response_schema=google_schema,
+            response_mime_type="application/json",
+            # Disable Gemini 3 thinking so the full token budget is
+            # available for structured JSON output (see streaming
+            # branch for full rationale).
+            thinking_config={"thinking_budget": 0},
+            timeout=SYNTHESIS_TIMEOUT_SECONDS,
         )
-    except Exception as exc:
+    except LLMError as exc:
         raise SynthesisError(f"google api error: {exc}") from exc
 
-    text = getattr(resp, "text", None) or ""
+    choices = getattr(resp, "choices", None) or []
+    text = ""
+    if choices:
+        message = getattr(choices[0], "message", None)
+        text = getattr(message, "content", None) or ""
     if not text:
         return _fallback_parse_text("")
     try:
@@ -609,6 +625,40 @@ async def _call_google(
     except json.JSONDecodeError:
         pass
     return _fallback_parse_text(text)
+
+
+def _check_provider_credentials(*, provider: str, env_name: str) -> None:
+    """Raise SynthesisError when neither the provider key nor a LiteLLM
+    gateway is configured. After Phase-0b chunk A, managed-isolated
+    tenants run without provider keys — the gateway URL carries the
+    credential — so we must accept either condition.
+    """
+    from shared.llm import gateway_url
+
+    secret = getattr(get_settings(), f"{provider}_api_key", None)
+    key = secret.get_secret_value() if secret is not None else ""
+    if not key and not gateway_url():
+        raise SynthesisError(f"{env_name} not configured")
+
+
+def _litellm_model(*, provider: str, model_id: str) -> str:
+    """Map our `provider` key + bare model id to a LiteLLM-prefixed model.
+
+    LiteLLM uses these provider prefixes (see shared/llm.py docstring):
+      * Anthropic -> ``anthropic/...``
+      * OpenAI    -> ``openai/...``
+      * Google    -> ``gemini/...`` (note: NOT ``google/...``)
+
+    If `model_id` already carries a slash we assume it's pre-prefixed
+    and pass it through.
+    """
+    if "/" in model_id:
+        return model_id
+    prefix_for = {"anthropic": "anthropic", "openai": "openai", "google": "gemini"}
+    prefix = prefix_for.get(provider)
+    if prefix is None:
+        raise SynthesisError(f"unknown provider for LiteLLM routing: {provider}")
+    return f"{prefix}/{model_id}"
 
 
 # ---------------------------------------------------------------------------
