@@ -958,7 +958,13 @@ CREATE POLICY custom_ingest_tokens_tenant_isolation ON custom_ingest_tokens
 -- update per 5 minutes to keep verification cheap on hot paths.
 CREATE OR REPLACE FUNCTION verify_and_touch_custom_ingest_token(p_token_hash text)
 RETURNS TABLE(token_id uuid, customer_id text)
-LANGUAGE plpgsql SECURITY DEFINER SET search_path = public AS $$
+-- search_path: ag_catalog FIRST — prbe-knowledge tables live there (AGE
+-- extension hijack at migrate time prepended ag_catalog to search_path
+-- during CREATE EXTENSION age, so `custom_ingest_tokens` actually resides
+-- in ag_catalog, not public). The original `SET search_path = public`
+-- (migration 0046) made the function body's `UPDATE custom_ingest_tokens`
+-- raise UndefinedTableError; see migration 0066_fix_custom_ingest_search_path.
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = ag_catalog, "$user", public AS $$
 BEGIN
     RETURN QUERY
     UPDATE custom_ingest_tokens
