@@ -39,7 +39,7 @@ _pool: asyncpg.Pool | None = None
 _CONNECTION_SEARCH_PATH = 'ag_catalog, public, "$user"'
 
 
-async def _setup_connection(conn: asyncpg.Connection) -> None:
+async def apply_connection_setup(conn: asyncpg.Connection) -> None:
     """Per-connection bootstrap. Runs once on connect, NOT per transaction.
 
     - Pins search_path to ``ag_catalog, public, "$user"`` so app code can
@@ -51,10 +51,20 @@ async def _setup_connection(conn: asyncpg.Connection) -> None:
 
     Does NOT set ``app.current_customer_id`` — that's per-tenant context
     and is set per-transaction by `with_tenant(customer_id)`.
+
+    Public so non-pool consumers (e.g. NotifyListener / nightly_trigger
+    one-shots) that bypass the pool via ``asyncpg.connect()`` can apply
+    the same hook the pool's ``init=`` runs.
     """
     # SET (not SET LOCAL) so the value persists for the connection's
     # lifetime, not just the implicit txn that issued it.
     await conn.execute(f"SET search_path = {_CONNECTION_SEARCH_PATH}")
+
+
+# Back-compat alias: existing internal callers still reference the
+# leading-underscore name. Both point at the same coroutine; the
+# public name is preferred for new call sites.
+_setup_connection = apply_connection_setup
 
 
 async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
