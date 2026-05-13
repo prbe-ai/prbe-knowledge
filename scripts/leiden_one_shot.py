@@ -28,7 +28,7 @@ import sys
 
 from services.community.leiden import MIN_EDGES_FOR_LEIDEN, run_leiden_for_tenant
 from shared.config import get_settings
-from shared.db import close_pool, init_pool, raw_conn
+from shared.db import close_pool, init_pool, with_tenant
 from shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -46,7 +46,11 @@ async def _run(
         for customer_id in customer_ids:
             log.info("leiden_one_shot.starting", customer_id=customer_id)
             if dry_run:
-                async with raw_conn() as conn:
+                # Read counts inside with_tenant so FORCE-RLS on graph_edges
+                # and graph_nodes passes on the per-customer GUC under
+                # probe_app. Belt-and-suspenders with the explicit
+                # customer_id WHERE filter.
+                async with with_tenant(customer_id) as conn:
                     edge_count = await conn.fetchval(
                         "SELECT COUNT(*) FROM graph_edges WHERE customer_id = $1",
                         customer_id,
@@ -63,7 +67,9 @@ async def _run(
                     would_skip=edge_count < MIN_EDGES_FOR_LEIDEN,
                 )
             else:
-                async with raw_conn() as conn, conn.transaction():
+                # run_leiden_for_tenant expects a tenant-scoped conn so
+                # the FORCE-RLS UPDATE on graph_nodes passes on the GUC.
+                async with with_tenant(customer_id) as conn:
                     stats = await run_leiden_for_tenant(conn, customer_id)
                 log.info("leiden_one_shot.done", **stats)
     finally:

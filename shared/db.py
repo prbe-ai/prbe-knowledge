@@ -4,6 +4,16 @@ Every query runs inside `with_tenant()` which sets the GUC `app.current_customer
 at transaction start. That GUC powers the RLS policies on graph_nodes / graph_edges.
 
 Non-tenant operations (bootstrap, cron reclaim) use `raw_conn()`.
+
+search_path: prbe-knowledge's tables live in `ag_catalog` (the Apache-AGE
+extension's schema; see migration 0066 for the historical context). The
+pool's ``on_connect`` hook pins ``search_path = ag_catalog, public, "$user"``
+on every fresh connection — defense-in-depth so callers don't need a
+``SET search_path`` of their own and so the data plane works under any
+role whose default search_path hasn't been pre-set
+(``probe`` is set in prbe-backend's ``0005_probe_role_search_path``;
+``probe_app`` should be too, but the on_connect hook means a missed
+``ALTER ROLE`` won't silently route every query to ``public`` and 503).
 """
 
 from __future__ import annotations
@@ -21,6 +31,30 @@ from shared.logging import get_logger
 log = get_logger(__name__)
 
 _pool: asyncpg.Pool | None = None
+
+# Order matches prbe-backend's `0005_probe_role_search_path`: ag_catalog first
+# so the AGE-extension-owned tables resolve without a schema-qualified name;
+# public second for any third-party extensions (pg_trgm, vector, pg_search)
+# that landed there; "$user" last as a courtesy for per-role private schemas.
+_CONNECTION_SEARCH_PATH = 'ag_catalog, public, "$user"'
+
+
+async def _setup_connection(conn: asyncpg.Connection) -> None:
+    """Per-connection bootstrap. Runs once on connect, NOT per transaction.
+
+    - Pins search_path to ``ag_catalog, public, "$user"`` so app code can
+      reference `graph_nodes` (etc.) without schema qualification regardless
+      of the connecting role's per-role default. Critical under the
+      shared-managed cluster where the data plane connects as ``probe_app``
+      and AGE's install-time search_path hijack put every table in
+      ``ag_catalog`` (see migration 0066).
+
+    Does NOT set ``app.current_customer_id`` — that's per-tenant context
+    and is set per-transaction by `with_tenant(customer_id)`.
+    """
+    # SET (not SET LOCAL) so the value persists for the connection's
+    # lifetime, not just the implicit txn that issued it.
+    await conn.execute(f"SET search_path = {_CONNECTION_SEARCH_PATH}")
 
 
 async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
@@ -46,6 +80,7 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
                 command_timeout=settings.db_statement_timeout_ms / 1000,
                 timeout=settings.db_connect_timeout_seconds,
                 statement_cache_size=0,  # pgbouncer-compatible
+                init=_setup_connection,
             )
             return _pool
         except (OSError, asyncpg.PostgresError, TimeoutError) as exc:
