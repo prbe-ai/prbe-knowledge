@@ -94,6 +94,25 @@ async def two_tenants(live_db) -> AsyncIterator[tuple[str, str]]:
     yield TENANT_A, TENANT_B
 
 
+async def _skip_if_superuser(conn) -> None:
+    """Skip the calling test if the connection is running as a superuser.
+
+    The dev/CI Postgres connects as the ``probe`` (or ``postgres``) superuser,
+    which bypasses RLS entirely — both USING and WITH CHECK clauses are
+    short-circuited. These tests are only meaningful under the non-privileged
+    ``probe_app`` role (the operator switch when this PR's cutover lands).
+    """
+    is_superuser = await conn.fetchval(
+        "SELECT current_setting('is_superuser', true)::bool"
+    )
+    if is_superuser:
+        pytest.skip(
+            "Connection is running as superuser (probe/postgres); RLS USING "
+            "and WITH CHECK are bypassed. This test is meaningful only under "
+            "probe_app — see the operator-switch step in the PR body."
+        )
+
+
 @pytest.mark.asyncio
 async def test_with_tenant_read_isolation(two_tenants) -> None:
     """Reading graph_nodes under tenant A's GUC must see only A's rows.
@@ -105,6 +124,7 @@ async def test_with_tenant_read_isolation(two_tenants) -> None:
     tenant_a, tenant_b = two_tenants
 
     async with with_tenant(tenant_a) as conn:
+        await _skip_if_superuser(conn)
         # Intentionally NO `WHERE customer_id = ...` — let RLS enforce.
         rows = await conn.fetch("SELECT customer_id FROM graph_nodes")
     visible = {r["customer_id"] for r in rows}
@@ -134,6 +154,12 @@ async def test_with_tenant_write_check_rejects_cross_tenant(two_tenants) -> None
     import asyncpg
 
     tenant_a, tenant_b = two_tenants
+
+    # Skip when running as superuser — WITH CHECK is bypassed and the
+    # INSERT would succeed silently (the very bug WITH CHECK closes,
+    # but we can't observe it without the probe_app role).
+    async with raw_conn() as probe_conn:
+        await _skip_if_superuser(probe_conn)
 
     with pytest.raises(asyncpg.exceptions.CheckViolationError):
         async with with_tenant(tenant_a) as conn:
@@ -169,16 +195,7 @@ async def test_with_tenant_required_for_force_rls_tables(two_tenants) -> None:
     hook accidentally sets app.current_customer_id to a default.
     """
     async with raw_conn() as conn:
-        is_superuser = await conn.fetchval(
-            "SELECT current_setting('is_superuser', true)::bool"
-        )
-        if is_superuser:
-            pytest.skip(
-                "raw_conn is running as superuser (probe/postgres); FORCE RLS is "
-                "bypassed entirely. This test is meaningful only under "
-                "probe_app — see the operator-switch step in the PR body."
-            )
-
+        await _skip_if_superuser(conn)
         # Under probe_app: raw_conn with no GUC should see ZERO rows.
         rows = await conn.fetch("SELECT customer_id FROM graph_nodes")
     assert rows == [], (

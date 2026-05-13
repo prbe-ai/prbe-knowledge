@@ -118,6 +118,13 @@ async def refresh_cross_repo_edges(dsn: str) -> dict[str, int]:
     }
     conn = await asyncpg.connect(dsn)
     try:
+        # DO NOT REVIVE WITHOUT FIXING RLS: this cross-tenant aggregator runs as a
+        # bare connection (no with_tenant wrap). Under the probe_app role (post
+        # Phase 4 cutover) it returns zero rows silently because code_repo_state
+        # has FORCE ROW LEVEL SECURITY. Fix when reviving: either drop FORCE on
+        # code_repo_state (mirror migration 0068's pattern for inferred_edges_queue)
+        # or rewrite to drive off `customers` first + per-tenant with_tenant() loop.
+        # Tracked as backlog item.
         rows = await conn.fetch(
             """
             SELECT customer_id, ARRAY_AGG(DISTINCT repo) AS repos
