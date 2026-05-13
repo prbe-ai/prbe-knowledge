@@ -97,3 +97,55 @@ them).
    through; the cache-hit-rate is observable from
    `usage.cache_creation_input_tokens` / `usage.cache_read_input_tokens`
    in the response — preserve that telemetry on migration.
+
+## Phase 0c — per-tenant virtual-key attribution (shared-managed)
+
+Phase 0b made every call route through `shared.llm`, which honors a
+single process-wide `LLM_GATEWAY_KEY`. That's correct for **managed-
+isolated** (one Helm release per tenant → one key baked into the pod's
+env). It is NOT sufficient for the **shared-managed** data plane where
+one worker handles many tenants — every call would attribute to the
+master key and per-tenant cost accounting collapses.
+
+`shared/litellm_key.py` (added in this PR) fills that gap:
+
+  - `get_tenant_virtual_key(customer_id)` fetches the tenant's LiteLLM
+    virtual key from the control plane (`GET {backend_base_url}/routing/
+    customer/{customer_id}/litellm-key`, auth: `X-Internal-Key`) and
+    caches it for 5 minutes per customer.
+  - `tenant_virtual_key_context(customer_id)` is an `async with` block
+    that binds the key onto a ContextVar; `shared/llm.py`
+    `_maybe_inject_gateway` consults the ContextVar first and prefers
+    it over `LLM_GATEWAY_KEY` when both `LLM_GATEWAY_URL` and a tenant
+    key are set.
+
+**Required entrypoint wiring (follow-up PRs, NOT in this PR).** Every
+request/worker-task that knows its `customer_id` should wrap the LLM
+call window:
+
+```python
+async with tenant_virtual_key_context(customer_id):
+    await call_haiku_router(query)
+    await synthesize_stream(...)
+```
+
+Recommended order, in descending impact:
+
+  1. `services/retrieval/router._call_haiku` + the synthesize path in
+     `services/retrieval/synthesis.py` (hot per-query path — every
+     user query routes through these).
+  2. `services/synthesis/triage_worker.py` + `wiki_synthesis_worker.py`
+     drain loops (highest token-volume background jobs).
+  3. `services/ingestion/inferred_edges/extractor.py` and
+     `services/ingestion/code_graph/cross_repo_deps.py` per-tenant
+     ingest paths.
+
+**Control-plane dependency.** The endpoint
+`GET /routing/customer/{customer_id}/litellm-key` is owned by
+prbe-backend (PR #206 in the control-plane repo, per the triggering
+ticket). Until it lands, `get_tenant_virtual_key` raises
+`LiteLLMKeyUnavailable`; callers that wrap entrypoints in
+`tenant_virtual_key_context` must either gate the call behind a flag
+or treat `LiteLLMKeyUnavailable` as a soft-fall-back to the master
+key (the existing `LLM_GATEWAY_KEY` path keeps working without the
+context wrapper).
