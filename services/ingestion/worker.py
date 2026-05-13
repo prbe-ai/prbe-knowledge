@@ -26,7 +26,7 @@ from shared.constants import (
     QueueStatus,
     SourceSystem,
 )
-from shared.db import get_pool, init_pool
+from shared.db import apply_connection_setup, get_pool, init_pool
 from shared.exceptions import (
     DuplicateEventIgnored,
     PrbeError,
@@ -608,6 +608,10 @@ class GranolaNotifyListener:
         while not self._shutdown.is_set():
             try:
                 conn = await asyncpg.connect(self._dsn)
+                # Direct asyncpg.connect bypasses the pool's on_connect hook
+                # (which pins search_path so AGE Cypher resolves ag_catalog.*).
+                # Apply the same setup to keep LISTEN-channel callbacks consistent.
+                await apply_connection_setup(conn)
             except (asyncpg.PostgresError, OSError) as exc:
                 log.warning(
                     "granola_listener.connect_failed",

@@ -51,7 +51,7 @@ from shared.constants import (
     WIKI_BACKFILL_CANCEL_CHANNEL,
     WIKI_BACKFILL_CHANNEL,
 )
-from shared.db import init_pool, raw_conn
+from shared.db import apply_connection_setup, init_pool, raw_conn
 from shared.locks import advisory_lock_key
 from shared.logging import configure_logging, get_logger
 
@@ -761,6 +761,10 @@ class BackfillWorker:
         while not self._shutdown.is_set():
             try:
                 conn = await asyncpg.connect(self._dsn)
+                # Direct asyncpg.connect bypasses the pool's on_connect hook;
+                # apply the same setup so LISTEN-channel callbacks resolve
+                # ag_catalog.* via Cypher consistently with pool-backed paths.
+                await apply_connection_setup(conn)
             except (asyncpg.PostgresError, OSError) as exc:
                 log.warning(
                     "backfill_worker.cancel_listener.connect_failed",
