@@ -826,14 +826,18 @@ async def run_search(
     retriever_doc_types: list[str] | None = None
 
     async def _vec_runner() -> list:
-        return await vector_search(
-            customer_id,
-            req.query,
-            top_k=req.top_k * pool_multiplier,
-            sources=sources,
-            doc_types=retriever_doc_types,
-            temporal=spec,
-        )
+        t = time.perf_counter()
+        try:
+            return await vector_search(
+                customer_id,
+                req.query,
+                top_k=req.top_k * pool_multiplier,
+                sources=sources,
+                doc_types=retriever_doc_types,
+                temporal=spec,
+            )
+        finally:
+            timing["vector_ms"] = (time.perf_counter() - t) * 1000
 
     async def _bm25_runner() -> list:
         # Fan out the query + router expansions in parallel — each is an
@@ -868,37 +872,45 @@ async def run_search(
         if not bm25_queries:
             return []
 
-        per_query_hits = await asyncio.gather(
-            *(
-                bm25_search(
-                    customer_id,
-                    q,
-                    top_k=req.top_k * pool_multiplier,
-                    sources=sources,
-                    doc_types=retriever_doc_types,
-                    temporal=spec,
+        t = time.perf_counter()
+        try:
+            per_query_hits = await asyncio.gather(
+                *(
+                    bm25_search(
+                        customer_id,
+                        q,
+                        top_k=req.top_k * pool_multiplier,
+                        sources=sources,
+                        doc_types=retriever_doc_types,
+                        temporal=spec,
+                    )
+                    for q in bm25_queries
                 )
-                for q in bm25_queries
             )
-        )
-        hits_by_chunk: dict = {}
-        for hits in per_query_hits:
-            for hit in hits:
-                prior = hits_by_chunk.get(hit.chunk_id)
-                if prior is None or hit.score > prior.score:
-                    hits_by_chunk[hit.chunk_id] = hit
-        return sorted(hits_by_chunk.values(), key=lambda h: h.score, reverse=True)
+            hits_by_chunk: dict = {}
+            for hits in per_query_hits:
+                for hit in hits:
+                    prior = hits_by_chunk.get(hit.chunk_id)
+                    if prior is None or hit.score > prior.score:
+                        hits_by_chunk[hit.chunk_id] = hit
+            return sorted(hits_by_chunk.values(), key=lambda h: h.score, reverse=True)
+        finally:
+            timing["bm25_ms"] = (time.perf_counter() - t) * 1000
 
     async def _graph_runner() -> list:
         if not routed.entities:
             return []
-        return await graph_search(
-            customer_id,
-            [(e.entity_type, e.canonical_id) for e in routed.entities],
-            doc_types=retriever_doc_types,
-            temporal=spec,
-            min_confidence=req.min_confidence,
-        )
+        t = time.perf_counter()
+        try:
+            return await graph_search(
+                customer_id,
+                [(e.entity_type, e.canonical_id) for e in routed.entities],
+                doc_types=retriever_doc_types,
+                temporal=spec,
+                min_confidence=req.min_confidence,
+            )
+        finally:
+            timing["graph_ms"] = (time.perf_counter() - t) * 1000
 
     async def _id_lookup_runner() -> list:
         # Pin docs whose source_id/doc_id matches a router-extracted stable
@@ -909,7 +921,11 @@ async def run_search(
         ]
         if not ids:
             return []
-        return await id_lookup_search(customer_id, ids, temporal=spec)
+        t = time.perf_counter()
+        try:
+            return await id_lookup_search(customer_id, ids, temporal=spec)
+        finally:
+            timing["id_lookup_ms"] = (time.perf_counter() - t) * 1000
 
     async def _directed_runner() -> list:
         # Per-doc trigger phrases: surfaces wiki pages whose engineer-pinned
@@ -926,6 +942,7 @@ async def run_search(
         # for tenants who haven't enabled the feature, ~1ms penalty for
         # tenants who have. As soon as the first row lands, the gate
         # opens.
+        t = time.perf_counter()
         async with with_tenant(customer_id) as conn:
             has_any = await conn.fetchval(
                 "SELECT 1 FROM directed_vectors "
@@ -934,31 +951,28 @@ async def run_search(
             )
         if not has_any:
             return []
-        return await directed_search(
-            customer_id,
-            req.query,
-            top_k=req.top_k * pool_multiplier,
-            temporal=spec,
-        )
-
-    async def _timed(name: str, coro):
-        # Wrap one retriever leg with its own perf_counter span so we can
-        # see which leg of the asyncio.gather is the tall pole instead of
-        # attributing the whole wall-clock to one bucket. Re-raises via
-        # try/finally; the timing key always lands.
-        t = time.perf_counter()
         try:
-            return await coro
+            return await directed_search(
+                customer_id,
+                req.query,
+                top_k=req.top_k * pool_multiplier,
+                temporal=spec,
+            )
         finally:
-            timing[f"{name}_ms"] = (time.perf_counter() - t) * 1000
+            timing["directed_ms"] = (time.perf_counter() - t) * 1000
 
+    # Per-leg timing lives inside each runner (see `_vec_runner` etc.) so the
+    # span only covers actual work — matching the inline try/finally pattern
+    # used by `_related_runner` and `_build_inferred_edge_results`. Runners
+    # that short-circuit (no entities, no ids, no directed_vectors rows)
+    # skip the timing key. `retrieve_ms` below is the gather wall-clock.
     t_retrieve = time.perf_counter()
     vec_hits, bm25_hits, graph_hits, id_hits, directed_hits = await asyncio.gather(
-        _timed("vector", _vec_runner()),
-        _timed("bm25", _bm25_runner()),
-        _timed("graph", _graph_runner()),
-        _timed("id_lookup", _id_lookup_runner()),
-        _timed("directed", _directed_runner()),
+        _vec_runner(),
+        _bm25_runner(),
+        _graph_runner(),
+        _id_lookup_runner(),
+        _directed_runner(),
     )
     ranked_lists = {
         "vector": vec_hits,
