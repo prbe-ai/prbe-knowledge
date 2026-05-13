@@ -152,7 +152,11 @@ async def _log_connected_role(pool: asyncpg.Pool, settings: Settings) -> None:
         )
         return
 
-    log.info("db.role", role=role, is_superuser=bool(is_superuser))
+    # Skip the INFO line entirely on `local` -- it pollutes stdout in
+    # subprocess-based CLI tests (`tests/synth/test_seed_db.py` asserts empty
+    # stdout). Local dev doesn't need the cutover signal anyway.
+    if settings.environment != "local":
+        log.info("db.role", role=role, is_superuser=bool(is_superuser))
     if is_superuser and settings.environment != "local":
         log.warning(
             "db.superuser_in_managed_env",
