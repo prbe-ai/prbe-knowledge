@@ -19,6 +19,7 @@ import contextlib
 
 import asyncpg
 
+from shared.db import apply_connection_setup
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -54,6 +55,12 @@ class NotifyListener:
         while not self._shutdown.is_set():
             try:
                 conn = await asyncpg.connect(self._dsn)
+                # Apply the same per-connection bootstrap the pool's
+                # ``init=`` hook runs (pins ``search_path`` to include
+                # ``ag_catalog``). Without this, any LISTEN callback that
+                # touches AGE/Cypher fails with "relation graph_nodes
+                # does not exist". See shared/db.py:apply_connection_setup.
+                await apply_connection_setup(conn)
             except (asyncpg.PostgresError, OSError) as exc:
                 log.warning(
                     f"{self._log_prefix}.connect_failed",
