@@ -1017,12 +1017,18 @@ CREATE INDEX idx_inferred_edges_queue_pending
     ON inferred_edges_queue (enqueued_at)
     WHERE processing_started_at IS NULL AND done_at IS NULL;
 
-ALTER TABLE inferred_edges_queue ENABLE ROW LEVEL SECURITY;
-ALTER TABLE inferred_edges_queue FORCE ROW LEVEL SECURITY;
-CREATE POLICY inferred_edges_queue_tenant_isolation
-    ON inferred_edges_queue
-    USING (customer_id = current_setting('app.current_customer_id', true))
-    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+-- inferred_edges_queue is an internal queue table drained CROSS-tenant by
+-- the inferred-edges side-worker (services/ingestion/inferred_edges/
+-- worker.py:_claim_one). Under FORCE RLS that drain SELECT silently
+-- zero-matches when running as a non-superuser role (e.g. probe_app),
+-- because there's no GUC to set before the row is claimed. Follows the
+-- same no-RLS pattern as ingestion_queue / backfill_state /
+-- wiki_synthesis_queue. See migration 0068.
+--
+-- Tenant scoping is enforced by the side-worker wrapping the per-row
+-- processing in `with_tenant(customer_id)` AND the SQL filtering on
+-- customer_id explicitly — same belt-and-suspenders as the other queue
+-- tables in this schema.
 
 -- ---------------------------------------------------------------------------
 -- mcp_oauth_* — OAuth 2.1 provider tables for the MCP server.

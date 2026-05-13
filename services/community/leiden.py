@@ -21,9 +21,14 @@ Memory budget: 1 GB per Fly machine. igraph + leidenalg are C extensions
 and handle 1M+ edge graphs comfortably. Tenant-by-tenant processing keeps
 peak memory = single largest tenant graph.
 
-CRITICAL: UPDATE on graph_nodes is wrapped in NO FORCE / FORCE RLS toggle.
-Without this toggle, Alembic-style superuser operations silently zero-match
-on FORCE ROW LEVEL SECURITY tables. See feedback_graph_nodes_rls_force.
+RLS: The read+write happens inside `with_tenant(customer_id)` so the
+graph_nodes FORCE-RLS policy passes on the per-customer GUC. The
+previous implementation toggled `ALTER TABLE graph_nodes NO FORCE / FORCE`
+inside a raw connection, which requires SUPERUSER and breaks under the
+non-privileged `probe_app` role used in the shared-managed cluster.
+See feedback_graph_nodes_rls_force for the historic context — the
+toggle dance was the right answer when running as the table-owning
+superuser, but the right answer under probe_app is just `with_tenant`.
 """
 
 from __future__ import annotations
@@ -37,7 +42,7 @@ import igraph
 import leidenalg
 
 from shared.config import get_settings
-from shared.db import close_pool, init_pool, raw_conn
+from shared.db import close_pool, init_pool, raw_conn, with_tenant
 from shared.locks import advisory_lock_key
 from shared.logging import configure_logging, get_logger
 
@@ -59,6 +64,11 @@ async def run_leiden_for_tenant(
     """Run Leiden community detection for a single tenant.
 
     Returns a stats dict for logging.
+
+    Precondition: ``conn`` is already inside a ``with_tenant(customer_id)``
+    transaction — i.e. the ``app.current_customer_id`` GUC is set so the
+    FORCE-RLS policies on ``graph_edges`` and ``graph_nodes`` pass. The
+    caller (``run_leiden_all_tenants``) owns the txn/lock lifecycle.
     """
     # Acquire per-customer advisory lock. This prevents two concurrent cron
     # runs (or a manual one-shot + cron overlap) from racing on community_id
@@ -67,10 +77,11 @@ async def run_leiden_for_tenant(
     lock_key = advisory_lock_key(_LOCK_SALT, customer_id)
     await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
 
-    # Fetch all edges for this customer (raw, bypassing RLS by using
-    # raw_conn which is outside with_tenant). The NO FORCE toggle below
-    # is the write-side RLS bypass; we read here without RLS because this
-    # is an administrative cron operation, not a tenant-initiated query.
+    # Fetch all edges for this customer. Read passes the FORCE-RLS policy
+    # on graph_edges because `with_tenant(customer_id)` has set the GUC.
+    # The explicit `customer_id = $1` WHERE clause is belt-and-suspenders
+    # against accidental RLS bypass (BYPASSRLS role, an explicit
+    # NO FORCE toggle, etc.).
     rows = await conn.fetch(
         """
         SELECT from_node_id, to_node_id
@@ -125,14 +136,13 @@ async def run_leiden_for_tenant(
     node_count = len(node_list)
 
     # Batch UPDATE graph_nodes.community_id.
-    # CRITICAL: wrap in NO FORCE / FORCE RLS toggle.
-    # This UPDATE is executed by a raw (non-tenant) connection which may be
-    # a superuser role that Postgres still restricts via FORCE ROW LEVEL
-    # SECURITY. Without the toggle, UPDATE silently zero-matches.
+    # The UPDATE runs inside the caller's `with_tenant(customer_id)` txn,
+    # so the FORCE-RLS USING/WITH CHECK policy on graph_nodes passes on
+    # the GUC. The historical NO FORCE / FORCE toggle dance is gone —
+    # it required SUPERUSER and breaks under probe_app.
     update_node_ids = list(community_by_node.keys())
     update_community_ids = [community_by_node[nid] for nid in update_node_ids]
 
-    await conn.execute("ALTER TABLE graph_nodes NO FORCE ROW LEVEL SECURITY")
     # RETURNING emits per-row column values, not aggregates — wrap in a CTE
     # so we can COUNT(*) over the rows that actually got updated.
     updated = await conn.fetchval(
@@ -151,7 +161,6 @@ async def run_leiden_for_tenant(
         update_community_ids,
         customer_id,
     )
-    await conn.execute("ALTER TABLE graph_nodes FORCE ROW LEVEL SECURITY")
 
     stats = {
         "customer_id": customer_id,
@@ -182,10 +191,12 @@ async def run_leiden_all_tenants() -> None:
         results = []
         for customer_id in customer_ids:
             try:
-                # Each tenant gets its own transaction for the advisory lock
-                # and community_id UPDATE. Failure on one tenant doesn't
-                # abort the others.
-                async with raw_conn() as conn, conn.transaction():
+                # Each tenant gets its own with_tenant txn for the advisory
+                # lock and community_id UPDATE. with_tenant sets the
+                # `app.current_customer_id` GUC so FORCE RLS passes on
+                # graph_edges (read) and graph_nodes (write). Failure on
+                # one tenant doesn't abort the others.
+                async with with_tenant(customer_id) as conn:
                     stats = await run_leiden_for_tenant(conn, customer_id)
                     results.append(stats)
             except Exception:

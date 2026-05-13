@@ -8,7 +8,7 @@ Tests:
   2. Tenant with < 100 edges: skipped (community_id stays NULL)
   3. Advisory lock is acquired before any DB operations
   4. Per-customer isolation: separate tenant data stays separate
-  5. RLS NO FORCE / FORCE toggle: both ALTER TABLE calls are made
+  5. No NO FORCE / FORCE toggle: writes rely on caller's with_tenant GUC
   6. UPDATE uses the correct node_id -> community_id mapping
   7. Empty graph (0 edges): treated as < MIN_EDGES, skipped
 """
@@ -207,13 +207,23 @@ async def test_leiden_acquires_advisory_lock() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Test 5: RLS NO FORCE / FORCE toggle is applied
+# Test 5: No NO FORCE / FORCE toggle is emitted
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_leiden_rls_toggle_applied() -> None:
-    """Both NO FORCE and FORCE RLS ALTER TABLE calls are made around the UPDATE."""
+async def test_leiden_does_not_toggle_rls() -> None:
+    """run_leiden_for_tenant must NOT emit ALTER TABLE ... NO FORCE / FORCE.
+
+    The previous implementation toggled FORCE RLS off and back on around the
+    UPDATE. That dance requires SUPERUSER and breaks under the non-privileged
+    probe_app role used in the shared-managed cluster. The new pattern is:
+    the caller wraps the call in `with_tenant(customer_id)` so the
+    app.current_customer_id GUC is set and the FORCE-RLS USING/WITH CHECK
+    policy passes on the UPDATE.
+
+    Regression guard so the toggle dance does not reappear.
+    """
     from services.community.leiden import run_leiden_for_tenant
 
     edges = [(i, i + 1) for i in range(0, 100)]
@@ -223,11 +233,15 @@ async def test_leiden_rls_toggle_applied() -> None:
 
     execute_sqls = [str(c[0][0]) for c in conn.execute.call_args_list if c[0]]
     no_force_calls = [s for s in execute_sqls if "NO FORCE" in s.upper()]
-    force_calls = [s for s in execute_sqls if "FORCE ROW LEVEL SECURITY" in s.upper()]
-
-    assert len(no_force_calls) >= 1, "Expected ALTER TABLE ... NO FORCE ROW LEVEL SECURITY"
-    assert len(force_calls) >= 2, (
-        "Expected at least 2 FORCE calls (one NO FORCE + one FORCE to re-enable)"
+    assert no_force_calls == [], (
+        "run_leiden_for_tenant must not emit ALTER TABLE ... NO FORCE — "
+        "rely on the caller's with_tenant() GUC instead. "
+        f"Saw: {no_force_calls}"
+    )
+    alter_table_calls = [s for s in execute_sqls if s.upper().startswith("ALTER TABLE")]
+    assert alter_table_calls == [], (
+        "run_leiden_for_tenant must not emit any ALTER TABLE inside the "
+        f"per-tenant write path. Saw: {alter_table_calls}"
     )
 
 
