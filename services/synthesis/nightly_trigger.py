@@ -125,13 +125,13 @@ async def refresh_cross_repo_edges(dsn: str) -> dict[str, int]:
     # apply the same setup so Cypher resolves ag_catalog.* consistently.
     await apply_connection_setup(conn)
     try:
-        # DO NOT REVIVE WITHOUT FIXING RLS: this cross-tenant aggregator runs as a
-        # bare connection (no with_tenant wrap). Under the probe_app role (post
-        # Phase 4 cutover) it returns zero rows silently because code_repo_state
-        # has FORCE ROW LEVEL SECURITY. Fix when reviving: either drop FORCE on
-        # code_repo_state (mirror migration 0068's pattern for inferred_edges_queue)
-        # or rewrite to drive off `customers` first + per-tenant with_tenant() loop.
-        # Tracked as backlog item.
+        # Cross-tenant aggregator: runs as a bare connection (no with_tenant
+        # wrap). Safe to use because migration 0069 dropped FORCE RLS on
+        # code_repo_state (mirroring 0068's pattern for inferred_edges_queue);
+        # the table is a per-(customer, repo, file) bookkeeping cache, not
+        # tenant-facing data. Per-customer reads/writes elsewhere in the
+        # codebase remain wrapped in with_tenant(customer_id) + an explicit
+        # customer_id = $1 WHERE clause for defence in depth.
         rows = await conn.fetch(
             """
             SELECT customer_id, ARRAY_AGG(DISTINCT repo) AS repos
