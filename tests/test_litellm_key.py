@@ -13,7 +13,6 @@ Covers:
 
 from __future__ import annotations
 
-import json
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -169,10 +168,12 @@ async def test_context_binds_and_unbinds_key() -> None:
 
     transport = httpx.MockTransport(handler)
     assert current_tenant_virtual_key() is None
-    async with httpx.AsyncClient(transport=transport) as http:
-        async with tenant_virtual_key_context("cust-xyz", http=http) as key:
-            assert key == "sk-cust-xyz"
-            assert current_tenant_virtual_key() == "sk-cust-xyz"
+    async with (
+        httpx.AsyncClient(transport=transport) as http,
+        tenant_virtual_key_context("cust-xyz", http=http) as key,
+    ):
+        assert key == "sk-cust-xyz"
+        assert current_tenant_virtual_key() == "sk-cust-xyz"
     # Always unset on block exit.
     assert current_tenant_virtual_key() is None
 
