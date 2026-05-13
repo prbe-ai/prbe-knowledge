@@ -34,6 +34,14 @@ class Settings(BaseSettings):
     service_name: str = "prbe-knowledge"
 
     # --- Postgres ------------------------------------------------------------
+    # Local dev default connects as the ``prbe`` superuser for migration
+    # convenience. In every managed-isolated deployment (staging / prod /
+    # per-tenant) the operator-set DATABASE_URL secret MUST point at the
+    # non-privileged ``probe_app`` role instead — superuser bypasses FORCE
+    # RLS and would silently disable tenant isolation. The boot path
+    # (``shared.db.init_pool``) emits ``db.superuser_in_managed_env`` if it
+    # lands on a superuser anywhere ``environment != "local"``; see
+    # ``docs/database-url-cutover.md`` for the operator switch.
     database_url: str = "postgresql://prbe:prbe@localhost:5432/prbe_knowledge"
     # Direct (non-pooler) DSN used ONLY by LISTEN/NOTIFY consumers. Neon's
     # pooler endpoint runs pgbouncer in transaction mode, which resets

@@ -14,6 +14,13 @@ role whose default search_path hasn't been pre-set
 (``probe`` is set in prbe-backend's ``0005_probe_role_search_path``;
 ``probe_app`` should be too, but the on_connect hook means a missed
 ``ALTER ROLE`` won't silently route every query to ``public`` and 503).
+
+Role discipline (managed-isolated cutover, bug #46): in production the
+``DATABASE_URL`` should point at the non-privileged ``probe_app`` role,
+NOT the ``probe`` superuser. Superuser connections silently bypass RLS,
+which would defeat the whole tenant-isolation story. ``init_pool`` logs
+a warning at startup if it lands on a superuser in any non-local env; see
+``docs/database-url-cutover.md`` for the operator switch.
 """
 
 from __future__ import annotations
@@ -92,6 +99,7 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
                 statement_cache_size=0,  # pgbouncer-compatible
                 init=_setup_connection,
             )
+            await _log_connected_role(_pool, settings)
             return _pool
         except (OSError, asyncpg.PostgresError, TimeoutError) as exc:
             last_exc = exc
@@ -110,6 +118,56 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
         f"could not connect to Postgres after {attempts} attempt(s): "
         f"{type(last_exc).__name__}: {last_exc}"
     ) from last_exc
+
+
+async def _log_connected_role(pool: asyncpg.Pool, settings: Settings) -> None:
+    """Emit one log line on boot identifying the role the pool connects as.
+
+    Defense-in-depth for the bug #46 cutover (DATABASE_URL switch from
+    ``probe`` superuser to non-privileged ``probe_app``). Superuser
+    connections silently bypass FORCE RLS, so a misconfigured production
+    DSN would produce zero RLS enforcement with no other visible signal.
+
+    Behavior:
+    - Always logs ``db.role`` at INFO with role + is_superuser.
+    - WARN-logs ``db.superuser_in_managed_env`` when running on a
+      non-local environment as a superuser — the operator-visible
+      signal that the cutover hasn't happened yet (or has regressed).
+
+    Best-effort: any failure is swallowed (the boot path mustn't block
+    on a probe). Local dev runs as superuser by design, so no warning
+    there.
+    """
+    try:
+        async with pool.acquire() as conn:
+            role = await conn.fetchval("SELECT current_user")
+            is_superuser = await conn.fetchval(
+                "SELECT current_setting('is_superuser', true)::bool"
+            )
+    except Exception as exc:  # pragma: no cover — best-effort probe
+        log.debug(
+            "db.role_probe_failed",
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
+        return
+
+    # Skip the INFO line entirely on `local` -- it pollutes stdout in
+    # subprocess-based CLI tests (`tests/synth/test_seed_db.py` asserts empty
+    # stdout). Local dev doesn't need the cutover signal anyway.
+    if settings.environment != "local":
+        log.info("db.role", role=role, is_superuser=bool(is_superuser))
+    if is_superuser and settings.environment != "local":
+        log.warning(
+            "db.superuser_in_managed_env",
+            role=role,
+            environment=settings.environment,
+            remediation=(
+                "DATABASE_URL connects as a superuser, which bypasses RLS. "
+                "Switch to the non-privileged probe_app role — see "
+                "docs/database-url-cutover.md."
+            ),
+        )
 
 
 async def close_pool() -> None:

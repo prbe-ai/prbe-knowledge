@@ -148,3 +148,131 @@ async def test_init_pool_passes_connect_timeout(monkeypatch: pytest.MonkeyPatch)
 
     assert captured["timeout"] == settings.db_connect_timeout_seconds
     db_module.reset_pool()
+
+
+# ---------------------------------------------------------------------------
+# Role-warning probe (bug #46 cutover guard)
+# ---------------------------------------------------------------------------
+#
+# `init_pool` issues a one-shot warning at boot when DATABASE_URL connects
+# as a superuser in any non-local environment. The probe is best-effort
+# (boot must not block on its failure) but it must fire when it should
+# and stay quiet otherwise — both branches are pinned here so an
+# accidental refactor doesn't silently drop the cutover signal.
+
+
+class _FakeConn:
+    def __init__(self, role: str, is_superuser: bool) -> None:
+        self._role = role
+        self._is_superuser = is_superuser
+
+    async def fetchval(self, query: str, *args: object) -> object:
+        if "current_user" in query:
+            return self._role
+        if "is_superuser" in query:
+            return self._is_superuser
+        return None
+
+
+class _FakeAcquireCtx:
+    def __init__(self, conn: _FakeConn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> _FakeConn:
+        return self._conn
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+
+class _RoleProbePool(_FakePool):
+    """FakePool that answers the role probe with a fixed role + flag."""
+
+    def __init__(self, role: str, is_superuser: bool) -> None:
+        self._conn = _FakeConn(role, is_superuser)
+
+    def acquire(self) -> _FakeAcquireCtx:
+        return _FakeAcquireCtx(self._conn)
+
+
+@pytest.mark.asyncio
+async def test_init_pool_warns_when_superuser_in_non_local_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import structlog.testing
+
+    db_module.reset_pool()
+
+    async def fake_create_pool(*_args: object, **_kwargs: object) -> _RoleProbePool:
+        return _RoleProbePool(role="probe", is_superuser=True)
+
+    monkeypatch.setattr(db_module.asyncpg, "create_pool", fake_create_pool)
+
+    settings = Settings(
+        database_url="postgresql://probe:probe@neon/prbe",
+        environment="main",
+        db_init_retry_attempts=1,
+        db_init_retry_base_seconds=0.01,
+    )
+    with structlog.testing.capture_logs() as logs:
+        await db_module.init_pool(settings)
+
+    events = [entry.get("event") for entry in logs]
+    assert "db.superuser_in_managed_env" in events, events
+    db_module.reset_pool()
+
+
+@pytest.mark.asyncio
+async def test_init_pool_quiet_when_probe_app_in_managed_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import structlog.testing
+
+    db_module.reset_pool()
+
+    async def fake_create_pool(*_args: object, **_kwargs: object) -> _RoleProbePool:
+        return _RoleProbePool(role="probe_app", is_superuser=False)
+
+    monkeypatch.setattr(db_module.asyncpg, "create_pool", fake_create_pool)
+
+    settings = Settings(
+        database_url="postgresql://probe_app:x@neon/prbe",
+        environment="main",
+        db_init_retry_attempts=1,
+        db_init_retry_base_seconds=0.01,
+    )
+    with structlog.testing.capture_logs() as logs:
+        await db_module.init_pool(settings)
+
+    events = [entry.get("event") for entry in logs]
+    assert "db.superuser_in_managed_env" not in events, events
+    # The neutral INFO probe still fires so ops can see the role.
+    assert "db.role" in events, events
+    db_module.reset_pool()
+
+
+@pytest.mark.asyncio
+async def test_init_pool_quiet_when_superuser_but_local_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import structlog.testing
+
+    db_module.reset_pool()
+
+    async def fake_create_pool(*_args: object, **_kwargs: object) -> _RoleProbePool:
+        return _RoleProbePool(role="prbe", is_superuser=True)
+
+    monkeypatch.setattr(db_module.asyncpg, "create_pool", fake_create_pool)
+
+    settings = Settings(
+        database_url="postgresql://prbe:prbe@localhost/prbe_knowledge",
+        environment="local",
+        db_init_retry_attempts=1,
+        db_init_retry_base_seconds=0.01,
+    )
+    with structlog.testing.capture_logs() as logs:
+        await db_module.init_pool(settings)
+
+    events = [entry.get("event") for entry in logs]
+    assert "db.superuser_in_managed_env" not in events, events
+    db_module.reset_pool()
