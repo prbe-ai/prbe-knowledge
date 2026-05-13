@@ -430,7 +430,8 @@ CREATE TABLE code_repo_state (
 ALTER TABLE code_repo_state ENABLE ROW LEVEL SECURITY;
 ALTER TABLE code_repo_state FORCE ROW LEVEL SECURITY;
 CREATE POLICY code_repo_state_tenant_isolation ON code_repo_state
-    USING (customer_id = current_setting('app.current_customer_id', true));
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
 -- integration_tokens: per-customer per-source credentials.
@@ -621,10 +622,12 @@ ALTER TABLE graph_edges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE graph_edges FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_isolation ON graph_nodes
-    USING (customer_id = current_setting('app.current_customer_id', true));
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 CREATE POLICY tenant_isolation ON graph_edges
-    USING (customer_id = current_setting('app.current_customer_id', true));
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
 -- usage_events: per-tenant audit trail of /retrieve, /query, /sources calls.
@@ -671,7 +674,8 @@ ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE usage_events FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY usage_events_tenant_isolation ON usage_events
-    USING (customer_id = current_setting('app.current_customer_id', true));
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
 -- query_traces: full request/response payload log per retrieval call.
@@ -708,7 +712,8 @@ ALTER TABLE query_traces ENABLE ROW LEVEL SECURITY;
 ALTER TABLE query_traces FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY query_traces_tenant_isolation ON query_traces
-    USING (customer_id = current_setting('app.current_customer_id', true));
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
 -- wiki_synthesis_queue / wiki_synthesis_runs
