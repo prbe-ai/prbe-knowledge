@@ -21,9 +21,14 @@ Memory budget: 1 GB per Fly machine. igraph + leidenalg are C extensions
 and handle 1M+ edge graphs comfortably. Tenant-by-tenant processing keeps
 peak memory = single largest tenant graph.
 
-CRITICAL: UPDATE on graph_nodes is wrapped in NO FORCE / FORCE RLS toggle.
-Without this toggle, Alembic-style superuser operations silently zero-match
-on FORCE ROW LEVEL SECURITY tables. See feedback_graph_nodes_rls_force.
+CRITICAL: UPDATE on graph_nodes uses `SET LOCAL row_security = OFF`
+(txn-scoped) to write across the FORCE ROW LEVEL SECURITY policy. The
+older ALTER TABLE NO FORCE / FORCE toggle took ACCESS EXCLUSIVE on
+graph_nodes and stalled every other tenant's read for the duration of
+the cron run -- on the shared cluster that's minutes of fleet-wide
+blocking (Bug #70). `row_security = off` requires the connection to be
+a SUPERUSER or have BYPASSRLS, which the leiden worker's DSN already
+satisfies. See feedback_graph_nodes_rls_force.
 """
 
 from __future__ import annotations
@@ -68,9 +73,9 @@ async def run_leiden_for_tenant(
     await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
 
     # Fetch all edges for this customer (raw, bypassing RLS by using
-    # raw_conn which is outside with_tenant). The NO FORCE toggle below
-    # is the write-side RLS bypass; we read here without RLS because this
-    # is an administrative cron operation, not a tenant-initiated query.
+    # raw_conn which is outside with_tenant). The `SET LOCAL row_security = OFF`
+    # below is the write-side RLS bypass; we read here without RLS because
+    # this is an administrative cron operation, not a tenant-initiated query.
     rows = await conn.fetch(
         """
         SELECT from_node_id, to_node_id
@@ -125,14 +130,27 @@ async def run_leiden_for_tenant(
     node_count = len(node_list)
 
     # Batch UPDATE graph_nodes.community_id.
-    # CRITICAL: wrap in NO FORCE / FORCE RLS toggle.
-    # This UPDATE is executed by a raw (non-tenant) connection which may be
-    # a superuser role that Postgres still restricts via FORCE ROW LEVEL
-    # SECURITY. Without the toggle, UPDATE silently zero-matches.
+    #
+    # This UPDATE runs on a raw (non-tenant) connection that needs to write
+    # across the FORCE ROW LEVEL SECURITY policy. Two paths previously
+    # considered:
+    #   (a) ALTER TABLE NO FORCE ... ALTER TABLE FORCE around the UPDATE.
+    #       Works but takes ACCESS EXCLUSIVE on graph_nodes, blocking every
+    #       other tenant's READ on the table for the duration -- on the
+    #       shared cluster that means the cron stalls all tenant graph
+    #       traffic for minutes. (Bug #70.)
+    #   (b) SET LOCAL row_security = OFF: session-scoped (txn-local because
+    #       the outer caller wraps in conn.transaction()), takes NO lock,
+    #       overrides FORCE for this session only. Requires the connection
+    #       role to be either a SUPERUSER or to have the BYPASSRLS attribute
+    #       -- the worker DSN already runs as the probe superuser (see the
+    #       leiden cron's deploy env), so the precondition holds.
+    # We use (b). The toggle is bounded to the same txn the UPDATE runs in,
+    # and the connection is returned to the pool with row_security default.
     update_node_ids = list(community_by_node.keys())
     update_community_ids = [community_by_node[nid] for nid in update_node_ids]
 
-    await conn.execute("ALTER TABLE graph_nodes NO FORCE ROW LEVEL SECURITY")
+    await conn.execute("SET LOCAL row_security = OFF")
     # RETURNING emits per-row column values, not aggregates — wrap in a CTE
     # so we can COUNT(*) over the rows that actually got updated.
     updated = await conn.fetchval(
@@ -151,7 +169,6 @@ async def run_leiden_for_tenant(
         update_community_ids,
         customer_id,
     )
-    await conn.execute("ALTER TABLE graph_nodes FORCE ROW LEVEL SECURITY")
 
     stats = {
         "customer_id": customer_id,
