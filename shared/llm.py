@@ -184,16 +184,26 @@ def _wrap_litellm_error(exc: BaseException) -> LLMError:
 
 def _maybe_inject_gateway(kwargs: dict[str, Any]) -> dict[str, Any]:
     """If ``LLM_GATEWAY_URL`` is set and the caller didn't override
-    ``api_base``, inject it; and inject ``api_key`` from
-    ``LLM_GATEWAY_KEY`` when both are set and the caller didn't override
+    ``api_base``, inject it; and inject ``api_key`` (in precedence order:
+    per-tenant virtual key bound on a ContextVar > ``LLM_GATEWAY_KEY``
+    env var) when neither is None and the caller didn't override
     ``api_key``. Caller-supplied ``api_base`` / ``api_key`` always win,
     so per-call overrides remain possible (the eval harness pointing at
     a staging gateway, or an explicit direct provider call).
 
-    ``LLM_GATEWAY_KEY`` is only forwarded when ``LLM_GATEWAY_URL`` is
-    set — a stray key with no URL would otherwise override the direct-
-    provider credentials LiteLLM picks up from ``ANTHROPIC_API_KEY`` /
+    A gateway key is only forwarded when ``LLM_GATEWAY_URL`` is set — a
+    stray key with no URL would otherwise override the direct-provider
+    credentials LiteLLM picks up from ``ANTHROPIC_API_KEY`` /
     ``OPENAI_API_KEY`` / ``GOOGLE_API_KEY`` and break the dev path.
+
+    Per-tenant precedence (shared-managed data plane)
+    -------------------------------------------------
+    ``shared.litellm_key.current_tenant_virtual_key()`` returns the
+    LiteLLM virtual key bound to the current async context by
+    ``tenant_virtual_key_context(customer_id)``. When set, it wins over
+    ``LLM_GATEWAY_KEY``: the env var is a process-wide fallback for
+    managed-isolated (1 tenant per pod), and the contextvar is the
+    per-request override for shared-managed (N tenants per pod).
     """
     url_already_set = bool(kwargs.get("api_base"))
     if not url_already_set:
@@ -202,7 +212,13 @@ def _maybe_inject_gateway(kwargs: dict[str, Any]) -> dict[str, Any]:
             kwargs["api_base"] = url
             url_already_set = True
     if url_already_set and not kwargs.get("api_key"):
-        key = gateway_key()
+        # Per-tenant override first (shared-managed); env-var fallback
+        # second (managed-isolated). Lazy-import the helper so a
+        # circular import (litellm_key imports config; config might one
+        # day import llm) is impossible.
+        from shared.litellm_key import current_tenant_virtual_key
+
+        key = current_tenant_virtual_key() or gateway_key()
         if key:
             kwargs["api_key"] = key
     return kwargs

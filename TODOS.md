@@ -38,6 +38,40 @@ or retry loop that increments version on conflict. ~10 lines.
 
 ## P2 — operational hygiene
 
+### Wire `tenant_virtual_key_context` at LLM entrypoints (Phase 0c)
+**Where:** `services/retrieval/router.py` (`_call_haiku`),
+`services/retrieval/synthesis.py` (`synthesize_stream` + `_call_*` non-
+stream), `services/synthesis/triage_worker.py`,
+`services/synthesis/wiki_synthesis_worker.py`,
+`services/ingestion/inferred_edges/extractor.py`,
+`services/ingestion/code_graph/cross_repo_deps.py`.
+
+This PR added `shared/litellm_key.py` — a per-tenant LiteLLM virtual-key
+fetcher (control plane `GET /routing/customer/{id}/litellm-key`) plus a
+`tenant_virtual_key_context(customer_id)` async-context-manager that
+`shared.llm._maybe_inject_gateway` consults via ContextVar. Until each
+LLM entrypoint wraps its call window in that context manager, the
+shared-managed data plane attributes every call to the master
+`LLM_GATEWAY_KEY` and per-tenant cost accounting silently degrades.
+
+**Order, in descending impact:**
+
+1. Retrieval router + synthesize (every user query — wrap at the FastAPI
+   request handler so the whole pipeline inherits the binding).
+2. Triage + wiki-synthesis workers (highest token-volume background
+   jobs — wrap inside the per-customer drain loop, NOT at process
+   start).
+3. Cross-repo deps + inferred-edges extractors (ingest-side).
+
+**Dependency:** control-plane endpoint
+`GET /routing/customer/{customer_id}/litellm-key` must be live (PR #206
+in the control-plane repo). `get_tenant_virtual_key` raises
+`LiteLLMKeyUnavailable` until then — wrap calls in try/except to
+soft-fall-back to the env-var key (which is the path we have today).
+
+**Trigger:** shared-managed cutover, or any prod logs showing the
+LiteLLM master key dominating spend with no per-customer breakdown.
+
 ### Slack display-name cache: 429 / Retry-After retry
 **Where:** `services/ingestion/handlers/slack.py` (`_SlackUserCache.resolve` /
 `.prime`)
