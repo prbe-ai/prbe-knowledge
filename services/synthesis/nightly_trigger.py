@@ -44,6 +44,7 @@ from services.ingestion.code_graph.bridge import enqueue_initial_backfill
 from services.synthesis.diagram_renderer import regenerate_wiki_diagram
 from shared.config import get_settings
 from shared.constants import WIKI_PENDING_CHANNEL, SourceSystem
+from shared.db import apply_connection_setup
 from shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
@@ -69,6 +70,9 @@ async def trigger_nightly_synthesis(dsn: str) -> int:
     started_at = datetime.now(UTC)
     customer_ids: list[str] = []
     conn = await asyncpg.connect(dsn)
+    # Direct asyncpg.connect bypasses the pool's on_connect hook;
+    # apply the same setup so Cypher resolves ag_catalog.* consistently.
+    await apply_connection_setup(conn)
     try:
         rows = await conn.fetch(
             """
@@ -117,6 +121,9 @@ async def refresh_cross_repo_edges(dsn: str) -> dict[str, int]:
         "drain_timeouts": 0,
     }
     conn = await asyncpg.connect(dsn)
+    # Direct asyncpg.connect bypasses the pool's on_connect hook;
+    # apply the same setup so Cypher resolves ag_catalog.* consistently.
+    await apply_connection_setup(conn)
     try:
         # DO NOT REVIVE WITHOUT FIXING RLS: this cross-tenant aggregator runs as a
         # bare connection (no with_tenant wrap). Under the probe_app role (post
@@ -210,6 +217,9 @@ async def _resolve_github_token_id(dsn: str, customer_id: str) -> str | None:
     customer instead of erroring.
     """
     conn = await asyncpg.connect(dsn)
+    # Direct asyncpg.connect bypasses the pool's on_connect hook;
+    # apply the same setup so Cypher resolves ag_catalog.* consistently.
+    await apply_connection_setup(conn)
     try:
         row = await conn.fetchrow(
             """
@@ -235,6 +245,7 @@ async def _wait_for_code_graph_drain(dsn: str, customer_id: str) -> bool:
     deadline = datetime.now(UTC).timestamp() + _CODE_GRAPH_DRAIN_TIMEOUT_SECONDS
     while datetime.now(UTC).timestamp() < deadline:
         conn = await asyncpg.connect(dsn)
+        await apply_connection_setup(conn)
         try:
             in_flight = await conn.fetchval(
                 """
