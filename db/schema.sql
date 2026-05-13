@@ -620,12 +620,18 @@ ALTER TABLE graph_nodes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE graph_nodes FORCE ROW LEVEL SECURITY;
 ALTER TABLE graph_edges ENABLE ROW LEVEL SECURITY;
 ALTER TABLE graph_edges FORCE ROW LEVEL SECURITY;
+ALTER TABLE graph_node_provenance ENABLE ROW LEVEL SECURITY;
+ALTER TABLE graph_node_provenance FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY tenant_isolation ON graph_nodes
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 CREATE POLICY tenant_isolation ON graph_edges
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+CREATE POLICY tenant_isolation ON graph_node_provenance
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
