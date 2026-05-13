@@ -1014,6 +1014,93 @@ CREATE POLICY inferred_edges_queue_tenant_isolation
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
+-- mcp_oauth_* — OAuth 2.1 provider tables for the MCP server.
+--
+-- prbe-backend acts as the OAuth issuer for prbe-knowledge-mcp; customer AI
+-- agents (Claude Desktop, Cursor, etc.) register dynamically via RFC 7591
+-- and present issued JWTs to the MCP endpoint. The session is the
+-- persistent identity for a grant — refresh tokens are rotating tickets
+-- within a session.
+--
+-- Sources: db/migrations/versions/20260425_0009_mcp_oauth.py and
+--          db/migrations/versions/20260429_0027_mcp_oauth_sessions.py
+-- (kept in sync here so a fresh-DB provision via schema.sql + stamp head
+-- lands these tables instead of leaving the dashboard's /mcp/connections
+-- 500-ing on UndefinedTableError.)
+--
+-- No RLS: these are global per-customer rows scoped by user_id /
+-- customer_id columns and accessed only by the issuer code path.
+-- ---------------------------------------------------------------------------
+
+CREATE TABLE mcp_oauth_clients (
+    client_id                  TEXT PRIMARY KEY,
+    client_name                TEXT NOT NULL,
+    redirect_uris              TEXT[] NOT NULL,
+    grant_types                TEXT[] NOT NULL
+                               DEFAULT ARRAY['authorization_code','refresh_token'],
+    response_types             TEXT[] NOT NULL DEFAULT ARRAY['code'],
+    token_endpoint_auth_method TEXT NOT NULL DEFAULT 'none',
+    software_id                TEXT,
+    software_version           TEXT,
+    scope                      TEXT NOT NULL DEFAULT 'mcp:read',
+    created_at                 TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE mcp_oauth_sessions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client_id       TEXT NOT NULL
+                    REFERENCES mcp_oauth_clients(client_id) ON DELETE CASCADE,
+    user_id         TEXT NOT NULL,
+    customer_id     TEXT NOT NULL
+                    REFERENCES customers(customer_id) ON DELETE CASCADE,
+    scope           TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_active_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    revoked_at      TIMESTAMPTZ
+);
+CREATE INDEX mcp_oauth_sessions_user
+    ON mcp_oauth_sessions(user_id, customer_id)
+    WHERE revoked_at IS NULL;
+
+CREATE TABLE mcp_oauth_codes (
+    code                  TEXT PRIMARY KEY,
+    client_id             TEXT NOT NULL
+                          REFERENCES mcp_oauth_clients(client_id) ON DELETE CASCADE,
+    user_id               TEXT NOT NULL,
+    customer_id           TEXT NOT NULL
+                          REFERENCES customers(customer_id) ON DELETE CASCADE,
+    redirect_uri          TEXT NOT NULL,
+    code_challenge        TEXT NOT NULL,
+    code_challenge_method TEXT NOT NULL,
+    scope                 TEXT NOT NULL,
+    issued_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at            TIMESTAMPTZ NOT NULL,
+    used_at               TIMESTAMPTZ
+);
+CREATE INDEX mcp_oauth_codes_expires_at ON mcp_oauth_codes(expires_at);
+
+CREATE TABLE mcp_oauth_refresh_tokens (
+    token_id     TEXT PRIMARY KEY,
+    client_id    TEXT NOT NULL
+                 REFERENCES mcp_oauth_clients(client_id) ON DELETE CASCADE,
+    user_id      TEXT NOT NULL,
+    customer_id  TEXT NOT NULL
+                 REFERENCES customers(customer_id) ON DELETE CASCADE,
+    scope        TEXT NOT NULL,
+    issued_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at   TIMESTAMPTZ NOT NULL,
+    revoked_at   TIMESTAMPTZ,
+    session_id   UUID NOT NULL
+                 REFERENCES mcp_oauth_sessions(id) ON DELETE CASCADE
+);
+CREATE INDEX mcp_oauth_refresh_tokens_user
+    ON mcp_oauth_refresh_tokens(user_id, customer_id)
+    WHERE revoked_at IS NULL;
+CREATE INDEX mcp_oauth_refresh_tokens_session_active
+    ON mcp_oauth_refresh_tokens(session_id, issued_at DESC)
+    WHERE revoked_at IS NULL;
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents
