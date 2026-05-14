@@ -1,9 +1,9 @@
 """LLM eval: day-review fixture corpus -> expected wiki diff (edit-distance).
 
-Skips cleanly when GEMINI_API_KEY isn't set in the environment so CI
+Skips cleanly when GOOGLE_API_KEY isn't set in the environment so CI
 doesn't burn live model spend on every commit. To run locally:
 
-    GEMINI_API_KEY=... uv run pytest tests/synthesis/evals/
+    GOOGLE_API_KEY=... uv run pytest tests/synthesis/evals/
 
 Fixture: 50-event hand-curated corpus (loaded from
 `tests/synthesis/evals/fixtures/day_review_corpus.json`) plus an
@@ -29,14 +29,12 @@ _CORPUS_FILE = _FIXTURE_DIR / "day_review_corpus.json"
 
 
 def _missing_api_key() -> bool:
-    return not os.environ.get("GEMINI_API_KEY") and not os.environ.get(
-        "GOOGLE_API_KEY"
-    )
+    return not os.environ.get("GOOGLE_API_KEY")
 
 
 @pytest.mark.skipif(
     _missing_api_key(),
-    reason="GEMINI_API_KEY / GOOGLE_API_KEY not set; LLM eval requires live model.",
+    reason="GOOGLE_API_KEY not set; LLM eval requires live model.",
 )
 def test_day_review_fixture_corpus_produces_expected_wiki_diff() -> None:
     """Eval scaffold: load fixture, run agent, assert per-page edit-distance.
