@@ -60,11 +60,30 @@ def _node_ids(*pairs: tuple[str, str, int]) -> dict[tuple[str, str], int]:
 
 
 def _make_conn() -> AsyncMock:
-    """Build a conn that returns [] from fetch (no rows -> no degree UPDATE)."""
+    """Build a conn that returns [] from fetch (no rows -> no degree UPDATE).
+
+    `upsert_edges` issues two fetches when there are real edges to write:
+    (1) the entity_aliases lookup (no rows here = no rewrite) and
+    (2) the INSERT ... RETURNING. Both return [] so the post-INSERT degree
+    UPDATE never runs.
+    """
     conn = AsyncMock()
     conn.fetch = AsyncMock(return_value=[])
     conn.execute = AsyncMock()
     return conn
+
+
+def _insert_call(conn: AsyncMock):
+    """Return the conn.fetch call_args corresponding to the INSERT.
+
+    `_fetch_aliases` issues a SELECT against entity_aliases first; the
+    INSERT is the call whose SQL mentions `INSERT INTO graph_edges`.
+    """
+    for call in conn.fetch.call_args_list:
+        sql = call[0][0]
+        if "INSERT INTO graph_edges" in sql:
+            return call
+    raise AssertionError("conn.fetch was never invoked with the graph_edges INSERT")
 
 
 @pytest.mark.asyncio
@@ -83,11 +102,10 @@ async def test_upsert_edges_null_extractor_id_by_default() -> None:
 
     await upsert_edges(conn, "cust-test", edges, node_ids, "slack")
 
-    conn.fetch.assert_called_once()
-    call_args = conn.fetch.call_args[0]
+    call_args = _insert_call(conn)[0]
     # Positional args: (sql, customer_id, source_system, edge_types, from_ids,
     #   to_ids, properties_json, valid_from_list, valid_to_list, confidences,
-    #   extractor_id, extracted_at)
+    #   extractor_id, extracted_at, aliased_from_list, aliased_to_list)
     # Index: 0=sql, 1=$1, ..., 9=$9=confidences, 10=$10=extractor_id, 11=$11=extracted_at
     assert call_args[10] is None, f"extractor_id should be None, got {call_args[10]}"
     assert call_args[11] is None, f"extracted_at should be None, got {call_args[11]}"
@@ -115,8 +133,7 @@ async def test_upsert_edges_with_extractor_id_passed() -> None:
         extracted_at=extracted_at,
     )
 
-    conn.fetch.assert_called_once()
-    call_args = conn.fetch.call_args[0]
+    call_args = _insert_call(conn)[0]
     assert call_args[10] == "inferred_edges:v1"
     assert call_args[11] == extracted_at
 
@@ -144,9 +161,12 @@ async def test_upsert_edges_skips_unknown_endpoints() -> None:
 
     result = await upsert_edges(conn, "cust-test", edges, node_ids, "slack")
 
-    # All edges dropped (endpoint not found)
+    # All edges dropped (endpoint not found). One fetch fires regardless of
+    # endpoint resolution — the entity_aliases lookup at the top of
+    # upsert_edges runs before dedup — but no INSERT is issued.
     assert result == 0
-    conn.fetch.assert_not_called()
+    for call in conn.fetch.call_args_list:
+        assert "INSERT INTO graph_edges" not in call[0][0]
     conn.execute.assert_not_called()
 
 
@@ -169,11 +189,10 @@ async def test_upsert_edges_extracted_confidence_never_demoted() -> None:
 
     await upsert_edges(conn, "cust-test", edges, node_ids, "slack")
 
-    conn.fetch.assert_called_once()
-    call_args = conn.fetch.call_args[0]
-    # Positional args (0=sql, then $1..$11 at indices 1..11):
+    call_args = _insert_call(conn)[0]
+    # Positional args (0=sql, then $1..$13 at indices 1..13):
     #   0=sql, 1=customer_id, 2=source_system, 3=edge_types, 4=from_ids,
     #   5=to_ids, 6=properties, 7=valid_from, 8=valid_to, 9=confidences,
-    #   10=extractor_id, 11=extracted_at
+    #   10=extractor_id, 11=extracted_at, 12=aliased_from_list, 13=aliased_to_list
     confidences_list = call_args[9]
     assert confidences_list == ["EXTRACTED"]

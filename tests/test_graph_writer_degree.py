@@ -61,6 +61,24 @@ def _returning_row(from_node_id: int, to_node_id: int, inserted: bool) -> MagicM
     return row
 
 
+def _mock_fetch(returning_rows: list[MagicMock]) -> AsyncMock:
+    """Build a mock for conn.fetch that distinguishes the alias query from
+    the INSERT...RETURNING.
+
+    `upsert_edges` now performs a `_fetch_aliases` lookup before the INSERT,
+    which issues one extra `conn.fetch(...)`. For pure-mock tests with no
+    `entity_aliases` table, the alias query should return an empty list so
+    no rewrites occur (preserving the legacy behaviour these tests assert).
+    """
+
+    async def _dispatch(sql: str, *args, **kwargs):
+        if "entity_aliases" in sql:
+            return []
+        return returning_rows
+
+    return AsyncMock(side_effect=_dispatch)
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -71,8 +89,8 @@ async def test_insert_increments_degree_for_both_endpoints() -> None:
     """A genuine INSERT (inserted=True) -> both endpoints get degree++."""
     conn = AsyncMock()
     # fetch() simulates the INSERT RETURNING; execute() is the degree UPDATE
-    conn.fetch = AsyncMock(
-        return_value=[_returning_row(from_node_id=10, to_node_id=20, inserted=True)]
+    conn.fetch = _mock_fetch(
+        [_returning_row(from_node_id=10, to_node_id=20, inserted=True)]
     )
     conn.execute = AsyncMock()
 
@@ -82,8 +100,8 @@ async def test_insert_increments_degree_for_both_endpoints() -> None:
     )
     await upsert_edges(conn, "cust-1", [_edge()], node_ids, "slack")
 
-    # The INSERT fetch was called once
-    assert conn.fetch.call_count == 1
+    # Two fetches: the alias lookup + the INSERT RETURNING.
+    assert conn.fetch.call_count == 2
 
     # The degree UPDATE must have been called
     assert conn.execute.call_count == 1
@@ -104,8 +122,8 @@ async def test_insert_increments_degree_for_both_endpoints() -> None:
 async def test_conflict_does_not_increment_degree() -> None:
     """ON CONFLICT DO UPDATE (inserted=False) -> degree NOT touched."""
     conn = AsyncMock()
-    conn.fetch = AsyncMock(
-        return_value=[_returning_row(from_node_id=10, to_node_id=20, inserted=False)]
+    conn.fetch = _mock_fetch(
+        [_returning_row(from_node_id=10, to_node_id=20, inserted=False)]
     )
     conn.execute = AsyncMock()
 
@@ -115,8 +133,8 @@ async def test_conflict_does_not_increment_degree() -> None:
     )
     await upsert_edges(conn, "cust-1", [_edge()], node_ids, "slack")
 
-    # INSERT fetch ran
-    assert conn.fetch.call_count == 1
+    # Two fetches: alias lookup + INSERT RETURNING.
+    assert conn.fetch.call_count == 2
     # Degree UPDATE must NOT have been called (no inserted rows)
     conn.execute.assert_not_called()
 
@@ -126,8 +144,8 @@ async def test_mixed_batch_only_bumps_new_edges() -> None:
     """Batch with one new edge and one conflict: only new edge bumps degree."""
     conn = AsyncMock()
     # Two rows returned: first is new, second is conflict
-    conn.fetch = AsyncMock(
-        return_value=[
+    conn.fetch = _mock_fetch(
+        [
             _returning_row(from_node_id=10, to_node_id=20, inserted=True),
             _returning_row(from_node_id=30, to_node_id=40, inserted=False),
         ]
@@ -159,8 +177,8 @@ async def test_shared_node_degree_incremented_by_correct_sum() -> None:
     """Node shared by 3 new edges -> degree bumped by 3 in one UPDATE."""
     # Node 10 is the hub; edges: 10-20, 10-30, 10-40 (all new inserts)
     conn = AsyncMock()
-    conn.fetch = AsyncMock(
-        return_value=[
+    conn.fetch = _mock_fetch(
+        [
             _returning_row(from_node_id=10, to_node_id=20, inserted=True),
             _returning_row(from_node_id=10, to_node_id=30, inserted=True),
             _returning_row(from_node_id=10, to_node_id=40, inserted=True),
