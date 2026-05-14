@@ -155,7 +155,14 @@ async def run_backfill(
 
     store = get_store()
     bucket = store.bucket_for(customer_id)
-    await store.ensure_bucket(bucket)
+    # Bucket ensure used to live OUTSIDE the try/except — a 403 from R2
+    # (per-tenant bucket never created, e.g. a slug/UUID mismatch in the
+    # provisioning path) would raise out of run_backfill BEFORE
+    # _mark_running ever fired, leaving the backfill_state row in
+    # 'pending' for the reaper to reclaim ad infinitum.
+    # ``events_enqueued`` stayed at 0 forever and ops saw "wedged at zero".
+    # Claim the row FIRST, then ensure the bucket inside the try so a 403
+    # flips the row to 'failed' with the StorageUnavailable message.
 
     connector = build_connector(source, ctx)
 
@@ -181,6 +188,11 @@ async def run_backfill(
     # prior run's count rather than starting from zero.
     enqueued = initial_enqueued
     try:
+        # Inside the try so a HeadBucket 403 / bucket-missing surfaces via
+        # _mark_failed below (StorageUnavailable -> generic Exception
+        # branch) instead of bubbling up past the claim. See above comment.
+        await store.ensure_bucket(bucket)
+
         try:
             events = connector.backfill(customer_id, token, cursor)
         except NotSupportedByConnector as exc:
