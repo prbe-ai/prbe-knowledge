@@ -5,17 +5,15 @@ at transaction start. That GUC powers the RLS policies on graph_nodes / graph_ed
 
 Non-tenant operations (bootstrap, cron reclaim) use `raw_conn()`.
 
-search_path: prbe-knowledge's app tables live in ``public`` post
-migration 0071 (which swept them out of ``ag_catalog`` after the
-Apache-AGE-extension hijack landed them there at migrate time; see
-0071 + the prbe-backend ``0010_probe_role_public_first`` sibling for
-the full cleanup). The pool's ``on_connect`` hook pins
-``search_path = public, ag_catalog, "$user"`` on every fresh
-connection — defense-in-depth so callers don't need a
+search_path: prbe-knowledge's tables live in `ag_catalog` (the Apache-AGE
+extension's schema; see migration 0066 for the historical context). The
+pool's ``on_connect`` hook pins ``search_path = ag_catalog, public, "$user"``
+on every fresh connection — defense-in-depth so callers don't need a
 ``SET search_path`` of their own and so the data plane works under any
-role whose default search_path hasn't been pre-set. ag_catalog stays
-in the list (second slot) so AGE's own catalog access (``ag_label``,
-``cypher(...)``, etc.) still resolves unqualified.
+role whose default search_path hasn't been pre-set
+(``probe`` is set in prbe-backend's ``0005_probe_role_search_path``;
+``probe_app`` should be too, but the on_connect hook means a missed
+``ALTER ROLE`` won't silently route every query to ``public`` and 503).
 
 Role discipline (RLS non-superuser cutover, bug #46): in production the
 ``DATABASE_URL`` should point at the non-privileged ``probe_app`` role,
@@ -41,22 +39,22 @@ log = get_logger(__name__)
 
 _pool: asyncpg.Pool | None = None
 
-# public first so unqualified app-table references resolve in public
-# (where 0071_move_app_tables_to_public swept them); ag_catalog second
-# as a fallback for AGE's own catalog access (cypher, ag_label, ...);
-# "$user" last as a courtesy for per-role private schemas. Order
-# matches prbe-backend's ``0010_probe_role_public_first`` role default.
-_CONNECTION_SEARCH_PATH = 'public, ag_catalog, "$user"'
+# Order matches prbe-backend's `0005_probe_role_search_path`: ag_catalog first
+# so the AGE-extension-owned tables resolve without a schema-qualified name;
+# public second for any third-party extensions (pg_trgm, vector, pg_search)
+# that landed there; "$user" last as a courtesy for per-role private schemas.
+_CONNECTION_SEARCH_PATH = 'ag_catalog, public, "$user"'
 
 
 async def apply_connection_setup(conn: asyncpg.Connection) -> None:
     """Per-connection bootstrap. Runs once on connect, NOT per transaction.
 
-    - Pins search_path to ``public, ag_catalog, "$user"`` so app code
-      can reference ``graph_nodes`` (etc.) without schema qualification
-      regardless of the connecting role's per-role default. Post-0071
-      the tables live in ``public``; ag_catalog stays in the list as a
-      fallback for AGE's own catalog access (cypher(), ag_label, ...).
+    - Pins search_path to ``ag_catalog, public, "$user"`` so app code can
+      reference `graph_nodes` (etc.) without schema qualification regardless
+      of the connecting role's per-role default. Critical under the
+      shared-managed cluster where the data plane connects as ``probe_app``
+      and AGE's install-time search_path hijack put every table in
+      ``ag_catalog`` (see migration 0066).
 
     Does NOT set ``app.current_customer_id`` — that's per-tenant context
     and is set per-transaction by `with_tenant(customer_id)`.
