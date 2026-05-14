@@ -4,10 +4,9 @@ Background
 ----------
 `shared/llm.py` already routes every LiteLLM call through the central
 LiteLLM gateway when ``LLM_GATEWAY_URL`` is set, authenticated with a
-single process-wide ``LLM_GATEWAY_KEY``. That works for managed-isolated
-(one Helm release per customer → one env-var-baked virtual key per pod)
-but loses per-tenant attribution on the **shared-managed** data plane
-where one process handles many tenants.
+single process-wide ``LLM_GATEWAY_KEY``. That's fine for self-host
+(one virtual key per pod) but loses per-tenant attribution on the
+**shared-managed** data plane where one process handles many tenants.
 
 This module bridges that gap:
 

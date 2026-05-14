@@ -138,7 +138,7 @@ async def call_summarizer(
         text = getattr(resp, "text", None) or ""
     else:
         # Production path: route through shared.llm so the call honors
-        # LLM_GATEWAY_URL on managed-isolated tenants. The wrapper
+        # LLM_GATEWAY_URL for gateway-routed tenants. The wrapper
         # auto-injects api_base (and, post-chunk-A, api_key) when the
         # gateway env var is set; otherwise litellm uses GOOGLE_API_KEY.
         from shared import llm as shared_llm

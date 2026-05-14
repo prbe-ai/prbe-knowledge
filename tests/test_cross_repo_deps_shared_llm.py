@@ -2,7 +2,7 @@
 `cross_repo_deps._call_classifier_llm`.
 
 The production path now routes through `shared.llm.acompletion` so the
-classifier honors `LLM_GATEWAY_URL` on managed-isolated tenants. The
+classifier honors `LLM_GATEWAY_URL` for gateway routing. The
 test-injected `client` kwarg (mimicking the google-genai surface) is
 preserved for fixtures that pre-date the migration.
 """

@@ -92,7 +92,7 @@ async def test_call_summarizer_routes_through_shared_llm(monkeypatch) -> None:
     """When no client is injected, the summarizer calls
     `shared.llm.acompletion` with the gemini/<model> prefix and surfaces
     the message content. This is the production path that honors
-    `LLM_GATEWAY_URL` for managed-isolated tenants."""
+    `LLM_GATEWAY_URL` for gateway-routed tenants."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
 

@@ -15,7 +15,7 @@ role whose default search_path hasn't been pre-set
 ``probe_app`` should be too, but the on_connect hook means a missed
 ``ALTER ROLE`` won't silently route every query to ``public`` and 503).
 
-Role discipline (managed-isolated cutover, bug #46): in production the
+Role discipline (RLS non-superuser cutover, bug #46): in production the
 ``DATABASE_URL`` should point at the non-privileged ``probe_app`` role,
 NOT the ``probe`` superuser. Superuser connections silently bypass RLS,
 which would defeat the whole tenant-isolation story. ``init_pool`` logs

@@ -201,7 +201,7 @@ class _BaseEmbedder:
 class OpenAIEmbedder(_BaseEmbedder):
     """text-embedding-3-large via the AsyncOpenAI SDK.
 
-    Gateway-aware (managed-isolated / self-host, plan D1): when
+    Gateway-aware (managed-shared / self-host, plan D1): when
     ``llm_gateway_url`` is set we point AsyncOpenAI at the central LiteLLM
     proxy with ``llm_gateway_key`` as the bearer. LiteLLM exposes
     OpenAI-compatible ``/v1/embeddings``, so the SDK + all of its
@@ -305,7 +305,7 @@ class GeminiEmbedder(_BaseEmbedder):
     before being sent to the model so the same vector space encodes
     "this is a chunk to retrieve" vs "this is a question to match".
 
-    Transport (plan D1, managed-isolated):
+    Transport (plan D1, gateway routing):
 
       - **Gateway mode** (``llm_gateway_url`` set): call via
         ``shared.llm.aembedding`` so the LiteLLM proxy holds the Google

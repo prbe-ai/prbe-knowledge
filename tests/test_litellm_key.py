@@ -229,7 +229,7 @@ async def test_acompletion_falls_back_to_env_key_without_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Outside `tenant_virtual_key_context`, the process-wide
-    ``LLM_GATEWAY_KEY`` is used (managed-isolated path)."""
+    ``LLM_GATEWAY_KEY`` is used (self-host / no-tenant-context path)."""
     monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.litellm.svc.cluster.local:4000")
     monkeypatch.setenv("LLM_GATEWAY_KEY", "sk-master-fallback")
 

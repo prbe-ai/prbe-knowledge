@@ -17,8 +17,8 @@ shared/constants.py alongside RRF_K, source half-lives, and the rest of
 the LLM-id registry.
 
 Phase-0b: every provider call goes through `shared.llm.acompletion` so
-managed-isolated tenants without provider API keys route through the
-central LiteLLM gateway. Prompt caching (cache_control: ephemeral)
+tenants without provider API keys route through the central LiteLLM
+gateway. Prompt caching (cache_control: ephemeral)
 survives — LiteLLM forwards it on Anthropic provider calls.
 """
 
