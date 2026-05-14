@@ -169,15 +169,16 @@ CREATE TABLE chunks (
     content_hash         TEXT NOT NULL,
     token_count          INT  NOT NULL,
 
-    embedding            halfvec(3072) NOT NULL,
-    embedding_model      TEXT NOT NULL DEFAULT 'openai/text-embedding-3-large',
-    embedding_dim        INT  NOT NULL DEFAULT 3072,
-    -- Stage 1 of the Gemini embedding migration: every newly-ingested
-    -- chunk also gets a gemini-embedding-2-preview vector written here
-    -- alongside the OpenAI vector above. NULLABLE -- a Gemini API outage
-    -- during dual-write leaves these NULL for affected rows; the Stage 2
-    -- backfill sweeps them up. The query path keeps reading `embedding`
-    -- until Stage 4 cuts over.
+    -- Legacy OpenAI vector. NULLABLE post-cutover (2026-05-14, mig 0071):
+    -- new rows leave this NULL and only populate embedding_v2 below. Kept
+    -- so the eval harness can still read pre-cutover OpenAI baselines for
+    -- apples-to-apples comparisons. No production code path reads this.
+    embedding            halfvec(3072) NULL,
+    embedding_model      TEXT NULL,
+    embedding_dim        INT  NULL,
+    -- Production embedding column (gemini-embedding-2). Every newly-ingested
+    -- chunk's vector is written here. NULLABLE only so embed-failure paths
+    -- can record a chunk for later backfill without blocking the txn.
     embedding_v2         halfvec(3072) NULL,
     embedding_v2_model   TEXT NULL,
     embedding_v2_dim     INT  NULL,
@@ -215,12 +216,9 @@ CREATE TABLE chunks (
 );
 
 -- halfvec_cosine_ops: pgvector HNSW indexes halfvec up to 4000 dims.
-CREATE INDEX idx_chunks_embedding_hnsw ON chunks USING hnsw (embedding halfvec_cosine_ops);
--- Stage 3 of the Gemini embedding migration: parallel HNSW over the
--- gemini-embedding-2-preview vectors, used by the query path after the
--- Stage 4 cutover. Defaults (m=16, ef_construction=64) match the v1 index
--- above so any retrieval tuning translates 1:1; written without explicit
--- WITH (...) for symmetry with the v1 line.
+-- Production retrieval index over gemini-embedding-2 vectors. The legacy
+-- v1 HNSW index over `embedding` was dropped in migration 0071 (no
+-- production reader after the cutover).
 CREATE INDEX idx_chunks_embedding_v2_hnsw ON chunks USING hnsw (embedding_v2 halfvec_cosine_ops);
 CREATE INDEX idx_chunks_customer       ON chunks (customer_id);
 CREATE INDEX idx_chunks_doc            ON chunks (doc_id);

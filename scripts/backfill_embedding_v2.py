@@ -1,8 +1,10 @@
-"""Stage 2 of the OpenAI -> Gemini embedding migration.
+"""Backfill `chunks.embedding_v2` with gemini-embedding-2 vectors.
 
-Iterates every chunk where embedding_v2 IS NULL and populates it via
-gemini-embedding-2-preview. Designed to be run from a one-off Fly machine
-(NOT triggered by deploy) against the production Neon DB.
+Use cases post-cutover (2026-05-14):
+- Re-embed any pre-cutover rows that still have embedding_v2 IS NULL.
+- Recover from a Gemini outage that left some new rows with NULL v2 (the
+  ingest path records the failure in failed_chunks but doesn't block the
+  doc-commit; this script picks them up).
 
 Idempotent: the WHERE embedding_v2 IS NULL filter means a re-run picks up
 exactly the chunks the previous run didn't finish. No external cursor or
@@ -30,8 +32,6 @@ Usage::
 Verify completion via::
 
     SELECT COUNT(*) FROM chunks WHERE embedding_v2 IS NULL;
-
-Once that returns 0, Stage 3 (HNSW index on embedding_v2) is safe to land.
 """
 
 from __future__ import annotations
@@ -55,8 +55,8 @@ from shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
 
-# gemini-embedding-2-preview input pricing (as of 2026-05). Used only for
-# the sanity cost cap -- real billing is whatever Gemini actually charges.
+# gemini-embedding-2 input pricing (as of 2026-05). Used only for the
+# sanity cost cap -- real billing is whatever Gemini actually charges.
 # Update when pricing shifts; the constant is a guard rail, not accounting.
 GEMINI_2_INPUT_USD_PER_M_TOKENS = 0.15
 

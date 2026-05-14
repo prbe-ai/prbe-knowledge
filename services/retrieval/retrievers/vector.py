@@ -8,7 +8,7 @@ from datetime import datetime
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_VECTOR
 from shared.db import with_tenant
-from shared.embeddings import get_embedder
+from shared.embeddings import get_embedder_v2
 from shared.models import TemporalSpec, normalize_author_id
 
 
@@ -52,7 +52,7 @@ async def vector_search(
     passes None and uses doc_type as a soft RRF boost; the list pipeline
     passes the resolved set as a hard filter — same retriever, two callers.
     """
-    embedder = get_embedder()
+    embedder = get_embedder_v2()
     query_vec = await embedder.embed_query(query_text)
     literal = "[" + ",".join(f"{x:.7f}" for x in query_vec) + "]"
 
@@ -88,18 +88,19 @@ async def vector_search(
                    c.kind,
                    d.created_at,
                    d.updated_at,
-                   1 - (c.embedding <=> $2::halfvec) AS score
+                   1 - (c.embedding_v2 <=> $2::halfvec) AS score
             FROM chunks c
             JOIN documents d
               ON c.doc_id = d.doc_id
              AND d.customer_id = c.customer_id
              AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
             WHERE c.customer_id = $1
+              AND c.embedding_v2 IS NOT NULL
               {pred.chunk_sql}
               {pred.doc_sql}
               {source_filter}
               {doc_type_filter}
-            ORDER BY c.embedding <=> $2::halfvec
+            ORDER BY c.embedding_v2 <=> $2::halfvec
             LIMIT $3
             """,
             *params,

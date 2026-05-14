@@ -313,12 +313,15 @@ async def test_recursive_half_split_isolates_poison_chunk() -> None:
 # ---- API surface backward compatibility --------------------------------
 
 
-def test_embedder_alias_points_at_openai() -> None:
-    from shared.embeddings import Embedder
+def test_embedder_alias_removed() -> None:
+    """The pre-cutover `Embedder = OpenAIEmbedder` alias was removed in the
+    2026-05-14 Gemini cutover. Production callers explicitly use
+    GeminiEmbedder / get_embedder_v2; the eval harness uses OpenAIEmbedder
+    by name. The alias is gone so a future caller can't grab `Embedder`
+    and silently get OpenAI back."""
+    import shared.embeddings as mod
 
-    # Existing call sites import Embedder directly. Keep the alias stable so
-    # the migration doesn't break synthesis_worker or other consumers.
-    assert Embedder is OpenAIEmbedder
+    assert not hasattr(mod, "Embedder")
 
 
 def test_dataclass_re_exports_unchanged() -> None:
@@ -416,7 +419,7 @@ async def test_gemini_embedder_routes_through_shared_llm_aembedding_in_gateway_m
     get_settings.cache_clear()
     s = get_settings()
 
-    embedder = GeminiEmbedder(settings=s, model="gemini-embedding-2-preview")
+    embedder = GeminiEmbedder(settings=s, model="gemini-embedding-2")
     assert embedder._gateway_url == "http://litellm.litellm.svc:4000"
 
     captured: dict[str, object] = {}
@@ -443,7 +446,7 @@ async def test_gemini_embedder_routes_through_shared_llm_aembedding_in_gateway_m
     # Gateway transport was hit — direct client never constructed.
     assert embedder._client is None
     # Model id carries the `gemini/` prefix for the proxy glob.
-    assert captured["model"] == "gemini/gemini-embedding-2-preview"
+    assert captured["model"] == "gemini/gemini-embedding-2"
     # All inputs went through; vectors round-trip.
     assert len(out) == 3
     assert all(vec == [0.11, 0.22, 0.33] for vec in out)

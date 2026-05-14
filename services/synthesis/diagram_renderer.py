@@ -49,7 +49,7 @@ from services.synthesis.index_renderer import (
 )
 from shared.constants import DocClass, SourceSystem
 from shared.db import with_tenant
-from shared.embeddings import Embedder
+from shared.embeddings import get_embedder_v2
 from shared.logging import get_logger
 from shared.models import NormalizationResult, WebhookEvent
 from shared.storage import get_store
@@ -200,7 +200,7 @@ async def regenerate_wiki_diagram(
 
     if normalizer is None:
         ctx = make_default_context()
-        normalizer = Normalizer(ctx, store=get_store(), embedder=Embedder())
+        normalizer = Normalizer(ctx, store=get_store(), embedder=get_embedder_v2())
 
     received_at = datetime.now(UTC)
     raw_payload: dict[str, Any] = {

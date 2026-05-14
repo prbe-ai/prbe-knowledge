@@ -22,7 +22,6 @@ change rather than the size of the document.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import re
 from dataclasses import dataclass, field
@@ -38,8 +37,6 @@ from services.ingestion.handlers.base import Connector, ConnectorContext
 from services.ingestion.handlers.registry import build_connector
 from shared.constants import (
     CHUNKER_VERSION,
-    EMBEDDING_DIM,
-    EMBEDDING_MODEL,
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
     NORMALIZER_VERSION,
@@ -49,9 +46,7 @@ from shared.customer_prefs import is_wiki_generation_enabled
 from shared.db import get_pool, with_tenant
 from shared.embeddings import (
     DocItem,
-    Embedder,
     GeminiEmbedder,
-    get_embedder,
     get_embedder_v2,
 )
 from shared.encryption import decrypt_token
@@ -92,18 +87,15 @@ class Normalizer:
         self,
         ctx: ConnectorContext,
         store: ObjectStore | None = None,
-        embedder: Embedder | None = None,
-        embedder_v2: GeminiEmbedder | None = None,
+        embedder: GeminiEmbedder | None = None,
     ) -> None:
         self._ctx = ctx
         self._store = store or get_store()
-        self._embedder = embedder or get_embedder()
-        # Stage 1 of the Gemini migration: every newly-ingested chunk is
-        # embedded by both providers concurrently. The Gemini side is
-        # best-effort -- a v2 failure leaves embedding_v2 NULL and is
-        # picked up by the Stage 2 backfill, which means an outage at
-        # Gemini doesn't take down ingest.
-        self._embedder_v2 = embedder_v2 or get_embedder_v2()
+        # Single-provider write path (cutover 2026-05-14). Every newly-ingested
+        # chunk is embedded by gemini-embedding-2 and persisted to
+        # `chunks.embedding_v2`. The legacy `chunks.embedding` column is
+        # nullable post-migration 0071 and is no longer written.
+        self._embedder = embedder or get_embedder_v2()
         self._connectors: dict[SourceSystem, Connector] = {}
 
     def _connector(self, source: SourceSystem) -> Connector:
@@ -594,37 +586,18 @@ class Normalizer:
         # sessions. Holding a write txn across it caused the 2026-04-29
         # incident.
         #
-        # Dual-write: the OpenAI embedder is the primary; the Gemini embedder
-        # populates `embedding_v2` for the migration. Both run concurrently
-        # via asyncio.gather so dual-write latency is max(openai, gemini),
-        # not sum. A Gemini failure here is isolated -- v2 is left NULL and
-        # the Stage 2 backfill sweeps it up later. A primary (OpenAI)
-        # failure still fails the ingest, matching pre-migration behavior.
-        added_pieces: list[tuple[ChunkPiece, list[float], list[float] | None, str]] = []
+        # Single-provider write: gemini-embedding-2 populates `embedding_v2`.
+        # The legacy `embedding` column is left NULL on new rows (post-0071
+        # migration; the column is nullable, no index, no readers).
+        added_pieces: list[tuple[ChunkPiece, list[float], str]] = []
         failed_pieces: list[tuple[ChunkPiece | None, Any]] = []
         failed_count = 0
         if embed_inputs:
-            v1_task = self._embedder.embed_many([p.content for p in embed_inputs])
-            v2_task = self._embedder_v2.embed_documents(
+            embeds = await self._embedder.embed_documents(
                 [DocItem(content=p.content, title=doc.title) for p in embed_inputs]
             )
-            v1_embeds, v2_outcome = await asyncio.gather(
-                v1_task, v2_task, return_exceptions=True
-            )
-            if isinstance(v1_embeds, BaseException):
-                # Primary failure: re-raise. Worker requeues the row.
-                raise v1_embeds
-            if isinstance(v2_outcome, BaseException):
-                log.warning(
-                    "embed.v2_provider_unavailable",
-                    doc_id=doc.doc_id,
-                    error=str(v2_outcome),
-                )
-                v2_by_idx: dict[int, list[float]] = {}
-            else:
-                v2_by_idx = {e.chunk_index: e.embedding for e in v2_outcome.embedded}
 
-            for match in v1_embeds.embedded:
+            for match in embeds.embedded:
                 if match.chunk_index < 0 or match.chunk_index >= len(embed_inputs):
                     continue
                 piece = embed_inputs[match.chunk_index]
@@ -634,9 +607,8 @@ class Normalizer:
                     and match.chunk_index == metadata_input_index
                     else "content"
                 )
-                v2_vec = v2_by_idx.get(match.chunk_index)
-                added_pieces.append((piece, match.embedding, v2_vec, kind))
-            for fail in v1_embeds.failed:
+                added_pieces.append((piece, match.embedding, kind))
+            for fail in embeds.failed:
                 # Map back to the originating piece to record chunk_index on failure.
                 if 0 <= fail.chunk_index < len(embed_inputs):
                     fail_piece: ChunkPiece | None = embed_inputs[fail.chunk_index]
@@ -725,11 +697,10 @@ class _ChunkPlan:
     # Metadata chunk's hash if it already exists live (singleton). None if no
     # metadata chunk in the plan or if it's being added/changed.
     reused_metadata_hash: str | None = None
-    # (piece, v1_embedding, v2_embedding_or_None, kind) tuples to insert. Kind is
-    # "content" or "metadata". v2 is the Gemini vector during the migration
-    # window; None when Gemini failed for that chunk (dual-write isolated
-    # the failure).
-    added_pieces: list[tuple[ChunkPiece, list[float], list[float] | None, str]] = field(
+    # (piece, gemini_embedding, kind) tuples to insert. Kind is "content"
+    # or "metadata". Single-provider write path (Gemini-2) — the legacy
+    # OpenAI `embedding` column is left NULL.
+    added_pieces: list[tuple[ChunkPiece, list[float], str]] = field(
         default_factory=list
     )
     # (piece_or_None, failed_record) tuples from embedding failures. Goes to
@@ -976,43 +947,43 @@ async def _insert_chunk(
     piece: ChunkPiece,
     embedding: list[float],
     kind: str = "content",
-    embedding_v2: list[float] | None = None,
 ) -> None:
+    """Insert one chunk row with its Gemini-2 embedding (post-cutover).
+
+    The legacy `embedding` / `embedding_model` / `embedding_dim` columns are
+    left NULL on new rows: the column is nullable post-migration 0071 and
+    no production reader queries it. ON CONFLICT preserves whatever the
+    existing row had in those legacy columns (so pre-cutover rows keep
+    their OpenAI vectors until re-ingest or wipe).
+    """
     content_hash = _chunk_hash(piece.content)
     # Distinct chunk_id prefix for metadata so a same-content_hash collision
     # between content and metadata (theoretical) doesn't ON CONFLICT-update
     # the wrong row.
     prefix = "m_" if kind == "metadata" else "c_"
     chunk_id = f"{doc.doc_id}:{prefix}{content_hash[:16]}"
-    v2_pg = _pg_vector(embedding_v2) if embedding_v2 is not None else None
-    v2_model = EMBEDDING_V2_MODEL if embedding_v2 is not None else None
-    v2_dim = EMBEDDING_V2_DIM if embedding_v2 is not None else None
     await conn.execute(
         """
         INSERT INTO chunks (
             chunk_id, doc_id, customer_id,
             chunk_index, content, content_hash, token_count,
-            embedding, embedding_model, embedding_dim, chunker_version,
+            chunker_version,
             first_seen_version, last_seen_version, kind,
             embedding_v2, embedding_v2_model, embedding_v2_dim
         )
         VALUES (
             $1, $2, $3,
             $4, $5, $6, $7,
-            $8::halfvec, $9, $10, $11,
-            $12, $12, $13,
-            $14::halfvec, $15, $16
+            $8,
+            $9, $9, $10,
+            $11::halfvec, $12, $13
         )
         ON CONFLICT (doc_id, content_hash) DO UPDATE
             SET last_seen_version = EXCLUDED.last_seen_version,
                 valid_to = NULL,
-                -- Fill in embedding_v2 only when the existing row has none
-                -- (Stage 1 dual-write window). Once Stage 2 backfill or a
-                -- prior write has populated v2, keep it -- no churn writes
-                -- and no clobbering with NULL when Gemini fails on a re-ingest.
-                embedding_v2 = COALESCE(chunks.embedding_v2, EXCLUDED.embedding_v2),
-                embedding_v2_model = COALESCE(chunks.embedding_v2_model, EXCLUDED.embedding_v2_model),
-                embedding_v2_dim = COALESCE(chunks.embedding_v2_dim, EXCLUDED.embedding_v2_dim)
+                embedding_v2 = EXCLUDED.embedding_v2,
+                embedding_v2_model = EXCLUDED.embedding_v2_model,
+                embedding_v2_dim = EXCLUDED.embedding_v2_dim
         """,
         chunk_id,
         doc.doc_id,
@@ -1021,22 +992,19 @@ async def _insert_chunk(
         piece.content,
         content_hash,
         piece.token_count,
-        _pg_vector(embedding),
-        EMBEDDING_MODEL,
-        EMBEDDING_DIM,
         CHUNKER_VERSION,
         doc.version,
         kind,
-        v2_pg,
-        v2_model,
-        v2_dim,
+        _pg_vector(embedding),
+        EMBEDDING_V2_MODEL,
+        EMBEDDING_V2_DIM,
     )
 
 
 async def _insert_chunks_batch(
     conn: asyncpg.Connection,
     doc: Document,
-    added_pieces: list[tuple[ChunkPiece, list[float], list[float] | None, str]],
+    added_pieces: list[tuple[ChunkPiece, list[float], str]],
 ) -> None:
     """Batched counterpart to `_insert_chunk` — one INSERT for all pieces.
 
@@ -1048,22 +1016,21 @@ async def _insert_chunks_batch(
     semantics on the per-piece fields (chunk_index, content) — they're
     identical across same-hash entries in practice.
 
-    `added_pieces` carries (piece, v1_embedding, v2_embedding_or_None, kind).
-    During the Gemini migration window the v2 slot is the
-    gemini-embedding-2-preview vector when available, NULL otherwise --
-    each NULL gets cleaned up later by the Stage 2 backfill script.
+    `added_pieces` carries (piece, gemini_embedding, kind). Single-provider
+    write path post-cutover (2026-05-14): the Gemini-2 vector goes to
+    `embedding_v2`; the legacy `embedding` column is left NULL on new
+    rows (nullable post-0071, no readers).
     """
     chunk_ids: list[str] = []
     chunk_indexes: list[int] = []
     contents: list[str] = []
     content_hashes: list[str] = []
     token_counts: list[int] = []
-    embeddings: list[str] = []
-    embeddings_v2: list[str | None] = []
+    embeddings_v2: list[str] = []
     kinds: list[str] = []
     seen_hashes: set[str] = set()
 
-    for piece, embedding, embedding_v2, kind in added_pieces:
+    for piece, embedding, kind in added_pieces:
         content_hash = _chunk_hash(piece.content)
         if content_hash in seen_hashes:
             continue
@@ -1077,8 +1044,7 @@ async def _insert_chunks_batch(
         contents.append(piece.content)
         content_hashes.append(content_hash)
         token_counts.append(piece.token_count)
-        embeddings.append(_pg_vector(embedding))
-        embeddings_v2.append(_pg_vector(embedding_v2) if embedding_v2 is not None else None)
+        embeddings_v2.append(_pg_vector(embedding))
         kinds.append(kind)
 
     if not chunk_ids:
@@ -1089,36 +1055,27 @@ async def _insert_chunks_batch(
         INSERT INTO chunks (
             chunk_id, doc_id, customer_id,
             chunk_index, content, content_hash, token_count,
-            embedding, embedding_model, embedding_dim, chunker_version,
+            chunker_version,
             first_seen_version, last_seen_version, kind,
             embedding_v2, embedding_v2_model, embedding_v2_dim
         )
         SELECT
             chunk_id, $2, $3,
             chunk_index, content, content_hash, token_count,
-            embedding::halfvec, $9, $10, $11,
-            $12, $12, kind,
-            embedding_v2::halfvec,
-            -- Cast the bound params explicitly. Without the casts, the CASE
-            -- expression unifies the NULL branch to the parameter's wire type
-            -- (text), and Postgres rejects the INSERT against the INT column
-            -- with DatatypeMismatchError.
-            CASE WHEN embedding_v2 IS NULL THEN NULL ELSE $15::text END,
-            CASE WHEN embedding_v2 IS NULL THEN NULL ELSE $16::int END
+            $9,
+            $10, $10, kind,
+            embedding_v2::halfvec, $12, $13
         FROM unnest(
             $1::text[], $4::int[], $5::text[], $6::text[], $7::int[],
-            $8::text[], $13::text[], $14::text[]
+            $8::text[], $11::text[]
         ) AS t(chunk_id, chunk_index, content, content_hash, token_count,
-               embedding, kind, embedding_v2)
+               embedding_v2, kind)
         ON CONFLICT (doc_id, content_hash) DO UPDATE
             SET last_seen_version = EXCLUDED.last_seen_version,
                 valid_to = NULL,
-                -- COALESCE: backfill NULL v2 slots from this insert, but
-                -- never clobber a populated v2 with a fresh NULL (Gemini
-                -- failed this round) or with another fresh value (no churn).
-                embedding_v2 = COALESCE(chunks.embedding_v2, EXCLUDED.embedding_v2),
-                embedding_v2_model = COALESCE(chunks.embedding_v2_model, EXCLUDED.embedding_v2_model),
-                embedding_v2_dim = COALESCE(chunks.embedding_v2_dim, EXCLUDED.embedding_v2_dim)
+                embedding_v2 = EXCLUDED.embedding_v2,
+                embedding_v2_model = EXCLUDED.embedding_v2_model,
+                embedding_v2_dim = EXCLUDED.embedding_v2_dim
         """,
         chunk_ids,
         doc.doc_id,
@@ -1127,13 +1084,10 @@ async def _insert_chunks_batch(
         contents,
         content_hashes,
         token_counts,
-        embeddings,
-        EMBEDDING_MODEL,
-        EMBEDDING_DIM,
+        embeddings_v2,
         CHUNKER_VERSION,
         doc.version,
         kinds,
-        embeddings_v2,
         EMBEDDING_V2_MODEL,
         EMBEDDING_V2_DIM,
     )

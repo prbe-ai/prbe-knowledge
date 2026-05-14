@@ -9,11 +9,12 @@
 
 Two concrete providers live here:
 
-- `Embedder` (also `OpenAIEmbedder`): the existing OpenAI text-embedding-3-large
-  client. Used by the query path until Stage 4 of the Gemini migration cuts
-  over.
-- `GeminiEmbedder`: gemini-embedding-2-preview. Used by the ingest path's
-  dual-write today; will become the only embedder after Stage 4.
+- `GeminiEmbedder`: gemini-embedding-2. The production embedder for both
+  ingestion (writes `chunks.embedding_v2`) and retrieval (embeds queries).
+- `OpenAIEmbedder`: text-embedding-3-large. EVAL-HARNESS ONLY post-2026-05-14
+  cutover. Kept so `scripts/eval_data/fixtures.py` can regenerate v1
+  baselines for apples-to-apples retrieval comparisons. No production code
+  path reads from it.
 
 The recursive half-split + batching machinery lives on `_BaseEmbedder` and
 is shared between providers. Providers override `_embed_once` (raw bytes
@@ -283,23 +284,21 @@ class OpenAIEmbedder(_BaseEmbedder):
                 await asyncio.sleep(1)
 
 
-# Backward-compatible alias. Existing call sites import `Embedder` directly
-# (synthesis_worker, normalizer); those keep working unchanged.
-Embedder = OpenAIEmbedder
 
 
 # ---- Gemini -------------------------------------------------------------
 
-# gemini-embedding-2-preview does NOT expose a `task_type` field. Asymmetric
-# retrieval is implemented by prefixing the input string itself. Format is
-# from https://ai.google.dev/gemini-api/docs/models/gemini-embedding-2-preview.
+# gemini-embedding-2 does NOT expose a `task_type` field (unlike
+# gemini-embedding-001). Asymmetric retrieval is implemented by prefixing
+# the input string itself. Format is from
+# https://ai.google.dev/gemini-api/docs/embeddings.
 _GEMINI_DOC_PREFIX_WITH_TITLE = "title: {title} | text: {content}"
 _GEMINI_DOC_PREFIX_NO_TITLE = "text: {content}"
 _GEMINI_QUERY_PREFIX = "task: search result | query: {query}"
 
 
 class GeminiEmbedder(_BaseEmbedder):
-    """gemini-embedding-2-preview, two transports.
+    """gemini-embedding-2, two transports.
 
     Asymmetric retrieval: documents and queries are formatted differently
     before being sent to the model so the same vector space encodes
@@ -312,7 +311,7 @@ class GeminiEmbedder(_BaseEmbedder):
         credentials. The google-genai SDK has no ``base_url`` knob (unlike
         AsyncOpenAI), so we can't point the SDK at the proxy directly —
         the wrapper is the only way through. LiteLLM's ``gemini-*`` model
-        route covers ``gemini-embedding-2-preview`` as long as the proxy
+        route covers ``gemini-embedding-2`` as long as the proxy
         config lists it on the embeddings side (a managed-tenant
         precondition).
       - **Direct mode** (no gateway): the original google-genai async path
@@ -648,7 +647,9 @@ _embedder_v2: GeminiEmbedder | None = None
 
 
 def get_embedder() -> OpenAIEmbedder:
-    """OpenAI embedder. Used by the query path until Stage 4 cutover."""
+    """OpenAI embedder singleton. EVAL-HARNESS ONLY — see module docstring.
+    Production callers (normalizer, retrievers, synthesis) use
+    :func:`get_embedder_v2`."""
     global _embedder
     if _embedder is None:
         _embedder = OpenAIEmbedder()
@@ -656,8 +657,8 @@ def get_embedder() -> OpenAIEmbedder:
 
 
 def get_embedder_v2() -> GeminiEmbedder:
-    """Gemini embedder. Used by the ingest dual-write path; will become the
-    primary at Stage 4."""
+    """Gemini embedder singleton. Production embedder for ingestion and
+    retrieval (cutover 2026-05-14)."""
     global _embedder_v2
     if _embedder_v2 is None:
         _embedder_v2 = GeminiEmbedder()
@@ -674,7 +675,6 @@ __all__ = [
     "DocItem",
     "EmbedResult",
     "EmbeddedChunk",
-    "Embedder",
     "FailedChunk",
     "GeminiEmbedder",
     "OpenAIEmbedder",
