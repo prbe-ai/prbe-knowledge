@@ -68,7 +68,20 @@ class _StubStore:
 
 
 class _ZeroEmbedder:
-    """Stub embedder returning zero-vector embeddings of the right dim."""
+    """Stub embedder returning zero-vector embeddings of the right dim.
+
+    Implements `embed_documents` (what Normalizer calls post-cutover) and
+    `embed_many` (compat for older direct callers in this test file).
+    """
+
+    async def embed_documents(self, items: list) -> EmbedResult:
+        return EmbedResult(
+            embedded=[
+                EmbeddedChunk(chunk_index=i, embedding=[0.0] * EMBEDDING_DIM)
+                for i in range(len(items))
+            ],
+            failed=[],
+        )
 
     async def embed_many(self, texts: list[str]) -> EmbedResult:
         return EmbedResult(

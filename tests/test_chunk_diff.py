@@ -28,7 +28,7 @@ from services.ingestion.normalizer import Normalizer
 from shared import db as db_module
 from shared.config import Settings
 from shared.constants import SourceSystem
-from shared.embeddings import Embedder
+from shared.embeddings import GeminiEmbedder
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "slack" / "message_simple.json"
 
@@ -59,8 +59,8 @@ def _base_payload() -> dict[str, Any]:
 def _make_normalizer(store: _StubStore) -> Normalizer:
     settings = Settings(environment="local")
     ctx = ConnectorContext(settings=settings, http=httpx.AsyncClient())
-    embedder = Embedder(settings=settings)  # no api key → zero-vector stub
-    return Normalizer(ctx, store=store, embedder=embedder)  # type: ignore[arg-type]
+    embedder = GeminiEmbedder(settings=settings)  # no api key → zero-vector stub
+    return Normalizer(ctx, store=store, embedder=embedder)
 
 
 async def _seed_customer(customer_id: str) -> None:

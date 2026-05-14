@@ -34,7 +34,7 @@ from shared.constants import (
     MAX_HUMAN_DIRECTED_PER_DOC,
 )
 from shared.db import with_tenant
-from shared.embeddings import Embedder
+from shared.embeddings import GeminiEmbedder, get_embedder_v2
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -232,7 +232,7 @@ async def persist_directed_vectors(
     page_body: str,
     frontmatter: dict[str, Any] | None,
     synthesis_run_id: int | None,
-    embedder: Embedder | None = None,
+    embedder: GeminiEmbedder | None = None,
     provider: DirectedPhrasesProvider | None = None,
 ) -> DirectedPersistResult:
     """End-to-end: parse frontmatter pins, generate LLM phrases, dedupe,
@@ -256,7 +256,7 @@ async def persist_directed_vectors(
     it). Pass None for human-pin-only paths (e.g. manual-entry pages).
     """
     result = DirectedPersistResult()
-    embedder = embedder or Embedder()
+    embedder = embedder or get_embedder_v2()
 
     human_phrases = parse_directed_frontmatter(frontmatter)
     human_phrases = list(dict.fromkeys(human_phrases))  # preserve order, dedupe by string

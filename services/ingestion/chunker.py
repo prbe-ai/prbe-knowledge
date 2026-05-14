@@ -1,12 +1,12 @@
 """Naive token-based chunker.
 
 Phase 0 strategy: fixed token window with overlap, using the cl100k_base
-tokenizer. Sized for OpenAI text-embedding-3-large originally; the Gemini
-migration adds dual-write to gemini-embedding-2-preview, which has a
-much lower input ceiling (~2048 tokens). The hard cap below picks the
-smaller of the two so a chunk can never overflow the Gemini side.
-Structural chunking (respect headings, code blocks, thread boundaries)
-is Phase 1+.
+tokenizer. Sized for OpenAI text-embedding-3-large originally; post the
+2026-05-14 Gemini cutover the embedder is gemini-embedding-2 with an
+8192-token input ceiling (EMBEDDING_V2_MAX_INPUT_TOKENS). The hard cap
+below stays as the absolute upper bound regardless of which embedder is
+active. Structural chunking (respect headings, code blocks, thread
+boundaries) is Phase 1+.
 """
 
 from __future__ import annotations

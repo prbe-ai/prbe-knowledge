@@ -42,7 +42,7 @@ from shared.constants import (
     WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
 )
 from shared.db import raw_conn
-from shared.embeddings import Embedder
+from shared.embeddings import GeminiEmbedder
 from shared.exceptions import AgentHaltError
 from shared.logging import get_logger
 from shared.storage import ObjectStore, get_store
@@ -64,7 +64,7 @@ class SynthesisWorker:
         *,
         ctx: ConnectorContext | None = None,
         store: ObjectStore | None = None,
-        embedder: Embedder | None = None,
+        embedder: GeminiEmbedder | None = None,
         llm_client: object | None = None,
         periodic_wake_seconds: float = WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
         global_concurrency: int = WIKI_AGENT_GLOBAL_CONCURRENCY,

@@ -412,23 +412,24 @@ async def _fetch_vector_similar_cross_source(
         rows = await conn.fetch(
             """
             WITH anchor_embedding AS (
-                SELECT c.embedding
+                SELECT c.embedding_v2 AS embedding
                 FROM chunks c
                 WHERE c.customer_id = $1
                   AND c.doc_id = $2
                   AND c.valid_to IS NULL
-                  AND c.embedding IS NOT NULL
+                  AND c.embedding_v2 IS NOT NULL
                 ORDER BY c.chunk_index ASC
                 LIMIT 1
             ),
             similar AS (
                 SELECT DISTINCT c.doc_id,
-                       1 - (c.embedding <=> ae.embedding) AS similarity
+                       1 - (c.embedding_v2 <=> ae.embedding) AS similarity
                 FROM chunks c
                 CROSS JOIN anchor_embedding ae
                 WHERE c.customer_id = $1
                   AND c.valid_to IS NULL
                   AND c.doc_id <> $2
+                  AND c.embedding_v2 IS NOT NULL
                 ORDER BY similarity DESC
                 LIMIT 200
             )

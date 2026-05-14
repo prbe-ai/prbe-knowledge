@@ -71,18 +71,18 @@ async def _seed_customer(customer_id: str) -> None:
 
 class _ConnectionFenceEmbedder:
     """Embedder that records the asyncpg pool's in-flight connection count
-    each time `embed_many` is invoked.
+    each time `embed_documents` is invoked.
 
     The fence: in-flight count must be 0 during the embed call. Anything else
     means a `with_tenant` (or raw_conn) block is holding a connection across
-    the OpenAI round trip — the exact bug from 2026-04-29.
+    the Gemini round trip — the exact bug from 2026-04-29.
     """
 
     def __init__(self, dim: int = EMBEDDING_DIM) -> None:
         self.calls: list[int] = []
         self._dim = dim
 
-    async def embed_many(self, texts: list[str]) -> EmbedResult:
+    async def embed_documents(self, items: list) -> EmbedResult:
         pool = db_module.get_pool()
         # asyncpg.Pool exposes get_size (total connections owned) and
         # get_idle_size (those not currently checked out). Their difference
@@ -94,7 +94,7 @@ class _ConnectionFenceEmbedder:
         return EmbedResult(
             embedded=[
                 EmbeddedChunk(chunk_index=i, embedding=[0.0] * self._dim)
-                for i in range(len(texts))
+                for i in range(len(items))
             ],
             failed=[],
         )
@@ -129,10 +129,10 @@ async def test_embed_many_runs_with_no_db_connection_in_flight(live_db) -> None:
     )
 
     assert embedder.calls, (
-        "embed_many should have been called at least once for the slack message"
+        "embed_documents should have been called at least once for the slack message"
     )
     assert all(c == 0 for c in embedder.calls), (
-        "asyncpg connection in flight during embed_many — Phase A txn fence is "
+        "asyncpg connection in flight during embed_documents — Phase A txn fence is "
         f"broken. Per-call in_flight counts: {embedder.calls!r}. The embed "
         "call must run AFTER `with_tenant` exits, not inside it."
     )

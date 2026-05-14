@@ -30,7 +30,7 @@ from datetime import datetime
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_DIRECTED
 from shared.db import with_tenant
-from shared.embeddings import get_embedder
+from shared.embeddings import get_embedder_v2
 from shared.models import TemporalSpec, normalize_author_id
 
 
@@ -74,8 +74,17 @@ async def directed_search(
     is None the caller gets latest-live doc semantics by default
     (TemporalSpec()).
     """
-    embedder = get_embedder()
-    query_vec = await embedder.embed_query(query_text)
+    embedder = get_embedder_v2()
+    # Symmetric phrase matching: directed_vectors stores trigger phrases
+    # via `embed_many` (no doc prefix). Querying with `embed_query` would
+    # apply Gemini's "task: search result | query: ..." prefix, putting the
+    # two sides in different vector subspaces. Use `embed_many` on the
+    # query too so both sides are unprefixed — directed phrases are short
+    # paraphrases, not chunk/query asymmetric retrieval.
+    query_vecs = await embedder.embed_many([query_text])
+    if not query_vecs.embedded:
+        return []
+    query_vec = query_vecs.embedded[0].embedding
     literal = "[" + ",".join(f"{x:.7f}" for x in query_vec) + "]"
 
     spec = temporal or TemporalSpec()

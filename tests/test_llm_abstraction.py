@@ -127,6 +127,80 @@ async def test_gateway_url_sets_api_base_for_embedding(
 
 
 @pytest.mark.asyncio
+async def test_gateway_embedding_forces_openai_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin (2026-05-14 cutover): when the gateway is set,
+    `aembedding` must force `custom_llm_provider="openai"` regardless of
+    the model's provider prefix.
+
+    Without this, LiteLLM SDK picks the wire shape from the prefix —
+    `gemini/...` builds the Gemini-native URL
+    `/v1beta/models/<m>:batchEmbedContents` against the proxy, which
+    answers FastAPI 405 because it only serves `/embeddings`. The proxy
+    routes the call to the real Gemini upstream via its own `model_list`,
+    so the SDK should speak OpenAI HTTP regardless of the model prefix.
+    """
+    monkeypatch.setenv("LLM_GATEWAY_URL", "https://customer-proxy.example.com")
+    fake = AsyncMock(return_value="resp")
+    with patch.object(llm.litellm, "aembedding", fake):
+        await aembedding("gemini/gemini-embedding-2", ["x"])
+    assert fake.await_args.kwargs["api_base"] == "https://customer-proxy.example.com"
+    assert fake.await_args.kwargs["custom_llm_provider"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_no_gateway_does_not_force_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct-provider mode (no gateway): SDK picks the provider from the
+    model prefix. We must NOT inject `custom_llm_provider` — that would
+    override the SDK's correct gemini routing and break the dev path."""
+    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
+    fake = AsyncMock(return_value="resp")
+    with patch.object(llm.litellm, "aembedding", fake):
+        await aembedding("gemini/gemini-embedding-2", ["x"])
+    assert "custom_llm_provider" not in fake.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_caller_api_base_does_not_force_openai_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider override is scoped to env-injected gateway URLs only.
+    A caller passing an explicit `api_base` (e.g. pointing at a Vertex AI
+    endpoint or a non-LiteLLM proxy) is trusted to pick its own
+    `custom_llm_provider`. Without this scoping, the override would
+    silently route caller-supplied endpoints through OpenAI wire shape."""
+    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
+    fake = AsyncMock(return_value="resp")
+    with patch.object(llm.litellm, "aembedding", fake):
+        await aembedding(
+            "gemini/gemini-embedding-2",
+            ["x"],
+            api_base="https://my-custom-gemini-endpoint.example.com",
+        )
+    assert fake.await_args.kwargs["api_base"] == "https://my-custom-gemini-endpoint.example.com"
+    assert "custom_llm_provider" not in fake.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_caller_custom_llm_provider_wins_over_gateway_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If a caller explicitly passes `custom_llm_provider`, that wins. The
+    gateway injection is a default, not an override (mirrors the api_base
+    / api_key precedence rules)."""
+    monkeypatch.setenv("LLM_GATEWAY_URL", "https://customer-proxy.example.com")
+    fake = AsyncMock(return_value="resp")
+    with patch.object(llm.litellm, "aembedding", fake):
+        await aembedding(
+            "gemini/gemini-embedding-2", ["x"], custom_llm_provider="gemini"
+        )
+    assert fake.await_args.kwargs["custom_llm_provider"] == "gemini"
+
+
+@pytest.mark.asyncio
 async def test_no_gateway_url_means_no_api_base(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

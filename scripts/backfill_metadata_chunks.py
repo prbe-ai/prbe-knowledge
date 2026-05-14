@@ -31,7 +31,7 @@ from services.ingestion.normalizer import (
 )
 from shared.config import get_settings
 from shared.db import close_pool, init_pool, raw_conn, with_tenant
-from shared.embeddings import get_embedder
+from shared.embeddings import get_embedder_v2
 from shared.exceptions import EmbeddingError
 from shared.logging import configure_logging, get_logger
 from shared.models import (
@@ -134,7 +134,7 @@ async def _backfill_tenant(
     customer_id: str, batch_size: int, dry_run: bool
 ) -> tuple[int, int, int]:
     """Returns (skipped, embedded, failed)."""
-    embedder = get_embedder()
+    embedder = get_embedder_v2()
     embedded = 0
     failed = 0
     skipped = 0
@@ -160,8 +160,15 @@ async def _backfill_tenant(
         # Embed FIRST. If embed fails permanently, record to failed_chunks
         # and move on. Transient errors raise and cause the loop to surface
         # the exception — operator restarts.
+        #
+        # Use embed_documents (not embed_many) so the Gemini doc-side prefix
+        # is applied — keeps these metadata-chunk vectors in the same
+        # subspace as content chunks the normalizer writes.
+        from shared.embeddings import DocItem
         try:
-            embeds = await embedder.embed_many([piece.content])
+            embeds = await embedder.embed_documents(
+                [DocItem(content=piece.content, title=doc.title)]
+            )
         except EmbeddingError:
             log.exception(
                 "backfill_metadata.embed_failed",

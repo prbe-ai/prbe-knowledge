@@ -39,7 +39,7 @@ preferred because it's unambiguous:
   - OpenAI      -> ``openai/text-embedding-3-large`` /
                    ``openai/gpt-4o-mini`` etc.
   - Google      -> ``gemini/gemini-3-flash-preview`` /
-                   ``gemini/gemini-embedding-2-preview``
+                   ``gemini/gemini-embedding-2``
 
 Bare ids that are unambiguous (e.g. ``text-embedding-3-large`` ->
 OpenAI by SDK convention, ``claude-sonnet-4-6`` -> Anthropic) work too,
@@ -293,7 +293,7 @@ async def aembedding(
     model : str
         LiteLLM model id. Examples:
         ``openai/text-embedding-3-large``,
-        ``gemini/gemini-embedding-2-preview``.
+        ``gemini/gemini-embedding-2``.
     input : list[str]
         The texts to embed. LiteLLM batches these into a single
         provider call where the provider supports it.
@@ -312,8 +312,34 @@ async def aembedding(
     ------
     LLMError
         See ``acompletion``.
+
+    Gateway transport
+    -----------------
+    When ``LLM_GATEWAY_URL`` is set, embedding calls route through the
+    central LiteLLM proxy. The proxy is OpenAI-compatible on
+    ``POST /embeddings`` and resolves the requested model id via its own
+    ``model_list`` (so a ``gemini-embedding-*`` request lands on Gemini
+    upstream). The LiteLLM SDK, however, picks its wire format from the
+    model's provider prefix: a ``gemini/...`` model would otherwise build
+    the Gemini-native URL ``/v1beta/models/<m>:batchEmbedContents`` and
+    POST that against the proxy — which doesn't serve that path and
+    answers FastAPI 405 ``{"detail":"Method Not Allowed"}``. We force
+    ``custom_llm_provider="openai"`` so the SDK uses the OpenAI wire
+    shape against the proxy regardless of model prefix. Routing to the
+    real upstream happens inside the proxy.
+
+    Scope of the override: ONLY when ``_maybe_inject_gateway`` injects
+    ``api_base`` from ``LLM_GATEWAY_URL``. A caller who passes an
+    explicit ``api_base`` (e.g. pointing at a non-LiteLLM provider's
+    OpenAI-compatible endpoint, or at the Google Vertex AI gateway with
+    different wire semantics) is trusted to also pick the right
+    ``custom_llm_provider`` and gets no override.
     """
+    caller_set_api_base = "api_base" in kwargs
     kwargs = _maybe_inject_gateway(kwargs)
+    gateway_injected = not caller_set_api_base and "api_base" in kwargs
+    if gateway_injected and "custom_llm_provider" not in kwargs:
+        kwargs["custom_llm_provider"] = "openai"
     try:
         return await litellm.aembedding(model=model, input=input, **kwargs)
     except _LiteLLMBaseError as exc:

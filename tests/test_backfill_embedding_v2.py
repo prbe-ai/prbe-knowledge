@@ -222,7 +222,7 @@ async def test_backfill_populates_null_chunk(live_db) -> None:
                 cust,
             )
             assert row["embedding_v2"] is not None
-            assert row["embedding_v2_model"] == "google/gemini-embedding-2-preview"
+            assert row["embedding_v2_model"] == "google/gemini-embedding-2"
             assert row["embedding_v2_dim"] == 3072
     finally:
         await _cleanup(cust)

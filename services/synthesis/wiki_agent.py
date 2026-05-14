@@ -58,7 +58,7 @@ from shared.constants import (
     SourceSystem,
 )
 from shared.db import with_tenant
-from shared.embeddings import Embedder
+from shared.embeddings import GeminiEmbedder, get_embedder_v2
 from shared.exceptions import ToolValidationError
 from shared.locks import advisory_lock_key
 from shared.logging import get_logger
@@ -110,7 +110,7 @@ class WikiAgentRuntime:
         run_kind: str,
         ctx: ConnectorContext | None = None,
         store: ObjectStore | None = None,
-        embedder: Embedder | None = None,
+        embedder: GeminiEmbedder | None = None,
         normalizer: Normalizer | None = None,
     ) -> None:
         self.customer_id = customer_id
@@ -874,7 +874,7 @@ async def regenerate_wiki_index(
     """
     if normalizer is None:
         ctx = make_default_context()
-        normalizer = Normalizer(ctx, store=get_store(), embedder=Embedder())
+        normalizer = Normalizer(ctx, store=get_store(), embedder=get_embedder_v2())
 
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(
