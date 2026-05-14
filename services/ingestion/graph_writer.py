@@ -13,6 +13,38 @@ import orjson
 from shared.models import GraphEdgeSpec, GraphNodeSpec
 
 
+async def _fetch_aliases(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    keys: list[tuple[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Bulk-resolve `(label, canonical_id) → primary_canonical_id` for aliased keys.
+
+    Returned dict only contains entries for keys that ARE aliases. Non-aliased
+    keys are absent; callers should treat absence as "no rewrite needed."
+
+    One bulk query per call regardless of input size — entity_aliases is
+    typically O(100s) of rows per tenant; the (customer_id, label,
+    alias_canonical_id) PK answers this with an index-only scan.
+    """
+    if not keys:
+        return {}
+    labels = [k[0] for k in keys]
+    aliases = [k[1] for k in keys]
+    rows = await conn.fetch(
+        """
+        SELECT label, alias_canonical_id, primary_canonical_id
+        FROM entity_aliases
+        WHERE customer_id = $1
+          AND (label, alias_canonical_id) IN (
+                SELECT * FROM UNNEST($2::text[], $3::text[])
+              )
+        """,
+        customer_id, labels, aliases,
+    )
+    return {(r["label"], r["alias_canonical_id"]): r["primary_canonical_id"] for r in rows}
+
+
 async def upsert_nodes(
     conn: asyncpg.Connection,
     customer_id: str,
@@ -36,6 +68,20 @@ async def upsert_nodes(
     """
     if not nodes:
         return {}
+
+    # Alias resolution: if any inbound (label, canonical_id) is an alias of
+    # a merged cluster, rewrite to the primary BEFORE the existing dedup
+    # logic. Empty entity_aliases → no-op.
+    alias_map = await _fetch_aliases(
+        conn,
+        customer_id,
+        keys=[(n.label.value, n.canonical_id) for n in nodes],
+    )
+    if alias_map:
+        for n in nodes:
+            primary = alias_map.get((n.label.value, n.canonical_id))
+            if primary is not None:
+                n.canonical_id = primary
 
     # Dedupe: ON CONFLICT DO UPDATE cannot affect the same row twice in one
     # statement, so collapse repeated (label, canonical_id) entries here.
@@ -129,24 +175,57 @@ async def upsert_edges(
     if not edges:
         return 0
 
-    # Resolve endpoints + dedupe. ON CONFLICT DO UPDATE can't touch the same
-    # row twice in one statement, so collapse repeated
-    # (edge_type, from_node_id, to_node_id) entries here. Merge semantics
-    # match the prior loop: shallow JSONB merge on properties (later wins on
-    # key collision), `LEAST` on valid_from, last-seen on valid_to.
+    # Alias resolution for both endpoints. Populate aliased_from/to on
+    # the spec object so the INSERT row carries the original alias.
+    endpoint_keys: list[tuple[str, str]] = []
+    for e in edges:
+        endpoint_keys.append((e.from_label.value, e.from_canonical_id))
+        endpoint_keys.append((e.to_label.value, e.to_canonical_id))
+    alias_map = await _fetch_aliases(conn, customer_id, endpoint_keys)
+
+    if alias_map:
+        kept: list[GraphEdgeSpec] = []
+        for e in edges:
+            from_primary = alias_map.get((e.from_label.value, e.from_canonical_id))
+            to_primary = alias_map.get((e.to_label.value, e.to_canonical_id))
+            if from_primary is not None:
+                e.aliased_from_canonical_id = e.from_canonical_id
+                e.from_canonical_id = from_primary
+            if to_primary is not None:
+                e.aliased_to_canonical_id = e.to_canonical_id
+                e.to_canonical_id = to_primary
+            # Self-loop after resolution → drop (matches Lane B Rule 5 +
+            # the system-wide "no self-edges" convention).
+            if (
+                e.from_label == e.to_label
+                and e.from_canonical_id == e.to_canonical_id
+            ):
+                continue
+            kept.append(e)
+        edges = kept
+
+    # Resolve endpoints + dedupe. Composite UNIQUE means different alias
+    # lanes (same edge_type/from/to but different aliased_from_canonical_id)
+    # coexist; the dedup key must reflect that so two webhook events from
+    # different alias origins don't collapse into one entry.
+    # Merge semantics match the prior loop: shallow JSONB merge on
+    # properties (later wins on key collision), `LEAST` on valid_from,
+    # last-seen on valid_to.
     # Confidence semantics on dedupe + conflict: never demote. If the
     # batch contains both an EXTRACTED and an AMBIGUOUS assertion of the
     # same edge (one extractor resolved it, a sibling didn't), EXTRACTED
     # wins. Same rule on ON CONFLICT — an existing EXTRACTED row stays
     # EXTRACTED even if a later AMBIGUOUS write touches it.
     # Order: EXTRACTED > INFERRED > AMBIGUOUS.
-    deduped: dict[tuple[str, int, int], dict] = {}
+    deduped: dict[tuple[str, int, int, str, str], dict] = {}
     for edge in edges:
         from_id = node_ids.get((edge.from_label.value, edge.from_canonical_id))
         to_id = node_ids.get((edge.to_label.value, edge.to_canonical_id))
         if from_id is None or to_id is None:
             continue
-        key = (edge.edge_type.value, from_id, to_id)
+        aliased_from = edge.aliased_from_canonical_id or ""
+        aliased_to = edge.aliased_to_canonical_id or ""
+        key = (edge.edge_type.value, from_id, to_id, aliased_from, aliased_to)
         existing = deduped.get(key)
         if existing is None:
             deduped[key] = {
@@ -154,6 +233,8 @@ async def upsert_edges(
                 "valid_from": edge.valid_from,
                 "valid_to": edge.valid_to,
                 "confidence": edge.confidence,
+                "aliased_from": edge.aliased_from_canonical_id,
+                "aliased_to": edge.aliased_to_canonical_id,
             }
         else:
             existing["properties"] = {**existing["properties"], **edge.properties}
@@ -180,6 +261,8 @@ async def upsert_edges(
     valid_from_list = [deduped[k]["valid_from"] for k in sorted_keys]
     valid_to_list = [deduped[k]["valid_to"] for k in sorted_keys]
     confidences = [deduped[k]["confidence"] for k in sorted_keys]
+    aliased_from_list = [deduped[k]["aliased_from"] for k in sorted_keys]
+    aliased_to_list = [deduped[k]["aliased_to"] for k in sorted_keys]
 
     # Use RETURNING to detect genuine INSERTs vs ON CONFLICT merges.
     # xmax = 0 on the returning row means a fresh insert (no existing tuple
@@ -191,16 +274,25 @@ async def upsert_edges(
         INSERT INTO graph_edges (
             customer_id, edge_type, from_node_id, to_node_id,
             properties, valid_from, valid_to, source_system, confidence,
-            extractor_id, extracted_at
+            extractor_id, extracted_at,
+            aliased_from_canonical_id, aliased_to_canonical_id
         )
         SELECT $1, edge_type, from_node_id, to_node_id,
                properties::jsonb, COALESCE(valid_from, NOW()), valid_to, $2, confidence,
-               $10, $11
+               $10, $11,
+               aliased_from, aliased_to
         FROM unnest(
             $3::text[], $4::bigint[], $5::bigint[],
-            $6::text[], $7::timestamptz[], $8::timestamptz[], $9::text[]
-        ) AS t(edge_type, from_node_id, to_node_id, properties, valid_from, valid_to, confidence)
-        ON CONFLICT (customer_id, edge_type, from_node_id, to_node_id)
+            $6::text[], $7::timestamptz[], $8::timestamptz[], $9::text[],
+            $12::text[], $13::text[]
+        ) AS t(edge_type, from_node_id, to_node_id,
+               properties, valid_from, valid_to, confidence,
+               aliased_from, aliased_to)
+        ON CONFLICT (
+            customer_id, edge_type, from_node_id, to_node_id,
+            COALESCE(aliased_from_canonical_id, ''),
+            COALESCE(aliased_to_canonical_id, '')
+        )
         DO UPDATE SET
             properties = graph_edges.properties || EXCLUDED.properties,
             valid_from = LEAST(graph_edges.valid_from, EXCLUDED.valid_from),
@@ -226,6 +318,8 @@ async def upsert_edges(
         confidences,
         extractor_id,
         extracted_at,
+        aliased_from_list,
+        aliased_to_list,
     )
 
     # Collect all node_ids that are endpoints of genuinely-inserted edges.
