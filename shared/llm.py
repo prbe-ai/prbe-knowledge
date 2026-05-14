@@ -69,8 +69,8 @@ env var is also set. Two modes use this:
 
 Without ``LLM_GATEWAY_URL``, LiteLLM uses each provider's default
 endpoint and picks credentials out of the standard env vars
-(``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``, ``GOOGLE_API_KEY`` /
-``GEMINI_API_KEY``) — the dev / self-host-with-own-keys path. A
+(``ANTHROPIC_API_KEY``, ``OPENAI_API_KEY``, ``GOOGLE_API_KEY``) — the
+dev / self-host-with-own-keys path. A
 ``LLM_GATEWAY_KEY`` without a ``LLM_GATEWAY_URL`` is ignored. A per-call
 ``api_base`` / ``api_key`` kwarg always wins over the env.
 """
