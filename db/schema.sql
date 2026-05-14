@@ -969,7 +969,7 @@ CREATE POLICY custom_ingest_tokens_tenant_isolation ON custom_ingest_tokens
 -- update per 5 minutes to keep verification cheap on hot paths.
 CREATE OR REPLACE FUNCTION verify_and_touch_custom_ingest_token(p_token_hash text)
 RETURNS TABLE(token_id uuid, customer_id text)
--- search_path: public FIRST — app tables live in public. Migration 0067
+-- search_path: public FIRST — app tables live in public. Migration 0071
 -- moved them out of ag_catalog (where the AGE extension hijack had
 -- landed them at migrate time during CREATE EXTENSION age); ag_catalog
 -- stays in the list as a fallback for AGE's own catalog access.

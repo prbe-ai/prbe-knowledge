@@ -27,7 +27,7 @@ target_metadata = None
 # ag_catalog instead of public. Public-first means new tables land in
 # public; ag_catalog stays in the list so AGE's own catalog access
 # (e.g. ``ag_label``) still resolves unqualified within migration
-# bodies. See migration ``0067_move_app_tables_to_public`` for the
+# bodies. See migration ``0071_move_app_tables_to_public`` for the
 # sweep that fixed the pre-existing drift.
 _PIN_SEARCH_PATH_SQL = "SET search_path = public, ag_catalog"
 

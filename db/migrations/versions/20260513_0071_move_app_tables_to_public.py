@@ -111,23 +111,37 @@ APP_TABLES: tuple[str, ...] = (
 def _move_one(tbl: str, src: str, dst: str) -> str:
     """Build an idempotent ALTER TABLE ... SET SCHEMA DO-block.
 
-    Only fires when the table still exists in ``src`` AND does not yet
-    exist in ``dst``. Both halves of the guard matter — a partial replay
-    after a crash could leave the table already in ``dst``; the second
-    half prevents a same-name collision from raising.
+    Branch logic:
+      * src has it, dst doesn't  → ALTER TABLE SET SCHEMA (the normal case).
+      * src missing, dst has it  → no-op (idempotent re-run after success).
+      * src missing, dst missing → no-op (SQLite path / fresh DB without the table).
+      * src AND dst both have it → RAISE EXCEPTION. This is split-brain
+        (a manually-recovered backup or an out-of-band restore that
+        doubled up rows during a crash); silent skip would leave a
+        ghost copy in the wrong schema. Fail loudly so an operator
+        reconciles before the migration claims success.
     """
     return f"""
         DO $$
+        DECLARE
+            in_src BOOLEAN;
+            in_dst BOOLEAN;
         BEGIN
-            IF EXISTS (
+            in_src := EXISTS (
                 SELECT 1 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE c.relname = '{tbl}' AND n.nspname = '{src}'
-            ) AND NOT EXISTS (
+            );
+            in_dst := EXISTS (
                 SELECT 1 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE c.relname = '{tbl}' AND n.nspname = '{dst}'
-            ) THEN
+            );
+            IF in_src AND in_dst THEN
+                RAISE EXCEPTION
+                    'split-brain: % exists in both {src} and {dst} -- manual reconciliation required',
+                    '{tbl}';
+            ELSIF in_src AND NOT in_dst THEN
                 EXECUTE 'ALTER TABLE {src}.{tbl} SET SCHEMA {dst}';
             END IF;
         END $$;
@@ -148,17 +162,25 @@ def upgrade() -> None:
     # of the chain regardless).
     op.execute('SET LOCAL search_path TO public, ag_catalog')
 
+    # Fail fast if any table is locked by a concurrent transaction. The
+    # data-plane chart has NO migrate Job — this migration runs via
+    # kubectl exec against a Postgres serving live traffic, so a
+    # contended ALTER TABLE could otherwise hang indefinitely on
+    # AccessExclusiveLock and stall the deploy. 5s is enough to outlast
+    # any reasonable request handler; longer waits should bail and let
+    # an operator pick a quieter window.
+    op.execute("SET LOCAL lock_timeout = '5s'")
+
     for tbl in APP_TABLES:
         op.execute(_move_one(tbl, "ag_catalog", "public"))
 
-    # Flip the SECURITY DEFINER function's per-call search_path to
-    # public-first now that the table it touches lives there. The
-    # 0066 setting (``ag_catalog, "$user", public``) would keep working
-    # because public is still in the list, but the semantic order is
-    # wrong post-move — public is where the table is, ag_catalog is
-    # only there as a fallback for AGE's own catalog access.
+    # Schema-qualified — the function was created in ag_catalog by 0046
+    # (AGE hijack landed it there) and 0066 altered its per-call
+    # search_path without moving it. Don't rely on search_path
+    # resolution for this ALTER FUNCTION; a same-named function in
+    # public would silently mis-target.
     op.execute(
-        'ALTER FUNCTION verify_and_touch_custom_ingest_token(text) '
+        'ALTER FUNCTION ag_catalog.verify_and_touch_custom_ingest_token(text) '
         'SET search_path = public, "$user", ag_catalog'
     )
 
@@ -169,11 +191,12 @@ def downgrade() -> None:
         return
 
     op.execute('SET LOCAL search_path TO ag_catalog, public')
+    op.execute("SET LOCAL lock_timeout = '5s'")
 
     # Restore 0066's setting first so the function points at ag_catalog
-    # before we move tables back.
+    # before we move tables back. Schema-qualified — see upgrade() note.
     op.execute(
-        'ALTER FUNCTION verify_and_touch_custom_ingest_token(text) '
+        'ALTER FUNCTION ag_catalog.verify_and_touch_custom_ingest_token(text) '
         'SET search_path = ag_catalog, "$user", public'
     )
 
