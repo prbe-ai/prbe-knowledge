@@ -817,16 +817,24 @@ class GitHubConnector(Connector):
         token: IntegrationToken,
         cursor: str | None = None,
     ):
-        """Historical GitHub backfill — walks installation repos, PRs, and issues.
+        """Historical GitHub backfill — walks installation repos, PRs, issues,
+        reviews, commits, and releases.
 
         When `token.scope` starts with `installation:` we fetch a fresh App
         installation bearer from prbe-backend (via `shared.backend_client`).
         Otherwise we use `token.access_token` verbatim (legacy / test path).
 
+        Phase order per repo: pulls → issues → reviews → commits → releases.
+        Reviews iterate the PRs collected during the pulls phase (no repo-wide
+        reviews endpoint exists in the REST API). Commits walk the default
+        branch only — non-default branches' commit history is intentionally
+        out of scope (forward push webhooks cover them when they merge).
+
         Resumable via the `cursor` arg: an opaque JSON blob capturing which
-        repos remain, the current repo + phase (pulls/issues), and the next
-        page URL. Yields synthetic WebhookEvents shaped like live webhook
-        deliveries so the normalizer has one code path.
+        repos remain, the current repo + phase, the next page URL, the
+        per-phase sub-state (review_prs_remaining + review_current_pr +
+        default_branch). Yields synthetic WebhookEvents shaped like live
+        webhook deliveries so the normalizer has one code path.
         """
         import asyncio as _asyncio
         import json as _json
@@ -859,13 +867,18 @@ class GitHubConnector(Connector):
                         continue
                     repo_objs[full_name] = next_repo
                     state["current_repo"] = full_name
+                    state["default_branch"] = next_repo.get("default_branch") or "main"
                 else:
                     state["current_repo"] = next_repo
+                    state["default_branch"] = "main"
                 state["current_phase"] = "pulls"
                 state["next_url"] = (
                     f"{_GITHUB_API}/repos/{state['current_repo']}/pulls"
                     "?state=all&sort=updated&direction=desc&per_page=100"
                 )
+                # Reset reviews sub-state for the new repo.
+                state["review_prs_remaining"] = []
+                state["review_current_pr"] = None
                 state["repo_objs"] = repo_objs
 
             full_name = state["current_repo"]
@@ -873,6 +886,7 @@ class GitHubConnector(Connector):
 
             url = state["next_url"]
             if not url:
+                # Phase machine: pulls → issues → reviews → commits → releases → next repo.
                 if state["current_phase"] == "pulls":
                     state["current_phase"] = "issues"
                     state["next_url"] = (
@@ -880,9 +894,44 @@ class GitHubConnector(Connector):
                         "?state=all&sort=updated&direction=desc&per_page=100"
                     )
                     continue
+                if state["current_phase"] == "issues":
+                    state["current_phase"] = "reviews"
+                    # Drain one PR at a time below.
+                    state["review_current_pr"] = None
+                    state["next_url"] = None
+                    # Fall through: the reviews branch below will advance
+                    # to the next PR (or skip the phase if none).
+                if state["current_phase"] == "reviews":
+                    if state["review_prs_remaining"]:
+                        nxt = state["review_prs_remaining"].pop(0)
+                        state["review_current_pr"] = nxt
+                        state["next_url"] = (
+                            f"{_GITHUB_API}/repos/{full_name}/pulls/{nxt}/reviews"
+                            "?per_page=100"
+                        )
+                        continue
+                    # No more PRs to review → advance to commits.
+                    state["current_phase"] = "commits"
+                    state["review_current_pr"] = None
+                    branch = state.get("default_branch") or "main"
+                    state["next_url"] = (
+                        f"{_GITHUB_API}/repos/{full_name}/commits"
+                        f"?sha={branch}&per_page=100"
+                    )
+                    continue
+                if state["current_phase"] == "commits":
+                    state["current_phase"] = "releases"
+                    state["next_url"] = (
+                        f"{_GITHUB_API}/repos/{full_name}/releases?per_page=100"
+                    )
+                    continue
+                # `releases` done (or any unknown phase falls here) → next repo.
                 state["current_repo"] = None
                 state["current_phase"] = "pulls"
                 state["next_url"] = None
+                state["review_prs_remaining"] = []
+                state["review_current_pr"] = None
+                state["default_branch"] = None
                 repo_objs.pop(full_name, None)
                 state["repo_objs"] = repo_objs
                 continue
@@ -937,14 +986,20 @@ class GitHubConnector(Connector):
                 state["next_url"] = None
                 continue
 
+            phase = state["current_phase"]
             for row in rows:
                 if not isinstance(row, dict):
                     continue
-                if state["current_phase"] == "pulls":
+                if phase == "pulls":
                     number = row.get("number")
                     updated_at = row.get("updated_at")
                     if number is None or not updated_at:
                         continue
+                    # Stash the PR number so the reviews phase can fetch
+                    # /pulls/{number}/reviews after issues completes. Done
+                    # before the yield so a CancelledError mid-yield still
+                    # leaves the PR queued in the resumed cursor.
+                    state["review_prs_remaining"].append(number)
                     raw_payload = {
                         "action": "opened",
                         "repository": repo,
@@ -963,7 +1018,7 @@ class GitHubConnector(Connector):
                         raw_payload=raw_payload,
                         headers={"X-GitHub-Event": _EVENT_PULL_REQUEST},
                     )
-                else:
+                elif phase == "issues":
                     # GitHub's /issues endpoint returns PRs as issues (with a
                     # `pull_request` field). Skip those — they're covered in
                     # the pulls phase above.
@@ -988,6 +1043,93 @@ class GitHubConnector(Connector):
                         payload_s3_key="",
                         raw_payload=raw_payload,
                         headers={"X-GitHub-Event": _EVENT_ISSUES},
+                    )
+                elif phase == "reviews":
+                    review_id = row.get("id")
+                    if review_id is None:
+                        continue
+                    pr_number = state["review_current_pr"]
+                    if pr_number is None:
+                        # Defensive — shouldn't happen if state machine is
+                        # consistent. Skip rather than emit a malformed event.
+                        continue
+                    submitted_at = (
+                        row.get("submitted_at") or row.get("created_at") or ""
+                    )
+                    raw_payload = {
+                        "action": "submitted",
+                        "repository": repo,
+                        # _normalize_review only reads pr.get("number") off
+                        # this; richer fields aren't needed for backfilled
+                        # reviews.
+                        "pull_request": {"number": pr_number},
+                        "review": row,
+                        "_cursor": _json.dumps(state),
+                    }
+                    source_event_id = (
+                        f"pr_review:{full_name}:{pr_number}:{review_id}"
+                    )
+                    yield WebhookEvent(
+                        customer_id=customer_id,
+                        source_system=SourceSystem.GITHUB,
+                        source_event_id=source_event_id,
+                        received_at=_parse_iso8601(submitted_at) if submitted_at else datetime.now(UTC),
+                        payload_s3_key="",
+                        raw_payload=raw_payload,
+                        headers={"X-GitHub-Event": _EVENT_PR_REVIEW},
+                    )
+                elif phase == "commits":
+                    sha = row.get("sha")
+                    if not isinstance(sha, str) or not sha:
+                        continue
+                    push_commit = _rest_commit_to_push_commit(row)
+                    commit_ts = push_commit["timestamp"]
+                    raw_payload = {
+                        "ref": f"refs/heads/{state.get('default_branch') or 'main'}",
+                        "repository": repo,
+                        "commits": [push_commit],
+                        "head_commit": push_commit,
+                        "_cursor": _json.dumps(state),
+                    }
+                    source_event_id = (
+                        f"push:{full_name}:{sha}:{commit_ts}:"
+                        f"{_payload_fp(push_commit)}"
+                    )
+                    yield WebhookEvent(
+                        customer_id=customer_id,
+                        source_system=SourceSystem.GITHUB,
+                        source_event_id=source_event_id,
+                        received_at=_parse_iso8601(commit_ts) if commit_ts else datetime.now(UTC),
+                        payload_s3_key="",
+                        raw_payload=raw_payload,
+                        headers={"X-GitHub-Event": _EVENT_PUSH},
+                    )
+                elif phase == "releases":
+                    release_id = row.get("id")
+                    if release_id is None:
+                        continue
+                    created_at = (
+                        row.get("published_at") or row.get("created_at") or ""
+                    )
+                    raw_payload = {
+                        # `published` is the live-webhook action that
+                        # _normalize_release treats as a create; "deleted"
+                        # and "unpublished" are the delete-side actions and
+                        # we explicitly avoid those here.
+                        "action": "published",
+                        "repository": repo,
+                        "release": row,
+                        "_cursor": _json.dumps(state),
+                    }
+                    source_event_id = f"release:{full_name}:{release_id}"
+                    yield WebhookEvent(
+                        customer_id=customer_id,
+                        source_system=SourceSystem.GITHUB,
+                        source_event_id=source_event_id,
+                        received_at=_parse_iso8601(created_at) if created_at else datetime.now(UTC),
+                        payload_s3_key="",
+                        raw_payload=raw_payload,
+                        headers={"X-GitHub-Event": _EVENT_RELEASE},
                     )
 
             state["next_url"] = _next_link(resp)
@@ -2155,6 +2297,17 @@ def _decode_github_cursor(cursor: str | None) -> dict:
         "current_phase": "pulls",
         "next_url": None,
         "repo_objs": {},
+        # PR numbers seen during the pulls phase; drained one-by-one during
+        # the reviews phase. Empty list = nothing to review-paginate for
+        # the current repo.
+        "review_prs_remaining": [],
+        # The PR currently being reviews-paginated (so the loop resumes on
+        # the same PR after a heartbeat-bounded restart).
+        "review_current_pr": None,
+        # Captured from the installation repo metadata; used to scope the
+        # commits phase to the repo's default branch (otherwise GitHub
+        # would walk every ref, blowing up the page count).
+        "default_branch": None,
     }
     if not cursor:
         return default
@@ -2167,6 +2320,37 @@ def _decode_github_cursor(cursor: str | None) -> dict:
     for key, value in default.items():
         parsed.setdefault(key, value)
     return parsed
+
+
+def _rest_commit_to_push_commit(rest: Mapping[str, Any]) -> dict[str, Any]:
+    """Reshape a GET /repos/.../commits row into the push-webhook commit shape.
+
+    `_commit_to_doc` (and the rest of `_normalize_push`) expects keys laid
+    out the way the push webhook sends them — `id`, `message`, `timestamp`,
+    `author.username`, `url`, plus `added/modified/removed` file lists. The
+    REST /commits endpoint nests differently and doesn't return file lists
+    at all (those require a per-commit GET /commits/{sha} which we skip to
+    avoid N+1 fetches; the live push webhook will fill in file deltas for
+    new commits going forward).
+    """
+    commit = rest.get("commit") or {}
+    author = commit.get("author") or {}
+    gh_user = rest.get("author") or {}
+    return {
+        "id": rest.get("sha", ""),
+        "message": commit.get("message", ""),
+        "timestamp": author.get("date", ""),
+        "author": {
+            "name": author.get("name", ""),
+            "email": author.get("email", ""),
+            "username": gh_user.get("login") if isinstance(gh_user, Mapping) else None,
+        },
+        "url": rest.get("html_url", ""),
+        # File-deltas are intentionally empty for backfilled commits.
+        "added": [],
+        "modified": [],
+        "removed": [],
+    }
 
 
 def _header(headers: Mapping[str, str], name: str) -> str | None:

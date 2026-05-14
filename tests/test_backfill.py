@@ -1448,6 +1448,230 @@ async def test_github_backfill_paginates_repos_pulls_and_issues() -> None:
 
 
 @pytest.mark.asyncio
+async def test_github_backfill_full_phase_order_pulls_issues_reviews_commits_releases() -> None:
+    """End-to-end phase machine: pulls -> issues -> reviews -> commits -> releases.
+
+    - Reviews phase fetches /pulls/{n}/reviews for each PR collected during pulls
+    - Commits phase walks /commits?sha=<default_branch>
+    - Releases phase walks /releases
+    - REST commit shape is reshaped to push-webhook shape (id/timestamp/author at top level)
+    """
+
+    def installation_repos(req):
+        return httpx.Response(
+            200,
+            json={
+                "repositories": [
+                    {
+                        "full_name": "acme/api",
+                        "name": "api",
+                        "owner": {"login": "acme"},
+                        "private": True,
+                        "default_branch": "trunk",
+                    },
+                ]
+            },
+        )
+
+    def pulls(req):
+        return httpx.Response(
+            200,
+            json=[
+                {"number": 1, "updated_at": "2026-04-01T00:00:00Z", "title": "pr1"},
+                {"number": 2, "updated_at": "2026-04-02T00:00:00Z", "title": "pr2"},
+            ],
+        )
+
+    def issues(req):
+        return httpx.Response(
+            200,
+            json=[
+                {"number": 10, "updated_at": "2026-04-03T00:00:00Z", "title": "i10"},
+            ],
+        )
+
+    def reviews_pr1(req):
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 9001,
+                    "state": "approved",
+                    "submitted_at": "2026-04-01T01:00:00Z",
+                    "user": {"login": "alice"},
+                    "body": "lgtm",
+                    "html_url": "https://github.com/acme/api/pull/1#pullrequestreview-9001",
+                },
+            ],
+        )
+
+    def reviews_pr2(req):
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 9002,
+                    "state": "changes_requested",
+                    "submitted_at": "2026-04-02T02:00:00Z",
+                    "user": {"login": "bob"},
+                    "body": "nope",
+                    "html_url": "https://github.com/acme/api/pull/2#pullrequestreview-9002",
+                },
+                {
+                    "id": 9003,
+                    "state": "approved",
+                    "submitted_at": "2026-04-02T03:00:00Z",
+                    "user": {"login": "carol"},
+                    "body": "fixed",
+                    "html_url": "https://github.com/acme/api/pull/2#pullrequestreview-9003",
+                },
+            ],
+        )
+
+    def commits(req):
+        # `sha=trunk` must be on the URL (default_branch from installation_repos)
+        assert "sha=trunk" in str(req.url), f"commits URL missing sha=trunk: {req.url}"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "sha": "abc123",
+                    "html_url": "https://github.com/acme/api/commit/abc123",
+                    "commit": {
+                        "author": {
+                            "name": "Alice",
+                            "email": "alice@acme.test",
+                            "date": "2026-04-05T10:00:00Z",
+                        },
+                        "message": "first commit",
+                    },
+                    "author": {"login": "alice"},
+                },
+            ],
+        )
+
+    def releases(req):
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 555,
+                    "tag_name": "v1.0",
+                    "name": "v1.0",
+                    "body": "first release",
+                    "html_url": "https://github.com/acme/api/releases/tag/v1.0",
+                    "created_at": "2026-04-10T00:00:00Z",
+                    "published_at": "2026-04-10T00:00:00Z",
+                    "author": {"login": "alice"},
+                },
+            ],
+        )
+
+    transport = _mock_transport(
+        {
+            ("GET", "/installation/repositories"): installation_repos,
+            ("GET", "/repos/acme/api/pulls"): pulls,
+            ("GET", "/repos/acme/api/issues"): issues,
+            ("GET", "/repos/acme/api/pulls/1/reviews"): reviews_pr1,
+            ("GET", "/repos/acme/api/pulls/2/reviews"): reviews_pr2,
+            ("GET", "/repos/acme/api/commits"): commits,
+            ("GET", "/repos/acme/api/releases"): releases,
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.GITHUB, access_token="x"
+    )
+
+    events = [e async for e in gh.backfill("cust", token)]
+    by_type: dict[str, list] = {}
+    for e in events:
+        by_type.setdefault(e.headers["X-GitHub-Event"], []).append(e)
+
+    # 2 PRs + 1 issue + 3 reviews (1 + 2) + 1 commit + 1 release = 8
+    assert len(events) == 8, [e.headers["X-GitHub-Event"] for e in events]
+    assert len(by_type["pull_request"]) == 2
+    assert len(by_type["issues"]) == 1
+    assert len(by_type["pull_request_review"]) == 3
+    assert len(by_type["push"]) == 1
+    assert len(by_type["release"]) == 1
+
+    # Phase order: pulls events fire before reviews fire (reviews need PR list first).
+    phases = [e.headers["X-GitHub-Event"] for e in events]
+    last_pr_idx = max(i for i, p in enumerate(phases) if p == "pull_request")
+    first_review_idx = next(i for i, p in enumerate(phases) if p == "pull_request_review")
+    assert last_pr_idx < first_review_idx
+
+    # Reviews carry the PR number they belong to.
+    review_pr_numbers = sorted(
+        e.raw_payload["pull_request"]["number"] for e in by_type["pull_request_review"]
+    )
+    assert review_pr_numbers == [1, 2, 2]
+
+    # Commit was reshaped into push-webhook form: top-level id/message/timestamp.
+    push_evt = by_type["push"][0]
+    head = push_evt.raw_payload["commits"][0]
+    assert head["id"] == "abc123"
+    assert head["message"] == "first commit"
+    assert head["timestamp"] == "2026-04-05T10:00:00Z"
+    assert head["author"]["username"] == "alice"
+    # No file deltas — backfill skips per-commit hydration.
+    assert head["added"] == [] and head["modified"] == [] and head["removed"] == []
+    # Ref reflects the repo's default_branch from installation metadata.
+    assert push_evt.raw_payload["ref"] == "refs/heads/trunk"
+
+    # Release event carries the release object.
+    rel_evt = by_type["release"][0]
+    assert rel_evt.raw_payload["action"] == "published"
+    assert rel_evt.raw_payload["release"]["id"] == 555
+
+
+@pytest.mark.asyncio
+async def test_github_backfill_skips_reviews_phase_when_no_prs_seen() -> None:
+    """If a repo has zero PRs, the reviews phase advances cleanly to commits."""
+
+    def installation_repos(req):
+        return httpx.Response(
+            200,
+            json={
+                "repositories": [
+                    {
+                        "full_name": "acme/empty",
+                        "name": "empty",
+                        "owner": {"login": "acme"},
+                        "default_branch": "main",
+                    },
+                ]
+            },
+        )
+
+    transport = _mock_transport(
+        {
+            ("GET", "/installation/repositories"): installation_repos,
+            ("GET", "/repos/acme/empty/pulls"): lambda r: httpx.Response(200, json=[]),
+            ("GET", "/repos/acme/empty/issues"): lambda r: httpx.Response(200, json=[]),
+            ("GET", "/repos/acme/empty/commits"): lambda r: httpx.Response(200, json=[]),
+            ("GET", "/repos/acme/empty/releases"): lambda r: httpx.Response(200, json=[]),
+        }
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.GITHUB, access_token="x"
+    )
+    events = [e async for e in gh.backfill("cust", token)]
+    # Zero events but loop should complete without trying to fetch a reviews URL.
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_github_backfill_with_installation_scope_fetches_token_from_backend(
     monkeypatch,
 ) -> None:
