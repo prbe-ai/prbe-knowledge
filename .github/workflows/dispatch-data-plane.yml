@@ -1,0 +1,48 @@
+name: dispatch-data-plane
+
+# When prbe-knowledge's main advances, notify prbe-data-plane-image so it
+# bumps PRBE_KNOWLEDGE_SHA in build/versions.lock and rebuilds the
+# multi-app data-plane image. From there build.yml + fleet-rollout.yml
+# roll the managed fleet (post 2026-05-13 Fly sunset — the legacy
+# flyctl deploy workflow has been removed).
+#
+# Requires UPSTREAM_DISPATCH_TOKEN: a PAT with `repo` scope on
+# prbe-ai/prbe-data-plane-image (or fine-grained PAT with Actions:write +
+# Contents:read on that repo).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Rapid main pushes coalesce — only the latest SHA matters.
+  group: dispatch-data-plane
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send repository_dispatch
+        env:
+          DISPATCH_TOKEN: ${{ secrets.UPSTREAM_DISPATCH_TOKEN }}
+          DOWNSTREAM_REPO: ${{ vars.DOWNSTREAM_IMAGE_REPO || 'prbe-ai/prbe-data-plane-image' }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          http_code=$(curl --silent --output /tmp/resp.txt --write-out '%{http_code}' \
+            -X POST "https://api.github.com/repos/${DOWNSTREAM_REPO}/dispatches" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -d "{\"event_type\":\"upstream-bump\",\"client_payload\":{\"repo\":\"knowledge\",\"sha\":\"${SHA}\"}}")
+          if [ "${http_code}" != "204" ]; then
+            echo "::error::dispatch to ${DOWNSTREAM_REPO} failed (HTTP ${http_code})"
+            cat /tmp/resp.txt
+            exit 1
+          fi
+          echo "Dispatched upstream-bump{repo=knowledge,sha=${SHA}} to ${DOWNSTREAM_REPO}"
