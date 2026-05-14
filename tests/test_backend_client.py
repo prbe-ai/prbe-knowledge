@@ -61,9 +61,9 @@ async def test_happy_path_returns_token_and_expires_at() -> None:
     assert token == "ghs_abc"
     assert expires_at == datetime(2026, 12, 31, tzinfo=UTC)
 
-    # Verify the request shape: customer_id in body, X-Internal-Key header.
+    # Verify the request shape: customer_id in body, X-Internal-Backend-Key header.
     request = route.calls[0].request
-    assert request.headers["x-internal-key"] == "test-internal-key"
+    assert request.headers["x-internal-backend-key"] == "test-internal-key"
     assert b'"customer_id"' in request.content
     assert b'"cust-1"' in request.content
 

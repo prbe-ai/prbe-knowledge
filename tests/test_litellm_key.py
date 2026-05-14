@@ -3,7 +3,7 @@
 Covers:
   - control-plane fetch happy path (httpx.MockTransport)
   - in-memory TTL cache (second call doesn't refetch)
-  - X-Internal-Key header is set correctly
+  - X-Internal-Backend-Key header is set correctly
   - 404 / 5xx / missing config raise LiteLLMKeyUnavailable
   - tenant_virtual_key_context binds the ContextVar for the block
   - shared.llm.acompletion prefers the contextvar key over LLM_GATEWAY_KEY
@@ -52,7 +52,7 @@ def _clear_cache_and_env(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.mark.asyncio
 async def test_fetch_happy_path() -> None:
-    """Control plane returns a virtual key; X-Internal-Key header is set."""
+    """Control plane returns a virtual key; X-Internal-Backend-Key header is set."""
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -66,7 +66,7 @@ async def test_fetch_happy_path() -> None:
 
     assert key == "sk-virtual-cust-abc"
     assert captured["url"].endswith("/routing/customer/cust-abc/litellm-key")
-    assert captured["headers"]["x-internal-key"] == "test-internal-key"
+    assert captured["headers"]["x-internal-backend-key"] == "test-internal-key"
 
 
 @pytest.mark.asyncio

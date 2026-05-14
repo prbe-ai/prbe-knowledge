@@ -129,7 +129,7 @@ class Settings(BaseSettings):
     # installation tokens (the App private key lives in backend, not here).
     # `backend_base_url` is typically `http://prbe-backend.internal:8080` over
     # Fly's 6PN private networking; `internal_backend_api_key` is shared with
-    # backend and sent as `X-Internal-Key`.
+    # backend and sent as `X-Internal-Backend-Key`.
     backend_base_url: str = ""
     internal_backend_api_key: SecretStr = SecretStr("")
 

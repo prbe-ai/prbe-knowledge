@@ -36,9 +36,9 @@ the source of truth; we cache for latency, not authority.
 In-cluster trust
 ----------------
 The control-plane endpoint is gated by the shared
-``INTERNAL_BACKEND_API_KEY`` secret, sent as ``X-Internal-Key`` (same
-header `shared/backend_client.py` uses for the GitHub installation-token
-endpoint).
+``INTERNAL_BACKEND_API_KEY`` secret, sent as ``X-Internal-Backend-Key``
+(same header `shared/backend_client.py` uses for the GitHub
+installation-token endpoint).
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ async def get_tenant_virtual_key(
 
     Hits the control plane endpoint
     ``GET {backend_base_url}/routing/customer/{customer_id}/litellm-key``
-    with ``X-Internal-Key`` set to ``INTERNAL_BACKEND_API_KEY``. The
+    with ``X-Internal-Backend-Key`` set to ``INTERNAL_BACKEND_API_KEY``. The
     response body shape is ``{"litellm_key": "<sk-...>", ...}``.
 
     Parameters
@@ -170,7 +170,7 @@ async def get_tenant_virtual_key(
         )
 
     url = f"{base}/routing/customer/{customer_id}/litellm-key"
-    headers = {"X-Internal-Key": api_key}
+    headers = {"X-Internal-Backend-Key": api_key}
 
     async def _do_fetch(client: httpx.AsyncClient) -> str:
         resp = await client.get(url, headers=headers, timeout=_FETCH_TIMEOUT_SECONDS)

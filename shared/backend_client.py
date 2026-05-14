@@ -51,7 +51,10 @@ async def fetch_github_installation_token(
             url,
             json={"customer_id": customer_id},
             headers={
-                "X-Internal-Key": api_key,
+                # Canonical header — prbe-backend retired the X-Internal-Key
+                # alias when the Fly sunset closed (see
+                # apps/data_plane/dependencies/internal.py).
+                "X-Internal-Backend-Key": api_key,
                 "Content-Type": "application/json",
             },
             timeout=10.0,
