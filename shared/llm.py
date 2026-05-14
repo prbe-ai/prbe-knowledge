@@ -4,7 +4,7 @@ Why this exists
 ---------------
 Today the repo calls Anthropic, OpenAI and Google via three different
 SDKs (see `docs/llm-migration-inventory.md` for the full call-site
-table). Phase 0 of the managed-isolated / self-host split requires:
+table). Phase 0 of the managed-shared / self-host split requires:
 
   1. **Self-host customers bring their own LLM keys** and route through
      their own LiteLLM proxy via ``LLM_GATEWAY_URL``. We never see the
@@ -59,9 +59,11 @@ embedding) is forwarded to that URL via LiteLLM's ``api_base`` parameter,
 authenticated with ``LLM_GATEWAY_KEY`` (LiteLLM's ``api_key``) when that
 env var is also set. Two modes use this:
 
-  - **managed-isolated**: the central LiteLLM proxy on the cluster, with
-    ``LLM_GATEWAY_KEY`` the tenant's per-customer virtual key (the proxy
-    holds the real provider keys; data planes never see them).
+  - **managed-shared**: the central LiteLLM proxy on the cluster; the
+    per-tenant virtual key is bound by ``tenant_virtual_key_context``
+    (see ``shared/litellm_key.py``) and wins over ``LLM_GATEWAY_KEY``,
+    which remains as a process-wide fallback for bootstrap/cron calls
+    that run without tenant context.
   - **self-host**: the customer runs their own LiteLLM / OpenAI-compatible
     gateway and we point at it with whatever key they configure.
 
@@ -202,8 +204,9 @@ def _maybe_inject_gateway(kwargs: dict[str, Any]) -> dict[str, Any]:
     LiteLLM virtual key bound to the current async context by
     ``tenant_virtual_key_context(customer_id)``. When set, it wins over
     ``LLM_GATEWAY_KEY``: the env var is a process-wide fallback for
-    managed-isolated (1 tenant per pod), and the contextvar is the
-    per-request override for shared-managed (N tenants per pod).
+    self-host (1 tenant per pod) and bootstrap/cron calls without tenant
+    context; the contextvar is the per-request override for shared-managed
+    (N tenants per pod).
     """
     url_already_set = bool(kwargs.get("api_base"))
     if not url_already_set:
@@ -213,7 +216,7 @@ def _maybe_inject_gateway(kwargs: dict[str, Any]) -> dict[str, Any]:
             url_already_set = True
     if url_already_set and not kwargs.get("api_key"):
         # Per-tenant override first (shared-managed); env-var fallback
-        # second (managed-isolated). Lazy-import the helper so a
+        # second (self-host / no-tenant-context). Lazy-import the helper so a
         # circular import (litellm_key imports config; config might one
         # day import llm) is impossible.
         from shared.litellm_key import current_tenant_virtual_key

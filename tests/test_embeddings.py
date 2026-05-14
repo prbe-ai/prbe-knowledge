@@ -330,7 +330,7 @@ def test_dataclass_re_exports_unchanged() -> None:
     assert EmbedResult.__name__ == "EmbedResult"
 
 
-# ---- Gateway-aware embedding (plan D1, managed-isolated / self-host) -----
+# ---- Gateway-aware embedding (plan D1, managed-shared / self-host) -----
 #
 # When `llm_gateway_url` is set, both embedders route through the LiteLLM
 # proxy: OpenAIEmbedder by pointing its AsyncOpenAI SDK at the gateway via

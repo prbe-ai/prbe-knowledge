@@ -2,7 +2,7 @@
 
 Covers the Phase-0b chunk B migration: `render_index_via_llm` now
 routes the production path through `shared.llm.acompletion` so the call
-honors `LLM_GATEWAY_URL` on managed-isolated tenants. The deterministic
+honors `LLM_GATEWAY_URL` for gateway routing. The deterministic
 fallback (no provider key AND no gateway → flat alphabetical list) and
 the legacy injected-client path are preserved for backward compat.
 """
@@ -108,7 +108,7 @@ async def test_render_index_via_shared_llm_happy_path(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_render_index_uses_gateway_without_google_key(monkeypatch) -> None:
-    """Managed-isolated tenant: only LLM_GATEWAY_URL is set. The
+    """Gateway-routed tenant: only LLM_GATEWAY_URL is set. The
     renderer must still call shared.llm.acompletion (the wrapper
     handles api_base/api_key injection)."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)

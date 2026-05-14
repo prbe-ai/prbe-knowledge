@@ -674,7 +674,7 @@ async def test_gateway_mode_blocks_client_construction(
     patched_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """In LLM_GATEWAY_URL (managed-isolated / self-host) mode the
+    """In LLM_GATEWAY_URL (gateway-routed) mode the
     GeminiAgentClient must refuse to make a real call. LiteLLM doesn't
     expose Gemini CachedContent or thought_signature round-tripping, so
     routing this call site through the proxy is not viable today —

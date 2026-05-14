@@ -12,8 +12,8 @@ shape is enforced at the API level, not by asking the model nicely:
     Google    — config.response_schema
 
 Phase-0b: the non-streaming paths route through `shared.llm.acompletion`
-so managed-isolated tenants without provider keys can use them via the
-central LiteLLM gateway. The streaming path (`synthesize_stream`) still
+so tenants without provider keys can use them via the central LiteLLM
+gateway. The streaming path (`synthesize_stream`) still
 uses the provider SDKs directly — chunk D handles that migration.
 
 This avoids the "did the model wrap in JSON or return prose?" guessing
@@ -338,8 +338,8 @@ async def synthesize_stream(
 
     # Route through `shared.llm.acompletion(..., stream=True)` so the
     # call automatically forwards to the customer's LiteLLM proxy when
-    # `LLM_GATEWAY_URL` is set (managed-isolated / self-host tenants
-    # have no provider keys locally). LiteLLM normalizes Anthropic's
+    # `LLM_GATEWAY_URL` is set (gateway-routed tenants have no provider
+    # keys locally). LiteLLM normalizes Anthropic's
     # `messages.stream` and Google's `generate_content_stream` into
     # one OpenAI-shaped chunk iterator: each chunk exposes
     # `chunk.choices[0].delta.content`; final usage rides on the last
@@ -647,7 +647,7 @@ async def _call_google(
 
 def _check_provider_credentials(*, provider: str, env_name: str) -> None:
     """Raise SynthesisError when neither the provider key nor a LiteLLM
-    gateway is configured. After Phase-0b chunk A, managed-isolated
+    gateway is configured. After Phase-0b chunk A, gateway-routed
     tenants run without provider keys — the gateway URL carries the
     credential — so we must accept either condition.
     """

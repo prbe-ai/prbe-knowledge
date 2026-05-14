@@ -6,8 +6,8 @@ than `response_format` JSON mode because tool-use enforces the schema more
 reliably across longer context windows.
 
 Phase-0b: routes through `shared.llm.acompletion` (chunk C migration) so
-managed-isolated tenants without provider API keys can use it via the
-central LiteLLM gateway.
+tenants without provider API keys can use it via the central LiteLLM
+gateway.
 """
 from __future__ import annotations
 

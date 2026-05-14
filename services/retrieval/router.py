@@ -420,7 +420,7 @@ async def route_query(customer_id: str, query: str) -> RouterOutput:
 async def _call_haiku(query: str) -> dict:
     settings = get_settings()
     # No Anthropic key configured AND no LiteLLM gateway: return empty
-    # (graceful no-op). On managed-isolated tenants the gateway URL is
+    # (graceful no-op). For gateway-routed tenants the gateway URL is
     # set and the gateway holds the provider key, so the local
     # `anthropic_api_key` may be empty even when calls succeed —
     # `shared.llm.acompletion` handles the routing precedence.

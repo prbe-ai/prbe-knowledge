@@ -281,8 +281,8 @@ async def render_index_via_llm(
     )
 
     # Phase-0b chunk B: the production call routes through
-    # shared.llm.acompletion so the call honors LLM_GATEWAY_URL on
-    # managed-isolated tenants (the central LiteLLM proxy supplies the
+    # shared.llm.acompletion so the call honors LLM_GATEWAY_URL for
+    # gateway-routed tenants (the central LiteLLM proxy supplies the
     # provider key). Without the gateway, LiteLLM falls back to the
     # direct provider call using GOOGLE_API_KEY. The ``client`` kwarg
     # is preserved for tests that inject a stub mimicking the google-

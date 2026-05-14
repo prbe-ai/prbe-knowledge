@@ -35,8 +35,8 @@ class Settings(BaseSettings):
 
     # --- Postgres ------------------------------------------------------------
     # Local dev default connects as the ``prbe`` superuser for migration
-    # convenience. In every managed-isolated deployment (staging / prod /
-    # per-tenant) the operator-set DATABASE_URL secret MUST point at the
+    # convenience. In every managed-shared deployment (staging / prod)
+    # the operator-set DATABASE_URL secret MUST point at the
     # non-privileged ``probe_app`` role instead — superuser bypasses FORCE
     # RLS and would silently disable tenant isolation. The boot path
     # (``shared.db.init_pool``) emits ``db.superuser_in_managed_env`` if it
@@ -99,7 +99,7 @@ class Settings(BaseSettings):
     google_api_key: SecretStr = SecretStr("")
     claude_code_extraction_model: str = Field(default="claude-sonnet-4-6")
 
-    # --- LLM gateway (managed-isolated / self-host: route LLM + embedding
+    # --- LLM gateway (managed-shared / self-host: route LLM + embedding
     #     calls through a central LiteLLM proxy instead of direct provider
     #     SDKs — plan D1, `shared/llm.py`) ------------------------------------
     # When `llm_gateway_url` is set, callers that go through `shared.llm`

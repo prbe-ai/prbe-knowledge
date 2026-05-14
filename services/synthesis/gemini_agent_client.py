@@ -9,8 +9,8 @@ This module wraps the production Gemini SDK with that contract. Stays
 out of the unit-test path (tests pass their own stub client into
 SynthesisWorker via llm_client=...).
 
-Phase-0b carve-out (managed-isolated / self-host)
--------------------------------------------------
+Phase-0b carve-out (gateway-routed mode)
+----------------------------------------
 This call site is the **one production call site that does NOT migrate
 to `shared.llm.acompletion`** in Phase 0b. Two reasons:
 
@@ -141,7 +141,7 @@ class GeminiAgentClient:
     def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
-        # Phase-0b carve-out gate: in managed-isolated / self-host mode
+        # Phase-0b carve-out gate: in gateway-routed mode
         # the data plane has no GOOGLE_API_KEY (provider creds live in
         # the central LiteLLM proxy). Since CachedContent + thought-
         # signature round-tripping don't migrate through LiteLLM today
@@ -151,7 +151,7 @@ class GeminiAgentClient:
         if shared_llm.gateway_url():
             raise RuntimeError(
                 "GeminiAgentClient is not available in LLM_GATEWAY_URL "
-                "(managed-isolated / self-host) mode — Gemini CachedContent "
+                "(gateway-routed) mode — Gemini CachedContent "
                 "and thought_signature round-tripping have no LiteLLM "
                 "equivalent. The wiki-agent loop is direct-keys-only "
                 "until either LiteLLM exposes Gemini caches or the proxy "

@@ -460,7 +460,7 @@ async def test_no_api_key_returns_empty() -> None:
     conn = _make_mock_conn()
 
     # Wipe both — the gateway check is the new fall-through that
-    # allows managed-isolated tenants to operate without provider keys.
+    # allows gateway-routed tenants to operate without provider keys.
     with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "", "LLM_GATEWAY_URL": ""}, clear=False):
         result = await extract_edges(bundle, conn)
 
