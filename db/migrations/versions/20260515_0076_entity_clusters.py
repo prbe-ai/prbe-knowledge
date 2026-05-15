@@ -1,8 +1,8 @@
 """Entity clusters: tables + graph_edges changes for manual identity merging (B-promote).
 
-Revision ID: 0071_entity_clusters
-Revises: 0070_gnp_rls
-Create Date: 2026-05-14
+Revision ID: 0076_entity_clusters
+Revises: 0075_r2_bucket_not_null
+Create Date: 2026-05-15
 
 Five new RLS-isolated tables backing manual entity merging (design doc:
 ``docs/superpowers/specs/2026-05-13-entity-clusters-design.md``):
@@ -62,8 +62,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0071_entity_clusters"
-down_revision: str | Sequence[str] | None = "0070_gnp_rls"
+revision: str = "0076_entity_clusters"
+down_revision: str | Sequence[str] | None = "0075_r2_bucket_not_null"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
