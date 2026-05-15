@@ -35,11 +35,33 @@ CREATE TABLE customers (
     -- shared.customer_prefs for the wiki-generation gate. Schema-on-read
     -- bool keys; missing keys resolve to False on every reader.
     preferences          JSONB NOT NULL DEFAULT '{}',
-    -- Per-tenant R2 bucket name (added by migration 0073). Until the CP
-    -- starts populating this for every customer, the runtime falls back
-    -- to f"{R2_BUCKET_PREFIX}-{customer_id}" when NULL.
-    r2_bucket            TEXT
+    -- Per-tenant R2 bucket name. Added by migration 0073, locked NOT NULL
+    -- by 0075. Every INSERT path (the CP→DP mirror, self-host's
+    -- seed-customer Helm job) writes this; the runtime never falls back
+    -- to a computed value.
+    r2_bucket            TEXT NOT NULL
 );
+
+-- BEFORE INSERT trigger that fills r2_bucket from customer_id when NULL
+-- (Postgres DEFAULTs can't reference other columns). Production callers
+-- supply r2_bucket explicitly via the CP→DP mirror; the trigger only
+-- fires for test fixtures and self-host installs that forget to set it.
+-- On the DP, ``customer_id`` IS the slug (see prbe-backend's
+-- apps/control_plane/routers/me/provision.py), so ``prbe-<customer_id>``
+-- == the canonical new-policy bucket name.
+CREATE OR REPLACE FUNCTION customers_fill_r2_bucket() RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.r2_bucket IS NULL THEN
+        NEW.r2_bucket := 'prbe-' || NEW.customer_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER customers_fill_r2_bucket_trg
+    BEFORE INSERT ON customers
+    FOR EACH ROW
+    EXECUTE FUNCTION customers_fill_r2_bucket();
 
 -- One customer per organization (where the link is set).
 CREATE UNIQUE INDEX customers_organization_id_unique

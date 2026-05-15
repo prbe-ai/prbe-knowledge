@@ -65,7 +65,7 @@ def _mock_db() -> AsyncMock:
 
 def _mock_bucket() -> AsyncMock:
     bucket = AsyncMock()
-    bucket.bucket_for = MagicMock(return_value="prbe-synth-bucket")
+    bucket.bucket_for = AsyncMock(return_value="prbe-synth-bucket")
     bucket.ensure_bucket = AsyncMock(return_value=None)
     bucket.list_keys = AsyncMock(return_value=[])
     bucket.delete = AsyncMock(return_value=None)

@@ -28,29 +28,39 @@ _BUCKET_CACHE_LOCK = asyncio.Lock()
 
 
 async def _load_bucket(customer_id: str, settings: Settings) -> str:
-    """Resolve r2_bucket from DB; fall back to the legacy prefix-formula
-    when the row is missing or the column is still NULL. Import db lazily
-    to avoid a cycle (shared.db imports shared.config which can be loaded
-    before storage is imported by tests)."""
+    """Resolve r2_bucket from the customers row. Raises if the row is
+    missing or the column is unexpectedly NULL — both should be impossible
+    after migration 0075 (NOT NULL on r2_bucket) and the CP-side mirror
+    populating r2_bucket on every INSERT.
+
+    The ``settings`` arg is kept on the signature so test stubs / fakes
+    that monkey-patched ``_load_bucket`` upstream don't break, but the
+    legacy prefix-formula fallback that 0073 and 0074 propped up is
+    intentionally gone here — silently writing to the wrong bucket is
+    worse than 5xx-ing the request and letting the retry land in the
+    correct place once the DB is back. db import is lazy to avoid a
+    module-load cycle (shared.db imports shared.config which can be
+    imported before storage by tests)."""
     from shared.db import raw_conn  # local import: avoid module-load cycle
 
-    try:
-        async with raw_conn() as conn:
-            row = await conn.fetchrow(
-                "SELECT r2_bucket FROM customers WHERE customer_id = $1",
-                customer_id,
-            )
-    except Exception as exc:  # noqa: BLE001 - fall back rather than 500 every upload
-        log.warning(
-            "storage.bucket_for db_lookup_failed customer_id=%s err=%s — "
-            "falling back to legacy prefix formula",
+    del settings  # no longer consulted; kept for signature compat
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT r2_bucket FROM customers WHERE customer_id = $1",
             customer_id,
-            exc,
         )
-        return settings.bucket_for(customer_id)
-    if row and row["r2_bucket"]:
-        return str(row["r2_bucket"])
-    return settings.bucket_for(customer_id)
+    if not row:
+        raise StorageUnavailable(
+            f"no customers row for customer_id={customer_id!r}; "
+            "mirror should have created it before any upload"
+        )
+    bucket = row["r2_bucket"]
+    if not bucket:
+        raise StorageUnavailable(
+            f"customers.r2_bucket is NULL for customer_id={customer_id!r}; "
+            "migration 0075 should have backfilled every row"
+        )
+    return str(bucket)
 
 
 def _reset_bucket_cache_for_tests() -> None:
@@ -110,16 +120,13 @@ class ObjectStore:
     async def bucket_for(self, customer_id: str) -> str:
         """Per-tenant R2 bucket name.
 
-        Reads ``customers.r2_bucket`` (cached) so the bucket name is whatever
-        the control plane recorded at provision time — currently
-        ``prbe-customer-<uuid>`` for existing tenants (backfilled by
-        migration 0073) and ``prbe-<slug>`` for new tenants (written by the
-        CP fleet provisioner). Falls back to the legacy
-        ``f"{R2_BUCKET_PREFIX}-{customer_id}"`` formula ONLY when the row is
-        missing or ``r2_bucket`` is still NULL — keeps the rollout safe in
-        the window between this migration landing and the CP starting to
-        populate the column. The fallback (and this comment) will be
-        deleted in the follow-up cleanup PR once the column goes NOT NULL.
+        Reads ``customers.r2_bucket`` (cached, immutable once a tenant
+        is provisioned). Migration 0075 made the column NOT NULL and
+        the CP-side mirror populates it on every customer INSERT, so
+        a NULL/missing value here is a real bug rather than a normal
+        rollout state — ``_load_bucket`` raises ``StorageUnavailable``
+        rather than guessing a bucket name. Caller surfaces that as a
+        5xx; the upload retries.
         """
         cached = _BUCKET_CACHE.get(customer_id)
         if cached is not None:
