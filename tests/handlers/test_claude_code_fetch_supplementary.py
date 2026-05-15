@@ -20,7 +20,7 @@ class _StubStore:
     def __init__(self) -> None:
         self.blobs: dict[tuple[str, str], bytes] = {}
 
-    def bucket_for(self, customer_id: str) -> str:
+    async def bucket_for(self, customer_id: str) -> str:
         return f"test-bucket-{customer_id}"
 
     async def ensure_bucket(self, bucket: str) -> None:
@@ -102,7 +102,7 @@ async def test_fetch_supplementary_merges_all_batches_for_session(
     customer = "fs-test-cust"
     session = "sess-1"
     store = stub_store
-    bucket = store.bucket_for(customer)
+    bucket = await store.bucket_for(customer)
     await store.ensure_bucket(bucket)
 
     keys: list[str] = []
@@ -143,7 +143,7 @@ async def test_fetch_supplementary_carries_identity_from_later_payloads(
     customer = "fs-identity-cust"
     session = "sess-identity"
     store = stub_store
-    bucket = store.bucket_for(customer)
+    bucket = await store.bucket_for(customer)
     await store.ensure_bucket(bucket)
 
     key0 = f"raw/claude_code/{customer}/2026/04/29/{session}:0.json"
@@ -192,7 +192,7 @@ async def test_fetch_supplementary_detects_finalize_marker(
     customer = "fs-finalize-cust"
     session = "sess-final"
     store = stub_store
-    bucket = store.bucket_for(customer)
+    bucket = await store.bucket_for(customer)
     await store.ensure_bucket(bucket)
 
     live_key = f"raw/claude_code/{customer}/2026/04/29/{session}:0.json"
@@ -233,7 +233,7 @@ async def test_fetch_supplementary_dedupes_overlapping_line_nos(
     customer = "fs-dedup-cust"
     session = "sess-dup"
     store = stub_store
-    bucket = store.bucket_for(customer)
+    bucket = await store.bucket_for(customer)
     await store.ensure_bucket(bucket)
 
     # Batch 0 has line_no 0,1; batch 1 has line_no 1,2 (line_no=1 overlaps).

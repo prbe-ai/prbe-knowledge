@@ -54,7 +54,7 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
     from shared.storage import get_store
 
     store = get_store()
-    await store.ensure_bucket(store.bucket_for(CUSTOMER))
+    await store.ensure_bucket(await store.bucket_for(CUSTOMER))
 
     source_event_id: str = ""
     await close_pool()

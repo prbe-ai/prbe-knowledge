@@ -51,7 +51,7 @@ from shared.tokens import save_device_token
 class _StubStore:
     blobs: dict[tuple[str, str], bytes]
 
-    def bucket_for(self, customer_id: str) -> str:
+    async def bucket_for(self, customer_id: str) -> str:
         return f"test-bucket-{customer_id}"
 
     async def get(self, bucket: str, key: str) -> bytes:
@@ -306,7 +306,7 @@ async def test_full_session_body_has_events_from_all_batches(live_db, monkeypatc
     # Stage 3 distinct batches in the stub store. Each has one unique
     # event whose content is the batch number — easy to verify below.
     store = _StubStore(blobs={})
-    bucket = store.bucket_for(customer)
+    bucket = await store.bucket_for(customer)
     keys: list[str] = []
     for batch_seq in range(3):
         key = f"raw/claude_code/{customer}/2026/04/29/{session}:{batch_seq}.json"

@@ -142,7 +142,7 @@ class Normalizer:
         # For non-CC connectors this is THE payload; for CC the connector
         # reads the full set in fetch_supplementary.
         first_key = payload_s3_keys[0]
-        raw_bytes = await self._store.get(self._store.bucket_for(customer_id), first_key)
+        raw_bytes = await self._store.get(await self._store.bucket_for(customer_id), first_key)
         raw_payload = orjson.loads(raw_bytes)
         headers = raw_payload.get("_headers", {})
         payload = raw_payload.get("payload", raw_payload)

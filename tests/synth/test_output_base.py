@@ -54,7 +54,7 @@ def test_storage_protocol_satisfied_by_stub() -> None:
         async def delete(self, bucket: str, key: str) -> None:
             pass
 
-        def bucket_for(self, customer_id: str) -> str:
+        async def bucket_for(self, customer_id: str) -> str:
             return f"bucket-{customer_id}"
 
         async def ensure_bucket(self, bucket: str) -> None:

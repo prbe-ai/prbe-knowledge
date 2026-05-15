@@ -6,6 +6,7 @@ boto3 is sync; we run calls in a thread executor to stay out of the asyncio path
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +16,47 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from shared.config import Settings, get_settings
 from shared.exceptions import StorageNotFound, StorageUnavailable
+
+log = logging.getLogger(__name__)
+
+# Per-pod cache of customer_id -> r2_bucket. The bucket name is immutable
+# once a customer is provisioned (renaming would orphan all uploads), so
+# there's no TTL — set on first read, kept until pod restart. ~50 bytes/
+# entry * a few thousand tenants = trivial memory.
+_BUCKET_CACHE: dict[str, str] = {}
+_BUCKET_CACHE_LOCK = asyncio.Lock()
+
+
+async def _load_bucket(customer_id: str, settings: Settings) -> str:
+    """Resolve r2_bucket from DB; fall back to the legacy prefix-formula
+    when the row is missing or the column is still NULL. Import db lazily
+    to avoid a cycle (shared.db imports shared.config which can be loaded
+    before storage is imported by tests)."""
+    from shared.db import raw_conn  # local import: avoid module-load cycle
+
+    try:
+        async with raw_conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT r2_bucket FROM customers WHERE customer_id = $1",
+                customer_id,
+            )
+    except Exception as exc:  # noqa: BLE001 - fall back rather than 500 every upload
+        log.warning(
+            "storage.bucket_for db_lookup_failed customer_id=%s err=%s — "
+            "falling back to legacy prefix formula",
+            customer_id,
+            exc,
+        )
+        return settings.bucket_for(customer_id)
+    if row and row["r2_bucket"]:
+        return str(row["r2_bucket"])
+    return settings.bucket_for(customer_id)
+
+
+def _reset_bucket_cache_for_tests() -> None:
+    """Test-only hook so fixtures can swap out the customers DB between cases
+    without seeing stale cached bucket names from a prior test's customer_id."""
+    _BUCKET_CACHE.clear()
 
 
 @dataclass(slots=True)
@@ -65,8 +107,31 @@ class ObjectStore:
 
         await asyncio.to_thread(_ensure)
 
-    def bucket_for(self, customer_id: str) -> str:
-        return self._settings.bucket_for(customer_id)
+    async def bucket_for(self, customer_id: str) -> str:
+        """Per-tenant R2 bucket name.
+
+        Reads ``customers.r2_bucket`` (cached) so the bucket name is whatever
+        the control plane recorded at provision time — currently
+        ``prbe-customer-<uuid>`` for existing tenants (backfilled by
+        migration 0073) and ``prbe-<slug>`` for new tenants (written by the
+        CP fleet provisioner). Falls back to the legacy
+        ``f"{R2_BUCKET_PREFIX}-{customer_id}"`` formula ONLY when the row is
+        missing or ``r2_bucket`` is still NULL — keeps the rollout safe in
+        the window between this migration landing and the CP starting to
+        populate the column. The fallback (and this comment) will be
+        deleted in the follow-up cleanup PR once the column goes NOT NULL.
+        """
+        cached = _BUCKET_CACHE.get(customer_id)
+        if cached is not None:
+            return cached
+        async with _BUCKET_CACHE_LOCK:
+            # Re-check under the lock — another waiter may have populated it.
+            cached = _BUCKET_CACHE.get(customer_id)
+            if cached is not None:
+                return cached
+            bucket = await _load_bucket(customer_id, self._settings)
+            _BUCKET_CACHE[customer_id] = bucket
+            return bucket
 
     # ---- object ops ---------------------------------------------------------
 

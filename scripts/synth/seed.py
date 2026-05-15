@@ -236,7 +236,7 @@ async def seed_tenant(
 
     canonical_id = _load_canonical_id(canonical_dir)
 
-    bucket_name = bucket.bucket_for(customer_id)
+    bucket_name = await bucket.bucket_for(customer_id)
     await bucket.ensure_bucket(bucket_name)
 
     envelopes = sorted(raw_root.rglob("*.json"))

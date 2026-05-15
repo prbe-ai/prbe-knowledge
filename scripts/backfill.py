@@ -35,7 +35,7 @@ async def backfill(customer_id: str, source_value: str) -> None:
     source = SourceSystem(source_value)
 
     store = get_store()
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     await store.ensure_bucket(bucket)
 
     # Load token + cursor

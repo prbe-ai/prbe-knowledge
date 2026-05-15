@@ -34,7 +34,11 @@ CREATE TABLE customers (
     -- Per-tenant feature toggles (added by migration 0023). Read by
     -- shared.customer_prefs for the wiki-generation gate. Schema-on-read
     -- bool keys; missing keys resolve to False on every reader.
-    preferences          JSONB NOT NULL DEFAULT '{}'
+    preferences          JSONB NOT NULL DEFAULT '{}',
+    -- Per-tenant R2 bucket name (added by migration 0073). Until the CP
+    -- starts populating this for every customer, the runtime falls back
+    -- to f"{R2_BUCKET_PREFIX}-{customer_id}" when NULL.
+    r2_bucket            TEXT
 );
 
 -- One customer per organization (where the link is set).

@@ -106,7 +106,7 @@ async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
             for r in rows:
                 customer_id = r["customer_id"]
                 session_id = r["session_id"]
-                bucket = store.bucket_for(customer_id)
+                bucket = await store.bucket_for(customer_id)
                 if bucket not in seen_buckets:
                     await store.ensure_bucket(bucket)
                     seen_buckets.add(bucket)
