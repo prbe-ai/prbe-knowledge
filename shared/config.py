@@ -201,6 +201,11 @@ class Settings(BaseSettings):
     # claims is fine.
     worker_per_customer_max_inflight: int = 30
 
+    # GitHub backfill: how many repos walk in parallel via the GraphQL v4
+    # engine. Each walker holds one in-flight POST /graphql at a time; sized
+    # to stay well under the 5000-points/hour cap at ~3 points/page.
+    github_backfill_repo_concurrency: int = 4
+
     # --- HTTP / outbound ----------------------------------------------------
     http_timeout_seconds: float = 30.0
 
