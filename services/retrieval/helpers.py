@@ -183,6 +183,6 @@ async def expand_to_cluster_members(
     )
     out: dict[str, list[str]] = {}
     for r in rows:
-        cluster = [r["primary_canonical_id"]] + list(r["alias_list"] or [])
+        cluster = [r["primary_canonical_id"], *(r["alias_list"] or [])]
         out[r["input_id"]] = cluster
     return out

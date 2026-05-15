@@ -797,10 +797,12 @@ async def _build_entity_results(
         # Phase 2: prefer curated entity_cluster_metadata.display_name if set
         # (NULLIF coerces empty strings to NULL upstream).
         override = r["override_display_name"]
+        display_name: str | None
         if isinstance(override, str) and override:
             display_name = override
         else:
-            display_name = properties.get("name") if isinstance(properties.get("name"), str) else None
+            name = properties.get("name")
+            display_name = name if isinstance(name, str) else None
 
         edge_types = list(r["edge_types"] or [])
         doc_count = int(r["doc_count"] or 0)

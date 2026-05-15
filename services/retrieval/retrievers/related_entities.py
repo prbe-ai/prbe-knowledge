@@ -14,11 +14,19 @@ tier ordering. The walk is bidirectional (UNION ALL on `from_node_id` /
 
 from __future__ import annotations
 
+import re
+
 from services.retrieval.helpers import resolve_aliases
 from services.retrieval.retrievers.graph import _CONFIDENCE_RANK, _ENTITY_TO_LABEL
 from shared.constants import NodeLabel
 from shared.db import with_tenant
 from shared.models import RelatedEntity
+
+# Strip everything up to and including the last '/' to convert
+# 'prbe-ai/prbe-backend' -> 'prbe-backend'. Shared by
+# build_exclude_node_keys and expand_exclude_keys_with_aliases so the
+# regex stays in lockstep if either function evolves.
+_NAMESPACE_STRIP_RE = re.compile(r"^.*/")
 
 
 def _confidence_case_sql(column: str) -> str:
@@ -84,9 +92,7 @@ def build_exclude_node_keys(
     `entity_type`, `canonical_id`, `confidence`, and optionally
     `display_name` attributes.
     """
-    import re
     out: set[tuple[str, str]] = set()
-    namespace_strip = re.compile(r"^.*/")
     for e in routed_entities:
         confidence = getattr(e, "confidence", 1.0) or 0.0
         if confidence < entity_match_threshold:
@@ -102,7 +108,7 @@ def build_exclude_node_keys(
                 continue
             lowered = raw.lower()
             out.add((label, lowered))
-            stripped = namespace_strip.sub("", lowered)
+            stripped = _NAMESPACE_STRIP_RE.sub("", lowered)
             if stripped and stripped != lowered:
                 out.add((label, stripped))
     return out
@@ -131,8 +137,6 @@ async def expand_exclude_keys_with_aliases(
 
     Returns a new set (does not mutate the input).
     """
-    import re
-
     refs: list[tuple[str, str]] = []
     for e in routed_entities:
         confidence = getattr(e, "confidence", 1.0) or 0.0
@@ -151,12 +155,11 @@ async def expand_exclude_keys_with_aliases(
         alias_map = await resolve_aliases(conn, customer_id, refs=refs)
     if not alias_map:
         return exclude_keys
-    namespace_strip = re.compile(r"^.*/")
     expanded = set(exclude_keys)
     for (label, _orig_cid), primary in alias_map.items():
         lowered = primary.lower()
         expanded.add((label, lowered))
-        stripped = namespace_strip.sub("", lowered)
+        stripped = _NAMESPACE_STRIP_RE.sub("", lowered)
         if stripped and stripped != lowered:
             expanded.add((label, stripped))
     return expanded
