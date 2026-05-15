@@ -1129,3 +1129,32 @@ ALTER TABLE documents
     FOREIGN KEY (ingestion_event_id)
     REFERENCES ingestion_events(event_id)
     ON DELETE SET NULL;
+
+-- ---------------------------------------------------------------------------
+-- ingestion_cursors: per-customer-per-source-per-resource polling state
+-- (migration 0072). For self-host customers (INGESTION_MODE=poll), the
+-- worker pod runs PollScheduler which walks this table every tick. See
+-- services/ingestion/polling/ for the framework. RLS is NON-FORCE (matches
+-- the inferred_edges_queue pattern) — the scheduler reads cross-tenant for
+-- work distribution, per-tenant writes set the GUC via with_tenant().
+-- ---------------------------------------------------------------------------
+CREATE TABLE ingestion_cursors (
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    source          TEXT NOT NULL,
+    resource_id     TEXT NOT NULL,
+    cursor_value    TEXT,
+    polled_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_error      TEXT,
+    last_error_at   TIMESTAMPTZ,
+    CONSTRAINT ingestion_cursors_pkey PRIMARY KEY (customer_id, source, resource_id)
+);
+
+CREATE INDEX ix_ingestion_cursors_source_polled_at
+    ON ingestion_cursors (source, polled_at DESC);
+
+ALTER TABLE ingestion_cursors ENABLE ROW LEVEL SECURITY;
+-- NO FORCE — the scheduler walks cross-tenant.
+CREATE POLICY ingestion_cursors_tenant_isolation ON ingestion_cursors
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
