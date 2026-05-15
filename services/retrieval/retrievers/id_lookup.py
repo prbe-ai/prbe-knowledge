@@ -24,6 +24,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from services.retrieval.temporal import build_predicate
 from shared.db import with_tenant
@@ -78,8 +79,8 @@ async def id_lookup_search(
     canonical_ids: list[str],
     temporal: TemporalSpec | None = None,
 ) -> list[IdLookupHit]:
-    """Return one content chunk per doc whose source_id/doc_id matches any
-    of `canonical_ids`.
+    """Return one content chunk per doc whose source_id/doc_id/source_url
+    matches any of `canonical_ids`.
 
     Match shape:
       - `documents.source_id = ANY($canonical_ids)` — direct hit on the
@@ -93,6 +94,13 @@ async def id_lookup_search(
       - `documents.doc_id LIKE '%:<canonical_id>'` — fallback for docs
         whose doc_id terminator equals the canonical_id (covers GitHub
         PR refs, Linear ticket codes after coalescing, etc.).
+      - `documents.source_url LIKE '%/<canonical_id>...'` — Linear stores
+        tickets keyed by an internal UUID (source_id = `issue:<uuid>`,
+        doc_id ends in `:<uuid>`) but the URL carries the human handle
+        (`/issue/PRB-17/...`). Patterns anchor on a path separator so
+        `/PRB-17/` matches but `/PRB-170/` does not. Until we backfill an
+        identifier alias for tickets, URL match is the only signal that
+        connects extractor-emitted `PRB-17` to the issue's doc row.
 
     Temporal applies the same predicate as the other retrievers so a
     historical-version lookup goes against the right SCD2 row. Returns one
@@ -104,9 +112,24 @@ async def id_lookup_search(
 
     spec = temporal or TemporalSpec()
     suffixes = [f"%:{c}" for c in ids]
+    # URL path-segment patterns. The four variants cover the boundary the
+    # ticket code can sit against in a real URL:
+    #   /PRB-17/  in the middle of the path
+    #   /PRB-17   at the very end (no trailing slash)
+    #   /PRB-17?  immediately before a query string
+    #   /PRB-17#  immediately before a fragment
+    # `%PRB-17%` would over-match (`/PRB-170/`, `?prb-17-attached`); the
+    # leading `/` plus a terminator on the trailing side keeps matches
+    # to whole path segments.
+    url_patterns: list[str] = []
+    for c in ids:
+        url_patterns.append(f"%/{c}/%")
+        url_patterns.append(f"%/{c}")
+        url_patterns.append(f"%/{c}?%")
+        url_patterns.append(f"%/{c}#%")
 
     async with with_tenant(customer_id) as conn:
-        params: list = [customer_id, ids, suffixes]
+        params: list[Any] = [customer_id, ids, suffixes, url_patterns]
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
         )
@@ -136,6 +159,7 @@ async def id_lookup_search(
                 d.source_id = ANY($2::text[])
                 OR d.source_id LIKE ANY($3::text[])
                 OR d.doc_id LIKE ANY($3::text[])
+                OR d.source_url LIKE ANY($4::text[])
               )
               {pred.chunk_sql}
               {pred.doc_sql}

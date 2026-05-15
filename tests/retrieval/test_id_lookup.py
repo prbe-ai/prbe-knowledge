@@ -122,13 +122,20 @@ async def _seed_session_doc(
     doc_id: str,
     source_id: str,
     body: str = "session transcript content",
+    source_url: str | None = None,
 ) -> None:
     """Seed a claude_code session doc + one content chunk.
 
     Mirrors the shape the claude_code handler produces so the lookup SQL
     runs against realistic data (kind='content', valid version range,
     matching source_id).
+
+    `source_url` defaults to the claude_code agent-sessions path; pass an
+    explicit URL to seed docs from other sources (e.g. Linear) without
+    needing a separate helper.
     """
+    if source_url is None:
+        source_url = f"https://prbe.ai/dashboard/agent-sessions/{source_id}"
     async with raw_conn() as conn:
         await conn.execute(
             """
@@ -148,13 +155,13 @@ async def _seed_session_doc(
                 created_at, updated_at, valid_from, ingested_at, acl
             ) VALUES (
                 $1, 1, $2,
-                'claude_code', $3, 'https://prbe.ai/dashboard/agent-sessions/' || $3,
+                'claude_code', $3, $5,
                 'raw_source', 'claude_code.session', 'application/json',
                 'h-' || $1, 'Session ' || substr($3, 1, 8), 100, 0,
                 $4, $4, $4, $4, '{}'::jsonb
             )
             """,
-            doc_id, customer_id, source_id, _NOW,
+            doc_id, customer_id, source_id, _NOW, source_url,
         )
         await conn.execute(
             """
@@ -219,6 +226,83 @@ async def test_id_lookup_matches_prefixed_source_id(live_db) -> None:
 
     assert len(hits) == 1
     assert hits[0].doc_id == f"linear:{cust}:issue:{bare}"
+
+
+@pytest.mark.asyncio
+async def test_id_lookup_matches_url_path_segment(live_db) -> None:
+    """Linear keys tickets by an internal UUID in source_id and doc_id, but
+    the URL carries the human handle (`/issue/PRB-17/...`). The URL-LIKE
+    branch lets a router-extracted ticket code reach the issue's doc row
+    even though neither source_id nor doc_id contain the code.
+    """
+    cust = "cust-id-lookup-url"
+    issue_uuid = "aaaa1111-bbbb-2222-cccc-333333333333"
+    ticket_code = "PRB-17"
+    await _seed_session_doc(
+        cust,
+        doc_id=f"linear:{cust}:issue:{issue_uuid}",
+        source_id=f"issue:{issue_uuid}",
+        source_url=f"https://linear.app/prbe/issue/{ticket_code}/some-title",
+        body="ticket body",
+    )
+
+    hits = await id_lookup_search(cust, [ticket_code], temporal=TemporalSpec())
+
+    assert len(hits) == 1
+    assert hits[0].doc_id == f"linear:{cust}:issue:{issue_uuid}"
+
+
+@pytest.mark.asyncio
+async def test_id_lookup_url_match_no_false_positive_on_longer_id(live_db) -> None:
+    """`/PRB-170/` must NOT match a search for `PRB-17`. The URL patterns
+    require a path-separator boundary on the trailing side (`/`, `?`, `#`,
+    or end-of-string), so `/PRB-170/` correctly fails to match.
+    """
+    cust = "cust-id-lookup-url-fp"
+    await _seed_session_doc(
+        cust,
+        doc_id=f"linear:{cust}:issue:bbbb1111-bbbb-2222-cccc-333333333333",
+        source_id="issue:bbbb1111-bbbb-2222-cccc-333333333333",
+        source_url="https://linear.app/prbe/issue/PRB-170/different-ticket",
+        body="other ticket",
+    )
+
+    hits = await id_lookup_search(cust, ["PRB-17"], temporal=TemporalSpec())
+
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_id_lookup_url_match_handles_url_trailers(live_db) -> None:
+    """Each path-boundary variant — bare end, query string, anchor — must
+    catch the corresponding URL shape. Comments on a Linear ticket use the
+    anchor form (`/issue/PRB-17/.../#comment-xyz`); a query-string form
+    would appear if Linear's URL builder ever drops the trailing slug.
+    """
+    cust = "cust-id-lookup-url-trailers"
+    await _seed_session_doc(
+        cust,
+        doc_id=f"linear:{cust}:issue:cccc1111-1111-1111-1111-111111111111",
+        source_id="issue:cccc1111-1111-1111-1111-111111111111",
+        source_url="https://linear.app/prbe/issue/PRB-42",  # bare end
+        body="bare-end doc",
+    )
+    await _seed_session_doc(
+        cust,
+        doc_id=f"linear:{cust}:comment:dddd1111-1111-1111-1111-111111111111",
+        source_id="comment:dddd1111-1111-1111-1111-111111111111",
+        source_url=(
+            "https://linear.app/prbe/issue/PRB-42/title-slug"
+            "#comment-eeee1111-1111-1111-1111-111111111111"
+        ),
+        body="comment doc",
+    )
+
+    hits = await id_lookup_search(cust, ["PRB-42"], temporal=TemporalSpec())
+
+    doc_ids = {h.doc_id for h in hits}
+    assert f"linear:{cust}:issue:cccc1111-1111-1111-1111-111111111111" in doc_ids
+    assert f"linear:{cust}:comment:dddd1111-1111-1111-1111-111111111111" in doc_ids
 
 
 @pytest.mark.asyncio
