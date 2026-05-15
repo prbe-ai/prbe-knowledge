@@ -23,6 +23,7 @@ from services.retrieval.acl import filter_by_acl
 from services.retrieval.helpers import expand_to_cluster_members
 from services.retrieval.retrievers.related_entities import (
     build_exclude_node_keys,
+    expand_exclude_keys_with_aliases,
     walk_result_doc_neighbors,
 )
 from services.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
@@ -280,6 +281,14 @@ async def run_list(
         # rationale. Threshold + normalized variants.
         exclude_keys = build_exclude_node_keys(
             routed.entities,
+            entity_match_threshold=req.entity_match_threshold,
+        )
+        # Phase 2: translate alias canonical_ids to primaries so the walker
+        # doesn't recommend the cluster the user just typed.
+        exclude_keys = await expand_exclude_keys_with_aliases(
+            customer_id,
+            routed.entities,
+            exclude_keys,
             entity_match_threshold=req.entity_match_threshold,
         )
         # Dedupe doc_id, keep best (lowest) rank per doc -- list mode emits

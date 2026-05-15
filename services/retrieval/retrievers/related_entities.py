@@ -14,6 +14,7 @@ tier ordering. The walk is bidirectional (UNION ALL on `from_node_id` /
 
 from __future__ import annotations
 
+from services.retrieval.helpers import resolve_aliases
 from services.retrieval.retrievers.graph import _CONFIDENCE_RANK, _ENTITY_TO_LABEL
 from shared.constants import NodeLabel
 from shared.db import with_tenant
@@ -105,6 +106,60 @@ def build_exclude_node_keys(
             if stripped and stripped != lowered:
                 out.add((label, stripped))
     return out
+
+
+async def expand_exclude_keys_with_aliases(
+    customer_id: str,
+    routed_entities,
+    exclude_keys: set[tuple[str, str]],
+    *,
+    entity_match_threshold: float = 0.7,
+) -> set[tuple[str, str]]:
+    """Augment a `build_exclude_node_keys` set with the cluster primaries.
+
+    When the router emits an alias canonical_id (e.g. Person:mahit@prbe.ai
+    post-merge), the walker's SQL exclusion compares against
+    gn.canonical_id which is now the primary (richardwei6), not the alias.
+    Without translation the walker would happily recommend the primary as
+    a related-entities suggestion even though the user just typed it via
+    one of its aliases.
+
+    Mirrors the threshold + label-resolution semantics of
+    `build_exclude_node_keys` so the SAME set of routed entities feeds
+    both paths. Adds lowercased + namespace-stripped variants of the
+    primary canonical_id to match the SQL's normalized comparison.
+
+    Returns a new set (does not mutate the input).
+    """
+    import re
+
+    refs: list[tuple[str, str]] = []
+    for e in routed_entities:
+        confidence = getattr(e, "confidence", 1.0) or 0.0
+        if confidence < entity_match_threshold:
+            continue
+        label = _ENTITY_TO_LABEL.get(e.entity_type.lower())
+        if not label:
+            continue
+        cid = getattr(e, "canonical_id", None)
+        if not cid:
+            continue
+        refs.append((label, cid))
+    if not refs:
+        return exclude_keys
+    async with with_tenant(customer_id) as conn:
+        alias_map = await resolve_aliases(conn, customer_id, refs=refs)
+    if not alias_map:
+        return exclude_keys
+    namespace_strip = re.compile(r"^.*/")
+    expanded = set(exclude_keys)
+    for (label, _orig_cid), primary in alias_map.items():
+        lowered = primary.lower()
+        expanded.add((label, lowered))
+        stripped = namespace_strip.sub("", lowered)
+        if stripped and stripped != lowered:
+            expanded.add((label, stripped))
+    return expanded
 
 
 async def walk_result_doc_neighbors(

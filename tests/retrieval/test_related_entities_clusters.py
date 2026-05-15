@@ -310,3 +310,45 @@ async def test_walker_treats_empty_override_as_no_override(live_db):
     )
     person = next(r for r in rels if r.label == "Person")
     assert person.display_name == "Richard"
+
+
+async def test_walker_excludes_primary_when_alias_in_exclude_keys(live_db):
+    """When `expand_exclude_keys_with_aliases` is called on a set that
+    includes an alias, the resulting set should also exclude the primary
+    so the walker doesn't recommend the cluster the user just typed.
+    """
+    await _seed_full_cluster(CUSTOMER_ID)
+    from services.retrieval.retrievers.related_entities import (
+        expand_exclude_keys_with_aliases,
+    )
+
+    # Simulate: router extracted Person:mahit@prbe.ai (an alias of richardwei6).
+    class _Entity:
+        entity_type = "person"
+        canonical_id = ALIAS_A
+        display_name = ALIAS_A
+        confidence = 0.9
+    routed_entities = [_Entity()]
+
+    # Base set from build_exclude_node_keys-equivalent: lowercased ALIAS_A.
+    base = {("Person", ALIAS_A.lower())}
+
+    expanded = await expand_exclude_keys_with_aliases(
+        CUSTOMER_ID,
+        routed_entities,
+        base,
+    )
+    # Expanded set must contain the primary (so walker excludes it).
+    assert ("Person", PRIMARY.lower()) in expanded
+    # Base alias key is preserved.
+    assert ("Person", ALIAS_A.lower()) in expanded
+
+    # End-to-end: walker called with the expanded set must NOT return Person:PRIMARY.
+    rels = await walk_result_doc_neighbors(
+        customer_id=CUSTOMER_ID,
+        ranked_result_docs=[(DOC_ID, 1)],
+        exclude_node_keys=expanded,
+        min_confidence=None,
+        top_n=10,
+    )
+    assert all(r.label != "Person" for r in rels)
