@@ -339,6 +339,12 @@ async def query_stream(
                     "applied_mode": rresp.applied_mode,
                     "applied_doc_types": rresp.applied_doc_types,
                     "aggregation": rresp.aggregation,
+                    "related_entities": (
+                        [e.model_dump(mode="json") for e in rresp.related_entities]
+                        if rresp.related_entities is not None
+                        else None
+                    ),
+                    "related_entities_error": rresp.related_entities_error,
                 },
             )
 
