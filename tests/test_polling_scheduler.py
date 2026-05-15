@@ -1,7 +1,7 @@
 """Polling-scheduler framework tests (PR B foundation).
 
 Covers the framework only — no per-source poller is registered here.
-Tests use a stub poller that registers as ``SourceSystem.SLACK`` for
+Tests use a stub poller that registers as ``SourceSystem.WIKI`` for
 the duration of the test (then unregisters) so the scheduler's
 dispatch + cursor management is exercised end-to-end without any
 real upstream API call.
@@ -78,7 +78,7 @@ async def _seed_customer():
 class _StubPoller(BasePoller):
     """Test stub. Returns whatever the test put into _next_result."""
 
-    source = SourceSystem.SLACK
+    source = SourceSystem.WIKI
     _next_result: ClassVar[PollResult] = PollResult(documents=[], next_cursor=None)
     _calls: ClassVar[list[tuple[str, str, str | None]]] = []
 
@@ -104,43 +104,43 @@ def _register_stub_poller():
     Side-stepping `register_poller`'s collision check by clearing the
     registry entry directly during cleanup."""
     _StubPoller.reset()
-    register_poller(SourceSystem.SLACK, _StubPoller)
+    register_poller(SourceSystem.WIKI, _StubPoller)
     yield _StubPoller
-    polling_base._REGISTRY.pop(SourceSystem.SLACK, None)
+    polling_base._REGISTRY.pop(SourceSystem.WIKI, None)
 
 
 def test_register_get_poller():
-    register_poller(SourceSystem.GITHUB, _StubPoller)
+    register_poller(SourceSystem.CLAUDE_CODE, _StubPoller)
     try:
-        assert get_poller(SourceSystem.GITHUB) is _StubPoller
-        assert SourceSystem.GITHUB in registered_sources()
+        assert get_poller(SourceSystem.CLAUDE_CODE) is _StubPoller
+        assert SourceSystem.CLAUDE_CODE in registered_sources()
     finally:
-        polling_base._REGISTRY.pop(SourceSystem.GITHUB, None)
+        polling_base._REGISTRY.pop(SourceSystem.CLAUDE_CODE, None)
 
 
 def test_register_poller_idempotent_same_class():
-    register_poller(SourceSystem.GITHUB, _StubPoller)
+    register_poller(SourceSystem.CLAUDE_CODE, _StubPoller)
     try:
         # Re-registering the SAME class is a no-op, not a raise.
-        register_poller(SourceSystem.GITHUB, _StubPoller)
-        assert get_poller(SourceSystem.GITHUB) is _StubPoller
+        register_poller(SourceSystem.CLAUDE_CODE, _StubPoller)
+        assert get_poller(SourceSystem.CLAUDE_CODE) is _StubPoller
     finally:
-        polling_base._REGISTRY.pop(SourceSystem.GITHUB, None)
+        polling_base._REGISTRY.pop(SourceSystem.CLAUDE_CODE, None)
 
 
 def test_register_poller_collision_raises():
     class _OtherPoller(BasePoller):
-        source = SourceSystem.GITHUB
+        source = SourceSystem.CLAUDE_CODE
 
         async def poll(self, *, customer_id, resource_id, cursor):
             return PollResult(documents=[])
 
-    register_poller(SourceSystem.GITHUB, _StubPoller)
+    register_poller(SourceSystem.CLAUDE_CODE, _StubPoller)
     try:
         with pytest.raises(RuntimeError, match="already registered"):
-            register_poller(SourceSystem.GITHUB, _OtherPoller)
+            register_poller(SourceSystem.CLAUDE_CODE, _OtherPoller)
     finally:
-        polling_base._REGISTRY.pop(SourceSystem.GITHUB, None)
+        polling_base._REGISTRY.pop(SourceSystem.CLAUDE_CODE, None)
 
 
 def test_get_poller_unknown_returns_none():
@@ -155,13 +155,13 @@ async def test_advance_cursor_inserts_first_then_updates(_seed_customer):
     # First call inserts.
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         new_cursor_value="ts:1000",
     )
     loaded = await load_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
     )
     assert loaded is not None
@@ -171,13 +171,13 @@ async def test_advance_cursor_inserts_first_then_updates(_seed_customer):
     # Second call updates the same row (composite PK).
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         new_cursor_value="ts:2000",
     )
     loaded = await load_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
     )
     assert loaded.cursor_value == "ts:2000"
@@ -189,19 +189,19 @@ async def test_advance_cursor_none_keeps_existing_value(_seed_customer):
     the existing value must stick (COALESCE in the UPSERT)."""
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         new_cursor_value="ts:1000",
     )
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         new_cursor_value=None,
     )
     loaded = await load_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
     )
     assert loaded.cursor_value == "ts:1000"
@@ -211,19 +211,19 @@ async def test_advance_cursor_none_keeps_existing_value(_seed_customer):
 async def test_stamp_error_records_without_advancing_cursor(_seed_customer):
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         new_cursor_value="ts:1000",
     )
     await stamp_error(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         error="rate_limited 429",
     )
     loaded = await load_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
     )
     assert loaded.cursor_value == "ts:1000"  # unchanged
@@ -236,13 +236,13 @@ async def test_list_due_cursors_filters_by_age(_seed_customer):
     # Insert a row, then backdate its polled_at.
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="recent",
         new_cursor_value="x",
     )
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="stale",
         new_cursor_value="x",
     )
@@ -276,7 +276,7 @@ async def test_tick_one_runs_registered_poller_and_advances_cursor(
     # Seed an old cursor row so it's "due".
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         new_cursor_value="ts:5000",
     )
@@ -301,7 +301,7 @@ async def test_tick_one_runs_registered_poller_and_advances_cursor(
     assert documents_seen == [(_TENANT, [{"id": "doc1"}])]
 
     loaded = await load_cursor(
-        customer_id=_TENANT, source=SourceSystem.SLACK, resource_id="C123"
+        customer_id=_TENANT, source=SourceSystem.WIKI, resource_id="C123"
     )
     assert loaded.cursor_value == "ts:9999"
     assert loaded.last_error is None
@@ -315,7 +315,7 @@ async def test_tick_one_stamps_error_on_poll_error_field(
 
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         new_cursor_value="ts:1000",
     )
@@ -329,7 +329,7 @@ async def test_tick_one_stamps_error_on_poll_error_field(
     await scheduler.tick_once()
 
     loaded = await load_cursor(
-        customer_id=_TENANT, source=SourceSystem.SLACK, resource_id="C123"
+        customer_id=_TENANT, source=SourceSystem.WIKI, resource_id="C123"
     )
     # Cursor unchanged; error stamped.
     assert loaded.cursor_value == "ts:1000"
@@ -341,17 +341,17 @@ async def test_tick_one_stamps_error_on_poller_raised(
     _seed_customer, _register_stub_poller
 ):
     class _ExplodingPoller(BasePoller):
-        source = SourceSystem.SLACK
+        source = SourceSystem.WIKI
 
         async def poll(self, *, customer_id, resource_id, cursor):
             raise RuntimeError("boom")
 
     # Swap the registered stub for an exploding one.
-    polling_base._REGISTRY[SourceSystem.SLACK] = _ExplodingPoller
+    polling_base._REGISTRY[SourceSystem.WIKI] = _ExplodingPoller
 
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         new_cursor_value="ts:1000",
     )
@@ -365,7 +365,7 @@ async def test_tick_one_stamps_error_on_poller_raised(
     await scheduler.tick_once()
 
     loaded = await load_cursor(
-        customer_id=_TENANT, source=SourceSystem.SLACK, resource_id="C123"
+        customer_id=_TENANT, source=SourceSystem.WIKI, resource_id="C123"
     )
     assert loaded.cursor_value == "ts:1000"
     assert loaded.last_error is not None
@@ -381,7 +381,7 @@ async def test_tick_one_skips_unregistered_source(_seed_customer):
     # Source = NOTION; nothing registered for it.
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.NOTION,
+        source=SourceSystem.MANUAL_UPLOAD,
         resource_id="page-xyz",
         new_cursor_value="t:1",
     )
@@ -397,7 +397,7 @@ async def test_tick_one_skips_unregistered_source(_seed_customer):
     assert processed == 1
     loaded = await load_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.NOTION,
+        source=SourceSystem.MANUAL_UPLOAD,
         resource_id="page-xyz",
     )
     assert loaded.cursor_value == "t:1"
@@ -410,7 +410,7 @@ async def test_tick_one_no_due_rows_returns_zero(_seed_customer, _register_stub_
     # due yet.
     await advance_cursor(
         customer_id=_TENANT,
-        source=SourceSystem.SLACK,
+        source=SourceSystem.WIKI,
         resource_id="C123",
         new_cursor_value="ts:1000",
     )
