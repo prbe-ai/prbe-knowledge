@@ -47,8 +47,40 @@ def upgrade() -> None:
             "WHERE r2_bucket IS NULL"
         ).bindparams(prefix=prefix)
     )
+
+    # BEFORE INSERT trigger to fill r2_bucket from customer_id when NULL.
+    # Postgres DEFAULTs can't reference other columns, so a trigger is the
+    # only way to derive r2_bucket from customer_id at insert time. The
+    # CP→DP mirror (production INSERT path) always supplies r2_bucket
+    # explicitly, so the trigger only fires for tests / self-host's
+    # seed-customer Job that forgets to set it. On the DP, ``customer_id``
+    # IS the slug (see prbe-backend's apps/control_plane/routers/me/
+    # provision.py:432-439), so ``prbe-<customer_id>`` == ``prbe-<slug>``
+    # — the trigger produces the canonical new-policy name.
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION customers_fill_r2_bucket() RETURNS TRIGGER AS $$
+        BEGIN
+            IF NEW.r2_bucket IS NULL THEN
+                NEW.r2_bucket := 'prbe-' || NEW.customer_id;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER customers_fill_r2_bucket_trg
+            BEFORE INSERT ON customers
+            FOR EACH ROW
+            EXECUTE FUNCTION customers_fill_r2_bucket();
+        """
+    )
     op.alter_column("customers", "r2_bucket", nullable=False)
 
 
 def downgrade() -> None:
     op.alter_column("customers", "r2_bucket", nullable=True)
+    op.execute("DROP TRIGGER IF EXISTS customers_fill_r2_bucket_trg ON customers")
+    op.execute("DROP FUNCTION IF EXISTS customers_fill_r2_bucket()")
