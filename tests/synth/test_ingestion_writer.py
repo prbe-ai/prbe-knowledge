@@ -8,7 +8,7 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import orjson
 import pytest
@@ -150,7 +150,7 @@ async def test_local_writes_github_envelope_to_disk(tmp_path: Path) -> None:
 
 def _mock_bucket() -> AsyncMock:
     bucket = AsyncMock()
-    bucket.bucket_for = MagicMock(return_value="prbe-synth-bucket")
+    bucket.bucket_for = AsyncMock(return_value="prbe-synth-bucket")
     bucket.put = AsyncMock(return_value=None)
     return bucket
 
