@@ -415,7 +415,7 @@ CREATE INDEX idx_backfill_state_running ON backfill_state (status, heartbeat_at)
 -- steady-state pushes do zero re-embedding. Survives across worker restarts.
 -- ---------------------------------------------------------------------------
 CREATE TABLE code_repo_state (
-    customer_id            TEXT NOT NULL,
+    customer_id            TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     repo                   TEXT NOT NULL,
     file_path              TEXT NOT NULL,
     content_hash           TEXT NOT NULL,
