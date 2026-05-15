@@ -2069,6 +2069,8 @@ matching the same treatment applied to RelatedEntity by the walker."
 
 ### Task 7: Final pass — full test suite + design-doc consistency
 
+> **Pytest is not enough.** Task 8 (container smoke test) is REQUIRED before declaring Phase 2 done. Do not open the PR until both Tasks 7 and 8 pass.
+
 **Files:**
 - No code changes; sanity check + (optional) cross-reference note in design doc.
 
@@ -2121,7 +2123,7 @@ git commit -m "docs(entity-clusters): cross-link Phase 2 implementation to desig
 git push -u origin entity-clusters-phase2
 ```
 
-- [ ] **Step 7: Open PR**
+- [ ] **Step 7: Open PR — but only after Task 8 passes**
 
 Stack the PR on `entity-clusters-phase1` (the parent branch). Use `gh pr create --base entity-clusters-phase1 ...` once Phase 1 PRs are merged you can rebase onto `main` and retarget.
 
@@ -2157,6 +2159,445 @@ EOF
 
 ---
 
+---
+
+### Task 8: Live container smoke test (REQUIRED before merge)
+
+**Files:**
+- Create: `scripts/smoke_phase2_clusters.py` (scratch seed script — committed to the branch but never imported by application code)
+- No application code changes.
+
+**Context:** Pytest exercises the modules in isolation but does not verify the full ASGI stack (lifespan context, RLS GUC inheritance across endpoints, header passthrough, asyncpg pool initialization). Phase 1 caught real semantic issues this way (e.g., 409-already-aliased path being unreachable because the existence check fires first). Phase 2 needs the same end-to-end verification: spin up real uvicorn against Docker Postgres, seed a cluster, hit BOTH the ingestion merge endpoint AND every retrieval surface this PR touches, and visually confirm the responses match the design doc's read-side claims.
+
+**Auth scheme:** retrieval supports two paths:
+1. `X-Prbe-Customer-Key: <raw_key>` (external) — hashed and compared to `customers.api_key_hash`.
+2. `X-Internal-Knowledge-Key: <secret>` + `X-Prbe-Customer: <id>` (internal trust boundary) — used by the BFF.
+
+We use scheme #2 for the smoke test because `INTERNAL_KNOWLEDGE_API_KEY` is already configured for the ingestion-side merge call; reusing it avoids computing a SHA hash for a raw external key.
+
+**Ports:** Ingestion `services.ingestion.main:app` → 9817 (same as Phase 1 smoke). Retrieval `services.retrieval.main:app` → 8081 (the default in `services/retrieval/main.py:1276`). Run both concurrently in the background.
+
+- [ ] **Step 1: Pre-flight checks**
+
+```bash
+cd /Users/mahitnamburu/Desktop/prbe/prbe-knowledge-worktrees/entity-clusters-phase2
+docker compose ps                       # confirm postgres + minio up
+.venv/bin/alembic -c db/alembic.ini current   # confirm head includes 20260514_0071
+echo $INTERNAL_KNOWLEDGE_API_KEY          # confirm env var set (use test-internal-key)
+```
+
+If Docker isn't running: `docker compose up -d` and wait for healthy.
+If migration isn't at head: `.venv/bin/alembic -c db/alembic.ini upgrade head`.
+
+- [ ] **Step 2: Write the seed script**
+
+Create `scripts/smoke_phase2_clusters.py`:
+
+```python
+"""One-off seed for the Phase 2 cluster-awareness smoke test.
+
+Idempotent: drops the smoke customer first, then re-seeds. Safe to
+re-run between iterations. Never imported by application code.
+
+Seed shape:
+  - Customer: smoke-phase2-cust
+  - Person nodes:    richardwei6, mahit@prbe.ai, U07ABC123
+  - Provenance:      richardwei6 -> github
+                     mahit@prbe.ai -> slack
+                     U07ABC123 -> linear
+  - Document:        d-1 (authored by richardwei6) + d-2 (authored by mahit@prbe.ai)
+  - Graph edges:     richardwei6 -AUTHORED-> Document:d-1
+                     mahit@prbe.ai -AUTHORED-> Document:d-2
+  - No entity_aliases rows yet — that's what /api/entity-clusters/merge writes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
+
+from shared.db import close_pool, init_pool, raw_conn
+
+CUSTOMER = "smoke-phase2-cust"
+NOW = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+
+
+async def main() -> None:
+    await init_pool()
+    try:
+        async with raw_conn() as conn:
+            # Wipe prior smoke state.
+            await conn.execute("DELETE FROM customers WHERE customer_id = $1", CUSTOMER)
+            # Seed (FKs cascade from customers).
+            await conn.execute(
+                """
+                INSERT INTO customers (customer_id, display_name, api_key_hash)
+                VALUES ($1, 'phase2 smoke', 'h-' || $1)
+                """,
+                CUSTOMER,
+            )
+            # Documents + chunks.
+            for doc_id, author in [("d-1", "richardwei6"), ("d-2", "mahit@prbe.ai")]:
+                await conn.execute(
+                    """
+                    INSERT INTO documents (
+                        doc_id, version, customer_id,
+                        source_system, source_id, source_url,
+                        doc_class, doc_type, content_type,
+                        content_hash, title, body_size_bytes, body_token_count,
+                        created_at, updated_at, valid_from, ingested_at, acl,
+                        author_id
+                    ) VALUES (
+                        $1, 1, $2,
+                        'github', $3, 'https://example/' || $1,
+                        'raw_source', 'github.commit', 'text/plain',
+                        'h-' || $1, 'doc-' || $1, 100, 0,
+                        $4, $4, $4, $4, '{}'::jsonb,
+                        $5
+                    )
+                    """,
+                    doc_id, CUSTOMER, f"commit:{doc_id}", NOW, author,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO chunks (
+                        chunk_id, doc_id, customer_id,
+                        chunk_index, content, content_hash, token_count,
+                        embedding, first_seen_version, last_seen_version
+                    ) VALUES (
+                        $1, $2, $3, 0, $4, $5, 5,
+                        array_fill(0::real, ARRAY[3072])::halfvec,
+                        1, 1
+                    )
+                    """,
+                    f"{doc_id}:c0", doc_id, CUSTOMER,
+                    f"body of {doc_id}", f"chash-{doc_id}",
+                )
+            # Graph nodes + provenance.
+            for canonical, source in [
+                ("richardwei6", "github"),
+                ("mahit@prbe.ai", "slack"),
+                ("U07ABC123", "linear"),
+            ]:
+                await conn.execute(
+                    """
+                    INSERT INTO graph_nodes (customer_id, label, canonical_id, properties, degree)
+                    VALUES ($1, 'Person', $2, jsonb_build_object('name', $2), 1)
+                    """,
+                    CUSTOMER, canonical,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO graph_node_provenance (
+                        customer_id, node_id, source_system,
+                        first_seen_at, last_seen_at
+                    )
+                    SELECT $1, gn.node_id, $3, $4, $4
+                    FROM graph_nodes gn
+                    WHERE gn.customer_id = $1 AND gn.label = 'Person' AND gn.canonical_id = $2
+                    """,
+                    CUSTOMER, canonical, source, NOW,
+                )
+            # Document graph_nodes.
+            for doc_id in ("d-1", "d-2"):
+                await conn.execute(
+                    """
+                    INSERT INTO graph_nodes (customer_id, label, canonical_id, properties, degree)
+                    VALUES ($1, 'Document', $2, '{}'::jsonb, 1)
+                    """,
+                    CUSTOMER, doc_id,
+                )
+            # AUTHORED edges.
+            for author, doc_id in [("richardwei6", "d-1"), ("mahit@prbe.ai", "d-2")]:
+                await conn.execute(
+                    """
+                    INSERT INTO graph_edges (
+                        customer_id, edge_type,
+                        from_node_id, to_node_id,
+                        confidence, properties
+                    )
+                    SELECT $1, 'AUTHORED',
+                           p.node_id, d.node_id,
+                           'EXTRACTED', '{}'::jsonb
+                    FROM graph_nodes p, graph_nodes d
+                    WHERE p.customer_id = $1 AND p.label = 'Person'   AND p.canonical_id = $2
+                      AND d.customer_id = $1 AND d.label = 'Document' AND d.canonical_id = $3
+                    """,
+                    CUSTOMER, author, doc_id,
+                )
+        print(f"Seeded {CUSTOMER} with 3 Person nodes + 2 docs + AUTHORED edges + provenance.")
+    finally:
+        await close_pool()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Run:
+
+```bash
+.venv/bin/python scripts/smoke_phase2_clusters.py
+```
+
+Expected: `Seeded smoke-phase2-cust with ...`.
+
+- [ ] **Step 3: Launch both uvicorn services in the background**
+
+```bash
+# Ingestion (merge endpoint) on 9817
+.venv/bin/uvicorn services.ingestion.main:app --host 127.0.0.1 --port 9817 > /tmp/phase2-ingest.log 2>&1 &
+INGEST_PID=$!
+# Retrieval (graph_explore + query) on 8081
+.venv/bin/uvicorn services.retrieval.main:app --host 127.0.0.1 --port 8081 > /tmp/phase2-retrieval.log 2>&1 &
+RETRIEVAL_PID=$!
+
+sleep 2  # let lifespan init pools
+
+# Sanity: both report healthy. Tail logs if either fails to start.
+curl -s http://127.0.0.1:9817/healthz | head -5
+curl -s http://127.0.0.1:8081/healthz | head -5
+```
+
+If health checks fail, check `tail -50 /tmp/phase2-ingest.log /tmp/phase2-retrieval.log`. Common causes: stale connections from a prior smoke test (kill old uvicorn first: `pkill -f "uvicorn services\."`); migration not at head; env vars missing.
+
+- [ ] **Step 4: Baseline read — pre-merge state**
+
+These should all behave the way they do today (no Phase 2 effect yet because `entity_aliases` is empty).
+
+```bash
+# 4a. Anchor on the actual node "mahit@prbe.ai" -> returns its graph.
+curl -s -X POST http://127.0.0.1:8081/graph/explore \
+  -H "X-Internal-Knowledge-Key: $INTERNAL_KNOWLEDGE_API_KEY" \
+  -H "X-Prbe-Customer: smoke-phase2-cust" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"anchor","anchor_node_id":"mahit@prbe.ai"}' | jq '.nodes | length'
+# Expect: 2 (Person:mahit@prbe.ai + Document:d-2)
+```
+
+- [ ] **Step 5: Merge mahit@prbe.ai + U07ABC123 into richardwei6**
+
+```bash
+curl -s -X POST http://127.0.0.1:9817/api/entity-clusters/merge \
+  -H "X-Internal-Knowledge-Key: $INTERNAL_KNOWLEDGE_API_KEY" \
+  -H "X-Prbe-Customer: smoke-phase2-cust" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "label":                "Person",
+    "primary_canonical_id": "richardwei6",
+    "alias_canonical_ids":  ["mahit@prbe.ai", "U07ABC123"],
+    "customer_id":          "smoke-phase2-cust",
+    "performed_by_user_id": "11111111-1111-1111-1111-111111111111",
+    "reason":               "phase2 smoke"
+  }' | jq .
+```
+
+Expected:
+
+```json
+{
+  "merge_id": "...",
+  "label": "Person",
+  "primary_canonical_id": "richardwei6",
+  "merged_alias_canonical_ids": ["mahit@prbe.ai", "U07ABC123"]
+}
+```
+
+Verify alias nodes are gone:
+
+```bash
+docker compose exec -T postgres psql -U prbe -d prbe -c \
+  "SELECT canonical_id FROM graph_nodes WHERE customer_id='smoke-phase2-cust' AND label='Person';"
+# Expect: only 'richardwei6' (the two aliases were hard-deleted at merge time).
+```
+
+- [ ] **Step 6: Verify Phase 2 read-side behaviors**
+
+**6a. `/graph/explore` anchor translation:**
+
+```bash
+# Hit anchor with the ALIAS canonical_id. Without Phase 2 this would 404.
+curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8081/graph/explore \
+  -H "X-Internal-Knowledge-Key: $INTERNAL_KNOWLEDGE_API_KEY" \
+  -H "X-Prbe-Customer: smoke-phase2-cust" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"anchor","anchor_node_id":"mahit@prbe.ai"}'
+# Expect: 200
+
+# And the returned graph contains the primary's nodes.
+curl -s -X POST http://127.0.0.1:8081/graph/explore \
+  -H "X-Internal-Knowledge-Key: $INTERNAL_KNOWLEDGE_API_KEY" \
+  -H "X-Prbe-Customer: smoke-phase2-cust" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"anchor","anchor_node_id":"mahit@prbe.ai"}' \
+  | jq '.nodes | map(.id)'
+# Expect: ["richardwei6", "d-1", "d-2"] (primary + both documents now-attached after edge rewrite).
+```
+
+**6b. List-mode author filter expansion:**
+
+```bash
+# Build a /query request that filters by author_id=mahit@prbe.ai.
+# The router would normally extract this from natural language; we
+# pre-construct the routed entities by hitting an explicit endpoint or
+# faking via the dispatcher. Easiest path: invoke /query with q that
+# trivially extracts the person, and assert d-1 (authored by primary)
+# AND d-2 (authored by alias) both appear.
+#
+# If routing extracts unreliably, fall back to a Python REPL one-liner:
+.venv/bin/python -c "
+import asyncio
+from services.retrieval.list_pipeline import run_list
+from services.retrieval.router import RouterEntity, RouterOutput
+from shared.models import QueryRequest, TemporalSpec
+async def main():
+    req = QueryRequest(q='by mahit', top_k=20, entity_must_match=True)
+    routed = RouterOutput(operation='list',
+        entities=[RouterEntity(entity_type='person', canonical_id='mahit@prbe.ai',
+                               display_name='Mahit', confidence=0.9)])
+    resp = await run_list(req=req, customer_id='smoke-phase2-cust', routed=routed,
+                          spec=TemporalSpec(), temporal_meta={}, sort_meta=None,
+                          extracted_entities=[], doc_types=None,
+                          trace_id='smoke', timing={})
+    print(sorted(d.doc_id for d in resp.documents))
+asyncio.run(main())
+"
+# Expect: ['d-1', 'd-2']
+# (d-1 was authored by richardwei6, d-2 by mahit@prbe.ai. Without Phase 2
+# expansion the author_id='mahit@prbe.ai' filter would only return d-2.)
+```
+
+**6c. `RelatedEntity` cluster fields:**
+
+```bash
+# Query that surfaces the Person primary as a related entity. Easiest:
+# request docs and let the walker run.
+.venv/bin/python -c "
+import asyncio
+from services.retrieval.retrievers.related_entities import walk_result_doc_neighbors
+async def main():
+    rels = await walk_result_doc_neighbors(
+        customer_id='smoke-phase2-cust',
+        ranked_result_docs=[('d-1', 1), ('d-2', 2)],
+        exclude_node_keys=set(),
+        min_confidence=None,
+        top_n=10,
+    )
+    for r in rels:
+        if r.label == 'Person':
+            print(f'canonical={r.canonical_id} member_count={r.member_count} '
+                  f'member_sources={sorted(r.member_sources)} display_name={r.display_name}')
+asyncio.run(main())
+"
+# Expect: canonical=richardwei6 member_count=3 member_sources=['github','linear','slack'] display_name=richardwei6
+```
+
+**6d. Display-name override:**
+
+```bash
+docker compose exec -T postgres psql -U prbe -d prbe -c \
+  "INSERT INTO entity_cluster_metadata (customer_id, label, primary_canonical_id, display_name)
+   VALUES ('smoke-phase2-cust', 'Person', 'richardwei6', 'Richard Wei (canonical)');"
+
+# Re-run the related_entities query — display_name now reflects the override.
+.venv/bin/python -c "
+import asyncio
+from services.retrieval.retrievers.related_entities import walk_result_doc_neighbors
+async def main():
+    rels = await walk_result_doc_neighbors(
+        customer_id='smoke-phase2-cust',
+        ranked_result_docs=[('d-1', 1), ('d-2', 2)],
+        exclude_node_keys=set(),
+        min_confidence=None,
+        top_n=10,
+    )
+    person = next(r for r in rels if r.label == 'Person')
+    print(person.display_name)
+asyncio.run(main())
+"
+# Expect: Richard Wei (canonical)
+```
+
+**6e. Routed-entity translation (search pipeline):**
+
+```bash
+.venv/bin/python -c "
+import asyncio
+from services.retrieval.router import RouterEntity, RouterOutput
+from services.retrieval.search_pipeline import _build_entity_results
+async def main():
+    routed = RouterOutput(operation='search',
+        entities=[RouterEntity(entity_type='person', canonical_id='mahit@prbe.ai',
+                               display_name='Mahit', confidence=0.9)])
+    results = await _build_entity_results(customer_id='smoke-phase2-cust',
+                                          routed=routed, timing={})
+    for r in results:
+        print(f'canonical={r.canonical_id} display_name={r.display_name}')
+asyncio.run(main())
+"
+# Expect: canonical=richardwei6 display_name=Richard Wei (canonical)
+# (Without Phase 2 the alias miss would print nothing.)
+```
+
+- [ ] **Step 7: Verify post-partial-unmerge reverts to per-alias behavior for the unmerged member**
+
+```bash
+# Unmerge mahit@prbe.ai only — U07ABC123 stays in the cluster.
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE \
+  "http://127.0.0.1:9817/api/entity-clusters/Person/richardwei6/aliases/mahit@prbe.ai" \
+  -H "X-Internal-Knowledge-Key: $INTERNAL_KNOWLEDGE_API_KEY" \
+  -H "X-Prbe-Customer: smoke-phase2-cust"
+# Expect: 204
+
+# Anchor on mahit@prbe.ai now returns mahit's OWN graph (not richardwei6's).
+curl -s -X POST http://127.0.0.1:8081/graph/explore \
+  -H "X-Internal-Knowledge-Key: $INTERNAL_KNOWLEDGE_API_KEY" \
+  -H "X-Prbe-Customer: smoke-phase2-cust" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"anchor","anchor_node_id":"mahit@prbe.ai"}' \
+  | jq '.nodes | map(.id)'
+# Expect: ["mahit@prbe.ai", "d-2"]  -- restored from snapshot.
+
+# Anchor on U07ABC123 still translates to richardwei6 (still aliased).
+curl -s -X POST http://127.0.0.1:8081/graph/explore \
+  -H "X-Internal-Knowledge-Key: $INTERNAL_KNOWLEDGE_API_KEY" \
+  -H "X-Prbe-Customer: smoke-phase2-cust" \
+  -H "Content-Type: application/json" \
+  -d '{"mode":"anchor","anchor_node_id":"U07ABC123"}' \
+  | jq '.nodes | map(.id)'
+# Expect: includes "richardwei6"; not "U07ABC123" (which is hard-deleted)
+```
+
+- [ ] **Step 8: Cleanup**
+
+```bash
+kill $INGEST_PID $RETRIEVAL_PID 2>/dev/null || true
+wait $INGEST_PID $RETRIEVAL_PID 2>/dev/null || true
+
+docker compose exec -T postgres psql -U prbe -d prbe -c \
+  "DELETE FROM customers WHERE customer_id = 'smoke-phase2-cust';"
+```
+
+- [ ] **Step 9: Write up the smoke-test results**
+
+Append a `<details>` block to the Phase 2 PR body listing:
+- What was seeded
+- Which endpoints/functions were exercised (6a, 6b, 6c, 6d, 6e, 7)
+- The observed response for each (one line per check: "✅ /graph/explore alias anchor → 200 + ['richardwei6','d-1','d-2']")
+- Any deviations from expected output (these become follow-up tickets, not silent passes)
+
+- [ ] **Step 10: Commit the seed script**
+
+```bash
+git add scripts/smoke_phase2_clusters.py
+git commit -m "test(scripts): phase2 smoke seed script
+
+Reproduces the Phase 2 verification fixture (3 Person nodes + 2 docs +
+provenance). Idempotent — wipes 'smoke-phase2-cust' before re-seeding."
+```
+
+---
+
 ## Self-review
 
 **1. Spec coverage:**
@@ -2173,6 +2614,7 @@ EOF
 |---|---|
 | Search-pipeline routed-entity translation (alias inputs must land on primary) | Task 6 |
 | `exclude_node_keys` translation so typed aliases exclude the cluster | Task 5 |
+| End-to-end live-service verification (per user feedback: "spinning up a docker instance and merging nodes then reading nodes actually worked") | Task 8 |
 
 No gaps.
 
