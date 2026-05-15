@@ -1,16 +1,16 @@
-"""Unit tests for shared.embeddings dual-provider surface.
+"""Unit tests for shared.embeddings (Gemini-only post-2026-05-14 cutover).
 
 Covers the bits that aren't reachable from a live_db ingest test:
 
 - GeminiEmbedder asymmetric prefixing (doc vs query format)
-- get_embedder() vs get_embedder_v2() singletons
+- get_embedder_v2() singleton
 - _translate_gemini_error mapping from raw SDK errors to our taxonomy
 - Stub mode produces a deterministic vector when no provider key is set
 - Recursive half-split poison-chunk isolation works on the base class
 
-The OpenAI client + Google genai client are NOT exercised over the wire --
-that's the live ingest test's job. Stub mode (no key) gives us a real
-non-None vector to assert against without a network call.
+The Google genai client is NOT exercised over the wire — that's the live
+ingest test's job. Stub mode (no key) gives us a real non-None vector to
+assert against without a network call.
 """
 
 from __future__ import annotations
@@ -26,11 +26,9 @@ from shared.embeddings import (
     EmbedResult,
     FailedChunk,
     GeminiEmbedder,
-    OpenAIEmbedder,
     _BaseEmbedder,
     _format_gemini_document,
     _translate_gemini_error,
-    get_embedder,
     get_embedder_v2,
     reset_embedder,
 )
@@ -89,50 +87,23 @@ def test_gemini_doc_strips_separator_from_title() -> None:
 # ---- Singleton behavior ------------------------------------------------
 
 
-def test_get_embedder_returns_openai_singleton() -> None:
+def test_get_embedder_v2_returns_gemini_singleton() -> None:
     reset_embedder()
-    a = get_embedder()
-    b = get_embedder()
+    a = get_embedder_v2()
+    b = get_embedder_v2()
     assert a is b
-    assert isinstance(a, OpenAIEmbedder)
+    assert isinstance(a, GeminiEmbedder)
 
 
-def test_get_embedder_v2_returns_distinct_gemini_singleton() -> None:
+def test_reset_embedder_clears_singleton() -> None:
     reset_embedder()
-    v1 = get_embedder()
-    v2 = get_embedder_v2()
-    assert v1 is not v2
-    assert isinstance(v2, GeminiEmbedder)
-    # Same call twice keeps returning the same instance.
-    assert get_embedder_v2() is v2
-
-
-def test_reset_embedder_clears_both_singletons() -> None:
+    first = get_embedder_v2()
     reset_embedder()
-    v1_first = get_embedder()
-    v2_first = get_embedder_v2()
-    reset_embedder()
-    v1_second = get_embedder()
-    v2_second = get_embedder_v2()
-    assert v1_first is not v1_second
-    assert v2_first is not v2_second
+    second = get_embedder_v2()
+    assert first is not second
 
 
 # ---- Stub-mode vectors --------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_openai_stub_mode_returns_deterministic_unit_vector() -> None:
-    reset_embedder()
-    embedder = OpenAIEmbedder()
-    # Stub-mode: conftest sets OPENAI_API_KEY="" so AsyncOpenAI is None.
-    assert embedder._client is None
-    result = await embedder.embed_many(["hello"])
-    assert len(result.embedded) == 1
-    vec = result.embedded[0].embedding
-    assert len(vec) == embedder.dim
-    norm = math.sqrt(sum(v * v for v in vec))
-    assert abs(norm - 1.0) < 1e-6  # unit vector
 
 
 @pytest.mark.asyncio
@@ -313,17 +284,6 @@ async def test_recursive_half_split_isolates_poison_chunk() -> None:
 # ---- API surface backward compatibility --------------------------------
 
 
-def test_embedder_alias_removed() -> None:
-    """The pre-cutover `Embedder = OpenAIEmbedder` alias was removed in the
-    2026-05-14 Gemini cutover. Production callers explicitly use
-    GeminiEmbedder / get_embedder_v2; the eval harness uses OpenAIEmbedder
-    by name. The alias is gone so a future caller can't grab `Embedder`
-    and silently get OpenAI back."""
-    import shared.embeddings as mod
-
-    assert not hasattr(mod, "Embedder")
-
-
 def test_dataclass_re_exports_unchanged() -> None:
     # Sanity-check: callers depend on these dataclasses by name. If we ever
     # rename or move them, the import will fail loudly here, not silently
@@ -335,72 +295,10 @@ def test_dataclass_re_exports_unchanged() -> None:
 
 # ---- Gateway-aware embedding (plan D1, managed-shared / self-host) -----
 #
-# When `llm_gateway_url` is set, both embedders route through the LiteLLM
-# proxy: OpenAIEmbedder by pointing its AsyncOpenAI SDK at the gateway via
-# `base_url` (no wrapper hop), GeminiEmbedder by going through
+# When `llm_gateway_url` is set, GeminiEmbedder routes through
 # `shared.llm.aembedding` (the google-genai SDK has no `base_url` knob).
-# These tests are SDK-shape only — no network — but they nail down which
-# transport each embedder uses and that the gateway credentials reach it.
-
-
-def test_openai_embedder_uses_gateway_base_url_when_configured(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Gateway mode: AsyncOpenAI is constructed with `base_url=<gw>` and
-    `api_key=<LLM_GATEWAY_KEY>` — not the direct openai_api_key."""
-
-    from shared.config import get_settings
-
-    monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.litellm.svc:4000")
-    monkeypatch.setenv("LLM_GATEWAY_KEY", "sk-virtual-customer-x")
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-direct-must-not-be-used")
-    get_settings.cache_clear()
-    s = get_settings()
-    # sanity: pydantic-settings picked the gateway value up
-    assert s.llm_gateway_url == "http://litellm.litellm.svc:4000"
-    assert s.llm_gateway_key.get_secret_value() == "sk-virtual-customer-x"
-
-    captured: dict[str, object] = {}
-
-    class _FakeAsyncOpenAI:
-        def __init__(self, **kwargs: object) -> None:
-            captured.update(kwargs)
-            self.embeddings = None  # never called in this test
-
-    monkeypatch.setattr("shared.embeddings.AsyncOpenAI", _FakeAsyncOpenAI)
-
-    OpenAIEmbedder(settings=s)
-
-    assert captured["base_url"] == "http://litellm.litellm.svc:4000"
-    assert captured["api_key"] == "sk-virtual-customer-x"
-    get_settings.cache_clear()
-
-
-def test_openai_embedder_falls_back_to_direct_key_when_no_gateway(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Without LLM_GATEWAY_URL the embedder uses the direct openai_api_key
-    and no `base_url` — the existing dev / self-host-with-own-keys path."""
-    from shared.config import get_settings
-
-    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    monkeypatch.delenv("LLM_GATEWAY_KEY", raising=False)
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-direct")
-    get_settings.cache_clear()
-    s = get_settings()
-
-    captured: dict[str, object] = {}
-
-    class _FakeAsyncOpenAI:
-        def __init__(self, **kwargs: object) -> None:
-            captured.update(kwargs)
-            self.embeddings = None
-
-    monkeypatch.setattr("shared.embeddings.AsyncOpenAI", _FakeAsyncOpenAI)
-
-    OpenAIEmbedder(settings=s)
-    assert captured == {"api_key": "sk-direct"}
-    get_settings.cache_clear()
+# This test is SDK-shape only — no network — but it nails down which
+# transport the embedder uses and that the gateway credentials reach it.
 
 
 @pytest.mark.asyncio

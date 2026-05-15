@@ -48,9 +48,9 @@ if _ENV_PATH.exists():
 import google.genai as genai  # type: ignore[import-untyped]
 from anthropic import AsyncAnthropic
 from google.genai import types as genai_types  # type: ignore[import-untyped]
-from openai import AsyncOpenAI
 
 from scripts.eval_data.fixtures import FIXTURES, Fixture
+from shared.embeddings import GeminiEmbedder
 
 # ---- Models under test ----------------------------------------------------
 
@@ -289,17 +289,17 @@ async def run_gemini(model: str, fixture: Fixture) -> GenerationResult:
 
 
 async def embed_batch(texts: list[str]) -> list[list[float]]:
-    """Embed via OpenAI (matches what the production directed retriever
-    uses). Returns parallel list of vectors.
+    """Embed via Gemini (matches the production retriever post-2026-05-14
+    cutover). Returns parallel list of vectors.
     """
     if not texts:
         return []
-    client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    resp = await client.embeddings.create(
-        model="text-embedding-3-large",
-        input=texts,
-    )
-    return [d.embedding for d in resp.data]
+    embedder = GeminiEmbedder()
+    result = await embedder.embed_many(texts)
+    # Reassemble in input order; embed_many returns chunks tagged with
+    # the input index so a poison-chunk half-split doesn't scramble alignment.
+    by_index = {c.chunk_index: c.embedding for c in result.embedded}
+    return [by_index[i] for i in range(len(texts)) if i in by_index]
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

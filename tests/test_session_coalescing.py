@@ -38,7 +38,7 @@ from shared import claude_code_extraction as _ext
 from shared import db as db_module
 from shared.claude_code_extraction import UnitBundle
 from shared.config import Settings
-from shared.constants import EMBEDDING_DIM, SourceSystem
+from shared.constants import EMBEDDING_V2_DIM, SourceSystem
 from shared.customer_mapping import record_mapping
 from shared.embeddings import EmbeddedChunk, EmbedResult
 from shared.encryption import encrypt_token
@@ -78,7 +78,7 @@ class _ZeroEmbedder:
     async def embed_documents(self, items: list) -> EmbedResult:
         return EmbedResult(
             embedded=[
-                EmbeddedChunk(chunk_index=i, embedding=[0.0] * EMBEDDING_DIM)
+                EmbeddedChunk(chunk_index=i, embedding=[0.0] * EMBEDDING_V2_DIM)
                 for i in range(len(items))
             ],
             failed=[],
@@ -87,7 +87,7 @@ class _ZeroEmbedder:
     async def embed_many(self, texts: list[str]) -> EmbedResult:
         return EmbedResult(
             embedded=[
-                EmbeddedChunk(chunk_index=i, embedding=[0.0] * EMBEDDING_DIM)
+                EmbeddedChunk(chunk_index=i, embedding=[0.0] * EMBEDDING_V2_DIM)
                 for i in range(len(texts))
             ],
             failed=[],

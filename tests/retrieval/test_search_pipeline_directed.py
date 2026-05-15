@@ -25,7 +25,7 @@ from services.retrieval.router import RouterOutput
 from services.retrieval.search_pipeline import run_search
 from shared.config import Settings, get_settings
 from shared.db import raw_conn, with_tenant
-from shared.embeddings import get_embedder, reset_embedder
+from shared.embeddings import get_embedder_v2, reset_embedder
 from shared.models import QueryDocumentResult, QueryRequest, TemporalSpec
 from shared.storage import reset_store
 
@@ -96,7 +96,7 @@ async def _seed_doc(customer_id: str, *, doc_id: str, title: str) -> None:
 
 
 async def _seed_directed(customer_id: str, doc_id: str, phrase: str) -> None:
-    embedder = get_embedder()
+    embedder = get_embedder_v2()
     [vec] = (await embedder.embed_many([phrase])).embedded[:]
     literal = "[" + ",".join(f"{x:.7f}" for x in vec.embedding) + "]"
     h = hashlib.sha256(phrase.lower().encode("utf-8")).digest()
