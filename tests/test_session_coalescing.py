@@ -41,6 +41,7 @@ from shared.config import Settings
 from shared.constants import EMBEDDING_DIM, SourceSystem
 from shared.customer_mapping import record_mapping
 from shared.embeddings import EmbeddedChunk, EmbedResult
+from shared.encryption import encrypt_token
 from shared.models import IntegrationToken
 from shared.tokens import save_device_token
 
@@ -129,6 +130,24 @@ async def _seed_customer(customer_id: str) -> None:
         )
 
 
+async def _seed_integration_token(customer_id: str, source: SourceSystem) -> None:
+    """Seed an active integration_tokens row so the pre-enqueue connectedness
+    gate (services/ingestion/connectedness.py) lets OAuth-source enqueues
+    through. Each test gets a freshly-truncated DB (conftest live_db fixture),
+    so a plain INSERT is enough."""
+    async with db_module.raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO integration_tokens
+                (customer_id, source_system, access_token_encrypted, status)
+            VALUES ($1, $2, $3, 'active')
+            """,
+            customer_id,
+            source.value,
+            encrypt_token("test-token"),
+        )
+
+
 # ---- 1. coalescing ----------------------------------------------------------
 
 
@@ -181,6 +200,7 @@ async def test_github_claims_before_cc_at_same_pending_state(live_db) -> None:
 
     customer = "priority-cust-1"
     await _seed_customer(customer)
+    await _seed_integration_token(customer, SourceSystem.GITHUB)
 
     # Insert CC first (older enqueued_at) so without priority it would claim
     # first via the secondary ORDER BY enqueued_at.
@@ -379,6 +399,7 @@ async def test_slack_still_uses_one_row_per_event(live_db) -> None:
 
     customer = "slack-cust-1"
     await _seed_customer(customer)
+    await _seed_integration_token(customer, SourceSystem.SLACK)
 
     for evt_id in ("evt-A1B2", "evt-D4E5", "evt-F6G7"):
         await _enqueue(

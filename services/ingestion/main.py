@@ -38,6 +38,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from services.ingestion.admin_routes import router as admin_router
 from services.ingestion.backfill_routes import router as backfill_router
+from services.ingestion.connectedness import is_source_connected
 from services.ingestion.custom_ingest_routes import router as custom_ingest_router
 from services.ingestion.handlers.base import make_default_context
 from services.ingestion.handlers.registry import (
@@ -798,6 +799,20 @@ async def _enqueue(
     on insert; CC UPSERTs leave the legacy column at whatever the
     earliest batch wrote (fine, nothing reads it once the deploy lands).
     """
+    # Pre-insert gate: refuse to enqueue if the user disconnected this source
+    # while the payload was in flight (webhook handler or backfill drain
+    # racing the DELETE in disconnect_integration). The check is a one-row
+    # SELECT on the (customer_id, source_system) unique index — cheap enough
+    # to run on every enqueue. See connectedness.is_source_connected.
+    if not await is_source_connected(customer_id, source):
+        log.info(
+            "enqueue.dropped_disconnected",
+            customer=customer_id,
+            source=source.value,
+            source_event_id=source_event_id,
+        )
+        return False
+
     priority = SOURCE_INGESTION_PRIORITY.get(source, DEFAULT_INGESTION_PRIORITY)
 
     if source in (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX):

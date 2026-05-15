@@ -13,8 +13,10 @@ import pytest
 from httpx import ASGITransport
 
 from shared.config import Settings, get_settings
+from shared.constants import SourceSystem
 from shared.db import close_pool, init_pool, raw_conn
 from shared.embeddings import reset_embedder
+from shared.encryption import encrypt_token
 from shared.storage import reset_store
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "slack" / "message_simple.json"
@@ -52,6 +54,20 @@ async def test_replay_produces_one_doc(live_db, settings: Settings) -> None:
         await conn.execute(
             "INSERT INTO customers (customer_id, display_name, api_key_hash) VALUES ($1, 't', 'x') ON CONFLICT DO NOTHING",
             CUSTOMER,
+        )
+        # The pre-enqueue connectedness gate (services/ingestion/connectedness.py)
+        # requires an active integration_tokens row for OAuth sources before
+        # _enqueue will write to ingestion_queue. Seed slack as "connected"
+        # so the webhook replay actually lands rows.
+        await conn.execute(
+            """
+            INSERT INTO integration_tokens
+                (customer_id, source_system, access_token_encrypted, status)
+            VALUES ($1, $2, $3, 'active')
+            """,
+            CUSTOMER,
+            SourceSystem.SLACK.value,
+            encrypt_token("xoxb-test"),
         )
 
     from shared.storage import get_store
@@ -92,7 +108,6 @@ async def test_replay_produces_one_doc(live_db, settings: Settings) -> None:
                 CUSTOMER,
             )
         normalizer = Normalizer(ctx)
-        from shared.constants import SourceSystem
 
         for _ in range(10):
             await normalizer.process_queue_row(

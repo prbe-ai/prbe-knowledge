@@ -23,6 +23,7 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from services.ingestion.connectedness import is_source_connected
 from services.ingestion.handlers.base import ConnectorContext
 from services.ingestion.handlers.registry import build_connector
 from shared.constants import BackfillStatus, QueueStatus, SourceSystem
@@ -43,10 +44,6 @@ _PENDING_RELEASE_TASKS: set[asyncio.Task[bool]] = set()
 
 PROGRESS_EVERY_N_EVENTS = 25
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
-# How often to re-check `integration_tokens.status='active'` mid-backfill.
-# A SELECT every event is wasteful; once per ~50 events bounds the disconnect-race
-# window to one Granola page (~250ms) without flooding the DB. See _token_still_active.
-TOKEN_RECHECK_EVERY_N_EVENTS = 50
 
 
 class BackfillReclaimedError(Exception):
@@ -214,13 +211,12 @@ async def run_backfill(
             # before writing more rows so we don't leave zombie R2 objects +
             # ingestion_queue entries for a now-disconnected source.
             #
-            # Checking once per N events rather than every event keeps the
-            # SELECT cost bounded (~250ms race window for Granola at ~50
-            # events/page).
-            if (
-                enqueued % TOKEN_RECHECK_EVERY_N_EVENTS == 0
-                and not await _token_still_active(customer_id, source)
-            ):
+            # We check on every event (not every N) — the race window for
+            # the probe-founders/github incident was ~180ms after disconnect,
+            # well under TOKEN_RECHECK_EVERY_N_EVENTS at peak Granola rates.
+            # The cost is one indexed SELECT per event (~0.3ms); the gate in
+            # is_source_connected short-circuits for non-OAuth sources.
+            if not await is_source_connected(customer_id, source):
                 log.info(
                     "backfill.aborted_disconnect",
                     customer=customer_id,
@@ -850,21 +846,6 @@ async def _mark_failed(
             )
 
 
-async def _token_still_active(customer_id: str, source: SourceSystem) -> bool:
-    """Re-check integration_tokens.status='active' mid-backfill.
-
-    Used to bail out of `run_backfill` when a concurrent disconnect deletes
-    the token row (or flips status). Cheap one-row SELECT keyed on the unique
-    index (customer_id, source_system).
-    """
-    async with raw_conn() as conn:
-        status = await conn.fetchval(
-            "SELECT status FROM integration_tokens "
-            "WHERE customer_id=$1 AND source_system=$2",
-            customer_id,
-            source.value,
-        )
-    return status == "active"
 
 
 async def _load_resume_state(
