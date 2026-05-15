@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from services.ingestion.connectedness import is_source_connected
 from services.ingestion.handlers.base import ConnectorContext
 from services.ingestion.handlers.registry import build_connector
+from shared.config import get_settings
 from shared.constants import BackfillStatus, QueueStatus, SourceSystem
 from shared.db import get_pool, raw_conn
 from shared.encryption import decrypt_token
@@ -33,7 +34,7 @@ from shared.exceptions import NotSupportedByConnector, PermanentSourceError
 from shared.logging import get_logger
 from shared.metrics import counter
 from shared.models import IntegrationToken
-from shared.storage import get_store
+from shared.storage import ObjectStore, get_store
 
 log = get_logger(__name__)
 
@@ -44,6 +45,10 @@ _PENDING_RELEASE_TASKS: set[asyncio.Task[bool]] = set()
 
 PROGRESS_EVERY_N_EVENTS = 25
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
+# Bounded concurrency for R2 puts within a batch. R2 is throughput-friendly;
+# fanning out 16 puts in parallel hides per-put latency without pushing the
+# remote into rate-limited territory.
+R2_PUT_CONCURRENCY = 16
 
 
 class BackfillReclaimedError(Exception):
@@ -119,6 +124,58 @@ def _slack_channel_cursor(channels: dict[str, str | None]) -> str:
         },
         sort_keys=True,
     )
+
+
+async def _flush_batch(
+    store: ObjectStore,
+    bucket: str,
+    customer_id: str,
+    source: SourceSystem,
+    batch: list[tuple[str, bytes, str]],
+    sem: asyncio.Semaphore,
+) -> None:
+    """Coalesced flush: parallel R2 puts + one executemany for queue rows.
+
+    `batch` is a list of (key, envelope_bytes, source_event_id). All puts run
+    concurrently under a Semaphore so we don't blow the per-process socket
+    budget. Once R2 succeeds for every put, the queue rows go in via a single
+    executemany. ON CONFLICT DO NOTHING preserves the per-row dedup semantics
+    of the old single-row path.
+
+    Raises on first failure. Caller is responsible for routing the exception
+    to _mark_failed so the run flips to status='failed' rather than silently
+    swallowing a partial batch.
+    """
+    if not batch:
+        return
+
+    async def _bounded_put(key: str, envelope: bytes) -> None:
+        async with sem:
+            await store.put(bucket, key, envelope)
+
+    await asyncio.gather(
+        *(_bounded_put(key, envelope) for key, envelope, _ in batch)
+    )
+
+    rows = [
+        (customer_id, source.value, source_event_id, key, QueueStatus.PENDING.value)
+        for key, _, source_event_id in batch
+    ]
+    async with get_pool().acquire() as conn:
+        # Backfill rows always land at priority 50 (never block live).
+        # Both columns are populated for the migration window:
+        # `payload_s3_key` for back-compat readers, `payload_s3_keys`
+        # for the new array-based normalizer/worker path.
+        await conn.executemany(
+            """
+            INSERT INTO ingestion_queue
+                (customer_id, source_system, source_event_id,
+                 payload_s3_key, payload_s3_keys, status, priority)
+            VALUES ($1, $2, $3, $4, ARRAY[$4], $5, 50)
+            ON CONFLICT DO NOTHING
+            """,
+            rows,
+        )
 
 
 async def run_backfill(
@@ -205,18 +262,55 @@ async def run_backfill(
             return enqueued
 
         latest_cursor = cursor
+        # Batched flush state. Events accumulate here and get flushed (R2
+        # puts in parallel + one executemany) on batch full / checkpoint /
+        # end-of-stream. `last_progress_at_enqueued` tracks the value of
+        # `enqueued` at the last progress write so we only checkpoint once
+        # per PROGRESS_EVERY_N_EVENTS window even if a batch crosses several
+        # multiples at once.
+        batch_size = get_settings().backfill_batch_size
+        r2_sem = asyncio.Semaphore(R2_PUT_CONCURRENCY)
+        batch: list[tuple[str, bytes, str]] = []
+        last_progress_at_enqueued = enqueued
+
+        async def _flush_now() -> None:
+            nonlocal batch, enqueued, latest_cursor, last_progress_at_enqueued
+            if not batch:
+                return
+            await _flush_batch(
+                store, bucket, customer_id, source, batch, r2_sem
+            )
+            enqueued += len(batch)
+            batch = []
+            # Write a progress checkpoint at most once per batch, gated on
+            # crossing a PROGRESS_EVERY_N_EVENTS boundary since the last
+            # write. Use floor-division: a single 100-event batch crossing
+            # four 25-event boundaries still only writes once.
+            if (
+                enqueued // PROGRESS_EVERY_N_EVENTS
+                > last_progress_at_enqueued // PROGRESS_EVERY_N_EVENTS
+            ):
+                await _update_progress(
+                    customer_id, source, latest_cursor, enqueued, claim_token
+                )
+                last_progress_at_enqueued = enqueued
+
         async for event in events:
             # Disconnect race: if the user disconnected mid-backfill, the
             # integration_tokens row was deleted (or status flipped). Bail
             # before writing more rows so we don't leave zombie R2 objects +
             # ingestion_queue entries for a now-disconnected source.
             #
-            # We check on every event (not every N) — the race window for
-            # the probe-founders/github incident was ~180ms after disconnect,
-            # well under TOKEN_RECHECK_EVERY_N_EVENTS at peak Granola rates.
-            # The cost is one indexed SELECT per event (~0.3ms); the gate in
-            # is_source_connected short-circuits for non-OAuth sources.
+            # Per-event check (added in #278): the probe-founders/github
+            # incident saw a ~180ms race after disconnect, so checking once
+            # per N events was too coarse. is_source_connected is one
+            # indexed SELECT (~0.3ms) and short-circuits for non-OAuth
+            # sources. Under batching, the pending `batch` is dropped on
+            # disconnect — preserving #278's intent that NO new rows land
+            # for a disconnected source, including events the connector
+            # already streamed into our buffer.
             if not await is_source_connected(customer_id, source):
+                batch = []
                 log.info(
                     "backfill.aborted_disconnect",
                     customer=customer_id,
@@ -228,17 +322,22 @@ async def run_backfill(
 
             # Cursor-only checkpoint event (e.g. Granola end-of-pagination).
             # The connector is telling us the watermark may safely advance now
-            # that pagination completed cleanly. Persist immediately; do NOT
-            # enqueue into ingestion_queue or R2. `payload.get(...)` is
+            # that pagination completed cleanly. Flush the pending batch first
+            # so the cursor advance reflects what's actually on disk, then
+            # persist the new watermark. Checkpoint event itself is NOT
+            # enqueued into ingestion_queue or R2. `payload.get(...)` is
             # defensive against `raw_payload=None` or missing key.
             payload = event.raw_payload or {}
             if payload.get("_checkpoint"):
                 cursor_str = payload.get("_cursor")
                 if cursor_str is not None:
                     latest_cursor = str(cursor_str)
+                await _flush_now()
+                if cursor_str is not None:
                     await _update_progress(
                         customer_id, source, latest_cursor, enqueued, claim_token
                     )
+                    last_progress_at_enqueued = enqueued
                 continue
 
             envelope = json.dumps(
@@ -246,7 +345,10 @@ async def run_backfill(
                     "_headers": event.headers,
                     "payload": event.raw_payload,
                     "received_at": event.received_at.isoformat(),
-                    "trace_id": f"backfill-{customer_id}-{source.value}-{enqueued}",
+                    "trace_id": (
+                        f"backfill-{customer_id}-{source.value}-"
+                        f"{enqueued + len(batch)}"
+                    ),
                     "_backfill": True,
                 }
             ).encode()
@@ -254,27 +356,7 @@ async def run_backfill(
                 f"raw/{source.value}/{customer_id}/backfill/"
                 f"{event.source_event_id.replace('/', '_')}.json"
             )
-            await store.put(bucket, key, envelope)
-
-            async with get_pool().acquire() as conn:
-                # Backfill rows always land at priority 50 (never block live).
-                # Both columns are populated for the migration window:
-                # `payload_s3_key` for back-compat readers, `payload_s3_keys`
-                # for the new array-based normalizer/worker path.
-                await conn.execute(
-                    """
-                    INSERT INTO ingestion_queue
-                        (customer_id, source_system, source_event_id,
-                         payload_s3_key, payload_s3_keys, status, priority)
-                    VALUES ($1, $2, $3, $4, ARRAY[$4], $5, 50)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    customer_id,
-                    source.value,
-                    event.source_event_id,
-                    key,
-                    QueueStatus.PENDING.value,
-                )
+            batch.append((key, envelope, event.source_event_id))
 
             # The runner can discover a new cursor via the event's parse_hint
             # or via the connector yielding a tuple — keep it simple for now:
@@ -284,11 +366,11 @@ async def run_backfill(
             if possible_cursor is not None:
                 latest_cursor = str(possible_cursor)
 
-            enqueued += 1
-            if enqueued % PROGRESS_EVERY_N_EVENTS == 0:
-                await _update_progress(
-                    customer_id, source, latest_cursor, enqueued, claim_token
-                )
+            if len(batch) >= batch_size:
+                await _flush_now()
+
+        # Flush trailing partial batch so the tail of the stream lands.
+        await _flush_now()
 
         await _mark_done(
             customer_id, source, enqueued, latest_cursor, claim_token

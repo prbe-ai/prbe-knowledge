@@ -206,6 +206,13 @@ class Settings(BaseSettings):
     # to stay well under the 5000-points/hour cap at ~3 points/page.
     github_backfill_repo_concurrency: int = 4
 
+    # --- Backfill batching --------------------------------------------------
+    # Backfill consumer batches events: one R2 gather + one DB executemany per
+    # batch instead of N round-trips for N events. 100 keeps batches small
+    # enough that a single failure rolls back at most ~100 events while still
+    # cutting per-event round-trip overhead by ~100x at 100k-event scale.
+    backfill_batch_size: int = Field(default=100, ge=1, le=1000)
+
     # --- HTTP / outbound ----------------------------------------------------
     http_timeout_seconds: float = 30.0
 
