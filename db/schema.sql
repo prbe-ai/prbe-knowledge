@@ -35,10 +35,11 @@ CREATE TABLE customers (
     -- shared.customer_prefs for the wiki-generation gate. Schema-on-read
     -- bool keys; missing keys resolve to False on every reader.
     preferences          JSONB NOT NULL DEFAULT '{}',
-    -- Per-tenant R2 bucket name (added by migration 0073). Until the CP
-    -- starts populating this for every customer, the runtime falls back
-    -- to f"{R2_BUCKET_PREFIX}-{customer_id}" when NULL.
-    r2_bucket            TEXT
+    -- Per-tenant R2 bucket name. Added by migration 0073, locked NOT NULL
+    -- by 0075. Every INSERT path (the CP→DP mirror, self-host's
+    -- seed-customer Helm job) writes this; the runtime never falls back
+    -- to a computed value.
+    r2_bucket            TEXT NOT NULL
 );
 
 -- One customer per organization (where the link is set).
