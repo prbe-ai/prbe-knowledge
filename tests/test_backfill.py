@@ -2594,3 +2594,316 @@ async def test_backfill_status_endpoint(live_db) -> None:
     sources = {s["source"]: s for s in body["sources"]}
     assert set(sources.keys()) == {"slack", "linear"}
     assert sources["slack"]["status"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# run_backfill: batched R2 puts + DB inserts
+# ---------------------------------------------------------------------------
+#
+# These tests exercise the coalesced-flush path: instead of one R2 put + one
+# ingestion_queue INSERT per event, the runner accumulates a batch (size set
+# by Settings.backfill_batch_size) and flushes via a single asyncio.gather of
+# R2 puts plus one asyncpg `executemany`. At 100k events that's ~1000 round
+# trips instead of 200000.
+
+from collections.abc import AsyncIterator  # noqa: E402
+from datetime import UTC, datetime  # noqa: E402
+
+from services.ingestion import backfill_runner as _bf_runner  # noqa: E402
+from services.ingestion.backfill_runner import (  # noqa: E402
+    PROGRESS_EVERY_N_EVENTS,
+    run_backfill,
+)
+from services.ingestion.handlers.base import Connector  # noqa: E402
+from shared.encryption import encrypt_token  # noqa: E402
+from shared.models import IntegrationToken, WebhookEvent  # noqa: E402
+
+_BATCH_CUSTOMER = "cust-bf-batch"
+_BATCH_SOURCE = SourceSystem.GRANOLA
+
+
+async def _seed_batch_customer_and_token() -> None:
+    """Seed customer (with r2_bucket) + active integration_tokens row.
+
+    Mirrors the helper shape in test_mark_failed_token_flip.py without
+    importing it (keeps this test module self-contained).
+    """
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO customers (customer_id, display_name, api_key_hash) "
+            "VALUES ($1, 'bf-batch', 'bf-batch-hash') "
+            "ON CONFLICT DO NOTHING",
+            _BATCH_CUSTOMER,
+        )
+        await conn.execute(
+            """
+            INSERT INTO integration_tokens
+                (customer_id, source_system, access_token_encrypted, status)
+            VALUES ($1, $2, $3, 'active')
+            ON CONFLICT DO NOTHING
+            """,
+            _BATCH_CUSTOMER,
+            _BATCH_SOURCE.value,
+            encrypt_token("grn_batch_TOKEN"),
+        )
+
+
+async def _batch_queue_count() -> int:
+    async with raw_conn() as conn:
+        return await conn.fetchval(
+            "SELECT count(*) FROM ingestion_queue "
+            "WHERE customer_id=$1 AND source_system=$2",
+            _BATCH_CUSTOMER,
+            _BATCH_SOURCE.value,
+        )
+
+
+async def _batch_state_row():
+    async with raw_conn() as conn:
+        return await conn.fetchrow(
+            "SELECT status, events_enqueued, last_cursor, last_progress_at "
+            "FROM backfill_state "
+            "WHERE customer_id=$1 AND source_system=$2",
+            _BATCH_CUSTOMER,
+            _BATCH_SOURCE.value,
+        )
+
+
+def _bf_evt(idx: int, *, cursor: str | None = None) -> WebhookEvent:
+    """Synthetic event. `cursor` populates payload._cursor so the runner can
+    persist the watermark progression."""
+    payload: dict = {"idx": idx}
+    if cursor is not None:
+        payload["_cursor"] = cursor
+    return WebhookEvent(
+        customer_id=_BATCH_CUSTOMER,
+        source_system=_BATCH_SOURCE,
+        source_event_id=f"bf-batch-{idx}",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/granola/fake/key.json",
+        raw_payload=payload,
+    )
+
+
+class _BatchConnector(Connector):
+    """Yields N synthetic events. Each event carries a fresh `_cursor` so the
+    runner exercises its cursor-advance path on every flush."""
+
+    source_system = _BATCH_SOURCE
+
+    def __init__(self, ctx: ConnectorContext, total: int) -> None:
+        super().__init__(ctx)
+        self._total = total
+
+    def verify_signature(self, headers, raw_body):  # pragma: no cover
+        return True
+
+    def parse_webhook_event(self, customer_id, headers, raw_payload):  # pragma: no cover
+        return None
+
+    async def normalize(self, event, hydrated):  # pragma: no cover
+        raise NotImplementedError
+
+    async def backfill(  # type: ignore[override]
+        self,
+        customer_id: str,
+        token: IntegrationToken,
+        cursor: str | None = None,
+    ) -> AsyncIterator[WebhookEvent]:
+        for i in range(self._total):
+            yield _bf_evt(i, cursor=f"watermark-{i}")
+
+
+def _bf_ctx() -> ConnectorContext:
+    return ConnectorContext(settings=Settings(environment="local"), http=httpx.AsyncClient())
+
+
+@pytest.mark.asyncio
+async def test_backfill_batches_r2_and_db(live_db, monkeypatch) -> None:
+    """N events -> ceil(N / batch_size) R2 gather rounds + ceil(N / batch_size)
+    executemany calls.
+
+    Verifies the coalescing collapsed per-event round-trips into per-batch
+    round-trips. Count R2 puts via store.put monkeypatch; count executemany
+    calls via asyncpg Connection.executemany monkeypatch.
+    """
+    from shared.config import get_settings as _get_settings
+
+    await _seed_batch_customer_and_token()
+
+    from services.ingestion.backfill_runner import enqueue_backfill as _eq
+    await _eq(_BATCH_CUSTOMER, _BATCH_SOURCE)
+
+    batch_size = _get_settings().backfill_batch_size  # default 100
+    total = batch_size * 2 + batch_size // 4  # e.g. 225 → 3 batches
+    expected_flushes = (total + batch_size - 1) // batch_size
+
+    # Count store.put calls (one per event during a flush).
+    put_calls = {"n": 0}
+    real_put = _bf_runner.get_store().put
+
+    async def counting_put(bucket, key, body, content_type="application/json"):
+        put_calls["n"] += 1
+        return await real_put(bucket, key, body, content_type=content_type)
+
+    monkeypatch.setattr(_bf_runner.get_store(), "put", counting_put)
+
+    # Count executemany calls on asyncpg Connections.
+    executemany_calls = {"n": 0}
+    import asyncpg
+
+    real_executemany = asyncpg.Connection.executemany
+
+    async def counting_executemany(self, query, args, *a, **kw):
+        if "ingestion_queue" in query:
+            executemany_calls["n"] += 1
+        return await real_executemany(self, query, args, *a, **kw)
+
+    monkeypatch.setattr(asyncpg.Connection, "executemany", counting_executemany)
+
+    fake = _BatchConnector(_bf_ctx(), total=total)
+    monkeypatch.setattr(
+        "services.ingestion.backfill_runner.build_connector",
+        lambda src, ctx: fake,
+    )
+
+    enqueued = await run_backfill(_bf_ctx(), _BATCH_CUSTOMER, _BATCH_SOURCE)
+
+    assert enqueued == total
+    assert await _batch_queue_count() == total
+    assert put_calls["n"] == total, (
+        f"expected one R2 put per event, got {put_calls['n']}"
+    )
+    assert executemany_calls["n"] == expected_flushes, (
+        f"expected {expected_flushes} executemany calls "
+        f"(ceil({total}/{batch_size})), got {executemany_calls['n']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_partial_batch_flushed_at_end(live_db, monkeypatch) -> None:
+    """A partial trailing batch (e.g. 23 events with batch_size=100) must
+    still flush at end-of-stream — one executemany with 23 rows, not zero."""
+    await _seed_batch_customer_and_token()
+
+    from services.ingestion.backfill_runner import enqueue_backfill as _eq
+    await _eq(_BATCH_CUSTOMER, _BATCH_SOURCE)
+
+    total = 23  # well below default batch_size=100
+
+    executemany_invocations: list[int] = []
+    import asyncpg
+
+    real_executemany = asyncpg.Connection.executemany
+
+    async def recording_executemany(self, query, args, *a, **kw):
+        if "ingestion_queue" in query:
+            # args is a list of row-tuples — record the rowcount per call.
+            executemany_invocations.append(len(args))
+        return await real_executemany(self, query, args, *a, **kw)
+
+    monkeypatch.setattr(asyncpg.Connection, "executemany", recording_executemany)
+
+    fake = _BatchConnector(_bf_ctx(), total=total)
+    monkeypatch.setattr(
+        "services.ingestion.backfill_runner.build_connector",
+        lambda src, ctx: fake,
+    )
+
+    enqueued = await run_backfill(_bf_ctx(), _BATCH_CUSTOMER, _BATCH_SOURCE)
+
+    assert enqueued == total
+    assert await _batch_queue_count() == total
+    assert executemany_invocations == [total], (
+        f"trailing partial batch must flush exactly once with all {total} rows, "
+        f"got {executemany_invocations}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_cursor_checkpoint_every_25(live_db, monkeypatch) -> None:
+    """last_progress_at writes (via _update_progress) must fire at the right
+    cadence under batching: at most once per batch, but only when a
+    PROGRESS_EVERY_N_EVENTS boundary is crossed since the last write.
+
+    With batch_size=100 and PROGRESS_EVERY_N_EVENTS=25, 200 events → 2 batches
+    → 2 progress writes (not 8, which the old per-event path would produce)."""
+    await _seed_batch_customer_and_token()
+
+    from services.ingestion.backfill_runner import enqueue_backfill as _eq
+    await _eq(_BATCH_CUSTOMER, _BATCH_SOURCE)
+
+    total = 200
+
+    progress_calls: list[tuple[int, str | None]] = []
+    real_update = _bf_runner._update_progress
+
+    async def recording_update_progress(customer_id, source, cursor, enqueued, claim_token):
+        progress_calls.append((enqueued, cursor))
+        return await real_update(customer_id, source, cursor, enqueued, claim_token)
+
+    monkeypatch.setattr(_bf_runner, "_update_progress", recording_update_progress)
+
+    fake = _BatchConnector(_bf_ctx(), total=total)
+    monkeypatch.setattr(
+        "services.ingestion.backfill_runner.build_connector",
+        lambda src, ctx: fake,
+    )
+
+    enqueued = await run_backfill(_bf_ctx(), _BATCH_CUSTOMER, _BATCH_SOURCE)
+
+    assert enqueued == total
+    # 2 flushes (events 100, 200) — both cross at least one 25-event boundary
+    # since the last write, so each one writes a progress checkpoint.
+    assert len(progress_calls) == 2, (
+        f"expected one progress write per flush (2 batches), got {progress_calls}"
+    )
+    # Both writes have an `enqueued` value at a multiple of the batch size.
+    written_enqueued = [c[0] for c in progress_calls]
+    assert written_enqueued == [100, 200]
+    # Cursor watermark advanced to the last event's _cursor in each batch.
+    assert progress_calls[0][1] == "watermark-99"
+    assert progress_calls[1][1] == "watermark-199"
+    # Each progress write crosses a PROGRESS_EVERY_N_EVENTS boundary —
+    # spec invariant: cadence stays >= 25 events between writes.
+    from itertools import pairwise
+    for prev, nxt in pairwise(written_enqueued):
+        assert nxt - prev >= PROGRESS_EVERY_N_EVENTS
+
+
+@pytest.mark.asyncio
+async def test_backfill_batch_exception_marks_failed(live_db, monkeypatch) -> None:
+    """If the batched flush raises (e.g. asyncpg executemany fails on a
+    constraint violation), the run must flip to status='failed' — do NOT
+    silently drop the partial batch."""
+    await _seed_batch_customer_and_token()
+
+    from services.ingestion.backfill_runner import enqueue_backfill as _eq
+    await _eq(_BATCH_CUSTOMER, _BATCH_SOURCE)
+
+    # Make every executemany on ingestion_queue raise.
+    import asyncpg
+
+    real_executemany = asyncpg.Connection.executemany
+
+    async def exploding_executemany(self, query, args, *a, **kw):
+        if "ingestion_queue" in query:
+            raise RuntimeError("simulated db failure during batched insert")
+        return await real_executemany(self, query, args, *a, **kw)
+
+    monkeypatch.setattr(asyncpg.Connection, "executemany", exploding_executemany)
+
+    fake = _BatchConnector(_bf_ctx(), total=150)  # crosses a batch boundary
+    monkeypatch.setattr(
+        "services.ingestion.backfill_runner.build_connector",
+        lambda src, ctx: fake,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated db failure"):
+        await run_backfill(_bf_ctx(), _BATCH_CUSTOMER, _BATCH_SOURCE)
+
+    bf = await _batch_state_row()
+    assert bf is not None
+    assert bf["status"] == BackfillStatus.FAILED.value, (
+        f"expected status=failed after flush exception, got {bf['status']}"
+    )
