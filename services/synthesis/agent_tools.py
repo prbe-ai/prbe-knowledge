@@ -29,11 +29,72 @@ Tools (BOOKKEEPING):
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from services.synthesis.models import WikiType
+
+# Slug normalization: collapse `/`, whitespace, and dots into `-`, drop any
+# remaining chars outside `[a-z0-9_-]`, collapse hyphen runs, trim leading/
+# trailing hyphens/underscores. Mirrors the markdown extractor's allowed
+# slug class in `services/synthesis/wiki_links.py` so a freshly-created
+# page's slug is always linkable from another page's body.
+_SLUG_SEP_RE = re.compile(r"[\s/.]+")
+_SLUG_DISALLOWED_RE = re.compile(r"[^a-z0-9_-]+")
+_SLUG_DASH_RUN_RE = re.compile(r"-{2,}")
+
+# Typed title prefix shape (e.g. `Repo:`, `Service:`, `Person:`) used by
+# the wiki agent when titling pages and by the index renderer when
+# referencing them via `[[Type: Name]]`. Used to defensively strip a
+# leading prefix from a summary when no authoritative title is in scope.
+_TYPED_PREFIX_RE = re.compile(r"^\s*[A-Z][A-Za-z]+\s*:\s*[^:\n]{1,80}:\s+")
+
+
+def _normalize_slug(value: str) -> str:
+    """Coerce an LLM-supplied slug into the canonical `[a-z0-9_-]+` shape.
+
+    Examples:
+        `prbe-ai/kb`  -> `prbe-ai-kb`
+        `Repo Name`   -> `repo-name`
+        `Some.Thing`  -> `some-thing`
+    """
+    s = value.lower()
+    s = _SLUG_SEP_RE.sub("-", s)
+    s = _SLUG_DISALLOWED_RE.sub("", s)
+    s = _SLUG_DASH_RUN_RE.sub("-", s)
+    return s.strip("-_")
+
+
+def _strip_title_prefix(summary: str, *, title: str | None = None) -> str:
+    """Drop a leading `<title>:` (or generic `<Type>: <Name>:`) prefix.
+
+    The wiki agent occasionally writes summaries like
+    `Repo: prbe-ai/kb: Markdown knowledge base ...` which render in the
+    index as duplicated chrome (`[[Repo: prbe-ai/kb]] - Repo: prbe-ai/kb:
+    Markdown ...`). The summary field is meant to be the bare blurb after
+    the title; strip the prefix at the validator boundary so persistence
+    is the single source of truth.
+
+    When `title` is supplied, only strip the exact match (case-insensitive,
+    whitespace-tolerant). Otherwise apply the looser typed-prefix
+    heuristic — caller carries the risk of stripping a legitimate
+    leading bareword like `URL: ...`.
+    """
+    stripped = summary.lstrip()
+    if title:
+        prefix = title.strip().rstrip(":")
+        # Match the literal title followed by `:` and optional whitespace.
+        pattern = re.compile(
+            rf"^{re.escape(prefix)}\s*:\s*",
+            re.IGNORECASE,
+        )
+        rewritten = pattern.sub("", stripped, count=1)
+        if rewritten != stripped:
+            return rewritten.lstrip()
+    rewritten = _TYPED_PREFIX_RE.sub("", stripped, count=1)
+    return rewritten.lstrip() if rewritten != stripped else summary
 
 # ---------------------------------------------------------------------------
 # Tool schemas (Gemini function-call format)
@@ -281,6 +342,16 @@ class UpdatePageArgs(BaseModel):
     commit_message: str = Field(min_length=1, max_length=240)
     applied_queue_ids: list[int] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _strip_summary_prefix(self) -> UpdatePageArgs:
+        # No title in scope on update — apply the generic typed-prefix
+        # heuristic so the index renderer doesn't double-print the
+        # `[[Type: Name]] - Type: Name: ...` chrome.
+        cleaned = _strip_title_prefix(self.summary)
+        if cleaned != self.summary and cleaned:
+            object.__setattr__(self, "summary", cleaned)
+        return self
+
 
 class CreatePageArgs(BaseModel):
     wiki_type: WikiType
@@ -291,6 +362,22 @@ class CreatePageArgs(BaseModel):
     frontmatter: dict[str, Any] = Field(default_factory=dict)
     commit_message: str = Field(min_length=1, max_length=240)
     applied_queue_ids: list[int] = Field(default_factory=list)
+
+    @field_validator("slug", mode="before")
+    @classmethod
+    def _normalize_slug_value(cls, value: object) -> object:
+        # Normalize at create time only — updates need to use the slug
+        # the page already lives under, which may pre-date this rule.
+        if isinstance(value, str):
+            return _normalize_slug(value) or value
+        return value
+
+    @model_validator(mode="after")
+    def _strip_summary_prefix(self) -> CreatePageArgs:
+        cleaned = _strip_title_prefix(self.summary, title=self.title)
+        if cleaned != self.summary and cleaned:
+            object.__setattr__(self, "summary", cleaned)
+        return self
 
 
 class SkipEventsArgs(BaseModel):
