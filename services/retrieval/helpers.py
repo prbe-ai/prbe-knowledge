@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncpg
+
 from shared.constants import SourceSystem
 from shared.db import with_tenant
 
@@ -80,3 +82,39 @@ async def embeddings_for_chunks(customer_id: str, chunk_ids: list[str]) -> dict[
         raw = r["emb"].strip("[]")
         out[r["chunk_id"]] = [float(x) for x in raw.split(",")] if raw else []
     return out
+
+
+async def resolve_aliases(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    refs: list[tuple[str, str]],
+) -> dict[tuple[str, str], str]:
+    """Bulk-resolve ``(label, alias_canonical_id) → primary_canonical_id``.
+
+    Returns a dict with one entry per input ref that IS an alias. Refs that
+    are not aliases (either unmerged nodes or primaries of clusters) are
+    absent from the dict — callers should treat absence as "no rewrite
+    needed" and use the original canonical_id.
+
+    Mirrors ``services/ingestion/graph_writer.py:_fetch_aliases`` so the
+    write-path and read-path share batching semantics. One bulk SELECT per
+    call regardless of input size — ``entity_aliases`` is keyed on
+    ``(customer_id, label, alias_canonical_id)`` and answers via index-only
+    scan.
+    """
+    if not refs:
+        return {}
+    labels = [r[0] for r in refs]
+    aliases = [r[1] for r in refs]
+    rows = await conn.fetch(
+        """
+        SELECT label, alias_canonical_id, primary_canonical_id
+        FROM entity_aliases
+        WHERE customer_id = $1
+          AND (label, alias_canonical_id) IN (
+                SELECT * FROM UNNEST($2::text[], $3::text[])
+              )
+        """,
+        customer_id, labels, aliases,
+    )
+    return {(r["label"], r["alias_canonical_id"]): r["primary_canonical_id"] for r in rows}
