@@ -842,10 +842,15 @@ class GitHubConnector(Connector):
         import asyncio as _asyncio
 
         from services.ingestion.handlers._github_graphql import (
+            BACKFILL_COMMITS_QUERY,
             BACKFILL_ISSUES_QUERY,
             BACKFILL_PULLS_QUERY,
+            BACKFILL_RELEASES_QUERY,
+            normalize_commit_node,
             normalize_issue_node,
             normalize_pr_node,
+            normalize_release_node,
+            normalize_review_node,
             run_graphql,
         )
         from shared.models import WebhookEvent
@@ -894,12 +899,18 @@ class GitHubConnector(Connector):
                     "phase": state.get("current_phase") or "pulls",
                     "pulls_cursor": state.get("pulls_cursor"),
                     "issues_cursor": state.get("issues_cursor"),
+                    "commits_cursor": state.get("commits_cursor"),
+                    "releases_cursor": state.get("releases_cursor"),
+                    "default_branch": state.get("default_branch"),
                 }
             else:
                 repo_state[repo] = {
                     "phase": "pulls",
                     "pulls_cursor": None,
                     "issues_cursor": None,
+                    "commits_cursor": None,
+                    "releases_cursor": None,
+                    "default_branch": None,
                 }
 
         completed: set[str] = set()
@@ -926,6 +937,9 @@ class GitHubConnector(Connector):
                     "current_phase": (rs or {}).get("phase") or "pulls",
                     "pulls_cursor": (rs or {}).get("pulls_cursor"),
                     "issues_cursor": (rs or {}).get("issues_cursor"),
+                    "commits_cursor": (rs or {}).get("commits_cursor"),
+                    "releases_cursor": (rs or {}).get("releases_cursor"),
+                    "default_branch": (rs or {}).get("default_branch"),
                     "repo_objs": {
                         r: repo_objs[r] for r in remaining if r in repo_objs
                     },
@@ -986,6 +1000,57 @@ class GitHubConnector(Connector):
                                     headers={"X-GitHub-Event": _EVENT_PULL_REQUEST},
                                 )
                             )
+
+                            # Emit one pull_request_review event per review
+                            # attached to this PR. Reviews come back nested
+                            # in the PR query (BACKFILL_PULLS_QUERY) so this
+                            # is free piggybacked data, not a second fetch.
+                            review_nodes = (
+                                (node.get("reviews") or {}).get("nodes") or []
+                            )
+                            for r_node in review_nodes:
+                                if not isinstance(r_node, dict):
+                                    continue
+                                review = normalize_review_node(r_node)
+                                review_id = review.get("id")
+                                if review_id is None:
+                                    continue
+                                submitted_at = (
+                                    review.get("submitted_at")
+                                    or pr.get("updated_at")
+                                    or ""
+                                )
+                                async with snapshot_lock:
+                                    review_cursor_blob = _snapshot_cursor()
+                                review_payload = {
+                                    "action": "submitted",
+                                    "repository": repo,
+                                    # _normalize_review only reads
+                                    # pull_request.number off this stub.
+                                    "pull_request": {"number": number},
+                                    "review": review,
+                                    "_cursor": review_cursor_blob,
+                                }
+                                review_event_id = (
+                                    f"pr_review:{full_name}:{number}:{review_id}"
+                                )
+                                await queue.put(
+                                    WebhookEvent(
+                                        customer_id=customer_id,
+                                        source_system=SourceSystem.GITHUB,
+                                        source_event_id=review_event_id,
+                                        received_at=(
+                                            _parse_iso8601(submitted_at)
+                                            if submitted_at
+                                            else datetime.now(UTC)
+                                        ),
+                                        payload_s3_key="",
+                                        raw_payload=review_payload,
+                                        headers={
+                                            "X-GitHub-Event": _EVENT_PR_REVIEW
+                                        },
+                                    )
+                                )
                         page_info = pulls.get("pageInfo") or {}
                         rs["pulls_cursor"] = page_info.get("endCursor")
                         if not page_info.get("hasNextPage"):
@@ -1038,6 +1103,140 @@ class GitHubConnector(Connector):
                             )
                         page_info = issues.get("pageInfo") or {}
                         rs["issues_cursor"] = page_info.get("endCursor")
+                        if not page_info.get("hasNextPage"):
+                            break
+                    rs["phase"] = "commits"
+
+                # Commits phase. Paginates the default-branch history and
+                # emits one synthetic `push` event per commit. The default
+                # branch comes from the first GraphQL response so the
+                # synthetic ref (refs/heads/<branch>) is correct even on
+                # repos with non-main defaults.
+                if rs["phase"] == "commits":
+                    while True:
+                        data = await run_graphql(
+                            self.http,
+                            auth_headers,
+                            BACKFILL_COMMITS_QUERY,
+                            {
+                                "owner": owner,
+                                "name": name,
+                                "cursor": rs["commits_cursor"],
+                            },
+                        )
+                        if data is None:
+                            break
+                        repo_node = data.get("repository") or {}
+                        default_ref = repo_node.get("defaultBranchRef") or {}
+                        branch = default_ref.get("name") or rs.get(
+                            "default_branch"
+                        ) or "main"
+                        rs["default_branch"] = branch
+                        target = default_ref.get("target") or {}
+                        history = target.get("history") or {}
+                        nodes = history.get("nodes") or []
+                        for node in nodes:
+                            if not isinstance(node, dict):
+                                continue
+                            push_commit = normalize_commit_node(node, branch)
+                            sha = push_commit.get("id")
+                            if not isinstance(sha, str) or not sha:
+                                continue
+                            commit_ts = push_commit["timestamp"]
+                            async with snapshot_lock:
+                                cursor_blob = _snapshot_cursor()
+                            raw_payload = {
+                                "ref": f"refs/heads/{branch}",
+                                "repository": repo,
+                                "commits": [push_commit],
+                                "head_commit": push_commit,
+                                "_cursor": cursor_blob,
+                            }
+                            source_event_id = (
+                                f"push:{full_name}:{sha}:{commit_ts}:"
+                                f"{_payload_fp(push_commit)}"
+                            )
+                            await queue.put(
+                                WebhookEvent(
+                                    customer_id=customer_id,
+                                    source_system=SourceSystem.GITHUB,
+                                    source_event_id=source_event_id,
+                                    received_at=(
+                                        _parse_iso8601(commit_ts)
+                                        if commit_ts
+                                        else datetime.now(UTC)
+                                    ),
+                                    payload_s3_key="",
+                                    raw_payload=raw_payload,
+                                    headers={"X-GitHub-Event": _EVENT_PUSH},
+                                )
+                            )
+                        page_info = history.get("pageInfo") or {}
+                        rs["commits_cursor"] = page_info.get("endCursor")
+                        if not page_info.get("hasNextPage"):
+                            break
+                    rs["phase"] = "releases"
+
+                # Releases phase. Emits one synthetic `release` event per
+                # release with action=published; deleted/unpublished actions
+                # are deliberately never synthesized from backfill.
+                if rs["phase"] == "releases":
+                    while True:
+                        data = await run_graphql(
+                            self.http,
+                            auth_headers,
+                            BACKFILL_RELEASES_QUERY,
+                            {
+                                "owner": owner,
+                                "name": name,
+                                "cursor": rs["releases_cursor"],
+                            },
+                        )
+                        if data is None:
+                            break
+                        repo_node = data.get("repository") or {}
+                        releases = repo_node.get("releases") or {}
+                        nodes = releases.get("nodes") or []
+                        for node in nodes:
+                            if not isinstance(node, dict):
+                                continue
+                            release = normalize_release_node(node)
+                            release_id = release.get("id")
+                            if release_id is None:
+                                continue
+                            created_at = (
+                                release.get("published_at")
+                                or release.get("created_at")
+                                or ""
+                            )
+                            async with snapshot_lock:
+                                cursor_blob = _snapshot_cursor()
+                            raw_payload = {
+                                "action": "published",
+                                "repository": repo,
+                                "release": release,
+                                "_cursor": cursor_blob,
+                            }
+                            source_event_id = (
+                                f"release:{full_name}:{release_id}"
+                            )
+                            await queue.put(
+                                WebhookEvent(
+                                    customer_id=customer_id,
+                                    source_system=SourceSystem.GITHUB,
+                                    source_event_id=source_event_id,
+                                    received_at=(
+                                        _parse_iso8601(created_at)
+                                        if created_at
+                                        else datetime.now(UTC)
+                                    ),
+                                    payload_s3_key="",
+                                    raw_payload=raw_payload,
+                                    headers={"X-GitHub-Event": _EVENT_RELEASE},
+                                )
+                            )
+                        page_info = releases.get("pageInfo") or {}
+                        rs["releases_cursor"] = page_info.get("endCursor")
                         if not page_info.get("hasNextPage"):
                             break
 
@@ -2235,6 +2434,9 @@ def _decode_github_cursor(cursor: str | None) -> dict:
         "current_phase": "pulls",
         "pulls_cursor": None,
         "issues_cursor": None,
+        "commits_cursor": None,
+        "releases_cursor": None,
+        "default_branch": None,
         "repo_objs": {},
     }
     if not cursor:

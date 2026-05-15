@@ -39,6 +39,19 @@ _RATE_LIMIT_REMAINING_FLOOR = 100
 # so keep them smaller than issues to stay under the 500k-node-cost ceiling.
 _PR_PAGE_SIZE = 50
 _ISSUE_PAGE_SIZE = 100
+# Commits and releases ship lighter nodes than PRs; bigger pages are safe.
+_COMMIT_PAGE_SIZE = 100
+_RELEASE_PAGE_SIZE = 100
+
+
+# REST `pull_request_review.state` values we map GraphQL onto.
+_REST_REVIEW_STATES = {
+    "APPROVED": "approved",
+    "CHANGES_REQUESTED": "changes_requested",
+    "COMMENTED": "commented",
+    "DISMISSED": "dismissed",
+    "PENDING": "pending",
+}
 
 
 BACKFILL_PULLS_QUERY = (
@@ -99,6 +112,49 @@ BACKFILL_ISSUES_QUERY = (
     "        comments(first: 100) {\n"
     "          nodes { id body createdAt updatedAt author { login } }\n"
     "        }\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  rateLimit { cost remaining resetAt }\n"
+    "}\n"
+)
+
+
+BACKFILL_COMMITS_QUERY = (
+    "query BackfillCommits($owner: String!, $name: String!, $cursor: String) {\n"
+    "  repository(owner: $owner, name: $name) {\n"
+    "    defaultBranchRef {\n"
+    "      name\n"
+    "      target {\n"
+    "        ... on Commit {\n"
+    f"          history(first: {_COMMIT_PAGE_SIZE}, after: $cursor) {{\n"
+    "            pageInfo { endCursor hasNextPage }\n"
+    "            nodes {\n"
+    "              oid message committedDate\n"
+    "              author { name email user { login } }\n"
+    "            }\n"
+    "          }\n"
+    "        }\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  rateLimit { cost remaining resetAt }\n"
+    "}\n"
+)
+
+
+BACKFILL_RELEASES_QUERY = (
+    "query BackfillReleases($owner: String!, $name: String!, $cursor: String) {\n"
+    "  repository(owner: $owner, name: $name) {\n"
+    f"    releases(first: {_RELEASE_PAGE_SIZE}, after: $cursor, "
+    "orderBy: {field: CREATED_AT, direction: DESC}) {\n"
+    "      pageInfo { endCursor hasNextPage }\n"
+    "      nodes {\n"
+    "        id databaseId tagName name body\n"
+    "        createdAt publishedAt updatedAt\n"
+    "        isDraft isPrerelease\n"
+    "        author { login }\n"
+    "        url\n"
     "      }\n"
     "    }\n"
     "  }\n"
@@ -295,11 +351,107 @@ def normalize_issue_node(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def normalize_review_node(node: dict[str, Any]) -> dict[str, Any]:
+    """Map a GraphQL PullRequestReview node to the REST `review` shape.
+
+    Keys mirror what `_normalize_review` reads:
+      id, state, body, submitted_at, user.login.
+
+    GraphQL `state` is uppercase (APPROVED / CHANGES_REQUESTED / COMMENTED /
+    DISMISSED / PENDING); the REST equivalent is lowercase + snake_case. The
+    GraphQL global `id` is kept as-is — uniqueness is the only contract on
+    that field (it flows into source_event_id).
+    """
+    raw_state = (node.get("state") or "").upper()
+    rest_state = _REST_REVIEW_STATES.get(raw_state, raw_state.lower())
+    return {
+        "id": node.get("id"),
+        "state": rest_state,
+        "body": node.get("body") or "",
+        "submitted_at": node.get("submittedAt"),
+        "user": {"login": ((node.get("author") or {}).get("login")) or "unknown"},
+    }
+
+
+def normalize_commit_node(
+    node: dict[str, Any], default_branch: str | None = None
+) -> dict[str, Any]:
+    """Map a GraphQL Commit history node to the push-event commit shape.
+
+    Output matches `_rest_commit_to_push_commit` so the downstream
+    `_normalize_push` path sees a uniform structure. `default_branch` is
+    accepted for symmetry with the REST helper but isn't embedded here —
+    the synthesized push `ref` is built by the caller.
+    """
+    del default_branch  # unused; kept for API symmetry with the REST helper
+    author = node.get("author") or {}
+    user = author.get("user") if isinstance(author, dict) else None
+    username = user.get("login") if isinstance(user, dict) else None
+    return {
+        "id": node.get("oid") or "",
+        "message": node.get("message") or "",
+        "timestamp": node.get("committedDate") or "",
+        "author": {
+            "name": (author.get("name") if isinstance(author, dict) else "") or "",
+            "email": (author.get("email") if isinstance(author, dict) else "") or "",
+            "username": username,
+        },
+        # GraphQL Commit doesn't expose `url` on this query path; leave blank
+        # rather than synthesize. _normalize_push reads url best-effort.
+        "url": "",
+        # File deltas are intentionally empty for backfilled commits, matching
+        # the REST path's behaviour (avoids N+1 per-commit fetches).
+        "added": [],
+        "modified": [],
+        "removed": [],
+    }
+
+
+def normalize_release_node(node: dict[str, Any]) -> dict[str, Any]:
+    """Map a GraphQL Release node to the REST `release` shape.
+
+    Keys mirror what `_normalize_release` reads:
+      id, tag_name, name, body, published_at, created_at, updated_at,
+      draft, prerelease, html_url, author.login.
+
+    Prefers `databaseId` (REST numeric id) for the `id` field, falling back
+    to the GraphQL global id when absent (older releases occasionally lack
+    a databaseId in GraphQL responses).
+    """
+    rest_id = node.get("databaseId")
+    if rest_id is None:
+        rest_id = node.get("id")
+    author = node.get("author") or {}
+    author_login = author.get("login") if isinstance(author, dict) else None
+    return {
+        "id": rest_id,
+        "tag_name": node.get("tagName") or "",
+        "name": node.get("name") or "",
+        "body": node.get("body") or "",
+        "published_at": node.get("publishedAt"),
+        "created_at": node.get("createdAt"),
+        "updated_at": node.get("updatedAt"),
+        "draft": bool(node.get("isDraft")),
+        "prerelease": bool(node.get("isPrerelease")),
+        "html_url": node.get("url") or "",
+        "author": (
+            {"login": author_login}
+            if isinstance(author_login, str) and author_login
+            else None
+        ),
+    }
+
+
 __all__ = [
+    "BACKFILL_COMMITS_QUERY",
     "BACKFILL_ISSUES_QUERY",
     "BACKFILL_PULLS_QUERY",
+    "BACKFILL_RELEASES_QUERY",
     "GITHUB_GRAPHQL_URL",
+    "normalize_commit_node",
     "normalize_issue_node",
     "normalize_pr_node",
+    "normalize_release_node",
+    "normalize_review_node",
     "run_graphql",
 ]

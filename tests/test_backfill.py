@@ -1413,6 +1413,76 @@ def _gh_issue_node(
     }
 
 
+def _gh_review_node(
+    review_id: str,
+    *,
+    state: str = "APPROVED",
+    body: str = "",
+    submitted_at: str = "2026-04-01T00:00:00Z",
+    author: str = "alice",
+) -> dict:
+    """Minimal GraphQL review node shape for tests."""
+    return {
+        "id": review_id,
+        "state": state,
+        "body": body,
+        "submittedAt": submitted_at,
+        "author": {"login": author},
+        "comments": {"nodes": []},
+    }
+
+
+def _gh_commit_node(
+    sha: str,
+    *,
+    message: str = "msg",
+    committed_at: str = "2026-04-01T00:00:00Z",
+    author_name: str = "Alice",
+    author_email: str = "alice@example.com",
+    author_login: str = "alice",
+) -> dict:
+    """Minimal GraphQL commit history node shape for tests."""
+    return {
+        "oid": sha,
+        "message": message,
+        "committedDate": committed_at,
+        "author": {
+            "name": author_name,
+            "email": author_email,
+            "user": {"login": author_login},
+        },
+    }
+
+
+def _gh_release_node(
+    *,
+    release_id: int,
+    tag: str,
+    name: str = "",
+    body: str = "",
+    created_at: str = "2026-04-01T00:00:00Z",
+    published_at: str = "2026-04-01T00:00:00Z",
+    is_draft: bool = False,
+    is_prerelease: bool = False,
+    author: str = "alice",
+) -> dict:
+    """Minimal GraphQL release node shape for tests."""
+    return {
+        "id": f"R_{release_id}",
+        "databaseId": release_id,
+        "tagName": tag,
+        "name": name or tag,
+        "body": body,
+        "createdAt": created_at,
+        "publishedAt": published_at,
+        "updatedAt": published_at,
+        "isDraft": is_draft,
+        "isPrerelease": is_prerelease,
+        "author": {"login": author},
+        "url": f"https://github.com/o/r/releases/tag/{tag}",
+    }
+
+
 def _gh_graphql_response(
     repo_block: dict, *, remaining: int = 5000, reset_at: str = "2099-01-01T00:00:00Z"
 ) -> httpx.Response:
@@ -1432,17 +1502,24 @@ def _gh_graphql_transport(
     installation_repos: list[dict],
     pulls_by_repo: dict[str, list[dict]] | None = None,
     issues_by_repo: dict[str, list[dict]] | None = None,
+    commits_by_repo: dict[str, list[dict]] | None = None,
+    releases_by_repo: dict[str, list[dict]] | None = None,
+    default_branch_by_repo: dict[str, str] | None = None,
     on_graphql=None,
 ) -> httpx.MockTransport:
     """Build a transport that mocks both REST /installation/repositories and
     POST /graphql.
 
-    The GraphQL responder picks pulls vs. issues by inspecting the query body
-    and dispatches by `variables.owner/name`. Optional `on_graphql` callback
-    fires for every GraphQL call (used by rate-limit + parallel tests).
+    The GraphQL responder picks pulls / issues / commits / releases by
+    inspecting the query body and dispatches by `variables.owner/name`.
+    Optional `on_graphql` callback fires for every GraphQL call (used by
+    rate-limit + parallel tests).
     """
     pulls_by_repo = pulls_by_repo or {}
     issues_by_repo = issues_by_repo or {}
+    commits_by_repo = commits_by_repo or {}
+    releases_by_repo = releases_by_repo or {}
+    default_branch_by_repo = default_branch_by_repo or {}
 
     def handler(request: httpx.Request) -> httpx.Response:
         if (
@@ -1466,7 +1543,7 @@ def _gh_graphql_transport(
                 if override is not None:
                     return override
 
-            if "pullRequests(" in query:
+            if "BackfillPulls" in query or "pullRequests(" in query:
                 nodes = pulls_by_repo.get(full_name, [])
                 return _gh_graphql_response(
                     {
@@ -1476,7 +1553,36 @@ def _gh_graphql_transport(
                         }
                     }
                 )
-            if "issues(" in query:
+            if "BackfillCommits" in query or "defaultBranchRef" in query:
+                nodes = commits_by_repo.get(full_name, [])
+                branch = default_branch_by_repo.get(full_name, "main")
+                return _gh_graphql_response(
+                    {
+                        "defaultBranchRef": {
+                            "name": branch,
+                            "target": {
+                                "history": {
+                                    "pageInfo": {
+                                        "endCursor": None,
+                                        "hasNextPage": False,
+                                    },
+                                    "nodes": nodes,
+                                }
+                            },
+                        }
+                    }
+                )
+            if "BackfillReleases" in query or "releases(" in query:
+                nodes = releases_by_repo.get(full_name, [])
+                return _gh_graphql_response(
+                    {
+                        "releases": {
+                            "pageInfo": {"endCursor": None, "hasNextPage": False},
+                            "nodes": nodes,
+                        }
+                    }
+                )
+            if "BackfillIssues" in query or "issues(" in query:
                 nodes = issues_by_repo.get(full_name, [])
                 return _gh_graphql_response(
                     {
@@ -1493,8 +1599,10 @@ def _gh_graphql_transport(
 
 
 @pytest.mark.asyncio
-async def test_github_backfill_paginates_repos_pulls_and_issues() -> None:
-    """GitHub: list installation repos, then GraphQL pulls + issues per repo."""
+async def test_github_backfill_paginates_all_phases() -> None:
+    """GitHub: list installation repos, then GraphQL pulls + issues +
+    commits + releases per repo. Reviews piggyback on the pulls phase.
+    """
 
     installation_repos = [
         {
@@ -1511,11 +1619,17 @@ async def test_github_backfill_paginates_repos_pulls_and_issues() -> None:
         },
     ]
 
+    pr1 = _gh_pr_node(1, updated_at="2026-04-01T00:00:00Z")
+    pr1["reviews"] = {
+        "nodes": [
+            _gh_review_node("PRR_1", submitted_at="2026-04-01T01:00:00Z"),
+        ]
+    }
     transport = _gh_graphql_transport(
         installation_repos=installation_repos,
         pulls_by_repo={
             "acme/api": [
-                _gh_pr_node(1, updated_at="2026-04-01T00:00:00Z"),
+                pr1,
                 _gh_pr_node(2, updated_at="2026-04-02T00:00:00Z"),
             ],
             "acme/web": [
@@ -1528,6 +1642,21 @@ async def test_github_backfill_paginates_repos_pulls_and_issues() -> None:
             ],
             "acme/web": [],
         },
+        commits_by_repo={
+            "acme/api": [
+                _gh_commit_node(
+                    "a" * 40, committed_at="2026-04-04T00:00:00Z"
+                ),
+            ],
+            "acme/web": [],
+        },
+        releases_by_repo={
+            "acme/api": [
+                _gh_release_node(release_id=11, tag="v1.0.0"),
+            ],
+            "acme/web": [],
+        },
+        default_branch_by_repo={"acme/api": "main", "acme/web": "main"},
     )
 
     from services.ingestion.handlers.registry import build_connector
@@ -1540,14 +1669,20 @@ async def test_github_backfill_paginates_repos_pulls_and_issues() -> None:
 
     events = [e async for e in gh.backfill("cust", token)]
 
-    # 3 PRs + 1 issue = 4 events. GraphQL's `issues` query excludes PRs by
-    # design (unlike REST), so no filter logic needed here.
-    assert len(events) == 4
-
+    # 3 PRs + 1 review + 1 issue + 1 commit-as-push + 1 release = 7 events.
     pr_events = [e for e in events if e.headers.get("X-GitHub-Event") == "pull_request"]
     issue_events = [e for e in events if e.headers.get("X-GitHub-Event") == "issues"]
+    review_events = [
+        e for e in events if e.headers.get("X-GitHub-Event") == "pull_request_review"
+    ]
+    push_events = [e for e in events if e.headers.get("X-GitHub-Event") == "push"]
+    release_events = [e for e in events if e.headers.get("X-GitHub-Event") == "release"]
     assert len(pr_events) == 3
     assert len(issue_events) == 1
+    assert len(review_events) == 1
+    assert len(push_events) == 1
+    assert len(release_events) == 1
+    assert len(events) == 7
 
     issue_numbers = {e.raw_payload["issue"]["number"] for e in issue_events}
     assert issue_numbers == {10}
@@ -1753,6 +1888,162 @@ async def test_github_graphql_parallel_repos(monkeypatch) -> None:
     pr_events = [e for e in events if e.headers["X-GitHub-Event"] == "pull_request"]
     repos = {e.raw_payload["repository"]["full_name"] for e in pr_events}
     assert repos == {"acme/r0", "acme/r1", "acme/r2"}
+
+
+@pytest.mark.asyncio
+async def test_github_graphql_reviews_emitted_inline() -> None:
+    """A PR node with 2 reviews produces 1 pull_request event + 2
+    pull_request_review events. Reviews are nested in BACKFILL_PULLS_QUERY
+    so this never costs a second fetch.
+    """
+    pr = _gh_pr_node(42, updated_at="2026-04-01T00:00:00Z")
+    pr["reviews"] = {
+        "nodes": [
+            _gh_review_node(
+                "PRR_A", state="APPROVED", submitted_at="2026-04-01T01:00:00Z"
+            ),
+            _gh_review_node(
+                "PRR_B",
+                state="CHANGES_REQUESTED",
+                submitted_at="2026-04-01T02:00:00Z",
+            ),
+        ]
+    }
+
+    transport = _gh_graphql_transport(
+        installation_repos=[
+            {"full_name": "acme/api", "name": "api", "owner": {"login": "acme"}}
+        ],
+        pulls_by_repo={"acme/api": [pr]},
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.GITHUB, access_token="x"
+    )
+
+    events = [e async for e in gh.backfill("cust", token)]
+    pr_events = [e for e in events if e.headers.get("X-GitHub-Event") == "pull_request"]
+    review_events = [
+        e for e in events if e.headers.get("X-GitHub-Event") == "pull_request_review"
+    ]
+    assert len(pr_events) == 1
+    assert len(review_events) == 2
+
+    # Each review event uses pr_review:<repo>:<pr#>:<review_id> as the
+    # source_event_id so the dedupe key is unique across reviews.
+    event_ids = {e.source_event_id for e in review_events}
+    assert event_ids == {
+        "pr_review:acme/api:42:PRR_A",
+        "pr_review:acme/api:42:PRR_B",
+    }
+
+    # State is mapped from GraphQL uppercase to REST lowercase + snake_case.
+    states = {e.raw_payload["review"]["state"] for e in review_events}
+    assert states == {"approved", "changes_requested"}
+
+    # _normalize_review only reads pull_request.number off the stub.
+    for ev in review_events:
+        assert ev.raw_payload["pull_request"]["number"] == 42
+        assert ev.raw_payload["action"] == "submitted"
+
+
+@pytest.mark.asyncio
+async def test_github_graphql_commits_phase() -> None:
+    """The commits phase paginates defaultBranchRef.target.history and
+    emits one synthetic push event per commit with the correct branch
+    pulled from the GraphQL response.
+    """
+    transport = _gh_graphql_transport(
+        installation_repos=[
+            {"full_name": "acme/api", "name": "api", "owner": {"login": "acme"}}
+        ],
+        commits_by_repo={
+            "acme/api": [
+                _gh_commit_node(
+                    "a" * 40, committed_at="2026-04-01T00:00:00Z", message="m1"
+                ),
+                _gh_commit_node(
+                    "b" * 40, committed_at="2026-04-02T00:00:00Z", message="m2"
+                ),
+                _gh_commit_node(
+                    "c" * 40, committed_at="2026-04-03T00:00:00Z", message="m3"
+                ),
+            ]
+        },
+        default_branch_by_repo={"acme/api": "develop"},
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.GITHUB, access_token="x"
+    )
+
+    events = [e async for e in gh.backfill("cust", token)]
+    push_events = [e for e in events if e.headers.get("X-GitHub-Event") == "push"]
+    assert len(push_events) == 3
+
+    # Push payload mirrors the live-webhook shape: commits[0].id == oid.
+    shas = {e.raw_payload["commits"][0]["id"] for e in push_events}
+    assert shas == {"a" * 40, "b" * 40, "c" * 40}
+
+    # Default branch from the GraphQL response flows into the synthetic ref.
+    for ev in push_events:
+        assert ev.raw_payload["ref"] == "refs/heads/develop"
+        commit = ev.raw_payload["commits"][0]
+        assert commit["author"]["username"] == "alice"
+        # File deltas are intentionally empty for backfilled commits.
+        assert commit["added"] == []
+        assert commit["modified"] == []
+        assert commit["removed"] == []
+
+
+@pytest.mark.asyncio
+async def test_github_graphql_releases_phase() -> None:
+    """The releases phase emits one synthetic release event per release
+    with action='published' (never deleted/unpublished from backfill).
+    """
+    transport = _gh_graphql_transport(
+        installation_repos=[
+            {"full_name": "acme/api", "name": "api", "owner": {"login": "acme"}}
+        ],
+        releases_by_repo={
+            "acme/api": [
+                _gh_release_node(release_id=100, tag="v1.0.0", name="First"),
+                _gh_release_node(release_id=101, tag="v1.1.0", name="Second"),
+            ]
+        },
+    )
+
+    from services.ingestion.handlers.registry import build_connector
+    from shared.models import IntegrationToken
+
+    gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
+    token = IntegrationToken(
+        customer_id="cust", source_system=SourceSystem.GITHUB, access_token="x"
+    )
+
+    events = [e async for e in gh.backfill("cust", token)]
+    release_events = [e for e in events if e.headers.get("X-GitHub-Event") == "release"]
+    assert len(release_events) == 2
+
+    for ev in release_events:
+        assert ev.raw_payload["action"] == "published"
+        # databaseId becomes the REST `id`.
+        assert ev.raw_payload["release"]["id"] in {100, 101}
+        # source_event_id format: release:<repo>:<release_id>.
+        assert ev.source_event_id.startswith("release:acme/api:")
+
+    ids = {e.raw_payload["release"]["id"] for e in release_events}
+    assert ids == {100, 101}
+    tags = {e.raw_payload["release"]["tag_name"] for e in release_events}
+    assert tags == {"v1.0.0", "v1.1.0"}
 
 
 @pytest.mark.asyncio
