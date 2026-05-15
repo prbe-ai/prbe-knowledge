@@ -207,7 +207,11 @@ async def walk_result_doc_neighbors(
                 -- Rank-ordered samples. Carries duplicates intentionally so
                 -- the lowest-rank doc surfaces first; Python dedupes
                 -- preserving first-seen order, then truncates to 3 (codex-A2).
-                array_agg(doc_gn.canonical_id ORDER BY ne.doc_rank ASC) AS sample_pool
+                array_agg(doc_gn.canonical_id ORDER BY ne.doc_rank ASC) AS sample_pool,
+                -- PHASE 2: cluster size = primary + alias count.
+                (1 + COALESCE(ea_count.alias_count, 0))::int AS member_count,
+                -- PHASE 2: distinct source_systems from consolidated provenance.
+                COALESCE(gnp.sources, ARRAY[]::text[]) AS member_sources
             FROM neighbor_edges ne
             JOIN graph_nodes gn
               ON gn.node_id = ne.neighbor_node_id
@@ -215,6 +219,22 @@ async def walk_result_doc_neighbors(
             JOIN graph_nodes doc_gn
               ON doc_gn.node_id = ne.doc_node_id
              AND doc_gn.customer_id = $1
+            -- PHASE 2: per-primary alias count (NULL when no merge happened).
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS alias_count
+                FROM entity_aliases
+                WHERE customer_id = $1
+                  AND label = gn.label
+                  AND primary_canonical_id = gn.canonical_id
+            ) ea_count ON TRUE
+            -- PHASE 2: distinct source_systems for the primary's node.
+            -- LATERAL keyed on node_id (PK-ish) -> one index probe per neighbor.
+            LEFT JOIN LATERAL (
+                SELECT array_agg(DISTINCT source_system ORDER BY source_system) AS sources
+                FROM graph_node_provenance
+                WHERE customer_id = $1
+                  AND node_id = gn.node_id
+            ) gnp ON TRUE
             WHERE gn.label != '{document_label}'
               -- Fuzzy exclusion (codex-P2): the routed-entity canonical_id
               -- the LLM extracted may not exactly match the graph node's
@@ -235,7 +255,8 @@ async def walk_result_doc_neighbors(
                         regexp_replace(lower(gn.properties->>'name'), '^.*/', '')
                     )
               )
-            GROUP BY gn.canonical_id, gn.label, gn.properties->>'name', gn.node_id
+            GROUP BY gn.canonical_id, gn.label, gn.properties->>'name',
+                     gn.node_id, ea_count.alias_count, gnp.sources
             HAVING max({confidence_case}) >= $6  -- min_confidence floor
         ),
         neighbor_global_freq AS (
@@ -282,7 +303,9 @@ async def walk_result_doc_neighbors(
             -- IDF-adjusted score: more weight to specific (low-freq) entities
             (ra.doc_count::float / ln(1 + COALESCE(ngf.global_doc_count, 1)))
                 AS score,
-            ra.sample_pool
+            ra.sample_pool,
+            ra.member_count,
+            ra.member_sources
         FROM result_aggregates ra
         LEFT JOIN neighbor_global_freq ngf USING (node_id)
         -- Final tiebreakers (label, canonical_id) make ordering deterministic
@@ -328,6 +351,8 @@ async def walk_result_doc_neighbors(
                 doc_count=int(r["doc_count"]),
                 score=float(r["score"]),
                 associated_doc_ids=associated_doc_ids,
+                member_count=int(r["member_count"]),
+                member_sources=list(r["member_sources"] or []),
             )
         )
     return out
