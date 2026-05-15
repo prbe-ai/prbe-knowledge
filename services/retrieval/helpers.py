@@ -68,7 +68,9 @@ async def embeddings_for_chunks(customer_id: str, chunk_ids: list[str]) -> dict[
             """
             SELECT chunk_id, embedding::text AS emb
             FROM chunks
-            WHERE customer_id = $1 AND chunk_id = ANY($2::text[])
+            WHERE customer_id = $1
+              AND chunk_id = ANY($2::text[])
+              AND embedding IS NOT NULL
             """,
             customer_id,
             chunk_ids,
