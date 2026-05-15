@@ -15,8 +15,6 @@ assert against without a network call.
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from shared.embeddings import (
