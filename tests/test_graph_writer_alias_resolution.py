@@ -19,14 +19,13 @@ Invariants:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
 
 import pytest
 
+from services.ingestion.graph_writer import upsert_edges, upsert_nodes
 from shared.constants import EdgeType, NodeLabel
 from shared.db import raw_conn, with_tenant
 from shared.models import GraphEdgeSpec, GraphNodeSpec
-from services.ingestion.graph_writer import upsert_edges, upsert_nodes
 
 
 async def _seed_customer(conn, customer_id: str) -> None:
@@ -118,7 +117,7 @@ async def test_upsert_nodes_rewrites_aliased_canonical_id(live_db) -> None:
         # but the underlying graph_nodes row is the primary's.
         # Implementations may choose either convention; assert the underlying row.
         assert len(node_ids) == 1
-        node_id = list(node_ids.values())[0]
+        node_id = next(iter(node_ids.values()))
         row = await conn.fetchrow(
             "SELECT canonical_id FROM graph_nodes WHERE node_id = $1",
             node_id,
@@ -236,7 +235,7 @@ async def test_upsert_edges_drops_self_loop_after_resolution(live_db) -> None:
         )
         # Try to write Person↔Person edge between two aliases of the same
         # cluster — post-resolution it's a self-loop.
-        count = await upsert_edges(
+        await upsert_edges(
             conn,
             customer_id=cust,
             edges=[

@@ -35,10 +35,9 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
+from services.ingestion.main import app
 from shared.config import Settings, get_settings
 from shared.db import close_pool, init_pool, raw_conn, with_tenant
-from services.ingestion.main import app
-
 
 CUSTOMER_ID = "ec-routes-cust"
 USER_ID = "11111111-1111-1111-1111-111111111111"
