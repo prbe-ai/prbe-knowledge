@@ -39,6 +39,9 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from services.ingestion.admin_routes import router as admin_router
 from services.ingestion.backfill_routes import router as backfill_router
 from services.ingestion.custom_ingest_routes import router as custom_ingest_router
+from services.ingestion.entity_clusters_routes import (
+    router as entity_clusters_router,
+)
 from services.ingestion.handlers.base import make_default_context
 from services.ingestion.handlers.registry import (
     build_connector,
@@ -100,6 +103,7 @@ app = FastAPI(title="prbe-knowledge ingestion", lifespan=lifespan)
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 app.include_router(backfill_router)
 app.include_router(admin_router)
+app.include_router(entity_clusters_router)
 app.include_router(devices_router)
 app.include_router(wiki_router)
 app.include_router(custom_ingest_router)
