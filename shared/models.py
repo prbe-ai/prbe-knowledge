@@ -424,7 +424,7 @@ class RelatedEntity(BaseModel):
 
     canonical_id: str
     label: str  # NodeLabel.value (Service, Repo, Person, Ticket, ...)
-    display_name: str | None = None  # from properties->>'name'
+    display_name: str | None = None  # from properties->>'name' or entity_cluster_metadata.display_name override
     edge_types: list[str] = Field(default_factory=list)  # MENTIONS, AUTHORED, ...
     max_confidence: str  # EXTRACTED | INFERRED | AMBIGUOUS
     doc_count: int  # # of result-set docs adjacent to this entity (BFS priority)
@@ -439,6 +439,18 @@ class RelatedEntity(BaseModel):
     # list, not to enumerate every attached doc. DISTINCT -- multi-edge
     # docs do not duplicate.
     associated_doc_ids: list[str] = Field(default_factory=list)
+    # Total size of the entity cluster (primary + all merged aliases).
+    # 1 for unmerged nodes. Lets agents prefer cluster-rich nodes when
+    # picking BFS crawl candidates. Populated by the related-entities
+    # walker from `entity_aliases` keyed on the primary.
+    member_count: int = 1
+    # Distinct source_systems across the cluster (from the primary's
+    # consolidated `graph_node_provenance` -- Phase 1 merges alias
+    # provenance into the primary at merge time). [] for unmerged nodes
+    # whose node hasn't been provenance-stamped yet (edge case; normal
+    # ingest stamps it). Lets agents see "this person is GitHub +
+    # Slack + Linear" without an extra round-trip.
+    member_sources: list[str] = Field(default_factory=list)
 
 
 class MatchProvenance(BaseModel):

@@ -20,13 +20,16 @@ from __future__ import annotations
 import time
 
 from services.retrieval.acl import filter_by_acl
+from services.retrieval.helpers import expand_to_cluster_members
 from services.retrieval.retrievers.related_entities import (
     build_exclude_node_keys,
+    expand_exclude_keys_with_aliases,
     walk_result_doc_neighbors,
 )
 from services.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
 from services.retrieval.router import RouterOutput
-from shared.constants import SourceSystem
+from shared.constants import NodeLabel, SourceSystem
+from shared.db import with_tenant
 from shared.logging import get_logger
 from shared.models import (
     MatchProvenance,
@@ -146,6 +149,24 @@ async def run_list(
     if req.entity_must_match:
         author_ids = _author_ids_from_entities(routed)
         graph_entity_filters = _graph_entity_filters_from_routed(routed)
+        # Phase 2: expand each author_id to its full Person cluster
+        # (primary + aliases) so post-merge entities still match docs
+        # written under their pre-merge author_id. `documents.author_id`
+        # is historical raw text and is never rewritten on merge.
+        if author_ids:
+            async with with_tenant(customer_id) as conn:
+                cluster_map = await expand_to_cluster_members(
+                    conn, customer_id, label=NodeLabel.PERSON.value,
+                    canonical_ids=author_ids,
+                )
+            expanded: list[str] = []
+            seen: set[str] = set()
+            for aid in author_ids:
+                for member in cluster_map.get(aid, [aid]):
+                    if member not in seen:
+                        seen.add(member)
+                        expanded.append(member)
+            author_ids = expanded
     else:
         author_ids = None
         graph_entity_filters = []
@@ -260,6 +281,14 @@ async def run_list(
         # rationale. Threshold + normalized variants.
         exclude_keys = build_exclude_node_keys(
             routed.entities,
+            entity_match_threshold=req.entity_match_threshold,
+        )
+        # Phase 2: translate alias canonical_ids to primaries so the walker
+        # doesn't recommend the cluster the user just typed.
+        exclude_keys = await expand_exclude_keys_with_aliases(
+            customer_id,
+            routed.entities,
+            exclude_keys,
             entity_match_threshold=req.entity_match_threshold,
         )
         # Dedupe doc_id, keep best (lowest) rank per doc -- list mode emits

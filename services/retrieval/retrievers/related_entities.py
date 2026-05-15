@@ -14,10 +14,19 @@ tier ordering. The walk is bidirectional (UNION ALL on `from_node_id` /
 
 from __future__ import annotations
 
+import re
+
+from services.retrieval.helpers import resolve_aliases
 from services.retrieval.retrievers.graph import _CONFIDENCE_RANK, _ENTITY_TO_LABEL
 from shared.constants import NodeLabel
 from shared.db import with_tenant
 from shared.models import RelatedEntity
+
+# Strip everything up to and including the last '/' to convert
+# 'prbe-ai/prbe-backend' -> 'prbe-backend'. Shared by
+# build_exclude_node_keys and expand_exclude_keys_with_aliases so the
+# regex stays in lockstep if either function evolves.
+_NAMESPACE_STRIP_RE = re.compile(r"^.*/")
 
 
 def _confidence_case_sql(column: str) -> str:
@@ -83,9 +92,7 @@ def build_exclude_node_keys(
     `entity_type`, `canonical_id`, `confidence`, and optionally
     `display_name` attributes.
     """
-    import re
     out: set[tuple[str, str]] = set()
-    namespace_strip = re.compile(r"^.*/")
     for e in routed_entities:
         confidence = getattr(e, "confidence", 1.0) or 0.0
         if confidence < entity_match_threshold:
@@ -101,10 +108,61 @@ def build_exclude_node_keys(
                 continue
             lowered = raw.lower()
             out.add((label, lowered))
-            stripped = namespace_strip.sub("", lowered)
+            stripped = _NAMESPACE_STRIP_RE.sub("", lowered)
             if stripped and stripped != lowered:
                 out.add((label, stripped))
     return out
+
+
+async def expand_exclude_keys_with_aliases(
+    customer_id: str,
+    routed_entities,
+    exclude_keys: set[tuple[str, str]],
+    *,
+    entity_match_threshold: float = 0.7,
+) -> set[tuple[str, str]]:
+    """Augment a `build_exclude_node_keys` set with the cluster primaries.
+
+    When the router emits an alias canonical_id (e.g. Person:mahit@prbe.ai
+    post-merge), the walker's SQL exclusion compares against
+    gn.canonical_id which is now the primary (richardwei6), not the alias.
+    Without translation the walker would happily recommend the primary as
+    a related-entities suggestion even though the user just typed it via
+    one of its aliases.
+
+    Mirrors the threshold + label-resolution semantics of
+    `build_exclude_node_keys` so the SAME set of routed entities feeds
+    both paths. Adds lowercased + namespace-stripped variants of the
+    primary canonical_id to match the SQL's normalized comparison.
+
+    Returns a new set (does not mutate the input).
+    """
+    refs: list[tuple[str, str]] = []
+    for e in routed_entities:
+        confidence = getattr(e, "confidence", 1.0) or 0.0
+        if confidence < entity_match_threshold:
+            continue
+        label = _ENTITY_TO_LABEL.get(e.entity_type.lower())
+        if not label:
+            continue
+        cid = getattr(e, "canonical_id", None)
+        if not cid:
+            continue
+        refs.append((label, cid))
+    if not refs:
+        return exclude_keys
+    async with with_tenant(customer_id) as conn:
+        alias_map = await resolve_aliases(conn, customer_id, refs=refs)
+    if not alias_map:
+        return exclude_keys
+    expanded = set(exclude_keys)
+    for (label, _orig_cid), primary in alias_map.items():
+        lowered = primary.lower()
+        expanded.add((label, lowered))
+        stripped = _NAMESPACE_STRIP_RE.sub("", lowered)
+        if stripped and stripped != lowered:
+            expanded.add((label, stripped))
+    return expanded
 
 
 async def walk_result_doc_neighbors(
@@ -199,7 +257,7 @@ async def walk_result_doc_neighbors(
             SELECT
                 gn.canonical_id,
                 gn.label,
-                gn.properties->>'name' AS display_name,
+                COALESCE(NULLIF(ecm.display_name, ''), gn.properties->>'name') AS display_name,
                 gn.node_id,
                 array_agg(DISTINCT ne.edge_type) AS edge_types,
                 max({confidence_case}) AS max_confidence_rank,
@@ -207,7 +265,11 @@ async def walk_result_doc_neighbors(
                 -- Rank-ordered samples. Carries duplicates intentionally so
                 -- the lowest-rank doc surfaces first; Python dedupes
                 -- preserving first-seen order, then truncates to 3 (codex-A2).
-                array_agg(doc_gn.canonical_id ORDER BY ne.doc_rank ASC) AS sample_pool
+                array_agg(doc_gn.canonical_id ORDER BY ne.doc_rank ASC) AS sample_pool,
+                -- PHASE 2: cluster size = primary + alias count.
+                (1 + COALESCE(ea_count.alias_count, 0))::int AS member_count,
+                -- PHASE 2: distinct source_systems from consolidated provenance.
+                COALESCE(gnp.sources, ARRAY[]::text[]) AS member_sources
             FROM neighbor_edges ne
             JOIN graph_nodes gn
               ON gn.node_id = ne.neighbor_node_id
@@ -215,6 +277,27 @@ async def walk_result_doc_neighbors(
             JOIN graph_nodes doc_gn
               ON doc_gn.node_id = ne.doc_node_id
              AND doc_gn.customer_id = $1
+            -- PHASE 2: per-primary alias count (NULL when no merge happened).
+            LEFT JOIN LATERAL (
+                SELECT COUNT(*) AS alias_count
+                FROM entity_aliases
+                WHERE customer_id = $1
+                  AND label = gn.label
+                  AND primary_canonical_id = gn.canonical_id
+            ) ea_count ON TRUE
+            -- PHASE 2: distinct source_systems for the primary's node.
+            -- LATERAL keyed on node_id (PK-ish) -> one index probe per neighbor.
+            LEFT JOIN LATERAL (
+                SELECT array_agg(DISTINCT source_system ORDER BY source_system) AS sources
+                FROM graph_node_provenance
+                WHERE customer_id = $1
+                  AND node_id = gn.node_id
+            ) gnp ON TRUE
+            -- PHASE 2: optional curated display name override.
+            LEFT JOIN entity_cluster_metadata ecm
+              ON ecm.customer_id = $1
+             AND ecm.label = gn.label
+             AND ecm.primary_canonical_id = gn.canonical_id
             WHERE gn.label != '{document_label}'
               -- Fuzzy exclusion (codex-P2): the routed-entity canonical_id
               -- the LLM extracted may not exactly match the graph node's
@@ -235,7 +318,8 @@ async def walk_result_doc_neighbors(
                         regexp_replace(lower(gn.properties->>'name'), '^.*/', '')
                     )
               )
-            GROUP BY gn.canonical_id, gn.label, gn.properties->>'name', gn.node_id
+            GROUP BY gn.canonical_id, gn.label, gn.properties->>'name',
+                     gn.node_id, ea_count.alias_count, gnp.sources, ecm.display_name
             HAVING max({confidence_case}) >= $6  -- min_confidence floor
         ),
         neighbor_global_freq AS (
@@ -282,7 +366,9 @@ async def walk_result_doc_neighbors(
             -- IDF-adjusted score: more weight to specific (low-freq) entities
             (ra.doc_count::float / ln(1 + COALESCE(ngf.global_doc_count, 1)))
                 AS score,
-            ra.sample_pool
+            ra.sample_pool,
+            ra.member_count,
+            ra.member_sources
         FROM result_aggregates ra
         LEFT JOIN neighbor_global_freq ngf USING (node_id)
         -- Final tiebreakers (label, canonical_id) make ordering deterministic
@@ -328,6 +414,8 @@ async def walk_result_doc_neighbors(
                 doc_count=int(r["doc_count"]),
                 score=float(r["score"]),
                 associated_doc_ids=associated_doc_ids,
+                member_count=int(r["member_count"]),
+                member_sources=list(r["member_sources"] or []),
             )
         )
     return out

@@ -452,6 +452,8 @@ The pivot to B-promote dramatically simplifies retrieval-side code compared to A
 
 Three touchpoints vs. Approach A's three, but each is shorter and simpler.
 
+> **Phase 2 implementation landed.** See `docs/superpowers/specs/2026-05-14-entity-clusters-phase2-plan.md` and commits in the `entity-clusters-phase2` branch range. Retrieval surfaces (anchor lookup, list author filter, related-entities walker, search-pipeline entity hits) all consult `entity_aliases` and `entity_cluster_metadata` per the plan.
+
 ## graph_writer.py ingest-path changes (Phase 1)
 
 ```python

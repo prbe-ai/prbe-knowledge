@@ -47,6 +47,7 @@ from services.retrieval.fusion import FusedChunk, FusedDocument, fuse
 from services.retrieval.helpers import (
     apply_entity_filter,
     embeddings_for_chunks,
+    resolve_aliases,
 )
 from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search, residualize_for_bm25
 from services.retrieval.retrievers.directed import directed_search
@@ -58,6 +59,7 @@ from services.retrieval.retrievers.inferred_edges import (
 )
 from services.retrieval.retrievers.related_entities import (
     build_exclude_node_keys,
+    expand_exclude_keys_with_aliases,
     walk_result_doc_neighbors,
 )
 from services.retrieval.retrievers.vector import vector_search
@@ -643,21 +645,55 @@ async def _build_entity_results(
     if not resolved:
         return []
 
-    labels = [r[0] for r in resolved]
-    canonical_ids = [r[1] for r in resolved]
-
+    # Phase 2: translate any alias canonical_ids to their primaries so
+    # the (label, canonical_id) lookup in graph_nodes hits the surviving
+    # primary row. Without this, the lookup misses (alias graph_nodes
+    # rows were hard-deleted at merge time) and the routed entity is
+    # silently dropped from search results.
+    #
+    # When two router-extracted entities collapse to the same primary
+    # (e.g. user typed both `mahit@prbe.ai` and `U07ABC123`), we keep
+    # the highest-confidence entity so downstream score = confidence *
+    # log(1 + doc_count) isn't depressed by router extraction order.
     t_entity = time.perf_counter()
     async with with_tenant(customer_id) as conn:
+        alias_map = await resolve_aliases(
+            conn, customer_id,
+            refs=[(r[0], r[1]) for r in resolved],
+        )
+        if alias_map:
+            # Collapse aliases of the same primary into a single tuple,
+            # keeping the highest-confidence RouterEntity so downstream
+            # scoring isn't depressed by arbitrary router-extraction order.
+            by_primary: dict[tuple[str, str], tuple[str, str, RouterEntity]] = {}
+            for label, cid, entity in resolved:
+                primary = alias_map.get((label, cid), cid)
+                key = (label, primary)
+                existing = by_primary.get(key)
+                if existing is None or float(entity.confidence) > float(existing[2].confidence):
+                    by_primary[key] = (label, primary, entity)
+            resolved = list(by_primary.values())
+
+        labels = [r[0] for r in resolved]
+        canonical_ids = [r[1] for r in resolved]
+
         rows = await conn.fetch(
             """
             WITH wanted AS (
                 SELECT * FROM unnest($2::text[], $3::text[]) AS t(label, canonical_id)
             ),
             entity_nodes AS (
-                SELECT gn.node_id, gn.label, gn.canonical_id, gn.properties
+                SELECT
+                    gn.node_id, gn.label, gn.canonical_id, gn.properties,
+                    -- PHASE 2: optional curated display name override.
+                    NULLIF(ecm.display_name, '') AS override_display_name
                 FROM graph_nodes gn
                 JOIN wanted w ON w.label = gn.label
                               AND w.canonical_id = gn.canonical_id
+                LEFT JOIN entity_cluster_metadata ecm
+                  ON ecm.customer_id = gn.customer_id
+                 AND ecm.label = gn.label
+                 AND ecm.primary_canonical_id = gn.canonical_id
                 WHERE gn.customer_id = $1
             ),
             attached_from AS (
@@ -712,6 +748,7 @@ async def _build_entity_results(
                 ) AS distinct_attachments
             )
             SELECT en.node_id, en.label, en.canonical_id, en.properties,
+                   en.override_display_name,
                    (SELECT array_agg(DISTINCT eda.edge_type)
                           FILTER (WHERE eda.edge_type IS NOT NULL)
                     FROM entity_doc_attachments eda
@@ -757,7 +794,15 @@ async def _build_entity_results(
                 properties = {}
         if not isinstance(properties, dict):
             properties = {}
-        display_name = properties.get("name") if isinstance(properties.get("name"), str) else None
+        # Phase 2: prefer curated entity_cluster_metadata.display_name if set
+        # (NULLIF coerces empty strings to NULL upstream).
+        override = r["override_display_name"]
+        display_name: str | None
+        if isinstance(override, str) and override:
+            display_name = override
+        else:
+            name = properties.get("name")
+            display_name = name if isinstance(name, str) else None
 
         edge_types = list(r["edge_types"] or [])
         doc_count = int(r["doc_count"] or 0)
@@ -1064,6 +1109,14 @@ async def run_search(
             return None, None
         exclude_keys = build_exclude_node_keys(
             routed.entities,
+            entity_match_threshold=req.entity_match_threshold,
+        )
+        # Phase 2: translate alias canonical_ids to primaries so the walker
+        # doesn't recommend the cluster the user just typed.
+        exclude_keys = await expand_exclude_keys_with_aliases(
+            customer_id,
+            routed.entities,
+            exclude_keys,
             entity_match_threshold=req.entity_match_threshold,
         )
         ranked_docs = [(d.doc_id, i) for i, d in enumerate(top, start=1)]
