@@ -183,7 +183,7 @@ async def create_manual_uploads(
     bind_trace(trace_id)
 
     store = request.app.state.store
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     try:
         await store.ensure_bucket(bucket)
     except PrbeError as exc:
@@ -502,7 +502,7 @@ async def webhook(
         }
     )
     store = request.app.state.store
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     storage_id = _compose_storage_id(
         source_enum, parsed.source_event_id, parsed.parse_hint
     )

@@ -53,7 +53,7 @@ class Storage(Protocol):
     async def delete(self, bucket: str, key: str) -> None:
         ...
 
-    def bucket_for(self, customer_id: str) -> str:
+    async def bucket_for(self, customer_id: str) -> str:
         ...
 
     async def ensure_bucket(self, bucket: str) -> None:

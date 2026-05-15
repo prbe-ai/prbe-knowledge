@@ -71,7 +71,7 @@ class IngestionWriter:
             return
 
         # integrate mode: R2 put + queue batching
-        bucket_name = self.bucket.bucket_for(self.customer_id)
+        bucket_name = await self.bucket.bucket_for(self.customer_id)
         key = f"raw/{doc.source.value}/{self.customer_id}/synth/{doc.source_event_id}.json"
         await self.bucket.put(bucket_name, key, envelope)
         self._batch.append((doc, key))

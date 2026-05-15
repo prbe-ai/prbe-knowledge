@@ -89,7 +89,7 @@ async def rotate_customer_key(customer_id: str) -> str:
 async def ensure_bucket_for(customer_id: str) -> str:
     """Create the per-tenant R2/MinIO bucket if it doesn't exist. Returns bucket name."""
     store = get_store()
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     await store.ensure_bucket(bucket)
     return bucket
 
@@ -110,7 +110,7 @@ async def delete_customer(customer_id: str) -> None:
         raise CustomerNotFound("customer not found", customer_id=customer_id)
 
     store = get_store()
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     try:
         await store.delete_bucket_recursive(bucket)
     except Exception as exc:

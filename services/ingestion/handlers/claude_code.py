@@ -232,7 +232,7 @@ class ClaudeCodeConnector(Connector):
             keys = [event.payload_s3_key]
 
         store = get_store()
-        bucket = store.bucket_for(event.customer_id)
+        bucket = await store.bucket_for(event.customer_id)
         sem = asyncio.Semaphore(_FETCH_SUPP_R2_CONCURRENCY)
 
         async def _fetch(key: str) -> tuple[str, bytes]:

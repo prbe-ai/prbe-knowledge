@@ -42,7 +42,7 @@ FIXTURE_PATH = Path(__file__).parent / "fixtures" / "slack" / "message_simple.js
 class _StubStore:
     blobs: dict[tuple[str, str], bytes]
 
-    def bucket_for(self, customer_id: str) -> str:
+    async def bucket_for(self, customer_id: str) -> str:
         return f"test-bucket-{customer_id}"
 
     async def get(self, bucket: str, key: str) -> bytes:
@@ -116,7 +116,7 @@ async def test_embed_many_runs_with_no_db_connection_in_flight(live_db) -> None:
     normalizer = Normalizer(ctx, store=store, embedder=embedder)  # type: ignore[arg-type]
 
     payload = _base_payload()
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     key = f"raw/slack/{customer_id}/evt-fence-1.json"
     store.blobs[(bucket, key)] = _wrap_payload(payload)
 

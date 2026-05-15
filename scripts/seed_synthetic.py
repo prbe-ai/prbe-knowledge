@@ -75,7 +75,7 @@ async def seed(customer_id: str, count: int) -> None:
     await init_pool(settings)
 
     store = get_store()
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     await store.ensure_bucket(bucket)
 
     async with raw_conn() as conn:

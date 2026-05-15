@@ -406,7 +406,7 @@ class Worker:
         should_delete = staging_key and row["original_deleted_at"] is None
         if should_delete:
             store = get_store()
-            await store.delete(store.bucket_for(customer_id), staging_key)
+            await store.delete(await store.bucket_for(customer_id), staging_key)
 
         async with get_pool().acquire() as conn:
             await conn.execute(

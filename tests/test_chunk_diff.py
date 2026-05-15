@@ -40,7 +40,7 @@ FIXTURE_PATH = Path(__file__).parent / "fixtures" / "slack" / "message_simple.js
 class _StubStore:
     blobs: dict[tuple[str, str], bytes]
 
-    def bucket_for(self, customer_id: str) -> str:
+    async def bucket_for(self, customer_id: str) -> str:
         return f"test-bucket-{customer_id}"
 
     async def get(self, bucket: str, key: str) -> bytes:
@@ -82,7 +82,7 @@ async def _put_and_ingest(
     source_event_id: str,
     payload: dict[str, Any],
 ) -> None:
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     key = f"raw/slack/{customer_id}/{source_event_id}.json"
     store.blobs[(bucket, key)] = _wrap_payload(payload)
     await normalizer.process_queue_row(

@@ -162,7 +162,7 @@ async def test_finalize_event_processes_through_normalizer(
     # cron runs, payload_s3_keys will be [live_key, finalize.marker] and
     # fetch_supplementary will read both.
     store = get_store()
-    bucket = store.bucket_for(customer)
+    bucket = await store.bucket_for(customer)
     await store.ensure_bucket(bucket)
     live_key = f"raw/claude_code/{customer}/2026/04/29/{session_id}:0.json"
     live_envelope = orjson.dumps({

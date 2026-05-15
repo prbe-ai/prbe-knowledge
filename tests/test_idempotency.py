@@ -57,7 +57,7 @@ async def test_replay_produces_one_doc(live_db, settings: Settings) -> None:
     from shared.storage import get_store
 
     store = get_store()
-    await store.ensure_bucket(store.bucket_for(CUSTOMER))
+    await store.ensure_bucket(await store.bucket_for(CUSTOMER))
 
     body = json.dumps(json.loads(FIXTURE.read_text())).encode()
     from services.ingestion.main import app as ingestion_app

@@ -154,7 +154,7 @@ async def run_backfill(
         return 0
 
     store = get_store()
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     # Bucket ensure used to live OUTSIDE the try/except — a 403 from R2
     # (per-tenant bucket never created, e.g. a slug/UUID mismatch in the
     # provisioning path) would raise out of run_backfill BEFORE

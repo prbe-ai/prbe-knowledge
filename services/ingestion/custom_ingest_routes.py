@@ -85,7 +85,7 @@ async def custom_ingest_documents(
     bind_trace(trace_id)
 
     store = getattr(request.app.state, "store", None) or get_store()
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     try:
         await store.ensure_bucket(bucket)
     except PrbeError as exc:

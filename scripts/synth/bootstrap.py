@@ -77,7 +77,7 @@ async def init_tenant(profile: Profile, db, bucket: ObjectStore) -> None:
         placeholder_hash,
     )
 
-    bucket_name = bucket.bucket_for(customer_id)
+    bucket_name = await bucket.bucket_for(customer_id)
     await bucket.ensure_bucket(bucket_name)
 
     # The worker decrypts integration_tokens.access_token_encrypted with the
@@ -133,7 +133,7 @@ async def clean_tenant(customer_id: str, db, bucket: ObjectStore) -> None:
                 customer_id,
             )
 
-    bucket_name = bucket.bucket_for(customer_id)
+    bucket_name = await bucket.bucket_for(customer_id)
     needle = f"/{customer_id}/synth/"
     keys = await bucket.list_keys(bucket_name, "raw/")
     synth_keys = [k for k in keys if needle in k]

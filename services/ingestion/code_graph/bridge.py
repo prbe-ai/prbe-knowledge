@@ -189,7 +189,7 @@ async def _put_and_enqueue(
     """R2 write + ingestion_queue insert. Mirrors main._enqueue's
     non-coalesced path: ON CONFLICT DO NOTHING dedupes redeliveries."""
     store = get_store()
-    bucket = store.bucket_for(customer_id)
+    bucket = await store.bucket_for(customer_id)
     key = (
         f"raw/{SourceSystem.CODE_GRAPH.value}/{customer_id}/"
         f"{uuid.uuid4()}.json"
