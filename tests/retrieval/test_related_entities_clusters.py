@@ -250,3 +250,63 @@ async def test_walker_member_count_one_for_unmerged_node(live_db):
     person = people[0]
     assert person.member_count == 1
     assert person.member_sources == ["github"]
+
+
+async def test_walker_uses_display_name_override(live_db):
+    """A curated entity_cluster_metadata.display_name wins over properties->>'name'."""
+    await _seed_full_cluster(CUSTOMER_ID)
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO entity_cluster_metadata (
+                customer_id, label, primary_canonical_id, display_name
+            ) VALUES ($1, 'Person', $2, 'Richard Wei (canonical)')
+            """,
+            CUSTOMER_ID, PRIMARY,
+        )
+    rels = await walk_result_doc_neighbors(
+        customer_id=CUSTOMER_ID,
+        ranked_result_docs=[(DOC_ID, 1)],
+        exclude_node_keys=set(),
+        min_confidence=None,
+        top_n=10,
+    )
+    person = next(r for r in rels if r.label == "Person")
+    assert person.display_name == "Richard Wei (canonical)"
+
+
+async def test_walker_falls_back_to_properties_name_when_no_override(live_db):
+    """No entity_cluster_metadata row -> use graph_nodes.properties->>'name'."""
+    await _seed_full_cluster(CUSTOMER_ID)
+    rels = await walk_result_doc_neighbors(
+        customer_id=CUSTOMER_ID,
+        ranked_result_docs=[(DOC_ID, 1)],
+        exclude_node_keys=set(),
+        min_confidence=None,
+        top_n=10,
+    )
+    person = next(r for r in rels if r.label == "Person")
+    assert person.display_name == "Richard"
+
+
+async def test_walker_treats_empty_override_as_no_override(live_db):
+    """Empty-string display_name override falls through to properties name."""
+    await _seed_full_cluster(CUSTOMER_ID)
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO entity_cluster_metadata (
+                customer_id, label, primary_canonical_id, display_name
+            ) VALUES ($1, 'Person', $2, '')
+            """,
+            CUSTOMER_ID, PRIMARY,
+        )
+    rels = await walk_result_doc_neighbors(
+        customer_id=CUSTOMER_ID,
+        ranked_result_docs=[(DOC_ID, 1)],
+        exclude_node_keys=set(),
+        min_confidence=None,
+        top_n=10,
+    )
+    person = next(r for r in rels if r.label == "Person")
+    assert person.display_name == "Richard"

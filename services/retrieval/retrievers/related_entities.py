@@ -199,7 +199,7 @@ async def walk_result_doc_neighbors(
             SELECT
                 gn.canonical_id,
                 gn.label,
-                gn.properties->>'name' AS display_name,
+                COALESCE(NULLIF(ecm.display_name, ''), gn.properties->>'name') AS display_name,
                 gn.node_id,
                 array_agg(DISTINCT ne.edge_type) AS edge_types,
                 max({confidence_case}) AS max_confidence_rank,
@@ -235,6 +235,11 @@ async def walk_result_doc_neighbors(
                 WHERE customer_id = $1
                   AND node_id = gn.node_id
             ) gnp ON TRUE
+            -- PHASE 2: optional curated display name override.
+            LEFT JOIN entity_cluster_metadata ecm
+              ON ecm.customer_id = $1
+             AND ecm.label = gn.label
+             AND ecm.primary_canonical_id = gn.canonical_id
             WHERE gn.label != '{document_label}'
               -- Fuzzy exclusion (codex-P2): the routed-entity canonical_id
               -- the LLM extracted may not exactly match the graph node's
@@ -256,7 +261,7 @@ async def walk_result_doc_neighbors(
                     )
               )
             GROUP BY gn.canonical_id, gn.label, gn.properties->>'name',
-                     gn.node_id, ea_count.alias_count, gnp.sources
+                     gn.node_id, ea_count.alias_count, gnp.sources, ecm.display_name
             HAVING max({confidence_case}) >= $6  -- min_confidence floor
         ),
         neighbor_global_freq AS (
