@@ -74,6 +74,29 @@
 
 ---
 
+## Execution chunks (subagent dispatch roadmap)
+
+Tasks below are split into 12 logical chunks, each scoped to a single concern + single reviewable commit. The chunk index drives subagent dispatch; chunks within the same parent Task share file context but produce independent commits.
+
+| # | Chunk | Files | Parent Task |
+|---|---|---|---|
+| 1 | `resolve_aliases` helper | `helpers.py` + 1 test file | Task 1 (helpers) |
+| 2 | `expand_to_cluster_members` helper | `helpers.py` + 1 test file | Task 1 (helpers) |
+| 3 | `RelatedEntity` model fields | `shared/models.py` | Task 2 |
+| 4 | `/graph/explore` anchor translation | `services/retrieval/main.py` + endpoint test | Task 3 |
+| 5 | List-pipeline author filter expansion | `services/retrieval/list_pipeline.py` + integration test | Task 4 |
+| 6 | Walker cluster metadata (`member_count` + `member_sources`) | `related_entities.py` SQL + Python builder | Task 5 (walker) |
+| 7 | Walker display-name override | `related_entities.py` SQL + Python builder | Task 5 (walker) |
+| 8 | `exclude_node_keys` translation at caller | caller of walker (search_pipeline / pipeline) | Task 5 (walker) |
+| 9 | Search-pipeline routed-entity translation | `search_pipeline.py` `_build_entity_results` translation block | Task 6 |
+| 10 | Search-pipeline display-name override | `search_pipeline.py` SQL LEFT JOIN + Python builder | Task 6 |
+| 11 | Final pass — full suite + lint/types + docs cross-link | (no code) | Task 7 |
+| 12 | Live container smoke test | `scripts/smoke_phase2_clusters.py` | Task 8 |
+
+**Dispatch protocol:** one implementer subagent per chunk, then spec-compliance reviewer → fix loop → code-quality reviewer → fix loop → mark complete → next chunk. After Chunk 11 passes, dispatch one final code-reviewer for the entire branch. Chunks 6, 7, 8 all modify the walker SQL — they will re-edit the same CTE block on consecutive commits; this is intentional and not churn (each commit isolates one logical concern). Chunks 9 and 10 likewise modify `_build_entity_results` on consecutive commits.
+
+---
+
 ## Tasks
 
 ### Task 1: Alias-resolution helpers
