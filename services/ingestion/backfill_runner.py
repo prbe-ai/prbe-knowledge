@@ -139,8 +139,15 @@ async def _flush_batch(
     `batch` is a list of (key, envelope_bytes, source_event_id). All puts run
     concurrently under a Semaphore so we don't blow the per-process socket
     budget. Once R2 succeeds for every put, the queue rows go in via a single
-    executemany. ON CONFLICT DO NOTHING preserves the per-row dedup semantics
-    of the old single-row path.
+    pipelined executemany. ON CONFLICT DO NOTHING preserves the per-row dedup
+    semantics of the old single-row path.
+
+    Crash recovery invariant: the R2 key is deterministic from
+    source_event_id (see caller). If executemany raises after R2 puts
+    succeeded, the orphaned objects are overwritten idempotently on retry,
+    and ON CONFLICT DO NOTHING admits duplicate queue rows safely. Callers
+    MUST NOT change the key scheme away from source_event_id without
+    revisiting this property.
 
     Raises on first failure. Caller is responsible for routing the exception
     to _mark_failed so the run flips to status='failed' rather than silently
@@ -270,18 +277,37 @@ async def run_backfill(
         # multiples at once.
         batch_size = get_settings().backfill_batch_size
         r2_sem = asyncio.Semaphore(R2_PUT_CONCURRENCY)
-        batch: list[tuple[str, bytes, str]] = []
+        # 4-tuple: (key, envelope_bytes, source_event_id, cursor_or_None).
+        # The trailing cursor is the value latest_cursor SHOULD advance to
+        # after this event's batch is durably persisted. Holding it on the
+        # batch tuple (instead of mutating latest_cursor at append-time)
+        # ensures _mark_failed reads the cursor of the last successfully
+        # flushed batch — not one that crashed half-way through.
+        batch: list[tuple[str, bytes, str, str | None]] = []
         last_progress_at_enqueued = enqueued
 
         async def _flush_now() -> None:
             nonlocal batch, enqueued, latest_cursor, last_progress_at_enqueued
             if not batch:
                 return
+            # The latest non-None cursor in the batch becomes the new
+            # watermark — but only AFTER _flush_batch succeeds.
+            pending_cursor = next(
+                (c for _, _, _, c in reversed(batch) if c is not None),
+                None,
+            )
             await _flush_batch(
-                store, bucket, customer_id, source, batch, r2_sem
+                store,
+                bucket,
+                customer_id,
+                source,
+                [(k, e, sid) for k, e, sid, _ in batch],
+                r2_sem,
             )
             enqueued += len(batch)
             batch = []
+            if pending_cursor is not None:
+                latest_cursor = pending_cursor
             # Write a progress checkpoint at most once per batch, gated on
             # crossing a PROGRESS_EVERY_N_EVENTS boundary since the last
             # write. Use floor-division: a single 100-event batch crossing
@@ -322,18 +348,18 @@ async def run_backfill(
 
             # Cursor-only checkpoint event (e.g. Granola end-of-pagination).
             # The connector is telling us the watermark may safely advance now
-            # that pagination completed cleanly. Flush the pending batch first
-            # so the cursor advance reflects what's actually on disk, then
-            # persist the new watermark. Checkpoint event itself is NOT
-            # enqueued into ingestion_queue or R2. `payload.get(...)` is
-            # defensive against `raw_payload=None` or missing key.
+            # that pagination completed cleanly. Flush the pending batch
+            # FIRST; only advance latest_cursor after the flush succeeds so a
+            # crash in _flush_now doesn't persist a cursor past dropped
+            # events. Checkpoint event itself is NOT enqueued into
+            # ingestion_queue or R2. `payload.get(...)` is defensive against
+            # `raw_payload=None` or missing key.
             payload = event.raw_payload or {}
             if payload.get("_checkpoint"):
                 cursor_str = payload.get("_cursor")
-                if cursor_str is not None:
-                    latest_cursor = str(cursor_str)
                 await _flush_now()
                 if cursor_str is not None:
+                    latest_cursor = str(cursor_str)
                     await _update_progress(
                         customer_id, source, latest_cursor, enqueued, claim_token
                     )
@@ -356,15 +382,18 @@ async def run_backfill(
                 f"raw/{source.value}/{customer_id}/backfill/"
                 f"{event.source_event_id.replace('/', '_')}.json"
             )
-            batch.append((key, envelope, event.source_event_id))
-
             # The runner can discover a new cursor via the event's parse_hint
             # or via the connector yielding a tuple — keep it simple for now:
             # most connectors set a `_cursor` on their synthesized events
-            # specifically so the runner can persist it.
+            # specifically so the runner can persist it. Carry the cursor on
+            # the batch tuple instead of mutating latest_cursor here, so the
+            # watermark only advances after _flush_now durably persists this
+            # event.
             possible_cursor = payload.get("_cursor")
-            if possible_cursor is not None:
-                latest_cursor = str(possible_cursor)
+            pending_cursor = (
+                str(possible_cursor) if possible_cursor is not None else None
+            )
+            batch.append((key, envelope, event.source_event_id, pending_cursor))
 
             if len(batch) >= batch_size:
                 await _flush_now()

@@ -207,11 +207,13 @@ class Settings(BaseSettings):
     github_backfill_repo_concurrency: int = 4
 
     # --- Backfill batching --------------------------------------------------
-    # Backfill consumer batches events: one R2 gather + one DB executemany per
-    # batch instead of N round-trips for N events. 100 keeps batches small
-    # enough that a single failure rolls back at most ~100 events while still
-    # cutting per-event round-trip overhead by ~100x at 100k-event scale.
-    backfill_batch_size: int = Field(default=100, ge=1, le=1000)
+    # Backfill consumer batches events: one R2 gather (16-wide) + one asyncpg
+    # executemany per batch (pipelined prepared inserts, ~5-10x fewer
+    # round-trips end-to-end). 100 keeps batches small enough that a single
+    # failure rolls back at most ~100 events. Upper bound 500 caps in-memory
+    # payload buffer at ~500MB worst-case (one heavy PR body per event), well
+    # under the 1Gi ingestion-pod request.
+    backfill_batch_size: int = Field(default=100, ge=1, le=500)
 
     # --- HTTP / outbound ----------------------------------------------------
     http_timeout_seconds: float = 30.0
