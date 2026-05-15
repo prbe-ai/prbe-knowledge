@@ -332,6 +332,12 @@ EMBEDDING_DIM = 3072
 # values, not chasing string literals across the codebase.
 EMBEDDING_V2_MODEL = "google/gemini-embedding-2"
 EMBEDDING_V2_DIM = 3072
+# Bare model id as exposed by the LiteLLM proxy's `model_list` (matches the
+# `gemini-embedding-*` alias). Use this when routing through the gateway;
+# prefixing with `gemini/` falls through to the proxy's `*` catch-all and
+# returns "invalid model ID" because the catch-all routes to OpenAI.
+# Direct-SDK callers (google-genai) also accept this bare form.
+EMBEDDING_V2_PROXY_ALIAS = "gemini-embedding-2"
 # Per https://ai.google.dev/gemini-api/docs/embeddings, gemini-embedding-2
 # accepts up to 8192 input tokens. The chunker's DEFAULT_CHUNK_TOKENS (512)
 # is well under this; this constant is the absolute upper bound the chunker

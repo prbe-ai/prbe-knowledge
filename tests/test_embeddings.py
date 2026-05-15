@@ -408,8 +408,8 @@ async def test_gemini_embedder_routes_through_shared_llm_aembedding_in_gateway_m
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Gateway mode for Gemini goes through shared.llm.aembedding (no
-    base_url knob on google-genai). Model id is sent with the `gemini/`
-    prefix so LiteLLM's glob routes it to Gemini."""
+    base_url knob on google-genai). Model id is sent as the bare alias so
+    it matches the LiteLLM proxy's `gemini-embedding-*` model_name."""
 
     from shared.config import get_settings
 
@@ -445,8 +445,10 @@ async def test_gemini_embedder_routes_through_shared_llm_aembedding_in_gateway_m
 
     # Gateway transport was hit — direct client never constructed.
     assert embedder._client is None
-    # Model id carries the `gemini/` prefix for the proxy glob.
-    assert captured["model"] == "gemini/gemini-embedding-2"
+    # Model id is the bare alias the proxy's model_list exposes
+    # (`gemini-embedding-*`). Prefixing with `gemini/` would miss the alias
+    # and fall through to the `*` catch-all (→ 400 invalid model ID).
+    assert captured["model"] == "gemini-embedding-2"
     # All inputs went through; vectors round-trip.
     assert len(out) == 3
     assert all(vec == [0.11, 0.22, 0.33] for vec in out)
