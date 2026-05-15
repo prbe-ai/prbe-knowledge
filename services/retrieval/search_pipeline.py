@@ -47,6 +47,7 @@ from services.retrieval.fusion import FusedChunk, FusedDocument, fuse
 from services.retrieval.helpers import (
     apply_entity_filter,
     embeddings_for_chunks,
+    resolve_aliases,
 )
 from services.retrieval.retrievers.bm25 import BM25Hit, bm25_search, residualize_for_bm25
 from services.retrieval.retrievers.directed import directed_search
@@ -644,11 +645,38 @@ async def _build_entity_results(
     if not resolved:
         return []
 
-    labels = [r[0] for r in resolved]
-    canonical_ids = [r[1] for r in resolved]
-
+    # Phase 2: translate any alias canonical_ids to their primaries so
+    # the (label, canonical_id) lookup in graph_nodes hits the surviving
+    # primary row. Without this, the lookup misses (alias graph_nodes
+    # rows were hard-deleted at merge time) and the routed entity is
+    # silently dropped from search results.
+    #
+    # When two router-extracted entities collapse to the same primary
+    # (e.g. user typed both `mahit@prbe.ai` and `U07ABC123`), we keep
+    # the highest-confidence entity so downstream score = confidence *
+    # log(1 + doc_count) isn't depressed by router extraction order.
     t_entity = time.perf_counter()
     async with with_tenant(customer_id) as conn:
+        alias_map = await resolve_aliases(
+            conn, customer_id,
+            refs=[(r[0], r[1]) for r in resolved],
+        )
+        if alias_map:
+            # Collapse aliases of the same primary into a single tuple,
+            # keeping the highest-confidence RouterEntity so downstream
+            # scoring isn't depressed by arbitrary router-extraction order.
+            by_primary: dict[tuple[str, str], tuple[str, str, RouterEntity]] = {}
+            for label, cid, entity in resolved:
+                primary = alias_map.get((label, cid), cid)
+                key = (label, primary)
+                existing = by_primary.get(key)
+                if existing is None or float(entity.confidence) > float(existing[2].confidence):
+                    by_primary[key] = (label, primary, entity)
+            resolved = list(by_primary.values())
+
+        labels = [r[0] for r in resolved]
+        canonical_ids = [r[1] for r in resolved]
+
         rows = await conn.fetch(
             """
             WITH wanted AS (
