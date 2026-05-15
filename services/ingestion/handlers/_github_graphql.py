@@ -74,21 +74,10 @@ BACKFILL_PULLS_QUERY = (
     "        }\n"
     "        reviews(first: 50) {\n"
     "          nodes {\n"
-    "            id state body submittedAt author { login }\n"
-    "            comments(first: 50) {\n"
-    "              nodes { id body path createdAt author { login } }\n"
-    "            }\n"
+    "            id databaseId state body submittedAt author { login }\n"
     "          }\n"
     "        }\n"
     "        files(first: 100) { nodes { path additions deletions } }\n"
-    "        commits(first: 50) {\n"
-    "          nodes {\n"
-    "            commit {\n"
-    "              oid message committedDate\n"
-    "              author { name email user { login } }\n"
-    "            }\n"
-    "          }\n"
-    "        }\n"
     "      }\n"
     "    }\n"
     "  }\n"
@@ -163,6 +152,13 @@ BACKFILL_RELEASES_QUERY = (
 )
 
 
+_RECOVERABLE_GRAPHQL_ERROR_TYPES = {"RATE_LIMITED", "MAX_NODE_LIMIT_EXCEEDED"}
+# Up to 3 attempts total: initial + 2 retries with backoffs of 1s and 2s.
+# Covers transient 5xx (502/503/504 common under load) and recoverable
+# GraphQL `errors[]` blocks (RATE_LIMITED / MAX_NODE_LIMIT_EXCEEDED).
+_TRANSIENT_BACKOFF_SECONDS = (1, 2)
+
+
 async def run_graphql(
     http,
     auth_headers: dict[str, str],
@@ -174,19 +170,30 @@ async def run_graphql(
     Returns the `data` block on success. Returns None on a non-recoverable
     failure (the caller should advance state past the current page).
 
-    Handles three retry/backoff cases:
-    1. HTTP 429 or 403 with `x-ratelimit-remaining: 0` — sleep per
+    Handles five retry/backoff cases:
+    1. HTTP 429 or 403 with `x-ratelimit-remaining: 0` -- sleep per
        retry-after or x-ratelimit-reset, then retry once.
-    2. Response body reports `rateLimit.remaining < FLOOR` — proactively
+    2. HTTP 500/502/503/504 -- transient infra blip, retry with backoff
+       (1s then 2s). Killing a repo phase on a single 502 silently drops
+       the rest of its page stream.
+    3. Response body reports `rateLimit.remaining < FLOOR` -- proactively
        sleep until resetAt before returning. Lets downstream callers keep
        paging without burning their entire window.
-    3. Body contains `errors` — log + return None.
+    4. Body contains `errors` with recoverable types
+       (RATE_LIMITED / MAX_NODE_LIMIT_EXCEEDED) -- retry with backoff.
+       If GitHub returned partial `data` alongside the error, surface it
+       so the caller can emit those nodes (the embedded cursor stays
+       valid for the next page).
+    5. Body contains non-recoverable `errors` (FORBIDDEN, etc.) -- log
+       and return None.
     """
     import httpx
 
     payload = {"query": query, "variables": variables}
 
-    for attempt in range(2):
+    # max_attempts = 1 + len(backoff schedule); attempt 0 is the initial call.
+    max_attempts = 1 + len(_TRANSIENT_BACKOFF_SECONDS)
+    for attempt in range(max_attempts):
         try:
             resp = await http.post(
                 GITHUB_GRAPHQL_URL,
@@ -202,8 +209,20 @@ async def run_graphql(
             and resp.headers.get("x-ratelimit-remaining") == "0"
         ):
             await asyncio.sleep(_compute_retry_delay(resp))
-            if attempt == 0:
+            if attempt + 1 < max_attempts:
                 continue
+            return None
+
+        if resp.status_code in (500, 502, 503, 504):
+            # Transient infra blip. Don't kill the phase on one bad page.
+            if attempt + 1 < max_attempts:
+                await asyncio.sleep(_TRANSIENT_BACKOFF_SECONDS[attempt])
+                continue
+            log.warning(
+                "github.graphql_5xx_exhausted",
+                status=resp.status_code,
+                body=resp.text[:200],
+            )
             return None
 
         if resp.status_code != 200:
@@ -217,11 +236,35 @@ async def run_graphql(
         body = resp.json()
         if not isinstance(body, dict):
             return None
-        if body.get("errors"):
-            log.warning("github.graphql_errors", errors=body.get("errors"))
+
+        errors = body.get("errors")
+        data = body.get("data")
+
+        if errors:
+            error_types = {
+                (e.get("type") or "").upper()
+                for e in errors
+                if isinstance(e, dict)
+            }
+            recoverable = bool(error_types & _RECOVERABLE_GRAPHQL_ERROR_TYPES)
+            if recoverable and attempt + 1 < max_attempts:
+                log.warning(
+                    "github.graphql_recoverable_errors",
+                    error_types=sorted(error_types),
+                    has_partial_data=isinstance(data, dict),
+                )
+                await asyncio.sleep(_TRANSIENT_BACKOFF_SECONDS[attempt])
+                # If partial data is present alongside a recoverable error,
+                # surface it: the nodes are valid and their embedded cursor
+                # advances the page stream. The retry covers the next page.
+                if isinstance(data, dict):
+                    return data
+                continue
+            log.warning("github.graphql_errors", errors=errors)
+            if isinstance(data, dict):
+                return data
             return None
 
-        data = body.get("data")
         if not isinstance(data, dict):
             return None
 
@@ -351,24 +394,40 @@ def normalize_issue_node(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_review_node(node: dict[str, Any]) -> dict[str, Any]:
+def normalize_review_node(
+    node: dict[str, Any], pr_html_url: str | None = None
+) -> dict[str, Any]:
     """Map a GraphQL PullRequestReview node to the REST `review` shape.
 
     Keys mirror what `_normalize_review` reads:
-      id, state, body, submitted_at, user.login.
+      id, state, body, submitted_at, html_url, user.login.
 
     GraphQL `state` is uppercase (APPROVED / CHANGES_REQUESTED / COMMENTED /
-    DISMISSED / PENDING); the REST equivalent is lowercase + snake_case. The
-    GraphQL global `id` is kept as-is — uniqueness is the only contract on
-    that field (it flows into source_event_id).
+    DISMISSED / PENDING); the REST equivalent is lowercase + snake_case.
+
+    Prefers `databaseId` (REST numeric id) for `id`, falling back to the
+    GraphQL global id (string) when absent. Without this, backfill would
+    write review docs keyed on the string global-id while live webhooks
+    write on the integer REST id, producing two pgvector rows per review.
+
+    `html_url` is synthesized from the parent PR url + databaseId so the
+    downstream Document's source_url is non-empty (GraphQL Review nodes
+    don't carry their own url field).
     """
     raw_state = (node.get("state") or "").upper()
     rest_state = _REST_REVIEW_STATES.get(raw_state, raw_state.lower())
+    rest_id = node.get("databaseId")
+    if rest_id is None:
+        rest_id = node.get("id")
+    html_url = ""
+    if pr_html_url and node.get("databaseId") is not None:
+        html_url = f"{pr_html_url}#pullrequestreview-{node.get('databaseId')}"
     return {
-        "id": node.get("id"),
+        "id": rest_id,
         "state": rest_state,
         "body": node.get("body") or "",
         "submitted_at": node.get("submittedAt"),
+        "html_url": html_url,
         "user": {"login": ((node.get("author") or {}).get("login")) or "unknown"},
     }
 

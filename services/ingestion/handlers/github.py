@@ -1008,10 +1008,13 @@ class GitHubConnector(Connector):
                             review_nodes = (
                                 (node.get("reviews") or {}).get("nodes") or []
                             )
+                            pr_html_url = pr.get("html_url") or ""
                             for r_node in review_nodes:
                                 if not isinstance(r_node, dict):
                                     continue
-                                review = normalize_review_node(r_node)
+                                review = normalize_review_node(
+                                    r_node, pr_html_url=pr_html_url
+                                )
                                 review_id = review.get("id")
                                 if review_id is None:
                                     continue
@@ -1031,8 +1034,12 @@ class GitHubConnector(Connector):
                                     "review": review,
                                     "_cursor": review_cursor_blob,
                                 }
+                                # Match the webhook _parse_review prefix
+                                # (review:<repo>:<pr#>:<review_id>) so a
+                                # backfilled review and the live webhook
+                                # event dedupe on source_event_id.
                                 review_event_id = (
-                                    f"pr_review:{full_name}:{number}:{review_id}"
+                                    f"review:{full_name}:{number}:{review_id}"
                                 )
                                 await queue.put(
                                     WebhookEvent(
@@ -1052,10 +1059,12 @@ class GitHubConnector(Connector):
                                     )
                                 )
                         page_info = pulls.get("pageInfo") or {}
-                        rs["pulls_cursor"] = page_info.get("endCursor")
+                        async with snapshot_lock:
+                            rs["pulls_cursor"] = page_info.get("endCursor")
                         if not page_info.get("hasNextPage"):
                             break
-                    rs["phase"] = "issues"
+                    async with snapshot_lock:
+                        rs["phase"] = "issues"
 
                 # Issues phase.
                 if rs["phase"] == "issues":
@@ -1102,10 +1111,12 @@ class GitHubConnector(Connector):
                                 )
                             )
                         page_info = issues.get("pageInfo") or {}
-                        rs["issues_cursor"] = page_info.get("endCursor")
+                        async with snapshot_lock:
+                            rs["issues_cursor"] = page_info.get("endCursor")
                         if not page_info.get("hasNextPage"):
                             break
-                    rs["phase"] = "commits"
+                    async with snapshot_lock:
+                        rs["phase"] = "commits"
 
                 # Commits phase. Paginates the default-branch history and
                 # emits one synthetic `push` event per commit. The default
@@ -1131,7 +1142,8 @@ class GitHubConnector(Connector):
                         branch = default_ref.get("name") or rs.get(
                             "default_branch"
                         ) or "main"
-                        rs["default_branch"] = branch
+                        async with snapshot_lock:
+                            rs["default_branch"] = branch
                         target = default_ref.get("target") or {}
                         history = target.get("history") or {}
                         nodes = history.get("nodes") or []
@@ -1172,10 +1184,12 @@ class GitHubConnector(Connector):
                                 )
                             )
                         page_info = history.get("pageInfo") or {}
-                        rs["commits_cursor"] = page_info.get("endCursor")
+                        async with snapshot_lock:
+                            rs["commits_cursor"] = page_info.get("endCursor")
                         if not page_info.get("hasNextPage"):
                             break
-                    rs["phase"] = "releases"
+                    async with snapshot_lock:
+                        rs["phase"] = "releases"
 
                 # Releases phase. Emits one synthetic `release` event per
                 # release with action=published; deleted/unpublished actions
@@ -1236,7 +1250,8 @@ class GitHubConnector(Connector):
                                 )
                             )
                         page_info = releases.get("pageInfo") or {}
-                        rs["releases_cursor"] = page_info.get("endCursor")
+                        async with snapshot_lock:
+                            rs["releases_cursor"] = page_info.get("endCursor")
                         if not page_info.get("hasNextPage"):
                             break
 
@@ -1257,12 +1272,18 @@ class GitHubConnector(Connector):
                 continue
             yield event
 
-        # Surface walker exceptions to the caller for visibility (run_backfill
-        # decides whether to mark the row failed or partial-progress).
+        # Re-raise the first walker exception so backfill_runner.run_backfill
+        # marks this row failed instead of writing a "success" cursor over a
+        # partial walk. Previously the loop just logged and exited normally;
+        # any walker that raised silently dropped its repo from the backfill.
         for task in tasks:
-            exc = task.exception() if task.done() else None
-            if exc is not None and not isinstance(exc, _asyncio.CancelledError):
-                log.warning("github.backfill_walker_error", error=str(exc))
+            if not task.done():
+                continue
+            exc = task.exception()
+            if exc is None or isinstance(exc, _asyncio.CancelledError):
+                continue
+            log.warning("github.backfill_walker_error", error=str(exc))
+            raise exc
 
     # ------------------------------------------------------------------
     # 4. normalization
