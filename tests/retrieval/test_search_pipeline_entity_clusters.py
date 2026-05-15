@@ -184,3 +184,65 @@ async def test_collapse_keeps_highest_confidence_alias(live_db):
     assert results[0].canonical_id == PRIMARY
     # score = 0.9 * 0.5 = 0.45 (0-doc branch) vs first-wins 0.5*0.5=0.25
     assert results[0].score == pytest.approx(0.45)
+
+
+async def test_alias_input_uses_display_name_override(live_db):
+    """Alias input lands on primary AND override display_name applies."""
+    await _seed_customer(CUSTOMER_ID)
+    await _seed_primary_node(CUSTOMER_ID)
+    await _seed_cluster(CUSTOMER_ID, aliases=[ALIAS_A])
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO entity_cluster_metadata (
+                customer_id, label, primary_canonical_id, display_name
+            ) VALUES ($1, 'Person', $2, 'Richard Wei (canonical)')
+            """,
+            CUSTOMER_ID, PRIMARY,
+        )
+
+    results = await _build_entity_results(
+        customer_id=CUSTOMER_ID,
+        routed_entities=[_routed_person(ALIAS_A)],
+        timing={},
+    )
+    assert len(results) == 1
+    assert results[0].canonical_id == PRIMARY
+    assert results[0].display_name == "Richard Wei (canonical)"
+
+
+async def test_no_override_falls_back_to_properties_name(live_db):
+    """No entity_cluster_metadata row -> use properties->>'name'."""
+    await _seed_customer(CUSTOMER_ID)
+    await _seed_primary_node(CUSTOMER_ID)
+
+    results = await _build_entity_results(
+        customer_id=CUSTOMER_ID,
+        routed_entities=[_routed_person(PRIMARY)],
+        timing={},
+    )
+    assert len(results) == 1
+    assert results[0].display_name == "Richard"  # from properties->>'name'
+
+
+async def test_empty_override_falls_back_to_properties_name(live_db):
+    """Empty-string display_name override falls through."""
+    await _seed_customer(CUSTOMER_ID)
+    await _seed_primary_node(CUSTOMER_ID)
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO entity_cluster_metadata (
+                customer_id, label, primary_canonical_id, display_name
+            ) VALUES ($1, 'Person', $2, '')
+            """,
+            CUSTOMER_ID, PRIMARY,
+        )
+
+    results = await _build_entity_results(
+        customer_id=CUSTOMER_ID,
+        routed_entities=[_routed_person(PRIMARY)],
+        timing={},
+    )
+    assert len(results) == 1
+    assert results[0].display_name == "Richard"  # falls through

@@ -683,10 +683,17 @@ async def _build_entity_results(
                 SELECT * FROM unnest($2::text[], $3::text[]) AS t(label, canonical_id)
             ),
             entity_nodes AS (
-                SELECT gn.node_id, gn.label, gn.canonical_id, gn.properties
+                SELECT
+                    gn.node_id, gn.label, gn.canonical_id, gn.properties,
+                    -- PHASE 2: optional curated display name override.
+                    NULLIF(ecm.display_name, '') AS override_display_name
                 FROM graph_nodes gn
                 JOIN wanted w ON w.label = gn.label
                               AND w.canonical_id = gn.canonical_id
+                LEFT JOIN entity_cluster_metadata ecm
+                  ON ecm.customer_id = gn.customer_id
+                 AND ecm.label = gn.label
+                 AND ecm.primary_canonical_id = gn.canonical_id
                 WHERE gn.customer_id = $1
             ),
             attached_from AS (
@@ -741,6 +748,7 @@ async def _build_entity_results(
                 ) AS distinct_attachments
             )
             SELECT en.node_id, en.label, en.canonical_id, en.properties,
+                   en.override_display_name,
                    (SELECT array_agg(DISTINCT eda.edge_type)
                           FILTER (WHERE eda.edge_type IS NOT NULL)
                     FROM entity_doc_attachments eda
@@ -786,7 +794,13 @@ async def _build_entity_results(
                 properties = {}
         if not isinstance(properties, dict):
             properties = {}
-        display_name = properties.get("name") if isinstance(properties.get("name"), str) else None
+        # Phase 2: prefer curated entity_cluster_metadata.display_name if set
+        # (NULLIF coerces empty strings to NULL upstream).
+        override = r["override_display_name"]
+        if isinstance(override, str) and override:
+            display_name = override
+        else:
+            display_name = properties.get("name") if isinstance(properties.get("name"), str) else None
 
         edge_types = list(r["edge_types"] or [])
         doc_count = int(r["doc_count"] or 0)
