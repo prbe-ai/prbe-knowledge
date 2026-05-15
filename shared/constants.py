@@ -320,12 +320,10 @@ class EntityType(StrEnum):
     CHANNEL = "channel"
 
 
-EMBEDDING_MODEL = "openai/text-embedding-3-large"
-EMBEDDING_DIM = 3072
-# Gemini-2 is the production embedder (cutover from OpenAI 2026-05-14). The
-# v1 OpenAI constants above are retained only so the eval harness can
-# regenerate apples-to-apples baselines; no production code path reads
-# them. The v1 column on `chunks` is nullable and unindexed post-0067.
+# Gemini-2 is the sole embedder (OpenAI text-embedding-3-large was retired
+# 2026-05-14, PR #263; the OpenAI embedder + SDK were stripped in a follow-up).
+# The v1 column on `chunks` is nullable and unindexed post-0067; reads target
+# `embedding_v2`.
 #
 # Treat the two V2 constants below as the single source of truth for
 # "what's the embedder?" — swapping models later means flipping these

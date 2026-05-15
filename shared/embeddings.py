@@ -1,4 +1,4 @@
-"""Embedding clients with:
+"""Gemini embedding client.
 
 - Configurable batch size
 - Native retries via tenacity on transient failures
@@ -7,20 +7,14 @@
   `failed_chunks` for later inspection
 - Async (wraps the sync provider SDKs in a thread)
 
-Two concrete providers live here:
+`GeminiEmbedder` (gemini-embedding-2) is the sole embedder for both
+ingestion (writes `chunks.embedding_v2`) and retrieval (embeds queries).
+Cutover from OpenAI text-embedding-3-large landed 2026-05-14 (PR #263);
+the OpenAI embedder + SDK dependency were stripped in a follow-up.
 
-- `GeminiEmbedder`: gemini-embedding-2. The production embedder for both
-  ingestion (writes `chunks.embedding_v2`) and retrieval (embeds queries).
-- `OpenAIEmbedder`: text-embedding-3-large. EVAL-HARNESS ONLY post-2026-05-14
-  cutover. Kept so `scripts/eval_data/fixtures.py` can regenerate v1
-  baselines for apples-to-apples retrieval comparisons. No production code
-  path reads from it.
-
-The recursive half-split + batching machinery lives on `_BaseEmbedder` and
-is shared between providers. Providers override `_embed_once` (raw bytes
-in, raw vectors out) and may override `embed_documents` / `embed_query`
-when the provider needs asymmetric input formatting (Gemini does;
-OpenAI does not).
+The recursive half-split + batching machinery lives on `_BaseEmbedder`.
+Gemini overrides `_embed_once` (raw bytes in, raw vectors out) and
+`embed_documents` / `embed_query` for asymmetric retrieval prefixing.
 """
 
 from __future__ import annotations
@@ -31,19 +25,8 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from openai import (
-    APIConnectionError,
-    APIError,
-    APIStatusError,
-    APITimeoutError,
-    AsyncOpenAI,
-    RateLimitError,
-)
-
 from shared.config import Settings, get_settings
 from shared.constants import (
-    EMBEDDING_DIM,
-    EMBEDDING_MODEL,
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
 )
@@ -82,9 +65,8 @@ class DocItem:
     """A document chunk + its parent doc title.
 
     Gemini-2 retrieval quality is meaningfully better when document inputs
-    are formatted as `title: {title} | text: {content}`. OpenAI ignores the
-    title but accepting the same shape from callers means ingest can drive
-    both providers off one input list.
+    are formatted as `title: {title} | text: {content}`. See
+    `_format_gemini_document` for the prefix shape.
     """
 
     content: str
@@ -133,9 +115,8 @@ class _BaseEmbedder:
         return await self.embed_many([item.content for item in items])
 
     async def embed_query(self, text: str) -> list[float]:
-        """Single-text helper for the retrieval path. Providers override
-        this to apply query-side prefixing (Gemini) or leave it as a passthrough
-        (OpenAI)."""
+        """Single-text helper for the retrieval path. Gemini overrides
+        this to apply query-side prefixing; the base impl is a passthrough."""
         vectors = await self._embed_once([text])
         return vectors[0]
 
@@ -197,93 +178,6 @@ class _BaseEmbedder:
         mid = len(batch) // 2
         await self._embed_with_split(batch[:mid], indices[:mid], embedded, failed)
         await self._embed_with_split(batch[mid:], indices[mid:], embedded, failed)
-
-
-class OpenAIEmbedder(_BaseEmbedder):
-    """text-embedding-3-large via the AsyncOpenAI SDK.
-
-    Gateway-aware (managed-shared / self-host, plan D1): when
-    ``llm_gateway_url`` is set we point AsyncOpenAI at the central LiteLLM
-    proxy with ``llm_gateway_key`` as the bearer. LiteLLM exposes
-    OpenAI-compatible ``/v1/embeddings``, so the SDK + all of its
-    retry / timeout / error machinery work unchanged through the gateway —
-    we don't pay a wrapper hop on the hot embedding path. Without the
-    gateway var we keep the direct-provider path (``openai_api_key``) for
-    dev, self-host-with-own-keys, and the eval harness.
-    """
-
-    def __init__(
-        self,
-        settings: Settings | None = None,
-        model: str = EMBEDDING_MODEL,
-    ) -> None:
-        settings = settings or get_settings()
-        super().__init__(
-            model_id=model,
-            dim=EMBEDDING_DIM,
-            batch_size=settings.embedding_batch_size,
-        )
-        gw_url = settings.llm_gateway_url.strip()
-        if gw_url:
-            # `api_key=""` makes the SDK omit the Authorization header
-            # entirely, which a no-auth proxy would reject; pass a literal
-            # space so the header is always present (LiteLLM ignores the
-            # value when `master_key` isn't enforced).
-            gw_key = settings.llm_gateway_key.get_secret_value() or " "
-            self._client = AsyncOpenAI(api_key=gw_key, base_url=gw_url)
-        else:
-            key = settings.openai_api_key.get_secret_value()
-            self._client = AsyncOpenAI(api_key=key) if key else None
-        # Strip `openai/` prefix from the canonical model constant for the SDK call.
-        # Through the LiteLLM gateway the raw id is fine — the proxy's
-        # `*` catch-all glob routes it to OpenAI.
-        self._sdk_model = model.split("/", 1)[-1] if "/" in model else model
-
-    async def _embed_once(self, batch: list[str]) -> list[list[float]]:
-        if self._client is None:
-            # Stub mode for tests / local dev without an OpenAI key.
-            return [_hash_vector(t, self.dim) for t in batch]
-
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                resp = await self._client.embeddings.create(
-                    model=self._sdk_model,
-                    input=batch,
-                )
-                return [d.embedding for d in resp.data]
-            except RateLimitError as exc:
-                if attempt >= 5:
-                    raise EmbeddingRateLimited(str(exc)) from exc
-                await asyncio.sleep(min(2**attempt, 30))
-            except APITimeoutError as exc:
-                if attempt >= 3:
-                    raise EmbeddingProviderUnavailable(f"timeout: {exc}") from exc
-                await asyncio.sleep(1 * attempt)
-            except APIConnectionError as exc:
-                if attempt >= 3:
-                    raise EmbeddingProviderUnavailable(
-                        f"connection error: {exc}"
-                    ) from exc
-                await asyncio.sleep(1 * attempt)
-            except APIError as exc:
-                msg = str(exc).lower()
-                if "maximum context length" in msg or ("token" in msg and "exceed" in msg):
-                    raise EmbeddingContextLengthExceeded(str(exc)) from exc
-                status = getattr(exc, "status_code", None)
-                if isinstance(exc, APIStatusError) and isinstance(status, int) and status >= 500:
-                    if attempt >= 2:
-                        raise EmbeddingProviderUnavailable(
-                            f"openai {status}: {exc}"
-                        ) from exc
-                    await asyncio.sleep(1 * attempt)
-                    continue
-                if attempt >= 2:
-                    raise EmbeddingBatchRejected(str(exc)) from exc
-                await asyncio.sleep(1)
-
-
 
 
 # ---- Gemini -------------------------------------------------------------
@@ -645,18 +539,7 @@ def _translate_gemini_error(exc: BaseException) -> Exception:
 
 # ---- module-level singletons -------------------------------------------
 
-_embedder: OpenAIEmbedder | None = None
 _embedder_v2: GeminiEmbedder | None = None
-
-
-def get_embedder() -> OpenAIEmbedder:
-    """OpenAI embedder singleton. EVAL-HARNESS ONLY — see module docstring.
-    Production callers (normalizer, retrievers, synthesis) use
-    :func:`get_embedder_v2`."""
-    global _embedder
-    if _embedder is None:
-        _embedder = OpenAIEmbedder()
-    return _embedder
 
 
 def get_embedder_v2() -> GeminiEmbedder:
@@ -669,8 +552,7 @@ def get_embedder_v2() -> GeminiEmbedder:
 
 
 def reset_embedder() -> None:
-    global _embedder, _embedder_v2
-    _embedder = None
+    global _embedder_v2
     _embedder_v2 = None
 
 
@@ -680,8 +562,6 @@ __all__ = [
     "EmbeddedChunk",
     "FailedChunk",
     "GeminiEmbedder",
-    "OpenAIEmbedder",
-    "get_embedder",
     "get_embedder_v2",
     "reset_embedder",
 ]

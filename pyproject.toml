@@ -19,15 +19,13 @@ dependencies = [
     "boto3>=1.35.0,<1.36.0",
     "botocore>=1.35.0,<1.36.0",
 
-    "openai>=1.55.0",
     "anthropic>=0.40.0",
     "google-genai>=0.3.0",
 
-    # Phase 0a: LLM provider abstraction (D1). Wraps the per-provider SDKs
-    # above through a single `litellm.acompletion` / `litellm.aembedding`
-    # surface. Existing call sites are migrated to it in Phase 0b; the raw
-    # SDKs stay pinned until that migration completes so nothing churns
-    # underfoot mid-cutover.
+    # LLM provider abstraction (D1). Wraps the per-provider SDKs above
+    # through a single `litellm.acompletion` / `litellm.aembedding` surface.
+    # Anthropic + google-genai stay pinned for direct-SDK paths
+    # (`scripts/synth/llm/anthropic_client.py`, `GeminiEmbedder`).
     "litellm>=1.83,<2.0",
 
     "httpx>=0.27.0",

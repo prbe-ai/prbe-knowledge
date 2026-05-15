@@ -16,7 +16,7 @@ import pytest
 
 from services.retrieval.retrievers.directed import directed_search
 from shared.db import raw_conn, with_tenant
-from shared.embeddings import get_embedder, reset_embedder
+from shared.embeddings import get_embedder_v2, reset_embedder
 
 _NOW = datetime(2026, 5, 8, tzinfo=UTC)
 
@@ -81,7 +81,7 @@ async def _seed_directed_phrase(
     synthesis_run_id: int | None = None,
 ) -> None:
     """Insert one directed_vector row using the embedder's stub vector."""
-    embedder = get_embedder()
+    embedder = get_embedder_v2()
     [vec] = (await embedder.embed_many([phrase])).embedded[:]  # one item
     async with with_tenant(customer_id) as conn:
         await conn.execute(
