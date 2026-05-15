@@ -26,12 +26,11 @@ from datetime import UTC, datetime
 import pytest
 
 from services.ingestion.backfill_runner import (
-    TOKEN_RECHECK_EVERY_N_EVENTS,
     _mark_failed,
-    _token_still_active,
     enqueue_backfill,
     run_backfill,
 )
+from services.ingestion.connectedness import is_source_connected
 from services.ingestion.handlers.base import Connector, ConnectorContext
 from shared.config import Settings, get_settings
 from shared.constants import BackfillStatus, SourceSystem
@@ -289,15 +288,15 @@ async def test_mark_failed_token_already_flipped(live_db) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _token_still_active helper (used by run_backfill mid-loop)
+# is_source_connected helper (used by run_backfill mid-loop and _enqueue)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_token_still_active_returns_false_when_deleted(live_db) -> None:
+async def test_is_source_connected_returns_false_when_deleted(live_db) -> None:
     await _seed_customer()
     await _seed_token(status="active")
-    assert await _token_still_active(CUSTOMER_ID, SOURCE) is True
+    assert await is_source_connected(CUSTOMER_ID, SOURCE) is True
 
     async with raw_conn() as conn:
         await conn.execute(
@@ -305,14 +304,14 @@ async def test_token_still_active_returns_false_when_deleted(live_db) -> None:
             CUSTOMER_ID,
             SOURCE.value,
         )
-    assert await _token_still_active(CUSTOMER_ID, SOURCE) is False
+    assert await is_source_connected(CUSTOMER_ID, SOURCE) is False
 
 
 @pytest.mark.asyncio
-async def test_token_still_active_returns_false_when_auth_failed(live_db) -> None:
+async def test_is_source_connected_returns_false_when_auth_failed(live_db) -> None:
     await _seed_customer()
     await _seed_token(status="auth_failed")
-    assert await _token_still_active(CUSTOMER_ID, SOURCE) is False
+    assert await is_source_connected(CUSTOMER_ID, SOURCE) is False
 
 
 # ---------------------------------------------------------------------------
@@ -399,22 +398,25 @@ async def _ingestion_queue_count() -> int:
 @pytest.mark.asyncio
 async def test_run_backfill_aborts_when_token_deleted(live_db, monkeypatch) -> None:
     """If the token row is deleted mid-iteration, `run_backfill` must bail
-    BEFORE writing the next page of ingestion_queue rows."""
+    on the next event without writing it.
+
+    Post-change semantics: the connectedness check fires on every event, so
+    abort is immediate. Events written = events yielded BEFORE on_disconnect
+    fires (i.e. = disconnect_at).
+    """
     await _seed_customer()
     await _seed_token(status="active")
     await enqueue_backfill(CUSTOMER_ID, SOURCE)
 
-    # Need at least 2 token-recheck windows to verify we stop. The first
-    # recheck (at enqueued=0) sees active. We delete the token at index N
-    # such that the SECOND recheck (at enqueued=TOKEN_RECHECK_EVERY_N_EVENTS)
-    # sees the row gone.
-    n = TOKEN_RECHECK_EVERY_N_EVENTS  # e.g. 50
-    disconnect_idx = n - 1  # disconnect right before the next recheck
-
+    # Disconnect at event index 60 (well above any old modulo boundary so
+    # this would also have failed under the previous "check every 50" logic
+    # if it slipped through). We expect exactly 60 queue rows: events 0-59
+    # were enqueued before the on_disconnect hook deleted the token at i=60.
+    disconnect_at = 60
     fake = _FakeConnector(
         _ctx(),
-        total=n * 4,  # plenty of headroom
-        disconnect_at=disconnect_idx,
+        total=200,  # plenty of headroom; abort should stop us well before this
+        disconnect_at=disconnect_at,
         on_disconnect=_delete_token,
     )
 
@@ -424,14 +426,11 @@ async def test_run_backfill_aborts_when_token_deleted(live_db, monkeypatch) -> N
 
     enqueued = await run_backfill(_ctx(), CUSTOMER_ID, SOURCE)
 
-    # We should have written exactly one full page (`n` events) before the
-    # next recheck found the deleted token and bailed. We must NOT have
-    # written another full page worth of rows on top.
     queue_count = await _ingestion_queue_count()
-    assert queue_count == n, (
-        f"expected exactly {n} queue rows before disconnect-abort, got {queue_count}"
+    assert queue_count == disconnect_at, (
+        f"expected {disconnect_at} queue rows before disconnect-abort, got {queue_count}"
     )
-    assert enqueued == n
+    assert enqueued == disconnect_at
 
     # backfill_state was NOT marked done (we returned early); status still 'running'.
     bf = await _backfill_state_row()
@@ -447,7 +446,7 @@ async def test_run_backfill_continues_when_token_active(live_db, monkeypatch) ->
     await _seed_token(status="active")
     await enqueue_backfill(CUSTOMER_ID, SOURCE)
 
-    total = TOKEN_RECHECK_EVERY_N_EVENTS + 5  # ensure we cross at least one recheck
+    total = 55
     fake = _FakeConnector(_ctx(), total=total)
 
     monkeypatch.setattr(

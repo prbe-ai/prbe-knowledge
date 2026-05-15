@@ -73,6 +73,10 @@ async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
     # this INSERTs a fresh row whose payload_s3_keys contains only the
     # marker — the worker will process it once and emit complete=True
     # with an empty event list (no unit docs, no harm).
+    #
+    # Intentionally NOT gated by services.ingestion.connectedness:
+    # finalize markers only fire for CLAUDE_CODE / CODEX, which don't
+    # have integration_tokens rows (agent sessions, no OAuth lifecycle).
     upsert_sql = """
     INSERT INTO ingestion_queue
         (customer_id, source_system, source_event_id,

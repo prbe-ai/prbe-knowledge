@@ -200,6 +200,10 @@ async def _put_and_enqueue(
     priority = SOURCE_INGESTION_PRIORITY.get(
         SourceSystem.CODE_GRAPH, DEFAULT_INGESTION_PRIORITY
     )
+    # Intentionally NOT gated by services.ingestion.connectedness:
+    # CODE_GRAPH is derived from already-ingested github content; the
+    # upstream github enqueue gate stops new work when github is
+    # disconnected, so this path has nothing left to do downstream.
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             """

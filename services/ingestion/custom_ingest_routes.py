@@ -235,6 +235,9 @@ async def _enqueue_custom_document(
         SourceSystem.CUSTOM_INGEST,
         DEFAULT_INGESTION_PRIORITY,
     )
+    # Intentionally NOT gated by services.ingestion.connectedness:
+    # CUSTOM_INGEST uses BYO signed tokens (custom_ingest_tokens table,
+    # validated upstream at the API boundary), not integration_tokens.
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
             """
