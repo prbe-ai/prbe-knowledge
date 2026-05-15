@@ -13,7 +13,7 @@ Pieces:
   * ``register_poller`` / ``get_poller`` (base.py) — registry the
     scheduler reads at tick time.
   * ``PollScheduler`` (scheduler.py) — tick loop that walks every
-    enabled (customer × source × resource) cursor row and dispatches
+    enabled (customer x source x resource) cursor row and dispatches
     to the registered poller. Per-customer cursor reads/writes are
     wrapped in ``with_tenant`` so RLS gates everything.
   * Cursor helpers (cursors.py) — read/write/error-stamp helpers

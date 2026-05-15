@@ -26,8 +26,10 @@ walk the cursor list without racing each other on the same row.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from typing import Any, Callable, Coroutine
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 from services.ingestion.polling.base import (
     PollResult,
@@ -98,15 +100,14 @@ class PollScheduler:
             while not self._stopping.is_set():
                 try:
                     await self.tick_once()
-                except Exception:  # noqa: BLE001 - per-tick failures must not kill the loop
+                except Exception:
                     logger.exception("polling.scheduler.tick failed; continuing")
                 # asyncio.wait_for + an Event lets stop() interrupt the sleep.
-                try:
+                # Timeout is the normal "next tick" path — suppress it.
+                with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(
                         self._stopping.wait(), self.tick_interval_seconds
                     )
-                except asyncio.TimeoutError:
-                    pass
         finally:
             logger.info("polling.scheduler.stop")
 
@@ -150,7 +151,7 @@ class PollScheduler:
                 resource_id=row.resource_id,
                 cursor=row.cursor_value,
             )
-        except Exception as exc:  # noqa: BLE001 - per-poll isolation
+        except Exception as exc:
             logger.exception(
                 "polling.poll_raised customer_id=%s source=%s resource=%s",
                 row.customer_id,
@@ -177,7 +178,7 @@ class PollScheduler:
         if result.documents:
             try:
                 await self._sink(row.customer_id, result.documents)
-            except Exception as exc:  # noqa: BLE001 - sink failure is per-tenant
+            except Exception as exc:
                 logger.exception(
                     "polling.sink_raised customer_id=%s source=%s resource=%s docs=%d",
                     row.customer_id,

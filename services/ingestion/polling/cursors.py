@@ -13,7 +13,7 @@ non-FORCE RLS for exactly this reason.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from shared.constants import SourceSystem
@@ -116,7 +116,7 @@ async def advance_cursor(
     any previous ``last_error``. The composite PK
     (customer_id, source, resource_id) makes the ON CONFLICT safe even
     under two concurrent ticks on the same resource."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     async with with_tenant(customer_id) as conn:
         await conn.execute(
             """
@@ -149,7 +149,7 @@ async def stamp_error(
     (so the scheduler doesn't immediately re-poll a known-broken
     resource) and stamps the error string + timestamp. Does NOT touch
     cursor_value — the next successful poll uses the same cursor."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     # Truncate to fit a reasonable column width while preserving the
     # head of the error (which is usually the most diagnostic).
     truncated = error[:2048]

@@ -16,7 +16,8 @@ Test surface:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
+from typing import ClassVar
 
 import pytest
 import pytest_asyncio
@@ -78,8 +79,8 @@ class _StubPoller(BasePoller):
     """Test stub. Returns whatever the test put into _next_result."""
 
     source = SourceSystem.SLACK
-    _next_result: PollResult = PollResult(documents=[], next_cursor=None)
-    _calls: list[tuple[str, str, str | None]] = []
+    _next_result: ClassVar[PollResult] = PollResult(documents=[], next_cursor=None)
+    _calls: ClassVar[list[tuple[str, str, str | None]]] = []
 
     @classmethod
     def reset(cls) -> None:
@@ -252,7 +253,7 @@ async def test_list_due_cursors_filters_by_age(_seed_customer):
                SET polled_at = $1
              WHERE resource_id = 'stale'
             """,
-            datetime.now(timezone.utc) - timedelta(hours=1),
+            datetime.now(UTC) - timedelta(hours=1),
         )
 
     due = await list_due_cursors(min_age_seconds=300, limit=10)
@@ -282,7 +283,7 @@ async def test_tick_one_runs_registered_poller_and_advances_cursor(
     async with with_tenant(_TENANT) as conn:
         await conn.execute(
             "UPDATE ingestion_cursors SET polled_at = $1",
-            datetime.now(timezone.utc) - timedelta(hours=1),
+            datetime.now(UTC) - timedelta(hours=1),
         )
 
     documents_seen: list[tuple[str, list]] = []
@@ -321,7 +322,7 @@ async def test_tick_one_stamps_error_on_poll_error_field(
     async with with_tenant(_TENANT) as conn:
         await conn.execute(
             "UPDATE ingestion_cursors SET polled_at = $1",
-            datetime.now(timezone.utc) - timedelta(hours=1),
+            datetime.now(UTC) - timedelta(hours=1),
         )
 
     scheduler = PollScheduler(min_resource_age_seconds=60)
@@ -357,7 +358,7 @@ async def test_tick_one_stamps_error_on_poller_raised(
     async with with_tenant(_TENANT) as conn:
         await conn.execute(
             "UPDATE ingestion_cursors SET polled_at = $1",
-            datetime.now(timezone.utc) - timedelta(hours=1),
+            datetime.now(UTC) - timedelta(hours=1),
         )
 
     scheduler = PollScheduler(min_resource_age_seconds=60)
@@ -387,7 +388,7 @@ async def test_tick_one_skips_unregistered_source(_seed_customer):
     async with with_tenant(_TENANT) as conn:
         await conn.execute(
             "UPDATE ingestion_cursors SET polled_at = $1",
-            datetime.now(timezone.utc) - timedelta(hours=1),
+            datetime.now(UTC) - timedelta(hours=1),
         )
 
     scheduler = PollScheduler(min_resource_age_seconds=60)
