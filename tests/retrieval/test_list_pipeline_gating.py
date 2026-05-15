@@ -102,9 +102,21 @@ class TestListPipelineEntityGating:
 
         routed = _routed_with_repo_and_person()
 
+        # Phase 2 Chunk 5: list pipeline expands author_ids to their Person
+        # cluster (primary + aliases) via expand_to_cluster_members. Mock
+        # the helper so this unit test doesn't require a live DB pool;
+        # the expansion semantics are covered by the integration test in
+        # test_list_pipeline_author_alias.py.
         with patch(
             "services.retrieval.list_pipeline.sql_list", new=AsyncMock(return_value=[])
-        ) as m_list:
+        ) as m_list, patch(
+            "services.retrieval.list_pipeline.with_tenant"
+        ) as m_with_tenant, patch(
+            "services.retrieval.list_pipeline.expand_to_cluster_members",
+            new=AsyncMock(return_value={"user:alice": ["user:alice"]}),
+        ):
+            m_with_tenant.return_value.__aenter__ = AsyncMock(return_value=None)
+            m_with_tenant.return_value.__aexit__ = AsyncMock(return_value=None)
             await run_list(
                 req=req,
                 customer_id="cust-1",
