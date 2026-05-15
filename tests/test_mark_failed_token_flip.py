@@ -400,22 +400,25 @@ async def test_run_backfill_aborts_when_token_deleted(live_db, monkeypatch) -> N
     """If the token row is deleted mid-iteration, `run_backfill` must bail
     on the next event without writing it.
 
-    Post-change semantics: the connectedness check fires on every event, so
-    abort is immediate. Events written = events yielded BEFORE on_disconnect
-    fires (i.e. = disconnect_at).
+    Post-batching semantics: the connectedness check fires on every event
+    (immediate abort). Already-flushed batches stay; the in-flight batch is
+    intentionally DROPPED so a disconnected source never gets new rows. So
+    queue_count = floor(disconnect_at / batch_size) * batch_size.
     """
+    from shared.config import get_settings as _get_settings
+
     await _seed_customer()
     await _seed_token(status="active")
     await enqueue_backfill(CUSTOMER_ID, SOURCE)
 
-    # Disconnect at event index 60 (well above any old modulo boundary so
-    # this would also have failed under the previous "check every 50" logic
-    # if it slipped through). We expect exactly 60 queue rows: events 0-59
-    # were enqueued before the on_disconnect hook deleted the token at i=60.
-    disconnect_at = 60
+    batch_size = _get_settings().backfill_batch_size  # default 100
+    # Disconnect after 2 full batches plus 50 in-flight: 2 batches land,
+    # the trailing 50 are dropped on disconnect.
+    disconnect_at = batch_size * 2 + 50
+    expected_landed = (disconnect_at // batch_size) * batch_size
     fake = _FakeConnector(
         _ctx(),
-        total=200,  # plenty of headroom; abort should stop us well before this
+        total=disconnect_at + 100,  # headroom; abort stops us before total
         disconnect_at=disconnect_at,
         on_disconnect=_delete_token,
     )
@@ -427,10 +430,11 @@ async def test_run_backfill_aborts_when_token_deleted(live_db, monkeypatch) -> N
     enqueued = await run_backfill(_ctx(), CUSTOMER_ID, SOURCE)
 
     queue_count = await _ingestion_queue_count()
-    assert queue_count == disconnect_at, (
-        f"expected {disconnect_at} queue rows before disconnect-abort, got {queue_count}"
+    assert queue_count == expected_landed, (
+        f"expected {expected_landed} queue rows (2 full batches) before "
+        f"disconnect-abort dropped the in-flight batch, got {queue_count}"
     )
-    assert enqueued == disconnect_at
+    assert enqueued == expected_landed
 
     # backfill_state was NOT marked done (we returned early); status still 'running'.
     bf = await _backfill_state_row()
