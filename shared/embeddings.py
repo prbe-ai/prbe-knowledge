@@ -342,9 +342,11 @@ class GeminiEmbedder(_BaseEmbedder):
         # gateway env vars are read fresh in `shared.llm` per call, so we
         # just need to know which branch to enter on the embedding call.
         self._gateway_url = settings.llm_gateway_url.strip()
-        # Strip `google/` prefix from the canonical constant for the SDK call.
-        # In gateway mode the wrapper takes the bare id and prepends
-        # `gemini/` so LiteLLM's glob routes it to the Gemini provider.
+        # Strip the provider prefix from the canonical constant. Both
+        # transports take the bare id: the google-genai SDK accepts it
+        # directly, and the LiteLLM proxy's model_list aliases the bare
+        # `gemini-embedding-*` to the Gemini provider. See
+        # EMBEDDING_V2_PROXY_ALIAS in shared.constants.
         self._sdk_model = model.split("/", 1)[-1] if "/" in model else model
 
     def _ensure_client(self) -> Any:
@@ -522,14 +524,15 @@ class GeminiEmbedder(_BaseEmbedder):
         # never touch the gateway path (eval scripts, etc).
         from shared import llm as shared_llm
 
-        # LiteLLM glob-routes `gemini-*` to the Gemini provider; pass the
-        # explicit prefix so the proxy config doesn't have to alias the
-        # bare id (and to keep parity with shared/llm.py's convention).
-        model_id = (
-            self._sdk_model
-            if "/" in self._sdk_model
-            else f"gemini/{self._sdk_model}"
-        )
+        # Pass the bare id. The proxy's model_list aliases
+        # `gemini-embedding-*` (and `gemini-*`) to the Gemini provider, and
+        # `shared.llm.aembedding` forces `custom_llm_provider="openai"` so
+        # the wire shape against the proxy is OpenAI-compatible regardless
+        # of the model prefix. Prefixing with `gemini/` would fall through
+        # to the proxy's `*` catch-all (OpenAI upstream) and 400 with
+        # "invalid model ID". See EMBEDDING_V2_PROXY_ALIAS in
+        # shared.constants for the canonical proxy alias.
+        model_id = self._sdk_model
         attempt = 0
         while True:
             attempt += 1
