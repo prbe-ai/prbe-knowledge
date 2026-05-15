@@ -33,6 +33,11 @@ PRs E1-E5 (one per source).
 
 from __future__ import annotations
 
+# Per-source pollers — importing each module triggers its
+# ``register_poller(...)`` side effect so the scheduler's registry
+# resolves SourceSystem -> poller-class without any extra wiring at
+# the boot site.
+from services.ingestion.polling import sentry as _sentry_poller  # noqa: F401
 from services.ingestion.polling.base import BasePoller, get_poller, register_poller
 from services.ingestion.polling.cursors import (
     advance_cursor,
