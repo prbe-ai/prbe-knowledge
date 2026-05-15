@@ -133,15 +133,14 @@ async def _seed_customer(customer_id: str) -> None:
 async def _seed_integration_token(customer_id: str, source: SourceSystem) -> None:
     """Seed an active integration_tokens row so the pre-enqueue connectedness
     gate (services/ingestion/connectedness.py) lets OAuth-source enqueues
-    through. CLAUDE_CODE / CODEX bypass the gate so seeding for them is a
-    no-op cost, kept here for consistency."""
+    through. Each test gets a freshly-truncated DB (conftest live_db fixture),
+    so a plain INSERT is enough."""
     async with db_module.raw_conn() as conn:
         await conn.execute(
             """
             INSERT INTO integration_tokens
                 (customer_id, source_system, access_token_encrypted, status)
             VALUES ($1, $2, $3, 'active')
-            ON CONFLICT (customer_id, source_system) DO NOTHING
             """,
             customer_id,
             source.value,

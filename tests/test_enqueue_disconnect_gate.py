@@ -41,7 +41,6 @@ async def _seed_token(status: str = "active") -> None:
             INSERT INTO integration_tokens
                 (customer_id, source_system, access_token_encrypted, status)
             VALUES ($1, $2, $3, $4)
-            ON CONFLICT (customer_id, source_system) DO UPDATE SET status = EXCLUDED.status
             """,
             CUSTOMER_ID,
             SOURCE.value,

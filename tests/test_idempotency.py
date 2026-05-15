@@ -64,7 +64,6 @@ async def test_replay_produces_one_doc(live_db, settings: Settings) -> None:
             INSERT INTO integration_tokens
                 (customer_id, source_system, access_token_encrypted, status)
             VALUES ($1, $2, $3, 'active')
-            ON CONFLICT (customer_id, source_system) DO NOTHING
             """,
             CUSTOMER,
             SourceSystem.SLACK.value,
