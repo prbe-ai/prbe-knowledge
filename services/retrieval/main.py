@@ -565,6 +565,32 @@ class GraphSearchResponse(BaseModel):
     matches: list[GraphSearchMatch]
 
 
+async def _resolve_anchor_alias(*, customer_id: str, anchor_canonical_id: str) -> str:
+    """Translate a user-typed canonical_id through entity_aliases.
+
+    If the input is an alias of a merged cluster, returns the primary's
+    canonical_id. Otherwise returns the input unchanged (the lookup
+    returns 0 rows for both unmerged nodes and primaries).
+
+    Label-less by design — the anchor endpoint doesn't carry label
+    context, and ``anchor_exists`` matches across labels too. The
+    LIMIT 1 guards against the unlikely case where the same canonical_id
+    is an alias under two different labels.
+    """
+    async with with_tenant(customer_id) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT primary_canonical_id
+            FROM entity_aliases
+            WHERE customer_id = $1
+              AND alias_canonical_id = $2
+            LIMIT 1
+            """,
+            customer_id, anchor_canonical_id,
+        )
+    return row["primary_canonical_id"] if row else anchor_canonical_id
+
+
 @app.post("/graph/explore", response_model=GraphExploreResponse)
 async def graph_explore(
     req: GraphExploreRequest,
@@ -594,13 +620,23 @@ async def graph_explore(
         # `anchor_node_id` is guaranteed non-None by the request
         # validator above; assert for type narrowing.
         assert req.anchor_node_id is not None
+
+        # Phase 2: translate alias canonical_id to the cluster's primary
+        # before the existence check. Without this, anchors typed as an
+        # alias (e.g. mahit@prbe.ai post-merge) return 404 because their
+        # graph_nodes row was hard-deleted at merge time.
+        anchor_canonical_id = await _resolve_anchor_alias(
+            customer_id=customer_id,
+            anchor_canonical_id=req.anchor_node_id,
+        )
+
         if not await anchor_exists(
-            customer_id=customer_id, anchor_canonical_id=req.anchor_node_id
+            customer_id=customer_id, anchor_canonical_id=anchor_canonical_id
         ):
             raise HTTPException(status_code=404, detail="anchor_node_id not found")
         result = await anchor_graph_query(
             customer_id=customer_id,
-            anchor_canonical_id=req.anchor_node_id,
+            anchor_canonical_id=anchor_canonical_id,
             filters=req.filters.to_dataclass() if req.filters else None,
         )
     else:
