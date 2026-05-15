@@ -40,7 +40,7 @@ async def _load_bucket(customer_id: str, settings: Settings) -> str:
                 "SELECT r2_bucket FROM customers WHERE customer_id = $1",
                 customer_id,
             )
-    except Exception as exc:  # noqa: BLE001 - fall back rather than 500 every upload
+    except Exception as exc:
         log.warning(
             "storage.bucket_for db_lookup_failed customer_id=%s err=%s — "
             "falling back to legacy prefix formula",

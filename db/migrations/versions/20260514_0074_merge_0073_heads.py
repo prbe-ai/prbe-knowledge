@@ -24,9 +24,6 @@ Revises: 0073_code_repo_state_cascade, 0073_customers_r2_bucket
 Create Date: 2026-05-14
 """
 
-from __future__ import annotations
-
-
 revision = "0074_merge_0073_heads"
 down_revision = (
     "0073_code_repo_state_cascade",
