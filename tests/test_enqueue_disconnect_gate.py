@@ -28,8 +28,8 @@ SOURCE = SourceSystem.GITHUB
 async def _seed_customer() -> None:
     async with raw_conn() as conn:
         await conn.execute(
-            "INSERT INTO customers (customer_id, slug, mode) "
-            "VALUES ($1, $1, 'MANAGED') ON CONFLICT DO NOTHING",
+            "INSERT INTO customers (customer_id, display_name, api_key_hash) "
+            "VALUES ($1, 'gate-test', 'gate-hash') ON CONFLICT DO NOTHING",
             CUSTOMER_ID,
         )
 
