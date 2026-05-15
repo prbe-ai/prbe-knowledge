@@ -610,7 +610,13 @@ CREATE TABLE graph_edges (
     -- re-extract via the backfill script.
     extractor_id  TEXT,
     extracted_at  TIMESTAMPTZ,
-    UNIQUE (customer_id, edge_type, from_node_id, to_node_id)
+    -- Provenance for alias-resolved or merge-rewritten edges. NULL when
+    -- the edge has never been touched by alias resolution. Populated by
+    -- graph_writer at ingest (when the inbound canonical_id was an alias)
+    -- and by the merge transaction (when an alias node's edge was rewritten
+    -- to point at the primary).
+    aliased_from_canonical_id TEXT,
+    aliased_to_canonical_id   TEXT
 );
 
 CREATE INDEX idx_graph_edges_customer_type ON graph_edges (customer_id, edge_type);
@@ -621,6 +627,16 @@ CREATE INDEX idx_graph_edges_confidence
 -- Lane B: partial index for prompt-version invalidation queries.
 CREATE INDEX idx_graph_edges_customer_extractor
     ON graph_edges (customer_id, extractor_id) WHERE extractor_id IS NOT NULL;
+-- Composite UNIQUE keyed by (edge_type, from, to, alias_from, alias_to).
+-- Different alias lanes coexist as distinct rows; common-case "both
+-- aliased_from cols NULL" inserts still dedup (COALESCE-to-empty-string
+-- collides). graph_writer.upsert_edges' ON CONFLICT references this
+-- index by name.
+CREATE UNIQUE INDEX graph_edges_unique_lane ON graph_edges (
+    customer_id, edge_type, from_node_id, to_node_id,
+    COALESCE(aliased_from_canonical_id, ''),
+    COALESCE(aliased_to_canonical_id, '')
+);
 
 -- Per-node provenance: which source system(s) asserted this node. A node
 -- touched by multiple connectors must survive disconnection of any single
@@ -658,6 +674,116 @@ CREATE POLICY tenant_isolation ON graph_edges
 CREATE POLICY tenant_isolation ON graph_node_provenance
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
+-- Entity clusters: manual identity merging via dashboard (migration 0071).
+-- Physical merge (B-promote) -- alias edges rewritten, alias nodes
+-- hard-deleted. See docs/superpowers/specs/2026-05-13-entity-clusters-design.md.
+-- ---------------------------------------------------------------------------
+CREATE TABLE entity_merge_audit (
+    merge_id                    UUID PRIMARY KEY,
+    customer_id                 TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    label                       TEXT NOT NULL,
+    primary_canonical_id        TEXT NOT NULL,
+    merged_alias_canonical_ids  TEXT[] NOT NULL,
+    performed_by_user_id        UUID NOT NULL,
+    performed_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reason                      TEXT NULL,
+    status                      TEXT NOT NULL DEFAULT 'active'
+                                CHECK (status IN ('active', 'reversed'))
+);
+CREATE INDEX idx_entity_merge_audit_primary
+    ON entity_merge_audit (customer_id, label, primary_canonical_id);
+
+CREATE TABLE entity_merge_node_snapshot (
+    merge_id      UUID NOT NULL REFERENCES entity_merge_audit(merge_id),
+    customer_id   TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    label         TEXT NOT NULL,
+    canonical_id  TEXT NOT NULL,
+    properties    JSONB NOT NULL,
+    degree        INT  NOT NULL,
+    community_id  INT  NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    provenance    JSONB NOT NULL,
+    PRIMARY KEY (merge_id, label, canonical_id)
+);
+
+CREATE TABLE entity_merge_edge_snapshot (
+    merge_id                       UUID NOT NULL REFERENCES entity_merge_audit(merge_id),
+    snapshot_seq                   INT  NOT NULL,
+    customer_id                    TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    operation                      TEXT NOT NULL
+                                   CHECK (operation IN ('deleted_self_loop')),
+    pre_edge_type                  TEXT NOT NULL,
+    pre_from_canonical_id          TEXT NOT NULL,
+    pre_from_label                 TEXT NOT NULL,
+    pre_to_canonical_id            TEXT NOT NULL,
+    pre_to_label                   TEXT NOT NULL,
+    pre_properties                 JSONB NOT NULL,
+    pre_confidence                 TEXT NOT NULL,
+    pre_valid_from                 TIMESTAMPTZ NOT NULL,
+    pre_valid_to                   TIMESTAMPTZ NULL,
+    pre_source_system              TEXT NULL,
+    pre_extractor_id               TEXT NULL,
+    pre_extracted_at               TIMESTAMPTZ NULL,
+    pre_aliased_from_canonical_id  TEXT NULL,
+    pre_aliased_to_canonical_id    TEXT NULL,
+    PRIMARY KEY (merge_id, snapshot_seq)
+);
+CREATE INDEX idx_entity_merge_edge_snapshot_merge
+    ON entity_merge_edge_snapshot (merge_id);
+
+CREATE TABLE entity_aliases (
+    customer_id           TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    label                 TEXT NOT NULL,
+    alias_canonical_id    TEXT NOT NULL,
+    primary_canonical_id  TEXT NOT NULL,
+    merge_id              UUID NOT NULL REFERENCES entity_merge_audit(merge_id),
+    added_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (customer_id, label, alias_canonical_id),
+    CONSTRAINT entity_aliases_not_self CHECK (alias_canonical_id <> primary_canonical_id)
+);
+CREATE INDEX idx_entity_aliases_primary
+    ON entity_aliases (customer_id, label, primary_canonical_id);
+CREATE INDEX idx_entity_aliases_merge
+    ON entity_aliases (merge_id);
+
+CREATE TABLE entity_cluster_metadata (
+    customer_id                  TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    label                        TEXT NOT NULL,
+    primary_canonical_id         TEXT NOT NULL,
+    display_name                 TEXT NOT NULL,
+    display_name_last_edited_by  UUID NULL,
+    display_name_last_edited_at  TIMESTAMPTZ NULL,
+    PRIMARY KEY (customer_id, label, primary_canonical_id)
+);
+
+ALTER TABLE entity_merge_audit         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entity_merge_audit         FORCE  ROW LEVEL SECURITY;
+ALTER TABLE entity_merge_node_snapshot ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entity_merge_node_snapshot FORCE  ROW LEVEL SECURITY;
+ALTER TABLE entity_merge_edge_snapshot ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entity_merge_edge_snapshot FORCE  ROW LEVEL SECURITY;
+ALTER TABLE entity_aliases             ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entity_aliases             FORCE  ROW LEVEL SECURITY;
+ALTER TABLE entity_cluster_metadata    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entity_cluster_metadata    FORCE  ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON entity_merge_audit
+    USING       (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK  (customer_id = current_setting('app.current_customer_id', true));
+CREATE POLICY tenant_isolation ON entity_merge_node_snapshot
+    USING       (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK  (customer_id = current_setting('app.current_customer_id', true));
+CREATE POLICY tenant_isolation ON entity_merge_edge_snapshot
+    USING       (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK  (customer_id = current_setting('app.current_customer_id', true));
+CREATE POLICY tenant_isolation ON entity_aliases
+    USING       (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK  (customer_id = current_setting('app.current_customer_id', true));
+CREATE POLICY tenant_isolation ON entity_cluster_metadata
+    USING       (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK  (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
 -- usage_events: per-tenant audit trail of /retrieve, /query, /sources calls.

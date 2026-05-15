@@ -781,6 +781,8 @@ class GraphEdgeSpec(BaseModel):
     valid_from: datetime | None = None
     valid_to: datetime | None = None
     confidence: str = "EXTRACTED"
+    aliased_from_canonical_id: str | None = None
+    aliased_to_canonical_id: str | None = None
 
 
 class ACLSnapshotRow(BaseModel):
