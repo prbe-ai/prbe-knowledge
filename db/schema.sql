@@ -42,6 +42,27 @@ CREATE TABLE customers (
     r2_bucket            TEXT NOT NULL
 );
 
+-- BEFORE INSERT trigger that fills r2_bucket from customer_id when NULL
+-- (Postgres DEFAULTs can't reference other columns). Production callers
+-- supply r2_bucket explicitly via the CP→DP mirror; the trigger only
+-- fires for test fixtures and self-host installs that forget to set it.
+-- On the DP, ``customer_id`` IS the slug (see prbe-backend's
+-- apps/control_plane/routers/me/provision.py), so ``prbe-<customer_id>``
+-- == the canonical new-policy bucket name.
+CREATE OR REPLACE FUNCTION customers_fill_r2_bucket() RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.r2_bucket IS NULL THEN
+        NEW.r2_bucket := 'prbe-' || NEW.customer_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER customers_fill_r2_bucket_trg
+    BEFORE INSERT ON customers
+    FOR EACH ROW
+    EXECUTE FUNCTION customers_fill_r2_bucket();
+
 -- One customer per organization (where the link is set).
 CREATE UNIQUE INDEX customers_organization_id_unique
     ON customers (organization_id)
