@@ -247,6 +247,14 @@ class QueryTrace:
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     error_class: str | None = None
     error_message: str | None = None
+    # Router Intelligence v1 columns (Task 6)
+    grounding_bundle: dict[str, Any] | None = None
+    router_raw: dict[str, Any] | None = None
+    intents_count: int | None = None
+    intent_dispatch: list[dict[str, Any]] | None = None
+    cache_tokens: dict[str, Any] | None = None
+    router_model: str | None = None
+    failure_recovered: bool = False
 
 
 def _payload_to_jsonable(payload: BaseModel | dict[str, Any] | None) -> dict[str, Any]:
@@ -366,15 +374,32 @@ async def write_query_trace(trace: QueryTrace) -> None:
         request_json = json.dumps(request_dict)
         response_json = json.dumps(response_dict)
 
+        grounding_bundle_json = (
+            json.dumps(trace.grounding_bundle) if trace.grounding_bundle is not None else None
+        )
+        router_raw_json = (
+            json.dumps(trace.router_raw) if trace.router_raw is not None else None
+        )
+        intent_dispatch_json = (
+            json.dumps(trace.intent_dispatch) if trace.intent_dispatch is not None else None
+        )
+        cache_tokens_json = (
+            json.dumps(trace.cache_tokens) if trace.cache_tokens is not None else None
+        )
+
         async with with_tenant(trace.customer_id) as conn:
             await conn.execute(
                 """
                 INSERT INTO query_traces (
                     customer_id, occurred_at, request_id, event_type,
                     schema_version, request, response,
-                    response_size_bytes, response_truncated
+                    response_size_bytes, response_truncated,
+                    grounding_bundle, router_raw, intents_count,
+                    intent_dispatch, cache_tokens, router_model, failure_recovered
                 ) VALUES (
-                    $1, $2, $3::uuid, $4, $5, $6::jsonb, $7::jsonb, $8, $9
+                    $1, $2, $3::uuid, $4, $5, $6::jsonb, $7::jsonb, $8, $9,
+                    $10::jsonb, $11::jsonb, $12,
+                    $13::jsonb, $14::jsonb, $15, $16
                 )
                 """,
                 trace.customer_id,
@@ -386,6 +411,13 @@ async def write_query_trace(trace: QueryTrace) -> None:
                 response_json,
                 response_size_bytes,
                 response_truncated,
+                grounding_bundle_json,
+                router_raw_json,
+                trace.intents_count,
+                intent_dispatch_json,
+                cache_tokens_json,
+                trace.router_model,
+                trace.failure_recovered,
             )
     except (Exception, asyncio.CancelledError) as exc:
         counter("query_traces.write_failed", 1, event_type=trace.event_type)

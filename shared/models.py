@@ -458,6 +458,8 @@ class MatchProvenance(BaseModel):
 
     A single QueryResult can have multiple entries -- e.g. a Document
     reached via vector AND graph walks carries two MatchProvenance rows.
+    Each entry also carries `intent_idx` identifying which router intent
+    surfaced this match (0 for single-intent / pre-fan-out callers).
     """
 
     channel: Literal[
@@ -465,6 +467,7 @@ class MatchProvenance(BaseModel):
     ]
     rank: int
     score: float
+    intent_idx: int = 0
     # Populated only when channel == "inferred_edge":
     anchor_doc_id: str | None = None
     edge_type: str | None = None
@@ -535,6 +538,19 @@ QueryResult = Annotated[
 ]
 
 
+class IntentAggregation(BaseModel):
+    """Per-intent aggregation output (count / group_by).
+
+    Doc-ranking intents produce chunks fused into `results` via RRF.
+    Aggregation intents produce shape-incompatible payloads (counts,
+    group rows) and are appended here keyed by intent position.
+    """
+
+    intent_idx: int
+    operation: Literal["count", "group_by"]
+    payload: dict[str, Any]
+
+
 class QueryResponse(BaseModel):
     query: str
     # Polymorphic per-node results -- Document or Entity, discriminated on
@@ -542,6 +558,7 @@ class QueryResponse(BaseModel):
     results: list[QueryResult] = Field(default_factory=list)
     total_candidates: int
     router_hit_cache: bool
+    aggregations: list[IntentAggregation] = Field(default_factory=list)
     # Flat aggregate over GraphEvidence entries on every chunk in the
     # response. Keys always present; zeros when no graph hits surfaced.
     confidence_breakdown: dict[str, int] = Field(

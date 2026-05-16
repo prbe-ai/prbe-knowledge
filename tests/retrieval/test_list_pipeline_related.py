@@ -15,7 +15,7 @@ import pytest
 
 from services.retrieval.list_pipeline import run_list
 from services.retrieval.retrievers.bm25 import BM25Hit
-from services.retrieval.router import RouterOutput
+from services.retrieval.router import Intent
 from shared.config import Settings, get_settings
 from shared.constants import EdgeType, NodeLabel
 from shared.db import raw_conn
@@ -170,7 +170,7 @@ async def test_list_response_populates_related_entities(live_db) -> None:
     )
     await _seed_edge(cust, doc_id="doc:1", label=NodeLabel.REPO.value, canonical_id="r")
 
-    routed = RouterOutput(operation="list", mode="list")
+    intent = Intent(query_text="x", mode="list", confidence=0.9, operation="list")
     req = QueryRequest(query="x", top_k=5, top_k_related=10)
 
     with patch(
@@ -180,7 +180,8 @@ async def test_list_response_populates_related_entities(live_db) -> None:
         resp = await run_list(
             req=req,
             customer_id=cust,
-            routed=routed,
+            intent=intent,
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -203,7 +204,7 @@ async def test_count_aggregation_skips_walk(live_db) -> None:
     cust = "cust-list-count"
     await _seed_customer(cust)
 
-    routed = RouterOutput(operation="count", mode="list")
+    intent = Intent(query_text="x", mode="list", confidence=0.9, operation="count")
     req = QueryRequest(query="x", top_k=5, top_k_related=10)
 
     with patch(
@@ -216,7 +217,8 @@ async def test_count_aggregation_skips_walk(live_db) -> None:
         resp = await run_list(
             req=req,
             customer_id=cust,
-            routed=routed,
+            intent=intent,
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -238,9 +240,11 @@ async def test_group_by_aggregation_skips_walk(live_db) -> None:
     cust = "cust-list-groupby"
     await _seed_customer(cust)
 
-    routed = RouterOutput(
-        operation="group_by",
+    intent = Intent(
+        query_text="x",
         mode="list",
+        confidence=0.9,
+        operation="group_by",
         group_by_key="source_system",
     )
     req = QueryRequest(query="x", top_k=5, top_k_related=10)
@@ -255,7 +259,8 @@ async def test_group_by_aggregation_skips_walk(live_db) -> None:
         resp = await run_list(
             req=req,
             customer_id=cust,
-            routed=routed,
+            intent=intent,
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -278,7 +283,7 @@ async def test_list_top_k_related_zero_skips_walk(live_db) -> None:
     await _seed_customer(cust)
     await _seed_doc(cust, doc_id="doc:1", title="d1")
 
-    routed = RouterOutput(operation="list", mode="list")
+    intent = Intent(query_text="x", mode="list", confidence=0.9, operation="list")
     req = QueryRequest(query="x", top_k=5, top_k_related=0)
 
     with patch(
@@ -291,7 +296,8 @@ async def test_list_top_k_related_zero_skips_walk(live_db) -> None:
         resp = await run_list(
             req=req,
             customer_id=cust,
-            routed=routed,
+            intent=intent,
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,

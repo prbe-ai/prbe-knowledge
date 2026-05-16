@@ -21,7 +21,7 @@ import pytest
 from services.retrieval.retrievers.bm25 import BM25Hit
 from services.retrieval.retrievers.graph import GraphHit
 from services.retrieval.retrievers.vector import VectorHit
-from services.retrieval.router import RouterEntity, RouterOutput
+from services.retrieval.router import Intent, RouterEntity
 from services.retrieval.search_pipeline import run_search
 from shared.config import Settings, get_settings
 from shared.constants import EdgeType, NodeLabel
@@ -263,7 +263,10 @@ async def test_related_entities_populated_and_excludes_routed_entity(
         canonical_id="prbe-backend",
     )
 
-    routed = RouterOutput(
+    intent = Intent(
+        query_text="prbe-backend",
+        mode="search",
+        confidence=0.9,
         entities=[
             RouterEntity(
                 entity_type="service",
@@ -283,7 +286,8 @@ async def test_related_entities_populated_and_excludes_routed_entity(
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=routed,
+            intent=intent,
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -328,7 +332,8 @@ async def test_top_k_related_zero_skips_walk(live_db) -> None:
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=RouterOutput(),
+            intent=Intent(query_text="x", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -387,7 +392,8 @@ async def test_dedup_best_rank_per_doc(live_db) -> None:
         await run_search(
             req=req,
             customer_id=cust,
-            routed=RouterOutput(),
+            intent=Intent(query_text="r", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -441,7 +447,8 @@ async def test_walk_failure_isolation_chunks_still_return(live_db) -> None:
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=RouterOutput(),
+            intent=Intent(query_text="x", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -482,7 +489,8 @@ async def test_walk_legitimate_empty_returns_empty_list(live_db) -> None:
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=RouterOutput(),
+            intent=Intent(query_text="x", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,

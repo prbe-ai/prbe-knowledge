@@ -297,6 +297,14 @@ async def _build_and_write_trace(
             response_payload=response_payload,
             error_class=error_class,
             error_message=error_message,
+            # Router Intelligence v1 telemetry fields
+            grounding_bundle=getattr(request.state, "grounding_bundle", None),
+            router_raw=getattr(request.state, "router_raw", None),
+            intents_count=getattr(request.state, "intents_count", None),
+            intent_dispatch=getattr(request.state, "intent_dispatch", None),
+            cache_tokens=getattr(request.state, "cache_tokens", None),
+            router_model=getattr(request.state, "router_model", None),
+            failure_recovered=getattr(request.state, "failure_recovered", False),
         )
     )
 

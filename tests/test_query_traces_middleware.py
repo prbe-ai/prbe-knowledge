@@ -82,7 +82,7 @@ def _stub_pipeline(monkeypatch, *, chunk_count: int = 2) -> None:
     """
     from shared.models import QueryDocumentResult
 
-    async def fake_run_retrieval(req, customer_id):
+    async def fake_run_retrieval(req, customer_id, request=None):
         now = datetime.now(UTC)
         docs = [
             QueryDocumentResult(
@@ -271,7 +271,7 @@ async def test_middleware_handler_raises_emits_error_trace(
     The original exception MUST still propagate to the user as a 500."""
     api_key = await _seed_customer("cust-mw-err")
 
-    async def boom_pipeline(req, customer_id):
+    async def boom_pipeline(req, customer_id, request=None):
         raise RuntimeError("retrieval blew up")
 
     import services.retrieval.main as main_mod
@@ -319,24 +319,33 @@ async def test_middleware_query_stream_captures_response(
     from datetime import UTC
     from datetime import datetime as _dt
 
-    from services.retrieval.pipeline import RouterPhaseResult
-    from services.retrieval.router import RouterOutput
+    from services.retrieval.grounding import GroundingBundle
+    from services.retrieval.pipeline import ResolvedIntent, RouterPhaseResult
+    from services.retrieval.router import Intent, RouterOutput
     from services.retrieval.synthesis import StreamDelta, StreamFinal
     from shared.models import QueryResponse, TemporalSpec
 
     async def _async_return(value):  # type: ignore[no-untyped-def]
         return value
 
-    phase = RouterPhaseResult(
-        routed=RouterOutput(),
+    _intent = Intent(query_text="x", mode="search", confidence=0.9)
+    _resolved = ResolvedIntent(
+        intent=_intent,
         spec=TemporalSpec(),
-        temporal_meta={"mode": "latest", "source": "default", "raw_phrase": None, "error": None},
         sort_meta=None,
         extracted_entities=[],
         doc_types=None,
+        dispatch_mode="search",
+        temporal_meta={"mode": "latest", "source": "default", "raw_phrase": None, "error": None},
+    )
+    phase = RouterPhaseResult(
+        routed=RouterOutput(
+            intents=[_intent],
+            grounding_bundle=GroundingBundle(),
+        ),
+        resolved_intents=[_resolved],
         trace_id="trace-stream-1",
         timing={"router_ms": 5.0},
-        dispatch_mode="search",
     )
     from shared.models import QueryDocumentResult
 
@@ -383,10 +392,10 @@ async def test_middleware_query_stream_captures_response(
     import services.retrieval.main as main_mod
 
     monkeypatch.setattr(
-        main_mod, "run_router_phase", lambda req, cid: _async_return(phase)
+        main_mod, "run_router_phase", lambda req, cid, request=None: _async_return(phase)
     )
     monkeypatch.setattr(
-        main_mod, "run_search_phase", lambda req, cid, p: _async_return(rresp)
+        main_mod, "run_search_phase", lambda req, cid, p, request=None: _async_return(rresp)
     )
     monkeypatch.setattr(main_mod, "synthesize_stream", fake_synth_stream)
 
@@ -432,3 +441,305 @@ async def test_middleware_query_stream_captures_response(
     # `{}` placeholder this test was added to prevent).
     assert trace["response_truncated"] is False
     assert trace["response_size_bytes"] > 100
+
+
+# ---------------------------------------------------------------------------
+# Router Intelligence v1 — telemetry column tests (Task 6)
+# ---------------------------------------------------------------------------
+
+
+def _stub_router_pipeline(monkeypatch) -> None:
+    """Replace run_retrieval with a stub that populates request.state with the
+    7 new telemetry fields, mirroring what the real pipeline does.
+
+    We stub at the main.py level (via run_retrieval) so the middleware still
+    reads request.state exactly as it would in production. /retrieve calls
+    run_retrieval — not the phase functions — so we stub that.
+    """
+    from services.retrieval.grounding import GroundingBundle, GroundingCandidate
+    from shared.constants import HAIKU_MODEL, SourceSystem
+    from shared.models import QueryDocumentResult, QueryResponse
+
+    _bundle = GroundingBundle(
+        candidates=[
+            GroundingCandidate(
+                entity_type="repo",
+                canonical_id="prbe",
+                display_name="prbe",
+                last_seen_at=None,
+                match_source="trgm",
+            )
+        ],
+        connected_sources=["github"],
+        bare_id_matches=[],
+        timing_ms=5.0,
+    )
+
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    now = _dt.now(UTC)
+    _rresp = QueryResponse(
+        query="hello world",
+        results=[
+            QueryDocumentResult(
+                canonical_id="doc-0",
+                doc_id="doc-0",
+                doc_version=1,
+                source_system=SourceSystem.SLACK,
+                source_url="https://example/0",
+                title="doc 0",
+                created_at=now,
+                updated_at=now,
+                score=0.9,
+                rank=1,
+                chunks=[],
+                chunk_count=0,
+            )
+        ],
+        total_candidates=1,
+        router_hit_cache=False,
+        timing_ms={"router_ms": 5.0, "search_ms": 20.0},
+        trace_id="trace-telemetry-test",
+    )
+
+    async def fake_run_retrieval(req, customer_id, request=None):
+        if request is not None:
+            from services.retrieval.pipeline import _bundle_to_jsonable
+            request.state.grounding_bundle = _bundle_to_jsonable(_bundle)
+            request.state.router_raw = {"intents": [{"query_text": "hello world", "mode": "search"}]}
+            request.state.intents_count = 1
+            request.state.router_model = HAIKU_MODEL
+            request.state.cache_tokens = None
+            request.state.failure_recovered = False
+            request.state.intent_dispatch = [
+                {
+                    "intent_idx": 0,
+                    "mode": "search",
+                    "latency_ms": 20.0,
+                    "result_count": 1,
+                    "error_class": None,
+                }
+            ]
+        return _rresp
+
+    import services.retrieval.main as main_mod
+    monkeypatch.setattr(main_mod, "run_retrieval", fake_run_retrieval)
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_trace_records_router_intelligence_columns(
+    live_db, settings, monkeypatch
+) -> None:
+    """Happy path: after a /retrieve POST, the query_traces row carries all
+    7 new router-intelligence columns with the expected values."""
+    api_key = await _seed_customer("cust-ri-happy")
+    _stub_router_pipeline(monkeypatch)
+
+    resp = await _post(
+        headers={"Authorization": f"Bearer {api_key}", "X-Caller-Kind": "mcp"},
+        body={"query": "hello world", "top_k": 1},
+    )
+    await init_pool(settings)
+    assert resp.status_code == 200, resp.text
+
+    traces = await _wait_for_traces("cust-ri-happy", 1)
+    assert len(traces) == 1
+    trace = traces[0]
+
+    # intents_count
+    assert trace["intents_count"] == 1
+
+    # router_model
+    from shared.constants import HAIKU_MODEL
+    assert trace["router_model"] == HAIKU_MODEL
+
+    # grounding_bundle — should be a non-null JSONB dict
+    gb = _jsonb(trace["grounding_bundle"]) if isinstance(trace["grounding_bundle"], str) else trace["grounding_bundle"]
+    assert gb is not None
+    assert "candidates" in gb
+
+    # router_raw — non-null dict
+    rr = _jsonb(trace["router_raw"]) if isinstance(trace["router_raw"], str) else trace["router_raw"]
+    assert rr is not None
+
+    # intent_dispatch — list with one entry
+    id_raw = trace["intent_dispatch"]
+    if isinstance(id_raw, str):
+        id_raw = json.loads(id_raw)
+    assert isinstance(id_raw, list)
+    assert len(id_raw) == 1
+    entry = id_raw[0]
+    assert entry["intent_idx"] == 0
+    assert entry["mode"] == "search"
+    assert "latency_ms" in entry
+    assert entry["result_count"] == 1
+
+    # failure_recovered — should be False (happy path)
+    assert trace["failure_recovered"] is False
+
+    # cache_tokens — None (stub, no real Haiku call)
+    assert trace["cache_tokens"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_trace_records_failure_recovered_on_haiku_failure(
+    live_db, settings, monkeypatch
+) -> None:
+    """When the router returns with router_raw == {} (Haiku timeout / parse
+    error), failure_recovered is set True on the trace row.
+
+    We stub run_retrieval directly so that request.state is populated as
+    pipeline.run_router_phase would populate it on a real Haiku failure
+    (router_raw={} is the fallback-path sentinel).
+    """
+    api_key = await _seed_customer("cust-ri-haiku-fail")
+
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from shared.constants import HAIKU_MODEL, SourceSystem
+    from shared.models import QueryDocumentResult, QueryResponse
+
+    now = _dt.now(UTC)
+    _rresp = QueryResponse(
+        query="will fail",
+        results=[
+            QueryDocumentResult(
+                canonical_id="fallback-doc",
+                doc_id="fallback-doc",
+                doc_version=1,
+                source_system=SourceSystem.SLACK,
+                source_url="https://example/fallback",
+                title="fallback",
+                created_at=now,
+                updated_at=now,
+                score=0.1,
+                rank=1,
+                chunks=[],
+                chunk_count=0,
+            )
+        ],
+        total_candidates=1,
+        router_hit_cache=False,
+        timing_ms={"router_ms": 1.0},
+        trace_id="trace-haiku-fail",
+    )
+
+    async def fake_run_retrieval(req, customer_id, request=None):
+        # Simulate what run_router_phase does when Haiku fails:
+        # router_raw == {} means failure_recovered=True.
+        if request is not None:
+            request.state.grounding_bundle = None
+            request.state.router_raw = {}  # sentinel for router failure
+            request.state.intents_count = 1
+            request.state.router_model = HAIKU_MODEL
+            request.state.cache_tokens = None
+            request.state.failure_recovered = True  # router_raw == {} → True
+            request.state.intent_dispatch = [
+                {
+                    "intent_idx": 0,
+                    "mode": "search",
+                    "latency_ms": 10.0,
+                    "result_count": 1,
+                    "error_class": None,
+                }
+            ]
+        return _rresp
+
+    import services.retrieval.main as main_mod
+    monkeypatch.setattr(main_mod, "run_retrieval", fake_run_retrieval)
+
+    resp = await _post(
+        headers={"Authorization": f"Bearer {api_key}", "X-Caller-Kind": "mcp"},
+        body={"query": "will fail", "top_k": 1},
+    )
+    await init_pool(settings)
+    assert resp.status_code == 200, resp.text
+
+    traces = await _wait_for_traces("cust-ri-haiku-fail", 1)
+    assert len(traces) == 1
+    trace = traces[0]
+    assert trace["failure_recovered"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.integration
+async def test_trace_records_failure_recovered_on_all_intents_failing(
+    live_db, settings, monkeypatch
+) -> None:
+    """When all intents fail in run_search_phase, failure_recovered is True.
+
+    We stub run_retrieval directly so that request.state is populated as
+    run_search_phase would populate it when every intent raises.
+    """
+    api_key = await _seed_customer("cust-ri-all-fail")
+
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from shared.constants import HAIKU_MODEL, SourceSystem
+    from shared.models import QueryDocumentResult, QueryResponse
+
+    now = _dt.now(UTC)
+    _rresp = QueryResponse(
+        query="all fail query",
+        results=[
+            QueryDocumentResult(
+                canonical_id="fallback-doc",
+                doc_id="fallback-doc",
+                doc_version=1,
+                source_system=SourceSystem.SLACK,
+                source_url="https://example/fallback",
+                title="fallback",
+                created_at=now,
+                updated_at=now,
+                score=0.1,
+                rank=1,
+                chunks=[],
+                chunk_count=0,
+            )
+        ],
+        total_candidates=1,
+        router_hit_cache=False,
+        timing_ms={"router_ms": 1.0},
+        trace_id="trace-all-fail",
+    )
+
+    async def fake_run_retrieval(req, customer_id, request=None):
+        # Simulate: router OK but all intents failed in search phase.
+        if request is not None:
+            request.state.grounding_bundle = None
+            request.state.router_raw = {"intents": [{"query_text": req.query, "mode": "search"}]}
+            request.state.intents_count = 1
+            request.state.router_model = HAIKU_MODEL
+            request.state.cache_tokens = None
+            # failure_recovered=True because all intents failed
+            request.state.failure_recovered = True
+            request.state.intent_dispatch = [
+                {
+                    "intent_idx": 0,
+                    "mode": "search",
+                    "latency_ms": 5.0,
+                    "result_count": None,
+                    "error_class": "RuntimeError",
+                }
+            ]
+        return _rresp
+
+    import services.retrieval.main as main_mod
+    monkeypatch.setattr(main_mod, "run_retrieval", fake_run_retrieval)
+
+    resp = await _post(
+        headers={"Authorization": f"Bearer {api_key}", "X-Caller-Kind": "mcp"},
+        body={"query": "all fail query", "top_k": 1},
+    )
+    await init_pool(settings)
+    assert resp.status_code == 200, resp.text
+
+    traces = await _wait_for_traces("cust-ri-all-fail", 1)
+    assert len(traces) == 1
+    trace = traces[0]
+    assert trace["failure_recovered"] is True

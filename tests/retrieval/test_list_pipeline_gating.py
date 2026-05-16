@@ -26,17 +26,20 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from services.retrieval.list_pipeline import run_list
-from services.retrieval.router import RouterEntity, RouterOutput
+from services.retrieval.router import Intent, RouterEntity
 from shared.models import QueryRequest, TemporalSpec
 
 pytestmark = pytest.mark.asyncio
 
 
-def _routed_with_repo_and_person() -> RouterOutput:
-    """Router output with one narrowing repo entity AND one person
+def _intent_with_repo_and_person() -> Intent:
+    """Intent with one narrowing repo entity AND one person
     entity — exercises both the `graph_entity_filters` and `author_ids`
     branches in a single test."""
-    return RouterOutput(
+    return Intent(
+        query_text="recent prbe-backend commits by alice",
+        mode="list",
+        confidence=0.9,
         entities=[
             RouterEntity(
                 entity_type="repo",
@@ -52,7 +55,6 @@ def _routed_with_repo_and_person() -> RouterOutput:
             ),
         ],
         sort={"field": "updated_at", "direction": "desc"},
-        mode="list",
         operation="list",
     )
 
@@ -65,7 +67,7 @@ class TestListPipelineEntityGating:
         req = QueryRequest(query="recent prbe-backend commits by alice", top_k=5)
         assert req.entity_must_match is False  # belt-and-suspenders
 
-        routed = _routed_with_repo_and_person()
+        intent = _intent_with_repo_and_person()
 
         # Phase 2 Chunk 8: list pipeline's related-entities branch now calls
         # expand_exclude_keys_with_aliases, which opens a `with_tenant`
@@ -84,7 +86,8 @@ class TestListPipelineEntityGating:
             await run_list(
                 req=req,
                 customer_id="cust-1",
-                routed=routed,
+                intent=intent,
+                intent_idx=0,
                 spec=TemporalSpec(),
                 temporal_meta={},
                 sort_meta=None,
@@ -111,7 +114,7 @@ class TestListPipelineEntityGating:
             entity_must_match=True,
         )
 
-        routed = _routed_with_repo_and_person()
+        intent = _intent_with_repo_and_person()
 
         # Phase 2 Chunk 5: list pipeline expands author_ids to their Person
         # cluster (primary + aliases) via expand_to_cluster_members. Mock
@@ -137,7 +140,8 @@ class TestListPipelineEntityGating:
             await run_list(
                 req=req,
                 customer_id="cust-1",
-                routed=routed,
+                intent=intent,
+                intent_idx=0,
                 spec=TemporalSpec(),
                 temporal_meta={},
                 sort_meta=None,
@@ -159,8 +163,8 @@ class TestListPipelineEntityGating:
     async def test_flag_off_count_branch_skips_entity_filters(self) -> None:
         """Same gating applies to the `count` branch."""
         req = QueryRequest(query="how many backend commits", top_k=5)
-        routed = _routed_with_repo_and_person()
-        routed.operation = "count"
+        intent = _intent_with_repo_and_person()
+        intent.operation = "count"
 
         with patch(
             "services.retrieval.list_pipeline.sql_count", new=AsyncMock(return_value=0)
@@ -168,7 +172,8 @@ class TestListPipelineEntityGating:
             await run_list(
                 req=req,
                 customer_id="cust-1",
-                routed=routed,
+                intent=intent,
+                intent_idx=0,
                 spec=TemporalSpec(),
                 temporal_meta={},
                 sort_meta=None,
@@ -185,9 +190,9 @@ class TestListPipelineEntityGating:
     async def test_flag_off_group_by_branch_skips_entity_filters(self) -> None:
         """Same gating applies to the `group_by` branch."""
         req = QueryRequest(query="commits by author", top_k=5)
-        routed = _routed_with_repo_and_person()
-        routed.operation = "group_by"
-        routed.group_by_key = "author_id"
+        intent = _intent_with_repo_and_person()
+        intent.operation = "group_by"
+        intent.group_by_key = "author_id"
 
         with patch(
             "services.retrieval.list_pipeline.sql_group_by",
@@ -196,7 +201,8 @@ class TestListPipelineEntityGating:
             await run_list(
                 req=req,
                 customer_id="cust-1",
-                routed=routed,
+                intent=intent,
+                intent_idx=0,
                 spec=TemporalSpec(),
                 temporal_meta={},
                 sort_meta=None,

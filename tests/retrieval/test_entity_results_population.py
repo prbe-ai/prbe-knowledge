@@ -25,7 +25,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from services.retrieval.router import RouterEntity, RouterOutput
+from services.retrieval.router import Intent, RouterEntity
 from services.retrieval.search_pipeline import run_search
 from shared.config import Settings, get_settings
 from shared.constants import NodeLabel
@@ -176,7 +176,7 @@ def _patch_retrievers():
     ]
 
 
-async def _run(cust: str, routed: RouterOutput, top_k: int = 5):
+async def _run(cust: str, intent: Intent, top_k: int = 5):
     req = QueryRequest(query="x", top_k=top_k, top_k_related=0)
     patches = _patch_retrievers()
     with (
@@ -185,7 +185,8 @@ async def _run(cust: str, routed: RouterOutput, top_k: int = 5):
         return await run_search(
             req=req,
             customer_id=cust,
-            routed=routed,
+            intent=intent,
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -209,7 +210,10 @@ async def test_routed_entity_becomes_query_entity_result(live_db) -> None:
         canonical_id="prbe-backend",
         properties_json='{"name": "prbe-backend", "team": "platform"}',
     )
-    routed = RouterOutput(
+    intent = Intent(
+        query_text="x",
+        mode="search",
+        confidence=0.9,
         entities=[
             RouterEntity(
                 entity_type="service",
@@ -219,7 +223,7 @@ async def test_routed_entity_becomes_query_entity_result(live_db) -> None:
             )
         ],
     )
-    resp = await _run(cust, routed)
+    resp = await _run(cust, intent)
     entities = [r for r in resp.results if isinstance(r, QueryEntityResult)]
     assert len(entities) == 1
     e = entities[0]
@@ -248,7 +252,10 @@ async def test_attached_docs_capped_at_five_doc_count_uncapped(live_db) -> None:
             cust, doc_id=f"doc:{i}",
             label=NodeLabel.REPO.value, canonical_id="big-repo",
         )
-    routed = RouterOutput(
+    intent = Intent(
+        query_text="x",
+        mode="search",
+        confidence=0.9,
         entities=[
             RouterEntity(
                 entity_type="repo", canonical_id="big-repo",
@@ -256,7 +263,7 @@ async def test_attached_docs_capped_at_five_doc_count_uncapped(live_db) -> None:
             )
         ],
     )
-    resp = await _run(cust, routed)
+    resp = await _run(cust, intent)
     entities = [r for r in resp.results if isinstance(r, QueryEntityResult)]
     assert len(entities) == 1
     e = entities[0]
@@ -291,7 +298,10 @@ async def test_two_routed_entities_emit_two_results(live_db) -> None:
         canonical_id="repo-1", edge_type="TOUCHES",
     )
 
-    routed = RouterOutput(
+    intent = Intent(
+        query_text="x",
+        mode="search",
+        confidence=0.9,
         entities=[
             RouterEntity(
                 entity_type="service", canonical_id="svc-1",
@@ -303,7 +313,7 @@ async def test_two_routed_entities_emit_two_results(live_db) -> None:
             ),
         ],
     )
-    resp = await _run(cust, routed)
+    resp = await _run(cust, intent)
     entities = {
         e.canonical_id: e
         for e in resp.results
@@ -325,7 +335,10 @@ async def test_unmapped_entity_type_dropped(live_db) -> None:
     we have no NodeLabel to look it up under."""
     cust = "cust-entity-unmapped"
     await _seed_customer(cust)
-    routed = RouterOutput(
+    intent = Intent(
+        query_text="x",
+        mode="search",
+        confidence=0.9,
         entities=[
             RouterEntity(
                 entity_type="alien_type", canonical_id="weird",
@@ -333,7 +346,7 @@ async def test_unmapped_entity_type_dropped(live_db) -> None:
             ),
         ],
     )
-    resp = await _run(cust, routed)
+    resp = await _run(cust, intent)
     entities = [r for r in resp.results if isinstance(r, QueryEntityResult)]
     assert entities == []
 
@@ -353,7 +366,10 @@ async def test_session_entity_type_dropped_handled_via_id_lookup(
         cust, label=NodeLabel.DOCUMENT.value,
         canonical_id="3c325e11-2008-46a9-83f7-fc40d11eaf82",
     )
-    routed = RouterOutput(
+    intent = Intent(
+        query_text="x",
+        mode="search",
+        confidence=0.9,
         entities=[
             RouterEntity(
                 entity_type="session",
@@ -362,7 +378,7 @@ async def test_session_entity_type_dropped_handled_via_id_lookup(
             ),
         ],
     )
-    resp = await _run(cust, routed)
+    resp = await _run(cust, intent)
     entities = [r for r in resp.results if isinstance(r, QueryEntityResult)]
     assert entities == []
 
@@ -374,7 +390,10 @@ async def test_routed_entity_with_no_graph_node_is_dropped(live_db) -> None:
     cust = "cust-entity-missing"
     await _seed_customer(cust)
     # Note: NO graph_node seeded for this canonical_id.
-    routed = RouterOutput(
+    intent = Intent(
+        query_text="x",
+        mode="search",
+        confidence=0.9,
         entities=[
             RouterEntity(
                 entity_type="service", canonical_id="not-in-graph",
@@ -382,6 +401,6 @@ async def test_routed_entity_with_no_graph_node_is_dropped(live_db) -> None:
             ),
         ],
     )
-    resp = await _run(cust, routed)
+    resp = await _run(cust, intent)
     entities = [r for r in resp.results if isinstance(r, QueryEntityResult)]
     assert entities == []

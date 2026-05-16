@@ -18,8 +18,9 @@ import pytest
 from httpx import ASGITransport
 
 from services.retrieval.auth import authenticate_query
-from services.retrieval.pipeline import RouterPhaseResult
-from services.retrieval.router import RouterOutput
+from services.retrieval.grounding import GroundingBundle
+from services.retrieval.pipeline import ResolvedIntent, RouterPhaseResult
+from services.retrieval.router import Intent, RouterEntity, RouterOutput
 from services.retrieval.synthesis import StreamDelta, StreamFinal, SynthesisError
 from shared.models import (
     QueryChunk,
@@ -56,18 +57,26 @@ def _parse_sse(body: str) -> list[tuple[str, dict]]:
 
 
 def _phase_result() -> RouterPhaseResult:
-    return RouterPhaseResult(
-        routed=RouterOutput(),
+    intent = Intent(query_text="what shipped?", mode="search", confidence=0.9)
+    resolved = ResolvedIntent(
+        intent=intent,
         spec=TemporalSpec(),
-        temporal_meta={"mode": "latest", "source": "default", "raw_phrase": None, "error": None},
         sort_meta=None,
         extracted_entities=[
             {"entity_type": "repo", "canonical_id": "prbe", "display_name": "prbe", "confidence": 0.9}
         ],
         doc_types=None,
+        dispatch_mode="search",
+        temporal_meta={"mode": "latest", "source": "default", "raw_phrase": None, "error": None},
+    )
+    return RouterPhaseResult(
+        routed=RouterOutput(
+            intents=[intent],
+            grounding_bundle=GroundingBundle(),
+        ),
+        resolved_intents=[resolved],
         trace_id="q-test-1",
         timing={"router_ms": 10.0},
-        dispatch_mode="search",
     )
 
 
@@ -135,11 +144,11 @@ async def test_query_stream_emits_full_event_sequence(monkeypatch) -> None:
     """
     monkeypatch.setattr(
         "services.retrieval.main.run_router_phase",
-        lambda req, customer_id: _async_return(_phase_result()),
+        lambda req, customer_id, request=None: _async_return(_phase_result()),
     )
     monkeypatch.setattr(
         "services.retrieval.main.run_search_phase",
-        lambda req, customer_id, phase: _async_return(_query_response()),
+        lambda req, customer_id, phase, request=None: _async_return(_query_response()),
     )
 
     delta_texts = ["Hello ", "world ", "[chunk:1]."]
@@ -215,11 +224,11 @@ async def test_query_stream_emits_error_event_on_synthesis_failure(monkeypatch) 
     """
     monkeypatch.setattr(
         "services.retrieval.main.run_router_phase",
-        lambda req, customer_id: _async_return(_phase_result()),
+        lambda req, customer_id, request=None: _async_return(_phase_result()),
     )
     monkeypatch.setattr(
         "services.retrieval.main.run_search_phase",
-        lambda req, customer_id, phase: _async_return(_query_response()),
+        lambda req, customer_id, phase, request=None: _async_return(_query_response()),
     )
 
     async def boom_stream(query, chunks, model, max_tokens):  # type: ignore[no-untyped-def]
@@ -253,6 +262,107 @@ async def _async_return(value):  # type: ignore[no-untyped-def]
     monkeypatch-substitutable for `async def` functions in main.py.
     """
     return value
+
+
+async def test_stream_emits_per_intent_entities(monkeypatch) -> None:
+    """The `entities` SSE frame must include the full union across all intents,
+    each entity tagged with its `intent_idx`, plus `intents_count` and
+    a `per_intent` meta list."""
+    intent_a = Intent(
+        query_text="auth refactor",
+        mode="search",
+        confidence=0.8,
+        entities=[RouterEntity(
+            entity_type="feature",
+            canonical_id="auth-refactor",
+            display_name="auth refactor",
+            confidence=0.9,
+        )],
+    )
+    intent_b = Intent(
+        query_text="shipped to prod",
+        mode="search",
+        confidence=0.7,
+        entities=[],
+    )
+    resolved_a = ResolvedIntent(
+        intent=intent_a,
+        spec=TemporalSpec(),
+        sort_meta=None,
+        extracted_entities=[
+            {"entity_type": "feature", "canonical_id": "auth-refactor",
+             "display_name": "auth refactor", "confidence": 0.9}
+        ],
+        doc_types=None,
+        dispatch_mode="search",
+        temporal_meta={"mode": "latest", "source": "default",
+                       "raw_phrase": None, "error": None},
+    )
+    resolved_b = ResolvedIntent(
+        intent=intent_b,
+        spec=TemporalSpec(),
+        sort_meta=None,
+        extracted_entities=[],
+        doc_types=None,
+        dispatch_mode="search",
+        temporal_meta={"mode": "latest", "source": "default",
+                       "raw_phrase": None, "error": None},
+    )
+    multi_phase = RouterPhaseResult(
+        routed=RouterOutput(
+            intents=[intent_a, intent_b],
+            grounding_bundle=GroundingBundle(),
+            router_raw={},
+        ),
+        resolved_intents=[resolved_a, resolved_b],
+        trace_id="q-multi-intent",
+        timing={"router_ms": 12.0},
+    )
+
+    monkeypatch.setattr(
+        "services.retrieval.main.run_router_phase",
+        lambda req, customer_id, request=None: _async_return(multi_phase),
+    )
+    monkeypatch.setattr(
+        "services.retrieval.main.run_search_phase",
+        lambda req, customer_id, phase, request=None: _async_return(_query_response()),
+    )
+
+    async def fake_stream(query, chunks, model, max_tokens):  # type: ignore[no-untyped-def]
+        yield StreamFinal(
+            answer="ok",
+            citations=[],
+            insufficient_context=False,
+            model=model,
+        )
+
+    monkeypatch.setattr("services.retrieval.main.synthesize_stream", fake_stream)
+
+    resp = await _post({"query": "auth refactor shipped to prod?", "top_k": 5})
+    assert resp.status_code == 200
+
+    events = _parse_sse(resp.text)
+    entities_payload = next(d for n, d in events if n == "entities")
+
+    # intents_count == 2 (two intents in the stub)
+    assert entities_payload["intents_count"] == 2
+
+    # extracted_entities: one entity from intent 0; intent 1 has none.
+    extracted = entities_payload["extracted_entities"]
+    assert len(extracted) == 1
+    assert extracted[0]["canonical_id"] == "auth-refactor"
+    assert extracted[0]["intent_idx"] == 0
+
+    # per_intent meta list has 2 entries
+    per_intent = entities_payload["per_intent"]
+    assert len(per_intent) == 2
+    assert per_intent[0]["intent_idx"] == 0
+    assert per_intent[1]["intent_idx"] == 1
+
+    # Back-compat keys still present at top level
+    assert "applied_mode" in entities_payload
+    assert "trace_id" in entities_payload
+    assert entities_payload["trace_id"] == "q-multi-intent"
 
 
 # Sanity: the QueryRequest import has to resolve so tests fail fast

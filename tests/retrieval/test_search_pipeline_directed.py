@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from services.retrieval.retrievers.bm25 import BM25Hit
-from services.retrieval.router import RouterOutput
+from services.retrieval.router import Intent
 from services.retrieval.search_pipeline import run_search
 from shared.config import Settings, get_settings
 from shared.db import raw_conn, with_tenant
@@ -153,7 +153,7 @@ async def test_directed_signal_flows_end_to_end_to_query_response(
     # below matches the phrase but not the body.
     await _seed_directed(cust, doc_id, "deploy keeps timing out")
 
-    routed = RouterOutput(entities=[])
+    intent = Intent(query_text="deploy keeps timing out", mode="search", confidence=0.9)
     req = QueryRequest(query="deploy keeps timing out", top_k=5, top_k_related=0)
 
     patches = {
@@ -191,7 +191,8 @@ async def test_directed_signal_flows_end_to_end_to_query_response(
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=routed,
+            intent=intent,
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -237,6 +238,7 @@ async def test_directed_signal_flows_end_to_end_to_query_response(
     )
     directed_prov = next(m for m in doc.matched_via if m.channel == "directed")
     assert directed_prov.rank == 1, "single hit -> rank 1 in directed list"
+    assert directed_prov.intent_idx == 0
     # MatchProvenance.score on directed carries the cosine SIMILARITY
     # (DirectedHit.score), NOT the RRF contribution. The RRF value is in
     # retriever_scores; matched_via shows the raw signal strength so
@@ -266,7 +268,7 @@ async def test_directed_runner_skips_directed_search_when_tenant_has_no_rows(
     # Note: deliberately NOT seeding directed_vectors — the runner's
     # pre-check should skip the call entirely.
 
-    routed = RouterOutput(entities=[])
+    intent = Intent(query_text="anything", mode="search", confidence=0.9)
     req = QueryRequest(query="anything", top_k=5, top_k_related=0)
 
     # If the pre-check fails, directed_search runs and trips this assertion.
@@ -317,7 +319,8 @@ async def test_directed_runner_skips_directed_search_when_tenant_has_no_rows(
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=routed,
+            intent=intent,
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
