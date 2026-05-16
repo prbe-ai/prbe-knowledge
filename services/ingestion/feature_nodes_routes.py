@@ -34,7 +34,7 @@ import hmac
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from shared.config import get_settings
@@ -197,22 +197,21 @@ async def upsert_feature_node(
     # Persist inside with_tenant() so RLS GUC fires + entity-clusters
     # alias resolution (PR #265 / shared/graph_writer.upsert_*) rewrites
     # any aliased endpoints transparently.
-    async with raw_conn() as conn:
-        async with with_tenant(conn, customer_id):
-            from shared.graph_writer import upsert_edges, upsert_nodes  # local import
+    async with raw_conn() as conn, with_tenant(conn, customer_id):
+        from shared.graph_writer import upsert_edges, upsert_nodes  # local import
 
-            node_ids = await upsert_nodes(
-                conn,
-                nodes=[feature_node],
-                customer_id=customer_id,
-                source_system=SourceSystem.GITHUB,
-            )
-            await upsert_edges(
-                conn,
-                edges=edges,
-                customer_id=customer_id,
-                source_system=SourceSystem.GITHUB,
-            )
+        node_ids = await upsert_nodes(
+            conn,
+            nodes=[feature_node],
+            customer_id=customer_id,
+            source_system=SourceSystem.GITHUB,
+        )
+        await upsert_edges(
+            conn,
+            edges=edges,
+            customer_id=customer_id,
+            source_system=SourceSystem.GITHUB,
+        )
 
     node_id: int | None = None
     if isinstance(node_ids, dict):

@@ -818,7 +818,12 @@ async def run_worker_forever() -> None:
     configure_logging(settings.log_level)
     await init_pool(settings)
     # Import handlers package so @register_connector decorators run.
-    import services.ingestion.handlers  # noqa: F401
+    # Side-effect import — handlers' @register_connector decorators run on
+    # import. The module name is used by the registry, so ruff doesn't flag
+    # it as unused.
+    import services.ingestion.handlers
+
+    _ = services.ingestion.handlers  # defensive against future ruff strictness
 
     # INGESTION_MODE=poll is set by the self-host chart only — public
     # webhook URLs aren't reachable from inside a customer's cluster, so
