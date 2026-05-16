@@ -92,10 +92,13 @@ from shared.models import (
 log = get_logger(__name__)
 
 # When the router detects sort intent on a search-path query, drop the
-# recency half-life by this factor (and clamp to a 7-day floor). Caller's
-# explicit `recency_half_life_days` always wins.
+# recency half-life by this factor (and clamp to a 3-day floor). Caller's
+# explicit `recency_half_life_days` always wins. Tightened from 7d to 3d
+# 2026-05-16: "the most recent X about Y" queries were still surfacing
+# month-old docs at parity with last-week docs at the 7d half-life; 3d
+# pushes a 7-day-old doc down to ~20% of a fresh hit's score.
 _SORT_INTENT_HALF_LIFE_DIVISOR = 4
-_SORT_INTENT_MIN_HALF_LIFE_DAYS = 7.0
+_SORT_INTENT_MIN_HALF_LIFE_DAYS = 3.0
 _CODING_AGENT_SOURCES = {
     SourceSystem.CLAUDE_CODE.value,
     SourceSystem.CODEX.value,

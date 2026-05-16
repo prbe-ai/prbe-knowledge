@@ -353,9 +353,21 @@ TEMPORAL (per intent)
     "recent", "recently", "lately", "in progress", "working on",
     "ongoing", "this sprint", "latest", "newest", "just shipped".
   For these, emit `{{"since": {{"kind":"rel","offset_days":N}}, ...}}`
-  with a reasonable N (0 for today/now/currently, -7 for this week /
-  recent / recently / in progress, -30 for this month). N negative
-  for past, 0 for now.
+  with a reasonable N:
+    -1  for now / right now / currently / today / yesterday /
+         just shipped — these point at the last 24 hours of
+         activity (the resolver pegs `until` to request time, so
+         this is a "last day" window, not "yesterday's calendar
+         day only").
+    -3  for in progress / working on — status cues that
+         legitimately span the last few days.
+    -7  for this week / recent / recently / lately / ongoing /
+         this sprint
+    -30 for this month / latest / newest
+    -90 for this quarter
+    -365 for this year
+  N negative for past. The dispatcher resolves these relative to
+  the request time, not when this prompt was generated.
 - "abs" only for fully-qualified dates ("since 2024-03-15") or where the
   user gave the year explicitly.
 - Bare month/day phrases like "April 15th" or "since March" resolve to the
