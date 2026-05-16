@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import hmac
 from datetime import datetime
-from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel, Field
