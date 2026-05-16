@@ -544,3 +544,182 @@ async def test_unmerge_401_without_internal_key(
         "/api/entity-clusters/Person/x/aliases/y",
     )
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /api/entity-clusters — list
+# ---------------------------------------------------------------------------
+
+
+async def _merge(
+    client: httpx.AsyncClient,
+    *,
+    primary: str,
+    aliases: list[str],
+) -> str:
+    """POST a merge and return its `merge_id`. Caller seeds graph_nodes."""
+    resp = await client.post(
+        "/api/entity-clusters/merge",
+        headers=_headers(),
+        json={
+            "customer_id":          CUSTOMER_ID,
+            "performed_by_user_id": USER_ID,
+            "label":                "Person",
+            "primary_canonical_id": primary,
+            "alias_canonical_ids":  aliases,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    return resp.json()["merge_id"]
+
+
+@pytest.mark.asyncio
+async def test_list_empty_when_no_clusters(client: httpx.AsyncClient) -> None:
+    async with raw_conn() as conn:
+        await _seed_customer(conn)
+    resp = await client.get("/api/entity-clusters", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"clusters": []}
+
+
+@pytest.mark.asyncio
+async def test_list_after_single_merge(client: httpx.AsyncClient) -> None:
+    async with raw_conn() as conn:
+        await _seed_customer(conn)
+    async with with_tenant(CUSTOMER_ID) as conn:
+        await _seed_person(conn, "richardwei6")
+        await _seed_person(conn, "mahit@prbe.ai")
+    await _merge(client, primary="richardwei6", aliases=["mahit@prbe.ai"])
+
+    resp = await client.get("/api/entity-clusters", headers=_headers())
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert len(body["clusters"]) == 1
+    cluster = body["clusters"][0]
+    assert cluster["label"] == "Person"
+    assert cluster["primary_canonical_id"] == "richardwei6"
+    assert cluster["display_name"] is None
+    assert [a["alias_canonical_id"] for a in cluster["aliases"]] == [
+        "mahit@prbe.ai",
+    ]
+    # merge_id round-trips as a UUID string.
+    uuid.UUID(cluster["aliases"][0]["merge_id"])
+
+
+@pytest.mark.asyncio
+async def test_list_groups_multiple_merges_into_same_primary(
+    client: httpx.AsyncClient,
+) -> None:
+    """Two merges extending the same primary surface as ONE cluster row
+    whose `aliases` list has both, each with its own merge_id."""
+    async with raw_conn() as conn:
+        await _seed_customer(conn)
+    async with with_tenant(CUSTOMER_ID) as conn:
+        await _seed_person(conn, "richardwei6")
+        await _seed_person(conn, "mahit@prbe.ai")
+        await _seed_person(conn, "U07ABC123")
+
+    m1 = await _merge(client, primary="richardwei6", aliases=["mahit@prbe.ai"])
+    m2 = await _merge(client, primary="richardwei6", aliases=["U07ABC123"])
+
+    resp = await client.get("/api/entity-clusters", headers=_headers())
+    body = resp.json()
+    assert len(body["clusters"]) == 1
+    aliases = body["clusters"][0]["aliases"]
+    assert {a["alias_canonical_id"] for a in aliases} == {
+        "mahit@prbe.ai",
+        "U07ABC123",
+    }
+    merge_ids = {a["merge_id"] for a in aliases}
+    assert merge_ids == {m1, m2}, "each alias should carry its own merge_id"
+
+
+@pytest.mark.asyncio
+async def test_list_hides_buried_clusters_under_chains(
+    client: httpx.AsyncClient,
+) -> None:
+    """Chain `a → b → c`: only the outer cluster (c with alias b) shows.
+    `b`'s own cluster (with alias a) is hidden until b is unmerged out
+    of c."""
+    async with raw_conn() as conn:
+        await _seed_customer(conn)
+    async with with_tenant(CUSTOMER_ID) as conn:
+        await _seed_person(conn, "a")
+        await _seed_person(conn, "b")
+        await _seed_person(conn, "c")
+
+    # Inner merge: a → b.
+    await _merge(client, primary="b", aliases=["a"])
+    # Outer merge: b → c. b's graph_node still exists here (a's was
+    # deleted by the inner merge), so this is allowed by the current
+    # server-side guard (which only blocks "alias already aliased",
+    # not "primary already a primary of something else").
+    await _merge(client, primary="c", aliases=["b"])
+
+    resp = await client.get("/api/entity-clusters", headers=_headers())
+    clusters = resp.json()["clusters"]
+    primaries = [c["primary_canonical_id"] for c in clusters]
+    assert primaries == ["c"], (
+        f"expected only the outer cluster 'c' to surface; got {primaries}"
+    )
+    assert [a["alias_canonical_id"] for a in clusters[0]["aliases"]] == ["b"]
+
+
+@pytest.mark.asyncio
+async def test_list_resurfaces_inner_cluster_after_outer_unmerge(
+    client: httpx.AsyncClient,
+) -> None:
+    """After unmerging b from c, b becomes a primary again and its inner
+    cluster (b with alias a) reappears in the list."""
+    async with raw_conn() as conn:
+        await _seed_customer(conn)
+    async with with_tenant(CUSTOMER_ID) as conn:
+        await _seed_person(conn, "a")
+        await _seed_person(conn, "b")
+        await _seed_person(conn, "c")
+
+    await _merge(client, primary="b", aliases=["a"])
+    await _merge(client, primary="c", aliases=["b"])
+
+    # Before unmerge: only outer cluster visible.
+    before = await client.get("/api/entity-clusters", headers=_headers())
+    assert [c["primary_canonical_id"] for c in before.json()["clusters"]] == [
+        "c",
+    ]
+
+    # Unmerge b from c → b's node restored, b→c routing gone.
+    resp = await client.delete(
+        "/api/entity-clusters/Person/c/aliases/b",
+        headers=_headers(),
+    )
+    assert resp.status_code == 204, resp.text
+
+    # After unmerge: inner cluster (b with alias a) reappears. c has no
+    # remaining aliases and drops out entirely.
+    after = await client.get("/api/entity-clusters", headers=_headers())
+    clusters = after.json()["clusters"]
+    primaries = [c["primary_canonical_id"] for c in clusters]
+    assert primaries == ["b"]
+    assert [a["alias_canonical_id"] for a in clusters[0]["aliases"]] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_list_400_without_customer_header(
+    client: httpx.AsyncClient,
+) -> None:
+    resp = await client.get(
+        "/api/entity-clusters",
+        headers={"X-Internal-Knowledge-Key": "test-internal-key"},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_list_401_without_internal_key(
+    client: httpx.AsyncClient,
+) -> None:
+    resp = await client.get(
+        "/api/entity-clusters",
+        headers={"X-Prbe-Customer": CUSTOMER_ID},
+    )
+    assert resp.status_code == 401

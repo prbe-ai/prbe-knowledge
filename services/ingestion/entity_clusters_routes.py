@@ -24,8 +24,10 @@ Design + plan:
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -533,3 +535,134 @@ async def unmerge_alias(
         "entity_clusters.unmerge: customer=%s label=%s primary=%s alias=%s merge_id=%s",
         customer_id, label, primary_canonical_id, alias_canonical_id, merge_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/entity-clusters — list active top-level clusters
+# ---------------------------------------------------------------------------
+
+
+class ClusterAlias(BaseModel):
+    """One row in `entity_aliases` for a cluster, plus join data the UI
+    needs to render an unmerge button without a second round-trip."""
+
+    alias_canonical_id: str
+    merge_id:           uuid.UUID
+    added_at:           datetime
+
+
+class ActiveCluster(BaseModel):
+    """A cluster whose primary is *itself* not currently aliased into
+    another cluster. Stacked-merge case (a→b→c): when `b` is also an
+    alias of `c`, `b`'s own cluster is hidden from this list until `b`
+    is unmerged out of `c` — at which point `b` reappears as a primary
+    here on the next fetch."""
+
+    label:                str
+    primary_canonical_id: str
+    primary_title:        str | None
+    display_name:         str | None
+    aliases:              list[ClusterAlias]
+
+
+class ListClustersResponse(BaseModel):
+    clusters: list[ActiveCluster]
+
+
+@router.get(
+    "",
+    response_model=ListClustersResponse,
+    dependencies=[Depends(_require_internal_key)],
+)
+async def list_clusters(
+    x_prbe_customer: str | None = Header(default=None, alias="X-Prbe-Customer"),
+) -> ListClustersResponse:
+    """List the customer's *immediately-unmergeable* clusters.
+
+    Filters with ``NOT EXISTS`` to a primary that is not itself an alias —
+    so chained merges (a→b→c) only surface the outer cluster (c with
+    alias b). Unmerging b from c lets a/b's own cluster appear on the
+    next refetch. This sidesteps the open question of rendering chains
+    or restoring partial state across multiple `entity_merge_audit` rows.
+
+    Per-alias rows carry their own `merge_id` (multiple merges extending
+    the same primary live side-by-side here) and `added_at` so the UI
+    can show "last merged X ago" and route unmerges through the
+    existing DELETE endpoint.
+    """
+    if not x_prbe_customer:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Prbe-Customer header is required",
+        )
+    customer_id = x_prbe_customer
+
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                ea.label,
+                ea.primary_canonical_id,
+                -- Entity nodes carry their display name in properties.name
+                -- (set by graph_writer's upsert). graph_nodes has no `title`
+                -- column; Document titles live elsewhere but the cluster
+                -- endpoint never lists Documents.
+                gn.properties->>'name' AS primary_title,
+                ecm.display_name,
+                jsonb_agg(
+                    jsonb_build_object(
+                        'alias_canonical_id', ea.alias_canonical_id,
+                        'merge_id',           ea.merge_id::text,
+                        'added_at',           ea.added_at
+                    )
+                    ORDER BY ea.added_at
+                ) AS aliases
+            FROM entity_aliases ea
+            LEFT JOIN entity_cluster_metadata ecm
+                ON ecm.customer_id          = ea.customer_id
+                AND ecm.label               = ea.label
+                AND ecm.primary_canonical_id = ea.primary_canonical_id
+            LEFT JOIN graph_nodes gn
+                ON gn.customer_id  = ea.customer_id
+                AND gn.label       = ea.label
+                AND gn.canonical_id = ea.primary_canonical_id
+            WHERE ea.customer_id = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM entity_aliases ea2
+                   WHERE ea2.customer_id        = ea.customer_id
+                     AND ea2.label              = ea.label
+                     AND ea2.alias_canonical_id = ea.primary_canonical_id
+              )
+            GROUP BY ea.label, ea.primary_canonical_id, gn.properties, ecm.display_name
+            ORDER BY MAX(ea.added_at) DESC
+            """,
+            customer_id,
+        )
+
+    clusters = []
+    for r in rows:
+        # asyncpg returns jsonb_agg output as a JSON string by default
+        # (no jsonb codec registered on this connection). Decode here so
+        # the pydantic model gets a real list of dicts.
+        raw_aliases = r["aliases"]
+        if isinstance(raw_aliases, str):
+            raw_aliases = json.loads(raw_aliases)
+        clusters.append(
+            ActiveCluster(
+                label=r["label"],
+                primary_canonical_id=r["primary_canonical_id"],
+                primary_title=r["primary_title"],
+                display_name=r["display_name"],
+                aliases=[
+                    ClusterAlias(
+                        alias_canonical_id=a["alias_canonical_id"],
+                        merge_id=uuid.UUID(a["merge_id"]),
+                        added_at=datetime.fromisoformat(a["added_at"])
+                        if isinstance(a["added_at"], str)
+                        else a["added_at"],
+                    )
+                    for a in (raw_aliases or [])
+                ],
+            )
+        )
+    return ListClustersResponse(clusters=clusters)
