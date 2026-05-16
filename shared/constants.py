@@ -225,6 +225,20 @@ class EdgeType(StrEnum):
     RELATES_TO = "RELATES_TO"
 
 
+class EdgeConfidence(StrEnum):
+    """Confidence tier on a graph edge — mirrors the string literals used
+    in `graph_edges.confidence` SQL CASEs and `_stronger_confidence`
+    (services/ingestion/graph_writer.py). StrEnum so members compare
+    equal to the bare string ("EXTRACTED" == EdgeConfidence.EXTRACTED),
+    keeping the existing string-based SQL + asyncpg parameter binding
+    paths working unchanged.
+    """
+
+    EXTRACTED = "EXTRACTED"  # explicit upstream signal (webhook, API field)
+    INFERRED = "INFERRED"    # LLM-derived from text
+    AMBIGUOUS = "AMBIGUOUS"  # LLM-derived with low certainty
+
+
 class PrincipalType(StrEnum):
     USER = "user"
     GROUP = "group"
