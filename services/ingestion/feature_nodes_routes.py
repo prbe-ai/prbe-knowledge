@@ -92,7 +92,10 @@ MAX_EVIDENCE_DOC_IDS = 100
 def _verify_internal_key(request: Request) -> None:
     """Constant-time check of X-Internal-Knowledge-Key. Matches the
     gate already on admin_routes.py + entity_clusters_routes.py."""
-    expected = get_settings().internal_knowledge_api_key or ""
+    # Settings field is SecretStr | None — unwrap before hmac.compare_digest
+    # (which requires both args be the same type, str or bytes).
+    expected_secret = get_settings().internal_knowledge_api_key
+    expected = expected_secret.get_secret_value() if expected_secret else ""
     provided = request.headers.get("X-Internal-Knowledge-Key", "")
     if not expected or not hmac.compare_digest(expected, provided):
         raise HTTPException(
