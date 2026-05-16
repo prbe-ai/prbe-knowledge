@@ -832,13 +832,26 @@ async def run_worker_forever() -> None:
     ingestion_mode = os.environ.get("INGESTION_MODE", "webhook").strip().lower()
     poll_scheduler: PollScheduler | None = None
     if ingestion_mode == "poll":
-        # Side-effect imports — each registers its BasePoller subclass
-        # against a SourceSystem via register_poller() at import time.
-        import services.ingestion.polling.github  # noqa: F401
-        import services.ingestion.polling.linear  # noqa: F401
-        import services.ingestion.polling.notion  # noqa: F401
-        import services.ingestion.polling.sentry  # noqa: F401
-        import services.ingestion.polling.slack  # noqa: F401
+        # Side-effect imports — each module's @register_poller decorator
+        # runs at import time, registering the per-source BasePoller
+        # subclass under its SourceSystem. The scheduler reads from that
+        # registry on the first tick. The names ARE used (by the
+        # registry), so ruff doesn't flag them as unused — no noqa.
+        import services.ingestion.polling.github
+        import services.ingestion.polling.linear
+        import services.ingestion.polling.notion
+        import services.ingestion.polling.sentry
+        import services.ingestion.polling.slack
+
+        # Reference the modules so ruff sees them as "used" — defensive,
+        # in case a future ruff version flags side-effect-only imports.
+        _ = (
+            services.ingestion.polling.github,
+            services.ingestion.polling.linear,
+            services.ingestion.polling.notion,
+            services.ingestion.polling.sentry,
+            services.ingestion.polling.slack,
+        )
 
         poll_scheduler = PollScheduler(sink=PollDocumentSink())
         log.info("worker.boot.polling_enabled", mode=ingestion_mode)
