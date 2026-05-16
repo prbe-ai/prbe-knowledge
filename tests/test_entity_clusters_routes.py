@@ -631,7 +631,7 @@ async def test_list_groups_multiple_merges_into_same_primary(
         "U07ABC123",
     }
     merge_ids = {a["merge_id"] for a in aliases}
-    assert merge_ids == {m1, m2}, f"each alias should carry its own merge_id"
+    assert merge_ids == {m1, m2}, "each alias should carry its own merge_id"
 
 
 @pytest.mark.asyncio
