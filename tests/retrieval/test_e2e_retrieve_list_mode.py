@@ -51,6 +51,9 @@ def _tool_use_resp(payload: dict) -> SimpleNamespace:
     ``shared.llm_tools.forced_tool_call`` after the Phase-0b migration:
     ``choices[0].message.tool_calls[0].function.{name, arguments}`` where
     ``arguments`` is a JSON string.
+
+    ``payload`` must already be the multi-intent envelope
+    ``{"intents": [{...}]}``. Use ``_intent(...)`` to build one intent.
     """
     func = SimpleNamespace(
         name="route_query",
@@ -60,6 +63,38 @@ def _tool_use_resp(payload: dict) -> SimpleNamespace:
     message = SimpleNamespace(content=None, tool_calls=[call])
     choice = SimpleNamespace(message=message, finish_reason="tool_calls")
     return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _intent(
+    *,
+    query_text: str = "query",
+    mode: str = "list",
+    entities: list | None = None,
+    expansions: list | None = None,
+    temporal: dict | None = None,
+    sort: dict | None = None,
+    doc_type: str | None = None,
+    operation: str | None = None,
+    group_by_key: str | None = None,
+    confidence: float = 0.9,
+) -> dict:
+    """Build a single-intent multi-intent envelope for _tool_use_resp."""
+    return {
+        "intents": [
+            {
+                "query_text": query_text,
+                "confidence": confidence,
+                "entities": entities or [],
+                "expansions": expansions or [],
+                "temporal": temporal,
+                "sort": sort,
+                "mode": mode,
+                "doc_type": doc_type,
+                "operation": operation,
+                "group_by_key": group_by_key,
+            }
+        ]
+    }
 
 
 async def _seed_customer(customer_id: str) -> str:
@@ -192,16 +227,13 @@ async def test_three_most_recent_commits_returns_only_commits_sorted(live_db) ->
     # no narrowing entity (github is a source-system mention, not a repo
     # canonical_id). With no entity, the list path skips the graph entity
     # filter and returns N most-recent commits.
-    haiku_payload = {
-        "entities": [],
-        "expansions": [],
-        "temporal": None,
-        "sort": {"field": "updated_at", "direction": "desc", "trigger_phrase": "most recent"},
-        "mode": "list",
-        "doc_type": "commit",
-        "operation": "list",
-        "group_by_key": None,
-    }
+    haiku_payload = _intent(
+        query_text="3 most recent github commits",
+        mode="list",
+        sort={"field": "updated_at", "direction": "desc", "trigger_phrase": "most recent"},
+        doc_type="commit",
+        operation="list",
+    )
 
     # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
     with patch(
@@ -249,8 +281,10 @@ async def test_haiku_misclassifies_topic_query_as_list_dispatcher_falls_back(
         updated_at=base,
     )
 
-    haiku_payload = {
-        "entities": [
+    haiku_payload = _intent(
+        query_text="most recent commits about auth",
+        mode="list",  # Haiku said list (incorrectly!) — gate must catch this
+        entities=[
             {
                 "entity_type": "feature",  # TOPIC — should force search
                 "canonical_id": "auth",
@@ -258,14 +292,10 @@ async def test_haiku_misclassifies_topic_query_as_list_dispatcher_falls_back(
                 "confidence": 0.85,
             }
         ],
-        "expansions": [],
-        "temporal": None,
-        "sort": {"field": "updated_at", "direction": "desc", "trigger_phrase": "most recent"},
-        "mode": "list",  # Haiku said list (incorrectly!) — gate must catch this
-        "doc_type": "commit",
-        "operation": "list",
-        "group_by_key": None,
-    }
+        sort={"field": "updated_at", "direction": "desc", "trigger_phrase": "most recent"},
+        doc_type="commit",
+        operation="list",
+    )
 
     # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
     with patch(
@@ -300,16 +330,10 @@ async def test_router_fallback_routes_to_search(live_db) -> None:
     )
 
     # Empty payload — like the router's RouterTimeout / RouterParseError fallback.
-    haiku_payload = {
-        "entities": [],
-        "expansions": [],
-        "temporal": None,
-        "sort": None,
-        "mode": "search",
-        "doc_type": None,
-        "operation": None,
-        "group_by_key": None,
-    }
+    haiku_payload = _intent(
+        query_text="what is the auth middleware",
+        mode="search",
+    )
     # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
     with patch(
         "shared.llm_tools.acompletion",
@@ -356,16 +380,13 @@ async def test_author_id_surfaces_on_list_chunks(live_db) -> None:
         author_id="unknown",
     )
 
-    haiku_payload = {
-        "entities": [],
-        "expansions": [],
-        "temporal": None,
-        "sort": {"field": "updated_at", "direction": "desc", "trigger_phrase": "most recent"},
-        "mode": "list",
-        "doc_type": "commit",
-        "operation": "list",
-        "group_by_key": None,
-    }
+    haiku_payload = _intent(
+        query_text="recent commits",
+        mode="list",
+        sort={"field": "updated_at", "direction": "desc", "trigger_phrase": "most recent"},
+        doc_type="commit",
+        operation="list",
+    )
     # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
     with patch(
         "shared.llm_tools.acompletion",
@@ -407,16 +428,10 @@ async def test_author_id_surfaces_on_search_chunks(live_db) -> None:
     )
 
     # Empty router payload → search mode (vector + BM25 + graph + fusion).
-    haiku_payload = {
-        "entities": [],
-        "expansions": [],
-        "temporal": None,
-        "sort": None,
-        "mode": "search",
-        "doc_type": None,
-        "operation": None,
-        "group_by_key": None,
-    }
+    haiku_payload = _intent(
+        query_text="auth fix",
+        mode="search",
+    )
     # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
     with patch(
         "shared.llm_tools.acompletion",
@@ -453,16 +468,13 @@ async def test_count_query_returns_aggregation(live_db) -> None:
             updated_at=base - timedelta(minutes=i),
         )
 
-    haiku_payload = {
-        "entities": [],
-        "expansions": [],
-        "temporal": None,
-        "sort": {"field": "updated_at", "direction": "desc", "trigger_phrase": "this week"},
-        "mode": "list",
-        "doc_type": "commit",
-        "operation": "count",
-        "group_by_key": None,
-    }
+    haiku_payload = _intent(
+        query_text="how many commits this week",
+        mode="list",
+        sort={"field": "updated_at", "direction": "desc", "trigger_phrase": "this week"},
+        doc_type="commit",
+        operation="count",
+    )
     # Phase-0b: router goes through shared.llm; mock at the helper's boundary.
     with patch(
         "shared.llm_tools.acompletion",

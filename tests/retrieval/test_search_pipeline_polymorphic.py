@@ -22,7 +22,7 @@ import pytest
 
 from services.retrieval.retrievers.bm25 import BM25Hit
 from services.retrieval.retrievers.inferred_edges import INFERRED_EDGES_EXTRACTOR_ID
-from services.retrieval.router import RouterEntity, RouterOutput
+from services.retrieval.router import Intent, RouterEntity
 from services.retrieval.search_pipeline import run_search
 from shared.config import Settings, get_settings
 from shared.constants import EdgeType, NodeLabel
@@ -257,7 +257,8 @@ async def test_response_carries_polymorphic_results_with_matched_via(
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=RouterOutput(),
+            intent=Intent(query_text="x", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -274,6 +275,7 @@ async def test_response_carries_polymorphic_results_with_matched_via(
     assert first.matched_via, "every primary doc must have at least one channel"
     channels = {p.channel for p in first.matched_via}
     assert "bm25" in channels
+    assert all(p.intent_idx == 0 for p in first.matched_via)
 
 
 async def test_inferred_edge_documents_surface_with_why(live_db) -> None:
@@ -298,7 +300,8 @@ async def test_inferred_edge_documents_surface_with_why(live_db) -> None:
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=RouterOutput(),
+            intent=Intent(query_text="x", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -322,6 +325,7 @@ async def test_inferred_edge_documents_surface_with_why(live_db) -> None:
     assert prov.edge_type == EdgeType.DISCUSSES.value
     assert prov.confidence == "INFERRED"
     assert prov.why == "Both docs cover the auth refactor decision."
+    assert prov.intent_idx == 0
     # Inferred-edge timing key was recorded.
     # (timing was passed as a fresh dict; we don't assert keys here -- the
     # retriever-error path is covered separately. The fact that the doc
@@ -351,7 +355,10 @@ async def test_routed_entity_surfaces_as_entity_result_alongside_docs(
         canonical_id="prbe-backend",
     )
 
-    routed = RouterOutput(
+    intent = Intent(
+        query_text="prbe-backend",
+        mode="search",
+        confidence=0.9,
         entities=[
             RouterEntity(
                 entity_type="service",
@@ -369,7 +376,8 @@ async def test_routed_entity_surfaces_as_entity_result_alongside_docs(
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=routed,
+            intent=intent,
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -407,7 +415,8 @@ async def test_results_sorted_by_score_with_rank_assigned(live_db) -> None:
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=RouterOutput(),
+            intent=Intent(query_text="x", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -441,7 +450,8 @@ async def test_chunk_carries_rank_in_doc_not_doc_level_fields(
         resp = await run_search(
             req=req,
             customer_id=cust,
-            routed=RouterOutput(),
+            intent=Intent(query_text="x", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(),
             temporal_meta={},
             sort_meta=None,
@@ -489,7 +499,9 @@ async def test_inferred_edge_results_hydrate_chunks(live_db) -> None:
         patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]
     ):
         resp = await run_search(
-            req=req, customer_id=cust, routed=RouterOutput(),
+            req=req, customer_id=cust,
+            intent=Intent(query_text="x", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(), temporal_meta={}, sort_meta=None,
             extracted_entities=[], doc_types=None, trace_id="t-hydrate",
             timing={},
@@ -563,7 +575,9 @@ async def test_fanout_penalty_crushes_hub_doc_below_primary(live_db) -> None:
         patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]
     ):
         resp = await run_search(
-            req=req, customer_id=cust, routed=RouterOutput(),
+            req=req, customer_id=cust,
+            intent=Intent(query_text="x", mode="search", confidence=0.9),
+            intent_idx=0,
             spec=TemporalSpec(), temporal_meta={}, sort_meta=None,
             extracted_entities=[], doc_types=None, trace_id="t-fanout",
             timing={},

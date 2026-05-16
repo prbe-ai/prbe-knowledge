@@ -856,7 +856,14 @@ CREATE TABLE query_traces (
     request             JSONB NOT NULL,
     response            JSONB NOT NULL,
     response_size_bytes INT NOT NULL,
-    response_truncated  BOOLEAN NOT NULL DEFAULT FALSE
+    response_truncated  BOOLEAN NOT NULL DEFAULT FALSE,
+    grounding_bundle    JSONB,
+    router_raw          JSONB,
+    intents_count       INT,
+    intent_dispatch     JSONB,
+    cache_tokens        JSONB,
+    router_model        TEXT,
+    failure_recovered   BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX idx_query_traces_customer_time

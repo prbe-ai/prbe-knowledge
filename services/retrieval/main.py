@@ -179,7 +179,7 @@ async def retrieve(
     request.state.usage_summary = req.query
     request.state.usage_request_payload = req
     t_total = time.perf_counter()
-    resp = await run_retrieval(req, customer_id)
+    resp = await run_retrieval(req, customer_id, request=request)
     request.state.result_count = len(resp.results)
     request.state.usage_response_payload = resp
     total_ms = (time.perf_counter() - t_total) * 1000
@@ -212,7 +212,7 @@ async def query(
     request.state.usage_request_payload = req
     t_total = time.perf_counter()
     base_req = QueryRequest(**req.model_dump(exclude={"model", "max_tokens"}))
-    rresp = await run_retrieval(base_req, customer_id)
+    rresp = await run_retrieval(base_req, customer_id, request=request)
     request.state.result_count = len(rresp.results)
 
     model = req.model or DEFAULT_SYNTHESIS_MODEL
@@ -309,21 +309,45 @@ async def query_stream(
     async def _gen() -> AsyncIterator[bytes]:
         try:
             yield _sse("step", {"step": "refining"})
-            phase = await run_router_phase(base_req, customer_id)
+            phase = await run_router_phase(base_req, customer_id, request=request)
+            # Build union of entities across all intents. Each entity gets an
+            # `intent_idx` so consumers can attribute it to its source intent.
+            all_entities: list[dict] = []
+            for idx, ri in enumerate(phase.resolved_intents):
+                for e in ri.extracted_entities:
+                    all_entities.append({**e, "intent_idx": idx})
+
+            per_intent_meta = [
+                {
+                    "intent_idx": idx,
+                    "mode": ri.dispatch_mode,
+                    "doc_types": ri.doc_types,
+                    "applied_temporal": ri.temporal_meta,
+                    "applied_sort": ri.sort_meta,
+                }
+                for idx, ri in enumerate(phase.resolved_intents)
+            ]
+
+            # Back-compat keys from first intent (kept at top level for
+            # consumers that depended on the old single-intent shape).
+            _first = phase.resolved_intents[0] if phase.resolved_intents else None
             yield _sse(
                 "entities",
                 {
-                    "extracted_entities": phase.extracted_entities,
-                    "applied_temporal": phase.temporal_meta,
-                    "applied_sort": phase.sort_meta,
-                    "applied_doc_types": phase.doc_types,
-                    "applied_mode": phase.dispatch_mode,
+                    "extracted_entities": all_entities,
+                    "intents_count": len(phase.resolved_intents),
+                    "per_intent": per_intent_meta,
                     "trace_id": phase.trace_id,
+                    # Back-compat: first-intent values at top level.
+                    "applied_temporal": _first.temporal_meta if _first else None,
+                    "applied_sort": _first.sort_meta if _first else None,
+                    "applied_doc_types": _first.doc_types if _first else None,
+                    "applied_mode": _first.dispatch_mode if _first else "search",
                 },
             )
 
             yield _sse("step", {"step": "searching"})
-            rresp = await run_search_phase(base_req, customer_id, phase)
+            rresp = await run_search_phase(base_req, customer_id, phase, request=request)
             request.state.result_count = len(rresp.results)
             yield _sse(
                 "results",

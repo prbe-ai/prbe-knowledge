@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 import pytest
 
 from services.retrieval.list_pipeline import run_list
-from services.retrieval.router import RouterEntity, RouterOutput
+from services.retrieval.router import Intent, RouterEntity
 from shared.config import Settings, get_settings
 from shared.db import raw_conn
 from shared.embeddings import reset_embedder
@@ -115,11 +115,13 @@ async def _seed_cluster(customer_id: str) -> None:
         )
 
 
-def _routed_with_person(canonical_id: str) -> RouterOutput:
-    """Build a minimal RouterOutput with one Person entity."""
-    return RouterOutput(
-        operation="list",
+def _intent_with_person(canonical_id: str) -> Intent:
+    """Build a minimal Intent with one Person entity (list mode)."""
+    return Intent(
+        query_text="author filter test",
         mode="list",
+        confidence=0.9,
+        operation="list",
         entities=[
             RouterEntity(
                 entity_type="person",
@@ -142,12 +144,12 @@ async def test_alias_author_expands_to_cluster(live_db):
 
     req = QueryRequest(query="anything", top_k=10, entity_must_match=True)
     spec = TemporalSpec()
-    routed = _routed_with_person(ALIAS)
+    intent = _intent_with_person(ALIAS)
 
     response = await run_list(
         req=req,
         customer_id=CUSTOMER_ID,
-        routed=routed,
+        intent=intent,
         spec=spec,
         temporal_meta={},
         sort_meta=None,
@@ -169,12 +171,12 @@ async def test_unmerged_author_passes_through(live_db):
 
     req = QueryRequest(query="anything", top_k=10, entity_must_match=True)
     spec = TemporalSpec()
-    routed = _routed_with_person("loner-id")
+    intent = _intent_with_person("loner-id")
 
     response = await run_list(
         req=req,
         customer_id=CUSTOMER_ID,
-        routed=routed,
+        intent=intent,
         spec=spec,
         temporal_meta={},
         sort_meta=None,

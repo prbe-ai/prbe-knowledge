@@ -65,7 +65,7 @@ def _stub_pipeline(monkeypatch, *, chunk_count: int = 3) -> None:
     from shared.constants import SourceSystem
     from shared.models import QueryChunk, QueryDocumentResult, QueryResponse
 
-    async def fake_run_retrieval(req, customer_id):
+    async def fake_run_retrieval(req, customer_id, request=None):
         now = datetime.now(UTC)
         docs = [
             QueryDocumentResult(
@@ -182,7 +182,7 @@ async def test_middleware_writes_row_on_successful_retrieve(live_db, settings, m
 async def test_middleware_records_error_when_handler_raises(live_db, settings, monkeypatch) -> None:
     api_key = await _seed_customer("cust-mw-err")
 
-    async def boom(req, customer_id):
+    async def boom(req, customer_id, request=None):
         raise RuntimeError("pipeline kaboom")
 
     import services.retrieval.main as main_mod

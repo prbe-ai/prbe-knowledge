@@ -27,7 +27,7 @@ from services.retrieval.retrievers.related_entities import (
     walk_result_doc_neighbors,
 )
 from services.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
-from services.retrieval.router import RouterOutput
+from services.retrieval.router import Intent
 from shared.constants import NodeLabel, SourceSystem
 from shared.db import with_tenant
 from shared.logging import get_logger
@@ -45,11 +45,11 @@ from shared.models import (
 log = get_logger(__name__)
 
 
-def _pick_sort(routed: RouterOutput) -> tuple[str, str]:
+def _pick_sort(intent: Intent) -> tuple[str, str]:
     """Default to (updated_at, desc). Honor router-extracted sort when present."""
-    if routed.sort:
-        field = routed.sort.get("field") or "updated_at"
-        direction = routed.sort.get("direction") or "desc"
+    if intent.sort:
+        field = intent.sort.get("field") or "updated_at"
+        direction = intent.sort.get("direction") or "desc"
         if field not in ("created_at", "updated_at"):
             field = "updated_at"
         if direction not in ("asc", "desc"):
@@ -58,13 +58,13 @@ def _pick_sort(routed: RouterOutput) -> tuple[str, str]:
     return "updated_at", "desc"
 
 
-def _author_ids_from_entities(routed: RouterOutput) -> list[str] | None:
+def _author_ids_from_entities(intent: Intent) -> list[str] | None:
     """Pull person canonical_ids out of the extracted entities for the
     SQL `author_id = ANY(...)` filter. Confidence threshold matches what
     apply_entity_filter uses by default — entities below 0.7 are noise."""
     ids = [
         e.canonical_id
-        for e in routed.entities
+        for e in intent.entities
         if e.entity_type == "person" and e.confidence >= 0.7 and e.canonical_id
     ]
     return ids or None
@@ -85,8 +85,8 @@ _NARROWING_TO_LABEL: dict[str, str] = {
 }
 
 
-def _graph_entity_filters_from_routed(
-    routed: RouterOutput, min_confidence: float = 0.7
+def _graph_entity_filters_from_intent(
+    intent: Intent, min_confidence: float = 0.7
 ) -> list:
     """Build GraphEntityFilters from narrowing entities in the router's
     output. Each entity becomes one filter (label, [canonical_id,
@@ -100,7 +100,7 @@ def _graph_entity_filters_from_routed(
     from services.retrieval.retrievers.sql import GraphEntityFilter
 
     filters: list[GraphEntityFilter] = []
-    for e in routed.entities:
+    for e in intent.entities:
         label = _NARROWING_TO_LABEL.get(e.entity_type)
         if label is None:
             continue
@@ -128,7 +128,7 @@ def _graph_entity_filters_from_routed(
 async def run_list(
     req: QueryRequest,
     customer_id: str,
-    routed: RouterOutput,
+    intent: Intent,
     spec: TemporalSpec,
     temporal_meta: dict[str, object],
     sort_meta: dict[str, object] | None,
@@ -136,6 +136,7 @@ async def run_list(
     doc_types: list[str] | None,
     trace_id: str,
     timing: dict[str, float],
+    intent_idx: int = 0,
 ) -> QueryResponse:
     sources = [s.value for s in req.sources] if req.sources else None
     # Entity-based hard filters (author_id from `person` entities,
@@ -147,8 +148,8 @@ async def run_list(
     # when the router extracts an entity that doesn't have a matching
     # graph_nodes row or documents.author_id.
     if req.entity_must_match:
-        author_ids = _author_ids_from_entities(routed)
-        graph_entity_filters = _graph_entity_filters_from_routed(routed)
+        author_ids = _author_ids_from_entities(intent)
+        graph_entity_filters = _graph_entity_filters_from_intent(intent)
         # Phase 2: expand each author_id to its full Person cluster
         # (primary + aliases) so post-merge entities still match docs
         # written under their pre-merge author_id. `documents.author_id`
@@ -170,7 +171,7 @@ async def run_list(
     else:
         author_ids = None
         graph_entity_filters = []
-    operation = (routed.operation or "list").lower()
+    operation = (intent.operation or "list").lower()
     if operation not in ("list", "count", "group_by"):
         operation = "list"
 
@@ -193,7 +194,7 @@ async def run_list(
         total_candidates = n
 
     elif operation == "group_by":
-        key = (routed.group_by_key or "source_system").lower()
+        key = (intent.group_by_key or "source_system").lower()
         if key not in ("source_system", "doc_type", "author_id"):
             key = "source_system"
         groups = await sql_group_by(
@@ -210,7 +211,7 @@ async def run_list(
         total_candidates = len(groups)
 
     else:  # operation == "list"
-        sort_field, sort_dir = _pick_sort(routed)
+        sort_field, sort_dir = _pick_sort(intent)
         hits = await sql_list(
             customer_id,
             top_k=req.top_k,
@@ -249,6 +250,7 @@ async def run_list(
                         channel="bm25",  # SQL list path is closest to BM25
                         rank=i + 1,
                         score=h.score,
+                        intent_idx=intent_idx,
                     )
                 ],
                 chunk_count=1,
@@ -280,14 +282,14 @@ async def run_list(
         # Fuzzy exclusion (codex-P2): see search_pipeline.run_search for
         # rationale. Threshold + normalized variants.
         exclude_keys = build_exclude_node_keys(
-            routed.entities,
+            intent.entities,
             entity_match_threshold=req.entity_match_threshold,
         )
         # Phase 2: translate alias canonical_ids to primaries so the walker
         # doesn't recommend the cluster the user just typed.
         exclude_keys = await expand_exclude_keys_with_aliases(
             customer_id,
-            routed.entities,
+            intent.entities,
             exclude_keys,
             entity_match_threshold=req.entity_match_threshold,
         )

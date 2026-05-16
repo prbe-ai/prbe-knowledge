@@ -63,7 +63,7 @@ from services.retrieval.retrievers.related_entities import (
     walk_result_doc_neighbors,
 )
 from services.retrieval.retrievers.vector import vector_search
-from services.retrieval.router import RouterEntity, RouterOutput
+from services.retrieval.router import Intent, RouterEntity
 from services.retrieval.temporal import build_predicate
 from shared.constants import (
     INFERRED_EDGE_DAMPENING,
@@ -333,6 +333,7 @@ def _build_document_results_from_fused(
     ranked_lists: dict[str, list[Any]],
     graph_hits: list[GraphHit],
     directed_hits: list[Any] | None = None,
+    intent_idx: int = 0,
 ) -> list[QueryDocumentResult]:
     """Convert each FusedDocument to a QueryDocumentResult.
 
@@ -387,7 +388,7 @@ def _build_document_results_from_fused(
                 continue
             rank, score = entry
             provenances.append(
-                MatchProvenance(channel=channel, rank=rank, score=score)
+                MatchProvenance(channel=channel, rank=rank, score=score, intent_idx=intent_idx)
             )
 
         results.append(
@@ -497,6 +498,7 @@ async def _build_inferred_edge_results(
     document_results: list[QueryDocumentResult],
     requesting_user_id: str | None,
     timing: dict[str, float],
+    intent_idx: int = 0,
 ) -> list[QueryDocumentResult]:
     """Walk inferred Doc-Doc edges from the primary docs and wrap the hits
     as QueryDocumentResults with the inferred-edge channel populated.
@@ -568,6 +570,7 @@ async def _build_inferred_edge_results(
             channel="inferred_edge",
             rank=h.anchor_rank,
             score=final_score,
+            intent_idx=intent_idx,
             anchor_doc_id=h.anchor_doc_id,
             edge_type=h.edge_type,
             confidence=h.confidence,
@@ -612,6 +615,7 @@ async def _build_entity_results(
     customer_id: str,
     routed_entities: list[RouterEntity],
     timing: dict[str, float],
+    intent_idx: int = 0,
 ) -> list[QueryEntityResult]:
     """Look up routed entities in graph_nodes and build QueryEntityResults.
 
@@ -825,7 +829,7 @@ async def _build_entity_results(
                 score=score,
                 rank=0,  # filled in by the caller after final sort
                 matched_via=[
-                    MatchProvenance(channel="graph", rank=1, score=confidence)
+                    MatchProvenance(channel="graph", rank=1, score=confidence, intent_idx=intent_idx)
                 ],
             )
         )
@@ -849,7 +853,7 @@ def _final_rank(results: list[QueryResult]) -> list[QueryResult]:
 async def run_search(
     req: QueryRequest,
     customer_id: str,
-    routed: RouterOutput,
+    intent: Intent,
     spec: TemporalSpec,
     temporal_meta: dict[str, object],
     sort_meta: dict[str, object] | None,
@@ -857,13 +861,14 @@ async def run_search(
     doc_types: list[str] | None,
     trace_id: str,
     timing: dict[str, float],
+    intent_idx: int = 0,
 ) -> QueryResponse:
     """Run the existing semantic pipeline. Caller has already authenticated,
     resolved customer_id, and called the router."""
     sources = [s.value for s in req.sources] if req.sources else None
     pool_multiplier = 2  # No widening even when sort intent fires; recency
     # boost handles "give me recent X about Y" without needing to widen.
-    queries = [req.query, *routed.expansions]
+    queries = [req.query, *intent.expansions]
 
     # On the search path, doc_type is a SOFT signal. We pass None to the
     # retrievers (preserving recall) — the entity filter or RRF boost
@@ -895,7 +900,7 @@ async def run_search(
         # unrelated chunks through the heap recheck + ts_rank_cd).
         identifier_canonical_ids = [
             e.canonical_id
-            for e in routed.entities
+            for e in intent.entities
             if is_lookup_candidate(e.canonical_id)
         ]
         bm25_queries: list[str]
@@ -935,11 +940,11 @@ async def run_search(
         return sorted(hits_by_chunk.values(), key=lambda h: h.score, reverse=True)
 
     async def _graph_runner() -> list:
-        if not routed.entities:
+        if not intent.entities:
             return []
         return await graph_search(
             customer_id,
-            [(e.entity_type, e.canonical_id) for e in routed.entities],
+            [(e.entity_type, e.canonical_id) for e in intent.entities],
             doc_types=retriever_doc_types,
             temporal=spec,
             min_confidence=req.min_confidence,
@@ -950,7 +955,7 @@ async def run_search(
         # identifier (UUID, ticket code, PR ref). Vector and BM25 both miss
         # exact-id queries — see retrievers/id_lookup.py for the rationale.
         ids = [
-            e.canonical_id for e in routed.entities if is_lookup_candidate(e.canonical_id)
+            e.canonical_id for e in intent.entities if is_lookup_candidate(e.canonical_id)
         ]
         if not ids:
             return []
@@ -1023,7 +1028,7 @@ async def run_search(
     # backfilled content from surfacing at parity with fresh docs.
     if req.recency_half_life_days is not None:
         effective_half_life: float | None = req.recency_half_life_days
-    elif routed.sort:
+    elif intent.sort:
         # No caller default and Haiku saw sort intent — bias toward recent.
         effective_half_life = _SORT_INTENT_MIN_HALF_LIFE_DAYS
     else:
@@ -1055,7 +1060,7 @@ async def run_search(
     if req.entity_must_match:
         pre_count = len(fused)
         fused, applied_entity_filter = apply_entity_filter(
-            fused, routed.entities, threshold=req.entity_match_threshold
+            fused, intent.entities, threshold=req.entity_match_threshold
         )
         applied_entity_filter["candidates_before"] = pre_count
         applied_entity_filter["candidates_after"] = len(fused)
@@ -1087,7 +1092,7 @@ async def run_search(
     # (feat/doc-grouped-retrieval) enriches the chunk-list aggregation;
     # for now we group chunks already present in the fused output.
     document_results = _build_document_results_from_fused(
-        top, ranked_lists, graph_hits, directed_hits=directed_hits
+        top, ranked_lists, graph_hits, directed_hits=directed_hits, intent_idx=intent_idx
     )
 
     # Primary docs feed the inferred-edge channel anchors. document_results
@@ -1096,7 +1101,7 @@ async def run_search(
 
     # Post-fusion enrichment trio runs in parallel: inferred-edge walk,
     # entity result hydration, and the related_entities crawl are all
-    # independent (each only reads primary_documents / routed.entities /
+    # independent (each only reads primary_documents / intent.entities /
     # `top`), so sequential awaits cost ~1.7s of wall-time we don't need.
     # Total enrichment block now collapses to wall-time of the slowest leg.
     async def _related_runner() -> tuple[list[RelatedEntity] | None, str | None]:
@@ -1108,14 +1113,14 @@ async def run_search(
         if req.top_k_related <= 0:
             return None, None
         exclude_keys = build_exclude_node_keys(
-            routed.entities,
+            intent.entities,
             entity_match_threshold=req.entity_match_threshold,
         )
         # Phase 2: translate alias canonical_ids to primaries so the walker
         # doesn't recommend the cluster the user just typed.
         exclude_keys = await expand_exclude_keys_with_aliases(
             customer_id,
-            routed.entities,
+            intent.entities,
             exclude_keys,
             entity_match_threshold=req.entity_match_threshold,
         )
@@ -1147,7 +1152,7 @@ async def run_search(
         # already-computed inferred docs and the related-entities walk).
         try:
             return await _build_entity_results(
-                customer_id, list(routed.entities), timing
+                customer_id, list(intent.entities), timing, intent_idx=intent_idx
             )
         except Exception as exc:
             log.warning("entity_results failed", exc_info=exc, trace_id=trace_id)
@@ -1158,7 +1163,7 @@ async def run_search(
         # Inferred-edge channel: walk Doc-Doc INFERRED edges from the top
         # primary docs. Returns Documents not already in primary_documents.
         _build_inferred_edge_results(
-            customer_id, primary_documents, req.requesting_user_id, timing
+            customer_id, primary_documents, req.requesting_user_id, timing, intent_idx=intent_idx
         ),
         # Entity results: surface routed entities as primary results so the
         # consumer can see "the user asked about Service:foo" alongside the
