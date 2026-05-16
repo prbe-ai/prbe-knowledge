@@ -97,8 +97,13 @@ def _request_body(
         "canonical_id": canonical_id,
         "title": title,
         "why": why,
-        "source_pr_url": source_pr_url
-        or f"https://github.com/{repo_full_name}/pull/{pr_number}",
+        # `is None` not `or` — must let empty-string + other falsy
+        # invalid URLs through verbatim so the parser tests exercise them.
+        "source_pr_url": (
+            f"https://github.com/{repo_full_name}/pull/{pr_number}"
+            if source_pr_url is None
+            else source_pr_url
+        ),
         "merged_at": merged_at,
         "merge_sha": merge_sha,
         "evidence_doc_ids": evidence_doc_ids or [],
@@ -373,22 +378,28 @@ async def test_evidence_cross_tenant_canonical_id_is_not_stubbed(
     # OWNS + TOUCHES + 0 DOCUMENTS (cross-tenant canonical_id silently dropped) = 2.
     assert resp.json()["edges_created"] == 2
 
-    # Under CUSTOMER_ID's GUC: foreign canonical_id MUST NOT exist.
-    async with with_tenant(CUSTOMER_ID) as conn:
+    # No row exists UNDER CUSTOMER_ID with the foreign canonical_id.
+    # (Scoped by customer_id explicitly — the test DB role bypasses RLS
+    # USING, so the seeded row under 'other-tenant' is otherwise visible
+    # to a bare SELECT under the CUSTOMER_ID GUC. The route's own
+    # `WHERE customer_id = $1` filter is what makes lookup-only safe
+    # in this environment.)
+    async with raw_conn() as conn:
         leaked = await conn.fetchval(
             "SELECT COUNT(*) FROM graph_nodes "
-            "WHERE label = 'Document' AND canonical_id = $1",
-            foreign_doc,
+            "WHERE customer_id = $1 AND label = 'Document' "
+            "  AND canonical_id = $2",
+            CUSTOMER_ID, foreign_doc,
         )
         assert leaked == 0, (
             "cross-tenant leak: foreign canonical_id was stubbed under THIS tenant"
         )
-    # Under other-tenant's GUC: the originally-seeded row is still there.
-    async with with_tenant("other-tenant") as conn:
+        # Original seeded row is still there under other-tenant.
         kept = await conn.fetchval(
             "SELECT COUNT(*) FROM graph_nodes "
-            "WHERE label = 'Document' AND canonical_id = $1",
-            foreign_doc,
+            "WHERE customer_id = $1 AND label = 'Document' "
+            "  AND canonical_id = $2",
+            "other-tenant", foreign_doc,
         )
         assert kept == 1
 
@@ -670,10 +681,13 @@ async def test_race_winner_reuses_existing_node(client: httpx.AsyncClient) -> No
 
 
 @pytest.mark.asyncio
-async def test_cross_tenant_isolation_rls(client: httpx.AsyncClient) -> None:
-    """A call as customer A must not bleed any rows into customer B's view.
-    Verify by setting B's GUC and querying — only B's rows (zero, here) should
-    be visible.
+async def test_cross_tenant_customer_id_pinned(client: httpx.AsyncClient) -> None:
+    """A call as customer A must only INSERT rows with customer_id=A. We can't
+    directly test the RLS USING clause here (the test DB role is superuser
+    locally — see `test_rls_cross_tenant_denial.py` for the dedicated RLS
+    coverage), but we CAN verify the route's writes are correctly scoped to
+    the X-Prbe-Customer header. All graph_nodes / graph_edges rows for B
+    must remain zero after a call posted as A.
     """
     cust_a = "cust-a-feat"
     cust_b = "cust-b-feat"
@@ -688,11 +702,16 @@ async def test_cross_tenant_isolation_rls(client: httpx.AsyncClient) -> None:
     )
     assert resp.status_code == 200, resp.text
 
-    # Under A's GUC: rows visible.
-    async with with_tenant(cust_a) as conn:
-        a_count = await conn.fetchval("SELECT COUNT(*) FROM graph_nodes")
-        assert a_count > 0
-    # Under B's GUC: zero rows.
-    async with with_tenant(cust_b) as conn:
-        b_count = await conn.fetchval("SELECT COUNT(*) FROM graph_nodes")
-        assert b_count == 0
+    async with raw_conn() as conn:
+        a_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM graph_nodes WHERE customer_id = $1", cust_a
+        )
+        assert a_count > 0, "expected A's nodes to land"
+        b_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM graph_nodes WHERE customer_id = $1", cust_b
+        )
+        assert b_count == 0, "no rows should have landed under B"
+        b_edges = await conn.fetchval(
+            "SELECT COUNT(*) FROM graph_edges WHERE customer_id = $1", cust_b
+        )
+        assert b_edges == 0, "no edges should have landed under B"
