@@ -16,6 +16,8 @@ import asyncpg
 
 from services.ingestion.handlers.base import ConnectorContext, make_default_context
 from services.ingestion.normalizer import Normalizer
+from services.ingestion.polling.scheduler import PollScheduler
+from services.ingestion.polling.sink import PollDocumentSink
 from shared.constants import (
     GRANOLA_REFRESH_CHANNEL,
     QUEUE_HEARTBEAT_INTERVAL_SECONDS,
@@ -816,7 +818,48 @@ async def run_worker_forever() -> None:
     configure_logging(settings.log_level)
     await init_pool(settings)
     # Import handlers package so @register_connector decorators run.
-    import services.ingestion.handlers  # noqa: F401
+    # Side-effect import — handlers' @register_connector decorators run on
+    # import. The module name is used by the registry, so ruff doesn't flag
+    # it as unused.
+    import services.ingestion.handlers
+
+    _ = services.ingestion.handlers  # defensive against future ruff strictness
+
+    # INGESTION_MODE=poll is set by the self-host chart only — public
+    # webhook URLs aren't reachable from inside a customer's cluster, so
+    # ingestion has to be outbound-poll. When set, import the per-source
+    # poller modules so their module-level register_poller() calls run
+    # before PollScheduler.run_forever() scans the registry; instantiate
+    # the real document sink that pipes polled docs through the same
+    # R2 + ingestion_queue path the inbound-webhook handlers use.
+    # Managed-shared leaves this unset and keeps the existing webhook
+    # ingestion path untouched.
+    ingestion_mode = os.environ.get("INGESTION_MODE", "webhook").strip().lower()
+    poll_scheduler: PollScheduler | None = None
+    if ingestion_mode == "poll":
+        # Side-effect imports — each module's @register_poller decorator
+        # runs at import time, registering the per-source BasePoller
+        # subclass under its SourceSystem. The scheduler reads from that
+        # registry on the first tick. The names ARE used (by the
+        # registry), so ruff doesn't flag them as unused — no noqa.
+        import services.ingestion.polling.github
+        import services.ingestion.polling.linear
+        import services.ingestion.polling.notion
+        import services.ingestion.polling.sentry
+        import services.ingestion.polling.slack
+
+        # Reference the modules so ruff sees them as "used" — defensive,
+        # in case a future ruff version flags side-effect-only imports.
+        _ = (
+            services.ingestion.polling.github,
+            services.ingestion.polling.linear,
+            services.ingestion.polling.notion,
+            services.ingestion.polling.sentry,
+            services.ingestion.polling.slack,
+        )
+
+        poll_scheduler = PollScheduler(sink=PollDocumentSink())
+        log.info("worker.boot.polling_enabled", mode=ingestion_mode)
 
     ctx = make_default_context()
     # Shared wake event: NotifyListener sets it on pg_notify, BackfillWorker
@@ -885,6 +928,8 @@ async def run_worker_forever() -> None:
         backfill_worker.shutdown()
         granola_listener.shutdown()
         reclaim_loop.shutdown()
+        if poll_scheduler is not None:
+            poll_scheduler.stop()
         health_server.should_exit = True
         if gather_future is not None and not gather_future.done():
             gather_future.cancel()
@@ -896,14 +941,21 @@ async def run_worker_forever() -> None:
             # (KeyboardInterrupt for SIGINT, terminate for SIGTERM) applies.
             loop.add_signal_handler(getattr(signal, signame), handle_signal, signame)
 
+    coroutines = [
+        ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
+        backfill_worker.run(),
+        granola_listener.run(),
+        reclaim_loop.run(),
+        health_server.serve(),
+    ]
+    if poll_scheduler is not None:
+        # Polling scheduler runs alongside the existing drains. Its sink
+        # writes into the same ingestion_queue the webhook handlers do, so
+        # the ingestion drain above picks the rows up unchanged.
+        coroutines.append(poll_scheduler.run_forever())
+
     try:
-        gather_future = asyncio.gather(
-            ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
-            backfill_worker.run(),
-            granola_listener.run(),
-            reclaim_loop.run(),
-            health_server.serve(),
-        )
+        gather_future = asyncio.gather(*coroutines)
         try:
             await gather_future
         except asyncio.CancelledError:

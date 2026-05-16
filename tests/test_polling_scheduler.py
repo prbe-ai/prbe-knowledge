@@ -286,10 +286,10 @@ async def test_tick_one_runs_registered_poller_and_advances_cursor(
             datetime.now(UTC) - timedelta(hours=1),
         )
 
-    documents_seen: list[tuple[str, list]] = []
+    documents_seen: list[tuple[str, SourceSystem, list]] = []
 
-    async def _sink(cust_id: str, docs: list) -> None:
-        documents_seen.append((cust_id, docs))
+    async def _sink(cust_id: str, src: SourceSystem, docs: list) -> None:
+        documents_seen.append((cust_id, src, docs))
 
     scheduler = PollScheduler(
         tick_interval_seconds=1, min_resource_age_seconds=60, sink=_sink
@@ -298,7 +298,7 @@ async def test_tick_one_runs_registered_poller_and_advances_cursor(
 
     assert processed == 1
     assert _StubPoller._calls == [(_TENANT, "C123", "ts:5000")]
-    assert documents_seen == [(_TENANT, [{"id": "doc1"}])]
+    assert documents_seen == [(_TENANT, SourceSystem.WIKI, [{"id": "doc1"}])]
 
     loaded = await load_cursor(
         customer_id=_TENANT, source=SourceSystem.WIKI, resource_id="C123"

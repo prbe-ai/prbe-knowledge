@@ -42,26 +42,34 @@ from services.ingestion.polling.cursors import (
     list_due_cursors,
     stamp_error,
 )
+from shared.constants import SourceSystem
 
 logger = logging.getLogger(__name__)
 
 
 # Callback shape for "do something with the documents the poller
-# emitted". Wired by the worker (PR C) — for now the scheduler accepts
-# any async callable so tests can inject a recorder.
+# emitted". The scheduler passes both ``customer_id`` and ``source`` so
+# the sink can dispatch into the right ingestion-queue row (the queue's
+# uniqueness key includes ``source_system``). The production sink lives
+# at :class:`services.ingestion.polling.sink.PollDocumentSink`; tests
+# inject a recorder.
 DocumentSink = Callable[
-    [str, list[dict[str, Any]]], Coroutine[Any, Any, None]
+    [str, SourceSystem, list[dict[str, Any]]], Coroutine[Any, Any, None]
 ]
 
 
-async def _default_sink(customer_id: str, documents: list[dict[str, Any]]) -> None:
-    """No-op sink. PR E1+ replaces this with a real ingestion-queue
-    write (or a direct insert into the normalizer's input)."""
+async def _default_sink(
+    customer_id: str, source: SourceSystem, documents: list[dict[str, Any]]
+) -> None:
+    """No-op sink used when no production sink is wired (early-stage
+    tests, environments where INGESTION_MODE!=poll, or anywhere a real
+    queue is undesirable). The real sink is
+    :class:`services.ingestion.polling.sink.PollDocumentSink`."""
     if documents:
         logger.info(
-            "polling.sink default no-op: customer_id=%s documents=%d "
-            "(PR E1+ wires a real sink)",
+            "polling.sink default no-op: customer_id=%s source=%s documents=%d",
             customer_id,
+            source.value,
             len(documents),
         )
 
@@ -177,7 +185,7 @@ class PollScheduler:
 
         if result.documents:
             try:
-                await self._sink(row.customer_id, result.documents)
+                await self._sink(row.customer_id, row.source, result.documents)
             except Exception as exc:
                 logger.exception(
                     "polling.sink_raised customer_id=%s source=%s resource=%s docs=%d",
