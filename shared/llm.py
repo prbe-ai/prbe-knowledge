@@ -266,8 +266,29 @@ async def acompletion(
     LLMError
         Wraps any LiteLLM exception. Inspect ``status_code`` / ``provider``
         for routing decisions; ``__cause__`` carries the original error.
+
+    Gateway transport (mirrors `aembedding`)
+    ----------------------------------------
+    When ``LLM_GATEWAY_URL`` is set and the caller didn't pass an
+    explicit ``api_base``, force ``custom_llm_provider="openai"`` so
+    LiteLLM uses the OpenAI chat-completion wire shape against the
+    proxy. Without this, models like ``fireworks_ai/...`` or
+    ``gemini/...`` build their respective native paths
+    (e.g. Fireworks-native chat-completion endpoint with non-OpenAI
+    response_format semantics) and the proxy either 405s OR silently
+    drops fields like ``response_format`` that only the OpenAI wire
+    shape carries. The agent's structured-output enforcement depends on
+    this — verified 2026-05-17 that without the override Fireworks
+    receives no response_format and the gatherer 100% prose-fails.
+    See `feedback_litellm_gateway_gemini_405.md` for the same gotcha
+    on `aembedding`. Routing to the real upstream happens inside the
+    proxy regardless of which wire shape the SDK uses.
     """
+    caller_set_api_base = "api_base" in kwargs
     kwargs = _maybe_inject_gateway(kwargs)
+    gateway_injected = not caller_set_api_base and "api_base" in kwargs
+    if gateway_injected and "custom_llm_provider" not in kwargs:
+        kwargs["custom_llm_provider"] = "openai"
     try:
         return await litellm.acompletion(model=model, messages=messages, **kwargs)
     except _LiteLLMBaseError as exc:
