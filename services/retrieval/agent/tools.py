@@ -1,17 +1,47 @@
-"""Tool surface for the gatherer agent.
+"""Fat tool surface for the gatherer agent.
 
-Each tool wraps an existing retrieval primitive and returns a
-JSON-serializable dict the model reads on the next turn. Tool defs are
-emitted as OpenAI-style function schemas for LiteLLM forwarding to
-Fireworks; the model can't emit a malformed tool call when the SDK
-exposes the tools properly (`tool_use` schema enforcement).
+Design principle: **FAT skills, thin harness.** Each tool is a complete
+capability the agent invokes for a self-contained task — not a primitive
+the agent has to chain together. The harness owns parallel fan-out and
+multi-step plumbing internally.
 
-Defense in depth from PR #282 inherited here:
-- `_escape_query_for_xml` wraps every user-controllable text field that
-  flows into a downstream LLM call (today only `reissue_query`, but
-  any future tool that re-invokes LLM-touching code needs the same).
-- `top_k` is clamped to a per-tool hard cap so an agent loop cannot DOS
-  the DB by asking for 10k rows.
+Four fat tools + one terminal:
+
+    search(queries[], entity_ids?, top_k?)
+        Always fans out vector + bm25 + graph + inferred_edge in parallel
+        per sub-query. Accepts 1+ queries (subsumes parallel_multi_query
+        and the old reissue_query). Optionally accepts explicit
+        entity_ids; otherwise the harness re-runs grounding per query
+        for entity anchoring.
+
+    subgraph(anchor_canonical_id, depth?, edge_types?, include_inferred?,
+             include_aliases?, top_k_per_hop?)
+        Multi-hop BFS in ONE call. Returns a tree of {nodes, edges,
+        inferred_edges, alias_clusters}. depth 1-3. Subsumes graph_walk +
+        expand_inferred_neighbors + expand_entity_cluster.
+
+    fetch_doc(doc_id, max_chunks?, with_inferred_edges?, with_evidence?)
+        Full doc detail. Subsumes fetch_doc_chunks +
+        read_inferred_edge_evidence. Returns chunks + outbound inferred
+        edges + the evidence chunks that produced each `why` string.
+
+    need_deeper(reason)
+        Soft budget extension (+10 tool calls, max 2). Handled directly
+        by the loop, not via the registry — left here as a schema entry
+        so the model can pick it.
+
+    emit_gatherer_output(entities, chunks, gatherer_notes)
+        TERMINAL — the agent calls this to end the loop. Its parameters
+        ARE the GathererOutput schema; the loop reads the call's
+        arguments as the final output. With tool_choice="required", the
+        model MUST call something — either a retrieval tool or this
+        terminal — so no prose path exists. This kills the prose-retry
+        latency tax and eliminates the schema-violation failure mode.
+
+Defense-in-depth from PR #282 inherited:
+- `_escape_query_for_xml` wraps user-controlled text flowing into any
+  downstream LLM call (the harness's own LLM extraction does this too).
+- `top_k` is clamped per-tool so an agent loop can't DOS the DB.
 
 Plan: docs/specs/agentic-search.md, section "Tool surface".
 """
@@ -19,26 +49,23 @@ Plan: docs/specs/agentic-search.md, section "Tool surface".
 from __future__ import annotations
 
 import asyncio
-import dataclasses
-import math
+import json
 from collections.abc import Awaitable, Callable
-from datetime import datetime
 from typing import Any
 
+from services.retrieval.agent.models import GathererOutput
 from services.retrieval.grounding import GroundingBundle, build_bundle
 from services.retrieval.helpers import expand_to_cluster_members
 from services.retrieval.retrievers.bm25 import bm25_search as _bm25
 from services.retrieval.retrievers.graph import graph_search as _graph
 from services.retrieval.retrievers.inferred_edges import inferred_edge_search as _inferred
-from services.retrieval.retrievers.related_entities import (
-    walk_result_doc_neighbors as _walk_neighbors,
-)
 from services.retrieval.retrievers.vector import vector_search as _vector
-from services.retrieval.router import _escape_query_for_xml
+from services.retrieval.router import (
+    _escape_query_for_xml,  # noqa: F401 — re-exported for any caller
+)
 from shared.constants import (
     INFERRED_EDGE_HYDRATION_CHUNKS,
     SEARCH_AGENT_BM25_TOP_K,
-    SEARCH_AGENT_EXPAND_NEIGHBORS_TOP_K,
     SEARCH_AGENT_FETCH_CHUNKS_MAX,
     SEARCH_AGENT_GRAPH_TOP_K,
     SEARCH_AGENT_GRAPH_WALK_TOP_K,
@@ -53,10 +80,34 @@ from shared.models import TemporalSpec
 
 log = get_logger(__name__)
 
-# Hard cap to keep an agent from asking for top_k=10000. Any tool that
-# accepts `top_k` enforces this — even if the prompt and JSON Schema
-# both lie, this is the floor.
+
+# ============================================================
+# Identifiers used outside this module
+# ============================================================
+
+# Name of the terminal tool. The loop checks `tool_call.function.name ==
+# TERMINAL_TOOL_NAME` to detect end-of-loop and parse arguments as
+# GathererOutput. Don't rename without updating loop.py.
+TERMINAL_TOOL_NAME = "emit_gatherer_output"
+
+# Name of the budget-extension tool. Like the terminal, this is handled
+# by the loop directly (not via the registry) — listed here so the
+# loop's dispatcher logic can short-circuit it cleanly.
+NEED_DEEPER_TOOL_NAME = "need_deeper"
+
+# Hard cap to keep an agent from asking for top_k=10000. Per-tool clamps
+# enforce this — even if the prompt and JSON Schema both lie, this is
+# the floor.
 _HARD_TOP_K_CAP = 100
+
+# Subgraph depth cap. depth=3 means up to 3 hops from the anchor.
+# Iterative 1-hop walks (no AGE/Cypher), so each hop costs ~1 SQL round
+# trip. Cap prevents pathological depth=10 BFS exhausting the DB pool.
+_SUBGRAPH_MAX_DEPTH = 3
+
+# Per-query sub-search cap (for execute_search). 5 mirrors MAX_INTENTS+headroom
+# from PR #282; the agent uses this for 2-3 sub-queries typically.
+_SEARCH_MAX_SUBQUERIES = 5
 
 
 # ============================================================
@@ -73,21 +124,11 @@ def _clamp_top_k(value: int | None, default: int) -> int:
 
 
 def _trim_properties(props: dict[str, Any]) -> dict[str, Any]:
-    """Cap serialized properties at SEARCH_AGENT_PER_HIT_PROPERTIES_CAP bytes.
-
-    Drops the longest string fields one by one until the dict fits.
-    Long fields are replaced with `"<TRUNCATED N chars>"`. Numeric and
-    boolean fields are kept verbatim. Preserves common short fields
-    (`name`, `display_name`, `summary`, `why`) first.
-    """
-    import json
-
+    """Cap serialized properties at SEARCH_AGENT_PER_HIT_PROPERTIES_CAP bytes."""
     encoded = json.dumps(props, default=str)
     if len(encoded) <= SEARCH_AGENT_PER_HIT_PROPERTIES_CAP:
         return props
-
     out = dict(props)
-    # Truncate the longest str-valued field repeatedly until under cap.
     while len(json.dumps(out, default=str)) > SEARCH_AGENT_PER_HIT_PROPERTIES_CAP:
         candidates = [
             (k, len(str(v))) for k, v in out.items() if isinstance(v, str)
@@ -97,7 +138,6 @@ def _trim_properties(props: dict[str, Any]) -> dict[str, Any]:
         candidates.sort(key=lambda kv: kv[1], reverse=True)
         biggest_key, biggest_len = candidates[0]
         if biggest_len <= 120:
-            # Everything left is short; give up to avoid stripping all fields.
             break
         truncated = str(out[biggest_key])[:120] + f"... <TRUNCATED {biggest_len} chars>"
         out[biggest_key] = truncated
@@ -109,12 +149,12 @@ def _hit_to_chunk_dict(hit: Any, channel: str) -> dict[str, Any]:
     chunk-shaped dict the agent reads."""
     return {
         "channel": channel,
-        "chunk_id": hit.chunk_id,
+        "chunk_id": getattr(hit, "chunk_id", None),
         "doc_id": hit.doc_id,
         "source_system": hit.source_system,
         "source_url": hit.source_url,
         "title": hit.title,
-        "content": hit.content,
+        "content": getattr(hit, "content", None),
         "score": float(hit.score),
         "created_at": hit.created_at.isoformat() if hit.created_at else None,
         "updated_at": hit.updated_at.isoformat() if hit.updated_at else None,
@@ -123,11 +163,7 @@ def _hit_to_chunk_dict(hit: Any, channel: str) -> dict[str, Any]:
 
 
 def _inferred_hit_to_dict(hit: Any) -> dict[str, Any]:
-    """Normalize an InferredEdgeHit for the agent.
-
-    Surfaces `why` prominently — it's the moat. Also includes the
-    `linked_edge_count` so the agent can self-filter hub-anchored edges.
-    """
+    """Normalize an InferredEdgeHit for the agent. `why` is the moat."""
     return {
         "channel": "inferred_edge",
         "doc_id": hit.doc_id,
@@ -147,167 +183,32 @@ def _inferred_hit_to_dict(hit: Any) -> dict[str, Any]:
     }
 
 
-def _related_to_dict(ent: Any) -> dict[str, Any]:
-    """Normalize a RelatedEntity (shared.models) for the agent.
-
-    Drops the heavyweight `associated_doc_ids` past 3 (it's already
-    capped server-side, but be explicit) and trims member_sources to a
-    set-style list.
-    """
-    base = {
-        "canonical_id": ent.canonical_id,
-        "label": ent.label,
-        "display_name": ent.display_name,
-        "edge_types": list(ent.edge_types or []),
-        "max_confidence": ent.max_confidence,
-        "doc_count": ent.doc_count,
-        "score": float(ent.score),
-        "associated_doc_ids": list(ent.associated_doc_ids or [])[:3],
-        "member_count": ent.member_count,
-        "member_sources": list(ent.member_sources or []),
-    }
-    return base
-
-
-# ============================================================
-# Tool implementations
-# ============================================================
-
-async def execute_vector_search(
-    customer_id: str,
-    *,
-    query: str,
-    top_k: int | None = None,
-) -> dict[str, Any]:
-    top_k = _clamp_top_k(top_k, SEARCH_AGENT_VECTOR_TOP_K)
-    hits = await _vector(
-        customer_id=customer_id,
-        query_text=query,
-        top_k=top_k,
-        temporal=TemporalSpec(),
-    )
-    return {"hits": [_hit_to_chunk_dict(h, "vector") for h in hits]}
-
-
-async def execute_bm25_search(
-    customer_id: str,
-    *,
-    query: str,
-    top_k: int | None = None,
-) -> dict[str, Any]:
-    top_k = _clamp_top_k(top_k, SEARCH_AGENT_BM25_TOP_K)
-    hits = await _bm25(
-        customer_id=customer_id,
-        query_text=query,
-        top_k=top_k,
-        temporal=TemporalSpec(),
-    )
-    return {"hits": [_hit_to_chunk_dict(h, "bm25") for h in hits]}
-
-
-async def execute_graph_search(
-    customer_id: str,
-    *,
-    entities: list[dict[str, str]],
-    top_k: int | None = None,
-) -> dict[str, Any]:
-    """Wraps graph_search. `entities` is a list of {entity_type, canonical_id} dicts;
-    we cast to tuples for the underlying call."""
-    top_k = _clamp_top_k(top_k, SEARCH_AGENT_GRAPH_TOP_K)
-    if not entities:
-        return {"hits": []}
-    pairs: list[tuple[str, str]] = [
-        (e["entity_type"], e["canonical_id"])
-        for e in entities
-        if e.get("entity_type") and e.get("canonical_id")
-    ]
-    if not pairs:
-        return {"hits": []}
-    hits = await _graph(
-        customer_id=customer_id,
-        entities=pairs,
-        top_k=top_k,
-        temporal=TemporalSpec(),
-    )
+def _bundle_to_compact(bundle: GroundingBundle) -> dict[str, Any]:
+    def _c(c: Any) -> dict[str, Any]:
+        return {
+            "entity_type": c.entity_type,
+            "canonical_id": c.canonical_id,
+            "display_name": c.display_name,
+            "match_source": c.match_source,
+        }
     return {
-        "hits": [
-            {
-                **_hit_to_chunk_dict(h, "graph"),
-                "via_entity": h.via_entity,
-                "via_label": h.via_label,
-                "edge_type": h.edge_type,
-                "confidence": h.confidence,
-            }
-            for h in hits
-        ]
+        "candidates": [_c(c) for c in bundle.candidates],
+        "bare_id_matches": [_c(c) for c in bundle.bare_id_matches],
+        "connected_sources": list(bundle.connected_sources),
+        "timing_ms": float(bundle.timing_ms),
     }
-
-
-async def execute_inferred_edge_search(
-    customer_id: str,
-    *,
-    entities: list[dict[str, str]] | None = None,
-    doc_ids: list[str] | None = None,
-    top_k: int | None = None,
-) -> dict[str, Any]:
-    """Walks INFERRED Doc-Doc edges.
-
-    The plan asks for `entity_ids` on turn 1 (the agent doesn't have docs
-    yet), so this tool accepts EITHER:
-      - `doc_ids` directly (the existing primitive — used by
-        `expand_inferred_neighbors`), OR
-      - `entities` — we first resolve to attached Docs via a 1-hop graph
-        walk, then run the inferred-edge walk from those Docs.
-
-    Returns linked docs with their `why` strings attached.
-    """
-    top_k = _clamp_top_k(top_k, SEARCH_AGENT_INFERRED_EDGE_TOP_K)
-
-    anchor_doc_ids: list[str]
-    if doc_ids:
-        anchor_doc_ids = list(doc_ids)
-    elif entities:
-        anchor_doc_ids = await _resolve_entities_to_anchor_docs(
-            customer_id=customer_id,
-            entities=entities,
-            per_entity_cap=5,
-            total_cap=top_k,
-        )
-    else:
-        return {"hits": []}
-
-    if not anchor_doc_ids:
-        return {"hits": []}
-
-    # Dampening=1.0 here: the gatherer reads inferred-edge hits as a
-    # first-class tool return, no fusion with other channels. The old
-    # 0.2 dampening was a fusion-time score adjustment that doesn't
-    # apply when the agent reads each channel separately (see plan
-    # "Dampening is deleted" + decision-log entry on INFERRED_EDGE_DAMPENING).
-    hits = await _inferred(
-        customer_id=customer_id,
-        top_doc_ids=anchor_doc_ids,
-        top_k=top_k,
-        dampening=1.0,
-    )
-    return {"hits": [_inferred_hit_to_dict(h) for h in hits]}
 
 
 async def _resolve_entities_to_anchor_docs(
     customer_id: str,
     *,
     entities: list[dict[str, str]],
-    per_entity_cap: int,
     total_cap: int,
 ) -> list[str]:
     """Find Document graph_nodes attached to each entity (1-hop), return
-    up to `total_cap` distinct doc canonical_ids."""
+    up to `total_cap` distinct doc canonical_ids ordered by recency."""
     if not entities:
         return []
-
-    # Map RouterEntity entity_type -> graph_node label via the inverse of
-    # grounding._LABEL_TO_ENTITY_TYPE. Build inline to avoid importing
-    # a private symbol.
     from services.retrieval.grounding import _LABEL_TO_ENTITY_TYPE
     entity_to_label = {v: k for k, v in _LABEL_TO_ENTITY_TYPE.items()}
 
@@ -361,143 +262,172 @@ async def _resolve_entities_to_anchor_docs(
     return [r["doc_id"] for r in rows]
 
 
-async def execute_parallel_multi_query(
+# ============================================================
+# 1. search — fat 4-channel fan-out per sub-query
+# ============================================================
+
+async def execute_search(
     customer_id: str,
     *,
     queries: list[str],
+    entity_ids: list[dict[str, str]] | None = None,
     top_k: int | None = None,
 ) -> dict[str, Any]:
-    """Fan out N sub-queries through vector+bm25 in parallel. Returns
-    per-query merged candidates so the agent can pick which sub-query
-    each hit came from.
+    """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
+    inferred_edge) in parallel — same shape the harness runs on turn 0.
 
-    Caps at 5 sub-queries to mirror MAX_INTENTS + headroom; the agent
-    is encouraged to use this for 2-3 sub-queries, not as a search-everything.
+    If `entity_ids` is omitted and the agent provides multiple queries,
+    each query gets its own grounding run; entity-anchored channels
+    (graph, inferred_edge) anchor on the per-query grounding bundle.
+    When `entity_ids` IS provided, those entities anchor every sub-query.
+
+    Use cases:
+      - Reformulate the original query (one new sub-query).
+      - Multi-intent decomposition ("X and Y about different things").
+      - Recover from an entity-extraction misfire (pass explicit entity_ids).
+
+    Returns: {sub_queries: [{query, grounded_entities, vector[], bm25[],
+                            graph[], inferred_edge[]}]}
     """
-    queries = [q for q in (queries or []) if isinstance(q, str) and q.strip()][:5]
+    queries = [q for q in (queries or []) if isinstance(q, str) and q.strip()][:_SEARCH_MAX_SUBQUERIES]
     if not queries:
         return {"sub_queries": []}
-    top_k = _clamp_top_k(top_k, SEARCH_AGENT_VECTOR_TOP_K)
+    top_k_v = _clamp_top_k(top_k, SEARCH_AGENT_VECTOR_TOP_K)
+    top_k_b = _clamp_top_k(top_k, SEARCH_AGENT_BM25_TOP_K)
+    top_k_g = _clamp_top_k(top_k, SEARCH_AGENT_GRAPH_TOP_K)
+    top_k_i = _clamp_top_k(top_k, SEARCH_AGENT_INFERRED_EDGE_TOP_K)
 
-    async def _one(q: str) -> dict[str, Any]:
-        v, b = await asyncio.gather(
-            _vector(customer_id=customer_id, query_text=q, top_k=top_k, temporal=TemporalSpec()),
-            _bm25(customer_id=customer_id, query_text=q, top_k=top_k, temporal=TemporalSpec()),
-            return_exceptions=True,
+    async def _per_query(q: str) -> dict[str, Any]:
+        # Resolve entities for this sub-query (use provided ones, else
+        # per-query grounding).
+        if entity_ids:
+            ents = list(entity_ids)
+            grounded_summary = {"source": "caller", "candidates": ents}
+        else:
+            bundle = await build_bundle(customer_id=customer_id, query=q)
+            ents = [
+                {"entity_type": c.entity_type, "canonical_id": c.canonical_id}
+                for c in (list(bundle.candidates) + list(bundle.bare_id_matches))
+            ]
+            grounded_summary = _bundle_to_compact(bundle)
+
+        # Channel-side anchor pairs for graph_search.
+        graph_pairs: list[tuple[str, str]] = []
+        if ents:
+            from services.retrieval.retrievers.graph import _ENTITY_TO_LABEL
+            for e in ents:
+                et = (e.get("entity_type") or "").lower()
+                cid = e.get("canonical_id")
+                label = _ENTITY_TO_LABEL.get(et)
+                if label and cid:
+                    graph_pairs.append((label, cid))
+
+        async def _vec_call() -> list[dict[str, Any]]:
+            try:
+                hits = await _vector(
+                    customer_id=customer_id, query_text=q,
+                    top_k=top_k_v, temporal=TemporalSpec(),
+                )
+                return [_hit_to_chunk_dict(h, "vector") for h in hits]
+            except Exception as exc:
+                log.warning("agent.search_vector_failed", error=str(exc), query=q[:50])
+                return []
+
+        async def _bm25_call() -> list[dict[str, Any]]:
+            try:
+                hits = await _bm25(
+                    customer_id=customer_id, query_text=q,
+                    top_k=top_k_b, temporal=TemporalSpec(),
+                )
+                return [_hit_to_chunk_dict(h, "bm25") for h in hits]
+            except Exception as exc:
+                log.warning("agent.search_bm25_failed", error=str(exc), query=q[:50])
+                return []
+
+        async def _graph_call() -> list[dict[str, Any]]:
+            if not graph_pairs:
+                return []
+            try:
+                hits = await _graph(
+                    customer_id=customer_id, entities=graph_pairs,
+                    top_k=top_k_g, temporal=TemporalSpec(),
+                )
+                return [
+                    {
+                        **_hit_to_chunk_dict(h, "graph"),
+                        "via_entity": h.via_entity,
+                        "via_label": h.via_label,
+                        "edge_type": h.edge_type,
+                        "confidence": h.confidence,
+                    }
+                    for h in hits
+                ]
+            except Exception as exc:
+                log.warning("agent.search_graph_failed", error=str(exc), query=q[:50])
+                return []
+
+        async def _inferred_call() -> list[dict[str, Any]]:
+            if not ents:
+                return []
+            try:
+                anchor_doc_ids = await _resolve_entities_to_anchor_docs(
+                    customer_id=customer_id, entities=ents, total_cap=top_k_i,
+                )
+                if not anchor_doc_ids:
+                    return []
+                hits = await _inferred(
+                    customer_id=customer_id, top_doc_ids=anchor_doc_ids,
+                    top_k=top_k_i, dampening=1.0,
+                )
+                return [_inferred_hit_to_dict(h) for h in hits]
+            except Exception as exc:
+                log.warning("agent.search_inferred_failed", error=str(exc), query=q[:50])
+                return []
+
+        v, b, g, i = await asyncio.gather(
+            _vec_call(), _bm25_call(), _graph_call(), _inferred_call(),
         )
-        v_hits = [_hit_to_chunk_dict(h, "vector") for h in v] if not isinstance(v, BaseException) else []
-        b_hits = [_hit_to_chunk_dict(h, "bm25") for h in b] if not isinstance(b, BaseException) else []
-        return {"query": q, "vector": v_hits, "bm25": b_hits}
+        return {
+            "query": q,
+            "grounded_entities": ents,
+            "grounding_summary": grounded_summary,
+            "vector": v,
+            "bm25": b,
+            "graph": g,
+            "inferred_edge": i,
+        }
 
-    results = await asyncio.gather(*(_one(q) for q in queries))
-    return {"sub_queries": list(results)}
-
-
-async def execute_expand_inferred_neighbors(
-    customer_id: str,
-    *,
-    doc_id: str,
-    max: int | None = None,
-) -> dict[str, Any]:
-    top_k = _clamp_top_k(max, SEARCH_AGENT_EXPAND_NEIGHBORS_TOP_K)
-    hits = await _inferred(
-        customer_id=customer_id,
-        top_doc_ids=[doc_id],
-        top_k=top_k,
-        dampening=1.0,
-    )
-    return {"hits": [_inferred_hit_to_dict(h) for h in hits]}
+    sub_queries = await asyncio.gather(*(_per_query(q) for q in queries))
+    return {"sub_queries": list(sub_queries)}
 
 
-async def execute_expand_entity_cluster(
-    customer_id: str,
-    *,
-    canonical_ids: list[str],
-    label: str,
-) -> dict[str, Any]:
-    if not canonical_ids or not label:
-        return {"clusters": {}}
-    async with with_tenant(customer_id) as conn:
-        mapping = await expand_to_cluster_members(
-            conn=conn,
-            customer_id=customer_id,
-            label=label,
-            canonical_ids=canonical_ids,
-        )
-    return {"clusters": mapping}
+# ============================================================
+# 2. subgraph — multi-hop graph BFS in ONE call
+# ============================================================
 
-
-async def execute_fetch_doc_chunks(
-    customer_id: str,
-    *,
-    doc_id: str,
-    max: int | None = None,
-    query: str | None = None,
-) -> dict[str, Any]:
-    """Hydrate up to `max` chunks of `doc_id` from the chunks table.
-
-    For now selects chunks by `chunk_index ASC` (mirror's INFERRED_EDGE_HYDRATION
-    behavior). The `query` kwarg is reserved for future per-chunk re-rank
-    but is not used in v1 — the agent already saw the chunks via
-    vector/bm25 channels.
-    """
-    n = _clamp_top_k(max, SEARCH_AGENT_FETCH_CHUNKS_MAX)
-    sql = """
-        SELECT chunk_id, doc_id, content, kind, chunk_index
-        FROM chunks
-        WHERE customer_id = $1 AND doc_id = $2
-        ORDER BY chunk_index ASC
-        LIMIT $3
-    """
-    async with with_tenant(customer_id) as conn:
-        rows = await conn.fetch(sql, customer_id, doc_id, n)
-    return {
-        "chunks": [
-            {
-                "chunk_id": r["chunk_id"],
-                "doc_id": r["doc_id"],
-                "content": r["content"],
-                "kind": r["kind"],
-                "chunk_index": int(r["chunk_index"]),
-            }
-            for r in rows
-        ]
-    }
-
-
-async def execute_graph_walk(
+async def _graph_walk_one_hop(
     customer_id: str,
     *,
     anchor_canonical_id: str,
-    edge_types: list[str] | None = None,
-    top_k: int | None = None,
+    edge_types: list[str] | None,
+    top_k: int,
 ) -> dict[str, Any]:
-    """1-hop bidirectional walk on graph_edges from `anchor_canonical_id`.
-
-    Modeled after `related_entities.walk_result_doc_neighbors` (the IDF
-    pattern from line 168+), reuses the alias-resolution + existence-check
-    plumbing (`_resolve_anchor_alias` from main.py, `anchor_exists` from
-    graph_explore.py). New SQL because that walker takes (doc_id, rank)
-    tuples; we want a single-anchor input.
-
-    Returns up to `top_k` neighbor nodes (any label) sorted by IDF score
-    descending. Neighbor properties are trimmed to ~2KB each.
-    """
-    top_k = _clamp_top_k(top_k, SEARCH_AGENT_GRAPH_WALK_TOP_K)
+    """1-hop bidirectional walk on graph_edges from a single anchor.
+    Internal helper for execute_subgraph; same shape as the old
+    execute_graph_walk."""
     from services.retrieval.graph_explore import anchor_exists
     from services.retrieval.main import _resolve_anchor_alias
 
-    resolved_anchor = await _resolve_anchor_alias(
+    resolved = await _resolve_anchor_alias(
         customer_id=customer_id,
         anchor_canonical_id=anchor_canonical_id,
     )
-    if not await anchor_exists(customer_id=customer_id, anchor_canonical_id=resolved_anchor):
-        return {"neighbors": [], "anchor_canonical_id": resolved_anchor, "anchor_existed": False}
+    if not await anchor_exists(customer_id=customer_id, anchor_canonical_id=resolved):
+        return {"anchor_canonical_id": resolved, "anchor_existed": False, "neighbors": []}
 
     edge_filter_sql = ""
-    params: list[Any] = [customer_id, resolved_anchor, top_k]
+    params: list[Any] = [customer_id, resolved, top_k]
     if edge_types:
-        # Pin to known edge types only; ignore unknown to avoid SQL surprise.
         edge_types_clean = [
             t for t in edge_types if isinstance(t, str) and t.replace("_", "").isalnum()
         ]
@@ -505,12 +435,9 @@ async def execute_graph_walk(
             edge_filter_sql = "AND ge.edge_type = ANY($4::text[])"
             params.append(edge_types_clean)
 
-    # 1-hop walk: bidirectional UNION ALL (hits both edge indexes), then
-    # IDF score per neighbor based on global degree.
     sql = f"""
         WITH anchor AS (
-            SELECT node_id
-            FROM graph_nodes
+            SELECT node_id FROM graph_nodes
             WHERE customer_id = $1 AND canonical_id = $2
             LIMIT 1
         ),
@@ -556,7 +483,6 @@ async def execute_graph_walk(
         ORDER BY idf_score DESC, nd.hit_count DESC
         LIMIT $3
     """
-
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(sql, *params)
 
@@ -573,245 +499,306 @@ async def execute_graph_walk(
             "hit_count": int(r["hit_count"]),
             "global_degree": int(r["global_degree"]),
         })
-
     return {
-        "anchor_canonical_id": resolved_anchor,
+        "anchor_canonical_id": resolved,
         "anchor_existed": True,
         "neighbors": neighbors,
     }
 
 
-async def execute_reissue_query(
+async def execute_subgraph(
     customer_id: str,
     *,
-    reformulated_query: str,
+    anchor_canonical_id: str,
+    depth: int | None = None,
+    edge_types: list[str] | None = None,
+    include_inferred: bool | None = None,
+    include_aliases: bool | None = None,
+    top_k_per_hop: int | None = None,
 ) -> dict[str, Any]:
-    """Re-run grounding + the 4-channel turn-1 fan-out on a reformulated query.
+    """Multi-hop BFS from an anchor node in ONE tool call.
 
-    Returns the bundle + per-channel hits as a single tool return so the
-    agent can pivot without burning 5 follow-up turns.
+    Walks the graph up to `depth` hops, deduping nodes, accumulating
+    edges. Optionally enriches Document nodes with their outbound
+    INFERRED Doc-Doc edges (`include_inferred=True`) so the LLM `why`
+    strings surface inline. Optionally expands entity aliases
+    (`include_aliases=True`) so Person/Repo clusters are visible.
+
+    Returns: {anchor, depth, nodes[], inferred_edges[], alias_clusters{}}
     """
-    safe = _escape_query_for_xml(reformulated_query)  # noqa: F841 — placeholder if downstream LLMs are added
-    bundle = await build_bundle(customer_id=customer_id, query=reformulated_query)
+    depth = max(1, min(depth or 1, _SUBGRAPH_MAX_DEPTH))
+    top_k_per_hop = _clamp_top_k(top_k_per_hop, SEARCH_AGENT_GRAPH_WALK_TOP_K)
+    if include_inferred is None:
+        include_inferred = True
+    if include_aliases is None:
+        include_aliases = True
 
-    # Re-fire the 4 channels in parallel, anchored on the new grounding.
-    entity_dicts = [
-        {"entity_type": c.entity_type, "canonical_id": c.canonical_id}
-        for c in (list(bundle.candidates) + list(bundle.bare_id_matches))
-    ]
-
-    vector_t, bm25_t, graph_t, inferred_t = await asyncio.gather(
-        execute_vector_search(customer_id, query=reformulated_query),
-        execute_bm25_search(customer_id, query=reformulated_query),
-        execute_graph_search(customer_id, entities=entity_dicts),
-        execute_inferred_edge_search(customer_id, entities=entity_dicts),
-        return_exceptions=True,
+    # Hop 1 — must succeed to even know the anchor exists.
+    hop1 = await _graph_walk_one_hop(
+        customer_id=customer_id,
+        anchor_canonical_id=anchor_canonical_id,
+        edge_types=edge_types,
+        top_k=top_k_per_hop,
     )
-
-    def _ok(r: Any) -> dict[str, Any]:
-        return r if not isinstance(r, BaseException) else {"hits": [], "error": str(r)}
-
-    return {
-        "grounding": _bundle_to_compact(bundle),
-        "channels": {
-            "vector": _ok(vector_t),
-            "bm25": _ok(bm25_t),
-            "graph": _ok(graph_t),
-            "inferred_edge": _ok(inferred_t),
-        },
-    }
-
-
-def _bundle_to_compact(bundle: GroundingBundle) -> dict[str, Any]:
-    def _c(c: Any) -> dict[str, Any]:
+    if not hop1.get("anchor_existed"):
         return {
-            "entity_type": c.entity_type,
-            "canonical_id": c.canonical_id,
-            "display_name": c.display_name,
-            "match_source": c.match_source,
+            "anchor_canonical_id": hop1["anchor_canonical_id"],
+            "anchor_existed": False,
+            "depth": depth,
+            "nodes": [],
+            "inferred_edges": [],
+            "alias_clusters": {},
         }
-    return {
-        "candidates": [_c(c) for c in bundle.candidates],
-        "bare_id_matches": [_c(c) for c in bundle.bare_id_matches],
-        "connected_sources": list(bundle.connected_sources),
-        "timing_ms": float(bundle.timing_ms),
-    }
+    resolved_anchor = hop1["anchor_canonical_id"]
 
+    # Accumulate nodes (dedup by canonical_id); track depth-of-discovery.
+    nodes: dict[str, dict[str, Any]] = {}
+    for n in hop1["neighbors"]:
+        nodes[n["canonical_id"]] = {**n, "hop": 1}
+    frontier = [n["canonical_id"] for n in hop1["neighbors"]]
 
-async def execute_read_inferred_edge_evidence(
-    customer_id: str,
-    *,
-    edge_id: str,
-) -> dict[str, Any]:
-    """Fetch the chunks the LLM was reasoning over when it wrote a
-    given inferred edge's `why`.
-
-    The producer (`services/ingestion/inferred_edges/`) stages bundles
-    in the `inferred_edges_queue` table; finalized rows materialize on
-    `graph_edges.properties->>'why'` + `properties->>'evidence_chunk_ids'`.
-    We surface the evidence chunk IDs and hydrate their content.
-    """
-    sql_edge = """
-        SELECT properties->>'why' AS why,
-               properties->'evidence_chunk_ids' AS evidence_chunk_ids,
-               properties->>'producer_model' AS producer_model
-        FROM graph_edges
-        WHERE customer_id = $1 AND edge_id = $2
-        LIMIT 1
-    """
-    async with with_tenant(customer_id) as conn:
-        edge_row = await conn.fetchrow(sql_edge, customer_id, edge_id)
-        if not edge_row:
-            return {"edge_id": edge_id, "found": False}
-
-        chunk_ids: list[str] = []
-        raw_ids = edge_row["evidence_chunk_ids"]
-        if isinstance(raw_ids, list):
-            chunk_ids = [str(x) for x in raw_ids]
-
-        chunks: list[dict[str, Any]] = []
-        if chunk_ids:
-            chunk_rows = await conn.fetch(
-                """
-                SELECT chunk_id, doc_id, content, kind
-                FROM chunks
-                WHERE customer_id = $1 AND chunk_id = ANY($2::text[])
-                LIMIT $3
-                """,
-                customer_id,
-                chunk_ids,
-                INFERRED_EDGE_HYDRATION_CHUNKS,
+    # Hops 2..depth — sequential per hop level, but parallel within a hop.
+    for hop_idx in range(2, depth + 1):
+        if not frontier:
+            break
+        hop_results = await asyncio.gather(
+            *(
+                _graph_walk_one_hop(
+                    customer_id=customer_id,
+                    anchor_canonical_id=anchor,
+                    edge_types=edge_types,
+                    top_k=top_k_per_hop,
+                )
+                for anchor in frontier
             )
-            chunks = [
-                {
-                    "chunk_id": r["chunk_id"],
-                    "doc_id": r["doc_id"],
-                    "content": r["content"],
-                    "kind": r["kind"],
-                }
-                for r in chunk_rows
-            ]
+        )
+        next_frontier: list[str] = []
+        for parent, h in zip(frontier, hop_results, strict=True):
+            for n in h.get("neighbors", []):
+                cid = n["canonical_id"]
+                if cid == resolved_anchor or cid in nodes:
+                    continue
+                nodes[cid] = {**n, "hop": hop_idx, "via_parent": parent}
+                next_frontier.append(cid)
+        frontier = next_frontier
 
-        return {
-            "edge_id": edge_id,
-            "found": True,
-            "why": edge_row["why"],
-            "producer_model": edge_row["producer_model"],
-            "evidence_chunks": chunks,
-        }
+    # Inferred-edge enrichment on Document nodes in the subgraph.
+    inferred_edges: list[dict[str, Any]] = []
+    if include_inferred:
+        doc_label = NodeLabel.DOCUMENT.value
+        doc_ids = [
+            cid for cid, n in nodes.items()
+            if n.get("label") == doc_label
+        ][:10]
+        if doc_ids:
+            try:
+                hits = await _inferred(
+                    customer_id=customer_id,
+                    top_doc_ids=doc_ids,
+                    top_k=10,
+                    dampening=1.0,
+                )
+                inferred_edges = [_inferred_hit_to_dict(h) for h in hits]
+            except Exception as exc:
+                log.warning("agent.subgraph_inferred_failed", error=str(exc))
+
+    # Alias-cluster enrichment per non-Document label.
+    alias_clusters: dict[str, dict[str, list[str]]] = {}
+    if include_aliases:
+        by_label: dict[str, list[str]] = {}
+        for cid, n in nodes.items():
+            lbl = n.get("label")
+            if lbl and lbl != NodeLabel.DOCUMENT.value:
+                by_label.setdefault(lbl, []).append(cid)
+        async with with_tenant(customer_id) as conn:
+            for lbl, cids in by_label.items():
+                try:
+                    mapping = await expand_to_cluster_members(
+                        conn=conn,
+                        customer_id=customer_id,
+                        label=lbl,
+                        canonical_ids=cids[:20],
+                    )
+                    if any(len(v) > 1 for v in mapping.values()):
+                        alias_clusters[lbl] = mapping
+                except Exception as exc:
+                    log.warning(
+                        "agent.subgraph_alias_failed",
+                        error=str(exc),
+                        label=lbl,
+                    )
+
+    return {
+        "anchor_canonical_id": resolved_anchor,
+        "anchor_existed": True,
+        "depth": depth,
+        "nodes": list(nodes.values()),
+        "inferred_edges": inferred_edges,
+        "alias_clusters": alias_clusters,
+    }
 
 
 # ============================================================
-# Tool definitions for LiteLLM (OpenAI-style schemas)
+# 3. fetch_doc — full doc detail in ONE call
+# ============================================================
+
+async def execute_fetch_doc(
+    customer_id: str,
+    *,
+    doc_id: str,
+    max_chunks: int | None = None,
+    with_inferred_edges: bool | None = None,
+    with_evidence: bool | None = None,
+) -> dict[str, Any]:
+    """Pull a doc's chunks plus optional inferred-edge context in ONE call.
+
+    Returns: {doc_id, chunks[], outbound_inferred_edges[], evidence_by_edge_id{}}
+    """
+    n = _clamp_top_k(max_chunks, SEARCH_AGENT_FETCH_CHUNKS_MAX)
+    if with_inferred_edges is None:
+        with_inferred_edges = False
+    if with_evidence is None:
+        with_evidence = False
+
+    chunks_sql = """
+        SELECT chunk_id, doc_id, content, kind, chunk_index
+        FROM chunks
+        WHERE customer_id = $1 AND doc_id = $2
+        ORDER BY chunk_index ASC
+        LIMIT $3
+    """
+
+    inferred_edges: list[dict[str, Any]] = []
+    evidence_by_edge: dict[str, list[dict[str, Any]]] = {}
+
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(chunks_sql, customer_id, doc_id, n)
+        chunks = [
+            {
+                "chunk_id": r["chunk_id"],
+                "doc_id": r["doc_id"],
+                "content": r["content"],
+                "kind": r["kind"],
+                "chunk_index": int(r["chunk_index"]),
+            }
+            for r in rows
+        ]
+
+        if with_inferred_edges:
+            try:
+                hits = await _inferred(
+                    customer_id=customer_id,
+                    top_doc_ids=[doc_id],
+                    top_k=10,
+                    dampening=1.0,
+                )
+                inferred_edges = [_inferred_hit_to_dict(h) for h in hits]
+            except Exception as exc:
+                log.warning("agent.fetch_doc_inferred_failed", error=str(exc), doc_id=doc_id)
+
+        if with_evidence and inferred_edges:
+            # Pull the chunks the LLM was reasoning over for each edge.
+            # graph_edges.properties->>'evidence_chunk_ids' is the producer's
+            # stamp; hydrate from the chunks table.
+            edge_sql = """
+                SELECT edge_id, properties->>'why' AS why,
+                       properties->'evidence_chunk_ids' AS evidence_chunk_ids
+                FROM graph_edges
+                WHERE customer_id = $1
+                  AND extractor_id = 'inferred_edges:v1'
+                  AND (from_node_id IN (
+                       SELECT node_id FROM graph_nodes
+                       WHERE customer_id = $1 AND canonical_id = $2
+                       LIMIT 1
+                  ) OR to_node_id IN (
+                       SELECT node_id FROM graph_nodes
+                       WHERE customer_id = $1 AND canonical_id = $2
+                       LIMIT 1
+                  ))
+                LIMIT 20
+            """
+            edge_rows = await conn.fetch(edge_sql, customer_id, doc_id)
+            all_chunk_ids: set[str] = set()
+            edge_to_chunk_ids: dict[str, list[str]] = {}
+            for r in edge_rows:
+                raw = r["evidence_chunk_ids"]
+                cids: list[str] = []
+                if isinstance(raw, list):
+                    cids = [str(x) for x in raw][:INFERRED_EDGE_HYDRATION_CHUNKS]
+                edge_to_chunk_ids[str(r["edge_id"])] = cids
+                all_chunk_ids.update(cids)
+            if all_chunk_ids:
+                ev_rows = await conn.fetch(
+                    """
+                    SELECT chunk_id, doc_id, content, kind
+                    FROM chunks
+                    WHERE customer_id = $1 AND chunk_id = ANY($2::text[])
+                    """,
+                    customer_id,
+                    list(all_chunk_ids),
+                )
+                ev_by_id = {
+                    r["chunk_id"]: {
+                        "chunk_id": r["chunk_id"],
+                        "doc_id": r["doc_id"],
+                        "content": r["content"],
+                        "kind": r["kind"],
+                    }
+                    for r in ev_rows
+                }
+                for edge_id, cids in edge_to_chunk_ids.items():
+                    evidence_by_edge[edge_id] = [ev_by_id[c] for c in cids if c in ev_by_id]
+
+    return {
+        "doc_id": doc_id,
+        "chunks": chunks,
+        "outbound_inferred_edges": inferred_edges,
+        "evidence_by_edge_id": evidence_by_edge,
+    }
+
+
+# ============================================================
+# Tool schemas — OpenAI-style function defs forwarded to LiteLLM
 # ============================================================
 
 def tool_definitions() -> list[dict[str, Any]]:
-    """Return the tool schemas LiteLLM forwards to Fireworks.
-
-    Order matches the prompt's tool list to preserve cache-friendliness
-    (system prompt + tool defs are the cached prefix; reordering busts
-    the cache).
-    """
+    """Return the schemas LiteLLM forwards to Fireworks. Order matches
+    the prompt's enumeration so the cached prefix stays stable."""
     return [
         {
             "type": "function",
             "function": {
-                "name": "vector_search",
-                "description": "pgvector cosine search on chunks for `query`. Returns ranked chunks.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Raw natural-language query."},
-                        "top_k": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "bm25_search",
-                "description": "pg_search Lucene-style BM25 on chunks for `query`. Returns ranked chunks.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "top_k": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "graph_search",
+                "name": "search",
                 "description": (
-                    "1-hop walk from explicit entity IDs to attached Documents. "
-                    "Pass entities from the <grounding> block."
+                    "Re-search with one or more reformulated queries. Always fans out "
+                    "vector + bm25 + graph + inferred_edge in parallel per sub-query. "
+                    "Use for: reformulating the original query, multi-intent splits, "
+                    "or recovering from a bad entity match by passing explicit entity_ids."
                 ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "entities": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "entity_type": {"type": "string"},
-                                    "canonical_id": {"type": "string"},
-                                },
-                                "required": ["entity_type", "canonical_id"],
-                            },
-                        },
-                        "top_k": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
-                    },
-                    "required": ["entities"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "inferred_edge_search",
-                "description": (
-                    "Walk INFERRED Doc-Doc edges. Accepts either `entities` (resolves to Docs internally) "
-                    "or `doc_ids` (direct). Returns linked docs with their LLM-written `why` strings."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "entities": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "entity_type": {"type": "string"},
-                                    "canonical_id": {"type": "string"},
-                                },
-                                "required": ["entity_type", "canonical_id"],
-                            },
-                        },
-                        "doc_ids": {"type": "array", "items": {"type": "string"}},
-                        "top_k": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
-                    },
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "parallel_multi_query",
-                "description": "Fan out 2-5 sub-queries through vector + bm25 in parallel.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "queries": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "minItems": 2,
-                            "maxItems": 5,
+                            "minItems": 1,
+                            "maxItems": _SEARCH_MAX_SUBQUERIES,
+                        },
+                        "entity_ids": {
+                            "type": "array",
+                            "description": (
+                                "Optional: explicit entities to anchor graph + inferred_edge "
+                                "channels on. When omitted, the harness re-runs grounding "
+                                "per sub-query."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "entity_type": {"type": "string"},
+                                    "canonical_id": {"type": "string"},
+                                },
+                                "required": ["entity_type", "canonical_id"],
+                            },
                         },
                         "top_k": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
                     },
@@ -822,66 +809,21 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "expand_inferred_neighbors",
-                "description": "Walk INFERRED edges out of a single doc. Returns its neighbors + `why` strings.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "doc_id": {"type": "string"},
-                        "max": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
-                    },
-                    "required": ["doc_id"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "expand_entity_cluster",
+                "name": "subgraph",
                 "description": (
-                    "Resolve a list of canonical_ids into their full cluster (aliases + primary). "
-                    "Useful when grounding returned an alias but you want the whole entity-cluster."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "canonical_ids": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                        "label": {"type": "string"},
-                    },
-                    "required": ["canonical_ids", "label"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "fetch_doc_chunks",
-                "description": "Pull more chunks from a doc you want to read fully (default ~3, up to ~10).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "doc_id": {"type": "string"},
-                        "max": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
-                        "query": {"type": "string"},
-                    },
-                    "required": ["doc_id"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "graph_walk",
-                "description": (
-                    "Thin 1-hop bidirectional walk from a single anchor canonical_id. "
-                    "IDF-ranked top-20. Use to BFS the graph one neighbor at a time."
+                    "Multi-hop BFS from an anchor node. Returns a tree of "
+                    "{nodes, inferred_edges, alias_clusters}. Subsumes the old "
+                    "graph_walk + expand_inferred_neighbors + expand_entity_cluster."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "anchor_canonical_id": {"type": "string"},
+                        "depth": {"type": "integer", "minimum": 1, "maximum": _SUBGRAPH_MAX_DEPTH},
                         "edge_types": {"type": "array", "items": {"type": "string"}},
-                        "top_k": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
+                        "include_inferred": {"type": "boolean"},
+                        "include_aliases": {"type": "boolean"},
+                        "top_k_per_hop": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
                     },
                     "required": ["anchor_canonical_id"],
                 },
@@ -890,76 +832,67 @@ def tool_definitions() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
-                "name": "reissue_query",
+                "name": "fetch_doc",
                 "description": (
-                    "Re-run grounding + the 4-channel turn-1 fan-out with a reformulated query. "
-                    "Use ONLY when the original query was malformed."
+                    "Pull a doc's chunks plus optional outbound inferred-edges and per-edge "
+                    "evidence chunks. ONE call replaces fetch_doc_chunks + "
+                    "read_inferred_edge_evidence."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "reformulated_query": {"type": "string"},
+                        "doc_id": {"type": "string"},
+                        "max_chunks": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
+                        "with_inferred_edges": {"type": "boolean"},
+                        "with_evidence": {"type": "boolean"},
                     },
-                    "required": ["reformulated_query"],
+                    "required": ["doc_id"],
                 },
             },
         },
         {
             "type": "function",
             "function": {
-                "name": "read_inferred_edge_evidence",
+                "name": NEED_DEEPER_TOOL_NAME,
                 "description": (
-                    "Fetch the chunks the LLM was reasoning over when an INFERRED edge's `why` "
-                    "was produced. Use when the `why` is ambiguous and you need context."
+                    "Soft-budget extension. +10 tool calls per extension, max 2. "
+                    "Provide a `reason` string (logged for trace review)."
                 ),
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "edge_id": {"type": "string"},
-                    },
-                    "required": ["edge_id"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "need_deeper",
-                "description": (
-                    "Soft-budget extension. Requests +10 tool calls. Provide a `reason` string; "
-                    "max 2 extensions across the loop."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reason": {"type": "string"},
-                    },
+                    "properties": {"reason": {"type": "string"}},
                     "required": ["reason"],
                 },
+            },
+        },
+        # TERMINAL — the loop watches for this name and parses arguments as
+        # GathererOutput. With tool_choice="required", the model MUST call
+        # something — either a retrieval tool above or this terminal — so
+        # prose-only output is impossible.
+        {
+            "type": "function",
+            "function": {
+                "name": TERMINAL_TOOL_NAME,
+                "description": (
+                    "TERMINAL. Call this when you've curated the answer. The "
+                    "arguments ARE the final GathererOutput (entities, chunks, "
+                    "gatherer_notes). Calling this ends the loop — do not call "
+                    "any other tool in the same turn."
+                ),
+                "parameters": GathererOutput.model_json_schema(),
             },
         },
     ]
 
 
 # ============================================================
-# Dispatcher
+# Registry + dispatcher
 # ============================================================
 
-# Map from JSON Schema tool name -> executor.
-# `need_deeper` is handled out-of-band by the loop (it's a budget signal,
-# not a retrieval call), so it deliberately routes to a sentinel.
 TOOL_REGISTRY: dict[str, Callable[..., Awaitable[dict[str, Any]]]] = {
-    "vector_search": execute_vector_search,
-    "bm25_search": execute_bm25_search,
-    "graph_search": execute_graph_search,
-    "inferred_edge_search": execute_inferred_edge_search,
-    "parallel_multi_query": execute_parallel_multi_query,
-    "expand_inferred_neighbors": execute_expand_inferred_neighbors,
-    "expand_entity_cluster": execute_expand_entity_cluster,
-    "fetch_doc_chunks": execute_fetch_doc_chunks,
-    "graph_walk": execute_graph_walk,
-    "reissue_query": execute_reissue_query,
-    "read_inferred_edge_evidence": execute_read_inferred_edge_evidence,
+    "search": execute_search,
+    "subgraph": execute_subgraph,
+    "fetch_doc": execute_fetch_doc,
 }
 
 
@@ -968,11 +901,14 @@ async def dispatch_tool_call(
     tool_name: str,
     arguments: dict[str, Any],
 ) -> dict[str, Any]:
-    """Route a model-emitted tool call to its executor.
+    """Route a model-emitted retrieval tool call to its executor.
 
-    Catches and packages exceptions so the agent loop never crashes on a
-    single tool failure — instead the agent sees `{"error": "..."}` and
-    can recover (skip, retry differently, surface as low-confidence).
+    `need_deeper` and `emit_gatherer_output` are handled by the loop
+    directly (need_deeper extends budget, emit_gatherer_output is
+    terminal) and never reach this dispatcher.
+
+    Catches exceptions so the agent loop never crashes on a single
+    tool failure — agent sees `{"error": "..."}` and can recover.
     """
     executor = TOOL_REGISTRY.get(tool_name)
     if executor is None:
@@ -980,13 +916,7 @@ async def dispatch_tool_call(
     try:
         return await executor(customer_id=customer_id, **arguments)
     except TypeError as exc:
-        # Wrong kwargs — the JSON Schema should have caught this, but
-        # be defensive so a model misfire doesn't 500 the loop.
-        log.warning(
-            "agent.tool_arg_mismatch",
-            tool_name=tool_name,
-            error=str(exc),
-        )
+        log.warning("agent.tool_arg_mismatch", tool_name=tool_name, error=str(exc))
         return {"error": f"argument mismatch: {exc}"}
     except Exception as exc:
         log.warning(
@@ -999,12 +929,12 @@ async def dispatch_tool_call(
 
 
 __all__ = [
+    "NEED_DEEPER_TOOL_NAME",
+    "TERMINAL_TOOL_NAME",
     "TOOL_REGISTRY",
     "dispatch_tool_call",
+    "execute_fetch_doc",
+    "execute_search",
+    "execute_subgraph",
     "tool_definitions",
 ]
-
-
-# Suppress unused-import warnings for symbols re-exported via the module
-# but only referenced for docstring symmetry / future hookups.
-_unused = (datetime, dataclasses, math, _walk_neighbors)
