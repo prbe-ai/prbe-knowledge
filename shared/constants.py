@@ -590,6 +590,60 @@ INFERRED_EDGE_DAMPENING = 0.2
 # synthesizer also can't cite the doc -- both regressions of the v1 design.
 INFERRED_EDGE_HYDRATION_CHUNKS = 3
 
+# ---- Search agent (gatherer) -------------------------------------------------
+# The gatherer is the retrieval pipeline (see
+# docs/specs/agentic-search.md). Tunables below are read at agent loop
+# construction; changing them requires a redeploy (no hot-reload).
+
+SEARCH_AGENT_INFERENCE_MODEL = "fireworks_ai/accounts/fireworks/models/gpt-oss-120b"
+
+# Soft budget: total tool calls across all turns. Covers turn-1 mandatory 4
+# + ~16 exploration calls across 2-3 follow-up turns. The agent may extend
+# by emitting need_deeper{reason}; +10 per extension, max 2 extensions.
+SEARCH_AGENT_TOOL_BUDGET = 20
+SEARCH_AGENT_EXTENSION_GRANT = 10
+SEARCH_AGENT_MAX_EXTENSIONS = 2
+
+# Hard ceiling. Even with extensions the agent never exceeds this.
+SEARCH_AGENT_HARD_CAP = SEARCH_AGENT_TOOL_BUDGET + (
+    SEARCH_AGENT_EXTENSION_GRANT * SEARCH_AGENT_MAX_EXTENSIONS
+)  # 40
+
+# Min curated results the agent should return before falling back to "no
+# confident match". If the agent emits fewer than this, harness logs a
+# `gatherer.under_min_output` anomaly for trace review.
+SEARCH_AGENT_MIN_OUTPUT = 5
+
+# Per-tool top_k defaults. The agent may override at call time. See plan
+# section "Per-tool top_k defaults" for the bytes/turn budget reasoning.
+SEARCH_AGENT_VECTOR_TOP_K = 15
+SEARCH_AGENT_BM25_TOP_K = 15
+SEARCH_AGENT_GRAPH_TOP_K = 10
+SEARCH_AGENT_INFERRED_EDGE_TOP_K = 10
+SEARCH_AGENT_GRAPH_WALK_TOP_K = 20
+SEARCH_AGENT_EXPAND_NEIGHBORS_TOP_K = 10
+SEARCH_AGENT_FETCH_CHUNKS_MAX = 10
+
+# Per-channel result byte cap. Node properties / chunk content trimmed to
+# this when assembled into a tool return. Keeps the per-turn evidence pack
+# around 15K tokens.
+SEARCH_AGENT_PER_HIT_PROPERTIES_CAP = 2048
+
+# Fireworks 90% cache discount only fires when consecutive turns land on
+# the same replica. We set `x-session-affinity` per query so the prefix
+# (system prompt + tool defs + grounding) cache-hits. This is the
+# acceptance gate observed via query_traces.cache_hit_rate; if production
+# rate drops below this, hard-query cost roughly doubles.
+SEARCH_AGENT_CACHE_HIT_RATE_FLOOR = 0.7
+
+# Wall-clock cap on a single agent turn (model + tool execution combined).
+# Aborts a stuck turn loudly rather than waiting on the LiteLLM default.
+SEARCH_AGENT_TURN_TIMEOUT_SECONDS = 30.0
+
+# Overall agent loop cap. Prevents pathological queries from monopolising
+# a worker. p99 should land far below this; trip = log + 503.
+SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 90.0
+
 # Prefix used in `integration_tokens.scope` to signal the row represents a
 # GitHub App installation rather than an OAuth access_token. The installation
 # id follows the colon; tokens are minted on demand from the App private key.

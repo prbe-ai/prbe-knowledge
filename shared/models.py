@@ -585,6 +585,15 @@ class QueryResponse(BaseModel):
     # Populated only on walk failure (set to type(exc).__name__). Lets MCP
     # consumers and ops distinguish "feature broken" from "no neighbors".
     related_entities_error: str | None = None
+    # Search-agent (gatherer) self-reported notes. Optional; absent on
+    # router/list-only paths and on pre-gatherer responses. Schema is the
+    # `GathererNotes` Pydantic shape from
+    # `services.retrieval.agent.models`; dumped here as a dict so this
+    # module doesn't need to import the gatherer model (which would close
+    # a layering loop on startup-time imports). Consumers that don't
+    # know about this field (older MCP clients) ignore it under
+    # Pydantic's default extra='ignore' semantics.
+    gatherer_notes: dict[str, object] | None = None
 
 
 class AnswerRequest(QueryRequest):
