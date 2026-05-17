@@ -130,3 +130,53 @@ class GathererOutput(BaseModel):
     entities: list[GatheredEntity] = Field(default_factory=list)
     chunks: list[GatheredChunk] = Field(default_factory=list)
     gatherer_notes: GathererNotes
+
+
+# ============================================================
+# LLM-based entity extraction (parallel with deterministic grounding)
+# ============================================================
+# The Haiku router used to do LLM-based entity extraction before the
+# cutover. Grounding's pg_trgm fuzzy + tsvector match recovers most
+# bare-ID and prefix cases, but it misses paraphrased entities ("the
+# new login flow" when the graph node is named "Authentication Phase 2").
+# This shape is the recovery path: a tiny LLM call (same Fireworks model
+# as the agent loop, parallel with grounding) reads the query and proposes
+# entities. Results merge with grounding before pre-fan-out.
+
+EntityType = Literal[
+    "person",
+    "repo",
+    "service",
+    "ticket",
+    "pr",
+    "feature",
+    "decision",
+    "error_group",
+    "file_path",
+    "channel",
+    "session",
+    "commit_sha",
+]
+
+
+class ExtractedEntity(BaseModel):
+    """One LLM-proposed entity. canonical_id may be the LLM's best guess
+    (synthesized) — `_reconcile_entities_with_bundle` swaps it for the
+    grounded value when a fuzzy/bare-ID match exists in the bundle."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entity_type: EntityType
+    canonical_id: str
+    display_name: str
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+
+class EntityExtraction(BaseModel):
+    """`response_format=EntityExtraction` is constrained-decoded on a tiny
+    upfront call. The model returns only entities — no temporal/sort/mode
+    classification (the agent infers those from query text + tool selection)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entities: list[ExtractedEntity] = Field(default_factory=list)
