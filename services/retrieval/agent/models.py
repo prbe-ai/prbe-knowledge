@@ -53,53 +53,57 @@ GathererStatus = Literal[
 
 
 class GatheredEntity(BaseModel):
-    """A graph node the agent chose to surface alongside the chunks."""
+    """A graph node the agent chose to surface alongside the chunks.
+
+    Trim discipline: every field here ships in the JSON output every call.
+    At ~80-120 output tok/s on Fireworks gpt-oss-120B each unused token is
+    ~10ms wall-clock. Don't add free-form text fields; the consumer reads
+    `canonical_id` + `label` (+ optional `display_name`) and nothing else.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     canonical_id: str
     label: str
-    properties: dict = Field(
-        default_factory=dict,
-        description="Node properties, trimmed at the tool layer to ~2KB.",
-    )
-    why_relevant: str = Field(
-        ...,
-        description="One-line, agent-written rationale for surfacing this entity.",
-    )
+    # Optional short human-readable name. Replaces the old `properties`
+    # dict (~2KB/entity of JSON-encoded node attrs the agent rarely
+    # populated and no downstream consumer reads beyond `name`/
+    # `display_name`). Adapter falls back to canonical_id when absent.
+    display_name: str | None = Field(default=None, max_length=120)
 
 
 class GatheredChunk(BaseModel):
-    """A doc chunk the agent chose to surface."""
+    """A doc chunk the agent chose to surface.
+
+    `content` is capped to 1500 chars — the synthesizer's user prompt
+    truncates at the same boundary (`services/retrieval/synthesis.py
+    _format_user_prompt`), so emitting longer just burns output tokens
+    the synthesizer never reads.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     doc_id: str
     chunk_id: str
-    content: str
+    content: str = Field(..., max_length=1500)
     matched_via: list[MatchedViaChannel] = Field(
         ...,
         description="Channels that surfaced this chunk during the loop.",
-    )
-    why_relevant: str = Field(
-        ...,
-        description="One-line, agent-written rationale. For inferred-edge "
-        "neighbors, quote the edge `why` string verbatim.",
     )
 
 
 class DroppedCandidate(BaseModel):
     """A candidate the agent saw but chose not to surface.
 
-    `reason` is mandatory: the schema prevents the model from emitting a
-    drop without a justification, so the dashboard's debug pane can
-    always render the audit trail.
+    `reason` is mandatory and capped: enough room for a one-liner audit
+    trail, not enough to invite a paragraph. Only consumer is the
+    `dropped_count` integer column and the trace blob (debug-only).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     canonical_id: str
-    reason: str
+    reason: str = Field(..., max_length=200)
 
 
 class GathererNotes(BaseModel):
@@ -112,10 +116,7 @@ class GathererNotes(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     turns_used: int = Field(..., ge=0)
-    tools_called: list[str] = Field(
-        default_factory=list,
-        description="Tool names in call order. Sequence preserved for trace replay.",
-    )
+    tools_called: list[str] = Field(default_factory=list)
     confidence: ConfidenceLabel
     dropped: list[DroppedCandidate] = Field(default_factory=list)
 

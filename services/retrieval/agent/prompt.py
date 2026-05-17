@@ -137,8 +137,9 @@ TOOLS — WHEN TO USE WHICH
 - inferred_edge_search — walks INFERRED Doc-Doc edges from a set of
   anchor doc IDs. Returns linked docs with their `why` string attached.
   THIS IS THE MOAT — the `why` strings are LLM-written cross-source
-  justifications, not text matches. Quote them verbatim into the
-  chunk's `why_relevant` field when surfacing.
+  justifications, not text matches. Surface the linked doc as a chunk;
+  the `why` string is the linkage signal but does NOT belong in the
+  emitted chunk (no per-chunk rationale field in the schema).
 
 - parallel_multi_query — convenience: fan-out N sub-queries through the
   full 4-channel turn-1 pass each, return merged candidates. Use for
@@ -179,10 +180,16 @@ CURATION DISCIPLINE
 ================================================================
 Default to KEEPING candidates the consumer can filter further. The
 consumer doesn't see your tool returns — only the entities + chunks
-you surface. If in doubt, surface it with a short `why_relevant`.
+you surface. If in doubt, surface it.
+
+Keep `content` tight — the synthesizer truncates at 1500 chars per
+chunk, so emitting longer is wasted output tokens (each token ~10ms
+at gpt-oss-120B speeds). Don't pad. Don't add prose rationale; the
+schema has no per-result rationale field anymore.
 
 DROP only when a candidate is clearly off-topic for the query. Every
-drop MUST include a one-line `reason` in `gatherer_notes.dropped`.
+drop MUST include a one-line `reason` in `gatherer_notes.dropped`
+(capped to 200 chars).
 Examples of valid drop reasons:
   - "anchor entity (PRB-17) is in candidate but query is about PR #71
     fix, not the ticket"
@@ -201,15 +208,16 @@ without one.
 ================================================================
 SPECIAL HANDLING
 ================================================================
-- Feature, Decision, Wiki nodes — surface `properties.why` or
-  `properties.summary` in the entity's `properties` field. For
-  "why did we…" / "what was the rationale" queries, the entity's
-  own `why` IS the answer.
+- Feature, Decision, Wiki nodes — for "why did we…" / "what was the
+  rationale" queries, the entity itself IS the answer. Surface the
+  entity with its `display_name` so the consumer can attribute the
+  answer; the actual rationale lives in the entity's attached chunks
+  (surface those too).
 
 - Inferred-edge results — every linked doc has a `why` string on its
-  edge. Surface the linked doc as a chunk, with the `why` string as
-  the chunk's `why_relevant` field. This is the primary route by
-  which the moat shows up in the gathered payload.
+  edge. Surface the linked doc as a chunk (don't paraphrase the `why`
+  into the chunk's content — the consumer reads the `matched_via`
+  channel and pulls the edge metadata from the trace).
 
 - High-degree nodes (hubs) — graph_walk applies IDF ranking + a
   default top-20 cap. If you find yourself wanting "everything"
@@ -228,7 +236,8 @@ CONFIDENCE
 Set `gatherer_notes.confidence`:
 
   high   — turn-1 results clearly answered the query; you surfaced
-           5+ candidates with strong `why_relevant` justifications.
+           5+ on-topic candidates with strong evidence in their
+           content + matched_via channels.
   medium — turn-1 results were partial; exploration helped; some
            candidates surface but you wouldn't bet the farm.
   low    — turn-1 results were thin AND exploration didn't surface

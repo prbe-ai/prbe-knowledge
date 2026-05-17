@@ -54,7 +54,7 @@ def _chunk_to_query_chunk(chunk: Any, doc_id: str, rank: int) -> QueryChunk:
         chunk_id=chunk.chunk_id,
         content=chunk.content,
         score=1.0 - (0.01 * rank),  # decay so consumers' sort is stable; agent's
-                                    # actual ranking signal is matched_via / why_relevant
+                                    # actual ranking signal is matched_via order
         rank_in_doc=rank + 1,
         retriever_scores={},
         graph_evidence=[],
@@ -135,6 +135,11 @@ def to_query_response(
 
     for entity in gathered.entities:
         rank_counter += 1
+        # Gatherer emits a short `display_name` only — `properties` is
+        # no longer in the schema (saved ~2KB/entity of unused output
+        # tokens). Adapter fills the legacy `properties` dict empty so
+        # the response shape is unchanged for older MCP clients.
+        display = entity.display_name or entity.canonical_id
         results.append(
             QueryEntityResult(
                 canonical_id=entity.canonical_id,
@@ -142,8 +147,8 @@ def to_query_response(
                 rank=rank_counter,
                 matched_via=[],
                 label=entity.label,
-                display_name=str(entity.properties.get("name") or entity.properties.get("display_name") or entity.canonical_id),
-                properties=entity.properties,
+                display_name=display,
+                properties={},
                 attached_doc_ids=[],
                 edge_types=[],
                 doc_count=0,
@@ -161,9 +166,7 @@ def to_query_response(
             {
                 "entity_type": e.label.lower(),
                 "canonical_id": e.canonical_id,
-                "display_name": str(
-                    e.properties.get("name") or e.properties.get("display_name") or e.canonical_id
-                ),
+                "display_name": e.display_name or e.canonical_id,
                 "confidence": 1.0,
             }
             for e in gathered.entities

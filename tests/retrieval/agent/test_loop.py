@@ -75,7 +75,6 @@ def _final_emission_json(*, confidence: str = "high", chunks: int = 2) -> str:
                 "chunk_id": f"chunk-{i}",
                 "content": f"content body {i}",
                 "matched_via": ["vector"],
-                "why_relevant": f"surfaced via vector channel, rank {i+1}",
             }
             for i in range(chunks)
         ],

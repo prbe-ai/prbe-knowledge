@@ -71,7 +71,6 @@ def _mk_gathered(confidence: str = "high") -> GathererOutput:
                 chunk_id="chunk-1",
                 content="body",
                 matched_via=["vector"],
-                why_relevant="surfaced via vector channel",
             ),
         ],
         gatherer_notes=GathererNotes(
