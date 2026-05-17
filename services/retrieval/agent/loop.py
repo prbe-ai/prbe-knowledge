@@ -609,7 +609,7 @@ async def _drive_loop(state: _LoopState) -> GathererOutput | None:
                     "no markdown, no preamble, no commentary."
                 ),
             })
-            retry_resp, retry_content = await _run_turn(state, force_final=True)
+            _retry_resp, retry_content = await _run_turn(state, force_final=True)
             parsed = _parse_gatherer_output(retry_content)
             return parsed
 
