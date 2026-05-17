@@ -595,7 +595,16 @@ INFERRED_EDGE_HYDRATION_CHUNKS = 3
 # docs/specs/agentic-search.md). Tunables below are read at agent loop
 # construction; changing them requires a redeploy (no hot-reload).
 
-SEARCH_AGENT_INFERENCE_MODEL = "fireworks_ai/accounts/fireworks/models/gpt-oss-120b"
+# IMPORTANT: no `fireworks_ai/` provider prefix. When `shared.llm.acompletion`
+# forces `custom_llm_provider="openai"` for gateway-routed calls (so
+# Fireworks honors response_format), LiteLLM forwards this model id
+# verbatim in the OpenAI chat-completion request body. The LiteLLM proxy
+# matches `model_name: "accounts/fireworks/*"` in its modelList (per
+# prbe-backend/charts/litellm/values.yaml) and adds the `fireworks_ai/`
+# prefix back for the upstream call. Including the prefix here causes the
+# proxy to receive `fireworks_ai/accounts/...` which doesn't match the
+# route and 400s. Verified live 2026-05-17.
+SEARCH_AGENT_INFERENCE_MODEL = "accounts/fireworks/models/gpt-oss-120b"
 
 # Soft budget: total tool calls across all turns. Covers turn-1 mandatory 4
 # + ~16 exploration calls across 2-3 follow-up turns. The agent may extend
