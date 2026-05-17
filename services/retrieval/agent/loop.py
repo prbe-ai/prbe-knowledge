@@ -575,8 +575,42 @@ async def _drive_loop(state: _LoopState) -> GathererOutput | None:
             ]
 
         if not tool_calls:
-            # Curate path — final emission.
+            # Curate path — final emission. Try parse first; if the model
+            # emitted prose (Fireworks treats response_format as advisory
+            # when tools are present in the same request, so a model that
+            # chooses to "answer" instead of tool-call can ignore the
+            # schema), kick once more WITHOUT tools — that forces strict
+            # structured-output decoding via response_format.
             parsed = _parse_gatherer_output(content)
+            if parsed is not None:
+                return parsed
+
+            if force_final:
+                # Already retried without tools — give up.
+                return None
+
+            # Inject the prose response into history + a "re-emit as JSON"
+            # nudge, then run an immediate force-final turn (tools=None).
+            log.info(
+                "agent.prose_emission_retry",
+                customer_id=state.customer_id,
+                trace_id=state.trace_id,
+                content_preview=(content or "")[:120],
+            )
+            state.messages.append({
+                "role": "assistant",
+                "content": content or "",
+            })
+            state.messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous output was prose, not the GathererOutput "
+                    "JSON shape. Emit ONLY the GathererOutput JSON now — "
+                    "no markdown, no preamble, no commentary."
+                ),
+            })
+            _retry_resp, retry_content = await _run_turn(state, force_final=True)
+            parsed = _parse_gatherer_output(retry_content)
             return parsed
 
         if force_final:
