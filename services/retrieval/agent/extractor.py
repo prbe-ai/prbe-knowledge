@@ -183,6 +183,9 @@ async def extract_entities_with_llm(
             # response_format survives the gateway. See loop.py
             # _GATHERER_OUTPUT_RESPONSE_FORMAT for the same reasoning.
             custom_llm_provider="openai",
+            # Greedy decoding — same query must produce the same extracted
+            # entities run-to-run. See loop.py _run_turn for the same fix.
+            temperature=0,
             max_tokens=600,
             timeout=SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
         )
