@@ -42,7 +42,14 @@ from services.retrieval.agent.models import (
     GathererStatus,
 )
 from services.retrieval.agent.prompt import build_system_prompt
-from services.retrieval.agent.tools import dispatch_tool_call, tool_definitions
+from services.retrieval.agent.tools import (
+    dispatch_tool_call,
+    execute_bm25_search,
+    execute_graph_search,
+    execute_inferred_edge_search,
+    execute_vector_search,
+    tool_definitions,
+)
 from services.retrieval.grounding import GroundingBundle
 from services.retrieval.router import (
     _build_bundle_with_token_fallback,
@@ -102,6 +109,14 @@ class _LoopState:
     cache_hit_rates: list[float] = field(default_factory=list)
     turn_1_tools_fired: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.perf_counter)
+    # Per-turn LLM call latencies (ms). One entry per acompletion call.
+    # Includes the prose-retry call when it fires.
+    turn_latencies_ms: list[float] = field(default_factory=list)
+    # Per-tool execution latencies (ms). One entry per dispatched tool.
+    tool_latencies_ms: list[float] = field(default_factory=list)
+    # Count of prose-emission retry calls (model emitted prose, harness
+    # retried with tools=None). Each retry adds one extra LLM round-trip.
+    prose_retries: int = 0
 
 
 # ============================================================
@@ -116,11 +131,20 @@ _REQUIRED_TURN_1_CHANNELS: frozenset[str] = frozenset({
 })
 
 
-def _build_user_message(query: str, bundle: GroundingBundle) -> str:
+def _build_user_message(
+    query: str,
+    bundle: GroundingBundle,
+    prefanout: dict[str, Any] | None = None,
+) -> str:
     """Render the per-query user message.
 
-    Mirrors PR #282's router user-message style (grounding first, query
-    last for recency bias) so the cache prefix can remain stable.
+    Layout (grounding-first for cache stability, then channel results,
+    then the raw query last for recency bias):
+        <grounding>           — entity bag from deterministic grounding
+        <connected_sources>   — which source systems the tenant has wired
+        <channel_results>     — pre-fan-out vector + bm25 + graph +
+                                inferred_edge results, when present
+        <query>               — raw user query, last for recency
     """
     grounding_lines = []
     for c in bundle.candidates:
@@ -137,10 +161,39 @@ def _build_user_message(query: str, bundle: GroundingBundle) -> str:
     sources_block = (
         ", ".join(bundle.connected_sources) if bundle.connected_sources else "(none)"
     )
+
+    channel_results_block = ""
+    if prefanout:
+        # Serialize each channel's hits with a per-channel header so the
+        # agent can quickly skim. JSON-encoded payload so the model reads
+        # rich fields (score, why, source_url, content) verbatim. Trim if
+        # the combined dump would exceed 60KB (same as our per-turn
+        # tool-result cap) to keep turn 1 from blowing context.
+        payload_str = json.dumps(prefanout, default=str)
+        if len(payload_str) > 60_000:
+            payload_str = json.dumps({
+                "truncated": True,
+                "original_size_chars": len(payload_str),
+                "note": "pre-fan-out results too large; truncated. Use fetch_doc_chunks for any specific doc_id you need more of.",
+                "head": payload_str[:30_000],
+            })
+        channel_results_block = (
+            f"\n\n<channel_results>\n"
+            f"Results from the deterministic pre-fan-out (vector + bm25 + graph + "
+            f"inferred_edge anchored on the grounded entities, fired before this "
+            f"turn). Use these as your turn-1 evidence — do NOT re-fire these "
+            f"four channels unless you need a different query or top_k. Use the "
+            f"other tools (graph_walk, expand_inferred_neighbors, expand_entity_cluster, "
+            f"fetch_doc_chunks, parallel_multi_query, reissue_query) for exploration.\n"
+            f"{payload_str}\n"
+            f"</channel_results>"
+        )
+
     safe_query = _escape_query_for_xml(query)
     return (
         f"<grounding>\n{grounding_block}\n</grounding>\n\n"
-        f"<connected_sources>{sources_block}</connected_sources>\n\n"
+        f"<connected_sources>{sources_block}</connected_sources>"
+        f"{channel_results_block}\n\n"
         f"<query>\n{safe_query}\n</query>"
     )
 
@@ -309,10 +362,33 @@ async def _execute_tool_call(
             },
         }
 
+    t_tool = time.perf_counter()
     result = await dispatch_tool_call(
         customer_id=state.customer_id,
         tool_name=name,
         arguments=arguments,
+    )
+    elapsed_ms = (time.perf_counter() - t_tool) * 1000
+    state.tool_latencies_ms.append(elapsed_ms)
+    # Rough hit-count for logging — peek at the returned shape's common
+    # "hits" / "sub_queries" / "clusters" arrays. Not authoritative; just
+    # a debug breadcrumb so we can correlate slow tool calls with payload
+    # size during latency investigations.
+    hit_count = 0
+    if isinstance(result, dict):
+        for k in ("hits", "sub_queries", "neighbors", "chunks"):
+            v = result.get(k)
+            if isinstance(v, list):
+                hit_count = len(v)
+                break
+    log.info(
+        "agent.tool_complete",
+        customer_id=state.customer_id,
+        trace_id=state.trace_id,
+        tool_name=name,
+        elapsed_ms=round(elapsed_ms, 1),
+        hit_count=hit_count,
+        is_error="error" in result if isinstance(result, dict) else False,
     )
     return {"name": name, "result": result}
 
@@ -350,28 +426,46 @@ async def _run_turn(
         call_kwargs["tools"] = tools
         call_kwargs["tool_choice"] = tool_choice
 
+    t_turn = time.perf_counter()
     try:
         resp = await acompletion(**call_kwargs)
     except LLMError as exc:
+        elapsed_ms = (time.perf_counter() - t_turn) * 1000
         log.warning(
             "agent.turn_llm_error",
             customer_id=state.customer_id,
             trace_id=state.trace_id,
             turn=state.turn_count,
+            elapsed_ms=round(elapsed_ms, 1),
             error=str(exc),
         )
         raise
 
+    elapsed_ms = (time.perf_counter() - t_turn) * 1000
     state.turn_count += 1
+    state.turn_latencies_ms.append(elapsed_ms)
     rate = _extract_cache_hit_rate(resp)
     if rate is not None:
         state.cache_hit_rates.append(rate)
 
     choices = getattr(resp, "choices", None) or []
+    msg = getattr(choices[0], "message", None) if choices else None
+    tool_calls = getattr(msg, "tool_calls", None) or [] if msg is not None else []
+    content = getattr(msg, "content", None) if msg is not None else None
+    log.info(
+        "agent.turn_complete",
+        customer_id=state.customer_id,
+        trace_id=state.trace_id,
+        turn=state.turn_count,
+        elapsed_ms=round(elapsed_ms, 1),
+        force_final=force_final,
+        tool_calls_count=len(tool_calls),
+        content_len=len(content) if content else 0,
+        cache_hit_rate=round(rate, 3) if rate is not None else None,
+    )
+
     if not choices:
         return resp, None
-    msg = getattr(choices[0], "message", None)
-    content = getattr(msg, "content", None) if msg is not None else None
     return resp, content
 
 
@@ -431,8 +525,52 @@ async def run_gatherer(
         bundle = GroundingBundle()
     timing["grounding_ms"] = (time.perf_counter() - t_grounding) * 1000
 
-    # Build the agent input message.
-    user_msg = _build_user_message(req.query, bundle)
+    # Step 2 — deterministic pre-fan-out. Fire vector + bm25 + graph +
+    # inferred_edge in parallel BEFORE the LLM call. The agent gets these
+    # results in its first user message and skips the "what should I call"
+    # decision entirely on turn 1. This is the recall guarantee:
+    # deterministic, can't be skipped by a misbehaving model.
+    #
+    # Latency win: cuts turn count from 3-8 to 1-3 (pure curation on the
+    # happy path), saving ~10-20s/query at gpt-oss-120B latencies.
+    # Cost: one extra ~500ms-1s of parallel SQL even when only one channel
+    # would have surfaced the answer — worth it for the determinism and
+    # the ~2-4x turn-count reduction.
+    t_prefanout = time.perf_counter()
+    entity_dicts: list[dict[str, str]] = [
+        {"entity_type": c.entity_type, "canonical_id": c.canonical_id}
+        for c in (list(bundle.candidates) + list(bundle.bare_id_matches))
+    ]
+    prefanout = await asyncio.gather(
+        execute_vector_search(customer_id, query=req.query),
+        execute_bm25_search(customer_id, query=req.query),
+        execute_graph_search(customer_id, entities=entity_dicts),
+        execute_inferred_edge_search(customer_id, entities=entity_dicts),
+        return_exceptions=True,
+    )
+    timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
+
+    channel_names = ("vector", "bm25", "graph", "inferred_edge")
+    prefanout_dict: dict[str, Any] = {}
+    prefanout_hit_counts: dict[str, int] = {}
+    for name, result in zip(channel_names, prefanout, strict=True):
+        if isinstance(result, BaseException):
+            prefanout_dict[name] = {"error": f"{type(result).__name__}: {result}"}
+            prefanout_hit_counts[name] = 0
+        else:
+            prefanout_dict[name] = result
+            hits = result.get("hits") if isinstance(result, dict) else None
+            prefanout_hit_counts[name] = len(hits) if isinstance(hits, list) else 0
+    log.info(
+        "agent.prefanout_complete",
+        customer_id=customer_id,
+        trace_id=trace_id,
+        elapsed_ms=round(timing["prefanout_ms"], 1),
+        hits=prefanout_hit_counts,
+    )
+
+    # Build the agent input message (now includes the pre-fan-out results).
+    user_msg = _build_user_message(req.query, bundle, prefanout_dict)
     system_prompt = build_system_prompt(datetime.now(UTC))
 
     state = _LoopState(
@@ -535,6 +673,35 @@ async def run_gatherer(
             fired=state.turn_1_tools_fired,
         )
 
+    # Per-query latency breakdown — single log line, easy to grep.
+    timing["agent_loop_ms"] = sum(state.turn_latencies_ms)
+    timing["agent_tools_ms"] = sum(state.tool_latencies_ms)
+    log.info(
+        "agent.query_summary",
+        customer_id=customer_id,
+        trace_id=trace_id,
+        status=status,
+        confidence=gathered.gatherer_notes.confidence,
+        turns=state.turn_count,
+        tool_calls=state.tool_calls_count,
+        prose_retries=state.prose_retries,
+        extensions=state.extensions_used,
+        results=len(gathered.chunks) + len(gathered.entities),
+        # ms breakdown — each stage independently slow points at the fix
+        grounding_ms=round(timing.get("grounding_ms", 0), 1),
+        prefanout_ms=round(timing.get("prefanout_ms", 0), 1),
+        agent_total_ms=round(timing.get("agent_ms", 0), 1),
+        agent_llm_ms=round(timing["agent_loop_ms"], 1),
+        agent_tool_ms=round(timing["agent_tools_ms"], 1),
+        per_turn_ms=[round(t, 1) for t in state.turn_latencies_ms],
+        per_tool_ms=[round(t, 1) for t in state.tool_latencies_ms],
+        cache_hit_rate=(
+            round(sum(state.cache_hit_rates) / len(state.cache_hit_rates), 3)
+            if state.cache_hit_rates
+            else None
+        ),
+    )
+
     # Telemetry written to request.state for the query_traces middleware.
     if request is not None:
         request.state.gatherer_status = status
@@ -582,9 +749,33 @@ async def _drive_loop(state: _LoopState) -> GathererOutput | None:
             ]
 
         if not tool_calls:
-            # Curate path — final emission.
+            # Curate path — final emission. Try parse first; if the model
+            # emitted prose (Fireworks treats response_format as advisory
+            # when tools are present in the same request), kick once more
+            # WITHOUT tools — that forces strict structured-output decoding.
             parsed = _parse_gatherer_output(content)
-            return parsed
+            if parsed is not None:
+                return parsed
+            if force_final:
+                return None
+            state.prose_retries += 1
+            log.info(
+                "agent.prose_emission_retry",
+                customer_id=state.customer_id,
+                trace_id=state.trace_id,
+                content_preview=(content or "")[:120],
+            )
+            state.messages.append({"role": "assistant", "content": content or ""})
+            state.messages.append({
+                "role": "user",
+                "content": (
+                    "Your previous output was prose, not the GathererOutput "
+                    "JSON shape. Emit ONLY the GathererOutput JSON now — "
+                    "no markdown, no preamble, no commentary."
+                ),
+            })
+            _retry_resp, retry_content = await _run_turn(state, force_final=True)
+            return _parse_gatherer_output(retry_content)
 
         if force_final:
             # We told the model "no more tools" — if it still emitted tool
