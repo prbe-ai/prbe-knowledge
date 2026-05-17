@@ -40,6 +40,7 @@ from services.retrieval.agent.adapter import to_query_response
 from services.retrieval.agent.extractor import extract_entities_with_llm
 from services.retrieval.agent.models import (
     DroppedCandidate,
+    GatheredChunk,
     GathererNotes,
     GathererOutput,
     GathererStatus,
@@ -318,6 +319,99 @@ def _empty_passthrough(reason: GathererStatus) -> GathererOutput:
                     reason=f"harness_passthrough: {reason}",
                 )
             ],
+        ),
+    )
+
+
+# ============================================================
+# Deterministic high-confidence fast-path
+# ============================================================
+
+# Number of pre-fan-out hits to surface on the fast path. Matches the
+# loop's typical curated-output size and the consumer's default top-K.
+# Picked here (not a shared constant) because the LLM-driven loop
+# chooses its own K via curation; this is purely the fast-path budget.
+_FAST_PATH_TOP_K: int = 10
+
+# Channels that the deterministic pre-fan-out fires. Order is the
+# preference for tie-breaking when score is equal (vector ranked
+# highest, then bm25, graph, inferred_edge).
+_FAST_PATH_CHANNEL_PRIORITY: tuple[str, ...] = ("vector", "bm25", "graph", "inferred_edge")
+
+
+def _build_fast_path_output(
+    bundle: GroundingBundle,
+    prefanout_dict: dict[str, Any],
+) -> GathererOutput:
+    """Assemble a GathererOutput deterministically from pre-fan-out hits.
+
+    Caller has already validated len(bundle.bare_id_matches) == 1; we
+    surface that entity plus the top-K chunks across all four pre-fan-out
+    channels, ranked by score desc with channel priority as tie-breaker.
+    Each chunk's `matched_via` is the single channel it came from; the
+    `why_relevant` quotes the bare-ID anchor verbatim.
+
+    No LLM call. No tool dispatch. Pure data shuffling — ~5-10ms.
+    """
+    anchor = bundle.bare_id_matches[0]
+    anchor_label = f"{anchor.entity_type}:{anchor.canonical_id} ({anchor.display_name})"
+
+    # Flatten all channel hits, tagging each with its source channel for
+    # both the matched_via field and the priority tie-break.
+    flat: list[tuple[float, int, str, dict[str, Any]]] = []
+    for channel_priority, channel_name in enumerate(_FAST_PATH_CHANNEL_PRIORITY):
+        result = prefanout_dict.get(channel_name)
+        if not isinstance(result, dict):
+            continue
+        hits = result.get("hits")
+        if not isinstance(hits, list):
+            continue
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            score = float(hit.get("score") or 0.0)
+            flat.append((score, channel_priority, channel_name, hit))
+
+    # Sort: score desc, then channel priority asc (vector wins ties).
+    flat.sort(key=lambda x: (-x[0], x[1]))
+
+    seen_chunk_ids: set[str] = set()
+    chunks: list[GatheredChunk] = []
+    for _score, _prio, channel_name, hit in flat:
+        chunk_id = hit.get("chunk_id")
+        doc_id = hit.get("doc_id")
+        content = hit.get("content") or ""
+        if not chunk_id or not doc_id:
+            continue
+        # Dedupe by chunk_id so the same chunk surfaced by two channels
+        # is only emitted once. Channel priority above ensures the
+        # higher-priority channel name wins the matched_via slot.
+        if chunk_id in seen_chunk_ids:
+            continue
+        seen_chunk_ids.add(chunk_id)
+
+        # Channel name must satisfy GatheredChunk.MatchedViaChannel; the
+        # four pre-fan-out channels are all valid Literal values.
+        chunks.append(
+            GatheredChunk(
+                doc_id=str(doc_id),
+                chunk_id=str(chunk_id),
+                content=str(content),
+                matched_via=[channel_name],  # type: ignore[list-item]
+                why_relevant=f"pinned by bare-ID anchor {anchor_label}; surfaced via {channel_name}",
+            )
+        )
+        if len(chunks) >= _FAST_PATH_TOP_K:
+            break
+
+    return GathererOutput(
+        entities=[],
+        chunks=chunks,
+        gatherer_notes=GathererNotes(
+            turns_used=0,
+            tools_called=[],
+            confidence="high",
+            dropped=[],
         ),
     )
 
@@ -772,6 +866,81 @@ async def run_gatherer(
             query=req.query, gathered=gathered, trace_id=trace_id, timing_ms=timing
         )
 
+    # Deterministic high-confidence fast-path. When grounding pinned the
+    # query to exactly ONE bare-ID match (e.g. "PRB-17", "#71", a SHA),
+    # the answer is already in the pre-fan-out hits — the LLM call would
+    # spend ~12s curating something we can synthesize in microseconds.
+    # Skip the loop, assemble GathererOutput directly. Ambiguous cases
+    # (0 or 2+ bare-IDs) fall through to the normal loop so the LLM can
+    # disambiguate. See team-memory: "FAST-PATH LOGIC (high-confidence
+    # bare-ID match)" in the agent prompt design doc.
+    fast_path_label: str | None = None
+    if len(bundle.bare_id_matches) == 1:
+        fast_path_label = "high_confidence_id_match"
+        gathered_fp = _build_fast_path_output(bundle, prefanout_dict)
+        timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
+        log.info(
+            "agent.fast_path_taken",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            fast_path=fast_path_label,
+            anchor=f"{bundle.bare_id_matches[0].entity_type}:{bundle.bare_id_matches[0].canonical_id}",
+            chunks=len(gathered_fp.chunks),
+        )
+        # Mirror the standard query_summary log shape so dashboards keep
+        # working — fast-path rows just have zeros for the LLM-driven
+        # fields and a non-null `fast_path` to flag them.
+        timing["agent_loop_ms"] = 0.0
+        timing["agent_tools_ms"] = 0.0
+        log.info(
+            "agent.query_summary",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            status="ok",
+            confidence=gathered_fp.gatherer_notes.confidence,
+            turns=0,
+            tool_calls=0,
+            prose_retries=0,
+            extensions=0,
+            results=len(gathered_fp.chunks) + len(gathered_fp.entities),
+            grounding_ms=round(timing.get("grounding_ms", 0), 1),
+            extraction_ms=round(timing.get("extraction_ms", 0), 1),
+            prefanout_ms=round(timing.get("prefanout_ms", 0), 1),
+            agent_total_ms=round(timing.get("agent_ms", 0), 1),
+            agent_llm_ms=0.0,
+            agent_tool_ms=0.0,
+            per_turn_ms=[],
+            per_tool_ms=[],
+            cache_hit_rate=None,
+            fast_path=fast_path_label,
+        )
+        if request is not None:
+            request.state.gatherer_status = "ok"
+            request.state.tool_calls_count = 0
+            request.state.need_deeper_extensions = 0
+            request.state.confidence = gathered_fp.gatherer_notes.confidence
+            request.state.dropped_count = len(gathered_fp.gatherer_notes.dropped)
+            request.state.cache_hit_rate = None
+            request.state.intents_count = 1
+            request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
+            request.state.failure_recovered = False
+        _stash_for_trace_persist(
+            request,
+            customer_id=customer_id,
+            trace_id=trace_id,
+            query=req.query,
+            state=state,
+            gathered=gathered_fp,
+            status="ok",
+            timing=timing,
+        )
+        return to_query_response(
+            query=req.query,
+            gathered=gathered_fp,
+            trace_id=trace_id,
+            timing_ms=timing,
+        )
+
     gathered: GathererOutput | None = None
     try:
         gathered = await asyncio.wait_for(
@@ -859,6 +1028,7 @@ async def run_gatherer(
             if state.cache_hit_rates
             else None
         ),
+        fast_path=None,
     )
 
     # Telemetry written to request.state for the query_traces middleware.

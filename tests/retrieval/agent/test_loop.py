@@ -30,7 +30,7 @@ from services.retrieval.agent.loop import (
     run_gatherer,
 )
 from services.retrieval.agent.models import GathererOutput
-from services.retrieval.grounding import GroundingBundle
+from services.retrieval.grounding import GroundingBundle, GroundingCandidate
 from shared.models import QueryRequest
 
 # ============================================================
@@ -590,3 +590,140 @@ async def test_trace_id_falls_back_to_uuid_when_no_request_id(
     parsed = _uuid.UUID(resp.trace_id)
     assert str(parsed) == resp.trace_id
     assert not resp.trace_id.startswith("q-")
+
+
+# ============================================================
+# Deterministic high-confidence fast-path
+# ============================================================
+
+def _mk_candidate(canonical_id: str, *, entity_type: str = "ticket") -> GroundingCandidate:
+    """Build a GroundingCandidate suitable for bare_id_matches in tests."""
+    return GroundingCandidate(
+        entity_type=entity_type,
+        canonical_id=canonical_id,
+        display_name=canonical_id,
+        last_seen_at=None,
+        match_source="bare_id_exact",
+    )
+
+
+def _mk_prefanout_chunks(n: int) -> dict[str, Any]:
+    """Build a fake vector_search return shape with n chunk hits."""
+    return {
+        "hits": [
+            {
+                "channel": "vector",
+                "chunk_id": f"chunk-{i}",
+                "doc_id": f"doc-{i}",
+                "source_system": "linear",
+                "source_url": f"https://linear.app/x/PRB-17#{i}",
+                "title": f"PRB-17 chunk {i}",
+                "content": f"body {i}",
+                "score": 0.9 - 0.01 * i,
+                "created_at": None,
+                "updated_at": None,
+                "author_id": None,
+            }
+            for i in range(n)
+        ]
+    }
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_grounding_skips_llm(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Single bare_id_match in grounding -> deterministic GathererOutput,
+    zero LLM calls. Validates the ~12.7s-per-query latency win on
+    ID-pinned queries (e.g. "PRB-17").
+    """
+    req = QueryRequest(query="PRB-17", customer_id="cust-1", top_k=5)
+    bundle = GroundingBundle(bare_id_matches=[_mk_candidate("PRB-17")])
+    prefanout_vector = _mk_prefanout_chunks(5)
+
+    boom_acompletion = AsyncMock(side_effect=AssertionError("acompletion MUST NOT be called on the fast path"))
+
+    with patch(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        new=AsyncMock(return_value=bundle),
+    ), patch(
+        "services.retrieval.agent.loop.extract_entities_with_llm",
+        new=AsyncMock(return_value=[]),
+    ), patch(
+        "services.retrieval.agent.loop.execute_vector_search",
+        new=AsyncMock(return_value=prefanout_vector),
+    ), patch(
+        "services.retrieval.agent.loop.execute_bm25_search",
+        new=AsyncMock(return_value={"hits": []}),
+    ), patch(
+        "services.retrieval.agent.loop.execute_graph_search",
+        new=AsyncMock(return_value={"hits": []}),
+    ), patch(
+        "services.retrieval.agent.loop.execute_inferred_edge_search",
+        new=AsyncMock(return_value={"hits": []}),
+    ), patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=boom_acompletion,
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    boom_acompletion.assert_not_called()
+    # All 5 pre-fan-out chunks surfaced (under the fast-path top-K of 10).
+    assert resp.total_candidates == 5
+    assert resp.gatherer_notes is not None
+    assert resp.gatherer_notes["confidence"] == "high"
+    assert resp.gatherer_notes["turns_used"] == 0
+    assert resp.gatherer_notes["tools_called"] == []
+    # Telemetry: status ok, no tool calls, no failure flag.
+    assert fake_request.state.gatherer_status == "ok"
+    assert fake_request.state.tool_calls_count == 0
+    assert fake_request.state.confidence == "high"
+    assert fake_request.state.failure_recovered is False
+
+
+@pytest.mark.asyncio
+async def test_multiple_bare_id_matches_takes_normal_loop(
+    fake_request: SimpleNamespace,
+) -> None:
+    """When grounding pinned MULTIPLE bare-IDs, the query is ambiguous —
+    let the LLM disambiguate via the normal loop. The fast path is for
+    UNAMBIGUOUS single-ID matches only.
+    """
+    req = QueryRequest(
+        query="compare PRB-17 with PRB-18", customer_id="cust-1", top_k=5
+    )
+    bundle = GroundingBundle(
+        bare_id_matches=[_mk_candidate("PRB-17"), _mk_candidate("PRB-18")]
+    )
+
+    # Mock the LLM to emit a final GathererOutput on turn 1 (the normal
+    # loop should be entered and the LLM should make the call).
+    final = _mk_resp(content=_final_emission_json(chunks=1, confidence="medium"))
+
+    with patch(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        new=AsyncMock(return_value=bundle),
+    ), patch(
+        "services.retrieval.agent.loop.extract_entities_with_llm",
+        new=AsyncMock(return_value=[]),
+    ), patch(
+        "services.retrieval.agent.loop.execute_vector_search",
+        new=AsyncMock(return_value={"hits": []}),
+    ), patch(
+        "services.retrieval.agent.loop.execute_bm25_search",
+        new=AsyncMock(return_value={"hits": []}),
+    ), patch(
+        "services.retrieval.agent.loop.execute_graph_search",
+        new=AsyncMock(return_value={"hits": []}),
+    ), patch(
+        "services.retrieval.agent.loop.execute_inferred_edge_search",
+        new=AsyncMock(return_value={"hits": []}),
+    ), patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=final),
+    ) as mock_acomp:
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    # LLM was called — the fast path was correctly skipped.
+    mock_acomp.assert_called()
+    assert resp.gatherer_notes["confidence"] == "medium"
