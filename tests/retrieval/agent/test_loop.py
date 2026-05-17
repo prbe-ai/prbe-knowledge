@@ -31,8 +31,7 @@ from services.retrieval.agent.loop import (
 )
 from services.retrieval.agent.models import GathererOutput
 from services.retrieval.grounding import GroundingBundle
-from shared.models import QueryRequest, TemporalSpec
-
+from shared.models import QueryRequest
 
 # ============================================================
 # Test fixtures: fake LiteLLM response builder
@@ -307,9 +306,8 @@ async def test_llm_error_raises_503(
     ), patch(
         "services.retrieval.agent.loop.acompletion",
         new=AsyncMock(side_effect=LLMError("fireworks down")),
-    ):
-        with pytest.raises(HTTPException) as exc_info:
-            await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    ), pytest.raises(HTTPException) as exc_info:
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
     assert exc_info.value.status_code == 503
     assert fake_request.state.full_failure is True
 

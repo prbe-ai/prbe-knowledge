@@ -24,7 +24,6 @@ from services.retrieval.agent.tools import (
     tool_definitions,
 )
 
-
 # ============================================================
 # Tool definitions: schema sanity
 # ============================================================

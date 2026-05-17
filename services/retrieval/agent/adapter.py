@@ -93,7 +93,6 @@ def to_query_response(
 
     for doc_id in doc_order:
         chunks = doc_groups[doc_id]
-        first = chunks[0]
         rank_counter += 1
         provenance: list[MatchProvenance] = []
         for c in chunks:

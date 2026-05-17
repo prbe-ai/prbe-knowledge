@@ -432,7 +432,7 @@ async def execute_fetch_doc_chunks(
     *,
     doc_id: str,
     max: int | None = None,
-    query: str | None = None,  # noqa: ARG001 -- reserved for future re-rank
+    query: str | None = None,
 ) -> dict[str, Any]:
     """Hydrate up to `max` chunks of `doc_id` from the chunks table.
 

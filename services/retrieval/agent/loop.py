@@ -37,15 +37,13 @@ if TYPE_CHECKING:
 from services.retrieval.agent.adapter import to_query_response
 from services.retrieval.agent.models import (
     DroppedCandidate,
-    GatheredChunk,
-    GatheredEntity,
     GathererNotes,
     GathererOutput,
     GathererStatus,
 )
 from services.retrieval.agent.prompt import build_system_prompt
 from services.retrieval.agent.tools import dispatch_tool_call, tool_definitions
-from services.retrieval.grounding import GroundingBundle, GroundingCandidate
+from services.retrieval.grounding import GroundingBundle
 from services.retrieval.router import (
     _build_bundle_with_token_fallback,
     _escape_query_for_xml,
@@ -416,7 +414,7 @@ async def run_gatherer(
         else:
             if state.tool_calls_count >= SEARCH_AGENT_HARD_CAP and not gathered.chunks and not gathered.entities:
                 status = "tool_budget_exceeded"
-    except asyncio.TimeoutError:
+    except TimeoutError:
         log.warning(
             "agent.loop_timeout",
             customer_id=customer_id,
