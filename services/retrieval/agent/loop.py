@@ -128,6 +128,92 @@ class LoopState:
 # Message + helpers
 # ============================================================
 
+# Per-hit snippet cap (chars). Enough for the model to judge relevance;
+# full content is one fetch_doc call away. 150 chars ≈ 1-2 sentences.
+_PREFANOUT_SNIPPET_CHARS = 150
+
+# Per-channel hit cap in the compact rendering. The pre-fan-out returns
+# top-K hits per channel (config-controlled, currently up to ~20 each).
+# Rendering all of them in the first-turn input bloats prompts to 15K+
+# tokens of low-signal evidence. Cap at 10 — model sees the strongest
+# hits per channel; weaker hits remain in the database for fetch_doc /
+# explicit-search recovery (not lost, just not in the cold-cache prompt).
+_PREFANOUT_PER_CHANNEL_DISPLAY_CAP = 10
+
+
+def _truncate_snippet(text: str | None, n: int = _PREFANOUT_SNIPPET_CHARS) -> str:
+    """One-line snippet for the compact channel rendering."""
+    if not text:
+        return ""
+    flat = " ".join(text.split())
+    if len(flat) <= n:
+        return flat
+    return flat[: n - 1].rstrip() + "…"
+
+
+def _format_prefanout_compact(prefanout: dict[str, Any]) -> str:
+    """Render `execute_search` result as compact text instead of JSON dump.
+
+    Why: the JSON form embeds every per-hit field (chunk_id, created_at,
+    updated_at, author_id, source_url, full content, plus field-name
+    overhead × N hits × 4 channels) and hits ~15K input tokens on cold
+    cache. gpt-oss-120b is a reasoning model — that much input deterministically
+    blows past the 90s loop timeout on cold cache. The compact form keeps
+    every doc_id (so fetch_doc still works), every score, every title, and
+    a 150-char snippet — everything the model needs to pick its next tool
+    call. Verbose fields are one fetch_doc away.
+
+    Format (per hit):
+        [v1] doc_id score=0.87 src=slack title="..."
+             "first 150 chars of content..."
+    """
+    out_lines: list[str] = []
+    sub_queries = prefanout.get("sub_queries") or []
+    for sq_idx, sq in enumerate(sub_queries, 1):
+        if len(sub_queries) > 1:
+            q_label = (sq.get("query") or "").strip()
+            out_lines.append(f"\n=== sub_query {sq_idx}: {_truncate_snippet(q_label, 100)} ===")
+        for channel_name, prefix in (
+            ("vector", "v"),
+            ("bm25", "b"),
+            ("graph", "g"),
+            ("inferred_edge", "i"),
+        ):
+            hits = sq.get(channel_name) or []
+            if not hits:
+                continue
+            shown = hits[:_PREFANOUT_PER_CHANNEL_DISPLAY_CAP]
+            omitted = len(hits) - len(shown)
+            header = f"<{channel_name}>"
+            if omitted > 0:
+                header = (
+                    f"<{channel_name} showing_top_{len(shown)}_of_{len(hits)} "
+                    f"(remaining accessible via fetch_doc / search)>"
+                )
+            out_lines.append(header)
+            for i, hit in enumerate(shown, 1):
+                doc_id = hit.get("doc_id") or "?"
+                score = hit.get("score")
+                score_str = f"{score:.3f}" if isinstance(score, int | float) else "?"
+                src = hit.get("source_system") or "?"
+                title = _truncate_snippet(hit.get("title"), 80)
+                snippet = _truncate_snippet(hit.get("content"))
+                # inferred_edge carries the "why" rationale — the moat.
+                why = hit.get("why")
+                edge = hit.get("edge_type")
+                tag_parts = [f"[{prefix}{i}]", doc_id, f"score={score_str}", f"src={src}"]
+                if edge:
+                    tag_parts.append(f"edge={edge}")
+                if title:
+                    tag_parts.append(f'title="{title}"')
+                out_lines.append(" ".join(tag_parts))
+                if snippet:
+                    out_lines.append(f'    "{snippet}"')
+                if why:
+                    out_lines.append(f"    why: {_truncate_snippet(why, 200)}")
+    return "\n".join(out_lines) if out_lines else "(no pre-fan-out hits)"
+
+
 def _build_user_message(
     query: str,
     bundle: GroundingBundle,
@@ -160,28 +246,15 @@ def _build_user_message(
 
     channel_results_block = ""
     if prefanout:
-        payload_str = json.dumps(prefanout, default=str)
-        if len(payload_str) > 60_000:
-            payload_str = json.dumps({
-                "truncated": True,
-                "original_size_chars": len(payload_str),
-                "note": (
-                    "pre-fan-out results too large; truncated. Call "
-                    "`fetch_doc(doc_id=…)` for any specific doc you need "
-                    "more of, or `search` with a tighter query."
-                ),
-                "head": payload_str[:30_000],
-            })
         channel_results_block = (
             f"\n\n<channel_results>\n"
             f"The harness already fired `search([raw_query])` before this turn — "
-            f"the result is below (vector + bm25 + graph + inferred_edge fan-out "
-            f"anchored on the grounded entities). Use this as turn-1 evidence. "
-            f"For exploration, call `search` with REFORMULATED queries, "
-            f"`subgraph(anchor)` for graph walks, `fetch_doc(doc_id)` for doc "
-            f"detail. When you've curated the answer, call "
-            f"`emit_gatherer_output` with the final entities + chunks + notes.\n"
-            f"{payload_str}\n"
+            f"results below (vector + bm25 + graph + inferred_edge, anchored on "
+            f"the grounded entities). Use this as turn-1 evidence. For more "
+            f"detail on any doc_id, call `fetch_doc(doc_id)`. For exploration, "
+            f"call `search` with REFORMULATED queries or `subgraph(anchor)`. "
+            f"When you've curated the answer, call `emit_gatherer_output`.\n"
+            f"{_format_prefanout_compact(prefanout)}\n"
             f"</channel_results>"
         )
 

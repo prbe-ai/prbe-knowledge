@@ -25,7 +25,9 @@ from services.retrieval.agent.loop import (
     _affinity_key,
     _empty_passthrough,
     _extract_cache_hit_rate,
+    _format_prefanout_compact,
     _parse_terminal_args,
+    _PREFANOUT_PER_CHANNEL_DISPLAY_CAP,
     run_gatherer,
 )
 from services.retrieval.agent.models import GathererOutput
@@ -195,6 +197,132 @@ def test_empty_passthrough_constructs_low_confidence_dummy() -> None:
     assert out.chunks == []
     assert out.gatherer_notes.confidence == "low"
     assert "schema_violation" in out.gatherer_notes.dropped[0].reason
+
+
+# ============================================================
+# Pre-fan-out compact formatter — input-token compression
+# ============================================================
+# The first-turn user message used to embed pre-fan-out as a JSON dump
+# (~15K tokens worst-case). gpt-oss-120b is a reasoning model; that much
+# cold-cache input deterministically hangs past the 90s loop timeout.
+# Compact format preserves every doc_id + score + snippet (everything the
+# model needs to pick its next tool call) while cutting per-hit overhead.
+
+def _mk_hit(
+    doc_id: str = "github:owner/repo:pr:42",
+    score: float = 0.87,
+    source_system: str = "github",
+    title: str = "PR #42: add self-host docs",
+    content: str = "This PR adds documentation for the self-hosting setup, including the Helm chart values and the data-plane secrets template.",
+) -> dict[str, Any]:
+    return {
+        "channel": "vector",
+        "chunk_id": "chunk-1",
+        "doc_id": doc_id,
+        "source_system": source_system,
+        "source_url": "https://github.com/owner/repo/pull/42",
+        "title": title,
+        "content": content,
+        "score": score,
+        "created_at": "2026-05-17T12:00:00Z",
+        "updated_at": "2026-05-17T12:00:00Z",
+        "author_id": "richard",
+    }
+
+
+def test_compact_format_includes_doc_id_score_title_snippet() -> None:
+    """Per-hit minimum: doc_id (so fetch_doc works), score (relevance),
+    source_system + title + snippet (so model can judge what's in the doc)."""
+    prefanout = {"sub_queries": [{
+        "query": "self-hosting features",
+        "vector": [_mk_hit()],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    out = _format_prefanout_compact(prefanout)
+    assert "github:owner/repo:pr:42" in out
+    assert "0.870" in out
+    assert "github" in out
+    assert "self-host docs" in out
+    # Snippet truncated but present
+    assert "documentation for the self-hosting" in out
+
+
+def test_compact_format_caps_per_channel_display_with_note() -> None:
+    """Beyond the per-channel cap the agent sees a 'showing_top_X_of_Y'
+    note so it knows the rest is reachable via fetch_doc / search."""
+    n_hits = _PREFANOUT_PER_CHANNEL_DISPLAY_CAP + 5
+    hits = [_mk_hit(doc_id=f"doc:{i}", score=1.0 - i * 0.01) for i in range(n_hits)]
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": hits, "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    out = _format_prefanout_compact(prefanout)
+    assert f"showing_top_{_PREFANOUT_PER_CHANNEL_DISPLAY_CAP}_of_{n_hits}" in out
+    # First N appear, last 5 don't
+    for i in range(_PREFANOUT_PER_CHANNEL_DISPLAY_CAP):
+        assert f"doc:{i}" in out
+    for i in range(_PREFANOUT_PER_CHANNEL_DISPLAY_CAP, n_hits):
+        assert f"doc:{i}" not in out
+
+
+def test_compact_format_preserves_inferred_edge_why() -> None:
+    """`why` is the inferred-edge moat — the rationale the agent uses to
+    decide whether the edge is signal or noise. Must survive compression."""
+    inf_hit = {
+        "channel": "inferred_edge",
+        "doc_id": "github:owner/repo:pr:78",
+        "source_system": "github",
+        "title": "PR #78: dashboard auth flow",
+        "content": "...",
+        "score": 0.76,
+        "edge_type": "references_pr",
+        "why": "PR #78 body explicitly references PR #71 as its prerequisite",
+    }
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": [], "bm25": [], "graph": [], "inferred_edge": [inf_hit],
+    }]}
+    out = _format_prefanout_compact(prefanout)
+    assert "why: PR #78 body explicitly references PR #71" in out
+    assert "edge=references_pr" in out
+
+
+def test_compact_format_is_much_smaller_than_json_dump() -> None:
+    """Compression target: the new format should be at least 4x smaller
+    than the equivalent JSON dump for a realistic 4-channel × 10-hit
+    payload with production-sized chunk content (~800 chars/hit). This
+    is the worst case the first turn sees on cold cache."""
+    # Realistic chunk: ~800 chars (typical Slack/Linear/GitHub chunk)
+    big_content = (
+        "We retired managed-mode in chart 0.24.0 (PR #266). The CustomerMode "
+        "enum kept MANAGED but it now means 'Probe-hosted'. Self-host stays "
+        "as the second mode. The dashboard now ships as a standalone Docker "
+        "image (ghcr.io/prbe-ai/prbe-dashboard, PR #77) and chart 0.27.1 "
+        "(PR #271) renders deployment-dashboard.yaml + service-dashboard.yaml "
+        "+ ingress / catch-all in mode=self-host. Managed-shared still uses "
+        "Vercel for the dashboard (templates gated on `not isManagedShared`). "
+        "Per-tenant K8s migration is still ongoing — one DOKS cluster, one "
+        "customer-<uuid> namespace per tenant, each a prbe-data-plane Helm "
+        "release behind <slug>.prbe.ai. Auth is HMAC via the data-plane key "
+        "header which is shared across all data-plane services and rotates "
+        "every 90 days via the rotation cron."
+    )
+    hits = [_mk_hit(doc_id=f"doc:{i}", content=big_content) for i in range(10)]
+    prefanout = {"sub_queries": [{
+        "query": "what features did we implement for self-hosting?",
+        "vector": hits, "bm25": hits, "graph": hits, "inferred_edge": hits,
+    }]}
+    json_size = len(json.dumps(prefanout, default=str))
+    compact_size = len(_format_prefanout_compact(prefanout))
+    ratio = json_size / compact_size if compact_size else float("inf")
+    assert ratio >= 4.0, (
+        f"compact {compact_size} vs json {json_size} = {ratio:.1f}x "
+        f"— compression target missed (want ≥4x)"
+    )
+
+
+def test_compact_format_handles_empty_prefanout() -> None:
+    """Edge case: pre-fan-out returned nothing on any channel."""
+    out = _format_prefanout_compact({"sub_queries": []})
+    assert out == "(no pre-fan-out hits)"
 
 
 # ============================================================
