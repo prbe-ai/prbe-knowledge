@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from starlette.requests import Request
 
 from services.retrieval.agent.adapter import to_query_response
+from services.retrieval.agent.extractor import extract_entities_with_llm
 from services.retrieval.agent.models import (
     DroppedCandidate,
     GathererNotes,
@@ -52,8 +53,11 @@ from services.retrieval.agent.tools import (
 )
 from services.retrieval.grounding import GroundingBundle
 from services.retrieval.router import (
+    Intent,
+    RouterEntity,
     _build_bundle_with_token_fallback,
     _escape_query_for_xml,
+    _reconcile_entities_with_bundle,
 )
 from shared.constants import (
     SEARCH_AGENT_EXTENSION_GRANT,
@@ -511,19 +515,56 @@ async def run_gatherer(
     trace_id = req.trace_id or f"q-{int(datetime.now().timestamp() * 1000)}"
     timing: dict[str, float] = {}
 
-    # Step 1 — deterministic grounding (synchronous, ~25ms).
-    t_grounding = time.perf_counter()
-    try:
-        bundle = await _build_bundle_with_token_fallback(customer_id, req.query)
-    except Exception as exc:
-        log.warning(
-            "agent.grounding_failed",
-            customer_id=customer_id,
-            trace_id=trace_id,
-            error=str(exc),
+    # Step 1 — deterministic grounding + LLM entity extraction run in
+    # PARALLEL. Grounding is a fast SQL-only pg_trgm/tsvector match (~25ms);
+    # extraction is a single Fireworks call (~1-2s with cache hit) that
+    # catches paraphrased entities pg_trgm misses ("the new login flow"
+    # when the graph node is "Authentication Phase 2"). Total upfront
+    # cost = max(grounding_ms, extraction_ms) ≈ ~1.5s, not their sum.
+    t_extraction_start = time.perf_counter()
+
+    async def _safe_grounding() -> GroundingBundle:
+        try:
+            return await _build_bundle_with_token_fallback(customer_id, req.query)
+        except Exception as exc:
+            log.warning(
+                "agent.grounding_failed",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                error=str(exc),
+            )
+            return GroundingBundle()
+
+    bundle, extracted = await asyncio.gather(
+        _safe_grounding(),
+        extract_entities_with_llm(customer_id, req.query),
+        return_exceptions=False,
+    )
+    timing["extraction_ms"] = (time.perf_counter() - t_extraction_start) * 1000
+    timing["grounding_ms"] = bundle.timing_ms  # measured inside grounding
+
+    # Reconcile LLM-proposed entities against grounded candidates: if the
+    # bundle covers an entity, swap the LLM's synthesized canonical_id
+    # for the grounded one. Reuses PR #282's helper.
+    if extracted:
+        synthetic_intent = Intent(
+            query_text=req.query,
+            mode="search",
+            confidence=0.0,
+            entities=[
+                RouterEntity(
+                    entity_type=e.entity_type,
+                    canonical_id=e.canonical_id,
+                    display_name=e.display_name,
+                    confidence=e.confidence,
+                )
+                for e in extracted
+            ],
         )
-        bundle = GroundingBundle()
-    timing["grounding_ms"] = (time.perf_counter() - t_grounding) * 1000
+        _reconcile_entities_with_bundle([synthetic_intent], bundle)
+        reconciled = synthetic_intent.entities
+    else:
+        reconciled = []
 
     # Step 2 — deterministic pre-fan-out. Fire vector + bm25 + graph +
     # inferred_edge in parallel BEFORE the LLM call. The agent gets these
@@ -537,10 +578,34 @@ async def run_gatherer(
     # would have surfaced the answer — worth it for the determinism and
     # the ~2-4x turn-count reduction.
     t_prefanout = time.perf_counter()
-    entity_dicts: list[dict[str, str]] = [
-        {"entity_type": c.entity_type, "canonical_id": c.canonical_id}
-        for c in (list(bundle.candidates) + list(bundle.bare_id_matches))
-    ]
+
+    # Union: grounding candidates + bare-IDs + reconciled LLM picks.
+    # Dedupe by (entity_type, canonical_id) — preserve first-seen which
+    # tends to be the grounded match (highest-confidence anchor).
+    seen: set[tuple[str, str]] = set()
+    entity_dicts: list[dict[str, str]] = []
+    for c in (list(bundle.candidates) + list(bundle.bare_id_matches)):
+        key = (c.entity_type, c.canonical_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        entity_dicts.append({"entity_type": c.entity_type, "canonical_id": c.canonical_id})
+    for e in reconciled:
+        key = (e.entity_type, e.canonical_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        entity_dicts.append({"entity_type": e.entity_type, "canonical_id": e.canonical_id})
+    log.info(
+        "agent.entity_bag_assembled",
+        customer_id=customer_id,
+        trace_id=trace_id,
+        grounded=len(bundle.candidates) + len(bundle.bare_id_matches),
+        extracted=len(extracted),
+        final=len(entity_dicts),
+        grounding_ms=round(timing["grounding_ms"], 1),
+        extraction_ms=round(timing["extraction_ms"], 1),
+    )
     prefanout = await asyncio.gather(
         execute_vector_search(customer_id, query=req.query),
         execute_bm25_search(customer_id, query=req.query),
@@ -689,6 +754,7 @@ async def run_gatherer(
         results=len(gathered.chunks) + len(gathered.entities),
         # ms breakdown — each stage independently slow points at the fix
         grounding_ms=round(timing.get("grounding_ms", 0), 1),
+        extraction_ms=round(timing.get("extraction_ms", 0), 1),
         prefanout_ms=round(timing.get("prefanout_ms", 0), 1),
         agent_total_ms=round(timing.get("agent_ms", 0), 1),
         agent_llm_ms=round(timing["agent_loop_ms"], 1),
