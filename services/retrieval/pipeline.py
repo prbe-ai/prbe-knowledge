@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
@@ -202,7 +202,7 @@ async def run_router_phase(
 async def run_search_phase(
     req: QueryRequest,
     customer_id: str,
-    phase: RouterPhaseResult,  # noqa: ARG001 — kept for streaming-endpoint signature compat
+    phase: RouterPhaseResult,
     request: Request | None = None,
 ) -> QueryResponse:
     """Agent loop. Reads the query, runs the gatherer, returns a QueryResponse.
