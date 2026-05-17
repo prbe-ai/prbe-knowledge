@@ -186,6 +186,37 @@ def _parse_gatherer_output(content: str | None) -> GathererOutput | None:
         return None
 
 
+def _no_llm_configured() -> bool:
+    """True when no LLM provider is reachable.
+
+    Mirrors `services/retrieval/router.py`'s pre-cutover guard in
+    `_call_haiku`: short-circuits when neither a provider API key nor
+    the LiteLLM gateway URL is available. Tests / bootstrap / self-host-
+    without-keys hit this path and get an empty result (status
+    `no_llm_configured`) instead of a 503. Provider outages with config
+    present still bubble up as `LLMError` -> 503.
+    """
+    from shared.config import get_settings
+    from shared.llm import gateway_url
+
+    if gateway_url():
+        return False
+    try:
+        settings = get_settings()
+    except Exception:
+        return True
+    # Fireworks is the primary model — accept its key as sufficient.
+    # Other provider keys (ANTHROPIC, OPENAI, GOOGLE) also count because
+    # the LiteLLM SDK can route directly to them when gateway is absent.
+    for attr in ("fireworks_api_key", "anthropic_api_key", "openai_api_key", "google_api_key"):
+        key = getattr(settings, attr, None)
+        if key is not None:
+            value = key.get_secret_value() if hasattr(key, "get_secret_value") else key
+            if value:
+                return False
+    return True
+
+
 def _empty_passthrough(reason: GathererStatus) -> GathererOutput:
     """Synthesise an empty GathererOutput for fallback paths.
 
@@ -401,6 +432,34 @@ async def run_gatherer(
 
     t_agent = time.perf_counter()
     status: GathererStatus = "ok"
+
+    # Short-circuit when no LLM provider is configured (test env,
+    # bootstrap, self-host without keys). Mirrors the pre-cutover router's
+    # graceful no-op in `_call_haiku` — returns empty results with a clear
+    # status rather than 503ing. Provider-side outages (ANTHROPIC_API_KEY
+    # set + Fireworks down) still raise 503 via the LLMError catch below.
+    if _no_llm_configured():
+        log.info(
+            "agent.no_llm_configured_short_circuit",
+            customer_id=customer_id,
+            trace_id=trace_id,
+        )
+        status = "no_llm_configured"
+        gathered = _empty_passthrough("no_llm_configured")
+        timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
+        if request is not None:
+            request.state.gatherer_status = status
+            request.state.tool_calls_count = 0
+            request.state.need_deeper_extensions = 0
+            request.state.confidence = gathered.gatherer_notes.confidence
+            request.state.dropped_count = len(gathered.gatherer_notes.dropped)
+            request.state.cache_hit_rate = None
+            request.state.intents_count = 1
+            request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
+            request.state.failure_recovered = True
+        return to_query_response(
+            query=req.query, gathered=gathered, trace_id=trace_id, timing_ms=timing
+        )
 
     gathered: GathererOutput | None = None
     try:

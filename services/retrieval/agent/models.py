@@ -38,6 +38,12 @@ GathererStatus = Literal[
     "loop_timeout",
     "schema_violation",
     "tool_budget_exceeded",
+    # No LLM credentials configured (test env / bootstrap / self-host without
+    # SEARCH_AGENT_INFERENCE_MODEL provider key). Loop short-circuits to an
+    # empty GathererOutput rather than 503ing — mirrors the pre-cutover
+    # router's `_call_haiku` short-circuit when neither Anthropic key nor
+    # LLM gateway URL was set.
+    "no_llm_configured",
 ]
 
 

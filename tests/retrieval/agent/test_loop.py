@@ -100,6 +100,21 @@ def fake_bundle() -> GroundingBundle:
     return GroundingBundle()
 
 
+@pytest.fixture(autouse=True)
+def _force_llm_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default: every loop test runs as if a provider is configured.
+
+    The new `_no_llm_configured()` short-circuit returns True in the test
+    env (no API keys set), which would make every mocked-acompletion test
+    short-circuit to an empty passthrough before reaching the mock.
+    Pin it to False so tests exercise the real loop. Specific tests that
+    want the short-circuit path can re-override.
+    """
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop._no_llm_configured", lambda: False
+    )
+
+
 # ============================================================
 # Pure helpers
 # ============================================================
@@ -334,6 +349,38 @@ async def test_unparseable_emission_emits_schema_violation(
     assert fake_request.state.gatherer_status == "schema_violation"
     assert resp.total_candidates == 0
     assert resp.gatherer_notes["confidence"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_no_llm_configured_short_circuits_to_empty(
+    fake_request: SimpleNamespace, fake_bundle: GroundingBundle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When neither the gateway URL nor any provider key is set, the
+    gatherer returns an empty result with status 'no_llm_configured'
+    instead of 503ing. Mirrors the pre-cutover router's graceful no-op
+    in `_call_haiku` and lets test envs / bootstrap / self-host-without-
+    keys keep `/retrieve` callable."""
+    req = QueryRequest(query="anything", customer_id="cust-1", top_k=5)
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop._no_llm_configured", lambda: True
+    )
+
+    boom_acompletion = AsyncMock(side_effect=AssertionError("acompletion should NOT be called"))
+    with patch(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        new=AsyncMock(return_value=fake_bundle),
+    ), patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=boom_acompletion,
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert resp.total_candidates == 0
+    assert resp.gatherer_notes["confidence"] == "low"
+    assert fake_request.state.gatherer_status == "no_llm_configured"
+    assert fake_request.state.tool_calls_count == 0
+    assert fake_request.state.failure_recovered is True
+    boom_acompletion.assert_not_called()
 
 
 @pytest.mark.asyncio
