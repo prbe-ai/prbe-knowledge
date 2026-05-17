@@ -61,12 +61,16 @@ def test_prompt_lists_all_tools() -> None:
 
 
 def test_prompt_enforces_turn_1_mandate_textually() -> None:
-    """The recall guarantee is the prompt-level turn-1 mandate. Lock
-    the mandatory-4 channel list so we don't accidentally drop one."""
+    """Post-pre-fan-out cutover: the recall guarantee is the harness-side
+    deterministic pre-fan-out (vector + bm25 + graph + inferred_edge fired
+    BEFORE the LLM call, results passed in `<channel_results>`). The
+    prompt must reflect that the model READS pre-fan-out results rather
+    than being instructed to fire the same 4 channels itself."""
     prompt = build_system_prompt(datetime(2026, 5, 16, tzinfo=UTC))
     for channel in ("vector_search", "bm25_search", "graph_search", "inferred_edge_search"):
         assert channel in prompt
-    assert "TURN 1 — MANDATORY PARALLEL FAN-OUT" in prompt
+    assert "<channel_results>" in prompt
+    assert "ALREADY FIRED" in prompt or "already fired" in prompt.lower()
 
 
 def test_prompt_forbids_prose_output() -> None:
