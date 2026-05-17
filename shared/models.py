@@ -905,6 +905,10 @@ class NormalizationResult(BaseModel):
     code_repo_state_updates: list[CodeRepoStateUpdate] = Field(default_factory=list)
     # Non-fatal reason this event produced no documents (e.g. "slack edit of deleted msg").
     skipped_reason: str | None = None
+    # Set True by handlers when this event should trigger the
+    # investigation pipeline (Plan 4 wires this up). Default False
+    # keeps every existing connector unchanged.
+    requires_investigation: bool = False
 
     @property
     def is_empty(self) -> bool:
