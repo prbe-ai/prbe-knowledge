@@ -1,0 +1,99 @@
+# In-cluster trace digest builder.
+#
+# Why this lives outside the prbe-data-plane Helm chart: this job is
+# driven by the GitHub Actions nightly workflow, not by `helm upgrade`.
+# Putting it in the chart would require a separate Helm release per run
+# (or shoehorning a CronJob in, which conflicts with the workflow's
+# kubectl-launch + tail-logs pattern). Cleaner to keep this manifest
+# alongside the workflow that owns it.
+#
+# Flow (see .github/workflows/agent-optimization-nightly.yml):
+#   1. envsubst inflates DATE_PLACEHOLDER + JOB_SUFFIX_PLACEHOLDER
+#   2. kubectl create -f
+#   3. kubectl wait --for=condition=complete
+#   4. kubectl logs <pod>           ← yields the JSONL digest
+#   5. kubectl delete job ...       ← (or rely on ttlSecondsAfterFinished)
+#
+# RLS: the trace_analyzer module iterates customers and runs each
+# per-tenant query inside `with_tenant()` — works correctly under the
+# DATABASE_URL secret (RLS-enforced app role).
+#
+# DB connection: shares the same `managed-data-plane-secrets` the app
+# tier uses, so it reaches CNPG via pgbouncer the same way.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nightly-trace-digest-DATE_PLACEHOLDER-JOB_SUFFIX_PLACEHOLDER
+  namespace: managed
+  labels:
+    app.kubernetes.io/name: prbe-data-plane
+    app.kubernetes.io/instance: prbe-data-plane
+    app.kubernetes.io/part-of: prbe-data-plane
+    probe.prbe.ai/role: trace-analyzer
+    probe.prbe.ai/mode: managed-shared
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 2
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prbe-data-plane
+        app.kubernetes.io/instance: prbe-data-plane
+        probe.prbe.ai/role: trace-analyzer
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: trace-analyzer
+          # Pinned to the knowledge image (where the trace_analyzer
+          # module ships). IMAGE_TAG_PLACEHOLDER is substituted by the
+          # workflow with the current main-branch SHA tag so the job
+          # always runs the latest code.
+          image: ghcr.io/prbe-ai/prbe-data-plane-knowledge:IMAGE_TAG_PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+          args:
+            - |
+              uv run python -m services.retrieval.agent.trace_analyzer \
+                --date "${TARGET_DATE}" \
+                --out -
+          env:
+            - name: TARGET_DATE
+              value: "DATE_PLACEHOLDER"
+            # Per `feedback_psql_prefer_port_forward.md` + the migrate-
+            # job's prior art: use the app role's DSN (not the migrator
+            # superuser DSN) so RLS is enforced on every per-tenant
+            # query in the loader.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: managed-data-plane-secrets
+                  key: DATABASE_URL
+            - name: NEON_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: managed-data-plane-secrets
+                  key: DATABASE_URL
+            - name: PROBE_DEPLOYMENT_MODE
+              value: managed-shared
+          envFrom:
+            # Pulls R2 creds + any LiteLLM gateway settings the loader
+            # might transitively need.
+            - secretRef:
+                name: managed-data-plane-secrets
+            - configMapRef:
+                name: managed-data-plane-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 1
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: false

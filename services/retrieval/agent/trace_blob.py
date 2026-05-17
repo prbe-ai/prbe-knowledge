@@ -93,6 +93,13 @@ def build_trace_blob(
         # analyzer can correlate channel coverage with curated outcomes.
         blob["prefanout"] = state.prefanout
         blob["prefanout_hit_counts"] = dict(state.prefanout_hit_counts)
+        # Per-turn chain-of-thought from message.reasoning_content (gpt-oss
+        # harmony `analysis` block, normalized by LiteLLM). NOT echoed
+        # back into the next turn (OpenAI chat-completion contract
+        # round-trips only role/content/tool_calls), so without this field
+        # the agent's "why" per tool call is unrecoverable. May be all-
+        # None when the provider doesn't emit reasoning for this model.
+        blob["reasoning_per_turn"] = list(state.reasoning_per_turn)
     else:
         # Pre-loop failure (e.g. grounding raised before state was constructed
         # in a future refactor). Keep the keys present so analyzer schema
@@ -109,6 +116,7 @@ def build_trace_blob(
         blob["prose_retries"] = 0
         blob["prefanout"] = {}
         blob["prefanout_hit_counts"] = {}
+        blob["reasoning_per_turn"] = []
 
     if gathered is not None:
         blob["gathered"] = gathered.model_dump(mode="json")
