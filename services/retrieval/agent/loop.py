@@ -336,6 +336,13 @@ async def _run_turn(
         # prose; passing the explicit json_schema returns valid JSON).
         # See _GATHERER_OUTPUT_RESPONSE_FORMAT below for the cached schema.
         "response_format": _GATHERER_OUTPUT_RESPONSE_FORMAT,
+        # Force OpenAI wire shape per-call so `response_format` survives
+        # the proxy transport. The shared `acompletion` wrapper doesn't
+        # do this globally because other callers (synthesizer using
+        # `gemini/...` + `reasoning_effort`) need the provider-native
+        # shape to pass their Gemini-only params. See
+        # `feedback_fireworks_response_format_4_layer_gotcha`.
+        "custom_llm_provider": "openai",
         "extra_headers": {"x-session-affinity": _affinity_key(state.customer_id, state.query)},
         "timeout": SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
     }
