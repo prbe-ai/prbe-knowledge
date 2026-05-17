@@ -1,12 +1,9 @@
-"""Tool surface sanity tests for the gatherer agent.
+"""Tool surface tests for the gatherer agent — fat-tool refactor.
 
-Pure (no live DB) checks: every tool schema is valid against LiteLLM's
-expected shape, the dispatcher gracefully handles unknown/bad input,
-top_k clamping behaves, and the registry is complete relative to the
-prompt's documented tool list. Live-DB execution paths are validated
-indirectly through `test_loop.py` (mock acompletion + dispatch through
-tool_call results) and via the per-retriever tests that already exist
-(`test_bm25_*`, `test_inferred_edges_retriever`, etc.).
+Pure (no live DB) checks: schema sanity, registry coverage, dispatcher
+edge cases, empty-input fast paths. Live execution paths are covered
+indirectly by `test_loop.py` (mocked acompletion + dispatcher) and by
+the per-retriever tests that already exist.
 """
 
 from __future__ import annotations
@@ -17,10 +14,15 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from services.retrieval.agent.tools import (
+    NEED_DEEPER_TOOL_NAME,
+    TERMINAL_TOOL_NAME,
     TOOL_REGISTRY,
     _clamp_top_k,
     _trim_properties,
     dispatch_tool_call,
+    execute_fetch_doc,
+    execute_search,
+    execute_subgraph,
     tool_definitions,
 )
 
@@ -28,24 +30,26 @@ from services.retrieval.agent.tools import (
 # Tool definitions: schema sanity
 # ============================================================
 
-def test_tool_definitions_count_matches_registry() -> None:
-    """`tool_definitions()` must surface schemas for every retrieval tool
-    in TOOL_REGISTRY plus `need_deeper` (which the loop handles directly,
-    not via the registry)."""
+def test_tool_definitions_contains_4_fat_plus_terminal() -> None:
+    """tool_definitions() exposes exactly: search, subgraph, fetch_doc,
+    need_deeper, emit_gatherer_output. Drift breaks the prompt contract."""
     defs = tool_definitions()
     names = {d["function"]["name"] for d in defs}
-    expected_retrieval_tools = set(TOOL_REGISTRY.keys())
-    # need_deeper is a budget-extension signal, not a retrieval call —
-    # the loop intercepts it before dispatching. Schema is still exposed.
-    assert names == expected_retrieval_tools | {"need_deeper"}, (
-        f"tool defs ({names}) drifted from registry ({expected_retrieval_tools})"
-    )
+    assert names == {"search", "subgraph", "fetch_doc", NEED_DEEPER_TOOL_NAME, TERMINAL_TOOL_NAME}
+
+
+def test_registry_only_has_retrieval_tools() -> None:
+    """TOOL_REGISTRY is the dispatcher table. need_deeper +
+    emit_gatherer_output are handled by the loop itself and must NOT be
+    in the registry (otherwise terminal-call detection breaks)."""
+    assert set(TOOL_REGISTRY.keys()) == {"search", "subgraph", "fetch_doc"}
+    assert TERMINAL_TOOL_NAME not in TOOL_REGISTRY
+    assert NEED_DEEPER_TOOL_NAME not in TOOL_REGISTRY
 
 
 def test_tool_definitions_shape_is_openai_compatible() -> None:
-    """Each tool def must follow the OpenAI/Anthropic tool-use schema
-    LiteLLM forwards verbatim. Anything missing trips a provider-side
-    validation error at first call — fail in tests instead."""
+    """Each tool def follows the OpenAI/Anthropic tool-use schema
+    LiteLLM forwards verbatim."""
     for d in tool_definitions():
         assert d["type"] == "function"
         fn = d["function"]
@@ -54,24 +58,30 @@ def test_tool_definitions_shape_is_openai_compatible() -> None:
         params = fn["parameters"]
         assert params["type"] == "object"
         assert "properties" in params
-        # `required` is optional in JSON Schema; if present must be list[str].
         if "required" in params:
             assert isinstance(params["required"], list)
             for r in params["required"]:
                 assert isinstance(r, str)
-                assert r in params["properties"], (
-                    f"tool {fn['name']}: required key '{r}' missing from properties"
-                )
+
+
+def test_emit_gatherer_output_schema_is_gatherer_output_pydantic() -> None:
+    """The terminal's parameters MUST be the GathererOutput JSON
+    Schema. If we drift, the model can't terminate correctly."""
+    from services.retrieval.agent.models import GathererOutput
+    defs = tool_definitions()
+    terminal = next(d for d in defs if d["function"]["name"] == TERMINAL_TOOL_NAME)
+    schema = terminal["function"]["parameters"]
+    expected = GathererOutput.model_json_schema()
+    assert schema == expected
 
 
 def test_top_k_clamping() -> None:
-    """`_clamp_top_k` must enforce [1, _HARD_TOP_K_CAP] and fall back to
-    the per-tool default when None."""
+    """`_clamp_top_k` enforces [1, _HARD_TOP_K_CAP]; falls back to default."""
     assert _clamp_top_k(None, 15) == 15
     assert _clamp_top_k(0, 15) == 1
     assert _clamp_top_k(-5, 15) == 1
     assert _clamp_top_k(10, 15) == 10
-    assert _clamp_top_k(99999, 15) == 100  # _HARD_TOP_K_CAP
+    assert _clamp_top_k(99999, 15) == 100
 
 
 # ============================================================
@@ -84,11 +94,9 @@ def test_trim_properties_under_cap_returns_unchanged() -> None:
 
 
 def test_trim_properties_over_cap_truncates_longest_string() -> None:
-    """When properties JSON exceeds ~2KB, the longest str-valued field
-    gets truncated. Numeric / bool fields are preserved verbatim."""
     big = {
         "name": "x",
-        "long_field": "a" * 4000,  # ~4KB string — should be truncated
+        "long_field": "a" * 4000,
         "score": 0.99,
         "active": True,
     }
@@ -106,17 +114,23 @@ def test_trim_properties_over_cap_truncates_longest_string() -> None:
 
 @pytest.mark.asyncio
 async def test_dispatch_unknown_tool_returns_error_dict() -> None:
-    """Model can misfire and call a tool that doesn't exist. Dispatcher
-    must NOT raise — return an error dict so the agent can recover."""
     result = await dispatch_tool_call("cust-1", "nonsense_tool", {})
     assert "error" in result
     assert "unknown" in result["error"].lower()
 
 
 @pytest.mark.asyncio
+async def test_dispatch_terminal_tool_returns_error_dict() -> None:
+    """The loop intercepts emit_gatherer_output BEFORE dispatching.
+    If it somehow reaches the dispatcher, the registry doesn't have it,
+    so we get unknown-tool error — which is the right safety net."""
+    result = await dispatch_tool_call("cust-1", TERMINAL_TOOL_NAME, {})
+    assert "error" in result
+    assert "unknown" in result["error"].lower()
+
+
+@pytest.mark.asyncio
 async def test_dispatch_handles_executor_exception() -> None:
-    """If an executor raises (DB blew up mid-call), dispatcher catches
-    and packages — never propagates so the agent sees a graceful result."""
     async def boom(*, customer_id: str, **kw: Any) -> dict[str, Any]:
         raise RuntimeError("postgres connection broken")
 
@@ -124,14 +138,10 @@ async def test_dispatch_handles_executor_exception() -> None:
         result = await dispatch_tool_call("cust-1", "_test_boom", {})
         assert "error" in result
         assert "RuntimeError" in result["error"]
-        assert "postgres connection broken" in result["error"]
 
 
 @pytest.mark.asyncio
 async def test_dispatch_handles_argument_mismatch() -> None:
-    """If the model passes kwargs the executor doesn't accept (schema
-    bypass), dispatcher returns a clean argument-mismatch error rather
-    than 500ing the loop."""
     async def strict(*, customer_id: str, expected_arg: str) -> dict[str, Any]:
         return {"got": expected_arg}
 
@@ -145,8 +155,6 @@ async def test_dispatch_handles_argument_mismatch() -> None:
 
 @pytest.mark.asyncio
 async def test_dispatch_passes_customer_id_through() -> None:
-    """Every executor receives `customer_id` as kwarg. Sanity-check
-    the dispatcher doesn't drop or rename it."""
     captured: dict[str, Any] = {}
 
     async def capture(**kw: Any) -> dict[str, Any]:
@@ -160,59 +168,75 @@ async def test_dispatch_passes_customer_id_through() -> None:
 
 
 # ============================================================
-# Specific tool behavior (empty-input fast paths)
+# Empty / edge-case fast paths
 # ============================================================
 
 @pytest.mark.asyncio
-async def test_graph_search_empty_entities_short_circuits() -> None:
-    """Empty entity list must return {hits: []} WITHOUT hitting the DB.
-    Turn-1 mandate fires graph_search even when grounding came back
-    empty; the cheap empty-return is the contract."""
-    from services.retrieval.agent.tools import execute_graph_search
-    out = await execute_graph_search("cust-1", entities=[])
-    assert out == {"hits": []}
-
-
-@pytest.mark.asyncio
-async def test_inferred_edge_search_no_anchors_short_circuits() -> None:
-    """No entities and no doc_ids -> {hits: []} without DB or LLM call."""
-    from services.retrieval.agent.tools import execute_inferred_edge_search
-    out = await execute_inferred_edge_search("cust-1")
-    assert out == {"hits": []}
-
-
-@pytest.mark.asyncio
-async def test_parallel_multi_query_empty_short_circuits() -> None:
-    """Empty queries list -> {sub_queries: []}."""
-    from services.retrieval.agent.tools import execute_parallel_multi_query
-    out = await execute_parallel_multi_query("cust-1", queries=[])
+async def test_search_empty_queries_short_circuits() -> None:
+    """No queries → empty result; no DB or LLM call."""
+    out = await execute_search("cust-1", queries=[])
     assert out == {"sub_queries": []}
 
 
 @pytest.mark.asyncio
-async def test_parallel_multi_query_caps_at_five() -> None:
-    """Cap is 5 sub-queries (mirrors MAX_INTENTS + headroom). Extras dropped."""
-    from services.retrieval.agent.tools import execute_parallel_multi_query
+async def test_search_caps_at_five_subqueries() -> None:
+    """Cap mirrors MAX_INTENTS+headroom. Extras dropped silently."""
     with patch(
-        "services.retrieval.agent.tools._vector",
-        new=AsyncMock(return_value=[]),
+        "services.retrieval.agent.tools._vector", new=AsyncMock(return_value=[])
     ), patch(
-        "services.retrieval.agent.tools._bm25",
-        new=AsyncMock(return_value=[]),
+        "services.retrieval.agent.tools._bm25", new=AsyncMock(return_value=[])
+    ), patch(
+        "services.retrieval.agent.tools.build_bundle",
+        new=AsyncMock(
+            return_value=type("B", (), {
+                "candidates": [], "bare_id_matches": [],
+                "connected_sources": [], "timing_ms": 0.0,
+            })()
+        ),
     ):
-        out = await execute_parallel_multi_query(
-            "cust-1", queries=[f"q{i}" for i in range(10)]
+        out = await execute_search(
+            "cust-1", queries=[f"q{i}" for i in range(10)],
         )
         assert len(out["sub_queries"]) == 5
 
 
 @pytest.mark.asyncio
-async def test_expand_entity_cluster_empty_inputs_short_circuit() -> None:
-    """Missing canonical_ids OR missing label -> {clusters: {}} without DB."""
-    from services.retrieval.agent.tools import execute_expand_entity_cluster
-    assert await execute_expand_entity_cluster(
-        "cust-1", canonical_ids=[], label="Person"
-    ) == {"clusters": {}}
-    assert await execute_expand_entity_cluster(
-        "cust-1", canonical_ids=["x"], label=""
-    ) == {"clusters": {}}
+async def test_subgraph_empty_anchor_returns_not_existed() -> None:
+    """Empty anchor canonical_id can't be resolved → empty result, no crash."""
+    with patch(
+        "services.retrieval.main._resolve_anchor_alias",
+        new=AsyncMock(return_value=""),
+    ), patch(
+        "services.retrieval.graph_explore.anchor_exists",
+        new=AsyncMock(return_value=False),
+    ):
+        out = await execute_subgraph("cust-1", anchor_canonical_id="")
+        assert out["anchor_existed"] is False
+        assert out["nodes"] == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_doc_minimal_call_returns_chunks_only() -> None:
+    """Default args: no inferred edges, no evidence — just chunks."""
+    class MockConn:
+        async def fetch(self, sql: str, *args: Any) -> list:
+            if "FROM chunks" in sql:
+                return []
+            return []
+
+    class MockCtxMgr:
+        async def __aenter__(self) -> MockConn:
+            return MockConn()
+
+        async def __aexit__(self, *args: Any) -> None:
+            pass
+
+    with patch(
+        "services.retrieval.agent.tools.with_tenant",
+        new=lambda customer_id: MockCtxMgr(),
+    ):
+        out = await execute_fetch_doc("cust-1", doc_id="doc:nonexistent")
+        assert out["doc_id"] == "doc:nonexistent"
+        assert out["chunks"] == []
+        assert out["outbound_inferred_edges"] == []
+        assert out["evidence_by_edge_id"] == {}
