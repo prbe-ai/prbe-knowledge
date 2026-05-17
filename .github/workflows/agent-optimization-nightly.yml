@@ -1,0 +1,229 @@
+# Nightly trace-driven gatherer-optimization workflow.
+#
+# Flow:
+#   1. Kill-switch check (repo variable AGENT_OPTIMIZATION_ENABLED)
+#   2. K8s Job in managed-shared cluster builds per-trace digest JSONL
+#      (RLS-respecting; iterates customers via with_tenant)
+#   3. Workflow tails the job's stdout → /tmp/digests.jsonl
+#   4. List existing open auto-optimization PRs (dedup input)
+#   5. Run Claude Code orchestrator headless. Orchestrator: TRIAGE then
+#      DISPATCH up to MAX_PRS sub-agents, each producing one focused
+#      branch + PR body draft. Sub-agents do NOT push or open PRs —
+#      that's centralized in Step 7 so the workflow controls auth.
+#   6. Workflow-level path-diff gate: drop any branch that touched files
+#      outside services/retrieval/agent/ or shared/constants.py
+#   7. Push surviving branches + open draft PRs via gh CLI
+#   8. Upload orchestrator-summary.json as a workflow artifact
+#
+# The `schedule:` block is commented out — first 2 weeks run via
+# workflow_dispatch only so we can verify PR quality manually before
+# letting cron fire it 3 AM PT every night. Re-enable in a follow-up PR.
+name: agent-optimization-nightly
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_prs:
+        description: "Cap on PRs opened (default 3; set 1 for first dispatch)"
+        type: number
+        default: 3
+      target_date:
+        description: "UTC date to digest (default: yesterday)"
+        type: string
+        default: ""
+  # schedule:
+  #   - cron: "0 10 * * *"   # 3 AM PT during PDT (March-November).
+                              # 2 AM PT during PST — accept the DST drift.
+                              # Re-enable after 2 weeks of dogfooding.
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: agent-optimization
+  cancel-in-progress: false
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      AGENT_OPTIMIZATION_MAX_PRS: ${{ inputs.max_prs || 3 }}
+
+    steps:
+      - name: Kill switch
+        run: |
+          if [ "${{ vars.AGENT_OPTIMIZATION_ENABLED }}" = "false" ]; then
+            echo "::notice::AGENT_OPTIMIZATION_ENABLED=false — exiting cleanly."
+            exit 0
+          fi
+          echo "kill switch: not set or set to non-false; proceeding."
+
+      - uses: actions/checkout@v4
+        with:
+          # Sub-agents create worktrees off origin/main — need history.
+          fetch-depth: 0
+
+      - name: Configure kubectl for managed-shared cluster
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - run: doctl kubernetes cluster kubeconfig save probe-managed
+
+      - name: Resolve target date + current knowledge image tag
+        id: ctx
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.target_date }}" ]; then
+            TARGET_DATE="${{ inputs.target_date }}"
+          else
+            TARGET_DATE="$(date -u -d yesterday +%F)"
+          fi
+          echo "target_date=$TARGET_DATE" >> "$GITHUB_OUTPUT"
+
+          IMAGE_TAG=$(kubectl -n managed get deploy managed-retrieval \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            | sed 's|.*:||')
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          JOB_SUFFIX="$(date +%s | tail -c 6)"
+          echo "job_suffix=$JOB_SUFFIX" >> "$GITHUB_OUTPUT"
+          echo "Target: $TARGET_DATE, image tag: $IMAGE_TAG, job suffix: $JOB_SUFFIX"
+
+      - name: Render + launch trace-digest K8s Job
+        id: launch
+        run: |
+          set -euo pipefail
+          export DATE_PLACEHOLDER="${{ steps.ctx.outputs.target_date }}"
+          export JOB_SUFFIX_PLACEHOLDER="${{ steps.ctx.outputs.job_suffix }}"
+          export IMAGE_TAG_PLACEHOLDER="${{ steps.ctx.outputs.image_tag }}"
+          JOB_NAME="nightly-trace-digest-${DATE_PLACEHOLDER}-${JOB_SUFFIX_PLACEHOLDER}"
+          echo "job_name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+          envsubst < k8s/jobs/nightly-trace-digest.yaml \
+            > /tmp/job.yaml
+          kubectl apply -f /tmp/job.yaml
+
+      - name: Wait for digest job + stream output
+        id: digest
+        run: |
+          set -euo pipefail
+          kubectl -n managed wait \
+            --for=condition=complete \
+            --timeout=20m \
+            "job/${{ steps.launch.outputs.job_name }}"
+          # Pull pod name once the job's pod is settled.
+          POD=$(kubectl -n managed get pods \
+            -l "job-name=${{ steps.launch.outputs.job_name }}" \
+            -o jsonpath='{.items[0].metadata.name}')
+          # Job stdout IS the JSONL digest (one line per trace).
+          kubectl -n managed logs "$POD" > /tmp/digests.jsonl
+          LINE_COUNT=$(wc -l < /tmp/digests.jsonl | tr -d ' ')
+          echo "line_count=$LINE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Pulled $LINE_COUNT digest line(s)."
+          if [ "$LINE_COUNT" = "0" ]; then
+            echo "::notice::No traces digested for ${{ steps.ctx.outputs.target_date }} — exiting cleanly."
+          fi
+
+      - name: Bail if no traces
+        if: steps.digest.outputs.line_count == '0'
+        run: exit 0
+
+      - name: List open auto-optimization PRs (dedup input)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr list --repo prbe-ai/prbe-knowledge \
+            --label auto-optimization --state open \
+            --json number,title,body \
+            > /tmp/open-auto-prs.json
+          echo "Open auto-PRs: $(jq length /tmp/open-auto-prs.json)"
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run orchestrator (headless)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          AGENT_OPTIMIZATION_MAX_PRS: ${{ env.AGENT_OPTIMIZATION_MAX_PRS }}
+        run: |
+          set -euo pipefail
+          # Stage the prompt + inputs so the agent can read paths
+          # consistently. Sub-agent worktrees are placed under /tmp.
+          claude -p "$(cat .github/prompts/nightly-optimization.md)" \
+            --output-format stream-json \
+            --max-turns 80 \
+            --allowedTools "Read,Grep,Glob,Bash(gh:*),Bash(git:*),Bash(uv:*),Edit,Write,Task" \
+            2>&1 | tee /tmp/orchestrator.log
+          # Orchestrator writes its plan + result here for the
+          # post-process gate + the artifact upload.
+          if [ ! -f /tmp/orchestrator-summary.json ]; then
+            echo "::warning::orchestrator-summary.json not written — agent may have aborted."
+            echo '{"patterns_identified":0,"prs_opened":0,"skipped":[],"branches":[]}' \
+              > /tmp/orchestrator-summary.json
+          fi
+          jq . /tmp/orchestrator-summary.json
+
+      - name: Path-diff gate (workflow-level, not self-policed)
+        id: gate
+        run: |
+          set -euo pipefail
+          ALLOWED='^(services/retrieval/agent/|shared/constants\.py$)'
+          ACCEPTED=()
+          REJECTED=()
+          for branch in $(git branch --list 'auto-opt/*' --format='%(refname:short)'); do
+            OFFENDERS=$(git diff --name-only origin/main..."$branch" \
+              | grep -vE "$ALLOWED" || true)
+            if [ -n "$OFFENDERS" ]; then
+              echo "::warning::branch $branch touched out-of-scope: $OFFENDERS — dropping"
+              git branch -D "$branch"
+              REJECTED+=("$branch")
+            else
+              ACCEPTED+=("$branch")
+            fi
+          done
+          printf '%s\n' "${ACCEPTED[@]}" > /tmp/accepted-branches.txt
+          echo "accepted=${#ACCEPTED[@]}" >> "$GITHUB_OUTPUT"
+          echo "rejected=${#REJECTED[@]}" >> "$GITHUB_OUTPUT"
+          echo "Accepted: ${ACCEPTED[*]:-(none)}"
+          echo "Rejected: ${REJECTED[*]:-(none)}"
+
+      - name: Push branches + open PRs
+        if: steps.gate.outputs.accepted != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          while read -r branch; do
+            [ -z "$branch" ] && continue
+            TITLE_FILE=".git/auto-opt-titles/$(basename "$branch")"
+            BODY_FILE=".git/auto-opt-bodies/$(basename "$branch")"
+            if [ ! -f "$TITLE_FILE" ] || [ ! -f "$BODY_FILE" ]; then
+              echo "::warning::missing title/body for $branch — skipping PR open"
+              continue
+            fi
+            git push origin "$branch"
+            gh pr create --draft --label auto-optimization \
+              --reviewer richardwei6 \
+              --head "$branch" \
+              --title "$(cat "$TITLE_FILE")" \
+              --body "$(cat "$BODY_FILE")"
+          done < /tmp/accepted-branches.txt
+
+      - name: Upload orchestrator summary as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orchestrator-summary-${{ steps.ctx.outputs.target_date }}
+          path: |
+            /tmp/orchestrator-summary.json
+            /tmp/orchestrator.log
+            /tmp/digests.jsonl
+          retention-days: 14
+
+      - name: Cleanup digest job
+        if: always()
+        run: |
+          kubectl -n managed delete job "${{ steps.launch.outputs.job_name }}" \
+            --ignore-not-found=true

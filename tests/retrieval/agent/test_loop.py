@@ -43,8 +43,15 @@ def _mk_resp(
     content: str | None = None,
     prompt_tokens: int = 100,
     cached_tokens: int = 0,
+    reasoning_content: str | None = None,
 ) -> SimpleNamespace:
-    """Build a SimpleNamespace mimicking a LiteLLM chat-completion response."""
+    """Build a SimpleNamespace mimicking a LiteLLM chat-completion response.
+
+    `reasoning_content` simulates the gpt-oss harmony `analysis` block
+    that LiteLLM surfaces as `message.reasoning_content`. Default None
+    so existing tests don't shift; pass a string to assert the loop
+    captures it onto state.
+    """
     tcs = []
     for tc in tool_calls or []:
         tcs.append(SimpleNamespace(
@@ -54,7 +61,11 @@ def _mk_resp(
                 arguments=json.dumps(tc.get("arguments", {})) if not isinstance(tc.get("arguments"), str) else tc["arguments"],
             ),
         ))
-    msg = SimpleNamespace(content=content, tool_calls=tcs)
+    msg = SimpleNamespace(
+        content=content,
+        tool_calls=tcs,
+        reasoning_content=reasoning_content,
+    )
     return SimpleNamespace(
         choices=[SimpleNamespace(message=msg)],
         usage=SimpleNamespace(
@@ -356,3 +367,69 @@ async def test_per_stage_latency_recorded_on_state(
 
     # cache_hit_rate is averaged across turns
     assert fake_request.state.cache_hit_rate is not None
+
+
+@pytest.mark.asyncio
+async def test_reasoning_content_captured_per_turn(
+    fake_request: SimpleNamespace,
+) -> None:
+    """The gpt-oss harmony `analysis` block (surfaced by LiteLLM as
+    `message.reasoning_content`) lands on `state.reasoning_per_turn`
+    parallel to `turn_latencies_ms`. Without this capture the
+    agent's "why" trail is lost because the OpenAI chat-completion
+    round-trip only echoes role/content/tool_calls — not reasoning."""
+    req = QueryRequest(query="why was PR 71 made", customer_id="cust-1", top_k=5)
+    turn_1 = _mk_resp(
+        tool_calls=[{"id": "s1", "name": "search", "arguments": {"queries": ["q1"]}}],
+        reasoning_content=(
+            "User asks about PR #71 motivation. I'll start with the "
+            "vector channel anchored on PR-71 ID."
+        ),
+    )
+    turn_2 = _mk_resp(
+        tool_calls=[_terminal_call()],
+        reasoning_content=None,  # provider may emit reasoning on some turns and not others
+    )
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1, turn_2]),
+    ), patch(
+        "services.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    # PR 1's stash exposes the LoopState ref on request.state.
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state is not None
+    assert len(loop_state.reasoning_per_turn) == 2
+    assert loop_state.reasoning_per_turn[0] is not None
+    assert "PR #71" in loop_state.reasoning_per_turn[0]
+    assert loop_state.reasoning_per_turn[1] is None  # provider didn't emit on turn 2
+
+
+@pytest.mark.asyncio
+async def test_reasoning_per_turn_starts_empty_and_grows(
+    fake_request: SimpleNamespace,
+) -> None:
+    """No reasoning emitted = list of None entries (one per turn), NOT
+    a missing key. The analyzer relies on len(reasoning_per_turn) ==
+    turn_count for per-turn correlation."""
+    req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
+    # Single turn — terminal immediately, no reasoning.
+    turn_1 = _mk_resp(tool_calls=[_terminal_call()], reasoning_content=None)
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1]),
+    ), patch(
+        "services.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state is not None
+    assert len(loop_state.reasoning_per_turn) == loop_state.turn_count
+    assert loop_state.reasoning_per_turn == [None]

@@ -57,6 +57,11 @@ def _mk_state(**overrides: Any) -> LoopState:
         "prose_retries": 0,
         "prefanout": {"vector": {"hits": []}, "bm25": {"hits": []}},
         "prefanout_hit_counts": {"vector": 3, "bm25": 2, "graph": 0, "inferred_edge": 1},
+        "reasoning_per_turn": [
+            "User wants recent shipping activity. Vector + BM25 both hit; "
+            "picking fetch_doc_chunks on top result for fuller context.",
+            None,
+        ],
     }
     defaults.update(overrides)
     return LoopState(**defaults)
@@ -123,6 +128,10 @@ def test_build_trace_blob_includes_all_fields() -> None:
     assert blob["prose_retries"] == 0
     assert blob["prefanout"] == state.prefanout
     assert blob["prefanout_hit_counts"]["graph"] == 0
+    # reasoning_per_turn from message.reasoning_content
+    assert len(blob["reasoning_per_turn"]) == 2
+    assert blob["reasoning_per_turn"][0].startswith("User wants recent shipping")
+    assert blob["reasoning_per_turn"][1] is None
 
     # GathererOutput round-trips through model_dump
     assert blob["gathered"]["gatherer_notes"]["confidence"] == "medium"
@@ -170,6 +179,8 @@ def test_build_trace_blob_handles_none_state() -> None:
     assert blob["messages"] == []
     assert blob["turn_count"] == 0
     assert blob["prefanout"] == {}
+    # reasoning_per_turn key present but empty so analyzer schema stays stable
+    assert blob["reasoning_per_turn"] == []
 
 
 def test_build_trace_blob_handles_none_gathered() -> None:

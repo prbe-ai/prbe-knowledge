@@ -114,6 +114,14 @@ class LoopState:
     # nightly analyzer can correlate channel coverage with curated outcomes.
     prefanout: dict[str, Any] = field(default_factory=dict)
     prefanout_hit_counts: dict[str, int] = field(default_factory=dict)
+    # Per-turn chain-of-thought from the model's `reasoning_content`
+    # channel (gpt-oss harmony `analysis` block, surfaced by LiteLLM as
+    # message.reasoning_content). One entry per acompletion call. None
+    # when the provider didn't emit reasoning for that turn. Not echoed
+    # back into the next turn's request (OpenAI chat-completion contract
+    # only round-trips role/content/tool_calls), so without this list
+    # the agent's "why did it pick this tool" trail is lost.
+    reasoning_per_turn: list[str | None] = field(default_factory=list)
 
 
 # ============================================================
@@ -309,6 +317,13 @@ async def _run_turn(state: LoopState) -> Any:
     msg = getattr(choices[0], "message", None) if choices else None
     tool_calls = getattr(msg, "tool_calls", None) or [] if msg is not None else []
     content = getattr(msg, "content", None) if msg is not None else None
+    # Capture the model's reasoning channel (gpt-oss harmony `analysis`
+    # block, normalized by LiteLLM to `message.reasoning_content`). NOT
+    # echoed back to the next turn; saved on state for the trace blob so
+    # the nightly analyzer can see "why did the agent pick fetch_doc_chunks
+    # here" instead of only the chosen arguments.
+    reasoning = getattr(msg, "reasoning_content", None) if msg is not None else None
+    state.reasoning_per_turn.append(reasoning if reasoning else None)
     log.info(
         "agent.turn_complete",
         customer_id=state.customer_id,
@@ -317,6 +332,7 @@ async def _run_turn(state: LoopState) -> Any:
         elapsed_ms=round(elapsed_ms, 1),
         tool_calls_count=len(tool_calls),
         content_len=len(content) if content else 0,
+        reasoning_len=len(reasoning) if reasoning else 0,
         cache_hit_rate=round(rate, 3) if rate is not None else None,
     )
     return resp
