@@ -15,6 +15,7 @@ from services.ingestion.handlers import (
     linear,  # noqa: F401
     manual_upload,  # noqa: F401
     notion,  # noqa: F401
+    pagerduty,  # noqa: F401
     sentry,  # noqa: F401
     slack,  # noqa: F401
     wiki,  # noqa: F401

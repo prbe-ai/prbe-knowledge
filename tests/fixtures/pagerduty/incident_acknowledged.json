@@ -1,0 +1,29 @@
+{
+  "event": {
+    "id": "01EVENT0000ABCDEG",
+    "event_type": "incident.acknowledged",
+    "resource_type": "incident",
+    "occurred_at": "2026-05-17T12:01:30Z",
+    "agent": {"id": "PXYZ123", "type": "user_reference", "summary": "Jane Doe"},
+    "data": {
+      "id": "PD-INC-001",
+      "type": "incident",
+      "self": "https://api.pagerduty.com/incidents/PD-INC-001",
+      "html_url": "https://acme.pagerduty.com/incidents/PD-INC-001",
+      "number": 42,
+      "status": "acknowledged",
+      "incident_key": "checkout-svc/db-conn-pool-exhaust",
+      "created_at": "2026-05-17T12:00:00Z",
+      "title": "Checkout service: database connection pool exhausted",
+      "service": {
+        "id": "PSRV001", "type": "service_reference",
+        "summary": "Checkout API",
+        "html_url": "https://acme.pagerduty.com/services/PSRV001"
+      },
+      "urgency": "high",
+      "priority": {"name": "P1", "summary": "P1"},
+      "escalation_policy": {"summary": "Checkout oncall"},
+      "teams": [{"summary": "Payments"}]
+    }
+  }
+}
