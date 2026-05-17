@@ -403,3 +403,190 @@ async def test_grounding_failure_does_not_break_loop(
 
     assert resp.total_candidates == 1
     assert fake_request.state.gatherer_status == "ok"
+
+
+# ============================================================
+# Trace blob stash (PR 1)
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_trace_stash_set_on_happy_path(
+    fake_request: SimpleNamespace,
+    fake_bundle: GroundingBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Happy path stashes raw refs onto request.state for the BackgroundTask
+    persister to consume."""
+    monkeypatch.setattr("services.retrieval.agent.loop.random.random", lambda: 0.0)
+    req = QueryRequest(query="what shipped", customer_id="cust-1", top_k=5)
+
+    with patch(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        new=AsyncMock(return_value=fake_bundle),
+    ), patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(content=_final_emission_json(chunks=1))),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert fake_request.state.search_agent_should_persist is True
+    assert fake_request.state.search_agent_status == "ok"
+    assert fake_request.state.search_agent_customer_id == "cust-1"
+    assert fake_request.state.search_agent_query == "what shipped"
+    # LoopState ref should be present and have the expected shape
+    state = fake_request.state.search_agent_loop_state
+    assert state is not None
+    assert state.customer_id == "cust-1"
+    assert isinstance(state.messages, list) and len(state.messages) > 0
+    # Gathered should be set on the happy path
+    assert fake_request.state.search_agent_gathered is not None
+
+
+@pytest.mark.asyncio
+async def test_trace_stash_skipped_when_sample_rate_zero(
+    fake_request: SimpleNamespace,
+    fake_bundle: GroundingBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """random.random > sample_rate => no stash. Pin sample_rate to 0.0
+    and random to 0.5 (the inequality `random > 0.0` is True, so skip).
+    """
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop.SEARCH_AGENT_TRACE_SAMPLE_RATE", 0.0
+    )
+    monkeypatch.setattr("services.retrieval.agent.loop.random.random", lambda: 0.5)
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+
+    with patch(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        new=AsyncMock(return_value=fake_bundle),
+    ), patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(content=_final_emission_json(chunks=1))),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert not getattr(
+        fake_request.state, "search_agent_should_persist", False
+    )
+
+
+@pytest.mark.asyncio
+async def test_trace_stash_set_on_503_fatal_provider_error(
+    fake_request: SimpleNamespace,
+    fake_bundle: GroundingBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION GUARD: 503 path must ALSO stash the trace. The
+    fatal_provider_error transcripts are the most valuable ones to keep
+    — without them we'd have a Sentry breadcrumb but no per-turn record
+    of what the agent was doing when the provider died.
+    """
+    monkeypatch.setattr("services.retrieval.agent.loop.random.random", lambda: 0.0)
+    from shared.llm import LLMError
+    req = QueryRequest(query="boom", customer_id="cust-1", top_k=5)
+
+    with patch(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        new=AsyncMock(return_value=fake_bundle),
+    ), patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=LLMError("fireworks down")),
+    ), pytest.raises(HTTPException):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    # Stash MUST have happened before the raise
+    assert fake_request.state.search_agent_should_persist is True
+    assert fake_request.state.search_agent_status == "fatal_provider_error"
+    # gathered is None because we never got to the final emission
+    assert fake_request.state.search_agent_gathered is None
+    # State was constructed before the LLMError, so it should be present
+    # with the partial fields the model managed to populate.
+    state = fake_request.state.search_agent_loop_state
+    assert state is not None
+    assert state.customer_id == "cust-1"
+
+
+@pytest.mark.asyncio
+async def test_trace_stash_set_on_no_llm_configured(
+    fake_request: SimpleNamespace,
+    fake_bundle: GroundingBundle,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """no_llm_configured short-circuit also stashes. These traces tell
+    us whether self-host installations are bypassing the LLM accidentally."""
+    monkeypatch.setattr("services.retrieval.agent.loop.random.random", lambda: 0.0)
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop._no_llm_configured", lambda: True
+    )
+    req = QueryRequest(query="anything", customer_id="cust-1", top_k=5)
+
+    boom = AsyncMock(side_effect=AssertionError("acompletion should NOT be called"))
+    with patch(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        new=AsyncMock(return_value=fake_bundle),
+    ), patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=boom,
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert fake_request.state.search_agent_should_persist is True
+    assert fake_request.state.search_agent_status == "no_llm_configured"
+
+
+@pytest.mark.asyncio
+async def test_trace_id_unified_with_request_id(
+    fake_request: SimpleNamespace,
+    fake_bundle: GroundingBundle,
+) -> None:
+    """When request.state.request_id is set (middleware did its job),
+    the gatherer's trace_id MUST match it — single id across logs,
+    query_traces row, response, and R2 blob key.
+    """
+    fake_request.state.request_id = "11111111-2222-3333-4444-555555555555"
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+
+    with patch(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        new=AsyncMock(return_value=fake_bundle),
+    ), patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(content=_final_emission_json(chunks=1))),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert resp.trace_id == "11111111-2222-3333-4444-555555555555"
+    # Stash should carry the same id (sampling is 1.0 by default).
+    assert (
+        fake_request.state.search_agent_trace_id
+        == "11111111-2222-3333-4444-555555555555"
+    )
+
+
+@pytest.mark.asyncio
+async def test_trace_id_falls_back_to_uuid_when_no_request_id(
+    fake_request: SimpleNamespace,
+    fake_bundle: GroundingBundle,
+) -> None:
+    """When request.state.request_id is missing AND caller didn't supply
+    req.trace_id, generate a UUID. No more 'q-{ts}' placeholders.
+    """
+    # fake_request.state has no request_id attribute by default
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+
+    with patch(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        new=AsyncMock(return_value=fake_bundle),
+    ), patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(content=_final_emission_json(chunks=1))),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    # Should be a valid UUID, not "q-..."
+    import uuid as _uuid
+    parsed = _uuid.UUID(resp.trace_id)
+    assert str(parsed) == resp.trace_id
+    assert not resp.trace_id.startswith("q-")

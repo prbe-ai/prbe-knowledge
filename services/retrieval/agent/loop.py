@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from fastapi import HTTPException
 
@@ -62,6 +64,7 @@ from shared.constants import (
     SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
     SEARCH_AGENT_MAX_EXTENSIONS,
     SEARCH_AGENT_TOOL_BUDGET,
+    SEARCH_AGENT_TRACE_SAMPLE_RATE,
     SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
 )
 from shared.llm import LLMError, acompletion
@@ -90,7 +93,7 @@ _GATHERER_OUTPUT_RESPONSE_FORMAT: dict[str, Any] = {
 # ============================================================
 
 @dataclass(slots=True)
-class _LoopState:
+class LoopState:
     """Mutable per-request loop bookkeeping.
 
     Held entirely in memory for the duration of one query. Persisted
@@ -117,6 +120,12 @@ class _LoopState:
     # Count of prose-emission retry calls (model emitted prose, harness
     # retried with tools=None). Each retry adds one extra LLM round-trip.
     prose_retries: int = 0
+    # Deterministic pre-fan-out results (vector + bm25 + graph +
+    # inferred_edge), captured for the trace blob so the nightly analyzer
+    # can correlate channel coverage with curated outcomes. Populated by
+    # run_gatherer right after asyncio.gather returns.
+    prefanout: dict[str, Any] = field(default_factory=dict)
+    prefanout_hit_counts: dict[str, int] = field(default_factory=dict)
 
 
 # ============================================================
@@ -314,7 +323,7 @@ def _empty_passthrough(reason: GathererStatus) -> GathererOutput:
 # ============================================================
 
 async def _execute_tool_call(
-    state: _LoopState,
+    state: LoopState,
     tool_call: Any,
 ) -> dict[str, Any]:
     """Dispatch a single tool call, return the result dict + serialized JSON content."""
@@ -394,7 +403,7 @@ async def _execute_tool_call(
 
 
 async def _run_turn(
-    state: _LoopState,
+    state: LoopState,
     *,
     force_final: bool,
 ) -> tuple[Any, str | None]:
@@ -487,6 +496,52 @@ def _serialize_tool_calls(tool_calls: list[Any]) -> list[dict[str, Any]]:
 
 
 # ============================================================
+# Trace-blob stash
+# ============================================================
+
+def _stash_for_trace_persist(
+    request: Request | None,
+    *,
+    customer_id: str,
+    trace_id: str,
+    query: str,
+    state: LoopState | None,
+    gathered: GathererOutput | None,
+    status: GathererStatus | None,
+    timing: dict[str, float],
+) -> None:
+    """Stash raw refs onto request.state so middleware can persist the
+    trace blob to R2 as a post-flush BackgroundTask.
+
+    Sampling decided here (cheap, deterministic-per-call). Wrapped in
+    try/except so a misshapen state can NEVER 500 the user request —
+    telemetry that fails the user defeats the whole purpose.
+    """
+    if request is None:
+        return
+    try:
+        if random.random() > SEARCH_AGENT_TRACE_SAMPLE_RATE:
+            return
+        request.state.search_agent_loop_state = state
+        request.state.search_agent_gathered = gathered
+        request.state.search_agent_status = status
+        request.state.search_agent_timing = timing
+        request.state.search_agent_query = query
+        request.state.search_agent_model = SEARCH_AGENT_INFERENCE_MODEL
+        request.state.search_agent_trace_id = trace_id
+        request.state.search_agent_customer_id = customer_id
+        request.state.search_agent_should_persist = True
+    except Exception as exc:
+        log.warning(
+            "agent.trace_stash_failed",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
+
+
+# ============================================================
 # Top-level entry point
 # ============================================================
 
@@ -508,7 +563,20 @@ async def run_gatherer(
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="empty query")
 
-    trace_id = req.trace_id or f"q-{int(datetime.now().timestamp() * 1000)}"
+    # Unify trace_id with middleware's request_id. The middleware mints
+    # request.state.request_id (UUID, indexed in query_traces, RLS-safe)
+    # BEFORE the handler runs. Falls back to caller-supplied trace_id or a
+    # fresh UUID for direct calls (tests, scripts). The old `q-{ts}`
+    # placeholder is gone; only test fixtures in prbe-knowledge-mcp had it
+    # and they treat it as an opaque string.
+    if request is not None:
+        trace_id = (
+            getattr(request.state, "request_id", None)
+            or req.trace_id
+            or str(uuid4())
+        )
+    else:
+        trace_id = req.trace_id or str(uuid4())
     timing: dict[str, float] = {}
 
     # Step 1 — deterministic grounding (synchronous, ~25ms).
@@ -573,10 +641,12 @@ async def run_gatherer(
     user_msg = _build_user_message(req.query, bundle, prefanout_dict)
     system_prompt = build_system_prompt(datetime.now(UTC))
 
-    state = _LoopState(
+    state = LoopState(
         customer_id=customer_id,
         trace_id=trace_id,
         query=req.query,
+        prefanout=prefanout_dict,
+        prefanout_hit_counts=prefanout_hit_counts,
         messages=[
             {
                 "role": "system",
@@ -623,6 +693,16 @@ async def run_gatherer(
             request.state.intents_count = 1
             request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
             request.state.failure_recovered = True
+        _stash_for_trace_persist(
+            request,
+            customer_id=customer_id,
+            trace_id=trace_id,
+            query=req.query,
+            state=state,
+            gathered=gathered,
+            status=status,
+            timing=timing,
+        )
         return to_query_response(
             query=req.query, gathered=gathered, trace_id=trace_id, timing_ms=timing
         )
@@ -658,6 +738,19 @@ async def run_gatherer(
         )
         if request is not None:
             request.state.full_failure = True
+        # Stash BEFORE raising. The 503 path is the most valuable trace
+        # to keep — without it we'd have a Sentry breadcrumb but no
+        # transcript showing which turn the provider failed on.
+        _stash_for_trace_persist(
+            request,
+            customer_id=customer_id,
+            trace_id=trace_id,
+            query=req.query,
+            state=state,
+            gathered=None,
+            status="fatal_provider_error",
+            timing=timing,
+        )
         raise HTTPException(status_code=503, detail="search agent unavailable") from exc
 
     timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
@@ -718,6 +811,21 @@ async def run_gatherer(
         request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
         request.state.failure_recovered = status != "ok"
 
+    # Stash for the R2 trace blob persist BackgroundTask. The middleware
+    # reads request.state lazily post-flush, so the CPU cost of
+    # build_trace_blob (json serialization of state.messages) lands OFF
+    # the request path.
+    _stash_for_trace_persist(
+        request,
+        customer_id=customer_id,
+        trace_id=trace_id,
+        query=req.query,
+        state=state,
+        gathered=gathered,
+        status=status,
+        timing=timing,
+    )
+
     return to_query_response(
         query=req.query,
         gathered=gathered,
@@ -726,7 +834,7 @@ async def run_gatherer(
     )
 
 
-async def _drive_loop(state: _LoopState) -> GathererOutput | None:
+async def _drive_loop(state: LoopState) -> GathererOutput | None:
     """Multi-turn loop: model -> tool calls -> tool results -> model -> ...
     Terminates on first turn with no tool_calls (final emission)."""
     while True:

@@ -149,6 +149,11 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
                 # Fire-and-forget. write_usage_event() swallows its own
                 # exceptions, so this task can never raise unhandled.
                 asyncio.create_task(write_usage_event(event))  # noqa: RUF006
+            # R2 trace blob persist — fire-and-forget on the failure
+            # path too, because a 503 / mid-loop crash is exactly the
+            # trace we most want to keep. Sets request.state.trace_blob_key
+            # on success; the query_traces row write below reads it lazily.
+            asyncio.create_task(_persist_trace_blob_r2(request))  # noqa: RUF006
             asyncio.create_task(  # noqa: RUF006
                 _build_and_write_trace(
                     request,
@@ -189,6 +194,12 @@ class UsageLoggingMiddleware(BaseHTTPMiddleware):
             tasks.add_task(_run_existing, existing)
         if event is not None:
             tasks.add_task(write_usage_event, event)
+        # R2 trace blob persist runs BEFORE _build_and_write_trace so the
+        # query_traces row write below picks up trace_blob_key from
+        # request.state. Both are post-flush; ordering doesn't affect
+        # user-visible latency. Cost of build_trace_blob (JSON serialization
+        # of state.messages) lands here, not in the request path.
+        tasks.add_task(_persist_trace_blob_r2, request)
         tasks.add_task(
             _build_and_write_trace,
             request,
@@ -305,8 +316,81 @@ async def _build_and_write_trace(
             cache_tokens=getattr(request.state, "cache_tokens", None),
             router_model=getattr(request.state, "router_model", None),
             failure_recovered=getattr(request.state, "failure_recovered", False),
+            # Pointer to the per-turn R2 transcript. Set by
+            # _persist_trace_blob_r2 above us in the BackgroundTasks chain;
+            # NULL when sampling skipped the run or R2 PUT failed.
+            trace_blob_key=getattr(request.state, "trace_blob_key", None),
         )
     )
+
+
+async def _persist_trace_blob_r2(request: Request) -> None:
+    """Build the trace blob and PUT it to R2 as a post-flush BackgroundTask.
+
+    Runs AFTER the response body is flushed to the client — zero impact
+    on user-visible latency, even though build_trace_blob does the CPU
+    work of serializing state.messages. On success, stamps
+    request.state.trace_blob_key so the next task in the chain
+    (_build_and_write_trace) writes it on the query_traces row.
+
+    No-op when:
+      - request.state.search_agent_should_persist is missing/False
+        (handler didn't run, or sampling skipped the run)
+      - customer_id missing (auth never ran)
+
+    Swallows every exception including CancelledError — telemetry must
+    never escape into the BackgroundTask chain. On any failure,
+    trace_blob_key stays unset and the DB row writes NULL.
+    """
+    try:
+        if not getattr(request.state, "search_agent_should_persist", False):
+            return
+        customer_id: str | None = getattr(request.state, "search_agent_customer_id", None) \
+            or getattr(request.state, "customer_id", None)
+        if not customer_id:
+            return
+
+        trace_id: str = getattr(request.state, "search_agent_trace_id", "")
+        if not trace_id:
+            return
+
+        # Lazy imports to avoid pulling the retrieval-agent stack into
+        # processes that don't need it (e.g. /sources-only deployments).
+        from services.retrieval.agent.trace_blob import (
+            build_trace_blob,
+            compute_blob_key,
+            persist_trace_blob_to_r2,
+        )
+
+        loop_state = getattr(request.state, "search_agent_loop_state", None)
+        gathered = getattr(request.state, "search_agent_gathered", None)
+        status = getattr(request.state, "search_agent_status", None)
+        timing = getattr(request.state, "search_agent_timing", {}) or {}
+        query = getattr(request.state, "search_agent_query", "")
+        model = getattr(request.state, "search_agent_model", "")
+
+        payload = build_trace_blob(
+            state=loop_state,
+            gathered=gathered,
+            status=status,
+            timing=timing,
+            query=query,
+            customer_id=customer_id,
+            trace_id=trace_id,
+            model=model,
+        )
+        from datetime import UTC
+        from datetime import datetime as _dt
+        key = compute_blob_key(trace_id, _dt.now(UTC))
+        result = await persist_trace_blob_to_r2(customer_id, key, payload)
+        if result is not None:
+            request.state.trace_blob_key = result
+    except (Exception, asyncio.CancelledError) as exc:
+        log.warning(
+            "trace_blob.background_task_failed",
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
 
 
 async def _run_existing(task: BackgroundTask) -> None:

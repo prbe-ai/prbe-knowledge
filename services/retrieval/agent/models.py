@@ -44,6 +44,11 @@ GathererStatus = Literal[
     # router's `_call_haiku` short-circuit when neither Anthropic key nor
     # LLM gateway URL was set.
     "no_llm_configured",
+    # LLMError raised mid-loop (provider 5xx, network, etc). The
+    # harness re-raises as HTTPException(503), but we still capture the
+    # trace blob with this status — the partial transcript is exactly
+    # the artifact we need to debug provider-side regressions.
+    "fatal_provider_error",
 ]
 
 

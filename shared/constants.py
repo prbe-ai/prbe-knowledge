@@ -653,6 +653,15 @@ SEARCH_AGENT_TURN_TIMEOUT_SECONDS = 30.0
 # a worker. p99 should land far below this; trip = log + 503.
 SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 90.0
 
+# Fraction of gatherer runs whose full per-turn transcript gets persisted
+# to R2 alongside the query_traces summary row. 1.0 = persist every run.
+# Drop via `kubectl set env DEPLOY SEARCH_AGENT_TRACE_SAMPLE_RATE=0.1`
+# without a deploy if R2 spend spikes. Sampled-out rows still get the
+# summary in `query_traces`; only the full blob is skipped.
+SEARCH_AGENT_TRACE_SAMPLE_RATE = float(
+    os.getenv("SEARCH_AGENT_TRACE_SAMPLE_RATE", "1.0")
+)
+
 # Prefix used in `integration_tokens.scope` to signal the row represents a
 # GitHub App installation rather than an OAuth access_token. The installation
 # id follows the colon; tokens are minted on demand from the App private key.
