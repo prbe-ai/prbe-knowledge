@@ -63,6 +63,21 @@ from shared.models import QueryRequest, QueryResponse
 
 log = get_logger(__name__)
 
+
+# Cached response_format payload — built once at import time. LiteLLM
+# forwards this dict verbatim to Fireworks as the OpenAI
+# `response_format: {type: json_schema, json_schema: {...}}` shape.
+# Schema must be derived from `GathererOutput.model_json_schema()` (Pydantic
+# v2) — passing the Pydantic class directly to LiteLLM's `response_format`
+# kwarg gets silently dropped on the wire for Fireworks via the proxy.
+_GATHERER_OUTPUT_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "GathererOutput",
+        "schema": GathererOutput.model_json_schema(),
+    },
+}
+
 # ============================================================
 # Loop state
 # ============================================================
@@ -314,7 +329,13 @@ async def _run_turn(
     call_kwargs: dict[str, Any] = {
         "model": SEARCH_AGENT_INFERENCE_MODEL,
         "messages": state.messages,
-        "response_format": GathererOutput,
+        # Use the explicit OpenAI-style json_schema form rather than passing
+        # the Pydantic class directly. LiteLLM SDK's auto-translation of
+        # Pydantic -> json_schema gets dropped on the wire to Fireworks via
+        # the proxy (verified live 2026-05-17: passing the class returned
+        # prose; passing the explicit json_schema returns valid JSON).
+        # See _GATHERER_OUTPUT_RESPONSE_FORMAT below for the cached schema.
+        "response_format": _GATHERER_OUTPUT_RESPONSE_FORMAT,
         "extra_headers": {"x-session-affinity": _affinity_key(state.customer_id, state.query)},
         "timeout": SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
     }
