@@ -255,6 +255,11 @@ class QueryTrace:
     cache_tokens: dict[str, Any] | None = None
     router_model: str | None = None
     failure_recovered: bool = False
+    # Pointer to the per-turn R2 transcript (migration 0079). Nullable:
+    # sampled-out rows + R2-write-failure rows still get the summary
+    # row, just without the blob pointer. Lookup-by-request_id via
+    # idx_query_traces_request_id is sufficient; no new index needed.
+    trace_blob_key: str | None = None
 
 
 def _payload_to_jsonable(payload: BaseModel | dict[str, Any] | None) -> dict[str, Any]:
@@ -395,11 +400,13 @@ async def write_query_trace(trace: QueryTrace) -> None:
                     schema_version, request, response,
                     response_size_bytes, response_truncated,
                     grounding_bundle, router_raw, intents_count,
-                    intent_dispatch, cache_tokens, router_model, failure_recovered
+                    intent_dispatch, cache_tokens, router_model, failure_recovered,
+                    trace_blob_key
                 ) VALUES (
                     $1, $2, $3::uuid, $4, $5, $6::jsonb, $7::jsonb, $8, $9,
                     $10::jsonb, $11::jsonb, $12,
-                    $13::jsonb, $14::jsonb, $15, $16
+                    $13::jsonb, $14::jsonb, $15, $16,
+                    $17
                 )
                 """,
                 trace.customer_id,
@@ -418,6 +425,7 @@ async def write_query_trace(trace: QueryTrace) -> None:
                 cache_tokens_json,
                 trace.router_model,
                 trace.failure_recovered,
+                trace.trace_blob_key,
             )
     except (Exception, asyncio.CancelledError) as exc:
         counter("query_traces.write_failed", 1, event_type=trace.event_type)
