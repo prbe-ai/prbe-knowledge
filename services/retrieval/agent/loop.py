@@ -277,6 +277,12 @@ async def _run_turn(state: LoopState) -> Any:
         "model": SEARCH_AGENT_INFERENCE_MODEL,
         "messages": state.messages,
         "tools": tool_definitions(),
+        # Greedy decoding. Without this, Fireworks defaults to
+        # temperature=1.0 and the same query produces different tool
+        # trajectories run-to-run (3x test on "self-hosting features":
+        # one run 13 results, one run dead-end, one run timeout). For a
+        # retrieval gatherer same-question-same-evidence is the contract.
+        "temperature": 0,
         # The whole point: model MUST call a tool. With this set, prose-
         # only output is not an option — the model picks a retrieval
         # tool (search/subgraph/fetch_doc/need_deeper) or the terminal
