@@ -80,6 +80,7 @@ class NormalizeOutcome:
     reused_chunk_count: int = 0
     removed_chunk_count: int = 0
     quarantined_doc_ids: list[str] = field(default_factory=list)
+    requires_investigation: bool = False
 
 
 class Normalizer:
@@ -380,6 +381,7 @@ class Normalizer:
             reused_chunk_count=total_reused,
             removed_chunk_count=total_removed,
             quarantined_doc_ids=quarantined,
+            requires_investigation=result.requires_investigation,
         )
 
     async def _enqueue_wiki_synthesis(
