@@ -1,0 +1,26 @@
+{
+  "event": {
+    "id": "01EVENT_ANNOTATED_001",
+    "event_type": "incident.annotated",
+    "resource_type": "incident",
+    "occurred_at": "2026-05-17T12:05:00Z",
+    "agent": {"id": "PXYZ123", "type": "user_reference", "summary": "Jane Doe"},
+    "data": {
+      "id": "PNOTE-001",
+      "type": "incident_note",
+      "content": "Started investigating; pool stats look normal.",
+      "trimmed": false,
+      "incident": {
+        "id": "PD-INC-001",
+        "type": "incident_reference",
+        "summary": "Checkout service: database connection pool exhausted",
+        "html_url": "https://acme.pagerduty.com/incidents/PD-INC-001",
+        "service": {
+          "id": "PSRV001",
+          "type": "service_reference",
+          "summary": "Checkout API"
+        }
+      }
+    }
+  }
+}

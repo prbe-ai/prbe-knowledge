@@ -83,12 +83,26 @@ class PagerDutyConnector(Connector):
         if not isinstance(data, dict):
             raise InvalidWebhookPayload("pagerduty payload missing 'event.data'")
 
-        incident_id = data.get("id")
+        # Sub-resource events (notes/status updates/responders/etc.) put the
+        # sub-resource at event.data, with the parent incident referenced via
+        # event.data.incident. The lifecycle events (triggered/acknowledged/
+        # resolved/escalated/reassigned/priority_updated/reopened/unacknowledged/
+        # delegated) put the incident itself at event.data with data.type =
+        # "incident".
+        data_type = data.get("type")
+        if data_type == "incident":
+            incident_id = data.get("id")
+            service = data.get("service") if isinstance(data.get("service"), dict) else {}
+        else:
+            # Sub-resource event — the incident is referenced under data.incident.
+            incident = data.get("incident") if isinstance(data.get("incident"), dict) else {}
+            incident_id = incident.get("id")
+            service = incident.get("service") if isinstance(incident.get("service"), dict) else {}
+
         if not incident_id:
-            raise InvalidWebhookPayload("pagerduty incident missing data.id")
+            raise InvalidWebhookPayload("pagerduty event has no resolvable incident id")
 
         received_at = _parse_iso8601(event.get("occurred_at")) or datetime.now(UTC)
-        service = data.get("service") if isinstance(data.get("service"), dict) else {}
 
         return WebhookParseResult(
             source_event_id=f"pd:incident:{incident_id}:{event_type}",
@@ -111,25 +125,36 @@ class PagerDutyConnector(Connector):
         event_type: str = pd_event.get("event_type") or ""
         occurred_at_str: str | None = pd_event.get("occurred_at")
         data: dict[str, Any] = pd_event.get("data") or {}
-        service: dict[str, Any] = data.get("service") if isinstance(data.get("service"), dict) else {}
-        priority: dict[str, Any] = data.get("priority") if isinstance(data.get("priority"), dict) else {}
-        escalation_policy: dict[str, Any] = data.get("escalation_policy") if isinstance(data.get("escalation_policy"), dict) else {}
 
-        incident_id: str | None = data.get("id")
+        # Resolve the incident object — lifecycle events have data.type="incident"
+        # and the incident fields directly on data; sub-resource events (annotated,
+        # status_update_published, responder.added, etc.) have the incident
+        # referenced under data.incident.
+        data_type = data.get("type")
+        if data_type == "incident":
+            incident: dict[str, Any] = data
+        else:
+            incident = data.get("incident") if isinstance(data.get("incident"), dict) else {}
+
+        service: dict[str, Any] = incident.get("service") if isinstance(incident.get("service"), dict) else {}
+        priority: dict[str, Any] = incident.get("priority") if isinstance(incident.get("priority"), dict) else {}
+        escalation_policy: dict[str, Any] = incident.get("escalation_policy") if isinstance(incident.get("escalation_policy"), dict) else {}
+
+        incident_id: str | None = incident.get("id")
         if not incident_id:
             return NormalizationResult(skipped_reason="missing event.data.id")
 
         doc_id = f"pd:incident:{incident_id}"
-        status: str = data.get("status") or ""
-        urgency: str | None = data.get("urgency")
-        incident_key: str | None = data.get("incident_key")
-        title_raw: str = data.get("title") or f"PagerDuty incident {incident_id}"
+        status: str = incident.get("status") or ""
+        urgency: str | None = incident.get("urgency")
+        incident_key: str | None = incident.get("incident_key")
+        title_raw: str = incident.get("title") or f"PagerDuty incident {incident_id}"
         service_id: str | None = service.get("id")
         service_summary: str | None = service.get("summary")
         service_url: str | None = service.get("html_url")
         ep_summary: str | None = escalation_policy.get("summary")
         priority_name: str | None = priority.get("name")
-        created_at_str: str | None = data.get("created_at")
+        created_at_str: str | None = incident.get("created_at")
 
         # Build human-readable markdown body
         body_lines: list[str] = [
@@ -175,7 +200,7 @@ class PagerDutyConnector(Connector):
             customer_id=event.customer_id,
             source_system=SourceSystem.PAGERDUTY,
             source_id=incident_id,
-            source_url=data.get("html_url") or "",
+            source_url=incident.get("html_url") or "",
             doc_class=DocClass.RAW_SOURCE,
             doc_type=DocType.INCIDENT,
             content_type="text/markdown",

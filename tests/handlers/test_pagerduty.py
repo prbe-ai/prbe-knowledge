@@ -86,7 +86,7 @@ def test_parse_missing_data_block_raises() -> None:
 
 def test_parse_missing_incident_id_raises() -> None:
     pd = _build()
-    with pytest.raises(InvalidWebhookPayload, match="missing data.id"):
+    with pytest.raises(InvalidWebhookPayload, match="no resolvable incident id"):
         pd.parse_webhook_event(
             "cust-1", {},
             {"event": {"event_type": "incident.triggered", "data": {}}},
@@ -286,3 +286,33 @@ async def test_normalize_content_hash_differs_across_lifecycle() -> None:
               ack.documents[0].content_hash,
               resolved.documents[0].content_hash}
     assert len(hashes) == 3
+
+
+def test_parse_annotated_extracts_incident_id_not_note_id() -> None:
+    """`incident.annotated`'s data.id is the NOTE id; the actual incident
+    id is at data.incident.id. The connector must extract the latter so
+    lifecycle dedup keys on the incident, not the note."""
+    pd = _build()
+    result = pd.parse_webhook_event("cust-1", {}, _load("incident_annotated.json"))
+    assert result is not None
+    # Source event id keys on the INCIDENT id, not PNOTE-001.
+    assert result.source_event_id == "pd:incident:PD-INC-001:incident.annotated"
+    assert result.parse_hint["incident_id"] == "PD-INC-001"
+    assert result.parse_hint["service_id"] == "PSRV001"
+
+
+@pytest.mark.asyncio
+async def test_normalize_annotated_keys_doc_on_incident_id() -> None:
+    """`incident.annotated` should land an UPDATE on the same logical
+    incident doc — keyed by the incident id, not the note id, and
+    requires_investigation=False (only triggered creates a new
+    investigation)."""
+    pd = _build()
+    payload = _load("incident_annotated.json")
+    result = await pd.normalize(
+        _make_event(payload, "pd:incident:PD-INC-001:incident.annotated"),
+        {},
+    )
+    assert result.documents[0].doc_id == "pd:incident:PD-INC-001"
+    assert result.documents[0].metadata["last_event_type"] == "incident.annotated"
+    assert result.requires_investigation is False
