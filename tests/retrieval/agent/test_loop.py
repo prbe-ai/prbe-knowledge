@@ -231,6 +231,36 @@ def test_parse_terminal_args_lenient_derives_doc_id_from_chunk_id() -> None:
     assert out.chunks[0].chunk_id == "github:owner/repo:pr:42:chunk:3"
 
 
+def test_parse_terminal_args_aliases_id_to_canonical_id() -> None:
+    """Fourth Cerebras failure mode: entities emitted with `id` instead
+    of `canonical_id` (common API convention)."""
+    out = _parse_terminal_args({
+        "entities": [
+            {"id": "github:prbe-ai/prbe-backend:pr:256", "label": "PR"},
+            {"canonical_id": "github:prbe-ai/prbe-backend:pr:299"},
+            {"id": "notion:doc:abc", "title": "ignored"},
+        ],
+    })
+    assert out is not None
+    assert len(out.entities) == 3
+    assert out.entities[0].canonical_id == "github:prbe-ai/prbe-backend:pr:256"
+    assert out.entities[1].canonical_id == "github:prbe-ai/prbe-backend:pr:299"
+    assert out.entities[2].canonical_id == "notion:doc:abc"
+
+
+def test_parse_terminal_args_repairs_truncated_json() -> None:
+    """Fifth Cerebras failure mode: model glitches mid-emission and the
+    JSON is unterminated. Bracket-balancer salvages the valid prefix."""
+    truncated = '''{"entities":[{"canonical_id":"a"},{"canonical_id":"b"}],"chunks":[{"doc_id":"x","chunk_id":"x","content":"first"},{"doc_id":"y","chunk_id":"y","content":"sec'''
+    out = _parse_terminal_args(truncated)
+    assert out is not None
+    assert len(out.entities) == 2
+    assert out.entities[0].canonical_id == "a"
+    assert out.entities[1].canonical_id == "b"
+    assert len(out.chunks) >= 1
+    assert out.chunks[0].content == "first"
+
+
 def test_parse_terminal_args_filters_non_dict_entities() -> None:
     """Third failure mode observed on Cerebras 2026-05-18: model emits
     malformed JSON fragments as bare strings inside the entities array

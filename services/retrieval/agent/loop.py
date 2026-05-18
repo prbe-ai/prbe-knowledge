@@ -554,14 +554,24 @@ def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> di
     that are missing.
     """
     out = dict(raw) if isinstance(raw, dict) else {}
-    # Entities: filter non-dict items. Cerebras gpt-oss-120b occasionally
-    # emits malformed JSON fragments as bare strings inside arrays
-    # (e.g. `entities=[{...valid...}, '{', '{canonical_id":...']`) — a
-    # constrained-decoding partial-failure mode. Pydantic rejects the
-    # whole emission on the first non-dict; drop the malformed items so
-    # the valid neighbors survive.
+    # Entities: filter non-dict items + alias `id` → `canonical_id`.
+    # Cerebras gpt-oss-120b occasionally emits malformed JSON fragments as
+    # bare strings inside arrays (e.g. `entities=[{...valid...}, '{',
+    # '{canonical_id":...']`) — a constrained-decoding partial-failure
+    # mode. Pydantic rejects the whole emission on the first non-dict;
+    # drop the malformed items so the valid neighbors survive. Also
+    # accept `id` as an alias for `canonical_id` (common API convention
+    # — Cerebras emits this for github/notion-shaped docs).
     entities_in = out.get("entities") or []
-    out["entities"] = [e for e in entities_in if isinstance(e, dict)]
+    entities_out: list[dict[str, Any]] = []
+    for e in entities_in:
+        if not isinstance(e, dict):
+            continue
+        e_out = dict(e)
+        if not e_out.get("canonical_id") and e_out.get("id"):
+            e_out["canonical_id"] = e_out["id"]
+        entities_out.append(e_out)
+    out["entities"] = entities_out
     # Chunks: derive missing required fields where possible
     chunks_in = out.get("chunks") or []
     chunks_out: list[dict[str, Any]] = []
@@ -602,6 +612,81 @@ def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> di
     return out
 
 
+def _repair_truncated_json(s: str) -> str | None:
+    """Best-effort repair of unterminated JSON. Cerebras gpt-oss-120b
+    occasionally cuts a long emit mid-string (observed live: single
+    per-turn-ms hit 12.5s vs typical 1-3s, then emitted ~5400 chars of
+    JSON ending mid-string). The valid prefix usually has many complete
+    entities/chunks worth recovering.
+
+    Walks the prefix tracking quote state + bracket stack, records the
+    position after every closing `}` or `]` keyed by the depth AFTER
+    closure. When the walk ends in a broken state (open brackets and/or
+    unterminated string), finds the deepest clean boundary at or above
+    the broken depth, truncates there, then appends just enough closers
+    to balance. Returns repaired string if it parses, else None.
+    """
+    if not s:
+        return None
+
+    def walk(text: str) -> tuple[list[str], bool, dict[int, int]]:
+        stack: list[str] = []
+        in_string = False
+        escape = False
+        last_clean_at_depth: dict[int, int] = {}
+        for i, c in enumerate(text):
+            if escape:
+                escape = False
+                continue
+            if in_string:
+                if c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_string = False
+                continue
+            if c == '"':
+                in_string = True
+                continue
+            if c in "{[":
+                stack.append(c)
+            elif c in "}]":
+                if stack and (
+                    (c == "}" and stack[-1] == "{") or (c == "]" and stack[-1] == "[")
+                ):
+                    stack.pop()
+                    last_clean_at_depth[len(stack)] = i + 1
+        return stack, in_string, last_clean_at_depth
+
+    stack, in_string, last_clean = walk(s)
+    if not stack and not in_string:
+        return s  # already valid
+
+    broken_depth = len(stack)
+    cut_at: int | None = None
+    for d in range(broken_depth, -1, -1):
+        if d in last_clean:
+            cut_at = last_clean[d]
+            break
+    if cut_at is None or cut_at == 0:
+        return None
+
+    prefix = s[:cut_at]
+    stack, in_string, _ = walk(prefix)
+    if in_string:
+        return None
+
+    closer = ""
+    while stack:
+        c = stack.pop()
+        closer += "}" if c == "{" else "]"
+    candidate = prefix + closer
+    try:
+        json.loads(candidate)
+        return candidate
+    except Exception:
+        return None
+
+
 def _parse_terminal_args(
     raw_args: str | dict[str, Any] | None,
     state: "LoopState | None" = None,
@@ -622,7 +707,18 @@ def _parse_terminal_args(
         return None
     try:
         if isinstance(raw_args, str):
-            raw_dict = json.loads(raw_args)
+            try:
+                raw_dict = json.loads(raw_args)
+            except json.JSONDecodeError:
+                repaired = _repair_truncated_json(raw_args)
+                if repaired is None:
+                    raise
+                raw_dict = json.loads(repaired)
+                log.info(
+                    "agent.terminal_args_json_repaired",
+                    original_len=len(raw_args),
+                    repaired_len=len(repaired),
+                )
         else:
             raw_dict = dict(raw_args)
     except Exception as exc:
