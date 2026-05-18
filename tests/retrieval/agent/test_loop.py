@@ -33,7 +33,7 @@ from services.retrieval.agent.loop import (
     _parse_terminal_args,
     run_gatherer,
 )
-from services.retrieval.agent.models import GathererOutput
+from services.retrieval.agent.models import ExtractedEntity, GathererOutput
 from services.retrieval.agent.tools import TERMINAL_TOOL_NAME
 from services.retrieval.grounding import GroundingBundle
 from shared.models import QueryRequest
@@ -922,13 +922,53 @@ async def test_zero_recall_short_circuits_to_empty(
     fake_request: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When grounding+extraction surface no entities AND every pre-fan-out
-    channel returns 0 hits, the LLM has nothing to curate. Skip the loop,
-    return empty — saves 3-5s on truly hopeless queries."""
+    """When every pre-fan-out channel (vector + BM25 + graph + inferred)
+    returns 0 hits, the LLM has nothing to curate. Skip the loop, return
+    empty — saves 67-90s on truly hopeless queries that would otherwise
+    burn the wall-clock oscillating search/fetch_doc."""
     req = QueryRequest(query="zxyq-no-matches", customer_id="cust-1", top_k=5)
     monkeypatch.setattr(
         "services.retrieval.agent.loop.execute_search",
         AsyncMock(return_value={"sub_queries": []}),
+    )
+    boom = AsyncMock(side_effect=AssertionError("acompletion should NOT be called"))
+
+    with patch("services.retrieval.agent.loop.acompletion", new=boom):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert resp.total_candidates == 0
+    assert fake_request.state.gatherer_status == "zero_recall_short_circuit"
+    assert fake_request.state.tool_calls_count == 0
+    boom.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_zero_recall_short_circuits_even_with_extracted_entities(
+    fake_request: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`entity_dicts` is fed into execute_search above as `entity_ids`,
+    so the graph + inferred_edge channels already exercised anchor-driven
+    exploration with these entities. A 0-hit prefanout result therefore
+    means even entity-anchored paths found nothing; the loop has nothing
+    new to try. Regression guard: prior gate required `not entity_dicts`,
+    which kept "blue yeti microphones"-style queries in the 90s wall-clock
+    death loop whenever extraction surfaced any entity at all."""
+    req = QueryRequest(query="blue yeti microphones", customer_id="cust-1", top_k=5)
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop.execute_search",
+        AsyncMock(return_value={"sub_queries": []}),
+    )
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop.extract_entities_with_llm",
+        AsyncMock(return_value=[
+            ExtractedEntity(
+                entity_type="service",
+                canonical_id="blue_yeti",
+                display_name="Blue Yeti",
+                confidence=0.5,
+            ),
+        ]),
     )
     boom = AsyncMock(side_effect=AssertionError("acompletion should NOT be called"))
 
