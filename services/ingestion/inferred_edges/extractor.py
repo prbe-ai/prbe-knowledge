@@ -73,7 +73,18 @@ _VALID_CONFIDENCES = {"INFERRED", "AMBIGUOUS"}
 
 # Kill-switch threshold: if more than 50% of all proposed edges have
 # unknown endpoints, the whole bundle is failed.
-_UNKNOWN_ENDPOINT_FAIL_RATIO = 0.5
+#
+# Threshold history: 0.5 was the original spec; in practice it killed
+# the entire batch whenever the LLM's body had a mix of real cross-refs
+# (PR/issue/file mentions that exist in the graph) and ad-hoc free-text
+# references ("user-reported symptoms", "loop_timeout traces") that
+# don't have a canonical_id. Live trace from 2026-05-18 on PRs #328 /
+# #329 / #332 (auto-rationale bodies citing 3-6 entities each) showed
+# ratios of 0.75-0.80 — every single batch was killed, valid edges lost.
+# Raised to 0.9 so the kill-switch only fires on near-total
+# hallucination (genuine "bad LLM run" signal); mixed runs now emit the
+# valid edges and let `dropped["unknown_endpoint"]` carry the warning.
+_UNKNOWN_ENDPOINT_FAIL_RATIO = 0.9
 
 
 @dataclass(slots=True)
