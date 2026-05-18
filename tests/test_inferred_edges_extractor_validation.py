@@ -379,8 +379,58 @@ async def test_drop_bad_format_non_dict() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bundle_kill_switch_unknown_endpoint_majority() -> None:
-    """When >50% of edges have unknown_endpoint, the bundle is failed entirely."""
+async def test_bundle_kill_switch_unknown_endpoint_near_total() -> None:
+    """When unknown_endpoint ratio is at-or-near 100%, the bundle is
+    failed entirely — the LLM clearly hallucinated the whole run. The
+    one valid edge (if it happens to land) is also dropped to err on
+    the side of not polluting the graph from a suspect run.
+
+    Threshold is `_UNKNOWN_ENDPOINT_FAIL_RATIO = 0.9` (was 0.5 — see the
+    constant's comment for why it was raised). To trip 0.9 we need
+    almost all edges to be unknown; the test uses 9 ghosts + 1 valid =
+    90.0% which (correctly) doesn't trip (`>` not `>=`); we use 10
+    ghosts + 1 valid = ~90.9% to land just past the gate.
+    """
+    edges = [
+        {
+            "from": {"label": "Document", "canonical_id": "doc1"},
+            "to": {"label": "Service", "canonical_id": f"ghost-{i}"},
+            "edge_type": "DISCUSSES",
+            "confidence": "INFERRED",
+            "why": "Ghost reference that does not exist",
+        }
+        for i in range(10)
+    ] + [
+        {
+            "from": {"label": "Document", "canonical_id": "doc1"},
+            "to": {"label": "Document", "canonical_id": "doc2"},
+            "edge_type": "RELATES_TO",
+            "confidence": "INFERRED",
+            "why": "Valid cross-source edge in the same bundle",
+        }
+    ]
+
+    bundle = _make_bundle()
+    conn = _make_mock_conn()
+
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm(edges),
+    ):
+        result = await extract_edges(bundle, conn)
+
+    assert result.bundle_failed is True
+    assert "unknown_endpoint" in result.bundle_fail_reason
+    assert result.edges == []
+
+
+@pytest.mark.asyncio
+async def test_bundle_kill_switch_not_triggered_mixed_unknown() -> None:
+    """Kill-switch does NOT fire when unknown_endpoint stays below the
+    threshold. 4 ghost + 1 valid = 80% — this is the live shape that
+    auto-rationale-body PRs hit (PR #328 had ratios of 0.75-0.80).
+    Under the old 0.5 threshold this whole batch was killed; under the
+    new 0.9 threshold the 1 valid edge flows through."""
     edges = [
         {
             "from": {"label": "Document", "canonical_id": "doc1"},
@@ -409,14 +459,15 @@ async def test_bundle_kill_switch_unknown_endpoint_majority() -> None:
     ):
         result = await extract_edges(bundle, conn)
 
-    assert result.bundle_failed is True
-    assert "unknown_endpoint" in result.bundle_fail_reason
-    assert result.edges == []
+    assert result.bundle_failed is False
+    assert len(result.edges) == 1
+    assert result.dropped.get("unknown_endpoint", 0) == 4
 
 
 @pytest.mark.asyncio
-async def test_bundle_kill_switch_not_triggered_below_threshold() -> None:
-    """Kill-switch does NOT fire when unknown_endpoint <= 50% of total."""
+async def test_bundle_kill_switch_not_triggered_below_half() -> None:
+    """Below-half ratio (1 ghost + 1 valid = 50%) is well clear of the
+    new threshold — still emits the valid edge."""
     edges = [
         {
             "from": {"label": "Document", "canonical_id": "doc1"},
