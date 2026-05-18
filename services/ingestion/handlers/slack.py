@@ -117,30 +117,35 @@ def _pick_display_name(profile: Mapping[str, Any] | None) -> str | None:
     return _sanitize_display_name(profile.get("real_name"))
 
 
-class _SlackUserCache:
-    """Per-(customer, team) Slack display-name cache.
+class _SlackJsonbNameCache:
+    """Shared LRU + JSONB cold-tier name cache for Slack identifiers.
 
     Two tiers:
       - Hot tier: in-memory `OrderedDict` (LRU), capped at `MAX_IN_MEMORY`. Read
         on every normalize / backfill peek; written on resolve cache miss.
-      - Cold tier: `customer_source_mapping.metadata.user_names` JSONB on the
+      - Cold tier: `customer_source_mapping.metadata[_JSONB_KEY]` JSONB on the
         row keyed by (source=slack, external_id=team_id). Lazy-loaded on first
         use; debounced flush ~30s after the most-recent in-memory write.
 
-    Lifecycle: instantiated lazily by `SlackConnector._get_cache(team_id)`; one
-    instance per Slack workspace per worker process. Auto-cleaned when the
-    customer disconnects (their `customer_source_mapping` row is deleted; the
-    JSONB goes with it). Worker crash drops up to `FLUSH_DEBOUNCE_S` seconds
-    of unflushed updates — acceptable since display names are regenerable from
-    `users.info`.
+    Subclasses fill in `_JSONB_KEY` and `_fetch_remote` for the specific Slack
+    object kind (users via `users.info`, channels via `conversations.info`).
 
-    Why per-team (not per-customer): Slack `U_id`s are unique within a workspace
-    but a customer can connect multiple workspaces, where `U07ABC` could be two
-    different humans. Keying by team_id makes cross-workspace mixing impossible.
+    Lifecycle: instantiated lazily by `SlackConnector._get_*_cache(team_id)`;
+    one instance per (workspace, kind) per worker process. Auto-cleaned when
+    the customer disconnects (the `customer_source_mapping` row is deleted;
+    the JSONB goes with it). Worker crash drops up to `FLUSH_DEBOUNCE_S`
+    seconds of unflushed updates — acceptable since names are regenerable.
+
+    Why per-team (not per-customer): Slack IDs are unique within a workspace
+    but a customer can connect multiple workspaces, where `U07ABC`/`C123ABC`
+    could mean different things. Keying by team_id makes cross-workspace
+    mixing impossible.
     """
 
-    MAX_IN_MEMORY: ClassVar[int] = 500    # in-memory cap per (customer, team)
-    MAX_PERSIST: ClassVar[int] = 50       # top-N kept in JSONB
+    _JSONB_KEY: ClassVar[str] = ""           # subclass override required
+    _LOG_PREFIX: ClassVar[str] = "slack"     # used in flush-failed log line
+    MAX_IN_MEMORY: ClassVar[int] = 500       # in-memory cap per (customer, team)
+    MAX_PERSIST: ClassVar[int] = 50          # top-N kept in JSONB
     FLUSH_DEBOUNCE_S: ClassVar[float] = 30.0
 
     def __init__(self, customer_id: str, team_id: str) -> None:
@@ -149,13 +154,29 @@ class _SlackUserCache:
         # OrderedDict: back = most-recently-touched, front = least-recent.
         # Entry shape: {"name": str | None, "ts": iso8601 string}.
         self._entries: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        # Per-user singleflight locks: concurrent webhooks for the same new
-        # user share one users.info call. Bounded by MAX_IN_MEMORY because we
+        # Per-key singleflight locks: concurrent webhooks for the same new
+        # id share one remote-fetch call. Bounded by MAX_IN_MEMORY because we
         # prune locks alongside cache evictions.
         self._locks: dict[str, asyncio.Lock] = {}
         self._loaded = False
         self._dirty = False
         self._flush_task: asyncio.Task[None] | None = None
+
+    async def _fetch_remote(
+        self,
+        http: httpx.AsyncClient,
+        token: str,
+        key_id: str,
+    ) -> tuple[bool, str | None]:
+        """Fetch one name from the Slack API.
+
+        Returns (authoritative, name):
+          authoritative=True, name=<str|None>  -> cache the result (positive
+            or negative; ok=true with no name, or ok=false terminal failure).
+          authoritative=False, name=None       -> transient failure (network,
+            429, 5xx). Do NOT cache; the next caller will retry.
+        """
+        raise NotImplementedError
 
     async def ensure_loaded(self) -> None:
         if self._loaded:
@@ -166,83 +187,186 @@ class _SlackUserCache:
             # DB unavailable — degrade to in-memory-only mode for this run;
             # we'll attempt the load again on next instantiation.
             log.warning(
-                "slack.user_cache_load_failed",
+                f"{self._LOG_PREFIX}.cache_load_failed",
                 team=self.team_id,
                 error=type(exc).__name__,
             )
             self._loaded = True
             return
-        for u_id, entry in (metadata.get("user_names") or {}).items():
+        for k_id, entry in (metadata.get(self._JSONB_KEY) or {}).items():
             if isinstance(entry, dict):
-                self._entries[u_id] = entry
+                self._entries[k_id] = entry
         self._loaded = True
 
-    def peek(self, user_id: str | None) -> str | None:
+    def peek(self, key_id: str | None) -> str | None:
         """Read with LRU bump but no API fetch on miss.
 
         Used by backfill to stamp cached names onto yielded synthetic events
-        without paying a users.info round-trip per message.
+        without paying a remote round-trip per message.
         """
-        if not user_id:
+        if not key_id:
             return None
-        entry = self._entries.get(user_id)
+        entry = self._entries.get(key_id)
         if entry is None:
             return None
-        self._entries.move_to_end(user_id)  # in-memory recency only; no flush
+        self._entries.move_to_end(key_id)  # in-memory recency only; no flush
         return entry.get("name")
 
     async def resolve(
         self,
         http: httpx.AsyncClient,
         token: str,
-        user_id: str,
+        key_id: str,
     ) -> str | None:
-        """Cache-or-fetch via users.info with singleflight + transient-no-cache.
+        """Cache-or-fetch with singleflight + transient-no-cache.
 
-        Caches authoritative results (`ok=true` positive/empty profile, `ok=false`
-        terminal failure). Does NOT cache transient failures (network error,
-        429, 5xx) — poisoning on a 429 storm would permanently suppress display
-        names for every user looked up during the storm.
+        Caches authoritative results (positive name, or terminal negative).
+        Does NOT cache transient failures (network error, 429, 5xx) —
+        poisoning on a 429 storm would permanently suppress names for every
+        id looked up during the storm.
         """
-        if not user_id:
+        if not key_id:
             return None
         await self.ensure_loaded()
-        if user_id in self._entries:
-            self._entries.move_to_end(user_id)
-            return self._entries[user_id].get("name")
-        lock = self._locks.setdefault(user_id, asyncio.Lock())
+        if key_id in self._entries:
+            self._entries.move_to_end(key_id)
+            return self._entries[key_id].get("name")
+        lock = self._locks.setdefault(key_id, asyncio.Lock())
         async with lock:
-            if user_id in self._entries:
-                self._entries.move_to_end(user_id)
-                return self._entries[user_id].get("name")
-            try:
-                resp = await http.get(
-                    f"{_SLACK_API}/users.info",
-                    params={"user": user_id},
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-            except httpx.HTTPError as exc:
-                log.warning(
-                    "slack.users_info_transient",
-                    user=user_id,
-                    error=type(exc).__name__,
-                )
+            if key_id in self._entries:
+                self._entries.move_to_end(key_id)
+                return self._entries[key_id].get("name")
+            authoritative, name = await self._fetch_remote(http, token, key_id)
+            if not authoritative:
                 return None
-            if resp.status_code != 200:
-                log.warning(
-                    "slack.users_info_non_200",
-                    user=user_id,
-                    status=resp.status_code,
-                )
-                return None
-            body = resp.json()
-            if body.get("ok"):
-                name = _pick_display_name((body.get("user") or {}).get("profile"))
-                self._set(user_id, name)
-                return name
-            # Authoritative negative (e.g., user_not_found).
-            self._set(user_id, None)
-            return None
+            self._set(key_id, name)
+            return name
+
+    def _set(self, key_id: str, name: str | None) -> None:
+        self._entries[key_id] = {
+            "name": name,
+            "ts": datetime.now(UTC).isoformat(),
+        }
+        self._entries.move_to_end(key_id)
+        # Evict oldest until under the in-memory cap. Drop their locks too so
+        # _locks doesn't outgrow _entries.
+        while len(self._entries) > self.MAX_IN_MEMORY:
+            evicted_key, _ = self._entries.popitem(last=False)
+            self._locks.pop(evicted_key, None)
+        self._mark_dirty()
+
+    def _mark_dirty(self) -> None:
+        self._dirty = True
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._debounced_flush())
+
+    async def _debounced_flush(self) -> None:
+        await asyncio.sleep(self.FLUSH_DEBOUNCE_S)
+        if not self._dirty:
+            return
+        try:
+            await self._flush_to_db()
+            self._dirty = False
+        except Exception as exc:
+            # Best-effort; the next dirty mark will reschedule. Log so silent
+            # flush failures are visible in operations.
+            log.warning(
+                f"{self._LOG_PREFIX}.cache_flush_failed",
+                customer=self.customer_id,
+                team=self.team_id,
+                error=type(exc).__name__,
+            )
+
+    async def _flush_to_db(self) -> None:
+        """Persist this worker's view, merged with whatever's already in JSONB.
+
+        Without merge: each `patch_source_metadata` replaces the whole
+        sub-object (top-level JSONB `||` semantics), so two workers flushing
+        concurrently would clobber each other's contributions. With merge:
+        read current state, take the most-recent entry per id across both
+        views, cap at `MAX_PERSIST` by recency, write back. Cold-starting
+        workers then load the union of all flushes, not just whoever wrote
+        last.
+
+        Race window: between read and write here, another worker could write
+        and have its contributions overwritten. Acceptable trade — flushes
+        are debounced 30s, concurrent flushes for the same team are rare,
+        and a missed entry comes back on the next dirty mark anywhere. If we
+        ever need stronger guarantees, the upgrade path is a SQL-side merge
+        via `jsonb_set(metadata, '{<key>}', ... || $patch::jsonb)`.
+        """
+        try:
+            persisted = await load_source_metadata(SourceSystem.SLACK, self.team_id)
+        except Exception:
+            # Read failed — fall back to write-only (last-writer-wins). The
+            # exception will surface in the outer flush handler's logs.
+            persisted = {}
+        merged: dict[str, dict[str, Any]] = {}
+        for source in (persisted.get(self._JSONB_KEY) or {}, dict(self._entries)):
+            for k_id, entry in source.items():
+                if not isinstance(entry, dict):
+                    continue
+                existing = merged.get(k_id)
+                if existing is None or entry.get("ts", "") >= existing.get("ts", ""):
+                    merged[k_id] = entry
+
+        # Cap at MAX_PERSIST by recency (latest ts wins, ties resolved by
+        # iteration order which is fine — both versions are equivalent).
+        ranked = sorted(
+            merged.items(),
+            key=lambda kv: kv[1].get("ts", ""),
+            reverse=True,
+        )
+        keep = dict(ranked[: self.MAX_PERSIST])
+        await patch_source_metadata(
+            SourceSystem.SLACK,
+            self.team_id,
+            patch={self._JSONB_KEY: keep},
+        )
+
+    async def flush_now(self) -> None:
+        """Synchronous flush bypass for tests and shutdown hooks."""
+        if self._dirty:
+            await self._flush_to_db()
+            self._dirty = False
+
+
+class _SlackUserCache(_SlackJsonbNameCache):
+    """Display-name cache for Slack user ids (`U…`) via `users.info`."""
+
+    _JSONB_KEY: ClassVar[str] = "user_names"
+    _LOG_PREFIX: ClassVar[str] = "slack.user"
+
+    async def _fetch_remote(
+        self,
+        http: httpx.AsyncClient,
+        token: str,
+        key_id: str,
+    ) -> tuple[bool, str | None]:
+        try:
+            resp = await http.get(
+                f"{_SLACK_API}/users.info",
+                params={"user": key_id},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except httpx.HTTPError as exc:
+            log.warning(
+                "slack.users_info_transient",
+                user=key_id,
+                error=type(exc).__name__,
+            )
+            return (False, None)
+        if resp.status_code != 200:
+            log.warning(
+                "slack.users_info_non_200",
+                user=key_id,
+                status=resp.status_code,
+            )
+            return (False, None)
+        body = resp.json()
+        if body.get("ok"):
+            return (True, _pick_display_name((body.get("user") or {}).get("profile")))
+        return (True, None)  # authoritative negative (e.g. user_not_found)
 
     async def prime(self, http: httpx.AsyncClient, token: str) -> None:
         """Bulk-fill from Slack users.list paginated. Best-effort.
@@ -282,93 +406,71 @@ class _SlackUserCache:
             if not cursor:
                 return
 
-    def _set(self, user_id: str, name: str | None) -> None:
-        self._entries[user_id] = {
-            "name": name,
-            "ts": datetime.now(UTC).isoformat(),
-        }
-        self._entries.move_to_end(user_id)
-        # Evict oldest until under the in-memory cap. Drop their locks too so
-        # _locks doesn't outgrow _entries.
-        while len(self._entries) > self.MAX_IN_MEMORY:
-            evicted_uid, _ = self._entries.popitem(last=False)
-            self._locks.pop(evicted_uid, None)
-        self._mark_dirty()
 
-    def _mark_dirty(self) -> None:
-        self._dirty = True
-        if self._flush_task is None or self._flush_task.done():
-            self._flush_task = asyncio.create_task(self._debounced_flush())
+class _SlackChannelCache(_SlackJsonbNameCache):
+    """Name cache for Slack channel ids (`C…`/`G…`) via `conversations.info`.
 
-    async def _debounced_flush(self) -> None:
-        await asyncio.sleep(self.FLUSH_DEBOUNCE_S)
-        if not self._dirty:
-            return
+    `conversations.info` returns `{"channel": {"name": "engineering", ...}}`
+    for both public and private channels under the `channels:read` and
+    `groups:read` scopes the connector already requests at install time.
+
+    Bulk-fill path is `prime_from_listing` because the backfill already
+    paginates `conversations.list` to rank channels by member count — pulling
+    names from that same response avoids a second walk through the workspace.
+    """
+
+    _JSONB_KEY: ClassVar[str] = "channel_names"
+    _LOG_PREFIX: ClassVar[str] = "slack.channel"
+
+    async def _fetch_remote(
+        self,
+        http: httpx.AsyncClient,
+        token: str,
+        key_id: str,
+    ) -> tuple[bool, str | None]:
         try:
-            await self._flush_to_db()
-            self._dirty = False
-        except Exception as exc:
-            # Best-effort; the next dirty mark will reschedule. Log so silent
-            # flush failures are visible in operations.
+            resp = await http.get(
+                f"{_SLACK_API}/conversations.info",
+                params={"channel": key_id},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        except httpx.HTTPError as exc:
             log.warning(
-                "slack.user_cache_flush_failed",
-                customer=self.customer_id,
-                team=self.team_id,
+                "slack.conversations_info_transient",
+                channel=key_id,
                 error=type(exc).__name__,
             )
+            return (False, None)
+        if resp.status_code != 200:
+            log.warning(
+                "slack.conversations_info_non_200",
+                channel=key_id,
+                status=resp.status_code,
+            )
+            return (False, None)
+        body = resp.json()
+        if body.get("ok"):
+            ch = body.get("channel") or {}
+            return (True, _sanitize_display_name(ch.get("name")))
+        # Authoritative negative (channel_not_found, missing_scope, etc.).
+        return (True, None)
 
-    async def _flush_to_db(self) -> None:
-        """Persist this worker's view, merged with whatever's already in JSONB.
+    async def prime_from_listing(
+        self, listed: list[tuple[str, int, str | None]]
+    ) -> None:
+        """Bulk-fill from an already-paginated `conversations.list` result.
 
-        Without merge: each `patch_source_metadata` replaces the whole
-        `user_names` sub-object (top-level JSONB `||` semantics), so two
-        workers flushing concurrently would clobber each other's
-        contributions. With merge: read current state, take the most-recent
-        entry per user across both views, cap at `MAX_PERSIST` by recency,
-        write back. Cold-starting workers then load the union of all flushes,
-        not just whoever wrote last.
-
-        Race window: between read and write here, another worker could write
-        and have its contributions overwritten. Acceptable trade — flushes
-        are debounced 30s, concurrent flushes for the same team are rare,
-        and a missed entry comes back on the next dirty mark anywhere. If we
-        ever need stronger guarantees, the upgrade path is a SQL-side merge
-        via `jsonb_set(metadata, '{user_names}', ... || $patch::jsonb)`.
+        Backfill already pulls (id, num_members, name) from conversations.list
+        to rank hot channels first; reusing that data avoids a redundant API
+        walk. Names with no value sanitize to None and still get cached so
+        `resolve` short-circuits instead of firing conversations.info per
+        message.
         """
-        try:
-            persisted = await load_source_metadata(SourceSystem.SLACK, self.team_id)
-        except Exception:
-            # Read failed — fall back to write-only (last-writer-wins). The
-            # exception will surface in the outer flush handler's logs.
-            persisted = {}
-        merged: dict[str, dict[str, Any]] = {}
-        for source in (persisted.get("user_names") or {}, dict(self._entries)):
-            for u_id, entry in source.items():
-                if not isinstance(entry, dict):
-                    continue
-                existing = merged.get(u_id)
-                if existing is None or entry.get("ts", "") >= existing.get("ts", ""):
-                    merged[u_id] = entry
-
-        # Cap at MAX_PERSIST by recency (latest ts wins, ties resolved by
-        # iteration order which is fine — both versions are equivalent).
-        ranked = sorted(
-            merged.items(),
-            key=lambda kv: kv[1].get("ts", ""),
-            reverse=True,
-        )
-        keep = dict(ranked[: self.MAX_PERSIST])
-        await patch_source_metadata(
-            SourceSystem.SLACK,
-            self.team_id,
-            patch={"user_names": keep},
-        )
-
-    async def flush_now(self) -> None:
-        """Synchronous flush bypass for tests and shutdown hooks."""
-        if self._dirty:
-            await self._flush_to_db()
-            self._dirty = False
+        await self.ensure_loaded()
+        for ch_id, _members, name in listed:
+            if not ch_id:
+                continue
+            self._set(ch_id, _sanitize_display_name(name))
 
 
 def _get_history_limiter() -> AsyncLimiter:
@@ -389,17 +491,27 @@ class SlackConnector(Connector):
 
     def __init__(self, ctx: ConnectorContext) -> None:
         super().__init__(ctx)
-        # One cache per Slack workspace (keyed by team_id). Lives for the
-        # lifetime of this connector instance, which is itself one-per-process
-        # via Normalizer._connectors. Persists across requests; flushed to
-        # JSONB on customer_source_mapping.metadata.
+        # One cache per Slack workspace per kind (keyed by team_id). Lives
+        # for the lifetime of this connector instance, which is itself
+        # one-per-process via Normalizer._connectors. Persists across
+        # requests; flushed to JSONB on customer_source_mapping.metadata.
         self._caches: dict[str, _SlackUserCache] = {}
+        self._channel_caches: dict[str, _SlackChannelCache] = {}
 
     def _get_cache(self, customer_id: str, team_id: str) -> _SlackUserCache:
         cache = self._caches.get(team_id)
         if cache is None:
             cache = _SlackUserCache(customer_id=customer_id, team_id=team_id)
             self._caches[team_id] = cache
+        return cache
+
+    def _get_channel_cache(
+        self, customer_id: str, team_id: str
+    ) -> _SlackChannelCache:
+        cache = self._channel_caches.get(team_id)
+        if cache is None:
+            cache = _SlackChannelCache(customer_id=customer_id, team_id=team_id)
+            self._channel_caches[team_id] = cache
         return cache
 
     # ------------------------------------------------------------------
@@ -576,6 +688,19 @@ class SlackConnector(Connector):
             if name:
                 result["user_profile"] = {"display_name": name}
 
+        # Resolve channel name. Webhook bodies never carry it (only the id),
+        # and the backfill prime won't have run for a workspace whose first
+        # contact is a live message. Cache absorbs subsequent traffic so the
+        # API call fires at most once per channel per worker.
+        channel_id = msg.get("channel")
+        if channel_id and team_id:
+            ch_cache = self._get_channel_cache(event.customer_id, team_id)
+            ch_name = await ch_cache.resolve(
+                self.http, token.access_token, channel_id
+            )
+            if ch_name:
+                result["channel_name"] = ch_name
+
         thread_ts = msg.get("thread_ts")
         channel = msg.get("channel")
         if not thread_ts or not channel:
@@ -642,6 +767,15 @@ class SlackConnector(Connector):
         # do NOT fall back to the raw U_ID (would pollute embeddings).
         display_name = _pick_display_name(
             hydrated.get("user_profile") or msg.get("user_profile")
+        )
+        # Channel name: fetch_supplementary sets channel_name from the cache
+        # on the webhook path. Backfill stamps it via cache.peek() onto the
+        # synthetic event's msg dict at `channel_name`. Missing => no
+        # display_name on the Channel node; the JSONB-merge upsert
+        # (graph_writer.py: properties || EXCLUDED.properties) lets a later
+        # message with a resolved name fill it in without re-running anything.
+        channel_name = _sanitize_display_name(
+            hydrated.get("channel_name") or msg.get("channel_name")
         )
         body_text = "" if is_delete else (
             f"{display_name}: {text}" if display_name else text
@@ -723,19 +857,37 @@ class SlackConnector(Connector):
             doc_references=_references_from_text(text),
         )
 
-        # Person properties: only attach display_name when the canonical_id is a
-        # real Slack user ID (msg.user). When the canonical_id is a bot_id or
-        # the "unknown" sentinel, display_name belongs to a different identity
+        # Person properties: only attach name/display_name when the canonical_id
+        # is a real Slack user ID (msg.user). When the canonical_id is a bot_id
+        # or the "unknown" sentinel, the name belongs to a different identity
         # and would be misleading on the node.
+        #
+        # Both fields are populated: `name` is what retrieval reads
+        # (`properties->>'name'` in graph_explore._node_title_expr +
+        # retrievers/sql._entity_match_clause + the alnum/lowercased functional
+        # indexes from migrations 0019/0022), and `display_name` is the legacy
+        # alias that downstream UI code still references.
         person_props: dict[str, Any] = {"source_system": SourceSystem.SLACK.value}
         if msg.get("user") and display_name:
+            person_props["name"] = display_name
             person_props["display_name"] = display_name
+
+        channel_props: dict[str, Any] = {"team_id": team_id}
+        if channel_name:
+            # `name` is what retrieval reads — graph_explore._node_title_expr
+            # surfaces it as the entity title, and retrievers/sql matches it
+            # via the LOWER + alnum functional indexes (migrations 0019/0022).
+            # Without `name`, the entity title falls back to canonical_id and
+            # users see "C0B20FZSCUU" in results. `display_name` carries the
+            # "#" prefix for UI renderers that distinguish channels from DMs.
+            channel_props["name"] = channel_name
+            channel_props["display_name"] = f"#{channel_name}"
 
         nodes = [
             GraphNodeSpec(
                 label=NodeLabel.CHANNEL,
                 canonical_id=channel,
-                properties={"team_id": team_id},
+                properties=channel_props,
             ),
             GraphNodeSpec(
                 label=NodeLabel.PERSON,
@@ -975,10 +1127,18 @@ class SlackConnector(Connector):
         # conversations.list call per worker restart (~10-30s under the rate
         # cap on a 1000-channel workspace). Worth it for stable ranking.
         listed = await _list_channels(self.http, token.access_token)
-        members_map: dict[str, int] = {ch_id: n for ch_id, n in listed}
+        members_map: dict[str, int] = {ch_id: n for ch_id, n, _name in listed}
+
+        # Prime the channel-name cache from the conversations.list payload
+        # we already paid for. After this every Channel GraphNodeSpec produced
+        # by normalize() can stamp `display_name=#<name>` without firing
+        # conversations.info per message.
+        ch_cache = self._get_channel_cache(customer_id, team_id)
+        await ch_cache.prime_from_listing(listed)
+
         if cursor is None:
             state = {
-                "active": {ch_id: None for ch_id, _ in listed},
+                "active": {ch_id: None for ch_id, _, _name in listed},
                 "done": [],
             }
 
@@ -1056,6 +1216,7 @@ class SlackConnector(Connector):
                     # backfill (where it never does). Cache miss => no key
                     # written, normalize falls back gracefully.
                     cached_name = cache.peek(msg.get("user"))
+                    cached_channel_name = ch_cache.peek(ch_id)
                     event_body: dict[str, Any] = {
                         **msg,
                         "type": "message",
@@ -1063,6 +1224,8 @@ class SlackConnector(Connector):
                     }
                     if cached_name:
                         event_body["user_profile"] = {"display_name": cached_name}
+                    if cached_channel_name:
+                        event_body["channel_name"] = cached_channel_name
                     payload = {
                         "team_id": team_id,
                         "type": "event_callback",
@@ -1202,16 +1365,19 @@ async def _join_all_public_channels(
     )
 
 
-async def _list_channels(http, token: str) -> list[tuple[str, int]]:
+async def _list_channels(http, token: str) -> list[tuple[str, int, str | None]]:
     """Enumerate all channels the bot can see. Paginated.
 
-    Returns [(channel_id, num_members), ...]. num_members lets the round-robin
-    walker rank hot channels first so #engineering's recent messages don't sit
-    behind 499 dead channels' first-page fetches. num_members is in
-    conversations.list's default response shape per Slack docs (public AND
-    private channels). Channels missing the field default to 0 -> sort last.
+    Returns [(channel_id, num_members, name), ...]. num_members lets the
+    round-robin walker rank hot channels first so #engineering's recent
+    messages don't sit behind 499 dead channels' first-page fetches.
+    num_members is in conversations.list's default response shape per Slack
+    docs (public AND private channels). Channels missing the field default
+    to 0 -> sort last. `name` feeds the per-workspace channel-name cache so
+    Channel GraphNodeSpecs get a `#<name>` display name without firing
+    conversations.info per message.
     """
-    channels: list[tuple[str, int]] = []
+    channels: list[tuple[str, int, str | None]] = []
     cursor: str | None = None
     while True:
         params = {"types": "public_channel,private_channel", "limit": 1000}
@@ -1229,7 +1395,13 @@ async def _list_channels(http, token: str) -> list[tuple[str, int]]:
             break
         for ch in body.get("channels", []):
             if ch.get("id") and ch.get("is_member", True):
-                channels.append((ch["id"], int(ch.get("num_members") or 0)))
+                channels.append(
+                    (
+                        ch["id"],
+                        int(ch.get("num_members") or 0),
+                        ch.get("name"),
+                    )
+                )
         cursor = (body.get("response_metadata") or {}).get("next_cursor") or None
         if not cursor:
             break

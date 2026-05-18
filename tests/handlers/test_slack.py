@@ -20,6 +20,7 @@ from services.ingestion.handlers.registry import build_connector
 from services.ingestion.handlers.slack import (  # noqa: F401 - registers
     SlackConnector,
     _decode_slack_cursor,
+    _SlackChannelCache,
     _SlackUserCache,
 )
 from shared.config import Settings
@@ -1081,3 +1082,300 @@ async def test_fetch_supplementary_resolves_user_for_webhook() -> None:
         # And normalize() consumes it correctly.
         result = await slack.normalize(event, hydrated)
         assert result.documents[0].body == "Richard Wei: hello"
+
+
+# ---------------------------------------------------------------------------
+# Channel-name cache + Channel node display_name stamping.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_channel_resolver_caches_channel_name(fast_flush) -> None:
+    """Cache-or-fetch via conversations.info, second hit must not re-call."""
+    calls = {"n": 0}
+
+    def conversations_info(req):
+        calls["n"] += 1
+        return httpx.Response(
+            200, json={"ok": True, "channel": {"id": "C1", "name": "engineering"}}
+        )
+
+    cache = _SlackChannelCache("cust-1", "T1")
+    transport = _slack_transport({("GET", "/api/conversations.info"): conversations_info})
+    async with httpx.AsyncClient(transport=transport) as http:
+        first = await cache.resolve(http, "tok", "C1")
+        second = await cache.resolve(http, "tok", "C1")
+
+    assert first == "engineering"
+    assert second == "engineering"
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_resolver_negative_caches_missing(fast_flush) -> None:
+    """ok=false (channel_not_found, missing_scope) must be cached so we don't
+    retry on every message in an unreadable channel."""
+    calls = {"n": 0}
+
+    def conversations_info(req):
+        calls["n"] += 1
+        return httpx.Response(200, json={"ok": False, "error": "channel_not_found"})
+
+    cache = _SlackChannelCache("cust-1", "T1")
+    transport = _slack_transport({("GET", "/api/conversations.info"): conversations_info})
+    async with httpx.AsyncClient(transport=transport) as http:
+        first = await cache.resolve(http, "tok", "Cghost")
+        second = await cache.resolve(http, "tok", "Cghost")
+
+    assert first is None
+    assert second is None
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_channel_resolver_does_not_cache_transient(fast_flush) -> None:
+    """429 / 5xx / network blip must NOT poison the cache for channels —
+    same rule as the user cache. A storm shouldn't permanently suppress
+    channel names."""
+    calls = {"n": 0}
+
+    def conversations_info(req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, json={"error": "rate_limited"})
+        return httpx.Response(
+            200, json={"ok": True, "channel": {"id": "C1", "name": "engineering"}}
+        )
+
+    cache = _SlackChannelCache("cust-1", "T1")
+    transport = _slack_transport({("GET", "/api/conversations.info"): conversations_info})
+    async with httpx.AsyncClient(transport=transport) as http:
+        first = await cache.resolve(http, "tok", "C1")
+        assert first is None
+        assert "C1" not in cache._entries
+        second = await cache.resolve(http, "tok", "C1")
+        assert second == "engineering"
+
+
+@pytest.mark.asyncio
+async def test_channel_resolver_sanitizes_name(fast_flush) -> None:
+    """Slack channel names are user-controlled. Strip structure-breaking
+    chars same as user display_names."""
+
+    def conversations_info(req):
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "channel": {"id": "C1", "name": "eng\nfake-system:\tx\x00"},
+            },
+        )
+
+    cache = _SlackChannelCache("cust-1", "T1")
+    transport = _slack_transport({("GET", "/api/conversations.info"): conversations_info})
+    async with httpx.AsyncClient(transport=transport) as http:
+        name = await cache.resolve(http, "tok", "C1")
+
+    assert name is not None
+    assert "\n" not in name and "\t" not in name and "\x00" not in name
+
+
+@pytest.mark.asyncio
+async def test_channel_cache_prime_from_listing_no_api_call(fast_flush) -> None:
+    """prime_from_listing reuses the conversations.list payload backfill
+    already paid for — must not fire conversations.info."""
+    calls = {"n": 0}
+
+    def conversations_info(req):
+        calls["n"] += 1
+        return httpx.Response(200, json={"ok": True, "channel": {"name": "x"}})
+
+    cache = _SlackChannelCache("cust-1", "T1")
+    await cache.prime_from_listing(
+        [("C1", 50, "engineering"), ("C2", 3, "random"), ("C3", 0, None)]
+    )
+
+    transport = _slack_transport({("GET", "/api/conversations.info"): conversations_info})
+    async with httpx.AsyncClient(transport=transport) as http:
+        # Primed entries serve from cache.
+        assert await cache.resolve(http, "tok", "C1") == "engineering"
+        assert await cache.resolve(http, "tok", "C2") == "random"
+        # C3 was authoritatively-cached as None (no name in listing).
+        assert await cache.resolve(http, "tok", "C3") is None
+
+    assert calls["n"] == 0, "primed channels must not trigger conversations.info"
+
+
+@pytest.mark.asyncio
+async def test_normalize_stamps_person_name_when_display_known() -> None:
+    """Person node must carry BOTH `name` and `display_name` — retrieval reads
+    `properties->>'name'` (graph_explore._node_title_expr +
+    retrievers/sql._entity_match_clause), so a Person without `name` falls
+    back to canonical_id and shows up as `U07ABC123` in results."""
+    ctx = _make_ctx()
+    slack = build_connector(SourceSystem.SLACK, ctx)
+
+    from datetime import datetime
+
+    from shared.models import WebhookEvent
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        source_event_id="C456:1713628800.000100",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/slack/cust-1/2026/04/22/test.json",
+        raw_payload=SAMPLE_EVENT,
+        headers={},
+    )
+
+    result = await slack.normalize(
+        event, {"user_profile": {"display_name": "Richard Wei"}}
+    )
+
+    person = next(n for n in result.graph_nodes if n.label == NodeLabel.PERSON)
+    assert person.canonical_id == "U789"
+    # Both fields populated. `name` for retrieval, `display_name` for UI.
+    assert person.properties["name"] == "Richard Wei"
+    assert person.properties["display_name"] == "Richard Wei"
+
+
+@pytest.mark.asyncio
+async def test_normalize_stamps_channel_display_name_from_hydrated() -> None:
+    """When hydrated carries channel_name, the Channel GraphNodeSpec gets
+    `display_name=#<name>` and `name=<name>` in properties so retrieval can
+    render `#engineering` instead of `C456`."""
+    ctx = _make_ctx()
+    slack = build_connector(SourceSystem.SLACK, ctx)
+
+    from datetime import datetime
+
+    from shared.models import WebhookEvent
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        source_event_id="C456:1713628800.000100",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/slack/cust-1/2026/04/22/test.json",
+        raw_payload=SAMPLE_EVENT,
+        headers={},
+    )
+
+    result = await slack.normalize(event, {"channel_name": "engineering"})
+
+    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.CHANNEL]
+    assert len(channel_nodes) == 1
+    props = channel_nodes[0].properties
+    # `name` is the retrieval-readable one; `display_name` has the `#` prefix.
+    assert props["name"] == "engineering"
+    assert props["display_name"] == "#engineering"
+    assert props["team_id"] == "T123"
+
+
+@pytest.mark.asyncio
+async def test_normalize_no_channel_display_name_when_unresolved() -> None:
+    """No channel_name in hydrated and none on msg => Channel node carries
+    team_id only. graph_writer's JSONB-merge upsert (properties || EXCLUDED)
+    means a later message with a resolved name fills in display_name without
+    needing a backfill job."""
+    ctx = _make_ctx()
+    slack = build_connector(SourceSystem.SLACK, ctx)
+
+    from datetime import datetime
+
+    from shared.models import WebhookEvent
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        source_event_id="C456:1713628800.000100",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/slack/cust-1/2026/04/22/test.json",
+        raw_payload=SAMPLE_EVENT,
+        headers={},
+    )
+
+    result = await slack.normalize(event, {})  # no channel_name
+
+    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.CHANNEL]
+    assert len(channel_nodes) == 1
+    props = channel_nodes[0].properties
+    assert "display_name" not in props
+    assert "name" not in props
+    assert props["team_id"] == "T123"
+
+
+@pytest.mark.asyncio
+async def test_normalize_channel_name_falls_back_to_msg_inline() -> None:
+    """Backfill stamps channel_name onto the synthetic event_body (slack.py
+    backfill round-robin walker), not into a separate hydrated dict. Verify
+    normalize picks it up from there too."""
+    ctx = _make_ctx()
+    slack = build_connector(SourceSystem.SLACK, ctx)
+
+    from datetime import datetime
+
+    from shared.models import WebhookEvent
+
+    payload = {
+        **SAMPLE_EVENT,
+        "event": {**SAMPLE_EVENT["event"], "channel_name": "random"},
+    }
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        source_event_id="C456:1713628800.000100",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/slack/cust-1/2026/04/22/test.json",
+        raw_payload=payload,
+        headers={},
+    )
+
+    result = await slack.normalize(event, {})
+
+    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.CHANNEL]
+    assert channel_nodes[0].properties["display_name"] == "#random"
+
+
+@pytest.mark.asyncio
+async def test_fetch_supplementary_resolves_channel_name(fast_flush) -> None:
+    """Webhook path: when the event lacks channel_name, fetch_supplementary
+    calls conversations.info via the channel cache and stamps the resolved
+    name onto the hydrated dict, where normalize() will pick it up."""
+    from datetime import datetime
+
+    from shared.models import IntegrationToken, WebhookEvent
+
+    ctx = _make_ctx()
+    slack = build_connector(SourceSystem.SLACK, ctx)
+
+    def conversations_info(req):
+        return httpx.Response(
+            200, json={"ok": True, "channel": {"id": "C456", "name": "engineering"}}
+        )
+
+    transport = _slack_transport({("GET", "/api/conversations.info"): conversations_info})
+    slack.http = httpx.AsyncClient(transport=transport)
+    try:
+        event = WebhookEvent(
+            customer_id="cust-1",
+            source_system=SourceSystem.SLACK,
+            source_event_id="C456:1713628800.000100",
+            received_at=datetime.now(UTC),
+            payload_s3_key="raw/slack/cust-1/2026/04/22/test.json",
+            raw_payload=SAMPLE_EVENT,
+            headers={},
+        )
+        token = IntegrationToken(
+            customer_id="cust-1", source_system=SourceSystem.SLACK, access_token="tok"
+        )
+
+        hydrated = await slack.fetch_supplementary(event, token)
+        assert hydrated.get("channel_name") == "engineering"
+
+        result = await slack.normalize(event, hydrated)
+        ch = next(n for n in result.graph_nodes if n.label == NodeLabel.CHANNEL)
+        assert ch.properties["display_name"] == "#engineering"
+    finally:
+        await slack.http.aclose()
