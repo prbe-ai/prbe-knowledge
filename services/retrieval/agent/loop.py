@@ -67,6 +67,7 @@ from shared.constants import (
     SEARCH_AGENT_INFERENCE_MODEL,
     SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
     SEARCH_AGENT_MAX_EXTENSIONS,
+    SEARCH_AGENT_SOFT_TURN_CAP,
     SEARCH_AGENT_TOOL_BUDGET,
     SEARCH_AGENT_TRACE_SAMPLE_RATE,
     SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
@@ -1253,6 +1254,20 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
     """
     while True:
         budget_exhausted = state.tool_calls_count >= state.budget
+        # Soft turn cap: once the model has burned through SOFT_TURN_CAP
+        # exploration turns without emitting, force the next turn to be the
+        # terminal. Broad open-ended queries (e.g. "what features did we
+        # implement for self-hosting?") oscillate fetch_doc / search and
+        # never call emit_gatherer_output on their own; each retained
+        # tool-result balloons the prefill, the final turn hits 30-40s,
+        # and the loop wall-clock (90s) kills it with status=loop_timeout
+        # + chunk_count=0. Tripping the existing forcing-nudge path on
+        # turn count instead of waiting for the wall clock keeps the
+        # output non-empty and bounds p95 turns. The first turn always
+        # gets a free shot at the terminal (turn_count incremented inside
+        # _run_turn); the cap only matters once the model has chosen
+        # exploration at least SOFT_TURN_CAP times.
+        turn_cap_reached = state.turn_count >= SEARCH_AGENT_SOFT_TURN_CAP
         resp = await _run_turn(state)
 
         choices = getattr(resp, "choices", None) or []
@@ -1300,17 +1315,21 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
                 )
                 return parsed
 
-        if budget_exhausted:
-            # Budget gone but the model didn't terminate. Inject a forcing
-            # nudge and run one more turn. tool_choice="required" still
-            # applies — model must pick a tool — but with the explicit
-            # "emit_gatherer_output now" instruction it should pick the
-            # terminal. If it doesn't, we return None.
+        if budget_exhausted or turn_cap_reached:
+            # Tool-call budget gone OR soft turn cap tripped, and the model
+            # still didn't terminate. Inject a forcing nudge and run one
+            # more turn. tool_choice="required" still applies — the model
+            # must pick a tool — but with the explicit "emit_gatherer_output
+            # now" instruction it should pick the terminal. If it doesn't,
+            # we return None.
+            reason = "budget_exhausted" if budget_exhausted else "soft_turn_cap"
             log.info(
-                "agent.budget_exhausted_force_terminate",
+                "agent.force_terminate",
                 customer_id=state.customer_id,
                 trace_id=state.trace_id,
                 tool_calls=state.tool_calls_count,
+                turns=state.turn_count,
+                reason=reason,
             )
             state.messages.append({
                 "role": "assistant",
@@ -1320,9 +1339,10 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
             state.messages.append({
                 "role": "user",
                 "content": (
-                    "Tool-call budget exhausted. Call `emit_gatherer_output` "
-                    "NOW with the final GathererOutput based on the evidence "
-                    "you already have. Do not call any other tool."
+                    "Stop exploring. Call `emit_gatherer_output` NOW with "
+                    "the final GathererOutput based on the evidence you "
+                    "already have in `<channel_results>` and prior tool "
+                    "results. Do not call any other tool."
                 ),
             })
             resp2 = await _run_turn(state)
