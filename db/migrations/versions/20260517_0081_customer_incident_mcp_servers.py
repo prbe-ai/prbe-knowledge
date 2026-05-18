@@ -16,8 +16,8 @@ Revises: 0080_incident_investigations
 Create Date: 2026-05-17
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 # revision identifiers
 revision = "0081_incident_mcp_servers"

@@ -16,7 +16,6 @@ from httpx import ASGITransport, AsyncClient
 
 from services.ingestion.main import app
 
-
 pytestmark = pytest.mark.asyncio
 
 
@@ -76,11 +75,10 @@ async def client():
     from shared.db import close_pool, init_pool
     await close_pool()
     await init_pool()
-    async with app.router.lifespan_context(app):
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test",
-        ) as ac:
-            yield ac
+    async with app.router.lifespan_context(app), AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test",
+    ) as ac:
+        yield ac
 
 
 _INTERNAL_HEADERS = {

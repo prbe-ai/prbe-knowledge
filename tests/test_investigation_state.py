@@ -6,7 +6,6 @@ using a unique customer_id per test, skip cleanly if no DB is configured.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import uuid
 
@@ -20,9 +19,7 @@ from services.ingestion.investigation_state import (
     upsert_pending_review,
 )
 from shared import db as db_module
-from shared.db import with_tenant
 from shared.exceptions import InvestigationNotFound
-
 
 pytestmark = pytest.mark.asyncio
 

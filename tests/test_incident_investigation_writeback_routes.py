@@ -17,7 +17,6 @@ from services.ingestion.main import app
 from shared.config import Settings, get_settings
 from shared.db import close_pool, init_pool, raw_conn
 
-
 pytestmark = pytest.mark.asyncio
 
 

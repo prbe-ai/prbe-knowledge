@@ -1,6 +1,8 @@
 """Smoke test that migration 0081 applies and the table is shaped as expected."""
 from __future__ import annotations
+
 import os
+
 import pytest
 
 pytestmark = pytest.mark.asyncio

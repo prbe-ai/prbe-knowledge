@@ -8,7 +8,6 @@ Live Postgres + minio required (DATABASE_URL + R2_* set in conftest).
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import os
 import uuid
@@ -30,7 +29,6 @@ from shared.constants import (
 )
 from shared.db import raw_conn
 from shared.models import ACLPrincipal, ACLSnapshot, Document
-
 
 pytestmark = pytest.mark.asyncio
 
