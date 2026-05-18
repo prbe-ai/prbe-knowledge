@@ -48,10 +48,15 @@ WHERE occurred_at >= $1 AND occurred_at < $2
 async def _iter_customer_ids() -> list[str]:
     """Return all live customer_ids. Read outside `with_tenant` because
     `customers` is the routing table and not itself RLS-tenant-scoped.
+
+    Filter: `status = 'active'` matches the schema as of migration
+    chain head (no soft-delete `deleted_at` column exists; the lifecycle
+    is encoded in `status` instead — value 'active' for live, anything
+    else (e.g. 'suspended', 'deleted') is excluded from the nightly).
     """
     async with raw_conn() as conn:
         rows = await conn.fetch(
-            "SELECT customer_id FROM customers WHERE deleted_at IS NULL"
+            "SELECT customer_id FROM customers WHERE status = 'active'"
         )
     return [r["customer_id"] for r in rows]
 
