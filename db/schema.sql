@@ -863,7 +863,8 @@ CREATE TABLE query_traces (
     intent_dispatch     JSONB,
     cache_tokens        JSONB,
     router_model        TEXT,
-    failure_recovered   BOOLEAN NOT NULL DEFAULT FALSE
+    failure_recovered   BOOLEAN NOT NULL DEFAULT FALSE,
+    trace_blob_key      TEXT
 );
 
 CREATE INDEX idx_query_traces_customer_time

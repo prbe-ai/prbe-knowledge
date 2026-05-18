@@ -105,9 +105,10 @@ async def _seed_customer(live_db) -> str:
     customer_id = f"cust-{uuid.uuid4().hex[:8]}"
     async with raw_conn() as conn:
         await conn.execute(
-            "INSERT INTO customers (customer_id, r2_bucket) VALUES ($1, $2) "
-            "ON CONFLICT (customer_id) DO NOTHING",
+            "INSERT INTO customers (customer_id, display_name, api_key_hash) "
+            "VALUES ($1, $2, $3) ON CONFLICT (customer_id) DO NOTHING",
             customer_id,
-            f"bucket-{customer_id}",
+            f"{customer_id} display",
+            f"hash-{customer_id}",
         )
     return customer_id
