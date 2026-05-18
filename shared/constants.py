@@ -595,23 +595,29 @@ INFERRED_EDGE_HYDRATION_CHUNKS = 3
 # docs/specs/agentic-search.md). Tunables below are read at agent loop
 # construction; changing them requires a redeploy (no hot-reload).
 
-# IMPORTANT: no `fireworks_ai/` provider prefix. When `shared.llm.acompletion`
-# forces `custom_llm_provider="openai"` for gateway-routed calls (so
-# Fireworks honors response_format), LiteLLM forwards this model id
+# IMPORTANT: no provider-prefix expansion. When `shared.llm.acompletion`
+# forces `custom_llm_provider="openai"` for gateway-routed calls (so the
+# upstream honors response_format), LiteLLM forwards this model id
 # verbatim in the OpenAI chat-completion request body. The LiteLLM proxy
-# matches `model_name: "accounts/fireworks/*"` in its modelList (per
-# prbe-backend/charts/litellm/values.yaml) and adds the `fireworks_ai/`
-# prefix back for the upstream call. Including the prefix here causes the
-# proxy to receive `fireworks_ai/accounts/...` which doesn't match the
-# route and 400s. Verified live 2026-05-17.
+# matches `model_name: "cerebras/*"` in its modelList (per
+# prbe-backend/charts/litellm/values.yaml) and the same model id flows
+# through to the upstream call.
 #
-# Env-overridable so we can A/B-test alternative providers (Groq Llama-8B,
-# etc.) without a code change. Set SEARCH_AGENT_INFERENCE_MODEL on the
-# managed-retrieval pod to e.g. `groq/llama-3.1-8b-instant` and the proxy's
-# `groq/*` modelList route picks it up.
+# Env-overridable so we can A/B-test alternative providers without a code
+# change. Set SEARCH_AGENT_INFERENCE_MODEL on the retrieval pod to e.g.
+# `claude-sonnet-4-6` (routed via the proxy's claude-* modelList entry)
+# and that's what gets called.
+#
+# Default flipped 2026-05-18 from `accounts/fireworks/models/gpt-oss-120b`
+# to `cerebras/gpt-oss-120b`. Same model id, ~10x the output throughput
+# on Cerebras's wafer-scale chips — eliminated the 90s gatherer-timeout
+# cascade on conceptual queries. The Fireworks route was simultaneously
+# dropped from the LiteLLM modelList (prbe-backend PR #342), so a stale
+# install relying on the old default now 404s at the proxy with a clean
+# error instead of silently routing through the catch-all.
 SEARCH_AGENT_INFERENCE_MODEL = os.getenv(
     "SEARCH_AGENT_INFERENCE_MODEL",
-    "accounts/fireworks/models/gpt-oss-120b",
+    "cerebras/gpt-oss-120b",
 )
 
 # Soft budget: total tool calls across all turns. Covers turn-1 mandatory 4
