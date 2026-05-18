@@ -604,7 +604,15 @@ INFERRED_EDGE_HYDRATION_CHUNKS = 3
 # prefix back for the upstream call. Including the prefix here causes the
 # proxy to receive `fireworks_ai/accounts/...` which doesn't match the
 # route and 400s. Verified live 2026-05-17.
-SEARCH_AGENT_INFERENCE_MODEL = "accounts/fireworks/models/gpt-oss-120b"
+#
+# Env-overridable so we can A/B-test alternative providers (Groq Llama-8B,
+# etc.) without a code change. Set SEARCH_AGENT_INFERENCE_MODEL on the
+# managed-retrieval pod to e.g. `groq/llama-3.1-8b-instant` and the proxy's
+# `groq/*` modelList route picks it up.
+SEARCH_AGENT_INFERENCE_MODEL = os.getenv(
+    "SEARCH_AGENT_INFERENCE_MODEL",
+    "accounts/fireworks/models/gpt-oss-120b",
+)
 
 # Soft budget: total tool calls across all turns. Covers turn-1 mandatory 4
 # + ~16 exploration calls across 2-3 follow-up turns. The agent may extend
