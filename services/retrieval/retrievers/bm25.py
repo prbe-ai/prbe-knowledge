@@ -184,7 +184,7 @@ async def bm25_search(
               {pred.doc_sql}
               {source_filter}
               {doc_type_filter}
-            ORDER BY score DESC
+            ORDER BY score DESC, c.chunk_id
             LIMIT $3
             """,
             *params,

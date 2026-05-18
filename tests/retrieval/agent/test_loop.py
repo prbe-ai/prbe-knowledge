@@ -23,11 +23,12 @@ from fastapi import HTTPException
 
 from services.retrieval.agent.loop import (
     _affinity_key,
+    _build_prefanout_doc_meta,
+    _derive_source_system_from_doc_id,
     _empty_passthrough,
     _extract_cache_hit_rate,
     _format_prefanout_compact,
     _parse_terminal_args,
-    _PREFANOUT_PER_CHANNEL_DISPLAY_CAP,
     run_gatherer,
 )
 from services.retrieval.agent.models import GathererOutput
@@ -131,7 +132,13 @@ def _force_llm_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _stub_grounding_extraction_prefanout(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub the three upstream-of-loop calls so tests exercise only the
-    agent loop itself. Individual tests can re-patch as needed."""
+    agent loop itself. Individual tests can re-patch as needed.
+
+    Pre-fan-out is stubbed to return one minimal vector hit so the
+    `zero_recall_short_circuit` fast-path doesn't fire by default; tests
+    that want to assert the short-circuit override this fixture with an
+    empty `sub_queries`.
+    """
     monkeypatch.setattr(
         "services.retrieval.agent.loop._build_bundle_with_token_fallback",
         AsyncMock(return_value=GroundingBundle()),
@@ -142,7 +149,14 @@ def _stub_grounding_extraction_prefanout(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     monkeypatch.setattr(
         "services.retrieval.agent.loop.execute_search",
-        AsyncMock(return_value={"sub_queries": []}),
+        AsyncMock(return_value={"sub_queries": [{
+            "query": "stub",
+            "grounded_entities": [],
+            "vector": [{"doc_id": "stub:0", "score": 0.5,
+                        "source_system": "github", "title": "stub",
+                        "content": "stub"}],
+            "bm25": [], "graph": [], "inferred_edge": [],
+        }]}),
     )
 
 
@@ -386,9 +400,12 @@ def _mk_hit(
     }
 
 
-def test_compact_format_includes_doc_id_score_title_snippet() -> None:
-    """Per-hit minimum: doc_id (so fetch_doc works), score (relevance),
-    source_system + title + snippet (so model can judge what's in the doc)."""
+def test_prefanout_full_dump_includes_all_doc_fields() -> None:
+    """Post-uncompress: every per-hit field reaches the LLM verbatim.
+    The compact rendering used to strip chunk_id/created_at/updated_at/
+    author_id/source_url and truncate content; under Cerebras the input
+    throughput tax that motivated PR #307 doesn't apply, so we hand the
+    model the full evidence."""
     prefanout = {"sub_queries": [{
         "query": "self-hosting features",
         "vector": [_mk_hit()],
@@ -396,33 +413,36 @@ def test_compact_format_includes_doc_id_score_title_snippet() -> None:
     }]}
     out = _format_prefanout_compact(prefanout)
     assert "github:owner/repo:pr:42" in out
-    assert "0.870" in out
-    assert "github" in out
     assert "self-host docs" in out
-    # Snippet truncated but present
+    assert "0.87" in out
+    assert "github" in out
+    # Pre-extension these were stripped:
+    assert "richard" in out  # author_id
+    assert "2026-05-17" in out  # created_at/updated_at
+    # Content not truncated
     assert "documentation for the self-hosting" in out
 
 
-def test_compact_format_caps_per_channel_display_with_note() -> None:
-    """Beyond the per-channel cap the agent sees a 'showing_top_X_of_Y'
-    note so it knows the rest is reachable via fetch_doc / search."""
-    n_hits = _PREFANOUT_PER_CHANNEL_DISPLAY_CAP + 5
+def test_prefanout_full_dump_shows_every_hit_no_cap() -> None:
+    """No per-channel display cap: every hit the retrievers returned
+    must be visible to the LLM. The old top-10 cap silently hid
+    non-GitHub chunks when bm25/vector's top-10 happened to all be
+    GitHub — the "GitHub-only chunks" symptom."""
+    n_hits = 20
     hits = [_mk_hit(doc_id=f"doc:{i}", score=1.0 - i * 0.01) for i in range(n_hits)]
     prefanout = {"sub_queries": [{
         "query": "q", "vector": hits, "bm25": [], "graph": [], "inferred_edge": [],
     }]}
     out = _format_prefanout_compact(prefanout)
-    assert f"showing_top_{_PREFANOUT_PER_CHANNEL_DISPLAY_CAP}_of_{n_hits}" in out
-    # First N appear, last 5 don't
-    for i in range(_PREFANOUT_PER_CHANNEL_DISPLAY_CAP):
-        assert f"doc:{i}" in out
-    for i in range(_PREFANOUT_PER_CHANNEL_DISPLAY_CAP, n_hits):
-        assert f"doc:{i}" not in out
+    for i in range(n_hits):
+        assert f"doc:{i}" in out, f"hit {i}/{n_hits} not in LLM input"
 
 
-def test_compact_format_preserves_inferred_edge_why() -> None:
+def test_prefanout_full_dump_preserves_inferred_edge_why() -> None:
     """`why` is the inferred-edge moat — the rationale the agent uses to
-    decide whether the edge is signal or noise. Must survive compression."""
+    decide whether the edge is signal or noise. Always present, never
+    truncated."""
+    long_why = "PR #78 body explicitly references PR #71 as its prerequisite. " * 5
     inf_hit = {
         "channel": "inferred_edge",
         "doc_id": "github:owner/repo:pr:78",
@@ -431,54 +451,73 @@ def test_compact_format_preserves_inferred_edge_why() -> None:
         "content": "...",
         "score": 0.76,
         "edge_type": "references_pr",
-        "why": "PR #78 body explicitly references PR #71 as its prerequisite",
+        "why": long_why,
     }
     prefanout = {"sub_queries": [{
         "query": "q", "vector": [], "bm25": [], "graph": [], "inferred_edge": [inf_hit],
     }]}
     out = _format_prefanout_compact(prefanout)
-    assert "why: PR #78 body explicitly references PR #71" in out
-    assert "edge=references_pr" in out
+    assert "references_pr" in out
+    # Why is preserved in full — no 200-char truncate
+    assert long_why.strip() in out
 
 
-def test_compact_format_is_much_smaller_than_json_dump() -> None:
-    """Compression target: the new format should be at least 4x smaller
-    than the equivalent JSON dump for a realistic 4-channel × 10-hit
-    payload with production-sized chunk content (~800 chars/hit). This
-    is the worst case the first turn sees on cold cache."""
-    # Realistic chunk: ~800 chars (typical Slack/Linear/GitHub chunk)
-    big_content = (
-        "We retired managed-mode in chart 0.24.0 (PR #266). The CustomerMode "
-        "enum kept MANAGED but it now means 'Probe-hosted'. Self-host stays "
-        "as the second mode. The dashboard now ships as a standalone Docker "
-        "image (ghcr.io/prbe-ai/prbe-dashboard, PR #77) and chart 0.27.1 "
-        "(PR #271) renders deployment-dashboard.yaml + service-dashboard.yaml "
-        "+ ingress / catch-all in mode=self-host. Managed-shared still uses "
-        "Vercel for the dashboard (templates gated on `not isManagedShared`). "
-        "Per-tenant K8s migration is still ongoing — one DOKS cluster, one "
-        "customer-<uuid> namespace per tenant, each a prbe-data-plane Helm "
-        "release behind <slug>.prbe.ai. Auth is HMAC via the data-plane key "
-        "header which is shared across all data-plane services and rotates "
-        "every 90 days via the rotation cron."
-    )
-    hits = [_mk_hit(doc_id=f"doc:{i}", content=big_content) for i in range(10)]
-    prefanout = {"sub_queries": [{
-        "query": "what features did we implement for self-hosting?",
-        "vector": hits, "bm25": hits, "graph": hits, "inferred_edge": hits,
-    }]}
-    json_size = len(json.dumps(prefanout, default=str))
-    compact_size = len(_format_prefanout_compact(prefanout))
-    ratio = json_size / compact_size if compact_size else float("inf")
-    assert ratio >= 4.0, (
-        f"compact {compact_size} vs json {json_size} = {ratio:.1f}x "
-        f"— compression target missed (want ≥4x)"
-    )
-
-
-def test_compact_format_handles_empty_prefanout() -> None:
+def test_prefanout_full_dump_handles_empty_prefanout() -> None:
     """Edge case: pre-fan-out returned nothing on any channel."""
-    out = _format_prefanout_compact({"sub_queries": []})
-    assert out == "(no pre-fan-out hits)"
+    assert _format_prefanout_compact({"sub_queries": []}) == "(no pre-fan-out hits)"
+    assert _format_prefanout_compact({}) == "(no pre-fan-out hits)"
+
+
+def test_derive_source_system_from_doc_id_known_prefixes() -> None:
+    """Doc-id prefix → SourceSystem enum value. Pre-extension every
+    QueryDocumentResult was force-labelled `github` because the adapter
+    had no field to read; this maps `slack:thread:T123` → `"slack"` etc."""
+    cases = [
+        ("github:owner/repo:pr:42", "github"),
+        ("slack:thread:T123", "slack"),
+        ("linear:ticket:PRB-17", "linear"),
+        ("notion:doc:abc", "notion"),
+        ("sentry:issue:E-1", "sentry"),
+        ("code_graph:owner/repo:path/to.py", "code_graph"),
+        ("wiki:page:foo", "wiki"),
+    ]
+    for doc_id, expected in cases:
+        assert _derive_source_system_from_doc_id(doc_id) == expected
+
+
+def test_derive_source_system_from_doc_id_unknown_returns_blank() -> None:
+    """Unknown / unparseable inputs return empty string so the adapter
+    can decide the GitHub fallback rather than us silently mislabelling."""
+    assert _derive_source_system_from_doc_id(None) == ""
+    assert _derive_source_system_from_doc_id("") == ""
+    assert _derive_source_system_from_doc_id("nocolon") == ""
+    assert _derive_source_system_from_doc_id("unknown_source:foo:bar") == ""
+
+
+def test_build_prefanout_doc_meta_first_complete_wins() -> None:
+    """When the same doc appears in multiple channels, first-non-blank
+    write wins so the doc meta lookup is the most complete record."""
+    hit_v = {
+        "doc_id": "slack:thread:T123",
+        "source_system": "slack",
+        "title": "incident thread",
+        "source_url": "https://slack.com/...",
+        "created_at": "2026-05-10T00:00:00Z",
+        "updated_at": "2026-05-11T00:00:00Z",
+        "author_id": "user-1",
+    }
+    hit_b = {  # bm25 hit missing title — should not clobber the vector record
+        "doc_id": "slack:thread:T123",
+        "source_system": "slack",
+        "title": "",
+        "source_url": "",
+    }
+    meta = _build_prefanout_doc_meta({"sub_queries": [{
+        "vector": [hit_v], "bm25": [hit_b], "graph": [], "inferred_edge": [],
+    }]})
+    assert meta["slack:thread:T123"]["title"] == "incident thread"
+    assert meta["slack:thread:T123"]["source_url"] == "https://slack.com/..."
+    assert meta["slack:thread:T123"]["author_id"] == "user-1"
 
 
 # ============================================================
@@ -631,6 +670,30 @@ async def test_no_llm_configured_short_circuits_to_empty(
     assert fake_request.state.gatherer_status == "no_llm_configured"
     assert fake_request.state.tool_calls_count == 0
     assert fake_request.state.failure_recovered is True
+    boom.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_zero_recall_short_circuits_to_empty(
+    fake_request: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When grounding+extraction surface no entities AND every pre-fan-out
+    channel returns 0 hits, the LLM has nothing to curate. Skip the loop,
+    return empty — saves 3-5s on truly hopeless queries."""
+    req = QueryRequest(query="zxyq-no-matches", customer_id="cust-1", top_k=5)
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop.execute_search",
+        AsyncMock(return_value={"sub_queries": []}),
+    )
+    boom = AsyncMock(side_effect=AssertionError("acompletion should NOT be called"))
+
+    with patch("services.retrieval.agent.loop.acompletion", new=boom):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert resp.total_candidates == 0
+    assert fake_request.state.gatherer_status == "zero_recall_short_circuit"
+    assert fake_request.state.tool_calls_count == 0
     boom.assert_not_called()
 
 
