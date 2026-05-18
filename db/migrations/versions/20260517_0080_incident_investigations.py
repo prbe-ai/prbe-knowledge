@@ -14,8 +14,8 @@ Revises: 0079_search_agent_trace_blob
 Create Date: 2026-05-17
 """
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 
 # revision identifiers
 revision = "0080_incident_investigations"
