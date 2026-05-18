@@ -631,17 +631,30 @@ SEARCH_AGENT_MAX_EXTENSIONS = 2
 # emitting the terminal, the next exploration turn triggers a forcing
 # nudge to call `emit_gatherer_output` on the turn after that. Same
 # mechanism as the budget-exhausted nudge, but tripped by turn count
-# instead of tool-call count. Broad open-ended queries ("what features
-# did we implement for self-hosting?") would otherwise oscillate
-# fetch_doc / search across 6-7 turns, accumulating tool-result context
-# until the final turn's prefill alone takes 30-40s and the loop hits
-# SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 90s with chunk_count=0. Tripping
-# the existing forcing-nudge path on turn count keeps the output non-empty
-# and bounds p95 turns. Effective ceiling is SOFT_TURN_CAP + 2 (one extra
-# turn that detects the cap, plus the forced-emit turn). The single
-# observed successful trace for this query class ran 6 turns (5 explore
-# + 1 emit); the failing traces ran 6-7 turns of pure exploration.
-SEARCH_AGENT_SOFT_TURN_CAP = 4
+# instead of tool-call count.
+#
+# Set to 1 because the parallel 4-channel fan-out (vector + BM25 +
+# graph + inferred edges) already runs PRE-LOOP in run_gatherer and
+# its results are baked into the model's turn-1 evidence pack as
+# `<channel_results>`. Vector and BM25 already surface anything one
+# hop from a real answer, so the only useful in-loop exploration is
+# at most one 1-hop follow-up (graph_walk / fetch_doc); beyond that
+# is provably noise.
+#
+# Concretely the loop runs at most:
+#   model turn 1 — sees prefanout, may emit terminal OR pick one
+#                  exploration tool (cap not yet tripped: turn_count
+#                  was 0 on entry).
+#   model turn 2 — should emit terminal; if it picks another tool,
+#                  the cap (turn_count was 1 on entry, >= 1) fires
+#                  on the way out of this iteration.
+#   model turn 3 — forced-emit turn after the nudge (only reached
+#                  if turns 1 and 2 both explored).
+#
+# Effective ceiling: SOFT_TURN_CAP + 2 = 3 LLM turns (~3-5s on
+# Cerebras), down from the prior 67-90s oscillation that hit the
+# 90s SEARCH_AGENT_LOOP_TIMEOUT_SECONDS wall-clock.
+SEARCH_AGENT_SOFT_TURN_CAP = 1
 
 # Hard ceiling. Even with extensions the agent never exceeds this.
 SEARCH_AGENT_HARD_CAP = SEARCH_AGENT_TOOL_BUDGET + (

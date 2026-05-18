@@ -1065,18 +1065,37 @@ async def run_gatherer(
     t_agent = time.perf_counter()
     status: GathererStatus = "ok"
 
-    # Pre-flight zero-recall fast-path. If grounding + extraction surfaced
-    # no entities AND every pre-fan-out channel returned zero hits, the
-    # LLM has nothing to curate from. Skip the loop, return an empty
-    # GathererOutput. Saves ~3-5s per truly-hopeless query (the loop
-    # otherwise burns one or two turns hitting `search` with the same
-    # query before terminating).
+    # Pre-flight zero-recall fast-path. If every pre-fan-out channel
+    # (vector + BM25 + graph + inferred edges, run in parallel) returned
+    # zero hits, the LLM has nothing to curate from. Skip the loop,
+    # return an empty GathererOutput. Saves ~67-90s per truly-hopeless
+    # query (e.g. "blue yeti microphones" against a tech KB) — the loop
+    # otherwise oscillates hitting `search` / `fetch_doc` with rephrases
+    # of the same query until the wall-clock kills it.
+    #
+    # We do NOT also require entity_dicts == [] here. `entity_dicts`
+    # combines grounded entities (bundle.candidates + bare_id_matches,
+    # KB-anchored via alias resolution) and reconciled LLM-extracted
+    # entities, and the whole bag was already passed to execute_search
+    # above as `entity_ids` — so the graph + inferred_edge channels
+    # have already exercised anchor-driven exploration. A 0-hit result
+    # across all 4 channels means even the entity-anchored paths found
+    # nothing; no in-loop tool call can recover.
+    #
+    # Trade-off: a degraded-prefanout window where bundle.bare_id_matches
+    # has a real doc canonical_id but all 4 channels coincidentally
+    # returned [] (e.g. transient embedder + AGE outage) used to recover
+    # via in-loop fetch_doc. Acceptable: that's a multi-channel failure,
+    # not a query-shape issue, and the previous behavior was a 90s
+    # death loop for the much more common "query has no answer" case.
     prefanout_total = sum(prefanout_hit_counts.values())
-    if prefanout_total == 0 and not entity_dicts:
+    if prefanout_total == 0:
         log.info(
             "agent.zero_recall_short_circuit",
             customer_id=customer_id,
             trace_id=trace_id,
+            entity_count=len(entity_dicts),
+            prefanout_hit_counts=prefanout_hit_counts,
         )
         status = "zero_recall_short_circuit"
         gathered = _empty_passthrough("zero_recall_short_circuit")
