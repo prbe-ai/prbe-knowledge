@@ -167,7 +167,7 @@ jobs:
             --output-format stream-json \
             --verbose \
             --max-turns 80 \
-            --allowedTools "Read,Grep,Glob,Bash(gh:*),Bash(git:*),Bash(uv:*),Edit,Write,Task" \
+            --allowedTools "Read,Grep,Glob,Bash(gh:*),Bash(git:*),Bash(uv:*),Bash(kubectl:*),Edit,Write,Task" \
             2>&1 | tee /tmp/orchestrator.log
           # Orchestrator writes its plan + result here for the
           # post-process gate + the artifact upload.
