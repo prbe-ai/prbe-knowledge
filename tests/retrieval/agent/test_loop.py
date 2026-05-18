@@ -186,9 +186,87 @@ def test_parse_terminal_args_valid_json_string() -> None:
 
 
 def test_parse_terminal_args_invalid_returns_none() -> None:
+    """Unrecoverable inputs (None, JSON parse failures) still return None.
+    Schema-shape violations now degrade gracefully to an empty
+    GathererOutput rather than None — see
+    test_parse_terminal_args_lenient_accepts_unknown_fields."""
     assert _parse_terminal_args(None) is None
     assert _parse_terminal_args("{not valid json") is None
-    assert _parse_terminal_args({"foo": "bar"}) is None
+
+
+def test_parse_terminal_args_lenient_accepts_unknown_fields() -> None:
+    """Cerebras gpt-oss-120b emits emit_gatherer_output args with input-
+    shaped fields (title/source/url) instead of the strict schema. With
+    extra='ignore' + optional fields with defaults, those become empty
+    GathererOutput instead of None — same downstream effect as the old
+    schema_violation status, but the loop trace records the model DID
+    emit (just with wrong fields)."""
+    out = _parse_terminal_args({"foo": "bar"})
+    assert out is not None
+    assert out.entities == []
+    assert out.chunks == []
+    # Defaults from model_config
+    assert out.gatherer_notes.turns_used == 0
+    assert out.gatherer_notes.confidence == "medium"
+
+
+def test_parse_terminal_args_lenient_derives_doc_id_from_chunk_id() -> None:
+    """Pre-parse coercion: when the model emits a chunk without doc_id
+    but with a chunk_id that encodes the parent doc, derive it."""
+    out = _parse_terminal_args({
+        "chunks": [
+            {
+                "chunk_id": "github:owner/repo:pr:42:chunk:3",
+                "content": "snippet",
+            },
+            {
+                # No chunk_id either — can't derive, will be dropped
+                "content": "orphan",
+            },
+        ],
+    })
+    assert out is not None
+    assert len(out.chunks) == 1
+    assert out.chunks[0].doc_id == "github:owner/repo:pr:42"
+    assert out.chunks[0].chunk_id == "github:owner/repo:pr:42:chunk:3"
+
+
+def test_parse_terminal_args_cerebras_real_failure_mode() -> None:
+    """Reproduction of the exact failure observed live on 2026-05-18 when
+    we flipped SEARCH_AGENT_INFERENCE_MODEL=cerebras/gpt-oss-120b.
+    Cerebras emitted entities with input-shaped fields (title/source/url)
+    and chunks missing doc_id + matched_via. Tolerant parser should
+    produce a valid GathererOutput with the recoverable data."""
+    cerebras_actual_payload = {
+        "entities": [
+            {
+                "canonical_id": "github:prbe-ai/prbe-knowledge:pr:286",
+                "title": "feat(id_lookup): match URL path segments",
+                "source": "github",
+                "url": "https://github.com/prbe-ai/prbe-knowledge/pull/286",
+            }
+        ],
+        "chunks": [
+            {
+                "chunk_id": "github:prbe-ai/prbe-knowledge:pr:286:chunk:0",
+                "content": "Implements the URL-path-segment match for id_lookup so PRB-17 hits rank 1.",
+            },
+        ],
+        "gatherer_notes": {
+            "confidence": "high",
+            "dropped": [],
+        },
+    }
+    out = _parse_terminal_args(cerebras_actual_payload)
+    assert out is not None
+    assert len(out.entities) == 1
+    assert out.entities[0].canonical_id == "github:prbe-ai/prbe-knowledge:pr:286"
+    # title/source/url silently dropped via extra="ignore"; label/why_relevant default to ""
+    assert out.entities[0].label == ""
+    assert out.entities[0].why_relevant == ""
+    assert len(out.chunks) == 1
+    assert out.chunks[0].doc_id == "github:prbe-ai/prbe-knowledge:pr:286"
+    assert out.gatherer_notes.confidence == "high"
 
 
 def test_empty_passthrough_constructs_low_confidence_dummy() -> None:
@@ -414,11 +492,16 @@ async def test_no_tool_calls_returns_schema_violation(
 
 
 @pytest.mark.asyncio
-async def test_invalid_terminal_args_returns_schema_violation(
+async def test_wrong_shape_terminal_args_degrades_to_empty_output(
     fake_request: SimpleNamespace,
 ) -> None:
-    """Model calls emit_gatherer_output but with args that don't validate
-    against GathererOutput → schema_violation."""
+    """Model calls emit_gatherer_output with args that don't match the
+    GathererOutput schema (e.g. Cerebras gpt-oss-120b emitting input-
+    shaped fields like title/source/url). Tolerant parser absorbs the
+    drift: parses as empty GathererOutput, status='ok', 0 results.
+    Effect on the user is identical to the old `schema_violation`
+    branch (no results returned), but the loop trace records the
+    model DID emit rather than treating it as a parse failure."""
     req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
     bad_terminal = _terminal_call({"completely": "wrong shape"})
 
@@ -428,7 +511,7 @@ async def test_invalid_terminal_args_returns_schema_violation(
     ):
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
-    assert fake_request.state.gatherer_status == "schema_violation"
+    assert fake_request.state.gatherer_status == "ok"
     assert resp.total_candidates == 0
 
 

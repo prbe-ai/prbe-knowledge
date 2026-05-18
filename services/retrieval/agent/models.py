@@ -53,70 +53,85 @@ GathererStatus = Literal[
 
 
 class GatheredEntity(BaseModel):
-    """A graph node the agent chose to surface alongside the chunks."""
+    """A graph node the agent chose to surface alongside the chunks.
 
-    model_config = ConfigDict(extra="forbid")
+    Schema tolerance: `extra="ignore"` so providers (e.g. Cerebras
+    gpt-oss-120b) that emit non-schema fields like `title`/`source`/`url`
+    by copying input shapes don't fail the whole emission. Required-field
+    defaults absorb providers whose constrained decoding is laxer than
+    Fireworks's — Fireworks still emits these fields, the defaults are
+    only a fallback for non-strict providers.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     canonical_id: str
-    label: str
+    label: str = Field(
+        default="",
+        description="GraphLabel (Repo, Ticket, Person, etc.). Adapter falls "
+        "back to canonical_id prefix when blank.",
+    )
     properties: dict = Field(
         default_factory=dict,
         description="Node properties, trimmed at the tool layer to ~2KB.",
     )
     why_relevant: str = Field(
-        ...,
+        default="",
         description="One-line, agent-written rationale for surfacing this entity.",
     )
 
 
 class GatheredChunk(BaseModel):
-    """A doc chunk the agent chose to surface."""
+    """A doc chunk the agent chose to surface.
 
-    model_config = ConfigDict(extra="forbid")
+    Schema tolerance: `extra="ignore"` for non-strict providers.
+    `doc_id` stays required — without it the chunk has no resolvable
+    citation. Pre-parse coercion in loop.py derives `doc_id` from
+    `chunk_id` when the model omits it.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     doc_id: str
     chunk_id: str
     content: str
     matched_via: list[MatchedViaChannel] = Field(
-        ...,
+        default_factory=list,
         description="Channels that surfaced this chunk during the loop.",
     )
     why_relevant: str = Field(
-        ...,
+        default="",
         description="One-line, agent-written rationale. For inferred-edge "
         "neighbors, quote the edge `why` string verbatim.",
     )
 
 
 class DroppedCandidate(BaseModel):
-    """A candidate the agent saw but chose not to surface.
+    """A candidate the agent saw but chose not to surface."""
 
-    `reason` is mandatory: the schema prevents the model from emitting a
-    drop without a justification, so the dashboard's debug pane can
-    always render the audit trail.
-    """
-
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     canonical_id: str
-    reason: str
+    reason: str = ""
 
 
 class GathererNotes(BaseModel):
     """Self-reported metadata about the agent's loop.
 
-    Persisted into `query_traces` via migration 0078 columns and
-    surfaced to debug consumers in the response.
+    `turns_used` is harness-authoritative — the loop overwrites whatever
+    the model emits from `state.turn_count` in `_parse_terminal_args`.
+    Same pattern for `tools_called` (from `state.tools_fired`). These
+    defaults are only relevant if those harness overwrites don't run.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
-    turns_used: int = Field(..., ge=0)
+    turns_used: int = Field(default=0, ge=0)
     tools_called: list[str] = Field(
         default_factory=list,
         description="Tool names in call order. Sequence preserved for trace replay.",
     )
-    confidence: ConfidenceLabel
+    confidence: ConfidenceLabel = "medium"
     dropped: list[DroppedCandidate] = Field(default_factory=list)
 
 
@@ -127,14 +142,17 @@ class GathererOutput(BaseModel):
     on the final turn. The harness re-parses for defence in depth; on
     parse failure it emits an empty GathererOutput with
     gatherer_status='passthrough_harness_fallback' (consumers see zero
-    results + clear status).
+    results + clear status). For non-strict providers (Cerebras et al.),
+    pre-parse coercion in loop.py normalizes common field-name drift
+    (title→ignored, source→ignored) and derives missing required fields
+    from harness state before validation.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     entities: list[GatheredEntity] = Field(default_factory=list)
     chunks: list[GatheredChunk] = Field(default_factory=list)
-    gatherer_notes: GathererNotes
+    gatherer_notes: GathererNotes = Field(default_factory=GathererNotes)
 
 
 # ============================================================

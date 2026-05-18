@@ -504,18 +504,101 @@ async def _execute_tool_call(
 # Terminal extraction
 # ============================================================
 
-def _parse_terminal_args(raw_args: str | dict[str, Any] | None) -> GathererOutput | None:
+def _derive_doc_id_from_chunk_id(chunk_id: str) -> str | None:
+    """Some providers (Cerebras gpt-oss-120b in non-strict mode) emit
+    chunks without `doc_id`. chunk_id typically encodes the parent doc
+    as a prefix — split on ':chunk:' or strip trailing ':<index>'.
+
+    Examples:
+      `github:owner/repo:pr:42:chunk:3` → `github:owner/repo:pr:42`
+      `notion:doc:abc123:chunk:0`       → `notion:doc:abc123`
+      `linear:ticket:PRB-17`            → `linear:ticket:PRB-17` (chunk_id == doc_id)
+    """
+    if not chunk_id:
+        return None
+    if ":chunk:" in chunk_id:
+        return chunk_id.split(":chunk:", 1)[0]
+    # Fall through: chunk_id may already be doc_id (some retrievers index
+    # whole-document chunks). Caller will dedupe.
+    return chunk_id
+
+
+def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> dict[str, Any]:
+    """Pre-parse coercion for non-strict providers (Cerebras et al.).
+
+    Cerebras's gpt-oss-120b emits emit_gatherer_output args with input-
+    shaped fields (`title`/`source`/`url` from <channel_results>) instead
+    of the strict GathererOutput schema. With `extra="ignore"` on the
+    models those extras drop silently, but missing required fields still
+    fail validation. Derive what we can from harness state + chunk_id,
+    leave the rest to Pydantic defaults.
+
+    Safe to call even on Fireworks-strict output — only fills fields
+    that are missing.
+    """
+    out = dict(raw) if isinstance(raw, dict) else {}
+    # Chunks: derive doc_id from chunk_id prefix when omitted
+    chunks_in = out.get("chunks") or []
+    chunks_out: list[dict[str, Any]] = []
+    for ch in chunks_in:
+        if not isinstance(ch, dict):
+            continue
+        ch_out = dict(ch)
+        if not ch_out.get("doc_id"):
+            cid = ch_out.get("chunk_id") or ""
+            derived = _derive_doc_id_from_chunk_id(cid)
+            if derived:
+                ch_out["doc_id"] = derived
+            else:
+                # Can't recover — drop the chunk (no resolvable citation)
+                continue
+        chunks_out.append(ch_out)
+    if chunks_out or "chunks" in out:
+        out["chunks"] = chunks_out
+    # gatherer_notes: harness is authoritative for turns_used + tools_called
+    notes = dict(out.get("gatherer_notes") or {})
+    if state is not None:
+        notes["turns_used"] = state.turn_count
+        notes["tools_called"] = list(state.tools_fired) + [TERMINAL_TOOL_NAME]
+    out["gatherer_notes"] = notes
+    return out
+
+
+def _parse_terminal_args(
+    raw_args: str | dict[str, Any] | None,
+    state: "LoopState | None" = None,
+) -> GathererOutput | None:
     """Parse the emit_gatherer_output tool-call arguments as
-    GathererOutput. Returns None on failure — caller surfaces
-    `gatherer_status='terminal_args_invalid'`."""
+    GathererOutput. Returns None on JSON-parse failure (unrecoverable).
+    Pydantic-level schema drift from non-strict providers is absorbed
+    via `_coerce_lenient` + the lenient `extra="ignore"` model config —
+    no fallback parse needed.
+
+    `state` is used to fill harness-authoritative fields (`turns_used`,
+    `tools_called`) regardless of what the model emitted. Pre-#306
+    (temperature=0) the model sometimes populated these; post-#306 it
+    deterministically omits the optional `tools_called` field. Either
+    way harness state is the canonical record (per trace_blob.py).
+    """
     if raw_args is None:
         return None
     try:
         if isinstance(raw_args, str):
-            return GathererOutput.model_validate_json(raw_args)
-        return GathererOutput.model_validate(raw_args)
+            raw_dict = json.loads(raw_args)
+        else:
+            raw_dict = dict(raw_args)
     except Exception as exc:
-        log.warning("agent.terminal_args_parse_failed", error=str(exc))
+        log.warning("agent.terminal_args_json_parse_failed", error=str(exc))
+        return None
+    coerced = _coerce_lenient(raw_dict, state)
+    try:
+        return GathererOutput.model_validate(coerced)
+    except Exception as exc:
+        log.warning(
+            "agent.terminal_args_parse_failed",
+            error=str(exc),
+            preview=str(coerced)[:300],
+        )
         return None
 
 
@@ -887,7 +970,7 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
             name = getattr(fn, "name", None)
             if name == TERMINAL_TOOL_NAME:
                 raw_args = getattr(fn, "arguments", None)
-                parsed = _parse_terminal_args(raw_args)
+                parsed = _parse_terminal_args(raw_args, state=state)
                 log.info(
                     "agent.terminal_emit",
                     customer_id=state.customer_id,
@@ -929,7 +1012,7 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
             for tc in tcs2:
                 fn = getattr(tc, "function", None)
                 if getattr(fn, "name", None) == TERMINAL_TOOL_NAME:
-                    return _parse_terminal_args(getattr(fn, "arguments", None))
+                    return _parse_terminal_args(getattr(fn, "arguments", None), state=state)
             return None
 
         # Echo the assistant turn so the model sees its own tool_calls
