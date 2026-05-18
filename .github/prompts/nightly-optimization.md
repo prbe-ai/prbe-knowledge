@@ -153,9 +153,16 @@ Sub-agent brief (template — fill in the bracketed slots):
 > 5. **Commit** on the worktree's branch. Do NOT push and do NOT open
 >    the PR — the orchestrator workflow handles both centrally.
 >
-> 6. **Write the PR title + body** to:
->    - `.git/auto-opt-titles/<branch-name>` — single line, ≤70 chars
->    - `.git/auto-opt-bodies/<branch-name>` — structured markdown body:
+> 6. **Write the PR title + body** to (paths OUTSIDE `.git/` because
+>    the Claude Code sandbox blocks Write/Bash under `.git/`):
+>    - `/tmp/auto-opt-staging/titles/<branch-basename>` — single line, ≤70 chars
+>    - `/tmp/auto-opt-staging/bodies/<branch-basename>` — structured markdown body:
+>
+>    where `<branch-basename>` is just the last segment of the branch
+>    name (e.g. for `auto-opt/loop-timeout-self-hosting-2026-05-17`,
+>    the basename is `loop-timeout-self-hosting-2026-05-17`).
+>    Create the parent dirs (`mkdir -p`) before writing.
+>    Body structure:
 >      - **Pattern observed** — 1 paragraph + the 5 cited request_id
 >        links (or just the IDs if you can't form URLs)
 >      - **Hypothesized cause** — 1 paragraph with file:line refs

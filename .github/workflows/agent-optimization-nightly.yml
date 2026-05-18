@@ -210,10 +210,23 @@ jobs:
           set -euo pipefail
           while read -r branch; do
             [ -z "$branch" ] && continue
-            TITLE_FILE=".git/auto-opt-titles/$(basename "$branch")"
-            BODY_FILE=".git/auto-opt-bodies/$(basename "$branch")"
-            if [ ! -f "$TITLE_FILE" ] || [ ! -f "$BODY_FILE" ]; then
-              echo "::warning::missing title/body for $branch — skipping PR open"
+            # Sub-agents write title/body to /tmp/auto-opt-staging/ —
+            # NOT under .git/ which the Claude Code sandbox blocks for
+            # Write/Bash. See the prompt for the writing contract.
+            # Tolerate the legacy path (.git-auto-opt-staging/) for
+            # orchestrator runs that pre-date the prompt update.
+            STAGING_TITLE="/tmp/auto-opt-staging/titles/$(basename "$branch")"
+            STAGING_BODY="/tmp/auto-opt-staging/bodies/$(basename "$branch")"
+            LEGACY_TITLE=".git-auto-opt-staging/auto-opt-titles/$(basename "$branch")"
+            LEGACY_BODY=".git-auto-opt-staging/auto-opt-bodies/$(basename "$branch")"
+            if [ -f "$STAGING_TITLE" ] && [ -f "$STAGING_BODY" ]; then
+              TITLE_FILE="$STAGING_TITLE"
+              BODY_FILE="$STAGING_BODY"
+            elif [ -f "$LEGACY_TITLE" ] && [ -f "$LEGACY_BODY" ]; then
+              TITLE_FILE="$LEGACY_TITLE"
+              BODY_FILE="$LEGACY_BODY"
+            else
+              echo "::warning::missing title/body for $branch (checked $STAGING_TITLE and $LEGACY_TITLE) — skipping PR open"
               continue
             fi
             git push origin "$branch"
