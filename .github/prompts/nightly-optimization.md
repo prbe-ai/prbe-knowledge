@@ -122,11 +122,18 @@ Sub-agent brief (template — fill in the bracketed slots):
 >    where `<slug>` is a 4–6 word kebab-case summary of the pattern
 >    (e.g. `loop-timeout-on-multi-intent`). Work ONLY in that worktree.
 >
-> 2. **Fetch each cited trace blob in full** via `wrangler r2 object
->    get <bucket>/<key>` (R2 creds are in the runner's environment).
->    Gunzip and `jq .` each one. Read carefully — the `messages`
->    array carries the per-turn transcript including reasoning_per_turn
->    (when populated). Look for:
+> 2. **Fetch each cited trace blob in full** via:
+>
+>    ```
+>    kubectl --context do-sfo3-probe-managed -n managed exec deploy/managed-retrieval -- \
+>      python -m services.retrieval.agent.trace_analyzer.fetch_one \
+>      --bucket <bucket> --key <key> --pretty > /tmp/<request_id>.json
+>    ```
+>
+>    R2 access is via the cluster's existing creds; no wrangler / aws
+>    CLI required in the runner. Read each fetched blob carefully —
+>    the `messages` array carries the per-turn transcript including
+>    `reasoning_per_turn` (when populated). Look for:
 >    - Where the loop diverged from the happy path (which turn, which tool)
 >    - What the model's reasoning_content said about its decision
 >    - Whether the prefanout block was useful or noise

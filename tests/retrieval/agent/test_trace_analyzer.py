@@ -319,6 +319,73 @@ def test_cli_writes_jsonl_lines_for_blobs(
     assert parsed[0]["blob_key"] == "search-traces/2026-05-17/trace-abc.json.gz"
 
 
+# ============================================================
+# fetch_one CLI — sub-agent's blob reader
+# ============================================================
+
+
+@pytest.mark.asyncio
+async def test_fetch_one_happy_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Successful R2 fetch + gunzip + JSON print to stdout."""
+    import gzip as _gz
+    from services.retrieval.agent.trace_analyzer import fetch_one
+
+    blob = {"trace_id": "t-1", "schema_version": 1, "status": "ok"}
+    body = _gz.compress(json.dumps(blob).encode("utf-8"))
+
+    class _Store:
+        async def get(self, bucket: str, key: str) -> bytes:
+            assert bucket == "prbe-cust-1"
+            assert key == "search-traces/2026-05-17/t-1.json.gz"
+            return body
+
+    monkeypatch.setattr(fetch_one, "get_store", lambda: _Store())
+    rc = fetch_one.main(
+        ["--bucket", "prbe-cust-1", "--key", "search-traces/2026-05-17/t-1.json.gz"]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    parsed = json.loads(captured.out)
+    assert parsed == blob
+
+
+def test_fetch_one_missing_blob_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """StorageNotFound → exit code 2, error on stderr."""
+    from services.retrieval.agent.trace_analyzer import fetch_one
+    from shared.exceptions import StorageNotFound
+
+    class _Store:
+        async def get(self, bucket: str, key: str) -> bytes:
+            raise StorageNotFound(f"{bucket}/{key}")
+
+    monkeypatch.setattr(fetch_one, "get_store", lambda: _Store())
+    rc = fetch_one.main(["--bucket", "b", "--key", "k"])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "not found" in captured.err.lower()
+
+
+def test_fetch_one_storage_unavailable_distinct_exit_code(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """StorageUnavailable → exit code 3 (distinct from 2 so sub-agents
+    can tell 'blob is gone forever' vs 'try later')."""
+    from services.retrieval.agent.trace_analyzer import fetch_one
+    from shared.exceptions import StorageUnavailable
+
+    class _Store:
+        async def get(self, bucket: str, key: str) -> bytes:
+            raise StorageUnavailable("R2 down")
+
+    monkeypatch.setattr(fetch_one, "get_store", lambda: _Store())
+    rc = fetch_one.main(["--bucket", "b", "--key", "k"])
+    assert rc == 3
+
+
 def test_cli_closes_pool_on_exception(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
