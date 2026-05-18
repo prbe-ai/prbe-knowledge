@@ -151,6 +151,111 @@ def _format_prefanout_compact(prefanout: dict[str, Any]) -> str:
     return json.dumps(prefanout, default=str, indent=2)
 
 
+# Total chain-line cap. Each line ≈ 100-300 chars; capping ~30 keeps the
+# section under ~10KB on the worst-case 5-sub_query × 10-hit fan-out.
+# The full JSON dump in `_format_prefanout_compact` is the source of truth
+# for raw hits; this section is a complementary structural view (grouped
+# by anchor) — its job is making chain shape visible, not exhaustively
+# enumerating hits.
+_PREFANOUT_INFERRED_CHAINS_CAP = 30
+
+
+def _truncate_snippet(text: str | None, n: int) -> str:
+    """Whitespace-collapse + ellipsize for chain-section rendering.
+
+    PR #328 removed the original compact-rendering `_truncate_snippet`
+    along with the per-channel display cap (full JSON dump replaced
+    compact rendering). The chains section deliberately keeps its
+    truncation: chain lines optimize for at-a-glance chain shape, not
+    full hit fidelity (the JSON dump has the full fidelity).
+    """
+    if not text:
+        return ""
+    flat = " ".join(text.split())
+    if len(flat) <= n:
+        return flat
+    return flat[: n - 1].rstrip() + "…"
+
+
+def _format_inferred_chains(prefanout: dict[str, Any]) -> str:
+    """Re-group `inferred_edge` channel hits by `anchor_doc_id`.
+
+    The inferred-edge channel surfaces LLM-asserted cross-source links —
+    PR → Linear issue, PR → Slack discussion, PR → Notion design doc.
+    Each hit carries `anchor_doc_id` (the originating doc) + `why` (the
+    rationale). The full pre-fan-out JSON dump already shows every hit
+    (PR #328); this helper presents the SAME inferred-edge hits
+    additionally regrouped by anchor so the chain shape (one source doc
+    motivates / cites / references multiple downstream docs) is visible
+    at-a-glance — the structural view the agent needs for "why was X
+    created" / "what led to Y" queries that the flat JSON layout doesn't
+    expose.
+
+    Dedup: an `(anchor, doc_id, edge_type)` triple can appear under
+    multiple sub_queries when fan-out anchors overlap; we keep only the
+    first occurrence (highest-ranked sub-query position).
+
+    Bound: total emitted hit lines are capped at
+    `_PREFANOUT_INFERRED_CHAINS_CAP`. Excess hits drop with a single
+    "showing top N of M" note so the agent knows more is reachable via
+    `subgraph(anchor)` or `fetch_doc(... with_inferred_edges=true)`.
+
+    Returns empty string when no inferred-edge hits exist anywhere in
+    the pre-fan-out.
+    """
+    # Insertion-order dict of anchor → list of hits; dedup by (doc_id,
+    # edge_type) within each anchor block.
+    chains: dict[str, list[dict[str, Any]]] = {}
+    seen_per_anchor: dict[str, set[tuple[str, str]]] = {}
+    total_hits = 0
+    for sq in prefanout.get("sub_queries") or []:
+        for hit in sq.get("inferred_edge") or []:
+            anchor = hit.get("anchor_doc_id")
+            if not anchor:
+                continue
+            doc_id = hit.get("doc_id") or ""
+            edge_type = hit.get("edge_type") or ""
+            seen = seen_per_anchor.setdefault(anchor, set())
+            key = (doc_id, edge_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            chains.setdefault(anchor, []).append(hit)
+            total_hits += 1
+    if not chains:
+        return ""
+    out_lines: list[str] = []
+    rendered = 0
+    truncated = False
+    for anchor, hits in chains.items():
+        out_lines.append(f"anchor: {anchor}")
+        for hit in hits:
+            if rendered >= _PREFANOUT_INFERRED_CHAINS_CAP:
+                truncated = True
+                break
+            linked = hit.get("doc_id") or "?"
+            src = hit.get("source_system") or "?"
+            edge = hit.get("edge_type") or "?"
+            title = _truncate_snippet(hit.get("title"), 60)
+            why = _truncate_snippet(hit.get("why"), 200)
+            line = f"  -> {linked} [{src}] edge={edge}"
+            if title:
+                line += f' title="{title}"'
+            out_lines.append(line)
+            if why:
+                out_lines.append(f"     why: {why}")
+            rendered += 1
+        if truncated:
+            break
+    if truncated:
+        out_lines.append(
+            f"  (showing top {rendered} of {total_hits} chain hits; "
+            f"call subgraph(anchor) or fetch_doc(..., with_inferred_edges=true) "
+            f"for the remainder)"
+        )
+    return "\n".join(out_lines)
+
+
 def _build_user_message(
     query: str,
     bundle: GroundingBundle,
@@ -159,11 +264,17 @@ def _build_user_message(
     """Render the per-query user message.
 
     Layout (grounding-first for cache stability, then channel results,
-    then the raw query last for recency bias):
-        <grounding>           — entity bag from grounding + extraction
-        <connected_sources>   — which source systems the tenant has wired
-        <channel_results>     — output of pre-fan-out `execute_search`
-        <query>               — raw user query, last for recency
+    then the chain-shaped re-grouping, then the raw query last for
+    recency bias):
+        <grounding>          — entity bag from grounding + extraction
+        <connected_sources>  — which source systems the tenant has wired
+        <channel_results>    — output of pre-fan-out `execute_search`
+        <inferred_chains>    — same inferred-edge hits regrouped by
+                               anchor doc, so the why-chain structure
+                               (A → B → C with `why` per hop) is visible
+                               at-a-glance. Only present when the pre-
+                               fan-out surfaced any inferred-edge hits.
+        <query>              — raw user query, last for recency
     """
     grounding_lines = []
     for c in bundle.candidates:
@@ -182,6 +293,7 @@ def _build_user_message(
     )
 
     channel_results_block = ""
+    chains_section = ""
     if prefanout:
         channel_results_block = (
             f"\n\n<channel_results>\n"
@@ -194,12 +306,32 @@ def _build_user_message(
             f"{_format_prefanout_compact(prefanout)}\n"
             f"</channel_results>"
         )
+        chains_block = _format_inferred_chains(prefanout)
+        if chains_block:
+            chains_section = (
+                f"\n\n<inferred_chains>\n"
+                f"The same inferred-edge hits from `<channel_results>` above, "
+                f"additionally regrouped by their `anchor_doc_id` (the "
+                f"originating doc of each LLM-asserted link). Each anchor "
+                f"motivates / cites / references the listed downstream docs "
+                f"with a `why` rationale. For 'why was X created' / 'what led "
+                f"to Y' / 'what is the context behind Z' queries THIS is the "
+                f"answer chain — emit each linked doc as a `GatheredChunk` "
+                f"with the `why` quoted verbatim in `why_relevant`. If an "
+                f"`anchor:` value matches a doc_id whose graph entity also "
+                f"appears in `<grounding>`, ALSO emit that entity as a "
+                f"`GatheredEntity` (use its `canonical_id` from `<grounding>`, "
+                f"not the anchor doc_id).\n"
+                f"{chains_block}\n"
+                f"</inferred_chains>"
+            )
 
     safe_query = _escape_query_for_xml(query)
     return (
         f"<grounding>\n{grounding_block}\n</grounding>\n\n"
         f"<connected_sources>{sources_block}</connected_sources>"
-        f"{channel_results_block}\n\n"
+        f"{channel_results_block}"
+        f"{chains_section}\n\n"
         f"<query>\n{safe_query}\n</query>"
     )
 

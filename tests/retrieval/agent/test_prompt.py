@@ -86,3 +86,55 @@ def test_prompt_hash_is_stable_within_day() -> None:
     a = build_system_prompt(d)
     b = build_system_prompt(d)
     assert sha256(a.encode()).hexdigest() == sha256(b.encode()).hexdigest()
+
+
+def test_prompt_references_inferred_chains_section() -> None:
+    """When inferred-edge hits exist the harness renders a chain-shaped
+    re-grouping in `<inferred_chains>` (loop.py:_format_inferred_chains).
+    The prompt MUST tell the agent that section exists and that for
+    'why was X created' / 'what led to Y' queries it IS the answer
+    chain — otherwise the agent has no reason to walk it."""
+    prompt = build_system_prompt(datetime(2026, 5, 16, tzinfo=UTC))
+    assert "<inferred_chains>" in prompt
+    # The chain-shaped intent class — at least one phrasing has to
+    # survive, otherwise why-chain queries silently regress to flat
+    # chunk lists.
+    assert "why was" in prompt.lower() or "what led to" in prompt.lower()
+
+
+def test_prompt_requires_entity_emission_not_just_chunks() -> None:
+    """The previous failure mode (other-session diagnosis 2026-05-18)
+    was the agent emitting chunks-only because the prompt's happy path
+    biased toward `<channel_results>` which renders doc-shaped hits.
+    Lock the explicit 'emit entities, not just chunks' rule so a future
+    prompt simplification doesn't re-introduce the regression."""
+    prompt = build_system_prompt(datetime(2026, 5, 16, tzinfo=UTC))
+    # The structural rule, plus a justification anchor so the rule
+    # isn't accidentally weakened to 'consider emitting entities'.
+    assert "EMIT ENTITIES" in prompt
+    assert "GatheredEntity" in prompt
+    assert "properties.why" in prompt
+
+
+def test_prompt_documents_why_chain_walking_for_reason_queries() -> None:
+    """Why-chain queries (reason / cause / context) need explicit
+    walking instructions or the agent treats them like any other broad
+    query. Lock the guidance so it can't be silently dropped."""
+    prompt = build_system_prompt(datetime(2026, 5, 16, tzinfo=UTC))
+    lowered = prompt.lower()
+    # At least one reason-shaped intent phrase must appear in the
+    # special-handling guidance.
+    assert any(
+        phrase in lowered
+        for phrase in (
+            "why-chain",
+            "why was",
+            "what led to",
+            "what's the context behind",
+            "context behind",
+        )
+    )
+    # And the chain emission shape (anchor entity + linked chunks with
+    # edge `why`) must be specified.
+    assert "verbatim" in lowered
+    assert "why_relevant" in prompt
