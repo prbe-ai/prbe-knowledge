@@ -1,26 +1,30 @@
 """PagerDuty connector — incident-pager source.
 
 One INCIDENT document per logical PD incident, updated across lifecycle
-events (triggered / acknowledged / resolved / etc.).
+events (triggered / acknowledged / resolved / etc.) via SCD2 coalesce.
 `requires_investigation` fires only on `incident.triggered` so the
-investigation pipeline runs once per logical incident — see B.2 for the
-normalize implementation that owns that flag.
+investigation pipeline runs exactly once per logical incident.
 
-Signature verification is a no-op at the connector level: the gateway
-(prbe-backend `apps/data_plane/routers/webhooks/sources/pagerduty.py`)
-is the trust boundary, matching every other handler in this package.
+Connector-level `verify_signature` is intentionally a stub — see the
+method docstring for the rationale. PD's per-subscription secret is
+verified at the prbe-backend gateway BEFORE this code is reached.
 """
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
+from services.ingestion.chunker import count_tokens
 from services.ingestion.handlers.base import Connector
 from services.ingestion.handlers.registry import register_connector
-from shared.constants import IngestionEventType, SourceSystem
+from shared.constants import DocClass, DocType, IngestionEventType, Permission, PrincipalType, SourceSystem
 from shared.exceptions import InvalidWebhookPayload
 from shared.models import (
+    ACLPrincipal,
+    ACLSnapshot,
+    Document,
     NormalizationResult,
     WebhookEvent,
     WebhookParseResult,
@@ -102,11 +106,109 @@ class PagerDutyConnector(Connector):
     async def normalize(
         self, event: WebhookEvent, hydrated: Mapping[str, Any]
     ) -> NormalizationResult:
-        # B.2 owns the real normalize. Returning a non-empty skipped_reason
-        # so that any accidental routing through this stub is loud rather
-        # than silently producing zero-doc outcomes.
+        raw = event.raw_payload
+        pd_event = raw.get("event") or {}
+        event_type: str = pd_event.get("event_type") or ""
+        occurred_at_str: str | None = pd_event.get("occurred_at")
+        data: dict[str, Any] = pd_event.get("data") or {}
+        service: dict[str, Any] = data.get("service") if isinstance(data.get("service"), dict) else {}
+        priority: dict[str, Any] = data.get("priority") if isinstance(data.get("priority"), dict) else {}
+        escalation_policy: dict[str, Any] = data.get("escalation_policy") if isinstance(data.get("escalation_policy"), dict) else {}
+
+        incident_id: str | None = data.get("id")
+        if not incident_id:
+            return NormalizationResult(skipped_reason="missing event.data.id")
+
+        doc_id = f"pd:incident:{incident_id}"
+        status: str = data.get("status") or ""
+        urgency: str | None = data.get("urgency")
+        incident_key: str | None = data.get("incident_key")
+        title_raw: str = data.get("title") or f"PagerDuty incident {incident_id}"
+        service_id: str | None = service.get("id")
+        service_summary: str | None = service.get("summary")
+        service_url: str | None = service.get("html_url")
+        ep_summary: str | None = escalation_policy.get("summary")
+        priority_name: str | None = priority.get("name")
+        created_at_str: str | None = data.get("created_at")
+
+        # Build human-readable markdown body
+        body_lines: list[str] = [
+            f"# {title_raw}",
+            "",
+            f"**Status:** {status}",
+            f"**Urgency:** {urgency or 'unknown'}",
+            f"**Priority:** {priority_name or 'none'}",
+            f"**Service:** {service_summary or service_id or 'unknown'}",
+            f"**Escalation policy:** {ep_summary or 'unknown'}",
+            f"**Created at:** {created_at_str or 'unknown'}",
+            f"**Last event:** {event_type} at {occurred_at_str or 'unknown'}",
+        ]
+        if incident_key:
+            body_lines.append(f"**Incident key:** {incident_key}")
+        body = "\n".join(body_lines)
+
+        content_hash = hashlib.sha256(
+            f"{event_type}|{status}|{body}".encode("utf-8")
+        ).hexdigest()
+
+        # ACL: workspace principal + optional service group
+        acl_principals: list[ACLPrincipal] = [
+            ACLPrincipal(
+                principal_type=PrincipalType.WORKSPACE,
+                principal_id=event.customer_id,
+                permission=Permission.READ,
+            ),
+        ]
+        if service_id:
+            acl_principals.append(
+                ACLPrincipal(
+                    principal_type=PrincipalType.GROUP,
+                    principal_id=f"incident-service:{service_id}",
+                    permission=Permission.READ,
+                )
+            )
+
+        created_at = _parse_iso8601(created_at_str) or event.received_at
+
+        doc = Document(
+            doc_id=doc_id,
+            customer_id=event.customer_id,
+            source_system=SourceSystem.PAGERDUTY,
+            source_id=incident_id,
+            source_url=data.get("html_url") or "",
+            doc_class=DocClass.RAW_SOURCE,
+            doc_type=DocType.INCIDENT,
+            content_type="text/markdown",
+            content_hash=content_hash,
+            title=title_raw[:240],
+            body_preview=body[:280],
+            body_size_bytes=len(body.encode("utf-8")),
+            body_token_count=count_tokens(body),
+            author_id=None,
+            created_at=created_at,
+            updated_at=event.received_at,
+            valid_from=event.received_at,
+            ingested_at=datetime.now(UTC),
+            parent_doc_id=None,
+            acl=ACLSnapshot(principals=acl_principals, captured_at=event.received_at),
+            metadata={
+                "incident_id": incident_id,
+                "current_status": status,
+                "last_event_type": event_type,
+                "urgency": urgency,
+                "priority": priority_name,
+                "service_id": service_id,
+                "service_url": service_url,
+                "escalation_policy": ep_summary,
+                "incident_key": incident_key,
+            },
+            body=body,
+            coalesce_into_live=True,
+        )
+
         return NormalizationResult(
-            skipped_reason="pagerduty normalize not yet implemented (B.2)"
+            documents=[doc],
+            requires_investigation=(event_type == "incident.triggered"),
         )
 
 
