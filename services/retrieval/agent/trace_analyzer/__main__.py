@@ -24,6 +24,8 @@ from datetime import date as date_cls
 
 from services.retrieval.agent.trace_analyzer.digest import summarize_trace
 from services.retrieval.agent.trace_analyzer.loader import iter_trace_blobs
+from shared.config import get_settings
+from shared.db import close_pool, init_pool
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -56,6 +58,10 @@ async def _run(args: argparse.Namespace) -> int:
         file_handle = open(args.out, "w", encoding="utf-8")  # noqa: SIM115
         out_stream = file_handle
 
+    # The CLI runs outside FastAPI's lifespan, so the DB pool isn't
+    # initialized by the app's startup hook. The loader uses raw_conn()
+    # which expects an active pool — init it here, tear down on exit.
+    await init_pool(get_settings())
     yielded = 0
     try:
         async for blob in iter_trace_blobs(target):
@@ -63,6 +69,7 @@ async def _run(args: argparse.Namespace) -> int:
             out_stream.write(json.dumps(digest, default=str) + "\n")
             yielded += 1
     finally:
+        await close_pool()
         if file_handle is not None:
             file_handle.close()
 

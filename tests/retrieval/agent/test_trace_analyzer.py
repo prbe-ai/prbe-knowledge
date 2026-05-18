@@ -252,10 +252,27 @@ def test_cli_rejects_invalid_date() -> None:
     assert rc == 2
 
 
+def _stub_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub init_pool/close_pool so CLI tests don't touch a real DB.
+    The CLI initializes the pool on entry (the FastAPI app does this
+    via its startup hook, but the standalone CLI has no lifespan)."""
+    from unittest.mock import AsyncMock as _AsyncMock
+    monkeypatch.setattr(
+        "services.retrieval.agent.trace_analyzer.__main__.init_pool",
+        _AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "services.retrieval.agent.trace_analyzer.__main__.close_pool",
+        _AsyncMock(return_value=None),
+    )
+
+
 def test_cli_accepts_valid_date_no_traces(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Happy path with empty iteration writes 0 lines and exits 0."""
+    _stub_pool(monkeypatch)
+
     async def _empty_iter(*_args: Any, **_kwargs: Any) -> Any:
         if False:
             yield {}
@@ -277,6 +294,7 @@ def test_cli_writes_jsonl_lines_for_blobs(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
     """Each yielded blob produces one JSONL line via summarize_trace."""
+    _stub_pool(monkeypatch)
     blobs = [_mk_blob(), _mk_blob(trace_id="trace-2", status="loop_timeout")]
 
     async def _iter(*_args: Any, **_kwargs: Any) -> Any:
@@ -299,6 +317,39 @@ def test_cli_writes_jsonl_lines_for_blobs(
     assert parsed[1]["status"] == "loop_timeout"
     # blob_key threaded through from _db on the loaded blob
     assert parsed[0]["blob_key"] == "search-traces/2026-05-17/trace-abc.json.gz"
+
+
+def test_cli_closes_pool_on_exception(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """If the loader raises mid-iteration, close_pool must still run so
+    the next CLI invocation in the same process gets a fresh pool. The
+    K8s Job only runs once per pod so this is mostly belt-and-suspenders;
+    the local test catches a regression that'd bite in pytest sessions
+    or future scripted multi-call usage."""
+    from unittest.mock import AsyncMock as _AsyncMock
+    init_mock = _AsyncMock(return_value=None)
+    close_mock = _AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "services.retrieval.agent.trace_analyzer.__main__.init_pool", init_mock
+    )
+    monkeypatch.setattr(
+        "services.retrieval.agent.trace_analyzer.__main__.close_pool", close_mock
+    )
+
+    async def _boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("simulated DB hang")
+        yield {}  # makes it a generator
+
+    monkeypatch.setattr(
+        "services.retrieval.agent.trace_analyzer.__main__.iter_trace_blobs",
+        _boom,
+    )
+    out_path = tmp_path / "digests.jsonl"
+    with pytest.raises(RuntimeError, match="simulated DB hang"):
+        cli.main(["--date", "2026-05-17", "--out", str(out_path)])
+    assert init_mock.await_count == 1
+    assert close_mock.await_count == 1, "close_pool must run even on exception"
 
 
 # ============================================================
