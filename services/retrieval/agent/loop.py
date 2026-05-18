@@ -554,6 +554,14 @@ def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> di
     that are missing.
     """
     out = dict(raw) if isinstance(raw, dict) else {}
+    # Entities: filter non-dict items. Cerebras gpt-oss-120b occasionally
+    # emits malformed JSON fragments as bare strings inside arrays
+    # (e.g. `entities=[{...valid...}, '{', '{canonical_id":...']`) — a
+    # constrained-decoding partial-failure mode. Pydantic rejects the
+    # whole emission on the first non-dict; drop the malformed items so
+    # the valid neighbors survive.
+    entities_in = out.get("entities") or []
+    out["entities"] = [e for e in entities_in if isinstance(e, dict)]
     # Chunks: derive missing required fields where possible
     chunks_in = out.get("chunks") or []
     chunks_out: list[dict[str, Any]] = []

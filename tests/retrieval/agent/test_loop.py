@@ -231,6 +231,25 @@ def test_parse_terminal_args_lenient_derives_doc_id_from_chunk_id() -> None:
     assert out.chunks[0].chunk_id == "github:owner/repo:pr:42:chunk:3"
 
 
+def test_parse_terminal_args_filters_non_dict_entities() -> None:
+    """Third failure mode observed on Cerebras 2026-05-18: model emits
+    malformed JSON fragments as bare strings inside the entities array
+    (constrained-decoding partial failure inside the list). Drop the
+    non-dict items so the valid neighbors survive."""
+    out = _parse_terminal_args({
+        "entities": [
+            {"canonical_id": "github:owner/repo:pr:1", "label": "PR"},
+            "{",  # malformed fragment
+            {"canonical_id": "github:owner/repo:pr:2", "label": "PR"},
+            '{canonical_id":...',  # mangled string
+        ],
+    })
+    assert out is not None
+    assert len(out.entities) == 2
+    assert out.entities[0].canonical_id == "github:owner/repo:pr:1"
+    assert out.entities[1].canonical_id == "github:owner/repo:pr:2"
+
+
 def test_parse_terminal_args_lenient_doc_level_chunks() -> None:
     """Second failure mode observed on Cerebras 2026-05-18: model emits
     'doc-level chunks' where chunk_id is omitted (only doc_id present)
