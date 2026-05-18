@@ -103,6 +103,68 @@ def test_format_user_prompt_truncates_long_chunks() -> None:
     assert len(out) < 4000  # well under raw chunk size
 
 
+def test_format_user_prompt_renders_chain_section_when_graph_evidence_present() -> None:
+    """`graph_evidence` on a chunk is the chain rationale (anchor doc +
+    edge_type + `why`). Without rendering it in the user prompt the LLM
+    answer drops the chain — saw this live on "why was PR 72 created":
+    the Linear ticket was in the chunks but the synthesized answer said
+    "no explicit ticket triggered the PR" because the edge rationale
+    wasn't in its prompt. Lock the rendering so we don't regress."""
+    from shared.models import GraphEvidence
+
+    chunk = SynthesisChunk(
+        chunk_id="c-linear",
+        title="linear tickets not enriched",
+        content="customers report empty enrichment on linear tickets",
+        source_system="linear",
+        source_url="https://linear.app/x",
+        updated_at=_NOW_ISO,
+        graph_evidence=[
+            GraphEvidence(
+                edge_type="motivates_pr",
+                confidence="INFERRED",
+                via_entity="github:prbe-ai/prbe-backend:pr:72",
+                reason="PR #72 implements the proxy that fixes the 502s causing linear tickets to not be enriched",
+            )
+        ],
+    )
+    out = _format_user_prompt("why was pr72 created", [chunk])
+    assert "CHAIN:" in out
+    assert "github:prbe-ai/prbe-backend:pr:72" in out
+    assert "motivates_pr" in out
+    assert "INFERRED" in out
+    assert "implements the proxy that fixes" in out
+
+
+def test_format_user_prompt_truncates_long_chain_reasons() -> None:
+    """Per-edge `reason` cap protects the synthesizer's token budget when
+    the LLM-derived `why` string is long. The cap lives on the rendering
+    side, not the wire — full `why` survives in graph_evidence for
+    other consumers (dashboard chain panel, MCP graph_evidence field)."""
+    from shared.models import GraphEvidence
+
+    long_why = "a" * 5000
+    chunk = SynthesisChunk(
+        chunk_id="c-x", title=None, content="...", source_system="github",
+        source_url="x", updated_at=_NOW_ISO,
+        graph_evidence=[GraphEvidence(
+            edge_type="e", confidence="INFERRED", via_entity="anchor", reason=long_why,
+        )],
+    )
+    out = _format_user_prompt("q", [chunk])
+    # Rendered output stays manageable — the long reason is truncated.
+    chain_section_size = out.split("CHAIN:", 1)[1] if "CHAIN:" in out else ""
+    assert len(chain_section_size) < 1000
+
+
+def test_format_user_prompt_skips_chain_section_when_no_evidence() -> None:
+    """Vector/BM25-only chunks have empty graph_evidence — the CHAIN
+    section is omitted entirely to keep the prompt tight on queries
+    where there's no chain to render."""
+    out = _format_user_prompt("q", [_chunk(1, content="body")])
+    assert "CHAIN:" not in out
+
+
 # ---------------------------------------------------------------------------
 # Fallback parser (when a provider returns free-form text)
 # ---------------------------------------------------------------------------
