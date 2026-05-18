@@ -15,9 +15,25 @@
 #   7. Push surviving branches + open draft PRs via gh CLI
 #   8. Upload orchestrator-summary.json as a workflow artifact
 #
-# The `schedule:` block is commented out — first 2 weeks run via
-# workflow_dispatch only so we can verify PR quality manually before
-# letting cron fire it 3 AM PT every night. Re-enable in a follow-up PR.
+# Schedule fires every day at 10:00 UTC = 3 AM PT during PDT
+# (March-November) and 2 AM PT during PST (accept the DST drift). The
+# kill switch via repo Variable AGENT_OPTIMIZATION_ENABLED gates each
+# run — flip it to "false" to disable cron without touching this file.
+# Manual triggers via workflow_dispatch remain available.
+#
+# FUTURE ENHANCEMENT — wire Probe MCP for the orchestrator + sub-agents:
+# Currently no MCP servers are configured for the claude CLI in this
+# workflow. Adding Probe MCP would let sub-agents replay failing
+# queries against the live system to validate fix hypotheses before
+# proposing the PR. Auth needs either:
+#   - INTERNAL_ORCHESTRATOR_API_KEY (currently not deployed; orchestrator
+#     is dormant per project_orchestrator_dormant.md) deployed to the
+#     mcp.prbe.ai server + stored as a GH secret
+#   - Or a long-lived probe-founders OAuth bearer
+# Implementation when ready: write {"mcpServers": {"Probe": {...}}} to
+# /tmp/mcp.json and pass `--mcp-config /tmp/mcp.json --strict-mcp-config`
+# on the claude invocation. Leave the Bash(mcp__Probe__*) allowedTool
+# off until this is in place.
 name: agent-optimization-nightly
 
 on:
@@ -31,10 +47,8 @@ on:
         description: "UTC date to digest (default: yesterday)"
         type: string
         default: ""
-  # schedule:
-  #   - cron: "0 10 * * *"   # 3 AM PT during PDT (March-November).
-                              # 2 AM PT during PST — accept the DST drift.
-                              # Re-enable after 2 weeks of dogfooding.
+  schedule:
+    - cron: "0 10 * * *"   # 10:00 UTC daily = 3 AM PT (PDT) / 2 AM PT (PST)
 
 permissions:
   contents: write
