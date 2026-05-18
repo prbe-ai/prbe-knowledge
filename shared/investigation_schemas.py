@@ -55,8 +55,8 @@ class InvestigationWritebackRequest(BaseModel):
     source_event_id: str
     version: int = Field(ge=1)
     mode: InvestigationMode
-    title: str = Field(min_length=1, max_length=512)
-    body_markdown: str = Field(min_length=1)
+    title: str = Field(min_length=1, max_length=240)
+    body_markdown: str = Field(min_length=1, max_length=262144)
     evidence: list[EvidenceSection] = Field(default_factory=list)
     narrative: str | None = None
     tool_trace_run_id: str | None = None

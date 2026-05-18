@@ -90,6 +90,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     app.state.ctx = make_default_context()
     app.state.store = get_store()
+    from services.ingestion.normalizer import Normalizer
+    app.state.normalizer = Normalizer(app.state.ctx)
     log.info(
         "ingestion.boot",
         environment=settings.environment,
@@ -110,6 +112,10 @@ app.include_router(feature_nodes_router)
 app.include_router(devices_router)
 app.include_router(wiki_router)
 app.include_router(custom_ingest_router)
+from services.ingestion.investigation_writeback_routes import (
+    router as investigation_writeback_router,
+)
+app.include_router(investigation_writeback_router)
 
 
 @app.get("/health")

@@ -97,7 +97,7 @@ def test_writeback_request_rejects_empty_title_or_body() -> None:
         InvestigationWritebackRequest(**base, title="t", body_markdown="")
 
 
-def test_writeback_request_rejects_title_over_512_chars() -> None:
+def test_writeback_request_rejects_title_over_240_chars() -> None:
     base = {
         "customer_id": "c", "incident_doc_id": "d",
         "source_system": SourceSystem.PAGERDUTY,
@@ -105,7 +105,7 @@ def test_writeback_request_rejects_title_over_512_chars() -> None:
         "body_markdown": "b",
     }
     with pytest.raises(ValidationError):
-        InvestigationWritebackRequest(**base, title="x" * 513)
+        InvestigationWritebackRequest(**base, title="x" * 241)
 
 
 def test_writeback_response_round_trip() -> None:
@@ -159,3 +159,26 @@ def test_version_entry_defaults() -> None:
     assert v.decision == "pending"
     assert v.reviewed_by is None
     assert v.feedback is None
+
+
+def test_writeback_request_rejects_body_over_256kib() -> None:
+    base = {
+        "customer_id": "c", "incident_doc_id": "d",
+        "source_system": SourceSystem.PAGERDUTY,
+        "source_event_id": "e", "version": 1, "mode": "full",
+        "title": "t",
+    }
+    with pytest.raises(ValidationError):
+        # 262145 chars > 256 KiB
+        InvestigationWritebackRequest(**base, body_markdown="x" * 262145)
+
+
+def test_writeback_request_accepts_body_at_256kib_boundary() -> None:
+    base = {
+        "customer_id": "c", "incident_doc_id": "d",
+        "source_system": SourceSystem.PAGERDUTY,
+        "source_event_id": "e", "version": 1, "mode": "full",
+        "title": "t",
+    }
+    req = InvestigationWritebackRequest(**base, body_markdown="x" * 262144)
+    assert len(req.body_markdown) == 262144

@@ -75,6 +75,7 @@ TRUNCATE_SQL = """
         documents,
         customer_source_mapping,
         code_repo_state,
+        incident_investigations,
         customers
     RESTART IDENTITY CASCADE;
 """
