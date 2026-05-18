@@ -523,35 +523,65 @@ def _derive_doc_id_from_chunk_id(chunk_id: str) -> str | None:
     return chunk_id
 
 
+# Alternate text-field names non-strict providers emit for chunk content.
+# Cerebras gpt-oss-120b sometimes emits "doc-level chunks" with the body
+# under `description`/`summary` instead of `content`. Order matters —
+# the first non-empty match wins.
+_CHUNK_CONTENT_ALIASES = ("description", "summary", "snippet", "text", "body", "title")
+
+
 def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> dict[str, Any]:
     """Pre-parse coercion for non-strict providers (Cerebras et al.).
 
     Cerebras's gpt-oss-120b emits emit_gatherer_output args with input-
     shaped fields (`title`/`source`/`url` from <channel_results>) instead
-    of the strict GathererOutput schema. With `extra="ignore"` on the
-    models those extras drop silently, but missing required fields still
-    fail validation. Derive what we can from harness state + chunk_id,
-    leave the rest to Pydantic defaults.
+    of the strict GathererOutput schema, and sometimes "doc-level chunks"
+    where `chunk_id` is omitted and `content` lives under
+    `description`/`summary`. With `extra="ignore"` on the models the
+    unknown extras drop silently; this helper additionally:
+
+      - Derives `chunk.doc_id` from `chunk.chunk_id` prefix when missing.
+      - Derives `chunk.chunk_id` from `chunk.doc_id` when missing
+        (whole-doc citation fallback).
+      - Sources `chunk.content` from alternate text fields (description,
+        summary, snippet, text, body, title) when `content` is missing.
+      - Harness-fills `gatherer_notes.turns_used` and `tools_called` from
+        LoopState — that ledger is the canonical record per trace_blob.py.
+      - Drops chunks for which no usable doc_id + content pair can be
+        recovered (no resolvable citation).
 
     Safe to call even on Fireworks-strict output — only fills fields
     that are missing.
     """
     out = dict(raw) if isinstance(raw, dict) else {}
-    # Chunks: derive doc_id from chunk_id prefix when omitted
+    # Chunks: derive missing required fields where possible
     chunks_in = out.get("chunks") or []
     chunks_out: list[dict[str, Any]] = []
     for ch in chunks_in:
         if not isinstance(ch, dict):
             continue
         ch_out = dict(ch)
-        if not ch_out.get("doc_id"):
-            cid = ch_out.get("chunk_id") or ""
-            derived = _derive_doc_id_from_chunk_id(cid)
+        # doc_id ↔ chunk_id derivation (whichever is present can supply
+        # the other; without either we can't cite the chunk)
+        if not ch_out.get("doc_id") and ch_out.get("chunk_id"):
+            derived = _derive_doc_id_from_chunk_id(ch_out["chunk_id"])
             if derived:
                 ch_out["doc_id"] = derived
-            else:
-                # Can't recover — drop the chunk (no resolvable citation)
-                continue
+        if not ch_out.get("chunk_id") and ch_out.get("doc_id"):
+            # Whole-doc citation fallback — chunk_id == doc_id is a valid
+            # convention (id_lookup retriever does this for short docs).
+            ch_out["chunk_id"] = ch_out["doc_id"]
+        if not ch_out.get("doc_id") or not ch_out.get("chunk_id"):
+            continue  # Can't recover citation
+        # Content — try aliases when missing
+        if not ch_out.get("content"):
+            for alias in _CHUNK_CONTENT_ALIASES:
+                v = ch_out.get(alias)
+                if isinstance(v, str) and v.strip():
+                    ch_out["content"] = v
+                    break
+        if not ch_out.get("content"):
+            continue  # No body to cite
         chunks_out.append(ch_out)
     if chunks_out or "chunks" in out:
         out["chunks"] = chunks_out
@@ -597,7 +627,7 @@ def _parse_terminal_args(
         log.warning(
             "agent.terminal_args_parse_failed",
             error=str(exc),
-            preview=str(coerced)[:300],
+            preview=str(coerced)[:1000],
         )
         return None
 

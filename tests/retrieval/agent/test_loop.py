@@ -231,6 +231,35 @@ def test_parse_terminal_args_lenient_derives_doc_id_from_chunk_id() -> None:
     assert out.chunks[0].chunk_id == "github:owner/repo:pr:42:chunk:3"
 
 
+def test_parse_terminal_args_lenient_doc_level_chunks() -> None:
+    """Second failure mode observed on Cerebras 2026-05-18: model emits
+    'doc-level chunks' where chunk_id is omitted (only doc_id present)
+    and content lives under `description` or `summary` instead of
+    `content`. Coercion: chunk_id ← doc_id; content ← description."""
+    out = _parse_terminal_args({
+        "chunks": [
+            {
+                "doc_id": "github:prbe-ai/prbe-backend:commit:abc",
+                "description": "Refactored authentication flow.",
+            },
+            {
+                "doc_id": "github:prbe-ai/prbe-backend:pr:42",
+                "summary": "Wires up the dashboard self-host image.",
+            },
+            {
+                # No doc_id, no chunk_id — unrecoverable, drops
+                "content": "orphan content",
+            },
+        ],
+    })
+    assert out is not None
+    assert len(out.chunks) == 2
+    assert out.chunks[0].chunk_id == "github:prbe-ai/prbe-backend:commit:abc"
+    assert out.chunks[0].content == "Refactored authentication flow."
+    assert out.chunks[1].chunk_id == "github:prbe-ai/prbe-backend:pr:42"
+    assert out.chunks[1].content == "Wires up the dashboard self-host image."
+
+
 def test_parse_terminal_args_cerebras_real_failure_mode() -> None:
     """Reproduction of the exact failure observed live on 2026-05-18 when
     we flipped SEARCH_AGENT_INFERENCE_MODEL=cerebras/gpt-oss-120b.
