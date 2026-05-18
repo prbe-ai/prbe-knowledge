@@ -161,8 +161,11 @@ jobs:
           set -euo pipefail
           # Stage the prompt + inputs so the agent can read paths
           # consistently. Sub-agent worktrees are placed under /tmp.
+          # --verbose required when --output-format=stream-json is set
+          # alongside --print (the CLI rejects the combo otherwise).
           claude -p "$(cat .github/prompts/nightly-optimization.md)" \
             --output-format stream-json \
+            --verbose \
             --max-turns 80 \
             --allowedTools "Read,Grep,Glob,Bash(gh:*),Bash(git:*),Bash(uv:*),Edit,Write,Task" \
             2>&1 | tee /tmp/orchestrator.log
