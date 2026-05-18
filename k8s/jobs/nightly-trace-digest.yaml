@@ -29,7 +29,7 @@ metadata:
     app.kubernetes.io/name: prbe-data-plane
     app.kubernetes.io/instance: prbe-data-plane
     app.kubernetes.io/part-of: prbe-data-plane
-    probe.prbe.ai/role: trace-analyzer
+    probe.prbe.ai/role: worker
     probe.prbe.ai/mode: managed-shared
 spec:
   ttlSecondsAfterFinished: 3600
@@ -40,9 +40,15 @@ spec:
       labels:
         app.kubernetes.io/name: prbe-data-plane
         app.kubernetes.io/instance: prbe-data-plane
-        probe.prbe.ai/role: trace-analyzer
+        probe.prbe.ai/role: worker
     spec:
       restartPolicy: Never
+      # GHCR is private — same pull-secret the app tier uses. Without
+      # this, the Job pod hits ErrImagePull + ImagePullBackOff and the
+      # workflow's `kubectl wait --for=condition=complete` runs out the
+      # 20m timeout instead of failing fast.
+      imagePullSecrets:
+        - name: ghcr-pull-secret
       containers:
         - name: trace-analyzer
           # Pinned to the knowledge image (where the trace_analyzer
@@ -51,14 +57,20 @@ spec:
           # always runs the latest code.
           image: ghcr.io/prbe-ai/prbe-data-plane-knowledge:IMAGE_TAG_PLACEHOLDER
           imagePullPolicy: IfNotPresent
+          # `uv` is NOT in the runtime image — the image already has a
+          # baked venv at /opt/probe-venv with PATH set to include it,
+          # so plain `python` resolves to the right interpreter with
+          # all deps. /opt/upstreams/prbe-knowledge is on sys.path so
+          # `python -m services.retrieval.agent.trace_analyzer` finds
+          # the module regardless of cwd.
           command:
-            - sh
-            - -c
-          args:
-            - |
-              uv run python -m services.retrieval.agent.trace_analyzer \
-                --date "${TARGET_DATE}" \
-                --out -
+            - python
+            - -m
+            - services.retrieval.agent.trace_analyzer
+            - --date
+            - "DATE_PLACEHOLDER"
+            - --out
+            - "-"
           env:
             - name: TARGET_DATE
               value: "DATE_PLACEHOLDER"
