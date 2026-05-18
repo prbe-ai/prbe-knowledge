@@ -10,6 +10,7 @@ schema.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -19,8 +20,16 @@ def extract_from_doc(doc_row: dict[str, Any]) -> dict[str, Any]:
 
     Accepts both asyncpg Row-style mappings and plain dicts. The
     `metadata` field is the JSONB the connector stamped during normalize.
+    asyncpg returns JSONB columns as raw JSON strings; this function
+    decodes them transparently.
     """
-    metadata = doc_row.get("metadata") or {}
+    raw_metadata = doc_row.get("metadata") or {}
+    if isinstance(raw_metadata, str):
+        try:
+            raw_metadata = json.loads(raw_metadata)
+        except (ValueError, TypeError):
+            raw_metadata = {}
+    metadata: dict[str, Any] = raw_metadata
     source = doc_row.get("source_system") or ""
     title = doc_row.get("title") or ""
 

@@ -28,7 +28,7 @@ from shared.constants import (
     QueueStatus,
     SourceSystem,
 )
-from shared.db import apply_connection_setup, get_pool, init_pool
+from shared.db import apply_connection_setup, get_pool, init_pool, with_tenant
 from shared.exceptions import (
     DuplicateEventIgnored,
     PrbeError,
@@ -190,6 +190,18 @@ class Worker:
                 outcome,
                 captured_version,
             )
+            # After self._mark_done(...) completes successfully (queue row is in
+            # "done" state), fire the investigation dispatch if the connector
+            # requested it. The queue row is durable at this point so a dispatch
+            # crash can be re-triggered from the dashboard without re-driving the
+            # normalize pipeline.
+            if outcome.requires_investigation and outcome.doc_ids:
+                await self._maybe_dispatch_investigation(
+                    customer_id=customer_id,
+                    incident_doc_id=outcome.doc_ids[0],
+                    source=source,
+                    source_event_id=event_id,
+                )
         except DuplicateEventIgnored as exc:
             log.info("worker.skipped", queue_id=queue_id, reason=str(exc))
             await self._mark_skipped(
@@ -497,6 +509,73 @@ class Worker:
             )
             return False
         return dead
+
+    async def _maybe_dispatch_investigation(
+        self,
+        *,
+        customer_id: str,
+        incident_doc_id: str,
+        source: SourceSystem,
+        source_event_id: str,
+    ) -> None:
+        """Build the dispatch payload from the live INCIDENT doc row and
+        POST to orchestrator. On retry exhaustion, mark the incident doc
+        so the dashboard can surface a re-trigger action.
+
+        Wrapped in a broad except — a dispatch failure must never block
+        the worker loop. The queue row is already in "done" state; the
+        dashboard re-trigger button is the fallback.
+        """
+        try:
+            from services.investigation.dispatch import (
+                DispatchExhausted, dispatch_investigation,
+            )
+            from services.investigation.incident_signals import extract_from_doc
+            from services.investigation.mark_dispatch_failed import mark_dispatch_failed
+
+            # Fetch the live doc to build the signals payload.
+            async with with_tenant(customer_id) as conn:
+                row = await conn.fetchrow(
+                    "SELECT title, metadata, source_system::text AS source_system, "
+                    "       created_at "
+                    "FROM documents "
+                    "WHERE doc_id = $1 AND customer_id = $2 AND valid_to IS NULL",
+                    incident_doc_id, customer_id,
+                )
+            if row is None:
+                log.error(
+                    "investigation.dispatch.no_live_doc",
+                    extra={
+                        "customer_id": customer_id,
+                        "incident_doc_id": incident_doc_id,
+                    },
+                )
+                return
+
+            signals = extract_from_doc(dict(row))
+            payload = {
+                "customer_id": customer_id,
+                "source": source.value,
+                "incident_doc_id": incident_doc_id,
+                "source_event_id": source_event_id,
+                "incident_signals": signals,
+                "version": 1,
+            }
+            try:
+                await dispatch_investigation(payload)
+            except DispatchExhausted:
+                await mark_dispatch_failed(
+                    customer_id=customer_id,
+                    incident_doc_id=incident_doc_id,
+                )
+        except Exception:  # noqa: BLE001 — never block the worker loop
+            log.exception(
+                "investigation.dispatch.unhandled",
+                extra={
+                    "customer_id": customer_id,
+                    "incident_doc_id": incident_doc_id,
+                },
+            )
 
 
 def _event_type_for_source(source: SourceSystem) -> str:
