@@ -45,6 +45,12 @@ _UNGATED_SOURCES: frozenset[SourceSystem] = frozenset(
         SourceSystem.CUSTOM_INGEST,
         SourceSystem.WIKI,
         SourceSystem.CODE_GRAPH,
+        # Incident sources use per-tenant webhook secrets keyed in
+        # webhook_secrets (prbe-backend), not integration_tokens. The
+        # disconnect lifecycle for these is "secret removed", not "token
+        # row gone", so the integration_tokens-based gate doesn't apply.
+        SourceSystem.PAGERDUTY,
+        SourceSystem.INCIDENT_IO,
     }
 )
 

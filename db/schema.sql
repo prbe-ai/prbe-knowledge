@@ -1317,3 +1317,40 @@ ALTER TABLE ingestion_cursors ENABLE ROW LEVEL SECURITY;
 CREATE POLICY ingestion_cursors_tenant_isolation ON ingestion_cursors
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
+-- incident_investigations: per-incident review lifecycle state (migration
+-- 0080). The report content lives in `documents`; this is the small
+-- relational side (current state, version history, reviewer outcome).
+-- `incident_doc_id` and `current_report_doc_id` are intentionally
+-- unconstrained soft references — `documents` is SCD2-versioned and has
+-- no single-row PK on `doc_id` alone. Cleanup on customer deprovision
+-- runs through the `customer_id` CASCADE.
+-- ---------------------------------------------------------------------------
+CREATE TABLE incident_investigations (
+    customer_id            TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    incident_doc_id        TEXT NOT NULL,
+    current_report_doc_id  TEXT,
+    state                  TEXT NOT NULL,
+    versions               JSONB NOT NULL DEFAULT '[]'::jsonb,
+    reviewer_id            TEXT,
+    reviewed_at            TIMESTAMPTZ,
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT incident_investigations_pkey PRIMARY KEY (customer_id, incident_doc_id),
+    CONSTRAINT incident_investigations_state_chk CHECK (
+        state IN (
+            'pending_dispatch','running','pending_review',
+            'approved','rejected','failed_pending_review'
+        )
+    )
+);
+
+CREATE INDEX incident_investigations_state_idx
+    ON incident_investigations (customer_id, state);
+
+ALTER TABLE incident_investigations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE incident_investigations FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON incident_investigations
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
