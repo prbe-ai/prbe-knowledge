@@ -116,6 +116,10 @@ from services.ingestion.investigation_writeback_routes import (
     router as investigation_writeback_router,
 )
 app.include_router(investigation_writeback_router)
+from services.ingestion.investigation_review_routes import (
+    router as investigation_review_router,
+)
+app.include_router(investigation_review_router)
 
 
 @app.get("/health")
