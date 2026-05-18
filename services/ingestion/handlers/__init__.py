@@ -12,6 +12,7 @@ from services.ingestion.handlers import (
     custom_ingest,  # noqa: F401
     github,  # noqa: F401
     granola,  # noqa: F401
+    incident_io,  # noqa: F401
     linear,  # noqa: F401
     manual_upload,  # noqa: F401
     notion,  # noqa: F401
