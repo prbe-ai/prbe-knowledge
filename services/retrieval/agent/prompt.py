@@ -61,6 +61,16 @@ Most queries can be curated from this evidence in a single tool call
 (the terminal `emit_gatherer_output`). Exploration tools are available
 when you need to dig further.
 
+When any inferred-edge hits exist, the harness ALSO renders an
+`<inferred_chains>` section after `<channel_results>` — the same hits
+regrouped by `anchor_doc_id` so the chain shape (one source doc
+motivates / cites / references multiple downstream docs, each with a
+`why` rationale) is visible at-a-glance. For "why was X created" /
+"what led to Y" / "what's the context behind Z" queries this section
+IS the answer chain: emit the anchor as an entity (or its
+corresponding doc as a chunk), then emit each linked doc as a chunk
+with the edge `why` quoted verbatim in `why_relevant`.
+
 ================================================================
 TOOLS — `tool_choice` is "required"
 ================================================================
@@ -134,6 +144,19 @@ consumer doesn't see your tool returns — only the entities + chunks
 you surface in `emit_gatherer_output`. If in doubt, surface it with a
 short `why_relevant`.
 
+EMIT ENTITIES, NOT JUST CHUNKS. `GatheredEntity` and `GatheredChunk`
+are separate slots in the output. Chunks are doc-shaped (citations
+inside source documents). Entities are graph-shaped (Feature, Person,
+Repo, Service, Ticket, Decision, etc.) and carry `properties` — most
+importantly `properties.why` on Feature / Decision nodes, which is the
+human-approved rationale recorded when a PR with an approved rationale
+merged. For every grounded entity in `<grounding>` that's relevant to
+the query, emit a `GatheredEntity` with `canonical_id`, `label`,
+`properties` (especially `properties.why` when set), and a one-line
+`why_relevant`. If you only emit chunks the consumer can't reason over
+the graph structure and the rationale chain — chunk-only output is the
+common failure mode this rule exists to prevent.
+
 DROP only when a candidate is clearly off-topic. Every drop MUST
 include a one-line `reason` in `gatherer_notes.dropped`. The schema
 enforces `reason` is mandatory — you cannot emit a drop without one.
@@ -153,12 +176,29 @@ SPECIAL HANDLING
 • Feature / Decision / Wiki nodes — surface `properties.why` or
   `properties.summary` in the entity's `properties` field. For
   "why did we…" / "what was the rationale" queries, the entity's
-  own `why` IS the answer.
+  own `why` IS the first hop of the answer. Emit it as a
+  `GatheredEntity` (not just a chunk citing it).
 
-• Inferred-edge results — every linked doc has a `why` string on its
-  edge. Surface the linked doc as a chunk with the `why` string in
-  `why_relevant`. This is the primary way the moat (LLM-written
-  cross-source justifications) shows up in the gathered payload.
+• Why-chain queries — when the query asks reason / cause / context
+  ("why was X created", "what led to Y", "what's the context behind
+  Z", "show me the discussion / design behind W"), the answer is a
+  CHAIN, not a flat list. Walk `<inferred_chains>` from the resolved
+  anchor. Emit each linked doc as a `GatheredChunk` with the edge
+  `why` quoted verbatim in `why_relevant`. ALSO: if an anchor's doc_id
+  corresponds to a graph entity that appears in `<grounding>` (e.g. a
+  PR doc_id `github:org/repo:pr:42` with a Feature entity
+  `feature:gh:org/repo#42` in grounding), emit that entity as a
+  `GatheredEntity` using the canonical_id FROM `<grounding>`, not the
+  doc_id. The anchor doc_id IS the doc citation; the grounded
+  canonical_id IS the entity. Order chunks by which link is most
+  explanatory first — the consumer renders the chain in the order you
+  surface it.
+
+• Inferred-edge results (general case) — every linked doc has a `why`
+  string on its edge. Even outside why-chain queries, surface the
+  linked doc as a chunk with the `why` string in `why_relevant`. This
+  is the primary way the moat (LLM-written cross-source
+  justifications) shows up in the gathered payload.
 
 • High-degree nodes (hubs) — `subgraph` applies IDF ranking +
   default top-20 cap per hop. Don't ask for "everything" from a hub.

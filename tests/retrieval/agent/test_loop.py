@@ -24,9 +24,11 @@ from fastapi import HTTPException
 from services.retrieval.agent.loop import (
     _affinity_key,
     _build_prefanout_doc_meta,
+    _build_user_message,
     _derive_source_system_from_doc_id,
     _empty_passthrough,
     _extract_cache_hit_rate,
+    _format_inferred_chains,
     _format_prefanout_compact,
     _parse_terminal_args,
     run_gatherer,
@@ -448,10 +450,10 @@ def test_prefanout_full_dump_preserves_inferred_edge_why() -> None:
         "doc_id": "github:owner/repo:pr:78",
         "source_system": "github",
         "title": "PR #78: dashboard auth flow",
-        "content": "...",
         "score": 0.76,
         "edge_type": "references_pr",
         "why": long_why,
+        "anchor_doc_id": "github:owner/repo:pr:71",
     }
     prefanout = {"sub_queries": [{
         "query": "q", "vector": [], "bm25": [], "graph": [], "inferred_edge": [inf_hit],
@@ -518,6 +520,248 @@ def test_build_prefanout_doc_meta_first_complete_wins() -> None:
     assert meta["slack:thread:T123"]["title"] == "incident thread"
     assert meta["slack:thread:T123"]["source_url"] == "https://slack.com/..."
     assert meta["slack:thread:T123"]["author_id"] == "user-1"
+
+
+def test_format_inferred_chains_dedupes_within_anchor_across_sub_queries() -> None:
+    """The same `(anchor, doc_id, edge_type)` triple can appear under
+    multiple sub_queries when fan-out anchors overlap — first occurrence
+    wins, duplicates skip. Without dedup the agent sees the same chain
+    hop N times and biases toward redundant emission."""
+    anchor = "github:prbe-ai/prbe-backend:pr:72"
+    hit = {
+        "doc_id": "linear:org:issue:abc",
+        "source_system": "linear",
+        "title": "[Bug] enrichment 502s",
+        "edge_type": "motivates_pr",
+        "why": "ticket asks for the proxy that pr72 builds",
+        "anchor_doc_id": anchor,
+    }
+    sibling = {
+        "doc_id": "slack:T123:C456:1714.999",
+        "source_system": "slack",
+        "title": "discussion thread",
+        "edge_type": "discussed_in",
+        "why": "approach hashed out before pr72 landed",
+        "anchor_doc_id": anchor,
+    }
+    # Two sub_queries, each carrying the same `hit` plus an extra unique
+    # hit in the second sub_query.
+    out = _format_inferred_chains({"sub_queries": [
+        {"query": "q1", "vector": [], "bm25": [], "graph": [], "inferred_edge": [hit]},
+        {"query": "q2", "vector": [], "bm25": [], "graph": [], "inferred_edge": [hit, sibling]},
+    ]})
+    # The duplicate linked-doc line appears exactly once.
+    assert out.count("linear:org:issue:abc") == 1
+    assert out.count("ticket asks for the proxy") == 1
+    # The unique-to-q2 hit still renders.
+    assert "slack:T123:C456:1714.999" in out
+    assert "discussed_in" in out
+
+
+def test_format_inferred_chains_respects_cap_with_truncation_note() -> None:
+    """Worst-case 5-sub_query x 10-hit fanout would dump ~50 chain hits.
+    The cap stops at `_PREFANOUT_INFERRED_CHAINS_CAP` and emits a
+    "showing top N of M" footer so the agent knows the remainder is
+    reachable via subgraph / fetch_doc — chain shape stays scannable
+    even on hub-heavy queries."""
+    from services.retrieval.agent.loop import _PREFANOUT_INFERRED_CHAINS_CAP
+
+    over = _PREFANOUT_INFERRED_CHAINS_CAP + 5
+    hits = [
+        {
+            "doc_id": f"linear:issue:{i}",
+            "source_system": "linear",
+            "title": f"issue {i}",
+            "edge_type": "motivates_pr",
+            "why": f"reason {i}",
+            "anchor_doc_id": "github:prbe-ai/prbe-backend:pr:72",
+        }
+        for i in range(over)
+    ]
+    out = _format_inferred_chains({"sub_queries": [{
+        "query": "q", "vector": [], "bm25": [], "graph": [], "inferred_edge": hits,
+    }]})
+    # First N rendered, rest dropped.
+    for i in range(_PREFANOUT_INFERRED_CHAINS_CAP):
+        assert f"linear:issue:{i}" in out
+    for i in range(_PREFANOUT_INFERRED_CHAINS_CAP, over):
+        assert f"linear:issue:{i}" not in out
+    # Truncation note tells the agent what to do next.
+    assert (
+        f"showing top {_PREFANOUT_INFERRED_CHAINS_CAP} of {over}" in out
+    )
+    assert "subgraph(anchor)" in out or "with_inferred_edges=true" in out
+
+
+def test_format_inferred_chains_treats_empty_anchor_as_missing() -> None:
+    """`anchor_doc_id=""` is falsy — same handling as missing key:
+    the hit is silently skipped rather than grouped under a phantom
+    empty-string anchor."""
+    hits = [
+        {"doc_id": "d1", "edge_type": "e1", "why": "w1", "anchor_doc_id": ""},
+        {"doc_id": "d2", "edge_type": "e2", "why": "w2", "anchor_doc_id": "a-real"},
+    ]
+    out = _format_inferred_chains({"sub_queries": [{
+        "query": "q", "vector": [], "bm25": [], "graph": [], "inferred_edge": hits,
+    }]})
+    assert "anchor: a-real" in out
+    assert "d2" in out
+    assert "d1" not in out
+    assert "anchor: \n" not in out  # no phantom empty-anchor block
+
+
+# ============================================================
+# Inferred-chains re-grouping — chain shape for why-queries
+# ============================================================
+# The inferred_edge channel returns flat hits; `_format_inferred_chains`
+# regroups them by `anchor_doc_id` so the agent sees the chain (one
+# anchor → many linked docs with edge `why`s). This is the structural
+# view why-chain queries need.
+
+def test_format_inferred_chains_groups_by_anchor() -> None:
+    """Two hits sharing an anchor render under a single `anchor:` line
+    in call-order; a third hit with a different anchor opens its own
+    block. Anchors get listed in first-seen order so the agent reads
+    them top-down."""
+    anchor_a = "github:prbe-ai/prbe-backend:pr:72"
+    anchor_b = "github:prbe-ai/prbe-knowledge:pr:316"
+    hits = [
+        {
+            "doc_id": "linear:org:issue:abc",
+            "source_system": "linear",
+            "title": "[Bug] enrichment 502s",
+            "edge_type": "motivates_pr",
+            "why": "ticket asks for the proxy that pr72 builds",
+            "anchor_doc_id": anchor_a,
+        },
+        {
+            "doc_id": "github:prbe-ai/prbe-backend:issue:76",
+            "source_system": "github",
+            "title": "Issue 76",
+            "edge_type": "addresses",
+            "why": "pr72 implements the github webhook fan-out called for by issue 76",
+            "anchor_doc_id": anchor_a,
+        },
+        {
+            "doc_id": "search-traces/2026-05-17/q-1779050066661.json.gz",
+            "source_system": "trace",
+            "title": "loop_timeout trace",
+            "edge_type": "triggered_by",
+            "why": "the pr316 soft-cap fix was triggered by this loop_timeout trace",
+            "anchor_doc_id": anchor_b,
+        },
+    ]
+    out = _format_inferred_chains({"sub_queries": [{
+        "query": "q", "vector": [], "bm25": [], "graph": [], "inferred_edge": hits,
+    }]})
+    # Anchors render in first-seen order.
+    pos_a = out.find(f"anchor: {anchor_a}")
+    pos_b = out.find(f"anchor: {anchor_b}")
+    assert 0 <= pos_a < pos_b, f"expected anchor_a before anchor_b — got {pos_a=} {pos_b=}"
+    # Each anchor block contains its linked docs + edge + why.
+    assert "linear:org:issue:abc" in out
+    assert "edge=motivates_pr" in out
+    assert "why: ticket asks for the proxy" in out
+    assert "github:prbe-ai/prbe-backend:issue:76" in out
+    assert "edge=addresses" in out
+    assert "search-traces/2026-05-17" in out
+    assert "edge=triggered_by" in out
+
+
+def test_format_inferred_chains_returns_empty_with_no_inferred_hits() -> None:
+    """No inferred-edge hits anywhere → empty string (NOT a header with
+    nothing under it). `_build_user_message` checks this empty/non-empty
+    to decide whether to render the `<inferred_chains>` section at all."""
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": [{"doc_id": "x"}], "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    assert _format_inferred_chains(prefanout) == ""
+
+
+def test_format_inferred_chains_skips_hits_with_no_anchor() -> None:
+    """Defensive: an inferred-edge hit missing `anchor_doc_id` can't be
+    placed in a chain. Skip silently rather than crashing or grouping
+    under a phantom 'None' anchor."""
+    hits = [
+        {"doc_id": "d1", "edge_type": "e1", "why": "w1"},  # no anchor
+        {"doc_id": "d2", "edge_type": "e2", "why": "w2", "anchor_doc_id": "a-real"},
+    ]
+    out = _format_inferred_chains({"sub_queries": [{
+        "query": "q", "vector": [], "bm25": [], "graph": [], "inferred_edge": hits,
+    }]})
+    assert "anchor: a-real" in out
+    assert "d2" in out
+    assert "d1" not in out  # the anchor-less hit was skipped
+    assert "None" not in out
+    assert "anchor: ?" not in out
+
+
+# ============================================================
+# _build_user_message — section composition
+# ============================================================
+# The user message is assembled from grounding + connected_sources +
+# channel_results + inferred_chains + query. The chain section MUST
+# only render when there are inferred-edge hits, otherwise it pollutes
+# the prompt for all the vector/bm25-only queries.
+
+def test_build_user_message_includes_inferred_chains_when_present() -> None:
+    """When inferred-edge hits exist the `<inferred_chains>` section
+    renders AFTER `<channel_results>` with the regrouped view + the
+    instruction text. This is the structural cue for why-chain queries."""
+    from services.retrieval.grounding import GroundingBundle
+
+    inf_hit = {
+        "doc_id": "linear:org:issue:abc",
+        "source_system": "linear",
+        "title": "[Bug] enrichment 502s",
+        "edge_type": "motivates_pr",
+        "why": "ticket asks for the proxy that pr72 builds",
+        "anchor_doc_id": "github:prbe-ai/prbe-backend:pr:72",
+    }
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": [], "bm25": [], "graph": [], "inferred_edge": [inf_hit],
+    }]}
+    out = _build_user_message("why was PR 72 created", GroundingBundle(), prefanout)
+    assert "<inferred_chains>" in out
+    assert "anchor: github:prbe-ai/prbe-backend:pr:72" in out
+    # Order: channel_results before inferred_chains, both before query.
+    pos_chan = out.find("<channel_results>")
+    pos_chain = out.find("<inferred_chains>")
+    pos_query = out.find("<query>")
+    assert 0 <= pos_chan < pos_chain < pos_query
+
+
+def test_build_user_message_omits_inferred_chains_when_no_inferred_hits() -> None:
+    """Vector/bm25-only queries don't get the empty chain section —
+    that'd waste tokens + confuse the agent into looking for a chain
+    that isn't there. The `<channel_results>` intro prose references
+    `<inferred_chains>` by name (it tells the agent where inferred-edge
+    data lives WHEN present), so a bare substring search isn't enough;
+    we check the actual section opener appears on a fresh line."""
+    from services.retrieval.grounding import GroundingBundle
+
+    prefanout = {"sub_queries": [{
+        "query": "q",
+        "vector": [_mk_hit()],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    out = _build_user_message("self-hosting features", GroundingBundle(), prefanout)
+    assert "<channel_results>" in out
+    assert "\n<inferred_chains>\n" not in out
+    assert "</inferred_chains>" not in out
+
+
+def test_build_user_message_omits_inferred_chains_when_no_prefanout() -> None:
+    """No pre-fan-out at all (LLM-extraction-only path) → neither
+    channel_results nor inferred_chains render. Same opener-only check
+    as the no-inferred-hits sibling: the prose intro doesn't render
+    either since channel_results itself is skipped."""
+    from services.retrieval.grounding import GroundingBundle
+
+    out = _build_user_message("q", GroundingBundle(), None)
+    assert "<channel_results>" not in out
+    assert "\n<inferred_chains>\n" not in out
+    assert "</inferred_chains>" not in out
 
 
 # ============================================================
