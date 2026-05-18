@@ -324,12 +324,18 @@ def test_cli_writes_jsonl_lines_for_blobs(
 # ============================================================
 
 
-@pytest.mark.asyncio
-async def test_fetch_one_happy_path(
+def test_fetch_one_happy_path(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Successful R2 fetch + gunzip + JSON print to stdout."""
+    """Successful R2 fetch + gunzip + JSON print to stdout.
+
+    NOT marked @pytest.mark.asyncio because fetch_one.main() wraps
+    asyncio.run() internally; nesting another event loop via
+    pytest-asyncio would raise "asyncio.run() cannot be called from a
+    running event loop".
+    """
     import gzip as _gz
+
     from services.retrieval.agent.trace_analyzer import fetch_one
 
     blob = {"trace_id": "t-1", "schema_version": 1, "status": "ok"}
