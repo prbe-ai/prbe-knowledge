@@ -559,7 +559,7 @@ def test_format_inferred_chains_dedupes_within_anchor_across_sub_queries() -> No
 
 
 def test_format_inferred_chains_respects_cap_with_truncation_note() -> None:
-    """Worst-case 5-sub_query × 10-hit fanout would dump ~50 chain hits.
+    """Worst-case 5-sub_query x 10-hit fanout would dump ~50 chain hits.
     The cap stops at `_PREFANOUT_INFERRED_CHAINS_CAP` and emits a
     "showing top N of M" footer so the agent knows the remainder is
     reachable via subgraph / fetch_doc — chain shape stays scannable

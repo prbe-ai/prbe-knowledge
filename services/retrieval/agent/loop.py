@@ -151,8 +151,8 @@ def _format_prefanout_compact(prefanout: dict[str, Any]) -> str:
     return json.dumps(prefanout, default=str, indent=2)
 
 
-# Total chain-line cap. Each line ≈ 100-300 chars; capping ~30 keeps the
-# section under ~10KB on the worst-case 5-sub_query × 10-hit fan-out.
+# Total chain-line cap. Each line ~100-300 chars; capping ~30 keeps the
+# section under ~10KB on the worst-case 5-sub_query x 10-hit fan-out.
 # The full JSON dump in `_format_prefanout_compact` is the source of truth
 # for raw hits; this section is a complementary structural view (grouped
 # by anchor) — its job is making chain shape visible, not exhaustively
@@ -644,7 +644,7 @@ def _build_prefanout_doc_meta(prefanout: dict[str, Any] | None) -> dict[str, dic
     return out
 
 
-def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> dict[str, Any]:
+def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict[str, Any]:
     """Pre-parse coercion for non-strict providers (Cerebras et al.).
 
     Cerebras's gpt-oss-120b emits emit_gatherer_output args with input-
@@ -754,7 +754,7 @@ def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> di
     notes = dict(out.get("gatherer_notes") or {})
     if state is not None:
         notes["turns_used"] = state.turn_count
-        notes["tools_called"] = list(state.tools_fired) + [TERMINAL_TOOL_NAME]
+        notes["tools_called"] = [*state.tools_fired, TERMINAL_TOOL_NAME]
     out["gatherer_notes"] = notes
     return out
 
@@ -796,12 +796,11 @@ def _repair_truncated_json(s: str) -> str | None:
                 continue
             if c in "{[":
                 stack.append(c)
-            elif c in "}]":
-                if stack and (
-                    (c == "}" and stack[-1] == "{") or (c == "]" and stack[-1] == "[")
-                ):
-                    stack.pop()
-                    last_clean_at_depth[len(stack)] = i + 1
+            elif c in "}]" and stack and (
+                (c == "}" and stack[-1] == "{") or (c == "]" and stack[-1] == "[")
+            ):
+                stack.pop()
+                last_clean_at_depth[len(stack)] = i + 1
         return stack, in_string, last_clean_at_depth
 
     stack, in_string, last_clean = walk(s)
@@ -836,7 +835,7 @@ def _repair_truncated_json(s: str) -> str | None:
 
 def _parse_terminal_args(
     raw_args: str | dict[str, Any] | None,
-    state: "LoopState | None" = None,
+    state: LoopState | None = None,
 ) -> GathererOutput | None:
     """Parse the emit_gatherer_output tool-call arguments as
     GathererOutput. Returns None on JSON-parse failure (unrecoverable).
