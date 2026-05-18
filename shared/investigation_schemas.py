@@ -19,7 +19,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from shared.constants import SourceSystem
 
-
 InvestigationMode = Literal["full", "playbook_only", "stub"]
 InvestigationState = Literal[
     "pending_dispatch", "running", "pending_review",

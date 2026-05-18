@@ -1,10 +1,10 @@
 """Tests for PagerDuty + incident.io SourceSystem and DocType constants."""
 
 from shared.constants import (
-    DocType,
     SOURCE_DISPLAY_NAMES,
     SOURCE_HALF_LIFE_DAYS,
     SOURCE_INGESTION_PRIORITY,
+    DocType,
     SourceSystem,
 )
 

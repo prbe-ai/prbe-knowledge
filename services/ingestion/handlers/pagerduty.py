@@ -19,7 +19,14 @@ from typing import Any, ClassVar
 from services.ingestion.chunker import count_tokens
 from services.ingestion.handlers.base import Connector
 from services.ingestion.handlers.registry import register_connector
-from shared.constants import DocClass, DocType, IngestionEventType, Permission, PrincipalType, SourceSystem
+from shared.constants import (
+    DocClass,
+    DocType,
+    IngestionEventType,
+    Permission,
+    PrincipalType,
+    SourceSystem,
+)
 from shared.exceptions import InvalidWebhookPayload
 from shared.models import (
     ACLPrincipal,
@@ -173,7 +180,7 @@ class PagerDutyConnector(Connector):
         body = "\n".join(body_lines)
 
         content_hash = hashlib.sha256(
-            f"{event_type}|{status}|{body}".encode("utf-8")
+            f"{event_type}|{status}|{body}".encode()
         ).hexdigest()
 
         # ACL: workspace principal + optional service group

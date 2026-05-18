@@ -16,7 +16,6 @@ from shared.constants import (
     DocClass,
     DocType,
     IngestionEventType,
-    Permission,
     PrincipalType,
     SourceSystem,
 )
@@ -78,7 +77,7 @@ def test_parse_missing_event_block_raises() -> None:
 
 def test_parse_missing_data_block_raises() -> None:
     pd = _build()
-    with pytest.raises(InvalidWebhookPayload, match="missing 'event.data'"):
+    with pytest.raises(InvalidWebhookPayload, match=r"missing 'event\.data'"):
         pd.parse_webhook_event(
             "cust-1", {}, {"event": {"event_type": "incident.triggered"}},
         )

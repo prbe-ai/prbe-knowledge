@@ -16,7 +16,6 @@ from shared.constants import (
     DocClass,
     DocType,
     IngestionEventType,
-    Permission,
     PrincipalType,
     SourceSystem,
 )
@@ -114,7 +113,7 @@ def test_parse_missing_event_type_key_raises() -> None:
     iio = _build()
     with pytest.raises(
         InvalidWebhookPayload,
-        match="missing 'public_incident.incident_created_v2' object",
+        match=r"missing 'public_incident\.incident_created_v2' object",
     ):
         iio.parse_webhook_event(
             "cust-1", {},
