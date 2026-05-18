@@ -49,6 +49,11 @@ GathererStatus = Literal[
     # trace blob with this status — the partial transcript is exactly
     # the artifact we need to debug provider-side regressions.
     "fatal_provider_error",
+    # Grounding+extraction surfaced no entities AND all 4 pre-fan-out
+    # channels returned 0 hits. The LLM cannot synthesize results from
+    # nothing; the harness returns an empty GathererOutput without
+    # entering the loop, saving 3-5s on truly hopeless queries.
+    "zero_recall_short_circuit",
 ]
 
 
@@ -88,6 +93,14 @@ class GatheredChunk(BaseModel):
     `doc_id` stays required — without it the chunk has no resolvable
     citation. Pre-parse coercion in loop.py derives `doc_id` from
     `chunk_id` when the model omits it.
+
+    Doc-level pass-through fields (source_system / title / source_url /
+    created_at / updated_at / author_id) are optional on the agent's
+    emission contract — they're filled from the pre-fan-out hit by
+    `_coerce_lenient` in loop.py so the adapter doesn't have to
+    fabricate them. Pre-extension, every QueryDocumentResult landed
+    labelled `source_system="github"` because the adapter had no source
+    field to read.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -104,6 +117,16 @@ class GatheredChunk(BaseModel):
         description="One-line, agent-written rationale. For inferred-edge "
         "neighbors, quote the edge `why` string verbatim.",
     )
+    source_system: str = Field(
+        default="",
+        description="Source system slug (github/slack/linear/notion/sentry/...). "
+        "Harness fills from prefanout hit; falls back to doc_id prefix.",
+    )
+    title: str = Field(default="", description="Doc title; blank when not known.")
+    source_url: str = Field(default="", description="Doc URL; blank when not known.")
+    created_at: str | None = Field(default=None, description="ISO8601 timestamp from doc.")
+    updated_at: str | None = Field(default=None, description="ISO8601 timestamp from doc.")
+    author_id: str | None = Field(default=None, description="Author canonical_id from doc.")
 
 
 class DroppedCandidate(BaseModel):

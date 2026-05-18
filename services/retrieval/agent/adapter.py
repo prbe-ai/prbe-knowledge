@@ -28,19 +28,50 @@ from shared.models import (
 )
 
 
-def _safe_source_system(value: str | None) -> str:
+def _safe_source_system(value: str | None, doc_id: str | None = None) -> str:
     """Coerce a free-form source_system string to the SourceSystem enum value.
 
-    Falls back to the raw string when the gatherer surfaces an unknown
-    source (we don't want to drop a result just because the enum hasn't
-    been updated yet).
+    `value` is whatever the gatherer surfaced (now propagated through
+    GatheredChunk.source_system, filled from the prefanout hit by
+    `_coerce_lenient`). `doc_id` is the namespaced doc_id — its prefix
+    serves as a fallback (e.g. `slack:thread:T123` → `"slack"`) when
+    `value` is missing. Final fallback is GitHub to match the
+    pre-extension wire shape; this only fires when both the gatherer
+    value AND the doc_id prefix are unrecognised, which should be rare.
+
+    Pre-extension (before GatheredChunk grew a source_system field),
+    every call site passed `None` and got `"github"` — every result was
+    mislabelled as GitHub regardless of its true source.
     """
-    if not value:
-        return "github"  # safest default; matches most code paths
-    try:
-        return SourceSystem(value).value
-    except ValueError:
+    if value:
+        try:
+            return SourceSystem(value).value
+        except ValueError:
+            return value  # unknown enum value — surface rather than drop
+    if doc_id and ":" in doc_id:
+        prefix = doc_id.split(":", 1)[0].strip().lower()
+        try:
+            return SourceSystem(prefix).value
+        except ValueError:
+            pass
+    return SourceSystem.GITHUB.value
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse a GatheredChunk ISO8601 timestamp string into a datetime, or
+    return None when the input isn't a parseable string. The chunk model
+    types these as `str | None`; the upstream channel hit had a real
+    datetime that was stringified at the dict-conversion boundary."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
         return value
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _chunk_to_query_chunk(chunk: Any, doc_id: str, rank: int) -> QueryChunk:
@@ -113,6 +144,17 @@ def to_query_response(
                     )
                 )
 
+        # Doc-level metadata: take the first chunk's pass-through fields
+        # (they should agree across chunks of the same doc — populated
+        # from the prefanout hit by `_coerce_lenient`). Timestamps fall
+        # back to request time only when the chunk doesn't carry one.
+        first = chunks[0]
+        created_at = _parse_iso(getattr(first, "created_at", None)) or now
+        updated_at = _parse_iso(getattr(first, "updated_at", None)) or now
+        title = getattr(first, "title", "") or None
+        source_url = getattr(first, "source_url", "") or ""
+        author_id = getattr(first, "author_id", None)
+
         results.append(
             QueryDocumentResult(
                 canonical_id=doc_id,
@@ -121,12 +163,15 @@ def to_query_response(
                 matched_via=provenance,
                 doc_id=doc_id,
                 doc_version=1,
-                source_system=_safe_source_system(None),  # type: ignore[arg-type]
-                source_url="",
-                title=None,
-                author_id=None,
-                created_at=now,
-                updated_at=now,
+                source_system=_safe_source_system(  # type: ignore[arg-type]
+                    getattr(first, "source_system", None),
+                    doc_id=doc_id,
+                ),
+                source_url=source_url,
+                title=title,
+                author_id=author_id,
+                created_at=created_at,
+                updated_at=updated_at,
                 chunks=[_chunk_to_query_chunk(c, doc_id=doc_id, rank=i) for i, c in enumerate(chunks)],
                 chunk_count=len(chunks),
                 retriever_scores={},

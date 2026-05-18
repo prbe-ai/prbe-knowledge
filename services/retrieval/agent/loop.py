@@ -70,6 +70,7 @@ from shared.constants import (
     SEARCH_AGENT_TOOL_BUDGET,
     SEARCH_AGENT_TRACE_SAMPLE_RATE,
     SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
+    SourceSystem,
 )
 from shared.llm import LLMError, acompletion
 from shared.logging import get_logger
@@ -128,90 +129,26 @@ class LoopState:
 # Message + helpers
 # ============================================================
 
-# Per-hit snippet cap (chars). Enough for the model to judge relevance;
-# full content is one fetch_doc call away. 150 chars ≈ 1-2 sentences.
-_PREFANOUT_SNIPPET_CHARS = 150
-
-# Per-channel hit cap in the compact rendering. The pre-fan-out returns
-# top-K hits per channel (config-controlled, currently up to ~20 each).
-# Rendering all of them in the first-turn input bloats prompts to 15K+
-# tokens of low-signal evidence. Cap at 10 — model sees the strongest
-# hits per channel; weaker hits remain in the database for fetch_doc /
-# explicit-search recovery (not lost, just not in the cold-cache prompt).
-_PREFANOUT_PER_CHANNEL_DISPLAY_CAP = 10
-
-
-def _truncate_snippet(text: str | None, n: int = _PREFANOUT_SNIPPET_CHARS) -> str:
-    """One-line snippet for the compact channel rendering."""
-    if not text:
-        return ""
-    flat = " ".join(text.split())
-    if len(flat) <= n:
-        return flat
-    return flat[: n - 1].rstrip() + "…"
-
-
 def _format_prefanout_compact(prefanout: dict[str, Any]) -> str:
-    """Render `execute_search` result as compact text instead of JSON dump.
+    """Render `execute_search` result as a full JSON dump for the LLM.
 
-    Why: the JSON form embeds every per-hit field (chunk_id, created_at,
-    updated_at, author_id, source_url, full content, plus field-name
-    overhead × N hits × 4 channels) and hits ~15K input tokens on cold
-    cache. gpt-oss-120b is a reasoning model — that much input deterministically
-    blows past the 90s loop timeout on cold cache. The compact form keeps
-    every doc_id (so fetch_doc still works), every score, every title, and
-    a 150-char snippet — everything the model needs to pick its next tool
-    call. Verbose fields are one fetch_doc away.
+    History: PR #307 introduced a compact rendering (top-10 per channel,
+    150-char snippet truncation, fields stripped) because Fireworks
+    gpt-oss-120b deterministically blew past the 90s loop timeout on
+    cold-cache 15K-token inputs. Cerebras's higher input throughput
+    removed that constraint — and the cap was masking non-GitHub hits
+    from the LLM whenever bm25/vector's top 10 happened to be all
+    GitHub. Same query, same corpus → "GitHub-only chunks" symptom.
 
-    Format (per hit):
-        [v1] doc_id score=0.87 src=slack title="..."
-             "first 150 chars of content..."
+    Full uncompress: dump every channel hit with every field. The agent
+    now sees the complete pre-fan-out, can curate freely across all
+    sources, and only the LLM-emitted final selection feeds downstream
+    consumers. Function name kept (callsite stability) but the
+    "compact" semantic is gone.
     """
-    out_lines: list[str] = []
-    sub_queries = prefanout.get("sub_queries") or []
-    for sq_idx, sq in enumerate(sub_queries, 1):
-        if len(sub_queries) > 1:
-            q_label = (sq.get("query") or "").strip()
-            out_lines.append(f"\n=== sub_query {sq_idx}: {_truncate_snippet(q_label, 100)} ===")
-        for channel_name, prefix in (
-            ("vector", "v"),
-            ("bm25", "b"),
-            ("graph", "g"),
-            ("inferred_edge", "i"),
-        ):
-            hits = sq.get(channel_name) or []
-            if not hits:
-                continue
-            shown = hits[:_PREFANOUT_PER_CHANNEL_DISPLAY_CAP]
-            omitted = len(hits) - len(shown)
-            header = f"<{channel_name}>"
-            if omitted > 0:
-                header = (
-                    f"<{channel_name} showing_top_{len(shown)}_of_{len(hits)} "
-                    f"(remaining accessible via fetch_doc / search)>"
-                )
-            out_lines.append(header)
-            for i, hit in enumerate(shown, 1):
-                doc_id = hit.get("doc_id") or "?"
-                score = hit.get("score")
-                score_str = f"{score:.3f}" if isinstance(score, int | float) else "?"
-                src = hit.get("source_system") or "?"
-                title = _truncate_snippet(hit.get("title"), 80)
-                snippet = _truncate_snippet(hit.get("content"))
-                # inferred_edge carries the "why" rationale — the moat.
-                why = hit.get("why")
-                edge = hit.get("edge_type")
-                tag_parts = [f"[{prefix}{i}]", doc_id, f"score={score_str}", f"src={src}"]
-                if edge:
-                    tag_parts.append(f"edge={edge}")
-                if title:
-                    tag_parts.append(f'title="{title}"')
-                out_lines.append(" ".join(tag_parts))
-                if snippet:
-                    out_lines.append(f'    "{snippet}"')
-                if why:
-                    out_lines.append(f"    why: {_truncate_snippet(why, 200)}")
-    return "\n".join(out_lines) if out_lines else "(no pre-fan-out hits)"
+    if not prefanout or not prefanout.get("sub_queries"):
+        return "(no pre-fan-out hits)"
+    return json.dumps(prefanout, default=str, indent=2)
 
 
 def _build_user_message(
@@ -530,6 +467,51 @@ def _derive_doc_id_from_chunk_id(chunk_id: str) -> str | None:
 _CHUNK_CONTENT_ALIASES = ("description", "summary", "snippet", "text", "body", "title")
 
 
+def _derive_source_system_from_doc_id(doc_id: str | None) -> str:
+    """Doc IDs are namespaced `<source>:<...>` (e.g. `slack:thread:T123`,
+    `github:owner/repo:pr:42`, `linear:ticket:PRB-17`). Pull the prefix
+    and map it to the SourceSystem enum. Returns empty string when the
+    prefix doesn't match a known source — the adapter then keeps the
+    field blank rather than mislabelling.
+    """
+    if not doc_id or ":" not in doc_id:
+        return ""
+    prefix = doc_id.split(":", 1)[0].strip().lower()
+    try:
+        return SourceSystem(prefix).value
+    except ValueError:
+        return ""
+
+
+def _build_prefanout_doc_meta(prefanout: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """Flatten `execute_search` result into `doc_id → {source_system, title,
+    source_url, created_at, updated_at, author_id}`. Used by `_coerce_lenient`
+    to fill doc-level fields on emitted chunks when the model omits them.
+
+    First-write wins: vector channel typically lands first; later channels
+    won't overwrite. (The doc-level fields are identical across channels
+    for the same doc_id; ordering only matters when one channel happens
+    to omit a field — keep the most complete record.)
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for sq in (prefanout or {}).get("sub_queries") or []:
+        if not isinstance(sq, dict):
+            continue
+        for channel in ("vector", "bm25", "graph", "inferred_edge"):
+            for hit in sq.get(channel) or []:
+                if not isinstance(hit, dict):
+                    continue
+                doc_id = hit.get("doc_id")
+                if not doc_id:
+                    continue
+                meta = out.setdefault(doc_id, {})
+                for meta_field in ("source_system", "title", "source_url",
+                                   "created_at", "updated_at", "author_id"):
+                    if not meta.get(meta_field) and hit.get(meta_field):
+                        meta[meta_field] = hit[meta_field]
+    return out
+
+
 def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> dict[str, Any]:
     """Pre-parse coercion for non-strict providers (Cerebras et al.).
 
@@ -549,11 +531,22 @@ def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> di
         LoopState — that ledger is the canonical record per trace_blob.py.
       - Drops chunks for which no usable doc_id + content pair can be
         recovered (no resolvable citation).
+      - Fills doc-level pass-through fields (source_system, title,
+        source_url, created_at, updated_at, author_id) from the
+        pre-fan-out doc meta when the model omitted them. Falls back to
+        deriving `source_system` from the doc_id prefix. Pre-extension,
+        the adapter hard-coded `source_system="github"` for every
+        result because there was no source field to read.
 
     Safe to call even on Fireworks-strict output — only fills fields
     that are missing.
     """
     out = dict(raw) if isinstance(raw, dict) else {}
+    # Doc-meta lookup from the harness's pre-fan-out so we can fill
+    # source_system/title/url on chunks the model emitted by doc_id only.
+    prefanout_meta: dict[str, dict[str, Any]] = (
+        _build_prefanout_doc_meta(state.prefanout) if state is not None else {}
+    )
     # Entities: filter non-dict items + alias `id` → `canonical_id`.
     # Cerebras gpt-oss-120b occasionally emits malformed JSON fragments as
     # bare strings inside arrays (e.g. `entities=[{...valid...}, '{',
@@ -600,6 +593,28 @@ def _coerce_lenient(raw: dict[str, Any], state: "LoopState | None" = None) -> di
                     break
         if not ch_out.get("content"):
             continue  # No body to cite
+        # Fill doc-level pass-through fields. The prefanout meta is the
+        # canonical record from the DB (titles, URLs, timestamps the
+        # ingestion pipeline persisted), so it WINS over the model's
+        # emission whenever it's present — Cerebras's gpt-oss-120b is
+        # known to fabricate / schema-drift on these fields. When the
+        # doc isn't in prefanout (e.g., the agent followed an inferred
+        # edge via fetch_doc to a new doc), the model's emission is the
+        # only source — keep it. Final fallback for source_system is the
+        # doc_id prefix.
+        meta = prefanout_meta.get(ch_out["doc_id"], {})
+        if meta.get("source_system"):
+            ch_out["source_system"] = meta["source_system"]
+        elif not ch_out.get("source_system"):
+            ch_out["source_system"] = (
+                _derive_source_system_from_doc_id(ch_out["doc_id"]) or ""
+            )
+        for meta_field in ("title", "source_url"):
+            if meta.get(meta_field):
+                ch_out[meta_field] = meta[meta_field]
+        for meta_field in ("created_at", "updated_at", "author_id"):
+            if meta.get(meta_field) is not None:
+                ch_out[meta_field] = meta[meta_field]
         chunks_out.append(ch_out)
     if chunks_out or "chunks" in out:
         out["chunks"] = chunks_out
@@ -917,6 +932,46 @@ async def run_gatherer(
 
     t_agent = time.perf_counter()
     status: GathererStatus = "ok"
+
+    # Pre-flight zero-recall fast-path. If grounding + extraction surfaced
+    # no entities AND every pre-fan-out channel returned zero hits, the
+    # LLM has nothing to curate from. Skip the loop, return an empty
+    # GathererOutput. Saves ~3-5s per truly-hopeless query (the loop
+    # otherwise burns one or two turns hitting `search` with the same
+    # query before terminating).
+    prefanout_total = sum(prefanout_hit_counts.values())
+    if prefanout_total == 0 and not entity_dicts:
+        log.info(
+            "agent.zero_recall_short_circuit",
+            customer_id=customer_id,
+            trace_id=trace_id,
+        )
+        status = "zero_recall_short_circuit"
+        gathered = _empty_passthrough("zero_recall_short_circuit")
+        timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
+        if request is not None:
+            request.state.gatherer_status = status
+            request.state.tool_calls_count = 0
+            request.state.need_deeper_extensions = 0
+            request.state.confidence = gathered.gatherer_notes.confidence
+            request.state.dropped_count = len(gathered.gatherer_notes.dropped)
+            request.state.cache_hit_rate = None
+            request.state.intents_count = 1
+            request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
+            request.state.failure_recovered = True
+        _stash_for_trace_persist(
+            request,
+            customer_id=customer_id,
+            trace_id=trace_id,
+            query=req.query,
+            state=state,
+            gathered=gathered,
+            status=status,
+            timing=timing,
+        )
+        return to_query_response(
+            query=req.query, gathered=gathered, trace_id=trace_id, timing_ms=timing
+        )
 
     if _no_llm_configured():
         log.info(

@@ -100,7 +100,7 @@ async def vector_search(
               {pred.doc_sql}
               {source_filter}
               {doc_type_filter}
-            ORDER BY c.embedding_v2 <=> $2::halfvec
+            ORDER BY c.embedding_v2 <=> $2::halfvec, c.chunk_id
             LIMIT $3
             """,
             *params,
