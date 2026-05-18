@@ -60,7 +60,7 @@ def test_parse_created_event_id_is_lifecycle_scoped() -> None:
     assert result.event_kind == IngestionEventType.WEBHOOK
     assert result.parse_hint["incident_id"] == "01ABCDEFGHIJKLMNOPQRSTUVWX"
     assert result.parse_hint["event_type"] == "public_incident.incident_created_v2"
-    assert result.parse_hint["workspace_id"] == "ws_01XYZ"
+    assert result.parse_hint["slack_team_id"] == "T01XYZ"
 
 
 def test_parse_status_changed_event_id_is_lifecycle_scoped() -> None:
@@ -92,8 +92,10 @@ def test_parse_handles_any_public_incident_event_type(event_type: str) -> None:
     documented incident.io lifecycle event_type."""
     iio = _build()
     payload = _load("incident_created.json")
+    # Move the incident object to the new event_type key (real envelope shape)
+    incident_obj = payload.pop("public_incident.incident_created_v2")
     payload["event_type"] = event_type
-    payload["delivery_id"] = f"01EVENT_{event_type}"
+    payload[event_type] = incident_obj
     result = iio.parse_webhook_event("cust-1", {}, payload)
     assert result is not None
     assert event_type in result.source_event_id
@@ -108,21 +110,15 @@ def test_parse_non_incident_event_returns_none() -> None:
     assert result is None
 
 
-def test_parse_missing_data_block_raises() -> None:
+def test_parse_missing_event_type_key_raises() -> None:
     iio = _build()
-    with pytest.raises(InvalidWebhookPayload, match="missing 'data' dict"):
+    with pytest.raises(
+        InvalidWebhookPayload,
+        match="missing 'public_incident.incident_created_v2' object",
+    ):
         iio.parse_webhook_event(
             "cust-1", {},
             {"event_type": "public_incident.incident_created_v2"},
-        )
-
-
-def test_parse_missing_incident_block_raises() -> None:
-    iio = _build()
-    with pytest.raises(InvalidWebhookPayload, match="missing 'data.incident'"):
-        iio.parse_webhook_event(
-            "cust-1", {},
-            {"event_type": "public_incident.incident_created_v2", "data": {}},
         )
 
 
@@ -133,7 +129,7 @@ def test_parse_missing_incident_id_raises() -> None:
             "cust-1", {},
             {
                 "event_type": "public_incident.incident_created_v2",
-                "data": {"incident": {}},
+                "public_incident.incident_created_v2": {},
             },
         )
 
@@ -175,7 +171,7 @@ async def test_normalize_created_emits_incident_doc_and_flag() -> None:
     assert "investigating" in (doc.body or "").lower()
     assert doc.metadata["current_status"] == "Investigating"
     assert doc.metadata["severity"] == "Major"
-    assert doc.metadata["workspace_id"] == "ws_01XYZ"
+    assert doc.metadata["slack_team_id"] == "T01XYZ"
     assert doc.metadata["reference"] == "INC-42"
     assert doc.metadata["service_tag"] == "checkout-svc"
     assert doc.metadata["last_event_type"] == "public_incident.incident_created_v2"
@@ -229,7 +225,7 @@ async def test_normalize_acl_workspace_plus_service_group() -> None:
 async def test_normalize_acl_workspace_only_when_service_field_missing() -> None:
     iio = _build()
     payload = _load("incident_created.json")
-    payload["data"]["incident"]["custom_field_entries"] = []
+    payload["public_incident.incident_created_v2"]["custom_field_entries"] = []
     event_id = (
         "iio:incident:01ABCDEFGHIJKLMNOPQRSTUVWX:public_incident.incident_created_v2"
     )
@@ -246,7 +242,7 @@ async def test_normalize_acl_workspace_only_when_service_field_missing() -> None
 async def test_normalize_skipped_when_incident_id_missing() -> None:
     iio = _build()
     payload = _load("incident_created.json")
-    del payload["data"]["incident"]["id"]
+    del payload["public_incident.incident_created_v2"]["id"]
     event_id = "iio:incident:X:public_incident.incident_created_v2"
     result = await iio.normalize(_make_event(payload, event_id), {})
     assert result.skipped_reason == "missing data.incident.id"

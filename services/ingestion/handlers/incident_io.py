@@ -91,20 +91,19 @@ class IncidentIoConnector(Connector):
             _INCIDENT_EVENT_PREFIX
         ):
             return None
-        data = raw_payload.get("data")
-        if not isinstance(data, dict):
-            raise InvalidWebhookPayload("incident_io payload missing 'data' dict")
-        incident = data.get("incident")
+        # incident.io's actual envelope keys the resource by the event_type
+        # string itself. There is no `data` wrapper. Confirmed against
+        # docs.incident.io/openapi/webhooks.json (WebhooksPublicIncident*ResponseBody).
+        incident = raw_payload.get(event_type)
         if not isinstance(incident, dict):
             raise InvalidWebhookPayload(
-                "incident_io payload missing 'data.incident'"
+                f"incident_io payload missing '{event_type}' object"
             )
         incident_id = incident.get("id")
         if not incident_id:
             raise InvalidWebhookPayload("incident_io incident missing id")
         received_at = (
-            _parse_iso8601(raw_payload.get("delivered_at"))
-            or _parse_iso8601(incident.get("created_at"))
+            _parse_iso8601(incident.get("created_at"))
             or datetime.now(UTC)
         )
         return WebhookParseResult(
@@ -114,7 +113,7 @@ class IncidentIoConnector(Connector):
             parse_hint={
                 "incident_id": incident_id,
                 "event_type": event_type,
-                "workspace_id": incident.get("workspace_id"),
+                "slack_team_id": incident.get("slack_team_id"),
                 "reference": incident.get("reference"),
             },
         )
@@ -124,8 +123,9 @@ class IncidentIoConnector(Connector):
     ) -> NormalizationResult:
         payload = event.raw_payload
         event_type = payload.get("event_type") or ""
-        data = payload.get("data") or {}
-        incident = data.get("incident") or {}
+        incident = payload.get(event_type) if event_type else {}
+        if not isinstance(incident, dict):
+            incident = {}
         incident_id = incident.get("id")
         if not incident_id:
             return NormalizationResult(skipped_reason="missing data.incident.id")
@@ -223,7 +223,7 @@ class IncidentIoConnector(Connector):
                 "current_status": status,
                 "severity": severity,
                 "last_event_type": event_type,
-                "workspace_id": incident.get("workspace_id"),
+                "slack_team_id": incident.get("slack_team_id"),
                 "reference": reference,
                 "service_tag": service_tag,
                 "permalink": source_url,
