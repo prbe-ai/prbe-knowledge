@@ -94,14 +94,24 @@ jobs:
         id: launch
         run: |
           set -euo pipefail
-          export DATE_PLACEHOLDER="${{ steps.ctx.outputs.target_date }}"
-          export JOB_SUFFIX_PLACEHOLDER="${{ steps.ctx.outputs.job_suffix }}"
-          export IMAGE_TAG_PLACEHOLDER="${{ steps.ctx.outputs.image_tag }}"
-          JOB_NAME="nightly-trace-digest-${DATE_PLACEHOLDER}-${JOB_SUFFIX_PLACEHOLDER}"
+          DATE="${{ steps.ctx.outputs.target_date }}"
+          JOB_SUFFIX="${{ steps.ctx.outputs.job_suffix }}"
+          IMAGE_TAG="${{ steps.ctx.outputs.image_tag }}"
+          JOB_NAME="nightly-trace-digest-${DATE}-${JOB_SUFFIX}"
           echo "job_name=$JOB_NAME" >> "$GITHUB_OUTPUT"
 
-          envsubst < k8s/jobs/nightly-trace-digest.yaml \
-            > /tmp/job.yaml
+          # Use sed instead of envsubst so we only touch the 3 known
+          # placeholders. envsubst would expand ANY $VAR reference,
+          # which is hostile if anyone later adds a legit $VAR to the
+          # manifest (e.g. a secret reference in a comment).
+          sed \
+            -e "s|DATE_PLACEHOLDER|${DATE}|g" \
+            -e "s|JOB_SUFFIX_PLACEHOLDER|${JOB_SUFFIX}|g" \
+            -e "s|IMAGE_TAG_PLACEHOLDER|${IMAGE_TAG}|g" \
+            k8s/jobs/nightly-trace-digest.yaml > /tmp/job.yaml
+
+          echo "--- rendered Job (head) ---"
+          head -10 /tmp/job.yaml
           kubectl apply -f /tmp/job.yaml
 
       - name: Wait for digest job + stream output
