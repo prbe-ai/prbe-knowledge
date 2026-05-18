@@ -139,6 +139,18 @@ jobs:
         if: steps.digest.outputs.line_count == '0'
         run: exit 0
 
+      - name: Ensure auto-optimization label exists
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          # First nightly run on a fresh repo: the label needs to exist
+          # before `gh pr create --label auto-optimization` works. `gh
+          # label create` fails when the label exists, so swallow that.
+          gh label create auto-optimization \
+            --repo prbe-ai/prbe-knowledge \
+            --description "Draft PR produced by nightly trace-analyzer optimization workflow" \
+            --color BFD4F2 2>/dev/null || true
+
       - name: List open auto-optimization PRs (dedup input)
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
