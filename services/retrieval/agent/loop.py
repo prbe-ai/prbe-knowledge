@@ -1121,7 +1121,11 @@ async def run_gatherer(
             timing=timing,
         )
         return to_query_response(
-            query=req.query, gathered=gathered, trace_id=trace_id, timing_ms=timing
+            query=req.query,
+            gathered=gathered,
+            trace_id=trace_id,
+            timing_ms=timing,
+            prefanout=state.prefanout,
         )
 
     if _no_llm_configured():
@@ -1154,7 +1158,11 @@ async def run_gatherer(
             timing=timing,
         )
         return to_query_response(
-            query=req.query, gathered=gathered, trace_id=trace_id, timing_ms=timing
+            query=req.query,
+            gathered=gathered,
+            trace_id=trace_id,
+            timing_ms=timing,
+            prefanout=state.prefanout,
         )
 
     gathered: GathererOutput | None = None
@@ -1261,6 +1269,7 @@ async def run_gatherer(
         gathered=gathered,
         trace_id=trace_id,
         timing_ms=timing,
+        prefanout=state.prefanout,
     )
 
 

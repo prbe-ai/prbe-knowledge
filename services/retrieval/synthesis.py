@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -41,7 +41,7 @@ from shared.exceptions import PrbeError
 from shared.llm import LLMError
 from shared.llm_tools import ToolCallParseError, forced_tool_call
 from shared.logging import get_logger
-from shared.models import QueryDocumentResult, QueryResult
+from shared.models import GraphEvidence, QueryDocumentResult, QueryResult
 
 log = get_logger(__name__)
 
@@ -56,6 +56,14 @@ class SynthesisError(PrbeError):
 class SynthesisChunk:
     """Minimal chunk shape the synthesizer needs. Independent of QueryChunk
     so the synthesizer is reusable outside the /query handler.
+
+    `graph_evidence` carries the inferred-edge chain rationale (anchor doc
+    + edge_type + `why` string) for chunks that surfaced via the
+    inferred-edge channel — see `services/retrieval/agent/adapter.py`
+    `_build_doc_to_graph_evidence`. The synthesizer renders these
+    rationales in the user prompt so the LLM can connect the chain
+    ("ticket X motivated PR Y because <reason>"); without them, the
+    chunk text alone often doesn't explain why two docs are linked.
     """
 
     chunk_id: str
@@ -64,6 +72,11 @@ class SynthesisChunk:
     source_system: str
     source_url: str
     updated_at: str  # ISO8601
+    # Per-chunk chain provenance from the data-plane adapter. Each entry
+    # is one inferred edge that surfaced this chunk's parent doc. Empty
+    # list when the chunk reached the synthesizer via vector / bm25 /
+    # graph alone.
+    graph_evidence: list[GraphEvidence] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -204,6 +217,7 @@ def flatten_documents_for_synthesis(
                     source_system=r.source_system.value,
                     source_url=r.source_url,
                     updated_at=r.updated_at.isoformat(),
+                    graph_evidence=list(c.graph_evidence or []),
                 )
             )
     return out
@@ -448,9 +462,10 @@ def _format_user_prompt(query: str, chunks: list[SynthesisChunk]) -> str:
         body = (c.content or "").strip()
         if len(body) > 1500:
             body = body[:1500] + "…"
+        chain_section = _format_graph_evidence_for_prompt(c.graph_evidence)
         blocks.append(
             f"[chunk:{i}] ({c.source_system}{title} | {c.source_url} | "
-            f"updated {c.updated_at})\n{body}"
+            f"updated {c.updated_at})\n{body}{chain_section}"
         )
     chunk_block = "\n\n".join(blocks)
     return f"""Query: {query}
@@ -458,7 +473,53 @@ def _format_user_prompt(query: str, chunks: list[SynthesisChunk]) -> str:
 Chunks:
 {chunk_block}
 
-Answer using only these chunks. Cite every claim with [chunk:N]."""
+Answer using only these chunks. Cite every claim with [chunk:N]. When a
+chunk has a CHAIN section, those rationales are part of the chunk's
+evidence — use them to connect chunks across sources (e.g. "ticket X
+motivated PR Y because <chain rationale>") and cite the chunk normally."""
+
+
+# Per-edge cap on the rendered `why` string. Each graph_evidence entry's
+# rationale is LLM-derived and can grow long; cap so a single doc with
+# many inferred edges doesn't blow the synthesizer's token budget.
+_GE_REASON_RENDER_CAP = 240
+# Cap on edges rendered per chunk. Doc-level evidence is shared across
+# every chunk of a doc; rendering all of them per-chunk is redundant
+# and expensive. Top 5 keeps the strongest hops in front of the LLM.
+_GE_PER_CHUNK_RENDER_CAP = 5
+
+
+def _format_graph_evidence_for_prompt(evidence: list[GraphEvidence]) -> str:
+    """Render a chunk's `graph_evidence` entries as a short CHAIN section
+    appended after the body. Empty string when there's no evidence (the
+    common case — only inferred-edge-surfaced chunks carry chain data).
+
+    Format per entry:
+        CHAIN: <anchor doc_id> --[<edge_type> · <confidence>]--> <this doc>
+               reason: <the LLM-derived `why` string>
+
+    The synthesizer reads this alongside the chunk body to connect the
+    chain across sources — without it the answer often misses "X
+    motivated Y because <reason>" connections even when the linked doc
+    is present in the chunks.
+    """
+    if not evidence:
+        return ""
+    lines = ["", "  CHAIN:"]
+    for ge in evidence[:_GE_PER_CHUNK_RENDER_CAP]:
+        reason = (ge.reason or "").strip()
+        if len(reason) > _GE_REASON_RENDER_CAP:
+            reason = reason[: _GE_REASON_RENDER_CAP - 1].rstrip() + "…"
+        lines.append(
+            f"    {ge.via_entity} --[{ge.edge_type} · {ge.confidence}]--> this chunk's doc"
+        )
+        if reason:
+            lines.append(f"      reason: {reason}")
+    if len(evidence) > _GE_PER_CHUNK_RENDER_CAP:
+        lines.append(
+            f"    (+ {len(evidence) - _GE_PER_CHUNK_RENDER_CAP} more chain hop(s) omitted)"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
