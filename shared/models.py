@@ -386,6 +386,7 @@ class GraphEvidence(BaseModel):
     edge_type: str
     confidence: str  # EXTRACTED | INFERRED | AMBIGUOUS
     via_entity: str
+    via_entity_title: str | None = None
     reason: str | None = None
 
 

@@ -33,6 +33,11 @@ from shared.models import (
 
 log = get_logger(__name__)
 
+# Top-K cap on enriched edges per curated doc. Highly-connected anchors
+# (a much-referenced PR, a hub ticket) can carry hundreds of inferred
+# neighbours; without a cap the chain panel turns into a hairball.
+_ENRICH_TOP_K_PER_ANCHOR = 8
+
 
 def _safe_source_system(value: str | None, doc_id: str | None = None) -> str:
     """Coerce a free-form source_system string to the SourceSystem enum value.
@@ -158,31 +163,86 @@ async def _enrich_graph_evidence_from_result_set(
     the graph, regardless of which retrieval channel brought each doc
     in.
 
-    Returns empty dict when there are fewer than 2 doc_ids (nothing to
-    connect) or when the DB query fails (best-effort enrichment —
-    callers fall back to prefanout-only).
+    Returns empty dict when there are no doc_ids or when the DB query
+    fails (best-effort enrichment — callers fall back to prefanout-only).
+
+    Match shape: ONE-endpoint matching. An INFERRED edge is surfaced
+    whenever EITHER endpoint is in the curated result set. This catches
+    the dominant failure mode where Cerebras curates the result down to
+    a single doc — without one-endpoint matching the chain panel would
+    be empty even though the doc has dozens of inferred neighbours in
+    the graph. The "other" endpoint (not in the curated set) flows
+    through as `via_entity` + `via_entity_title` so the dashboard can
+    render it as a chain-adjacent node.
+
+    Per-anchor TOP-K cap keeps highly-connected docs from flooding the
+    chain panel. ROW_NUMBER picks the K strongest edges (highest
+    confidence first, then most recent) per (anchor_doc, edge_type).
     """
     out: dict[str, list[GraphEvidence]] = {}
-    if len(doc_ids) < 2:
+    if not doc_ids:
         return out
     try:
         async with with_tenant(customer_id) as conn:
             rows = await conn.fetch(
-                """
+                f"""
+                WITH edges AS (
+                    -- Forward direction: anchor doc is `gn_from`
+                    SELECT
+                        gn_from.canonical_id AS anchor_doc,
+                        gn_to.canonical_id   AS other_doc,
+                        ge.edge_type,
+                        ge.confidence,
+                        ge.properties->>'why' AS why,
+                        ge.created_at
+                    FROM graph_edges ge
+                    JOIN graph_nodes gn_from ON gn_from.node_id = ge.from_node_id
+                    JOIN graph_nodes gn_to   ON gn_to.node_id   = ge.to_node_id
+                    WHERE ge.customer_id = $1
+                      AND ge.confidence  = 'INFERRED'
+                      AND gn_from.canonical_id = ANY($2::text[])
+                      AND gn_from.canonical_id <> gn_to.canonical_id
+                    UNION ALL
+                    -- Reverse direction: anchor doc is `gn_to`
+                    SELECT
+                        gn_to.canonical_id   AS anchor_doc,
+                        gn_from.canonical_id AS other_doc,
+                        ge.edge_type,
+                        ge.confidence,
+                        ge.properties->>'why' AS why,
+                        ge.created_at
+                    FROM graph_edges ge
+                    JOIN graph_nodes gn_from ON gn_from.node_id = ge.from_node_id
+                    JOIN graph_nodes gn_to   ON gn_to.node_id   = ge.to_node_id
+                    WHERE ge.customer_id = $1
+                      AND ge.confidence  = 'INFERRED'
+                      AND gn_to.canonical_id = ANY($2::text[])
+                      AND gn_from.canonical_id <> gn_to.canonical_id
+                ),
+                ranked AS (
+                    SELECT
+                        e.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY anchor_doc, other_doc, edge_type
+                            ORDER BY created_at DESC
+                        ) AS rn_dedup,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY anchor_doc
+                            ORDER BY created_at DESC
+                        ) AS rn_top
+                    FROM edges e
+                )
                 SELECT
-                    gn_from.canonical_id AS from_doc,
-                    gn_to.canonical_id   AS to_doc,
-                    ge.edge_type,
-                    ge.confidence,
-                    ge.properties->>'why' AS why
-                FROM graph_edges ge
-                JOIN graph_nodes gn_from ON gn_from.node_id = ge.from_node_id
-                JOIN graph_nodes gn_to   ON gn_to.node_id   = ge.to_node_id
-                WHERE ge.customer_id = $1
-                  AND ge.confidence  = 'INFERRED'
-                  AND gn_from.canonical_id = ANY($2::text[])
-                  AND gn_to.canonical_id   = ANY($2::text[])
-                  AND gn_from.canonical_id <> gn_to.canonical_id
+                    r.anchor_doc,
+                    r.other_doc,
+                    r.edge_type,
+                    r.confidence,
+                    r.why,
+                    d.title AS other_title
+                FROM ranked r
+                LEFT JOIN documents d ON d.doc_id = r.other_doc
+                WHERE r.rn_dedup = 1
+                  AND r.rn_top <= {_ENRICH_TOP_K_PER_ANCHOR}
                 """,
                 customer_id,
                 doc_ids,
@@ -199,10 +259,11 @@ async def _enrich_graph_evidence_from_result_set(
         ev = GraphEvidence(
             edge_type=r["edge_type"],
             confidence=r["confidence"],
-            via_entity=r["from_doc"],
+            via_entity=r["other_doc"],
+            via_entity_title=r["other_title"],
             reason=r["why"],
         )
-        out.setdefault(r["to_doc"], []).append(ev)
+        out.setdefault(r["anchor_doc"], []).append(ev)
     return out
 
 
@@ -276,7 +337,7 @@ async def to_query_response(
     # derived doc_evidence below; dedup by (via_entity, edge_type) per
     # doc so a hop already surfaced via prefanout doesn't double-render.
     result_set_doc_ids = [c.doc_id for c in gathered.chunks if c.doc_id]
-    if customer_id and len(set(result_set_doc_ids)) >= 2:
+    if customer_id and result_set_doc_ids:
         graph_evidence_extra = await _enrich_graph_evidence_from_result_set(
             customer_id, list(set(result_set_doc_ids))
         )

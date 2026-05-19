@@ -325,14 +325,28 @@ async def test_enrichment_skipped_when_no_customer_id(monkeypatch) -> None:
     assert called["n"] == 0
 
 
-async def test_enrichment_skipped_when_only_one_doc(monkeypatch) -> None:
-    """No point querying the DB if only one doc is in the result set —
-    the enrichment function returns early but the harness shouldn't even
-    make the call. Pin that contract."""
-    called = {"n": 0}
+async def test_enrichment_fires_on_single_doc_curation(monkeypatch) -> None:
+    """Single-doc curation is the dominant Cerebras-non-determinism
+    failure: the gatherer returns one doc with no chain context. The
+    one-endpoint enrichment query MUST still fire so we can surface the
+    doc's inferred neighbours as chain evidence (other_doc → via_entity).
+    Without this the chain panel goes empty on every single-doc curation."""
+    from shared.models import GraphEvidence
+    called = {"n": 0, "doc_ids": []}
     async def fake_enrich(customer_id, doc_ids):
         called["n"] += 1
-        return {}
+        called["doc_ids"] = doc_ids
+        return {
+            "only-doc": [
+                GraphEvidence(
+                    edge_type="discusses",
+                    confidence="INFERRED",
+                    via_entity="neighbour-doc",
+                    via_entity_title="Neighbour Doc Title",
+                    reason="neighbour discusses the same topic",
+                )
+            ]
+        }
     monkeypatch.setattr(
         "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
         fake_enrich,
@@ -340,11 +354,17 @@ async def test_enrichment_skipped_when_only_one_doc(monkeypatch) -> None:
     gathered = GathererOutput(
         entities=[], chunks=[_ge("only-doc")], gatherer_notes=GathererNotes(),
     )
-    await to_query_response(
+    resp = await to_query_response(
         query="q", gathered=gathered, trace_id="t", timing_ms={},
         prefanout=None, customer_id="cust-test",
     )
-    assert called["n"] == 0
+    assert called["n"] == 1
+    assert called["doc_ids"] == ["only-doc"]
+    doc = next(r for r in resp.results if r.canonical_id == "only-doc")
+    assert len(doc.chunks[0].graph_evidence) == 1
+    ev = doc.chunks[0].graph_evidence[0]
+    assert ev.via_entity == "neighbour-doc"
+    assert ev.via_entity_title == "Neighbour Doc Title"
 
 
 async def test_enrichment_dedupes_against_prefanout_evidence(monkeypatch) -> None:
