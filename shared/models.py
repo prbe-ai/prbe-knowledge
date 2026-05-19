@@ -928,6 +928,11 @@ class NormalizationResult(BaseModel):
     # investigation pipeline (Plan 4 wires this up). Default False
     # keeps every existing connector unchanged.
     requires_investigation: bool = False
+    # Set True by handlers (PD/incident.io) when this event is the
+    # incident-resolution signal that the post-approval dispatch seam
+    # listens for (services/post_approval/dispatch.py:on_resolution_event).
+    # Default False keeps every existing connector unchanged.
+    requires_resolution_check: bool = False
 
     @property
     def is_empty(self) -> bool:

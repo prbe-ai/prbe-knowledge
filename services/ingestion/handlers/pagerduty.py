@@ -4,6 +4,9 @@ One INCIDENT document per logical PD incident, updated across lifecycle
 events (triggered / acknowledged / resolved / etc.) via SCD2 coalesce.
 `requires_investigation` fires only on `incident.triggered` so the
 investigation pipeline runs exactly once per logical incident.
+`requires_resolution_check` fires only on `incident.resolved` so the
+post-approval dispatch seam (services/post_approval/dispatch.py) can
+detect the (approved ∧ resolved) edge.
 
 Connector-level `verify_signature` is intentionally a stub — see the
 method docstring for the rationale. PD's per-subscription secret is
@@ -241,6 +244,7 @@ class PagerDutyConnector(Connector):
         return NormalizationResult(
             documents=[doc],
             requires_investigation=(event_type == "incident.triggered"),
+            requires_resolution_check=(event_type == "incident.resolved"),
         )
 
 
