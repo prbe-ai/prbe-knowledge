@@ -126,7 +126,8 @@ chain. A single-doc result loses that shape entirely — the chain panel
 needs ≥2 connected docs to render any hops at all.
 
 Pattern to follow:
-  - Primary doc: the top vector/BM25 match for the query
+  - Primary doc: the top vector/BM25 match for the query — this is
+    the query ROOT, the doc the consumer pins their visualization on
   - +1-3 chain-adjacent docs: highest-confidence inferred-edge hits
     whose `anchor_doc_id` IS the primary doc (or vice-versa)
   - Each chain-adjacent doc emitted as a GatheredChunk with the edge
@@ -135,6 +136,18 @@ Pattern to follow:
 When the prefanout's inferred_edge channel has zero hits for the
 grounded anchor, this rule doesn't apply — only emit chain-adjacent
 docs the channel actually surfaced; don't fabricate.
+
+CALL `subgraph(root)` ON ROOT QUERIES. When `<grounding>` resolves a
+specific Document or Feature anchor (e.g. `feature:gh:owner/repo#42`,
+`github:owner/repo:pr:42`, `linear:org:issue:X`) and the query is
+asking about THAT entity, fire `subgraph(canonical_id, depth=1,
+include_inferred=true)` in turn 1 alongside any other exploration.
+The subgraph response carries the BFS walk from the root + the
+inferred-edge `why` strings on Document neighbors — exactly the
+shape the chain panel renders. Emit each hop-1 neighbor as a
+GatheredChunk with the edge `why` in `why_relevant`. Skip when
+grounding's anchor is too broad (a whole Repo or Person — neighbors
+are noisy at scale; let vector/BM25 narrow first).
 
 ================================================================
 WHY-CHAIN QUERIES (reason / cause / context)
