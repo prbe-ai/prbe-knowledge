@@ -18,9 +18,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import re
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
@@ -76,6 +77,109 @@ _REQUEST_TS_SLACK_MAX_AGE_SEC = 5 * 60  # Slack recommends rejecting older signe
 _HISTORY_LIMITERS: dict[int, AsyncLimiter] = {}
 
 _DISPLAY_NAME_MAX_LEN = 80
+
+
+# Slack message-formatting tokens that wrap canonical IDs we want to render
+# as human-readable names. References:
+#   https://api.slack.com/reference/surfaces/formatting#retrieving-messages
+#
+# A token is one of:
+#   <@U07ABC>            — user mention, no fallback
+#   <@U07ABC|displayed>  — user mention with explicit fallback
+#   <#C07ABC|engineering>— channel mention with name
+#   <#C07ABC>            — channel mention without name (rare in modern Slack)
+#   <!channel>           — broadcast
+#   <!here> / <!everyone>
+#   <!subteam^S0ABC|@team>
+#   <!date^TS|fallback>
+#   <http://example|displayed>  — URL with display text
+#   <http://example>           — bare URL
+#
+# When `text` has none of these, expansion is a no-op. The expander never
+# reaches out to Slack APIs — it consumes the caches that fetch_supplementary
+# / backfill prime, and falls back to `|displayed` hints or a sanitized version
+# of the ID when no cache entry is available.
+_USER_MENTION_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|([^>]+))?>")
+_CHANNEL_MENTION_RE = re.compile(r"<#([CG][A-Z0-9]+)(?:\|([^>]+))?>")
+_SUBTEAM_MENTION_RE = re.compile(r"<!subteam\^[A-Z0-9]+(?:\|(@?[^>]+))?>")
+_BROADCAST_MENTION_RE = re.compile(r"<!(channel|here|everyone)>")
+_DATE_MENTION_RE = re.compile(r"<!date\^\d+\^[^|>]+(?:\^[^|>]+)?(?:\|([^>]+))?>")
+# URLs in Slack are wrapped <http…|displayed> or <http…>. Treat both shapes —
+# the bare form would otherwise also surface as opaque text after we strip
+# brackets.
+_URL_MENTION_RE = re.compile(r"<(https?://[^|>]+)(?:\|([^>]+))?>")
+
+
+def expand_slack_markup(
+    text: str,
+    *,
+    resolve_user: Callable[[str], str | None],
+    resolve_channel: Callable[[str], str | None],
+) -> str:
+    """Replace Slack's mention/URL markup with human-readable text.
+
+    `resolve_user(user_id)` and `resolve_channel(channel_id)` are pure
+    cache reads — `_SlackUserCache.peek` and `_SlackChannelCache.peek` from
+    the connector. They return `None` on miss; callers are expected to
+    warm the caches (via `prime`/`prime_from_listing` at backfill kickoff
+    or `resolve` at webhook hydration time) before this runs.
+
+    Resolution priority for `<@U…|fallback>` / `<#C…|name>`:
+      1. cache hit on the ID → use the resolved display name
+      2. explicit `|fallback` text from the Slack token → use that
+      3. last resort: `@<id>` / `#<id>` so the rendered text is at least
+         visibly an identifier, not raw markup
+
+    Idempotent: running the expander twice produces the same output as
+    running it once (regexes only match `<…>` wrappers, not plain text).
+    """
+    if not text:
+        return text
+
+    def user_repl(m: re.Match[str]) -> str:
+        uid, fallback = m.group(1), m.group(2)
+        name = resolve_user(uid)
+        if name:
+            return f"@{name}"
+        if fallback:
+            return f"@{fallback}"
+        return f"@{uid}"
+
+    def channel_repl(m: re.Match[str]) -> str:
+        cid, fallback = m.group(1), m.group(2)
+        name = resolve_channel(cid)
+        if name:
+            return f"#{name}"
+        if fallback:
+            return f"#{fallback}"
+        return f"#{cid}"
+
+    def subteam_repl(m: re.Match[str]) -> str:
+        fallback = m.group(1)
+        if fallback:
+            return fallback if fallback.startswith("@") else f"@{fallback}"
+        return "@group"
+
+    def broadcast_repl(m: re.Match[str]) -> str:
+        return f"@{m.group(1)}"
+
+    def date_repl(m: re.Match[str]) -> str:
+        fallback = m.group(1)
+        return fallback or m.group(0)
+
+    def url_repl(m: re.Match[str]) -> str:
+        url, displayed = m.group(1), m.group(2)
+        if displayed:
+            return f"{displayed} ({url})"
+        return url
+
+    text = _USER_MENTION_RE.sub(user_repl, text)
+    text = _CHANNEL_MENTION_RE.sub(channel_repl, text)
+    text = _SUBTEAM_MENTION_RE.sub(subteam_repl, text)
+    text = _BROADCAST_MENTION_RE.sub(broadcast_repl, text)
+    text = _DATE_MENTION_RE.sub(date_repl, text)
+    text = _URL_MENTION_RE.sub(url_repl, text)
+    return text
 
 
 def _sanitize_display_name(name: str | None) -> str | None:
@@ -701,6 +805,32 @@ class SlackConnector(Connector):
             if ch_name:
                 result["channel_name"] = ch_name
 
+        # Warm both caches for every <@U…> / <#C…> id referenced in the body
+        # so normalize()'s mention-expansion (which is peek-only) finds them.
+        # Each lookup is singleflight + transient-no-cache + LRU-bounded so a
+        # message that mentions 50 users still pays at most 50 users.info
+        # calls workspace-wide, ever. Skip the author user_id (already
+        # resolved above) and the message's own channel (already resolved).
+        body_text = (author_msg.get("text") or "")
+        seen_uids: set[str] = {user_id} if user_id else set()
+        for uid_match in _USER_MENTION_RE.finditer(body_text):
+            uid = uid_match.group(1)
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+            if team_id:
+                ucache = self._get_cache(event.customer_id, team_id)
+                await ucache.resolve(self.http, token.access_token, uid)
+        seen_cids: set[str] = {channel_id} if channel_id else set()
+        for cid_match in _CHANNEL_MENTION_RE.finditer(body_text):
+            cid = cid_match.group(1)
+            if cid in seen_cids:
+                continue
+            seen_cids.add(cid)
+            if team_id:
+                ccache = self._get_channel_cache(event.customer_id, team_id)
+                await ccache.resolve(self.http, token.access_token, cid)
+
         thread_ts = msg.get("thread_ts")
         channel = msg.get("channel")
         if not thread_ts or not channel:
@@ -763,11 +893,19 @@ class SlackConnector(Connector):
 
         # Display-name stamping: hydrated value (webhook fetch_supplementary)
         # wins over msg-inline (some webhooks ship user_profile in-band) wins
-        # over nothing. Critical: when no name is known, prefix is empty —
-        # do NOT fall back to the raw U_ID (would pollute embeddings).
+        # over cache.peek wins over nothing. Critical: when no name is known,
+        # prefix is empty — do NOT fall back to the raw U_ID (would pollute
+        # embeddings).
         display_name = _pick_display_name(
             hydrated.get("user_profile") or msg.get("user_profile")
         )
+        if not display_name and team_id and msg.get("user"):
+            # Cache fallback: backfill warms via prime(), webhook warms via
+            # fetch_supplementary's resolve() — either way, peek finds the
+            # name without an extra round-trip from normalize.
+            _peek = self._get_cache(event.customer_id, team_id).peek(msg.get("user"))
+            if _peek:
+                display_name = _peek
         # Channel name: fetch_supplementary sets channel_name from the cache
         # on the webhook path. Backfill stamps it via cache.peek() onto the
         # synthetic event's msg dict at `channel_name`. Missing => no
@@ -777,8 +915,33 @@ class SlackConnector(Connector):
         channel_name = _sanitize_display_name(
             hydrated.get("channel_name") or msg.get("channel_name")
         )
+
+        # Expand <@U…> / <#C…|name> / <!channel|here|everyone> / <!subteam…>
+        # / <!date…> / <http…|displayed> markup before they become body_text.
+        # Both caches are cheap to instantiate (lazy load on first peek) and
+        # are populated by fetch_supplementary (webhook path) or prime (backfill
+        # path); peek-only here so normalize stays sync-friendly. Unresolved
+        # IDs fall back to the `|fallback` hint or `@<id>` rather than the raw
+        # `<@U…>` markup — so even worst-case render is debuggable, not opaque.
+        user_cache = self._get_cache(event.customer_id, team_id) if team_id else None
+        channel_cache = (
+            self._get_channel_cache(event.customer_id, team_id) if team_id else None
+        )
+
+        def _resolve_user(uid: str) -> str | None:
+            return user_cache.peek(uid) if user_cache else None
+
+        def _resolve_channel(cid: str) -> str | None:
+            return channel_cache.peek(cid) if channel_cache else None
+
+        expanded_text = expand_slack_markup(
+            text,
+            resolve_user=_resolve_user,
+            resolve_channel=_resolve_channel,
+        ) if not is_delete else ""
+
         body_text = "" if is_delete else (
-            f"{display_name}: {text}" if display_name else text
+            f"{display_name}: {expanded_text}" if display_name else expanded_text
         )
 
         if not channel or not ts:
@@ -829,7 +992,11 @@ class SlackConnector(Connector):
             ),
             content_type="text/plain",
             content_hash=content_hash,
-            title=_derive_title(text),
+            # Title pulls from expanded_text (mention markup already resolved
+            # to names) so list-views / hover-cards render "Richard Wei has
+            # joined the channel" instead of "<@U0ARLAD3B2B> has joined the
+            # channel". For deletes, expanded_text is "" — title is None.
+            title=_derive_title(expanded_text) if not is_delete else None,
             body_preview=body_text[:280],
             body_size_bytes=len(body_text.encode("utf-8")),
             body_token_count=count_tokens(body_text),
@@ -852,6 +1019,13 @@ class SlackConnector(Connector):
                 "edited": bool(msg.get("edited")) or is_edit,
                 "deleted": is_delete,
                 "reactions": msg.get("reactions", []),
+                # Resolved author/channel names so the metadata-chunk renderer
+                # (normalizer._metadata_text) can emit "author: Richard Wei"
+                # instead of "author: U0ARLAD3B2B". Authoritative cache hits
+                # only — when unresolved, the keys are omitted and the
+                # renderer falls back to the raw author_id, same as today.
+                **({"author_display_name": display_name} if display_name else {}),
+                **({"channel_name": channel_name} if channel_name else {}),
             },
             body=body_text,
             doc_references=_references_from_text(text),

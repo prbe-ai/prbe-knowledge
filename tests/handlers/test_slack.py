@@ -22,6 +22,7 @@ from services.ingestion.handlers.slack import (  # noqa: F401 - registers
     _decode_slack_cursor,
     _SlackChannelCache,
     _SlackUserCache,
+    expand_slack_markup,
 )
 from shared.config import Settings
 from shared.constants import DocType, NodeLabel, SourceSystem
@@ -1379,3 +1380,293 @@ async def test_fetch_supplementary_resolves_channel_name(fast_flush) -> None:
         assert ch.properties["display_name"] == "#engineering"
     finally:
         await slack.http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# expand_slack_markup — unit tests for every supported token shape.
+# ---------------------------------------------------------------------------
+
+
+def _user_resolver(table: dict[str, str | None]):
+    return lambda uid: table.get(uid)
+
+
+def _channel_resolver(table: dict[str, str | None]):
+    return lambda cid: table.get(cid)
+
+
+def test_expand_user_mention_resolves_via_cache() -> None:
+    out = expand_slack_markup(
+        "<@U0ARLAD3B2B> deployed payments",
+        resolve_user=_user_resolver({"U0ARLAD3B2B": "Richard Wei"}),
+        resolve_channel=_channel_resolver({}),
+    )
+    assert out == "@Richard Wei deployed payments"
+
+
+def test_expand_user_mention_uses_fallback_on_cache_miss() -> None:
+    out = expand_slack_markup(
+        "<@U0DOESNTEXIST|guest-user> joined",
+        resolve_user=_user_resolver({}),
+        resolve_channel=_channel_resolver({}),
+    )
+    assert out == "@guest-user joined"
+
+
+def test_expand_user_mention_falls_back_to_id_when_no_hint() -> None:
+    out = expand_slack_markup(
+        "<@U0DOESNTEXIST> joined",
+        resolve_user=_user_resolver({}),
+        resolve_channel=_channel_resolver({}),
+    )
+    # Worst case still readable as a debug-friendly identifier, not raw markup.
+    assert out == "@U0DOESNTEXIST joined"
+
+
+def test_expand_channel_mention_prefers_cache_over_slack_hint() -> None:
+    out = expand_slack_markup(
+        "see <#C0B1T8PPK0D|stale-name> for context",
+        resolve_user=_user_resolver({}),
+        resolve_channel=_channel_resolver({"C0B1T8PPK0D": "engineering"}),
+    )
+    # Cache wins over Slack's |hint — the cache is rehydrated from the live
+    # workspace, so it reflects the current name even after a rename.
+    assert out == "see #engineering for context"
+
+
+def test_expand_channel_mention_falls_back_to_inline_hint() -> None:
+    out = expand_slack_markup(
+        "see <#C0NEW|engineering>",
+        resolve_user=_user_resolver({}),
+        resolve_channel=_channel_resolver({}),
+    )
+    assert out == "see #engineering"
+
+
+def test_expand_broadcast_mentions() -> None:
+    out = expand_slack_markup(
+        "<!channel> deploy starts; <!here> please ack; <!everyone> heads up",
+        resolve_user=_user_resolver({}),
+        resolve_channel=_channel_resolver({}),
+    )
+    assert out == "@channel deploy starts; @here please ack; @everyone heads up"
+
+
+def test_expand_subteam_mention() -> None:
+    out = expand_slack_markup(
+        "<!subteam^S0123|@oncall> please review",
+        resolve_user=_user_resolver({}),
+        resolve_channel=_channel_resolver({}),
+    )
+    assert out == "@oncall please review"
+
+
+def test_expand_url_with_display_text() -> None:
+    out = expand_slack_markup(
+        "see <https://example.com/run/42|the run log> for failure",
+        resolve_user=_user_resolver({}),
+        resolve_channel=_channel_resolver({}),
+    )
+    assert out == "see the run log (https://example.com/run/42) for failure"
+
+
+def test_expand_bare_url() -> None:
+    out = expand_slack_markup(
+        "context: <https://example.com/x>",
+        resolve_user=_user_resolver({}),
+        resolve_channel=_channel_resolver({}),
+    )
+    assert out == "context: https://example.com/x"
+
+
+def test_expand_idempotent() -> None:
+    """Expander on already-expanded text is a no-op — regexes only target
+    <…> wrappers, not plain @name / #name. Lets backfill scripts re-run
+    safely without compounding."""
+    original = (
+        "<@U0ARLAD3B2B> deployed to <#C0B1T8PPK0D|engineering>, see "
+        "<https://example.com|the run>"
+    )
+    table_user = _user_resolver({"U0ARLAD3B2B": "Richard Wei"})
+    table_ch = _channel_resolver({"C0B1T8PPK0D": "engineering"})
+    once = expand_slack_markup(original, resolve_user=table_user, resolve_channel=table_ch)
+    twice = expand_slack_markup(once, resolve_user=table_user, resolve_channel=table_ch)
+    assert once == twice
+    assert "<@" not in once and "<#" not in once and "<!" not in once
+
+
+def test_expand_empty_and_none() -> None:
+    assert (
+        expand_slack_markup("", resolve_user=lambda _: None, resolve_channel=lambda _: None)
+        == ""
+    )
+
+
+@pytest.mark.asyncio
+async def test_normalize_expands_mentions_in_title_and_body() -> None:
+    """End-to-end: the document's title and body_preview are mention-free
+    after normalize sees a message containing <@U…> markup. The user-cache
+    is warmed by fetch_supplementary (or backfill prime) before normalize
+    runs; here we simulate by pre-populating the cache."""
+    ctx = _make_ctx()
+    slack = build_connector(SourceSystem.SLACK, ctx)
+
+    # Pre-populate the user cache so normalize's peek finds the name without
+    # the connector having to make an API call.
+    cache = slack._get_cache("cust-1", "T123")
+    cache._set("U0ARLAD3B2B", "Richard Wei")
+    cache._set("U0AUKQNABUM", "Ashwarye Yadav")
+
+    from datetime import datetime
+
+    from shared.models import WebhookEvent
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        source_event_id="C456:1713628800.000100",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/slack/cust-1/2026/04/22/test.json",
+        raw_payload={
+            "team_id": "T123",
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "channel": "C456",
+                "user": "U0ARLAD3B2B",
+                "text": "<@U0AUKQNABUM> the deploy is done — see <!channel>",
+                "ts": "1713628800.000100",
+            },
+        },
+        headers={},
+    )
+
+    result = await slack.normalize(event, {})
+    doc = result.documents[0]
+
+    # The raw <@U…> and <!channel> markup must not survive into either
+    # column. Title is derived from the expanded text; body_preview comes
+    # from body_text which prefixes the speaker's resolved name.
+    assert "<@" not in (doc.title or "")
+    assert "<!" not in (doc.title or "")
+    assert "<@" not in (doc.body_preview or "")
+    assert "Ashwarye Yadav" in (doc.body_preview or "")
+    assert "@channel" in (doc.body_preview or "")
+    # author_display_name stashed on metadata so the metadata-chunk renderer
+    # can show the resolved name instead of the U-id.
+    assert doc.metadata.get("author_display_name") == "Richard Wei"
+
+
+@pytest.mark.asyncio
+async def test_normalize_falls_back_when_cache_cold() -> None:
+    """Cold cache => mentions render as @<id> not raw <@U…> markup. The
+    chunk content is still searchable by the ID via BM25, and an edit (or
+    the next webhook from that user) will warm the cache and re-stamp."""
+    ctx = _make_ctx()
+    slack = build_connector(SourceSystem.SLACK, ctx)
+
+    from datetime import datetime
+
+    from shared.models import WebhookEvent
+
+    event = WebhookEvent(
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        source_event_id="C456:1713628800.000100",
+        received_at=datetime.now(UTC),
+        payload_s3_key="raw/slack/cust-1/2026/04/22/test.json",
+        raw_payload={
+            "team_id": "T123",
+            "type": "event_callback",
+            "event": {
+                "type": "message",
+                "channel": "C456",
+                "user": "U0UNKNOWN",
+                "text": "<@U0OTHERS> joined the channel",
+                "ts": "1713628800.000100",
+            },
+        },
+        headers={},
+    )
+
+    result = await slack.normalize(event, {})
+    doc = result.documents[0]
+    assert "<@" not in (doc.title or "")
+    assert "@U0OTHERS" in (doc.title or "")
+    # No display_name was resolved so the metadata key is absent (renderer
+    # falls back to the raw author_id, matching current behavior).
+    assert "author_display_name" not in doc.metadata
+
+
+def test_metadata_chunk_renders_author_display_name() -> None:
+    """The metadata-chunk renderer prefers metadata.author_display_name over
+    author_id so chunks emit `author: Richard Wei` instead of `author: U…`."""
+    from datetime import UTC, datetime
+
+    from services.ingestion.normalizer import _metadata_text
+    from shared.constants import DocClass, DocType, SourceSystem
+    from shared.models import ACLSnapshot, Document
+
+    doc = Document(
+        doc_id="slack:T1:C1:1.2",
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        source_id="C1:1.2",
+        source_url="https://slack.com/archives/C1/p12",
+        doc_class=DocClass.RAW_SOURCE,
+        doc_type=DocType.SLACK_MESSAGE,
+        content_type="text/plain",
+        content_hash="x",
+        title="deploying payments",
+        body_preview="deploying payments",
+        body_size_bytes=20,
+        body_token_count=4,
+        author_id="U0ARLAD3B2B",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+        valid_from=datetime.now(UTC),
+        ingested_at=datetime.now(UTC),
+        acl=ACLSnapshot(principals=[], captured_at=datetime.now(UTC)),
+        metadata={"author_display_name": "Richard Wei"},
+    )
+
+    text = _metadata_text(doc)
+    assert "author: Richard Wei" in text
+    assert "author: U0ARLAD3B2B" not in text
+
+
+def test_metadata_chunk_falls_back_to_author_id_when_no_display_name() -> None:
+    """Sources that don't resolve names (or Slack messages where the cache
+    was cold) still get the existing `author: <author_id>` line — the new
+    behavior is opt-in via metadata.author_display_name."""
+    from datetime import UTC, datetime
+
+    from services.ingestion.normalizer import _metadata_text
+    from shared.constants import DocClass, DocType, SourceSystem
+    from shared.models import ACLSnapshot, Document
+
+    doc = Document(
+        doc_id="github:org/repo:pr:1",
+        customer_id="cust-1",
+        source_system=SourceSystem.GITHUB,
+        source_id="org/repo:pr:1",
+        source_url="https://github.com/org/repo/pull/1",
+        doc_class=DocClass.RAW_SOURCE,
+        doc_type=DocType.GITHUB_PULL_REQUEST,
+        content_type="text/plain",
+        content_hash="x",
+        title="fix the thing",
+        body_preview="...",
+        body_size_bytes=10,
+        body_token_count=2,
+        author_id="richardwei6",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+        valid_from=datetime.now(UTC),
+        ingested_at=datetime.now(UTC),
+        acl=ACLSnapshot(principals=[], captured_at=datetime.now(UTC)),
+        metadata={},
+    )
+
+    text = _metadata_text(doc)
+    assert "author: richardwei6" in text
