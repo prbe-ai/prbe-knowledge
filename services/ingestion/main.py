@@ -50,6 +50,9 @@ from services.ingestion.handlers.registry import (
     get_connector_class,
     list_registered,
 )
+from services.ingestion.incident_evidence_pack_routes import (
+    router as incident_evidence_pack_router,
+)
 from services.ingestion.internal_devices import router as devices_router
 from services.ingestion.investigation_review_routes import (
     router as investigation_review_router,
@@ -120,6 +123,7 @@ app.include_router(wiki_router)
 app.include_router(custom_ingest_router)
 app.include_router(investigation_writeback_router)
 app.include_router(investigation_review_router)
+app.include_router(incident_evidence_pack_router)
 
 
 @app.get("/health")
