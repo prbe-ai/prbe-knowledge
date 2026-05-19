@@ -18,6 +18,8 @@ from typing import Any
 
 from services.retrieval.agent.models import GathererOutput
 from shared.constants import SourceSystem
+from shared.db import with_tenant
+from shared.logging import get_logger
 from shared.models import (
     GraphEvidence,
     MatchProvenance,
@@ -28,6 +30,8 @@ from shared.models import (
     QueryResult,
     RelatedEntity,
 )
+
+log = get_logger(__name__)
 
 
 def _safe_source_system(value: str | None, doc_id: str | None = None) -> str:
@@ -127,6 +131,81 @@ def _build_doc_to_graph_evidence(
     return out
 
 
+async def _enrich_graph_evidence_from_result_set(
+    customer_id: str,
+    doc_ids: list[str],
+) -> dict[str, list[GraphEvidence]]:
+    """Query `graph_edges` for INFERRED edges between any pair of docs
+    in the result set; project each as a `GraphEvidence` entry on the
+    `to`-side doc.
+
+    Why this is separate from `_build_doc_to_graph_evidence`: the latter
+    only sees edges that the pre-fan-out's `inferred_edge` channel
+    surfaced (i.e. edges where one endpoint matched a *grounded*
+    anchor). It misses the very common case where the agent emits N
+    docs that came in via vector / BM25 / graph, all of which are
+    cross-linked in the inferred-edges graph but none of which were the
+    grounded anchor on this query — e.g. a "what is multi-granola"
+    query that returns the Linear ticket + the Notion design doc + the
+    Slack thread. The graph has dozens of INFERRED edges between them
+    (the LLM extractor ran when each was ingested) but the prefanout's
+    inferred_edge channel anchored on the wrong entity.
+
+    This post-hoc enrichment closes that gap: after the agent's
+    curation, we query the graph directly for edges where BOTH
+    endpoints are in the curated result set. The chain panel then
+    renders whenever the curated set has any inferred connectivity in
+    the graph, regardless of which retrieval channel brought each doc
+    in.
+
+    Returns empty dict when there are fewer than 2 doc_ids (nothing to
+    connect) or when the DB query fails (best-effort enrichment —
+    callers fall back to prefanout-only).
+    """
+    out: dict[str, list[GraphEvidence]] = {}
+    if len(doc_ids) < 2:
+        return out
+    try:
+        async with with_tenant(customer_id) as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    gn_from.canonical_id AS from_doc,
+                    gn_to.canonical_id   AS to_doc,
+                    ge.edge_type,
+                    ge.confidence,
+                    ge.properties->>'why' AS why
+                FROM graph_edges ge
+                JOIN graph_nodes gn_from ON gn_from.node_id = ge.from_node_id
+                JOIN graph_nodes gn_to   ON gn_to.node_id   = ge.to_node_id
+                WHERE ge.customer_id = $1
+                  AND ge.confidence  = 'INFERRED'
+                  AND gn_from.canonical_id = ANY($2::text[])
+                  AND gn_to.canonical_id   = ANY($2::text[])
+                  AND gn_from.canonical_id <> gn_to.canonical_id
+                """,
+                customer_id,
+                doc_ids,
+            )
+    except Exception as exc:
+        log.warning(
+            "adapter.enrich_graph_evidence.failed",
+            customer=customer_id,
+            doc_id_count=len(doc_ids),
+            error=str(exc),
+        )
+        return out
+    for r in rows:
+        ev = GraphEvidence(
+            edge_type=r["edge_type"],
+            confidence=r["confidence"],
+            via_entity=r["from_doc"],
+            reason=r["why"],
+        )
+        out.setdefault(r["to_doc"], []).append(ev)
+    return out
+
+
 def _chunk_to_query_chunk(
     chunk: Any,
     doc_id: str,
@@ -154,13 +233,14 @@ def _chunk_to_query_chunk(
     )
 
 
-def to_query_response(
+async def to_query_response(
     *,
     query: str,
     gathered: GathererOutput,
     trace_id: str,
     timing_ms: dict[str, float],
     prefanout: dict[str, Any] | None = None,
+    customer_id: str | None = None,
 ) -> QueryResponse:
     """Wrap a GathererOutput in the existing QueryResponse shape.
 
@@ -178,10 +258,37 @@ def to_query_response(
     edge metadata (`edge_type`, `confidence`, `anchor_doc_id`, `why`)
     onto the consumer-visible chain provenance. None on the no-LLM /
     harness-passthrough fallback paths (no chain data to project).
+
+    `customer_id` (optional): when set, the adapter ALSO queries
+    `graph_edges` for INFERRED edges between any pair of docs in the
+    result set and merges them into `graph_evidence`. This catches the
+    common case where the agent emits N cross-linked docs that came
+    via vector/BM25/graph — the prefanout's inferred_edge channel
+    missed them because none was the grounded anchor, but the graph
+    *does* have edges between them. None preserves the pre-enrichment
+    behaviour for tests / harness-passthrough.
     """
     now = datetime.now(UTC)
 
     doc_evidence = _build_doc_to_graph_evidence(prefanout)
+
+    # Post-hoc enrichment from graph_edges. Merged into the prefanout-
+    # derived doc_evidence below; dedup by (via_entity, edge_type) per
+    # doc so a hop already surfaced via prefanout doesn't double-render.
+    result_set_doc_ids = [c.doc_id for c in gathered.chunks if c.doc_id]
+    if customer_id and len(set(result_set_doc_ids)) >= 2:
+        graph_evidence_extra = await _enrich_graph_evidence_from_result_set(
+            customer_id, list(set(result_set_doc_ids))
+        )
+        for doc_id, extras in graph_evidence_extra.items():
+            existing = doc_evidence.setdefault(doc_id, [])
+            seen: set[tuple[str, str]] = {(e.via_entity, e.edge_type) for e in existing}
+            for ev in extras:
+                key = (ev.via_entity, ev.edge_type)
+                if key in seen:
+                    continue
+                seen.add(key)
+                existing.append(ev)
 
     # Group chunks by doc_id.
     doc_groups: dict[str, list[Any]] = {}

@@ -114,7 +114,7 @@ def test_evidence_index_empty_when_no_prefanout() -> None:
 # to_query_response — end-to-end chain projection
 # ============================================================
 
-def test_chunks_carry_graph_evidence_from_prefanout() -> None:
+async def test_chunks_carry_graph_evidence_from_prefanout() -> None:
     """The agent emits a chunk for `linear:org:issue:abc`; the prefanout
     has an inferred-edge hit pointing PR #72 → that doc with a `why`
     string. The adapter projects the `why` onto every chunk of that
@@ -138,7 +138,7 @@ def test_chunks_carry_graph_evidence_from_prefanout() -> None:
             "why": "linear ticket asks for the proxy that pr72 builds",
         }],
     }]}
-    resp = to_query_response(
+    resp = await to_query_response(
         query="why was pr72 built",
         gathered=gathered,
         trace_id="t-1",
@@ -156,7 +156,7 @@ def test_chunks_carry_graph_evidence_from_prefanout() -> None:
     assert ge.reason and "proxy that pr72 builds" in ge.reason
 
 
-def test_confidence_breakdown_aggregates_across_chunks() -> None:
+async def test_confidence_breakdown_aggregates_across_chunks() -> None:
     """Top-level `confidence_breakdown` is the count of evidence by
     tier across every chunk in the response. Mirrors the legacy
     fusion-path counter so MCP filters keyed on confidence keep working."""
@@ -175,13 +175,13 @@ def test_confidence_breakdown_aggregates_across_chunks() -> None:
         chunks=[_ge("d1"), _ge("d2")],
         gatherer_notes=GathererNotes(),
     )
-    resp = to_query_response(
+    resp = await to_query_response(
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=prefanout,
     )
     assert resp.confidence_breakdown == {"EXTRACTED": 0, "INFERRED": 2, "AMBIGUOUS": 0}
 
 
-def test_no_prefanout_leaves_graph_evidence_empty() -> None:
+async def test_no_prefanout_leaves_graph_evidence_empty() -> None:
     """Backward compat: empty/no prefanout (no-LLM short-circuit,
     harness passthrough) yields graph_evidence=[] per chunk and a
     zero confidence_breakdown — the legacy behaviour before this PR."""
@@ -190,7 +190,7 @@ def test_no_prefanout_leaves_graph_evidence_empty() -> None:
         chunks=[_ge("d1")],
         gatherer_notes=GathererNotes(),
     )
-    resp = to_query_response(
+    resp = await to_query_response(
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     docs = [r for r in resp.results if r.canonical_id == "d1"]
@@ -198,7 +198,7 @@ def test_no_prefanout_leaves_graph_evidence_empty() -> None:
     assert resp.confidence_breakdown == {"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0}
 
 
-def test_related_entities_populated_from_gathered_entities() -> None:
+async def test_related_entities_populated_from_gathered_entities() -> None:
     """`related_entities` is the dashboard / MCP crawl-candidate field.
     Before this PR the adapter left it None — the dashboard's related-
     entities panel rendered empty. Now we project gathered entities
@@ -216,7 +216,7 @@ def test_related_entities_populated_from_gathered_entities() -> None:
         chunks=[],
         gatherer_notes=GathererNotes(),
     )
-    resp = to_query_response(
+    resp = await to_query_response(
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     assert resp.related_entities is not None
@@ -228,7 +228,7 @@ def test_related_entities_populated_from_gathered_entities() -> None:
     assert re.max_confidence == "EXTRACTED"
 
 
-def test_related_entities_label_falls_back_to_canonical_prefix() -> None:
+async def test_related_entities_label_falls_back_to_canonical_prefix() -> None:
     """Empty `label` (Cerebras provider drift — schema-tolerant default
     on GatheredEntity is ""). The dashboard panel renders the label
     column; without a fallback it shows blank. We derive from the
@@ -238,13 +238,157 @@ def test_related_entities_label_falls_back_to_canonical_prefix() -> None:
         chunks=[],
         gatherer_notes=GathererNotes(),
     )
-    resp = to_query_response(
+    resp = await to_query_response(
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     assert resp.related_entities[0].label == "Feature"
 
 
-def test_related_entities_none_when_agent_emitted_no_entities() -> None:
+async def test_enrichment_merges_db_edges_with_prefanout(monkeypatch) -> None:
+    """Live shape from the "what is multi-granola" trace: agent emits
+    Linear + Notion + Slack docs that came via vector/BM25 (no
+    inferred_edge channel hit). The graph has INFERRED edges between
+    every pair; without the post-hoc enrichment graph_evidence stays
+    empty on all of them and the chain panel hides. With enrichment
+    the chain hops surface so the panel renders. Patch the DB function
+    to avoid needing a live Postgres in the test."""
+    gathered = GathererOutput(
+        entities=[],
+        chunks=[
+            _ge("linear:org:issue:abc"),
+            _ge("notion:page:xyz"),
+            _ge("slack:T1:C1:1.0"),
+        ],
+        gatherer_notes=GathererNotes(),
+    )
+
+    from shared.models import GraphEvidence as GE
+    async def fake_enrich(customer_id, doc_ids):
+        # Two INFERRED edges between the curated docs.
+        return {
+            "notion:page:xyz": [
+                GE(edge_type="DISCUSSES", confidence="INFERRED",
+                   via_entity="linear:org:issue:abc",
+                   reason="Notion describes the implementation plan in the Linear ticket"),
+            ],
+            "slack:T1:C1:1.0": [
+                GE(edge_type="DISCUSSES", confidence="INFERRED",
+                   via_entity="linear:org:issue:abc",
+                   reason="Slack thread discusses the Linear ticket's plan"),
+            ],
+        }
+    monkeypatch.setattr(
+        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        fake_enrich,
+    )
+
+    resp = await to_query_response(
+        query="what is multi-granola",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        prefanout=None,
+        customer_id="cust-test",  # opts into enrichment
+    )
+
+    # Both linked docs now carry graph_evidence even though prefanout
+    # had nothing for them.
+    notion = next(r for r in resp.results if getattr(r, "doc_id", "") == "notion:page:xyz")
+    slack = next(r for r in resp.results if getattr(r, "doc_id", "") == "slack:T1:C1:1.0")
+    assert len(notion.chunks[0].graph_evidence) == 1
+    assert notion.chunks[0].graph_evidence[0].reason and "Linear ticket" in notion.chunks[0].graph_evidence[0].reason
+    assert len(slack.chunks[0].graph_evidence) == 1
+    # And the aggregated breakdown counts both.
+    assert resp.confidence_breakdown["INFERRED"] == 2
+
+
+async def test_enrichment_skipped_when_no_customer_id(monkeypatch) -> None:
+    """`customer_id=None` is the no-LLM / harness-passthrough path —
+    enrichment is opt-in to keep those paths DB-free."""
+    called = {"n": 0}
+    async def fake_enrich(customer_id, doc_ids):
+        called["n"] += 1
+        return {}
+    monkeypatch.setattr(
+        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        fake_enrich,
+    )
+    gathered = GathererOutput(
+        entities=[],
+        chunks=[_ge("d1"), _ge("d2")],
+        gatherer_notes=GathererNotes(),
+    )
+    await to_query_response(
+        query="q", gathered=gathered, trace_id="t", timing_ms={},
+        prefanout=None, customer_id=None,
+    )
+    assert called["n"] == 0
+
+
+async def test_enrichment_skipped_when_only_one_doc(monkeypatch) -> None:
+    """No point querying the DB if only one doc is in the result set —
+    the enrichment function returns early but the harness shouldn't even
+    make the call. Pin that contract."""
+    called = {"n": 0}
+    async def fake_enrich(customer_id, doc_ids):
+        called["n"] += 1
+        return {}
+    monkeypatch.setattr(
+        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        fake_enrich,
+    )
+    gathered = GathererOutput(
+        entities=[], chunks=[_ge("only-doc")], gatherer_notes=GathererNotes(),
+    )
+    await to_query_response(
+        query="q", gathered=gathered, trace_id="t", timing_ms={},
+        prefanout=None, customer_id="cust-test",
+    )
+    assert called["n"] == 0
+
+
+async def test_enrichment_dedupes_against_prefanout_evidence(monkeypatch) -> None:
+    """If the same `(anchor, edge_type)` hop already came through via
+    prefanout's inferred_edge channel, the post-hoc enrichment must
+    NOT double-render it on the chunk."""
+    gathered = GathererOutput(
+        entities=[],
+        chunks=[_ge("d1"), _ge("d2")],
+        gatherer_notes=GathererNotes(),
+    )
+    prefanout = {"sub_queries": [{
+        "query": "q",
+        "vector": [], "bm25": [], "graph": [],
+        "inferred_edge": [{
+            "doc_id": "d2",
+            "anchor_doc_id": "d1",
+            "edge_type": "DISCUSSES",
+            "confidence": "INFERRED",
+            "why": "from prefanout",
+        }],
+    }]}
+    from shared.models import GraphEvidence as GE
+    async def fake_enrich(customer_id, doc_ids):
+        # Same (anchor, edge_type) tuple — should NOT re-add to d2.
+        return {
+            "d2": [GE(edge_type="DISCUSSES", confidence="INFERRED",
+                     via_entity="d1", reason="from db enrichment")]
+        }
+    monkeypatch.setattr(
+        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        fake_enrich,
+    )
+    resp = await to_query_response(
+        query="q", gathered=gathered, trace_id="t", timing_ms={},
+        prefanout=prefanout, customer_id="cust-test",
+    )
+    d2 = next(r for r in resp.results if getattr(r, "doc_id", "") == "d2")
+    # First-wins dedup — prefanout entry is kept, enrichment one is dropped.
+    assert len(d2.chunks[0].graph_evidence) == 1
+    assert d2.chunks[0].graph_evidence[0].reason == "from prefanout"
+
+
+async def test_related_entities_none_when_agent_emitted_no_entities() -> None:
     """The model contract distinguishes `None` (not requested / walk
     failed) from `[]` (requested, no neighbors). With zero gathered
     entities we emit None — that's the "this query didn't surface any
@@ -252,7 +396,7 @@ def test_related_entities_none_when_agent_emitted_no_entities() -> None:
     gathered = GathererOutput(
         entities=[], chunks=[_ge("d1")], gatherer_notes=GathererNotes(),
     )
-    resp = to_query_response(
+    resp = await to_query_response(
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     assert resp.related_entities is None
