@@ -1341,15 +1341,22 @@ CREATE POLICY ingestion_cursors_tenant_isolation ON ingestion_cursors
 -- runs through the `customer_id` CASCADE.
 -- ---------------------------------------------------------------------------
 CREATE TABLE incident_investigations (
-    customer_id            TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    incident_doc_id        TEXT NOT NULL,
-    current_report_doc_id  TEXT,
-    state                  TEXT NOT NULL,
-    versions               JSONB NOT NULL DEFAULT '[]'::jsonb,
-    reviewer_id            TEXT,
-    reviewed_at            TIMESTAMPTZ,
-    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    customer_id                  TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    incident_doc_id              TEXT NOT NULL,
+    current_report_doc_id        TEXT,
+    state                        TEXT NOT NULL,
+    versions                     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    reviewer_id                  TEXT,
+    reviewed_at                  TIMESTAMPTZ,
+    -- migration 0083 (post-approval downstream-actions pipeline)
+    approved_at                  TIMESTAMPTZ,
+    resolved_at                  TIMESTAMPTZ,
+    post_approval_dispatched_at  TIMESTAMPTZ,
+    evidence_pack                JSONB,
+    -- migration 0086 (post-approval dispatch-failed surface)
+    metadata                     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT incident_investigations_pkey PRIMARY KEY (customer_id, incident_doc_id),
     CONSTRAINT incident_investigations_state_chk CHECK (
         state IN (

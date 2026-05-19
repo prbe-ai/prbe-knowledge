@@ -133,7 +133,17 @@ class Settings(BaseSettings):
     backend_base_url: str = ""
     internal_backend_api_key: SecretStr = SecretStr("")
 
-    # --- prbe-orchestrator (incident investigation dispatch) -----------------
+    # --- prbe-orchestrator (incident investigation + post-approval) --------
+    # The post-approval dispatch seam (`services/post_approval/dispatch.py`)
+    # POSTs to the orchestrator's `/internal/post-approval-actions` endpoint
+    # whenever an investigation reaches the (approved ∧ resolved) edge.
+    # dispatch.py is robust to misconfiguration (returns False from
+    # _post_dispatch which leaves post_approval_dispatched_at NULL and marks
+    # metadata.post_approval_dispatch_failed=true for the dashboard
+    # re-trigger button). The auth header is shared with the orchestrator
+    # and sent as `X-Internal-Backend-Key` — the orchestrator already uses
+    # the same secret for inbound /internal/* calls, so we deliberately
+    # reuse `internal_backend_api_key` instead of minting a third secret.
     orchestrator_base_url: str = Field(
         default="http://localhost:8084",
         description="Base URL for prbe-orchestrator (incident investigation dispatch).",
