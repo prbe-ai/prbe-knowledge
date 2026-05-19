@@ -18,6 +18,7 @@ from services.ingestion.handlers.base import ConnectorContext, make_default_cont
 from services.ingestion.normalizer import Normalizer
 from services.ingestion.polling.scheduler import PollScheduler
 from services.ingestion.polling.sink import PollDocumentSink
+from services.post_approval import dispatch as post_approval_dispatch
 from shared.constants import (
     GRANOLA_REFRESH_CHANNEL,
     QUEUE_HEARTBEAT_INTERVAL_SECONDS,
@@ -181,6 +182,33 @@ class Worker:
             )
             if source == SourceSystem.MANUAL_UPLOAD:
                 await self._cleanup_manual_upload_original(customer_id, event_id)
+            # Post-approval dispatch seam: when the connector flagged a
+            # resolution event (PD incident.resolved / incident.io
+            # incident_closed_v2), tell the dispatch seam so it can
+            # detect the (approved ∧ resolved) edge. Each call is
+            # idempotent at the SQL layer; the seam handles
+            # row-doesn't-exist-yet by UPSERTing a partial row.
+            #
+            # Boundary swallow: ingestion has already persisted; a
+            # transient orchestrator hiccup MUST NOT poison the queue
+            # row and force a re-process (which would re-embed the
+            # whole event for nothing). Failures get logged + the
+            # seam itself stamps metadata.post_approval_dispatch_failed
+            # for dashboard recovery.
+            for incident_doc_id in outcome.resolution_check_doc_ids:
+                try:
+                    await post_approval_dispatch.on_resolution_event(
+                        customer_id=customer_id,
+                        incident_doc_id=incident_doc_id,
+                    )
+                except Exception as exc:
+                    log.warning(
+                        "post_approval.on_resolution_event_failed",
+                        customer=customer_id,
+                        incident_doc_id=incident_doc_id,
+                        error=str(exc),
+                        error_class=type(exc).__name__,
+                    )
             await self._mark_done(
                 queue_id,
                 customer_id,

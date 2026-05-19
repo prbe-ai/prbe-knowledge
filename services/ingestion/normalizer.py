@@ -81,6 +81,13 @@ class NormalizeOutcome:
     removed_chunk_count: int = 0
     quarantined_doc_ids: list[str] = field(default_factory=list)
     requires_investigation: bool = False
+    # Doc ids the worker should pass to
+    # services.post_approval.dispatch.on_resolution_event after this
+    # outcome commits. Populated only when the connector flagged
+    # NormalizationResult.requires_resolution_check=True (PD's
+    # incident.resolved and incident.io's incident_closed_v2). Empty
+    # for every other event kind.
+    resolution_check_doc_ids: list[str] = field(default_factory=list)
 
 
 class Normalizer:
@@ -373,6 +380,21 @@ class Normalizer:
             removed=total_removed,
             failed_chunks=total_failed,
         )
+        # Carry the post-approval signal forward when the connector
+        # flagged a resolution event (PD incident.resolved or
+        # incident.io incident_closed_v2). We forward only the doc_ids
+        # we actually persisted — quarantined / not-persisted docs
+        # have no incident row to update and would no-op anyway, but
+        # passing them on would emit spurious worker logs.
+        resolution_check_doc_ids: list[str] = []
+        if result.requires_resolution_check:
+            persisted_ids = set(doc_ids)
+            resolution_check_doc_ids = [
+                doc.doc_id
+                for doc in result.documents
+                if doc.doc_id in persisted_ids
+            ]
+
         return NormalizeOutcome(
             doc_ids=doc_ids,
             chunk_count=total_live_chunks,
@@ -382,6 +404,7 @@ class Normalizer:
             removed_chunk_count=total_removed,
             quarantined_doc_ids=quarantined,
             requires_investigation=result.requires_investigation,
+            resolution_check_doc_ids=resolution_check_doc_ids,
         )
 
     async def persist_single_document(
