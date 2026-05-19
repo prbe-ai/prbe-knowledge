@@ -427,6 +427,59 @@ async def test_reject_concurrent_race_does_not_double_dispatch(
 
 
 
+async def test_post_rerun_dispatch_sends_x_prbe_customer_header(
+    monkeypatch,
+) -> None:
+    """The orchestrator's /internal/post-approval-actions route uses
+    Depends(require_customer_id) and 400s without ``x-prbe-customer``.
+    The header must be on every re-run dispatch HTTP request, sourced
+    from the payload's customer_id."""
+    import httpx
+    import respx
+    from pydantic import SecretStr
+
+    from services.ingestion.wiki_artifact_review_routes import (
+        _post_rerun_dispatch,
+    )
+    from shared.config import Settings, get_settings
+
+    get_settings.cache_clear()
+
+    def _settings() -> Settings:
+        return Settings(
+            orchestrator_base_url="http://orchestrator.internal:8080",
+            internal_backend_api_key=SecretStr("test-internal-key"),
+        )
+
+    monkeypatch.setattr(
+        "services.ingestion.wiki_artifact_review_routes.get_settings",
+        _settings,
+    )
+
+    payload = {
+        "customer_id": "cust-1",
+        "incident_doc_id": "pd:incident:PD-RV-RD-HDR",
+        "prior_artifact_doc_id": "pd:wiki.postmortem:PD-RV-RD-HDR:v1",
+        "artifact_kind": "postmortem",
+        "reviewer_feedback": "needs more detail",
+    }
+
+    expected_url = (
+        "http://orchestrator.internal:8080/internal/post-approval-actions"
+    )
+    with respx.mock(assert_all_called=True) as router:
+        route = router.post(expected_url).mock(
+            return_value=httpx.Response(200, json={"ok": True}),
+        )
+        ok = await _post_rerun_dispatch(payload)
+
+    assert ok is True
+    request = route.calls[0].request
+    assert request.headers["x-prbe-customer"] == "cust-1"
+    assert request.headers["x-internal-backend-key"] == "test-internal-key"
+    get_settings.cache_clear()
+
+
 async def test_reject_approved_artifact_returns_409(client) -> None:
     artifact_id = await _seed_via_writeback(
         client, incident_doc_id="pd:incident:PD-RV-RJ-AP",

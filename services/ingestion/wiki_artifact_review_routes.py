@@ -205,6 +205,9 @@ async def _post_rerun_dispatch(payload: dict[str, Any]) -> bool:
     headers = {
         "x-internal-backend-key":
             settings.internal_backend_api_key.get_secret_value(),
+        # Orchestrator's route uses Depends(require_customer_id) and 400s
+        # without this header even though the body carries customer_id.
+        "x-prbe-customer": payload["customer_id"],
         "content-type": "application/json",
     }
 

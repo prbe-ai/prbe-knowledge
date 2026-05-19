@@ -470,3 +470,54 @@ async def test_dispatch_non_http_exception_triggers_rollback(
         md = json.loads(md)
     assert md is not None
     assert md.get("post_approval_dispatch_failed") is True
+
+
+async def test_post_dispatch_sends_x_prbe_customer_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The orchestrator's /internal/post-approval-actions route uses
+    Depends(require_customer_id) and 400s without ``x-prbe-customer``.
+    The header must be on every dispatch HTTP request, sourced from the
+    payload's customer_id."""
+    import httpx
+    import respx
+    from pydantic import SecretStr
+
+    from services.post_approval.dispatch import _post_dispatch
+    from shared.config import Settings, get_settings
+
+    get_settings.cache_clear()
+
+    def _settings() -> Settings:
+        return Settings(
+            orchestrator_base_url="http://orchestrator.internal:8080",
+            internal_backend_api_key=SecretStr("test-internal-key"),
+        )
+
+    monkeypatch.setattr(
+        "services.post_approval.dispatch.get_settings", _settings,
+    )
+
+    payload = {
+        "customer_id": "cust-1",
+        "incident_doc_id": "pd:incident:PD-INC-001",
+        "investigation_doc_id": "pd:investigation:PD-INC-001:v1",
+        "source": "pagerduty",
+        "approved_at": "2026-01-01T00:00:00+00:00",
+        "resolved_at": "2026-01-01T00:00:00+00:00",
+    }
+
+    expected_url = (
+        "http://orchestrator.internal:8080/internal/post-approval-actions"
+    )
+    with respx.mock(assert_all_called=True) as router:
+        route = router.post(expected_url).mock(
+            return_value=httpx.Response(200, json={"ok": True}),
+        )
+        ok = await _post_dispatch(payload)
+
+    assert ok is True
+    request = route.calls[0].request
+    assert request.headers["x-prbe-customer"] == "cust-1"
+    assert request.headers["x-internal-backend-key"] == "test-internal-key"
+    get_settings.cache_clear()
