@@ -325,14 +325,24 @@ async def test_enrichment_skipped_when_no_customer_id(monkeypatch) -> None:
     assert called["n"] == 0
 
 
-async def test_enrichment_skipped_when_only_one_doc(monkeypatch) -> None:
-    """No point querying the DB if only one doc is in the result set —
-    the enrichment function returns early but the harness shouldn't even
-    make the call. Pin that contract."""
-    called = {"n": 0}
+async def test_enrichment_fires_on_single_doc_result(monkeypatch) -> None:
+    """Live trace 2026-05-19: Cerebras agent curation collapsed
+    identical-query reruns from 5 docs to 2 docs. Under the old `>= 2`
+    threshold a 2-doc curated set (1 Document + 1 Entity) skipped
+    enrichment → confidence_breakdown.INFERRED dropped from 10 to 0 →
+    chain panel rendered empty.
+
+    Threshold now fires on >=1 doc — the enrichment function itself
+    handles the SELECT shape (edges where AT LEAST ONE endpoint is in
+    the curated set) so a single result doc still gets its chain
+    neighbors projected. Pin the new contract."""
+    called = {"n": 0, "doc_ids": []}
+
     async def fake_enrich(customer_id, doc_ids):
         called["n"] += 1
+        called["doc_ids"] = list(doc_ids)
         return {}
+
     monkeypatch.setattr(
         "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
         fake_enrich,
@@ -344,7 +354,57 @@ async def test_enrichment_skipped_when_only_one_doc(monkeypatch) -> None:
         query="q", gathered=gathered, trace_id="t", timing_ms={},
         prefanout=None, customer_id="cust-test",
     )
-    assert called["n"] == 0
+    assert called["n"] == 1
+    assert called["doc_ids"] == ["only-doc"]
+
+
+async def test_enrichment_carries_via_entity_title_through_to_response(monkeypatch) -> None:
+    """The new `via_entity_title` field on GraphEvidence lets the
+    dashboard chain-graph render the OTHER endpoint of an edge with a
+    human-readable label even when that doc isn't itself in the curated
+    result set. This test pins that the field flows from the
+    enrichment query down through to the QueryChunk shape consumers
+    actually read."""
+    gathered = GathererOutput(
+        entities=[],
+        chunks=[_ge("linear:org:issue:abc")],
+        gatherer_notes=GathererNotes(),
+    )
+
+    from shared.models import GraphEvidence as GE
+
+    async def fake_enrich(customer_id, doc_ids):
+        return {
+            "linear:org:issue:abc": [
+                GE(
+                    edge_type="DISCUSSES",
+                    confidence="INFERRED",
+                    via_entity="slack:T1:C1:1.0",
+                    via_entity_title="multi-granola deploy order is **strict**...",
+                    reason="The Slack thread discusses the Multi-Granola implementation plan.",
+                ),
+            ],
+        }
+
+    monkeypatch.setattr(
+        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        fake_enrich,
+    )
+
+    resp = await to_query_response(
+        query="multi-granola",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        prefanout=None,
+        customer_id="cust-test",
+    )
+    linear = next(
+        r for r in resp.results if getattr(r, "doc_id", "") == "linear:org:issue:abc"
+    )
+    ev = linear.chunks[0].graph_evidence[0]
+    assert ev.via_entity == "slack:T1:C1:1.0"
+    assert ev.via_entity_title == "multi-granola deploy order is **strict**..."
 
 
 async def test_enrichment_dedupes_against_prefanout_evidence(monkeypatch) -> None:
