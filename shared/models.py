@@ -20,6 +20,7 @@ from shared.constants import (
     PrincipalType,
     RefType,
     SourceSystem,
+    Visibility,
 )
 
 # Sentinel chunk_index for the synthetic per-Document metadata chunk
@@ -153,6 +154,15 @@ class Document(BaseModel):
     compilation_model: str | None = None
     compiled_at: datetime | None = None
     compile_trigger: CompileTrigger | None = None
+
+    # Retrieval-visibility gate. APPROVED (default) preserves the
+    # pre-existing contract for every connector — their docs land
+    # immediately readable, identical to behavior before migration
+    # 0082 added the column. Post-approval wiki artifacts (postmortem,
+    # knowledge_page, correction) override this to DRAFT at writeback
+    # time and rely on the review approve path to flip it to APPROVED
+    # in a single transaction. See shared/constants.py::Visibility.
+    visibility: Visibility = Visibility.APPROVED
 
 
 class Chunk(BaseModel):

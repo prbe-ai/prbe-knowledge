@@ -426,6 +426,12 @@ class Normalizer:
         SourceSystem.PAGERDUTY for a PD-incident investigation report — not
         SourceSystem.CUSTOM_INGEST) so source-system-keyed filters / score
         multipliers apply.
+
+        ``doc.visibility`` (default ``Visibility.APPROVED``) is threaded
+        through to both the ``documents`` and ``chunks`` inserts. Post-
+        approval wiki artifacts set ``Visibility.DRAFT`` here; the review
+        approve path flips both rows back to ``APPROVED`` in a single
+        atomic transaction.
         """
         result = NormalizationResult(documents=[doc])
         return await self._persist(customer_id, doc.source_system, result)
@@ -853,7 +859,8 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
                         entities = $11::jsonb,
                         attachments = $12::jsonb,
                         doc_references = $13::jsonb,
-                        ingested_at = $14
+                        ingested_at = $14,
+                        visibility = $16
                     WHERE customer_id = $1 AND doc_id = $2 AND version = $15
                       AND valid_to IS NULL
                     """,
@@ -872,6 +879,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
                     _json([r.model_dump() for r in doc.doc_references]),
                     doc.ingested_at,
                     existing["version"],
+                    doc.visibility.value,
                 )
                 # Returning True so the caller proceeds to chunk diff against
                 # the same version; chunk diff handles add/reuse/remove correctly.
@@ -919,7 +927,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
                 created_at, updated_at, valid_from, valid_to, deleted_at, ingested_at,
                 parent_doc_id, supersedes_doc_id,
                 acl, metadata, entities, attachments, doc_references,
-                normalizer_version
+                normalizer_version, visibility
             )
             VALUES (
                 $1, $2, $3,
@@ -930,7 +938,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
                 $17, $18, $19, $20, $21, $22,
                 $23, $24,
                 $25::jsonb, $26::jsonb, $27::jsonb, $28::jsonb, $29::jsonb,
-                $30
+                $30, $31
             )
             ON CONFLICT (customer_id, doc_id, version) DO NOTHING
             RETURNING 1
@@ -965,6 +973,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
             _json([a.model_dump() for a in doc.attachments]),
             _json([r.model_dump() for r in doc.doc_references]),
             NORMALIZER_VERSION,
+            doc.visibility.value,
         )
         if inserted is not None:
             doc.version = next_version
@@ -1017,21 +1026,24 @@ async def _insert_chunk(
             chunk_index, content, content_hash, token_count,
             chunker_version,
             first_seen_version, last_seen_version, kind,
-            embedding_v2, embedding_v2_model, embedding_v2_dim
+            embedding_v2, embedding_v2_model, embedding_v2_dim,
+            visibility
         )
         VALUES (
             $1, $2, $3,
             $4, $5, $6, $7,
             $8,
             $9, $9, $10,
-            $11::halfvec, $12, $13
+            $11::halfvec, $12, $13,
+            $14
         )
         ON CONFLICT (doc_id, content_hash) DO UPDATE
             SET last_seen_version = EXCLUDED.last_seen_version,
                 valid_to = NULL,
                 embedding_v2 = EXCLUDED.embedding_v2,
                 embedding_v2_model = EXCLUDED.embedding_v2_model,
-                embedding_v2_dim = EXCLUDED.embedding_v2_dim
+                embedding_v2_dim = EXCLUDED.embedding_v2_dim,
+                visibility = EXCLUDED.visibility
         """,
         chunk_id,
         doc.doc_id,
@@ -1046,6 +1058,7 @@ async def _insert_chunk(
         _pg_vector(embedding),
         EMBEDDING_V2_MODEL,
         EMBEDDING_V2_DIM,
+        doc.visibility.value,
     )
 
 
@@ -1105,14 +1118,16 @@ async def _insert_chunks_batch(
             chunk_index, content, content_hash, token_count,
             chunker_version,
             first_seen_version, last_seen_version, kind,
-            embedding_v2, embedding_v2_model, embedding_v2_dim
+            embedding_v2, embedding_v2_model, embedding_v2_dim,
+            visibility
         )
         SELECT
             chunk_id, $2, $3,
             chunk_index, content, content_hash, token_count,
             $9,
             $10, $10, kind,
-            embedding_v2::halfvec, $12, $13
+            embedding_v2::halfvec, $12, $13,
+            $14
         FROM unnest(
             $1::text[], $4::int[], $5::text[], $6::text[], $7::int[],
             $8::text[], $11::text[]
@@ -1123,7 +1138,8 @@ async def _insert_chunks_batch(
                 valid_to = NULL,
                 embedding_v2 = EXCLUDED.embedding_v2,
                 embedding_v2_model = EXCLUDED.embedding_v2_model,
-                embedding_v2_dim = EXCLUDED.embedding_v2_dim
+                embedding_v2_dim = EXCLUDED.embedding_v2_dim,
+                visibility = EXCLUDED.visibility
         """,
         chunk_ids,
         doc.doc_id,
@@ -1138,6 +1154,7 @@ async def _insert_chunks_batch(
         kinds,
         EMBEDDING_V2_MODEL,
         EMBEDDING_V2_DIM,
+        doc.visibility.value,
     )
 
 
