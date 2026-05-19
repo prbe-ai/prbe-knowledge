@@ -67,6 +67,9 @@ from services.ingestion.manual_uploads import (
     parse_manual_upload,
     safe_filename,
 )
+from services.ingestion.postmortem_template_routes import (
+    router as postmortem_template_router,
+)
 from services.ingestion.slack_lifecycle import handle_slack_lifecycle_event
 from services.ingestion.wiki_artifact_review_routes import (
     router as wiki_artifact_review_router,
@@ -132,6 +135,7 @@ app.include_router(investigation_review_router)
 app.include_router(incident_evidence_pack_router)
 app.include_router(wiki_artifact_writeback_router)
 app.include_router(wiki_artifact_review_router)
+app.include_router(postmortem_template_router)
 
 
 @app.get("/health")

@@ -27,9 +27,9 @@ from services.ingestion.handlers.base import make_default_context
 from services.ingestion.normalizer import Normalizer
 from shared import db as db_module
 from shared.constants import (
+    EMBEDDING_V2_DIM,
     DocClass,
     DocType,
-    EMBEDDING_V2_DIM,
     Permission,
     PrincipalType,
     SourceSystem,

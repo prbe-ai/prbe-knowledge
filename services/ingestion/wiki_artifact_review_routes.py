@@ -144,29 +144,28 @@ async def approve(
     # nested `async with conn.transaction()` runs as a SAVEPOINT,
     # which rolls back the three writes together on any failure
     # without dropping the outer tenant binding.
-    async with with_tenant(customer_id) as conn:
-        async with conn.transaction():
-            await conn.execute(
-                "UPDATE documents "
-                "SET visibility = 'approved', updated_at = now() "
-                "WHERE customer_id = $1 AND doc_id = $2",
-                customer_id, artifact_doc_id,
-            )
-            await conn.execute(
-                "UPDATE chunks "
-                "SET visibility = 'approved' "
-                "WHERE customer_id = $1 AND doc_id = $2",
-                customer_id, artifact_doc_id,
-            )
-            await conn.execute(
-                "UPDATE wiki_review_queue "
-                "SET state = 'approved', "
-                "    reviewer_id = $3, "
-                "    reviewed_at = now(), "
-                "    updated_at = now() "
-                "WHERE customer_id = $1 AND artifact_doc_id = $2",
-                customer_id, artifact_doc_id, body.reviewer_id,
-            )
+    async with with_tenant(customer_id) as conn, conn.transaction():
+        await conn.execute(
+            "UPDATE documents "
+            "SET visibility = 'approved', updated_at = now() "
+            "WHERE customer_id = $1 AND doc_id = $2",
+            customer_id, artifact_doc_id,
+        )
+        await conn.execute(
+            "UPDATE chunks "
+            "SET visibility = 'approved' "
+            "WHERE customer_id = $1 AND doc_id = $2",
+            customer_id, artifact_doc_id,
+        )
+        await conn.execute(
+            "UPDATE wiki_review_queue "
+            "SET state = 'approved', "
+            "    reviewer_id = $3, "
+            "    reviewed_at = now(), "
+            "    updated_at = now() "
+            "WHERE customer_id = $1 AND artifact_doc_id = $2",
+            customer_id, artifact_doc_id, body.reviewer_id,
+        )
 
     log.info(
         "wiki_artifact.review.approved",
