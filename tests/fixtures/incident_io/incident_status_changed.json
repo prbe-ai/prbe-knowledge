@@ -1,0 +1,17 @@
+{
+  "event_type": "public_incident.incident_status_changed_v2",
+  "public_incident.incident_status_changed_v2": {
+    "id": "01ABCDEFGHIJKLMNOPQRSTUVWX",
+    "reference": "INC-42",
+    "name": "Checkout payments degraded",
+    "summary": "Stripe webhooks delayed >5min for 8% of orders",
+    "incident_status": {"name": "Fixing", "category": "active"},
+    "severity": {"name": "Major", "rank": 2},
+    "incident_type": {"name": "Customer-impacting"},
+    "created_at": "2026-05-17T12:00:00Z",
+    "permalink": "https://app.incident.io/acme/incidents/01ABCDEFGHIJKLMNOPQRSTUVWX",
+    "slack_team_id": "T01XYZ",
+    "incident_role_assignments": [{"role": {"name": "Incident Lead"}, "assignee": {"name": "Jane Doe"}}],
+    "custom_field_entries": [{"custom_field": {"name": "Affected Service"}, "values": [{"value_text": "checkout-svc"}]}]
+  }
+}
