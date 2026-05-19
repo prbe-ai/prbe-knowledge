@@ -603,6 +603,16 @@ class QueryResponse(BaseModel):
     # know about this field (older MCP clients) ignore it under
     # Pydantic's default extra='ignore' semantics.
     gatherer_notes: dict[str, object] | None = None
+    # The doc the query is most about — the explicit "root" anchor of
+    # the result set. Surfaced so downstream consumers (esp. the
+    # dashboard's chain-of-reasoning graph viz) can deterministically
+    # pin a root node instead of guessing from `results[0]`. Computed
+    # by the adapter from the top-ranked Document in the result set
+    # (falling back to the top extracted_entity's canonical_id when no
+    # Document was emitted). None when there's nothing meaningful to
+    # anchor on (empty result set, entity-only queries with no
+    # extracted entities).
+    query_root_doc_id: str | None = None
 
 
 class AnswerRequest(QueryRequest):

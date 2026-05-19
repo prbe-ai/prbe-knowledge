@@ -448,6 +448,59 @@ async def test_enrichment_dedupes_against_prefanout_evidence(monkeypatch) -> Non
     assert d2.chunks[0].graph_evidence[0].reason == "from prefanout"
 
 
+async def test_query_root_doc_id_picks_top_ranked_document() -> None:
+    """The dashboard's chain-graph viz pins a `query_root` node so
+    everything else lays out radially around it. The adapter must
+    surface a deterministic root — top-ranked Document — instead of
+    making the frontend guess via `results[0]`. Pin that contract."""
+    gathered = GathererOutput(
+        entities=[],
+        chunks=[
+            _ge("github:prbe-ai/prbe-knowledge:pr:328"),
+            _ge("claude_code:probe-founders:abc-123"),
+        ],
+        gatherer_notes=GathererNotes(),
+    )
+    resp = await to_query_response(
+        query="why was pr328 created",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        prefanout=None,
+    )
+    assert resp.query_root_doc_id == "github:prbe-ai/prbe-knowledge:pr:328"
+
+
+async def test_query_root_doc_id_falls_back_to_top_entity() -> None:
+    """Entity-only result (grounding resolved the entity but agent
+    didn't emit a doc chunk): use the top entity's canonical_id so
+    the chain panel still has something to anchor on."""
+    gathered = GathererOutput(
+        entities=[
+            GatheredEntity(canonical_id="pr-328", label="PR"),
+            GatheredEntity(canonical_id="repo-x", label="Repo"),
+        ],
+        chunks=[],
+        gatherer_notes=GathererNotes(),
+    )
+    resp = await to_query_response(
+        query="pr 328", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
+    )
+    assert resp.query_root_doc_id == "pr-328"
+
+
+async def test_query_root_doc_id_none_for_empty_result() -> None:
+    """Empty result set → None. Frontend hides the root pin instead of
+    falling back to a stale value."""
+    gathered = GathererOutput(
+        entities=[], chunks=[], gatherer_notes=GathererNotes(),
+    )
+    resp = await to_query_response(
+        query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
+    )
+    assert resp.query_root_doc_id is None
+
+
 async def test_related_entities_none_when_agent_emitted_no_entities() -> None:
     """The model contract distinguishes `None` (not requested / walk
     failed) from `[]` (requested, no neighbors). With zero gathered

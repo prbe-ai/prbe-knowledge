@@ -490,6 +490,27 @@ async def to_query_response(
         for e in gathered.entities
     ]
 
+    # Explicit query root — the doc the query is most about. Surfaced so
+    # the dashboard's chain-of-reasoning graph pins a deterministic root
+    # node instead of guessing via `results[0]`. Resolution priority:
+    #
+    #   1. Top-ranked Document in the result set (i.e. the agent's
+    #      highest-ranked answer doc). Best signal because the agent
+    #      explicitly ordered docs by relevance.
+    #   2. The top extracted entity's canonical_id when no Document
+    #      surfaced (entity-only queries — e.g. "tell me about PR 328"
+    #      where grounding resolved the entity but the agent didn't
+    #      emit a doc chunk).
+    #   3. None when neither — nothing to anchor on, frontend hides the
+    #      root pin.
+    query_root_doc_id: str | None = None
+    for r in results:
+        if isinstance(r, QueryDocumentResult):
+            query_root_doc_id = r.doc_id
+            break
+    if query_root_doc_id is None and gathered.entities:
+        query_root_doc_id = gathered.entities[0].canonical_id
+
     return QueryResponse(
         query=query,
         results=results,
@@ -511,6 +532,7 @@ async def to_query_response(
         ],
         related_entities=related_entities or None,
         gatherer_notes=gathered.gatherer_notes.model_dump(),
+        query_root_doc_id=query_root_doc_id,
     )
 
 
