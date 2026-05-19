@@ -24,6 +24,8 @@ class SourceSystem(StrEnum):
     # from agent-compiled summaries (COMPILED_WIKI).
     WIKI = "wiki"
     CODE_GRAPH = "code_graph"
+    PAGERDUTY = "pagerduty"
+    INCIDENT_IO = "incident_io"
 
 
 # Canonical display labels for each SourceSystem. Exposed to the
@@ -45,6 +47,8 @@ SOURCE_DISPLAY_NAMES: dict[SourceSystem, str] = {
     SourceSystem.CUSTOM_INGEST: "Custom Ingest",
     SourceSystem.WIKI: "Wiki",
     SourceSystem.CODE_GRAPH: "Code",
+    SourceSystem.PAGERDUTY: "PagerDuty",
+    SourceSystem.INCIDENT_IO: "incident.io",
 }
 
 
@@ -101,6 +105,8 @@ class DocType(StrEnum):
     # lives in the embedded metadata chunk so semantic search ranks
     # repo-qualified queries correctly.
     CODE_FILE = "code.file"
+    INCIDENT = "incident"
+    INCIDENT_INVESTIGATION = "incident.investigation"
 
 
 # SQL pattern matching every wiki page doc_type (excludes the singleton
@@ -443,6 +449,11 @@ SOURCE_INGESTION_PRIORITY: dict[SourceSystem, int] = {
     # not user-facing latency-critical — sits in the same tier as backfill
     # rows so a large repo onboarding can't block live webhooks.
     SourceSystem.CODE_GRAPH: 50,
+    # Incident sources are first-class authored signals (same tier as Slack /
+    # Linear / GitHub webhooks). Sentry is unlisted (defaults to 100); these
+    # are explicit so the intent is obvious to future readers.
+    SourceSystem.PAGERDUTY: 100,
+    SourceSystem.INCIDENT_IO: 100,
 }
 
 TOP_K_VECTOR = 50
@@ -560,6 +571,11 @@ SOURCE_HALF_LIFE_DAYS: dict[SourceSystem, float] = {
     # Code symbols decay slower than CC/Codex transcripts (a function still
     # exists weeks later) but faster than authored docs (refactors happen).
     SourceSystem.CODE_GRAPH: 30.0,
+    # Incident records remain relevant for post-mortems and pattern-matching
+    # for months; 200d keeps them well above the 120d baseline while still
+    # allowing slow decay relative to very recent incidents.
+    SourceSystem.PAGERDUTY: 200.0,
+    SourceSystem.INCIDENT_IO: 200.0,
 }
 
 # Inferred-edge retrieval channel tuning. The channel walks INFERRED Doc-Doc
