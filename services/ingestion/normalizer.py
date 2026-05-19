@@ -1358,7 +1358,17 @@ def _metadata_text(doc: Document) -> str:
     if doc.source_id:
         lines.append(f"id: {doc.source_id}")
     if doc.author_id:
-        lines.append(f"author: {doc.author_id}")
+        # Prefer a resolved display name when the connector stashed one — e.g.
+        # Slack stores the user-cache hit at metadata.author_display_name so
+        # this line renders "author: Richard Wei" not "author: U0ARLAD3B2B".
+        # Other source systems either use human-readable author_ids (github
+        # logins, email-style ids) or omit the field.
+        author_label = doc.author_id
+        if isinstance(doc.metadata, dict):
+            stashed = doc.metadata.get("author_display_name")
+            if isinstance(stashed, str) and stashed:
+                author_label = stashed
+        lines.append(f"author: {author_label}")
     # Co-authors (currently github commits via Co-authored-by trailers) get
     # one line per entry so they're indexed by BM25 and vector alongside the
     # primary author. Without this, a commit Mahit only co-authored never
