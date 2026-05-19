@@ -381,12 +381,21 @@ class GraphEvidence(BaseModel):
     entries on QueryChunk.graph_evidence. Empty list when the chunk
     surfaced via vector / BM25 / id_lookup alone. Lets MCP / dashboard
     consumers filter on confidence tier without re-running the retrieval.
+
+    `via_entity_title` is an optional human-readable title for the
+    `via_entity` doc, populated only by the adapter's post-hoc
+    enrichment step (LEFT JOIN documents). Empty / null when the title
+    isn't known (entity nodes without docs, or pre-enrichment paths).
+    Lets the dashboard's chain-of-reasoning graph viz render the
+    OTHER endpoint of an edge with a readable label even when that doc
+    isn't itself in the curated result set.
     """
 
     edge_type: str
     confidence: str  # EXTRACTED | INFERRED | AMBIGUOUS
     via_entity: str
     reason: str | None = None
+    via_entity_title: str | None = None
 
 
 class QueryChunk(BaseModel):

@@ -131,61 +131,122 @@ def _build_doc_to_graph_evidence(
     return out
 
 
+# Per-anchor cap on injected neighbors. Surfacing graph_evidence for
+# INFERRED edges where the result-set doc is one endpoint regardless of
+# whether the OTHER endpoint is curated; cap so a high-degree doc
+# (claude_code session with 126 neighbors, wiki:repo:prbe_knowledge with
+# 83 neighbors) doesn't dump 100+ edges into the response and bloat
+# graph_evidence beyond what the chain panel can render. Top 8 keeps
+# the densest chains readable while letting low-degree docs surface
+# all of their (typically 2-5) connections.
+_ENRICH_TOP_K_PER_ANCHOR = 8
+
+
 async def _enrich_graph_evidence_from_result_set(
     customer_id: str,
     doc_ids: list[str],
 ) -> dict[str, list[GraphEvidence]]:
-    """Query `graph_edges` for INFERRED edges between any pair of docs
-    in the result set; project each as a `GraphEvidence` entry on the
-    `to`-side doc.
+    """Query `graph_edges` for INFERRED edges where AT LEAST ONE endpoint
+    is in the curated result set; project each as a `GraphEvidence`
+    entry on that endpoint's doc.
 
-    Why this is separate from `_build_doc_to_graph_evidence`: the latter
-    only sees edges that the pre-fan-out's `inferred_edge` channel
-    surfaced (i.e. edges where one endpoint matched a *grounded*
-    anchor). It misses the very common case where the agent emits N
-    docs that came in via vector / BM25 / graph, all of which are
-    cross-linked in the inferred-edges graph but none of which were the
-    grounded anchor on this query — e.g. a "what is multi-granola"
-    query that returns the Linear ticket + the Notion design doc + the
-    Slack thread. The graph has dozens of INFERRED edges between them
-    (the LLM extractor ran when each was ingested) but the prefanout's
-    inferred_edge channel anchored on the wrong entity.
+    Why ONE endpoint (not both): live-traced 2026-05-19. Same query
+    twice 4 min apart, same grounding/extraction (entity
+    `multi-granola-support`), but the Cerebras-backed gatherer emitted
+    5 docs on run 1 (Linear PRB-18 + 3 Slack threads + entity) and only
+    2 docs on run 2 (Linear PRB-18 + entity). Run 2's curation dropped
+    the Slack threads that carry all the chain edges to PRB-18 →
+    `confidence_breakdown.INFERRED` collapsed from 10 to 0 → chain
+    panel renders empty even though PRB-18 has 47+ inferred-edge
+    neighbors in the graph.
 
-    This post-hoc enrichment closes that gap: after the agent's
-    curation, we query the graph directly for edges where BOTH
-    endpoints are in the curated result set. The chain panel then
-    renders whenever the curated set has any inferred connectivity in
-    the graph, regardless of which retrieval channel brought each doc
-    in.
+    Requiring BOTH endpoints in the result set means we only surface
+    chain hops when the agent happened to curate matched pairs.
+    Defaulting to ONE means a single result doc still gets its chain
+    neighbors projected — the chain panel renders even under
+    aggressive curation. The other endpoint's title is LEFT JOINed
+    from `documents` so the chain viz can render the neighbor as a
+    labeled node via `GraphEvidence.via_entity_title`.
 
-    Returns empty dict when there are fewer than 2 doc_ids (nothing to
-    connect) or when the DB query fails (best-effort enrichment —
-    callers fall back to prefanout-only).
+    Per-anchor cap (`_ENRICH_TOP_K_PER_ANCHOR`) prevents a high-degree
+    doc from dominating the payload — top-K by extraction recency.
+
+    Returns empty dict when there are no doc_ids or the DB query
+    fails. Best-effort — callers fall back to prefanout-only.
     """
     out: dict[str, list[GraphEvidence]] = {}
-    if len(doc_ids) < 2:
+    if not doc_ids:
         return out
     try:
         async with with_tenant(customer_id) as conn:
             rows = await conn.fetch(
                 """
-                SELECT
-                    gn_from.canonical_id AS from_doc,
-                    gn_to.canonical_id   AS to_doc,
-                    ge.edge_type,
-                    ge.confidence,
-                    ge.properties->>'why' AS why
-                FROM graph_edges ge
-                JOIN graph_nodes gn_from ON gn_from.node_id = ge.from_node_id
-                JOIN graph_nodes gn_to   ON gn_to.node_id   = ge.to_node_id
-                WHERE ge.customer_id = $1
-                  AND ge.confidence  = 'INFERRED'
-                  AND gn_from.canonical_id = ANY($2::text[])
-                  AND gn_to.canonical_id   = ANY($2::text[])
-                  AND gn_from.canonical_id <> gn_to.canonical_id
+                WITH result_endpoints AS (
+                    -- All inferred edges touching at least one curated
+                    -- doc, with the curated doc as `anchor_doc` and the
+                    -- OTHER endpoint as `other_doc`. UNION ALL covers
+                    -- both directions so the chain panel sees edges
+                    -- regardless of from/to orientation.
+                    SELECT
+                        gn_from.canonical_id AS anchor_doc,
+                        gn_to.canonical_id   AS other_doc,
+                        ge.edge_type,
+                        ge.confidence,
+                        ge.properties->>'why' AS why,
+                        ge.extracted_at
+                    FROM graph_edges ge
+                    JOIN graph_nodes gn_from ON gn_from.node_id = ge.from_node_id
+                    JOIN graph_nodes gn_to   ON gn_to.node_id   = ge.to_node_id
+                    WHERE ge.customer_id = $1
+                      AND ge.confidence  = 'INFERRED'
+                      AND gn_from.canonical_id = ANY($2::text[])
+                      AND gn_from.canonical_id <> gn_to.canonical_id
+                    UNION ALL
+                    SELECT
+                        gn_to.canonical_id   AS anchor_doc,
+                        gn_from.canonical_id AS other_doc,
+                        ge.edge_type,
+                        ge.confidence,
+                        ge.properties->>'why' AS why,
+                        ge.extracted_at
+                    FROM graph_edges ge
+                    JOIN graph_nodes gn_from ON gn_from.node_id = ge.from_node_id
+                    JOIN graph_nodes gn_to   ON gn_to.node_id   = ge.to_node_id
+                    WHERE ge.customer_id = $1
+                      AND ge.confidence  = 'INFERRED'
+                      AND gn_to.canonical_id = ANY($2::text[])
+                      AND gn_from.canonical_id <> gn_to.canonical_id
+                ),
+                ranked AS (
+                    -- Dedup by (anchor, other, edge_type) so reciprocal
+                    -- entries from the UNION ALL collapse, then top-K
+                    -- per anchor by extraction recency.
+                    SELECT
+                        re.*,
+                        d.title AS other_title,
+                        row_number() OVER (
+                            PARTITION BY re.anchor_doc, re.other_doc, re.edge_type
+                            ORDER BY re.extracted_at DESC NULLS LAST
+                        ) AS dedup_rn,
+                        row_number() OVER (
+                            PARTITION BY re.anchor_doc
+                            ORDER BY re.extracted_at DESC NULLS LAST
+                        ) AS anchor_rn
+                    FROM result_endpoints re
+                    LEFT JOIN documents d
+                      ON d.customer_id = $1
+                     AND d.doc_id = re.other_doc
+                )
+                SELECT anchor_doc, other_doc, edge_type, confidence,
+                       why, other_title
+                FROM ranked
+                WHERE dedup_rn = 1
+                  AND anchor_rn <= $3
+                ORDER BY anchor_doc, anchor_rn
                 """,
                 customer_id,
                 doc_ids,
+                _ENRICH_TOP_K_PER_ANCHOR,
             )
     except Exception as exc:
         log.warning(
@@ -199,10 +260,11 @@ async def _enrich_graph_evidence_from_result_set(
         ev = GraphEvidence(
             edge_type=r["edge_type"],
             confidence=r["confidence"],
-            via_entity=r["from_doc"],
+            via_entity=r["other_doc"],
             reason=r["why"],
+            via_entity_title=r["other_title"],
         )
-        out.setdefault(r["to_doc"], []).append(ev)
+        out.setdefault(r["anchor_doc"], []).append(ev)
     return out
 
 
@@ -275,8 +337,16 @@ async def to_query_response(
     # Post-hoc enrichment from graph_edges. Merged into the prefanout-
     # derived doc_evidence below; dedup by (via_entity, edge_type) per
     # doc so a hop already surfaced via prefanout doesn't double-render.
+    # Threshold dropped to 1 doc (was 2) — `_enrich_graph_evidence_from_
+    # result_set` now surfaces edges where AT LEAST ONE endpoint is in
+    # the curated set, so a single result doc still gets its chain
+    # neighbors projected. Live trace 2026-05-19 showed Cerebras agent
+    # curation collapsing 5 docs → 2 docs on identical-query reruns,
+    # which under the old `>= 2` gate would have still failed to render
+    # the chain. Under the new logic a single PRB-18 doc still gets its
+    # 47 inferred-edge neighbors projected as graph_evidence.
     result_set_doc_ids = [c.doc_id for c in gathered.chunks if c.doc_id]
-    if customer_id and len(set(result_set_doc_ids)) >= 2:
+    if customer_id and result_set_doc_ids:
         graph_evidence_extra = await _enrich_graph_evidence_from_result_set(
             customer_id, list(set(result_set_doc_ids))
         )
