@@ -749,6 +749,9 @@ async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:
     )
 
     async with with_tenant(customer_id) as conn:
+        # Plan A Component 6: agent-facing wiki index excludes drafts —
+        # the agent picks (wiki_type, slug) targets from approved pages
+        # only. Drafts are pending reviewer approval (Component 5).
         rows = await conn.fetch(
             """
             SELECT title, source_id, version, updated_at, metadata
@@ -759,6 +762,7 @@ async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:
               AND doc_type <> $4
               AND valid_to IS NULL
               AND deleted_at IS NULL
+              AND visibility = 'approved'
             ORDER BY updated_at DESC
             """,
             customer_id,

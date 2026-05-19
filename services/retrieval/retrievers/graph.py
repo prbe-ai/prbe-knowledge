@@ -100,6 +100,7 @@ async def graph_search(
     doc_types: list[str] | None = None,
     temporal: TemporalSpec | None = None,
     min_confidence: str | None = "INFERRED",
+    include_drafts: bool = False,
 ) -> list[GraphHit]:
     """Return chunks from documents within 1 hop of any matching entity node.
 
@@ -167,6 +168,14 @@ async def graph_search(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
         )
         params.extend(pred.params)
+
+        # Hide drafts by default (Plan A Component 6); reviewer surfaces
+        # opt in via include_drafts=True.
+        visibility_filter = (
+            ""
+            if include_drafts
+            else "AND c.visibility = 'approved' AND d.visibility = 'approved'"
+        )
 
         rows = await conn.fetch(
             f"""
@@ -296,6 +305,7 @@ async def graph_search(
               {pred.chunk_sql}
               {pred.doc_sql}
               {doc_type_filter}
+              {visibility_filter}
             GROUP BY c.chunk_id, c.doc_id, c.chunk_index, d.version,
                      d.source_system, d.source_url, d.title, d.author_id,
                      c.content, d.created_at, d.updated_at

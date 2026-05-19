@@ -78,6 +78,7 @@ async def id_lookup_search(
     customer_id: str,
     canonical_ids: list[str],
     temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
 ) -> list[IdLookupHit]:
     """Return one content chunk per doc whose source_id/doc_id/source_url
     matches any of `canonical_ids`.
@@ -135,6 +136,14 @@ async def id_lookup_search(
         )
         params.extend(pred.params)
 
+        # Default branch hides drafts (Plan A Component 6); reviewer
+        # surfaces pass include_drafts=True to bypass.
+        visibility_filter = (
+            ""
+            if include_drafts
+            else "AND c.visibility = 'approved' AND d.visibility = 'approved'"
+        )
+
         rows = await conn.fetch(
             f"""
             SELECT DISTINCT ON (c.doc_id)
@@ -163,6 +172,7 @@ async def id_lookup_search(
               )
               {pred.chunk_sql}
               {pred.doc_sql}
+              {visibility_filter}
             ORDER BY c.doc_id, c.chunk_index ASC
             """,
             *params,

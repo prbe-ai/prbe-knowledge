@@ -62,6 +62,7 @@ async def directed_search(
     query_text: str,
     top_k: int = TOP_K_DIRECTED,
     temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
 ) -> list[DirectedHit]:
     """Embed `query_text`, ANN-search directed_vectors, return one hit per doc.
 
@@ -100,6 +101,9 @@ async def directed_search(
         )
         params.extend(pred.params)
 
+        # Hide drafts unless reviewer opts in (Plan A Component 6).
+        doc_visibility_filter = "" if include_drafts else "AND d.visibility = 'approved'"
+
         # Two-stage query: inner DISTINCT ON collapses to one row per doc
         # (the best phrase for that doc), outer ORDER BY dist + LIMIT picks
         # the top_k closest documents globally. The naive single-stage
@@ -127,6 +131,7 @@ async def directed_search(
                  AND dv.doc_id      = d.doc_id
                 WHERE dv.customer_id = $1
                   {pred.doc_sql}
+                  {doc_visibility_filter}
                 ORDER BY dv.doc_id, dv.embedding <=> $2::halfvec ASC
             ) per_doc_best
             ORDER BY dist ASC

@@ -877,6 +877,9 @@ async def regenerate_wiki_index(
         normalizer = Normalizer(ctx, store=get_store(), embedder=get_embedder_v2())
 
     async with with_tenant(customer_id) as conn:
+        # Plan A Component 6: the wiki agent's drain-time index regen
+        # only sees approved artifacts. Drafts are reviewer-pending
+        # writebacks (Component 5) and must not appear in the auto-index.
         rows = await conn.fetch(
             """
             SELECT title, body_preview, source_id, version, updated_at,
@@ -888,6 +891,7 @@ async def regenerate_wiki_index(
               AND doc_type <> $4
               AND valid_to IS NULL
               AND deleted_at IS NULL
+              AND visibility = 'approved'
             ORDER BY updated_at DESC
             """,
             customer_id,

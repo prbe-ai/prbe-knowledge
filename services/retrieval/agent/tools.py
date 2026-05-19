@@ -660,10 +660,13 @@ async def execute_fetch_doc(
     if with_evidence is None:
         with_evidence = False
 
+    # Plan A Component 6: hide draft chunks from the agent fetch path.
+    # The agent runs under an API key and never sees pre-approval content.
     chunks_sql = """
         SELECT chunk_id, doc_id, content, kind, chunk_index
         FROM chunks
         WHERE customer_id = $1 AND doc_id = $2
+          AND visibility = 'approved'
         ORDER BY chunk_index ASC
         LIMIT $3
     """
@@ -728,11 +731,14 @@ async def execute_fetch_doc(
                 edge_to_chunk_ids[str(r["edge_id"])] = cids
                 all_chunk_ids.update(cids)
             if all_chunk_ids:
+                # Hide drafts (Plan A Component 6): evidence chunks the
+                # agent surfaces must be approved content.
                 ev_rows = await conn.fetch(
                     """
                     SELECT chunk_id, doc_id, content, kind
                     FROM chunks
                     WHERE customer_id = $1 AND chunk_id = ANY($2::text[])
+                      AND visibility = 'approved'
                     """,
                     customer_id,
                     list(all_chunk_ids),

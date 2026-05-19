@@ -220,6 +220,7 @@ async def sql_list(
     sort_field: SortField = "updated_at",
     sort_direction: SortDirection = "desc",
     temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
 ) -> list[SQLListHit]:
     """ORDER BY <sort_field> <sort_direction> LIMIT top_k.
 
@@ -227,6 +228,10 @@ async def sql_list(
     (the first chunk of the doc) when one exists, otherwise the chunk with
     the lowest `chunk_index`. That gives the dispatcher something to put in
     `QueryResponse.chunks` without having to fetch the entire doc.
+
+    `include_drafts` defaults to False — Plan A Component 6's
+    ``visibility='approved'`` default filter. Reviewer-scoped BFF surfaces
+    pass True after role-checking.
     """
     field, direction = _validate_sort(sort_field, sort_direction)
     spec = temporal or TemporalSpec()
@@ -262,6 +267,13 @@ async def sql_list(
     pred = build_predicate(spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1)
     params.extend(pred.params)
 
+    # Default branch hides drafts; reviewer surfaces opt in (Plan A
+    # Component 6). The chunk-side LATERAL also filters by visibility so
+    # a doc with both draft + approved chunks (mid-flip) returns the
+    # approved chunk's content.
+    doc_visibility_filter = "" if include_drafts else "AND d.visibility = 'approved'"
+    chunk_visibility_filter = "" if include_drafts else "AND visibility = 'approved'"
+
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(
             f"""
@@ -275,6 +287,7 @@ async def sql_list(
                   {doc_type_filter}
                   {author_filter}
                   {entity_clauses_sql}
+                  {doc_visibility_filter}
                 ORDER BY d.{field} {direction.upper()}, d.doc_id
                 LIMIT $2
             )
@@ -298,6 +311,7 @@ async def sql_list(
                   AND valid_to IS NULL
                   AND kind = 'content'
                   AND rd.version BETWEEN first_seen_version AND last_seen_version
+                  {chunk_visibility_filter}
                 ORDER BY chunk_index
                 LIMIT 1
             ) c ON TRUE
@@ -336,8 +350,12 @@ async def sql_count(
     author_ids: list[str] | None = None,
     graph_entity_filters: list[GraphEntityFilter] | None = None,
     temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
 ) -> int:
-    """Single SELECT COUNT(*) over documents matching the filter set."""
+    """Single SELECT COUNT(*) over documents matching the filter set.
+
+    `include_drafts` defaults to False (Plan A Component 6 visibility filter).
+    """
     spec = temporal or TemporalSpec()
 
     params: list = [customer_id]
@@ -369,6 +387,8 @@ async def sql_count(
     pred = build_predicate(spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1)
     params.extend(pred.params)
 
+    doc_visibility_filter = "" if include_drafts else "AND d.visibility = 'approved'"
+
     async with with_tenant(customer_id) as conn:
         row = await conn.fetchrow(
             f"""
@@ -380,6 +400,7 @@ async def sql_count(
               {doc_type_filter}
               {author_filter}
               {entity_clauses_sql}
+              {doc_visibility_filter}
             """,
             *params,
         )
@@ -395,12 +416,15 @@ async def sql_group_by(
     author_ids: list[str] | None = None,
     graph_entity_filters: list[GraphEntityFilter] | None = None,
     temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
 ) -> list[dict[str, object]]:
     """SELECT <key>, COUNT(*) GROUP BY <key> ORDER BY count DESC LIMIT top_k.
 
     `key` is restricted to {source_system, doc_type, author_id} to prevent
     arbitrary column injection — the value flows through unparameterized.
     Returns a list of {"key": <value>, "n": <count>} dicts.
+
+    `include_drafts` defaults to False (Plan A Component 6 visibility filter).
     """
     col = _validate_group_key(key)
     spec = temporal or TemporalSpec()
@@ -434,6 +458,8 @@ async def sql_group_by(
     pred = build_predicate(spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1)
     params.extend(pred.params)
 
+    doc_visibility_filter = "" if include_drafts else "AND d.visibility = 'approved'"
+
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(
             f"""
@@ -445,6 +471,7 @@ async def sql_group_by(
               {doc_type_filter}
               {author_filter}
               {entity_clauses_sql}
+              {doc_visibility_filter}
             GROUP BY d.{col}
             ORDER BY n DESC, d.{col}
             LIMIT $2

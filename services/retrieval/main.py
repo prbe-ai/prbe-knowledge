@@ -830,16 +830,29 @@ async def _load_source_doc_and_chunks(
     customer_id: str,
     doc_id: str,
     version: int | None,
+    include_drafts: bool = False,
 ) -> tuple[object, list[object]]:
+    """Direct doc-by-id fetch + its chunks.
+
+    `include_drafts` defaults to False — drafts are invisible to API-key
+    callers (Plan A Component 6). Reviewer-scoped BFF flips this to True
+    after role-checking ``wiki_reviewer``.
+    """
+    # Default branch hides ``visibility='draft'`` rows. Sibling of the
+    # existing ``valid_to IS NULL`` filter — matches the style used in
+    # the retriever chokepoints.
+    doc_visibility_filter = "" if include_drafts else "AND visibility = 'approved'"
+    chunk_visibility_filter = "" if include_drafts else "AND visibility = 'approved'"
     async with with_tenant(customer_id) as conn:
         if version is not None:
             doc = await conn.fetchrow(
-                """
+                f"""
                 SELECT doc_id, version, source_system, source_id, source_url,
                        title, body_size_bytes, author_id, metadata, entities,
                        created_at, updated_at, ingested_at, deleted_at
                 FROM documents
                 WHERE customer_id = $1 AND doc_id = $2 AND version = $3
+                  {doc_visibility_filter}
                 """,
                 customer_id,
                 doc_id,
@@ -847,12 +860,13 @@ async def _load_source_doc_and_chunks(
             )
         else:
             doc = await conn.fetchrow(
-                """
+                f"""
                 SELECT doc_id, version, source_system, source_id, source_url,
                        title, body_size_bytes, author_id, metadata, entities,
                        created_at, updated_at, ingested_at, deleted_at
                 FROM documents
                 WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+                  {doc_visibility_filter}
                 ORDER BY version DESC
                 LIMIT 1
                 """,
@@ -863,7 +877,7 @@ async def _load_source_doc_and_chunks(
             raise HTTPException(status_code=404, detail=f"document not found: {doc_id}")
 
         chunk_rows = await conn.fetch(
-            """
+            f"""
             SELECT content, chunk_index
             FROM chunks
             WHERE customer_id = $1
@@ -871,6 +885,7 @@ async def _load_source_doc_and_chunks(
               AND valid_to IS NULL
               AND kind = 'content'
               AND $3 BETWEEN first_seen_version AND last_seen_version
+              {chunk_visibility_filter}
             ORDER BY chunk_index
             """,
             customer_id,
@@ -1236,6 +1251,9 @@ async def get_source(
     # query_traces request payload: GET has no body, so the doc_id +
     # version are the entire request shape.
     request.state.usage_request_payload = {"doc_id": doc_id, "version": version}
+    # /sources is an API-key surface; never bypass the approved-only
+    # filter. Reviewer surfaces (Plan C BFF) route through a separate
+    # endpoint that calls _load_source_doc_and_chunks(include_drafts=True).
     async with with_tenant(customer_id) as conn:
         if version is not None:
             doc = await conn.fetchrow(
@@ -1245,6 +1263,7 @@ async def get_source(
                        created_at, updated_at, ingested_at, deleted_at
                 FROM documents
                 WHERE customer_id = $1 AND doc_id = $2 AND version = $3
+                  AND visibility = 'approved'
                 """,
                 customer_id,
                 doc_id,
@@ -1258,6 +1277,7 @@ async def get_source(
                        created_at, updated_at, ingested_at, deleted_at
                 FROM documents
                 WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+                  AND visibility = 'approved'
                 ORDER BY version DESC
                 LIMIT 1
                 """,
@@ -1276,6 +1296,7 @@ async def get_source(
               AND valid_to IS NULL
               AND kind = 'content'
               AND $3 BETWEEN first_seen_version AND last_seen_version
+              AND visibility = 'approved'
             ORDER BY chunk_index
             """,
             customer_id,
