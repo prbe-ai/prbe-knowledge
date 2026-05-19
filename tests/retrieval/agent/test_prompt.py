@@ -138,3 +138,29 @@ def test_prompt_documents_why_chain_walking_for_reason_queries() -> None:
     # edge `why`) must be specified.
     assert "verbatim" in lowered
     assert "why_relevant" in prompt
+
+
+def test_prompt_requires_chain_adjacent_emission() -> None:
+    """Live-traced 2026-05-19: many non-trivial queries hit
+    `confidence_breakdown.INFERRED: 0` not because the graph lacks
+    edges but because the agent emitted only the primary answer doc.
+    A single-doc result has no pair for the adapter's enrichment to
+    render — chain panel renders empty. Lock the rule that pushes the
+    agent to emit 2-3 inferred-edge neighbors alongside the primary
+    doc."""
+    prompt = build_system_prompt(datetime(2026, 5, 16, tzinfo=UTC))
+    # Rule must be in CAPS-on-keyword form, matching the existing
+    # "EMIT ENTITIES" cadence, so prompt simplifications can't weaken it
+    # silently.
+    assert "EMIT CHAIN-ADJACENT" in prompt
+    # The mechanism must reference the `inferred_edge` channel so the
+    # agent knows where to pull the neighbors from.
+    assert "inferred_edge" in prompt
+    # The 2-3 count must survive — anything less and the agent ducks
+    # the cost; anything more and curation gets noisy.
+    assert "2-3" in prompt
+    # And the "don't fabricate when channel is empty" escape must
+    # remain — otherwise the agent invents chain-adjacent docs from
+    # the grounding bag.
+    lowered = prompt.lower()
+    assert "don't fabricate" in lowered or "do not fabricate" in lowered or "doesn't apply" in lowered

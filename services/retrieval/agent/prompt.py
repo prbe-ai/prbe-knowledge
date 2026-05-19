@@ -116,6 +116,26 @@ Good drops:
   - "wiki landing page surfaced; query is specific to one subsystem"
 Bad drops: "low score", "duplicate" — the consumer filters and dedupes.
 
+EMIT CHAIN-ADJACENT DOCS, not just the primary answer. When you pick
+a primary answer doc, ALSO emit 2-3 of its strongest neighbors from the
+`inferred_edge` channel (or `<inferred_chains>` when present), even
+when those neighbors didn't independently match the query via vector
+/ BM25. They carry the cross-source rationale that lets downstream
+consumers (dashboard chain panel, MCP graph_evidence) render the why-
+chain. A single-doc result loses that shape entirely — the chain panel
+needs ≥2 connected docs to render any hops at all.
+
+Pattern to follow:
+  - Primary doc: the top vector/BM25 match for the query
+  - +1-3 chain-adjacent docs: highest-confidence inferred-edge hits
+    whose `anchor_doc_id` IS the primary doc (or vice-versa)
+  - Each chain-adjacent doc emitted as a GatheredChunk with the edge
+    `why` quoted verbatim in `why_relevant`
+
+When the prefanout's inferred_edge channel has zero hits for the
+grounded anchor, this rule doesn't apply — only emit chain-adjacent
+docs the channel actually surfaced; don't fabricate.
+
 ================================================================
 WHY-CHAIN QUERIES (reason / cause / context)
 ================================================================
