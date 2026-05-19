@@ -68,6 +68,9 @@ from services.ingestion.manual_uploads import (
     safe_filename,
 )
 from services.ingestion.slack_lifecycle import handle_slack_lifecycle_event
+from services.ingestion.wiki_artifact_writeback_routes import (
+    router as wiki_artifact_writeback_router,
+)
 from services.ingestion.wiki_routes import router as wiki_router
 from services.system_settings import get_ingestion_killswitch
 from shared.config import get_settings
@@ -124,6 +127,7 @@ app.include_router(custom_ingest_router)
 app.include_router(investigation_writeback_router)
 app.include_router(investigation_review_router)
 app.include_router(incident_evidence_pack_router)
+app.include_router(wiki_artifact_writeback_router)
 
 
 @app.get("/health")
