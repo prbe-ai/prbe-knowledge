@@ -39,7 +39,7 @@ Five new alembic migrations (`0082`–`0086`):
 | Revision | Purpose |
 |---|---|
 | `0082_visibility_columns` | `documents.visibility` + `chunks.visibility` TEXT NOT NULL CHECK IN ('draft','approved'), default `'approved'`. Existing rows backfill to `'approved'`. Backed by partial indexes scoped to `visibility='approved'` so default retrieval gets the same plan it does today. |
-| `0083_incident_investigations_post_approval_cols` | `incident_investigations.approved_at`, `resolved_at`, `post_approval_dispatched_at`, `evidence_pack jsonb`. Drops the `incident_investigations_state_chk` NOT NULL constraint on `state` for the resolution-first race (`on_resolution_event` creates a partial row). |
+| `0083_incident_investigations_post_approval_cols` | Adds `incident_investigations.approved_at`, `resolved_at`, `post_approval_dispatched_at`, `evidence_pack jsonb` columns. On the resolution-first race (resolution arrives before the investigation row exists), `on_resolution_event` INSERTs a partial row with `state='pending_review'` (no constraint drop needed). |
 | `0084_wiki_review_queue` | New table `wiki_review_queue` — per-artifact review lifecycle (state in `pending_writeback`, `pending_review`, `approved`, `rejected`, `failed_pending_review`), with `parent_artifact_doc_id` self-referencing FK for the reject-and-revise version lineage. RLS enabled with `tenant_isolation` policy. |
 | `0085_customer_postmortem_templates` | New table `customer_postmortem_templates` — per-customer template override (inline body or doc_ref). RLS enabled. |
 | `0086_incident_investigations_metadata` | `incident_investigations.metadata jsonb` for the dispatcher's `post_approval_dispatch_failed` recovery flag and future per-incident dashboard hints. |
@@ -48,7 +48,7 @@ Net schema delta: **2 new columns + 4 new tables + 1 dispatch-state column tuple
 
 ## Behavior changes
 
-- **Default retrieval defaults to `visibility='approved'`.** All six
+- **Default retrieval defaults to `visibility='approved'`.** All seven
   retrievers (`vector`, `bm25`, `graph`, `directed`, `inferred_edges`,
   `sql`, `id_lookup`) take a new `include_drafts: bool = False`
   argument. The Plan C reviewer surface will opt in via
@@ -143,3 +143,28 @@ docker compose up -d postgres
 ```
 
 Expected last line: `=== ALL SMOKE CHECKS PASSED ===`.
+
+## Known asymmetry: incident-investigation vs wiki-artifact approve semantics
+
+Plan 4's `services/ingestion/investigation_state.py::mark_approved`
+silently transitions any state (including `rejected`) to `approved`
+without raising. Plan A's `services/post_approval/wiki_review_state.py::mark_approved`
+filters `WHERE state IN ('pending_review','failed_pending_review')` and
+raises `ValueError` on terminal-`rejected`, which the wiki review route
+maps to a 409.
+
+The two surfaces therefore respond differently to "approve a rejected row":
+
+- `POST /api/incident-investigations/{id}/approve` on a rejected
+  investigation: **200**, state flips to `approved`.
+- `POST /api/wiki-artifacts/{id}/approve` on a rejected artifact: **409**.
+
+Plan A's stricter semantic is the desired model. Plan 4's permissive
+semantic predates Plan A and was preserved here to avoid scope creep.
+A focused Plan-D (or investigation-state cleanup) should tighten the
+Plan 4 surface to match.
+
+Plan C's dashboard should be aware of this — its UI will see different
+responses from the two endpoints and needs to handle the 409 path for
+wiki-artifact approve while currently never seeing it from the
+investigation approve endpoint.
