@@ -1355,3 +1355,31 @@ ALTER TABLE incident_investigations FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON incident_investigations
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
+-- customer_incident_mcp_servers: per-customer external MCP server config
+-- (migration 0081). Used by the incident investigation agent
+-- (orchestrator side) — each row carries the URL + Fernet-encrypted auth
+-- token for an MCP server (Sentry, Datadog, Cloudflare, k8s, or a
+-- per-customer Knowledge override). Lives in the knowledge alembic
+-- chain because the two services share one Postgres database.
+-- ---------------------------------------------------------------------------
+CREATE TABLE customer_incident_mcp_servers (
+    customer_id        TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    mcp_kind           TEXT NOT NULL,
+    mcp_url            TEXT NOT NULL,
+    secret_ciphertext  BYTEA NOT NULL,
+    enabled            BOOLEAN NOT NULL DEFAULT true,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT customer_incident_mcp_servers_pkey PRIMARY KEY (customer_id, mcp_kind),
+    CONSTRAINT customer_incident_mcp_servers_kind_chk CHECK (
+        mcp_kind IN ('sentry','datadog','cloudflare','k8s','knowledge')
+    )
+);
+
+ALTER TABLE customer_incident_mcp_servers ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customer_incident_mcp_servers FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON customer_incident_mcp_servers
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));

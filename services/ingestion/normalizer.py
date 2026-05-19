@@ -382,6 +382,29 @@ class Normalizer:
             quarantined_doc_ids=quarantined,
         )
 
+    async def persist_single_document(
+        self,
+        customer_id: str,
+        doc: Document,
+    ) -> NormalizeOutcome:
+        """Persist one already-shaped Document directly.
+
+        Bypasses the ingestion queue + connector parse/normalize stages —
+        used by the typed incident-investigation writeback route, where the
+        orchestrator agent has already produced the final shape. Routes the
+        doc through the same chunker + embedder + SQL writes as the standard
+        normalize path, so retrieval-parity with other documents is
+        automatic: same Document table, same chunks, same embedding model,
+        same ACL handling.
+
+        The caller MUST set `doc.source_system` correctly (e.g.
+        SourceSystem.PAGERDUTY for a PD-incident investigation report — not
+        SourceSystem.CUSTOM_INGEST) so source-system-keyed filters / score
+        multipliers apply.
+        """
+        result = NormalizationResult(documents=[doc])
+        return await self._persist(customer_id, doc.source_system, result)
+
     async def _enqueue_wiki_synthesis(
         self,
         customer_id: str,
