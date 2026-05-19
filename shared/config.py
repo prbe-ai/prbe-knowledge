@@ -133,6 +133,12 @@ class Settings(BaseSettings):
     backend_base_url: str = ""
     internal_backend_api_key: SecretStr = SecretStr("")
 
+    # --- prbe-orchestrator (incident investigation dispatch) -----------------
+    orchestrator_base_url: str = Field(
+        default="http://localhost:8084",
+        description="Base URL for prbe-orchestrator (incident investigation dispatch).",
+    )
+
     # --- Per-source OAuth + webhook secrets ----
     # After the gateway migration, ACTIVE code in this service only uses
     # client_secrets (token exchange in /api/oauth/{source}/exchange). The
