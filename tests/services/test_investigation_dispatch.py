@@ -10,7 +10,6 @@ from services.investigation.dispatch import (
 )
 from shared.config import get_settings
 
-
 pytestmark = pytest.mark.asyncio
 
 _OriginalAsyncClient = httpx.AsyncClient

@@ -11,7 +11,6 @@ import pytest
 
 from services.investigation.dispatch import DispatchExhausted
 
-
 pytestmark = pytest.mark.asyncio
 
 

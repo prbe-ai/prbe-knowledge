@@ -2,6 +2,7 @@
 of `documents` (where doc_type='incident') into the orchestrator's
 dispatch `incident_signals` block."""
 from __future__ import annotations
+
 from datetime import UTC, datetime
 
 from services.investigation.incident_signals import extract_from_doc

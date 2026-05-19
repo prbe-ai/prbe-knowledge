@@ -1,7 +1,7 @@
 """NormalizeOutcome must propagate requires_investigation from the
 NormalizationResult so the worker can dispatch investigations."""
 from __future__ import annotations
-import pytest
+
 from services.ingestion.normalizer import NormalizeOutcome
 
 

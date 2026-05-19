@@ -528,7 +528,8 @@ class Worker:
         """
         try:
             from services.investigation.dispatch import (
-                DispatchExhausted, dispatch_investigation,
+                DispatchExhausted,
+                dispatch_investigation,
             )
             from services.investigation.incident_signals import extract_from_doc
             from services.investigation.mark_dispatch_failed import mark_dispatch_failed
@@ -568,7 +569,7 @@ class Worker:
                     customer_id=customer_id,
                     incident_doc_id=incident_doc_id,
                 )
-        except Exception:  # noqa: BLE001 — never block the worker loop
+        except Exception:  # never block the worker loop
             log.exception(
                 "investigation.dispatch.unhandled",
                 extra={

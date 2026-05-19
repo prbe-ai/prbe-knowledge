@@ -18,7 +18,6 @@ import httpx
 
 from shared.config import get_settings
 
-
 log = logging.getLogger(__name__)
 
 
