@@ -107,6 +107,37 @@ class DocType(StrEnum):
     CODE_FILE = "code.file"
     INCIDENT = "incident"
     INCIDENT_INVESTIGATION = "incident.investigation"
+    # Post-approval wiki artifacts authored by the postmortem / wiki-edit
+    # agents after an incident investigation is approved AND resolved.
+    # These doc_types share the `wiki.` prefix so existing wiki listings
+    # (`doc_type LIKE 'wiki.%'`) include them, while remaining
+    # distinguishable from human-authored wiki pages.
+    #
+    # Visibility (DRAFT vs APPROVED) gates retrieval -- DRAFT artifacts are
+    # excluded from search until a reviewer approves them via the
+    # wiki_review_queue lifecycle.
+    WIKI_POSTMORTEM = "wiki.postmortem"
+    WIKI_KNOWLEDGE_PAGE = "wiki.knowledge_page"
+    WIKI_CORRECTION = "wiki.correction"
+    # TODO(post-approval): wiki-listing queries in services/ingestion/wiki_routes.py,
+    #   services/synthesis/wiki_agent.py, and services/synthesis/persistence.py fan
+    #   over `doc_type LIKE 'wiki.%'` without filtering by visibility. Once the
+    #   writeback route (Component 5) starts persisting these doc types as drafts,
+    #   those queries need a `visibility = 'approved'` predicate.
+
+
+class Visibility(StrEnum):
+    """Retrieval-visibility gate on a Document / Chunk.
+
+    DRAFT rows are excluded from search and synthesis until promoted to
+    APPROVED via the post-approval review pipeline. Used by the
+    post-approval wiki artifacts (postmortems, knowledge pages,
+    corrections); existing wiki/source documents default to APPROVED at
+    write time, matching pre-existing behavior.
+    """
+
+    DRAFT = "draft"
+    APPROVED = "approved"
 
 
 # SQL pattern matching every wiki page doc_type (excludes the singleton
