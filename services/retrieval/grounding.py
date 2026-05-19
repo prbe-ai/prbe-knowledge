@@ -37,7 +37,32 @@ _STOPWORDS: Final[frozenset[str]] = frozenset({
 })
 
 _RE_LINEAR_JIRA: Final[re.Pattern[str]] = re.compile(r"\b([A-Z]{2,10}-\d+)\b")
-_RE_GITHUB_PR: Final[re.Pattern[str]] = re.compile(r"#(\d{1,6})\b")
+
+# PR number detection. We want to catch every natural English phrasing
+# that names a specific GitHub PR/issue:
+#
+#   #328                 -- the legacy GitHub-prefix form
+#   PR 328 / pr 328      -- the conversational form (NL queries hit this)
+#   PR#328 / pr#328      -- compact
+#   PR-328 / pr-328      -- hyphenated
+#   PR.328 / pr.328      -- defensive (rare but seen in NL output)
+#
+# The original regex was `r"#(\d{1,6})\b"` — `#`-prefix only. That broke
+# the user-visible "Why was PR 328 created" query: bare-id detection
+# missed it, grounding fell back to fuzzy match on the slug "prbe-knowledge"
+# (which only hit Repo nodes), and the agent never grounded on the PR doc
+# entity, so PR 328's body chunks never made the prefanout. Live-traced
+# 2026-05-18.
+#
+# Issues use the same numbering namespace and the same conversational
+# phrasings, so the alternation also catches "issue 77" / "issue#77" / etc.
+# We tag both as ("pr", ...) here — the grounding pipeline doesn't
+# distinguish the two for entity-lookup purposes; it'll match whichever
+# canonical_id (pr: or issue:) the customer has indexed.
+_RE_GITHUB_PR: Final[re.Pattern[str]] = re.compile(
+    r"(?:#|\b(?:pr|issue)\s*[-#.]?\s*)(\d{1,6})\b",
+    re.IGNORECASE,
+)
 _RE_GIT_SHA: Final[re.Pattern[str]] = re.compile(r"\b([0-9a-f]{7,40})\b")
 
 

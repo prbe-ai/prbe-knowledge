@@ -29,8 +29,10 @@ import asyncio
 import json
 import os
 import random
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Final
 
 import asyncpg
 
@@ -573,8 +575,14 @@ async def extract_edges(
     now = datetime.now(UTC)
 
     # Pre-load existing graph nodes for this customer for endpoint validation.
-    # Fetch (label, canonical_id) pairs from the DB once to avoid N queries.
-    existing_nodes: set[tuple[str, str]] = await _load_existing_nodes(
+    # Each entry maps (label, canonical_id) -> display_title (joined from
+    # documents.title for Document nodes, falling back to
+    # properties->>'name'). The title is consumed by `_topic_overlaps`
+    # to drop edges where the LLM's `why` rationale shares zero topical
+    # content words with either endpoint's title — catches hallucinations
+    # that pick plausible canonical_ids but assert a topical connection
+    # the endpoint doc doesn't actually carry.
+    existing_nodes: dict[tuple[str, str], str] = await _load_existing_nodes(
         conn, bundle.customer_id
     )
 
@@ -619,8 +627,10 @@ async def extract_edges(
             continue
 
         # Rule 1: endpoint existence
-        from_exists = (from_label, from_cid) in existing_nodes
-        to_exists = (to_label, to_cid) in existing_nodes
+        from_title = existing_nodes.get((from_label, from_cid))
+        to_title = existing_nodes.get((to_label, to_cid))
+        from_exists = from_title is not None
+        to_exists = to_title is not None
         if not from_exists or not to_exists:
             _inc(result.dropped, "unknown_endpoint")
             log.debug(
@@ -632,6 +642,28 @@ async def extract_edges(
                 to_cid=to_cid,
                 from_exists=from_exists,
                 to_exists=to_exists,
+            )
+            continue
+
+        # Rule 6: topic-relevance sanity check. The kill-switch
+        # threshold raise (0.5 → 0.9) let mixed-quality runs through,
+        # which surfaced a hallucination class where the LLM picks a
+        # valid-looking canonical_id but the `why` describes topics
+        # the endpoint doc doesn't actually cover. Catch the egregious
+        # cases per-edge: require at least one informative endpoint
+        # title to share a content word with the rationale. Edges
+        # where both endpoints have empty titles (stub-upserted Entity
+        # nodes) skip this check and fall back to the kill-switch.
+        if not _topic_overlaps(why, [from_title or "", to_title or ""]):
+            _inc(result.dropped, "unrelated_topic")
+            log.debug(
+                "inferred_edges.extractor.unrelated_topic",
+                customer=bundle.customer_id,
+                from_cid=from_cid,
+                to_cid=to_cid,
+                from_title=from_title,
+                to_title=to_title,
+                why_preview=why[:120],
             )
             continue
 
@@ -677,18 +709,121 @@ async def extract_edges(
 async def _load_existing_nodes(
     conn: asyncpg.Connection,
     customer_id: str,
-) -> set[tuple[str, str]]:
-    """Load all (label, canonical_id) pairs for customer_id from graph_nodes.
+) -> dict[tuple[str, str], str]:
+    """Load `(label, canonical_id) -> display_title` for every graph node.
 
-    The conn must already be scoped via with_tenant(customer_id). We also
-    add the explicit WHERE customer_id = $1 for defense-in-depth.
+    `display_title` is, in priority order:
+      1. `documents.title` for Document-class nodes (joined on
+         `canonical_id = documents.doc_id`)
+      2. `graph_nodes.properties->>'name'` (the human-readable display
+         name set by ingestion when the node first lands)
+      3. empty string when neither is set (e.g. stub-upserted Entity
+         nodes that were never enriched)
+
+    The conn must already be scoped via with_tenant(customer_id) so RLS
+    on graph_nodes / documents filters by tenant; the explicit WHERE on
+    customer_id is defence-in-depth.
+
+    Used downstream by the topic-relevance sanity check in
+    `_topic_overlaps` — without the title we have no signal that the
+    LLM's `why` actually describes the endpoint doc, and the threshold
+    can't catch hallucinations where the LLM picked a plausible-looking
+    canonical_id whose actual content has nothing to do with the `why`.
     """
     rows = await conn.fetch(
         """
-        SELECT label, canonical_id
-        FROM graph_nodes
-        WHERE customer_id = $1
+        SELECT gn.label,
+               gn.canonical_id,
+               COALESCE(d.title, gn.properties->>'name', '') AS display_title
+        FROM graph_nodes gn
+        LEFT JOIN documents d
+               ON d.customer_id = gn.customer_id
+              AND d.doc_id = gn.canonical_id
+        WHERE gn.customer_id = $1
         """,
         customer_id,
     )
-    return {(r["label"], r["canonical_id"]) for r in rows}
+    return {
+        (r["label"], r["canonical_id"]): r["display_title"] or ""
+        for r in rows
+    }
+
+
+# Content-word tokens shared by `why` and one of the endpoint titles
+# need to clear this floor for the edge to be kept. 1 token is permissive
+# — most hallucinations we've observed lose ALL topical overlap (e.g.
+# LLM proposes "PR #X implements graph traversals" but X's actual title
+# is "fix(DSN routing)" — zero topic overlap → reject).
+#
+# Live-trace context (2026-05-18): the kill-switch threshold was raised
+# 0.5 → 0.9 so mixed-quality runs land. Without this per-edge check, a
+# hallucinated-but-plausible edge (right canonical_id form, wrong topic)
+# slips into graph_edges and shows up in the dashboard's chain-of-
+# reasoning panel pointing at an unrelated doc.
+_MIN_TITLE_OVERLAP_TOKENS = 1
+
+# Tokens to strip from `why` before comparing — these are the identifier
+# parts of the LLM's own endpoint citation (e.g. "PR #327" or "pr:327")
+# and they create trivial false-positive overlap when the canonical_id
+# digits appear in both sides. The overlap check should be on the
+# topical content, not the cite itself.
+_WHY_TOPIC_STRIPPED_PREFIXES: Final[frozenset[str]] = frozenset({
+    "pr", "issue", "ticket", "doc", "id", "edge", "the", "session",
+    "this", "that", "those", "these", "implements", "implement",
+    "implemented", "implementing", "implementation", "implementations",
+    "discusses", "discussed", "discussing", "discussion", "discussions",
+    "references", "referenced", "referencing", "reference",
+    "describes", "described", "describing", "description",
+    "with", "from", "about", "regarding",
+})
+
+
+def _content_words(text: str) -> set[str]:
+    """Lower-case, len>=3, alphabetic-only content words.
+
+    Mirrors `grounding._extract_tokens` semantics for stop-word filtering
+    but is stricter — drops short tokens and pure-numeric tokens (which
+    is the canonical_id leakage path we explicitly want to suppress).
+    Kept local to this module so it stays calibrated for the topic-match
+    check; tuning it for retrieval-side query parsing is a separate
+    concern.
+    """
+    if not text:
+        return set()
+    out: set[str] = set()
+    for raw in re.split(r"[^A-Za-z0-9]+", text.lower()):
+        if len(raw) < 3:
+            continue
+        if not any(c.isalpha() for c in raw):
+            continue  # pure-numeric: skip
+        if raw in _WHY_TOPIC_STRIPPED_PREFIXES:
+            continue
+        out.add(raw)
+    return out
+
+
+def _topic_overlaps(why: str, endpoint_titles: list[str]) -> bool:
+    """True when `why` shares >= _MIN_TITLE_OVERLAP_TOKENS content
+    words with at least one endpoint's title.
+
+    Topic-only check: identifier slugs ("pr", "session", "327", etc.)
+    are stripped from both sides before comparing. Edges with at least
+    one informative endpoint title still need that title to share
+    content words with the rationale — otherwise the LLM is asserting
+    a connection between docs whose topics don't overlap.
+
+    Returns True (PASS) when every endpoint has an EMPTY title — we
+    can't validate topic match without any signal, so we defer to the
+    other validators (existence, edge_type, confidence, kill-switch).
+    """
+    why_tokens = _content_words(why)
+    if not why_tokens:
+        return True  # rationale itself was just identifiers — nothing to check
+    informative = [t for t in endpoint_titles if t]
+    if not informative:
+        return True  # both endpoints are stub-upserted — defer
+    for title in informative:
+        title_tokens = _content_words(title)
+        if len(why_tokens & title_tokens) >= _MIN_TITLE_OVERLAP_TOKENS:
+            return True
+    return False

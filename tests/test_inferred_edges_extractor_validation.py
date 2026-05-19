@@ -77,13 +77,31 @@ _EXISTING_NODES: set[tuple[str, str]] = {
 }
 
 
-def _make_mock_conn(existing_nodes: set[tuple[str, str]] | None = None) -> AsyncMock:
-    """Mock asyncpg connection that returns a preset node set."""
+def _make_mock_conn(
+    existing_nodes: set[tuple[str, str]] | None = None,
+    *,
+    titles: dict[tuple[str, str], str] | None = None,
+) -> AsyncMock:
+    """Mock asyncpg connection that returns a preset node set.
+
+    `_load_existing_nodes` joins documents → graph_nodes and surfaces a
+    `display_title` column. For legacy fixtures we default each title to
+    the empty string — the topic-overlap sanity check (Rule 6) skips
+    edges where both endpoints have empty titles (defers to the other
+    validators + the kill-switch), so existing tests keep asserting on
+    the validators they originally targeted. Tests exercising Rule 6
+    pass an explicit `titles` map keyed by (label, canonical_id).
+    """
     nodes = existing_nodes if existing_nodes is not None else _EXISTING_NODES
+    titles = titles or {}
     conn = AsyncMock()
     conn.fetch = AsyncMock(
         return_value=[
-            {"label": lbl, "canonical_id": cid}
+            {
+                "label": lbl,
+                "canonical_id": cid,
+                "display_title": titles.get((lbl, cid), ""),
+            }
             for (lbl, cid) in nodes
         ]
     )
@@ -496,6 +514,135 @@ async def test_bundle_kill_switch_not_triggered_below_half() -> None:
 
     assert result.bundle_failed is False
     assert len(result.edges) == 1
+
+
+# ---------------------------------------------------------------------------
+# Tests: topic-overlap sanity check (Rule 6) — drops hallucinations
+# where the `why` rationale and endpoint titles share zero topical
+# content words. Catches "LLM picked a real canonical_id but the why
+# describes topics that doc doesn't cover" failure mode that the
+# raised 0.9 kill-switch threshold can no longer catch alone.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rule6_drops_edge_with_zero_title_overlap() -> None:
+    """Live shape: LLM cites PR #X in `why` describing topic Y, but
+    PR #X's actual title is about topic Z. Rule 6 catches it because
+    `why` shares zero content words with either endpoint's title."""
+    edges = [
+        {
+            "from": {"label": "Document", "canonical_id": "doc1"},
+            "to": {"label": "Document", "canonical_id": "doc2"},
+            "edge_type": "DISCUSSES",
+            "confidence": "INFERRED",
+            "why": "Session discusses graph traversals which doc2 implements",
+        }
+    ]
+    bundle = _make_bundle()
+    conn = _make_mock_conn(titles={
+        ("Document", "doc1"): "Claude Code session 4c65a43c",
+        ("Document", "doc2"): "fix(migrate-job): correct DSN routing to CNPG",
+    })
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm(edges),
+    ):
+        result = await extract_edges(bundle, conn)
+    assert result.edges == []
+    assert result.dropped.get("unrelated_topic", 0) == 1
+
+
+@pytest.mark.asyncio
+async def test_rule6_keeps_edge_when_topic_words_overlap() -> None:
+    """When the `why` and at least one endpoint title share a topical
+    content word (case-insensitive, len>=3, identifier-prefixes
+    stripped), Rule 6 passes."""
+    edges = [
+        {
+            "from": {"label": "Document", "canonical_id": "doc1"},
+            "to": {"label": "Document", "canonical_id": "doc2"},
+            "edge_type": "DISCUSSES",
+            "confidence": "INFERRED",
+            "why": "Session discusses why-chain entity emission rule",
+        }
+    ]
+    bundle = _make_bundle()
+    conn = _make_mock_conn(titles={
+        ("Document", "doc1"): "Claude Code session 4c65a43c",
+        ("Document", "doc2"): "feat(gatherer): why-chain section + entity emission rule",
+    })
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm(edges),
+    ):
+        result = await extract_edges(bundle, conn)
+    assert len(result.edges) == 1
+    assert result.dropped.get("unrelated_topic", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_rule6_skipped_when_both_endpoints_have_empty_titles() -> None:
+    """Stub-upserted nodes (entity-cluster aliases, freshly-created
+    canonical_ids before enrichment runs) often have no title. The
+    sanity check can't catch hallucinations without title signal, so
+    it defers — the kill-switch is the only backstop for these. This
+    test pins the deferred behavior."""
+    edges = [
+        {
+            "from": {"label": "Document", "canonical_id": "doc1"},
+            "to": {"label": "Document", "canonical_id": "doc2"},
+            "edge_type": "DISCUSSES",
+            "confidence": "INFERRED",
+            "why": "completely unrelated rationale text",
+        }
+    ]
+    bundle = _make_bundle()
+    conn = _make_mock_conn()  # titles default to "" — Rule 6 defers
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm(edges),
+    ):
+        result = await extract_edges(bundle, conn)
+    assert len(result.edges) == 1
+    assert result.dropped.get("unrelated_topic", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_rule6_overlap_ignores_identifier_prefixes() -> None:
+    """`pr`, `issue`, `the`, `discusses`, `session`, etc. are stripped
+    from both sides of the content-word set — they're trivial-overlap
+    risks where the LLM cites a PR/issue identifier and the endpoint
+    title happens to lead with "PR" or "session".
+
+    Setup: why and titles share only words that are in the strip list,
+    plus content words that DON'T overlap (`rollout` vs `feature`).
+    Without the strip list "session" / "PR" / "discusses" would create
+    trivial overlap; with it, the actual content words diverge and Rule
+    6 correctly rejects.
+    """
+    edges = [
+        {
+            "from": {"label": "Document", "canonical_id": "doc1"},
+            "to": {"label": "Document", "canonical_id": "doc2"},
+            "edge_type": "DISCUSSES",
+            "confidence": "INFERRED",
+            "why": "PR session discusses the rollout strategy",
+        }
+    ]
+    bundle = _make_bundle()
+    conn = _make_mock_conn(titles={
+        # Strip-list words appear in both, real content words don't.
+        ("Document", "doc1"): "PR feature implementation session",
+        ("Document", "doc2"): "Discussion: PR migration the session",
+    })
+    with (
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
+        _patch_llm(edges),
+    ):
+        result = await extract_edges(bundle, conn)
+    assert result.edges == []
+    assert result.dropped.get("unrelated_topic", 0) == 1
 
 
 # ---------------------------------------------------------------------------
