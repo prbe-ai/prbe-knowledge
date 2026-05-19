@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 
+from services.post_approval import dispatch as post_approval_dispatch
 from shared.db import with_tenant
 from shared.exceptions import InvestigationNotFound
 from shared.investigation_schemas import (
@@ -114,7 +115,18 @@ async def mark_approved(
         )
     if row is None:
         raise InvestigationNotFound(f"no investigation for {incident_doc_id}")
-    return _row_to_detail(row)
+    detail = _row_to_detail(row)
+    # Signal the post-approval dispatch seam. on_approval is idempotent
+    # and a no-op when the incident has not yet resolved — safe to call
+    # unconditionally after every successful approve. The seam itself
+    # fires the orchestrator only on the (approved ∧ resolved) edge.
+    # Placed AFTER the UPDATE so a missing-row raise short-circuits
+    # before we touch the dispatch seam.
+    await post_approval_dispatch.on_approval(
+        customer_id=customer_id,
+        incident_doc_id=incident_doc_id,
+    )
+    return detail
 
 
 async def mark_rejected(

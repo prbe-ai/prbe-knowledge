@@ -230,3 +230,53 @@ async def test_list_filters_by_state(customer_id: str) -> None:
     assert "pd:incident:T-009" in pending_ids
     assert "pd:incident:T-008" not in pending_ids
     assert "pd:incident:T-008" in approved_ids
+
+
+async def test_mark_approved_calls_on_approval(customer_id: str) -> None:
+    """``mark_approved`` must signal the post-approval dispatch seam
+    after the row update succeeds — that's how the (approved ∧
+    resolved) edge gets detected when approval is the second flip."""
+    from unittest.mock import AsyncMock, patch
+
+    await upsert_pending_review(
+        customer_id=customer_id,
+        incident_doc_id="pd:incident:T-OA1",
+        report_doc_id="pd:investigation:T-OA1:v1",
+        version=1, mode="full",
+    )
+    with patch(
+        "services.ingestion.investigation_state."
+        "post_approval_dispatch.on_approval",
+        new_callable=AsyncMock,
+    ) as fake_on_approval:
+        await mark_approved(
+            customer_id=customer_id,
+            incident_doc_id="pd:incident:T-OA1",
+            reviewer_id="user-42",
+        )
+    fake_on_approval.assert_awaited_once_with(
+        customer_id=customer_id,
+        incident_doc_id="pd:incident:T-OA1",
+    )
+
+
+async def test_mark_approved_raises_skips_on_approval(customer_id: str) -> None:
+    """When the row is missing and ``mark_approved`` raises
+    ``InvestigationNotFound``, the dispatch seam must NOT be called —
+    there is nothing to signal post-approval about."""
+    from unittest.mock import AsyncMock, patch
+
+    with (
+        patch(
+            "services.ingestion.investigation_state."
+            "post_approval_dispatch.on_approval",
+            new_callable=AsyncMock,
+        ) as fake_on_approval,
+        pytest.raises(InvestigationNotFound),
+    ):
+        await mark_approved(
+            customer_id=customer_id,
+            incident_doc_id="pd:incident:T-DOES-NOT-EXIST",
+            reviewer_id="u",
+        )
+    fake_on_approval.assert_not_awaited()
