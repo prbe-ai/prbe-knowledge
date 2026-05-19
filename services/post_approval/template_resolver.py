@@ -118,11 +118,15 @@ async def _fetch_doc_body(
        ``valid_to IS NULL``, version between first_seen and last_seen).
     3. Join with the same separator (``"\n\n"``).
 
-    The visibility gate is on ``documents``: the override should only
-    resolve against approved wiki docs (draft revisions in flight
-    aren't a stable template target).
+    The ``visibility = 'approved'`` gate is applied on BOTH the documents
+    row and the chunks (matching the retrieval pattern at
+    ``services/retrieval/main.py:1215-1286``, ``sql_list``'s LATERAL, and
+    ``execute_fetch_doc``). Never render draft chunk content in a template
+    — a doc whose chunks are mid-flip (e.g. the approve transaction
+    failed between the docs UPDATE and the chunks UPDATE) must fall
+    through to the default rather than leak draft text.
 
-    Returns ``None`` if the doc isn't found or is missing content
+    Returns ``None`` if the doc isn't found or is missing approved content
     chunks (treat as unresolvable and fall through to the default).
     """
     doc = await conn.fetchrow(
@@ -145,6 +149,7 @@ async def _fetch_doc_body(
           AND doc_id = $2
           AND valid_to IS NULL
           AND kind = 'content'
+          AND visibility = 'approved'
           AND $3 BETWEEN first_seen_version AND last_seen_version
         ORDER BY chunk_index
         """,

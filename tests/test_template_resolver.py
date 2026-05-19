@@ -109,6 +109,63 @@ async def _seed_doc_with_body(
         await conn.close()
 
 
+async def _seed_doc_with_mixed_visibility(
+    customer_id: str, doc_id: str, body: str,
+    *, doc_visibility: str, chunk_visibility: str,
+) -> None:
+    """Insert a single-version wiki doc + one content chunk at the given
+    per-row visibilities. Used to verify the resolver gates BOTH sides
+    of the join — a doc whose row is ``approved`` but whose chunks are
+    still ``draft`` (e.g. mid-flip race) must NOT render.
+    """
+    import asyncpg
+    dsn = os.environ["DATABASE_URL"]
+    conn = await asyncpg.connect(dsn=dsn)
+    try:
+        now = datetime.now(UTC)
+        await conn.execute(
+            """
+            INSERT INTO documents (
+                doc_id, version, customer_id,
+                source_system, source_id, source_url,
+                doc_class, doc_type, content_type,
+                content_hash, title, body_size_bytes, body_token_count,
+                created_at, updated_at, valid_from, ingested_at,
+                acl, visibility
+            ) VALUES (
+                $1, 1, $2,
+                'wiki', $1, 'https://example/wiki',
+                'wiki_page', 'wiki_page', 'text/markdown',
+                $3, $4, $5, 0,
+                $6, $6, $6, $6,
+                '{}'::jsonb, $7
+            )
+            """,
+            doc_id, customer_id,
+            f"hash-{doc_id}", f"Template doc {doc_id}",
+            len(body.encode()), now, doc_visibility,
+        )
+        await conn.execute(
+            """
+            INSERT INTO chunks (
+                chunk_id, doc_id, customer_id,
+                chunk_index, content, content_hash, token_count,
+                first_seen_version, last_seen_version,
+                visibility
+            ) VALUES (
+                $1, $2, $3,
+                0, $4, $5, 5,
+                1, 1,
+                $6
+            )
+            """,
+            f"{doc_id}:c0:v1", doc_id, customer_id,
+            body, f"chunk-hash-{doc_id}", chunk_visibility,
+        )
+    finally:
+        await conn.close()
+
+
 async def _cleanup_customer(customer_id: str) -> None:
     import asyncpg
     dsn = os.environ["DATABASE_URL"]
@@ -176,6 +233,45 @@ async def test_doc_ref_override_fetches_doc_body(customer_id: str) -> None:
     assert resp.source == "doc_ref_override"
     assert resp.body_markdown == body
     assert resp.resolved_ref_doc_id == "wiki:postmortem-template"
+
+
+async def test_doc_ref_approved_doc_but_draft_chunks_falls_back_to_default(
+    customer_id: str,
+) -> None:
+    """A doc row whose ``visibility='approved'`` but whose chunks are
+    still ``visibility='draft'`` (an inconsistent transient state — e.g.
+    the approve transaction failed between the documents UPDATE and the
+    chunks UPDATE) must NOT render draft chunk content.
+
+    The chunks visibility gate in ``_fetch_doc_body`` matches the
+    docs-side gate so the resolver finds 0 matching chunks and falls
+    through to ``DEFAULT_POSTMORTEM_TEMPLATE`` rather than leak the
+    draft body. Regression for the chunks-side filter; without it the
+    template would silently render with draft content.
+    """
+    doc_id = "wiki:template-ref-mixed"
+    # Doc row is approved (so upsert_override's validation passes) but
+    # the chunks are still draft.
+    await _seed_doc_with_mixed_visibility(
+        customer_id, doc_id, body="DRAFT chunk content",
+        doc_visibility="approved", chunk_visibility="draft",
+    )
+    await upsert_override(
+        TemplateUpsertRequest(
+            customer_id=customer_id,
+            mode="doc_ref",
+            ref_doc_id=doc_id,
+        )
+    )
+
+    resp = await get_effective_template(customer_id)
+    # The chunks-side visibility filter returns 0 rows -> _fetch_doc_body
+    # returns None -> resolver falls back to default.
+    assert resp.source == "default"
+    assert resp.body_markdown == DEFAULT_POSTMORTEM_TEMPLATE
+    assert resp.resolved_ref_doc_id is None
+    # And the leaked draft body never reached the rendered template.
+    assert "DRAFT chunk content" not in resp.body_markdown
 
 
 async def test_doc_ref_unresolved_falls_back_to_default(
