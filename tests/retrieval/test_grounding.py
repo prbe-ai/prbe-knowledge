@@ -61,6 +61,54 @@ def test_detect_bare_ids_github_pr():
     assert ("pr", "49") in ids
 
 
+def test_detect_bare_ids_github_pr_conversational_forms():
+    """Live-traced 2026-05-18: the original `#`-only regex missed
+    natural English forms like 'Why was PR 328 created' — grounding
+    fell back to fuzzy match on the repo slug and the PR's body
+    chunks never made the prefanout. The broadened regex catches
+    every common phrasing: `PR 328`, `pr 328`, `PR#328`, `PR-328`."""
+    for query, expected in [
+        ("Why was PR 328 in prbe-knowledge created", "328"),
+        ("look up pr 49 in the backend", "49"),
+        ("see PR#100 for context", "100"),
+        ("PR-7 is the right reference", "7"),
+        ("check pr.42 first", "42"),
+    ]:
+        ids = _detect_bare_ids(query)
+        assert ("pr", expected) in ids, (
+            f"failed to detect ('pr', {expected!r}) from {query!r}; got {ids}"
+        )
+
+
+def test_detect_bare_ids_issue_alias():
+    """Issues share the PR namespace + phrasing; we tag both as `pr`
+    so downstream grounding looks up whichever canonical_id form
+    (pr: or issue:) the customer's graph has."""
+    for query, expected in [
+        ("Why was issue 77 raised", "77"),
+        ("issue#42 status please", "42"),
+    ]:
+        ids = _detect_bare_ids(query)
+        assert ("pr", expected) in ids, (
+            f"failed to detect ('pr', {expected!r}) from {query!r}; got {ids}"
+        )
+
+
+def test_detect_bare_ids_no_false_positives_on_bare_numbers():
+    """A bare number with no `#` / `PR` / `issue` prefix is NOT a
+    PR — we must keep the regex tight enough that conversational
+    numerics don't all get tagged as PRs."""
+    for query in [
+        "ship 3 features this week",
+        "the last 7 commits were clean",
+        "100x throughput on Cerebras",
+    ]:
+        ids = _detect_bare_ids(query)
+        assert not any(kind == "pr" for kind, _ in ids), (
+            f"false-positive PR detection in {query!r}: {ids}"
+        )
+
+
 def test_detect_bare_ids_git_sha_prefix():
     ids = _detect_bare_ids("revert 2d186dd please")
     assert any(kind == "commit_sha" for kind, _ in ids)
