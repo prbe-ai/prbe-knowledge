@@ -103,13 +103,18 @@ class PostWriteWorker:
 
         Returns a row with (customer_id, node_id, analyzer_status). Atomically
         flips locked_until to NOW() + 5min so concurrent workers skip it.
+
+        Also reclaims rows whose previous lock has expired (locked_until in
+        the past) — those got stuck because a worker pod died mid-process,
+        couldn't run the success-DELETE or failure-clear, and would
+        otherwise never get picked back up.
         """
         async with raw_conn() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """
                 SELECT customer_id, node_id, analyzer_status
                 FROM node_post_write_queue
-                WHERE (locked_until IS NULL)
+                WHERE (locked_until IS NULL OR locked_until < NOW())
                   AND COALESCE(
                       (analyzer_status->'auto_merge'->>'attempts')::int, 0
                   ) < $1

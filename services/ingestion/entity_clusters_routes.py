@@ -29,6 +29,7 @@ import logging
 import uuid
 from datetime import datetime
 
+import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -304,18 +305,58 @@ async def merge_cluster(body: MergeRequest) -> MergeResponse:
                 )
                 continue
             # Clean rewrite: UPDATE endpoints + stamp aliased_from/to.
-            await conn.execute(
-                """
-                UPDATE graph_edges
-                   SET from_node_id = $1,
-                       to_node_id   = $2,
-                       aliased_from_canonical_id = $3,
-                       aliased_to_canonical_id   = $4
-                 WHERE edge_id = $5
-                """,
-                new_from, new_to, new_aliased_from, new_aliased_to,
-                e["edge_id"],
-            )
+            # If the primary-side already has the same edge (same edge_type,
+            # endpoints, alias-lane key), the UPDATE collides with the
+            # composite UNIQUE index `graph_edges_unique_lane`. In that case
+            # the alias-side edge is redundant — the primary already carries
+            # the connection — so we DELETE it instead. The merge audit
+            # snapshotted the row at step 7 (provenance was merged), so
+            # unmerge can still restore it from entity_merge_edge_snapshot.
+            try:
+                await conn.execute(
+                    """
+                    UPDATE graph_edges
+                       SET from_node_id = $1,
+                           to_node_id   = $2,
+                           aliased_from_canonical_id = $3,
+                           aliased_to_canonical_id   = $4
+                     WHERE edge_id = $5
+                    """,
+                    new_from, new_to, new_aliased_from, new_aliased_to,
+                    e["edge_id"],
+                )
+            except asyncpg.exceptions.UniqueViolationError:
+                snapshot_seq += 1
+                await conn.execute(
+                    """
+                    INSERT INTO entity_merge_edge_snapshot
+                      (merge_id, snapshot_seq, customer_id, operation,
+                       pre_edge_type,
+                       pre_from_canonical_id, pre_from_label,
+                       pre_to_canonical_id,   pre_to_label,
+                       pre_properties, pre_confidence,
+                       pre_valid_from, pre_valid_to,
+                       pre_source_system, pre_extractor_id, pre_extracted_at,
+                       pre_aliased_from_canonical_id, pre_aliased_to_canonical_id)
+                    SELECT $1, $2, $3, 'deleted_duplicate_lane',
+                           $4,
+                           gn_from.canonical_id, gn_from.label,
+                           gn_to.canonical_id,   gn_to.label,
+                           $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13
+                      FROM graph_nodes gn_from, graph_nodes gn_to
+                     WHERE gn_from.node_id = $14 AND gn_to.node_id = $15
+                    """,
+                    merge_id, snapshot_seq, customer_id,
+                    e["edge_type"],
+                    e["properties"], e["confidence"],
+                    e["valid_from"], e["valid_to"],
+                    e["source_system"], e["extractor_id"], e["extracted_at"],
+                    e["aliased_from_canonical_id"], e["aliased_to_canonical_id"],
+                    e["from_node_id"], e["to_node_id"],
+                )
+                await conn.execute(
+                    "DELETE FROM graph_edges WHERE edge_id = $1", e["edge_id"]
+                )
 
         # 9. Hard-delete alias graph_nodes (CASCADE drops their remaining
         #    provenance rows — already merged into canonical at step 7).
