@@ -355,13 +355,43 @@ def _build_user_message(
     )
 
 
-def _affinity_key(customer_id: str, query: str) -> str:
-    """Per-query Fireworks session-affinity hash so consecutive turns
-    cache-hit on the same replica (90% discount only applies in-replica)."""
+def _affinity_key(customer_id: str, query: str) -> str:  # noqa: ARG001
+    """Per-customer Cerebras session-affinity hash so the static system
+    prompt + tool-defs prefix cache-hits ACROSS queries (not just across
+    turns of one query).
+
+    Original design (Fireworks): hash `(customer_id, query)` so the two
+    turns of a single query share a replica. That worked because the
+    only cache reuse Fireworks gave you was within a single multi-turn
+    query — and per-query affinity guaranteed it.
+
+    Why this changed (Cerebras, 2026-05-20): yesterday's digest of 126
+    single-turn queries showed turn-0 mean cache_hit_rate of 0.13. The
+    static system prompt + tool-defs (~2.4K tokens) gets a cold KV-cache
+    on turn 0 of every query because every new query hashed to a fresh
+    replica. The 4 traces that warmed (chr >= 0.5) ran 2.3x faster
+    (886ms vs 2029ms). 104/126 traces are single-turn, so per-query
+    affinity buys nothing in those cases — it just guarantees we cold-
+    start the prefix on every query.
+
+    With customer-only affinity all of one customer's queries route to
+    the same replica, so the system prompt + tool-defs prefix stays
+    warm. Multi-turn cache hit is preserved because Cerebras's prefix
+    cache is content-addressed (vLLM-style): turn 1 of a multi-turn
+    query still hits the warm token-prefix that turn 0 wrote to the
+    same replica's cache.
+
+    Signature keeps `query: str` so existing call sites compile
+    unchanged; the argument is intentionally unused
+    (see PRB-12; PR digest 2026-05-19 cited request_ids
+    fe737834-647c-43fa-9c8f-790dc271cee4,
+    4c55749c-d984-413b-8b8a-ff0458b21346,
+    a6edb1bc-37f6-404c-8107-856a7ec1f01a,
+    6d62d15a-285c-47d0-832d-b7c78d1fc0dc,
+    587edbbf-93f1-4679-ba0e-e41dd6fb0b4b).
+    """
     h = sha256()
     h.update(customer_id.encode("utf-8", errors="ignore"))
-    h.update(b":")
-    h.update(query.encode("utf-8", errors="ignore"))
     return h.hexdigest()[:32]
 
 

@@ -734,11 +734,15 @@ SEARCH_AGENT_FETCH_CHUNKS_MAX = 10
 # around 15K tokens.
 SEARCH_AGENT_PER_HIT_PROPERTIES_CAP = 2048
 
-# Fireworks 90% cache discount only fires when consecutive turns land on
-# the same replica. We set `x-session-affinity` per query so the prefix
-# (system prompt + tool defs + grounding) cache-hits. This is the
-# acceptance gate observed via query_traces.cache_hit_rate; if production
-# rate drops below this, hard-query cost roughly doubles.
+# Cerebras prefix-cache discount only fires when consecutive turns —
+# AND consecutive queries from the same customer — land on the same
+# replica. We set `x-session-affinity` per customer (not per query) so
+# the static prefix (system prompt + tool defs) cache-hits across queries,
+# and multi-turn cache continuity is preserved because Cerebras's prefix
+# cache is content-addressed (turn 1 still hits the warm prefix turn 0
+# wrote to the same replica). This is the acceptance gate observed via
+# query_traces.cache_hit_rate; if production rate drops below this,
+# hard-query cost roughly doubles. See `loop._affinity_key`.
 SEARCH_AGENT_CACHE_HIT_RATE_FLOOR = 0.7
 
 # Wall-clock cap on a single agent turn (model + tool execution combined).
