@@ -369,8 +369,11 @@ jobs:
             | jq -r '.id // .' \
             || echo "::warning::Resend send failed"
 
-      - name: Send Sendblue iMessage
-        if: always() && (steps.digestnote.outputs.prs_opened != '0' || steps.digestnote.outputs.status != 'success' || steps.digestnote.outputs.needs_human != '0')
+      - name: Send Sendblue iMessage (digest)
+        # Drops `needs_human != '0'` — when there's a needs-human note,
+        # the dedicated "Ask user via apps-plane" step below sends a
+        # focused question iMessage instead, so we don't double-send.
+        if: always() && (steps.digestnote.outputs.prs_opened != '0' || steps.digestnote.outputs.status != 'success')
         env:
           SENDBLUE_API_KEY_ID: ${{ secrets.SENDBLUE_API_KEY_ID }}
           SENDBLUE_API_SECRET: ${{ secrets.SENDBLUE_API_SECRET }}
@@ -398,6 +401,72 @@ jobs:
             -d "$PAYLOAD" \
             | jq -r '.message_handle // .status // .' \
             || echo "::warning::Sendblue send failed"
+
+      - name: Ask user via apps-plane (needs-human handoff)
+        # Async loop: when the orchestrator wrote /tmp/needs-human-*.md
+        # notes, hand the FIRST one off to apps.prbe.ai/api/sendblue/ask.
+        # That service stores the question, sends an iMessage, and
+        # listens for the reply on its inbound webhook. When the reply
+        # arrives, it fires repository_dispatch nightly-resume back here
+        # (handled by .github/workflows/nightly-improvement-resume.yml).
+        # The remaining needs-human notes (if any) wait in the apps-plane
+        # queue and get asked one-at-a-time as each prior is answered.
+        if: always() && steps.digestnote.outputs.needs_human != '0'
+        env:
+          APPS_PLANE_URL: ${{ vars.APPS_PLANE_URL || 'https://apps.prbe.ai' }}
+          # Apps-plane's /api/sendblue/ask is auth'd against
+          # `internal_backend_api_key`, which equals the existing
+          # INTERNAL_BACKEND_API_KEY value we already store in GH
+          # secrets as PROBE_MCP_INTERNAL_KEY (same source-of-truth).
+          INTERNAL_BACKEND_KEY: ${{ secrets.PROBE_MCP_INTERNAL_KEY }}
+          PROBE_MCP_CUSTOMER_ID: ${{ secrets.PROBE_MCP_CUSTOMER_ID }}
+          SENDBLUE_TO_NUMBER: ${{ secrets.SENDBLUE_TO_NUMBER }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INTERNAL_BACKEND_KEY:-}" ] || [ -z "${SENDBLUE_TO_NUMBER:-}" ]; then
+            echo "::warning::Cannot ask via apps-plane — PROBE_MCP_INTERNAL_KEY or SENDBLUE_TO_NUMBER missing."
+            exit 0
+          fi
+          # Take the first needs-human note (lexicographic — the
+          # orchestrator writes them as needs-human-<slug>.md so this
+          # is stable per slug). Apps-plane queues additional ones
+          # automatically if there's already an open question.
+          NOTE=$(find /tmp -maxdepth 1 -name 'needs-human-*.md' 2>/dev/null | sort | head -1)
+          if [ -z "$NOTE" ]; then
+            echo "::warning::digestnote claimed needs_human > 0 but no /tmp/needs-human-*.md found"
+            exit 0
+          fi
+          SLUG=$(basename "$NOTE" .md | sed 's/^needs-human-//')
+          NOTE_TEXT=$(cat "$NOTE")
+          # Question for iMessage = first non-empty line of the note,
+          # capped to ~200 chars. If the note's first line is a
+          # markdown header (#…), strip it. Tail with the slug so the
+          # user has context.
+          QUESTION=$(printf '%s' "$NOTE_TEXT" | grep -m1 -v '^[[:space:]]*$' | sed -E 's/^#+ +//' | head -c 200)
+          if [ -z "$QUESTION" ]; then
+            QUESTION="Needs human input on candidate: $SLUG"
+          fi
+          QUESTION_WITH_TAIL="$QUESTION  (slug: $SLUG · reply yes/no/details)"
+
+          # POST to apps-plane.  Context blob carries everything the
+          # resume workflow needs to rebuild the candidate without
+          # re-fetching artifacts.
+          PAYLOAD=$(jq -n \
+            --arg customer_id "$PROBE_MCP_CUSTOMER_ID" \
+            --arg to_number "$SENDBLUE_TO_NUMBER" \
+            --arg question "$QUESTION_WITH_TAIL" \
+            --arg run_id "${{ github.run_id }}" \
+            --arg run_url "$RUN_URL" \
+            --arg candidate_slug "$SLUG" \
+            --arg customer_id_ctx "$PROBE_MCP_CUSTOMER_ID" \
+            --arg note_text "$NOTE_TEXT" \
+            '{customer_id:$customer_id, to_number:$to_number, question:$question, context:{run_id:$run_id, run_url:$run_url, candidate_slug:$candidate_slug, customer_id:$customer_id_ctx, note_text:$note_text}}')
+          RESP=$(curl -fsS -X POST "${APPS_PLANE_URL}/api/sendblue/ask" \
+            -H "X-Internal-Backend-Key: $INTERNAL_BACKEND_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" 2>&1)
+          echo "$RESP" | jq -r '{question_id, status, marker}' || echo "$RESP"
 
       - name: Upload orchestrator summary as artifact
         if: always()
