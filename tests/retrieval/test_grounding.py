@@ -280,3 +280,158 @@ async def test_build_bundle_handles_operator_chars_in_query(seeded_customer):
     # and that the bundle assembles. Use connected_sources as the
     # canary that the gather completed without all-failure.
     assert "github" in bundle.connected_sources
+
+
+# ---- Doc-title channel (channel 4) --------------------------------------
+
+from services.retrieval.grounding import (  # noqa: E402
+    _doc_id_to_entity_type,
+    _fuzzy_match_document_titles,
+)
+
+
+def test_doc_id_to_entity_type_github_pr():
+    assert _doc_id_to_entity_type("github:prbe-ai/prbe-knowledge:pr:340", "github") == "pr"
+
+
+def test_doc_id_to_entity_type_github_issue():
+    assert _doc_id_to_entity_type("github:prbe-ai/prbe-knowledge:issue:77", "github") == "ticket"
+
+
+def test_doc_id_to_entity_type_github_commit():
+    assert _doc_id_to_entity_type(
+        "github:prbe-ai/prbe-knowledge:commit:abc1234", "github"
+    ) == "commit_sha"
+
+
+def test_doc_id_to_entity_type_linear():
+    assert _doc_id_to_entity_type("linear:org:issue:abc", "linear") == "ticket"
+
+
+def test_doc_id_to_entity_type_notion():
+    assert _doc_id_to_entity_type("notion:page:abc", "notion") == "page"
+
+
+def test_doc_id_to_entity_type_wiki_falls_to_document():
+    assert _doc_id_to_entity_type("wiki:project:mg", "wiki") == "document"
+
+
+def test_doc_id_to_entity_type_unknown_source_falls_to_document():
+    assert _doc_id_to_entity_type("foo:bar:baz", "unknown_src") == "document"
+
+
+def test_doc_id_to_entity_type_short_github_doc_id_falls_to_source_default():
+    """When a GitHub doc_id has fewer than 3 colon-parts (malformed or
+    repo-level), the structural parse falls through to the source_system
+    map. `github` maps to `document` as a generic fallback."""
+    assert _doc_id_to_entity_type("github:repo-only", "github") == "document"
+
+
+@pytest.mark.integration
+async def test_fuzzy_match_document_titles_returns_match_on_tsvector_hit(
+    seeded_customer_with_docs,
+):
+    """The classic failing case: query 'multi-granola' must surface the
+    Linear PRB-18 + Notion design rationale + wiki page as grounded
+    candidates. Pre-channel-4, all three were Document nodes that
+    grounding silently missed, leading to the phantom-entity / curation-
+    lottery non-determinism this channel exists to fix."""
+    candidates = await _fuzzy_match_document_titles(
+        customer_id=seeded_customer_with_docs.customer_id,
+        tokens=["multi-granola"],
+    )
+    canonical_ids = {c.canonical_id for c in candidates}
+    assert "linear:org:issue:prb-18" in canonical_ids
+    assert "notion:page:design-mg" in canonical_ids
+    assert "wiki:project:multi_granola" in canonical_ids
+    # All hits carry match_source for telemetry
+    assert all(c.match_source == "doc_title" for c in candidates)
+    # entity_type is derived from doc_id structure, not generic 'document'
+    linear_cand = next(c for c in candidates if c.canonical_id == "linear:org:issue:prb-18")
+    assert linear_cand.entity_type == "ticket"
+    notion_cand = next(c for c in candidates if c.canonical_id == "notion:page:design-mg")
+    assert notion_cand.entity_type == "page"
+
+
+@pytest.mark.integration
+async def test_fuzzy_match_document_titles_scopes_by_customer(
+    seeded_customer_with_docs,
+):
+    """The seeded fixture includes a cross-tenant doc with the same
+    'multi-granola' title under a DIFFERENT customer_id. The channel
+    must NOT leak it across tenants. This is a defense-in-depth check
+    on top of RLS — explicit WHERE customer_id = $1 in the SQL."""
+    candidates = await _fuzzy_match_document_titles(
+        customer_id=seeded_customer_with_docs.customer_id,
+        tokens=["multi-granola"],
+    )
+    cross_tenant_id = "linear:org:issue:prb-cross"
+    assert all(c.canonical_id != cross_tenant_id for c in candidates)
+
+
+@pytest.mark.integration
+async def test_fuzzy_match_document_titles_skips_soft_deleted(
+    seeded_customer_with_docs,
+):
+    """Soft-deleted docs (valid_to IS NOT NULL) must not surface — they
+    represent superseded versions whose titles may be stale or wrong.
+    The SQL's `valid_to IS NULL` filter enforces this."""
+    candidates = await _fuzzy_match_document_titles(
+        customer_id=seeded_customer_with_docs.customer_id,
+        tokens=["multi-granola"],
+    )
+    soft_deleted_id = "linear:org:issue:prb-old"
+    assert all(c.canonical_id != soft_deleted_id for c in candidates)
+
+
+@pytest.mark.integration
+async def test_fuzzy_match_document_titles_empty_tokens_returns_empty(
+    seeded_customer_with_docs,
+):
+    """Whitespace-only query produces no tokens; the channel short-
+    circuits to [] without firing any SQL (no needless DB load on
+    every empty request)."""
+    candidates = await _fuzzy_match_document_titles(
+        customer_id=seeded_customer_with_docs.customer_id,
+        tokens=[],
+    )
+    assert candidates == []
+
+
+@pytest.mark.integration
+async def test_fuzzy_match_document_titles_fts_only_path_hits_body_preview(
+    seeded_customer_with_docs,
+):
+    """When trgm similarity on title is below floor but tsvector FTS
+    matches in body_preview, the doc still surfaces. The "Onboarding
+    Runbook" doc has title="Onboarding Runbook" (zero trigram overlap
+    with "kubernetes") but body_preview mentions kubernetes. The
+    `idx_documents_fts_title_preview` GIN index covers both fields
+    via `to_tsvector(title || ' ' || body_preview)`, so the FTS
+    branch fires."""
+    candidates = await _fuzzy_match_document_titles(
+        customer_id=seeded_customer_with_docs.customer_id,
+        tokens=["kubernetes"],
+    )
+    assert any(c.canonical_id == "notion:page:onboarding" for c in candidates)
+
+
+@pytest.mark.integration
+async def test_build_bundle_merges_doc_title_into_candidates(
+    seeded_customer_with_docs,
+):
+    """Doc-title matches must merge into the bundle's `candidates` list
+    (not a separate field), so downstream consumers see them through
+    the existing API. Dedup-by-canonical_id keeps a doc from rendering
+    twice if it happens to surface via both entity-fuzzy and
+    doc-title channels."""
+    bundle = await build_bundle(
+        seeded_customer_with_docs.customer_id, "multi-granola plan"
+    )
+    canon_ids = {c.canonical_id for c in bundle.candidates}
+    assert "linear:org:issue:prb-18" in canon_ids
+    # No duplicate entries — canonical_id dedup
+    seen: set[str] = set()
+    for c in bundle.candidates:
+        assert c.canonical_id not in seen, f"duplicate candidate: {c.canonical_id}"
+        seen.add(c.canonical_id)
