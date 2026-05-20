@@ -107,7 +107,19 @@ class GatheredChunk(BaseModel):
 
     doc_id: str
     chunk_id: str
-    content: str
+    # `content` is filled BY THE HARNESS from a chunk_id → content lookup
+    # against the prefanout (and other tool results that carry chunk
+    # bodies). The agent SHOULD NOT emit a content string — any value it
+    # writes here is overwritten by `_coerce_lenient` when the chunk_id
+    # matches a prefanout hit. Default empty so the agent saves output
+    # tokens by omitting the field entirely.
+    #
+    # Why: pre-fix, the agent paraphrased / summarized chunk bodies and
+    # downstream synthesis (which receives this `content` verbatim) had
+    # ~150-char summary blurbs to ground answers in instead of the full
+    # ~1800-char body chunks the DB holds. Verbatim is the contract;
+    # the agent's job is "pick which chunks" not "rewrite them."
+    content: str = ""
     matched_via: list[MatchedViaChannel] = Field(
         default_factory=list,
         description="Channels that surfaced this chunk during the loop.",

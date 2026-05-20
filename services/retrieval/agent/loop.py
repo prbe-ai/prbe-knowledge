@@ -702,6 +702,56 @@ def _build_prefanout_doc_meta(prefanout: dict[str, Any] | None) -> dict[str, dic
     return out
 
 
+def _build_prefanout_chunk_content(
+    prefanout: dict[str, Any] | None,
+) -> dict[tuple[str, str], str]:
+    """Flatten `execute_search` result into `(chunk_id, doc_id) → content`.
+
+    Used by `_coerce_lenient` to OVERWRITE the model-emitted content
+    with the verbatim chunk body from the search hit. The agent's job
+    is to pick which chunks are relevant; the chunk bodies themselves
+    are not the agent's to rewrite. Pre-fix, the agent paraphrased
+    chunks down to ~150-char summary blurbs, starving downstream
+    synthesis of the factual content needed to answer.
+
+    The key is the (chunk_id, doc_id) PAIR rather than chunk_id alone.
+    Today `chunks.chunk_id` is content-addressed and unique per
+    customer, so collisions don't occur — but keying on the pair is
+    defensive against any future ingest path that mints
+    non-content-addressed chunk_ids (e.g., id-lookup aliases). Without
+    the pair check, a chunk_id collision would let the harness coerce
+    the model into citing the right body under the wrong doc.
+
+    First-write wins per channel ordering (vector / bm25 / graph).
+    Inferred-edge channel hits do NOT carry chunk-level content
+    (they're doc-level chain references) and are skipped — the
+    agent's emission for inferred-edge chunks is whole-doc and may
+    pick up content via fetch_doc instead.
+    """
+    out: dict[tuple[str, str], str] = {}
+    for sq in (prefanout or {}).get("sub_queries") or []:
+        if not isinstance(sq, dict):
+            continue
+        for channel in ("vector", "bm25", "graph"):
+            for hit in sq.get(channel) or []:
+                if not isinstance(hit, dict):
+                    continue
+                chunk_id = hit.get("chunk_id")
+                doc_id = hit.get("doc_id")
+                content = hit.get("content")
+                if (
+                    not chunk_id
+                    or not doc_id
+                    or not isinstance(content, str)
+                    or not content.strip()
+                ):
+                    continue
+                key = (chunk_id, doc_id)
+                if key not in out:
+                    out[key] = content
+    return out
+
+
 def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict[str, Any]:
     """Pre-parse coercion for non-strict providers (Cerebras et al.).
 
@@ -736,6 +786,19 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
     # source_system/title/url on chunks the model emitted by doc_id only.
     prefanout_meta: dict[str, dict[str, Any]] = (
         _build_prefanout_doc_meta(state.prefanout) if state is not None else {}
+    )
+    # Chunk-content lookup — the harness is authoritative for chunk
+    # bodies. When the agent emits a (chunk_id, doc_id) pair that's
+    # in the prefanout, we OVERWRITE its `content` with the verbatim
+    # chunk body from the search hit. This eliminates the failure mode
+    # where the model paraphrased chunks down to summary blurbs that
+    # starved downstream synthesis of the factual content needed to
+    # answer. Chunks discovered via fetch_doc / subgraph aren't in
+    # this map; their content stays as the model emitted it (the
+    # prompt instructs the model to copy those verbatim from the tool
+    # response, so trust the emission).
+    prefanout_chunks: dict[tuple[str, str], str] = (
+        _build_prefanout_chunk_content(state.prefanout) if state is not None else {}
     )
     # Entities: filter non-dict items + alias `id` → `canonical_id`.
     # Cerebras gpt-oss-120b occasionally emits malformed JSON fragments as
@@ -774,13 +837,26 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
             ch_out["chunk_id"] = ch_out["doc_id"]
         if not ch_out.get("doc_id") or not ch_out.get("chunk_id"):
             continue  # Can't recover citation
-        # Content — try aliases when missing
-        if not ch_out.get("content"):
-            for alias in _CHUNK_CONTENT_ALIASES:
-                v = ch_out.get(alias)
-                if isinstance(v, str) and v.strip():
-                    ch_out["content"] = v
-                    break
+        # Content — HARNESS-AUTHORITATIVE. If the (chunk_id, doc_id)
+        # pair is in prefanout, overwrite whatever the model wrote
+        # with the verbatim chunk body. Eliminates the agent-
+        # paraphrasing failure mode (live-traced 2026-05-20: agent
+        # emitted ~150-char summary blurbs instead of full ~1800-char
+        # chunk bodies, starving downstream synthesis). Falls back to
+        # the model's content (or alias fields) for chunks the agent
+        # discovered via fetch_doc/subgraph that aren't in prefanout —
+        # the prompt instructs the model to copy those verbatim from
+        # the tool response, so trust the emission.
+        verbatim = prefanout_chunks.get((ch_out["chunk_id"], ch_out["doc_id"]))
+        if verbatim:
+            ch_out["content"] = verbatim
+        else:
+            if not ch_out.get("content"):
+                for alias in _CHUNK_CONTENT_ALIASES:
+                    v = ch_out.get(alias)
+                    if isinstance(v, str) and v.strip():
+                        ch_out["content"] = v
+                        break
         if not ch_out.get("content"):
             continue  # No body to cite
         # Fill doc-level pass-through fields. The prefanout meta is the
