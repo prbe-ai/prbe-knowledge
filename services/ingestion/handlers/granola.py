@@ -2,8 +2,8 @@
 
 Granola does not offer webhooks (as of 2026-04). Integration is poll-only:
 
-    services/ingestion/poller (Fly app `prbe-knowledge-poller`)
-        │  every 5 min: re_enqueue_for_polling(customer, granola)
+    services/ingestion/poller.IntegrationPoller (in-process, worker deployment)
+        │  every GRANOLA_POLL_INTERVAL_SECONDS: re_enqueue_for_polling(customer, granola)
         │  on pg_notify('granola_refresh', customer): same
         ▼
     backfill_state.status = 'pending'
@@ -57,10 +57,13 @@ from typing import Any, ClassVar
 import httpx
 
 from services.ingestion.chunker import count_tokens
-from services.ingestion.handlers.base import Connector
+from services.ingestion.handlers.base import Connector, PollConfig
 from services.ingestion.handlers.registry import register_connector
 from shared.constants import (
+    GRANOLA_POLL_INTERVAL_SECONDS,
+    GRANOLA_REFRESH_CHANNEL,
     GRANOLA_REQUEST_INTERVAL_SECONDS,
+    BackfillStatus,
     DocClass,
     DocType,
     EdgeType,
@@ -103,6 +106,14 @@ _MAX_PAGES_PER_TICK = 1000
 class GranolaConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.GRANOLA
     display_name: ClassVar[str] = "Granola"
+    # Granola has no inbound webhooks, so the integration poller re-enqueues
+    # the backfill on a cadence. FAILED is in the eligible set so transient
+    # upstream errors (R2 5xx etc.) auto-retry on the next tick.
+    poll_config: ClassVar[PollConfig | None] = PollConfig(
+        interval_seconds=GRANOLA_POLL_INTERVAL_SECONDS,
+        eligible_statuses=(BackfillStatus.COMPLETE, BackfillStatus.FAILED),
+        notify_channel=GRANOLA_REFRESH_CHANNEL,
+    )
 
     # ---- 1. signature verification ----------------------------------------
     #
@@ -132,9 +143,7 @@ class GranolaConnector(Connector):
         # webhook support), accept the synthesized shape.
         note = raw_payload.get("note")
         if not isinstance(note, dict) or not note.get("id"):
-            raise InvalidWebhookPayload(
-                "granola payload missing 'note' object with id"
-            )
+            raise InvalidWebhookPayload("granola payload missing 'note' object with id")
         note_id = str(note["id"])
         received_at = _parse_iso(note.get("created_at")) or datetime.now(UTC)
         return WebhookParseResult(
@@ -163,9 +172,7 @@ class GranolaConnector(Connector):
     ) -> NormalizationResult:
         note = event.raw_payload.get("note")
         if not isinstance(note, dict) or not note.get("id"):
-            return NormalizationResult(
-                skipped_reason="granola event missing note.id"
-            )
+            return NormalizationResult(skipped_reason="granola event missing note.id")
 
         note_id = str(note["id"])
         title = (note.get("title") or "").strip() or None
@@ -354,9 +361,7 @@ class GranolaConnector(Connector):
                 # Capture created_at from the LIST response so we know it
                 # even if the per-note hydrate fails. Used to cap the
                 # checkpoint watermark below.
-                list_created_at = (
-                    note_summary.get("created_at") or ""
-                ).strip() or None
+                list_created_at = (note_summary.get("created_at") or "").strip() or None
 
                 # Hydrate: GET /notes/{id}?include=transcript per note.
                 # The list response doesn't include summary or transcript,
@@ -371,23 +376,18 @@ class GranolaConnector(Connector):
                     # created_at among skipped notes so we cap the
                     # final watermark and re-list this note next run.
                     if list_created_at and (
-                        min_skipped_created_at is None
-                        or list_created_at < min_skipped_created_at
+                        min_skipped_created_at is None or list_created_at < min_skipped_created_at
                     ):
                         min_skipped_created_at = list_created_at
                     continue
 
-                created_at_str = (
-                    note.get("created_at") or list_created_at or ""
-                )
+                created_at_str = note.get("created_at") or list_created_at or ""
                 received_at = _parse_iso(created_at_str) or datetime.now(UTC)
 
                 # Track the highest successfully-hydrated created_at.
                 # Strict > so we don't get stuck re-polling notes with
                 # identical timestamps (Granola IDs are unique within a tick).
-                if created_at_str and (
-                    final_watermark is None or created_at_str > final_watermark
-                ):
+                if created_at_str and (final_watermark is None or created_at_str > final_watermark):
                     final_watermark = created_at_str
                 saw_any = True
 
@@ -432,9 +432,7 @@ class GranolaConnector(Connector):
         if min_skipped_created_at is not None:
             # Cap so the skipped note will be re-listed next run.
             capped = _watermark_step_back_1ms(min_skipped_created_at)
-            if capped is not None and (
-                safe_watermark is None or capped < safe_watermark
-            ):
+            if capped is not None and (safe_watermark is None or capped < safe_watermark):
                 safe_watermark = capped
 
         if safe_watermark is None or safe_watermark == input_watermark:
@@ -459,9 +457,7 @@ class GranolaConnector(Connector):
     # Granola doesn't expose a workspace identifier we can route webhooks by.
     # No-op since there are no webhooks to route.
 
-    async def identify_workspaces(
-        self, token: IntegrationToken
-    ):  # type: ignore[override]
+    async def identify_workspaces(self, token: IntegrationToken):  # type: ignore[override]
         return []
 
     # ---- internal helpers -------------------------------------------------
@@ -563,10 +559,7 @@ def _watermark_step_back_1ms(value: str) -> str | None:
         return None
     stepped = (dt - timedelta(milliseconds=1)).astimezone(UTC)
     # Match Granola's wire format: ISO with 'Z' suffix, ms precision.
-    return (
-        stepped.strftime("%Y-%m-%dT%H:%M:%S.")
-        + f"{stepped.microsecond // 1000:03d}Z"
-    )
+    return stepped.strftime("%Y-%m-%dT%H:%M:%S.") + f"{stepped.microsecond // 1000:03d}Z"
 
 
 def _sha256(text: str) -> str:
@@ -591,10 +584,10 @@ def _transcript_digest(transcript: list[dict[str, Any]]) -> str:
             continue
         speaker = turn.get("speaker") or {}
         label = (
-            speaker.get("diarization_label")
-            or speaker.get("source")
-            or "unknown"
-        ) if isinstance(speaker, dict) else "unknown"
+            (speaker.get("diarization_label") or speaker.get("source") or "unknown")
+            if isinstance(speaker, dict)
+            else "unknown"
+        )
         parts.append(f"{label}: {text}")
     return "\n".join(parts)
 

@@ -47,7 +47,7 @@ from typing import Any, ClassVar
 import httpx
 
 from shared.config import Settings, get_settings
-from shared.constants import SourceSystem
+from shared.constants import BackfillStatus, SourceSystem
 from shared.exceptions import NotSupportedByConnector
 from shared.models import (
     ExternalWorkspaceRef,
@@ -56,6 +56,31 @@ from shared.models import (
     WebhookEvent,
     WebhookParseResult,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PollConfig:
+    """Declares that a Connector needs periodic backfill re-enqueueing.
+
+    Set as a ClassVar on the Connector subclass. None (the default) means
+    webhook-only — no polling. IntegrationPoller picks up every Connector
+    whose poll_config is not None.
+
+    Fields:
+      interval_seconds: cadence at which the integration poller wakes for
+        this source. Tick fires when NOW() - last_progress_at > interval.
+      eligible_statuses: backfill_state.status values to re-enqueue.
+        Typically (COMPLETE, FAILED) — PENDING/RUNNING are skipped because
+        they're already in-flight. Including FAILED auto-retries transient
+        upstream errors (R2 5xx, network blips) on the next tick.
+      notify_channel: pg_notify channel that wakes BackfillWorker
+        immediately after the row flips to PENDING. Without this, the worker
+        only picks up on its own poll cycle.
+    """
+
+    interval_seconds: int
+    eligible_statuses: tuple[BackfillStatus, ...]
+    notify_channel: str
 
 
 @dataclass(slots=True)
@@ -85,6 +110,11 @@ class Connector(ABC):
 
     # Display name used in logs / error messages. Defaults to the enum value.
     display_name: ClassVar[str] = ""
+
+    # Set on poll-only connectors (Granola etc.) — IntegrationPoller reads
+    # this to know how often to re-enqueue stale backfills. None means the
+    # source is webhook-driven and needs no periodic poll.
+    poll_config: ClassVar[PollConfig | None] = None
 
     def __init__(self, ctx: ConnectorContext) -> None:
         self.ctx = ctx
@@ -212,9 +242,7 @@ class Connector(ABC):
 
     # ---- 7. workspace identification (webhook → customer routing) ----------
 
-    async def identify_workspaces(
-        self, token: IntegrationToken
-    ) -> list[ExternalWorkspaceRef]:
+    async def identify_workspaces(self, token: IntegrationToken) -> list[ExternalWorkspaceRef]:
         """Return source-side workspace/team/org ids tied to this token.
 
         Called once at OAuth-callback time. Each returned ref is written
@@ -258,4 +286,4 @@ def make_default_context() -> ConnectorContext:
     return ConnectorContext(settings=settings, http=client)
 
 
-__all__ = ["Connector", "ConnectorContext", "make_default_context"]
+__all__ = ["Connector", "ConnectorContext", "PollConfig", "make_default_context"]

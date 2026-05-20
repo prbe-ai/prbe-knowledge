@@ -16,6 +16,7 @@ import asyncpg
 
 from services.ingestion.handlers.base import ConnectorContext, make_default_context
 from services.ingestion.normalizer import Normalizer
+from services.ingestion.poller import IntegrationPoller
 from services.ingestion.polling.scheduler import PollScheduler
 from services.ingestion.polling.sink import PollDocumentSink
 from shared.constants import (
@@ -541,7 +542,8 @@ class Worker:
                     "       created_at "
                     "FROM documents "
                     "WHERE doc_id = $1 AND customer_id = $2 AND valid_to IS NULL",
-                    incident_doc_id, customer_id,
+                    incident_doc_id,
+                    customer_id,
                 )
             if row is None:
                 log.error(
@@ -597,7 +599,7 @@ class BackfillWorker:
     Wake semantics:
       - Normal cycle: sleep `poll_interval` between claim attempts.
       - On `wake_event` set (via pg_notify from /admin/.../granola/refresh
-        or from prbe-knowledge-poller's tick), break sleep early and re-poll.
+        or from IntegrationPoller's tick), break sleep early and re-poll.
       - The wake_event is informational — the row was already enqueued by
         the caller; we just want to start work sub-second instead of waiting.
     """
@@ -961,6 +963,9 @@ async def run_worker_forever() -> None:
     reclaim_loop = ReclaimLoop(
         backfill_threshold_seconds=settings.backfill_stale_heartbeat_seconds,
     )
+    # IntegrationPoller replaces the retired prbe-knowledge-poller Fly app.
+    # Discovers participating connectors via their poll_config ClassVar.
+    integration_poller = IntegrationPoller()
     # Wiki triage + synthesis run in their own dedicated fly apps
     # (prbe-knowledge-wiki-worker / prbe-knowledge-wiki-synthesis), driven
     # by pg_notify channels and a nightly cron. Removed from this app's
@@ -1008,6 +1013,7 @@ async def run_worker_forever() -> None:
         backfill_worker.shutdown()
         granola_listener.shutdown()
         reclaim_loop.shutdown()
+        integration_poller.shutdown()
         if poll_scheduler is not None:
             poll_scheduler.stop()
         health_server.should_exit = True
@@ -1026,6 +1032,7 @@ async def run_worker_forever() -> None:
         backfill_worker.run(),
         granola_listener.run(),
         reclaim_loop.run(),
+        integration_poller.run(),
         health_server.serve(),
     ]
     if poll_scheduler is not None:
@@ -1044,6 +1051,7 @@ async def run_worker_forever() -> None:
         # Drain in-flight release tasks before asyncio.run's task-cancel sweep
         # interrupts their asyncpg UPDATE mid-roundtrip. See PR #210.
         from services.ingestion.backfill_runner import drain_pending_release_tasks
+
         await drain_pending_release_tasks()
         await ctx.http.aclose()
 
