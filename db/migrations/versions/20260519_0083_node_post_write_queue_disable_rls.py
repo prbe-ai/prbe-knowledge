@@ -20,7 +20,7 @@ state. Tenant scoping still happens elsewhere:
     calls ``with_tenant(customer_id)`` before loading the node — so all
     DOWNSTREAM access stays RLS-enforced.
 
-Revision ID: 0083_node_post_write_queue_disable_rls
+Revision ID: 0083_node_queue_no_rls
 Revises: 0082_node_post_write_pipeline
 Create Date: 2026-05-19
 """
@@ -31,7 +31,7 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0083_node_post_write_queue_disable_rls"
+revision: str = "0083_node_queue_no_rls"
 down_revision: str | Sequence[str] | None = "0082_node_post_write_pipeline"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
