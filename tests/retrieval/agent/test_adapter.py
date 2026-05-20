@@ -569,3 +569,162 @@ async def test_related_entities_none_when_agent_emitted_no_entities() -> None:
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     assert resp.related_entities is None
+
+
+# ---------------------------------------------------------------------------
+# display_name enrichment from graph_nodes.properties.name
+# ---------------------------------------------------------------------------
+
+
+async def test_display_name_enriched_from_graph_nodes_lookup(monkeypatch) -> None:
+    """The gatherer rarely populates GatheredEntity.properties; without
+    this enrichment the response's display_name falls back to canonical_id
+    and the dashboard renders opaque Slack IDs ("C0B20FZSCUU") instead of
+    resolved names ("engineering"). The adapter batches a single DB query
+    keyed by canonical_id, stamps the resolved `properties.name` into both
+    `related_entities[].display_name` and `extracted_entities[].display_name`."""
+    captured: dict[str, object] = {}
+
+    async def fake_lookup(customer_id, canonical_ids):
+        captured["customer_id"] = customer_id
+        captured["canonical_ids"] = sorted(canonical_ids)
+        return {
+            "C0B1T8PPK0D": "engineering",
+            "U0ARLAD3B2B": "Richard Wei",
+        }
+
+    monkeypatch.setattr(
+        "services.retrieval.agent.adapter._fetch_entity_names_from_graph",
+        fake_lookup,
+    )
+
+    gathered = GathererOutput(
+        entities=[
+            # Gatherer-emitted shape: label carries a readable string, but
+            # properties is empty (Cerebras provider drift). Pre-fix this
+            # surfaced display_name=canonical_id in the response.
+            GatheredEntity(canonical_id="C0B1T8PPK0D", label="engineering channel", properties={}),
+            GatheredEntity(canonical_id="U0ARLAD3B2B", label="Richard Wei", properties={}),
+            # Cache-miss case: not in the lookup result, falls back to
+            # gatherer label rather than canonical_id.
+            GatheredEntity(canonical_id="U0NOTINDEX", label="Some Person", properties={}),
+        ],
+        chunks=[],
+        gatherer_notes=GathererNotes(),
+    )
+
+    resp = await to_query_response(
+        query="q", gathered=gathered, trace_id="t", timing_ms={},
+        prefanout=None, customer_id="cust-1",
+    )
+
+    assert captured["customer_id"] == "cust-1"
+    assert captured["canonical_ids"] == ["C0B1T8PPK0D", "U0ARLAD3B2B", "U0NOTINDEX"]
+
+    related_by_id = {e.canonical_id: e for e in resp.related_entities}
+    assert related_by_id["C0B1T8PPK0D"].display_name == "engineering"
+    assert related_by_id["U0ARLAD3B2B"].display_name == "Richard Wei"
+    # Cache miss → falls back to the gatherer's label (still readable),
+    # not the raw canonical_id.
+    assert related_by_id["U0NOTINDEX"].display_name == "Some Person"
+
+    extracted_by_id = {e["canonical_id"]: e for e in resp.extracted_entities}
+    assert extracted_by_id["C0B1T8PPK0D"]["display_name"] == "engineering"
+    assert extracted_by_id["U0ARLAD3B2B"]["display_name"] == "Richard Wei"
+    assert extracted_by_id["U0NOTINDEX"]["display_name"] == "Some Person"
+
+
+async def test_display_name_enrichment_prefers_db_over_emitted_properties(
+    monkeypatch,
+) -> None:
+    """When BOTH the DB lookup AND the gatherer's emitted properties have
+    a name, the DB wins. The DB reflects current ingestion state; the
+    gatherer's emitted name is a token from the LLM's working memory and
+    may be stale or hallucinated."""
+
+    async def fake_lookup(customer_id, canonical_ids):
+        return {"C0B1T8PPK0D": "engineering"}
+
+    monkeypatch.setattr(
+        "services.retrieval.agent.adapter._fetch_entity_names_from_graph",
+        fake_lookup,
+    )
+
+    gathered = GathererOutput(
+        entities=[
+            GatheredEntity(
+                canonical_id="C0B1T8PPK0D",
+                label="Channel",
+                properties={"name": "stale-old-name"},
+            ),
+        ],
+        chunks=[],
+        gatherer_notes=GathererNotes(),
+    )
+    resp = await to_query_response(
+        query="q", gathered=gathered, trace_id="t", timing_ms={},
+        prefanout=None, customer_id="cust-1",
+    )
+    assert resp.related_entities[0].display_name == "engineering"
+
+
+async def test_display_name_enrichment_skipped_when_no_customer_id(monkeypatch) -> None:
+    """`customer_id=None` is the test / harness-passthrough path —
+    no DB available, so no enrichment. Falls back to the gatherer's
+    emitted properties / label / canonical_id chain (pre-PR behavior)."""
+    calls = {"n": 0}
+
+    async def fake_lookup(customer_id, canonical_ids):
+        calls["n"] += 1
+        return {}
+
+    monkeypatch.setattr(
+        "services.retrieval.agent.adapter._fetch_entity_names_from_graph",
+        fake_lookup,
+    )
+
+    gathered = GathererOutput(
+        entities=[
+            GatheredEntity(
+                canonical_id="C0B1T8PPK0D",
+                label="engineering channel",
+                properties={"name": "engineering"},
+            ),
+        ],
+        chunks=[],
+        gatherer_notes=GathererNotes(),
+    )
+    resp = await to_query_response(
+        query="q", gathered=gathered, trace_id="t", timing_ms={},
+        prefanout=None, customer_id=None,
+    )
+    assert calls["n"] == 0, "enrichment must not fire without customer_id"
+    # Falls back to gatherer's emitted properties.name.
+    assert resp.related_entities[0].display_name == "engineering"
+
+
+async def test_display_name_enrichment_handles_db_failure_gracefully(monkeypatch) -> None:
+    """DB outage / query timeout returns {} — response still renders
+    with the pre-enrichment fallback chain. The dashboard sees readable
+    text (the gatherer-emitted label) rather than a 500."""
+    from services.retrieval.agent import adapter as adapter_mod
+
+    async def boom(customer_id, canonical_ids):
+        # Simulate the underlying with_tenant path raising. The wrapper
+        # logs and returns {} so callers fall back to the chain.
+        return {}
+
+    monkeypatch.setattr(adapter_mod, "_fetch_entity_names_from_graph", boom)
+
+    gathered = GathererOutput(
+        entities=[GatheredEntity(canonical_id="C0NEW", label="brand-new-channel", properties={})],
+        chunks=[],
+        gatherer_notes=GathererNotes(),
+    )
+    resp = await to_query_response(
+        query="q", gathered=gathered, trace_id="t", timing_ms={},
+        prefanout=None, customer_id="cust-1",
+    )
+    # No DB hit — fall back to the gatherer-emitted label rather than
+    # raw canonical_id.
+    assert resp.related_entities[0].display_name == "brand-new-channel"
