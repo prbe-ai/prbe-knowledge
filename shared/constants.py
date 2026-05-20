@@ -107,6 +107,12 @@ class DocType(StrEnum):
     CODE_FILE = "code.file"
     INCIDENT = "incident"
     INCIDENT_INVESTIGATION = "incident.investigation"
+    # Standalone Document carrying the LLM-drafted + human-approved "why
+    # this PR exists" rationale produced by prbe-apps on PR merge. Persisted
+    # alongside the FEATURE GraphNode (see feature_nodes_routes.py) so the
+    # rationale text lands in BM25 + vector indexes. Prefix is `github.`
+    # so doc_type_resolver's SourceSystem.GITHUB narrowing includes it.
+    FEATURE_RATIONALE = "github.feature_rationale"
     # Post-approval wiki artifacts authored by the postmortem / wiki-edit
     # agents after an incident investigation is approved AND resolved.
     # These doc_types share the `wiki.` prefix so existing wiki listings
