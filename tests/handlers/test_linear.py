@@ -367,3 +367,321 @@ async def test_exchange_oauth_code_success() -> None:
     assert token.access_token == "lin_oauth_xxx"
     assert token.scope == "read,write"
     assert token.source_system == SourceSystem.LINEAR
+
+
+# ---------------------------------------------------------------------------
+# OAuth install URL — must include prompt=consent so Linear issues a
+# refresh_token alongside access_token. Without it, Linear hands back a
+# long-lived (10-year) access_token only — when revoked server-side the
+# connector has no path back without a fresh user-driven OAuth.
+# ---------------------------------------------------------------------------
+
+
+def test_oauth_install_url_includes_prompt_consent() -> None:
+    from pydantic import SecretStr
+
+    settings = Settings(environment="local", linear_client_id="cid_test", linear_client_secret=SecretStr("s"))
+    ctx = ConnectorContext(settings=settings, http=httpx.AsyncClient())
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+    url = linear.oauth_install_url(customer_id="cust-1", redirect_uri="https://x/cb")
+    assert "prompt=consent" in url
+    # Sanity: the other required params are still there
+    assert "client_id=cid_test" in url
+    assert "response_type=code" in url
+    assert "state=cust-1" in url
+    assert "redirect_uri=https%3A%2F%2Fx%2Fcb" in url or "redirect_uri=https://x/cb" in url
+
+
+# ---------------------------------------------------------------------------
+# exchange_oauth_code — refresh_token + expires_at persistence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_persists_refresh_token_and_expires_at() -> None:
+    """When `prompt=consent` is on the authorize URL Linear's response
+    carries `refresh_token` + `expires_in`. The exchange handler must
+    propagate both onto the returned IntegrationToken so save_token
+    persists them — without this, refresh is impossible and a revoked
+    access_token strands the integration permanently."""
+    from datetime import UTC, datetime
+
+    ctx = _make_oauth_ctx(
+        200,
+        {
+            "access_token": "lin_oauth_xxx",
+            "refresh_token": "lin_refresh_yyy",
+            "expires_in": 3600,
+            "scope": "read,write",
+        },
+    )
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+
+    before = datetime.now(UTC)
+    token = await linear.exchange_oauth_code(code="abc", redirect_uri="https://x/cb")
+
+    assert token.access_token == "lin_oauth_xxx"
+    assert token.refresh_token == "lin_refresh_yyy"
+    assert token.expires_at is not None
+    delta = (token.expires_at - before).total_seconds()
+    # Should land in [3590, 3610] — the 3600-second window plus the tiny
+    # latency of the call.
+    assert 3590 <= delta <= 3610, f"expires_at delta out of range: {delta}"
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_handles_missing_refresh_fields() -> None:
+    """Older OAuth flow (no prompt=consent) returns access_token alone.
+    The exchange handler must NOT crash; refresh_token + expires_at land
+    as None, and refresh attempts later raise a clear PermanentSourceError."""
+    ctx = _make_oauth_ctx(200, {"access_token": "lin_oauth_xxx", "scope": "read,write"})
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+
+    token = await linear.exchange_oauth_code(code="abc", redirect_uri="https://x/cb")
+    assert token.access_token == "lin_oauth_xxx"
+    assert token.refresh_token is None
+    assert token.expires_at is None
+
+
+# ---------------------------------------------------------------------------
+# exchange_refresh_token — refresh flow + error mapping
+# ---------------------------------------------------------------------------
+
+
+def _make_refresh_ctx(status_code: int, body: str | dict) -> ConnectorContext:
+    """Connector ctx whose http client returns a fixed Linear /oauth/token
+    response specifically for refresh_token grants."""
+    from pydantic import SecretStr
+
+    settings = Settings(
+        environment="local",
+        linear_client_id="cid_test",
+        linear_client_secret=SecretStr("secret_test"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.linear.app/oauth/token"
+        # We don't introspect request body here; the connector's grant_type
+        # routing is tested implicitly via the integration shape.
+        if isinstance(body, str):
+            return httpx.Response(status_code, text=body)
+        return httpx.Response(status_code, json=body)
+
+    transport = httpx.MockTransport(handler)
+    return ConnectorContext(
+        settings=settings, http=httpx.AsyncClient(transport=transport)
+    )
+
+
+@pytest.mark.asyncio
+async def test_exchange_refresh_token_no_refresh_token_raises_permanent() -> None:
+    """Tokens minted before prompt=consent has no refresh_token. Caller is
+    expected to flag the row auth_failed and prompt re-OAuth."""
+    from shared.exceptions import PermanentSourceError
+    from shared.models import IntegrationToken
+
+    ctx = _make_refresh_ctx(200, {})
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.LINEAR,
+        access_token="lin_oauth_old",
+        refresh_token=None,
+    )
+
+    with pytest.raises(PermanentSourceError, match="without a stored refresh_token"):
+        await linear.exchange_refresh_token(token)
+
+
+@pytest.mark.asyncio
+async def test_exchange_refresh_token_success_rotates_credential() -> None:
+    """Linear may issue a new refresh_token on each refresh (rotation). The
+    handler must surface the new one and preserve scope when the response
+    omits it."""
+    from shared.models import IntegrationToken
+
+    ctx = _make_refresh_ctx(
+        200,
+        {
+            "access_token": "lin_oauth_new",
+            "refresh_token": "lin_refresh_new",
+            "expires_in": 7200,
+        },
+    )
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+
+    old = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.LINEAR,
+        access_token="lin_oauth_old",
+        refresh_token="lin_refresh_old",
+        scope="read,write",
+    )
+    new = await linear.exchange_refresh_token(old)
+
+    assert new.access_token == "lin_oauth_new"
+    assert new.refresh_token == "lin_refresh_new"  # rotated
+    assert new.scope == "read,write"  # preserved from old when response omits
+    assert new.expires_at is not None  # populated from expires_in
+    assert new.customer_id == "cust-1"  # preserved
+
+
+@pytest.mark.asyncio
+async def test_exchange_refresh_token_echoes_existing_refresh_when_omitted() -> None:
+    """Some OAuth providers don't rotate refresh_tokens; they echo back the
+    existing one or omit it entirely. The handler must keep using the
+    persisted refresh_token in the latter case."""
+    from shared.models import IntegrationToken
+
+    ctx = _make_refresh_ctx(200, {"access_token": "lin_oauth_new", "expires_in": 3600})
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+
+    old = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.LINEAR,
+        access_token="lin_oauth_old",
+        refresh_token="lin_refresh_unchanged",
+    )
+    new = await linear.exchange_refresh_token(old)
+
+    assert new.refresh_token == "lin_refresh_unchanged"
+
+
+@pytest.mark.asyncio
+async def test_exchange_refresh_token_4xx_raises_permanent() -> None:
+    """Linear returns 400/401 when the refresh_token has been invalidated
+    server-side (user revoked grant, secret rotated, etc.). No retry will
+    help; cron should mark the row auth_failed."""
+    from shared.exceptions import PermanentSourceError
+    from shared.models import IntegrationToken
+
+    ctx = _make_refresh_ctx(400, {"error": "invalid_grant"})
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+    old = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.LINEAR,
+        access_token="x",
+        refresh_token="rotten",
+    )
+
+    with pytest.raises(PermanentSourceError):
+        await linear.exchange_refresh_token(old)
+
+
+@pytest.mark.asyncio
+async def test_exchange_refresh_token_5xx_raises_transient() -> None:
+    from shared.exceptions import TransientSourceError
+    from shared.models import IntegrationToken
+
+    ctx = _make_refresh_ctx(503, "down")
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+    old = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.LINEAR,
+        access_token="x",
+        refresh_token="r",
+    )
+
+    with pytest.raises(TransientSourceError):
+        await linear.exchange_refresh_token(old)
+
+
+# ---------------------------------------------------------------------------
+# verify_token_health — periodic liveness probe
+# ---------------------------------------------------------------------------
+
+
+def _make_viewer_ctx(status_code: int, body: dict) -> ConnectorContext:
+    """Connector ctx whose http client returns a fixed Linear GraphQL
+    response for the viewer probe."""
+    from pydantic import SecretStr
+
+    settings = Settings(
+        environment="local",
+        linear_client_id="cid_test",
+        linear_client_secret=SecretStr("s"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://api.linear.app/graphql"
+        return httpx.Response(status_code, json=body)
+
+    transport = httpx.MockTransport(handler)
+    return ConnectorContext(
+        settings=settings, http=httpx.AsyncClient(transport=transport)
+    )
+
+
+@pytest.mark.asyncio
+async def test_verify_token_health_returns_true_for_healthy_viewer() -> None:
+    from shared.models import IntegrationToken
+
+    ctx = _make_viewer_ctx(200, {"data": {"viewer": {"id": "uuid-x"}}})
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.LINEAR, access_token="x"
+    )
+
+    assert await linear.verify_token_health(token) is True
+
+
+@pytest.mark.asyncio
+async def test_verify_token_health_returns_false_on_401() -> None:
+    """HTTP 401 is the definitive "this token is dead" signal. The cron
+    flips the row to auth_failed on this return value."""
+    from shared.models import IntegrationToken
+
+    ctx = _make_viewer_ctx(
+        401,
+        {"errors": [{"message": "Authentication required"}]},
+    )
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.LINEAR, access_token="x"
+    )
+
+    assert await linear.verify_token_health(token) is False
+
+
+@pytest.mark.asyncio
+async def test_verify_token_health_returns_false_on_graphql_auth_error_200() -> None:
+    """Linear sometimes returns HTTP 200 with an `AUTHENTICATION_ERROR`
+    in the GraphQL errors array (observed when the token is partially
+    valid — e.g. expired but not yet purged). Treat that as a definite
+    negative health signal too."""
+    from shared.models import IntegrationToken
+
+    ctx = _make_viewer_ctx(
+        200,
+        {
+            "errors": [
+                {
+                    "message": "Authentication required",
+                    "extensions": {"code": "AUTHENTICATION_ERROR"},
+                }
+            ]
+        },
+    )
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.LINEAR, access_token="x"
+    )
+
+    assert await linear.verify_token_health(token) is False
+
+
+@pytest.mark.asyncio
+async def test_verify_token_health_5xx_raises_transient() -> None:
+    """5xx is inconclusive — don't poison the row over a Linear edge blip."""
+    from shared.exceptions import TransientSourceError
+    from shared.models import IntegrationToken
+
+    ctx = _make_viewer_ctx(503, {})
+    linear = build_connector(SourceSystem.LINEAR, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.LINEAR, access_token="x"
+    )
+
+    with pytest.raises(TransientSourceError):
+        await linear.verify_token_health(token)

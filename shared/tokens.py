@@ -125,6 +125,49 @@ async def load_token(
     )
 
 
+async def mark_token_auth_failed(
+    customer_id: str, source_system: SourceSystem, error: str
+) -> bool:
+    """Flip a singleton token row from `active` to `auth_failed`.
+
+    Returns True when a row was actually updated (the token was active and
+    is now flagged failed); False when no active row existed or the row
+    was already non-active (idempotent re-calls are safe).
+
+    Distinct from `revoked`:
+      - `revoked` is for user-initiated disconnects in the dashboard.
+      - `auth_failed` is for upstream-detected invalidation — the token
+        was working, then the upstream provider started returning 401.
+        Common causes: user revoked the OAuth grant in the upstream's
+        Connected Apps UI; provider rotated their OAuth app's secret;
+        provider auto-revoked after long inactivity (Linear behavior).
+
+    Caller is expected to flag this in the dashboard so the user knows
+    to re-OAuth. Until then, `load_token` returns None (filters on
+    `status='active'`) so ingestion stops trying to use the dead token.
+    """
+    async with get_pool().acquire() as conn:
+        result = await conn.execute(
+            """
+            UPDATE integration_tokens
+            SET status = $1,
+                last_refresh_error = $2,
+                last_refresh_at = NOW(),
+                updated_at = NOW()
+            WHERE customer_id = $3
+              AND source_system = $4
+              AND device_id IS NULL
+              AND status = $5
+            """,
+            IntegrationStatus.AUTH_FAILED.value,
+            error[:500],
+            customer_id,
+            source_system.value,
+            IntegrationStatus.ACTIVE.value,
+        )
+    return result.endswith(" 1")
+
+
 async def mark_refresh_error(
     customer_id: str, source_system: SourceSystem, error: str
 ) -> None:
