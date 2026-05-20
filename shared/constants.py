@@ -875,7 +875,7 @@ WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
 # Default flipped 2026-05-19 from "haiku" to "gemini-3.5-flash" after the
 # A/B sweep in scripts/eval_3_5_flash_sweep.py (report:
 # ~/.gstack/projects/prbe-knowledge/eval-3-5-flash-sweep-20260520T025718Z.md).
-# 20 fixtures × 2 trials per model. Label accuracy: both 100%. Opus-judged
+# 20 fixtures x 2 trials per model. Label accuracy: both 100%. Opus-judged
 # quality: 9.3 (haiku) vs 9.4 (3.5-flash) — statistical tie. p50 latency:
 # 1913ms → 1614ms (~16% faster). Cost per call: $0.00225 → $0.00060
 # (~3.75x cheaper). Net: equal quality at <30% of the wire cost on a
