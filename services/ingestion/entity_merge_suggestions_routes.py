@@ -292,3 +292,162 @@ async def dismiss_suggestion(
     return DecisionResponse(
         suggestion_id=suggestion_id, status="dismissed", merge_id=None
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/entity-merge-suggestions/approve-all
+# ---------------------------------------------------------------------------
+
+
+class ApproveAllRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    customer_id: str = Field(..., min_length=1, max_length=128)
+    performed_by_user_id: uuid.UUID = Field(default_factory=lambda: SYSTEM_USER_ID)
+    confidence: str | None = Field(
+        default=None,
+        description=(
+            "Optional filter: only approve suggestions at this confidence "
+            "level ('high'/'medium'/'low'). When unset, approves every "
+            "pending suggestion."
+        ),
+    )
+    max_to_approve: int = Field(
+        default=200,
+        ge=1,
+        le=500,
+        description="Safety cap so a stuck UI doesn't fire thousands.",
+    )
+
+
+class ApproveAllResult(BaseModel):
+    suggestion_id: uuid.UUID
+    outcome: str  # 'applied' | 'dismissed_already_merged' | 'error'
+    merge_id: uuid.UUID | None = None
+    error: str | None = None
+
+
+class ApproveAllResponse(BaseModel):
+    total_considered: int
+    approved: int
+    dismissed_already_merged: int
+    errors: int
+    results: list[ApproveAllResult]
+
+
+@router.post(
+    "/approve-all",
+    response_model=ApproveAllResponse,
+    dependencies=[Depends(_require_internal_key)],
+)
+async def approve_all_suggestions(body: ApproveAllRequest) -> ApproveAllResponse:
+    """Bulk-approve pending suggestions. Sequential — one merge txn per row.
+
+    Failure modes per row are recorded individually so a single bad merge
+    doesn't abort the batch. Already-merged aliases (409 on the inner
+    merge_cluster call) get flipped to 'dismissed' rather than counted as
+    errors. Returns a per-row result list for the UI to render.
+    """
+    if body.confidence is not None and body.confidence not in {"high", "medium", "low"}:
+        raise HTTPException(status_code=400, detail="invalid confidence filter")
+
+    async with with_tenant(body.customer_id) as conn:
+        if body.confidence:
+            rows = await conn.fetch(
+                """
+                SELECT suggestion_id, label, primary_canonical_id,
+                       candidate_canonical_id, rationale
+                FROM entity_merge_suggestions
+                WHERE status = 'pending' AND confidence = $1
+                ORDER BY created_at ASC
+                LIMIT $2
+                """,
+                body.confidence, body.max_to_approve,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT suggestion_id, label, primary_canonical_id,
+                       candidate_canonical_id, rationale
+                FROM entity_merge_suggestions
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT $1
+                """,
+                body.max_to_approve,
+            )
+
+    results: list[ApproveAllResult] = []
+    approved = 0
+    dismissed = 0
+    errors = 0
+
+    for r in rows:
+        sid: uuid.UUID = r["suggestion_id"]
+        try:
+            resp = await merge_cluster(
+                MergeRequest(
+                    customer_id=body.customer_id,
+                    performed_by_user_id=body.performed_by_user_id,
+                    label=r["label"],
+                    primary_canonical_id=r["primary_canonical_id"],
+                    alias_canonical_ids=[r["candidate_canonical_id"]],
+                    reason=f"approve-all: {(r['rationale'] or '')[:160]}",
+                )
+            )
+            async with with_tenant(body.customer_id) as conn:
+                await conn.execute(
+                    "UPDATE entity_merge_suggestions SET status='applied', "
+                    "decided_at=NOW(), decided_by_user_id=$2 WHERE suggestion_id=$1",
+                    sid, body.performed_by_user_id,
+                )
+            approved += 1
+            results.append(
+                ApproveAllResult(
+                    suggestion_id=sid, outcome="applied", merge_id=resp.merge_id
+                )
+            )
+        except HTTPException as e:
+            # 404 (alias node already deleted) or 409 (alias already in cluster)
+            # → the merge effect is already in place. Dismiss the row.
+            if e.status_code in (404, 409):
+                async with with_tenant(body.customer_id) as conn:
+                    await conn.execute(
+                        "UPDATE entity_merge_suggestions SET status='dismissed', "
+                        "decided_at=NOW(), decided_by_user_id=$2 WHERE suggestion_id=$1",
+                        sid, body.performed_by_user_id,
+                    )
+                dismissed += 1
+                results.append(
+                    ApproveAllResult(
+                        suggestion_id=sid, outcome="dismissed_already_merged"
+                    )
+                )
+            else:
+                errors += 1
+                results.append(
+                    ApproveAllResult(
+                        suggestion_id=sid,
+                        outcome="error",
+                        error=f"{e.status_code}: {e.detail}",
+                    )
+                )
+        except Exception as e:
+            log.exception(
+                "approve_all.merge_failed",
+                extra={"suggestion_id": str(sid)},
+            )
+            errors += 1
+            results.append(
+                ApproveAllResult(
+                    suggestion_id=sid, outcome="error", error=repr(e)[:240]
+                )
+            )
+
+    return ApproveAllResponse(
+        total_considered=len(rows),
+        approved=approved,
+        dismissed_already_merged=dismissed,
+        errors=errors,
+        results=results,
+    )
