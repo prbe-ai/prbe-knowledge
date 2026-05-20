@@ -141,6 +141,25 @@ async def upsert_nodes(
         customer_id,
         source_system,
     )
+
+    # Enqueue post-write processing (entity auto-merge, future analyzers).
+    # Same transaction as the upsert so queue rows track committed nodes
+    # exactly: a rollback drops both the node and the enqueue. ON CONFLICT
+    # resets analyzer_status to '{}' on re-write so an updated node gets
+    # re-analyzed against any new property values.
+    await conn.execute(
+        """
+        INSERT INTO node_post_write_queue (customer_id, node_id, analyzer_status)
+        SELECT $2, node_id, '{}'::jsonb
+        FROM unnest($1::bigint[]) AS t(node_id)
+        ON CONFLICT (customer_id, node_id) DO UPDATE
+            SET analyzer_status = '{}'::jsonb,
+                enqueued_at     = NOW(),
+                locked_until    = NULL
+        """,
+        provenance_node_ids,
+        customer_id,
+    )
     return results
 
 
