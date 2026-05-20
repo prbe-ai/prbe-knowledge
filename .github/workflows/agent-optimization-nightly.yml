@@ -185,15 +185,18 @@ jobs:
           AGENT_OPTIMIZATION_MAX_PRS: ${{ env.AGENT_OPTIMIZATION_MAX_PRS }}
         run: |
           set -euo pipefail
-          # Stage the prompt + inputs so the agent can read paths
-          # consistently. Sub-agent worktrees are placed under /tmp.
+          # The runner is the sandbox — its filesystem and creds are
+          # ephemeral, and the downstream Path-diff gate is what actually
+          # blocks out-of-scope edits from reaching a PR. Skip in-agent
+          # permission checks so the orchestrator can touch /tmp (digests,
+          # open-PR list, summary, sub-agent worktrees) without thrashing.
           # --verbose required when --output-format=stream-json is set
           # alongside --print (the CLI rejects the combo otherwise).
           claude -p "$(cat .github/prompts/nightly-optimization.md)" \
             --output-format stream-json \
             --verbose \
             --max-turns 80 \
-            --allowedTools "Read,Grep,Glob,Bash(gh:*),Bash(git:*),Bash(uv:*),Bash(kubectl:*),Edit,Write,Task" \
+            --dangerously-skip-permissions \
             2>&1 | tee /tmp/orchestrator.log
           # Orchestrator writes its plan + result here for the
           # post-process gate + the artifact upload.
