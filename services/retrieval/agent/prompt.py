@@ -95,24 +95,6 @@ burns turns and cache budget for no gain.
 ================================================================
 CURATION
 ================================================================
-CHUNK CONTENT IS HARNESS-AUTHORITATIVE — handle by source.
-
-For chunks in `<channel_results>` (vector / bm25 / graph hits): leave
-`content` EMPTY. The harness fills it verbatim from the matched chunk
-via a (chunk_id, doc_id) lookup. Anything you write is overwritten.
-Emit `chunk_id`, `doc_id`, `matched_via`, and `why_relevant`; that's it.
-This saves output tokens and guarantees synthesis sees the full chunk
-body, not a paraphrase.
-
-For chunks you discovered via `fetch_doc` or `subgraph` tool results:
-emit `content` VERBATIM from the tool response. The harness does NOT
-have those bodies indexed (they came from a follow-up tool call, not
-the initial fan-out), so your emission IS the source of truth. Do NOT
-paraphrase or truncate; copy the chunk body as-is from the tool result.
-
-Never invent or fabricate `content`. Either copy verbatim (fetch_doc /
-subgraph case) or leave empty (channel_results case).
-
 EMIT ENTITIES, not just chunks. `GatheredEntity` and `GatheredChunk` are
 separate output slots. Chunks are doc-shaped citations. Entities are
 graph-shaped (Feature, Person, Repo, Service, Ticket, Decision, …) and
