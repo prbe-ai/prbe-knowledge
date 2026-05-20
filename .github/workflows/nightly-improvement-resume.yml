@@ -1,0 +1,259 @@
+# Nightly improvement — resume workflow.
+#
+# Triggered by repository_dispatch from prbe-apps when the user replies
+# via iMessage to a needs-human question the nightly orchestrator asked.
+# Spawns a fresh Claude Code session with the original needs-human note
+# + the user's answer threaded into the system prompt, runs the standard
+# subagent brief, and (if it produces a branch) pushes a draft PR using
+# the same staging-dir + push pattern as the nightly cron.
+#
+# Payload (from prbe-apps -> github.event.client_payload):
+#   question_id: UUID
+#   answer:      user's reply text
+#   context:
+#     run_id:           original nightly run's id (for cross-reference)
+#     run_url:          original run URL (for the PR body)
+#     candidate_slug:   short kebab-case slug of the candidate
+#     note_text:        the full /tmp/needs-human-<slug>.md the
+#                       orchestrator wrote
+#     customer_id:      slug (probe-founders)
+#
+# Required secrets — mirror of the nightly workflow:
+#   ANTHROPIC_API_KEY, GH_PAT, DIGITALOCEAN_ACCESS_TOKEN,
+#   PROBE_MCP_INTERNAL_KEY, PROBE_MCP_CUSTOMER_ID,
+#   RESEND_API_KEY, RESEND_FROM_ADDRESS,
+#   SENDBLUE_API_KEY_ID, SENDBLUE_API_SECRET,
+#   SENDBLUE_FROM_NUMBER, SENDBLUE_TO_NUMBER.
+name: nightly-improvement-resume
+
+on:
+  repository_dispatch:
+    types: [nightly-resume]
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  # Per-question concurrency — answering question A and B simultaneously
+  # is fine; double-firing for the same question_id should serialize.
+  group: nightly-improvement-resume-${{ github.event.client_payload.question_id }}
+  cancel-in-progress: false
+
+jobs:
+  resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      QUESTION_ID: ${{ github.event.client_payload.question_id }}
+      ANSWER: ${{ github.event.client_payload.answer }}
+      ORIGINAL_RUN_ID: ${{ github.event.client_payload.context.run_id }}
+      ORIGINAL_RUN_URL: ${{ github.event.client_payload.context.run_url }}
+      CANDIDATE_SLUG: ${{ github.event.client_payload.context.candidate_slug }}
+      CUSTOMER_ID: ${{ github.event.client_payload.context.customer_id }}
+
+    steps:
+      - name: Kill switch
+        run: |
+          if [ "${{ vars.AGENT_OPTIMIZATION_ENABLED }}" = "false" ]; then
+            echo "::notice::AGENT_OPTIMIZATION_ENABLED=false — exiting cleanly."
+            exit 0
+          fi
+          echo "kill switch: proceeding."
+          echo "Resuming question $QUESTION_ID (original run $ORIGINAL_RUN_ID, candidate $CANDIDATE_SLUG)"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure kubectl for managed-shared cluster
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+      - run: doctl kubernetes cluster kubeconfig save probe-managed
+
+      - name: Stage payload + needs-human note
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/auto-opt-staging/titles /tmp/auto-opt-staging/bodies
+          # context.note_text is the full needs-human-*.md the original
+          # orchestrator wrote. Stage it on disk so claude can Read it.
+          jq -r '.client_payload.context.note_text // ""' \
+            "$GITHUB_EVENT_PATH" \
+            > "/tmp/needs-human-${CANDIDATE_SLUG}.md"
+          # Stash the answer too — the system-prompt path injects it,
+          # but having it on disk makes debugging easier.
+          jq -r '.client_payload.answer // ""' \
+            "$GITHUB_EVENT_PATH" \
+            > /tmp/user-answer.txt
+          echo "--- needs-human note ---"
+          head -20 "/tmp/needs-human-${CANDIDATE_SLUG}.md"
+          echo "--- user answer ---"
+          cat /tmp/user-answer.txt
+
+      - name: Ensure auto-optimization label exists
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create auto-optimization \
+            --repo prbe-ai/prbe-knowledge \
+            --description "Draft PR produced by nightly improvement workflow" \
+            --color BFD4F2 2>/dev/null || true
+
+      - name: Render Probe MCP config from template
+        env:
+          PROBE_MCP_INTERNAL_KEY: ${{ secrets.PROBE_MCP_INTERNAL_KEY }}
+          PROBE_MCP_CUSTOMER_ID: ${{ secrets.PROBE_MCP_CUSTOMER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROBE_MCP_INTERNAL_KEY:-}" ] || [ -z "${PROBE_MCP_CUSTOMER_ID:-}" ]; then
+            echo "::warning::Probe MCP secrets missing — resume will run without MCP."
+            echo '{"mcpServers": {}}' > /tmp/mcp-config.json
+            exit 0
+          fi
+          sed \
+            -e "s|__PROBE_MCP_INTERNAL_KEY__|${PROBE_MCP_INTERNAL_KEY}|g" \
+            -e "s|__PROBE_MCP_CUSTOMER_ID__|${PROBE_MCP_CUSTOMER_ID}|g" \
+            .github/mcp-config.json.template > /tmp/mcp-config.json
+          echo "MCP config rendered (keys redacted)."
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run resume orchestrator (headless)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Build the system prompt extension that threads the original
+          # question + user's answer into the resume agent's context.
+          NEEDS_HUMAN_TEXT=$(cat "/tmp/needs-human-${CANDIDATE_SLUG}.md")
+          USER_ANSWER=$(cat /tmp/user-answer.txt)
+          APPEND_PROMPT=$(cat <<APPEND
+          # RESUMING FROM A NEEDS-HUMAN CHECKPOINT
+
+          The original nightly orchestrator (run ${ORIGINAL_RUN_URL})
+          identified a candidate it couldn't decide on alone and wrote
+          a needs-human note. The user was texted a question via
+          Sendblue iMessage and has now replied.
+
+          You should NOT re-triage. Your job is to take this ONE
+          candidate, factor in the user's answer, and either:
+            * Draft a PR via the standard subagent brief, OR
+            * Write a follow-up /tmp/needs-human-<slug>.md if their
+              answer still leaves you uncertain.
+
+          ## Original needs-human note
+
+          ${NEEDS_HUMAN_TEXT}
+
+          ## User's reply
+
+          ${USER_ANSWER}
+
+          ## Candidate slug
+
+          ${CANDIDATE_SLUG}
+
+          You can skip Phase 1 (Triage). Go directly to Phase 2 with
+          this candidate. Write your branch under \`auto-opt/${CANDIDATE_SLUG}-resume-\$(date -u +%F)\`.
+          APPEND
+          )
+          claude -p "$(cat .github/prompts/nightly-optimization.md)" \
+            --output-format stream-json \
+            --verbose \
+            --max-turns 80 \
+            --dangerously-skip-permissions \
+            --mcp-config /tmp/mcp-config.json \
+            --strict-mcp-config \
+            --append-system-prompt "$APPEND_PROMPT" \
+            2>&1 | tee /tmp/orchestrator.log
+          if [ ! -f /tmp/orchestrator-summary.json ]; then
+            echo "::warning::orchestrator-summary.json not written"
+            echo '{"candidates_identified":1,"prs_opened":0,"tracks":{},"skipped":[],"branches":[]}' \
+              > /tmp/orchestrator-summary.json
+          fi
+          jq . /tmp/orchestrator-summary.json
+
+      - name: Push branches + open PRs
+        id: push
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          OPENED=0
+          : > /tmp/opened-prs.txt
+          while read -r branch; do
+            [ -z "$branch" ] && continue
+            STAGING_TITLE="/tmp/auto-opt-staging/titles/$(basename "$branch")"
+            STAGING_BODY="/tmp/auto-opt-staging/bodies/$(basename "$branch")"
+            if [ ! -f "$STAGING_TITLE" ] || [ ! -f "$STAGING_BODY" ]; then
+              echo "::warning::missing title/body for $branch — skipping PR open"
+              continue
+            fi
+            git push origin "$branch"
+            TITLE=$(cat "$STAGING_TITLE")
+            PR_URL=$(gh pr create --draft --label auto-optimization \
+              --reviewer richardwei6 \
+              --head "$branch" \
+              --title "$TITLE" \
+              --body "$(cat "$STAGING_BODY")")
+            echo "- $TITLE — $PR_URL" >> /tmp/opened-prs.txt
+            OPENED=$((OPENED + 1))
+          done < <(git branch --list 'auto-opt/*' --format='%(refname:short)')
+          echo "opened=$OPENED" >> "$GITHUB_OUTPUT"
+          echo "Opened $OPENED draft PR(s) (resume of question $QUESTION_ID)."
+
+      - name: Send Resend email
+        if: always()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM_ADDRESS: ${{ secrets.RESEND_FROM_ADDRESS }}
+          OPENED: ${{ steps.push.outputs.opened }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RESEND_API_KEY:-}" ] || [ -z "${RESEND_FROM_ADDRESS:-}" ]; then
+            echo "::warning::Resend not configured — skipping email."
+            exit 0
+          fi
+          SUBJECT="Probe nightly resume — ${OPENED:-0} PR(s) from your reply"
+          BODY=$(cat <<BODY
+          Resumed candidate: ${CANDIDATE_SLUG}
+          Question id: ${QUESTION_ID}
+          Original run: ${ORIGINAL_RUN_URL}
+          Your reply: $(cat /tmp/user-answer.txt | head -c 200)
+
+          PRs drafted this resume: ${OPENED:-0}
+          $(cat /tmp/opened-prs.txt 2>/dev/null || echo "")
+          BODY
+          )
+          BODY_HTML=$(printf '<pre style="font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;font-size:13px;">%s</pre>' \
+            "$(printf '%s' "$BODY" | python3 -c 'import sys,html;print(html.escape(sys.stdin.read()),end="")')")
+          PAYLOAD=$(jq -n \
+            --arg from "$RESEND_FROM_ADDRESS" \
+            --arg to "richard@prbe.ai" \
+            --arg subject "$SUBJECT" \
+            --arg text "$BODY" \
+            --arg html "$BODY_HTML" \
+            '{from:$from, to:[$to], subject:$subject, text:$text, html:$html}')
+          curl -fsS -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            | jq -r '.id // .' \
+            || echo "::warning::Resend send failed"
+
+      - name: Upload resume artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resume-${{ env.QUESTION_ID }}
+          path: |
+            /tmp/orchestrator-summary.json
+            /tmp/orchestrator.log
+            /tmp/needs-human-*.md
+            /tmp/user-answer.txt
+            /tmp/opened-prs.txt
+          retention-days: 14
