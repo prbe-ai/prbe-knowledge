@@ -19,7 +19,7 @@ import hmac
 import json
 import re
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 from services.ingestion.chunker import count_tokens
@@ -61,6 +61,20 @@ log = get_logger(__name__)
 _LINEAR_OAUTH_AUTHORIZE = "https://linear.app/oauth/authorize"
 _LINEAR_OAUTH_TOKEN = "https://api.linear.app/oauth/token"
 _LINEAR_SIGNATURE_HEADER = "linear-signature"
+
+
+def _expires_at_from_expires_in(expires_in: Any) -> datetime | None:
+    """Linear returns `expires_in` as seconds-from-now (int). Convert to a
+    UTC datetime so the standard `integration_tokens.expires_at` column can
+    drive `list_tokens_expiring_within` for proactive refresh. Returns None
+    when the field is absent (10-year default-token path) or malformed."""
+    try:
+        seconds = int(expires_in)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return datetime.now(UTC) + timedelta(seconds=seconds)
 
 # Linear's webhook payload `type` values we process. Anything else
 # (Project, Cycle, Reaction, ...) is ignored at the parse step.
@@ -639,10 +653,19 @@ class LinearConnector(Connector):
 
             raise MissingSecret("LINEAR_CLIENT_ID not configured")
         scopes = ",".join(["read", "write", "issues:create"])
+        # `prompt=consent` is the explicit trigger for Linear to issue a
+        # refresh_token alongside the access_token. Without it Linear hands
+        # back a long-lived (10-year) access_token only — when that token is
+        # revoked server-side (or rotated by Linear) the connector has no
+        # path back without a fresh user-driven OAuth round-trip. With
+        # consent prompt, the exchange response includes `refresh_token` and
+        # `expires_in`, and `refresh_oauth_token` can recover automatically.
+        # Reference: developers.linear.app/docs/oauth/authentication.
         return (
             f"{_LINEAR_OAUTH_AUTHORIZE}"
             f"?client_id={cid}&redirect_uri={redirect_uri}"
             f"&response_type=code&scope={scopes}&state={customer_id}"
+            f"&prompt=consent"
         )
 
     async def exchange_oauth_code(
@@ -691,12 +714,126 @@ class LinearConnector(Connector):
                 "linear /oauth/token 200 but missing access_token",
                 body=str(body)[:500],
             )
+        # When `prompt=consent` is on the authorize URL, Linear's exchange
+        # response carries `refresh_token` + `expires_in` (seconds). Without
+        # consent prompt these are absent and the access_token is long-lived
+        # (10-year default per Linear docs). Defensive `.get()` covers both
+        # shapes; `refresh_oauth_token` falls back to "no refresh available"
+        # when the persisted refresh_token is None.
+        expires_at = _expires_at_from_expires_in(body.get("expires_in"))
         return IntegrationToken(
             customer_id="",  # caller fills in — connector does not know the tenant
             source_system=SourceSystem.LINEAR,
             access_token=access_token,
+            refresh_token=body.get("refresh_token"),
+            expires_at=expires_at,
             scope=body.get("scope"),
         )
+
+    async def exchange_refresh_token(
+        self, token: IntegrationToken
+    ) -> IntegrationToken:
+        """Exchange the persisted refresh_token for a new access_token.
+
+        Method name matches `scripts/cron_token_refresh.py`'s convention so
+        Linear automatically participates in the existing refresh cron
+        once a token with a refresh_token and `expires_at <= now+1h` exists.
+
+        Raises `PermanentSourceError` when no refresh_token is on file (the
+        original install used the pre-2026 OAuth flow without
+        `prompt=consent`) — caller flips the token to `auth_failed` and
+        prompts the user to re-OAuth via the dashboard.
+
+        On Linear-side 4xx (invalidated grant, rotated client secret),
+        raises `PermanentSourceError` so the caller can mark the token
+        unrecoverable. 5xx → `TransientSourceError` so the retry loop can
+        backoff and try again.
+        """
+        if not token.refresh_token:
+            raise PermanentSourceError(
+                "linear exchange_refresh_token called without a stored refresh_token"
+                " — the original install predates prompt=consent; reconnect required",
+            )
+        cid = self.settings.linear_client_id
+        secret = self.settings.linear_client_secret
+        if not cid or secret is None:
+            from shared.exceptions import MissingSecret
+
+            raise MissingSecret(
+                "LINEAR_CLIENT_ID / LINEAR_CLIENT_SECRET not configured"
+            )
+        resp = await self.http.post(
+            _LINEAR_OAUTH_TOKEN,
+            data={
+                "client_id": cid,
+                "client_secret": secret.get_secret_value(),
+                "refresh_token": token.refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+        if resp.status_code >= 500:
+            raise TransientSourceError(
+                f"linear /oauth/token (refresh) returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        if resp.status_code >= 400:
+            raise PermanentSourceError(
+                f"linear /oauth/token (refresh) returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        body = resp.json()
+        new_access = body.get("access_token")
+        if not new_access:
+            raise PermanentSourceError(
+                "linear refresh_token 200 but missing access_token",
+                body=str(body)[:500],
+            )
+        return IntegrationToken(
+            customer_id=token.customer_id,
+            source_system=SourceSystem.LINEAR,
+            access_token=new_access,
+            # Linear may issue a NEW refresh_token on refresh (rotation) or
+            # echo back the existing one. Fall back to the input if the
+            # response omits it.
+            refresh_token=body.get("refresh_token") or token.refresh_token,
+            expires_at=_expires_at_from_expires_in(body.get("expires_in")),
+            scope=body.get("scope") or token.scope,
+        )
+
+    async def verify_token_health(self, token: IntegrationToken) -> bool:
+        """Liveness probe: send `{ viewer { id } }` and return True on success.
+
+        Returns False when Linear responds 401 (token revoked / invalidated
+        out of band). Any other status — including transient 5xx and
+        network errors — propagates as a raised exception so the caller
+        can distinguish "definitely-bad" from "we-don't-know". Used by
+        the periodic token-health job to flip
+        `integration_tokens.status` from `active` to `auth_failed` without
+        waiting for the next webhook delivery to fail.
+        """
+        resp = await self.http.post(
+            "https://api.linear.app/graphql",
+            json={"query": "{ viewer { id } }"},
+            headers={"Authorization": f"Bearer {token.access_token}"},
+        )
+        if resp.status_code == 401:
+            return False
+        if resp.status_code != 200:
+            raise TransientSourceError(
+                f"linear viewer probe returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        body = resp.json()
+        # GraphQL surfaces auth failures as `errors[].extensions.code ==
+        # AUTHENTICATION_ERROR` with HTTP 200 in some Linear edge cases.
+        # Treat that shape as a definite negative health signal too.
+        for err in body.get("errors") or []:
+            if (err.get("extensions") or {}).get("code") == "AUTHENTICATION_ERROR":
+                return False
+        return True
 
     # ------------------------------------------------------------------
     # 7. workspace identification
