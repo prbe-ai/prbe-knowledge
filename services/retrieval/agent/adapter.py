@@ -451,6 +451,18 @@ async def to_query_response(
             )
         )
 
+    # Batch-fetch the resolved `properties.name` for every gathered entity
+    # in one query so per-entity display_name lookups don't N+1 the DB.
+    # Customer-scoped (no enrichment when `customer_id` is None — tests +
+    # harness-passthrough paths preserve pre-enrichment behavior).
+    entity_names = (
+        await _fetch_entity_names_from_graph(
+            customer_id, [e.canonical_id for e in gathered.entities]
+        )
+        if customer_id and gathered.entities
+        else {}
+    )
+
     for entity in gathered.entities:
         rank_counter += 1
         results.append(
@@ -460,7 +472,7 @@ async def to_query_response(
                 rank=rank_counter,
                 matched_via=[],
                 label=entity.label,
-                display_name=str(entity.properties.get("name") or entity.properties.get("display_name") or entity.canonical_id),
+                display_name=_resolve_display_name(entity, entity_names),
                 properties=entity.properties,
                 attached_doc_ids=[],
                 edge_types=[],
@@ -482,11 +494,7 @@ async def to_query_response(
         RelatedEntity(
             canonical_id=e.canonical_id,
             label=e.label or _label_from_canonical_id(e.canonical_id),
-            display_name=str(
-                e.properties.get("name")
-                or e.properties.get("display_name")
-                or e.canonical_id
-            ),
+            display_name=_resolve_display_name(e, entity_names),
             edge_types=[],
             max_confidence="EXTRACTED",
             doc_count=1,
@@ -531,9 +539,7 @@ async def to_query_response(
             {
                 "entity_type": e.label.lower(),
                 "canonical_id": e.canonical_id,
-                "display_name": str(
-                    e.properties.get("name") or e.properties.get("display_name") or e.canonical_id
-                ),
+                "display_name": _resolve_display_name(e, entity_names),
                 "confidence": 1.0,
             }
             for e in gathered.entities
@@ -556,6 +562,82 @@ def _label_from_canonical_id(canonical_id: str) -> str:
         return ""
     prefix = canonical_id.split(":", 1)[0].strip()
     return prefix.capitalize() if prefix else ""
+
+
+async def _fetch_entity_names_from_graph(
+    customer_id: str, canonical_ids: list[str]
+) -> dict[str, str]:
+    """Batch lookup of `graph_nodes.properties->>'name'` keyed by canonical_id.
+
+    The gatherer's `GatheredEntity.properties` is rarely populated by
+    non-strict providers (Cerebras gpt-oss-120b emits `canonical_id`,
+    `label`, `why_relevant` and leaves `properties={}`). Without this
+    enrichment, every entity's `display_name` falls back to canonical_id
+    in the response — rendering opaque IDs (`C0B20FZSCUU`, `U07ABC123`)
+    in the dashboard's entity chips even though the resolved name lives
+    one column away in graph_nodes.
+
+    Label-agnostic by design: queries by (customer_id, canonical_id)
+    alone. Slack `U…/C…/G…`, github `repo:org/name`, linear
+    `linear:…:issue:…` namespaces don't collide across labels within a
+    customer, so the `DISTINCT ON (canonical_id)` is safe. Missing IDs
+    are absent from the result dict — callers fall back to the
+    gatherer-emitted label or canonical_id as before.
+
+    Best-effort: failures (DB down, query timeout) log and return {} —
+    the response still renders with the pre-enrichment fallback.
+    """
+    if not canonical_ids:
+        return {}
+    try:
+        async with with_tenant(customer_id) as conn:
+            rows = await conn.fetch(
+                """
+                SELECT DISTINCT ON (canonical_id)
+                       canonical_id,
+                       properties->>'name' AS name
+                FROM graph_nodes
+                WHERE customer_id = $1
+                  AND canonical_id = ANY($2::text[])
+                  AND properties->>'name' IS NOT NULL
+                  AND properties->>'name' <> ''
+                ORDER BY canonical_id, updated_at DESC
+                """,
+                customer_id,
+                list({cid for cid in canonical_ids if cid}),
+            )
+    except Exception as exc:
+        log.warning(
+            "adapter.entity_display_name_enrichment_failed",
+            error=type(exc).__name__,
+            count=len(canonical_ids),
+        )
+        return {}
+    return {r["canonical_id"]: r["name"] for r in rows}
+
+
+def _resolve_display_name(entity: Any, enriched: dict[str, str]) -> str:
+    """Pick the most human-readable name available for one gathered entity.
+
+    Priority:
+      1. graph_nodes.properties.name (this customer's resolved name —
+         e.g. "engineering" for `C0B1T8PPK0D`, "Richard Wei" for
+         `U0ARLAD3B2B`). Set during ingestion when the connector resolves
+         the upstream id; this is the authoritative source.
+      2. The gatherer's emitted properties.name / properties.display_name
+         on the off chance the LLM did populate them.
+      3. The gatherer's emitted label — non-strict providers like Cerebras
+         often shove a readable string here ("Mahit Namburu") instead of
+         the NodeLabel enum value.
+      4. canonical_id as last resort. Better than empty.
+    """
+    return str(
+        enriched.get(entity.canonical_id)
+        or entity.properties.get("name")
+        or entity.properties.get("display_name")
+        or entity.label
+        or entity.canonical_id
+    )
 
 
 __all__ = ["to_query_response"]
