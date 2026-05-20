@@ -495,13 +495,19 @@ def _format_graph_evidence_for_prompt(evidence: list[GraphEvidence]) -> str:
     common case — only inferred-edge-surfaced chunks carry chain data).
 
     Format per entry:
-        CHAIN: <anchor doc_id> --[<edge_type> · <confidence>]--> <this doc>
-               reason: <the LLM-derived `why` string>
+        CHAIN: "<title>" (<source> · <created date> · <url>)
+                 [<edge_type> · <confidence>] this chunk's doc
+                 id=<canonical_id>
+                 reason: <the LLM-derived `why` string>
 
-    The synthesizer reads this alongside the chunk body to connect the
-    chain across sources — without it the answer often misses "X
-    motivated Y because <reason>" connections even when the linked doc
-    is present in the chunks.
+    The neighbor's title / source / created_at / url come from
+    `_enrich_graph_evidence_from_result_set`'s LEFT JOIN documents.
+    They let the synthesis LLM (a) cite by source + URL and (b)
+    order chain hops chronologically. Empirically verified
+    2026-05-20: without these fields the LLM declined to answer
+    chronology queries (answer="" with 23 chain hops present).
+    Fields are all optional; rendering degrades gracefully when
+    any are missing (e.g. prefanout-derived entries with no JOIN).
     """
     if not evidence:
         return ""
@@ -510,9 +516,28 @@ def _format_graph_evidence_for_prompt(evidence: list[GraphEvidence]) -> str:
         reason = (ge.reason or "").strip()
         if len(reason) > _GE_REASON_RENDER_CAP:
             reason = reason[: _GE_REASON_RENDER_CAP - 1].rstrip() + "…"
+        title_part = f'"{ge.via_entity_title}"' if ge.via_entity_title else ge.via_entity
+        meta_bits: list[str] = []
+        if ge.via_entity_source_system:
+            meta_bits.append(ge.via_entity_source_system)
+        if ge.via_entity_created_at is not None:
+            # Date-precision is sufficient for chronological reconstruction;
+            # full ISO is noisy and burns tokens x 5 edges x N chunks.
+            meta_bits.append(ge.via_entity_created_at.date().isoformat())
+        if ge.via_entity_url:
+            meta_bits.append(ge.via_entity_url)
+        meta_part = f" ({' · '.join(meta_bits)})" if meta_bits else ""
         lines.append(
-            f"    {ge.via_entity} --[{ge.edge_type} · {ge.confidence}]--> this chunk's doc"
+            f"    {title_part}{meta_part}"
         )
+        lines.append(
+            f"      [{ge.edge_type} · {ge.confidence}] this chunk's doc"
+        )
+        if ge.via_entity_title:
+            # Keep the canonical_id on its own line for citations that
+            # need a stable handle; with a title rendered above, the id
+            # is now reference rather than display.
+            lines.append(f"      id={ge.via_entity}")
         if reason:
             lines.append(f"      reason: {reason}")
     if len(evidence) > _GE_PER_CHUNK_RENDER_CAP:
