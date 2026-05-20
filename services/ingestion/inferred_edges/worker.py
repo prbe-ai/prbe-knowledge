@@ -356,12 +356,16 @@ async def run_worker_forever() -> None:
 
     # Run the PostWriteWorker (entity auto-merge) in the same process. Both
     # workers drain independent queues; sharing the event loop avoids spinning
-    # up a separate Fly app/Helm deployment for the second analyzer. Gated by
-    # POST_WRITE_ENABLED (default off) so a stale env doesn't accidentally
-    # fire merges before the customer has flipped auto_merge_execute on.
+    # up a separate Fly app/Helm deployment for the second analyzer.
+    #
+    # POST_WRITE_ENABLED defaults to ON (suggestion-only mode is safe — never
+    # mutates the graph). POST_WRITE_EXECUTE gates whether high-confidence
+    # verdicts fire merges directly or land in entity_merge_suggestions for
+    # dashboard review; defaults to OFF so deploys don't auto-execute until
+    # a human flips the gate.
     from services.ingestion.post_write import PostWriteWorker
 
-    post_write_enabled = os.environ.get("POST_WRITE_ENABLED", "false").lower() == "true"
+    post_write_enabled = os.environ.get("POST_WRITE_ENABLED", "true").lower() == "true"
     post_write_execute = os.environ.get("POST_WRITE_EXECUTE", "false").lower() == "true"
     post_write_worker: PostWriteWorker | None = None
     if post_write_enabled:
