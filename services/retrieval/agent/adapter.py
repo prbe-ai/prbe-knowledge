@@ -223,7 +223,10 @@ async def _enrich_graph_evidence_from_result_set(
                     -- per anchor by extraction recency.
                     SELECT
                         re.*,
-                        d.title AS other_title,
+                        d.title         AS other_title,
+                        d.source_system AS other_source_system,
+                        d.created_at    AS other_created_at,
+                        d.source_url    AS other_url,
                         row_number() OVER (
                             PARTITION BY re.anchor_doc, re.other_doc, re.edge_type
                             ORDER BY re.extracted_at DESC NULLS LAST
@@ -236,9 +239,11 @@ async def _enrich_graph_evidence_from_result_set(
                     LEFT JOIN documents d
                       ON d.customer_id = $1
                      AND d.doc_id = re.other_doc
+                     AND d.valid_to IS NULL
                 )
                 SELECT anchor_doc, other_doc, edge_type, confidence,
-                       why, other_title
+                       why, other_title, other_source_system,
+                       other_created_at, other_url
                 FROM ranked
                 WHERE dedup_rn = 1
                   AND anchor_rn <= $3
@@ -263,6 +268,9 @@ async def _enrich_graph_evidence_from_result_set(
             via_entity=r["other_doc"],
             reason=r["why"],
             via_entity_title=r["other_title"],
+            via_entity_source_system=r["other_source_system"],
+            via_entity_created_at=r["other_created_at"],
+            via_entity_url=r["other_url"],
         )
         out.setdefault(r["anchor_doc"], []).append(ev)
     return out

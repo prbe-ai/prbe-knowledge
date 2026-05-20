@@ -165,6 +165,48 @@ def test_format_user_prompt_skips_chain_section_when_no_evidence() -> None:
     assert "CHAIN:" not in out
 
 
+def test_format_user_prompt_renders_neighbor_metadata_for_chronology() -> None:
+    """The synthesis LLM previously refused chronology queries
+    (answer="" on "reconstruct the multi-granola timeline") because
+    chain neighbors were rendered as opaque canonical_ids with no
+    date/source/url. The renderer now surfaces title + source +
+    created_at (date precision) + url alongside the edge metadata so
+    the LLM has the temporal + provenance grounding it needs."""
+    from datetime import UTC, datetime
+
+    from shared.models import GraphEvidence
+
+    chunk = SynthesisChunk(
+        chunk_id="c-linear",
+        title="Multi-Granola — End-to-End Implementation Plan",
+        content="PRB-18 plan body...",
+        source_system="linear",
+        source_url="https://linear.app/prbe/issue/PRB-18",
+        updated_at=_NOW_ISO,
+        graph_evidence=[
+            GraphEvidence(
+                edge_type="DISCUSSES",
+                confidence="INFERRED",
+                via_entity="slack:T0:C0:1778043682.343959",
+                via_entity_title="thread 1: Mahit raises Granola sync gap",
+                via_entity_source_system="slack",
+                via_entity_created_at=datetime(2026, 5, 4, 17, 0, 0, tzinfo=UTC),
+                via_entity_url="https://slack.com/archives/C0/p1778043682343959",
+                reason="The Slack thread raises the original gap.",
+            ),
+        ],
+    )
+    out = _format_user_prompt("reconstruct the multi-granola timeline", [chunk])
+    # Title is the human-readable display
+    assert "thread 1: Mahit raises Granola sync gap" in out
+    # Source + created-date + url all appear so the LLM can order + cite
+    assert "slack" in out
+    assert "2026-05-04" in out
+    assert "https://slack.com/archives/C0/p1778043682343959" in out
+    # Canonical_id is still present as a stable handle
+    assert "slack:T0:C0:1778043682.343959" in out
+
+
 # ---------------------------------------------------------------------------
 # Fallback parser (when a provider returns free-form text)
 # ---------------------------------------------------------------------------

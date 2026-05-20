@@ -407,6 +407,62 @@ async def test_enrichment_carries_via_entity_title_through_to_response(monkeypat
     assert ev.via_entity_title == "multi-granola deploy order is **strict**..."
 
 
+async def test_enrichment_carries_neighbor_metadata_through_to_response(monkeypatch) -> None:
+    """`via_entity_source_system` / `_created_at` / `_url` flow from
+    the enrichment query through to the synthesizer-visible shape so
+    the synthesis LLM can order chain hops chronologically and cite
+    by source. Without these the LLM saw an opaque canonical_id and
+    refused chronology questions (verified empty answer 2026-05-20).
+    """
+    from datetime import UTC, datetime
+
+    from shared.models import GraphEvidence as GE
+
+    fixed_ts = datetime(2026, 5, 5, 16, 6, 56, tzinfo=UTC)
+
+    async def fake_enrich(customer_id, doc_ids):
+        return {
+            "linear:org:issue:abc": [
+                GE(
+                    edge_type="DISCUSSES",
+                    confidence="INFERRED",
+                    via_entity="slack:T1:C1:1.0",
+                    via_entity_title="thread 1: Mahit raises Granola sync gap",
+                    via_entity_source_system="slack",
+                    via_entity_created_at=fixed_ts,
+                    via_entity_url="https://slack.com/archives/C1/p10",
+                    reason="The Slack thread raises the original gap.",
+                ),
+            ],
+        }
+
+    monkeypatch.setattr(
+        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        fake_enrich,
+    )
+
+    gathered = GathererOutput(
+        entities=[],
+        chunks=[_ge("linear:org:issue:abc")],
+        gatherer_notes=GathererNotes(),
+    )
+    resp = await to_query_response(
+        query="multi-granola timeline",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        prefanout=None,
+        customer_id="cust-test",
+    )
+    linear = next(
+        r for r in resp.results if getattr(r, "doc_id", "") == "linear:org:issue:abc"
+    )
+    ev = linear.chunks[0].graph_evidence[0]
+    assert ev.via_entity_source_system == "slack"
+    assert ev.via_entity_created_at == fixed_ts
+    assert ev.via_entity_url == "https://slack.com/archives/C1/p10"
+
+
 async def test_enrichment_dedupes_against_prefanout_evidence(monkeypatch) -> None:
     """If the same `(anchor, edge_type)` hop already came through via
     prefanout's inferred_edge channel, the post-hoc enrichment must

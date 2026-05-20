@@ -396,6 +396,19 @@ class GraphEvidence(BaseModel):
     via_entity: str
     reason: str | None = None
     via_entity_title: str | None = None
+    # `via_entity_source_system` / `_created_at` / `_url` give the
+    # synthesis LLM enough metadata to (a) order chain hops
+    # chronologically and (b) cite the OTHER endpoint by source +
+    # link. Without these the synthesis prompt rendered the
+    # neighbor as an opaque canonical_id and the LLM declined to
+    # commit to any temporal reconstruction (verified 2026-05-20:
+    # chronology query returned answer="" with these fields absent).
+    # Populated by the adapter's post-hoc enrichment via the same
+    # LEFT JOIN documents that fills `via_entity_title`. Optional
+    # so prefanout-derived entries (no JOIN available) stay valid.
+    via_entity_source_system: str | None = None
+    via_entity_created_at: datetime | None = None
+    via_entity_url: str | None = None
 
 
 class QueryChunk(BaseModel):
