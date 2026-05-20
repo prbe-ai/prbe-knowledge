@@ -101,7 +101,11 @@ class LoopState:
     tool_calls_count: int = 0
     extensions_used: int = 0
     budget: int = SEARCH_AGENT_TOOL_BUDGET
-    cache_hit_rates: list[float] = field(default_factory=list)
+    # One entry per turn (None when the provider response omitted
+    # `usage.prompt_tokens_details.cached_tokens`). Aligned by index
+    # with turn_latencies_ms / reasoning_per_turn / system_fingerprints
+    # so analyzers can join per-turn telemetry.
+    cache_hit_rates: list[float | None] = field(default_factory=list)
     turn_1_tools_fired: list[str] = field(default_factory=list)
     started_at: float = field(default_factory=time.perf_counter)
     # Per-turn LLM call latencies (ms).
@@ -124,6 +128,20 @@ class LoopState:
     # only round-trips role/content/tool_calls), so without this list
     # the agent's "why did it pick this tool" trail is lost.
     reasoning_per_turn: list[str | None] = field(default_factory=list)
+    # Deterministic 32-bit `seed` sent to the provider on every turn of
+    # this query. Same value for all turns so the tool trajectory stays
+    # stable; derived from sha256(customer_id, query). Recorded so the
+    # nightly analyzer can correlate seed vs reproducibility outcomes.
+    seed: int = 0
+    # Per-turn `system_fingerprint` from the provider response. Cerebras
+    # returns a string identifying the backend config the request ran
+    # against; pair with `seed` to detect when a fingerprint flip broke
+    # reproducibility (live-traced 2026-05-19: identical input, same
+    # seed, two distinct outputs because Q2/Q3 landed on a different
+    # backend than Q1 — cache hit dropped 99.96% → 8.67% as the
+    # smoking gun, but no fingerprint was captured). None when the
+    # provider omits it for that turn.
+    system_fingerprints_per_turn: list[str | None] = field(default_factory=list)
 
 
 # ============================================================
@@ -347,6 +365,28 @@ def _affinity_key(customer_id: str, query: str) -> str:
     return h.hexdigest()[:32]
 
 
+def _seed_for_query(customer_id: str, query: str) -> int:
+    """Deterministic 31-bit non-negative seed derived from (customer_id, query).
+
+    Sent on every turn of one query so the tool trajectory stays
+    stable; same input → same seed across reruns. Cerebras's API
+    documents `seed` as "best-effort deterministic sampling" — it
+    only holds within a fixed `system_fingerprint`, so the trace
+    blob captures both fields and the analyzer flags reruns where
+    fingerprint flipped under us.
+
+    Range: masked to signed-int31 (0 to 2^31-1) so the seed validates
+    against any provider that treats `seed` as signed int32 (some
+    gateway proxies do); also keeps it inside Python int → JSON int
+    representable range without losing precision.
+    """
+    h = sha256()
+    h.update(customer_id.encode("utf-8", errors="ignore"))
+    h.update(b":")
+    h.update(query.encode("utf-8", errors="ignore"))
+    return int.from_bytes(h.digest()[:4], "big") & 0x7FFFFFFF
+
+
 def _extract_cache_hit_rate(resp: Any) -> float | None:
     """Compute cache_read_input_tokens / prompt_tokens for one response."""
     try:
@@ -426,6 +466,16 @@ async def _run_turn(state: LoopState) -> Any:
         # one run 13 results, one run dead-end, one run timeout). For a
         # retrieval gatherer same-question-same-evidence is the contract.
         "temperature": 0,
+        # Deterministic seed. temperature=0 alone is NOT enough on
+        # Cerebras — live-traced 2026-05-19: identical input, three
+        # reruns of the same query produced 2 distinct outputs because
+        # requests landed on different backend replicas (cache hit rate
+        # dropped 99.96% → 8.67% on the divergent run). `seed` is
+        # provider-honored best-effort; it stabilises sampling within a
+        # given `system_fingerprint` and the trace blob captures the
+        # fingerprint per turn so the analyzer can flag fingerprint
+        # drift as a reproducibility breaker.
+        "seed": state.seed,
         # The whole point: model MUST call a tool. With this set, prose-
         # only output is not an option — the model picks a retrieval
         # tool (search/subgraph/fetch_doc/need_deeper) or the terminal
@@ -458,9 +508,15 @@ async def _run_turn(state: LoopState) -> Any:
     elapsed_ms = (time.perf_counter() - t_turn) * 1000
     state.turn_count += 1
     state.turn_latencies_ms.append(elapsed_ms)
+    # Cardinality contract: every per-turn list has exactly turn_count
+    # entries. Use None for "no signal this turn" so the analyzer can
+    # join cache / fingerprint / reasoning / latency by turn index.
     rate = _extract_cache_hit_rate(resp)
-    if rate is not None:
-        state.cache_hit_rates.append(rate)
+    state.cache_hit_rates.append(rate)
+    # Provider's backend fingerprint — Cerebras returns this on every
+    # response; pairs with `seed` to make replica drift visible.
+    fingerprint = getattr(resp, "system_fingerprint", None)
+    state.system_fingerprints_per_turn.append(fingerprint if fingerprint else None)
 
     choices = getattr(resp, "choices", None) or []
     msg = getattr(choices[0], "message", None) if choices else None
@@ -483,6 +539,7 @@ async def _run_turn(state: LoopState) -> Any:
         content_len=len(content) if content else 0,
         reasoning_len=len(reasoning) if reasoning else 0,
         cache_hit_rate=round(rate, 3) if rate is not None else None,
+        system_fingerprint=fingerprint,
     )
     return resp
 
@@ -958,7 +1015,13 @@ async def run_gatherer(
     timing["grounding_ms"] = (time.perf_counter() - t_grounding) * 1000
 
     t_extraction = time.perf_counter()
-    extracted = await extract_entities_with_llm(customer_id, req.query, bundle)
+    # Seed the extractor too — without it, entity extraction variance
+    # changes the prefanout anchors and the variance attribution in the
+    # trace gets misassigned to the (now-seeded) gatherer loop.
+    extraction_seed = _seed_for_query(customer_id, req.query)
+    extracted = await extract_entities_with_llm(
+        customer_id, req.query, bundle, seed=extraction_seed
+    )
     timing["extraction_ms"] = (time.perf_counter() - t_extraction) * 1000
 
     # Reconcile LLM-proposed entities against the bundle (safety net).
@@ -1045,6 +1108,7 @@ async def run_gatherer(
         customer_id=customer_id,
         trace_id=trace_id,
         query=req.query,
+        seed=_seed_for_query(customer_id, req.query),
         prefanout=prefanout_result,
         prefanout_hit_counts=prefanout_hit_counts,
         messages=[
@@ -1233,8 +1297,8 @@ async def run_gatherer(
         per_turn_ms=[round(t, 1) for t in state.turn_latencies_ms],
         per_tool_ms=[round(t, 1) for t in state.tool_latencies_ms],
         cache_hit_rate=(
-            round(sum(state.cache_hit_rates) / len(state.cache_hit_rates), 3)
-            if state.cache_hit_rates
+            round(sum(_r) / len(_r), 3)
+            if (_r := [r for r in state.cache_hit_rates if r is not None])
             else None
         ),
     )
@@ -1246,10 +1310,9 @@ async def run_gatherer(
         request.state.need_deeper_extensions = state.extensions_used
         request.state.confidence = gathered.gatherer_notes.confidence
         request.state.dropped_count = len(gathered.gatherer_notes.dropped)
+        _rates = [r for r in state.cache_hit_rates if r is not None]
         request.state.cache_hit_rate = (
-            sum(state.cache_hit_rates) / len(state.cache_hit_rates)
-            if state.cache_hit_rates
-            else None
+            sum(_rates) / len(_rates) if _rates else None
         )
         request.state.intents_count = 1
         request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL

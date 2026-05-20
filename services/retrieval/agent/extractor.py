@@ -148,11 +148,17 @@ async def extract_entities_with_llm(
     customer_id: str,
     query: str,
     bundle: GroundingBundle,
+    seed: int | None = None,
 ) -> list[ExtractedEntity]:
     """Run the Fireworks-backed extractor with the grounding bundle as
     context. Returns its proposed entities (mostly grounded canonical_ids
     picked from the candidates list, plus synthesized IDs for paraphrased
     entities not in the bundle).
+
+    `seed` (optional): same deterministic seed the gatherer loop uses,
+    so the entity bag stays stable across reruns of the same query.
+    Without it, extraction non-determinism leaks into pre-fan-out and
+    masquerades as gatherer variance in the trace blob.
 
     Returns `[]` on any failure (provider down, parse error, timeout) —
     extraction is enrichment, not a hard requirement.
@@ -163,9 +169,9 @@ async def extract_entities_with_llm(
     user_msg = _build_extraction_user_message(query, bundle)
 
     try:
-        resp = await acompletion(
-            model=SEARCH_AGENT_INFERENCE_MODEL,
-            messages=[
+        call_kwargs: dict[str, Any] = {
+            "model": SEARCH_AGENT_INFERENCE_MODEL,
+            "messages": [
                 {
                     "role": "system",
                     "content": [
@@ -178,17 +184,20 @@ async def extract_entities_with_llm(
                 },
                 {"role": "user", "content": user_msg},
             ],
-            response_format=_EXTRACTION_RESPONSE_FORMAT,
+            "response_format": _EXTRACTION_RESPONSE_FORMAT,
             # Same OpenAI-wire-shape trick the agent loop uses so
             # response_format survives the gateway. See loop.py
             # _GATHERER_OUTPUT_RESPONSE_FORMAT for the same reasoning.
-            custom_llm_provider="openai",
+            "custom_llm_provider": "openai",
             # Greedy decoding — same query must produce the same extracted
             # entities run-to-run. See loop.py _run_turn for the same fix.
-            temperature=0,
-            max_tokens=600,
-            timeout=SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
-        )
+            "temperature": 0,
+            "max_tokens": 600,
+            "timeout": SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
+        }
+        if seed is not None:
+            call_kwargs["seed"] = seed
+        resp = await acompletion(**call_kwargs)
     except LLMError as exc:
         log.warning(
             "agent.entity_extract_llm_error",
