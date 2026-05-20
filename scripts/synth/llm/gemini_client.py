@@ -7,10 +7,46 @@ import re
 from typing import Any
 
 from google import genai
-from google.genai.types import GenerateContentConfig
+from google.genai.types import GenerateContentConfig, ThinkingConfig
 from pydantic import BaseModel
 
 from scripts.synth.llm.base import LlmRequest, LlmResponse
+
+
+# Gemini 3.x defaults to thinking-on. Reasoning tokens are deducted from
+# max_output_tokens and silently truncate the JSON answer when reasoning +
+# answer exceed the budget. Empirically (eval_3_5_flash_sweep.py runs from
+# 2026-05-19 — see memory feedback-gemini-3-5-flash-gotchas): Flash and
+# Flash Lite tolerate budget=0 and produce the same output faster; Pro
+# rejects budget=0 and needs slack.
+#
+# SISTER COPY: services/synthesis/providers.py also defines a
+# `_thinking_budget_for(model)`. The two are intentionally separate:
+# providers.py emits a LiteLLM-passthrough dict (every gemini-* model goes
+# through LiteLLM and ignores unknown thinking knobs gracefully), while
+# this module emits a typed `ThinkingConfig` for direct google-genai SDK
+# calls (older non-thinking models would 400 on an unknown kwarg, so we
+# return None to skip the kwarg entirely). Pro-detection logic MUST stay
+# aligned across both — if you bump one, bump the other.
+def _thinking_budget_for(model: str) -> int | None:
+    name = (model or "").lower()
+    if "pro" in name:
+        return 4096
+    # Tight version-prefix match: "gemini-3.<n>-..." or "gemini-3-<n>-..." or
+    # "gemini-2.5-...". Avoids matching a hypothetical "gemini-30" or
+    # "gemini-3old" without an intervening separator.
+    if name.startswith(("gemini-3.", "gemini-3-", "gemini-2.5-", "gemini-2.5.")):
+        return 0
+    # Older Gemini families (no thinking support) — leave unset so the SDK
+    # picks its default; passing 0 there would 400.
+    return None
+
+
+def _config_kwargs_for_thinking(model: str) -> dict[str, Any]:
+    budget = _thinking_budget_for(model)
+    if budget is None:
+        return {}
+    return {"thinking_config": ThinkingConfig(thinking_budget=budget)}
 
 
 def _safe_parse_json(raw: str) -> dict:
@@ -141,6 +177,7 @@ class GeminiClient:
             system_instruction=req.system or None,
             max_output_tokens=req.max_tokens,
             temperature=req.temperature,
+            **_config_kwargs_for_thinking(req.model),
         )
         response = await self._client.aio.models.generate_content(
             model=req.model,
@@ -164,6 +201,7 @@ class GeminiClient:
             temperature=req.temperature,
             response_mime_type="application/json",
             response_schema=cleaned_schema,
+            **_config_kwargs_for_thinking(req.model),
         )
         response = await self._client.aio.models.generate_content(
             model=req.model,

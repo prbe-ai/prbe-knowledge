@@ -75,10 +75,16 @@ class TriageProvider(Protocol):
 
 
 _ANTHROPIC_TRIAGE_NAMES = {"haiku", "claude-haiku", HAIKU_MODEL}
-_GEMINI_FLASH_LITE_NAMES = {
+# Gemini triage variants. The dispatcher routes any name here to
+# `_GeminiTriage(model=name)` which forwards to LiteLLM via the
+# provider-prefixed `gemini/<id>` form. `_thinking_budget_for` (below)
+# auto-disables Gemini 3.x thinking for non-Pro models, so 3.5-flash
+# doesn't bleed reasoning tokens into the structured output budget.
+_GEMINI_TRIAGE_NAMES = {
     "gemini-flash-lite",
     "gemini-3.1-flash-lite",
     "gemini-2.5-flash-lite",
+    "gemini-3.5-flash",
 }
 
 
@@ -294,6 +300,14 @@ _GEMINI_REJECTED_SCHEMA_KEYS = (
 #   - Pro:        rejects budget=0; needs explicit non-zero.
 #   - Flash:      tolerates budget=0 and produces the same answer faster.
 #   - Flash Lite: tolerates budget=0; default already minimal.
+#
+# SISTER COPY: scripts/synth/llm/gemini_client.py also defines a
+# `_thinking_budget_for(model)` for direct google-genai SDK calls. That
+# variant returns `int | None` (None skips the kwarg for older models that
+# would 400 on an unknown ThinkingConfig). This one returns `int` because
+# the LiteLLM passthrough is tolerant — unsupported knobs land in the
+# provider config dict and the upstream ignores or 4xxs gracefully.
+# Pro-detection logic MUST stay aligned across both.
 def _thinking_budget_for(model: str) -> int:
     name = model.lower()
     if "pro" in name:
@@ -464,10 +478,10 @@ def get_triage_provider(
     `model_override` lets tests pin the choice without env vars.
     """
     name = (model_override or WIKI_TRIAGE_MODEL).lower()
-    if name in _GEMINI_FLASH_LITE_NAMES:
+    if name in _GEMINI_TRIAGE_NAMES:
         # "gemini-flash-lite" is the friendly alias for the GA 3.1 model;
-        # versioned ids ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite")
-        # are sent to the Google API unchanged.
+        # versioned ids ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
+        # "gemini-3.5-flash") are sent to the Google API unchanged.
         return _GeminiTriage(
             model="gemini-3.1-flash-lite" if name == "gemini-flash-lite" else name
         )
@@ -521,7 +535,7 @@ _GEMINI_FLASH_CANONICAL = {
 }
 
 # Directed-phrases-specific Flash-Lite registry. Intentionally distinct
-# from the triage-side `_GEMINI_FLASH_LITE_NAMES` so a future PR adding a
+# from the triage-side `_GEMINI_TRIAGE_NAMES` so a future PR adding a
 # triage-only Flash-Lite alias doesn't silently route directed-phrase
 # traffic through an unevaluated model.
 _GEMINI_FLASH_LITE_CANONICAL = {
