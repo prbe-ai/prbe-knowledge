@@ -173,12 +173,34 @@ def _stub_grounding_extraction_prefanout(monkeypatch: pytest.MonkeyPatch) -> Non
 # Pure helpers
 # ============================================================
 
-def test_affinity_key_is_stable_per_query() -> None:
+def test_affinity_key_is_customer_scoped_not_query_scoped() -> None:
+    """Affinity hash routes by customer_id only, NOT by query.
+
+    Rationale: the static system prompt + tool-defs prefix (~2.4K
+    tokens) must cache-hit ACROSS queries, not just across the turns
+    of a single query. Yesterday's digest (2026-05-19) measured a
+    turn-0 mean cache_hit_rate of 0.13 across 126 traces because the
+    old `(customer_id, query)` hash routed every new query to a fresh
+    Cerebras replica — guaranteeing a cold KV-cache on turn 0.
+
+    Multi-turn cache continuity is preserved because Cerebras's prefix
+    cache is content-addressed; both turns route to the same replica
+    so turn 1 still hits the warm prefix turn 0 wrote.
+
+    See PRB-12 + the docstring on `loop._affinity_key`.
+    """
     a = _affinity_key("cust-1", "what is PRB-17")
     b = _affinity_key("cust-1", "what is PRB-17")
     assert a == b
+    # Different customers → different replicas (avoids one customer's
+    # KV cache thrashing another's working set).
     assert _affinity_key("cust-2", "what is PRB-17") != a
-    assert _affinity_key("cust-1", "what is PRB-99") != a
+    # Same customer + different query → SAME replica. This is the
+    # behavior change: under the prior implementation these differed.
+    assert _affinity_key("cust-1", "what is PRB-99") == a
+    # Query value must not influence the hash at all — even an empty
+    # query yields the same key for the same customer.
+    assert _affinity_key("cust-1", "") == a
     assert len(a) == 32
 
 
