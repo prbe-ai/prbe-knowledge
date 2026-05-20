@@ -17,10 +17,13 @@ from scripts.synth.llm.mock_client import MockLlmClient
 
 
 def _make_llm_cfg(**kwargs) -> dict:
+    # Mirrors scripts/synth/cli.py:_LLM_DEFAULTS. Keep in sync if the
+    # production defaults shift (last bump: 2026-05-19 validator_model →
+    # gemini-3.5-flash after the A/B sweep in eval_3_5_flash_sweep.py).
     defaults = {
         "planner_model": "claude-opus-4-7",
         "writer_model": "claude-sonnet-4-6",
-        "validator_model": "claude-haiku-4-5-20251001",
+        "validator_model": "gemini-3.5-flash",
     }
     defaults.update(kwargs)
     return defaults

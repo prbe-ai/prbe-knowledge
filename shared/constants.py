@@ -863,16 +863,24 @@ WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
 
 # Provider knob for the triage stage. v4 uses the wiki agent (Gemini
 # Pro) for synthesis, so the synthesis + verifier provider knobs are
-# gone. Triage is provider-pluggable: flip the value and redeploy to
-# switch from Anthropic Haiku -> Gemini Flash Lite (or back). Defaults
-# to Anthropic.
+# gone. Triage is provider-pluggable: flip the value and redeploy.
 # Recognized values:
-#   "haiku" | "claude-haiku"           -> Anthropic Haiku 4.5
+#   "haiku" | "claude-haiku"            -> Anthropic Haiku 4.5
 #   "gemini-flash-lite" | "gemini-3.1-flash-lite" -> Gemini 3.1 Flash Lite
+#   "gemini-3.5-flash"                  -> Gemini 3.5 Flash (default; 2026-05-19)
 # No env-var override path — the prior `getattr(settings, ...)` plumbing
 # referenced fields that didn't exist on Settings, so the env var was
 # silently inert. Constants-only is honest.
-WIKI_TRIAGE_MODEL = "haiku"
+#
+# Default flipped 2026-05-19 from "haiku" to "gemini-3.5-flash" after the
+# A/B sweep in scripts/eval_3_5_flash_sweep.py (report:
+# ~/.gstack/projects/prbe-knowledge/eval-3-5-flash-sweep-20260520T025718Z.md).
+# 20 fixtures × 2 trials per model. Label accuracy: both 100%. Opus-judged
+# quality: 9.3 (haiku) vs 9.4 (3.5-flash) — statistical tie. p50 latency:
+# 1913ms → 1614ms (~16% faster). Cost per call: $0.00225 → $0.00060
+# (~3.75x cheaper). Net: equal quality at <30% of the wire cost on a
+# high-volume hot path.
+WIKI_TRIAGE_MODEL = "gemini-3.5-flash"
 
 # Directed-phrase generation runs once per wiki page during synthesis to
 # emit 5-10 trigger phrases that boost retrieval ranking when an engineer's

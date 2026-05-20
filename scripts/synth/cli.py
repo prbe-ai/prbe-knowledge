@@ -67,10 +67,16 @@ _DEFAULT_FIXTURE_ROOT = Path(__file__).parent.parent.parent / "tests" / "fixture
 
 # Canonical model roster for the three LLM roles.  Profile `llm:` section can
 # override individual keys; these are the fallback defaults.
+#
+# validator_model: flipped 2026-05-19 from claude-haiku-4-5-20251001 to
+# gemini-3.5-flash after the A/B sweep in scripts/eval_3_5_flash_sweep.py
+# (16 fixtures × 2 trials). Label-accuracy: 50% (haiku) → 88% (3.5-flash);
+# Opus-judged quality: 5.0 → 8.8; cost ~3.3x cheaper. Report:
+# ~/.gstack/projects/prbe-knowledge/eval-3-5-flash-sweep-20260520T025718Z.md.
 _LLM_DEFAULTS: dict[str, str] = {
     "planner_model": "claude-opus-4-7",
     "writer_model": "claude-sonnet-4-6",
-    "validator_model": "claude-haiku-4-5-20251001",
+    "validator_model": "gemini-3.5-flash",
 }
 
 
