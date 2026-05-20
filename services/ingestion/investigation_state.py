@@ -43,6 +43,45 @@ def _row_to_detail(row) -> InvestigationDetail:
     )
 
 
+async def upsert_failed_pending_review(
+    customer_id: str,
+    incident_doc_id: str,
+) -> InvestigationDetail:
+    """Create (or stamp) an `incident_investigations` row with
+    state='failed_pending_review' after the worker's dispatch retry
+    budget is exhausted.
+
+    Without this, an incident whose dispatch failed leaves zero rows
+    in `incident_investigations`, the dashboard's /incidents list is
+    empty, and the user has no surface to manually triage. By
+    materialising the row in the failed state, the list page
+    surfaces the incident with a "dispatch failed — review manually"
+    indicator and the existing approve/reject endpoints continue to
+    work against it.
+
+    ON CONFLICT: the row already exists (e.g. a prior successful
+    dispatch wrote `pending_review`, and we're now seeing a
+    re-dispatch fail). We promote it to `failed_pending_review` so
+    the dashboard surfaces the outage; the previous `versions`
+    history is preserved so audit isn't lost.
+    """
+    async with with_tenant(customer_id) as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO incident_investigations
+                (customer_id, incident_doc_id, current_report_doc_id,
+                 state, versions)
+            VALUES ($1, $2, NULL, 'failed_pending_review', '[]'::jsonb)
+            ON CONFLICT (customer_id, incident_doc_id) DO UPDATE
+              SET state = 'failed_pending_review',
+                  updated_at = now()
+            RETURNING *;
+            """,
+            customer_id, incident_doc_id,
+        )
+    return _row_to_detail(row)
+
+
 async def upsert_pending_review(
     customer_id: str,
     incident_doc_id: str,

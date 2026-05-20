@@ -16,6 +16,7 @@ from services.ingestion.investigation_state import (
     list_for_customer,
     mark_approved,
     mark_rejected,
+    upsert_failed_pending_review,
     upsert_pending_review,
 )
 from shared import db as db_module
@@ -92,6 +93,43 @@ async def test_upsert_creates_row_in_pending_review(customer_id: str) -> None:
     assert v.version == 1 and v.doc_id == "pd:investigation:T-001:v1"
     assert v.mode == "full" and v.decision == "pending"
     assert v.reviewed_by is None and v.feedback is None
+
+
+async def test_upsert_failed_creates_row_in_failed_pending_review(
+    customer_id: str,
+) -> None:
+    """Dispatch-failure path: when the orchestrator is unreachable
+    the worker materialises an `incident_investigations` row with
+    state='failed_pending_review' so the /incidents list surfaces
+    the incident at all. current_report_doc_id is NULL (no report
+    was produced) and `versions` is empty."""
+    detail = await upsert_failed_pending_review(
+        customer_id=customer_id,
+        incident_doc_id="pd:incident:F-001",
+    )
+    assert detail.state == "failed_pending_review"
+    assert detail.current_report_doc_id is None
+    assert detail.versions == []
+
+
+async def test_upsert_failed_demotes_existing_pending_review(
+    customer_id: str,
+) -> None:
+    """If a prior successful dispatch wrote `pending_review` and a
+    re-dispatch fails, the row flips to `failed_pending_review` so
+    the dashboard surfaces the outage. The prior `versions` history
+    is preserved for audit."""
+    await upsert_pending_review(
+        customer_id=customer_id, incident_doc_id="pd:incident:F-002",
+        report_doc_id="pd:investigation:F-002:v1", version=1, mode="full",
+    )
+    detail = await upsert_failed_pending_review(
+        customer_id=customer_id, incident_doc_id="pd:incident:F-002",
+    )
+    assert detail.state == "failed_pending_review"
+    # Prior version entry preserved (no rewrite on conflict).
+    assert len(detail.versions) == 1
+    assert detail.versions[0].version == 1
 
 
 async def test_upsert_second_call_appends_version_and_resets_state(
