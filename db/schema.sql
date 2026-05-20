@@ -563,6 +563,11 @@ CREATE TABLE graph_nodes (
     -- (services/retrieval/surprise.py).
     degree        INT NOT NULL DEFAULT 0,
     community_id  INT,
+    -- Migration 0082: per-entity embedding for AutoMergeAnalyzer vector
+    -- candidate gen. Same dim as chunks.embedding_v2 so the existing
+    -- GeminiEmbedder writes in-place. Nullable initially; backfill via
+    -- scripts/backfill_graph_node_embeddings.py.
+    embedding     halfvec(3072) NULL,
     UNIQUE (customer_id, label, canonical_id)
 );
 
@@ -582,6 +587,13 @@ CREATE INDEX idx_graph_nodes_alnum_canonical
     ON graph_nodes (customer_id, label, regexp_replace(LOWER(canonical_id), '[^a-z0-9]+', '', 'g'));
 CREATE INDEX idx_graph_nodes_alnum_props_name
     ON graph_nodes (customer_id, label, regexp_replace(LOWER(properties ->> 'name'), '[^a-z0-9]+', '', 'g'));
+-- Migration 0082: HNSW + trigram indexes for AutoMergeAnalyzer candidate gen.
+CREATE INDEX idx_graph_nodes_embedding_hnsw
+    ON graph_nodes USING hnsw (embedding halfvec_cosine_ops);
+CREATE INDEX idx_graph_nodes_canonical_id_trgm
+    ON graph_nodes USING gin (LOWER(canonical_id) gin_trgm_ops);
+CREATE INDEX idx_graph_nodes_name_trgm
+    ON graph_nodes USING gin (LOWER(properties->>'name') gin_trgm_ops);
 -- Lane A: partial index on community_id for cross-community surprise-score lookups.
 CREATE INDEX idx_graph_nodes_customer_community
     ON graph_nodes (customer_id, community_id) WHERE community_id IS NOT NULL;
@@ -1381,5 +1393,64 @@ CREATE TABLE customer_incident_mcp_servers (
 ALTER TABLE customer_incident_mcp_servers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE customer_incident_mcp_servers FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON customer_incident_mcp_servers
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
+-- node_post_write_queue: drain queue for the post-write pipeline
+-- (migrations 0082 + 0083). Enqueued by graph_writer.upsert_nodes in the
+-- same transaction as the node upsert. Drained by PostWriteWorker which
+-- runs AutoMergeAnalyzer + (future) other NodeAnalyzers per row.
+--
+-- RLS is DISABLED (per 0083): the worker drains cross-tenant and probe_app
+-- lacks BYPASSRLS. Tenant scoping is preserved at the INSERT site
+-- (graph_writer runs inside with_tenant) and at the downstream node
+-- read (worker calls with_tenant(customer_id) before loading the node).
+-- ---------------------------------------------------------------------------
+CREATE TABLE node_post_write_queue (
+    customer_id      TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    node_id          BIGINT NOT NULL,
+    enqueued_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    analyzer_status  JSONB NOT NULL DEFAULT '{}'::JSONB,
+    locked_until     TIMESTAMPTZ NULL,
+    PRIMARY KEY (customer_id, node_id)
+);
+CREATE INDEX idx_node_post_write_queue_pending
+    ON node_post_write_queue (enqueued_at)
+    WHERE locked_until IS NULL;
+
+-- ---------------------------------------------------------------------------
+-- entity_merge_suggestions: medium/low-confidence verdicts from
+-- AutoMergeAnalyzer surfaced in the dashboard /graph cluster admin UI
+-- (migration 0082). High-confidence verdicts go straight to the
+-- entity-clusters merge endpoint; everything else lands here for human
+-- review.
+-- ---------------------------------------------------------------------------
+CREATE TABLE entity_merge_suggestions (
+    suggestion_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id            TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    label                  TEXT NOT NULL,
+    primary_canonical_id   TEXT NOT NULL,
+    candidate_canonical_id TEXT NOT NULL,
+    confidence             TEXT NOT NULL CHECK (confidence IN ('high','medium','low')),
+    rationale              TEXT NULL,
+    llm_model              TEXT NOT NULL,
+    run_id                 UUID NULL,
+    status                 TEXT NOT NULL DEFAULT 'pending'
+                           CHECK (status IN ('pending','approved','dismissed','applied')),
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    decided_at             TIMESTAMPTZ NULL,
+    decided_by_user_id     UUID NULL
+);
+CREATE INDEX idx_entity_merge_suggestions_lookup
+    ON entity_merge_suggestions (customer_id, status, created_at DESC);
+CREATE UNIQUE INDEX uq_entity_merge_suggestions_pair
+    ON entity_merge_suggestions (customer_id, label, primary_canonical_id, candidate_canonical_id)
+    WHERE status = 'pending';
+
+ALTER TABLE entity_merge_suggestions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE entity_merge_suggestions FORCE ROW LEVEL SECURITY;
+CREATE POLICY entity_merge_suggestions_tenant_isolation
+    ON entity_merge_suggestions
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
