@@ -31,6 +31,7 @@ from services.retrieval.agent.loop import (
     _format_inferred_chains,
     _format_prefanout_compact,
     _parse_terminal_args,
+    _seed_for_query,
     run_gatherer,
 )
 from services.retrieval.agent.models import ExtractedEntity, GathererOutput
@@ -49,6 +50,7 @@ def _mk_resp(
     prompt_tokens: int = 100,
     cached_tokens: int = 0,
     reasoning_content: str | None = None,
+    system_fingerprint: str | None = None,
 ) -> SimpleNamespace:
     """Build a SimpleNamespace mimicking a LiteLLM chat-completion response.
 
@@ -56,6 +58,10 @@ def _mk_resp(
     that LiteLLM surfaces as `message.reasoning_content`. Default None
     so existing tests don't shift; pass a string to assert the loop
     captures it onto state.
+
+    `system_fingerprint` simulates the provider's backend identifier
+    (Cerebras returns it on every response). Default None; pass a
+    string to assert the loop captures it onto state.
     """
     tcs = []
     for tc in tool_calls or []:
@@ -78,6 +84,7 @@ def _mk_resp(
             completion_tokens=50,
             prompt_tokens_details={"cached_tokens": cached_tokens},
         ),
+        system_fingerprint=system_fingerprint,
     )
 
 
@@ -1069,3 +1076,135 @@ async def test_reasoning_per_turn_starts_empty_and_grows(
     assert loop_state is not None
     assert len(loop_state.reasoning_per_turn) == loop_state.turn_count
     assert loop_state.reasoning_per_turn == [None]
+
+
+# ============================================================
+# Determinism telemetry: seed sent + system_fingerprint captured
+# ============================================================
+
+
+def test_seed_for_query_is_deterministic_and_query_scoped() -> None:
+    """Same (customer_id, query) → same seed. Different query → different seed.
+    Range fits 32-bit unsigned (0 to 2^32-1) for cross-provider safety."""
+    a = _seed_for_query("cust-1", "what shipped this week")
+    b = _seed_for_query("cust-1", "what shipped this week")
+    c = _seed_for_query("cust-1", "what shipped last week")
+    d = _seed_for_query("cust-2", "what shipped this week")
+    assert a == b
+    assert a != c
+    assert a != d
+    for s in (a, c, d):
+        assert 0 <= s < 2**32
+
+
+@pytest.mark.asyncio
+async def test_seed_sent_and_system_fingerprint_captured_per_turn(
+    fake_request: SimpleNamespace,
+) -> None:
+    """`seed` is forwarded to acompletion (same value all turns) and each
+    response's `system_fingerprint` lands on state. The pair is the
+    only on-rails way to detect Cerebras backend drift breaking
+    reproducibility — live-traced 2026-05-19."""
+    req = QueryRequest(query="why did multi-granola happen", customer_id="cust-7", top_k=5)
+    turn_1 = _mk_resp(
+        tool_calls=[{"id": "s1", "name": "search", "arguments": {"queries": ["q1"]}}],
+        system_fingerprint="fp_alpha",
+    )
+    turn_2 = _mk_resp(
+        tool_calls=[_terminal_call()],
+        system_fingerprint="fp_beta",  # backend rolled between turns
+    )
+
+    fake_acompletion = AsyncMock(side_effect=[turn_1, turn_2])
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=fake_acompletion,
+    ), patch(
+        "services.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ):
+        await run_gatherer(req, customer_id="cust-7", request=fake_request)
+
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state is not None
+    # Same seed sent on every turn — derived from (customer_id, query).
+    expected_seed = _seed_for_query("cust-7", "why did multi-granola happen")
+    assert loop_state.seed == expected_seed
+    for call in fake_acompletion.await_args_list:
+        assert call.kwargs["seed"] == expected_seed
+    # Fingerprint stored per turn, in order.
+    assert loop_state.system_fingerprints_per_turn == ["fp_alpha", "fp_beta"]
+
+
+@pytest.mark.asyncio
+async def test_per_turn_telemetry_cardinality_preserved_when_usage_missing(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Provider may omit `usage` on some responses (LiteLLM passes
+    through whatever the gateway returned). cache_hit_rates must still
+    grow per-turn so analyzers joining by turn index don't misalign
+    cache vs fingerprint vs reasoning. None slots preserve cardinality."""
+    req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
+
+    # Turn 1: usage present (cache hit measurable). Turn 2: simulate
+    # missing usage by patching the helper to return None.
+    turn_1 = _mk_resp(
+        tool_calls=[{"id": "s1", "name": "search", "arguments": {"queries": ["q1"]}}],
+        prompt_tokens=100,
+        cached_tokens=80,
+        system_fingerprint="fp_a",
+    )
+    turn_2 = _mk_resp(
+        tool_calls=[_terminal_call()],
+        system_fingerprint="fp_b",
+    )
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1, turn_2]),
+    ), patch(
+        "services.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ), patch(
+        "services.retrieval.agent.loop._extract_cache_hit_rate",
+        side_effect=[0.8, None],  # turn 2's usage was unparseable
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state is not None
+    # All per-turn lists same length as turn_count.
+    assert loop_state.turn_count == 2
+    assert len(loop_state.cache_hit_rates) == 2
+    assert len(loop_state.system_fingerprints_per_turn) == 2
+    assert len(loop_state.turn_latencies_ms) == 2
+    assert len(loop_state.reasoning_per_turn) == 2
+    # None preserves the slot for turn 2.
+    assert loop_state.cache_hit_rates == [0.8, None]
+    # Aggregated mean filters None → 0.8.
+    assert fake_request.state.cache_hit_rate == pytest.approx(0.8)
+
+
+@pytest.mark.asyncio
+async def test_system_fingerprint_none_when_provider_omits(
+    fake_request: SimpleNamespace,
+) -> None:
+    """When the provider doesn't return system_fingerprint, the slot is
+    None — not missing — so len(system_fingerprints_per_turn) ==
+    turn_count for the analyzer's per-turn correlation."""
+    req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
+    turn_1 = _mk_resp(tool_calls=[_terminal_call()], system_fingerprint=None)
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1]),
+    ), patch(
+        "services.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state is not None
+    assert loop_state.system_fingerprints_per_turn == [None]
+    assert len(loop_state.system_fingerprints_per_turn) == loop_state.turn_count

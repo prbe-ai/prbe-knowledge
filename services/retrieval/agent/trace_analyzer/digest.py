@@ -29,10 +29,11 @@ _REQUIRED_TURN_1_CHANNELS = frozenset({
 })
 
 
-def _mean_or_none(values: list[float]) -> float | None:
-    if not values:
+def _mean_or_none(values: list[float | None]) -> float | None:
+    filtered = [v for v in values if v is not None]
+    if not filtered:
         return None
-    return sum(values) / len(values)
+    return sum(filtered) / len(filtered)
 
 
 def _has_tool(tools_fired: list[str], name: str) -> bool:
@@ -52,9 +53,12 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
 
     tools_fired: list[str] = list(blob.get("tools_fired") or [])
     turn_1_tools: list[str] = list(blob.get("turn_1_tools_fired") or [])
-    cache_rates: list[float] = list(blob.get("cache_hit_rates") or [])
+    cache_rates: list[float | None] = list(blob.get("cache_hit_rates") or [])
     turn_latencies: list[float] = list(blob.get("turn_latencies_ms") or [])
     reasoning_per_turn = list(blob.get("reasoning_per_turn") or [])
+    fingerprints_per_turn: list[str | None] = list(
+        blob.get("system_fingerprints_per_turn") or []
+    )
 
     missed = sorted(_REQUIRED_TURN_1_CHANNELS - set(turn_1_tools))
 
@@ -108,6 +112,15 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
         # Cache
         "cache_hit_rate_mean": _mean_or_none(cache_rates),
         "cache_hit_rate_per_turn": cache_rates,
+        # Determinism telemetry — seed + per-turn provider fingerprint.
+        # `seed_changed` flags a backend roll mid-query (same query, two
+        # distinct fingerprints across turns); the strong signal for
+        # within-query reproducibility breaking.
+        "seed": blob.get("seed"),
+        "system_fingerprints_per_turn": fingerprints_per_turn,
+        "system_fingerprint_changed_mid_query": (
+            len({f for f in fingerprints_per_turn if f}) > 1
+        ),
         # Per-turn LLM latency — slow turns surface model-side issues
         "turn_latencies_ms": turn_latencies,
         # Prefanout coverage

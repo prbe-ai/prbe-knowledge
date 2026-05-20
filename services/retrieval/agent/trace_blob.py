@@ -100,6 +100,13 @@ def build_trace_blob(
         # the agent's "why" per tool call is unrecoverable. May be all-
         # None when the provider doesn't emit reasoning for this model.
         blob["reasoning_per_turn"] = list(state.reasoning_per_turn)
+        # Deterministic seed sent on every turn + per-turn provider
+        # `system_fingerprint`. Pair: same seed across reruns + same
+        # fingerprint = sampling should be reproducible; same seed +
+        # different fingerprint = the backend changed under us, which
+        # is the documented reproducibility-breaker on Cerebras.
+        blob["seed"] = state.seed
+        blob["system_fingerprints_per_turn"] = list(state.system_fingerprints_per_turn)
     else:
         # Pre-loop failure (e.g. grounding raised before state was constructed
         # in a future refactor). Keep the keys present so analyzer schema
@@ -117,6 +124,11 @@ def build_trace_blob(
         blob["prefanout"] = {}
         blob["prefanout_hit_counts"] = {}
         blob["reasoning_per_turn"] = []
+        # Pre-loop failure → no seed was sent. Use None (not 0) so the
+        # analyzer doesn't bucket unrelated failures under a fake shared
+        # seed=0 (0 is a valid hash output in the live path too).
+        blob["seed"] = None
+        blob["system_fingerprints_per_turn"] = []
 
     if gathered is not None:
         blob["gathered"] = gathered.model_dump(mode="json")
