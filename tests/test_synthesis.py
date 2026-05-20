@@ -10,6 +10,8 @@ from services.retrieval.synthesis import (
     StreamFinal,
     SynthesisChunk,
     SynthesisError,
+    _build_streaming_system_prompt,
+    _build_system_prompt,
     _extract_citations,
     _fallback_parse_text,
     _format_user_prompt,
@@ -163,6 +165,61 @@ def test_format_user_prompt_skips_chain_section_when_no_evidence() -> None:
     where there's no chain to render."""
     out = _format_user_prompt("q", [_chunk(1, content="body")])
     assert "CHAIN:" not in out
+
+
+def test_system_prompt_carries_source_preference_rule() -> None:
+    """The synthesis LLM was returning empty answers when an agent-
+    session chunk (`claude_code:*`) landed as the primary doc and the
+    chunk content was meta-commentary about Probe rather than factual
+    content. The system prompt now instructs the LLM to treat
+    authoritative source docs (linear/notion/slack/github/wiki) as
+    primary truth and use session transcripts as supporting context
+    only. Verified 2026-05-20 against the multi-granola chronology
+    query — when curation lands on the live debugging session, the
+    prompt should keep the LLM from refusing to answer."""
+    from datetime import UTC, datetime
+
+    sp = _build_system_prompt(datetime(2026, 5, 20, tzinfo=UTC))
+    assert "Source-preference rule" in sp
+    # Anchors LLM on the chunk-header `source:` field, not body-text guessing
+    assert "`source:`" in sp
+    # Authoritative + session source-system identifiers both named
+    assert "claude_code" in sp and "codex" in sp
+    assert "linear" in sp and "notion" in sp and "slack" in sp
+    # Explicit session-query exception
+    assert "EXPLICITLY asking about" in sp or "explicitly asking about" in sp.lower()
+    # Don't-refuse-on-session-meta-text clause
+    assert "Session meta-text" in sp
+    # All-sessions fallback (no authoritative present)
+    assert "NO authoritative" in sp or "no authoritative" in sp.lower()
+
+
+def test_streaming_system_prompt_matches_nonstreaming_rule() -> None:
+    """Both prompt variants must carry identical Source-preference rule
+    text. Pre-fix the streaming variant dropped two clauses (the
+    explicit-session-query exception and the chunk-#1-fallback), which
+    would have over-suppressed legitimate session-focused queries on
+    the dashboard streaming path. Pin that the shared rule constant
+    flows through to both prompts identically."""
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 5, 20, tzinfo=UTC)
+    sp_nonstream = _build_system_prompt(now)
+    sp_stream = _build_streaming_system_prompt(now)
+    # Both must carry the same anchor signals
+    for marker in (
+        "Source-preference rule",
+        "`source:`",
+        "claude_code",
+        "codex",
+        "linear",
+        "notion",
+        "EXPLICITLY asking about",
+        "Session meta-text",
+        "NO authoritative",
+    ):
+        assert marker in sp_nonstream, f"non-streaming prompt missing: {marker}"
+        assert marker in sp_stream, f"streaming prompt missing: {marker}"
 
 
 def test_format_user_prompt_renders_neighbor_metadata_for_chronology() -> None:
