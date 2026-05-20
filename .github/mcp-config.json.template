@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "probe": {
+      "type": "http",
+      "url": "https://mcp.prbe.ai/mcp",
+      "headers": {
+        "X-Internal-Backend-Key": "__PROBE_MCP_INTERNAL_KEY__",
+        "X-Prbe-Customer": "__PROBE_MCP_CUSTOMER_ID__"
+      }
+    }
+  }
+}
