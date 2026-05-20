@@ -126,8 +126,8 @@ if ! psql_q "SELECT 1" >/dev/null 2>&1; then
 fi
 HEAD=$(psql_q "SELECT version_num FROM alembic_version" || echo "")
 echo "alembic head: $HEAD"
-if [[ "$HEAD" != "0086_inv_metadata" ]]; then
-    echo "Migrations not at expected head 0086_inv_metadata — run scripts/neon-migrate.sh local" >&2
+if [[ "$HEAD" != "0087_inv_metadata" ]]; then
+    echo "Migrations not at expected head 0087_inv_metadata — run scripts/neon-migrate.sh local" >&2
     exit 1
 fi
 

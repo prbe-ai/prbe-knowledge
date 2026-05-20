@@ -16,7 +16,7 @@ each row has exactly one of ``body_markdown`` or ``ref_doc_id`` populated.
 
 RLS: tenant_isolation matching every other tenant table.
 
-Revision ID: 0085_postmortem_templates
+Revision ID: 0086_postmortem_templates
 Revises: 0084_wiki_review_queue
 Create Date: 2026-05-18
 """
@@ -25,8 +25,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers
-revision = "0085_postmortem_templates"
-down_revision = "0084_wiki_review_queue"
+revision = "0086_postmortem_templates"
+down_revision = "0085_wiki_review_queue"
 branch_labels = None
 depends_on = None
 

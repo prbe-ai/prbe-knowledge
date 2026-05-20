@@ -16,7 +16,7 @@ the post-approval downstream-actions pipeline needs:
 All four columns are nullable: existing rows pre-date the post-approval
 pipeline and there is no sensible backfill value.
 
-Revision ID: 0083_inv_post_approval
+Revision ID: 0084_inv_post_approval
 Revises: 0082_visibility_columns
 Create Date: 2026-05-18
 """
@@ -26,8 +26,8 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
 # revision identifiers
-revision = "0083_inv_post_approval"
-down_revision = "0082_visibility_columns"
+revision = "0084_inv_post_approval"
+down_revision = "0083_visibility_columns"
 branch_labels = None
 depends_on = None
 
