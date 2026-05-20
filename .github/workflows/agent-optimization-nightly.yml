@@ -209,6 +209,13 @@ jobs:
           # Don't echo contents — secret is inlined.
           echo "MCP config rendered (keys redacted)."
 
+      - name: Ensure sub-agent staging dirs exist
+        # Defensive — subagents are told to mkdir -p these in the prompt,
+        # but if any subagent skips that step its title/body Write fails
+        # silently and the push step drops the branch. Create them here
+        # so the workflow never relies on subagent prompt compliance.
+        run: mkdir -p /tmp/auto-opt-staging/titles /tmp/auto-opt-staging/bodies
+
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
 
@@ -248,6 +255,7 @@ jobs:
           # The prompt's advisory blocklist asks the agent to write
           # /tmp/needs-human-*.md instead of touching dangerous paths.
           OPENED=0
+          : > /tmp/opened-prs.txt  # truncate; digest step reads this verbatim
           while read -r branch; do
             [ -z "$branch" ] && continue
             STAGING_TITLE="/tmp/auto-opt-staging/titles/$(basename "$branch")"
@@ -257,11 +265,13 @@ jobs:
               continue
             fi
             git push origin "$branch"
-            gh pr create --draft --label auto-optimization \
+            TITLE=$(cat "$STAGING_TITLE")
+            PR_URL=$(gh pr create --draft --label auto-optimization \
               --reviewer richardwei6 \
               --head "$branch" \
-              --title "$(cat "$STAGING_TITLE")" \
-              --body "$(cat "$STAGING_BODY")"
+              --title "$TITLE" \
+              --body "$(cat "$STAGING_BODY")")
+            echo "- $TITLE — $PR_URL" >> /tmp/opened-prs.txt
             OPENED=$((OPENED + 1))
           done < <(git branch --list 'auto-opt/*' --format='%(refname:short)')
           echo "opened=$OPENED" >> "$GITHUB_OUTPUT"
@@ -293,20 +303,26 @@ jobs:
             echo "status=$STATUS"
           } >> "$GITHUB_OUTPUT"
 
+          # PR list is whatever the push step actually opened (written
+          # verbatim to /tmp/opened-prs.txt). No gh search needed.
           PR_LIST=""
-          if [ "$PRS_OPENED" -gt 0 ]; then
-            PR_LIST=$(gh pr list --repo prbe-ai/prbe-knowledge \
-              --label auto-optimization --state open \
-              --search "created:>$(date -u -d '4 hours ago' +%FT%TZ)" \
-              --json number,title,url \
-              --jq '.[] | "- #\(.number): \(.title) — \(.url)"' || echo "")
+          if [ -s /tmp/opened-prs.txt ]; then
+            PR_LIST=$(cat /tmp/opened-prs.txt)
           fi
-          SKIP_LIST=$(jq -r '.skipped // [] | .[] | "  - \(.slug // .track // "?"): \(.reason)"' \
+          # Per-skip reason can be a paragraph; cap to ~120 chars per row
+          # so the digest stays readable when there are 4+ skips.
+          SKIP_LIST=$(jq -r '.skipped // [] | .[] | "  - \(.slug // .track // "?"): \(.reason)" | .[0:140]' \
             /tmp/orchestrator-summary.json 2>/dev/null || echo "")
 
+          # Top-of-digest order: highest-signal lines first (status + run
+          # URL + PRs), then verbose skip rationale last. Sendblue's
+          # iMessage cap (~1000 chars) truncates from the bottom, so if
+          # anything gets cut it's the skipped-pattern detail, not the
+          # action items.
           {
             echo "Probe nightly improvement run — $TARGET_DATE"
             echo "Status: $STATUS | PRs drafted: $PRS_OPENED | Candidates: $CANDIDATES | Skipped: $SKIPPED | needs-human: $NEEDS_HUMAN"
+            echo "Run: $RUN_URL"
             echo ""
             if [ -n "$PR_LIST" ]; then
               echo "Drafted PRs:"
@@ -318,7 +334,6 @@ jobs:
               echo "$SKIP_LIST"
               echo ""
             fi
-            echo "Run: $RUN_URL"
           } > /tmp/digest.txt
           cat /tmp/digest.txt
 
@@ -367,9 +382,10 @@ jobs:
             echo "::warning::Sendblue secrets missing (need SENDBLUE_API_KEY_ID + SENDBLUE_API_SECRET + SENDBLUE_TO_NUMBER) — skipping iMessage."
             exit 0
           fi
-          # Sendblue's blue-bubble cap is ~1000 chars per message; truncate
-          # the digest if longer and append the run URL so it always lands.
-          BODY=$(head -c 800 /tmp/digest.txt)
+          # Sendblue's blue-bubble cap is ~1000 chars per message; the
+          # digest is ordered status+url+PRs-first so a truncation here
+          # only ever loses the trailing skipped-pattern rationale.
+          BODY=$(head -c 1000 /tmp/digest.txt)
           PAYLOAD=$(jq -n \
             --arg number "$SENDBLUE_TO_NUMBER" \
             --arg from_number "${SENDBLUE_FROM_NUMBER:-}" \

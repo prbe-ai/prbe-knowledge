@@ -272,7 +272,9 @@ Use this template when `track == "generic"`:
 >
 > 7. **Commit** on the worktree's branch. Do NOT push.
 >
-> 8. **Write PR title + body** outside `.git/`:
+> 8. **Write PR title + body** outside `.git/`. **First**
+>    `mkdir -p /tmp/auto-opt-staging/titles /tmp/auto-opt-staging/bodies`
+>    (the workflow pre-creates these too, but be defensive). Then:
 >    - `/tmp/auto-opt-staging/titles/<branch-basename>` — ≤70 chars
 >    - `/tmp/auto-opt-staging/bodies/<branch-basename>` — markdown body:
 >      - **Opportunity** — 1 paragraph + cited evidence
@@ -282,6 +284,10 @@ Use this template when `track == "generic"`:
 >      - **Expected behavior delta** — concrete prediction
 >      - **Probe MCP queries used** — list of `search_knowledge` queries
 >      - **Rollback note** — exact `git revert` command
+>
+>    **Skipping this step means the workflow drops your branch with a
+>    `missing title/body` warning and your work is lost on the
+>    ephemeral runner.** Always do step 8 before returning `"ready"`.
 >
 > 9. Return JSON: `{"branch": "auto-opt/<slug>-<date>", "status": "ready"}`
 >    or `{"status": "skipped", "reason": "..."}`.
