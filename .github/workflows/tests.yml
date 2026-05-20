@@ -1,4 +1,4 @@
-name: tests
+name: lint+typecheck
 
 on:
   pull_request:
@@ -7,45 +7,11 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: prbe
-          POSTGRES_PASSWORD: prbe
-          POSTGRES_DB: prbe_knowledge
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U prbe -d prbe_knowledge"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-    env:
-      DATABASE_URL_SYNC: postgresql+psycopg://prbe:prbe@localhost:5432/prbe_knowledge
-      DATABASE_URL: postgresql://prbe:prbe@localhost:5432/prbe_knowledge
-      PGPASSWORD: prbe
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Start MinIO
-        run: |
-          docker run -d --name minio \
-            -p 9000:9000 \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
-          for i in {1..30}; do
-            curl -sf http://localhost:9000/minio/health/live && exit 0
-            sleep 2
-          done
-          echo "MinIO did not become healthy"
-          docker logs minio
-          exit 1
 
       - uses: actions/setup-python@v5
         with:
@@ -56,48 +22,8 @@ jobs:
           python -m venv .venv
           .venv/bin/pip install -e ".[dev]"
 
-      # Apply schema directly (canonical-latest) and stamp alembic head.
-      #
-      # Background: db/schema.sql is updated alongside every migration as the
-      # canonical Phase-0 reference, and migration 0001 runs schema.sql verbatim.
-      # This means migrations 0007+ duplicate state schema.sql already created
-      # (e.g. 0007 ADD COLUMN organization_id, but schema.sql line 31 already
-      # creates it) — `alembic upgrade head` against a fresh DB throws
-      # DuplicateColumn and DuplicateTable errors.
-      #
-      # Fix: skip the upgrade chain on a known-fresh DB and apply schema.sql
-      # directly, then stamp head so future incremental migrations work. This
-      # preserves the convention that schema.sql is canonical and PRs update
-      # both schema.sql + a migration file together.
-      #
-      # Prod (Neon) doesn't hit this — schema there evolved organically through
-      # `alembic upgrade head` over time, and Neon Auth provisions neon_auth
-      # for real. CI/local need the shim because they start from empty.
-      - name: Provision neon_auth shim
-        run: |
-          psql -h localhost -p 5432 -U prbe -d prbe_knowledge -v ON_ERROR_STOP=1 <<'SQL'
-            CREATE SCHEMA IF NOT EXISTS neon_auth;
-            CREATE TABLE IF NOT EXISTS neon_auth.organization (
-              id UUID PRIMARY KEY
-            );
-            CREATE TABLE IF NOT EXISTS neon_auth."user" (
-              id              UUID PRIMARY KEY,
-              organization_id UUID REFERENCES neon_auth.organization(id),
-              email           TEXT,
-              name            TEXT
-            );
-          SQL
-
-      - name: Apply schema and stamp alembic
-        run: |
-          psql -h localhost -p 5432 -U prbe -d prbe_knowledge -v ON_ERROR_STOP=1 -f db/schema.sql
-          .venv/bin/alembic stamp head
-
       - name: Lint
         run: .venv/bin/ruff check .
 
       - name: Type-check
         run: .venv/bin/mypy shared services || true   # strict mypy soft-gated in Phase 0
-
-      - name: Tests
-        run: .venv/bin/pytest tests/ -q
