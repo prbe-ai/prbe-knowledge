@@ -1670,3 +1670,239 @@ def test_metadata_chunk_falls_back_to_author_id_when_no_display_name() -> None:
 
     text = _metadata_text(doc)
     assert "author: richardwei6" in text
+
+
+# ---------------------------------------------------------------------------
+# OAuth resilience — refresh_token persistence, refresh exchange, health probe
+# ---------------------------------------------------------------------------
+
+
+def _make_slack_oauth_ctx(handler) -> ConnectorContext:
+    from pydantic import SecretStr
+
+    settings = Settings(
+        environment="local",
+        slack_client_id="cid_test",
+        slack_client_secret=SecretStr("secret_test"),
+    )
+    return ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_persists_refresh_and_expires_when_rotated() -> None:
+    from datetime import UTC, datetime
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "access_token": "xoxb-new",
+                "refresh_token": "xoxe-1-refresh",
+                "expires_in": 43200,
+                "scope": "channels:read,users:read",
+            },
+        )
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    before = datetime.now(UTC)
+    token = await slack.exchange_oauth_code(code="c", redirect_uri="https://x/cb")
+    assert token.access_token == "xoxb-new"
+    assert token.refresh_token == "xoxe-1-refresh"
+    assert token.expires_at is not None
+    delta = (token.expires_at - before).total_seconds()
+    assert 43190 <= delta <= 43210
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_legacy_no_rotation_no_expires_at() -> None:
+    """Slack OAuth apps with token rotation disabled return only access_token;
+    refresh_token + expires_at stay None."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"ok": True, "access_token": "xoxb-legacy", "scope": "channels:read"},
+        )
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    token = await slack.exchange_oauth_code(code="c", redirect_uri="https://x/cb")
+    assert token.refresh_token is None
+    assert token.expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_slack_exchange_refresh_token_no_refresh_token_raises_permanent() -> None:
+    from shared.exceptions import PermanentSourceError
+    from shared.models import IntegrationToken
+
+    ctx = _make_slack_oauth_ctx(lambda req: httpx.Response(200, json={}))
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        access_token="xoxb-old",
+        refresh_token=None,
+    )
+    with pytest.raises(PermanentSourceError, match="Token Rotation"):
+        await slack.exchange_refresh_token(token)
+
+
+@pytest.mark.asyncio
+async def test_slack_exchange_refresh_token_success_rotates() -> None:
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "access_token": "xoxb-new",
+                "refresh_token": "xoxe-1-new-refresh",
+                "expires_in": 43200,
+            },
+        )
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    old = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        access_token="xoxb-old",
+        refresh_token="xoxe-1-old-refresh",
+        webhook_secret="ws_secret",
+    )
+    new = await slack.exchange_refresh_token(old)
+    assert new.access_token == "xoxb-new"
+    assert new.refresh_token == "xoxe-1-new-refresh"
+    assert new.customer_id == "cust-1"
+    # webhook_secret preserved across refresh (signing secret is
+    # workspace-scoped, not token-scoped).
+    assert new.webhook_secret == "ws_secret"
+
+
+@pytest.mark.asyncio
+async def test_slack_exchange_refresh_token_ok_false_raises_permanent() -> None:
+    """Slack's quirk: HTTP 200 with `ok=false` on permanent failures like
+    `invalid_refresh_token`. Treat as permanent so the cron flips
+    auth_failed."""
+    from shared.exceptions import PermanentSourceError
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "error": "invalid_refresh_token"})
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    old = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.SLACK,
+        access_token="x",
+        refresh_token="rotten",
+    )
+    with pytest.raises(PermanentSourceError, match="invalid_refresh_token"):
+        await slack.exchange_refresh_token(old)
+
+
+@pytest.mark.asyncio
+async def test_slack_verify_token_health_ok_returns_true() -> None:
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/auth.test"
+        return httpx.Response(200, json={"ok": True, "team_id": "T123", "user_id": "U456"})
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.SLACK, access_token="x"
+    )
+    assert await slack.verify_token_health(token) is True
+
+
+@pytest.mark.asyncio
+async def test_slack_verify_token_health_token_revoked_returns_false() -> None:
+    """Slack returns HTTP 200 with ok=false + error='token_revoked' when the
+    user explicitly revokes. The cron must flip auth_failed on this signal."""
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "error": "token_revoked"})
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.SLACK, access_token="x"
+    )
+    assert await slack.verify_token_health(token) is False
+
+
+@pytest.mark.asyncio
+async def test_slack_verify_token_health_account_inactive_returns_false() -> None:
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "error": "account_inactive"})
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.SLACK, access_token="x"
+    )
+    assert await slack.verify_token_health(token) is False
+
+
+@pytest.mark.asyncio
+async def test_slack_verify_token_health_invalid_auth_returns_false() -> None:
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "error": "invalid_auth"})
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.SLACK, access_token="x"
+    )
+    assert await slack.verify_token_health(token) is False
+
+
+@pytest.mark.asyncio
+async def test_slack_verify_token_health_rate_limited_raises_transient() -> None:
+    """ok=false with a transient error (rate_limited) must NOT flip
+    auth_failed — those are recoverable."""
+    from shared.exceptions import TransientSourceError
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"ok": False, "error": "rate_limited"})
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.SLACK, access_token="x"
+    )
+    with pytest.raises(TransientSourceError):
+        await slack.verify_token_health(token)
+
+
+@pytest.mark.asyncio
+async def test_slack_verify_token_health_5xx_raises_transient() -> None:
+    from shared.exceptions import TransientSourceError
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="down")
+
+    ctx = _make_slack_oauth_ctx(handler)
+    slack = build_connector(SourceSystem.SLACK, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.SLACK, access_token="x"
+    )
+    with pytest.raises(TransientSourceError):
+        await slack.verify_token_health(token)

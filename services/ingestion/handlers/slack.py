@@ -22,7 +22,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 import httpx
@@ -77,6 +77,21 @@ _REQUEST_TS_SLACK_MAX_AGE_SEC = 5 * 60  # Slack recommends rejecting older signe
 _HISTORY_LIMITERS: dict[int, AsyncLimiter] = {}
 
 _DISPLAY_NAME_MAX_LEN = 80
+
+
+def _expires_at_from_expires_in(expires_in: Any) -> datetime | None:
+    """Slack returns `expires_in` as seconds-from-now (int) on rotated tokens.
+    Convert to a UTC datetime so the standard `integration_tokens.expires_at`
+    column can drive `list_tokens_expiring_within` for proactive refresh.
+    Returns None when the field is absent (legacy long-lived bot token path)
+    or malformed."""
+    try:
+        seconds = int(expires_in)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return datetime.now(UTC) + timedelta(seconds=seconds)
 
 
 # Slack message-formatting tokens that wrap canonical IDs we want to render
@@ -1179,12 +1194,143 @@ class SlackConnector(Connector):
 
             raise PermanentSourceError(f"slack oauth failed: {body.get('error')}")
 
+        # Slack returns refresh_token + expires_in only when the OAuth app has
+        # "Token Rotation" enabled in the app config (post-2022 feature). For
+        # legacy apps the access_token is long-lived; both fields stay None
+        # and the refresh cron leaves the row alone.
         return IntegrationToken(
             customer_id="",
             source_system=SourceSystem.SLACK,
             access_token=body["access_token"],
+            refresh_token=body.get("refresh_token"),
+            expires_at=_expires_at_from_expires_in(body.get("expires_in")),
             scope=body.get("scope"),
             webhook_secret=None,
+        )
+
+    async def exchange_refresh_token(
+        self, token: IntegrationToken
+    ) -> IntegrationToken:
+        """Exchange the persisted refresh_token for a new access_token.
+
+        Method name matches `scripts/cron_token_refresh.py`'s convention so
+        Slack automatically participates in the existing refresh cron once
+        a token with refresh_token + `expires_at <= now+1h` exists.
+
+        Slack rotation: tokens issued via OAuth apps configured for token
+        rotation expire in ~12 hours and include a refresh_token in the
+        exchange response. Legacy apps issue long-lived tokens with no
+        refresh_token; this method raises PermanentSourceError so the
+        caller flags auth_failed.
+        """
+        from shared.exceptions import (
+            MissingSecret,
+            PermanentSourceError,
+            TransientSourceError,
+        )
+
+        if not token.refresh_token:
+            raise PermanentSourceError(
+                "slack exchange_refresh_token called without a stored refresh_token"
+                " — OAuth app doesn't have Token Rotation enabled; reconnect required",
+            )
+        cid = self.settings.slack_client_id
+        secret = self.settings.slack_client_secret
+        if not cid or secret is None:
+            raise MissingSecret(
+                "SLACK_CLIENT_ID / SLACK_CLIENT_SECRET not configured"
+            )
+        resp = await self.http.post(
+            f"{_SLACK_API}/oauth.v2.access",
+            data={
+                "client_id": cid,
+                "client_secret": secret.get_secret_value(),
+                "grant_type": "refresh_token",
+                "refresh_token": token.refresh_token,
+            },
+        )
+        if resp.status_code >= 500:
+            raise TransientSourceError(
+                f"slack oauth.v2.access (refresh) returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        if resp.status_code >= 400:
+            raise PermanentSourceError(
+                f"slack oauth.v2.access (refresh) returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        body = resp.json()
+        # Slack returns ok=false with HTTP 200 on permanent failures (e.g.
+        # `invalid_refresh_token`, `token_revoked`). Treat those as permanent
+        # so the cron flips status auth_failed.
+        if not body.get("ok"):
+            raise PermanentSourceError(
+                f"slack refresh failed: {body.get('error')}",
+                body=str(body)[:500],
+            )
+        new_access = body.get("access_token")
+        if not new_access:
+            raise PermanentSourceError(
+                "slack refresh 200 ok=true but missing access_token",
+                body=str(body)[:500],
+            )
+        return IntegrationToken(
+            customer_id=token.customer_id,
+            source_system=SourceSystem.SLACK,
+            access_token=new_access,
+            # Slack rotates refresh_tokens on every refresh per their docs;
+            # fall back to the old one if the response omits it (defensive).
+            refresh_token=body.get("refresh_token") or token.refresh_token,
+            expires_at=_expires_at_from_expires_in(body.get("expires_in")),
+            scope=body.get("scope") or token.scope,
+            webhook_secret=token.webhook_secret,
+        )
+
+    async def verify_token_health(self, token: IntegrationToken) -> bool:
+        """Liveness probe: POST `auth.test` and return True on ok=true.
+
+        Returns False when Slack responds with `ok=false` AND error in the
+        revoked-credential family (`token_revoked`, `account_inactive`,
+        `invalid_auth`). Other ok=false errors (e.g. `not_authed`) and
+        non-200 statuses propagate as raises so the caller can distinguish
+        "definitely-bad" from "we-don't-know". Used by the periodic
+        token-health cron to flip `integration_tokens.status` from
+        `active` to `auth_failed`.
+
+        Slack semantics differ from Linear/Notion: auth.test returns HTTP
+        200 even for revoked tokens (the body's `error` field carries the
+        signal). We branch on `error` membership rather than status code.
+        """
+        from shared.exceptions import TransientSourceError
+
+        resp = await self.http.post(
+            f"{_SLACK_API}/auth.test",
+            headers={"Authorization": f"Bearer {token.access_token}"},
+        )
+        if resp.status_code != 200:
+            raise TransientSourceError(
+                f"slack auth.test returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        body = resp.json()
+        if body.get("ok"):
+            return True
+        # Per Slack's docs, these errors mean the token is permanently dead:
+        #   - token_revoked: user explicitly revoked
+        #   - account_inactive: workspace owner deactivated the user
+        #   - invalid_auth: token format invalid (rotated out + stored
+        #     bytes are stale)
+        # Other ok=false errors (rate_limited, internal_error, etc.) are
+        # transient — leave the row active.
+        permanent_errors = {"token_revoked", "account_inactive", "invalid_auth"}
+        if body.get("error") in permanent_errors:
+            return False
+        raise TransientSourceError(
+            f"slack auth.test ok=false error={body.get('error')!r} — inconclusive",
+            body=str(body)[:500],
         )
 
     # ------------------------------------------------------------------
