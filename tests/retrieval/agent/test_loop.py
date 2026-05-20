@@ -23,10 +23,8 @@ from fastapi import HTTPException
 
 from services.retrieval.agent.loop import (
     _affinity_key,
-    _build_prefanout_chunk_content,
     _build_prefanout_doc_meta,
     _build_user_message,
-    _coerce_lenient,
     _derive_source_system_from_doc_id,
     _empty_passthrough,
     _extract_cache_hit_rate,
@@ -503,146 +501,6 @@ def test_derive_source_system_from_doc_id_unknown_returns_blank() -> None:
     assert _derive_source_system_from_doc_id("") == ""
     assert _derive_source_system_from_doc_id("nocolon") == ""
     assert _derive_source_system_from_doc_id("unknown_source:foo:bar") == ""
-
-
-def test_build_prefanout_chunk_content_indexes_by_chunk_id_and_doc_id() -> None:
-    """Maps (chunk_id, doc_id) → content from vector/bm25/graph hits.
-    The pair key is defensive against future chunk_id namespace
-    changes that could let a stray collision coerce the model into
-    citing the right body under the wrong doc. inferred_edge is
-    skipped (doc-level, not chunk-level)."""
-    pf = {"sub_queries": [{
-        "vector": [
-            {"chunk_id": "ck-1", "doc_id": "d1", "content": "verbatim body of chunk 1"},
-            {"chunk_id": "ck-2", "doc_id": "d2", "content": "verbatim body of chunk 2"},
-        ],
-        "bm25": [
-            {"chunk_id": "ck-3", "doc_id": "d3", "content": "verbatim body of chunk 3"},
-        ],
-        "graph": [],
-        "inferred_edge": [
-            # Doc-level: should be skipped, not indexed
-            {"doc_id": "d4", "anchor_doc_id": "d1", "edge_type": "RELATES_TO"},
-        ],
-    }]}
-    out = _build_prefanout_chunk_content(pf)
-    assert out[("ck-1", "d1")] == "verbatim body of chunk 1"
-    assert out[("ck-2", "d2")] == "verbatim body of chunk 2"
-    assert out[("ck-3", "d3")] == "verbatim body of chunk 3"
-    # inferred_edge hits aren't indexed
-    assert ("d4", "d4") not in out
-    # Bare chunk_id without doc context is NOT a key — collision defense
-    assert "ck-1" not in out
-
-
-def test_build_prefanout_chunk_content_first_write_wins() -> None:
-    """Same (chunk_id, doc_id) surfaces in multiple channels (vector + bm25);
-    first non-empty content wins."""
-    pf = {"sub_queries": [{
-        "vector": [{"chunk_id": "ck-1", "doc_id": "d1", "content": "from vector"}],
-        "bm25": [{"chunk_id": "ck-1", "doc_id": "d1", "content": "from bm25"}],
-        "graph": [], "inferred_edge": [],
-    }]}
-    out = _build_prefanout_chunk_content(pf)
-    assert out[("ck-1", "d1")] == "from vector"
-
-
-def test_build_prefanout_chunk_content_empty_or_missing_skipped() -> None:
-    """Hits missing chunk_id or doc_id, or with empty/whitespace-only
-    content, don't pollute the map."""
-    pf = {"sub_queries": [{
-        "vector": [
-            {"chunk_id": "ck-1", "doc_id": "d1", "content": ""},  # empty
-            {"chunk_id": "ck-2", "doc_id": "d2", "content": "   "},  # whitespace-only
-            {"doc_id": "d3", "content": "no chunk_id"},  # missing chunk_id
-            {"chunk_id": "ck-no-doc", "content": "no doc_id"},  # missing doc_id
-            {"chunk_id": "ck-4", "doc_id": "d4", "content": "valid"},
-        ],
-        "bm25": [], "graph": [], "inferred_edge": [],
-    }]}
-    out = _build_prefanout_chunk_content(pf)
-    assert ("ck-1", "d1") not in out
-    assert ("ck-2", "d2") not in out
-    assert out[("ck-4", "d4")] == "valid"
-
-
-def test_build_prefanout_chunk_content_handles_empty_prefanout() -> None:
-    """None / empty / no-sub_queries all map to empty dict."""
-    assert _build_prefanout_chunk_content(None) == {}
-    assert _build_prefanout_chunk_content({}) == {}
-    assert _build_prefanout_chunk_content({"sub_queries": []}) == {}
-
-
-def test_coerce_lenient_overwrites_model_content_with_prefanout_verbatim() -> None:
-    """The harness is authoritative for chunk content. When the model
-    emits a paraphrased / summarized content but the chunk_id is in
-    the prefanout, we overwrite with the verbatim chunk body.
-    This is the fix for the live-traced 2026-05-20 issue where the
-    agent emitted ~150-char summary blurbs that starved downstream
-    synthesis of the factual content needed to answer."""
-    from types import SimpleNamespace
-    pf = {"sub_queries": [{
-        "vector": [
-            {
-                "chunk_id": "ck-real",
-                "doc_id": "linear:org:issue:abc",
-                "content": "VERBATIM: 1800-char chunk body from DB with full factual content...",
-                "source_system": "linear",
-                "title": "PRB-18: Multi-Granola Plan",
-            },
-        ],
-        "bm25": [], "graph": [], "inferred_edge": [],
-    }]}
-    raw = {
-        "entities": [],
-        "chunks": [
-            {
-                "chunk_id": "ck-real",
-                "doc_id": "linear:org:issue:abc",
-                # The model paraphrased — this should be overwritten
-                "content": "PARAPHRASED: short summary blurb… (truncated)",
-                "why_relevant": "primary doc for the query",
-            },
-        ],
-        "gatherer_notes": {},
-    }
-    state = SimpleNamespace(
-        prefanout=pf, turn_count=1, tools_fired=["execute_search"],
-    )
-    out = _coerce_lenient(raw, state)
-    assert out["chunks"][0]["content"].startswith("VERBATIM")
-    assert "PARAPHRASED" not in out["chunks"][0]["content"]
-
-
-def test_coerce_lenient_falls_back_when_chunk_id_not_in_prefanout() -> None:
-    """For chunk_ids the agent discovered via fetch_doc/subgraph (not
-    in the initial prefanout), keep the model's content. This is the
-    graceful-degradation path until we extend the chunk-content map
-    to track tool-call results too."""
-    from types import SimpleNamespace
-    pf = {"sub_queries": [{
-        "vector": [
-            {"chunk_id": "ck-known", "doc_id": "d1", "content": "verbatim"},
-        ],
-        "bm25": [], "graph": [], "inferred_edge": [],
-    }]}
-    raw = {
-        "entities": [],
-        "chunks": [
-            {
-                "chunk_id": "ck-from-fetch-doc",  # not in prefanout
-                "doc_id": "d2",
-                "content": "agent-supplied content from fetch_doc",
-                "why_relevant": "follow-up via fetch_doc",
-            },
-        ],
-        "gatherer_notes": {},
-    }
-    state = SimpleNamespace(
-        prefanout=pf, turn_count=2, tools_fired=["execute_search", "fetch_doc"],
-    )
-    out = _coerce_lenient(raw, state)
-    assert out["chunks"][0]["content"] == "agent-supplied content from fetch_doc"
 
 
 def test_build_prefanout_doc_meta_first_complete_wins() -> None:
