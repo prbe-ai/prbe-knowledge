@@ -567,7 +567,24 @@ class Worker:
             try:
                 await dispatch_investigation(payload)
             except DispatchExhausted:
+                # Two writes, both required for the dashboard to
+                # surface the failed dispatch:
+                #   1. Flag the live INCIDENT doc so a future
+                #      "Re-trigger investigation" action knows it's
+                #      eligible.
+                #   2. Materialise an `incident_investigations` row
+                #      in state='failed_pending_review'. Without
+                #      this the /incidents list (which JOINs against
+                #      incident_investigations) shows nothing, and
+                #      the user can't review or act on the incident.
+                from services.ingestion.investigation_state import (
+                    upsert_failed_pending_review,
+                )
                 await mark_dispatch_failed(
+                    customer_id=customer_id,
+                    incident_doc_id=incident_doc_id,
+                )
+                await upsert_failed_pending_review(
                     customer_id=customer_id,
                     incident_doc_id=incident_doc_id,
                 )
