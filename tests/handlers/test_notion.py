@@ -1156,3 +1156,218 @@ async def test_identify_workspaces_returns_empty_when_metadata_missing() -> None
         install_metadata=None,
     )
     assert await notion.identify_workspaces(token) == []
+
+
+# ---------------------------------------------------------------------------
+# exchange_oauth_code now persists expires_at when token rotation is enabled
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_persists_expires_at_when_rotated() -> None:
+    """Notion's rotated-token integrations include `expires_in` (seconds)
+    in the exchange response. The handler must surface it as a UTC datetime
+    on `IntegrationToken.expires_at` so the refresh cron can pick the row
+    up before the access_token dies."""
+    from datetime import UTC, datetime
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "ntn_access_xyz",
+                "refresh_token": "ntn_refresh_abc",
+                "expires_in": 3600,
+                "workspace_id": "ws_alpha",
+                "bot_id": "bot_42",
+            },
+        )
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    before = datetime.now(UTC)
+    token = await notion.exchange_oauth_code(
+        code="x", redirect_uri="https://example.com/cb"
+    )
+    assert token.expires_at is not None
+    delta = (token.expires_at - before).total_seconds()
+    assert 3590 <= delta <= 3610
+
+
+@pytest.mark.asyncio
+async def test_exchange_oauth_code_legacy_long_lived_no_expires_at() -> None:
+    """Legacy long-lived integrations omit expires_in; expires_at stays None
+    so the refresh cron doesn't pick the row up."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "ntn_access_xyz",
+                "workspace_id": "ws_alpha",
+                "bot_id": "bot_42",
+            },
+        )
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = await notion.exchange_oauth_code(
+        code="x", redirect_uri="https://example.com/cb"
+    )
+    assert token.expires_at is None
+
+
+# ---------------------------------------------------------------------------
+# exchange_refresh_token
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exchange_refresh_token_no_refresh_token_raises_permanent() -> None:
+    """Legacy tokens minted before rotation have no refresh_token; caller
+    flips auth_failed and prompts reconnect."""
+    from shared.exceptions import PermanentSourceError
+    from shared.models import IntegrationToken
+
+    ctx = _oauth_ctx_with_secret(handler=lambda req: httpx.Response(200, json={}))
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.NOTION,
+        access_token="ntn_legacy",
+        refresh_token=None,
+    )
+    with pytest.raises(PermanentSourceError, match="without a stored refresh_token"):
+        await notion.exchange_refresh_token(token)
+
+
+@pytest.mark.asyncio
+async def test_exchange_refresh_token_success_rotates() -> None:
+    from shared.models import IntegrationToken
+
+    seen: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "ntn_new",
+                "refresh_token": "ntn_new_refresh",
+                "expires_in": 3600,
+            },
+        )
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    old = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.NOTION,
+        access_token="ntn_old",
+        refresh_token="ntn_old_refresh",
+    )
+    new = await notion.exchange_refresh_token(old)
+
+    assert seen["body"] == {
+        "grant_type": "refresh_token",
+        "refresh_token": "ntn_old_refresh",
+    }
+    assert new.access_token == "ntn_new"
+    assert new.refresh_token == "ntn_new_refresh"
+    assert new.customer_id == "cust-1"
+    assert new.expires_at is not None
+
+
+@pytest.mark.asyncio
+async def test_exchange_refresh_token_4xx_raises_permanent() -> None:
+    from shared.exceptions import PermanentSourceError
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    old = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.NOTION,
+        access_token="x",
+        refresh_token="rotten",
+    )
+    with pytest.raises(PermanentSourceError):
+        await notion.exchange_refresh_token(old)
+
+
+@pytest.mark.asyncio
+async def test_exchange_refresh_token_5xx_raises_transient() -> None:
+    from shared.exceptions import TransientSourceError
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="down")
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    old = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.NOTION,
+        access_token="x",
+        refresh_token="r",
+    )
+    with pytest.raises(TransientSourceError):
+        await notion.exchange_refresh_token(old)
+
+
+# ---------------------------------------------------------------------------
+# verify_token_health
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_verify_token_health_healthy_returns_true() -> None:
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/users/me"
+        return httpx.Response(200, json={"id": "bot_42", "type": "bot"})
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.NOTION, access_token="x"
+    )
+    assert await notion.verify_token_health(token) is True
+
+
+@pytest.mark.asyncio
+async def test_verify_token_health_401_returns_false() -> None:
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401, json={"code": "unauthorized", "message": "Invalid token"}
+        )
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.NOTION, access_token="x"
+    )
+    assert await notion.verify_token_health(token) is False
+
+
+@pytest.mark.asyncio
+async def test_verify_token_health_5xx_raises_transient() -> None:
+    from shared.exceptions import TransientSourceError
+    from shared.models import IntegrationToken
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={})
+
+    ctx = _oauth_ctx_with_secret(handler=handler)
+    notion = build_connector(SourceSystem.NOTION, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1", source_system=SourceSystem.NOTION, access_token="x"
+    )
+    with pytest.raises(TransientSourceError):
+        await notion.verify_token_health(token)

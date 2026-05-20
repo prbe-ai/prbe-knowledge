@@ -39,7 +39,7 @@ import hashlib
 import hmac
 import json
 from collections.abc import AsyncIterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
 from services.ingestion.chunker import count_tokens
@@ -182,6 +182,22 @@ _DEFAULT_WORKSPACE_PRINCIPAL = "notion-default"
 # is what the gateway POSTs to (via /api/oauth/notion/exchange) once it
 # has a verified-state callback in hand.
 _NOTION_OAUTH_TOKEN = "https://api.notion.com/v1/oauth/token"
+_NOTION_API_BASE = "https://api.notion.com/v1"
+
+
+def _expires_at_from_expires_in(expires_in: Any) -> datetime | None:
+    """Notion returns `expires_in` as seconds-from-now (int) on token-rotated
+    integrations. Convert to a UTC datetime so the standard
+    `integration_tokens.expires_at` column can drive `list_tokens_expiring_within`
+    for proactive refresh. Returns None when the field is absent (legacy
+    long-lived token path) or malformed."""
+    try:
+        seconds = int(expires_in)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return datetime.now(UTC) + timedelta(seconds=seconds)
 
 
 # ---- source-shape discriminators -------------------------------------------
@@ -981,6 +997,11 @@ class NotionConnector(Connector):
             source_system=SourceSystem.NOTION,
             access_token=access_token,
             refresh_token=body.get("refresh_token"),
+            # Notion returns `expires_in` only when the integration is
+            # configured for token rotation (post-Sep-2024 feature). Without
+            # rotation, tokens are long-lived; expires_at stays None and the
+            # refresh cron leaves the row alone.
+            expires_at=_expires_at_from_expires_in(body.get("expires_in")),
             scope=None,  # Notion uses per-integration capability checkboxes
             install_metadata={
                 "workspace_id": workspace_id,
@@ -990,6 +1011,110 @@ class NotionConnector(Connector):
                 "owner": body.get("owner"),
             },
         )
+
+    async def exchange_refresh_token(
+        self, token: IntegrationToken
+    ) -> IntegrationToken:
+        """Exchange the persisted refresh_token for a new access_token.
+
+        Method name matches `scripts/cron_token_refresh.py`'s convention so
+        Notion automatically participates in the existing refresh cron once
+        a token with a refresh_token and `expires_at <= now+1h` exists.
+
+        Notion's token rotation: when the integration is configured with
+        rotated tokens, the exchange response includes refresh_token +
+        expires_in (~1 hour for the access_token). Legacy long-lived
+        integrations have no refresh_token; this method raises
+        PermanentSourceError so the caller can flag auth_failed.
+        """
+        from shared.exceptions import (
+            MissingSecret,
+            PermanentSourceError,
+            TransientSourceError,
+        )
+
+        if not token.refresh_token:
+            raise PermanentSourceError(
+                "notion exchange_refresh_token called without a stored refresh_token"
+                " — integration predates token rotation; reconnect required",
+            )
+        cid = self.settings.notion_client_id
+        secret = self.settings.notion_client_secret
+        if not cid or secret is None:
+            raise MissingSecret(
+                "NOTION_CLIENT_ID / NOTION_CLIENT_SECRET not configured"
+            )
+        resp = await self.http.post(
+            _NOTION_OAUTH_TOKEN,
+            auth=(cid, secret.get_secret_value()),
+            headers={"Notion-Version": _NOTION_VERSION},
+            json={
+                "grant_type": "refresh_token",
+                "refresh_token": token.refresh_token,
+            },
+        )
+        if resp.status_code >= 500:
+            raise TransientSourceError(
+                f"notion /oauth/token (refresh) returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        if resp.status_code >= 400:
+            raise PermanentSourceError(
+                f"notion /oauth/token (refresh) returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        body = resp.json()
+        new_access = body.get("access_token")
+        if not new_access:
+            raise PermanentSourceError(
+                "notion refresh_token 200 but missing access_token",
+                body=str(body)[:500],
+            )
+        return IntegrationToken(
+            customer_id=token.customer_id,
+            source_system=SourceSystem.NOTION,
+            access_token=new_access,
+            # Notion rotates refresh_tokens on every refresh per their docs;
+            # fall back to the old one if the response omits it (defensive).
+            refresh_token=body.get("refresh_token") or token.refresh_token,
+            expires_at=_expires_at_from_expires_in(body.get("expires_in")),
+        )
+
+    async def verify_token_health(self, token: IntegrationToken) -> bool:
+        """Liveness probe: GET `/v1/users/me` and return True on success.
+
+        Returns False when Notion responds 401 (token revoked / invalidated
+        out of band). Any other status — including transient 5xx — propagates
+        as a raised exception so the caller can distinguish "definitely-bad"
+        from "we-don't-know". Used by the periodic token-health cron to
+        flip `integration_tokens.status` from `active` to `auth_failed`
+        without waiting for the next webhook delivery to fail.
+
+        Notion returns 401 with `{"code": "unauthorized"}` when the token
+        is invalidated. We check status_code only; the body's `code` field
+        is consistent across revocation modes (user uninstalled,
+        integration deleted, admin revoked).
+        """
+        resp = await self.http.get(
+            f"{_NOTION_API_BASE}/users/me",
+            headers={
+                "Authorization": f"Bearer {token.access_token}",
+                "Notion-Version": _NOTION_VERSION,
+            },
+        )
+        if resp.status_code == 401:
+            return False
+        if resp.status_code != 200:
+            from shared.exceptions import TransientSourceError
+
+            raise TransientSourceError(
+                f"notion users/me probe returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        return True
 
     # ------------------------------------------------------------------
     # 7. workspace identification
