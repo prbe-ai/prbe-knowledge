@@ -154,7 +154,11 @@ def test_summarize_trace_happy_path_extracts_all_fields() -> None:
     assert out["turn_count"] == 2
     assert out["tool_call_sequence"] == ["vector_search", "bm25_search"]
     assert out["turn_1_tools_fired"] == ["vector_search", "bm25_search"]
-    assert set(out["turn_1_missed_channels"]) == {"graph_search", "inferred_edge_search"}
+    # `turn_1_missed_channels` derives from prefanout_hit_counts: a
+    # channel with a zero count (or missing key) is "missed". The
+    # fixture has vector=15, bm25=12, graph=0, inferred_edge=0 → the
+    # two zero-hit channels are flagged.
+    assert set(out["turn_1_missed_channels"]) == {"graph", "inferred_edge"}
     assert out["cache_hit_rate_mean"] == pytest.approx(0.6)
     assert out["turn_latencies_ms"] == [1500.0, 3000.0]
     assert out["agent_ms"] == 5000.0
@@ -166,7 +170,9 @@ def test_summarize_trace_happy_path_extracts_all_fields() -> None:
 
 def test_summarize_trace_handles_failure_status() -> None:
     """fatal_provider_error / loop_timeout traces have gathered=None.
-    The digest must not crash."""
+    The digest must not crash. When prefanout itself didn't populate
+    any hit counts (or all channels are zero), every required channel
+    is flagged as missed."""
     blob = _mk_blob(
         status="fatal_provider_error",
         gathered=None,
@@ -174,6 +180,7 @@ def test_summarize_trace_handles_failure_status() -> None:
         tools_fired=[],
         turn_1_tools_fired=[],
         cache_hit_rates=[0.2],
+        prefanout_hit_counts={},
     )
     blob["_db"]["gatherer_status"] = "fatal_provider_error"
     blob["_db"]["confidence"] = None
@@ -183,10 +190,10 @@ def test_summarize_trace_handles_failure_status() -> None:
     assert out["entity_count"] == 0
     assert out["confidence"] is None
     assert set(out["turn_1_missed_channels"]) == {
-        "vector_search",
-        "bm25_search",
-        "graph_search",
-        "inferred_edge_search",
+        "vector",
+        "bm25",
+        "graph",
+        "inferred_edge",
     }
 
 
@@ -239,6 +246,54 @@ def test_summarize_trace_need_deeper_signal() -> None:
     blob = _mk_blob(extensions_used=1)
     out = summarize_trace(blob)
     assert out["had_need_deeper"] is True
+
+
+def test_summarize_trace_turn_1_missed_channels_from_prefanout() -> None:
+    """`turn_1_missed_channels` derives from `prefanout_hit_counts`,
+    not from `turn_1_tools_fired`. A channel is "missed" when its
+    count is 0 OR when the key is absent from the dict entirely. This
+    is the post-#299 semantics: prefanout runs pre-loop so the agent
+    never dispatches those channels as turn-1 tools — driving the
+    signal off the tool list would fire on 100% of traces."""
+    # All four channels populated with non-zero hits → nothing missed,
+    # regardless of what turn_1_tools_fired contains.
+    out = summarize_trace(
+        _mk_blob(
+            turn_1_tools_fired=["emit_gatherer_output"],
+            prefanout_hit_counts={
+                "vector": 8,
+                "bm25": 3,
+                "graph": 5,
+                "inferred_edge": 2,
+            },
+        )
+    )
+    assert out["turn_1_missed_channels"] == []
+
+    # Two channels at zero → those two are flagged as missed.
+    out = summarize_trace(
+        _mk_blob(
+            turn_1_tools_fired=["emit_gatherer_output"],
+            prefanout_hit_counts={
+                "vector": 8,
+                "bm25": 3,
+                "graph": 0,
+                "inferred_edge": 0,
+            },
+        )
+    )
+    assert set(out["turn_1_missed_channels"]) == {"graph", "inferred_edge"}
+
+    # Missing keys are treated the same as zero — pre-#299 blobs that
+    # lacked `prefanout_hit_counts` get flagged as "all missed", and a
+    # partial dict flags the absent channels too.
+    out = summarize_trace(
+        _mk_blob(
+            turn_1_tools_fired=["emit_gatherer_output"],
+            prefanout_hit_counts={"vector": 8, "bm25": 3},
+        )
+    )
+    assert set(out["turn_1_missed_channels"]) == {"graph", "inferred_edge"}
 
 
 # ============================================================

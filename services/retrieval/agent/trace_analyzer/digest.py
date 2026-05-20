@@ -15,17 +15,25 @@ from __future__ import annotations
 
 from typing import Any
 
-# Mandatory turn-1 channels per the agent prompt. Anything missing from
-# `turn_1_tools_fired` is logged as `turn_1_missed_channels` so the
-# nightly orchestrator can cluster on "agent skipped the recall
-# guarantee" failures. (Note: with the prefanout cutover, this may now
-# fire on every trace because the channels run pre-loop; review and
-# retire the signal if so.)
-_REQUIRED_TURN_1_CHANNELS = frozenset({
-    "vector_search",
-    "bm25_search",
-    "graph_search",
-    "inferred_edge_search",
+# Required recall channels per the prefanout contract. A channel is
+# "missed" when prefanout returned zero hits for it (or the key is
+# absent from `prefanout_hit_counts`) — that's a real operational
+# signal the nightly orchestrator can cluster on: a recall-anchor
+# failure where the query didn't anchor on entities (graph /
+# inferred_edge) or BM25/vector found nothing.
+#
+# Prior semantics (pre-#299) derived this from `turn_1_tools_fired`,
+# flagging traces where the agent didn't call one of the four recall
+# tools on turn 1. After the prefanout cutover those channels run
+# BEFORE the agent loop starts and are no longer dispatched as
+# turn-1 tools, so the old derivation fired on 100% of traces and
+# carried no signal. The field name + downstream schema are
+# preserved; only the computation changed.
+_REQUIRED_PREFANOUT_CHANNELS = frozenset({
+    "vector",
+    "bm25",
+    "graph",
+    "inferred_edge",
 })
 
 
@@ -59,8 +67,16 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
     fingerprints_per_turn: list[str | None] = list(
         blob.get("system_fingerprints_per_turn") or []
     )
+    prefanout_hits: dict[str, Any] = dict(blob.get("prefanout_hit_counts") or {})
 
-    missed = sorted(_REQUIRED_TURN_1_CHANNELS - set(turn_1_tools))
+    # A channel is "missed" when prefanout returned zero hits for it
+    # OR the key is absent from `prefanout_hit_counts` entirely. See
+    # the docstring on `_REQUIRED_PREFANOUT_CHANNELS` for context.
+    missed = sorted(
+        ch
+        for ch in _REQUIRED_PREFANOUT_CHANNELS
+        if not prefanout_hits.get(ch)
+    )
 
     return {
         # Identity + routing
@@ -124,7 +140,7 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
         # Per-turn LLM latency — slow turns surface model-side issues
         "turn_latencies_ms": turn_latencies,
         # Prefanout coverage
-        "prefanout_hit_counts": dict(blob.get("prefanout_hit_counts") or {}),
+        "prefanout_hit_counts": prefanout_hits,
         # Response sizing (from DB summary)
         "response_size_bytes": db.get("response_size_bytes"),
     }
