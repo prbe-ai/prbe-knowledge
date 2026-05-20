@@ -13,7 +13,7 @@ metadata-mutation SQL technically redundant, but the COALESCE stays for
 defense-in-depth (in case a future row is inserted without the default
 honored — e.g. raw COPY paths).
 
-Revision ID: 0087_inv_metadata
+Revision ID: 0088_inv_metadata
 Revises: 0085_postmortem_templates
 Create Date: 2026-05-18
 """
@@ -23,8 +23,8 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
 # revision identifiers
-revision = "0087_inv_metadata"
-down_revision = "0086_postmortem_templates"
+revision = "0088_inv_metadata"
+down_revision = "0087_postmortem_templates"
 branch_labels = None
 depends_on = None
 

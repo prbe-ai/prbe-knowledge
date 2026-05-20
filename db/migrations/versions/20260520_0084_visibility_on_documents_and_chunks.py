@@ -21,7 +21,7 @@ and we cannot take ACCESS EXCLUSIVE for a non-blocking-read index.
 Pattern mirrors 0056_documents_id_trgm_idx, 0063_embedding_v2_hnsw,
 and 0064_graph_nodes_degree_idx.
 
-Revision ID: 0083_visibility_columns
+Revision ID: 0084_visibility_columns
 Revises: 0081_incident_mcp_servers
 Create Date: 2026-05-18
 """
@@ -30,8 +30,8 @@ import sqlalchemy as sa
 from alembic import op
 
 # revision identifiers
-revision = "0083_visibility_columns"
-down_revision = "0082_node_post_write_pipeline"
+revision = "0084_visibility_columns"
+down_revision = "0083_node_queue_no_rls"
 branch_labels = None
 depends_on = None
 

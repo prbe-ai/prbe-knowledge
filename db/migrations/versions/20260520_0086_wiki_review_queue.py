@@ -25,7 +25,7 @@ RLS: tenant_isolation bound to ``current_setting('app.current_customer_id')``
 matching every other tenant table. ``FORCE ROW LEVEL SECURITY`` so
 even the table owner role obeys the policy.
 
-Revision ID: 0085_wiki_review_queue
+Revision ID: 0086_wiki_review_queue
 Revises: 0083_inv_post_approval
 Create Date: 2026-05-18
 """
@@ -35,8 +35,8 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
 # revision identifiers
-revision = "0085_wiki_review_queue"
-down_revision = "0084_inv_post_approval"
+revision = "0086_wiki_review_queue"
+down_revision = "0085_inv_post_approval"
 branch_labels = None
 depends_on = None
 
