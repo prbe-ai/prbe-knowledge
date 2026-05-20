@@ -22,8 +22,8 @@
 #      Subagents do NOT push or open PRs.
 #   8. Push all auto-opt/* branches + open draft PRs. NO path-diff gate —
 #      draft PR + human review is the safety net.
-#   9. Build digest summary, send via Resend (always) and Poke (on action /
-#      failure / needs-human).
+#   9. Build digest summary, send via Resend (always) and Sendblue
+#      iMessage (on action / failure / needs-human).
 #   10. Upload artifact + cleanup digest job.
 #
 # Required secrets:
@@ -32,11 +32,16 @@
 #   DIGITALOCEAN_ACCESS_TOKEN   — kubectl access to probe-managed cluster
 #   PROBE_MCP_INTERNAL_KEY      — mcp.prbe.ai internal-key auth (matches
 #                                 managed-data-plane.env INTERNAL_BACKEND_API_KEY)
-#   PROBE_MCP_CUSTOMER_ID       — UUID for probe-founders customer
+#   PROBE_MCP_CUSTOMER_ID       — slug for probe-founders customer
+#                                 (must be the slug "probe-founders", NOT
+#                                 the CP customers.id UUID; data plane keys
+#                                 RLS scoping by slug)
 #   RESEND_API_KEY              — daily digest email
 #   RESEND_FROM_ADDRESS         — verified Resend sender (e.g. nightly@prbe.ai)
-#   POKE_API_KEY                — Poke API key (forwards to text/email per
-#                                 your Poke assistant config)
+#   SENDBLUE_API_KEY_ID         — Sendblue iMessage API key (from dashboard.sendblue.com)
+#   SENDBLUE_API_SECRET         — paired secret
+#   SENDBLUE_FROM_NUMBER        — Sendblue-provisioned sending number (+1XXXXXXXXXX)
+#   SENDBLUE_TO_NUMBER          — destination phone (+1XXXXXXXXXX)
 name: agent-optimization-nightly
 
 on:
@@ -349,22 +354,34 @@ jobs:
             | jq -r '.id // .' \
             || echo "::warning::Resend send failed"
 
-      - name: Send Poke message
+      - name: Send Sendblue iMessage
         if: always() && (steps.digestnote.outputs.prs_opened != '0' || steps.digestnote.outputs.status != 'success' || steps.digestnote.outputs.needs_human != '0')
         env:
-          POKE_API_KEY: ${{ secrets.POKE_API_KEY }}
+          SENDBLUE_API_KEY_ID: ${{ secrets.SENDBLUE_API_KEY_ID }}
+          SENDBLUE_API_SECRET: ${{ secrets.SENDBLUE_API_SECRET }}
+          SENDBLUE_FROM_NUMBER: ${{ secrets.SENDBLUE_FROM_NUMBER }}
+          SENDBLUE_TO_NUMBER: ${{ secrets.SENDBLUE_TO_NUMBER }}
         run: |
           set -euo pipefail
-          if [ -z "${POKE_API_KEY:-}" ]; then
-            echo "::warning::POKE_API_KEY missing — skipping Poke."
+          if [ -z "${SENDBLUE_API_KEY_ID:-}" ] || [ -z "${SENDBLUE_API_SECRET:-}" ] || [ -z "${SENDBLUE_TO_NUMBER:-}" ]; then
+            echo "::warning::Sendblue secrets missing (need SENDBLUE_API_KEY_ID + SENDBLUE_API_SECRET + SENDBLUE_TO_NUMBER) — skipping iMessage."
             exit 0
           fi
-          PAYLOAD=$(jq -n --arg message "$(cat /tmp/digest.txt)" '{message:$message}')
-          curl -fsS -X POST https://poke.com/api/v1/inbound/api-message \
-            -H "Authorization: Bearer $POKE_API_KEY" \
+          # Sendblue's blue-bubble cap is ~1000 chars per message; truncate
+          # the digest if longer and append the run URL so it always lands.
+          BODY=$(head -c 800 /tmp/digest.txt)
+          PAYLOAD=$(jq -n \
+            --arg number "$SENDBLUE_TO_NUMBER" \
+            --arg from_number "${SENDBLUE_FROM_NUMBER:-}" \
+            --arg content "$BODY" \
+            'if $from_number == "" then {number:$number, content:$content} else {number:$number, from_number:$from_number, content:$content} end')
+          curl -fsS -X POST https://api.sendblue.co/api/send-message \
+            -H "sb-api-key-id: $SENDBLUE_API_KEY_ID" \
+            -H "sb-api-secret-key: $SENDBLUE_API_SECRET" \
             -H "Content-Type: application/json" \
             -d "$PAYLOAD" \
-            || echo "::warning::Poke send failed"
+            | jq -r '.message_handle // .status // .' \
+            || echo "::warning::Sendblue send failed"
 
       - name: Upload orchestrator summary as artifact
         if: always()
