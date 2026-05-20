@@ -135,7 +135,11 @@ async def bm25_search(
     sources: list[str] | None = None,
     doc_types: list[str] | None = None,
     temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
 ) -> list[BM25Hit]:
+    """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
+    rows (see migration 0082 + Plan A Component 6). Reviewer surfaces pass
+    True after role-checking; API-key callers cannot bypass."""
     spec = temporal or TemporalSpec()
     or_query = _build_or_tsquery_string(query_text)
     if not or_query:
@@ -157,6 +161,13 @@ async def bm25_search(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
         )
         params.extend(pred.params)
+
+        # Hide drafts unless the reviewer surface explicitly opts in.
+        visibility_filter = (
+            ""
+            if include_drafts
+            else "AND c.visibility = 'approved' AND d.visibility = 'approved'"
+        )
 
         rows = await conn.fetch(
             f"""
@@ -184,6 +195,7 @@ async def bm25_search(
               {pred.doc_sql}
               {source_filter}
               {doc_type_filter}
+              {visibility_filter}
             ORDER BY score DESC, c.chunk_id
             LIMIT $3
             """,

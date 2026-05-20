@@ -39,6 +39,7 @@ async def vector_search(
     sources: list[str] | None = None,
     doc_types: list[str] | None = None,
     temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
 ) -> list[VectorHit]:
     """Embed `query_text`, ANN-search against chunks, return top_k hits.
 
@@ -51,6 +52,11 @@ async def vector_search(
     e.g. ['github.commit', 'github.pull_request']). The search pipeline
     passes None and uses doc_type as a soft RRF boost; the list pipeline
     passes the resolved set as a hard filter — same retriever, two callers.
+
+    `include_drafts` defaults to False so retrieval returns only rows with
+    ``visibility = 'approved'`` (the partial indexes from migration 0082
+    keep this cheap). Reviewer-scoped BFF surfaces flip this to True after
+    role-checking ``wiki_reviewer``; API-key callers never bypass.
     """
     embedder = get_embedder_v2()
     query_vec = await embedder.embed_query(query_text)
@@ -74,6 +80,15 @@ async def vector_search(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
         )
         params.extend(pred.params)
+
+        # Default branch hides drafts; visibility filter is a sibling of
+        # the existing valid_to predicate. Reviewer surfaces pass
+        # include_drafts=True to bypass.
+        visibility_filter = (
+            ""
+            if include_drafts
+            else "AND c.visibility = 'approved' AND d.visibility = 'approved'"
+        )
 
         rows = await conn.fetch(
             f"""
@@ -100,6 +115,7 @@ async def vector_search(
               {pred.doc_sql}
               {source_filter}
               {doc_type_filter}
+              {visibility_filter}
             ORDER BY c.embedding_v2 <=> $2::halfvec, c.chunk_id
             LIMIT $3
             """,

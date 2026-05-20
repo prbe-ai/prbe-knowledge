@@ -4,7 +4,10 @@ One INCIDENT document per logical incident.io incident, updated across
 lifecycle events (incident_created / status_changed / closed / etc.) via
 SCD2 coalesce. `requires_investigation` fires only on
 `public_incident.incident_created_v2` so the investigation pipeline runs
-exactly once per logical incident.
+exactly once per logical incident. `requires_resolution_check` fires only
+on `public_incident.incident_closed_v2` so the post-approval dispatch
+seam (services/post_approval/dispatch.py) can detect the
+(approved ∧ resolved) edge.
 
 Connector-level `verify_signature` is intentionally a stub — incident.io
 uses Svix-format signatures (HMAC over `id.timestamp.body`) verified by
@@ -41,6 +44,13 @@ from shared.models import (
 
 _INCIDENT_EVENT_PREFIX = "public_incident."
 _CREATED_EVENT_TYPE = "public_incident.incident_created_v2"
+# incident.io fires a dedicated `incident_closed_v2` event when an
+# incident transitions into the `closed` status category. That's the
+# signal the post-approval dispatch seam listens for. We deliberately do
+# NOT key off `incident_status_changed_v2` with category=closed too —
+# the closed_v2 event is the canonical, idempotent resolution signal,
+# and incident.io guarantees it fires exactly once per close.
+_CLOSED_EVENT_TYPE = "public_incident.incident_closed_v2"
 
 
 def _parse_iso8601(value: Any) -> datetime | None:
@@ -234,6 +244,7 @@ class IncidentIoConnector(Connector):
         return NormalizationResult(
             documents=[doc],
             requires_investigation=event_type == _CREATED_EVENT_TYPE,
+            requires_resolution_check=event_type == _CLOSED_EVENT_TYPE,
         )
 
 

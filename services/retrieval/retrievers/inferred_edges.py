@@ -78,6 +78,7 @@ async def inferred_edge_search(
     *,
     top_k: int = INFERRED_EDGE_TOP_K,
     dampening: float = INFERRED_EDGE_DAMPENING,
+    include_drafts: bool = False,
 ) -> list[InferredEdgeHit]:
     """Walk INFERRED Doc-Doc edges from `top_doc_ids` and return up to
     `top_k` linked documents.
@@ -96,6 +97,8 @@ async def inferred_edge_search(
         return []
 
     document_label = NodeLabel.DOCUMENT.value
+    # Hide drafts unless reviewer opts in (Plan A Component 6).
+    doc_visibility_filter = "" if include_drafts else "AND d.visibility = 'approved'"
     sql = f"""
         WITH anchors AS (
             -- Resolve each top_doc_id to its Document graph_node, carrying
@@ -179,6 +182,7 @@ async def inferred_edge_search(
           ON d.customer_id = $1
          AND d.doc_id = nd.doc_id
          AND d.valid_to IS NULL
+         {doc_visibility_filter}
         WHERE nd.doc_id <> ALL($2::text[])  -- exclude top_doc_ids themselves
         ORDER BY
           CASE nd.edge_type

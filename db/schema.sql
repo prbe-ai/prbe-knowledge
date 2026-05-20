@@ -145,10 +145,16 @@ CREATE TABLE documents (
     compiled_at          TIMESTAMPTZ DEFAULT NULL,
     compile_trigger      TEXT DEFAULT NULL,
 
+    -- migration 0082 (post-approval wiki-artifact draft gating). New
+    -- wiki-artifact writes set 'draft'; the review approve path flips
+    -- to 'approved' atomically. Existing rows backfill to 'approved'.
+    visibility           TEXT NOT NULL DEFAULT 'approved',
+
     -- PK includes customer_id so tenants ingesting the same source identity
     -- (e.g. the same Slack workspace replayed under a different customer)
     -- don't collide on doc_id and silently drop writes via ON CONFLICT.
-    PRIMARY KEY (customer_id, doc_id, version)
+    PRIMARY KEY (customer_id, doc_id, version),
+    CONSTRAINT documents_visibility_chk CHECK (visibility IN ('draft','approved'))
 );
 
 CREATE INDEX idx_documents_customer_source ON documents (customer_id, source_system, source_id);
@@ -172,6 +178,10 @@ CREATE INDEX idx_documents_metadata ON documents USING GIN (metadata jsonb_path_
 -- customer_id. See migration 0055.
 CREATE INDEX idx_documents_source_id_trgm ON documents USING GIN (source_id gin_trgm_ops);
 CREATE INDEX idx_documents_doc_id_trgm ON documents USING GIN (doc_id gin_trgm_ops);
+-- Partial index keeps the doc-type listing path from scanning draft rows
+-- once visibility='draft' wiki artifacts start appearing. See migration 0082.
+CREATE INDEX IF NOT EXISTS documents_visibility_approved_idx
+    ON documents (customer_id, doc_type) WHERE visibility = 'approved';
 
 -- ---------------------------------------------------------------------------
 -- chunks: content-addressable retrieval units.
@@ -229,10 +239,16 @@ CREATE TABLE chunks (
     -- bm25.py for the perf rationale.
     content_tsv          tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
 
+    -- migration 0082 (post-approval wiki-artifact draft gating). Tracks
+    -- the visibility of the chunk's owning document version so retrieval
+    -- can default-filter draft chunks without joining documents.
+    visibility           TEXT NOT NULL DEFAULT 'approved',
+
     -- PK includes customer_id so tenants ingesting overlapping source content
     -- can't collide on chunk_id (which is derived from doc_id + content_hash).
     PRIMARY KEY (customer_id, chunk_id),
-    UNIQUE (doc_id, content_hash)
+    UNIQUE (doc_id, content_hash),
+    CONSTRAINT chunks_visibility_chk CHECK (visibility IN ('draft','approved'))
     -- No FK to documents(doc_id, version). A chunk can span multiple versions
     -- (first_seen_version..last_seen_version), so pinning the FK to a specific
     -- version would cascade-delete live chunks if an old doc version ever
@@ -262,6 +278,11 @@ CREATE INDEX idx_chunks_fts_content    ON chunks USING GIN (to_tsvector('english
 CREATE INDEX idx_chunks_content_tsv    ON chunks USING GIN (content_tsv);
 -- One metadata chunk per doc; partial index serves backfill idempotency check.
 CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kind = 'metadata';
+-- Partial index keeps retrieval's per-doc chunk fetch index-only once
+-- visibility='draft' rows start appearing (post-approval wiki artifacts).
+-- See migration 0082.
+CREATE INDEX IF NOT EXISTS chunks_visibility_approved_idx
+    ON chunks (customer_id, doc_id) WHERE visibility = 'approved';
 
 -- ---------------------------------------------------------------------------
 -- directed_vectors: per-document trigger phrases used as a doc-level
@@ -1341,15 +1362,22 @@ CREATE POLICY ingestion_cursors_tenant_isolation ON ingestion_cursors
 -- runs through the `customer_id` CASCADE.
 -- ---------------------------------------------------------------------------
 CREATE TABLE incident_investigations (
-    customer_id            TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    incident_doc_id        TEXT NOT NULL,
-    current_report_doc_id  TEXT,
-    state                  TEXT NOT NULL,
-    versions               JSONB NOT NULL DEFAULT '[]'::jsonb,
-    reviewer_id            TEXT,
-    reviewed_at            TIMESTAMPTZ,
-    created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    customer_id                  TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    incident_doc_id              TEXT NOT NULL,
+    current_report_doc_id        TEXT,
+    state                        TEXT NOT NULL,
+    versions                     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    reviewer_id                  TEXT,
+    reviewed_at                  TIMESTAMPTZ,
+    -- migration 0083 (post-approval downstream-actions pipeline)
+    approved_at                  TIMESTAMPTZ,
+    resolved_at                  TIMESTAMPTZ,
+    post_approval_dispatched_at  TIMESTAMPTZ,
+    evidence_pack                JSONB,
+    -- migration 0086 (post-approval dispatch-failed surface)
+    metadata                     JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at                   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT incident_investigations_pkey PRIMARY KEY (customer_id, incident_doc_id),
     CONSTRAINT incident_investigations_state_chk CHECK (
         state IN (
@@ -1452,5 +1480,93 @@ ALTER TABLE entity_merge_suggestions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE entity_merge_suggestions FORCE ROW LEVEL SECURITY;
 CREATE POLICY entity_merge_suggestions_tenant_isolation
     ON entity_merge_suggestions
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
+-- wiki_review_queue: per-artifact review-state row for wiki artifacts
+-- produced by the post-approval orchestrator pipeline (migration 0085).
+-- Each artifact has exactly one row keyed by (customer_id, artifact_doc_id);
+-- re-runs create a NEW row whose parent_artifact_doc_id points at the prior
+-- version (versions are tracked via the parent-link chain, not as a jsonb
+-- history blob, so queries can join the chain without parsing nested arrays).
+-- target_doc_id is ONLY populated for 'correction' artifacts; postmortems
+-- and knowledge pages are new docs, not corrections (enforced via the
+-- target_consistency CHECK).
+-- ---------------------------------------------------------------------------
+CREATE TABLE wiki_review_queue (
+    customer_id              TEXT NOT NULL,
+    artifact_doc_id          TEXT NOT NULL,
+    incident_doc_id          TEXT NOT NULL,
+    artifact_kind            TEXT NOT NULL,
+    target_doc_id            TEXT,
+    parent_artifact_doc_id   TEXT,
+    state                    TEXT NOT NULL,
+    reviewer_id              TEXT,
+    reviewed_at              TIMESTAMPTZ,
+    metadata                 JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT wiki_review_queue_pkey PRIMARY KEY (customer_id, artifact_doc_id),
+    CONSTRAINT wiki_review_queue_customer_fkey
+        FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE,
+    CONSTRAINT wiki_review_queue_kind_chk CHECK (
+        artifact_kind IN ('postmortem','knowledge_page','correction')
+    ),
+    CONSTRAINT wiki_review_queue_state_chk CHECK (
+        state IN (
+            'pending_writeback','pending_review','approved',
+            'rejected','failed_pending_review'
+        )
+    ),
+    CONSTRAINT wiki_review_queue_target_consistency_chk CHECK (
+        (artifact_kind = 'correction' AND target_doc_id IS NOT NULL)
+        OR (artifact_kind <> 'correction' AND target_doc_id IS NULL)
+    )
+);
+
+CREATE INDEX wiki_review_queue_state_idx
+    ON wiki_review_queue (customer_id, state, updated_at DESC);
+CREATE INDEX wiki_review_queue_incident_idx
+    ON wiki_review_queue (customer_id, incident_doc_id);
+
+ALTER TABLE wiki_review_queue ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wiki_review_queue FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON wiki_review_queue
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
+-- customer_postmortem_templates: per-customer postmortem template override
+-- (migration 0086). Two modes:
+--   'inline'  — body_markdown holds the template directly.
+--   'doc_ref' — ref_doc_id points at an existing prbe-knowledge document
+--               whose body is fetched at postmortem-render time.
+-- The default template lives as a code constant in
+-- shared/templates/postmortem.py; this table holds OVERRIDES only —
+-- missing row means "use the default template". The mode-consistency
+-- CHECK enforces exactly one of body_markdown / ref_doc_id is populated.
+-- ---------------------------------------------------------------------------
+CREATE TABLE customer_postmortem_templates (
+    customer_id     TEXT NOT NULL,
+    mode            TEXT NOT NULL,
+    body_markdown   TEXT,
+    ref_doc_id      TEXT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT customer_postmortem_templates_pkey PRIMARY KEY (customer_id),
+    CONSTRAINT customer_postmortem_templates_customer_fkey
+        FOREIGN KEY (customer_id) REFERENCES customers(customer_id) ON DELETE CASCADE,
+    CONSTRAINT customer_postmortem_templates_mode_chk CHECK (
+        mode IN ('inline','doc_ref')
+    ),
+    CONSTRAINT customer_postmortem_templates_mode_consistency_chk CHECK (
+        (mode = 'inline' AND body_markdown IS NOT NULL AND ref_doc_id IS NULL)
+        OR (mode = 'doc_ref' AND ref_doc_id IS NOT NULL AND body_markdown IS NULL)
+    )
+);
+
+ALTER TABLE customer_postmortem_templates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customer_postmortem_templates FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON customer_postmortem_templates
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));

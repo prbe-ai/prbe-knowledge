@@ -775,6 +775,10 @@ async def get_wiki_index(
             customer_id,
             index_doc_id,
         )
+        # Plan A Component 6: the wiki TOC must hide draft artifacts.
+        # WIKI_POSTMORTEM / WIKI_KNOWLEDGE_PAGE / WIKI_CORRECTION docs
+        # land at visibility='draft' from the writeback route and only
+        # flip to 'approved' on the reviewer-approve route.
         page_rows = await conn.fetch(
             """
             SELECT title, source_id, version, updated_at, metadata
@@ -785,6 +789,7 @@ async def get_wiki_index(
               AND doc_type <> $4
               AND valid_to IS NULL
               AND deleted_at IS NULL
+              AND visibility = 'approved'
             ORDER BY updated_at DESC
             """,
             customer_id,

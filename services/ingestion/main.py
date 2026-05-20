@@ -53,6 +53,9 @@ from services.ingestion.handlers.registry import (
     get_connector_class,
     list_registered,
 )
+from services.ingestion.incident_evidence_pack_routes import (
+    router as incident_evidence_pack_router,
+)
 from services.ingestion.internal_devices import router as devices_router
 from services.ingestion.investigation_review_routes import (
     router as investigation_review_router,
@@ -67,7 +70,16 @@ from services.ingestion.manual_uploads import (
     parse_manual_upload,
     safe_filename,
 )
+from services.ingestion.postmortem_template_routes import (
+    router as postmortem_template_router,
+)
 from services.ingestion.slack_lifecycle import handle_slack_lifecycle_event
+from services.ingestion.wiki_artifact_review_routes import (
+    router as wiki_artifact_review_router,
+)
+from services.ingestion.wiki_artifact_writeback_routes import (
+    router as wiki_artifact_writeback_router,
+)
 from services.ingestion.wiki_routes import router as wiki_router
 from services.system_settings import get_ingestion_killswitch
 from shared.config import get_settings
@@ -124,6 +136,10 @@ app.include_router(wiki_router)
 app.include_router(custom_ingest_router)
 app.include_router(investigation_writeback_router)
 app.include_router(investigation_review_router)
+app.include_router(incident_evidence_pack_router)
+app.include_router(wiki_artifact_writeback_router)
+app.include_router(wiki_artifact_review_router)
+app.include_router(postmortem_template_router)
 
 
 @app.get("/health")
