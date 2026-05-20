@@ -380,11 +380,22 @@ class SentryConnector(Connector):
         ]
 
         if assignee:
+            assignee_props: dict[str, Any] = {"source_system": SourceSystem.SENTRY.value}
+            # Sentry assignee is often just an id; if the issue ships the
+            # assigneeTo object (Sentry API includes this), extract name/email.
+            assigned_to = issue.get("assignedTo") or {}
+            if isinstance(assigned_to, dict):
+                a_name = (assigned_to.get("name") or "").strip()
+                a_email = (assigned_to.get("email") or "").strip().lower()
+                if a_name:
+                    assignee_props["name"] = a_name
+                if a_email:
+                    assignee_props["email"] = a_email
             nodes.append(
                 GraphNodeSpec(
                     label=NodeLabel.PERSON,
                     canonical_id=assignee,
-                    properties={"source_system": SourceSystem.SENTRY.value},
+                    properties=assignee_props,
                 )
             )
             edges.append(
@@ -403,11 +414,17 @@ class SentryConnector(Connector):
         if actor_id:
             # Ensure node exists even when the actor isn't the assignee.
             if actor_id != assignee:
+                actor_props: dict[str, Any] = {"source_system": SourceSystem.SENTRY.value}
+                actor_obj = payload.get("actor") or {}
+                if isinstance(actor_obj, dict):
+                    actor_name = (actor_obj.get("name") or "").strip()
+                    if actor_name:
+                        actor_props["name"] = actor_name
                 nodes.append(
                     GraphNodeSpec(
                         label=NodeLabel.PERSON,
                         canonical_id=actor_id,
-                        properties={"source_system": SourceSystem.SENTRY.value},
+                        properties=actor_props,
                     )
                 )
             edges.append(

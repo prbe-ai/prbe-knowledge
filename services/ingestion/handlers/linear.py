@@ -352,7 +352,7 @@ class LinearConnector(Connector):
                 GraphNodeSpec(
                     label=NodeLabel.PERSON,
                     canonical_id=author_id,
-                    properties={"source_system": SourceSystem.LINEAR.value},
+                    properties=_linear_person_props(data, "creator"),
                 )
             )
         if assignee_id and assignee_id != author_id:
@@ -360,7 +360,7 @@ class LinearConnector(Connector):
                 GraphNodeSpec(
                     label=NodeLabel.PERSON,
                     canonical_id=assignee_id,
-                    properties={"source_system": SourceSystem.LINEAR.value},
+                    properties=_linear_person_props(data, "assignee"),
                 )
             )
 
@@ -554,7 +554,7 @@ class LinearConnector(Connector):
                 GraphNodeSpec(
                     label=NodeLabel.PERSON,
                     canonical_id=author_id,
-                    properties={"source_system": SourceSystem.LINEAR.value},
+                    properties=_linear_person_props(data, "user"),
                 )
             )
 
@@ -946,6 +946,26 @@ def _pick_person_id(
     if flat:
         return str(flat)
     return None
+
+
+def _linear_person_props(
+    data: Mapping[str, Any], object_key: str
+) -> dict[str, Any]:
+    """Linear Person properties — pulls name + email when the nested object is
+    present in the webhook payload. Falls back to source_system-only when only
+    a flat id is shipped. Empty values dropped so AutoMergeAnalyzer's
+    property-conflict filter doesn't see noise.
+    """
+    props: dict[str, Any] = {"source_system": SourceSystem.LINEAR.value}
+    obj = data.get(object_key)
+    if isinstance(obj, dict):
+        name = (obj.get("name") or obj.get("displayName") or "").strip()
+        email = (obj.get("email") or "").strip().lower()
+        if name:
+            props["name"] = name
+        if email:
+            props["email"] = email
+    return props
 
 
 def _derive_title(text: str) -> str | None:

@@ -1409,7 +1409,7 @@ class GitHubConnector(Connector):
             GraphNodeSpec(
                 label=NodeLabel.PERSON,
                 canonical_id=author,
-                properties={"source_system": SourceSystem.GITHUB.value},
+                properties=_person_props(login=author),
             ),
             GraphNodeSpec(
                 label=NodeLabel.DOCUMENT,
@@ -1551,7 +1551,7 @@ class GitHubConnector(Connector):
             GraphNodeSpec(
                 label=NodeLabel.PERSON,
                 canonical_id=author,
-                properties={"source_system": SourceSystem.GITHUB.value},
+                properties=_person_props(login=author),
             ),
             GraphNodeSpec(
                 label=NodeLabel.DOCUMENT,
@@ -1732,7 +1732,7 @@ class GitHubConnector(Connector):
             GraphNodeSpec(
                 label=NodeLabel.PERSON,
                 canonical_id=author,
-                properties={"source_system": SourceSystem.GITHUB.value},
+                properties=_person_props(login=author),
             ),
             GraphNodeSpec(
                 label=NodeLabel.DOCUMENT,
@@ -1888,7 +1888,7 @@ class GitHubConnector(Connector):
                 GraphNodeSpec(
                     label=NodeLabel.PERSON,
                     canonical_id=author_id,
-                    properties={"source_system": SourceSystem.GITHUB.value},
+                    properties=_person_props(login=author_id),
                 )
             )
             edges.append(
@@ -2012,7 +2012,7 @@ class GitHubConnector(Connector):
                 GraphNodeSpec(
                     label=NodeLabel.PERSON,
                     canonical_id=author_id,
-                    properties={"source_system": SourceSystem.GITHUB.value},
+                    properties=_person_props(login=author_id),
                 )
             )
             edges.append(
@@ -2565,6 +2565,31 @@ def _derive_title(text: str) -> str | None:
     return first_line[:120] if first_line else None
 
 
+def _person_props(
+    *,
+    login: str | None = None,
+    name: str | None = None,
+    email: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build GitHub Person properties with name/email/login when available.
+
+    Keeps `source_system` first so existing readers don't change behavior.
+    Drops blanks so AutoMergeAnalyzer's property-key conflict filter only
+    sees real values. `extra` overlays for site-specific keys (`is_team`).
+    """
+    props: dict[str, Any] = {"source_system": SourceSystem.GITHUB.value}
+    if login and login.strip():
+        props["login"] = login.strip()
+    if name and name.strip():
+        props["name"] = name.strip()
+    if email and email.strip():
+        props["email"] = email.strip().lower()
+    if extra:
+        props.update(extra)
+    return props
+
+
 def _repo_visibility(repo: Mapping[str, Any]) -> str:
     return "private" if repo.get("private") else "public"
 
@@ -2746,7 +2771,11 @@ def _commit_to_doc(
             GraphNodeSpec(
                 label=NodeLabel.PERSON,
                 canonical_id=author,
-                properties={"source_system": SourceSystem.GITHUB.value},
+                properties=_person_props(
+                    login=author_info.get("username"),
+                    name=author_info.get("name"),
+                    email=primary_email or author_info.get("email"),
+                ),
             )
         )
         seen_people.add(author)
@@ -2784,10 +2813,7 @@ def _commit_to_doc(
                 GraphNodeSpec(
                     label=NodeLabel.PERSON,
                     canonical_id=person_id,
-                    properties={
-                        "source_system": SourceSystem.GITHUB.value,
-                        "name": co["name"],
-                    },
+                    properties=_person_props(name=co["name"], email=co["email"]),
                 )
             )
             seen_people.add(person_id)
@@ -2846,10 +2872,11 @@ def _codeowners_artifacts(
                     GraphNodeSpec(
                         label=NodeLabel.PERSON,
                         canonical_id=owner_id,
-                        properties={
-                            "source_system": SourceSystem.GITHUB.value,
-                            "is_team": is_team,
-                        },
+                        properties=_person_props(
+                            login=owner_id if not is_team else None,
+                            name=owner_id,
+                            extra={"is_team": is_team},
+                        ),
                     )
                 )
                 edges.append(
