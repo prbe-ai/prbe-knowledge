@@ -1,39 +1,42 @@
-# Nightly trace-driven gatherer-optimization workflow.
+# Nightly codebase-improvement workflow.
+#
+# Generalized from the original retrieval-agent-only optimizer (PR #305 /
+# PR #318). Now reads THREE input signals to find improvement
+# opportunities anywhere in the codebase:
+#   A. Yesterday's retrieval-agent trace digests (high signal, narrow scope)
+#   B. Commits to main since the last successful run
+#   C. Probe MCP — team operational memory (Slack / GitHub / Linear /
+#      Notion / Sentry) via mcp.prbe.ai using the internal-key auth path
 #
 # Flow:
-#   1. Kill-switch check (repo variable AGENT_OPTIMIZATION_ENABLED)
+#   1. Kill switch (vars.AGENT_OPTIMIZATION_ENABLED)
 #   2. K8s Job in managed-shared cluster builds per-trace digest JSONL
-#      (RLS-respecting; iterates customers via with_tenant)
-#   3. Workflow tails the job's stdout → /tmp/digests.jsonl
-#   4. List existing open auto-optimization PRs (dedup input)
-#   5. Run Claude Code orchestrator headless. Orchestrator: TRIAGE then
-#      DISPATCH up to MAX_PRS sub-agents, each producing one focused
-#      branch + PR body draft. Sub-agents do NOT push or open PRs —
-#      that's centralized in Step 7 so the workflow controls auth.
-#   6. Workflow-level path-diff gate: drop any branch that touched files
-#      outside services/retrieval/agent/ or shared/constants.py
-#   7. Push surviving branches + open draft PRs via gh CLI
-#   8. Upload orchestrator-summary.json as a workflow artifact
+#   3. Workflow tails the job's stdout → /tmp/digests.jsonl  (empty is OK)
+#   4. Compute commits-since-last-successful-run → /tmp/commits-since-last-run.log
+#   5. List open auto-optimization PRs (dedup)
+#   6. Render mcp-config.json from template (Probe MCP HTTP server)
+#   7. Run Claude Code orchestrator headless with --mcp-config. Orchestrator
+#      triages across A/B/C then dispatches up to MAX_PRS subagents:
+#        - retrieval-agent track → traces + commits + MCP
+#        - generic track          → commits + MCP only
+#      Subagents do NOT push or open PRs.
+#   8. Push all auto-opt/* branches + open draft PRs. NO path-diff gate —
+#      draft PR + human review is the safety net.
+#   9. Build digest summary, send via Resend (always) and Poke (on action /
+#      failure / needs-human).
+#   10. Upload artifact + cleanup digest job.
 #
-# Schedule fires every day at 10:00 UTC = 3 AM PT during PDT
-# (March-November) and 2 AM PT during PST (accept the DST drift). The
-# kill switch via repo Variable AGENT_OPTIMIZATION_ENABLED gates each
-# run — flip it to "false" to disable cron without touching this file.
-# Manual triggers via workflow_dispatch remain available.
-#
-# FUTURE ENHANCEMENT — wire Probe MCP for the orchestrator + sub-agents:
-# Currently no MCP servers are configured for the claude CLI in this
-# workflow. Adding Probe MCP would let sub-agents replay failing
-# queries against the live system to validate fix hypotheses before
-# proposing the PR. Auth needs either:
-#   - INTERNAL_ORCHESTRATOR_API_KEY (currently not deployed; orchestrator
-#     is dormant per project_orchestrator_dormant.md) deployed to the
-#     mcp.prbe.ai server + stored as a GH secret
-#   - Or a long-lived probe-founders OAuth bearer
-# Implementation when ready: write {"mcpServers": {"Probe": {...}}} to
-# /tmp/mcp.json and pass `--mcp-config /tmp/mcp.json --strict-mcp-config`
-# on the claude invocation. Leave the Bash(mcp__Probe__*) allowedTool
-# off until this is in place.
+# Required secrets:
+#   ANTHROPIC_API_KEY           — Claude Code
+#   GH_PAT                      — push branches + open PRs
+#   DIGITALOCEAN_ACCESS_TOKEN   — kubectl access to probe-managed cluster
+#   PROBE_MCP_INTERNAL_KEY      — mcp.prbe.ai internal-key auth (matches
+#                                 managed-data-plane.env INTERNAL_BACKEND_API_KEY)
+#   PROBE_MCP_CUSTOMER_ID       — UUID for probe-founders customer
+#   RESEND_API_KEY              — daily digest email
+#   RESEND_FROM_ADDRESS         — verified Resend sender (e.g. nightly@prbe.ai)
+#   POKE_API_KEY                — Poke API key (forwards to text/email per
+#                                 your Poke assistant config)
 name: agent-optimization-nightly
 
 on:
@@ -61,9 +64,9 @@ concurrency:
 jobs:
   optimize:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
-      AGENT_OPTIMIZATION_MAX_PRS: ${{ inputs.max_prs || 3 }}
+      NIGHTLY_IMPROVEMENT_MAX_PRS: ${{ inputs.max_prs || 3 }}
 
     steps:
       - name: Kill switch
@@ -72,11 +75,11 @@ jobs:
             echo "::notice::AGENT_OPTIMIZATION_ENABLED=false — exiting cleanly."
             exit 0
           fi
-          echo "kill switch: not set or set to non-false; proceeding."
+          echo "kill switch: proceeding."
 
       - uses: actions/checkout@v4
         with:
-          # Sub-agents create worktrees off origin/main — need history.
+          # Subagents create worktrees off origin/main — need full history.
           fetch-depth: 0
 
       - name: Configure kubectl for managed-shared cluster
@@ -114,10 +117,6 @@ jobs:
           JOB_NAME="nightly-trace-digest-${DATE}-${JOB_SUFFIX}"
           echo "job_name=$JOB_NAME" >> "$GITHUB_OUTPUT"
 
-          # Use sed instead of envsubst so we only touch the 3 known
-          # placeholders. envsubst would expand ANY $VAR reference,
-          # which is hostile if anyone later adds a legit $VAR to the
-          # manifest (e.g. a secret reference in a comment).
           sed \
             -e "s|DATE_PLACEHOLDER|${DATE}|g" \
             -e "s|JOB_SUFFIX_PLACEHOLDER|${JOB_SUFFIX}|g" \
@@ -136,33 +135,43 @@ jobs:
             --for=condition=complete \
             --timeout=20m \
             "job/${{ steps.launch.outputs.job_name }}"
-          # Pull pod name once the job's pod is settled.
           POD=$(kubectl -n managed get pods \
             -l "job-name=${{ steps.launch.outputs.job_name }}" \
             -o jsonpath='{.items[0].metadata.name}')
-          # Job stdout IS the JSONL digest (one line per trace).
           kubectl -n managed logs "$POD" > /tmp/digests.jsonl
           LINE_COUNT=$(wc -l < /tmp/digests.jsonl | tr -d ' ')
           echo "line_count=$LINE_COUNT" >> "$GITHUB_OUTPUT"
           echo "Pulled $LINE_COUNT digest line(s)."
           if [ "$LINE_COUNT" = "0" ]; then
-            echo "::notice::No traces digested for ${{ steps.ctx.outputs.target_date }} — exiting cleanly."
+            echo "::notice::No traces for ${{ steps.ctx.outputs.target_date }} — retrieval-agent track will be quiet; generic track continues."
           fi
 
-      - name: Bail if no traces
-        if: steps.digest.outputs.line_count == '0'
-        run: exit 0
+      - name: Compute commits since last successful run
+        id: commits
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          LAST_SHA=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/agent-optimization-nightly.yml/runs?status=success&per_page=1" \
+            --jq '.workflow_runs[0].head_sha // ""')
+          if [ -z "$LAST_SHA" ] || ! git cat-file -e "$LAST_SHA^{commit}" 2>/dev/null; then
+            echo "::notice::No prior successful run sha (or sha not in history) — falling back to last 30 commits."
+            git log origin/main -30 --pretty=format:'%h %s' --name-status > /tmp/commits-since-last-run.log
+          else
+            echo "Last successful run sha: $LAST_SHA"
+            git log "${LAST_SHA}..origin/main" --pretty=format:'%h %s' --name-status > /tmp/commits-since-last-run.log
+          fi
+          COMMIT_COUNT=$(grep -cE '^[a-f0-9]{7,8} ' /tmp/commits-since-last-run.log || echo 0)
+          echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Commits since last run: $COMMIT_COUNT"
 
       - name: Ensure auto-optimization label exists
         env:
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
-          # First nightly run on a fresh repo: the label needs to exist
-          # before `gh pr create --label auto-optimization` works. `gh
-          # label create` fails when the label exists, so swallow that.
           gh label create auto-optimization \
             --repo prbe-ai/prbe-knowledge \
-            --description "Draft PR produced by nightly trace-analyzer optimization workflow" \
+            --description "Draft PR produced by nightly improvement workflow" \
             --color BFD4F2 2>/dev/null || true
 
       - name: List open auto-optimization PRs (dedup input)
@@ -175,6 +184,24 @@ jobs:
             > /tmp/open-auto-prs.json
           echo "Open auto-PRs: $(jq length /tmp/open-auto-prs.json)"
 
+      - name: Render Probe MCP config from template
+        env:
+          PROBE_MCP_INTERNAL_KEY: ${{ secrets.PROBE_MCP_INTERNAL_KEY }}
+          PROBE_MCP_CUSTOMER_ID: ${{ secrets.PROBE_MCP_CUSTOMER_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PROBE_MCP_INTERNAL_KEY:-}" ] || [ -z "${PROBE_MCP_CUSTOMER_ID:-}" ]; then
+            echo "::warning::PROBE_MCP_INTERNAL_KEY or PROBE_MCP_CUSTOMER_ID missing — orchestrator will run without Probe MCP."
+            echo '{"mcpServers": {}}' > /tmp/mcp-config.json
+            exit 0
+          fi
+          sed \
+            -e "s|__PROBE_MCP_INTERNAL_KEY__|${PROBE_MCP_INTERNAL_KEY}|g" \
+            -e "s|__PROBE_MCP_CUSTOMER_ID__|${PROBE_MCP_CUSTOMER_ID}|g" \
+            .github/mcp-config.json.template > /tmp/mcp-config.json
+          # Don't echo contents — secret is inlined.
+          echo "MCP config rendered (keys redacted)."
+
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
 
@@ -182,89 +209,160 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
-          AGENT_OPTIMIZATION_MAX_PRS: ${{ env.AGENT_OPTIMIZATION_MAX_PRS }}
+          NIGHTLY_IMPROVEMENT_MAX_PRS: ${{ env.NIGHTLY_IMPROVEMENT_MAX_PRS }}
         run: |
           set -euo pipefail
-          # The runner is the sandbox — its filesystem and creds are
-          # ephemeral, and the downstream Path-diff gate is what actually
-          # blocks out-of-scope edits from reaching a PR. Skip in-agent
-          # permission checks so the orchestrator can touch /tmp (digests,
-          # open-PR list, summary, sub-agent worktrees) without thrashing.
-          # --verbose required when --output-format=stream-json is set
-          # alongside --print (the CLI rejects the combo otherwise).
+          # Runner is the sandbox; --dangerously-skip-permissions lets the
+          # orchestrator touch /tmp (digests, summary, sub-agent worktrees,
+          # staging files) without thrashing on per-call permission prompts.
+          # The draft-PR + human-review flow is the actual safety gate.
           claude -p "$(cat .github/prompts/nightly-optimization.md)" \
             --output-format stream-json \
             --verbose \
-            --max-turns 80 \
+            --max-turns 120 \
             --dangerously-skip-permissions \
+            --mcp-config /tmp/mcp-config.json \
+            --strict-mcp-config \
             2>&1 | tee /tmp/orchestrator.log
-          # Orchestrator writes its plan + result here for the
-          # post-process gate + the artifact upload.
           if [ ! -f /tmp/orchestrator-summary.json ]; then
             echo "::warning::orchestrator-summary.json not written — agent may have aborted."
-            echo '{"patterns_identified":0,"prs_opened":0,"skipped":[],"branches":[]}' \
+            echo '{"candidates_identified":0,"prs_opened":0,"tracks":{"retrieval-agent":0,"generic":0},"skipped":[],"branches":[]}' \
               > /tmp/orchestrator-summary.json
           fi
           jq . /tmp/orchestrator-summary.json
 
-      - name: Path-diff gate (workflow-level, not self-policed)
-        id: gate
-        run: |
-          set -euo pipefail
-          ALLOWED='^(services/retrieval/agent/|shared/constants\.py$)'
-          ACCEPTED=()
-          REJECTED=()
-          for branch in $(git branch --list 'auto-opt/*' --format='%(refname:short)'); do
-            OFFENDERS=$(git diff --name-only origin/main..."$branch" \
-              | grep -vE "$ALLOWED" || true)
-            if [ -n "$OFFENDERS" ]; then
-              echo "::warning::branch $branch touched out-of-scope: $OFFENDERS — dropping"
-              git branch -D "$branch"
-              REJECTED+=("$branch")
-            else
-              ACCEPTED+=("$branch")
-            fi
-          done
-          printf '%s\n' "${ACCEPTED[@]}" > /tmp/accepted-branches.txt
-          echo "accepted=${#ACCEPTED[@]}" >> "$GITHUB_OUTPUT"
-          echo "rejected=${#REJECTED[@]}" >> "$GITHUB_OUTPUT"
-          echo "Accepted: ${ACCEPTED[*]:-(none)}"
-          echo "Rejected: ${REJECTED[*]:-(none)}"
-
       - name: Push branches + open PRs
-        if: steps.gate.outputs.accepted != '0'
+        id: push
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
+          # No path-diff gate — draft PR + human review is the safety net.
+          # The prompt's advisory blocklist asks the agent to write
+          # /tmp/needs-human-*.md instead of touching dangerous paths.
+          OPENED=0
           while read -r branch; do
             [ -z "$branch" ] && continue
-            # Sub-agents write title/body to /tmp/auto-opt-staging/ —
-            # NOT under .git/ which the Claude Code sandbox blocks for
-            # Write/Bash. See the prompt for the writing contract.
-            # Tolerate the legacy path (.git-auto-opt-staging/) for
-            # orchestrator runs that pre-date the prompt update.
             STAGING_TITLE="/tmp/auto-opt-staging/titles/$(basename "$branch")"
             STAGING_BODY="/tmp/auto-opt-staging/bodies/$(basename "$branch")"
-            LEGACY_TITLE=".git-auto-opt-staging/auto-opt-titles/$(basename "$branch")"
-            LEGACY_BODY=".git-auto-opt-staging/auto-opt-bodies/$(basename "$branch")"
-            if [ -f "$STAGING_TITLE" ] && [ -f "$STAGING_BODY" ]; then
-              TITLE_FILE="$STAGING_TITLE"
-              BODY_FILE="$STAGING_BODY"
-            elif [ -f "$LEGACY_TITLE" ] && [ -f "$LEGACY_BODY" ]; then
-              TITLE_FILE="$LEGACY_TITLE"
-              BODY_FILE="$LEGACY_BODY"
-            else
-              echo "::warning::missing title/body for $branch (checked $STAGING_TITLE and $LEGACY_TITLE) — skipping PR open"
+            if [ ! -f "$STAGING_TITLE" ] || [ ! -f "$STAGING_BODY" ]; then
+              echo "::warning::missing title/body for $branch — skipping PR open"
               continue
             fi
             git push origin "$branch"
             gh pr create --draft --label auto-optimization \
               --reviewer richardwei6 \
               --head "$branch" \
-              --title "$(cat "$TITLE_FILE")" \
-              --body "$(cat "$BODY_FILE")"
-          done < /tmp/accepted-branches.txt
+              --title "$(cat "$STAGING_TITLE")" \
+              --body "$(cat "$STAGING_BODY")"
+            OPENED=$((OPENED + 1))
+          done < <(git branch --list 'auto-opt/*' --format='%(refname:short)')
+          echo "opened=$OPENED" >> "$GITHUB_OUTPUT"
+          echo "Opened $OPENED draft PR(s)."
+          # Stamp the real count into the summary for the notification step.
+          jq --argjson n "$OPENED" '.prs_opened=$n' /tmp/orchestrator-summary.json \
+            > /tmp/orchestrator-summary.tmp
+          mv /tmp/orchestrator-summary.tmp /tmp/orchestrator-summary.json
+
+      - name: Build notification digest
+        id: digestnote
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TARGET_DATE: ${{ steps.ctx.outputs.target_date }}
+          STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          PRS_OPENED=$(jq -r '.prs_opened // 0' /tmp/orchestrator-summary.json 2>/dev/null || echo 0)
+          CANDIDATES=$(jq -r '.candidates_identified // 0' /tmp/orchestrator-summary.json 2>/dev/null || echo 0)
+          SKIPPED=$(jq -r '.skipped | length // 0' /tmp/orchestrator-summary.json 2>/dev/null || echo 0)
+          NEEDS_HUMAN=$(find /tmp -maxdepth 1 -name 'needs-human-*.md' 2>/dev/null | wc -l | tr -d ' ')
+          {
+            echo "prs_opened=$PRS_OPENED"
+            echo "candidates=$CANDIDATES"
+            echo "skipped=$SKIPPED"
+            echo "needs_human=$NEEDS_HUMAN"
+            echo "status=$STATUS"
+          } >> "$GITHUB_OUTPUT"
+
+          PR_LIST=""
+          if [ "$PRS_OPENED" -gt 0 ]; then
+            PR_LIST=$(gh pr list --repo prbe-ai/prbe-knowledge \
+              --label auto-optimization --state open \
+              --search "created:>$(date -u -d '4 hours ago' +%FT%TZ)" \
+              --json number,title,url \
+              --jq '.[] | "- #\(.number): \(.title) — \(.url)"' || echo "")
+          fi
+          SKIP_LIST=$(jq -r '.skipped // [] | .[] | "  - \(.slug // .track // "?"): \(.reason)"' \
+            /tmp/orchestrator-summary.json 2>/dev/null || echo "")
+
+          {
+            echo "Probe nightly improvement run — $TARGET_DATE"
+            echo "Status: $STATUS | PRs drafted: $PRS_OPENED | Candidates: $CANDIDATES | Skipped: $SKIPPED | needs-human: $NEEDS_HUMAN"
+            echo ""
+            if [ -n "$PR_LIST" ]; then
+              echo "Drafted PRs:"
+              echo "$PR_LIST"
+              echo ""
+            fi
+            if [ -n "$SKIP_LIST" ]; then
+              echo "Skipped patterns:"
+              echo "$SKIP_LIST"
+              echo ""
+            fi
+            echo "Run: $RUN_URL"
+          } > /tmp/digest.txt
+          cat /tmp/digest.txt
+
+      - name: Send Resend email
+        if: always()
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM_ADDRESS: ${{ secrets.RESEND_FROM_ADDRESS }}
+          TARGET_DATE: ${{ steps.ctx.outputs.target_date }}
+          STATUS: ${{ steps.digestnote.outputs.status }}
+          PRS_OPENED: ${{ steps.digestnote.outputs.prs_opened }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RESEND_API_KEY:-}" ] || [ -z "${RESEND_FROM_ADDRESS:-}" ]; then
+            echo "::warning::RESEND_API_KEY or RESEND_FROM_ADDRESS missing — skipping email."
+            exit 0
+          fi
+          SUBJECT="Probe nightly $TARGET_DATE — ${PRS_OPENED:-0} PR(s) — $STATUS"
+          BODY_TEXT=$(cat /tmp/digest.txt)
+          BODY_HTML=$(printf '<pre style="font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;font-size:13px;">%s</pre>' \
+            "$(python3 -c 'import sys,html;print(html.escape(sys.stdin.read()),end="")' < /tmp/digest.txt)")
+          PAYLOAD=$(jq -n \
+            --arg from "$RESEND_FROM_ADDRESS" \
+            --arg to "richard@prbe.ai" \
+            --arg subject "$SUBJECT" \
+            --arg text "$BODY_TEXT" \
+            --arg html "$BODY_HTML" \
+            '{from:$from, to:[$to], subject:$subject, text:$text, html:$html}')
+          curl -fsS -X POST https://api.resend.com/emails \
+            -H "Authorization: Bearer $RESEND_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            | jq -r '.id // .' \
+            || echo "::warning::Resend send failed"
+
+      - name: Send Poke message
+        if: always() && (steps.digestnote.outputs.prs_opened != '0' || steps.digestnote.outputs.status != 'success' || steps.digestnote.outputs.needs_human != '0')
+        env:
+          POKE_API_KEY: ${{ secrets.POKE_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${POKE_API_KEY:-}" ]; then
+            echo "::warning::POKE_API_KEY missing — skipping Poke."
+            exit 0
+          fi
+          PAYLOAD=$(jq -n --arg message "$(cat /tmp/digest.txt)" '{message:$message}')
+          curl -fsS -X POST https://poke.com/api/v1/inbound/api-message \
+            -H "Authorization: Bearer $POKE_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            || echo "::warning::Poke send failed"
 
       - name: Upload orchestrator summary as artifact
         if: always()
@@ -275,6 +373,9 @@ jobs:
             /tmp/orchestrator-summary.json
             /tmp/orchestrator.log
             /tmp/digests.jsonl
+            /tmp/commits-since-last-run.log
+            /tmp/needs-human-*.md
+            /tmp/digest.txt
           retention-days: 14
 
       - name: Cleanup digest job
