@@ -354,6 +354,22 @@ async def run_worker_forever() -> None:
     concurrency = int(os.environ.get("INFERRED_EDGES_CONCURRENCY", str(_DEFAULT_CONCURRENCY)))
     worker = InferredEdgesWorker(concurrency=concurrency)
 
+    # Run the PostWriteWorker (entity auto-merge) in the same process. Both
+    # workers drain independent queues; sharing the event loop avoids spinning
+    # up a separate Fly app/Helm deployment for the second analyzer. Gated by
+    # POST_WRITE_ENABLED (default off) so a stale env doesn't accidentally
+    # fire merges before the customer has flipped auto_merge_execute on.
+    from services.ingestion.post_write import PostWriteWorker
+
+    post_write_enabled = os.environ.get("POST_WRITE_ENABLED", "false").lower() == "true"
+    post_write_execute = os.environ.get("POST_WRITE_EXECUTE", "false").lower() == "true"
+    post_write_worker: PostWriteWorker | None = None
+    if post_write_enabled:
+        post_write_worker = PostWriteWorker(
+            concurrency=int(os.environ.get("POST_WRITE_CONCURRENCY", "16")),
+            execute_high_confidence=post_write_execute,
+        )
+
     health_port = int(os.environ.get("INFERRED_EDGES_HEALTH_PORT", "8083"))
     health_config = uvicorn.Config(
         _build_health_app(),
@@ -385,6 +401,8 @@ async def run_worker_forever() -> None:
         shutdown_started = True
         log.info("inferred_edges_worker.shutdown_signal", signal=signame)
         worker.shutdown()
+        if post_write_worker is not None:
+            post_write_worker.shutdown()
         health_server.should_exit = True
         if gather_future is not None and not gather_future.done():
             gather_future.cancel()
@@ -394,10 +412,11 @@ async def run_worker_forever() -> None:
             loop.add_signal_handler(getattr(signal, signame), handle_signal, signame)
 
     try:
-        gather_future = asyncio.gather(
-            worker.run(),
-            health_server.serve(),
-        )
+        coros = [worker.run(), health_server.serve()]
+        if post_write_worker is not None:
+            log.info("post_write_worker.enabled", execute=post_write_execute)
+            coros.append(post_write_worker.run())
+        gather_future = asyncio.gather(*coros)
         try:
             await gather_future
         except asyncio.CancelledError:
