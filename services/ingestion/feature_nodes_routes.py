@@ -60,21 +60,37 @@ typed-writeback path (``Normalizer.persist_single_document``) so the
 rationale text lands in BM25 + vector indexes — searchable by any
 phrase from the why. The Document is connected via
 ``rationaleDoc --DESCRIBES--> FEATURE`` (EdgeType.DESCRIBES,
-confidence=EXTRACTED). We also stub-upsert the rationale's
-graph_nodes row inside the same edges transaction so the DESCRIBES
-edge resolves (persist_single_document writes documents+chunks only,
-not graph_nodes — without the stub the edge would silently drop via
-the standard missing-endpoint behavior in graph_writer.upsert_edges).
+confidence=EXTRACTED). The DESCRIBES edge resolves because the main
+with_tenant block stub-upserts the rationale's graph_nodes row in
+the same transaction as the edge (persist_single_document writes
+documents+chunks only, not graph_nodes).
 
-Atomicity: persist_single_document commits in its own transaction
-BEFORE the with_tenant block here opens. If the second transaction
-fails after the rationale Doc has committed, a searchable Doc
-exists with no FEATURE pointing at it. Self-healing on retry:
-deterministic canonical_ids + content_hash idempotency mean a
-redelivered webhook re-runs the full flow cleanly (Doc no-ops on
-matching content_hash, FEATURE+edges retry succeeds). Same
-eventual-consistency story as wiki_synthesis_queue +
-inferred_edges_queue, which by design fire AFTER doc commit.
+Sequencing (three transactions, in order):
+  1. Pre-stub the rationale's DOCUMENT graph_nodes row. This is its
+     own short with_tenant block. Required because step (2) below
+     enqueues inferred_edges_queue, which the side-worker can claim
+     immediately — and the worker's 1-hop graph-walk anchors on
+     graph_nodes. Without a pre-stubbed anchor, the worker builds an
+     empty bundle, the extractor runs on degraded context, the queue
+     row is marked done, and content_hash idempotency means
+     same-content retries never re-enqueue. Lost inferred edges
+     become permanent.
+  2. ``persist_single_document`` commits the Document + chunks +
+     embedding in its OWN transaction, then enqueues
+     wiki_synthesis_queue + inferred_edges_queue.
+  3. Main with_tenant block: upserts FEATURE + PR/Repo/Person stubs +
+     (idempotent re-upsert of the rationale's stub from step 1) +
+     all edges including DESCRIBES.
+
+Atomicity: three separate transactions. If step (3) fails after
+steps (1) and (2) committed, a searchable rationale Doc exists with
+no FEATURE pointing at it. Self-healing on retry: deterministic
+canonical_ids + content_hash idempotency mean a redelivered webhook
+re-runs the full flow cleanly (the graph_nodes stub re-upserts
+idempotently, the Document no-ops on matching content_hash, the
+FEATURE + edges retry succeeds). Same eventual-consistency story as
+wiki_synthesis_queue + inferred_edges_queue, which by design fire
+AFTER doc commit.
 """
 
 from __future__ import annotations
@@ -85,7 +101,7 @@ import re
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Header, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field, field_validator
 
 from services.ingestion.chunker import count_tokens
 from services.ingestion.graph_writer import upsert_edges, upsert_nodes
@@ -249,8 +265,23 @@ class FeatureNodeUpsertRequest(BaseModel):
     source_pr_url: str = Field(
         ..., description="https://github.com/<owner>/<repo>/pull/<n>"
     )
-    merged_at: datetime
+    # AwareDatetime: Pydantic rejects naive datetime strings. Without
+    # this, a caller that sends "2026-05-20T00:00:00" (no tz) would land
+    # in a TIMESTAMPTZ column with an asyncpg coercion that may either
+    # 500 or silently shift to local time. Apps-plane already serializes
+    # ISO 8601 with "+00:00" so this is a defensive guard.
+    merged_at: AwareDatetime
     merge_sha: str
+
+    @field_validator("why")
+    @classmethod
+    def _why_not_blank(cls, v: str) -> str:
+        # min_length=1 above accepts "   \n  ". Reject whitespace-only
+        # rationales — they'd land as approved + searchable + queued
+        # docs with no useful text.
+        if not v.strip():
+            raise ValueError("why must contain non-whitespace text")
+        return v
     evidence_doc_ids: list[str] = Field(
         default_factory=list,
         max_length=MAX_EVIDENCE_DOC_IDS,
@@ -305,10 +336,33 @@ async def upsert_feature_node(
     # array sitting on the FEATURE node forever.
     evidence_doc_ids = list(dict.fromkeys(body.evidence_doc_ids))
 
+    # ---- Pre-stub the rationale Doc's graph_nodes row. persist_single_document
+    # below enqueues inferred_edges_queue right after it commits the Document;
+    # the side-worker can claim that row IMMEDIATELY and run a 1-hop graph
+    # walk anchored on the rationale's doc_id. If the graph_nodes anchor
+    # isn't already present, the bundle builder finds zero graph neighbors,
+    # the extractor runs on a degraded bundle, and the queue row is marked
+    # done — same-content retries no-op via content_hash idempotency, so
+    # the lost inferred edges are permanent. Writing the stub first means
+    # the worker sees a proper anchor and produces a full bundle.
+    rationale_node_stub = GraphNodeSpec(
+        label=NodeLabel.DOCUMENT,
+        canonical_id=rationale_doc_id,
+        properties={"doc_type": DocType.FEATURE_RATIONALE.value},
+    )
+    async with with_tenant(customer_id) as conn:
+        await upsert_nodes(
+            conn,
+            nodes=[rationale_node_stub],
+            customer_id=customer_id,
+            source_system=SourceSystem.GITHUB.value,
+        )
+
     # ---- Persist the rationale Document via the standard typed-writeback
     # path so its text is chunked + embedded + BM25-indexed. Commits in
-    # its OWN transaction before the FEATURE+edges with_tenant block
-    # below opens. See module docstring on atomicity + retry semantics.
+    # its OWN transaction (separate from the pre-stub above AND the
+    # FEATURE+edges block below). See module docstring on atomicity +
+    # retry semantics.
     rationale_doc = _build_rationale_document(
         customer_id=customer_id,
         rationale_doc_id=rationale_doc_id,

@@ -217,7 +217,7 @@ async def test_happy_path_minimal(client: httpx.AsyncClient) -> None:
     body = resp.json()
     assert body["canonical_id"] == "feature:gh:acme/widgets#42"
     assert body["node_id"] is not None
-    assert body["edges_created"] == 2  # OWNS + TOUCHES
+    assert body["edges_created"] == 3  # OWNS + TOUCHES + DESCRIBES
 
     async with with_tenant(CUSTOMER_ID) as conn:
         nodes = await conn.fetch(
@@ -237,7 +237,7 @@ async def test_happy_path_minimal(client: httpx.AsyncClient) -> None:
             "ORDER BY edge_type",
             CUSTOMER_ID,
         )
-        assert [r["edge_type"] for r in edges] == ["OWNS", "TOUCHES"]
+        assert [r["edge_type"] for r in edges] == ["DESCRIBES", "OWNS", "TOUCHES"]
 
 
 @pytest.mark.asyncio
@@ -276,8 +276,8 @@ async def test_happy_path_with_preseeded_evidence_and_author(
         ),
     )
     assert resp.status_code == 200, resp.text
-    # OWNS + TOUCHES + AUTHORED + 4 DOCUMENTS = 7.
-    assert resp.json()["edges_created"] == 7
+    # OWNS + TOUCHES + AUTHORED + 4 DOCUMENTS + DESCRIBES = 8.
+    assert resp.json()["edges_created"] == 8
 
     async with with_tenant(CUSTOMER_ID) as conn:
         edges = await conn.fetch(
@@ -288,7 +288,13 @@ async def test_happy_path_with_preseeded_evidence_and_author(
         by_type: dict[str, list[int]] = {}
         for r in edges:
             by_type.setdefault(r["edge_type"], []).append(r["to_node_id"])
-        assert set(by_type.keys()) == {"OWNS", "TOUCHES", "AUTHORED", "DOCUMENTS"}
+        assert set(by_type.keys()) == {
+            "OWNS",
+            "TOUCHES",
+            "AUTHORED",
+            "DOCUMENTS",
+            "DESCRIBES",
+        }
         assert len(by_type["DOCUMENTS"]) == 4
         # Every DOCUMENTS edge targets a pre-seeded node_id (no duplicates).
         seeded_node_ids = set(seeded_ids.values())
@@ -330,8 +336,8 @@ async def test_evidence_lookup_only_drops_edge_for_missing_doc(
         ),
     )
     assert resp.status_code == 200, resp.text
-    # OWNS + TOUCHES + 1 DOCUMENTS (only the present one) = 3.
-    assert resp.json()["edges_created"] == 3
+    # OWNS + TOUCHES + 1 DOCUMENTS (only the present one) + DESCRIBES = 4.
+    assert resp.json()["edges_created"] == 4
 
     async with with_tenant(CUSTOMER_ID) as conn:
         # Missing doc was NOT created as a phantom.
@@ -375,8 +381,9 @@ async def test_evidence_cross_tenant_canonical_id_is_not_stubbed(
         ),
     )
     assert resp.status_code == 200, resp.text
-    # OWNS + TOUCHES + 0 DOCUMENTS (cross-tenant canonical_id silently dropped) = 2.
-    assert resp.json()["edges_created"] == 2
+    # OWNS + TOUCHES + 0 DOCUMENTS (cross-tenant canonical_id silently dropped)
+    # + DESCRIBES = 3.
+    assert resp.json()["edges_created"] == 3
 
     # No row exists UNDER CUSTOMER_ID with the foreign canonical_id.
     # (Scoped by customer_id explicitly — the test DB role bypasses RLS
@@ -426,8 +433,8 @@ async def test_evidence_doc_ids_deduped_in_feature_properties(
         ),
     )
     assert resp.status_code == 200, resp.text
-    # OWNS + TOUCHES + 1 DOCUMENTS (deduped) = 3.
-    assert resp.json()["edges_created"] == 3
+    # OWNS + TOUCHES + 1 DOCUMENTS (deduped) + DESCRIBES = 4.
+    assert resp.json()["edges_created"] == 4
 
     async with with_tenant(CUSTOMER_ID) as conn:
         # FEATURE.properties.evidence_doc_ids is a single-entry list.
