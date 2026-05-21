@@ -37,6 +37,7 @@ from shared.constants import (
     GITHUB_INSTALLATION_SCOPE_PREFIX,
     DocClass,
     DocType,
+    DocumentKind,
     EdgeType,
     IngestionEventType,
     NodeLabel,
@@ -64,6 +65,8 @@ from shared.models import (
     NormalizationResult,
     WebhookEvent,
     WebhookParseResult,
+    make_document,
+    make_person,
 )
 
 log = get_logger(__name__)
@@ -1401,18 +1404,16 @@ class GitHubConnector(Connector):
 
         nodes = [
             _repo_node(repo),
-            GraphNodeSpec(
-                label=NodeLabel.PR,
+            make_document(
                 canonical_id=f"{full_name}#{number}",
+                kind=DocumentKind.PR,
                 properties={"repo": full_name, "number": number},
             ),
-            GraphNodeSpec(
-                label=NodeLabel.PERSON,
+            make_person(
                 canonical_id=author,
                 properties=_person_props(login=author),
             ),
-            GraphNodeSpec(
-                label=NodeLabel.DOCUMENT,
+            make_document(
                 canonical_id=doc_id,
                 properties={"doc_type": DocType.GITHUB_PULL_REQUEST.value},
             ),
@@ -1431,15 +1432,15 @@ class GitHubConnector(Connector):
                 edge_type=EdgeType.AUTHORED,
                 from_label=NodeLabel.PERSON,
                 from_canonical_id=author,
-                to_label=NodeLabel.PR,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=f"{full_name}#{number}",
                 valid_from=created,
             ),
             GraphEdgeSpec(
                 edge_type=EdgeType.TOUCHES,
-                from_label=NodeLabel.PR,
+                from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=f"{full_name}#{number}",
-                to_label=NodeLabel.REPO,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=full_name,
                 valid_from=created,
             ),
@@ -1452,7 +1453,7 @@ class GitHubConnector(Connector):
                 edge_type=EdgeType.TOUCHES,
                 from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=doc_id,
-                to_label=NodeLabel.REPO,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=full_name,
                 valid_from=created,
             ),
@@ -1461,7 +1462,7 @@ class GitHubConnector(Connector):
             _mention_edges(
                 body,
                 full_name,
-                from_label=NodeLabel.PR,
+                from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=f"{full_name}#{number}",
                 valid_from=created,
             )
@@ -1543,18 +1544,16 @@ class GitHubConnector(Connector):
 
         nodes = [
             _repo_node(repo),
-            GraphNodeSpec(
-                label=NodeLabel.ISSUE,
+            make_document(
                 canonical_id=f"{full_name}#{number}",
+                kind=DocumentKind.ISSUE,
                 properties={"repo": full_name, "number": number},
             ),
-            GraphNodeSpec(
-                label=NodeLabel.PERSON,
+            make_person(
                 canonical_id=author,
                 properties=_person_props(login=author),
             ),
-            GraphNodeSpec(
-                label=NodeLabel.DOCUMENT,
+            make_document(
                 canonical_id=doc_id,
                 properties={"doc_type": DocType.GITHUB_ISSUE.value},
             ),
@@ -1573,7 +1572,7 @@ class GitHubConnector(Connector):
                 edge_type=EdgeType.AUTHORED,
                 from_label=NodeLabel.PERSON,
                 from_canonical_id=author,
-                to_label=NodeLabel.ISSUE,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=f"{full_name}#{number}",
                 valid_from=created,
             ),
@@ -1581,15 +1580,15 @@ class GitHubConnector(Connector):
                 edge_type=EdgeType.TOUCHES,
                 from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=doc_id,
-                to_label=NodeLabel.REPO,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=full_name,
                 valid_from=created,
             ),
             GraphEdgeSpec(
                 edge_type=EdgeType.TOUCHES,
-                from_label=NodeLabel.ISSUE,
+                from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=f"{full_name}#{number}",
-                to_label=NodeLabel.REPO,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=full_name,
                 valid_from=created,
             ),
@@ -1598,7 +1597,7 @@ class GitHubConnector(Connector):
             _mention_edges(
                 body,
                 full_name,
-                from_label=NodeLabel.ISSUE,
+                from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=f"{full_name}#{number}",
                 valid_from=created,
             )
@@ -1724,18 +1723,16 @@ class GitHubConnector(Connector):
 
         nodes = [
             _repo_node(repo),
-            GraphNodeSpec(
-                label=NodeLabel.PR,
+            make_document(
                 canonical_id=f"{full_name}#{pr_number}",
+                kind=DocumentKind.PR,
                 properties={"repo": full_name, "number": pr_number},
             ),
-            GraphNodeSpec(
-                label=NodeLabel.PERSON,
+            make_person(
                 canonical_id=author,
                 properties=_person_props(login=author),
             ),
-            GraphNodeSpec(
-                label=NodeLabel.DOCUMENT,
+            make_document(
                 canonical_id=doc_id,
                 properties={"doc_type": DocType.GITHUB_REVIEW.value},
             ),
@@ -1756,7 +1753,7 @@ class GitHubConnector(Connector):
                 edge_type=EdgeType.TOUCHES,
                 from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=doc_id,
-                to_label=NodeLabel.REPO,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=full_name,
                 valid_from=submitted_at,
             ),
@@ -1867,8 +1864,7 @@ class GitHubConnector(Connector):
 
         nodes: list[GraphNodeSpec] = [
             _repo_node(repo),
-            GraphNodeSpec(
-                label=NodeLabel.DOCUMENT,
+            make_document(
                 canonical_id=doc_id,
                 properties={"doc_type": DocType.GITHUB_RELEASE.value},
             ),
@@ -1878,18 +1874,17 @@ class GitHubConnector(Connector):
                 edge_type=EdgeType.TOUCHES,
                 from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=doc_id,
-                to_label=NodeLabel.REPO,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=full_name,
                 valid_from=created,
             ),
         ]
         if author_id is not None:
             nodes.append(
-                GraphNodeSpec(
-                    label=NodeLabel.PERSON,
+                make_person(
                     canonical_id=author_id,
                     properties=_person_props(login=author_id),
-                )
+)
             )
             edges.append(
                 GraphEdgeSpec(
@@ -1988,8 +1983,7 @@ class GitHubConnector(Connector):
 
         nodes: list[GraphNodeSpec] = [
             _repo_node(repo),
-            GraphNodeSpec(
-                label=NodeLabel.DOCUMENT,
+            make_document(
                 canonical_id=doc_id,
                 properties={"doc_type": DocType.GITHUB_COMMIT_COMMENT.value},
             ),
@@ -2002,18 +1996,17 @@ class GitHubConnector(Connector):
                 edge_type=EdgeType.TOUCHES,
                 from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=doc_id,
-                to_label=NodeLabel.REPO,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=full_name,
                 valid_from=created,
             ),
         ]
         if author_id is not None:
             nodes.append(
-                GraphNodeSpec(
-                    label=NodeLabel.PERSON,
+                make_person(
                     canonical_id=author_id,
                     properties=_person_props(login=author_id),
-                )
+)
             )
             edges.append(
                 GraphEdgeSpec(
@@ -2596,9 +2589,9 @@ def _repo_visibility(repo: Mapping[str, Any]) -> str:
 
 def _repo_node(repo: Mapping[str, Any]) -> GraphNodeSpec:
     full_name = repo.get("full_name") or ""
-    return GraphNodeSpec(
-        label=NodeLabel.REPO,
+    return make_document(
         canonical_id=full_name,
+        kind=DocumentKind.REPO,
         properties={
             "name": repo.get("name"),
             "owner": (repo.get("owner") or {}).get("login"),
@@ -2760,16 +2753,14 @@ def _commit_to_doc(
     )
 
     nodes: list[GraphNodeSpec] = [
-        GraphNodeSpec(
-            label=NodeLabel.DOCUMENT,
+        make_document(
             canonical_id=doc_id,
             properties={"doc_type": DocType.GITHUB_COMMIT.value},
         ),
     ]
     if author not in seen_people:
         nodes.append(
-            GraphNodeSpec(
-                label=NodeLabel.PERSON,
+            make_person(
                 canonical_id=author,
                 properties=_person_props(
                     login=author_info.get("username"),
@@ -2793,7 +2784,7 @@ def _commit_to_doc(
             edge_type=EdgeType.TOUCHES,
             from_label=NodeLabel.DOCUMENT,
             from_canonical_id=doc_id,
-            to_label=NodeLabel.REPO,
+            to_label=NodeLabel.DOCUMENT,
             to_canonical_id=full_name,
             valid_from=timestamp,
         ),
@@ -2810,8 +2801,7 @@ def _commit_to_doc(
         person_id = co["email"]
         if person_id not in seen_people:
             nodes.append(
-                GraphNodeSpec(
-                    label=NodeLabel.PERSON,
+                make_person(
                     canonical_id=person_id,
                     properties=_person_props(name=co["name"], email=co["email"]),
                 )
@@ -2869,8 +2859,7 @@ def _codeowners_artifacts(
                 is_team = "/" in owner
                 owner_id = owner.lstrip("@")
                 nodes.append(
-                    GraphNodeSpec(
-                        label=NodeLabel.PERSON,
+                    make_person(
                         canonical_id=owner_id,
                         properties=_person_props(
                             login=owner_id if not is_team else None,
@@ -2884,7 +2873,7 @@ def _codeowners_artifacts(
                         edge_type=EdgeType.OWNS,
                         from_label=NodeLabel.PERSON,
                         from_canonical_id=owner_id,
-                        to_label=NodeLabel.REPO,
+                        to_label=NodeLabel.DOCUMENT,
                         to_canonical_id=full_name,
                         properties={"path_pattern": pattern, "is_team": is_team},
                         valid_from=timestamp,
@@ -2925,8 +2914,7 @@ def _codeowners_artifacts(
     )
 
     nodes.append(
-        GraphNodeSpec(
-            label=NodeLabel.DOCUMENT,
+        make_document(
             canonical_id=doc_id,
             properties={"doc_type": DocType.GITHUB_CODEOWNERS.value},
         )
@@ -2937,7 +2925,7 @@ def _codeowners_artifacts(
             edge_type=EdgeType.TOUCHES,
             from_label=NodeLabel.DOCUMENT,
             from_canonical_id=doc_id,
-            to_label=NodeLabel.REPO,
+            to_label=NodeLabel.DOCUMENT,
             to_canonical_id=full_name,
             valid_from=timestamp,
         )
@@ -3045,7 +3033,7 @@ def _mention_edges(
                 edge_type=EdgeType.MENTIONS,
                 from_label=from_label,
                 from_canonical_id=from_canonical_id,
-                to_label=NodeLabel.ISSUE,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=f"{other_repo}#{number}",
                 valid_from=valid_from,
             )
@@ -3063,7 +3051,7 @@ def _mention_edges(
                 edge_type=EdgeType.MENTIONS,
                 from_label=from_label,
                 from_canonical_id=from_canonical_id,
-                to_label=NodeLabel.ISSUE,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=f"{repo_full_name}#{number}",
                 valid_from=valid_from,
             )

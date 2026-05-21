@@ -618,6 +618,22 @@ CREATE INDEX idx_graph_nodes_name_trgm
 -- Lane A: partial index on community_id for cross-community surprise-score lookups.
 CREATE INDEX idx_graph_nodes_customer_community
     ON graph_nodes (customer_id, community_id) WHERE community_id IS NOT NULL;
+-- Migration 0091: partial functional indexes for resolve_to_person_canonical_ids.
+-- The retrieval path looks up Person nodes whose Lane E-enriched properties
+-- carry alternate identifiers (e.g. claude_code better-auth uuid as employee_id
+-- on a Slack-rooted Person row). Without these indexes, the per-tenant Person
+-- table is seq-scanned on every retrieval call once tenants pass a few hundred
+-- Persons. Partial WHERE keeps the indexes small for nodes that don't carry
+-- the enrichment property.
+CREATE INDEX idx_graph_nodes_person_employee_id
+    ON graph_nodes ((properties->>'employee_id'))
+    WHERE label = 'Person' AND properties->>'employee_id' IS NOT NULL;
+CREATE INDEX idx_graph_nodes_person_login
+    ON graph_nodes ((properties->>'login'))
+    WHERE label = 'Person' AND properties->>'login' IS NOT NULL;
+CREATE INDEX idx_graph_nodes_person_email
+    ON graph_nodes ((properties->>'email'))
+    WHERE label = 'Person' AND properties->>'email' IS NOT NULL;
 
 CREATE TABLE graph_edges (
     edge_id       BIGSERIAL PRIMARY KEY,

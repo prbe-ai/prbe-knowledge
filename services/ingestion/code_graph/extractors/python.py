@@ -25,7 +25,7 @@ from services.ingestion.code_graph.types import (
     ExtractResult,
     Symbol,
 )
-from shared.constants import EdgeType, NodeLabel
+from shared.constants import CodeSymbolKind, EdgeType
 
 _PY_LANGUAGE = Language(tsp.language())
 
@@ -81,7 +81,7 @@ class PythonExtractor:
         if module_qname:
             module_symbol = Symbol(
                 qualified_name=module_qname,
-                kind=NodeLabel.MODULE,
+                kind=CodeSymbolKind.MODULE,
                 file_path=file_path,
                 def_line=1,
                 end_line=max(1, content.count(b"\n") + 1),
@@ -277,12 +277,12 @@ class _Walker:
         )
 
         if node.type == "class_definition":
-            kind = NodeLabel.CLASS
+            kind = CodeSymbolKind.CLASS
             signature = f"class {name}"
             new_frame = _ScopeFrame(qname=own_qname, kind="class")
         else:
             # function_definition — Method if parent is class, else Function.
-            kind = NodeLabel.METHOD if parent_frame.kind == "class" else NodeLabel.FUNCTION
+            kind = CodeSymbolKind.METHOD if parent_frame.kind == "class" else CodeSymbolKind.FUNCTION
             signature = _signature_text(name, params_node, self.content)
             new_frame = _ScopeFrame(qname=own_qname, kind="function")
             # Track parameters as locals so call-resolution can fall back.

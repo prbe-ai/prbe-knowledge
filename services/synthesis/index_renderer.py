@@ -175,8 +175,8 @@ async def fetch_verified_repo_edges(customer_id: str) -> list[_RepoEdge]:
                 AND n_to.customer_id = e.customer_id
             WHERE e.customer_id = $1
               AND e.edge_type = 'DEPENDS_ON'
-              AND n_from.label = 'Repo'
-              AND n_to.label = 'Repo'
+              AND n_from.label = 'Document'
+              AND n_to.label = 'Document'
               AND e.valid_to IS NULL
             """,
             customer_id,

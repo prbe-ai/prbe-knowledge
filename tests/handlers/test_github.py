@@ -236,8 +236,8 @@ async def test_normalize_pr_produces_document_and_graph() -> None:
     assert doc.metadata["changed_files"] == 3
 
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
-    assert (NodeLabel.REPO, "prbe/payments") in labels
-    assert (NodeLabel.PR, "prbe/payments#42") in labels
+    assert (NodeLabel.DOCUMENT, "prbe/payments") in labels
+    assert (NodeLabel.DOCUMENT, "prbe/payments#42") in labels
     assert (NodeLabel.PERSON, "alice") in labels
     assert (NodeLabel.DOCUMENT, doc.doc_id) in labels
 
@@ -724,7 +724,7 @@ async def test_normalize_release_produces_document_and_graph() -> None:
     assert doc.metadata["release_id"] == 7001
 
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
-    assert (NodeLabel.REPO, "prbe/payments") in labels
+    assert (NodeLabel.DOCUMENT, "prbe/payments") in labels
     assert (NodeLabel.PERSON, "alice") in labels
     assert (NodeLabel.DOCUMENT, doc.doc_id) in labels
 
@@ -801,7 +801,7 @@ async def test_normalize_commit_comment_produces_document_and_graph() -> None:
     assert doc.body.startswith("Did we mean to remove")
 
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
-    assert (NodeLabel.REPO, "prbe/payments") in labels
+    assert (NodeLabel.DOCUMENT, "prbe/payments") in labels
     assert (NodeLabel.PERSON, "alice") in labels
     assert (NodeLabel.DOCUMENT, doc.doc_id) in labels
 

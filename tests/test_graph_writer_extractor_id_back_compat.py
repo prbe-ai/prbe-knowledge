@@ -29,7 +29,7 @@ def _edge(
     edge_type: EdgeType = EdgeType.MENTIONS,
     from_label: NodeLabel = NodeLabel.DOCUMENT,
     from_cid: str = "doc1",
-    to_label: NodeLabel = NodeLabel.TICKET,
+    to_label: NodeLabel = NodeLabel.DOCUMENT,
     to_cid: str = "AUTH-123",
     confidence: str = "EXTRACTED",
 ) -> GraphEdgeSpec:

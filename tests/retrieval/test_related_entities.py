@@ -325,17 +325,17 @@ async def test_two_docs_share_one_repo_doc_count_two(live_db) -> None:
     await _seed_doc_node(cust, doc_id="doc:1")
     await _seed_doc_node(cust, doc_id="doc:2")
     await _seed_neighbor_node(
-        cust, label=NodeLabel.REPO.value,
+        cust, label=NodeLabel.DOCUMENT.value,
         canonical_id="prbe-ai/prbe-backend", name="prbe-backend",
     )
     await _seed_edge(
         cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id="doc:1",
-        to_label=NodeLabel.REPO.value, to_canonical_id="prbe-ai/prbe-backend",
+        to_label=NodeLabel.DOCUMENT.value, to_canonical_id="prbe-ai/prbe-backend",
         edge_type=EdgeType.TOUCHES.value,
     )
     await _seed_edge(
         cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id="doc:2",
-        to_label=NodeLabel.REPO.value, to_canonical_id="prbe-ai/prbe-backend",
+        to_label=NodeLabel.DOCUMENT.value, to_canonical_id="prbe-ai/prbe-backend",
         edge_type=EdgeType.TOUCHES.value,
     )
 
@@ -347,7 +347,7 @@ async def test_two_docs_share_one_repo_doc_count_two(live_db) -> None:
     assert len(out) == 1
     repo = out[0]
     assert repo.canonical_id == "prbe-ai/prbe-backend"
-    assert repo.label == NodeLabel.REPO.value
+    assert repo.label == NodeLabel.DOCUMENT.value
     assert repo.display_name == "prbe-backend"
     assert repo.doc_count == 2
     assert EdgeType.TOUCHES.value in repo.edge_types
@@ -390,19 +390,19 @@ async def test_fuzzy_namespace_match_excludes_namespaced_canonical_id(
     await _seed_doc_node(cust, doc_id="doc:1")
     # Graph stores the namespaced form.
     await _seed_neighbor_node(
-        cust, label=NodeLabel.REPO.value,
+        cust, label=NodeLabel.DOCUMENT.value,
         canonical_id="prbe-ai/prbe-backend", name="prbe-backend",
     )
     await _seed_edge(
         cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id="doc:1",
-        to_label=NodeLabel.REPO.value, to_canonical_id="prbe-ai/prbe-backend",
+        to_label=NodeLabel.DOCUMENT.value, to_canonical_id="prbe-ai/prbe-backend",
     )
 
     # Router emits the bare form.
     out = await walk_result_doc_neighbors(
         cust,
         ranked_result_docs=[("doc:1", 1)],
-        exclude_node_keys={(NodeLabel.REPO.value, "prbe-backend")},
+        exclude_node_keys={(NodeLabel.DOCUMENT.value, "prbe-backend")},
     )
     assert out == []  # Excluded via namespace-stripped match.
 
@@ -505,20 +505,20 @@ async def test_min_confidence_extracted_drops_inferred_only_neighbors(
     await _seed_customer(cust)
     await _seed_doc_node(cust, doc_id="doc:1")
     await _seed_neighbor_node(
-        cust, label=NodeLabel.REPO.value, canonical_id="repo-extracted", name="A",
+        cust, label=NodeLabel.DOCUMENT.value, canonical_id="repo-extracted", name="A",
     )
     await _seed_neighbor_node(
-        cust, label=NodeLabel.REPO.value, canonical_id="repo-inferred", name="B",
+        cust, label=NodeLabel.DOCUMENT.value, canonical_id="repo-inferred", name="B",
     )
     # Doc -> A (EXTRACTED), Doc -> B (INFERRED only)
     await _seed_edge(
         cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id="doc:1",
-        to_label=NodeLabel.REPO.value, to_canonical_id="repo-extracted",
+        to_label=NodeLabel.DOCUMENT.value, to_canonical_id="repo-extracted",
         confidence="EXTRACTED",
     )
     await _seed_edge(
         cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id="doc:1",
-        to_label=NodeLabel.REPO.value, to_canonical_id="repo-inferred",
+        to_label=NodeLabel.DOCUMENT.value, to_canonical_id="repo-inferred",
         confidence="INFERRED",
     )
 
@@ -553,11 +553,11 @@ async def test_top_n_caps_response(live_db) -> None:
     for i in range(5):
         canonical = f"repo-{i}"
         await _seed_neighbor_node(
-            cust, label=NodeLabel.REPO.value, canonical_id=canonical, name=canonical,
+            cust, label=NodeLabel.DOCUMENT.value, canonical_id=canonical, name=canonical,
         )
         await _seed_edge(
             cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id="doc:1",
-            to_label=NodeLabel.REPO.value, to_canonical_id=canonical,
+            to_label=NodeLabel.DOCUMENT.value, to_canonical_id=canonical,
         )
 
     out = await walk_result_doc_neighbors(
@@ -587,11 +587,11 @@ async def test_max_confidence_rank_round_trip(
     await _seed_customer(cust)
     await _seed_doc_node(cust, doc_id="doc:1")
     await _seed_neighbor_node(
-        cust, label=NodeLabel.REPO.value, canonical_id="repo", name="r",
+        cust, label=NodeLabel.DOCUMENT.value, canonical_id="repo", name="r",
     )
     await _seed_edge(
         cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id="doc:1",
-        to_label=NodeLabel.REPO.value, to_canonical_id="repo",
+        to_label=NodeLabel.DOCUMENT.value, to_canonical_id="repo",
         confidence=seeded_confidence,
     )
 
@@ -666,12 +666,12 @@ async def test_valid_to_filter_excludes_closed_edges(live_db) -> None:
     await _seed_customer(cust)
     await _seed_doc_node(cust, doc_id="doc:1")
     await _seed_neighbor_node(
-        cust, label=NodeLabel.CHANNEL.value, canonical_id="#left", name="left",
+        cust, label=NodeLabel.DOCUMENT.value, canonical_id="#left", name="left",
     )
     yesterday = datetime.now(UTC) - timedelta(days=1)
     await _seed_edge(
         cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id="doc:1",
-        to_label=NodeLabel.CHANNEL.value, to_canonical_id="#left",
+        to_label=NodeLabel.DOCUMENT.value, to_canonical_id="#left",
         edge_type=EdgeType.MEMBER_OF.value,
         valid_to=yesterday,
     )
@@ -693,11 +693,11 @@ async def test_non_ascii_canonical_id_passes_through(live_db) -> None:
     await _seed_doc_node(cust, doc_id="doc:1")
     canonical = "channel-équipe-\U0001f680"  # accented + rocket emoji
     await _seed_neighbor_node(
-        cust, label=NodeLabel.CHANNEL.value, canonical_id=canonical, name=canonical,
+        cust, label=NodeLabel.DOCUMENT.value, canonical_id=canonical, name=canonical,
     )
     await _seed_edge(
         cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id="doc:1",
-        to_label=NodeLabel.CHANNEL.value, to_canonical_id=canonical,
+        to_label=NodeLabel.DOCUMENT.value, to_canonical_id=canonical,
     )
 
     out = await walk_result_doc_neighbors(
@@ -733,34 +733,34 @@ async def test_idf_ranking_promotes_specific_over_generic(live_db) -> None:
         await _seed_doc_node(cust, doc_id=f"global:{i}")
 
     await _seed_neighbor_node(
-        cust, label=NodeLabel.CHANNEL.value, canonical_id="#engineering", name="generic",
+        cust, label=NodeLabel.DOCUMENT.value, canonical_id="#engineering", name="generic",
     )
     await _seed_neighbor_node(
-        cust, label=NodeLabel.PR.value, canonical_id="pr:42", name="specific",
+        cust, label=NodeLabel.DOCUMENT.value, canonical_id="pr:42", name="specific",
     )
 
     # Generic A: attached to ALL 5 result docs + ALL 1000 global docs.
     for i in range(5):
         await _seed_edge(
             cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id=f"result:{i}",
-            to_label=NodeLabel.CHANNEL.value, to_canonical_id="#engineering",
+            to_label=NodeLabel.DOCUMENT.value, to_canonical_id="#engineering",
         )
     for i in range(1000):
         await _seed_edge(
             cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id=f"global:{i}",
-            to_label=NodeLabel.CHANNEL.value, to_canonical_id="#engineering",
+            to_label=NodeLabel.DOCUMENT.value, to_canonical_id="#engineering",
         )
 
     # Specific B: attached to only 2 result docs + 5 global docs.
     for i in range(2):
         await _seed_edge(
             cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id=f"result:{i}",
-            to_label=NodeLabel.PR.value, to_canonical_id="pr:42",
+            to_label=NodeLabel.DOCUMENT.value, to_canonical_id="pr:42",
         )
     for i in range(5):
         await _seed_edge(
             cust, from_label=NodeLabel.DOCUMENT.value, from_canonical_id=f"global:{i}",
-            to_label=NodeLabel.PR.value, to_canonical_id="pr:42",
+            to_label=NodeLabel.DOCUMENT.value, to_canonical_id="pr:42",
         )
 
     out = await walk_result_doc_neighbors(
@@ -792,12 +792,12 @@ async def test_rls_isolation_does_not_leak_other_tenant_neighbors(live_db) -> No
     # Tenant B has a doc with an attached entity.
     await _seed_doc_node("tenant-B", doc_id="b-doc:1")
     await _seed_neighbor_node(
-        "tenant-B", label=NodeLabel.REPO.value,
+        "tenant-B", label=NodeLabel.DOCUMENT.value,
         canonical_id="b-secret-repo", name="secret",
     )
     await _seed_edge(
         "tenant-B", from_label=NodeLabel.DOCUMENT.value, from_canonical_id="b-doc:1",
-        to_label=NodeLabel.REPO.value, to_canonical_id="b-secret-repo",
+        to_label=NodeLabel.DOCUMENT.value, to_canonical_id="b-secret-repo",
     )
 
     # Tenant A walks. Even though we pass tenant B's doc_id, the RLS

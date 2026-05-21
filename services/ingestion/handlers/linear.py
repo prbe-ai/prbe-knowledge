@@ -28,6 +28,7 @@ from services.ingestion.handlers.registry import register_connector
 from shared.constants import (
     DocClass,
     DocType,
+    DocumentKind,
     EdgeType,
     IngestionEventType,
     NodeLabel,
@@ -54,6 +55,8 @@ from shared.models import (
     NormalizationResult,
     WebhookEvent,
     WebhookParseResult,
+    make_document,
+    make_person,
 )
 
 log = get_logger(__name__)
@@ -343,9 +346,9 @@ class LinearConnector(Connector):
         )
 
         nodes: list[GraphNodeSpec] = [
-            GraphNodeSpec(
-                label=NodeLabel.TICKET,
+            make_document(
                 canonical_id=issue_id,
+                kind=DocumentKind.TICKET,
                 properties={
                     "source_system": SourceSystem.LINEAR.value,
                     "identifier": data.get("identifier"),
@@ -355,24 +358,21 @@ class LinearConnector(Connector):
                     "assignee_id": assignee_id,
                 },
             ),
-            GraphNodeSpec(
-                label=NodeLabel.DOCUMENT,
+            make_document(
                 canonical_id=doc_id,
                 properties={"doc_type": DocType.LINEAR_ISSUE.value},
             ),
         ]
         if author_id:
             nodes.append(
-                GraphNodeSpec(
-                    label=NodeLabel.PERSON,
+                make_person(
                     canonical_id=author_id,
                     properties=_linear_person_props(data, "creator"),
                 )
             )
         if assignee_id and assignee_id != author_id:
             nodes.append(
-                GraphNodeSpec(
-                    label=NodeLabel.PERSON,
+                make_person(
                     canonical_id=assignee_id,
                     properties=_linear_person_props(data, "assignee"),
                 )
@@ -385,7 +385,7 @@ class LinearConnector(Connector):
                 edge_type=EdgeType.LINKED_FROM,
                 from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=doc_id,
-                to_label=NodeLabel.TICKET,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=issue_id,
                 valid_from=created,
             ),
@@ -405,7 +405,7 @@ class LinearConnector(Connector):
             edges.append(
                 GraphEdgeSpec(
                     edge_type=EdgeType.ASSIGNED_TO,
-                    from_label=NodeLabel.TICKET,
+                    from_label=NodeLabel.DOCUMENT,
                     from_canonical_id=issue_id,
                     to_label=NodeLabel.PERSON,
                     to_canonical_id=assignee_id,
@@ -421,7 +421,7 @@ class LinearConnector(Connector):
                     edge_type=EdgeType.MENTIONS,
                     from_label=NodeLabel.DOCUMENT,
                     from_canonical_id=doc_id,
-                    to_label=NodeLabel.TICKET,
+                    to_label=NodeLabel.DOCUMENT,
                     to_canonical_id=ref_key,
                     valid_from=created,
                 )
@@ -554,9 +554,9 @@ class LinearConnector(Connector):
         ]
         if issue_id:
             nodes.append(
-                GraphNodeSpec(
-                    label=NodeLabel.TICKET,
+                make_document(
                     canonical_id=issue_id,
+                    kind=DocumentKind.TICKET,
                     properties={
                         "source_system": SourceSystem.LINEAR.value,
                         "team_id": team_id,
@@ -582,7 +582,7 @@ class LinearConnector(Connector):
                     edge_type=EdgeType.LINKED_FROM,
                     from_label=NodeLabel.DOCUMENT,
                     from_canonical_id=doc_id,
-                    to_label=NodeLabel.TICKET,
+                    to_label=NodeLabel.DOCUMENT,
                     to_canonical_id=issue_id,
                     valid_from=created,
                 )
@@ -605,7 +605,7 @@ class LinearConnector(Connector):
                     edge_type=EdgeType.MENTIONS,
                     from_label=NodeLabel.DOCUMENT,
                     from_canonical_id=doc_id,
-                    to_label=NodeLabel.TICKET,
+                    to_label=NodeLabel.DOCUMENT,
                     to_canonical_id=ref_key,
                     valid_from=created,
                 )

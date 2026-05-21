@@ -171,5 +171,5 @@ def test_module_node_emitted_for_each_file() -> None:
         else:
             content = b"public class X {}\n"
         result = ext.extract(path, content, ".")
-        modules = [s for s in result.symbols if s.kind == NodeLabel.MODULE]
+        modules = [s for s in result.symbols if s.kind == NodeLabel.CODE_SYMBOL]
         assert len(modules) == 1, f"{path}: expected 1 Module symbol, got {len(modules)}"

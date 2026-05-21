@@ -20,7 +20,7 @@ from services.ingestion.code_graph.types import (
     ExtractResult,
     Symbol,
 )
-from shared.constants import EdgeType, NodeLabel
+from shared.constants import CodeSymbolKind, EdgeType
 
 _JAVA_LANGUAGE = Language(tsjava.language())
 
@@ -52,7 +52,7 @@ class JavaExtractor:
             result.symbols.append(
                 Symbol(
                     qualified_name=module_qname,
-                    kind=NodeLabel.MODULE,
+                    kind=CodeSymbolKind.MODULE,
                     file_path=file_path,
                     def_line=1,
                     end_line=max(1, content.count(b"\n") + 1),
@@ -96,7 +96,7 @@ def _emit_class_like(node, content, file_path, module_qname, result):
     result.symbols.append(
         Symbol(
             qualified_name=qname,
-            kind=NodeLabel.CLASS,
+            kind=CodeSymbolKind.CLASS,
             file_path=file_path,
             def_line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
@@ -154,7 +154,7 @@ def _emit_class_like(node, content, file_path, module_qname, result):
                 result.symbols.append(
                     Symbol(
                         qualified_name=method_qname,
-                        kind=NodeLabel.METHOD,
+                        kind=CodeSymbolKind.METHOD,
                         file_path=file_path,
                         def_line=member.start_point[0] + 1,
                         end_line=member.end_point[0] + 1,

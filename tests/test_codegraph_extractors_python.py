@@ -33,7 +33,7 @@ def add(a, b):
     result = _extract(src)
     fn = _by_qname(result.symbols, "pkg.mod.add")
     assert fn is not None
-    assert fn.kind == NodeLabel.FUNCTION
+    assert fn.kind == NodeLabel.CODE_SYMBOL
     assert fn.docstring == "Add two integers."
     assert "def add(a, b)" in fn.signature
     assert fn.def_line == 2  # `def` keyword line, 1-indexed
@@ -52,9 +52,9 @@ class Foo:
     cls = _by_qname(result.symbols, "pkg.mod.Foo")
     bar = _by_qname(result.symbols, "pkg.mod.Foo.bar")
     baz = _by_qname(result.symbols, "pkg.mod.Foo.baz")
-    assert cls is not None and cls.kind == NodeLabel.CLASS
-    assert bar is not None and bar.kind == NodeLabel.METHOD
-    assert baz is not None and baz.kind == NodeLabel.METHOD
+    assert cls is not None and cls.kind == NodeLabel.CODE_SYMBOL
+    assert bar is not None and bar.kind == NodeLabel.CODE_SYMBOL
+    assert baz is not None and baz.kind == NodeLabel.CODE_SYMBOL
     assert bar.parent_qname == "pkg.mod.Foo"
     # DEFINED_IN edges from methods to parent class.
     method_defines = [

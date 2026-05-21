@@ -186,3 +186,105 @@ async def expand_to_cluster_members(
         cluster = [r["primary_canonical_id"], *(r["alias_list"] or [])]
         out[r["input_id"]] = cluster
     return out
+
+
+async def expand_to_author_id_set(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    person_canonical_ids: list[str],
+) -> list[str]:
+    """Return the union of (cluster member canonical_ids) and (Lane E enrichment
+    property values on cluster members) for the given Person canonical_ids.
+
+    This is the right input for the SQL filter ``documents.author_id = ANY(...)``
+    because ``documents.author_id`` is the raw connector-side identifier and is
+    never rewritten on merge:
+
+      * GitHub PR → ``author_id = 'mahitoburrito'`` (login)
+      * Slack    → ``author_id = 'U0AUP7A7WCS'``    (uid)
+      * Granola  → ``author_id = 'mahit@prbe.ai'``  (email)
+      * Claude Code → ``author_id = '08578d48-...'`` (better-auth uuid, stored
+        as a *property* on the Slack-rooted Person row by Lane E enrichment —
+        never reified as its own graph_nodes row, so plain cluster expansion
+        misses it)
+
+    To match all of Mahit's documents under a single Person cluster, the
+    SQL filter needs every (a) cluster member canonical_id AND (b) every
+    ``properties->>'employee_id'``/``'login'``/``'email'`` value on each
+    cluster member.
+
+    Indexed by partial functional indexes added in migration 0091:
+      idx_graph_nodes_person_{employee_id,login,email}.
+
+    Args:
+      person_canonical_ids: Person canonical_ids resolved from the extractor
+        (e.g. ``['U0AUP7A7WCS', 'mahit@prbe.ai']``). Caller may pass aliases,
+        primaries, or unmerged ids — all three shapes are handled.
+
+    Returns:
+      Flat deduplicated list of strings safe to substitute into
+      ``WHERE documents.author_id = ANY($1::text[])``. Empty input → empty
+      list.
+    """
+    if not person_canonical_ids:
+        return []
+    rows = await conn.fetch(
+        """
+        WITH inputs AS (
+            SELECT canonical_id FROM UNNEST($2::text[]) AS t(canonical_id)
+        ),
+        -- Resolve each input to its primary (self if unmerged).
+        primaries AS (
+            SELECT
+                COALESCE(ea.primary_canonical_id, i.canonical_id) AS primary_id
+            FROM inputs i
+            LEFT JOIN entity_aliases ea
+              ON ea.customer_id = $1
+             AND ea.label = 'Person'
+             AND ea.alias_canonical_id = i.canonical_id
+        ),
+        -- Full cluster membership: primary itself + every alias of that primary.
+        cluster_members AS (
+            SELECT primary_id AS member FROM primaries
+            UNION
+            SELECT ea2.alias_canonical_id
+            FROM primaries p
+            JOIN entity_aliases ea2
+              ON ea2.customer_id = $1
+             AND ea2.label = 'Person'
+             AND ea2.primary_canonical_id = p.primary_id
+        ),
+        -- Lane E enrichment values: each member Person's enrichment properties
+        -- become valid author_id matches.
+        property_values AS (
+            SELECT g.properties->>'employee_id' AS v
+            FROM graph_nodes g
+            JOIN cluster_members cm ON g.canonical_id = cm.member
+            WHERE g.customer_id = $1
+              AND g.label = 'Person'
+              AND g.properties->>'employee_id' IS NOT NULL
+            UNION
+            SELECT g.properties->>'login'
+            FROM graph_nodes g
+            JOIN cluster_members cm ON g.canonical_id = cm.member
+            WHERE g.customer_id = $1
+              AND g.label = 'Person'
+              AND g.properties->>'login' IS NOT NULL
+            UNION
+            SELECT g.properties->>'email'
+            FROM graph_nodes g
+            JOIN cluster_members cm ON g.canonical_id = cm.member
+            WHERE g.customer_id = $1
+              AND g.label = 'Person'
+              AND g.properties->>'email' IS NOT NULL
+        )
+        SELECT DISTINCT v FROM (
+            SELECT member AS v FROM cluster_members
+            UNION ALL
+            SELECT v FROM property_values
+        ) all_ids
+        WHERE v IS NOT NULL AND v <> ''
+        """,
+        customer_id, person_canonical_ids,
+    )
+    return [r["v"] for r in rows]

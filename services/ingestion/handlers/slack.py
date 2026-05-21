@@ -34,6 +34,7 @@ from services.ingestion.handlers.registry import register_connector
 from shared.constants import (
     DocClass,
     DocType,
+    DocumentKind,
     EdgeType,
     IngestionEventType,
     NodeLabel,
@@ -52,11 +53,12 @@ from shared.models import (
     DocRef,
     Document,
     GraphEdgeSpec,
-    GraphNodeSpec,
     IntegrationToken,
     NormalizationResult,
     WebhookEvent,
     WebhookParseResult,
+    make_document,
+    make_person,
 )
 
 log = get_logger(__name__)
@@ -1073,18 +1075,13 @@ class SlackConnector(Connector):
             channel_props["display_name"] = f"#{channel_name}"
 
         nodes = [
-            GraphNodeSpec(
-                label=NodeLabel.CHANNEL,
+            make_document(
                 canonical_id=channel,
+                kind=DocumentKind.CHANNEL,
                 properties=channel_props,
             ),
-            GraphNodeSpec(
-                label=NodeLabel.PERSON,
-                canonical_id=user,
-                properties=person_props,
-            ),
-            GraphNodeSpec(
-                label=NodeLabel.DOCUMENT,
+            make_person(canonical_id=user, properties=person_props),
+            make_document(
                 canonical_id=doc_id,
                 properties={"doc_type": doc.doc_type},
             ),
@@ -1095,7 +1092,7 @@ class SlackConnector(Connector):
                 edge_type=EdgeType.MEMBER_OF,
                 from_label=NodeLabel.PERSON,
                 from_canonical_id=user,
-                to_label=NodeLabel.CHANNEL,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=channel,
                 valid_from=created,
             ),
@@ -1107,13 +1104,13 @@ class SlackConnector(Connector):
                 to_canonical_id=doc_id,
                 valid_from=created,
             ),
-            # Document → Channel so list-pipeline entity filter
-            # ("messages from #engineering") can find the doc.
+            # Message Document → Channel Document so the list-pipeline entity
+            # filter ("messages from #engineering") can find the message.
             GraphEdgeSpec(
                 edge_type=EdgeType.MEMBER_OF,
                 from_label=NodeLabel.DOCUMENT,
                 from_canonical_id=doc_id,
-                to_label=NodeLabel.CHANNEL,
+                to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=channel,
                 valid_from=created,
             ),

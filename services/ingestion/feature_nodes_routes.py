@@ -109,6 +109,7 @@ from shared.config import get_settings
 from shared.constants import (
     DocClass,
     DocType,
+    DocumentKind,
     EdgeType,
     NodeLabel,
     Permission,
@@ -123,6 +124,7 @@ from shared.models import (
     Document,
     GraphEdgeSpec,
     GraphNodeSpec,
+    make_document,
 )
 
 log = get_logger(__name__)
@@ -407,10 +409,9 @@ async def upsert_feature_node(
             canonical_id=rationale_doc_id,
             properties={"doc_type": DocType.FEATURE_RATIONALE.value},
         ),
-        GraphNodeSpec(
-            label=NodeLabel.REPO,
+        make_document(
             canonical_id=body.repo_full_name,
-            properties={},
+            kind=DocumentKind.REPO,
         ),
     ]
     if body.author_id:
@@ -435,7 +436,7 @@ async def upsert_feature_node(
             from_label=NodeLabel.FEATURE,
             from_canonical_id=body.canonical_id,
             edge_type=EdgeType.TOUCHES,
-            to_label=NodeLabel.REPO,
+            to_label=NodeLabel.DOCUMENT,
             to_canonical_id=body.repo_full_name,
             confidence="EXTRACTED",
         ),

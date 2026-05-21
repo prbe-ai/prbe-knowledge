@@ -87,19 +87,19 @@ INDEX_SLUG = "contents"
 
 # `[[<kind>: ...]]` -> (graph node label, edge type emitted from the wiki page).
 #
-# `[[Person: X]]` resolves to NodeLabel.WIKI_PERSON (not PERSON) — wiki page
-# bodies carry only a rendered name, not a canonical platform id (e.g. a Slack
-# user_id or GitHub login). Merging into the canonical PERSON namespace at
-# ingest time would create false-canonical nodes whenever the rendered name
-# happens to match an existing PERSON canonical_id by accident. A future alias
-# resolver can fold WIKI_PERSON into PERSON via fuzzy match. The other typed
-# refs use canonical-shaped ids (slugs, repo names, ticket numbers) and slot
-# straight into their canonical NodeLabel.
+# Post-migration 0091 the label vocabulary is 4: Document | Person | Feature |
+# CodeSymbol. `[[Person: X]]`, `[[Repo: X]]`, `[[Ticket: X]]` previously emitted
+# distinct labels (WIKI_PERSON, REPO, TICKET) to keep wiki-side references
+# isolated from canonical platform ids. That isolation now happens at canonical_id
+# shape (rendered name vs. platform id) rather than at label level, and the
+# AutoMergeAnalyzer (services/ingestion/auto_merge/analyzer.py) handles the
+# wiki↔canonical fold via LLM-judged dedup on Person nodes that share
+# properties.name.
 _LINK_NODE_MAP: dict[str, tuple[NodeLabel, EdgeType]] = {
-    "person": (NodeLabel.WIKI_PERSON, EdgeType.MENTIONS),
+    "person": (NodeLabel.PERSON, EdgeType.MENTIONS),
     "service": (NodeLabel.SERVICE, EdgeType.DESCRIBES),
-    "repo": (NodeLabel.REPO, EdgeType.DESCRIBES),
-    "ticket": (NodeLabel.TICKET, EdgeType.DESCRIBES),
+    "repo": (NodeLabel.DOCUMENT, EdgeType.DESCRIBES),
+    "ticket": (NodeLabel.DOCUMENT, EdgeType.DESCRIBES),
 }
 
 

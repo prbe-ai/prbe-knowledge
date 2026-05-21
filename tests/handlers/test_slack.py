@@ -205,7 +205,7 @@ async def test_normalize_produces_document_and_graph() -> None:
     assert doc.body.startswith("deploying")
 
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
-    assert (NodeLabel.CHANNEL, "C456") in labels
+    assert (NodeLabel.DOCUMENT, "C456") in labels
     assert (NodeLabel.PERSON, "U789") in labels
     assert (NodeLabel.DOCUMENT, doc.doc_id) in labels
 
@@ -1265,7 +1265,7 @@ async def test_normalize_stamps_channel_display_name_from_hydrated() -> None:
 
     result = await slack.normalize(event, {"channel_name": "engineering"})
 
-    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.CHANNEL]
+    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.DOCUMENT]
     assert len(channel_nodes) == 1
     props = channel_nodes[0].properties
     # `name` is the retrieval-readable one; `display_name` has the `#` prefix.
@@ -1299,7 +1299,7 @@ async def test_normalize_no_channel_display_name_when_unresolved() -> None:
 
     result = await slack.normalize(event, {})  # no channel_name
 
-    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.CHANNEL]
+    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.DOCUMENT]
     assert len(channel_nodes) == 1
     props = channel_nodes[0].properties
     assert "display_name" not in props
@@ -1335,7 +1335,7 @@ async def test_normalize_channel_name_falls_back_to_msg_inline() -> None:
 
     result = await slack.normalize(event, {})
 
-    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.CHANNEL]
+    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.DOCUMENT]
     assert channel_nodes[0].properties["display_name"] == "#random"
 
 
@@ -1376,7 +1376,7 @@ async def test_fetch_supplementary_resolves_channel_name(fast_flush) -> None:
         assert hydrated.get("channel_name") == "engineering"
 
         result = await slack.normalize(event, hydrated)
-        ch = next(n for n in result.graph_nodes if n.label == NodeLabel.CHANNEL)
+        ch = next(n for n in result.graph_nodes if n.label == NodeLabel.DOCUMENT)
         assert ch.properties["display_name"] == "#engineering"
     finally:
         await slack.http.aclose()

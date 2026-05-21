@@ -7,7 +7,7 @@ from services.ingestion.code_graph.types import CodeEdge, ExtractResult, Symbol
 from shared.constants import EdgeType, NodeLabel
 
 
-def _sym(qname: str, kind: NodeLabel = NodeLabel.FUNCTION) -> Symbol:
+def _sym(qname: str, kind: NodeLabel = NodeLabel.CODE_SYMBOL) -> Symbol:
     return Symbol(
         qualified_name=qname,
         kind=kind,

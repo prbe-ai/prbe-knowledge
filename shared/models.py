@@ -9,9 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from shared.constants import (
     AttachmentKind,
+    CodeSymbolKind,
     CompileTrigger,
     DocClass,
     DocType,  # noqa: F401  (re-exported; other modules import via shared.models)
+    DocumentKind,
     EdgeType,
     EntityType,
     IngestionEventType,
@@ -835,11 +837,84 @@ class UsageStatsResponse(BaseModel):
 
 
 class GraphNodeSpec(BaseModel):
-    """One graph node to upsert. Resolved to a node_id by graph_writer."""
+    """One graph node to upsert. Resolved to a node_id by graph_writer.
+
+    Prefer the ``make_code_symbol`` / ``make_document`` / ``make_person`` /
+    ``make_feature`` factories below over constructing this directly. The
+    factories enforce the label-to-kind relationship — e.g. a CODE_SYMBOL
+    node must carry a CodeSymbolKind in properties['kind'], not an arbitrary
+    string. Direct construction is fine for SERVICE / DECISION / RUNBOOK /
+    ErrorGroup nodes which have no canonical kind enum today.
+    """
 
     label: NodeLabel
     canonical_id: str
     properties: dict[str, Any] = Field(default_factory=dict)
+
+
+def make_code_symbol(
+    canonical_id: str,
+    kind: CodeSymbolKind,
+    properties: dict[str, Any] | None = None,
+) -> "GraphNodeSpec":
+    """Build a CODE_SYMBOL GraphNodeSpec with the symbol kind stamped into
+    properties['kind']. ``kind`` is enum-typed so mypy refuses cross-category
+    confusion (e.g. ``kind=DocumentKind.PR``).
+    """
+    return GraphNodeSpec(
+        label=NodeLabel.CODE_SYMBOL,
+        canonical_id=canonical_id,
+        properties={**(properties or {}), "kind": kind.value},
+    )
+
+
+def make_document(
+    canonical_id: str,
+    kind: DocumentKind | None = None,
+    properties: dict[str, Any] | None = None,
+) -> "GraphNodeSpec":
+    """Build a DOCUMENT GraphNodeSpec. ``kind`` is optional — plain source
+    documents (slack messages, notion pages, claude_code sessions) leave it
+    unset. Set ``kind`` only for entities that were collapsed INTO Document
+    by migration 0091 where the sub-type is still meaningful (PR, Issue,
+    Ticket, Channel, Repo).
+    """
+    props = {**(properties or {})}
+    if kind is not None:
+        props["kind"] = kind.value
+    return GraphNodeSpec(
+        label=NodeLabel.DOCUMENT,
+        canonical_id=canonical_id,
+        properties=props,
+    )
+
+
+def make_person(
+    canonical_id: str,
+    properties: dict[str, Any] | None = None,
+) -> "GraphNodeSpec":
+    """Build a PERSON GraphNodeSpec. No kind enum — the wiki/canonical
+    distinction that motivated WikiPerson is now properties.source_system.
+    """
+    return GraphNodeSpec(
+        label=NodeLabel.PERSON,
+        canonical_id=canonical_id,
+        properties=properties or {},
+    )
+
+
+def make_feature(
+    canonical_id: str,
+    properties: dict[str, Any] | None = None,
+) -> "GraphNodeSpec":
+    """Build a FEATURE GraphNodeSpec. Reserved for the PR-rationale feature
+    node minted by services/ingestion/feature_nodes_routes.py.
+    """
+    return GraphNodeSpec(
+        label=NodeLabel.FEATURE,
+        canonical_id=canonical_id,
+        properties=properties or {},
+    )
 
 
 class GraphEdgeSpec(BaseModel):

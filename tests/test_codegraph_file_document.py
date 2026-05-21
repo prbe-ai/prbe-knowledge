@@ -17,7 +17,7 @@ from services.ingestion.code_graph.pipeline import (
     extract_files_to_result,
 )
 from services.ingestion.code_graph.types import Symbol
-from shared.constants import DocClass, DocType, EdgeType, NodeLabel, SourceSystem
+from shared.constants import CodeSymbolKind, DocClass, DocType, EdgeType, NodeLabel, SourceSystem
 
 
 @dataclass
@@ -69,7 +69,7 @@ def test_doc_id_format_is_repo_file_only() -> None:
     """
     from datetime import UTC, datetime
 
-    syms = [_make_symbol(qualified_name="foo", kind=NodeLabel.FUNCTION)]
+    syms = [_make_symbol(qualified_name="foo", kind=CodeSymbolKind.FUNCTION)]
     doc, _chunks, _metadata = _build_file_document_with_symbol_chunks(
         customer_id="c1",
         repo="acme/api",
@@ -91,9 +91,9 @@ def test_chunk_count_matches_symbol_count() -> None:
     from datetime import UTC, datetime
 
     syms = [
-        _make_symbol(qualified_name="Greeter", kind=NodeLabel.CLASS),
-        _make_symbol(qualified_name="Greeter.hello", kind=NodeLabel.METHOD),
-        _make_symbol(qualified_name="Greeter._format", kind=NodeLabel.METHOD),
+        _make_symbol(qualified_name="Greeter", kind=CodeSymbolKind.CLASS),
+        _make_symbol(qualified_name="Greeter.hello", kind=CodeSymbolKind.METHOD),
+        _make_symbol(qualified_name="Greeter._format", kind=CodeSymbolKind.METHOD),
     ]
     _doc, chunks, metadata = _build_file_document_with_symbol_chunks(
         customer_id="c1",
@@ -118,7 +118,7 @@ def test_content_chunks_carry_synthetic_header_with_repo_and_qname() -> None:
 
     sym = _make_symbol(
         qualified_name="Greeter.hello",
-        kind=NodeLabel.METHOD,
+        kind=CodeSymbolKind.METHOD,
         source_snippet="def hello(self, name): return name",
         def_line=42,
         end_line=43,
@@ -147,9 +147,9 @@ def test_metadata_chunk_lists_every_symbol_with_kind() -> None:
     from datetime import UTC, datetime
 
     syms = [
-        _make_symbol(qualified_name="Greeter", kind=NodeLabel.CLASS),
-        _make_symbol(qualified_name="Greeter.hello", kind=NodeLabel.METHOD),
-        _make_symbol(qualified_name="format_name", kind=NodeLabel.FUNCTION),
+        _make_symbol(qualified_name="Greeter", kind=CodeSymbolKind.CLASS),
+        _make_symbol(qualified_name="Greeter.hello", kind=CodeSymbolKind.METHOD),
+        _make_symbol(qualified_name="format_name", kind=CodeSymbolKind.FUNCTION),
     ]
     _doc, _chunks, metadata = _build_file_document_with_symbol_chunks(
         customer_id="c1",
@@ -219,7 +219,7 @@ def test_oversized_symbol_splits_into_multiple_chunks() -> None:
     syms = [
         _make_symbol(
             qualified_name="GiantClass",
-            kind=NodeLabel.CLASS,
+            kind=CodeSymbolKind.CLASS,
             file_path="src/giant.py",
             source_snippet=big_body,
             def_line=1,
@@ -227,7 +227,7 @@ def test_oversized_symbol_splits_into_multiple_chunks() -> None:
         ),
         _make_symbol(
             qualified_name="small_helper",
-            kind=NodeLabel.FUNCTION,
+            kind=CodeSymbolKind.FUNCTION,
             file_path="src/giant.py",
             source_snippet="def small_helper(): return 1",
             def_line=410,
@@ -286,7 +286,7 @@ def test_metadata_jsonb_carries_per_symbol_lookup() -> None:
 
     sym = _make_symbol(
         qualified_name="hello",
-        kind=NodeLabel.FUNCTION,
+        kind=CodeSymbolKind.FUNCTION,
         def_line=10,
         end_line=15,
     )

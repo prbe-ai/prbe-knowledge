@@ -77,11 +77,17 @@ def _is_path_canonical(label: str, canonical_id: str) -> bool:
     # Code symbol: `<owner>/<repo>:<path>.<symbol>` shape
     if ":" in canonical_id and "." in canonical_id.split(":", 1)[1]:
         return True
-    # Repo: `<owner>/<name>` — composite key, treat as path-canonical
+    # Repo: `<owner>/<name>` — composite key, treat as path-canonical.
+    # Post-migration 0091 the Repo label collapsed into Document, so the
+    # label discrimination accepts both. The `":" not in canonical_id`
+    # guard excludes source-prefixed Document ids like
+    # `github:owner/repo:pr:123` (which has exactly one slash but is not a
+    # repo-shaped composite key).
     return (
         "/" in canonical_id
         and canonical_id.count("/") == 1
-        and label.lower() == "repo"
+        and ":" not in canonical_id
+        and label.lower() in ("repo", "document")
     )
 
 
