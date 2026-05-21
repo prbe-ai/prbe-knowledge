@@ -355,7 +355,7 @@ def _build_user_message(
     )
 
 
-def _affinity_key(customer_id: str, query: str) -> str:  # noqa: ARG001
+def _affinity_key(customer_id: str, query: str) -> str:
     """Per-customer Cerebras session-affinity hash so the static system
     prompt + tool-defs prefix cache-hits ACROSS queries (not just across
     turns of one query).
