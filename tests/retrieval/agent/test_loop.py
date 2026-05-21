@@ -1036,59 +1036,104 @@ async def test_wrong_shape_terminal_args_degrades_to_empty_output(
 
 
 @pytest.mark.asyncio
-async def test_parse_fail_terminal_triggers_one_retry_then_succeeds(
+async def test_bad_confidence_literal_clamps_to_medium(
     fake_request: SimpleNamespace,
 ) -> None:
-    """When `_parse_terminal_args` returns None on the first terminal
-    turn, the loop injects a re-emit nudge and runs ONE more turn. A
-    valid emit on the retry produces status='ok' with the retried
-    chunks. Mirrors the budget/turn-cap force-terminate retry pattern.
-    Covers the nightly 2026-05-20 schema_violation Pattern A
-    (12/16 cases): turn_count=1, turn_1_tools_fired=['emit_gatherer
-    _output'], previously no recovery."""
+    """Model fabricates a `gatherer_notes.confidence` value outside the
+    allowed Literal set ({"high","medium","low"}). The coercer clamps
+    it to the schema default ("medium") so the emission parses and the
+    user still gets the chunks — no extra LLM round-trip, no
+    schema_violation. Replaces the retry path landed in PR #375.
+
+    Covers Pattern A of the 2026-05-20 nightly digest: 12/16
+    schema_violation traces were turn-1 emit_gatherer_output where the
+    model nailed the SHAPE but drifted a single Literal value."""
     req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
-    # Turn 1: emit_gatherer_output with bad confidence Literal — the
-    # tolerant coercer can't fix Literal mismatches, so Pydantic
-    # validation fails and _parse_terminal_args returns None.
-    bad_args = _final_emission_args(chunks=1)
+    bad_args = _final_emission_args(chunks=3)
     bad_args["gatherer_notes"]["confidence"] = "definitely_unknown_label"
-    turn_1 = _mk_resp(tool_calls=[_terminal_call(bad_args, id="bad_term")])
-    # Turn 2 (retry): a valid emit.
-    turn_2 = _mk_resp(tool_calls=[_terminal_call(
-        _final_emission_args(chunks=3, confidence="medium"),
-        id="good_term",
-    )])
     with patch(
         "services.retrieval.agent.loop.acompletion",
-        new=AsyncMock(side_effect=[turn_1, turn_2]),
-    ):
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(bad_args)],
+        )),
+    ) as mock_acomp:
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
     assert fake_request.state.gatherer_status == "ok"
     assert resp.total_candidates == 3
+    assert resp.gatherer_notes["confidence"] == "medium"
+    # No retry: single LLM round-trip per the new design.
+    assert mock_acomp.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_parse_fail_terminal_retry_fails_yields_schema_violation(
+async def test_explicit_null_confidence_clamps_to_medium(
     fake_request: SimpleNamespace,
 ) -> None:
-    """If BOTH the first terminal emit AND the recovery emit fail to
-    parse, the loop gives up (no cascading retries) and the status
-    remains schema_violation — the retry is single-shot. Pairs with
-    the success-path test above."""
+    """Model emits explicit JSON null for `confidence` (rare but real —
+    Pydantic Literal rejects None). The coercer clamps to "medium"
+    rather than letting the whole emission fail."""
     req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
-    bad_args = _final_emission_args(chunks=1)
-    bad_args["gatherer_notes"]["confidence"] = "definitely_unknown_label"
-    turn_1 = _mk_resp(tool_calls=[_terminal_call(bad_args, id="bad_a")])
-    turn_2 = _mk_resp(tool_calls=[_terminal_call(bad_args, id="bad_b")])
-    # A third side_effect entry would raise StopIteration — assert by
-    # construction that the loop only calls acompletion twice.
+    args = _final_emission_args(chunks=1)
+    args["gatherer_notes"]["confidence"] = None
     with patch(
         "services.retrieval.agent.loop.acompletion",
-        new=AsyncMock(side_effect=[turn_1, turn_2]),
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(args)],
+        )),
     ):
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
-    assert fake_request.state.gatherer_status == "schema_violation"
-    assert resp.total_candidates == 0
+    assert fake_request.state.gatherer_status == "ok"
+    assert resp.total_candidates == 1
+    assert resp.gatherer_notes["confidence"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_non_string_matched_via_member_does_not_crash(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Model emits a non-string member inside `matched_via` (dict from
+    a constrained-decoding partial failure). The filter restricts to
+    strings before the `in` check so it can't raise TypeError on an
+    unhashable member."""
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+    args = _final_emission_args(chunks=1)
+    args["chunks"][0]["matched_via"] = ["vector", {"broken": "shape"}, 123]
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(args)],
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "ok"
+    assert resp.total_candidates == 1
+
+
+@pytest.mark.asyncio
+async def test_bad_matched_via_values_are_filtered(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Model emits a chunk with `matched_via` containing one valid
+    channel and one fabricated label ("telepathy"). The coercer drops
+    the unknown member and keeps the chunk — the fabricated label was
+    only telemetry, not part of the user-facing answer.
+
+    If the entire list is invalid, it collapses to the empty-list
+    default and the chunk still survives."""
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+    args = _final_emission_args(chunks=2)
+    args["chunks"][0]["matched_via"] = ["vector", "telepathy"]
+    args["chunks"][1]["matched_via"] = ["fabricated_only"]
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(args)],
+        )),
+    ) as mock_acomp:
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "ok"
+    assert resp.total_candidates == 2
+    assert mock_acomp.await_count == 1
 
 
 @pytest.mark.asyncio

@@ -30,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args
 
 from fastapi import HTTPException
 
@@ -40,10 +40,12 @@ if TYPE_CHECKING:
 from services.retrieval.agent.adapter import to_query_response
 from services.retrieval.agent.extractor import extract_entities_with_llm
 from services.retrieval.agent.models import (
+    ConfidenceLabel,
     DroppedCandidate,
     GathererNotes,
     GathererOutput,
     GathererStatus,
+    MatchedViaChannel,
     SearchOptions,
 )
 from services.retrieval.agent.prompt import build_system_prompt
@@ -81,6 +83,13 @@ from shared.logging import get_logger
 from shared.models import QueryRequest, QueryResponse
 
 log = get_logger(__name__)
+
+# Allowed enum members for the two Literal-typed fields the model
+# routinely fabricates values for (`chunks[].matched_via`,
+# `gatherer_notes.confidence`). Sourced from the schema via get_args so
+# adding a new value in models.py automatically flows through.
+_MATCHED_VIA_VALID = frozenset(get_args(MatchedViaChannel))
+_CONFIDENCE_VALID = frozenset(get_args(ConfidenceLabel))
 
 
 # ============================================================
@@ -843,6 +852,13 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
         LoopState — that ledger is the canonical record per trace_blob.py.
       - Drops chunks for which no usable doc_id + content pair can be
         recovered (no resolvable citation).
+      - Filters `chunks[].matched_via` to schema-allowed channels — the
+        model sometimes fabricates labels here, and a single bad value
+        would otherwise tank the whole emission via Pydantic Literal
+        validation. Unknowns logged via `agent.literal_clamped`.
+      - Clamps `gatherer_notes.confidence` to schema-allowed values
+        (high/medium/low), defaulting to "medium" when the model
+        emits a fabricated label or explicit null. Same telemetry.
       - Fills doc-level pass-through fields (source_system, title,
         source_url, created_at, updated_at, author_id) from the
         pre-fan-out doc meta when the model omitted them. Falls back to
@@ -927,6 +943,31 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
         for meta_field in ("created_at", "updated_at", "author_id"):
             if meta.get(meta_field) is not None:
                 ch_out[meta_field] = meta[meta_field]
+        # Filter `matched_via` to the schema's allowed channel set. The
+        # model (Cerebras gpt-oss-120b in particular) sometimes invents
+        # labels here ("telepathy" etc.) and occasionally emits non-
+        # string members in the list (dicts, nested lists — same
+        # constrained-decoding partial-failure mode that produces the
+        # bare-string entities[] items handled above). Restrict the
+        # `in` check to strings so an unhashable member can't raise
+        # TypeError. Unknown values are dropped; if nothing survives,
+        # the field falls back to its empty-list default.
+        mv = ch_out.get("matched_via")
+        if isinstance(mv, list):
+            kept = [v for v in mv if isinstance(v, str) and v in _MATCHED_VIA_VALID]
+            dropped = [v for v in mv if not (isinstance(v, str) and v in _MATCHED_VIA_VALID)]
+            if dropped:
+                log.info(
+                    "agent.literal_clamped",
+                    customer_id=state.customer_id if state is not None else None,
+                    trace_id=state.trace_id if state is not None else None,
+                    field="chunks.matched_via",
+                    dropped=[str(d)[:50] for d in dropped[:5]],
+                )
+            ch_out["matched_via"] = kept
+        elif mv is not None:
+            # Non-list value (rare): drop it, let the default kick in.
+            ch_out.pop("matched_via", None)
         chunks_out.append(ch_out)
     if chunks_out or "chunks" in out:
         out["chunks"] = chunks_out
@@ -935,6 +976,22 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
     if state is not None:
         notes["turns_used"] = state.turn_count
         notes["tools_called"] = [*state.tools_fired, TERMINAL_TOOL_NAME]
+    # Clamp `confidence` to the schema's allowed set. The model
+    # occasionally emits fabricated labels here ("definitely_unknown_label",
+    # "uncertain", etc.) or explicit JSON null; without clamping, the
+    # Literal validation fails and we lose the entire emission. Bad
+    # values fall back to "medium" (the schema default — neither
+    # pessimistic nor optimistic). Absent key is left alone so Pydantic
+    # uses the field default.
+    if "confidence" in notes and notes["confidence"] not in _CONFIDENCE_VALID:
+        log.info(
+            "agent.literal_clamped",
+            customer_id=state.customer_id if state is not None else None,
+            trace_id=state.trace_id if state is not None else None,
+            field="gatherer_notes.confidence",
+            original=str(notes["confidence"])[:50],
+        )
+        notes["confidence"] = "medium"
     out["gatherer_notes"] = notes
     return out
 
@@ -1491,15 +1548,6 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
     `tool_choice="required"` guarantees the model picks SOME tool on
     every turn — no prose path.
     """
-    # One-shot recovery flag: if `_parse_terminal_args` fails on a
-    # non-forced terminal turn we inject a re-emit nudge and run one
-    # more turn. Tracked here (not on LoopState) because the budget /
-    # turn-cap force-terminate path already owns its own single-shot
-    # retry (lines 1442-1480); this flag covers the unforced terminal
-    # path that previously had zero recovery — see nightly 2026-05-20
-    # digest: 16/233 schema_violation, 12 of which were turn-1
-    # emit_gatherer_output parses returning None with no retry path.
-    parse_retry_used = False
     while True:
         budget_exhausted = state.tool_calls_count >= state.budget
         # Soft turn cap: once the model has burned through SOFT_TURN_CAP
@@ -1566,60 +1614,8 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
                 trace_id=state.trace_id,
                 turn=state.turn_count,
                 parsed_ok=parsed is not None,
-                parse_retry_used=parse_retry_used,
             )
-            if parsed is not None:
-                return parsed
-            # Parse failure on the terminal turn. Previously the loop
-            # returned None here → status=schema_violation, user-visible
-            # empty result. The model successfully SHAPED the emit
-            # (tool_choice=required + correct tool name); only the
-            # JSON/Pydantic validation drifted — exactly the shape
-            # recoverable by re-asking. Run ONE retry with an explicit
-            # re-emit nudge, then accept whatever the second attempt
-            # returns (incl. None). Skip retry on the forced-terminate
-            # path below — that branch already owns its own single-shot
-            # retry.
-            if parse_retry_used or budget_exhausted or turn_cap_reached:
-                return None
-            parse_retry_used = True
-            log.info(
-                "agent.terminal_parse_retry",
-                customer_id=state.customer_id,
-                trace_id=state.trace_id,
-                turn=state.turn_count,
-                raw_args_len=(
-                    len(raw_args) if isinstance(raw_args, str) else 0
-                ),
-            )
-            # Echo the failed assistant turn so the model sees what it
-            # just emitted, then nudge for a clean re-emit. The OpenAI
-            # chat-completion contract normally wants a `role=tool`
-            # response between an assistant tool_call and the next user
-            # message, but the force-terminate path already emits this
-            # same shape (assistant tool_calls → user nudge, no tool
-            # response) and both Fireworks and Cerebras accept it;
-            # mirroring that.
-            state.messages.append({
-                "role": "assistant",
-                "content": content or "",
-                "tool_calls": _serialize_tool_calls(tool_calls),
-            })
-            state.messages.append({
-                "role": "user",
-                "content": (
-                    "Your last `emit_gatherer_output` arguments could "
-                    "not be parsed as the GathererOutput schema. Call "
-                    "`emit_gatherer_output` again with VALID JSON: "
-                    "`entities` is a list of objects with "
-                    "`canonical_id`; `chunks` is a list of objects "
-                    "with `doc_id`, `chunk_id`, and `content`; "
-                    "`gatherer_notes.confidence` MUST be one of "
-                    "\"high\", \"medium\", or \"low\". Do not call "
-                    "any other tool. Re-emit now."
-                ),
-            })
-            continue
+            return parsed
 
         if budget_exhausted or turn_cap_reached:
             # Tool-call budget gone OR soft turn cap tripped, and the model
