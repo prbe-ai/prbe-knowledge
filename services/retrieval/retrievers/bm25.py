@@ -27,6 +27,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_BM25
@@ -136,10 +137,21 @@ async def bm25_search(
     doc_types: list[str] | None = None,
     temporal: TemporalSpec | None = None,
     include_drafts: bool = False,
+    author_ids: list[str] | None = None,
+    sort_by: Literal["relevance", "recency"] = "relevance",
 ) -> list[BM25Hit]:
     """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
     rows (see migration 0082 + Plan A Component 6). Reviewer surfaces pass
-    True after role-checking; API-key callers cannot bypass."""
+    True after role-checking; API-key callers cannot bypass.
+
+    `author_ids`, when set, hard-filters by
+    `documents.author_id = ANY(...)`. Mirrors `sql_list`'s author filter.
+
+    `sort_by="recency"` swaps `ORDER BY ts_rank_cd DESC` for
+    `ORDER BY d.updated_at DESC`. The `content_tsv @@ to_tsquery` filter
+    still narrows the pool to query-token matches; only the final ordering
+    flips. Used by the gatherer when the extractor flagged temporal intent.
+    """
     spec = temporal or TemporalSpec()
     or_query = _build_or_tsquery_string(query_text)
     if not or_query:
@@ -157,6 +169,11 @@ async def bm25_search(
             params.append(doc_types)
             doc_type_filter = f"AND d.doc_type = ANY(${len(params)}::text[])"
 
+        author_filter = ""
+        if author_ids:
+            params.append(author_ids)
+            author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
+
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
         )
@@ -167,6 +184,12 @@ async def bm25_search(
             ""
             if include_drafts
             else "AND c.visibility = 'approved' AND d.visibility = 'approved'"
+        )
+
+        order_by_sql = (
+            "d.updated_at DESC, c.chunk_id"
+            if sort_by == "recency"
+            else "score DESC, c.chunk_id"
         )
 
         rows = await conn.fetch(
@@ -196,7 +219,8 @@ async def bm25_search(
               {source_filter}
               {doc_type_filter}
               {visibility_filter}
-            ORDER BY score DESC, c.chunk_id
+              {author_filter}
+            ORDER BY {order_by_sql}
             LIMIT $3
             """,
             *params,

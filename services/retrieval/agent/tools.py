@@ -51,7 +51,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 from services.retrieval.agent.models import GathererOutput
 from services.retrieval.grounding import GroundingBundle, build_bundle
@@ -272,6 +272,8 @@ async def execute_search(
     queries: list[str],
     entity_ids: list[dict[str, str]] | None = None,
     top_k: int | None = None,
+    author_ids: list[str] | None = None,
+    sort_by: Literal["relevance", "recency"] = "relevance",
 ) -> dict[str, Any]:
     """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
     inferred_edge) in parallel — same shape the harness runs on turn 0.
@@ -281,10 +283,19 @@ async def execute_search(
     (graph, inferred_edge) anchor on the per-query grounding bundle.
     When `entity_ids` IS provided, those entities anchor every sub-query.
 
+    `author_ids` and `sort_by` thread into every retriever call so all
+    four channels apply the same author hard-filter and ordering
+    discipline. Defaults match today's behavior (no author filter,
+    relevance-ranked) — the harness only overrides when the LLM
+    extractor's `search_options` say otherwise. See
+    `services/retrieval/agent/extractor.py` and
+    `services/retrieval/agent/models.py:SearchOptions`.
+
     Use cases:
       - Reformulate the original query (one new sub-query).
       - Multi-intent decomposition ("X and Y about different things").
       - Recover from an entity-extraction misfire (pass explicit entity_ids).
+      - Author-anchored / recency-sorted shots (pass author_ids + sort_by="recency").
 
     Returns: {sub_queries: [{query, grounded_entities, vector[], bm25[],
                             graph[], inferred_edge[]}]}
@@ -327,6 +338,8 @@ async def execute_search(
                 hits = await _vector(
                     customer_id=customer_id, query_text=q,
                     top_k=top_k_v, temporal=TemporalSpec(),
+                    author_ids=author_ids,
+                    sort_by=sort_by,
                 )
                 return [_hit_to_chunk_dict(h, "vector") for h in hits]
             except Exception as exc:
@@ -338,6 +351,8 @@ async def execute_search(
                 hits = await _bm25(
                     customer_id=customer_id, query_text=q,
                     top_k=top_k_b, temporal=TemporalSpec(),
+                    author_ids=author_ids,
+                    sort_by=sort_by,
                 )
                 return [_hit_to_chunk_dict(h, "bm25") for h in hits]
             except Exception as exc:
@@ -351,6 +366,8 @@ async def execute_search(
                 hits = await _graph(
                     customer_id=customer_id, entities=graph_pairs,
                     top_k=top_k_g, temporal=TemporalSpec(),
+                    author_ids=author_ids,
+                    sort_by=sort_by,
                 )
                 return [
                     {
@@ -378,6 +395,8 @@ async def execute_search(
                 hits = await _inferred(
                     customer_id=customer_id, top_doc_ids=anchor_doc_ids,
                     top_k=top_k_i, dampening=1.0,
+                    author_ids=author_ids,
+                    sort_by=sort_by,
                 )
                 return [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:
@@ -779,7 +798,8 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "Re-search with one or more reformulated queries. Always fans out "
                     "vector + bm25 + graph + inferred_edge in parallel per sub-query. "
                     "Use for: reformulating the original query, multi-intent splits, "
-                    "or recovering from a bad entity match by passing explicit entity_ids."
+                    "recovering from a bad entity match by passing explicit entity_ids, "
+                    "or refining the harness's pre-fan-out with author / recency filters."
                 ),
                 "parameters": {
                     "type": "object",
@@ -805,6 +825,29 @@ def tool_definitions() -> list[dict[str, Any]]:
                                 },
                                 "required": ["entity_type", "canonical_id"],
                             },
+                        },
+                        "author_ids": {
+                            "type": "array",
+                            "description": (
+                                "Optional: canonical_ids of `person` entities that "
+                                "must be the authors of the returned docs. Hard "
+                                "filter — channels narrow to "
+                                "`documents.author_id = ANY(...)` before ranking. "
+                                "Use when the query says 'PRs by X', 'commits from "
+                                "Y', 'messages by Z', etc."
+                            ),
+                            "items": {"type": "string"},
+                        },
+                        "sort_by": {
+                            "type": "string",
+                            "enum": ["relevance", "recency"],
+                            "description": (
+                                "Default `relevance` (semantic + lexical scoring). Pass "
+                                "`recency` when you want the freshest hits first — e.g. "
+                                "the harness's pre-fan-out was relevance-ordered but you "
+                                "need to find the LATEST activity that matches. Works "
+                                "with or without `author_ids`."
+                            ),
                         },
                         "top_k": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
                     },

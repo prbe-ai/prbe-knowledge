@@ -116,6 +116,31 @@ def test_prompt_requires_entity_emission_not_just_chunks() -> None:
     assert "properties.why" in prompt
 
 
+def test_prompt_documents_search_options_block() -> None:
+    """`<search_options>` is rendered between `<connected_sources>` and
+    `<channel_results>` when the extractor flagged deterministic options.
+    The prompt MUST tell the agent that section exists and that the
+    channel ordering is authoritative when it's present — otherwise the
+    "what did X do last" class of queries silently regress to scattered
+    results."""
+    prompt = build_system_prompt(datetime(2026, 5, 16, tzinfo=UTC))
+    assert "<search_options>" in prompt
+    # Lock the "trust the ordering" semantic so future prompt edits can't
+    # weaken it to a soft hint.
+    lowered = prompt.lower()
+    assert "authoritative" in lowered or "trust the channel" in lowered
+
+
+def test_prompt_documents_search_tool_new_knobs() -> None:
+    """The `search` tool gained `author_ids` and `sort_by` parameters
+    (PR for "what did X do last" optimization). The prompt's tool
+    description MUST surface both knob names so the model can use them
+    on follow-up `search` calls."""
+    prompt = build_system_prompt(datetime(2026, 5, 16, tzinfo=UTC))
+    assert "author_ids" in prompt
+    assert "sort_by" in prompt
+
+
 def test_prompt_documents_why_chain_walking_for_reason_queries() -> None:
     """Why-chain queries (reason / cause / context) need explicit
     walking instructions or the agent treats them like any other broad

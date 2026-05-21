@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from services.retrieval.temporal import build_predicate
 from shared.constants import TOP_K_VECTOR
@@ -40,6 +41,8 @@ async def vector_search(
     doc_types: list[str] | None = None,
     temporal: TemporalSpec | None = None,
     include_drafts: bool = False,
+    author_ids: list[str] | None = None,
+    sort_by: Literal["relevance", "recency"] = "relevance",
 ) -> list[VectorHit]:
     """Embed `query_text`, ANN-search against chunks, return top_k hits.
 
@@ -57,6 +60,17 @@ async def vector_search(
     ``visibility = 'approved'`` (the partial indexes from migration 0082
     keep this cheap). Reviewer-scoped BFF surfaces flip this to True after
     role-checking ``wiki_reviewer``; API-key callers never bypass.
+
+    `author_ids`, when set, hard-filters by `documents.author_id = ANY(...)`.
+    Mirrors `sql_list`'s author filter (services/retrieval/retrievers/sql.py:246).
+    The gatherer's extractor populates this list from `person` entities when
+    the query asks "what did <person> do" / "PRs by <person>" / etc.
+
+    `sort_by="recency"` swaps the SQL `ORDER BY` from cosine-distance to
+    `d.updated_at DESC, c.chunk_id`. The ANN filter (chunks with embeddings
+    matching the query) still narrows the pool, but final order is by
+    recency. Used by the gatherer when the extractor flagged temporal
+    intent.
     """
     embedder = get_embedder_v2()
     query_vec = await embedder.embed_query(query_text)
@@ -76,6 +90,11 @@ async def vector_search(
             params.append(doc_types)
             doc_type_filter = f"AND d.doc_type = ANY(${len(params)}::text[])"
 
+        author_filter = ""
+        if author_ids:
+            params.append(author_ids)
+            author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
+
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
         )
@@ -88,6 +107,16 @@ async def vector_search(
             ""
             if include_drafts
             else "AND c.visibility = 'approved' AND d.visibility = 'approved'"
+        )
+
+        # Default: ANN distance ordering (HNSW-indexed, fast). recency: re-order
+        # by updated_at DESC across the narrowed pool (slower than the HNSW path
+        # but bounded — author/doc_type/temporal filters typically prune by
+        # orders of magnitude before this row count matters).
+        order_by_sql = (
+            "d.updated_at DESC, c.chunk_id"
+            if sort_by == "recency"
+            else "c.embedding_v2 <=> $2::halfvec, c.chunk_id"
         )
 
         rows = await conn.fetch(
@@ -116,7 +145,8 @@ async def vector_search(
               {source_filter}
               {doc_type_filter}
               {visibility_filter}
-            ORDER BY c.embedding_v2 <=> $2::halfvec, c.chunk_id
+              {author_filter}
+            ORDER BY {order_by_sql}
             LIMIT $3
             """,
             *params,

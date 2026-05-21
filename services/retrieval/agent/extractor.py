@@ -23,8 +23,12 @@ import json
 import time
 from datetime import UTC, datetime
 from typing import Any
+from typing import get_args as _get_args
 
-from services.retrieval.agent.models import EntityExtraction, ExtractedEntity
+from services.retrieval.agent.models import (
+    EntityExtraction,
+    SortMode,
+)
 from services.retrieval.grounding import GroundingBundle
 from services.retrieval.router import _escape_query_for_xml
 from shared.constants import (
@@ -107,6 +111,24 @@ refers to something in these blocks, prefer the canonical_id from the
 block rather than guessing a slug. The <connected_sources> block lists
 the customer's connected source systems.
 
+SEARCH OPTIONS
+The `search_options` object on the response controls HOW the downstream
+retrieval channels score and order their hits. Default values match
+today's behavior (relevance ranking), so only deviate when the query
+shape genuinely calls for it.
+
+- `search_options.sort`:
+  * `"recency"` — set when the query asks for the most recent / latest /
+    last / newest activity from a named anchor: "what did <person> do
+    last", "most recent PR by <person>", "latest commit from <repo>",
+    "newest slack from <channel>". The downstream retrievers will
+    order their hits by `updated_at DESC` instead of relevance score.
+  * `"relevance"` (default) — every other query. Topical / conceptual /
+    "how does X work" / "find me docs about Y" / single-keyword lookups.
+    Picking `"recency"` for a topical query degrades ranking; default to
+    `"relevance"` whenever the user's intent is "find the right thing"
+    rather than "find the latest thing".
+
 Always emit valid JSON matching the EntityExtraction schema. Never reply with prose.
 """
 
@@ -144,24 +166,64 @@ def _build_extraction_user_message(query: str, bundle: GroundingBundle) -> str:
     )
 
 
+# Allowed values for `search_options.sort`. Imported from the `SortMode`
+# Literal so the coercion helper stays in sync if a new mode is added —
+# adding to the Literal automatically extends this frozenset.
+_ALLOWED_SORTS: frozenset[str] = frozenset(_get_args(SortMode))
+
+
+def _coerce_search_options(raw_options: object) -> dict[str, object]:
+    """Defense-in-depth for non-strict providers (Cerebras gpt-oss-120b) that
+    don't always honor Pydantic Literal constraints under constrained
+    decoding. Returns a dict safe to pass into `SearchOptions(...)`.
+
+    Unknown `sort` values silently coerce to `"relevance"` — the safe
+    default that matches today's behavior. Logging the coercion lets us
+    track how often the provider drifts without raising user-visible
+    errors.
+    """
+    if not isinstance(raw_options, dict):
+        if raw_options is not None:
+            # Non-None but non-dict: provider drifted the field shape (list,
+            # string, etc.). Log so a sudden surge isn't invisible — silent
+            # drops would mask a deeper extractor regression.
+            log.info(
+                "agent.entity_extract_search_options_non_dict",
+                raw_type=type(raw_options).__name__,
+            )
+        return {}
+    out = dict(raw_options)
+    sort = out.get("sort")
+    if isinstance(sort, str) and sort not in _ALLOWED_SORTS:
+        log.info(
+            "agent.entity_extract_sort_coerced",
+            original=sort,
+            coerced_to="relevance",
+        )
+        out["sort"] = "relevance"
+    return out
+
+
 async def extract_entities_with_llm(
     customer_id: str,
     query: str,
     bundle: GroundingBundle,
     seed: int | None = None,
-) -> list[ExtractedEntity]:
+) -> EntityExtraction:
     """Run the Fireworks-backed extractor with the grounding bundle as
-    context. Returns its proposed entities (mostly grounded canonical_ids
-    picked from the candidates list, plus synthesized IDs for paraphrased
-    entities not in the bundle).
+    context. Returns the parsed `EntityExtraction` carrying both
+    `entities` (mostly grounded canonical_ids picked from the candidates
+    list, plus synthesized IDs for paraphrased entities not in the
+    bundle) and `search_options` (sort directive used by the pre-fan-out).
 
     `seed` (optional): same deterministic seed the gatherer loop uses,
     so the entity bag stays stable across reruns of the same query.
     Without it, extraction non-determinism leaks into pre-fan-out and
     masquerades as gatherer variance in the trace blob.
 
-    Returns `[]` on any failure (provider down, parse error, timeout) —
-    extraction is enrichment, not a hard requirement.
+    Returns a defaulted `EntityExtraction()` (no entities, sort=relevance)
+    on any failure — extraction is enrichment, not a hard requirement,
+    and downstream defaults are the safe fallback.
     """
     t0 = time.perf_counter()
     today_iso = datetime.now(UTC).strftime("%Y-%m-%d")
@@ -205,7 +267,7 @@ async def extract_entities_with_llm(
             elapsed_ms=round((time.perf_counter() - t0) * 1000, 1),
             error=str(exc),
         )
-        return []
+        return EntityExtraction()
 
     elapsed_ms = (time.perf_counter() - t0) * 1000
     choices = getattr(resp, "choices", None) or []
@@ -215,7 +277,7 @@ async def extract_entities_with_llm(
             customer_id=customer_id,
             elapsed_ms=round(elapsed_ms, 1),
         )
-        return []
+        return EntityExtraction()
     msg = getattr(choices[0], "message", None)
     content = getattr(msg, "content", None) if msg is not None else None
     if not content:
@@ -224,10 +286,27 @@ async def extract_entities_with_llm(
             customer_id=customer_id,
             elapsed_ms=round(elapsed_ms, 1),
         )
-        return []
+        return EntityExtraction()
 
+    # Two-stage parse: load to dict so we can coerce non-strict provider
+    # drift on `search_options.sort` before Pydantic Literal validation
+    # rejects it. Same defense-in-depth pattern as `_coerce_lenient` in
+    # loop.py.
     try:
-        parsed = EntityExtraction.model_validate_json(content)
+        raw = json.loads(content)
+    except json.JSONDecodeError as exc:
+        log.warning(
+            "agent.entity_extract_json_decode_failed",
+            customer_id=customer_id,
+            elapsed_ms=round(elapsed_ms, 1),
+            error=str(exc),
+            preview=content[:200],
+        )
+        return EntityExtraction()
+    if isinstance(raw, dict) and "search_options" in raw:
+        raw["search_options"] = _coerce_search_options(raw.get("search_options"))
+    try:
+        parsed = EntityExtraction.model_validate(raw)
     except Exception as exc:
         log.warning(
             "agent.entity_extract_parse_failed",
@@ -236,19 +315,20 @@ async def extract_entities_with_llm(
             error=str(exc),
             preview=content[:200],
         )
-        return []
+        return EntityExtraction()
 
     log.info(
         "agent.entity_extract_complete",
         customer_id=customer_id,
         elapsed_ms=round(elapsed_ms, 1),
         count=len(parsed.entities),
+        sort=parsed.search_options.sort,
         entities=[
             f"{e.entity_type}:{e.canonical_id}({round(e.confidence, 2)})"
             for e in parsed.entities[:10]
         ],
     )
-    return list(parsed.entities)
+    return parsed
 
 
 __all__ = ["extract_entities_with_llm"]

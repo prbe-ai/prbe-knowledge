@@ -218,11 +218,43 @@ class ExtractedEntity(BaseModel):
     confidence: float = Field(..., ge=0.0, le=1.0)
 
 
+# Allowed sort values for SearchOptions. Kept as a module-level tuple so the
+# post-parse coercion helper in extractor.py can validate against the same
+# source as the Pydantic Literal. Adding a value here requires updating the
+# Literal too — drift caught by `tests/retrieval/agent/test_extractor.py`.
+SortMode = Literal["recency", "relevance"]
+
+
+class SearchOptions(BaseModel):
+    """Deterministic options the extractor derives from the query shape.
+
+    The harness threads these into every retriever channel of the
+    pre-fan-out so the channels collectively honor the query's intent
+    (recency-sorted vs relevance-sorted, author-filtered vs unrestricted,
+    etc.).
+
+    v1 ships ONE field — `sort`. Future expansions land here:
+        - `temporal: TemporalSpecSymbolic | None` — date-window filters.
+        - `doc_types: list[str]` — "show PRs only" / "show commits only".
+        - `sources: list[str]` — "search only Slack".
+
+    None of those parsers exist yet; they're scheduled follow-up PRs and
+    `model_config["extra"] = "forbid"` ensures the schema can't drift
+    without an explicit revision here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sort: SortMode = "relevance"
+
+
 class EntityExtraction(BaseModel):
     """`response_format=EntityExtraction` is constrained-decoded on a tiny
-    upfront call. The model returns only entities — no temporal/sort/mode
-    classification (the agent infers those from query text + tool selection)."""
+    upfront call. The model returns entities plus search_options — the
+    options modify HOW the harness queries each channel (sort by recency
+    vs relevance, etc.), and default to today's behavior when unset."""
 
     model_config = ConfigDict(extra="forbid")
 
     entities: list[ExtractedEntity] = Field(default_factory=list)
+    search_options: SearchOptions = Field(default_factory=SearchOptions)

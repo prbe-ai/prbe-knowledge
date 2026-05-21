@@ -44,6 +44,7 @@ from services.retrieval.agent.models import (
     GathererNotes,
     GathererOutput,
     GathererStatus,
+    SearchOptions,
 )
 from services.retrieval.agent.prompt import build_system_prompt
 from services.retrieval.agent.tools import (
@@ -54,6 +55,7 @@ from services.retrieval.agent.tools import (
     tool_definitions,
 )
 from services.retrieval.grounding import GroundingBundle
+from services.retrieval.helpers import expand_to_author_id_set
 from services.retrieval.router import (
     Intent,
     RouterEntity,
@@ -73,6 +75,7 @@ from shared.constants import (
     SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
     SourceSystem,
 )
+from shared.db import with_tenant
 from shared.llm import LLMError, acompletion
 from shared.logging import get_logger
 from shared.models import QueryRequest, QueryResponse
@@ -142,6 +145,12 @@ class LoopState:
     # smoking gun, but no fingerprint was captured). None when the
     # provider omits it for that turn.
     system_fingerprints_per_turn: list[str | None] = field(default_factory=list)
+    # Resolved search_options from the LLM extractor — sort directive +
+    # downstream filter args the harness applied to the pre-fan-out. Kept
+    # on state so the trace blob captures intent without re-running the
+    # extractor at inspection time.
+    search_options: SearchOptions = field(default_factory=SearchOptions)
+    pre_fanout_author_ids: list[str] = field(default_factory=list)
 
 
 # ============================================================
@@ -275,10 +284,61 @@ def _format_inferred_chains(prefanout: dict[str, Any]) -> str:
     return "\n".join(out_lines)
 
 
+async def _resolve_person_author_ids(
+    customer_id: str,
+    entity_dicts: list[dict[str, str]],
+) -> list[str]:
+    """Pick `person` canonical_ids out of the unified entity bag and expand
+    each via `expand_to_author_id_set`, which unions:
+
+      1. The full entity_aliases cluster (primary + every alias of every
+         cluster the input ids belong to)
+      2. The Lane E enrichment property values (`employee_id`, `login`,
+         `email`) on every Person row in that cluster — these are the raw
+         identifiers that landed in `documents.author_id` from
+         non-canonical sources (claude_code better-auth uuid, github login,
+         granola email, etc.)
+
+    Returns `[]` (not None) when nothing applies — `execute_search`'s
+    `author_ids` arg treats both as "no filter", so the empty case is the
+    natural pass-through.
+
+    Without (2), claude_code documents authored by Mahit
+    (`author_id='08578d48-…'`) would never match a query that grounded on
+    his Slack-rooted Person canonical_id, because the uuid lives only as
+    a property on that Person row, not as a graph_node of its own.
+    """
+    person_ids = [
+        e["canonical_id"]
+        for e in entity_dicts
+        if (e.get("entity_type") or "").lower() == "person" and e.get("canonical_id")
+    ]
+    if not person_ids:
+        return []
+    try:
+        async with with_tenant(customer_id) as conn:
+            return await expand_to_author_id_set(
+                conn,
+                customer_id,
+                person_canonical_ids=person_ids,
+            )
+    except Exception as exc:
+        log.warning(
+            "agent.author_id_cluster_expand_failed",
+            customer_id=customer_id,
+            person_ids=person_ids,
+            error=str(exc),
+        )
+        return person_ids  # Fall back to unexpanded — never NULL the intent.
+
+
 def _build_user_message(
     query: str,
     bundle: GroundingBundle,
     prefanout: dict[str, Any] | None = None,
+    *,
+    options: SearchOptions | None = None,
+    author_ids: list[str] | None = None,
 ) -> str:
     """Render the per-query user message.
 
@@ -310,6 +370,37 @@ def _build_user_message(
     sources_block = (
         ", ".join(bundle.connected_sources) if bundle.connected_sources else "(none)"
     )
+
+    # Render `<search_options>` only when something deviates from defaults
+    # (sort=relevance, no author filter). Suppressing the tag in the default
+    # case keeps the cache prefix bit-identical to pre-PR so prompt cache
+    # hit rates don't drop for vanilla queries.
+    options_block = ""
+    sort_nondefault = options is not None and options.sort != "relevance"
+    has_author_filter = bool(author_ids)
+    if sort_nondefault or has_author_filter:
+        # Render each option INDEPENDENTLY — only emit `sort=...` when the
+        # sort directive deviates from the default; only emit `author_ids=...`
+        # when the harness actually applied one. Without this guard, a
+        # person-mentioning relevance-sorted query would render
+        # `sort=relevance` into the prompt — a string that never appeared
+        # pre-PR — and break prompt-cache prefix stability for every such
+        # query (measurable cost regression at scale).
+        parts: list[str] = []
+        if sort_nondefault:
+            parts.append(f"sort={options.sort}")  # type: ignore[union-attr]
+        if has_author_filter:
+            parts.append(f"author_ids={list(author_ids)}")
+        options_block = (
+            f"\n\n<search_options>\n"
+            f"The harness applied these options to the pre-fan-out below: "
+            f"{' '.join(parts)}. When sort=recency, each channel's hits "
+            f"are ordered by `updated_at DESC` after entity / token / "
+            f"embedding narrowing. When `author_ids` is set, all channels "
+            f"hard-filter `documents.author_id = ANY(...)`. Trust the "
+            f"channel ordering — don't re-rank by your own intuition.\n"
+            f"</search_options>"
+        )
 
     channel_results_block = ""
     chains_section = ""
@@ -349,6 +440,7 @@ def _build_user_message(
     return (
         f"<grounding>\n{grounding_block}\n</grounding>\n\n"
         f"<connected_sources>{sources_block}</connected_sources>"
+        f"{options_block}"
         f"{channel_results_block}"
         f"{chains_section}\n\n"
         f"<query>\n{safe_query}\n</query>"
@@ -1053,9 +1145,11 @@ async def run_gatherer(
         customer_id, req.query, bundle, seed=extraction_seed
     )
     timing["extraction_ms"] = (time.perf_counter() - t_extraction) * 1000
+    extracted_entities = extracted.entities
+    search_options = extracted.search_options
 
     # Reconcile LLM-proposed entities against the bundle (safety net).
-    if extracted:
+    if extracted_entities:
         synthetic_intent = Intent(
             query_text=req.query,
             mode="search",
@@ -1067,7 +1161,7 @@ async def run_gatherer(
                     display_name=e.display_name,
                     confidence=e.confidence,
                 )
-                for e in extracted
+                for e in extracted_entities
             ],
         )
         _reconcile_entities_with_bundle([synthetic_intent], bundle)
@@ -1092,25 +1186,38 @@ async def run_gatherer(
         seen.add(key)
         entity_dicts.append({"entity_type": e.entity_type, "canonical_id": e.canonical_id})
 
+    # Resolve `documents.author_id` filter from `person` entities in the bag.
+    # Expanded via the person's alias cluster so post-merge canonical_ids
+    # still match pre-merge raw author_id rows (raw historical text, never
+    # rewritten on merge). When no person entity is present, returns [] —
+    # the retrievers treat that as "no filter."
+    author_ids = await _resolve_person_author_ids(customer_id, entity_dicts)
+
     log.info(
         "agent.entity_bag_assembled",
         customer_id=customer_id,
         trace_id=trace_id,
         grounded=len(bundle.candidates) + len(bundle.bare_id_matches),
-        extracted=len(extracted),
+        extracted=len(extracted_entities),
         final=len(entity_dicts),
+        sort=search_options.sort,
+        author_id_count=len(author_ids),
         grounding_ms=round(timing["grounding_ms"], 1),
         extraction_ms=round(timing["extraction_ms"], 1),
     )
 
     # Step 2 — Pre-fan-out: single `execute_search` call covers all 4
     # channels (vector + bm25 + graph + inferred_edge) anchored on the
-    # unified entity bag. Result is the LLM's turn-1 evidence.
+    # unified entity bag. Result is the LLM's turn-1 evidence. The
+    # extractor's search_options thread into every channel so all four
+    # honor the same sort + author-filter discipline.
     t_prefanout = time.perf_counter()
     prefanout_result = await execute_search(
         customer_id=customer_id,
         queries=[req.query],
         entity_ids=entity_dicts or None,
+        author_ids=author_ids or None,
+        sort_by=search_options.sort,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
@@ -1131,7 +1238,13 @@ async def run_gatherer(
     )
 
     # Step 3 — Build the user message and short-circuit if no LLM.
-    user_msg = _build_user_message(req.query, bundle, prefanout_result)
+    user_msg = _build_user_message(
+        req.query,
+        bundle,
+        prefanout_result,
+        options=search_options,
+        author_ids=author_ids,
+    )
     system_prompt = build_system_prompt(datetime.now(UTC))
 
     state = LoopState(
@@ -1141,6 +1254,8 @@ async def run_gatherer(
         seed=_seed_for_query(customer_id, req.query),
         prefanout=prefanout_result,
         prefanout_hit_counts=prefanout_hit_counts,
+        search_options=search_options,
+        pre_fanout_author_ids=list(author_ids),
         messages=[
             {
                 "role": "system",
