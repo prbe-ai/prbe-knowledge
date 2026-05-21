@@ -230,15 +230,24 @@ class SearchOptions(BaseModel):
 
     The harness threads these into every retriever channel of the
     pre-fan-out so the channels collectively honor the query's intent
-    (recency-sorted vs relevance-sorted, author-filtered vs unrestricted,
-    etc.).
+    (recency-sorted vs relevance-sorted, narrowed to a class of docs vs
+    unrestricted, etc.).
 
-    v1 ships ONE field — `sort`. Future expansions land here:
+    Fields:
+      - `sort`: "recency" when the query asks for the most recent /
+        latest / etc.; "relevance" otherwise (default).
+      - `doc_types`: when the query asks about a CLASS of entity
+        ("show me the latest PRs", "what tickets are in progress") set
+        the matching DocType strings here (e.g. ["github.pull_request"])
+        so every channel filters `documents.doc_type = ANY(...)`.
+        Combined with `sort=recency` this is how "latest PR" gets the
+        actual latest PR — instead of the extractor over-grounding on
+        one specific PR candidate it found in the corpus.
+
+    Future expansions land here:
         - `temporal: TemporalSpecSymbolic | None` — date-window filters.
-        - `doc_types: list[str]` — "show PRs only" / "show commits only".
         - `sources: list[str]` — "search only Slack".
 
-    None of those parsers exist yet; they're scheduled follow-up PRs and
     `model_config["extra"] = "forbid"` ensures the schema can't drift
     without an explicit revision here.
     """
@@ -246,6 +255,7 @@ class SearchOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     sort: SortMode = "relevance"
+    doc_types: list[str] | None = None
 
 
 class EntityExtraction(BaseModel):

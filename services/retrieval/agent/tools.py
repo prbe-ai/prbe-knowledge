@@ -274,6 +274,7 @@ async def execute_search(
     top_k: int | None = None,
     author_ids: list[str] | None = None,
     sort_by: Literal["relevance", "recency"] = "relevance",
+    doc_types: list[str] | None = None,
 ) -> dict[str, Any]:
     """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
     inferred_edge) in parallel — same shape the harness runs on turn 0.
@@ -283,19 +284,28 @@ async def execute_search(
     (graph, inferred_edge) anchor on the per-query grounding bundle.
     When `entity_ids` IS provided, those entities anchor every sub-query.
 
-    `author_ids` and `sort_by` thread into every retriever call so all
-    four channels apply the same author hard-filter and ordering
-    discipline. Defaults match today's behavior (no author filter,
-    relevance-ranked) — the harness only overrides when the LLM
-    extractor's `search_options` say otherwise. See
+    `author_ids`, `sort_by`, and `doc_types` thread into every retriever
+    call so all four channels apply the same author hard-filter,
+    doc-type hard-filter, and ordering discipline. Defaults match today's
+    behavior (no filters, relevance-ranked) — the harness only overrides
+    when the LLM extractor's `search_options` say otherwise. See
     `services/retrieval/agent/extractor.py` and
     `services/retrieval/agent/models.py:SearchOptions`.
+
+    `doc_types`, when set, hard-filters `documents.doc_type = ANY(...)`.
+    Used for class-level queries ("the latest PR", "what tickets are in
+    progress") so the channels return the top-K by recency/relevance
+    from the matching class instead of being anchored on whatever
+    specific entity the extractor picked from its candidates list.
 
     Use cases:
       - Reformulate the original query (one new sub-query).
       - Multi-intent decomposition ("X and Y about different things").
       - Recover from an entity-extraction misfire (pass explicit entity_ids).
       - Author-anchored / recency-sorted shots (pass author_ids + sort_by="recency").
+      - Class-level queries ("latest PR", "tickets this week") — pass
+        doc_types=["github.pull_request"] etc. instead of a specific
+        entity anchor.
 
     Returns: {sub_queries: [{query, grounded_entities, vector[], bm25[],
                             graph[], inferred_edge[]}]}
@@ -340,6 +350,7 @@ async def execute_search(
                     top_k=top_k_v, temporal=TemporalSpec(),
                     author_ids=author_ids,
                     sort_by=sort_by,
+                    doc_types=doc_types,
                 )
                 return [_hit_to_chunk_dict(h, "vector") for h in hits]
             except Exception as exc:
@@ -353,6 +364,7 @@ async def execute_search(
                     top_k=top_k_b, temporal=TemporalSpec(),
                     author_ids=author_ids,
                     sort_by=sort_by,
+                    doc_types=doc_types,
                 )
                 return [_hit_to_chunk_dict(h, "bm25") for h in hits]
             except Exception as exc:
@@ -368,6 +380,7 @@ async def execute_search(
                     top_k=top_k_g, temporal=TemporalSpec(),
                     author_ids=author_ids,
                     sort_by=sort_by,
+                    doc_types=doc_types,
                 )
                 return [
                     {
@@ -397,6 +410,7 @@ async def execute_search(
                     top_k=top_k_i, dampening=1.0,
                     author_ids=author_ids,
                     sort_by=sort_by,
+                    doc_types=doc_types,
                 )
                 return [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:

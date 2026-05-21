@@ -1258,6 +1258,7 @@ async def run_gatherer(
         extracted=len(extracted_entities),
         final=len(entity_dicts),
         sort=search_options.sort,
+        doc_types=search_options.doc_types,
         author_id_count=len(author_ids),
         grounding_ms=round(timing["grounding_ms"], 1),
         extraction_ms=round(timing["extraction_ms"], 1),
@@ -1267,7 +1268,7 @@ async def run_gatherer(
     # channels (vector + bm25 + graph + inferred_edge) anchored on the
     # unified entity bag. Result is the LLM's turn-1 evidence. The
     # extractor's search_options thread into every channel so all four
-    # honor the same sort + author-filter discipline.
+    # honor the same sort + author-filter + doc-type discipline.
     t_prefanout = time.perf_counter()
     prefanout_result = await execute_search(
         customer_id=customer_id,
@@ -1275,6 +1276,7 @@ async def run_gatherer(
         entity_ids=entity_dicts or None,
         author_ids=author_ids or None,
         sort_by=search_options.sort,
+        doc_types=search_options.doc_types or None,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
