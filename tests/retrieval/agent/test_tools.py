@@ -201,6 +201,87 @@ async def test_search_caps_at_five_subqueries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_search_threads_sort_and_author_ids_to_every_channel() -> None:
+    """The `sort_by` + `author_ids` kwargs the harness derives from the
+    extractor's `search_options` must reach EVERY channel — vector, bm25,
+    graph, AND inferred_edge. A regression where only some channels
+    honored the options would silently scatter results."""
+    vec = AsyncMock(return_value=[])
+    bm = AsyncMock(return_value=[])
+    grp = AsyncMock(return_value=[])
+    inf = AsyncMock(return_value=[])
+    with patch(
+        "services.retrieval.agent.tools._vector", new=vec
+    ), patch(
+        "services.retrieval.agent.tools._bm25", new=bm
+    ), patch(
+        "services.retrieval.agent.tools._graph", new=grp
+    ), patch(
+        "services.retrieval.agent.tools._inferred", new=inf
+    ), patch(
+        "services.retrieval.agent.tools._resolve_entities_to_anchor_docs",
+        new=AsyncMock(return_value=["doc:1"]),  # non-empty so inferred fires
+    ):
+        await execute_search(
+            "cust-1",
+            queries=["what did mahit do last?"],
+            entity_ids=[{"entity_type": "person", "canonical_id": "mahit@prbe.ai"}],
+            author_ids=["mahit@prbe.ai"],
+            sort_by="recency",
+        )
+
+    for chan, mock in (("vector", vec), ("bm25", bm), ("graph", grp), ("inferred", inf)):
+        assert mock.await_count == 1, f"{chan} should fire once"
+        kwargs = mock.await_args.kwargs
+        assert kwargs.get("sort_by") == "recency", f"{chan} missing sort_by=recency"
+        assert kwargs.get("author_ids") == ["mahit@prbe.ai"], f"{chan} missing author_ids"
+
+
+@pytest.mark.asyncio
+async def test_search_defaults_preserve_today_behavior() -> None:
+    """Without sort_by / author_ids kwargs, channels see the same args
+    as before the optimization landed — author_ids=None, sort_by="relevance".
+    Regression guard for non-deterministic queries."""
+    vec = AsyncMock(return_value=[])
+    with patch(
+        "services.retrieval.agent.tools._vector", new=vec
+    ), patch(
+        "services.retrieval.agent.tools._bm25", new=AsyncMock(return_value=[])
+    ), patch(
+        "services.retrieval.agent.tools._graph", new=AsyncMock(return_value=[])
+    ), patch(
+        "services.retrieval.agent.tools._inferred", new=AsyncMock(return_value=[])
+    ), patch(
+        "services.retrieval.agent.tools._resolve_entities_to_anchor_docs",
+        new=AsyncMock(return_value=[]),
+    ):
+        await execute_search(
+            "cust-1",
+            queries=["how does auth work"],
+            entity_ids=[{"entity_type": "feature", "canonical_id": "auth"}],
+        )
+
+    kwargs = vec.await_args.kwargs
+    assert kwargs.get("sort_by") == "relevance"
+    assert kwargs.get("author_ids") is None
+
+
+def test_search_tool_schema_exposes_author_ids_and_sort_by() -> None:
+    """The agent's `search` tool description must surface both new knobs
+    so the model can use them on follow-up `search` calls (e.g. to
+    refine after recognizing the harness picked a bad anchor)."""
+    from services.retrieval.agent.tools import tool_definitions
+
+    defs = {d["function"]["name"]: d for d in tool_definitions()}
+    search_params = defs["search"]["function"]["parameters"]["properties"]
+
+    assert "author_ids" in search_params
+    assert search_params["author_ids"]["type"] == "array"
+    assert "sort_by" in search_params
+    assert sorted(search_params["sort_by"]["enum"]) == ["recency", "relevance"]
+
+
+@pytest.mark.asyncio
 async def test_subgraph_empty_anchor_returns_not_existed() -> None:
     """Empty anchor canonical_id can't be resolved → empty result, no crash."""
     with patch(

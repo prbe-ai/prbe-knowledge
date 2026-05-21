@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from services.retrieval.surprise import surprise_score
 from services.retrieval.temporal import build_predicate
@@ -103,6 +104,8 @@ async def graph_search(
     temporal: TemporalSpec | None = None,
     min_confidence: str | None = "INFERRED",
     include_drafts: bool = False,
+    author_ids: list[str] | None = None,
+    sort_by: Literal["relevance", "recency"] = "relevance",
 ) -> list[GraphHit]:
     """Return chunks from documents within 1 hop of any matching entity node.
 
@@ -111,6 +114,16 @@ async def graph_search(
     less-obviously-relevant docs (sibling tickets, co-owned services, etc.).
 
     `doc_types`, when set, hard-filters joined documents by `doc_type`.
+
+    `author_ids`, when set, hard-filters joined documents by `author_id`.
+    Lets the gatherer combine "anchored on entity X" with "authored by
+    person Y" — e.g. "what did mahit do in prbe-knowledge?".
+
+    `sort_by="recency"` flips the post-fetch Python sort from the
+    surprise-score ranking to `updated_at DESC`. The candidate pool
+    (entity-anchored joins) is unchanged; only the order returned to the
+    caller flips, so downstream fusion sees recency-ordered hits for this
+    channel when the gatherer flagged temporal intent.
     """
     if not entities:
         return []
@@ -165,6 +178,11 @@ async def graph_search(
         if doc_types:
             params.append(doc_types)
             doc_type_filter = f"AND d.doc_type = ANY(${len(params)}::text[])"
+
+        author_filter = ""
+        if author_ids:
+            params.append(author_ids)
+            author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -308,6 +326,7 @@ async def graph_search(
               {pred.doc_sql}
               {doc_type_filter}
               {visibility_filter}
+              {author_filter}
             GROUP BY c.chunk_id, c.doc_id, c.chunk_index, d.version,
                      d.source_system, d.source_url, d.title, d.author_id,
                      c.content, d.created_at, d.updated_at
@@ -362,6 +381,19 @@ async def graph_search(
                 retriever_scores={"surprise": surprise},
             )
         )
+
+    if sort_by == "recency":
+        # Gatherer flagged temporal intent — return the entity-anchored pool
+        # ordered by `updated_at DESC` instead of by surprise. Tie-break by
+        # chunk_id matches the relevance branch's determinism contract. The
+        # underlying `.score` field stays surprise-derived so cross-channel
+        # fusion math remains consistent if any caller still RRFs this
+        # channel; only the LIST ORDER changes.
+        hits.sort(key=lambda h: (
+            -(h.updated_at.timestamp() if h.updated_at else 0),
+            h.chunk_id,
+        ))
+        return hits
 
     # Sort by surprise score so the highest-surprise edge lands at rank 1
     # and gets the biggest graph-side RRF contribution (1/61) in fusion.

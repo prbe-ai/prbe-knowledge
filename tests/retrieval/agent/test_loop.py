@@ -34,7 +34,12 @@ from services.retrieval.agent.loop import (
     _seed_for_query,
     run_gatherer,
 )
-from services.retrieval.agent.models import ExtractedEntity, GathererOutput
+from services.retrieval.agent.models import (
+    EntityExtraction,
+    ExtractedEntity,
+    GathererOutput,
+    SearchOptions,
+)
 from services.retrieval.agent.tools import TERMINAL_TOOL_NAME
 from services.retrieval.grounding import GroundingBundle
 from shared.models import QueryRequest
@@ -154,7 +159,7 @@ def _stub_grounding_extraction_prefanout(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     monkeypatch.setattr(
         "services.retrieval.agent.loop.extract_entities_with_llm",
-        AsyncMock(return_value=[]),
+        AsyncMock(return_value=EntityExtraction()),
     )
     monkeypatch.setattr(
         "services.retrieval.agent.loop.execute_search",
@@ -780,6 +785,69 @@ def test_build_user_message_omits_inferred_chains_when_no_inferred_hits() -> Non
     assert "</inferred_chains>" not in out
 
 
+def test_build_user_message_includes_search_options_when_nondefault() -> None:
+    """When the extractor flagged `sort=recency` AND/OR resolved author_ids,
+    the `<search_options>` block renders between `<connected_sources>` and
+    `<channel_results>`. The block tells the agent the channel ordering is
+    authoritative — without it the agent will re-rank by intuition and
+    scatter the result set."""
+    from services.retrieval.grounding import GroundingBundle
+
+    out = _build_user_message(
+        "what did mahit do last?",
+        GroundingBundle(),
+        prefanout=None,
+        options=SearchOptions(sort="recency"),
+        author_ids=["mahit@prbe.ai"],
+    )
+    assert "<search_options>" in out
+    assert "sort=recency" in out
+    assert "author_ids" in out and "mahit@prbe.ai" in out
+    pos_sources = out.find("<connected_sources>")
+    pos_options = out.find("<search_options>")
+    pos_query = out.find("<query>")
+    assert 0 <= pos_sources < pos_options < pos_query
+
+
+def test_build_user_message_omits_sort_when_only_author_filter_applied() -> None:
+    """A person-mentioning relevance-sorted query (sort=relevance,
+    author_ids=[X]) used to render `sort=relevance` into the prompt —
+    a string that never appeared pre-PR. That string would break
+    prompt-cache prefix stability for every person-anchored query that
+    wasn't asking for recency, blowing up the cache miss rate. The block
+    must show ONLY `author_ids=[...]` in that case."""
+    from services.retrieval.grounding import GroundingBundle
+
+    out = _build_user_message(
+        "what does mahit work on",
+        GroundingBundle(),
+        prefanout=None,
+        options=SearchOptions(sort="relevance"),
+        author_ids=["mahit@prbe.ai"],
+    )
+    assert "<search_options>" in out
+    assert "author_ids" in out
+    assert "mahit@prbe.ai" in out
+    # The critical assertion: don't emit the no-op `sort=relevance` token.
+    assert "sort=relevance" not in out
+
+
+def test_build_user_message_omits_search_options_for_default_query() -> None:
+    """sort=relevance + no author filter → the tag is suppressed. This
+    keeps the prompt-cache prefix bit-identical to pre-PR for the 90%
+    case (non-deterministic queries), so cache hit rates don't drop."""
+    from services.retrieval.grounding import GroundingBundle
+
+    out = _build_user_message(
+        "how does auth work",
+        GroundingBundle(),
+        prefanout=None,
+        options=SearchOptions(),  # defaults
+        author_ids=[],
+    )
+    assert "<search_options>" not in out
+
+
 def test_build_user_message_omits_inferred_chains_when_no_prefanout() -> None:
     """No pre-fan-out at all (LLM-extraction-only path) → neither
     channel_results nor inferred_chains render. Same opener-only check
@@ -796,6 +864,68 @@ def test_build_user_message_omits_inferred_chains_when_no_prefanout() -> None:
 # ============================================================
 # Loop integration (mocked everything)
 # ============================================================
+
+@pytest.mark.asyncio
+async def test_extracted_search_options_flow_into_execute_search(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_request: SimpleNamespace,
+) -> None:
+    """End-to-end loop wiring: extractor returns sort=recency + a person
+    entity → run_gatherer must pass sort_by="recency" AND the resolved
+    author_ids to execute_search. Regression guard for the
+    "what did mahit do last" optimization — if the extracted options
+    don't reach execute_search, the channels stay relevance-sorted and
+    the deterministic queries scatter again."""
+    req = QueryRequest(query="what did mahit do last?", customer_id="cust-1", top_k=5)
+
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        AsyncMock(return_value=GroundingBundle()),
+    )
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop.extract_entities_with_llm",
+        AsyncMock(return_value=EntityExtraction(
+            entities=[
+                ExtractedEntity(
+                    entity_type="person",
+                    canonical_id="mahit@prbe.ai",
+                    display_name="Mahit",
+                    confidence=1.0,
+                ),
+            ],
+            search_options=SearchOptions(sort="recency"),
+        )),
+    )
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop._resolve_person_author_ids",
+        AsyncMock(return_value=["mahit@prbe.ai", "mahitoburrito"]),
+    )
+    captured = AsyncMock(return_value={"sub_queries": [{
+        "query": "what did mahit do last?",
+        "grounded_entities": [],
+        "vector": [{"doc_id": "stub:0", "score": 0.5,
+                    "source_system": "github", "title": "stub",
+                    "content": "stub"}],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]})
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop.execute_search",
+        captured,
+    )
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args(chunks=1, confidence="high"))],
+        )),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert captured.await_count == 1
+    kwargs = captured.await_args.kwargs
+    assert kwargs.get("sort_by") == "recency"
+    assert kwargs.get("author_ids") == ["mahit@prbe.ai", "mahitoburrito"]
+
 
 @pytest.mark.asyncio
 async def test_terminal_on_turn_1_is_happy_path(
@@ -990,14 +1120,14 @@ async def test_zero_recall_short_circuits_even_with_extracted_entities(
     )
     monkeypatch.setattr(
         "services.retrieval.agent.loop.extract_entities_with_llm",
-        AsyncMock(return_value=[
+        AsyncMock(return_value=EntityExtraction(entities=[
             ExtractedEntity(
                 entity_type="service",
                 canonical_id="blue_yeti",
                 display_name="Blue Yeti",
                 confidence=0.5,
             ),
-        ]),
+        ])),
     )
     boom = AsyncMock(side_effect=AssertionError("acompletion should NOT be called"))
 

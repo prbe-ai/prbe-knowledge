@@ -93,6 +93,12 @@ def build_trace_blob(
         # analyzer can correlate channel coverage with curated outcomes.
         blob["prefanout"] = state.prefanout
         blob["prefanout_hit_counts"] = dict(state.prefanout_hit_counts)
+        # Resolved search_options + author_ids the harness applied to the
+        # pre-fan-out — lets the nightly analyzer correlate deterministic
+        # query shapes with retrieval outcomes without re-running the
+        # extractor at inspection time.
+        blob["search_options"] = state.search_options.model_dump(mode="json")
+        blob["pre_fanout_author_ids"] = list(state.pre_fanout_author_ids)
         # Per-turn chain-of-thought from message.reasoning_content (gpt-oss
         # harmony `analysis` block, normalized by LiteLLM). NOT echoed
         # back into the next turn (OpenAI chat-completion contract
@@ -123,6 +129,8 @@ def build_trace_blob(
         blob["prose_retries"] = 0
         blob["prefanout"] = {}
         blob["prefanout_hit_counts"] = {}
+        blob["search_options"] = {"sort": "relevance"}
+        blob["pre_fanout_author_ids"] = []
         blob["reasoning_per_turn"] = []
         # Pre-loop failure → no seed was sent. Use None (not 0) so the
         # analyzer doesn't bucket unrelated failures under a fake shared

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal
 
 from shared.constants import INFERRED_EDGE_DAMPENING, INFERRED_EDGE_TOP_K, NodeLabel
 from shared.db import with_tenant
@@ -79,6 +80,8 @@ async def inferred_edge_search(
     top_k: int = INFERRED_EDGE_TOP_K,
     dampening: float = INFERRED_EDGE_DAMPENING,
     include_drafts: bool = False,
+    author_ids: list[str] | None = None,
+    sort_by: Literal["relevance", "recency"] = "relevance",
 ) -> list[InferredEdgeHit]:
     """Walk INFERRED Doc-Doc edges from `top_doc_ids` and return up to
     `top_k` linked documents.
@@ -92,6 +95,16 @@ async def inferred_edge_search(
     primary results doesn't need to surface again as its own neighbor).
 
     Empty `top_doc_ids` short-circuits without a SQL call.
+
+    `author_ids`, when set, hard-filters the joined `documents` by
+    `author_id` — neighbors authored by other people drop out. The
+    gatherer populates this when the query asks "what did <person> do".
+
+    `sort_by="recency"` swaps the primary edge-type-priority ordering for
+    `d.updated_at DESC`. The bidirectional edge walk + INFERRED filter
+    still narrow the pool; only the final ordering flips so the gatherer
+    sees the freshest inferred-edge-linked docs first when temporal
+    intent was flagged.
     """
     if not top_doc_ids:
         return []
@@ -99,6 +112,43 @@ async def inferred_edge_search(
     document_label = NodeLabel.DOCUMENT.value
     # Hide drafts unless reviewer opts in (Plan A Component 6).
     doc_visibility_filter = "" if include_drafts else "AND d.visibility = 'approved'"
+
+    # Positional params start at [customer_id, top_doc_ids, top_k]; the
+    # author filter, when present, takes the next slot ($4).
+    params: list = [customer_id, top_doc_ids, top_k]
+    author_filter_sql = ""
+    if author_ids:
+        params.append(author_ids)
+        author_filter_sql = f"AND d.author_id = ANY(${len(params)}::text[])"
+
+    # Default order: edge-type priority then recency within tier.
+    # sort_by="recency": pure recency first (still tie-broken by edge-type
+    # priority so similar-updated_at neighbors come back deterministically).
+    if sort_by == "recency":
+        order_by_sql = """
+          d.updated_at DESC,
+          CASE nd.edge_type
+            WHEN 'DISCUSSES' THEN 1
+            WHEN 'RESOLVES' THEN 2
+            WHEN 'DOCUMENTS' THEN 3
+            WHEN 'MENTIONS_ENTITY' THEN 4
+            WHEN 'RELATES_TO' THEN 5
+            ELSE 6
+          END
+        """
+    else:
+        order_by_sql = """
+          CASE nd.edge_type
+            WHEN 'DISCUSSES' THEN 1
+            WHEN 'RESOLVES' THEN 2
+            WHEN 'DOCUMENTS' THEN 3
+            WHEN 'MENTIONS_ENTITY' THEN 4
+            WHEN 'RELATES_TO' THEN 5
+            ELSE 6
+          END,
+          d.updated_at DESC
+        """
+
     sql = f"""
         WITH anchors AS (
             -- Resolve each top_doc_id to its Document graph_node, carrying
@@ -184,21 +234,13 @@ async def inferred_edge_search(
          AND d.valid_to IS NULL
          {doc_visibility_filter}
         WHERE nd.doc_id <> ALL($2::text[])  -- exclude top_doc_ids themselves
-        ORDER BY
-          CASE nd.edge_type
-            WHEN 'DISCUSSES' THEN 1
-            WHEN 'RESOLVES' THEN 2
-            WHEN 'DOCUMENTS' THEN 3
-            WHEN 'MENTIONS_ENTITY' THEN 4
-            WHEN 'RELATES_TO' THEN 5
-            ELSE 6
-          END,
-          d.updated_at DESC
+          {author_filter_sql}
+        ORDER BY {order_by_sql}
         LIMIT $3
     """
 
     async with with_tenant(customer_id) as conn:
-        rows = await conn.fetch(sql, customer_id, top_doc_ids, top_k)
+        rows = await conn.fetch(sql, *params)
 
     # Multi-anchor collapse: if the same neighbor doc surfaces from several
     # anchors, keep the BEST anchor (highest primary rank = lowest

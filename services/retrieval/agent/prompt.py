@@ -51,6 +51,16 @@ CONTEXT YOU GET ON TURN 1
                        (one source → many downstream docs, each with a
                        `why` rationale) is visible at-a-glance.
 
+When the extractor flagged deterministic search options, the harness
+renders a `<search_options>` block between `<connected_sources>` and
+`<channel_results>` showing the sort directive (`recency` vs default
+`relevance`) and any `author_ids` hard-filter applied to every channel
+of the pre-fan-out. When that block is present, the channel ordering is
+authoritative — the top hits are already author-filtered and recency-
+ranked. Don't second-guess by re-ranking; just curate from the top of
+each channel. The block is absent when the query is non-deterministic
+(default behavior).
+
 ================================================================
 TOOLS — `tool_choice` is "required"
 ================================================================
@@ -58,21 +68,50 @@ Call exactly one tool every turn. Pure text output is not permitted.
 
 {', '.join(_TOOLS)}
 
-• search(queries, entity_ids?, top_k?) — re-run the 4-channel fan-out
-  with REFORMULATED queries or different anchors. Do not re-fire the
-  same query you already have results for in `<channel_results>`.
-• subgraph(anchor, depth?, edge_types?, include_inferred?,
-           include_aliases?, top_k_per_hop?) — multi-hop BFS from one
-  anchor; returns nodes, inferred Doc-Doc edges (with `why` strings),
-  and alias-cluster expansions in ONE call. Prefer this over multiple
-  thin 1-hop walks.
-• fetch_doc(doc_id, max_chunks?, with_inferred_edges?, with_evidence?)
-  — full doc body + optional cross-references in ONE call.
-• need_deeper(reason) — soft budget extension. +10 tool calls per call,
-  max 2 extensions.
-• emit_gatherer_output(entities, chunks, gatherer_notes) — TERMINAL.
-  Its arguments ARE the final GathererOutput. Calling it ends the loop;
-  do not call any other tool in the same turn.
+EXPLORATION TOOLS
+─────────────────
+• `search(queries, entity_ids?, author_ids?, sort_by?, top_k?)` —
+  re-run the 4-channel fan-out with REFORMULATED queries or different
+  entity anchors. The harness fires vector + bm25 + graph +
+  inferred_edge in parallel per sub-query. Pass 2-5 queries for
+  multi-intent decomposition. Pass `entity_ids` when you want to anchor
+  on specific entities (overrides per-query re-grounding). Pass
+  `author_ids` (canonical_ids of `person` entities) to hard-filter
+  `documents.author_id` across every channel. Pass
+  `sort_by="recency"` to flip channel ordering from relevance to
+  `updated_at DESC`. Do NOT call this with the SAME query AND THE SAME
+  options you already have results for in `<channel_results>` — that's
+  wasted work.
+
+• `subgraph(anchor_canonical_id, depth?, edge_types?, include_inferred?,
+            include_aliases?, top_k_per_hop?)`
+  Multi-hop BFS from one anchor node. ONE call returns up to `depth`
+  hops worth of nodes (default 1, max 3), the inferred Doc-Doc edges
+  out of any Document nodes in the subgraph (with their `why` strings
+  attached), and the alias-cluster expansions for any Person/Repo
+  entities. Use this to traverse the knowledge graph instead of
+  multiple thin 1-hop calls.
+
+• `fetch_doc(doc_id, max_chunks?, with_inferred_edges?, with_evidence?)`
+  Full doc detail in ONE call. Returns the chunks (default 10), plus
+  optional outbound inferred edges (`with_inferred_edges=true`) and the
+  chunks the LLM was reasoning over when producing each `why` string
+  (`with_evidence=true`). Use when one specific doc in
+  `<channel_results>` looks important and you need the full body or
+  the cross-references.
+
+BUDGET
+──────
+• `need_deeper(reason)` — soft budget extension. +10 tool calls per
+  call, max 2 extensions. Use when you're close to the cap but one
+  more parallel tool call would materially improve curation.
+
+TERMINAL — call this to end the loop
+─────────────────────────────────────
+• `emit_gatherer_output(entities, chunks, gatherer_notes)`
+  The arguments ARE the final GathererOutput. Call this when you've
+  curated the answer. The loop ends as soon as you call it — do NOT
+  call any other tool in the same turn.
 
 ================================================================
 HAPPY PATH
