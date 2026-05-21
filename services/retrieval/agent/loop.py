@@ -1376,6 +1376,15 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
     `tool_choice="required"` guarantees the model picks SOME tool on
     every turn — no prose path.
     """
+    # One-shot recovery flag: if `_parse_terminal_args` fails on a
+    # non-forced terminal turn we inject a re-emit nudge and run one
+    # more turn. Tracked here (not on LoopState) because the budget /
+    # turn-cap force-terminate path already owns its own single-shot
+    # retry (lines 1442-1480); this flag covers the unforced terminal
+    # path that previously had zero recovery — see nightly 2026-05-20
+    # digest: 16/233 schema_violation, 12 of which were turn-1
+    # emit_gatherer_output parses returning None with no retry path.
+    parse_retry_used = False
     while True:
         budget_exhausted = state.tool_calls_count >= state.budget
         # Soft turn cap: once the model has burned through SOFT_TURN_CAP
@@ -1424,20 +1433,78 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
         # could theoretically emit emit_gatherer_output ALONGSIDE other
         # tool calls — we treat the terminal as authoritative and ignore
         # the rest.)
-        for tc in tool_calls:
-            fn = getattr(tc, "function", None)
-            name = getattr(fn, "name", None)
-            if name == TERMINAL_TOOL_NAME:
-                raw_args = getattr(fn, "arguments", None)
-                parsed = _parse_terminal_args(raw_args, state=state)
-                log.info(
-                    "agent.terminal_emit",
-                    customer_id=state.customer_id,
-                    trace_id=state.trace_id,
-                    turn=state.turn_count,
-                    parsed_ok=parsed is not None,
-                )
+        terminal_tc = next(
+            (
+                tc for tc in tool_calls
+                if getattr(getattr(tc, "function", None), "name", None)
+                == TERMINAL_TOOL_NAME
+            ),
+            None,
+        )
+        if terminal_tc is not None:
+            fn = getattr(terminal_tc, "function", None)
+            raw_args = getattr(fn, "arguments", None)
+            parsed = _parse_terminal_args(raw_args, state=state)
+            log.info(
+                "agent.terminal_emit",
+                customer_id=state.customer_id,
+                trace_id=state.trace_id,
+                turn=state.turn_count,
+                parsed_ok=parsed is not None,
+                parse_retry_used=parse_retry_used,
+            )
+            if parsed is not None:
                 return parsed
+            # Parse failure on the terminal turn. Previously the loop
+            # returned None here → status=schema_violation, user-visible
+            # empty result. The model successfully SHAPED the emit
+            # (tool_choice=required + correct tool name); only the
+            # JSON/Pydantic validation drifted — exactly the shape
+            # recoverable by re-asking. Run ONE retry with an explicit
+            # re-emit nudge, then accept whatever the second attempt
+            # returns (incl. None). Skip retry on the forced-terminate
+            # path below — that branch already owns its own single-shot
+            # retry.
+            if parse_retry_used or budget_exhausted or turn_cap_reached:
+                return None
+            parse_retry_used = True
+            log.info(
+                "agent.terminal_parse_retry",
+                customer_id=state.customer_id,
+                trace_id=state.trace_id,
+                turn=state.turn_count,
+                raw_args_len=(
+                    len(raw_args) if isinstance(raw_args, str) else 0
+                ),
+            )
+            # Echo the failed assistant turn so the model sees what it
+            # just emitted, then nudge for a clean re-emit. The OpenAI
+            # chat-completion contract normally wants a `role=tool`
+            # response between an assistant tool_call and the next user
+            # message, but the force-terminate path already emits this
+            # same shape (assistant tool_calls → user nudge, no tool
+            # response) and both Fireworks and Cerebras accept it;
+            # mirroring that.
+            state.messages.append({
+                "role": "assistant",
+                "content": content or "",
+                "tool_calls": _serialize_tool_calls(tool_calls),
+            })
+            state.messages.append({
+                "role": "user",
+                "content": (
+                    "Your last `emit_gatherer_output` arguments could "
+                    "not be parsed as the GathererOutput schema. Call "
+                    "`emit_gatherer_output` again with VALID JSON: "
+                    "`entities` is a list of objects with "
+                    "`canonical_id`; `chunks` is a list of objects "
+                    "with `doc_id`, `chunk_id`, and `content`; "
+                    "`gatherer_notes.confidence` MUST be one of "
+                    "\"high\", \"medium\", or \"low\". Do not call "
+                    "any other tool. Re-emit now."
+                ),
+            })
+            continue
 
         if budget_exhausted or turn_cap_reached:
             # Tool-call budget gone OR soft turn cap tripped, and the model
