@@ -852,6 +852,13 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
         LoopState — that ledger is the canonical record per trace_blob.py.
       - Drops chunks for which no usable doc_id + content pair can be
         recovered (no resolvable citation).
+      - Filters `chunks[].matched_via` to schema-allowed channels — the
+        model sometimes fabricates labels here, and a single bad value
+        would otherwise tank the whole emission via Pydantic Literal
+        validation. Unknowns logged via `agent.literal_clamped`.
+      - Clamps `gatherer_notes.confidence` to schema-allowed values
+        (high/medium/low), defaulting to "medium" when the model
+        emits a fabricated label or explicit null. Same telemetry.
       - Fills doc-level pass-through fields (source_system, title,
         source_url, created_at, updated_at, author_id) from the
         pre-fan-out doc meta when the model omitted them. Falls back to
@@ -938,21 +945,24 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
                 ch_out[meta_field] = meta[meta_field]
         # Filter `matched_via` to the schema's allowed channel set. The
         # model (Cerebras gpt-oss-120b in particular) sometimes invents
-        # labels here ("telepathy" etc.). Without filtering, one bad
-        # value tanks the entire emission via Pydantic Literal
-        # validation. Unknown values are dropped; if nothing survives,
+        # labels here ("telepathy" etc.) and occasionally emits non-
+        # string members in the list (dicts, nested lists — same
+        # constrained-decoding partial-failure mode that produces the
+        # bare-string entities[] items handled above). Restrict the
+        # `in` check to strings so an unhashable member can't raise
+        # TypeError. Unknown values are dropped; if nothing survives,
         # the field falls back to its empty-list default.
         mv = ch_out.get("matched_via")
         if isinstance(mv, list):
-            kept = [v for v in mv if v in _MATCHED_VIA_VALID]
-            dropped = [v for v in mv if v not in _MATCHED_VIA_VALID]
+            kept = [v for v in mv if isinstance(v, str) and v in _MATCHED_VIA_VALID]
+            dropped = [v for v in mv if not (isinstance(v, str) and v in _MATCHED_VIA_VALID)]
             if dropped:
                 log.info(
                     "agent.literal_clamped",
                     customer_id=state.customer_id if state is not None else None,
                     trace_id=state.trace_id if state is not None else None,
                     field="chunks.matched_via",
-                    dropped=dropped[:5],
+                    dropped=[str(d)[:50] for d in dropped[:5]],
                 )
             ch_out["matched_via"] = kept
         elif mv is not None:
@@ -968,17 +978,18 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
         notes["tools_called"] = [*state.tools_fired, TERMINAL_TOOL_NAME]
     # Clamp `confidence` to the schema's allowed set. The model
     # occasionally emits fabricated labels here ("definitely_unknown_label",
-    # "uncertain", etc.); without clamping, the Literal validation fails
-    # and we lose the entire emission. Bad values fall back to "medium"
-    # (the schema default — neither pessimistic nor optimistic).
-    conf = notes.get("confidence")
-    if conf is not None and conf not in _CONFIDENCE_VALID:
+    # "uncertain", etc.) or explicit JSON null; without clamping, the
+    # Literal validation fails and we lose the entire emission. Bad
+    # values fall back to "medium" (the schema default — neither
+    # pessimistic nor optimistic). Absent key is left alone so Pydantic
+    # uses the field default.
+    if "confidence" in notes and notes["confidence"] not in _CONFIDENCE_VALID:
         log.info(
             "agent.literal_clamped",
             customer_id=state.customer_id if state is not None else None,
             trace_id=state.trace_id if state is not None else None,
             field="gatherer_notes.confidence",
-            original=str(conf)[:50],
+            original=str(notes["confidence"])[:50],
         )
         notes["confidence"] = "medium"
     out["gatherer_notes"] = notes

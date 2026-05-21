@@ -1066,6 +1066,50 @@ async def test_bad_confidence_literal_clamps_to_medium(
 
 
 @pytest.mark.asyncio
+async def test_explicit_null_confidence_clamps_to_medium(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Model emits explicit JSON null for `confidence` (rare but real —
+    Pydantic Literal rejects None). The coercer clamps to "medium"
+    rather than letting the whole emission fail."""
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+    args = _final_emission_args(chunks=1)
+    args["gatherer_notes"]["confidence"] = None
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(args)],
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "ok"
+    assert resp.total_candidates == 1
+    assert resp.gatherer_notes["confidence"] == "medium"
+
+
+@pytest.mark.asyncio
+async def test_non_string_matched_via_member_does_not_crash(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Model emits a non-string member inside `matched_via` (dict from
+    a constrained-decoding partial failure). The filter restricts to
+    strings before the `in` check so it can't raise TypeError on an
+    unhashable member."""
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+    args = _final_emission_args(chunks=1)
+    args["chunks"][0]["matched_via"] = ["vector", {"broken": "shape"}, 123]
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(args)],
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "ok"
+    assert resp.total_candidates == 1
+
+
+@pytest.mark.asyncio
 async def test_bad_matched_via_values_are_filtered(
     fake_request: SimpleNamespace,
 ) -> None:
