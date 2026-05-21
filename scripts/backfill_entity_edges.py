@@ -80,7 +80,7 @@ def _edges_for_doc(
             edges.append(
                 _EdgeSpec(
                     edge_type=EdgeType.TOUCHES.value,
-                    target_label=NodeLabel.REPO.value,
+                    target_label=NodeLabel.DOCUMENT.value,
                     target_canonical_id=parts[1],
                 )
             )
@@ -96,7 +96,7 @@ def _edges_for_doc(
             edges.append(
                 _EdgeSpec(
                     edge_type=EdgeType.MEMBER_OF.value,
-                    target_label=NodeLabel.CHANNEL.value,
+                    target_label=NodeLabel.DOCUMENT.value,
                     target_canonical_id=channel,
                 )
             )
@@ -115,7 +115,7 @@ def _edges_for_doc(
             edges.append(
                 _EdgeSpec(
                     edge_type=EdgeType.LINKED_FROM.value,
-                    target_label=NodeLabel.TICKET.value,
+                    target_label=NodeLabel.DOCUMENT.value,
                     target_canonical_id=ticket_id,
                 )
             )

@@ -25,7 +25,9 @@ from services.ingestion.handlers.registry import register_connector
 from shared.constants import (
     DocClass,
     DocType,
+    EdgeType,
     IngestionEventType,
+    NodeLabel,
     Permission,
     PrincipalType,
     SourceSystem,
@@ -35,10 +37,41 @@ from shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     Document,
+    GraphEdgeSpec,
+    GraphNodeSpec,
     NormalizationResult,
     WebhookEvent,
     WebhookParseResult,
 )
+
+
+def _pd_person_id(obj: dict[str, Any] | None) -> str | None:
+    """Extract a PagerDuty user id from an embedded user/assignee object.
+
+    PD nests person references one of two ways:
+      - direct user object: ``{"id": "PXXXXXX", "type": "user_reference", ...}``
+      - assignment wrapper: ``{"assignee": {"id": "PXXXXXX", ...}, ...}``
+    Caller passes whichever shape they have; we accept both.
+    """
+    if not isinstance(obj, dict):
+        return None
+    assignee = obj.get("assignee")
+    if isinstance(assignee, dict):
+        obj = assignee
+    pid = obj.get("id")
+    return pid if isinstance(pid, str) and pid else None
+
+
+def _pd_person_props(obj: dict[str, Any] | None) -> dict[str, Any]:
+    """Properties dict for a PD Person graph node — name + source tag."""
+    props: dict[str, Any] = {"source_system": SourceSystem.PAGERDUTY.value}
+    if not isinstance(obj, dict):
+        return props
+    inner = obj.get("assignee") if isinstance(obj.get("assignee"), dict) else obj
+    summary = (inner.get("summary") or "").strip() if isinstance(inner, dict) else ""
+    if summary:
+        props["name"] = summary
+    return props
 
 
 def _parse_iso8601(value: str | None) -> datetime | None:
@@ -150,6 +183,24 @@ class PagerDutyConnector(Connector):
         priority: dict[str, Any] = incident.get("priority") if isinstance(incident.get("priority"), dict) else {}
         escalation_policy: dict[str, Any] = incident.get("escalation_policy") if isinstance(incident.get("escalation_policy"), dict) else {}
 
+        # Person attribution: PD nests "who's currently paged" and "who last
+        # changed status" separately. assignments[0].assignee is the current
+        # responder; last_status_change_by is whoever ack'd / resolved /
+        # reassigned the incident. We mirror the sentry pattern of
+        # `author_id = assignee or actor_id` so the Document points at one of
+        # them for the recency / author-id filter, and emit Person nodes for
+        # both (deduped when they're the same person).
+        assignments = incident.get("assignments")
+        first_assignment = assignments[0] if isinstance(assignments, list) and assignments else None
+        assignee_obj = first_assignment if isinstance(first_assignment, dict) else None
+        actor_obj = incident.get("last_status_change_by")
+        if not isinstance(actor_obj, dict):
+            actor_obj = None
+
+        assignee_id = _pd_person_id(assignee_obj)
+        actor_id = _pd_person_id(actor_obj)
+        author_id = assignee_id or actor_id
+
         incident_id: str | None = incident.get("id")
         if not incident_id:
             return NormalizationResult(skipped_reason="missing event.data.id")
@@ -219,7 +270,7 @@ class PagerDutyConnector(Connector):
             body_preview=body[:280],
             body_size_bytes=len(body.encode("utf-8")),
             body_token_count=count_tokens(body),
-            author_id=None,
+            author_id=author_id,
             created_at=created_at,
             updated_at=event.received_at,
             valid_from=event.received_at,
@@ -241,8 +292,65 @@ class PagerDutyConnector(Connector):
             coalesce_into_live=True,
         )
 
+        # Graph emission: Document + Person nodes for assignee/actor + edges.
+        graph_nodes: list[GraphNodeSpec] = [
+            GraphNodeSpec(
+                label=NodeLabel.DOCUMENT,
+                canonical_id=doc_id,
+                properties={"doc_type": DocType.INCIDENT.value},
+            ),
+        ]
+        graph_edges: list[GraphEdgeSpec] = []
+
+        if assignee_id:
+            graph_nodes.append(
+                GraphNodeSpec(
+                    label=NodeLabel.PERSON,
+                    canonical_id=assignee_id,
+                    properties=_pd_person_props(assignee_obj),
+                )
+            )
+            graph_edges.append(
+                GraphEdgeSpec(
+                    edge_type=EdgeType.ASSIGNED_TO,
+                    from_label=NodeLabel.DOCUMENT,
+                    from_canonical_id=doc_id,
+                    to_label=NodeLabel.PERSON,
+                    to_canonical_id=assignee_id,
+                    valid_from=event.received_at,
+                )
+            )
+
+        if actor_id and actor_id != assignee_id:
+            graph_nodes.append(
+                GraphNodeSpec(
+                    label=NodeLabel.PERSON,
+                    canonical_id=actor_id,
+                    properties=_pd_person_props(actor_obj),
+                )
+            )
+
+        # AUTHORED edge from the human who most recently touched the
+        # incident (actor preferred; falls back to assignee). Mirrors the
+        # sentry pattern where status changes are attributed to whoever
+        # triggered the webhook event.
+        author_node_id = actor_id or assignee_id
+        if author_node_id:
+            graph_edges.append(
+                GraphEdgeSpec(
+                    edge_type=EdgeType.AUTHORED,
+                    from_label=NodeLabel.PERSON,
+                    from_canonical_id=author_node_id,
+                    to_label=NodeLabel.DOCUMENT,
+                    to_canonical_id=doc_id,
+                    valid_from=event.received_at,
+                )
+            )
+
         return NormalizationResult(
             documents=[doc],
+            graph_nodes=graph_nodes,
+            graph_edges=graph_edges,
             requires_investigation=(event_type == "incident.triggered"),
             requires_resolution_check=(event_type == "incident.resolved"),
         )

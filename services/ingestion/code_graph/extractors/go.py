@@ -20,7 +20,7 @@ from services.ingestion.code_graph.types import (
     ExtractResult,
     Symbol,
 )
-from shared.constants import EdgeType, NodeLabel
+from shared.constants import CodeSymbolKind, EdgeType
 
 _GO_LANGUAGE = Language(tsgo.language())
 
@@ -52,7 +52,7 @@ class GoExtractor:
             result.symbols.append(
                 Symbol(
                     qualified_name=module_qname,
-                    kind=NodeLabel.MODULE,
+                    kind=CodeSymbolKind.MODULE,
                     file_path=file_path,
                     def_line=1,
                     end_line=max(1, content.count(b"\n") + 1),
@@ -93,7 +93,7 @@ def _emit_function(node, content, file_path, module_qname, result):
     result.symbols.append(
         Symbol(
             qualified_name=qname,
-            kind=NodeLabel.FUNCTION,
+            kind=CodeSymbolKind.FUNCTION,
             file_path=file_path,
             def_line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
@@ -138,7 +138,7 @@ def _emit_method(node, content, file_path, module_qname, result):
     result.symbols.append(
         Symbol(
             qualified_name=qname,
-            kind=NodeLabel.METHOD,
+            kind=CodeSymbolKind.METHOD,
             file_path=file_path,
             def_line=node.start_point[0] + 1,
             end_line=node.end_point[0] + 1,
@@ -167,7 +167,7 @@ def _emit_types(node, content, file_path, module_qname, result):
             continue
         name = _node_text(name_node, content)
         qname = f"{module_qname}.{name}" if module_qname else name
-        kind = NodeLabel.CLASS  # struct/interface both surface as Class for retrieval
+        kind = CodeSymbolKind.CLASS  # struct/interface both surface as Class for retrieval
         result.symbols.append(
             Symbol(
                 qualified_name=qname,

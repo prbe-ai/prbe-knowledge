@@ -21,7 +21,7 @@ def test_github_commit_yields_doc_to_repo() -> None:
     )
     assert len(out) == 1
     assert out[0].edge_type == EdgeType.TOUCHES.value
-    assert out[0].target_label == NodeLabel.REPO.value
+    assert out[0].target_label == NodeLabel.DOCUMENT.value
     assert out[0].target_canonical_id == "prbe-ai/prbe-backend"
 
 
@@ -48,7 +48,7 @@ def test_slack_message_yields_doc_to_channel() -> None:
     )
     assert len(out) == 1
     assert out[0].edge_type == EdgeType.MEMBER_OF.value
-    assert out[0].target_label == NodeLabel.CHANNEL.value
+    assert out[0].target_label == NodeLabel.DOCUMENT.value
     assert out[0].target_canonical_id == "C456"
 
 
@@ -72,7 +72,7 @@ def test_linear_issue_yields_doc_to_ticket() -> None:
     )
     assert len(out) == 1
     assert out[0].edge_type == EdgeType.LINKED_FROM.value
-    assert out[0].target_label == NodeLabel.TICKET.value
+    assert out[0].target_label == NodeLabel.DOCUMENT.value
     assert out[0].target_canonical_id == "PROJ-456"
 
 

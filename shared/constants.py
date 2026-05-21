@@ -155,32 +155,70 @@ WIKI_INDEX_DOC_TYPE = "wiki.index"
 
 
 class NodeLabel(StrEnum):
-    SERVICE = "Service"
-    REPO = "Repo"
-    PERSON = "Person"
-    CHANNEL = "Channel"
-    TICKET = "Ticket"
-    PR = "PR"
-    ISSUE = "Issue"
-    DOCUMENT = "Document"
-    ERROR_GROUP = "ErrorGroup"
+    """Graph node labels — four canonical kinds post-migration 0091.
 
+    Sub-type discrimination (Module vs Function for code; PR vs Issue for
+    documents) lives in ``properties['kind']`` using the typed enums below
+    (CodeSymbolKind, DocumentKind). Emit via the factories in shared.models
+    (`make_code_symbol`, `make_document`, `make_person`, `make_feature`)
+    rather than constructing GraphNodeSpec directly — the factories enforce
+    the label-to-kind relationship.
+
+    Other domain labels (SERVICE, SERVICE_CARD, DECISION, RUNBOOK,
+    ERROR_GROUP, AGENT, WORKFLOW, FIX_ARTIFACT, VERIFICATION_RESULT) are
+    out of scope for the collapse — they're either unused for probe-founders
+    today or carry distinct semantics worth preserving.
+    """
+
+    # ---- Canonical labels ----
+    PERSON = "Person"
+    DOCUMENT = "Document"
+    FEATURE = "Feature"
+    CODE_SYMBOL = "CodeSymbol"
+
+    # ---- Domain labels (untouched by 0091) ----
+    SERVICE = "Service"
+    ERROR_GROUP = "ErrorGroup"
     SERVICE_CARD = "ServiceCard"
     DECISION = "Decision"
-    FEATURE = "Feature"
     RUNBOOK = "Runbook"
-    WIKI_PERSON = "WikiPerson"
-
     AGENT = "Agent"
     WORKFLOW = "Workflow"
     FIX_ARTIFACT = "FixArtifact"
     VERIFICATION_RESULT = "VerificationResult"
 
+
+class CodeSymbolKind(StrEnum):
+    """Sub-type of a CODE_SYMBOL node, stored in ``properties['kind']``.
+
+    Tree-sitter extractors classify each emitted symbol with one of these.
+    Comparison sites (e.g. ``if symbol.kind == CodeSymbolKind.MODULE``)
+    use this enum to keep symbol-kind reasoning type-safe.
+    """
+
     MODULE = "Module"
     FUNCTION = "Function"
     CLASS = "Class"
     METHOD = "Method"
+    # Generic "Symbol" — tree-sitter emits this for symbols that don't fit
+    # the four categories above (interfaces, enums, constants, etc.).
     SYMBOL = "Symbol"
+
+
+class DocumentKind(StrEnum):
+    """Sub-type of a DOCUMENT node, stored in ``properties['kind']``.
+
+    Optional — plain source documents (a slack message, a notion page) leave
+    properties['kind'] unset. The five values below are the categories that
+    collapsed INTO the Document label during migration 0091, where the
+    sub-type is still meaningful enough to query against.
+    """
+
+    PR = "PR"
+    ISSUE = "Issue"
+    TICKET = "Ticket"
+    CHANNEL = "Channel"
+    REPO = "Repo"
 
 
 # ---------------------------------------------------------------------------
@@ -204,30 +242,36 @@ class NodeLabel(StrEnum):
 ROUTER_ENTITY_TO_LABEL: dict[str, NodeLabel] = {
     # Router-emitted typed entities (kept in sync with the router prompt's
     # entity_type enum at services/retrieval/router.py).
+    #
+    # After migration 0091's label collapse, multiple router entity_types
+    # share a target NodeLabel — e.g. "pr", "issue", "ticket", "channel",
+    # "repo", "file_path", "session" all map to DOCUMENT. The router prompt
+    # still emits the fine-grained entity_type; this dict is the single
+    # mapping into the (now coarser) graph_nodes.label vocabulary.
     "service":     NodeLabel.SERVICE,
-    "repo":        NodeLabel.REPO,
     "person":      NodeLabel.PERSON,
-    "ticket":      NodeLabel.TICKET,
-    "pr":          NodeLabel.PR,
-    "error_group": NodeLabel.ERROR_GROUP,
-    "channel":     NodeLabel.CHANNEL,
     "feature":     NodeLabel.FEATURE,
     "decision":    NodeLabel.DECISION,
-    # file_path is router-emitted but does not map 1:1 to a label -- file
-    # paths are sub-entities of a Repo, so we anchor on the repo node.
-    "file_path":   NodeLabel.REPO,
-    # session UUIDs are claude_code Document canonical_ids; anchoring lets
-    # the graph retriever follow inferred edges out of a session.
+    "error_group": NodeLabel.ERROR_GROUP,
+
+    # All addressable-source-document entities collapse to DOCUMENT post-0091.
+    "repo":        NodeLabel.DOCUMENT,
+    "ticket":      NodeLabel.DOCUMENT,
+    "pr":          NodeLabel.DOCUMENT,
+    "issue":       NodeLabel.DOCUMENT,
+    "channel":     NodeLabel.DOCUMENT,
+    "file_path":   NodeLabel.DOCUMENT,
     "session":     NodeLabel.DOCUMENT,
 
     # Code-graph entities (extracted by tree-sitter at ingest, not by the
     # router LLM, but the router can still emit these from queries that
     # mention qualified symbol names like `Normalizer.process_queue_row`).
-    "function":    NodeLabel.FUNCTION,
-    "method":      NodeLabel.METHOD,
-    "class":       NodeLabel.CLASS,
-    "module":      NodeLabel.MODULE,
-    "symbol":      NodeLabel.SYMBOL,
+    # All collapse to CODE_SYMBOL post-0091.
+    "function":    NodeLabel.CODE_SYMBOL,
+    "method":      NodeLabel.CODE_SYMBOL,
+    "class":       NodeLabel.CODE_SYMBOL,
+    "module":      NodeLabel.CODE_SYMBOL,
+    "symbol":      NodeLabel.CODE_SYMBOL,
 }
 
 

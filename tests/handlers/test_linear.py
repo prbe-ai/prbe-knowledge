@@ -192,7 +192,7 @@ async def test_normalize_issue_produces_document_and_graph() -> None:
     # Graph nodes: TICKET + DOCUMENT + two PERSON (creator, assignee).
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
     assert (
-        NodeLabel.TICKET,
+        NodeLabel.DOCUMENT,
         "11111111-2222-3333-4444-555555555555",
     ) in labels
     assert (NodeLabel.PERSON, "user_alice") in labels

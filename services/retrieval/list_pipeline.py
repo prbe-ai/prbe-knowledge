@@ -20,7 +20,7 @@ from __future__ import annotations
 import time
 
 from services.retrieval.acl import filter_by_acl
-from services.retrieval.helpers import expand_to_cluster_members
+from services.retrieval.helpers import expand_to_author_id_set
 from services.retrieval.retrievers.related_entities import (
     build_exclude_node_keys,
     expand_exclude_keys_with_aliases,
@@ -28,7 +28,7 @@ from services.retrieval.retrievers.related_entities import (
 )
 from services.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
 from services.retrieval.router import Intent
-from shared.constants import NodeLabel, SourceSystem
+from shared.constants import SourceSystem
 from shared.db import with_tenant
 from shared.logging import get_logger
 from shared.models import (
@@ -78,10 +78,16 @@ def _author_ids_from_entities(intent: Intent) -> list[str] | None:
 # graph_node representation, deferred to a follow-up.
 _NARROWING_TO_LABEL: dict[str, str] = {
     "service": "Service",
-    "repo": "Repo",
-    "ticket": "Ticket",
-    "pr": "PR",
-    "channel": "Channel",
+    # Post-0091, repo/ticket/pr/channel/issue all collapse to Document. The
+    # router's entity_type stays fine-grained; the SQL filter just sees
+    # graph_nodes labeled Document (with properties.kind = Repo/PR/etc. for
+    # the entity-shape rows, or just doc_type for the content rows). The
+    # broader loose-match in apply_entity_filter handles both shapes.
+    "repo": "Document",
+    "ticket": "Document",
+    "pr": "Document",
+    "issue": "Document",
+    "channel": "Document",
 }
 
 
@@ -150,24 +156,20 @@ async def run_list(
     if req.entity_must_match:
         author_ids = _author_ids_from_entities(intent)
         graph_entity_filters = _graph_entity_filters_from_intent(intent)
-        # Phase 2: expand each author_id to its full Person cluster
-        # (primary + aliases) so post-merge entities still match docs
-        # written under their pre-merge author_id. `documents.author_id`
-        # is historical raw text and is never rewritten on merge.
+        # Phase 2 (post-0091): expand each Person canonical_id to the FULL
+        # set of valid author_id values — cluster members + Lane E enrichment
+        # property values (employee_id / login / email) on each member.
+        # `documents.author_id` is historical raw text from whichever connector
+        # wrote the row, and that raw text might be a Slack uid OR a GitHub
+        # login OR a claude_code better-auth uuid that lives only as a Person
+        # property. Without expanding through properties, recency queries miss
+        # the claude_code sessions whose author_id is the uuid (see
+        # helpers.expand_to_author_id_set docstring).
         if author_ids:
             async with with_tenant(customer_id) as conn:
-                cluster_map = await expand_to_cluster_members(
-                    conn, customer_id, label=NodeLabel.PERSON.value,
-                    canonical_ids=author_ids,
+                author_ids = await expand_to_author_id_set(
+                    conn, customer_id, person_canonical_ids=author_ids,
                 )
-            expanded: list[str] = []
-            seen: set[str] = set()
-            for aid in author_ids:
-                for member in cluster_map.get(aid, [aid]):
-                    if member not in seen:
-                        seen.add(member)
-                        expanded.append(member)
-            author_ids = expanded
     else:
         author_ids = None
         graph_entity_filters = []

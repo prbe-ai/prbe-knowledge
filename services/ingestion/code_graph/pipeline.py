@@ -40,8 +40,10 @@ from services.ingestion.code_graph.secrets import (
 from services.ingestion.code_graph.types import ExtractResult, Symbol
 from shared.constants import (
     MAX_SYMBOL_CHUNK_TOKENS,
+    CodeSymbolKind,
     DocClass,
     DocType,
+    DocumentKind,
     EdgeType,
     NodeLabel,
     Permission,
@@ -61,6 +63,8 @@ from shared.models import (
     GraphNodeSpec,
     NormalizationResult,
     PreChunkedDocument,
+    make_code_symbol,
+    make_document,
 )
 
 if TYPE_CHECKING:
@@ -134,25 +138,26 @@ async def extract_files_to_result(
     # Cross-file qualifier promotion.
     promote_single_match([r for _, r, _ in extractions])
 
-    # qualified_name → NodeLabel for accurate edge endpoint typing.
-    # graph_writer.upsert_edges keys node lookup on (label, canonical_id), so a
-    # CALLS edge with from_label=FUNCTION whose actual node was written as
-    # METHOD silently misses. Build the map once across all files so any
-    # in-repo edge endpoint resolves to the correct label.
-    qname_to_kind: dict[str, NodeLabel] = {}
+    # Set of qualified_names this batch extracted. Used by _map_edge to
+    # distinguish in-repo endpoints (write as CODE_SYMBOL) from external
+    # endpoints (per-edge-type fallback label). Pre-0091 this dict stored
+    # the fine-grained NodeLabel per qname; post-collapse every extracted
+    # symbol writes as CODE_SYMBOL so we only need to know whether the qname
+    # is in this batch or not.
+    extracted_qnames: set[str] = set()
     for _, result, _ in extractions:
         for symbol in result.symbols:
-            key = symbol.file_path if symbol.kind == NodeLabel.MODULE else symbol.qualified_name
-            qname_to_kind[key] = symbol.kind
+            key = symbol.file_path if symbol.kind == CodeSymbolKind.MODULE else symbol.qualified_name
+            extracted_qnames.add(key)
 
     nodes: list[GraphNodeSpec] = []
     edges: list[GraphEdgeSpec] = []
     state_updates: list[CodeRepoStateUpdate] = []
     pre_chunked_docs: list = []  # PreChunkedDocument list — typed below
 
-    repo_node = GraphNodeSpec(
-        label=NodeLabel.REPO,
+    repo_node = make_document(
         canonical_id=repo,
+        kind=DocumentKind.REPO,
         properties={"name": repo.rsplit("/", 1)[-1]},
     )
     nodes.append(repo_node)
@@ -181,7 +186,7 @@ async def extract_files_to_result(
         # (Empty .py files, parse errors that returned an empty result.)
         if not result.symbols:
             for edge in result.edges:
-                mapped = _map_edge(repo, edge, qname_to_kind)
+                mapped = _map_edge(repo, edge, extracted_qnames)
                 if mapped is not None:
                     edges.append(mapped)
             continue
@@ -210,9 +215,10 @@ async def extract_files_to_result(
         )
         total_symbols += len(result.symbols)
 
-        # Per-symbol graph nodes (unchanged from today — symbol nodes are
-        # how callers/tools/the qualifier lookup symbols by qualified name).
-        # COMPILED_FROM edges now go file Document → N Symbol nodes (1:N).
+        # Per-symbol graph nodes — every code symbol writes as a CODE_SYMBOL
+        # node with the fine-grained kind stamped into properties (see
+        # _symbol_node). COMPILED_FROM edges go file Document → N CodeSymbol
+        # nodes (1:N).
         file_doc_id = file_doc.doc_id
         for symbol in result.symbols:
             nodes.append(_symbol_node(repo, symbol))
@@ -221,14 +227,14 @@ async def extract_files_to_result(
                     edge_type=EdgeType.COMPILED_FROM,
                     from_label=NodeLabel.DOCUMENT,
                     from_canonical_id=file_doc_id,
-                    to_label=symbol.kind,
+                    to_label=NodeLabel.CODE_SYMBOL,
                     to_canonical_id=f"{repo}:{symbol.qualified_name}"
-                    if symbol.kind != NodeLabel.MODULE
+                    if symbol.kind != CodeSymbolKind.MODULE
                     else f"{repo}:{symbol.file_path}",
                 )
             )
         for edge in result.edges:
-            mapped = _map_edge(repo, edge, qname_to_kind)
+            mapped = _map_edge(repo, edge, extracted_qnames)
             if mapped is not None:
                 edges.append(mapped)
 
@@ -688,13 +694,13 @@ def _build_file_document_with_symbol_chunks(
 
 
 def _symbol_node(repo: str, symbol: Symbol) -> GraphNodeSpec:
-    if symbol.kind == NodeLabel.MODULE:
+    if symbol.kind == CodeSymbolKind.MODULE:
         canonical_id = f"{repo}:{symbol.file_path}"
     else:
         canonical_id = f"{repo}:{symbol.qualified_name}"
-    return GraphNodeSpec(
-        label=symbol.kind,
+    return make_code_symbol(
         canonical_id=canonical_id,
+        kind=symbol.kind,
         properties={
             "name": symbol.qualified_name.rsplit(".", 1)[-1],
             "qualified_name": symbol.qualified_name,
@@ -707,15 +713,18 @@ def _symbol_node(repo: str, symbol: Symbol) -> GraphNodeSpec:
 def _map_edge(
     repo: str,
     edge,
-    qname_to_kind: dict[str, NodeLabel],
+    extracted_qnames: set[str],
 ) -> GraphEdgeSpec | None:
     """Map a CodeEdge (qualified-name endpoints) to a GraphEdgeSpec.
 
-    Endpoint labels are looked up in qname_to_kind first (built from the
-    actual symbols this batch wrote), falling back to per-edge-type
-    heuristics for cross-repo / external targets the lookup doesn't know.
-    Right label matters: graph_writer.upsert_edges keys node lookup on
-    (label, canonical_id), so a label miss silently drops the edge.
+    Endpoint labels are CODE_SYMBOL when the qname was extracted in this
+    batch (we just wrote it as such), otherwise a per-edge-type fallback
+    for cross-repo / external targets. Right label matters: graph_writer.
+    upsert_edges keys node lookup on (label, canonical_id), so a label
+    miss silently drops the edge.
+
+    Post-0091 the only non-CODE_SYMBOL fallback is DOCUMENT (for the repo
+    node, which is now a Document with DocumentKind.REPO).
     """
     from_canonical = f"{repo}:{edge.from_qname}"
     to_canonical = f"{repo}:{edge.to_qname}"
@@ -727,27 +736,23 @@ def _map_edge(
         properties["candidates"] = edge.target_candidates
 
     # Per-edge-type fallback labels for endpoints not in our extracted set
-    # (e.g. external imports, calls into stdlib).
-    fallback_from = NodeLabel.FUNCTION
-    fallback_to = NodeLabel.FUNCTION
-    if edge.edge_type == EdgeType.IMPORTS:
-        fallback_from = NodeLabel.MODULE
-        fallback_to = NodeLabel.MODULE
-    elif edge.edge_type == EdgeType.DEFINED_IN:
-        # Module-in-Repo case: to_qname matches the repo.
-        if edge.to_qname == repo or edge.to_qname.endswith(repo.rsplit("/", 1)[-1]):
-            fallback_from = NodeLabel.MODULE
-            fallback_to = NodeLabel.REPO
-            to_canonical = repo
-        else:
-            fallback_from = NodeLabel.FUNCTION
-            fallback_to = NodeLabel.MODULE
-    elif edge.edge_type in (EdgeType.INHERITS, EdgeType.IMPLEMENTS):
-        fallback_from = NodeLabel.CLASS
-        fallback_to = NodeLabel.CLASS
+    # (external imports, calls into stdlib, cross-repo references).
+    fallback_from = NodeLabel.CODE_SYMBOL
+    fallback_to = NodeLabel.CODE_SYMBOL
+    # Module-in-Repo case: a DEFINED_IN edge whose to_qname matches the repo
+    # points at the Repo node (now a Document post-0091).
+    if edge.edge_type == EdgeType.DEFINED_IN and (
+        edge.to_qname == repo or edge.to_qname.endswith(repo.rsplit("/", 1)[-1])
+    ):
+        fallback_to = NodeLabel.DOCUMENT
+        to_canonical = repo
 
-    from_label = qname_to_kind.get(edge.from_qname, fallback_from)
-    to_label = qname_to_kind.get(edge.to_qname, fallback_to)
+    from_label = (
+        NodeLabel.CODE_SYMBOL if edge.from_qname in extracted_qnames else fallback_from
+    )
+    to_label = (
+        NodeLabel.CODE_SYMBOL if edge.to_qname in extracted_qnames else fallback_to
+    )
 
     return GraphEdgeSpec(
         edge_type=edge.edge_type,

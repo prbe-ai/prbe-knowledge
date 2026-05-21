@@ -122,11 +122,11 @@ async def test_method_to_method_call_edge_carries_method_label() -> None:
         f"{[(e.from_canonical_id, e.to_canonical_id) for e in calls]}"
     )
     edge = method_to_method[0]
-    assert edge.from_label == NodeLabel.METHOD, (
+    assert edge.from_label == NodeLabel.CODE_SYMBOL, (
         f"from_label was {edge.from_label}, expected METHOD — "
         "node lookup in graph_writer would miss"
     )
-    assert edge.to_label == NodeLabel.METHOD, (
+    assert edge.to_label == NodeLabel.CODE_SYMBOL, (
         f"to_label was {edge.to_label}, expected METHOD"
     )
 

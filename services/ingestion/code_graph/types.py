@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from shared.constants import EdgeType, NodeLabel
+from shared.constants import CodeSymbolKind, EdgeType
 
 
 @dataclass(slots=True)
@@ -20,10 +20,14 @@ class Symbol:
     the decorator line above it. Per-language extractors enforce this so
     that adding/removing decorators doesn't change the symbol's identity.
     See spec §4.3 for the full doc_id format.
+
+    `kind` is a CodeSymbolKind (Module / Function / Class / Method / Symbol).
+    The graph_nodes row is always written with label=NodeLabel.CODE_SYMBOL
+    via make_code_symbol(); `kind` lives in properties['kind'].
     """
 
     qualified_name: str          # e.g. "module.submodule.Class.method"
-    kind: NodeLabel              # FUNCTION | METHOD | CLASS | MODULE
+    kind: CodeSymbolKind         # FUNCTION | METHOD | CLASS | MODULE | SYMBOL
     file_path: str               # repo-relative
     def_line: int                # 1-indexed; the `def`/`class` keyword line
     end_line: int                # 1-indexed; last line of the def block

@@ -719,9 +719,9 @@ async def update_edges_after_push(
                  ON n_to.node_id = e.to_node_id AND n_to.customer_id = e.customer_id
             WHERE e.customer_id = $1
               AND e.edge_type = 'DEPENDS_ON'
-              AND n_from.label = 'Repo'
+              AND n_from.label = 'Document'
               AND n_from.canonical_id = $2
-              AND n_to.label = 'Repo'
+              AND n_to.label = 'Document'
               AND e.valid_to IS NULL
             """,
             customer_id,
@@ -963,11 +963,17 @@ async def _get_or_create_repo_node(
     customer_id: str,
     repo: str,
 ) -> int:
-    """Find or create a ``Repo`` graph node for ``repo`` (``owner/name``)."""
+    """Find or create a ``Document`` graph node for ``repo`` (``owner/name``).
+
+    Post-migration 0091, repos collapse into the Document label alongside
+    source documents. The canonical_id (``owner/name``) is path-shaped and
+    doesn't collide with prefixed document canonical_ids like
+    ``github:owner/name:pr:123``.
+    """
     row = await conn.fetchrow(
         """
         INSERT INTO graph_nodes (customer_id, label, canonical_id, properties)
-        VALUES ($1, 'Repo', $2, $3)
+        VALUES ($1, 'Document', $2, $3)
         ON CONFLICT (customer_id, label, canonical_id)
         DO UPDATE SET updated_at = NOW()
         RETURNING node_id

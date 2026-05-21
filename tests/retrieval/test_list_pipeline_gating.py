@@ -116,11 +116,10 @@ class TestListPipelineEntityGating:
 
         intent = _intent_with_repo_and_person()
 
-        # Phase 2 Chunk 5: list pipeline expands author_ids to their Person
-        # cluster (primary + aliases) via expand_to_cluster_members. Mock
-        # the helper so this unit test doesn't require a live DB pool;
-        # the expansion semantics are covered by the integration test in
-        # test_list_pipeline_author_alias.py.
+        # Post-0091: list pipeline expands author_ids to (cluster members) +
+        # (Lane E property values on members) via expand_to_author_id_set.
+        # Mock the helper so this unit test doesn't require a live DB pool;
+        # expansion semantics are covered by test_list_pipeline_author_alias.py.
         async def _passthrough_exclude(_cid, _ents, keys, **_kw):
             return keys
 
@@ -129,8 +128,8 @@ class TestListPipelineEntityGating:
         ) as m_list, patch(
             "services.retrieval.list_pipeline.with_tenant"
         ) as m_with_tenant, patch(
-            "services.retrieval.list_pipeline.expand_to_cluster_members",
-            new=AsyncMock(return_value={"user:alice": ["user:alice"]}),
+            "services.retrieval.list_pipeline.expand_to_author_id_set",
+            new=AsyncMock(return_value=["user:alice"]),
         ), patch(
             "services.retrieval.list_pipeline.expand_exclude_keys_with_aliases",
             new=AsyncMock(side_effect=_passthrough_exclude),
@@ -156,7 +155,8 @@ class TestListPipelineEntityGating:
         assert kwargs["author_ids"] == ["user:alice"]
         gef = kwargs["graph_entity_filters"]
         assert gef is not None and len(gef) == 1
-        assert gef[0].label == "Repo"
+        # Post-0091: repo entity_type narrows to Document label (collapsed).
+        assert gef[0].label == "Document"
         assert "prbe-ai/prbe-backend" in gef[0].values
         assert "prbe-backend" in gef[0].values
 

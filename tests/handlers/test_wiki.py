@@ -256,10 +256,10 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     # only a rendered name, not a canonical platform id.
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
     assert (NodeLabel.DOCUMENT, doc.doc_id) in labels
-    assert (NodeLabel.WIKI_PERSON, "mahit") in labels
+    assert (NodeLabel.PERSON, "mahit") in labels
     assert (NodeLabel.PERSON, "mahit") not in labels
     assert (NodeLabel.SERVICE, "prbe-knowledge") in labels
-    assert (NodeLabel.REPO, "prbe-knowledge") in labels
+    assert (NodeLabel.DOCUMENT, "prbe-knowledge") in labels
 
     edge_keys = {
         (e.edge_type, e.from_canonical_id, e.to_label, e.to_canonical_id)
@@ -268,7 +268,7 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     assert (
         EdgeType.MENTIONS,
         doc.doc_id,
-        NodeLabel.WIKI_PERSON,
+        NodeLabel.PERSON,
         "mahit",
     ) in edge_keys
     assert (
@@ -280,7 +280,7 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     assert (
         EdgeType.DESCRIBES,
         doc.doc_id,
-        NodeLabel.REPO,
+        NodeLabel.DOCUMENT,
         "prbe-knowledge",
     ) in edge_keys
 
@@ -379,7 +379,7 @@ def test_build_dedupes_repeated_typed_links() -> None:
     result = build_normalization_result(event)
     # One DOCUMENT + one WikiPerson node (deduped), three MENTIONS edges.
     wiki_person_nodes = [
-        n for n in result.graph_nodes if n.label == NodeLabel.WIKI_PERSON
+        n for n in result.graph_nodes if n.label == NodeLabel.PERSON
     ]
     assert len(wiki_person_nodes) == 1
     person_edges = [e for e in result.graph_edges if e.edge_type == EdgeType.MENTIONS]

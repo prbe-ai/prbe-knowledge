@@ -166,9 +166,9 @@ async def test_list_response_populates_related_entities(live_db) -> None:
     await _seed_customer(cust)
     await _seed_doc(cust, doc_id="doc:1", title="d1")
     await _seed_neighbor(
-        cust, label=NodeLabel.REPO.value, canonical_id="r", name="r",
+        cust, label=NodeLabel.DOCUMENT.value, canonical_id="r", name="r",
     )
-    await _seed_edge(cust, doc_id="doc:1", label=NodeLabel.REPO.value, canonical_id="r")
+    await _seed_edge(cust, doc_id="doc:1", label=NodeLabel.DOCUMENT.value, canonical_id="r")
 
     intent = Intent(query_text="x", mode="list", confidence=0.9, operation="list")
     req = QueryRequest(query="x", top_k=5, top_k_related=10)

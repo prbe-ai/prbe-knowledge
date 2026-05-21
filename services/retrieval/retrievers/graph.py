@@ -90,7 +90,9 @@ _ENTITY_TO_LABEL = {k: v.value for k, v in ROUTER_ENTITY_TO_LABEL.items()}
 
 # Code-graph node labels — used by the bundle builder to detect when a
 # query seeded on a symbol so it can group results under that seed.
-CODE_GRAPH_LABELS = frozenset({"Function", "Method", "Class", "Module", "Symbol"})
+# Post-migration 0091 the fine-grained Function/Method/Class/Module/Symbol
+# labels all collapse to CodeSymbol; this set is now a singleton.
+CODE_GRAPH_LABELS = frozenset({"CodeSymbol"})
 
 
 async def graph_search(
