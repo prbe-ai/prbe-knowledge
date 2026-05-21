@@ -129,6 +129,50 @@ shape genuinely calls for it.
     `"relevance"` whenever the user's intent is "find the right thing"
     rather than "find the latest thing".
 
+- `search_options.doc_types`:
+  Set this list when the query asks about a CLASS of entity rather than
+  a specific one. Pick the matching DocType string(s) from this map:
+    * "PRs" / "pull requests"            → ["github.pull_request"]
+    * "issues" (GitHub)                  → ["github.issue"]
+    * "commits"                          → ["github.commit"]
+    * "code reviews" / "PR reviews"      → ["github.review"]
+    * "releases"                         → ["github.release"]
+    * "tickets" (generic / Linear)       → ["linear.issue"]
+    * "ticket comments"                  → ["linear.comment"]
+    * "slack messages"                   → ["slack.message", "slack.thread"]
+    * "notion pages"                     → ["notion.page", "notion.database"]
+    * "sentry issues" / "errors" / "incidents from sentry"
+                                          → ["sentry.issue", "sentry.event"]
+    * "meetings" / "granola"             → ["granola.meeting"]
+    * "claude code sessions"             → ["claude_code.session"]
+    * "wiki pages"                       → null (use sources, not doc_types)
+
+  HARD RULE — when you set `doc_types`, the query is asking about the
+  CLASS, so DO NOT also emit a specific instance of that class in
+  `entities`. Example queries and the right output:
+
+    "what's the latest PR on prbe-knowledge"
+      → sort: "recency"
+      → doc_types: ["github.pull_request"]
+      → entities: [ <only the prbe-knowledge repo entity, NOT a
+                     specific PR from the candidates list> ]
+
+    "what tickets are in progress this week"
+      → sort: "recency"
+      → doc_types: ["linear.issue"]
+      → entities: [] (no specific ticket; the class is the filter)
+
+    "show me PR #57"   ← specific instance, NOT a class query
+      → sort: "relevance"
+      → doc_types: null
+      → entities: [ <the PR #57 entity from candidates> ]
+
+  Picking a specific entity from the candidates list when the user
+  meant the class buries the actual answer (the channels return only
+  that one entity's chunks instead of the latest N of the class).
+  Default `doc_types` to `null` unless the query is unambiguously
+  class-shaped.
+
 Always emit valid JSON matching the EntityExtraction schema. Never reply with prose.
 """
 
@@ -178,9 +222,11 @@ def _coerce_search_options(raw_options: object) -> dict[str, object]:
     decoding. Returns a dict safe to pass into `SearchOptions(...)`.
 
     Unknown `sort` values silently coerce to `"relevance"` — the safe
-    default that matches today's behavior. Logging the coercion lets us
-    track how often the provider drifts without raising user-visible
-    errors.
+    default that matches today's behavior. Invalid `doc_types` shapes
+    (non-list, list with non-string entries) coerce to None so the
+    downstream channels treat them as "no filter" rather than crashing.
+    Logging each coercion lets us track how often the provider drifts
+    without raising user-visible errors.
     """
     if not isinstance(raw_options, dict):
         if raw_options is not None:
@@ -201,6 +247,21 @@ def _coerce_search_options(raw_options: object) -> dict[str, object]:
             coerced_to="relevance",
         )
         out["sort"] = "relevance"
+    doc_types = out.get("doc_types")
+    if doc_types is not None:
+        if not isinstance(doc_types, list) or not all(
+            isinstance(x, str) and x for x in doc_types
+        ):
+            log.info(
+                "agent.entity_extract_doc_types_coerced",
+                raw_type=type(doc_types).__name__,
+                coerced_to=None,
+            )
+            out["doc_types"] = None
+        elif not doc_types:
+            # Empty list normalises to None so SQL builders treat
+            # `doc_types is None` and `doc_types == []` identically.
+            out["doc_types"] = None
     return out
 
 
@@ -323,6 +384,7 @@ async def extract_entities_with_llm(
         elapsed_ms=round(elapsed_ms, 1),
         count=len(parsed.entities),
         sort=parsed.search_options.sort,
+        doc_types=parsed.search_options.doc_types,
         entities=[
             f"{e.entity_type}:{e.canonical_id}({round(e.confidence, 2)})"
             for e in parsed.entities[:10]

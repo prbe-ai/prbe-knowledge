@@ -82,6 +82,7 @@ async def inferred_edge_search(
     include_drafts: bool = False,
     author_ids: list[str] | None = None,
     sort_by: Literal["relevance", "recency"] = "relevance",
+    doc_types: list[str] | None = None,
 ) -> list[InferredEdgeHit]:
     """Walk INFERRED Doc-Doc edges from `top_doc_ids` and return up to
     `top_k` linked documents.
@@ -114,12 +115,17 @@ async def inferred_edge_search(
     doc_visibility_filter = "" if include_drafts else "AND d.visibility = 'approved'"
 
     # Positional params start at [customer_id, top_doc_ids, top_k]; the
-    # author filter, when present, takes the next slot ($4).
+    # author + doc_type filters take the next slots in order when set.
     params: list = [customer_id, top_doc_ids, top_k]
     author_filter_sql = ""
     if author_ids:
         params.append(author_ids)
         author_filter_sql = f"AND d.author_id = ANY(${len(params)}::text[])"
+
+    doc_type_filter_sql = ""
+    if doc_types:
+        params.append(doc_types)
+        doc_type_filter_sql = f"AND d.doc_type = ANY(${len(params)}::text[])"
 
     # Default order: edge-type priority then recency within tier.
     # sort_by="recency": pure recency first (still tie-broken by edge-type
@@ -235,6 +241,7 @@ async def inferred_edge_search(
          {doc_visibility_filter}
         WHERE nd.doc_id <> ALL($2::text[])  -- exclude top_doc_ids themselves
           {author_filter_sql}
+          {doc_type_filter_sql}
         ORDER BY {order_by_sql}
         LIMIT $3
     """
