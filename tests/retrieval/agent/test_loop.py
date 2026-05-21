@@ -1036,6 +1036,62 @@ async def test_wrong_shape_terminal_args_degrades_to_empty_output(
 
 
 @pytest.mark.asyncio
+async def test_parse_fail_terminal_triggers_one_retry_then_succeeds(
+    fake_request: SimpleNamespace,
+) -> None:
+    """When `_parse_terminal_args` returns None on the first terminal
+    turn, the loop injects a re-emit nudge and runs ONE more turn. A
+    valid emit on the retry produces status='ok' with the retried
+    chunks. Mirrors the budget/turn-cap force-terminate retry pattern.
+    Covers the nightly 2026-05-20 schema_violation Pattern A
+    (12/16 cases): turn_count=1, turn_1_tools_fired=['emit_gatherer
+    _output'], previously no recovery."""
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+    # Turn 1: emit_gatherer_output with bad confidence Literal — the
+    # tolerant coercer can't fix Literal mismatches, so Pydantic
+    # validation fails and _parse_terminal_args returns None.
+    bad_args = _final_emission_args(chunks=1)
+    bad_args["gatherer_notes"]["confidence"] = "definitely_unknown_label"
+    turn_1 = _mk_resp(tool_calls=[_terminal_call(bad_args, id="bad_term")])
+    # Turn 2 (retry): a valid emit.
+    turn_2 = _mk_resp(tool_calls=[_terminal_call(
+        _final_emission_args(chunks=3, confidence="medium"),
+        id="good_term",
+    )])
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1, turn_2]),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "ok"
+    assert resp.total_candidates == 3
+
+
+@pytest.mark.asyncio
+async def test_parse_fail_terminal_retry_fails_yields_schema_violation(
+    fake_request: SimpleNamespace,
+) -> None:
+    """If BOTH the first terminal emit AND the recovery emit fail to
+    parse, the loop gives up (no cascading retries) and the status
+    remains schema_violation — the retry is single-shot. Pairs with
+    the success-path test above."""
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+    bad_args = _final_emission_args(chunks=1)
+    bad_args["gatherer_notes"]["confidence"] = "definitely_unknown_label"
+    turn_1 = _mk_resp(tool_calls=[_terminal_call(bad_args, id="bad_a")])
+    turn_2 = _mk_resp(tool_calls=[_terminal_call(bad_args, id="bad_b")])
+    # A third side_effect entry would raise StopIteration — assert by
+    # construction that the loop only calls acompletion twice.
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1, turn_2]),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "schema_violation"
+    assert resp.total_candidates == 0
+
+
+@pytest.mark.asyncio
 async def test_llm_error_raises_503(
     fake_request: SimpleNamespace,
 ) -> None:
