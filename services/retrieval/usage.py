@@ -322,7 +322,7 @@ def _build_response_payload(
       2. Serialize, measure size.
       3. If serialized > RESPONSE_MAX_BYTES, replace with truncation marker.
 
-    The chunk-count pre-check sums `chunks` across `QueryResponse.results`
+    The chunk-count pre-check sums `chunks` across `RetrieveResponse.results`
     / `AnswerResponse.results` (polymorphic Document/Entity). SourceResponse
     uses `chunk_count` instead and returns reassembled `content`, which is
     bounded by the chunker.

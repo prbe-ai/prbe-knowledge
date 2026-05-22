@@ -185,7 +185,7 @@ async def walk_result_doc_neighbors(
     Sorted by `score DESC, doc_count DESC, max_confidence_rank DESC`.
 
     Returns `[]` (not None) when `ranked_result_docs` is empty -- the three-
-    state contract on `QueryResponse.related_entities` distinguishes that
+    state contract on `RetrieveResponse.related_entities` distinguishes that
     legitimate empty from "not requested" / "walk failed" (codex-B4).
 
     SQL runs under `with_tenant(customer_id)` so the RLS GUC

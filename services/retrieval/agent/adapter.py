@@ -1,6 +1,6 @@
-"""Adapter: GathererOutput -> existing QueryResponse shape.
+"""Adapter: GathererOutput -> existing RetrieveResponse shape.
 
-The MCP consumer schema (`shared.models.QueryResponse`) is unchanged
+The MCP consumer schema (`shared.models.RetrieveResponse`) is unchanged
 by the cutover (per plan anti-scope #1). The gatherer emits its own
 Pydantic shape; this adapter translates it into the existing response
 so downstream consumers (Claude Code, Codex, dashboard, MCP server)
@@ -26,12 +26,21 @@ from shared.models import (
     QueryChunk,
     QueryDocumentResult,
     QueryEntityResult,
-    QueryResponse,
     QueryResult,
     RelatedEntity,
+    RetrieveResponse,
 )
 
 log = get_logger(__name__)
+
+# Channel names that MatchProvenance.channel accepts as a Literal. Used to
+# coerce GatheredChunk.matched_via (MatchedViaChannel — a superset)
+# down into the consumer-visible MatchProvenance set. Centralized so the
+# chunk-level path (`_chunk_to_query_chunk`) and the doc-level union
+# loop in `to_query_response` agree on the same allowed set.
+_MATCH_PROVENANCE_CHANNELS: frozenset[str] = frozenset({
+    "vector", "bm25", "graph", "inferred_edge", "id_lookup", "directed",
+})
 
 
 def _safe_source_system(value: str | None, doc_id: str | None = None) -> str:
@@ -291,7 +300,22 @@ def _chunk_to_query_chunk(
     when the parent doc was surfaced via the inferred-edge channel;
     empty list when the doc reached the agent via vector / bm25 / graph
     alone.
+
+    `why_relevant` is the gatherer's per-chunk rationale (one line,
+    LLM-written; for inferred-edge neighbors the agent quotes the edge
+    `why` verbatim). `matched_via` is the chunk-level provenance derived
+    from `GatheredChunk.matched_via` channel names, coerced into
+    MatchProvenance rows so consumers see the same shape doc-level
+    `matched_via` uses.
     """
+    chunk_provenance = [
+        MatchProvenance(
+            channel=ch if ch in _MATCH_PROVENANCE_CHANNELS else "vector",
+            rank=rank + 1,
+            score=1.0,  # agent chose to surface; treat as max within the curated set
+        )
+        for ch in getattr(chunk, "matched_via", []) or []
+    ]
     return QueryChunk(
         chunk_id=chunk.chunk_id,
         content=chunk.content,
@@ -300,6 +324,8 @@ def _chunk_to_query_chunk(
         rank_in_doc=rank + 1,
         retriever_scores={},
         graph_evidence=graph_evidence,
+        why_relevant=getattr(chunk, "why_relevant", "") or "",
+        matched_via=chunk_provenance,
     )
 
 
@@ -311,8 +337,8 @@ async def to_query_response(
     timing_ms: dict[str, float],
     prefanout: dict[str, Any] | None = None,
     customer_id: str | None = None,
-) -> QueryResponse:
-    """Wrap a GathererOutput in the existing QueryResponse shape.
+) -> RetrieveResponse:
+    """Wrap a GathererOutput in the existing RetrieveResponse shape.
 
     Grouping: chunks with the same doc_id are merged into one
     QueryDocumentResult; the first chunk's doc_id determines metadata
@@ -390,11 +416,7 @@ async def to_query_response(
                 # MatchProvenance Literal allows only a subset; coerce unknown
                 # channels to "vector" (lowest-fidelity fallback). The gatherer
                 # tracks the real channel name in matched_via separately.
-                allowed = {
-                    "vector", "bm25", "graph", "inferred_edge",
-                    "id_lookup", "directed",
-                }
-                channel_value = ch if ch in allowed else "vector"
+                channel_value = ch if ch in _MATCH_PROVENANCE_CHANNELS else "vector"
                 provenance.append(
                     MatchProvenance(
                         channel=channel_value,  # type: ignore[arg-type]
@@ -477,6 +499,7 @@ async def to_query_response(
                 attached_doc_ids=[],
                 edge_types=[],
                 doc_count=0,
+                why_relevant=getattr(entity, "why_relevant", "") or "",
             )
         )
 
@@ -527,7 +550,7 @@ async def to_query_response(
     if query_root_doc_id is None and gathered.entities:
         query_root_doc_id = gathered.entities[0].canonical_id
 
-    return QueryResponse(
+    return RetrieveResponse(
         query=query,
         results=results,
         total_candidates=len(results),

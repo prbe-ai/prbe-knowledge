@@ -227,7 +227,7 @@ async def sql_list(
     Returns one hit per matching document — the chunk with `chunk_index = 0`
     (the first chunk of the doc) when one exists, otherwise the chunk with
     the lowest `chunk_index`. That gives the dispatcher something to put in
-    `QueryResponse.chunks` without having to fetch the entire doc.
+    `RetrieveResponse.chunks` without having to fetch the entire doc.
 
     `include_drafts` defaults to False — Plan A Component 6's
     ``visibility='approved'`` default filter. Reviewer-scoped BFF surfaces
@@ -324,7 +324,7 @@ async def sql_list(
     for i, r in enumerate(rows):
         # rank-derived score: 1.0 for the top hit, decaying. Callers that
         # care about pure recency reorder by `updated_at` directly; this
-        # field exists only so the QueryResponse shape stays consistent.
+        # field exists only so the RetrieveResponse shape stays consistent.
         hits.append(
             SQLListHit(
                 chunk_id=r["chunk_id"],

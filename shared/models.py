@@ -423,6 +423,33 @@ class GraphEvidence(BaseModel):
     via_entity_url: str | None = None
 
 
+class MatchProvenance(BaseModel):
+    """Per-result trace of which retrieval channel surfaced this node.
+
+    Carried at two granularities:
+      - QueryChunk.matched_via — the channels that surfaced *this specific
+        chunk* (preserves the gatherer's per-chunk fidelity).
+      - QueryResultBase.matched_via — the union across all chunks of the
+        parent doc (doc-level aggregate; consumers that don't care about
+        chunk-level provenance can read this directly).
+
+    `intent_idx` identifies which router intent surfaced this match (0 for
+    single-intent / pre-fan-out callers).
+    """
+
+    channel: Literal[
+        "vector", "bm25", "graph", "inferred_edge", "id_lookup", "directed"
+    ]
+    rank: int
+    score: float
+    intent_idx: int = 0
+    # Populated only when channel == "inferred_edge":
+    anchor_doc_id: str | None = None
+    edge_type: str | None = None
+    confidence: str | None = None
+    why: str | None = None  # LLM justification from properties.why
+
+
 class QueryChunk(BaseModel):
     """One body chunk inside a `QueryDocumentResult`.
 
@@ -430,7 +457,8 @@ class QueryChunk(BaseModel):
     created_at, updated_at, doc_version) live on the parent
     `QueryDocumentResult`, NOT on the chunk -- they are identical for every
     chunk of a given document. The chunk only carries identity + content +
-    rank-within-doc + per-retriever scores + graph-walk provenance.
+    rank-within-doc + per-retriever scores + graph-walk provenance + the
+    agent's per-chunk rationale.
     """
 
     chunk_id: str
@@ -445,6 +473,17 @@ class QueryChunk(BaseModel):
     # carries two entries. Empty list when the chunk surfaced via vector /
     # BM25 alone.
     graph_evidence: list[GraphEvidence] = Field(default_factory=list)
+    # The gatherer agent's one-line rationale for surfacing this chunk
+    # (copied from GatheredChunk.why_relevant by the adapter). For
+    # inferred-edge neighbors the agent quotes the edge `why` verbatim.
+    # Empty string on the no-LLM / harness-passthrough paths.
+    why_relevant: str = ""
+    # Per-chunk retrieval-channel provenance. Each entry is one channel
+    # that surfaced *this specific chunk*. The parent doc's
+    # `matched_via` is the union across its chunks; consumers that want
+    # chunk-level fidelity read here. Empty list on the no-LLM /
+    # harness-passthrough paths.
+    matched_via: list[MatchProvenance] = Field(default_factory=list)
 
 
 class RelatedEntity(BaseModel):
@@ -487,28 +526,6 @@ class RelatedEntity(BaseModel):
     member_sources: list[str] = Field(default_factory=list)
 
 
-class MatchProvenance(BaseModel):
-    """Per-result trace of which retrieval channel surfaced this node.
-
-    A single QueryResult can have multiple entries -- e.g. a Document
-    reached via vector AND graph walks carries two MatchProvenance rows.
-    Each entry also carries `intent_idx` identifying which router intent
-    surfaced this match (0 for single-intent / pre-fan-out callers).
-    """
-
-    channel: Literal[
-        "vector", "bm25", "graph", "inferred_edge", "id_lookup", "directed"
-    ]
-    rank: int
-    score: float
-    intent_idx: int = 0
-    # Populated only when channel == "inferred_edge":
-    anchor_doc_id: str | None = None
-    edge_type: str | None = None
-    confidence: str | None = None
-    why: str | None = None  # LLM justification from properties.why
-
-
 class QueryResultBase(BaseModel):
     """Common shape across all polymorphic QueryResult variants.
 
@@ -518,7 +535,7 @@ class QueryResultBase(BaseModel):
 
     canonical_id: str
     score: float
-    rank: int  # 1-indexed final rank in QueryResponse.results
+    rank: int  # 1-indexed final rank in RetrieveResponse.results
     matched_via: list[MatchProvenance] = Field(default_factory=list)
 
 
@@ -548,7 +565,7 @@ class QueryEntityResult(QueryResultBase):
     """A non-Document graph node returned as a primary search result.
 
     Distinct from `RelatedEntity` (which is a post-fusion crawl-candidate
-    enrichment): an EntityResult appears in `QueryResponse.results`
+    enrichment): an EntityResult appears in `RetrieveResponse.results`
     alongside Documents because the user's query asked about it.
     """
 
@@ -562,6 +579,10 @@ class QueryEntityResult(QueryResultBase):
     edge_types: list[str] = Field(default_factory=list)
     # Total 1-hop Document count, NOT capped at len(attached_doc_ids).
     doc_count: int = 0
+    # The gatherer agent's one-line rationale for surfacing this entity
+    # (copied from GatheredEntity.why_relevant by the adapter). Empty
+    # string on the no-LLM / harness-passthrough paths.
+    why_relevant: str = ""
 
 
 # Discriminated union: Pydantic v2 routes parsing to the right subclass
@@ -585,7 +606,16 @@ class IntentAggregation(BaseModel):
     payload: dict[str, Any]
 
 
-class QueryResponse(BaseModel):
+class RetrieveResponse(BaseModel):
+    """Canonical retrieval-data envelope. The single source of truth for
+    what a query produces.
+
+    Returned whole by POST /retrieve. Extended (via inheritance) by
+    `AnswerResponse` for POST /query, which adds synthesis fields.
+    POST /query/stream emits the same data progressively as SSE frames
+    (each frame is a typed slice of this shape).
+    """
+
     query: str
     # Polymorphic per-node results -- Document or Entity, discriminated on
     # `node_type`. Documents carry their body chunks nested under `chunks`.
@@ -647,17 +677,22 @@ class AnswerRequest(QueryRequest):
     callers can use the same body shape and just toggle the endpoint.
     """
 
-    # AnswerResponse has no related_entities field; the walk would run and
-    # be discarded, costing one DB round-trip per /query for nothing.
-    # Caller can opt back in with top_k_related > 0 if needed for debug.
+    # Default top_k_related=0 preserves the synthesis path's original
+    # cost optimization: synthesis itself doesn't consume related_entities
+    # (the LLM only reads chunks), so paying for the BFS walk on every
+    # /query call would burn a DB round-trip for nothing. AnswerResponse
+    # DOES now propagate related_entities (via RetrieveResponse
+    # inheritance) — callers that want the graph payload alongside the
+    # synthesized answer opt in with top_k_related >= 1.
     top_k_related: int = Field(
         default=0,
         ge=0,
         le=50,
         description=(
-            "Override of QueryRequest.top_k_related: defaults to 0 on the "
-            "synthesis path because AnswerResponse does not propagate "
-            "related_entities. Set explicitly to enable the walk."
+            "Override of QueryRequest.top_k_related. Defaults to 0 on the "
+            "synthesis path to skip the related-entities walk (synthesis "
+            "doesn't read it). Set >= 1 to populate "
+            "AnswerResponse.related_entities for graph-payload consumers."
         ),
     )
     model: str | None = Field(
@@ -676,28 +711,20 @@ class AnswerRequest(QueryRequest):
     )
 
 
-class AnswerResponse(BaseModel):
-    query: str
+class AnswerResponse(RetrieveResponse):
+    """Retrieval + LLM synthesis. Returned whole by POST /query.
+
+    Inherits every retrieval field from `RetrieveResponse` (results,
+    related_entities, query_root_doc_id, gatherer_notes, ...) and adds
+    the four synthesis-specific fields below. This inheritance is the
+    schema parity guarantee: anything /retrieve exposes, /query also
+    exposes — no drift between the two endpoints.
+    """
+
     answer: str
     citations: list[dict[str, object]] = Field(default_factory=list)
     insufficient_context: bool = False
     model: str
-    # Mirrors QueryResponse.results -- polymorphic Document/Entity.
-    # Documents carry their cited chunks nested under `chunks`.
-    results: list[QueryResult] = Field(default_factory=list)
-    total_candidates: int
-    confidence_breakdown: dict[str, int] = Field(
-        default_factory=lambda: {"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0}
-    )
-    applied_temporal: dict[str, object] | None = None
-    applied_sort: dict[str, object] | None = None
-    applied_entity_filter: dict[str, object] | None = None
-    applied_mode: str | None = None
-    applied_doc_types: list[str] | None = None
-    extracted_entities: list[dict[str, object]] = Field(default_factory=list)
-    aggregation: dict[str, object] | None = None
-    timing_ms: dict[str, float] = Field(default_factory=dict)
-    trace_id: str
 
 
 class SourceResponse(BaseModel):

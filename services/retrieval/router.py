@@ -139,23 +139,6 @@ def _fallback_intent(query: str) -> Intent:
     return Intent(query_text=query, mode="search", confidence=0.0)
 
 
-def _parse_intent(item: dict[str, Any]) -> Intent:
-    """Parse an Intent dict (back-compat for tests that built fixtures
-    against the pre-cutover Haiku tool-schema)."""
-    return Intent(
-        query_text=item["query_text"],
-        mode=item["mode"],
-        confidence=float(item.get("confidence", 0.0)),
-        entities=[RouterEntity(**e) for e in item.get("entities") or []],
-        expansions=item.get("expansions") or [],
-        temporal=item.get("temporal"),
-        sort=item.get("sort"),
-        doc_type=item.get("doc_type"),
-        operation=item.get("operation"),
-        group_by_key=item.get("group_by_key"),
-    )
-
-
 def _reconcile_entities_with_bundle(
     intents: list[Intent], bundle: GroundingBundle
 ) -> None:
@@ -265,38 +248,6 @@ async def _build_bundle_with_token_fallback(
     )
 
 
-# ---- Back-compat shim ---------------------------------------------------
-
-
-async def route_query(customer_id: str, query: str) -> RouterOutput:
-    """Back-compat shim.
-
-    Pre-cutover this was the Haiku LLM call. Post-cutover it does the
-    deterministic grounding step and returns a single-search-mode
-    `Intent` wrapping the result. Tests / list_pipeline that import
-    `route_query` keep working; new code calls
-    `_build_bundle_with_token_fallback` directly.
-    """
-    bundle = await _build_bundle_with_token_fallback(customer_id, query)
-    intent = _fallback_intent(query)
-    intent.entities = [
-        RouterEntity(
-            entity_type=c.entity_type,
-            canonical_id=c.canonical_id,
-            display_name=c.display_name,
-            confidence=1.0,
-        )
-        for c in (list(bundle.candidates) + list(bundle.bare_id_matches))
-    ]
-    return RouterOutput(
-        intents=[intent],
-        grounding_bundle=bundle,
-        router_raw={},
-        cache_tokens=None,
-        fallback_used=False,
-    )
-
-
 __all__ = [
     "DOC_TYPE_TOKENS",
     "GROUP_BY_KEYS",
@@ -310,7 +261,5 @@ __all__ = [
     "_build_bundle_with_token_fallback",
     "_escape_query_for_xml",
     "_fallback_intent",
-    "_parse_intent",
     "_reconcile_entities_with_bundle",
-    "route_query",
 ]

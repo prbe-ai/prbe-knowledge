@@ -36,9 +36,9 @@ from shared.models import (
     QueryChunk,
     QueryDocumentResult,
     QueryRequest,
-    QueryResponse,
     QueryResult,
     RelatedEntity,
+    RetrieveResponse,
     TemporalSpec,
 )
 
@@ -143,7 +143,7 @@ async def run_list(
     trace_id: str,
     timing: dict[str, float],
     intent_idx: int = 0,
-) -> QueryResponse:
+) -> RetrieveResponse:
     sources = [s.value for s in req.sources] if req.sources else None
     # Entity-based hard filters (author_id from `person` entities,
     # graph_nodes membership from narrowing entities) are gated on
@@ -326,7 +326,7 @@ async def run_list(
     # narrow on purpose (deterministic SQL window/aggregate semantics).
     results: list[QueryResult] = list(document_results)
 
-    return QueryResponse(
+    return RetrieveResponse(
         query=req.query,
         results=results,
         total_candidates=total_candidates,

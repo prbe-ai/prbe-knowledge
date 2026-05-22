@@ -6,7 +6,7 @@ Fireworks constrained decoding. The schema is the structural guarantee;
 the prompt does NOT instruct the model to emit JSON like this.
 
 The adapter (`services/retrieval/agent/adapter.py`) translates a
-`GathererOutput` into the existing `QueryResponse` shape for MCP /
+`GathererOutput` into the existing `RetrieveResponse` shape for MCP /
 dashboard consumers — no breaking changes downstream.
 """
 

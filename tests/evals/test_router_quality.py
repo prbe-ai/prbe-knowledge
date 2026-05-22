@@ -18,7 +18,35 @@ from pathlib import Path
 import pytest
 import yaml
 
-from services.retrieval.router import route_query
+from services.retrieval.router import (
+    RouterEntity,
+    RouterOutput,
+    _build_bundle_with_token_fallback,
+    _fallback_intent,
+)
+
+
+async def _route_query_for_eval(customer_id: str, query: str) -> RouterOutput:
+    """Inlined former `route_query` shim — kept eval-local so the shim
+    can be deleted from production code. Post-cutover the router is pure
+    deterministic grounding; we synthesise a single-search-mode Intent
+    over the bundle so the eval's intent-shape scoring still works."""
+    bundle = await _build_bundle_with_token_fallback(customer_id, query)
+    intent = _fallback_intent(query)
+    intent.entities = [
+        RouterEntity(
+            entity_type=c.entity_type,
+            canonical_id=c.canonical_id,
+            display_name=c.display_name,
+            confidence=1.0,
+        )
+        for c in (list(bundle.candidates) + list(bundle.bare_id_matches))
+    ]
+    return RouterOutput(
+        intents=[intent],
+        grounding_bundle=bundle,
+        router_raw={},
+    )
 
 
 @dataclass(slots=True)
@@ -143,7 +171,7 @@ async def test_router_quality_eval(eval_seeded_customer):
     reports: list[EvalReport] = []
 
     for case in cases:
-        routed = await route_query(eval_seeded_customer.customer_id, case.query)
+        routed = await _route_query_for_eval(eval_seeded_customer.customer_id, case.query)
         reports.append(_score_case(case, routed))
 
     total = len(reports)

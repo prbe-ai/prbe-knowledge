@@ -234,7 +234,7 @@ _INSUFFICIENT_SENTINEL = "<<INSUFFICIENT>>"
 def flatten_documents_for_synthesis(
     results: list[QueryResult],
 ) -> list[SynthesisChunk]:
-    """Flatten the polymorphic `QueryResponse.results` into a flat chunk
+    """Flatten the polymorphic `RetrieveResponse.results` into a flat chunk
     list the synthesizer can cite.
 
     Skips Entity results -- entities have no body content to cite. Each
