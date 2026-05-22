@@ -76,7 +76,7 @@ from shared.models import (
     AnswerRequest,
     AnswerResponse,
     QueryRequest,
-    QueryResponse,
+    RetrieveResponse,
     SourceResponse,
     SourceViewResponse,
     SourceViewSection,
@@ -129,7 +129,9 @@ def _log_query_handled(
     *,
     endpoint: str,
     req_query: str,
-    resp: QueryResponse | AnswerResponse,
+    # AnswerResponse is a RetrieveResponse subclass, so the base type covers
+    # both /retrieve and /query callers without an explicit union.
+    resp: RetrieveResponse,
     total_ms: float,
     stage_ms: dict[str, float],
     extra: dict[str, object] | None = None,
@@ -156,12 +158,12 @@ def _log_query_handled(
     log.info("query.handled", extra=payload)
 
 
-@app.post("/retrieve", response_model=QueryResponse)
+@app.post("/retrieve", response_model=RetrieveResponse)
 async def retrieve(
     req: QueryRequest,
     request: Request,
     customer_id: str = Depends(authenticate_query),
-) -> QueryResponse:
+) -> RetrieveResponse:
     """Raw-chunks retrieval. Branches on Haiku-emitted mode:
     list → SQL window/aggregate; search → vector + BM25 + graph fusion.
 
@@ -229,24 +231,15 @@ async def query(
     timing = dict(rresp.timing_ms)
     timing["synthesis_ms"] = (time.perf_counter() - t_syn) * 1000
 
+    # AnswerResponse inherits every retrieval field from RetrieveResponse,
+    # so we splat rresp once and add the four synthesis-specific fields.
+    # Override timing_ms to carry synthesis_ms; the rest passes through.
     answer = AnswerResponse(
-        query=req.query,
+        **{**rresp.model_dump(), "timing_ms": timing},
         answer=result.answer,
         citations=result.citations,
         insufficient_context=result.insufficient_context,
         model=result.model,
-        results=rresp.results,
-        total_candidates=rresp.total_candidates,
-        confidence_breakdown=rresp.confidence_breakdown,
-        applied_temporal=rresp.applied_temporal,
-        applied_sort=rresp.applied_sort,
-        applied_entity_filter=rresp.applied_entity_filter,
-        applied_mode=rresp.applied_mode,
-        applied_doc_types=rresp.applied_doc_types,
-        extracted_entities=rresp.extracted_entities,
-        aggregation=rresp.aggregation,
-        timing_ms=timing,
-        trace_id=rresp.trace_id,
     )
     request.state.usage_response_payload = answer
     total_ms = (time.perf_counter() - t_total) * 1000
@@ -410,25 +403,25 @@ async def query_stream(
             # from a real /query with zero results. Closes PR #64's documented
             # known-limitation for usage_events as a bonus (result_count is
             # already set on line 286).
-            request.state.usage_response_payload = AnswerResponse(
-                query=req.query,
-                answer=final.answer,
-                citations=final.citations,
-                insufficient_context=final.insufficient_context,
-                model=final.model,
-                results=rresp.results,
-                total_candidates=rresp.total_candidates,
-                confidence_breakdown=rresp.confidence_breakdown,
-                applied_temporal=rresp.applied_temporal,
-                applied_sort=rresp.applied_sort,
-                applied_entity_filter=rresp.applied_entity_filter,
-                applied_mode=rresp.applied_mode,
-                applied_doc_types=rresp.applied_doc_types,
-                extracted_entities=rresp.extracted_entities,
-                aggregation=rresp.aggregation,
-                timing_ms=timing,
-                trace_id=rresp.trace_id,
-            )
+            # AnswerResponse inherits every retrieval field from
+            # RetrieveResponse — splat rresp once, override timing_ms.
+            # Wrapped in its own try so a stash failure (Pydantic re-validation
+            # edge case, etc.) doesn't surface as an `error` SSE frame AFTER
+            # the client already saw `done`. The trace is observability —
+            # losing one is acceptable; misleading the client is not.
+            try:
+                request.state.usage_response_payload = AnswerResponse(
+                    **{**rresp.model_dump(), "timing_ms": timing},
+                    answer=final.answer,
+                    citations=final.citations,
+                    insufficient_context=final.insufficient_context,
+                    model=final.model,
+                )
+            except Exception:
+                log.exception(
+                    "query.stream_trace_stash_failed",
+                    extra={"trace_id": phase.trace_id, "query": req.query},
+                )
 
             log.info(
                 "query.handled",

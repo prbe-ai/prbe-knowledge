@@ -484,6 +484,7 @@ async def test_write_query_trace_persists_answer_response(live_db) -> None:
         model="anthropic/claude-sonnet-4-6",
         results=results,
         total_candidates=2,
+        router_hit_cache=False,
         timing_ms={"synthesis_ms": 50.0},
         trace_id="trace-answer",
     )

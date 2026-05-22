@@ -1,6 +1,6 @@
 """Gatherer agent loop.
 
-Entry point: `run_gatherer(req, customer_id, request)` -> QueryResponse.
+Entry point: `run_gatherer(req, customer_id, request)` -> RetrieveResponse.
 
 Flow:
 1. SEQUENTIAL grounding → LLM entity extraction (extraction uses the
@@ -16,7 +16,7 @@ Flow:
    `emit_gatherer_output` is called; its arguments ARE the final
    GathererOutput.
 4. Telemetry: per-stage latency log + R2 transcript blob (PR #301).
-5. Adapter converts GathererOutput → existing QueryResponse shape.
+5. Adapter converts GathererOutput → existing RetrieveResponse shape.
 
 Plan: docs/specs/agentic-search.md.
 """
@@ -80,7 +80,7 @@ from shared.constants import (
 from shared.db import with_tenant
 from shared.llm import LLMError, acompletion
 from shared.logging import get_logger
-from shared.models import QueryRequest, QueryResponse
+from shared.models import QueryRequest, RetrieveResponse
 
 log = get_logger(__name__)
 
@@ -1168,8 +1168,8 @@ async def run_gatherer(
     req: QueryRequest,
     customer_id: str,
     request: Request | None = None,
-) -> QueryResponse:
-    """Run the gatherer agent against `req.query` and return a QueryResponse.
+) -> RetrieveResponse:
+    """Run the gatherer agent against `req.query` and return a RetrieveResponse.
 
     Raises HTTPException(503) on fatal LLM/provider failures (no fallback).
     """

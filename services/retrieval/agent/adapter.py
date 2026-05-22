@@ -1,6 +1,6 @@
-"""Adapter: GathererOutput -> existing QueryResponse shape.
+"""Adapter: GathererOutput -> existing RetrieveResponse shape.
 
-The MCP consumer schema (`shared.models.QueryResponse`) is unchanged
+The MCP consumer schema (`shared.models.RetrieveResponse`) is unchanged
 by the cutover (per plan anti-scope #1). The gatherer emits its own
 Pydantic shape; this adapter translates it into the existing response
 so downstream consumers (Claude Code, Codex, dashboard, MCP server)
@@ -14,7 +14,7 @@ new `gatherer_notes` field is passed through verbatim for debug clients.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, get_args
 
 from services.retrieval.agent.models import GathererOutput
 from shared.constants import SourceSystem
@@ -26,12 +26,32 @@ from shared.models import (
     QueryChunk,
     QueryDocumentResult,
     QueryEntityResult,
-    QueryResponse,
     QueryResult,
     RelatedEntity,
+    RetrieveResponse,
 )
 
 log = get_logger(__name__)
+
+# Channel names that MatchProvenance.channel accepts as a Literal. Used to
+# coerce GatheredChunk.matched_via (which uses MatchedViaChannel — an
+# overlapping but distinct set; the two share {vector, bm25, graph,
+# inferred_edge, id_lookup} while agent-only channels like graph_walk /
+# inferred_neighbor / entity_cluster / reissue coerce to "vector" and
+# `directed` is a consumer-only channel that the agent never emits)
+# down into the consumer-visible MatchProvenance set. Derived from the
+# MatchProvenance model so adding a channel to the Literal in
+# shared.models automatically updates this set — no silent drift.
+_MATCH_PROVENANCE_CHANNELS: frozenset[str] = frozenset(
+    get_args(MatchProvenance.model_fields["channel"].annotation)
+)
+# Boot-time sanity: if the Literal failed to resolve (refactor, dynamic
+# typing, etc.), every channel would silently coerce to "vector". Assert
+# the set contains a known channel so a bad import surfaces immediately.
+assert "bm25" in _MATCH_PROVENANCE_CHANNELS, (
+    "MatchProvenance.channel Literal failed to resolve via get_args — "
+    "every chunk channel would silently coerce to 'vector'"
+)
 
 
 def _safe_source_system(value: str | None, doc_id: str | None = None) -> str:
@@ -291,7 +311,29 @@ def _chunk_to_query_chunk(
     when the parent doc was surfaced via the inferred-edge channel;
     empty list when the doc reached the agent via vector / bm25 / graph
     alone.
+
+    `why_relevant` is the gatherer's per-chunk rationale (one line,
+    LLM-written; for inferred-edge neighbors the agent quotes the edge
+    `why` verbatim). `matched_via` is the chunk-level provenance derived
+    from `GatheredChunk.matched_via` channel names, coerced into
+    MatchProvenance rows so consumers see the same shape doc-level
+    `matched_via` uses.
     """
+    # Defensive: non-strict providers (Cerebras et al.) with extra='ignore'
+    # could emit matched_via as None or as a string instead of a list.
+    # Without this guard, iterating a string yields per-character entries
+    # that all fall through to the "vector" fallback and produce bogus rows.
+    raw_matched_via = getattr(chunk, "matched_via", None)
+    if not isinstance(raw_matched_via, list):
+        raw_matched_via = []
+    chunk_provenance = [
+        MatchProvenance(
+            channel=ch if ch in _MATCH_PROVENANCE_CHANNELS else "vector",
+            rank=rank + 1,
+            score=1.0,  # agent chose to surface; treat as max within the curated set
+        )
+        for ch in raw_matched_via
+    ]
     return QueryChunk(
         chunk_id=chunk.chunk_id,
         content=chunk.content,
@@ -300,6 +342,8 @@ def _chunk_to_query_chunk(
         rank_in_doc=rank + 1,
         retriever_scores={},
         graph_evidence=graph_evidence,
+        why_relevant=getattr(chunk, "why_relevant", "") or "",
+        matched_via=chunk_provenance,
     )
 
 
@@ -311,8 +355,8 @@ async def to_query_response(
     timing_ms: dict[str, float],
     prefanout: dict[str, Any] | None = None,
     customer_id: str | None = None,
-) -> QueryResponse:
-    """Wrap a GathererOutput in the existing QueryResponse shape.
+) -> RetrieveResponse:
+    """Wrap a GathererOutput in the existing RetrieveResponse shape.
 
     Grouping: chunks with the same doc_id are merged into one
     QueryDocumentResult; the first chunk's doc_id determines metadata
@@ -390,11 +434,7 @@ async def to_query_response(
                 # MatchProvenance Literal allows only a subset; coerce unknown
                 # channels to "vector" (lowest-fidelity fallback). The gatherer
                 # tracks the real channel name in matched_via separately.
-                allowed = {
-                    "vector", "bm25", "graph", "inferred_edge",
-                    "id_lookup", "directed",
-                }
-                channel_value = ch if ch in allowed else "vector"
+                channel_value = ch if ch in _MATCH_PROVENANCE_CHANNELS else "vector"
                 provenance.append(
                     MatchProvenance(
                         channel=channel_value,  # type: ignore[arg-type]
@@ -477,6 +517,7 @@ async def to_query_response(
                 attached_doc_ids=[],
                 edge_types=[],
                 doc_count=0,
+                why_relevant=getattr(entity, "why_relevant", "") or "",
             )
         )
 
@@ -527,7 +568,7 @@ async def to_query_response(
     if query_root_doc_id is None and gathered.entities:
         query_root_doc_id = gathered.entities[0].canonical_id
 
-    return QueryResponse(
+    return RetrieveResponse(
         query=query,
         results=results,
         total_candidates=len(results),

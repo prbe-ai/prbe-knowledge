@@ -4,14 +4,14 @@ The gatherer agent IS the pipeline. This module is now a thin shim:
 
     /retrieve → run_retrieval → run_gatherer (Fireworks gpt-oss-120B)
                                     ↓
-                              GathererOutput → QueryResponse
+                              GathererOutput → RetrieveResponse
 
 The streaming endpoint (`/query/stream`) still calls `run_router_phase`
 + `run_search_phase` separately so it can emit progress SSE events
 between grounding and the agent loop. Those two are now compat shims:
 `run_router_phase` runs the grounding step and returns a synthetic
 single-intent `RouterPhaseResult`; `run_search_phase` runs the agent
-loop and adapts to `QueryResponse`.
+loop and adapts to `RetrieveResponse`.
 
 Deleted from the pre-cutover pipeline:
 - `fuse_intent_results` (RRF fusion — no fusion in the gatherer model)
@@ -46,7 +46,7 @@ from shared.constants import SEARCH_AGENT_INFERENCE_MODEL
 from shared.logging import get_logger
 from shared.models import (
     QueryRequest,
-    QueryResponse,
+    RetrieveResponse,
     TemporalMode,
     TemporalSpec,
 )
@@ -204,8 +204,8 @@ async def run_search_phase(
     customer_id: str,
     phase: RouterPhaseResult,
     request: Request | None = None,
-) -> QueryResponse:
-    """Agent loop. Reads the query, runs the gatherer, returns a QueryResponse.
+) -> RetrieveResponse:
+    """Agent loop. Reads the query, runs the gatherer, returns a RetrieveResponse.
 
     Ignores `phase` other than the trace_id continuity (the agent
     re-runs grounding internally — they're cheap and keep the agent
@@ -218,7 +218,7 @@ async def run_retrieval(
     req: QueryRequest,
     customer_id: str,
     request: Request | None = None,
-) -> QueryResponse:
+) -> RetrieveResponse:
     """Run the full retrieval pipeline.
 
     Post-cutover this is `run_gatherer`. The two-phase split survives
