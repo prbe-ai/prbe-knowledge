@@ -13,7 +13,7 @@ new `gatherer_notes` field is passed through verbatim for debug clients.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any, get_args
 
 from services.retrieval.agent.models import GathererOutput
@@ -382,8 +382,6 @@ async def to_query_response(
     *does* have edges between them. None preserves the pre-enrichment
     behaviour for tests / harness-passthrough.
     """
-    now = datetime.now(UTC)
-
     doc_evidence = _build_doc_to_graph_evidence(prefanout)
 
     # Post-hoc enrichment from graph_edges. Merged into the prefanout-
@@ -445,11 +443,14 @@ async def to_query_response(
 
         # Doc-level metadata: take the first chunk's pass-through fields
         # (they should agree across chunks of the same doc — populated
-        # from the prefanout hit by `_coerce_lenient`). Timestamps fall
-        # back to request time only when the chunk doesn't carry one.
+        # from the prefanout hit by `_coerce_lenient`). Timestamps stay
+        # None when the chunk doesn't carry one — substituting `now`
+        # here made docs reached via fetch_doc / inferred-edge follow-up
+        # (not in prefanout, LLM omitted updated_at) render as "less
+        # than a minute ago" in the dashboard.
         first = chunks[0]
-        created_at = _parse_iso(getattr(first, "created_at", None)) or now
-        updated_at = _parse_iso(getattr(first, "updated_at", None)) or now
+        created_at = _parse_iso(getattr(first, "created_at", None))
+        updated_at = _parse_iso(getattr(first, "updated_at", None))
         title = getattr(first, "title", "") or None
         source_url = getattr(first, "source_url", "") or ""
         author_id = getattr(first, "author_id", None)

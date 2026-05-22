@@ -71,7 +71,7 @@ class SynthesisChunk:
     content: str
     source_system: str
     source_url: str
-    updated_at: str  # ISO8601
+    updated_at: str | None  # ISO8601, None when source timestamp is unknown
     # Per-chunk chain provenance from the data-plane adapter. Each entry
     # is one inferred edge that surfaced this chunk's parent doc. Empty
     # list when the chunk reached the synthesizer via vector / bm25 /
@@ -256,7 +256,7 @@ def flatten_documents_for_synthesis(
                     content=c.content,
                     source_system=r.source_system.value,
                     source_url=r.source_url,
-                    updated_at=r.updated_at.isoformat(),
+                    updated_at=r.updated_at.isoformat() if r.updated_at else None,
                     graph_evidence=list(c.graph_evidence or []),
                 )
             )
@@ -503,9 +503,10 @@ def _format_user_prompt(query: str, chunks: list[SynthesisChunk]) -> str:
         if len(body) > 1500:
             body = body[:1500] + "…"
         chain_section = _format_graph_evidence_for_prompt(c.graph_evidence)
+        updated_segment = f" | updated {c.updated_at}" if c.updated_at else ""
         blocks.append(
-            f"[chunk:{i}] ({c.source_system}{title} | {c.source_url} | "
-            f"updated {c.updated_at})\n{body}{chain_section}"
+            f"[chunk:{i}] ({c.source_system}{title} | {c.source_url}"
+            f"{updated_segment})\n{body}{chain_section}"
         )
     chunk_block = "\n\n".join(blocks)
     return f"""Query: {query}
