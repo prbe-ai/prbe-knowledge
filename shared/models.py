@@ -568,8 +568,14 @@ class QueryDocumentResult(QueryResultBase):
     source_url: str
     title: str | None = None
     author_id: str | None = None
-    created_at: datetime
-    updated_at: datetime
+    # Null when the gathered chunk carries no timestamp — e.g. the agent
+    # reached this doc via fetch_doc / inferred-edge follow-up (not in
+    # the prefanout) and the LLM emission omitted the field. Consumers
+    # must treat None as "unknown", not "now": the adapter previously
+    # fell back to request time, which made stale docs render as
+    # "less than a minute ago" in the dashboard.
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
     chunks: list[QueryChunk] = Field(default_factory=list)
     chunk_count: int = 0
     retriever_scores: dict[str, float] = Field(default_factory=dict)
