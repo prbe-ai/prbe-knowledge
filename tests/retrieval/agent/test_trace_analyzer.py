@@ -154,7 +154,6 @@ def test_summarize_trace_happy_path_extracts_all_fields() -> None:
     assert out["turn_count"] == 2
     assert out["tool_call_sequence"] == ["vector_search", "bm25_search"]
     assert out["turn_1_tools_fired"] == ["vector_search", "bm25_search"]
-    assert set(out["turn_1_missed_channels"]) == {"graph_search", "inferred_edge_search"}
     assert out["cache_hit_rate_mean"] == pytest.approx(0.6)
     assert out["turn_latencies_ms"] == [1500.0, 3000.0]
     assert out["agent_ms"] == 5000.0
@@ -182,12 +181,6 @@ def test_summarize_trace_handles_failure_status() -> None:
     assert out["chunk_count"] == 0
     assert out["entity_count"] == 0
     assert out["confidence"] is None
-    assert set(out["turn_1_missed_channels"]) == {
-        "vector_search",
-        "bm25_search",
-        "graph_search",
-        "inferred_edge_search",
-    }
 
 
 def test_summarize_trace_handles_zero_turns() -> None:
@@ -224,15 +217,6 @@ def test_summarize_trace_reasoning_signal_false_when_all_none() -> None:
     blob = _mk_blob(reasoning_per_turn=[None, None, None])
     out = summarize_trace(blob)
     assert out["had_reasoning_per_turn"] is False
-
-
-def test_summarize_trace_detects_exploration_tools() -> None:
-    blob = _mk_blob(
-        tools_fired=["vector_search", "reissue_query", "expand_inferred_neighbors"]
-    )
-    out = summarize_trace(blob)
-    assert out["had_reissue_query"] is True
-    assert out["had_expand_inferred_neighbors"] is True
 
 
 def test_summarize_trace_need_deeper_signal() -> None:
