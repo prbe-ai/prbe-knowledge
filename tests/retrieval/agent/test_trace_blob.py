@@ -64,6 +64,10 @@ def _mk_state(**overrides: Any) -> LoopState:
         ],
         "seed": 1234567890,
         "system_fingerprints_per_turn": ["fp_abc123", "fp_abc123"],
+        "response_headers_per_turn": [
+            {"x-replica-id": "cb-abc-7"},
+            {"x-replica-id": "cb-abc-7"},
+        ],
     }
     defaults.update(overrides)
     return LoopState(**defaults)
@@ -139,6 +143,15 @@ def test_build_trace_blob_includes_all_fields() -> None:
     assert blob["seed"] == 1234567890
     assert blob["system_fingerprints_per_turn"] == ["fp_abc123", "fp_abc123"]
 
+    # Per-turn provider response headers (schema v2): present + a list,
+    # parallels the fingerprint assertion above. Used by the nightly
+    # analyzer to correlate cache_hit_rate with replica assignment.
+    assert isinstance(blob["response_headers_per_turn"], list)
+    assert blob["response_headers_per_turn"] == [
+        {"x-replica-id": "cb-abc-7"},
+        {"x-replica-id": "cb-abc-7"},
+    ]
+
     # GathererOutput round-trips through model_dump
     assert blob["gathered"]["gatherer_notes"]["confidence"] == "medium"
     assert blob["gathered"]["chunks"][0]["doc_id"] == "doc-1"
@@ -189,6 +202,7 @@ def test_build_trace_blob_handles_none_state() -> None:
     assert blob["reasoning_per_turn"] == []
     assert blob["seed"] is None
     assert blob["system_fingerprints_per_turn"] == []
+    assert blob["response_headers_per_turn"] == []
 
 
 def test_build_trace_blob_handles_none_gathered() -> None:
