@@ -232,7 +232,13 @@ MAX_CHUNK_COUNT_BEFORE_TRUNCATE = 200
 # Schema version stamped on every row. Bump when the request/response
 # JSONB shape changes in a way that breaks dashboard SQL — old rows
 # stay readable indefinitely, consumers filter by version.
-QUERY_TRACE_SCHEMA_VERSION = 1
+#
+# v2 (2026-05-21): AnswerResponse inherits RetrieveResponse, so /query
+# response JSONB now carries 7 additional top-level keys (related_entities,
+# related_entities_error, gatherer_notes, query_root_doc_id, aggregations,
+# router_hit_cache, applied_min_confidence) and chunks now carry
+# why_relevant + chunk-level matched_via. Pre-v2 rows lack these.
+QUERY_TRACE_SCHEMA_VERSION = 2
 
 
 @dataclass

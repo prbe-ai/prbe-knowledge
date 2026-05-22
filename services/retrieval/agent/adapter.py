@@ -14,7 +14,7 @@ new `gatherer_notes` field is passed through verbatim for debug clients.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, get_args
 
 from services.retrieval.agent.models import GathererOutput
 from shared.constants import SourceSystem
@@ -34,13 +34,24 @@ from shared.models import (
 log = get_logger(__name__)
 
 # Channel names that MatchProvenance.channel accepts as a Literal. Used to
-# coerce GatheredChunk.matched_via (MatchedViaChannel — a superset)
-# down into the consumer-visible MatchProvenance set. Centralized so the
-# chunk-level path (`_chunk_to_query_chunk`) and the doc-level union
-# loop in `to_query_response` agree on the same allowed set.
-_MATCH_PROVENANCE_CHANNELS: frozenset[str] = frozenset({
-    "vector", "bm25", "graph", "inferred_edge", "id_lookup", "directed",
-})
+# coerce GatheredChunk.matched_via (which uses MatchedViaChannel — an
+# overlapping but distinct set; the two share {vector, bm25, graph,
+# inferred_edge, id_lookup} while agent-only channels like graph_walk /
+# inferred_neighbor / entity_cluster / reissue coerce to "vector" and
+# `directed` is a consumer-only channel that the agent never emits)
+# down into the consumer-visible MatchProvenance set. Derived from the
+# MatchProvenance model so adding a channel to the Literal in
+# shared.models automatically updates this set — no silent drift.
+_MATCH_PROVENANCE_CHANNELS: frozenset[str] = frozenset(
+    get_args(MatchProvenance.model_fields["channel"].annotation)
+)
+# Boot-time sanity: if the Literal failed to resolve (refactor, dynamic
+# typing, etc.), every channel would silently coerce to "vector". Assert
+# the set contains a known channel so a bad import surfaces immediately.
+assert "bm25" in _MATCH_PROVENANCE_CHANNELS, (
+    "MatchProvenance.channel Literal failed to resolve via get_args — "
+    "every chunk channel would silently coerce to 'vector'"
+)
 
 
 def _safe_source_system(value: str | None, doc_id: str | None = None) -> str:
@@ -308,13 +319,20 @@ def _chunk_to_query_chunk(
     MatchProvenance rows so consumers see the same shape doc-level
     `matched_via` uses.
     """
+    # Defensive: non-strict providers (Cerebras et al.) with extra='ignore'
+    # could emit matched_via as None or as a string instead of a list.
+    # Without this guard, iterating a string yields per-character entries
+    # that all fall through to the "vector" fallback and produce bogus rows.
+    raw_matched_via = getattr(chunk, "matched_via", None)
+    if not isinstance(raw_matched_via, list):
+        raw_matched_via = []
     chunk_provenance = [
         MatchProvenance(
             channel=ch if ch in _MATCH_PROVENANCE_CHANNELS else "vector",
             rank=rank + 1,
             score=1.0,  # agent chose to surface; treat as max within the curated set
         )
-        for ch in getattr(chunk, "matched_via", []) or []
+        for ch in raw_matched_via
     ]
     return QueryChunk(
         chunk_id=chunk.chunk_id,

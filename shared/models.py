@@ -429,12 +429,26 @@ class MatchProvenance(BaseModel):
     Carried at two granularities:
       - QueryChunk.matched_via — the channels that surfaced *this specific
         chunk* (preserves the gatherer's per-chunk fidelity).
-      - QueryResultBase.matched_via — the union across all chunks of the
-        parent doc (doc-level aggregate; consumers that don't care about
-        chunk-level provenance can read this directly).
+      - QueryResultBase.matched_via — the doc-level concatenation across
+        all chunks of the parent doc. Note: this is NOT a set/union —
+        the adapter appends each chunk's channels in order without
+        deduplication, so a doc with 3 vector-surfaced chunks carries
+        3 MatchProvenance(channel='vector', ...) entries. Consumers that
+        want distinct channels per doc must dedupe by `(channel, intent_idx)`.
 
     `intent_idx` identifies which router intent surfaced this match (0 for
     single-intent / pre-fan-out callers).
+
+    `rank` carries DIFFERENT semantics at the two granularities:
+      - On chunk-level entries (QueryChunk.matched_via) it is the chunk's
+        1-indexed position within its parent doc (rank_in_doc).
+      - On doc-level entries (QueryResultBase.matched_via) it is the
+        doc's 1-indexed final position in QueryResponse.results.
+    Consumers ranking across both granularities must keep parent context.
+
+    `score` is always 1.0 on the gatherer path (the agent's curated
+    set has no underlying per-channel score). Pre-cutover list_pipeline
+    paths may emit real channel scores.
     """
 
     channel: Literal[
@@ -709,6 +723,13 @@ class AnswerRequest(QueryRequest):
         le=4096,
         description="Cap on synthesis output length.",
     )
+
+
+# Back-compat alias. QueryResponse was renamed to RetrieveResponse to align
+# the type name with its endpoint (/retrieve). External consumers and
+# in-repo test fixtures that still import QueryResponse keep working via
+# this alias; new code should use RetrieveResponse directly.
+QueryResponse = RetrieveResponse
 
 
 class AnswerResponse(RetrieveResponse):

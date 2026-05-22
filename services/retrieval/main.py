@@ -129,7 +129,9 @@ def _log_query_handled(
     *,
     endpoint: str,
     req_query: str,
-    resp: RetrieveResponse | AnswerResponse,
+    # AnswerResponse is a RetrieveResponse subclass, so the base type covers
+    # both /retrieve and /query callers without an explicit union.
+    resp: RetrieveResponse,
     total_ms: float,
     stage_ms: dict[str, float],
     extra: dict[str, object] | None = None,
@@ -403,13 +405,23 @@ async def query_stream(
             # already set on line 286).
             # AnswerResponse inherits every retrieval field from
             # RetrieveResponse — splat rresp once, override timing_ms.
-            request.state.usage_response_payload = AnswerResponse(
-                **{**rresp.model_dump(), "timing_ms": timing},
-                answer=final.answer,
-                citations=final.citations,
-                insufficient_context=final.insufficient_context,
-                model=final.model,
-            )
+            # Wrapped in its own try so a stash failure (Pydantic re-validation
+            # edge case, etc.) doesn't surface as an `error` SSE frame AFTER
+            # the client already saw `done`. The trace is observability —
+            # losing one is acceptable; misleading the client is not.
+            try:
+                request.state.usage_response_payload = AnswerResponse(
+                    **{**rresp.model_dump(), "timing_ms": timing},
+                    answer=final.answer,
+                    citations=final.citations,
+                    insufficient_context=final.insufficient_context,
+                    model=final.model,
+                )
+            except Exception:
+                log.exception(
+                    "query.stream_trace_stash_failed",
+                    extra={"trace_id": phase.trace_id, "query": req.query},
+                )
 
             log.info(
                 "query.handled",
