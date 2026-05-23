@@ -124,10 +124,6 @@ class LoopState:
     turn_latencies_ms: list[float] = field(default_factory=list)
     # Per-tool execution latencies (ms).
     tool_latencies_ms: list[float] = field(default_factory=list)
-    # Retained for trace_blob schema compat. Always 0 under the
-    # tool_choice="required" + emit_gatherer_output terminal — the model
-    # can no longer emit prose, so there's nothing to retry.
-    prose_retries: int = 0
     # Pre-fan-out search result, captured for the trace blob so the
     # nightly analyzer can correlate channel coverage with curated outcomes.
     prefanout: dict[str, Any] = field(default_factory=dict)

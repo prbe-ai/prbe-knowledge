@@ -46,7 +46,11 @@ log = logging.getLogger(__name__)
 # Bumped when the blob JSON shape changes in a way that breaks the
 # nightly trace-analyzer (renamed/restructured fields). Old blobs stay
 # readable indefinitely; the analyzer filters by version when needed.
-TRACE_BLOB_SCHEMA_VERSION = 1
+# v2 (2026-05-23): dropped always-0 `prose_retries` key (the model can
+# no longer emit prose under tool_choice="required"; PR #376 drained
+# the last write site). Removal is additive — analyzer reads via
+# `.get(...)`, so older blobs that still carry the key are unaffected.
+TRACE_BLOB_SCHEMA_VERSION = 2
 
 
 def build_trace_blob(
@@ -88,7 +92,6 @@ def build_trace_blob(
         blob["cache_hit_rates"] = list(state.cache_hit_rates)
         blob["turn_latencies_ms"] = list(state.turn_latencies_ms)
         blob["tool_latencies_ms"] = list(state.tool_latencies_ms)
-        blob["prose_retries"] = state.prose_retries
         # Pre-fan-out captured on LoopState by run_gatherer so the
         # analyzer can correlate channel coverage with curated outcomes.
         blob["prefanout"] = state.prefanout
@@ -126,7 +129,6 @@ def build_trace_blob(
         blob["cache_hit_rates"] = []
         blob["turn_latencies_ms"] = []
         blob["tool_latencies_ms"] = []
-        blob["prose_retries"] = 0
         blob["prefanout"] = {}
         blob["prefanout_hit_counts"] = {}
         blob["search_options"] = {"sort": "relevance"}

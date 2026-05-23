@@ -105,7 +105,6 @@ def _mk_blob(**overrides: Any) -> dict[str, Any]:
         "cache_hit_rates": [0.4, 0.8],
         "turn_latencies_ms": [1500.0, 3000.0],
         "tool_latencies_ms": [50.0, 80.0],
-        "prose_retries": 0,
         "prefanout": {},
         "prefanout_hit_counts": {"vector": 15, "bm25": 12, "graph": 0, "inferred_edge": 0},
         "reasoning_per_turn": ["picked vector_search first", None],
