@@ -1137,6 +1137,117 @@ async def test_bad_matched_via_values_are_filtered(
 
 
 @pytest.mark.asyncio
+async def test_force_terminate_retry_pins_tool_choice_to_emit(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Soft-turn-cap force-terminate retry MUST pin `tool_choice` to the
+    `emit_gatherer_output` named function so the model can't pick another
+    exploration tool.
+
+    Pattern replayed from the 2026-05-24 nightly's 4/40 schema_violation
+    traces (request_ids 2bc47038-d609-4e31-935e-9d46a9914533,
+    3810e737-b8cb-40d0-a960-24adbec644d4,
+    ce525fee-1013-416d-8dc7-95bf51e53d65,
+    31964f42-708e-4c7d-a785-905798c6bfe3). All four:
+      - turn 1: model picks an exploration tool (`search` / `fetch_doc`)
+      - turn 2: model picks ANOTHER exploration tool (`subgraph` /
+        `fetch_doc`) — soft-turn-cap (=1) tripped on entry to this turn
+      - turn 3: force-terminate retry with `tool_choice="required"` —
+        model IGNORES the "Stop exploring" nudge and emits `fetch_doc`
+        again because every other tool is still a legal pick
+      - result: loop returns None → status=schema_violation, 0 chunks
+
+    Pre-fix this returned None. Post-fix the third call structurally
+    requires `emit_gatherer_output` (no other tool selectable at the
+    provider), so the terminal is emitted and the parser/coercer can
+    process it normally.
+    """
+    req = QueryRequest(query="Probe marketing brand design", customer_id="cust-1", top_k=5)
+
+    turn_1 = _mk_resp(tool_calls=[{
+        "id": "search_1",
+        "name": "search",
+        "arguments": {"queries": ["Probe marketing homepage brand logo"]},
+    }])
+    # Turn 2 picks another exploration tool — soft turn cap trips next.
+    turn_2 = _mk_resp(tool_calls=[{
+        "id": "subgraph_1",
+        "name": "subgraph",
+        "arguments": {"anchor_canonical_id": "wiki:repo:prbe_marketing", "depth": 1},
+    }])
+    # Turn 3 is the force-terminate retry. With pinned tool_choice the
+    # provider can only return the terminal; mock that response.
+    turn_3 = _mk_resp(tool_calls=[_terminal_call(_final_emission_args(chunks=2))])
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1, turn_2, turn_3]),
+    ) as mock_acomp, patch(
+        "services.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    # Loop emitted a real GathererOutput on the retry instead of None.
+    assert fake_request.state.gatherer_status == "ok"
+    assert resp.total_candidates == 2
+    # Three LLM calls (turn 1, turn 2, force-terminate retry).
+    assert mock_acomp.await_count == 3
+    # First two turns use the default `tool_choice="required"`.
+    for call in mock_acomp.await_args_list[:2]:
+        assert call.kwargs.get("tool_choice") == "required"
+    # The third (force-terminate retry) MUST pin the named function.
+    third = mock_acomp.await_args_list[2]
+    assert third.kwargs.get("tool_choice") == {
+        "type": "function",
+        "function": {"name": "emit_gatherer_output"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_force_terminate_retry_with_non_terminal_still_returns_none(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Defense in depth: if a provider somehow ignores the named-function
+    `tool_choice` and emits a non-terminal tool on the retry anyway, the
+    loop still degrades to None → empty passthrough (no infinite loop,
+    no crash). The named tool_choice makes this branch unreachable on
+    cooperative providers; the warning log line `agent.force_terminate_
+    named_tool_choice_ignored` is the canary the nightly digest watches
+    for if a provider regresses on this contract."""
+    req = QueryRequest(query="Probe marketing brand design", customer_id="cust-1", top_k=5)
+
+    turn_1 = _mk_resp(tool_calls=[{
+        "id": "search_1",
+        "name": "search",
+        "arguments": {"queries": ["something"]},
+    }])
+    turn_2 = _mk_resp(tool_calls=[{
+        "id": "fetch_1",
+        "name": "fetch_doc",
+        "arguments": {"doc_id": "wiki:repo:prbe_marketing"},
+    }])
+    # Hypothetical bad provider: ignores the named-function pin.
+    turn_3_bad = _mk_resp(tool_calls=[{
+        "id": "fetch_2",
+        "name": "fetch_doc",
+        "arguments": {"doc_id": "wiki:repo:prbe_marketing"},
+    }])
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1, turn_2, turn_3_bad]),
+    ), patch(
+        "services.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert fake_request.state.gatherer_status == "schema_violation"
+    assert resp.total_candidates == 0
+
+
+@pytest.mark.asyncio
 async def test_llm_error_raises_503(
     fake_request: SimpleNamespace,
 ) -> None:
