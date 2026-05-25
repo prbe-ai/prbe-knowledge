@@ -92,6 +92,31 @@ class InvestigationVersionEntry(BaseModel):
     feedback: str | None = None
 
 
+class InvestigationReportContent(BaseModel):
+    """Resolved contents of the report Document pointed at by
+    ``InvestigationDetail.current_report_doc_id``.
+
+    The investigation agent writes a typed ``INCIDENT_INVESTIGATION``
+    Document on each pass (see ``investigation_writeback_routes.py``).
+    The dashboard's incident detail page needs the body markdown +
+    structured evidence rendered next to the reviewer-decision UI; this
+    sub-payload saves it a second round-trip.
+
+    All fields are optional at the top level so callers can degrade
+    gracefully when ``current_report_doc_id`` is set but the Document
+    isn't readable for some reason (RLS, race, stale row).
+    """
+
+    report_doc_id: str
+    version: int
+    mode: InvestigationMode
+    title: str
+    body_markdown: str
+    narrative: str | None = None
+    evidence: list[EvidenceSection] = Field(default_factory=list)
+    created_at: datetime
+
+
 class InvestigationDetail(BaseModel):
     """Row shape returned by GET /api/incident-investigations/{id}."""
 
@@ -104,6 +129,11 @@ class InvestigationDetail(BaseModel):
     reviewed_at: datetime | None
     created_at: datetime
     updated_at: datetime
+    # Resolved report content for ``current_report_doc_id``. Optional so
+    # the row is still returnable when there's no current report yet
+    # (``failed_pending_review`` state, or pre-writeback) or when the
+    # Document lookup raced the row write.
+    report: InvestigationReportContent | None = None
 
 
 class InvestigationListItem(BaseModel):

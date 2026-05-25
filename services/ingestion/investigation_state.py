@@ -18,9 +18,11 @@ from services.post_approval import dispatch as post_approval_dispatch
 from shared.db import with_tenant
 from shared.exceptions import InvestigationNotFound
 from shared.investigation_schemas import (
+    EvidenceSection,
     InvestigationDetail,
     InvestigationListItem,
     InvestigationMode,
+    InvestigationReportContent,
     InvestigationState,
     InvestigationVersionEntry,
 )
@@ -206,6 +208,55 @@ async def mark_rejected(
     return _row_to_detail(row)
 
 
+def _row_to_report_content(row) -> InvestigationReportContent | None:
+    """Build an ``InvestigationReportContent`` from a ``documents`` row.
+
+    The writeback route persists the report as a typed Document with
+    ``title`` + ``body`` (markdown) at top level and ``mode`` / ``evidence``
+    / ``narrative`` in JSONB ``metadata`` (see
+    ``investigation_writeback_routes.py``). This unpacks both halves into
+    the typed sub-payload the dashboard reads.
+
+    Returns ``None`` if any required field is missing — the detail
+    endpoint then surfaces the row without ``report`` populated and the
+    dashboard falls back to the metadata-only view.
+    """
+    if row is None:
+        return None
+    metadata = row["metadata"]
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    metadata = metadata or {}
+    mode = metadata.get("mode")
+    body = row["body"]
+    if not isinstance(body, str) or not body or mode not in (
+        "full", "playbook_only", "stub",
+    ):
+        return None
+    raw_evidence = metadata.get("evidence") or []
+    evidence: list[EvidenceSection] = []
+    for e in raw_evidence:
+        if not isinstance(e, dict):
+            continue
+        try:
+            evidence.append(EvidenceSection(**e))
+        except (TypeError, ValueError):
+            # Defensive: skip malformed entries rather than 500 the read.
+            continue
+    version_raw = metadata.get("version")
+    version = int(version_raw) if isinstance(version_raw, (int, str)) else 1
+    return InvestigationReportContent(
+        report_doc_id=row["doc_id"],
+        version=version,
+        mode=mode,
+        title=row["title"] or "Investigation",
+        body_markdown=body,
+        narrative=metadata.get("narrative"),
+        evidence=evidence,
+        created_at=row["created_at"],
+    )
+
+
 async def get_detail(
     customer_id: str, incident_doc_id: str,
 ) -> InvestigationDetail | None:
@@ -215,7 +266,26 @@ async def get_detail(
             "WHERE customer_id = $1 AND incident_doc_id = $2",
             customer_id, incident_doc_id,
         )
-    return _row_to_detail(row) if row else None
+        if row is None:
+            return None
+        detail = _row_to_detail(row)
+        if row["current_report_doc_id"]:
+            # Bundle the report contents in the same RLS-scoped connection
+            # so the dashboard's incident detail page can render the
+            # markdown body + structured evidence without a second round
+            # trip through `/api/sources/{id}` (which would also need its
+            # own auth gate).
+            doc_row = await conn.fetchrow(
+                "SELECT doc_id, title, body, metadata, created_at "
+                "FROM documents "
+                "WHERE doc_id = $1 AND customer_id = $2 "
+                "AND valid_to IS NULL",
+                row["current_report_doc_id"], customer_id,
+            )
+            detail = detail.model_copy(
+                update={"report": _row_to_report_content(doc_row)}
+            )
+        return detail
 
 
 async def list_for_customer(
