@@ -208,14 +208,18 @@ async def mark_rejected(
     return _row_to_detail(row)
 
 
-def _row_to_report_content(row) -> InvestigationReportContent | None:
+def _row_to_report_content(
+    row, body_markdown: str | None,
+) -> InvestigationReportContent | None:
     """Build an ``InvestigationReportContent`` from a ``documents`` row.
 
     The writeback route persists the report as a typed Document with
-    ``title`` + ``body`` (markdown) at top level and ``mode`` / ``evidence``
-    / ``narrative`` in JSONB ``metadata`` (see
-    ``investigation_writeback_routes.py``). This unpacks both halves into
-    the typed sub-payload the dashboard reads.
+    ``title`` at top level and ``mode`` / ``evidence`` / ``narrative`` in
+    JSONB ``metadata`` (see ``investigation_writeback_routes.py``). The
+    markdown body lives in ``chunks.content`` (``documents.body`` is a
+    transient field on the in-memory ``Document`` model — chunks are the
+    durable store), so the caller passes the reassembled body in via
+    ``body_markdown``.
 
     Returns ``None`` if any required field is missing — the detail
     endpoint then surfaces the row without ``report`` populated and the
@@ -228,8 +232,7 @@ def _row_to_report_content(row) -> InvestigationReportContent | None:
         metadata = json.loads(metadata)
     metadata = metadata or {}
     mode = metadata.get("mode")
-    body = row["body"]
-    if not isinstance(body, str) or not body or mode not in (
+    if not isinstance(body_markdown, str) or not body_markdown or mode not in (
         "full", "playbook_only", "stub",
     ):
         return None
@@ -250,11 +253,38 @@ def _row_to_report_content(row) -> InvestigationReportContent | None:
         version=version,
         mode=mode,
         title=row["title"] or "Investigation",
-        body_markdown=body,
+        body_markdown=body_markdown,
         narrative=metadata.get("narrative"),
         evidence=evidence,
         created_at=row["created_at"],
     )
+
+
+async def _fetch_body_markdown(
+    conn, *, customer_id: str, doc_id: str, version: int,
+) -> str | None:
+    """Reassemble a document's markdown body from its live ``chunks`` rows.
+
+    ``documents`` has no ``body`` column — body content lives in
+    ``chunks.content`` with one row per chunk. Same pattern as
+    ``services/post_approval/template_resolver.py`` uses for templates.
+    """
+    rows = await conn.fetch(
+        """
+        SELECT content FROM chunks
+        WHERE customer_id = $1
+          AND doc_id = $2
+          AND valid_to IS NULL
+          AND kind = 'content'
+          AND $3 BETWEEN first_seen_version AND last_seen_version
+        ORDER BY chunk_index
+        """,
+        customer_id, doc_id, version,
+    )
+    if not rows:
+        return None
+    body = "\n\n".join(r["content"] for r in rows)
+    return body or None
 
 
 async def get_detail(
@@ -276,14 +306,24 @@ async def get_detail(
             # trip through `/api/sources/{id}` (which would also need its
             # own auth gate).
             doc_row = await conn.fetchrow(
-                "SELECT doc_id, title, body, metadata, created_at "
+                "SELECT doc_id, version, title, metadata, created_at "
                 "FROM documents "
                 "WHERE doc_id = $1 AND customer_id = $2 "
                 "AND valid_to IS NULL",
                 row["current_report_doc_id"], customer_id,
             )
+            body_markdown: str | None = None
+            if doc_row is not None:
+                body_markdown = await _fetch_body_markdown(
+                    conn,
+                    customer_id=customer_id,
+                    doc_id=doc_row["doc_id"],
+                    version=doc_row["version"],
+                )
             detail = detail.model_copy(
-                update={"report": _row_to_report_content(doc_row)}
+                update={
+                    "report": _row_to_report_content(doc_row, body_markdown),
+                }
             )
         return detail
 
