@@ -1,0 +1,52 @@
+# Product-sandbox image for the prbe-knowledge retrieval-quality eval harness.
+#
+# ONE container = pgvector Postgres + the uvicorn `/retrieve` service. Postgres is
+# started, schema-applied, and (at grade time) corpus-seeded by entrypoint.sh
+# BEFORE uvicorn. This is the `build` target of the platform's ProductRuntimeSpec
+# (auto-research-planning/product-runtime-spec.md §1): build.context = the candidate
+# prbe-knowledge snapshot, dockerfile_path = ./sandbox/Dockerfile.product.
+#
+# This is NOT a production image and not the per-role data-plane image. Ingestion /
+# worker / cron / wiki / MCP never run here — only the retrieval serving slice. That
+# slice is self-contained: services/retrieval/main.py's lifespan opens a PG pool and
+# nothing else (no scheduler, no poller, no queue consumer).
+#
+# Base is pgvector/pgvector:pg16 (same as docker-compose.yml) so PG16 + the `vector`
+# extension are turnkey; pg_trgm + btree_gin ship in postgresql-contrib. The service
+# requires Python >=3.12 (pyproject.toml) but the base ships 3.11, so we add a pinned
+# standalone CPython 3.12 via the `uv` binary — reproducible, no PPA/deadsnakes.
+
+FROM pgvector/pgvector:pg16
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# build-essential + libpq-dev for the asyncpg/psycopg wheels (mirrors
+# services/retrieval/Dockerfile:8-9); curl for the health/smoke probes.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends build-essential libpq-dev curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Pinned standalone CPython 3.12 + an isolated venv at /opt/venv.
+COPY --from=ghcr.io/astral-sh/uv:0.5.11 /uv /bin/uv
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+RUN uv python install 3.12 && uv venv --python 3.12 /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+
+WORKDIR /app
+
+# Project metadata + source (mirrors services/retrieval/Dockerfile:14-20) plus the
+# sandbox/ harness scripts themselves.
+COPY pyproject.toml ./
+COPY shared/ ./shared/
+COPY services/ ./services/
+COPY db/ ./db/
+COPY alembic.ini ./
+COPY sandbox/ ./sandbox/
+
+RUN uv pip install --python /opt/venv/bin/python -e "."
+
+EXPOSE 8081
+
+ENTRYPOINT ["/app/sandbox/entrypoint.sh"]
