@@ -4,7 +4,7 @@ GET /api/incident-investigations/{id}.
 
 Pure-function tests so they run without a local Postgres. The DB-integration
 tests in ``test_investigation_state.py`` cover the surrounding
-``get_detail`` wiring.
+``get_detail`` wiring and the chunks→body reassembly.
 """
 
 from __future__ import annotations
@@ -21,15 +21,17 @@ def _doc_row(
     *,
     doc_id: str = "pd:investigation:ABC:v1",
     title: str = "Investigation: db CPU spike",
-    body: str = "# Investigation\n\nSomething happened.\n",
     metadata: dict[str, Any] | None = None,
     created_at: datetime | None = None,
 ) -> dict[str, Any]:
-    """Build the minimal asyncpg-style row dict the parser consumes."""
+    """Build the minimal asyncpg-style row dict the parser consumes.
+
+    Body lives in ``chunks.content`` and is passed to
+    ``_row_to_report_content`` as a separate arg — not on the row.
+    """
     return {
         "doc_id": doc_id,
         "title": title,
-        "body": body,
         "metadata": metadata if metadata is not None else {
             "mode": "full",
             "version": 1,
@@ -40,8 +42,11 @@ def _doc_row(
     }
 
 
+DEFAULT_BODY = "# Investigation\n\nSomething happened.\n"
+
+
 def test_returns_none_when_row_is_none() -> None:
-    assert _row_to_report_content(None) is None
+    assert _row_to_report_content(None, DEFAULT_BODY) is None
 
 
 def test_happy_path_full_mode() -> None:
@@ -58,7 +63,7 @@ def test_happy_path_full_mode() -> None:
         ],
         "narrative": "Root cause: slow query.",
     })
-    out = _row_to_report_content(row)
+    out = _row_to_report_content(row, DEFAULT_BODY)
     assert out is not None
     assert out.mode == "full"
     assert out.version == 3
@@ -77,7 +82,7 @@ def test_metadata_accepts_json_string() -> None:
     row["metadata"] = (
         '{"mode":"full","version":2,"evidence":[],"narrative":"x"}'
     )
-    out = _row_to_report_content(row)
+    out = _row_to_report_content(row, DEFAULT_BODY)
     assert out is not None
     assert out.mode == "full"
     assert out.version == 2
@@ -85,18 +90,19 @@ def test_metadata_accepts_json_string() -> None:
 
 
 def test_returns_none_when_body_missing() -> None:
-    row = _doc_row(body="")
-    assert _row_to_report_content(row) is None
+    row = _doc_row()
+    assert _row_to_report_content(row, "") is None
+    assert _row_to_report_content(row, None) is None
 
 
 def test_returns_none_when_mode_unknown() -> None:
     row = _doc_row(metadata={"mode": "bogus", "version": 1})
-    assert _row_to_report_content(row) is None
+    assert _row_to_report_content(row, DEFAULT_BODY) is None
 
 
 def test_returns_none_when_metadata_missing_mode() -> None:
     row = _doc_row(metadata={"version": 1})
-    assert _row_to_report_content(row) is None
+    assert _row_to_report_content(row, DEFAULT_BODY) is None
 
 
 def test_malformed_evidence_entries_are_skipped() -> None:
@@ -110,7 +116,7 @@ def test_malformed_evidence_entries_are_skipped() -> None:
             None,
         ],
     })
-    out = _row_to_report_content(row)
+    out = _row_to_report_content(row, DEFAULT_BODY)
     assert out is not None
     assert len(out.evidence) == 1
     assert out.evidence[0].source == "knowledge"
@@ -121,14 +127,14 @@ def test_default_version_when_metadata_misses_it() -> None:
         "mode": "stub",
         "evidence": [],
     })
-    out = _row_to_report_content(row)
+    out = _row_to_report_content(row, DEFAULT_BODY)
     assert out is not None
     assert out.version == 1
 
 
 def test_falsy_title_defaults_to_investigation_string() -> None:
     row = _doc_row(title="")
-    out = _row_to_report_content(row)
+    out = _row_to_report_content(row, DEFAULT_BODY)
     assert out is not None
     assert out.title == "Investigation"
 
@@ -136,6 +142,6 @@ def test_falsy_title_defaults_to_investigation_string() -> None:
 @pytest.mark.parametrize("mode", ["full", "playbook_only", "stub"])
 def test_all_three_modes_round_trip(mode: str) -> None:
     row = _doc_row(metadata={"mode": mode, "version": 1, "evidence": []})
-    out = _row_to_report_content(row)
+    out = _row_to_report_content(row, DEFAULT_BODY)
     assert out is not None
     assert out.mode == mode
