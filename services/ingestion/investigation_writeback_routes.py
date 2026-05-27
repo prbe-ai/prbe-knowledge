@@ -141,6 +141,9 @@ async def writeback(
             "mode": payload.mode,
             "evidence": [e.model_dump() for e in payload.evidence],
             "narrative": payload.narrative,
+            "triage": (
+                payload.triage.model_dump() if payload.triage is not None else None
+            ),
             "tool_trace_run_id": payload.tool_trace_run_id,
             "prior_report_doc_id": payload.prior_report_doc_id,
             "reviewer_feedback": payload.reviewer_feedback,

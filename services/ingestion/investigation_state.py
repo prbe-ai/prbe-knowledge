@@ -19,6 +19,7 @@ from shared.db import with_tenant
 from shared.exceptions import InvestigationNotFound
 from shared.investigation_schemas import (
     EvidenceSection,
+    IncidentTriageDecision,
     InvestigationDetail,
     InvestigationListItem,
     InvestigationMode,
@@ -246,6 +247,15 @@ def _row_to_report_content(
         except (TypeError, ValueError):
             # Defensive: skip malformed entries rather than 500 the read.
             continue
+    raw_triage = metadata.get("triage")
+    triage: IncidentTriageDecision | None = None
+    if isinstance(raw_triage, dict):
+        try:
+            triage = IncidentTriageDecision(**raw_triage)
+        except (TypeError, ValueError):
+            # Old reports without a triage block, or a malformed entry —
+            # leave it None and let the dashboard fall back.
+            triage = None
     version_raw = metadata.get("version")
     version = int(version_raw) if isinstance(version_raw, (int, str)) else 1
     return InvestigationReportContent(
@@ -255,6 +265,7 @@ def _row_to_report_content(
         title=row["title"] or "Investigation",
         body_markdown=body_markdown,
         narrative=metadata.get("narrative"),
+        triage=triage,
         evidence=evidence,
         created_at=row["created_at"],
     )

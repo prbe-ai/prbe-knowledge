@@ -24,6 +24,29 @@ InvestigationState = Literal[
     "pending_dispatch", "running", "pending_review",
     "approved", "rejected", "failed_pending_review",
 ]
+# Triage verdict the agent emits alongside the report. Lives on the
+# investigation domain (not the synthesis ``TriageVerdict`` model in
+# ``services/synthesis/models.py``) — namespaced as ``Incident*`` so
+# imports stay unambiguous.
+IncidentTriageVerdict = Literal["triage", "dismiss", "inconclusive"]
+
+
+class IncidentTriageDecision(BaseModel):
+    """Agent's first-pass alert filter.
+
+    The dashboard surfaces this as a colored badge at the top of the
+    incident detail page so a reviewer can decide whether the alert is
+    worth their time without reading the full report. The verdict is
+    advisory only — no automated action (no PagerDuty auto-resolve).
+
+    Cited evidence indices reference positions in the report's
+    ``evidence`` list and let the dashboard scroll the reviewer straight
+    to the supporting items.
+    """
+
+    verdict: IncidentTriageVerdict
+    justification: str = Field(min_length=1, max_length=600)
+    cited_evidence_indices: list[int] = Field(default_factory=list)
 
 
 class EvidenceSection(BaseModel):
@@ -59,6 +82,7 @@ class InvestigationWritebackRequest(BaseModel):
     body_markdown: str = Field(min_length=1, max_length=262144)
     evidence: list[EvidenceSection] = Field(default_factory=list)
     narrative: str | None = None
+    triage: IncidentTriageDecision | None = None
     tool_trace_run_id: str | None = None
     prior_report_doc_id: str | None = None
     reviewer_feedback: str | None = None
@@ -113,6 +137,7 @@ class InvestigationReportContent(BaseModel):
     title: str
     body_markdown: str
     narrative: str | None = None
+    triage: IncidentTriageDecision | None = None
     evidence: list[EvidenceSection] = Field(default_factory=list)
     created_at: datetime
 
