@@ -145,3 +145,74 @@ def test_all_three_modes_round_trip(mode: str) -> None:
     out = _row_to_report_content(row, DEFAULT_BODY)
     assert out is not None
     assert out.mode == mode
+
+
+def test_triage_round_trip_full_payload() -> None:
+    row = _doc_row(metadata={
+        "mode": "full",
+        "version": 1,
+        "evidence": [],
+        "triage": {
+            "verdict": "triage",
+            "justification": "Sentry surfaced a new exception class introduced by the 2026-05-24 deploy.",
+            "cited_evidence_indices": [0, 2],
+        },
+    })
+    out = _row_to_report_content(row, DEFAULT_BODY)
+    assert out is not None
+    assert out.triage is not None
+    assert out.triage.verdict == "triage"
+    assert out.triage.justification.startswith("Sentry surfaced")
+    assert out.triage.cited_evidence_indices == [0, 2]
+
+
+@pytest.mark.parametrize("verdict", ["triage", "dismiss", "inconclusive"])
+def test_triage_accepts_all_three_verdicts(verdict: str) -> None:
+    row = _doc_row(metadata={
+        "mode": "full",
+        "version": 1,
+        "evidence": [],
+        "triage": {
+            "verdict": verdict,
+            "justification": "x",
+            "cited_evidence_indices": [],
+        },
+    })
+    out = _row_to_report_content(row, DEFAULT_BODY)
+    assert out is not None
+    assert out.triage is not None
+    assert out.triage.verdict == verdict
+
+
+def test_triage_missing_yields_none() -> None:
+    row = _doc_row(metadata={"mode": "full", "version": 1, "evidence": []})
+    out = _row_to_report_content(row, DEFAULT_BODY)
+    assert out is not None
+    assert out.triage is None
+
+
+def test_triage_malformed_drops_to_none_without_failing_read() -> None:
+    """Old reports may have a non-dict triage entry, or a dict missing
+    required fields. The read path must surface the rest of the report
+    rather than 500."""
+    row = _doc_row(metadata={
+        "mode": "full",
+        "version": 1,
+        "evidence": [],
+        "triage": {"verdict": "bogus", "justification": "x"},
+    })
+    out = _row_to_report_content(row, DEFAULT_BODY)
+    assert out is not None
+    assert out.triage is None
+
+
+def test_triage_non_dict_yields_none() -> None:
+    row = _doc_row(metadata={
+        "mode": "full",
+        "version": 1,
+        "evidence": [],
+        "triage": "not-a-dict",
+    })
+    out = _row_to_report_content(row, DEFAULT_BODY)
+    assert out is not None
+    assert out.triage is None
