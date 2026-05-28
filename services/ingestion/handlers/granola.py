@@ -460,6 +460,45 @@ class GranolaConnector(Connector):
     async def identify_workspaces(self, token: IntegrationToken):  # type: ignore[override]
         return []
 
+    # ---- 8. token health probe --------------------------------------------
+
+    async def verify_token_health(self, token: IntegrationToken) -> bool:
+        """Liveness probe: GET `/v1/notes?limit=1` and return True on 200.
+
+        Returns False when Granola responds 401 (API key revoked — workspace
+        admin rotated it, or the issuing user was removed). Any other status
+        — including transient 5xx — and any network-level error propagate as
+        a raised `TransientSourceError` so the caller can distinguish
+        "definitely-bad" from "we-don't-know". Used by
+        `scripts/cron_token_health_check.py` to flip
+        `integration_tokens.status` from `active` to `auth_failed` without
+        waiting for the next poller tick to fail on 401.
+        """
+        # Granola doesn't expose a dedicated /ping or /me endpoint; the
+        # cheapest authenticated call is the listing endpoint we already
+        # use in backfill, restricted to a single row.
+        url = f"{_GRANOLA_API}/notes"
+        headers = {
+            "Authorization": f"Bearer {token.access_token}",
+            "User-Agent": "prbe-knowledge/0.1",
+        }
+        try:
+            resp = await self.http.get(url, params={"limit": 1}, headers=headers)
+        except (httpx.HTTPError, OSError) as exc:
+            raise TransientSourceError(
+                f"granola /notes probe network error: {exc!r}",
+                url=url,
+            ) from exc
+        if resp.status_code == 200:
+            return True
+        if resp.status_code == 401:
+            return False
+        raise TransientSourceError(
+            f"granola /notes probe returned {resp.status_code}",
+            status=resp.status_code,
+            body=resp.text[:500],
+        )
+
     # ---- internal helpers -------------------------------------------------
 
     async def _granola_get(
