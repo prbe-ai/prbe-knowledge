@@ -7,6 +7,7 @@ queues one document per row for the existing normalizer pipeline.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 from datetime import UTC, datetime
 from typing import Any
@@ -31,7 +32,7 @@ from shared.custom_ingest import (
     json_size,
     source_event_id,
 )
-from shared.db import get_pool
+from shared.db import get_pool, raw_conn
 from shared.exceptions import PrbeError
 from shared.logging import bind_trace, get_logger
 from shared.storage import get_store
@@ -46,10 +47,7 @@ async def custom_ingest_documents(
     x_trace_id: str | None = Header(default=None),
     x_prbe_customer: str | None = Header(default=None),
 ) -> JSONResponse:
-    _verify_internal_key(request)
-
-    if not x_prbe_customer:
-        raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
+    customer_id = await _resolve_custom_ingest_customer(request, x_prbe_customer)
 
     settings = get_settings()
     _require_json_content_type(request)
@@ -80,7 +78,6 @@ async def custom_ingest_documents(
             headers={"Retry-After": "300"},
         )
 
-    customer_id = x_prbe_customer
     trace_id = x_trace_id or f"custom-ingest-{int(datetime.now().timestamp() * 1000)}"
     bind_trace(trace_id)
 
@@ -167,6 +164,65 @@ def _verify_internal_key(request: Request) -> None:
             status_code=401,
             detail="missing or invalid X-Internal-Knowledge-Key",
         )
+
+
+async def _resolve_custom_ingest_customer(
+    request: Request, x_prbe_customer: str | None
+) -> str:
+    """Authorize the request and resolve the target tenant (dual-mode).
+
+    HOSTED: when INTERNAL_KNOWLEDGE_API_KEY is configured, trust the gateway's
+    X-Internal-Knowledge-Key + X-Prbe-Customer exactly as before.
+    STANDALONE (community): no internal key — accept the static KNOWLEDGE_API_TOKEN
+    bearer and scope to DEFAULT_CUSTOMER_ID (same seeded-hash path as /query).
+    """
+    settings = get_settings()
+    gateway_mode = bool(
+        settings.internal_knowledge_api_key
+        and settings.internal_knowledge_api_key.get_secret_value()
+    )
+    if gateway_mode:
+        _verify_internal_key(request)
+        if not x_prbe_customer:
+            raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
+        return x_prbe_customer
+    return await _resolve_bearer_customer(request)
+
+
+async def _resolve_bearer_customer(request: Request) -> str:
+    """Resolve customer_id from an Authorization: Bearer token (standalone mode).
+
+    Matched against customers.api_key_hash; in single-tenant mode the default
+    customer is seeded with sha256(KNOWLEDGE_API_TOKEN) on boot, so a valid token
+    resolves to DEFAULT_CUSTOMER_ID. Mirrors services/retrieval/auth.py.
+    """
+    authorization = request.headers.get("authorization")
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="missing bearer token or X-Internal-Knowledge-Key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(
+            status_code=401,
+            detail="invalid authorization scheme",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token_hash = hashlib.sha256(token.strip().encode()).hexdigest()
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT customer_id FROM customers WHERE api_key_hash = $1",
+            token_hash,
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=401,
+            detail="invalid api key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return str(row["customer_id"])
 
 
 def _require_json_content_type(request: Request) -> None:

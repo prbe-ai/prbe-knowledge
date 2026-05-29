@@ -5,10 +5,8 @@
 #   make health            # confirm services are up
 #   make query Q="what changed last week?"
 
-COMPOSE  ?= docker compose
-TOKEN    ?= $(shell grep -E '^KNOWLEDGE_API_TOKEN=' .env 2>/dev/null | cut -d= -f2)
-INTERNAL ?= $(shell grep -E '^INTERNAL_KNOWLEDGE_API_KEY=' .env 2>/dev/null | cut -d= -f2)
-CUSTOMER ?= $(shell grep -E '^DEFAULT_CUSTOMER_ID=' .env 2>/dev/null | cut -d= -f2)
+COMPOSE ?= docker compose
+TOKEN   ?= $(shell grep -E '^KNOWLEDGE_API_TOKEN=' .env 2>/dev/null | cut -d= -f2)
 
 .PHONY: up down logs ps health migrate seed query
 
@@ -31,14 +29,12 @@ health:        ## Hit /health on ingestion + retrieval
 	@echo "ingestion:" && curl -fsS http://localhost:8080/health && echo
 	@echo "retrieval:" && curl -fsS http://localhost:8081/health && echo
 
-# Ingest a sample doc via the custom-ingest push API. This API is internal-key
-# gated, so seeding this way needs INTERNAL_KNOWLEDGE_API_KEY set in .env.
-# (Webhook-based ingestion does NOT need it — see docs/connectors.md. And
-# `make query` works regardless, via the KNOWLEDGE_API_TOKEN bearer.)
-seed:          ## Ingest one sample doc (needs INTERNAL_KNOWLEDGE_API_KEY in .env)
+# Ingest a sample doc via the custom-ingest API. In single-tenant self-host mode
+# this authenticates with the KNOWLEDGE_API_TOKEN bearer (same token as
+# `make query`); a hosted gateway deployment uses X-Internal-Knowledge-Key.
+seed:          ## Ingest one sample doc for the default tenant
 	curl -fsS -X POST http://localhost:8080/api/custom-ingest/documents \
-	  -H "X-Internal-Knowledge-Key: $(INTERNAL)" \
-	  -H "X-Prbe-Customer: $(CUSTOMER)" \
+	  -H "Authorization: Bearer $(TOKEN)" \
 	  -H "Content-Type: application/json" \
 	  -d '{"source_key":"seed","documents":[{"id":"seed-1","body":"Probe is a self-hosted knowledge engine. This is a seed document."}]}' \
 	  && echo

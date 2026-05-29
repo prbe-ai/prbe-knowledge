@@ -129,14 +129,12 @@ the normal normalize → chunk → embed pipeline:
 POST http://<your-host>:8080/api/custom-ingest/documents
 ```
 
-This endpoint is service-to-service: it is gated by an internal key and a tenant
-header, not by `KNOWLEDGE_API_TOKEN`. For local single-tenant use, send the
-`INTERNAL_KNOWLEDGE_API_KEY` (set in the Compose `.env`) and the tenant id:
+In single-tenant self-host mode, authenticate with the same `KNOWLEDGE_API_TOKEN`
+bearer that `/query` uses (it resolves to your `DEFAULT_CUSTOMER_ID`):
 
 ```bash
 curl -X POST http://localhost:8080/api/custom-ingest/documents \
-  -H "X-Internal-Knowledge-Key: $INTERNAL_KNOWLEDGE_API_KEY" \
-  -H "X-Prbe-Customer: $DEFAULT_CUSTOMER_ID" \
+  -H "Authorization: Bearer $KNOWLEDGE_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
         "source_key": "my-docs",
@@ -145,6 +143,10 @@ curl -X POST http://localhost:8080/api/custom-ingest/documents \
         ]
       }'
 ```
+
+(A hosted/gateway deployment — where `INTERNAL_KNOWLEDGE_API_KEY` is set — instead
+uses `X-Internal-Knowledge-Key` + `X-Prbe-Customer`; the bearer path activates only
+when no internal key is configured. `make seed` runs the bearer version for you.)
 
 Each document requires `id` and `body`; `title`, `type`, `url`, `metadata`, and
 `acl` are optional. The envelope requires a `source_key` naming the logical
