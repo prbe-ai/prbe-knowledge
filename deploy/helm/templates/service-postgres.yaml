@@ -1,0 +1,18 @@
+{{- if .Values.postgresql.bundled.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "probe-knowledge.postgresName" . }}
+  labels:
+    {{- include "probe-knowledge.componentLabels" (dict "ctx" . "component" "postgres") | nindent 4 }}
+spec:
+  # Headless: stable per-pod DNS for the StatefulSet.
+  clusterIP: None
+  selector:
+    {{- include "probe-knowledge.componentSelectorLabels" (dict "ctx" . "component" "postgres") | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+{{- end }}

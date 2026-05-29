@@ -1,0 +1,225 @@
+# Default values for the probe-knowledge community chart.
+# This deploys ONLY the open-source knowledge engine: ingestion, retrieval, and
+# the background worker — all from one image. Single-tenant self-host mode.
+#
+# Quick start (bring-your-own Postgres):
+#   1. Point postgresql.external.url / .urlSync at your Postgres 16 + pgvector DB.
+#   2. Fill in the required secrets below (or supply your own Secret).
+#   3. helm install probe-knowledge ./deploy/helm -f my-values.yaml
+
+# -- Override the generated name (truncated to 63 chars).
+nameOverride: ""
+# -- Override the full release name used for all resources.
+fullnameOverride: ""
+
+image:
+  # TODO: A public image is not yet published. Until then, build it yourself from
+  # services/ingestion/Dockerfile and push to a registry you control:
+  #   docker build -t <your-registry>/prbe-knowledge:0.1.0 \
+  #     -f services/ingestion/Dockerfile .
+  # then set image.repository / image.tag to that.
+  repository: ghcr.io/prbe-ai/prbe-knowledge
+  # -- Image tag. Defaults to Chart.appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# -- Names of imagePullSecrets for a private registry (list of {name: ...}).
+imagePullSecrets: []
+
+# -- Extra labels applied to every resource.
+commonLabels: {}
+# -- Extra annotations applied to every resource.
+commonAnnotations: {}
+
+serviceAccount:
+  # -- Create a dedicated ServiceAccount.
+  create: true
+  # -- Use an existing ServiceAccount name (when create=false).
+  name: ""
+  annotations: {}
+
+# ---------------------------------------------------------------------------
+# Configuration (non-secret). Rendered into a ConfigMap and injected as env.
+# ---------------------------------------------------------------------------
+config:
+  # -- Single-tenant id. Keeps RLS on but trivially satisfied. Any stable string.
+  defaultCustomerId: "default"
+  # -- Free-form environment label surfaced in logs/telemetry.
+  environment: "self-host"
+
+  objectStore:
+    # -- S3-compatible endpoint (R2 / MinIO / AWS S3). Required.
+    endpointUrl: ""
+    # -- Region. "auto" works for Cloudflare R2.
+    region: "auto"
+    # -- Bucket name prefix. Per-tenant bucket is "<prefix>-<defaultCustomerId>".
+    bucketPrefix: "prbe-knowledge"
+
+  # -- Optional: route all LLM/embedding calls through a LiteLLM-compatible
+  #    gateway instead of provider SDKs. Leave blank to call providers directly.
+  llmGatewayUrl: ""
+
+  # -- Optional OpenTelemetry (OTLP) endpoint for traces/metrics.
+  otlpEndpoint: ""
+
+  # -- Arbitrary extra non-secret env vars (map of NAME: value). Merged in last.
+  extraEnv: {}
+
+# ---------------------------------------------------------------------------
+# Secrets. By default a Secret is created from the values below. To supply your
+# own Secret instead, set secrets.create=false and secrets.existingSecret=<name>
+# (it must define the same keys). Leave a value blank to omit that key.
+# ---------------------------------------------------------------------------
+secrets:
+  # -- Create the Secret from the values below.
+  create: true
+  # -- Name of a pre-existing Secret to use instead (when create=false).
+  existingSecret: ""
+
+  # --- Required ---
+  # -- Object-store credentials.
+  r2AccessKeyId: "CHANGEME"
+  r2SecretAccessKey: "CHANGEME"
+  # -- Embeddings provider (Gemini). Required.
+  googleApiKey: "CHANGEME"
+  # -- At least one LLM key (synthesis/router). Anthropic by default.
+  anthropicApiKey: ""
+  openaiApiKey: ""
+  # -- Fernet key encrypting connector tokens at rest. Required once any
+  #    OAuth/webhook source is connected. Generate via:
+  #    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+  tokenEncryptionKey: "CHANGEME"
+  # -- Static bearer token for /query + /retrieve. Generate via: openssl rand -hex 32
+  knowledgeApiToken: "CHANGEME"
+
+  # --- Optional LLM gateway key (paired with config.llmGatewayUrl) ---
+  llmGatewayKey: ""
+
+  # --- Optional connector credentials (set only the ones you wire up) ---
+  connectors:
+    githubAppId: ""
+    githubAppPrivateKey: ""
+    githubWebhookSecret: ""
+    slackClientSecret: ""
+    slackSigningSecret: ""
+    linearClientSecret: ""
+    linearWebhookSecret: ""
+    notionClientSecret: ""
+    notionWebhookVerificationToken: ""
+    sentryClientSecret: ""
+    sentryWebhookSecret: ""
+
+# ---------------------------------------------------------------------------
+# Postgres
+# ---------------------------------------------------------------------------
+postgresql:
+  # Bring-your-own Postgres (RECOMMENDED). Must be Postgres 16 with the
+  # extensions: vector (pgvector), pg_trgm, btree_gin.
+  external:
+    # -- asyncpg DSN, e.g. postgresql://user:pass@host:5432/prbe_knowledge
+    url: ""
+    # -- alembic DSN (psycopg driver), e.g.
+    #    postgresql+psycopg://user:pass@host:5432/prbe_knowledge
+    urlSync: ""
+
+  # Optional bundled Postgres StatefulSet — a convenience for kicking the tires,
+  # NOT for production. When enabled it overrides external.url/.urlSync.
+  bundled:
+    enabled: false
+    image: pgvector/pgvector:pg16
+    auth:
+      username: prbe
+      password: prbe
+      database: prbe_knowledge
+    persistence:
+      enabled: true
+      size: 10Gi
+      # -- StorageClass for the data PVC ("" = cluster default).
+      storageClass: ""
+    resources:
+      requests:
+        cpu: 250m
+        memory: 512Mi
+      limits:
+        memory: 1Gi
+
+# ---------------------------------------------------------------------------
+# DB migration. Runs scripts/migrate.py as a pre-install/pre-upgrade Helm hook
+# Job (weight -5) so the schema is ready before the Deployments roll.
+# ---------------------------------------------------------------------------
+migrate:
+  enabled: true
+  backoffLimit: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+# ---------------------------------------------------------------------------
+# Per-role workloads. All share the same image; only the command differs.
+# ---------------------------------------------------------------------------
+ingestion:
+  replicas: 1
+  port: 8080
+  uvicornWorkers: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+retrieval:
+  replicas: 1
+  port: 8081
+  uvicornWorkers: 2
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+worker:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+# ---------------------------------------------------------------------------
+# Ingress (disabled by default). When enabled, fronts the retrieval and
+# ingestion HTTP APIs. Self-host typically only exposes retrieval (/query,
+# /retrieve); ingestion receives connector webhooks.
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # -- Hostname for the retrieval API.
+  retrievalHost: knowledge.example.com
+  # -- Optional separate hostname for the ingestion/webhook API. Empty = not
+  #    routed through ingress (use cluster-internal service or your own route).
+  ingestionHost: ""
+  tls: []
+  # - secretName: knowledge-tls
+  #   hosts:
+  #     - knowledge.example.com
+
+# -- Pod-level security context applied to all role pods.
+podSecurityContext: {}
+# -- Container-level security context applied to all role containers.
+securityContext: {}

@@ -1,0 +1,20 @@
+apiVersion: v2
+name: probe-knowledge
+description: >-
+  Community Helm chart for the open-source Probe knowledge engine — ingestion,
+  retrieval, and the background worker, all from one image. Single-tenant
+  self-host mode: no control plane, no dashboard, no license/pairing, no MCP.
+type: application
+# Chart version. Bump on chart changes.
+version: 0.1.0
+# Tracks the engine release this chart targets. Override image.tag to pin.
+appVersion: "0.1.0"
+keywords:
+  - probe
+  - knowledge
+  - retrieval
+  - rag
+  - self-host
+home: https://github.com/prbe-ai/prbe-knowledge
+sources:
+  - https://github.com/prbe-ai/prbe-knowledge

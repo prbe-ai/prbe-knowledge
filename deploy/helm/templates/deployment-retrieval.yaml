@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "probe-knowledge.fullname" . }}-retrieval
+  labels:
+    {{- include "probe-knowledge.componentLabels" (dict "ctx" . "component" "retrieval") | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.retrieval.replicas }}
+  selector:
+    matchLabels:
+      {{- include "probe-knowledge.componentSelectorLabels" (dict "ctx" . "component" "retrieval") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "probe-knowledge.componentSelectorLabels" (dict "ctx" . "component" "retrieval") | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "probe-knowledge.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: retrieval
+          image: {{ include "probe-knowledge.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          command:
+            - uvicorn
+            - services.retrieval.main:app
+            - --host
+            - "::"
+            - --port
+            - {{ .Values.retrieval.port | quote }}
+            - --workers
+            - {{ .Values.retrieval.uvicornWorkers | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.retrieval.port }}
+          env:
+            {{- include "probe-knowledge.env" . | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.retrieval.resources | nindent 12 }}
+      {{- with .Values.retrieval.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.retrieval.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.retrieval.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

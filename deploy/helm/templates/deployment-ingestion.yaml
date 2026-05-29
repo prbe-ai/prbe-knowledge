@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "probe-knowledge.fullname" . }}-ingestion
+  labels:
+    {{- include "probe-knowledge.componentLabels" (dict "ctx" . "component" "ingestion") | nindent 4 }}
+  {{- with .Values.commonAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.ingestion.replicas }}
+  selector:
+    matchLabels:
+      {{- include "probe-knowledge.componentSelectorLabels" (dict "ctx" . "component" "ingestion") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "probe-knowledge.componentSelectorLabels" (dict "ctx" . "component" "ingestion") | nindent 8 }}
+      annotations:
+        # Roll pods when config/secret content changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "probe-knowledge.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: ingestion
+          image: {{ include "probe-knowledge.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          # migrate hook prepared the DB; start uvicorn directly (no alembic prefix).
+          command:
+            - uvicorn
+            - services.ingestion.main:app
+            - --host
+            - "::"
+            - --port
+            - {{ .Values.ingestion.port | quote }}
+            - --workers
+            - {{ .Values.ingestion.uvicornWorkers | quote }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.ingestion.port }}
+          env:
+            {{- include "probe-knowledge.env" . | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.ingestion.resources | nindent 12 }}
+      {{- with .Values.ingestion.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ingestion.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.ingestion.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

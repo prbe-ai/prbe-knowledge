@@ -19,6 +19,11 @@ COPY alembic.ini ./
 
 RUN pip install -e "."
 
+# scripts/ holds the generic DB migrate entrypoint (scripts/migrate.py) used by
+# the compose / Helm one-shot migrate step. Copied after the install so it
+# never busts the dependency-layer cache.
+COPY scripts/ ./scripts/
+
 EXPOSE 8080
 
 # Run alembic upgrade head first, then start uvicorn.
