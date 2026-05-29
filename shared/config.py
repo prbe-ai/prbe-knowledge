@@ -133,6 +133,19 @@ class Settings(BaseSettings):
     backend_base_url: str = ""
     internal_backend_api_key: SecretStr = SecretStr("")
 
+    # --- Single-tenant community mode (self-host) ---------------------------
+    # When the control plane is absent, the engine runs as a single tenant.
+    # `default_customer_id` (e.g. "default") becomes the tenant for every
+    # request: `with_tenant()` falls back to it (RLS stays ON, trivially
+    # satisfied) and a `customers` row is seeded on boot. `knowledge_api_token`
+    # is the static bearer for /query + /retrieve — its sha256 is seeded as the
+    # default customer's `api_key_hash`, so the EXISTING bearer auth path
+    # resolves it to `default_customer_id` with no special-casing. Both unset
+    # => hosted multi-tenant behavior is unchanged (per-request tenant +
+    # dashboard-minted bearer tokens + gateway trust).
+    default_customer_id: str = ""
+    knowledge_api_token: SecretStr = SecretStr("")
+
     # --- Per-source OAuth + webhook secrets ----
     # After the gateway migration, ACTIVE code in this service only uses
     # client_secrets (token exchange in /api/oauth/{source}/exchange). The
@@ -150,12 +163,17 @@ class Settings(BaseSettings):
     slack_client_secret: SecretStr | None = None
     slack_signing_secret: SecretStr | None = None  # unused in prod (gateway verifies)
 
-    # GitHub App credentials (id + private key) used to live here; they
-    # have moved to prbe-backend so the App private key only exists in one
-    # service. Knowledge fetches installation tokens via
-    # `shared.backend_client.fetch_github_installation_token` instead.
+    # GitHub App credentials. In HOSTED mode the App private key lives in
+    # prbe-backend and knowledge fetches installation tokens over HTTP via
+    # `shared.backend_client.fetch_github_installation_token`. In STANDALONE
+    # community mode (no BACKEND_BASE_URL) the self-hoster registers their own
+    # GitHub App and the engine mints installation tokens locally via
+    # `shared.github_app` using `github_app_id` + `github_app_private_key`.
+    # Both paths share the same call site; the branch is in backend_client.
     github_app_slug: str | None = None  # unused in prod (gateway builds install URL)
-    github_webhook_secret: SecretStr | None = None  # unused in prod
+    github_webhook_secret: SecretStr | None = None  # in-process webhook verify (standalone)
+    github_app_id: str = ""  # standalone: numeric GitHub App id for local token minting
+    github_app_private_key: SecretStr = SecretStr("")  # standalone: App private key (PEM)
 
     linear_client_id: str | None = None
     linear_client_secret: SecretStr | None = None

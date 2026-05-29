@@ -63,6 +63,7 @@ from services.retrieval.synthesis import (
     synthesize_stream,
 )
 from services.retrieval.usage import usage_router
+from shared.community import ensure_default_customer
 from shared.config import get_settings
 from shared.constants import (
     DEFAULT_SYNTHESIS_MODEL,
@@ -103,6 +104,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
     await init_pool(settings)
+    await ensure_default_customer()  # no-op unless DEFAULT_CUSTOMER_ID set
     log.info("retrieval.boot", environment=settings.environment)
     yield
 
