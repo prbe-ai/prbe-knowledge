@@ -85,12 +85,6 @@ class TenantIsolationError(DatabaseError):
     """Raised if a query executes without a bound customer_id GUC."""
 
 
-class InvestigationNotFound(PrbeError):
-    """Raised by `services.ingestion.investigation_state` when an
-    incident_investigations row is requested by (customer_id,
-    incident_doc_id) but does not exist. Routes map this to HTTP 404."""
-
-
 # --- Ingestion --------------------------------------------------------------
 
 class IngestionError(PrbeError): ...
@@ -298,7 +292,6 @@ __all__ = [
     "IngestionError",
     "InvalidSignature",
     "InvalidWebhookPayload",
-    "InvestigationNotFound",
     "MissingSecret",
     "NormalizationError",
     "NotSupportedByConnector",

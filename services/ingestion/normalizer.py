@@ -80,14 +80,6 @@ class NormalizeOutcome:
     reused_chunk_count: int = 0
     removed_chunk_count: int = 0
     quarantined_doc_ids: list[str] = field(default_factory=list)
-    requires_investigation: bool = False
-    # Doc ids the worker should pass to
-    # services.post_approval.dispatch.on_resolution_event after this
-    # outcome commits. Populated only when the connector flagged
-    # NormalizationResult.requires_resolution_check=True (PD's
-    # incident.resolved and incident.io's incident_closed_v2). Empty
-    # for every other event kind.
-    resolution_check_doc_ids: list[str] = field(default_factory=list)
 
 
 class Normalizer:
@@ -380,21 +372,6 @@ class Normalizer:
             removed=total_removed,
             failed_chunks=total_failed,
         )
-        # Carry the post-approval signal forward when the connector
-        # flagged a resolution event (PD incident.resolved or
-        # incident.io incident_closed_v2). We forward only the doc_ids
-        # we actually persisted — quarantined / not-persisted docs
-        # have no incident row to update and would no-op anyway, but
-        # passing them on would emit spurious worker logs.
-        resolution_check_doc_ids: list[str] = []
-        if result.requires_resolution_check:
-            persisted_ids = set(doc_ids)
-            resolution_check_doc_ids = [
-                doc.doc_id
-                for doc in result.documents
-                if doc.doc_id in persisted_ids
-            ]
-
         return NormalizeOutcome(
             doc_ids=doc_ids,
             chunk_count=total_live_chunks,
@@ -403,8 +380,6 @@ class Normalizer:
             reused_chunk_count=total_reused,
             removed_chunk_count=total_removed,
             quarantined_doc_ids=quarantined,
-            requires_investigation=result.requires_investigation,
-            resolution_check_doc_ids=resolution_check_doc_ids,
         )
 
     async def persist_single_document(
@@ -415,23 +390,18 @@ class Normalizer:
         """Persist one already-shaped Document directly.
 
         Bypasses the ingestion queue + connector parse/normalize stages —
-        used by the typed incident-investigation writeback route, where the
-        orchestrator agent has already produced the final shape. Routes the
-        doc through the same chunker + embedder + SQL writes as the standard
-        normalize path, so retrieval-parity with other documents is
-        automatic: same Document table, same chunks, same embedding model,
-        same ACL handling.
+        used by typed-writeback callers (e.g. feature-node PR rationales)
+        that already hold the final Document shape. Routes the doc through
+        the same chunker + embedder + SQL writes as the standard normalize
+        path, so retrieval-parity with other documents is automatic: same
+        Document table, same chunks, same embedding model, same ACL
+        handling.
 
-        The caller MUST set `doc.source_system` correctly (e.g.
-        SourceSystem.PAGERDUTY for a PD-incident investigation report — not
-        SourceSystem.CUSTOM_INGEST) so source-system-keyed filters / score
-        multipliers apply.
+        The caller MUST set `doc.source_system` correctly so source-system-
+        keyed filters / score multipliers apply.
 
         ``doc.visibility`` (default ``Visibility.APPROVED``) is threaded
-        through to both the ``documents`` and ``chunks`` inserts. Post-
-        approval wiki artifacts set ``Visibility.DRAFT`` here; the review
-        approve path flips both rows back to ``APPROVED`` in a single
-        atomic transaction.
+        through to both the ``documents`` and ``chunks`` inserts.
         """
         result = NormalizationResult(documents=[doc])
         return await self._persist(customer_id, doc.source_system, result)

@@ -197,8 +197,8 @@ def _build_rationale_document(
 ) -> Document:
     """Shape a FEATURE_RATIONALE Document for the typed-writeback path.
 
-    Mirrors services/ingestion/investigation_writeback_routes.py for
-    consistency with the other agent-artifact writeback path.
+    Routes through Normalizer.persist_single_document so the rationale
+    lands in the same retrieval index as ordinary ingested docs.
     content_hash is keyed on (canonical_id, why) so /probe regenerate
     bumps version + re-chunks, while a redelivered webhook with the
     same approved why no-ops cleanly inside _upsert_document.
