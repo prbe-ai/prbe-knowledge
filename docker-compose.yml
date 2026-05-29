@@ -4,10 +4,12 @@
 #   docker compose up
 #
 # Brings up: Postgres (pgvector), MinIO (object store), a one-shot DB migrate,
-# then ingestion + retrieval + worker. Single-tenant mode (DEFAULT_CUSTOMER_ID)
-# means no control plane and no *.prbe.ai egress. The `cron` profile adds the
-# nightly knowledge-page synthesis trigger. (The MCP server ships separately
-# for now — see docs once it is vendored in.)
+# then ingestion + retrieval + worker + mcp. Single-tenant mode
+# (DEFAULT_CUSTOMER_ID) means no control plane and no *.prbe.ai egress. The
+# `cron` profile adds the nightly knowledge-page synthesis trigger. The MCP
+# server (services/mcp, vendored from prbe-knowledge-mcp) runs in `static`
+# auth mode here — point your client at http://localhost:8084/mcp with
+# `Authorization: Bearer $MCP_API_TOKEN`.
 #
 # All app services share ONE image built from services/ingestion/Dockerfile and
 # override `command` — the engine code is identical across roles.
@@ -120,6 +122,32 @@ services:
       - "8081:8081"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # MCP server (vendored from prbe-knowledge-mcp). Reaches retrieval over the
+  # compose network — no *.prbe.ai egress. Community single-tenant auth: a
+  # static bearer (MCP_API_TOKEN) scoped to DEFAULT_CUSTOMER_ID. (Hosted/managed
+  # builds set MCP_OAUTH_* instead and resolve to oauth mode automatically.)
+  mcp:
+    <<: *engine
+    container_name: prbe-knowledge-mcp
+    depends_on:
+      retrieval:
+        condition: service_healthy
+    environment:
+      <<: *engine-env
+      MCP_AUTH_MODE: static
+      MCP_API_TOKEN: ${MCP_API_TOKEN:-local-mcp-token}
+      DEFAULT_CUSTOMER_ID: ${DEFAULT_CUSTOMER_ID:-default}
+      KNOWLEDGE_QUERY_URL: http://retrieval:8081
+      INTERNAL_KNOWLEDGE_API_KEY: ${INTERNAL_KNOWLEDGE_API_KEY:-local-internal-key}
+    command: ["uvicorn", "services.mcp.main:app", "--host", "::", "--port", "8084", "--workers", "2"]
+    ports:
+      - "8084:8084"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8084/health"]
       interval: 10s
       timeout: 5s
       retries: 10

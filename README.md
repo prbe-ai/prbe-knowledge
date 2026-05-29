@@ -98,6 +98,7 @@ prbe-knowledge/
 │   │   └── handlers/   one connector per source
 │   ├── worker/         queue drain: normalize · chunk · embed
 │   ├── retrieval/      /retrieve + /query (:8081)
+│   ├── mcp/            MCP server: agent tool surface (:8084)
 │   ├── synthesis/      knowledge-page generation
 │   └── ...
 ├── shared/             config, db, storage, models, enums
@@ -124,5 +125,19 @@ prbe-knowledge/
 - [Contributing](CONTRIBUTING.md) — dev setup, gates, PR norms.
 - [Design](docs/phase0-design.md) · [Storage architecture](docs/storage-architecture.md)
 
-> An MCP server (agent tool surface over this engine) is coming soon and will
-> ship separately.
+### MCP server
+
+The agent tool surface (`search_knowledge`, `query_knowledge`, `get_source`)
+ships in-repo at `services/mcp/` (vendored from the former standalone
+`prbe-knowledge-mcp`). It proxies to the retrieval service over HTTP
+(`KNOWLEDGE_QUERY_URL`) and has two auth modes via `MCP_AUTH_MODE`:
+
+- **`static`** (community self-host) — one shared bearer (`MCP_API_TOKEN`)
+  scoped to `DEFAULT_CUSTOMER_ID`. This is the `docker compose` default; point
+  your client at `http://localhost:8084/mcp` with `Authorization: Bearer
+  $MCP_API_TOKEN`.
+- **`oauth`** (Probe-hosted) — validates OAuth 2.1 JWTs against the issuer JWKS
+  (`MCP_OAUTH_*`).
+
+Mode auto-resolves from the env (static when only `MCP_API_TOKEN` is set, oauth
+when a JWKS URL is set); set `MCP_AUTH_MODE` to force one.
