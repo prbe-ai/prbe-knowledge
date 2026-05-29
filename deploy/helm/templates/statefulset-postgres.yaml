@@ -1,0 +1,94 @@
+{{- if .Values.postgresql.bundled.enabled }}
+{{- $pg := .Values.postgresql.bundled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "probe-knowledge.postgresName" . }}
+  labels:
+    {{- include "probe-knowledge.componentLabels" (dict "ctx" . "component" "postgres") | nindent 4 }}
+type: Opaque
+stringData:
+  POSTGRES_USER: {{ $pg.auth.username | quote }}
+  POSTGRES_PASSWORD: {{ $pg.auth.password | quote }}
+  POSTGRES_DB: {{ $pg.auth.database | quote }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "probe-knowledge.postgresName" . }}
+  labels:
+    {{- include "probe-knowledge.componentLabels" (dict "ctx" . "component" "postgres") | nindent 4 }}
+spec:
+  serviceName: {{ include "probe-knowledge.postgresName" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "probe-knowledge.componentSelectorLabels" (dict "ctx" . "component" "postgres") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "probe-knowledge.componentSelectorLabels" (dict "ctx" . "component" "postgres") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: postgres
+          # pgvector image. The engine needs extensions: vector, pg_trgm, btree_gin.
+          # vector + pg_trgm + btree_gin are created by db/schema.sql at migrate time.
+          image: {{ $pg.image | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: {{ include "probe-knowledge.postgresName" . }}
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml $pg.resources | nindent 12 }}
+      {{- if not $pg.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if $pg.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with $pg.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ $pg.persistence.size | quote }}
+  {{- end }}
+{{- end }}

@@ -1,3 +1,33 @@
+# Turnkey self-host stack for the Probe knowledge engine (community edition).
+#
+#   cp .env.example .env   # fill in GOOGLE_API_KEY + one LLM key
+#   docker compose up
+#
+# Brings up: Postgres (pgvector), MinIO (object store), a one-shot DB migrate,
+# then ingestion + retrieval + worker. Single-tenant mode (DEFAULT_CUSTOMER_ID)
+# means no control plane and no *.prbe.ai egress. The `cron` profile adds the
+# nightly knowledge-page synthesis trigger. (The MCP server ships separately
+# for now — see docs once it is vendored in.)
+#
+# All app services share ONE image built from services/ingestion/Dockerfile and
+# override `command` — the engine code is identical across roles.
+
+x-engine: &engine
+  build:
+    context: .
+    dockerfile: services/ingestion/Dockerfile
+  image: prbe-knowledge:local
+  env_file:
+    - .env
+  environment: &engine-env
+    # Service discovery inside the compose network.
+    DATABASE_URL: postgresql://prbe:prbe@postgres:5432/prbe_knowledge
+    DATABASE_URL_SYNC: postgresql+psycopg://prbe:prbe@postgres:5432/prbe_knowledge
+    R2_ENDPOINT_URL: http://minio:9000
+    R2_ACCESS_KEY_ID: minioadmin
+    R2_SECRET_ACCESS_KEY: minioadmin
+    ENVIRONMENT: local
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -33,6 +63,89 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # One-shot: create the per-tenant object-storage bucket for the default tenant.
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing local/prbe-knowledge-default &&
+      echo 'bucket ready'"
+    restart: "no"
+
+  # One-shot: apply the schema (fresh DB) or run alembic upgrade (existing DB).
+  migrate:
+    <<: *engine
+    container_name: prbe-knowledge-migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "scripts/migrate.py"]
+    restart: "no"
+
+  ingestion:
+    <<: *engine
+    container_name: prbe-knowledge-ingestion
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+    # migrate already prepared the DB; skip the Dockerfile's alembic prefix.
+    command: ["uvicorn", "services.ingestion.main:app", "--host", "::", "--port", "8080", "--workers", "2"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  retrieval:
+    <<: *engine
+    container_name: prbe-knowledge-retrieval
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    command: ["uvicorn", "services.retrieval.main:app", "--host", "::", "--port", "8081", "--workers", "2"]
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    <<: *engine
+    container_name: prbe-knowledge-worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+    command: ["python", "-m", "services.ingestion.worker"]
+
+  # Optional: nightly knowledge-page synthesis trigger. Meant to run on a
+  # schedule (cron / k8s CronJob); `docker compose --profile cron up` fires it
+  # once. Leave out of the default `up`.
+  cron:
+    <<: *engine
+    container_name: prbe-knowledge-cron
+    profiles: ["cron"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: ["python", "-m", "services.synthesis.nightly_trigger"]
+    restart: "no"
 
 volumes:
   postgres-data:

@@ -1,0 +1,47 @@
+Probe knowledge engine (community edition) installed as release "{{ .Release.Name }}".
+
+Workloads:
+  - {{ include "probe-knowledge.fullname" . }}-ingestion   (HTTP :{{ .Values.ingestion.port }})  connector webhooks + ingest API
+  - {{ include "probe-knowledge.fullname" . }}-retrieval   (HTTP :{{ .Values.retrieval.port }})  /query + /retrieve API
+  - {{ include "probe-knowledge.fullname" . }}-worker       background ingestion worker (no HTTP)
+{{- if .Values.postgresql.bundled.enabled }}
+  - {{ include "probe-knowledge.postgresName" . }}          bundled Postgres (pgvector) — convenience only, not for production
+{{- end }}
+
+The DB schema was applied by a pre-install/pre-upgrade hook Job
+({{ include "probe-knowledge.fullname" . }}-migrate-{{ .Release.Revision }}) running scripts/migrate.py.
+
+1. Check rollout:
+
+   kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }}
+
+2. Reach the retrieval API in-cluster (port-forward for a quick test):
+
+   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "probe-knowledge.fullname" . }}-retrieval {{ .Values.retrieval.port }}:{{ .Values.retrieval.port }}
+
+   Then call it with your KNOWLEDGE_API_TOKEN:
+
+   curl -s localhost:{{ .Values.retrieval.port }}/health
+   curl -s -H "Authorization: Bearer $KNOWLEDGE_API_TOKEN" \
+     "localhost:{{ .Values.retrieval.port }}/query?q=hello"
+
+{{- if .Values.ingress.enabled }}
+
+3. Ingress is enabled. Retrieval API: https://{{ .Values.ingress.retrievalHost }}/
+{{- if .Values.ingress.ingestionHost }}
+   Ingestion API: https://{{ .Values.ingress.ingestionHost }}/
+{{- end }}
+{{- end }}
+
+{{- if not .Values.secrets.existingSecret }}
+{{- if or (eq .Values.secrets.googleApiKey "CHANGEME") (eq .Values.secrets.knowledgeApiToken "CHANGEME") (eq .Values.secrets.tokenEncryptionKey "CHANGEME") }}
+
+WARNING: one or more required secrets are still set to "CHANGEME". Set real
+values via -f my-values.yaml (secrets.googleApiKey, secrets.knowledgeApiToken,
+secrets.tokenEncryptionKey, secrets.r2AccessKeyId/r2SecretAccessKey) or supply
+your own Secret with secrets.create=false and secrets.existingSecret=<name>.
+{{- end }}
+{{- end }}
+
+This chart deploys ONLY the open-source knowledge engine: no control plane, no
+dashboard, no license/pairing, no MCP server.

@@ -2,8 +2,8 @@
 
 Tests that need a live Postgres + MinIO expect:
 
-    docker compose up -d
-    scripts/neon-migrate.sh local
+    docker compose up -d        # includes a one-shot `migrate` service
+    # (or run the migration manually: python scripts/migrate.py)
 
 The `live_db` fixture truncates Phase 0 tables between runs so tests start clean.
 
