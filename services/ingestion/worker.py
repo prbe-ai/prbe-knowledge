@@ -19,7 +19,6 @@ from services.ingestion.normalizer import Normalizer
 from services.ingestion.poller import IntegrationPoller
 from services.ingestion.polling.scheduler import PollScheduler
 from services.ingestion.polling.sink import PollDocumentSink
-from services.post_approval import dispatch as post_approval_dispatch
 from shared.constants import (
     GRANOLA_REFRESH_CHANNEL,
     QUEUE_HEARTBEAT_INTERVAL_SECONDS,
@@ -30,7 +29,7 @@ from shared.constants import (
     QueueStatus,
     SourceSystem,
 )
-from shared.db import apply_connection_setup, get_pool, init_pool, with_tenant
+from shared.db import apply_connection_setup, get_pool, init_pool
 from shared.exceptions import (
     DuplicateEventIgnored,
     PrbeError,
@@ -183,33 +182,6 @@ class Worker:
             )
             if source == SourceSystem.MANUAL_UPLOAD:
                 await self._cleanup_manual_upload_original(customer_id, event_id)
-            # Post-approval dispatch seam: when the connector flagged a
-            # resolution event (PD incident.resolved / incident.io
-            # incident_closed_v2), tell the dispatch seam so it can
-            # detect the (approved ∧ resolved) edge. Each call is
-            # idempotent at the SQL layer; the seam handles
-            # row-doesn't-exist-yet by UPSERTing a partial row.
-            #
-            # Boundary swallow: ingestion has already persisted; a
-            # transient orchestrator hiccup MUST NOT poison the queue
-            # row and force a re-process (which would re-embed the
-            # whole event for nothing). Failures get logged + the
-            # seam itself stamps metadata.post_approval_dispatch_failed
-            # for dashboard recovery.
-            for incident_doc_id in outcome.resolution_check_doc_ids:
-                try:
-                    await post_approval_dispatch.on_resolution_event(
-                        customer_id=customer_id,
-                        incident_doc_id=incident_doc_id,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "post_approval.on_resolution_event_failed",
-                        customer=customer_id,
-                        incident_doc_id=incident_doc_id,
-                        error=str(exc),
-                        error_class=type(exc).__name__,
-                    )
             await self._mark_done(
                 queue_id,
                 customer_id,
@@ -219,18 +191,6 @@ class Worker:
                 outcome,
                 captured_version,
             )
-            # After self._mark_done(...) completes successfully (queue row is in
-            # "done" state), fire the investigation dispatch if the connector
-            # requested it. The queue row is durable at this point so a dispatch
-            # crash can be re-triggered from the dashboard without re-driving the
-            # normalize pipeline.
-            if outcome.requires_investigation and outcome.doc_ids:
-                await self._maybe_dispatch_investigation(
-                    customer_id=customer_id,
-                    incident_doc_id=outcome.doc_ids[0],
-                    source=source,
-                    source_event_id=event_id,
-                )
         except DuplicateEventIgnored as exc:
             log.info("worker.skipped", queue_id=queue_id, reason=str(exc))
             await self._mark_skipped(
@@ -538,92 +498,6 @@ class Worker:
             )
             return False
         return dead
-
-    async def _maybe_dispatch_investigation(
-        self,
-        *,
-        customer_id: str,
-        incident_doc_id: str,
-        source: SourceSystem,
-        source_event_id: str,
-    ) -> None:
-        """Build the dispatch payload from the live INCIDENT doc row and
-        POST to orchestrator. On retry exhaustion, mark the incident doc
-        so the dashboard can surface a re-trigger action.
-
-        Wrapped in a broad except — a dispatch failure must never block
-        the worker loop. The queue row is already in "done" state; the
-        dashboard re-trigger button is the fallback.
-        """
-        try:
-            from services.investigation.dispatch import (
-                DispatchExhausted,
-                dispatch_investigation,
-            )
-            from services.investigation.incident_signals import extract_from_doc
-            from services.investigation.mark_dispatch_failed import mark_dispatch_failed
-
-            # Fetch the live doc to build the signals payload.
-            async with with_tenant(customer_id) as conn:
-                row = await conn.fetchrow(
-                    "SELECT title, metadata, source_system::text AS source_system, "
-                    "       created_at "
-                    "FROM documents "
-                    "WHERE doc_id = $1 AND customer_id = $2 AND valid_to IS NULL",
-                    incident_doc_id,
-                    customer_id,
-                )
-            if row is None:
-                log.error(
-                    "investigation.dispatch.no_live_doc",
-                    extra={
-                        "customer_id": customer_id,
-                        "incident_doc_id": incident_doc_id,
-                    },
-                )
-                return
-
-            signals = extract_from_doc(dict(row))
-            payload = {
-                "customer_id": customer_id,
-                "source": source.value,
-                "incident_doc_id": incident_doc_id,
-                "source_event_id": source_event_id,
-                "incident_signals": signals,
-                "version": 1,
-            }
-            try:
-                await dispatch_investigation(payload)
-            except DispatchExhausted:
-                # Two writes, both required for the dashboard to
-                # surface the failed dispatch:
-                #   1. Flag the live INCIDENT doc so a future
-                #      "Re-trigger investigation" action knows it's
-                #      eligible.
-                #   2. Materialise an `incident_investigations` row
-                #      in state='failed_pending_review'. Without
-                #      this the /incidents list (which JOINs against
-                #      incident_investigations) shows nothing, and
-                #      the user can't review or act on the incident.
-                from services.ingestion.investigation_state import (
-                    upsert_failed_pending_review,
-                )
-                await mark_dispatch_failed(
-                    customer_id=customer_id,
-                    incident_doc_id=incident_doc_id,
-                )
-                await upsert_failed_pending_review(
-                    customer_id=customer_id,
-                    incident_doc_id=incident_doc_id,
-                )
-        except Exception:  # never block the worker loop
-            log.exception(
-                "investigation.dispatch.unhandled",
-                extra={
-                    "customer_id": customer_id,
-                    "incident_doc_id": incident_doc_id,
-                },
-            )
 
 
 def _event_type_for_source(source: SourceSystem) -> str:

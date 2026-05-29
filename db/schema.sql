@@ -1377,6 +1377,8 @@ CREATE POLICY ingestion_cursors_tenant_isolation ON ingestion_cursors
 -- no single-row PK on `doc_id` alone. Cleanup on customer deprovision
 -- runs through the `customer_id` CASCADE.
 -- ---------------------------------------------------------------------------
+-- DEPRECATED (pivot): on-call/incident code removed in Part 1 (strip). Table
+-- left dormant; dropped in Part 2 (gated behind backup + explicit approval).
 CREATE TABLE incident_investigations (
     customer_id                  TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     incident_doc_id              TEXT NOT NULL,
@@ -1420,6 +1422,8 @@ CREATE POLICY tenant_isolation ON incident_investigations
 -- per-customer Knowledge override). Lives in the knowledge alembic
 -- chain because the two services share one Postgres database.
 -- ---------------------------------------------------------------------------
+-- DEPRECATED (pivot): on-call/incident code removed in Part 1 (strip). Table
+-- left dormant; dropped in Part 2 (gated behind backup + explicit approval).
 CREATE TABLE customer_incident_mcp_servers (
     customer_id        TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     mcp_kind           TEXT NOT NULL,
@@ -1510,6 +1514,8 @@ CREATE POLICY entity_merge_suggestions_tenant_isolation
 -- and knowledge pages are new docs, not corrections (enforced via the
 -- target_consistency CHECK).
 -- ---------------------------------------------------------------------------
+-- DEPRECATED (pivot): incident-artifact review code removed in Part 1 (strip).
+-- Table left dormant; drop candidate for Part 2 (confirm before dropping).
 CREATE TABLE wiki_review_queue (
     customer_id              TEXT NOT NULL,
     artifact_doc_id          TEXT NOT NULL,
@@ -1563,6 +1569,8 @@ CREATE POLICY tenant_isolation ON wiki_review_queue
 -- missing row means "use the default template". The mode-consistency
 -- CHECK enforces exactly one of body_markdown / ref_doc_id is populated.
 -- ---------------------------------------------------------------------------
+-- DEPRECATED (pivot): postmortem-template code removed in Part 1 (strip).
+-- Table left dormant; drop candidate for Part 2 (confirm before dropping).
 CREATE TABLE customer_postmortem_templates (
     customer_id     TEXT NOT NULL,
     mode            TEXT NOT NULL,
