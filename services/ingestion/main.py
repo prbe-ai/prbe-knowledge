@@ -64,6 +64,7 @@ from services.ingestion.manual_uploads import (
 from services.ingestion.slack_lifecycle import handle_slack_lifecycle_event
 from services.ingestion.wiki_routes import router as wiki_router
 from services.system_settings import get_ingestion_killswitch
+from shared.community import ensure_default_customer
 from shared.config import get_settings
 from shared.constants import (
     DEFAULT_INGESTION_PRIORITY,
@@ -87,6 +88,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
     await init_pool(settings)
+    await ensure_default_customer()  # no-op unless DEFAULT_CUSTOMER_ID set
 
     # Trigger @register_connector decorators.
     import services.ingestion.handlers  # noqa: F401
@@ -405,12 +407,22 @@ async def webhook(
     x_trace_id: str | None = Header(default=None),
     x_prbe_customer: str | None = Header(default=None),
 ) -> JSONResponse:
-    """Internal-only webhook endpoint. Called by prbe-backend gateway.
+    """Webhook intake. Two trust modes (additive — dual-mode invariant):
 
-    Trusts X-Internal-Knowledge-Key + X-Prbe-Customer; does NOT verify the source
-    platform's signature (gateway already did).
+    - HOSTED: prbe-backend's gateway verified the provider signature and
+      forwards with X-Internal-Knowledge-Key + X-Prbe-Customer. Enforced
+      exactly as before whenever INTERNAL_KNOWLEDGE_API_KEY is configured.
+    - STANDALONE (community): no gateway. The provider's own signature is
+      verified in-process (connector.verify_signature) and the event is
+      scoped to DEFAULT_CUSTOMER_ID.
     """
-    _verify_internal_key(request)
+    settings = get_settings()
+    gateway_mode = bool(
+        settings.internal_knowledge_api_key
+        and settings.internal_knowledge_api_key.get_secret_value()
+    )
+    if gateway_mode:
+        _verify_internal_key(request)
 
     # Global ingestion killswitch — short-circuit BEFORE doing any of the
     # heavy work (R2 write, queue insert). If an operator has flipped the
@@ -428,9 +440,6 @@ async def webhook(
             headers={"Retry-After": "300"},
         )
 
-    if not x_prbe_customer:
-        raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
-
     trace_id = x_trace_id or f"wh-{int(datetime.now().timestamp() * 1000)}"
     bind_trace(trace_id)
 
@@ -447,13 +456,34 @@ async def webhook(
     raw_body = await request.body()
     connector = build_connector(source_enum, request.app.state.ctx)
 
+    # Resolve + authorize the tenant. Gateway mode trusts X-Prbe-Customer (the
+    # gateway already verified the provider signature). Standalone mode verifies
+    # the provider signature in-process and scopes to the single configured
+    # tenant.
+    if gateway_mode:
+        if not x_prbe_customer:
+            raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
+        customer_id = x_prbe_customer
+    else:
+        if not connector.verify_signature(dict(request.headers), raw_body):
+            raise HTTPException(status_code=401, detail="invalid webhook signature")
+        customer_id = settings.default_customer_id
+        if not customer_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "standalone webhook requires DEFAULT_CUSTOMER_ID "
+                    "(single-tenant community mode)"
+                ),
+            )
+
     # Receipt log fires once we know the source is valid and the body has
     # been fully read. Pairs with the gateway's `webhooks.<source>.forwarded`
     # log via `body_sha256_prefix` so an operator can join the two sides.
     log.info(
         "ingestion.received",
         source=source,
-        customer=x_prbe_customer,
+        customer=customer_id,
         body_size=len(raw_body),
         body_sha256_prefix=hashlib.sha256(raw_body).hexdigest()[:8],
         trace_id=trace_id,
@@ -463,8 +493,6 @@ async def webhook(
         payload = orjson.loads(raw_body) if raw_body else {}
     except orjson.JSONDecodeError as exc:
         raise HTTPException(status_code=400, detail=f"invalid json: {exc}") from exc
-
-    customer_id = x_prbe_customer
     if source_enum == SourceSystem.SLACK:
         lifecycle = await handle_slack_lifecycle_event(
             request.app.state.ctx,

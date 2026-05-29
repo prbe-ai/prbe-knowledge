@@ -41,8 +41,16 @@ async def fetch_github_installation_token(
         else ""
     )
     if not base or not api_key:
+        # Standalone (community) mode: no control plane. Mint the installation
+        # token locally from the self-hoster's own GitHub App creds, preserving
+        # the (token, expires_at) contract so call sites are unchanged.
+        if settings.github_app_id and settings.github_app_private_key.get_secret_value():
+            from shared.github_app import mint_installation_token
+
+            return await mint_installation_token(http, customer_id=customer_id)
         raise GitHubAuthError(
-            "BACKEND_BASE_URL or INTERNAL_BACKEND_API_KEY is not configured"
+            "GitHub tokens unavailable: set BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY "
+            "(hosted) or GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY (standalone)"
         )
 
     url = f"{base}/internal/github/installation_token"

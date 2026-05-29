@@ -210,7 +210,15 @@ async def with_tenant(customer_id: str) -> AsyncIterator[asyncpg.Connection]:
     return zero rows silently — that's by design.
     """
     if not customer_id:
-        raise TenantIsolationError("with_tenant() requires a non-empty customer_id")
+        # Standalone community mode: fall back to the single configured tenant
+        # so RLS stays ON (and is trivially satisfied) when no per-request
+        # tenant is resolved. Unset in hosted => raises exactly as before.
+        customer_id = get_settings().default_customer_id
+        if not customer_id:
+            raise TenantIsolationError(
+                "with_tenant() requires a non-empty customer_id "
+                "(or DEFAULT_CUSTOMER_ID in single-tenant mode)"
+            )
 
     async with get_pool().acquire() as conn, conn.transaction():
         # set_config with is_local=true scopes the GUC to this tx only.
