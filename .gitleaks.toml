@@ -1,0 +1,30 @@
+# gitleaks configuration for prbe-knowledge.
+#
+# Extends the default gitleaks ruleset and allowlists values that are
+# provably synthetic — test fixtures and config key NAMES — so a fresh
+# `gitleaks detect` returns zero findings. Real credentials are never
+# committed; they are supplied at runtime via env (.env.example documents
+# the keys, all blank).
+#
+# When adding an allowlist entry, allowlist the SPECIFIC synthetic value or a
+# test-only path — never a broad pattern that could mask a real future leak.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Synthetic test fixtures and config key names — no real credentials"
+
+# Files that exist solely to exercise secret handling / redaction. Their
+# contents are intentionally fake keys.
+paths = [
+  '''tests/test_codegraph_secrets\.py''', # synthetic Stripe + RSA keys for the redaction test
+]
+
+# Specific synthetic literals that appear in tests and Helm templates.
+regexes = [
+  '''test-internal-key-32bytes-padding-padding''',          # placeholder INTERNAL_KEY in tests
+  '''lin_api_test_abc123''',                                 # placeholder Linear API key in tests
+  '''VQzt8cN0Q8dUJYwQZUWaGKg_uvDyF-58DyHJ6m5f8ww=''',       # test-only Fernet key (tests/conftest.py)
+  '''^R2_BUCKET_PREFIX$''',                                  # Helm template: config key NAME, not a value
+]
