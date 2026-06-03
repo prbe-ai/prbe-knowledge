@@ -87,7 +87,8 @@ community mode everything is scoped to `DEFAULT_CUSTOMER_ID` (defaults to
   into knowledge pages.
 
 Full design: [docs/phase0-design.md](docs/phase0-design.md) ·
-storage/data flow: [docs/storage-architecture.md](docs/storage-architecture.md).
+storage/data flow: [docs/storage-architecture.md](docs/storage-architecture.md) ·
+how retrieval works: [docs/retrieval-architecture.md](docs/retrieval-architecture.md).
 
 ## Repo layout
 
@@ -113,7 +114,8 @@ prbe-knowledge/
     ├── self-hosting.md prerequisites, compose, Helm, Postgres, providers
     ├── connectors.md   per-source setup (GitHub App, webhook secrets)
     ├── phase0-design.md
-    └── storage-architecture.md
+    ├── storage-architecture.md   how data is stored at rest
+    └── retrieval-architecture.md how a query becomes a cited answer
 ```
 
 ## Documentation
@@ -123,7 +125,7 @@ prbe-knowledge/
 - [Connectors](docs/connectors.md) — per-source setup, including how to register
   your own GitHub App and where each webhook signing secret comes from.
 - [Contributing](CONTRIBUTING.md) — dev setup, gates, PR norms.
-- [Design](docs/phase0-design.md) · [Storage architecture](docs/storage-architecture.md)
+- [Design](docs/phase0-design.md) · [Storage architecture](docs/storage-architecture.md) · [Retrieval architecture](docs/retrieval-architecture.md)
 
 ### MCP server
 
