@@ -9,6 +9,7 @@ owns transport. Tests mock the wrapper instead of a fake
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -18,8 +19,11 @@ import pytest
 
 from services.synthesis.models import TriageInput
 from services.synthesis.providers import (
+    GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS,
     TriageParseError,
     _AnthropicTriage,
+    _gemini_call_json,
+    _gemini_temperature_for,
     _GeminiTriage,
     get_triage_provider,
 )
@@ -50,6 +54,15 @@ def _tool_response(tool_name: str, payload: dict) -> SimpleNamespace:
     return SimpleNamespace(choices=[choice], usage=None)
 
 
+def _gemini_json_response(payload: dict) -> SimpleNamespace:
+    message = SimpleNamespace(
+        content=orjson.dumps(payload).decode("utf-8"),
+        tool_calls=None,
+    )
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
 # ---------------------------------------------------------------------------
 # Factory dispatch
 # ---------------------------------------------------------------------------
@@ -77,6 +90,53 @@ def test_anthropic_provider_accepts_no_client_post_litellm_migration() -> None:
     None. Pin the new contract."""
     provider = get_triage_provider(anthropic_client=None, model_override="haiku")
     assert isinstance(provider, _AnthropicTriage)
+
+
+def test_gemini_temperature_uses_provider_default_for_gemini3() -> None:
+    assert _gemini_temperature_for("gemini-3.5-flash") == 1.0
+    assert _gemini_temperature_for("gemini-3.1-flash-lite") == 1.0
+    assert _gemini_temperature_for("gemini-2.5-flash-lite") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_gemini_call_json_sets_temperature_and_timeout(monkeypatch) -> None:
+    fake = AsyncMock(return_value=_gemini_json_response({"verdicts": {}}))
+    monkeypatch.setattr("shared.llm.acompletion", fake)
+
+    out = await _gemini_call_json(
+        model="gemini-3.5-flash",
+        system="system",
+        user="user",
+        schema={"type": "object"},
+        max_tokens=123,
+    )
+
+    assert out == {"verdicts": {}}
+    kwargs = fake.await_args.kwargs
+    assert kwargs["model"] == "gemini/gemini-3.5-flash"
+    assert kwargs["temperature"] == 1.0
+    assert kwargs["timeout"] == GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_gemini_call_json_times_out_stalled_completion(monkeypatch) -> None:
+    async def _stalled(*args, **kwargs):
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr("shared.llm.acompletion", _stalled)
+    monkeypatch.setattr(
+        "services.synthesis.providers.GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    with pytest.raises(RuntimeError, match=r"gemini call timed out after 0s"):
+        await _gemini_call_json(
+            model="gemini-3.5-flash",
+            system="system",
+            user="user",
+            schema={"type": "object"},
+            max_tokens=123,
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -589,6 +589,17 @@ def test_parse_overflow_matches_gemini_json_decode_error() -> None:
     assert _is_parse_overflow_error(err) is True
 
 
+def test_parse_overflow_matches_gemini_timeout() -> None:
+    """A stalled Gemini structured-output call should split-retry."""
+    from services.synthesis.providers import TriageParseError
+    from services.synthesis.triage import _is_parse_overflow_error
+
+    err = TriageParseError(
+        "gemini triage call failed: gemini call timed out after 120s"
+    )
+    assert _is_parse_overflow_error(err) is True
+
+
 def test_parse_overflow_skips_unrelated_parse_error() -> None:
     """Sanity: an unrelated TriageParseError (e.g. wrong tool name) MUST
     NOT be classified as overflow-shaped — those errors should propagate
@@ -617,6 +628,29 @@ async def test_gemini_malformed_json_triggers_split_retry(monkeypatch) -> None:
         monkeypatch,
         [
             _gemini_malformed_json_response(),
+            _gemini_success_response(events[:2]),
+            _gemini_success_response(events[2:]),
+        ],
+    )
+
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
+
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    assert fake.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_gemini_timeout_triggers_split_retry(monkeypatch) -> None:
+    """A timed-out Gemini full batch should split instead of DLQ."""
+    monkeypatch.setattr(
+        "services.synthesis.providers.WIKI_TRIAGE_MODEL",
+        "gemini-3.5-flash",
+    )
+    events = [_ev(i) for i in range(4)]
+    fake = _patch_shared_acompletion(
+        monkeypatch,
+        [
+            RuntimeError("gemini call timed out after 120s"),
             _gemini_success_response(events[:2]),
             _gemini_success_response(events[2:]),
         ],
