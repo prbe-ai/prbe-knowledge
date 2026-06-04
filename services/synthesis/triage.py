@@ -489,6 +489,25 @@ async def call_triage_with_split_retry(
                     doc_id=events[0].doc_id,
                 )
                 output = _rejected_output_for_single_oversize(events[0])
+            elif not output_qids:
+                # Parsed response, but `verdicts` was empty. Recursing on the
+                # "missing subset" would be the same event list and can loop
+                # forever if the provider keeps returning `{}`. Treat it like
+                # output-side overflow and split the full batch so each
+                # recursive call makes progress toward a single-event leaf.
+                midpoint = len(events) // 2
+                left = events[:midpoint]
+                right = events[midpoint:]
+                log.warning(
+                    "triage.split_retry.empty_response_splitting",
+                    batch_size=len(events),
+                    left_size=len(left),
+                    right_size=len(right),
+                    missing=len(missing_qids),
+                )
+                left_out = await _safe_recurse(client, left, now=now)
+                right_out = await _safe_recurse(client, right, now=now)
+                output = _merge_outputs(left_out, right_out)
             else:
                 # Partial response: keep the verdicts we got, recurse on
                 # just the events Haiku skipped. Splitting the skipped
