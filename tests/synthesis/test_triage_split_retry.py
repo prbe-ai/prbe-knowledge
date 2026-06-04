@@ -474,6 +474,31 @@ async def test_partial_response_single_missing_marked_rejected(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_empty_partial_response_splits_instead_of_retrying_same_batch(
+    monkeypatch,
+) -> None:
+    """A parsed response with `verdicts={}` for a multi-event batch must
+    split the full batch. Recursing on the missing subset would pass the
+    identical event list again and can loop forever if the provider keeps
+    returning an empty dict for that size.
+    """
+    events = [_ev(i) for i in range(4)]
+    fake = _patch_acompletion(
+        monkeypatch,
+        [
+            _partial_success_response([]),
+            _success_response(events[:2]),
+            _success_response(events[2:]),
+        ],
+    )
+
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
+
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    assert fake.await_count == 3
+
+
+@pytest.mark.asyncio
 async def test_partial_response_with_recurse_into_further_partial(monkeypatch) -> None:
     """Recurse can itself produce partial responses. 8 events; first
     call scores 3, recurse on missing 5 scores 2, recurse on missing 3
