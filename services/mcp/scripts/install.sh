@@ -150,31 +150,34 @@ echo ""
 # ---------------------------------------------------------------------------
 if command -v claude >/dev/null 2>&1; then
     claude_probe="$(claude mcp get "$MCP_NAME" 2>/dev/null || true)"
-    if printf "%s" "$claude_probe" | grep -qF "$MCP_URL"; then
-        yellow "✓ Claude Code: '$MCP_NAME' already points at $MCP_URL (skipping)"
-    elif [ -n "$claude_probe" ]; then
-        dim "→ Updating Claude Code '$MCP_NAME' URL…"
-        if claude mcp remove "$MCP_NAME" >/dev/null 2>&1 \
-            && claude mcp add -s user --transport http "$MCP_NAME" "$MCP_URL" >/dev/null 2>&1; then
-            green "✓ Claude Code: updated '$MCP_NAME' to $MCP_URL"
-        else
-            red   "✗ Claude Code: couldn't update '$MCP_NAME' — try manually:"
-            echo  "    claude mcp remove $MCP_NAME"
-            echo  "    claude mcp add -s user --transport http $MCP_NAME $MCP_URL"
-        fi
+    # Register Probe with "alwaysLoad": true so its tools load into context
+    # at session start instead of sitting behind MCP tool search (deferred).
+    # Deferred tools force Claude to run a ToolSearch step before it can call
+    # them, which makes agents reach for Probe far less often than tools that
+    # are always present — so we keep Probe always-loaded and proactive.
+    # alwaysLoad needs Claude Code v2.1.121+; older clients store the field
+    # harmlessly and ignore it.
+    #   https://code.claude.com/docs/en/mcp  ("Exempt a server from deferral")
+    #
+    # add-json is the only `claude mcp` path that can set alwaysLoad. `-s user`
+    # registers it once for every project (the default `local` scope would tie
+    # Probe to the cwd's project only).
+    probe_json="{\"type\":\"http\",\"url\":\"$MCP_URL\",\"alwaysLoad\":true}"
+    if printf "%s" "$claude_probe" | grep -qF "$MCP_URL" \
+        && printf "%s" "$claude_probe" | grep -qiE 'always.?load'; then
+        yellow "✓ Claude Code: '$MCP_NAME' already set ($MCP_URL, alwaysLoad — skipping)"
     else
-        # Pre-message so the user sees something while `claude mcp add`
-        # runs. We print on its own line and don't overwrite — the add
-        # step is sub-second and an overwrite trick made the in-progress
-        # message flash invisibly.
-        # `-s user` registers it once for every project; the default
-        # `local` scope would tie Probe to the cwd's project only.
-        dim "→ Adding to Claude Code (user scope)…"
-        if claude mcp add -s user --transport http "$MCP_NAME" "$MCP_URL" >/dev/null 2>&1; then
-            green "✓ Claude Code: added '$MCP_NAME' (user scope — applies to every project)"
+        # (Re)register so the entry always ends up at the right URL *and* with
+        # alwaysLoad. remove-first makes this idempotent on re-runs and heals a
+        # pre-existing URL-only entry from an older installer.
+        dim "→ Configuring Claude Code '$MCP_NAME' (user scope, alwaysLoad)…"
+        claude mcp remove "$MCP_NAME" >/dev/null 2>&1 || true
+        if claude mcp add-json -s user "$MCP_NAME" "$probe_json" >/dev/null 2>&1; then
+            green "✓ Claude Code: set '$MCP_NAME' (user scope, alwaysLoad — tools load upfront)"
         else
-            red   "✗ Claude Code: 'claude mcp add' failed — try manually:"
-            echo  "    claude mcp add -s user --transport http $MCP_NAME $MCP_URL"
+            red   "✗ Claude Code: couldn't configure '$MCP_NAME' — try manually:"
+            echo  "    claude mcp remove $MCP_NAME"
+            echo  "    claude mcp add-json -s user $MCP_NAME '$probe_json'"
         fi
     fi
 else
