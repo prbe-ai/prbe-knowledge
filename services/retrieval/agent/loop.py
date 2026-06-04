@@ -584,9 +584,26 @@ def _no_llm_configured() -> bool:
 # Per-turn LLM call + dispatcher
 # ============================================================
 
-async def _run_turn(state: LoopState) -> Any:
-    """Run one LLM turn with tool_choice='required'. Records latency +
-    cache hit rate on state. Returns the raw response."""
+async def _run_turn(
+    state: LoopState,
+    *,
+    tool_choice: Any = "required",
+) -> Any:
+    """Run one LLM turn. Records latency + cache hit rate on state.
+    Returns the raw response.
+
+    `tool_choice` defaults to "required" (model MUST call SOME tool but
+    picks freely). Override with the OpenAI-shape
+    ``{"type": "function", "function": {"name": <tool>}}`` to compel a
+    specific tool — the force-terminate retry uses this to make
+    `emit_gatherer_output` structurally mandatory instead of merely
+    requested in the natural-language nudge. Cerebras gpt-oss-120b
+    routinely ignores the nudge under non-trivial reasoning state, even
+    with `tool_choice="required"` set, because "required" still leaves
+    every other tool selectable (live-traced 2026-05-24:
+    request_ids 2bc47038-…, 3810e737-…, ce525fee-…, 31964f42-… — model
+    emitted fetch_doc/search instead of the terminal on the retry).
+    """
     call_kwargs: dict[str, Any] = {
         "model": SEARCH_AGENT_INFERENCE_MODEL,
         "messages": state.messages,
@@ -607,11 +624,13 @@ async def _run_turn(state: LoopState) -> Any:
         # fingerprint per turn so the analyzer can flag fingerprint
         # drift as a reproducibility breaker.
         "seed": state.seed,
-        # The whole point: model MUST call a tool. With this set, prose-
-        # only output is not an option — the model picks a retrieval
-        # tool (search/subgraph/fetch_doc/need_deeper) or the terminal
-        # (emit_gatherer_output). No prose, no schema-violation path.
-        "tool_choice": "required",
+        # The whole point: model MUST call a tool. With "required" set,
+        # prose-only output is not an option — the model picks a
+        # retrieval tool (search/subgraph/fetch_doc/need_deeper) or the
+        # terminal (emit_gatherer_output). On the force-terminate retry
+        # the caller passes a named-function tool_choice so the only
+        # acceptable tool IS the terminal — see the docstring above.
+        "tool_choice": tool_choice,
         # Force OpenAI wire shape so tool_choice + structured tool
         # schemas survive the LiteLLM proxy. See
         # `feedback_litellm_gateway_gemini_405` + the 4-layer Fireworks
@@ -1621,11 +1640,27 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
 
         if budget_exhausted or turn_cap_reached:
             # Tool-call budget gone OR soft turn cap tripped, and the model
-            # still didn't terminate. Inject a forcing nudge and run one
-            # more turn. tool_choice="required" still applies — the model
-            # must pick a tool — but with the explicit "emit_gatherer_output
-            # now" instruction it should pick the terminal. If it doesn't,
-            # we return None.
+            # still didn't terminate. Inject a forcing nudge AND constrain
+            # the retry's tool_choice to the named terminal, then run one
+            # more turn.
+            #
+            # Why named tool_choice here (not just "required" + nudge):
+            # tool_choice="required" forces the model to call SOMETHING,
+            # but every exploration tool is still selectable. Cerebras
+            # gpt-oss-120b under non-trivial reasoning state ("we haven't
+            # fetched the doc content yet — let's fetch it now") routinely
+            # ignores the natural-language "do not call any other tool"
+            # instruction and picks fetch_doc/search anyway — the
+            # 2026-05-24 nightly's 4/40 schema_violation traces were all
+            # this exact mode (request_ids 2bc47038-…, 3810e737-…,
+            # ce525fee-…, 31964f42-…; turn_count=3 with the third turn
+            # picking another exploration tool, never reaching
+            # `_parse_terminal_args`). PR #376's coercer fix couldn't
+            # cover this because there was no terminal emission to
+            # coerce. The OpenAI-shape named tool_choice removes the
+            # alternative tools from the provider's allowed set
+            # structurally — same pattern shared/llm_tools.py uses for
+            # forced single-tool callers.
             reason = "budget_exhausted" if budget_exhausted else "soft_turn_cap"
             log.info(
                 "agent.force_terminate",
@@ -1649,7 +1684,13 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
                     "results. Do not call any other tool."
                 ),
             })
-            resp2 = await _run_turn(state)
+            resp2 = await _run_turn(
+                state,
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": TERMINAL_TOOL_NAME},
+                },
+            )
             choices2 = getattr(resp2, "choices", None) or []
             msg2 = getattr(choices2[0], "message", None) if choices2 else None
             tcs2 = getattr(msg2, "tool_calls", None) or []
@@ -1657,6 +1698,20 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
                 fn = getattr(tc, "function", None)
                 if getattr(fn, "name", None) == TERMINAL_TOOL_NAME:
                     return _parse_terminal_args(getattr(fn, "arguments", None), state=state)
+            # Named tool_choice should make this branch unreachable —
+            # log it loudly so the nightly digest can flag any provider
+            # regression that ignores the structural pin (separate from
+            # the natural-language nudge being ignored, which was the
+            # pre-fix failure mode).
+            log.warning(
+                "agent.force_terminate_named_tool_choice_ignored",
+                customer_id=state.customer_id,
+                trace_id=state.trace_id,
+                tool_calls_emitted=[
+                    getattr(getattr(tc, "function", None), "name", "?")
+                    for tc in tcs2
+                ],
+            )
             return None
 
         # Echo the assistant turn so the model sees its own tool_calls
