@@ -100,6 +100,39 @@ def _success_response(events: list[TriageInput]) -> SimpleNamespace:
     return SimpleNamespace(choices=[choice], usage=None)
 
 
+def _gemini_success_response(events: list[TriageInput]) -> SimpleNamespace:
+    """Gemini structured-output response: JSON text in message.content."""
+    payload = {
+        "verdicts": {
+            str(ev.queue_id): {
+                "important": True,
+                "score": 7.0,
+                "reason": "ok",
+            }
+            for ev in events
+        }
+    }
+    message = SimpleNamespace(
+        content=orjson.dumps(payload).decode("utf-8"),
+        tool_calls=None,
+    )
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
+def _gemini_malformed_json_response() -> SimpleNamespace:
+    """Gemini response_schema response with invalid JSON content."""
+    message = SimpleNamespace(
+        content=(
+            '{"verdicts":{"0":{"important":true,"score":7.0,"reason":"ok"}'
+            '"1":{"important":true,"score":7.0,"reason":"ok"}}}'
+        ),
+        tool_calls=None,
+    )
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    return SimpleNamespace(choices=[choice], usage=None)
+
+
 def _empty_tool_call_response() -> SimpleNamespace:
     """Forced tool call with empty `{}` arguments → Pydantic surfaces
     `verdicts: Field required`. Mirrors Haiku stopping at max_tokens
@@ -181,6 +214,31 @@ def _patch_acompletion(monkeypatch, responses: list[object]) -> AsyncMock:
     fake = AsyncMock(side_effect=_create)
     monkeypatch.setattr("shared.llm_tools.acompletion", fake)
     return fake
+
+
+def _patch_shared_acompletion(monkeypatch, responses: list[object]) -> AsyncMock:
+    """Patch `shared.llm.acompletion` for Gemini provider tests."""
+    iterator = iter(responses)
+
+    async def _create(*args, **kwargs):
+        item = next(iterator)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    fake = AsyncMock(side_effect=_create)
+    monkeypatch.setattr("shared.llm.acompletion", fake)
+    return fake
+
+
+@pytest.fixture(autouse=True)
+def _force_anthropic_triage_for_split_retry(monkeypatch) -> None:
+    """These tests mostly exercise Anthropic tool-call parser shapes.
+
+    The production default is Gemini now, so pin Haiku for the legacy
+    split-retry cases and override explicitly in Gemini-specific tests.
+    """
+    monkeypatch.setattr("services.synthesis.providers.WIKI_TRIAGE_MODEL", "haiku")
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +552,18 @@ def test_parse_overflow_matches_string_should_have_at_most_phrasing() -> None:
     assert _is_parse_overflow_error(err) is True
 
 
+def test_parse_overflow_matches_gemini_json_decode_error() -> None:
+    """Malformed Gemini JSON should trigger split-retry, not DLQ."""
+    from services.synthesis.providers import TriageParseError
+    from services.synthesis.triage import _is_parse_overflow_error
+
+    err = TriageParseError(
+        "gemini triage call failed: gemini response was not JSON: "
+        "Expecting ',' delimiter: line 4 column 9487 (char 15970)"
+    )
+    assert _is_parse_overflow_error(err) is True
+
+
 def test_parse_overflow_skips_unrelated_parse_error() -> None:
     """Sanity: an unrelated TriageParseError (e.g. wrong tool name) MUST
     NOT be classified as overflow-shaped — those errors should propagate
@@ -503,6 +573,34 @@ def test_parse_overflow_skips_unrelated_parse_error() -> None:
 
     err = TriageParseError("response had unexpected tool name 'foo'")
     assert _is_parse_overflow_error(err) is False
+
+
+@pytest.mark.asyncio
+async def test_gemini_malformed_json_triggers_split_retry(monkeypatch) -> None:
+    """Gemini response_schema can still return malformed JSON.
+
+    The wrapper should classify that as output-side overflow/deviation,
+    split the batch, and preserve sibling verdicts instead of DLQ'ing
+    the whole customer.
+    """
+    monkeypatch.setattr(
+        "services.synthesis.providers.WIKI_TRIAGE_MODEL",
+        "gemini-3.5-flash",
+    )
+    events = [_ev(i) for i in range(4)]
+    fake = _patch_shared_acompletion(
+        monkeypatch,
+        [
+            _gemini_malformed_json_response(),
+            _gemini_success_response(events[:2]),
+            _gemini_success_response(events[2:]),
+        ],
+    )
+
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
+
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    assert fake.await_count == 3
 
 
 # ---------------------------------------------------------------------------

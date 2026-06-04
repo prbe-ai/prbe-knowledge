@@ -20,6 +20,7 @@ from services.synthesis.models import TriageInput
 from services.synthesis.providers import (
     TriageParseError,
     _AnthropicTriage,
+    _GeminiTriage,
     get_triage_provider,
 )
 
@@ -54,14 +55,12 @@ def _tool_response(tool_name: str, payload: dict) -> SimpleNamespace:
 # ---------------------------------------------------------------------------
 
 
-def test_default_triage_provider_is_anthropic() -> None:
+def test_default_triage_provider_is_gemini() -> None:
     provider = get_triage_provider()
-    assert isinstance(provider, _AnthropicTriage)
+    assert isinstance(provider, _GeminiTriage)
 
 
 def test_triage_provider_dispatches_to_gemini_on_override() -> None:
-    from services.synthesis.providers import _GeminiTriage
-
     provider = get_triage_provider(model_override="gemini-3.1-flash-lite")
     assert isinstance(provider, _GeminiTriage)
 

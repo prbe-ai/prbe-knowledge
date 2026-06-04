@@ -594,6 +594,13 @@ _PARSE_OVERFLOW_REGEXES = (
     # recovery applies.
     re.compile(r"type=dict_type", re.IGNORECASE),
     re.compile(r"valid dictionary", re.IGNORECASE),
+    # Gemini structured-output calls occasionally return malformed JSON
+    # even with response_schema + application/json set. In production
+    # this surfaced as:
+    #   gemini response was not JSON: Expecting ',' delimiter ...
+    # Treat it like the other output-side overflow/deviation shapes:
+    # split the batch and retry instead of DLQ'ing every sibling row.
+    re.compile(r"gemini response was not JSON", re.IGNORECASE),
     # Belt-and-suspenders for TriageVerdict.reason length: the model
     # has a `field_validator(mode="before")` that truncates 240+ char
     # reasons before the constraint runs, so this regex should never
