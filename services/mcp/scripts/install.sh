@@ -5,7 +5,7 @@
 # Usage:
 #   curl -fsSL https://mcp.knowledge.prbe.ai/install | bash
 #
-# Idempotent: re-running skips whatever is already configured.
+# Idempotent: re-running skips current entries and updates stale URLs.
 
 set -euo pipefail
 
@@ -149,8 +149,19 @@ echo ""
 # 1. Claude Code
 # ---------------------------------------------------------------------------
 if command -v claude >/dev/null 2>&1; then
-    if claude mcp list 2>/dev/null | grep -qE "^[[:space:]]*${MCP_NAME}([[:space:]]|:)"; then
-        yellow "✓ Claude Code: '$MCP_NAME' already configured (skipping)"
+    claude_probe="$(claude mcp get "$MCP_NAME" 2>/dev/null || true)"
+    if printf "%s" "$claude_probe" | grep -qF "$MCP_URL"; then
+        yellow "✓ Claude Code: '$MCP_NAME' already points at $MCP_URL (skipping)"
+    elif [ -n "$claude_probe" ]; then
+        dim "→ Updating Claude Code '$MCP_NAME' URL…"
+        if claude mcp remove "$MCP_NAME" >/dev/null 2>&1 \
+            && claude mcp add -s user --transport http "$MCP_NAME" "$MCP_URL" >/dev/null 2>&1; then
+            green "✓ Claude Code: updated '$MCP_NAME' to $MCP_URL"
+        else
+            red   "✗ Claude Code: couldn't update '$MCP_NAME' — try manually:"
+            echo  "    claude mcp remove $MCP_NAME"
+            echo  "    claude mcp add -s user --transport http $MCP_NAME $MCP_URL"
+        fi
     else
         # Pre-message so the user sees something while `claude mcp add`
         # runs. We print on its own line and don't overwrite — the add
@@ -179,8 +190,19 @@ fi
 # 2. Codex — global config via `codex mcp add`
 # ---------------------------------------------------------------------------
 if command -v codex >/dev/null 2>&1; then
-    if codex mcp get "$MCP_NAME" >/dev/null 2>&1; then
-        yellow "✓ Codex: '$MCP_NAME' already configured (skipping)"
+    codex_probe="$(codex mcp get "$MCP_NAME" 2>/dev/null || true)"
+    if printf "%s" "$codex_probe" | grep -qF "$MCP_URL"; then
+        yellow "✓ Codex: '$MCP_NAME' already points at $MCP_URL (skipping)"
+    elif [ -n "$codex_probe" ]; then
+        dim "→ Updating Codex '$MCP_NAME' URL…"
+        if codex mcp remove "$MCP_NAME" >/dev/null 2>&1 \
+            && codex mcp add "$MCP_NAME" --url "$MCP_URL" >/dev/null 2>&1; then
+            green "✓ Codex: updated '$MCP_NAME' to $MCP_URL"
+        else
+            red   "✗ Codex: couldn't update '$MCP_NAME' — try manually:"
+            echo  "    codex mcp remove $MCP_NAME"
+            echo  "    codex mcp add $MCP_NAME --url $MCP_URL"
+        fi
     else
         dim "→ Adding to Codex…"
         if codex mcp add "$MCP_NAME" --url "$MCP_URL" >/dev/null 2>&1; then
@@ -252,9 +274,39 @@ PY
     return 1
 }
 
+_cursor_probe_url() {
+    local cfg="$1" name="$2"
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$cfg" "$name" <<'PY' 2>/dev/null
+import json, pathlib, sys
+
+cfg_path, name = sys.argv[1], sys.argv[2]
+cfg = json.loads(pathlib.Path(cfg_path).read_text() or "{}")
+server = cfg.get("mcpServers", {}).get(name)
+if not isinstance(server, dict):
+    raise SystemExit(1)
+url = server.get("url")
+if not isinstance(url, str):
+    raise SystemExit(1)
+print(url)
+PY
+}
+
 if [ -d "$CURSOR_DIR" ]; then
     if [ -f "$CURSOR_CFG" ] && grep -q "\"$MCP_NAME\"[[:space:]]*:" "$CURSOR_CFG" 2>/dev/null; then
-        yellow "✓ Cursor: '$MCP_NAME' already in $CURSOR_CFG (skipping)"
+        cursor_probe_url="$(_cursor_probe_url "$CURSOR_CFG" "$MCP_NAME" || true)"
+        if [ "$cursor_probe_url" = "$MCP_URL" ]; then
+            yellow "✓ Cursor: '$MCP_NAME' already points at $MCP_URL (skipping)"
+        elif prompt_yn "Update existing Probe entry in Cursor's global config (~/.cursor/mcp.json)?"; then
+            if _merge_cursor_config "$CURSOR_CFG" "$MCP_NAME" "$MCP_URL"; then
+                green "✓ Cursor: updated '$MCP_NAME' in $CURSOR_CFG"
+            else
+                yellow "! Cursor: couldn't auto-update $CURSOR_CFG (python3 missing or JSON parse failed). Set this entry under \"mcpServers\":"
+                echo  "      \"$MCP_NAME\": { \"url\": \"$MCP_URL\" }"
+            fi
+        else
+            dim "· Cursor: skipped existing '$MCP_NAME' update (you said no)"
+        fi
     elif prompt_yn "Add Probe to Cursor's global config (~/.cursor/mcp.json)?"; then
         if [ -f "$CURSOR_CFG" ]; then
             # Existing config — merge atomically via python3 so other
