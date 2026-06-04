@@ -56,6 +56,22 @@ def _bearer_token(request: Request) -> str | None:
     return token or None
 
 
+def _oauth_challenge_headers(
+    settings: Settings, *, error: str | None = None
+) -> dict[str, str]:
+    resource_metadata = (
+        f"{settings.mcp_oauth_audience.rstrip('/')}/.well-known/oauth-protected-resource"
+    )
+    params = [
+        'realm="mcp"',
+        f'resource_metadata="{resource_metadata}"',
+        'scope="mcp:read"',
+    ]
+    if error:
+        params.append(f'error="{error}"')
+    return {"WWW-Authenticate": "Bearer " + ", ".join(params)}
+
+
 class McpAuthMiddleware(BaseHTTPMiddleware):
     """Gates /mcp/* requests. Branches on Settings.resolved_auth_mode:
     `oauth` (JWT primary + internal-key fallback) or `static` (shared bearer)."""
@@ -86,7 +102,11 @@ class McpAuthMiddleware(BaseHTTPMiddleware):
             try:
                 access_claims = await verify_access_token(bearer)
             except JwtAuthError as exc:
-                return JSONResponse({"detail": str(exc)}, status_code=401)
+                return JSONResponse(
+                    {"detail": str(exc)},
+                    status_code=401,
+                    headers=_oauth_challenge_headers(settings, error="invalid_token"),
+                )
             customer_token = current_customer.set(access_claims.customer_id)
             try:
                 return await call_next(request)
@@ -108,15 +128,10 @@ class McpAuthMiddleware(BaseHTTPMiddleware):
             finally:
                 current_customer.reset(token)
 
-        resource_metadata = (
-            f"{settings.mcp_oauth_audience.rstrip('/')}/.well-known/oauth-protected-resource"
-        )
         return JSONResponse(
             {"detail": "missing or invalid auth"},
             status_code=401,
-            headers={
-                "WWW-Authenticate": f'Bearer resource_metadata="{resource_metadata}"'
-            },
+            headers=_oauth_challenge_headers(settings),
         )
 
     async def _dispatch_static(
