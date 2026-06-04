@@ -620,6 +620,11 @@ _PARSE_OVERFLOW_REGEXES = (
     # Treat it like the other output-side overflow/deviation shapes:
     # split the batch and retry instead of DLQ'ing every sibling row.
     re.compile(r"gemini response was not JSON", re.IGNORECASE),
+    # Gemini 3 can hang on long structured-output calls. The provider
+    # helper enforces a transport timeout; treat that like output-side
+    # pressure so split-retry narrows the batch instead of DLQ'ing it.
+    re.compile(r"gemini call timed out", re.IGNORECASE),
+    re.compile(r"upstream timeout", re.IGNORECASE),
     # Belt-and-suspenders for TriageVerdict.reason length: the model
     # has a `field_validator(mode="before")` that truncates 240+ char
     # reasons before the constraint runs, so this regex should never

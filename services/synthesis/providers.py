@@ -24,6 +24,7 @@ survives — LiteLLM forwards it on Anthropic provider calls.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 from typing import Any, Protocol
@@ -49,6 +50,8 @@ from shared.llm_tools import ToolCallParseError, forced_tool_call
 from shared.logging import get_logger
 
 log = get_logger(__name__)
+
+GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +320,18 @@ def _thinking_budget_for(model: str) -> int:
     return 0
 
 
+def _gemini_temperature_for(model: str) -> float:
+    """Return a Gemini sampling value compatible with the model family.
+
+    Gemini 3 models can stall when temperature is forced below 1.0. Older
+    Gemini generations keep the deterministic setting used by the evals.
+    """
+    name = model.lower()
+    if name.startswith("gemini-3"):
+        return 1.0
+    return 0.0
+
+
 async def _gemini_call_json(
     *,
     model: str,
@@ -338,9 +353,10 @@ async def _gemini_call_json(
         the eval harness's call shape, so the eval's quality numbers
         actually predict production quality.
 
-      * `temperature=0.0` for determinism. Default Gemini temperature
-        (~1.0) adds run-to-run variance that hurts the deterministic
-        regen contract for directed-vector phrases.
+      * `temperature` follows `_gemini_temperature_for`. Gemini 3 models
+        need the provider default (1.0) to avoid long-running/stalled
+        generations; older Gemini models keep the deterministic setting
+        used by the evals.
 
       * `response_schema=<sanitized JSON Schema>` is forwarded to
         Gemini as the structured-output spec via LiteLLM's
@@ -375,13 +391,22 @@ async def _gemini_call_json(
     from shared.llm import acompletion
 
     try:
-        resp = await acompletion(
-            model=_gemini_litellm_model(model),
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            **extra_kwargs,
+        resp = await asyncio.wait_for(
+            acompletion(
+                model=_gemini_litellm_model(model),
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=_gemini_temperature_for(model),
+                timeout=GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS,
+                **extra_kwargs,
+            ),
+            timeout=GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS,
         )
+    except TimeoutError as exc:
+        raise RuntimeError(
+            "gemini call timed out after "
+            f"{GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS:.0f}s"
+        ) from exc
     except LLMError as exc:
         # Preserve the pre-migration exception shape callers expect
         # (the call sites wrap this in a domain-specific *ParseError).
