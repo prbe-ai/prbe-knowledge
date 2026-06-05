@@ -1,8 +1,16 @@
 """JWKS fetch + JWT verify against the api.knowledge.prbe.ai issuer.
 
 Mirrors prbe-backend's pattern: fetch JWKS once, cache by `kid`, refresh on
-unknown-kid or TTL expiry. Validates iss/aud/exp; returns a tiny dataclass
-of the claims we care about (sub = customer_id).
+unknown-kid or TTL expiry. Validates iss/aud and (when present) exp; returns a
+tiny dataclass of the claims we care about (sub = customer_id).
+
+The issuer issues non-expiring access tokens by default (no `exp` claim) so MCP
+clients treat them as long-lived and never need the refresh grant — which in
+practice neither Claude Code nor Codex perform. `exp` is therefore optional
+here: tokens that still carry one are honoured (rejected once past), tokens
+without one never expire. There is no per-token revocation for a non-expiring
+token — the only kill switch is issuer signing-key (kid) rotation, which drops
+every outstanding token at once.
 """
 
 from __future__ import annotations
@@ -28,7 +36,7 @@ class AccessClaims:
     user_id: str
     client_id: str
     scope: str
-    expires_at: int
+    expires_at: int | None  # None for non-expiring tokens (no `exp` claim)
 
 
 _jwks_cache: dict[str, PyJWK] = {}
@@ -80,13 +88,15 @@ async def verify_access_token(token: str) -> AccessClaims:
         raise JwtAuthError("jwt missing kid")
     key = await _key_for(kid)
     try:
+        # `exp` is not required (the issuer mints non-expiring tokens by
+        # default); pyjwt still rejects an `exp` that IS present and past.
         claims: dict[str, Any] = pyjwt.decode(
             token,
             key.key,
             algorithms=["ES256"],
             issuer=settings.mcp_oauth_issuer,
             audience=settings.mcp_oauth_audience,
-            options={"require": ["exp", "iss", "aud", "sub"]},
+            options={"require": ["iss", "aud", "sub"]},
         )
     except pyjwt.InvalidTokenError as exc:
         raise JwtAuthError(f"invalid jwt: {exc}") from exc
@@ -95,12 +105,12 @@ async def verify_access_token(token: str) -> AccessClaims:
     client_id = claims.get("client_id")
     scope = claims.get("scope") or "mcp:read"
     exp = claims.get("exp")
-    if not (sub and user_id and client_id and exp):
-        raise JwtAuthError("jwt missing required claims (sub, user_id, client_id, exp)")
+    if not (sub and user_id and client_id):
+        raise JwtAuthError("jwt missing required claims (sub, user_id, client_id)")
     return AccessClaims(
         customer_id=str(sub),
         user_id=str(user_id),
         client_id=str(client_id),
         scope=str(scope),
-        expires_at=int(exp),
+        expires_at=int(exp) if exp is not None else None,
     )
