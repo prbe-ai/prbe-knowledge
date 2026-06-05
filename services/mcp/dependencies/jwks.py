@@ -37,6 +37,7 @@ class AccessClaims:
     client_id: str
     scope: str
     expires_at: int | None  # None for non-expiring tokens (no `exp` claim)
+    session_id: str | None  # `sid` — auth session for the per-request revocation check
 
 
 _jwks_cache: dict[str, PyJWK] = {}
@@ -105,6 +106,7 @@ async def verify_access_token(token: str) -> AccessClaims:
     client_id = claims.get("client_id")
     scope = claims.get("scope") or "mcp:read"
     exp = claims.get("exp")
+    sid = claims.get("sid")
     if not (sub and user_id and client_id):
         raise JwtAuthError("jwt missing required claims (sub, user_id, client_id)")
     return AccessClaims(
@@ -113,4 +115,5 @@ async def verify_access_token(token: str) -> AccessClaims:
         client_id=str(client_id),
         scope=str(scope),
         expires_at=int(exp) if exp is not None else None,
+        session_id=str(sid) if sid else None,
     )

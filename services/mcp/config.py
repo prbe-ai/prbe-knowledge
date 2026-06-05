@@ -81,6 +81,31 @@ class Settings(BaseSettings):
         description="X-Internal-Knowledge-Key sent to prbe-knowledge",
     )
 
+    # ---- Revocation check (oauth mode) ------------------------------------
+    # Access tokens are non-expiring, so the issuer can't claw them back. We
+    # enforce revocation here: on each request, ask prbe-backend whether the
+    # token's `sid` session is still alive. Reuses the BACKEND_BASE_URL the MCP
+    # service is already given (same host it fetches JWKS from).
+    #
+    # Gated behind an explicit flag (default OFF) so the check is dormant until
+    # deliberately enabled — decoupled from BACKEND_BASE_URL (which is already
+    # populated in managed). This lets the code roll out with zero behavior
+    # change, then enforcement is switched on via config once the issuer is
+    # confirmed deployed and tokens carry `sid`. Managed-shared sets it "true"
+    # in the chart configmap; community/static self-host leaves it off.
+    mcp_revocation_check_enabled: bool = Field(
+        default=False,
+        description="Enable the per-request session-liveness (revocation) check. Off by default.",
+    )
+    backend_base_url: str = Field(
+        default="",
+        description="prbe-backend in-cluster base URL for /oauth/introspect (BACKEND_BASE_URL). Empty also disables the revocation check.",
+    )
+    revocation_check_timeout_s: float = Field(
+        default=3.0,
+        description="HTTP timeout for the per-request session-liveness check; fail-closed (reject) on timeout/error",
+    )
+
     @property
     def resolved_auth_mode(self) -> str:
         """The effective auth mode after applying the auto rule.
