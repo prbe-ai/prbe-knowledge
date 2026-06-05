@@ -31,6 +31,7 @@ from starlette.types import ASGIApp
 
 from services.mcp.config import Settings, get_settings
 from services.mcp.dependencies.jwks import JwtAuthError, verify_access_token
+from services.mcp.dependencies.revocation import assert_session_active
 
 current_customer: ContextVar[str] = ContextVar("current_customer")
 
@@ -101,6 +102,10 @@ class McpAuthMiddleware(BaseHTTPMiddleware):
         if bearer is not None:
             try:
                 access_claims = await verify_access_token(bearer)
+                # Non-expiring tokens can't be revoked by the issuer; enforce
+                # session-liveness here so a dashboard revoke takes effect on
+                # the next request. Fail-closed (see revocation module).
+                await assert_session_active(access_claims, settings)
             except JwtAuthError as exc:
                 return JSONResponse(
                     {"detail": str(exc)},
