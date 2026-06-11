@@ -75,7 +75,7 @@ def _flog(m):
     try:
         with open(LOGF, "a") as f:
             f.write(m + "\n")
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
@@ -103,7 +103,7 @@ async def _proxy(request):
     mode = STATE["mode"]
     try:
         model = (json.loads(body).get("model") if body else None)
-    except Exception:  # noqa: BLE001
+    except Exception:
         model = None
 
     key = _key(path, body)
