@@ -60,10 +60,17 @@ if [ "${REPLAY_ENABLED:-0}" = "1" ]; then
   export LLM_GATEWAY_URL="http://127.0.0.1:${REPLAY_PORT}"
   echo "[entrypoint] replay proxy ON (mode=${REPLAY_MODE}): product -> ${LLM_GATEWAY_URL} -> ${REPLAY_UPSTREAM_URL}"
   python /app/sandbox/replay_proxy.py &
+  _replay_up=0
   for _i in $(seq 1 120); do
-    if (exec 3<>/dev/tcp/127.0.0.1/"${REPLAY_PORT}") 2>/dev/null; then exec 3>&-; echo "[entrypoint] replay proxy up"; break; fi
+    if (exec 3<>/dev/tcp/127.0.0.1/"${REPLAY_PORT}") 2>/dev/null; then exec 3>&-; _replay_up=1; echo "[entrypoint] replay proxy up"; break; fi
     sleep 0.5
   done
+  # FAIL LOUD: LLM_GATEWAY_URL is already repointed at the proxy, so a never-started proxy would make
+  # every product LLM call hit a dead port and SILENTLY score a broken grade. Refuse to boot instead.
+  if [ "$_replay_up" != "1" ]; then
+    echo "[entrypoint] FATAL: replay proxy never came up on 127.0.0.1:${REPLAY_PORT}" >&2
+    exit 1
+  fi
 fi
 
 # --workers 1: one uvicorn + the embedded PG fit the sandbox resource box and keep
