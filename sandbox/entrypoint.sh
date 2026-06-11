@@ -48,6 +48,31 @@ elif [ -f /app/sandbox/dev_corpus.sql ]; then
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -f /app/sandbox/dev_corpus.sql
 fi
 
+# --- HELD-OUT eval infra: record/replay LLM proxy (sandbox/, agents cannot edit) ---
+# REPLAY_ENABLED=1 routes every product LLM call through sandbox/replay_proxy.py, so the grader's
+# replay pass returns cached responses at a TOKEN/BYTE-AWARE synthetic delay -> request wall-clock =
+# deterministic code path, zero LLM serving variance, and a wider/padded candidate pays real latency.
+# Gated + backward-compatible: unset -> the product talks to the gateway directly (unchanged).
+if [ "${REPLAY_ENABLED:-0}" = "1" ]; then
+  export REPLAY_UPSTREAM_URL="${LLM_GATEWAY_URL:?REPLAY_ENABLED requires LLM_GATEWAY_URL}"
+  export REPLAY_PORT="${REPLAY_PORT:-8900}"
+  export REPLAY_MODE="${REPLAY_MODE:-auto}"   # auto = record-on-miss / replay-on-hit; one mode all grade
+  export LLM_GATEWAY_URL="http://127.0.0.1:${REPLAY_PORT}"
+  echo "[entrypoint] replay proxy ON (mode=${REPLAY_MODE}): product -> ${LLM_GATEWAY_URL} -> ${REPLAY_UPSTREAM_URL}"
+  python /app/sandbox/replay_proxy.py &
+  _replay_up=0
+  for _i in $(seq 1 120); do
+    if (exec 3<>/dev/tcp/127.0.0.1/"${REPLAY_PORT}") 2>/dev/null; then exec 3>&-; _replay_up=1; echo "[entrypoint] replay proxy up"; break; fi
+    sleep 0.5
+  done
+  # FAIL LOUD: LLM_GATEWAY_URL is already repointed at the proxy, so a never-started proxy would make
+  # every product LLM call hit a dead port and SILENTLY score a broken grade. Refuse to boot instead.
+  if [ "$_replay_up" != "1" ]; then
+    echo "[entrypoint] FATAL: replay proxy never came up on 127.0.0.1:${REPLAY_PORT}" >&2
+    exit 1
+  fi
+fi
+
 # --workers 1: one uvicorn + the embedded PG fit the sandbox resource box and keep
 # logs legible (prod uses 4 — services/retrieval/Dockerfile:28). `::` = dual-stack.
 exec uvicorn services.retrieval.main:app --host :: --port 8081 --workers 1
