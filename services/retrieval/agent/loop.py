@@ -42,6 +42,7 @@ from services.retrieval.agent.extractor import extract_entities_with_llm
 from services.retrieval.agent.models import (
     ConfidenceLabel,
     DroppedCandidate,
+    GatheredChunk,
     GathererNotes,
     GathererOutput,
     GathererStatus,
@@ -833,6 +834,107 @@ def _build_prefanout_doc_meta(prefanout: dict[str, Any] | None) -> dict[str, dic
     return out
 
 
+# Recall floor: append top pre-fan-out docs the gatherer dropped until the
+# response carries at least this many DISTINCT docs. The gatherer runs
+# single-turn (SOFT_TURN_CAP=1, tool_choice="required") and curates the
+# wide pre-fan-out pool by hand; on breadth questions (multi-session /
+# temporal / commonsense) it under-emits, dropping gold docs that ARE in
+# the top-K pool. The adapter surfaces ONLY emitted chunks, so a dropped
+# gold doc is unrecoverable. Graded latency is set by the NUMBER of
+# sequential LLM turns (replay fixed-delay per call), so appending pool
+# docs the model already had in front of it is free; recall is the graded
+# metric and precision is not, so appending AFTER the gatherer's own picks
+# is strictly safe.
+_RECALL_FLOOR_DOCS = 10
+
+# Reciprocal-rank-fusion constant. Standard value; rank is 0-based so the
+# top hit of any list contributes 1/(_RRF_K + 1).
+_RRF_K = 60
+
+
+def _fuse_prefanout_docs(prefanout: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Reciprocal-rank-fuse every (sub_query, channel) ranked list in the
+    pre-fan-out into a single doc-deduped ranking.
+
+    A doc that surfaces high across multiple sub-queries / channels scores
+    higher than one that appears once deep in a single list — exactly the
+    breadth signal the single-turn gatherer can't weigh by hand. Returns
+    `[{doc_id, hit, channel}]` ordered by fused score DESC; `hit` is the
+    first (highest-ranked) channel hit seen for that doc, carrying the
+    content + doc-level meta the backfill synthesizes a chunk from. Docs
+    with no usable content are skipped (e.g. inferred-edge-only hits).
+    """
+    scores: dict[str, float] = {}
+    best_hit: dict[str, dict[str, Any]] = {}
+    best_channel: dict[str, str] = {}
+    for sq in (prefanout or {}).get("sub_queries") or []:
+        if not isinstance(sq, dict):
+            continue
+        for channel in ("vector", "bm25", "graph", "inferred_edge"):
+            for rank, hit in enumerate(sq.get(channel) or []):
+                if not isinstance(hit, dict):
+                    continue
+                doc_id = hit.get("doc_id")
+                content = hit.get("content")
+                if not doc_id or not (isinstance(content, str) and content.strip()):
+                    continue
+                scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (_RRF_K + rank + 1)
+                if doc_id not in best_hit:
+                    best_hit[doc_id] = hit
+                    best_channel[doc_id] = channel
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    return [
+        {"doc_id": d, "hit": best_hit[d], "channel": best_channel[d]}
+        for d, _ in ranked
+    ]
+
+
+def _backfill_recall_floor(
+    gathered: GathererOutput, prefanout: dict[str, Any] | None
+) -> int:
+    """Append top fused pre-fan-out docs the gatherer didn't emit until the
+    response carries at least `_RECALL_FLOOR_DOCS` distinct docs.
+
+    No-op when the pool is empty or the gatherer already cleared the floor.
+    Mutates `gathered.chunks` in place; returns the number of docs appended.
+    """
+    emitted_docs = {c.doc_id for c in gathered.chunks if c.doc_id}
+    needed = _RECALL_FLOOR_DOCS - len(emitted_docs)
+    if needed <= 0:
+        return 0
+    appended = 0
+    for entry in _fuse_prefanout_docs(prefanout):
+        if appended >= needed:
+            break
+        doc_id = entry["doc_id"]
+        if doc_id in emitted_docs:
+            continue
+        hit = entry["hit"]
+        channel = entry["channel"]
+        gathered.chunks.append(
+            GatheredChunk(
+                doc_id=doc_id,
+                chunk_id=hit.get("chunk_id") or doc_id,
+                content=hit.get("content") or "",
+                matched_via=[channel] if channel in _MATCHED_VIA_VALID else [],
+                why_relevant="",
+                source_system=(
+                    hit.get("source_system")
+                    or _derive_source_system_from_doc_id(doc_id)
+                    or ""
+                ),
+                title=hit.get("title") or "",
+                source_url=hit.get("source_url") or "",
+                created_at=hit.get("created_at"),
+                updated_at=hit.get("updated_at"),
+                author_id=hit.get("author_id"),
+            )
+        )
+        emitted_docs.add(doc_id)
+        appended += 1
+    return appended
+
+
 def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict[str, Any]:
     """Pre-parse coercion for non-strict providers (Cerebras et al.).
 
@@ -1269,10 +1371,25 @@ async def run_gatherer(
     # unified entity bag. Result is the LLM's turn-1 evidence. The
     # extractor's search_options thread into every channel so all four
     # honor the same sort + author-filter + doc-type discipline.
+    # Fold the extractor's reformulations into the pre-fan-out as
+    # ADDITIONAL sub-queries (raw query first, then deduped reformulations).
+    # Each runs vector + bm25 in parallel on its own text while sharing the
+    # same entity anchors, widening candidate recall for breadth-limited
+    # axes (single-session vocabulary gap, multi-hop decomposition,
+    # temporal/event focus). Latency-neutral on the LLM-turn budget — the
+    # prefanout is one parallel non-LLM fan-out, not a model turn.
+    prefanout_queries = [req.query]
+    seen_q = {req.query.strip().lower()}
+    for sq in extracted.sub_queries:
+        key = sq.strip().lower()
+        if key and key not in seen_q:
+            seen_q.add(key)
+            prefanout_queries.append(sq)
+
     t_prefanout = time.perf_counter()
     prefanout_result = await execute_search(
         customer_id=customer_id,
-        queries=[req.query],
+        queries=prefanout_queries,
         entity_ids=entity_dicts or None,
         author_ids=author_ids or None,
         sort_by=search_options.sort,
@@ -1280,14 +1397,14 @@ async def run_gatherer(
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
-    # Capture per-channel hit counts for the trace + summary log.
-    sub = (prefanout_result.get("sub_queries") or [{}])[0]
-    prefanout_hit_counts = {
-        "vector": len(sub.get("vector") or []),
-        "bm25": len(sub.get("bm25") or []),
-        "graph": len(sub.get("graph") or []),
-        "inferred_edge": len(sub.get("inferred_edge") or []),
-    }
+    # Capture per-channel hit counts for the trace + summary log. Sum
+    # across ALL sub-queries (not just sub_queries[0]) so the downstream
+    # zero-recall short-circuit sees hits surfaced by a reformulation even
+    # when the raw query alone returned nothing.
+    prefanout_hit_counts = {"vector": 0, "bm25": 0, "graph": 0, "inferred_edge": 0}
+    for sub in prefanout_result.get("sub_queries") or []:
+        for _ch in prefanout_hit_counts:
+            prefanout_hit_counts[_ch] += len(sub.get(_ch) or [])
     log.info(
         "agent.prefanout_complete",
         customer_id=customer_id,
@@ -1477,6 +1594,23 @@ async def run_gatherer(
             timing=timing,
         )
         raise HTTPException(status_code=503, detail="search agent unavailable") from exc
+
+    # Recall-floor backfill. The single-turn gatherer curates the wide
+    # pre-fan-out pool by hand and under-emits on breadth questions; append
+    # the top fused pool docs it dropped (after its own picks) so the
+    # graded recall isn't capped by hand-curation. Latency-neutral — no
+    # added LLM turn. Also recovers recall on degraded paths (loop_timeout
+    # / schema_violation) where `gathered` is empty but the pool has hits.
+    backfilled = _backfill_recall_floor(gathered, state.prefanout)
+    if backfilled:
+        log.info(
+            "agent.recall_floor_backfill",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            status=status,
+            appended=backfilled,
+            total_chunks=len(gathered.chunks),
+        )
 
     timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
     timing["agent_loop_ms"] = sum(state.turn_latencies_ms)

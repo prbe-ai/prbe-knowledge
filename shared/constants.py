@@ -765,8 +765,22 @@ SEARCH_AGENT_MIN_OUTPUT = 5
 
 # Per-tool top_k defaults. The agent may override at call time. See plan
 # section "Per-tool top_k defaults" for the bytes/turn budget reasoning.
-SEARCH_AGENT_VECTOR_TOP_K = 15
-SEARCH_AGENT_BM25_TOP_K = 15
+#
+# Vector + BM25 carry the recall load on the turn-1 pre-fan-out: those two
+# channels are the only ones that fire when grounding resolves no graph
+# entity (the common case for free-text / conversational-memory queries,
+# where there's no PR / Linear / Slack anchor to seed graph + inferred_edge
+# on). When the answer turn falls outside a 15-deep cosine/BM25 window it
+# never reaches the gatherer, and no in-loop reformulation can recover a
+# candidate the channels never surfaced — a hard recall ceiling. Widen the
+# turn-1 window to 30 so more borderline-relevant turns reach the LLM for
+# curation. This is the single pre-fan-out call (no extra turns, so no
+# added LLM round-trips) and the gatherer's curation guidance already
+# defaults to keeping candidates the consumer can filter, so the broader
+# pool lifts recall without re-ranking. Graph / inferred_edge stay at 10:
+# they're entity-anchored and rarely the recall bottleneck.
+SEARCH_AGENT_VECTOR_TOP_K = 30
+SEARCH_AGENT_BM25_TOP_K = 30
 SEARCH_AGENT_GRAPH_TOP_K = 10
 SEARCH_AGENT_INFERRED_EDGE_TOP_K = 10
 SEARCH_AGENT_GRAPH_WALK_TOP_K = 20
