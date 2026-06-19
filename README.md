@@ -94,6 +94,56 @@ Full design: [docs/phase0-design.md](docs/phase0-design.md) ·
 storage/data flow: [docs/storage-architecture.md](docs/storage-architecture.md) ·
 how retrieval works: [docs/retrieval-architecture.md](docs/retrieval-architecture.md).
 
+## Retrieval quality
+
+The agent retrieval path (`/retrieve`) is measured against a held-out
+conversational-memory benchmark — a blend of LongMemEval, LoCoMo, and two
+in-house graph suites (`gbrain`, `relational`) — scored as **macro-averaged
+recall@10** across 12 axes.
+
+A recent pass with our automated optimization harness (`auto-research`) lifted
+macro-avg recall@10 from **0.412 → 0.689** (+0.28 absolute, ~67% relative) by
+stacking four changes on the gatherer:
+
+1. **Wider candidate window** — vector + BM25 top-k 15 → 30 (the two channels
+   that carry recall when a query has no graph entity to anchor on).
+2. **Multi-query fan-out** — the extractor proposes up to 3 complementary
+   reformulations (multi-hop decomposition, source-vocabulary rephrasing,
+   temporal/event focus) that run alongside the raw query in one pre-fan-out.
+3. **RRF recall-floor backfill** — every `(sub-query × channel)` ranked list is
+   reciprocal-rank-fused, and the top fused docs the single-turn gatherer
+   dropped are appended until ≥10 distinct docs reach the consumer.
+4. **Recall-first curation** — the gatherer is prompted to emit every
+   plausibly-relevant turn, especially across multiple sessions and over time.
+
+These are **latency-neutral**: on this path the gatherer LLM *is* the reranker
+(raw channel hits go straight into its prompt), and graded latency is set by the
+number of sequential LLM turns — so widening the single-turn candidate pool adds
+no round-trips.
+
+![Retrieval recall@10 by axis: baseline vs optimized](docs/img/retrieval-optimization.png)
+
+| Axis | Baseline | Optimized | Δ |
+|---|--:|--:|--:|
+| **Macro-avg (combined)** | **0.412** | **0.689** | **+0.277** |
+| LongMemEval · single-session-preference | 0.188 | 0.875 | +0.688 |
+| LongMemEval · temporal-reasoning | 0.094 | 0.708 | +0.615 |
+| LongMemEval · multi-session | 0.458 | 0.833 | +0.375 |
+| LoCoMo · multi-hop | 0.229 | 0.576 | +0.347 |
+| LongMemEval · knowledge-update | 0.469 | 0.812 | +0.344 |
+| LoCoMo · temporal | 0.333 | 0.667 | +0.333 |
+| LoCoMo · commonsense | 0.042 | 0.292 | +0.250 |
+| LoCoMo · single-hop | 0.333 | 0.583 | +0.250 |
+| LongMemEval · single-session-user | 0.250 | 0.438 | +0.188 |
+| gbrain · brainbench-cat13 | 0.800 | 0.830 | +0.030 |
+| LongMemEval · single-session-assistant | 1.000 | 1.000 | +0.000 |
+| relational · who-rel | 0.747 | 0.657 | −0.090 |
+
+Gains concentrate on the weak conversational-memory axes. The one regression
+(`relational/who-rel`, −0.09) is a deliberate trade — broader recall for
+slightly lower precision on an already-strong, entity-anchored axis. (Macro-avg
+nDCG@10 also rose, 0.459 → 0.556.)
+
 ## Repo layout
 
 ```
