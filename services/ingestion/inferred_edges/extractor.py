@@ -59,7 +59,7 @@ log = get_logger(__name__)
 # Maximum output tokens from the LLM for the edge-extraction call.
 _MAX_OUTPUT_TOKENS = 4096
 
-# Rate-limit backoff. The first backfill on probe-founders dropped 1383/3257
+# Rate-limit backoff. The first backfill on acme dropped 1383/3257
 # bundles (42%) when 64 concurrent extractors blew through Haiku's per-minute
 # rate limit. Without backoff, a single attempt fails -> bundle marked failed
 # -> queue worker retries on next claim, but the rate-limit window persists

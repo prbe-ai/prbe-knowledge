@@ -9,7 +9,7 @@ arbitrary heap-scan order and fusion's RRF would weight an arbitrary
 neighbor highest.
 
 The sort is unconditional: prior to this PR it was gated behind a feature
-flag (SURPRISE_SCORE_ENABLED). Empirical 4-run A/B on probe-founders proved
+flag (SURPRISE_SCORE_ENABLED). Empirical 4-run A/B on acme proved
 the always-on path is safe and strictly better than heap-scan order. The
 flag was deleted; this file pins the always-on contract.
 """

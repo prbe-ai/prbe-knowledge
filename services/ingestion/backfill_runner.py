@@ -327,7 +327,7 @@ async def run_backfill(
             # before writing more rows so we don't leave zombie R2 objects +
             # ingestion_queue entries for a now-disconnected source.
             #
-            # Per-event check (added in #278): the probe-founders/github
+            # Per-event check (added in #278): the acme/github
             # incident saw a ~180ms race after disconnect, so checking once
             # per N events was too coarse. is_source_connected is one
             # indexed SELECT (~0.3ms) and short-circuits for non-OAuth

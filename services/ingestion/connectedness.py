@@ -4,7 +4,7 @@ Closes the race where a webhook / backfill drain / worker callback inserts
 into `ingestion_queue` between the moment a user clicks "disconnect" and the
 moment all in-flight tasks notice the integration is gone. Without the gate,
 those stragglers materialise documents for a source the user has already
-disconnected — exactly the probe-founders/github incident on 2026-05-15.
+disconnected — exactly the acme/github incident on 2026-05-15.
 """
 
 from __future__ import annotations

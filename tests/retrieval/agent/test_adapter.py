@@ -513,7 +513,7 @@ async def test_query_root_doc_id_picks_top_ranked_document() -> None:
         entities=[],
         chunks=[
             _ge("github:prbe-ai/prbe-knowledge:pr:328"),
-            _ge("claude_code:probe-founders:abc-123"),
+            _ge("claude_code:acme:abc-123"),
         ],
         gatherer_notes=GathererNotes(),
     )

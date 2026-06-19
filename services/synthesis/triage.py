@@ -119,7 +119,7 @@ PROMPT_OVERHEAD_TOKENS = 2_000
 # context. Drop it (caller DLQ's) rather than letting it poison the
 # pipeline.
 #
-# Lowered from 150_000 to 100_000 after probe-founders' first run
+# Lowered from 150_000 to 100_000 after acme' first run
 # exposed the failure mode: a single event of ~150K Anthropic tokens
 # on its own pushed a 1-event batch to 214K wire tokens because the
 # 1.30x ANTHROPIC_TOKEN_MULTIPLIER undershot. 100K leaves real room
@@ -261,7 +261,7 @@ TRIAGE_RECURSION_FAILED_REASON = "triage.recursion_failed"
 # output dict at the very last moment. The final-mile guard
 # synthesizes a rejection rather than letting the row dead-letter
 # as 'failed' with the misleading "no verdict from triage batch"
-# tombstone (production hot bug, probe-founders).
+# tombstone (production hot bug, acme).
 TRIAGE_FINAL_MILE_SYNTHESIS_REASON = "triage.final_mile_synthesis"
 
 
@@ -466,7 +466,7 @@ async def call_triage_with_split_retry(
             # branch (transient 5xx, network blip, unclassified parse
             # error) MUST NOT poison the sibling branch's verdicts or
             # bubble up — that's exactly the production failure mode
-            # this hardening targets (probe-founders, "no verdict from
+            # this hardening targets (acme, "no verdict from
             # triage batch").
             left_out = await _safe_recurse(client, left, now=now)
             right_out = await _safe_recurse(client, right, now=now)
@@ -530,7 +530,7 @@ async def call_triage_with_split_retry(
                 )
                 output = _merge_outputs(output, missing_out)
 
-    # Last-mile defense (production: probe-founders).
+    # Last-mile defense (production: acme).
     # Even after split-retry + partial-response recovery, if any input
     # qid is somehow STILL missing from output.verdicts (e.g. a
     # recursive call returned an output keyed on the wrong qid, a
@@ -570,7 +570,7 @@ async def _safe_recurse(
     unexpected exception by synthesizing rejection verdicts for every
     event the sub-call was supposed to cover.
 
-    Critical for probe-founders: a single recursive branch raising
+    Critical for acme: a single recursive branch raising
     a transient 5xx or network error MUST NOT bubble up and discard
     the sibling branch's already-collected verdicts. Instead we tag
     those events with `TRIAGE_RECURSION_FAILED_REASON` and let the

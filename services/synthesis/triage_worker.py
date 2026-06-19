@@ -222,7 +222,7 @@ class TriageWorker:
                 # see no verdict for them and call mark_for_retry, which
                 # churns through 3 attempts before dead-lettering as
                 # 'failed' with the misleading "no verdict from triage
-                # batch" tombstone (production hot bug, probe-founders
+                # batch" tombstone (production hot bug, acme
                 # 2026-05-08). The superseding version has its own queue
                 # row; this one is just stale.
                 input_qids = {ti.queue_id for ti in triage_inputs}

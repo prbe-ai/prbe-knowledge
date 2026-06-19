@@ -21,7 +21,7 @@ from shared.models import TemporalSpec, normalize_author_id
 log = get_logger(__name__)
 
 # Surprise score on graph hits is now unconditional. Empirical 4-run A/B on
-# probe-founders (3 flag-off baselines + 1 flag-on) showed flipping
+# acme (3 flag-off baselines + 1 flag-on) showed flipping
 # SURPRISE_SCORE_ENABLED produced zero ranking change beyond +/-0.001 jitter,
 # because graph's RRF contribution is bounded (1/(60+rank)) and flat
 # score=1.0 made the rank order arbitrary heap-scan order anyway.

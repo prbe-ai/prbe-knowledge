@@ -16,7 +16,7 @@ GeminiEmbedder writes in-place.
 Usage::
 
     .venv/bin/python -m scripts.backfill_graph_node_embeddings
-    .venv/bin/python -m scripts.backfill_graph_node_embeddings --customer probe-founders
+    .venv/bin/python -m scripts.backfill_graph_node_embeddings --customer acme
     .venv/bin/python -m scripts.backfill_graph_node_embeddings --dry-run
 
 Verify::

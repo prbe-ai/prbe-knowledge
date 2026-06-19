@@ -7,7 +7,7 @@ Create Date: 2026-05-03
 WHY
 ---
 Pre-handler-fix, every batch of a long-running Claude Code session
-opened a new SCD2 version of the session document. One willow-voice
+opened a new SCD2 version of the session document. One demo-tenant
 session accumulated 5+ versions, each carrying the entire transcript.
 Across all CC sessions: 1,726 superseded rows holding ~251 MB of
 redundant body data.

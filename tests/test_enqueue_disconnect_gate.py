@@ -1,6 +1,6 @@
 """Pre-insert gate: _enqueue must refuse when the source is disconnected.
 
-Covers the probe-founders/github incident (2026-05-15): a webhook handler
+Covers the acme/github incident (2026-05-15): a webhook handler
 raced the disconnect_integration DB transaction by ~180ms and wrote 9
 ingestion_queue rows for a source whose `integration_tokens` row had
 already been deleted. The new gate calls `is_source_connected` before

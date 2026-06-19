@@ -1,7 +1,7 @@
 """Regression tests for `pack_into_batches` token accounting.
 
 Pinned to the 2026-05 production incident where the packer's batches
-blew past Anthropic Haiku's 200K context limit on probe-founders. Root
+blew past Anthropic Haiku's 200K context limit on acme. Root
 cause: the packer counted only `documents.body_token_count` (cl100k_base
 from the chunker), but the wire request to Anthropic also includes:
 

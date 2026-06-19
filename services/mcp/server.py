@@ -171,7 +171,7 @@ async def search_knowledge(
             docs that connect to everything.
 
             Default to True for most queries against this corpus.
-            Empirically (post-anti-bonus, 6 paired probe-founders
+            Empirically (post-anti-bonus, 6 paired acme
             queries): 5/6 cases see canonical PRs/commits/Notion docs
             move into top-3 that focus mode buried at rank 6+ behind
             transcripts or wiki anchors. The 1 neutral case was already

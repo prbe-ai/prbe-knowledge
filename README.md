@@ -1,5 +1,9 @@
 # Probe knowledge engine
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](pyproject.toml)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
 Probe is a self-hosted knowledge engine. It ingests your team's activity from
 GitHub, Slack, Linear, Notion, Sentry, and custom sources; normalizes, chunks,
 and embeds it into Postgres; and serves hybrid retrieval (vector + keyword +
@@ -143,3 +147,20 @@ ships in-repo at `services/mcp/` (vendored from the former standalone
 
 Mode auto-resolves from the env (static when only `MCP_API_TOKEN` is set, oauth
 when a JWKS URL is set); set `MCP_AUTH_MODE` to force one.
+
+## Contributing & community
+
+- [Contributing](CONTRIBUTING.md) — dev setup, gates, PR norms.
+- [Code of Conduct](CODE_OF_CONDUCT.md) — expectations for participation.
+- [Security policy](SECURITY.md) — how to report a vulnerability privately.
+- [Changelog](CHANGELOG.md) — notable changes per release.
+
+## License
+
+[AGPL-3.0](LICENSE). Copyright © 2026 prbe-ai.
+
+This repository is the canonical engine and the open-source **community
+edition** — a single-tenant engine you run yourself. Probe's hosted
+multi-tenant control plane (per-tenant routing, gateway trust, usage
+metering) is intentionally dormant in this build, not removed; the
+community edition makes no calls out to Probe's hosted service.

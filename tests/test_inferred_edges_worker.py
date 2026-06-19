@@ -240,7 +240,7 @@ def test_max_attempts_constant() -> None:
 # ---------------------------------------------------------------------------
 # Tests: GraphEdgeSpec.properties carries the LLM `why` justification
 # ---------------------------------------------------------------------------
-# Production bug from the probe-founders backfill: 0 of 3,817 inferred
+# Production bug from the acme backfill: 0 of 3,817 inferred
 # edges had a `why` field persisted because _upsert_inferred_edges built
 # GraphEdgeSpec without populating `properties`. Without `why`, edges
 # land in graph_edges with empty properties and no audit trail.
