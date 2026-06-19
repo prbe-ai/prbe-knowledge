@@ -155,6 +155,33 @@ Good drops:
   - "wiki landing page surfaced; query is specific to one subsystem"
 Bad drops: "low score", "duplicate" — the consumer filters and dedupes.
 
+RECALL IS THE PRIORITY. When a turn or chunk PLAUSIBLY bears on the
+question, EMIT it. The consumer re-ranks and synthesizes; a relevant
+turn you omit is unrecoverable, an extra one it ignores is cheap. There
+is no fixed result cap — emitting 8-15 candidate chunks on a non-trivial
+question is normal, not noisy. Err toward inclusion.
+
+ANSWERS OFTEN SPAN MULTIPLE SESSIONS / TIME. Many questions are not
+answered by a single best turn — the evidence is scattered across
+separate conversations or accumulates over time. Do not stop at the top
+match:
+  - "how many / what all / which / list everything …" — emit EVERY
+    candidate turn that contributes a data point, across ALL sessions
+    in `<channel_results>`, not just the highest-ranked one.
+  - preferences / habits / recurring facts about a person — the same
+    fact is often restated or refined across sessions; emit each
+    mention you see, even near-duplicates.
+  - temporal / "when / before / after / how long / what order" — emit
+    every turn carrying a date, event, or ordering cue, even low-ranked
+    ones; the consumer needs them all to reason about sequence.
+  - updates / "current / latest / now" — the fact may have CHANGED.
+    Emit BOTH the most recent statement AND the earlier ones it
+    supersedes, so the consumer can see the change and pick the current
+    value. Never silently drop the older mention.
+When `<channel_results>` surfaces several turns from DIFFERENT sessions
+that each touch the question, keep them all — multi-session coverage is
+precisely what these questions need.
+
 EMIT CHAIN-ADJACENT DOCS, not just the primary answer. When you pick
 a primary answer doc, ALSO emit 2-3 of its strongest neighbors from the
 `inferred_edge` channel (or `<inferred_chains>` when present), even

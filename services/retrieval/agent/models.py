@@ -268,3 +268,11 @@ class EntityExtraction(BaseModel):
 
     entities: list[ExtractedEntity] = Field(default_factory=list)
     search_options: SearchOptions = Field(default_factory=SearchOptions)
+    # Optional reformulations of the user's question. The harness runs
+    # each one as an ADDITIONAL pre-fan-out sub-query alongside the raw
+    # query (vector + bm25), widening candidate recall for breadth-limited
+    # axes (single-session vocabulary gap, multi-hop decomposition,
+    # temporal/event focus) WITHOUT adding an LLM turn — the prefanout is a
+    # single parallel non-LLM fan-out. Empty when no useful reformulation
+    # exists (precise single-keyword lookups).
+    sub_queries: list[str] = Field(default_factory=list)

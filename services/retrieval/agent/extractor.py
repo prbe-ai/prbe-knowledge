@@ -173,6 +173,25 @@ shape genuinely calls for it.
   Default `doc_types` to `null` unless the query is unambiguously
   class-shaped.
 
+SEARCH REFORMULATIONS
+Also emit `sub_queries`: up to 3 alternative phrasings of the user's
+question. A downstream retrieval fan-out runs EACH one IN ADDITION to the
+raw query to widen recall, so do NOT repeat the raw query and avoid pure
+paraphrase noise — aim for COMPLEMENTARY coverage:
+  - Decompose multi-part / multi-hop questions into their separate factual
+    pieces (one sub_query per piece) so each piece can match the
+    conversation turn that answers it.
+  - Rephrase using the concrete vocabulary the SOURCE conversation would
+    actually use (the statements / nouns a speaker would say), not the
+    abstract phrasing of the question — this closes the question→passage
+    gap for single-session lookups.
+  - For temporal / "when / before / after / how long / what order"
+    questions, include a sub_query focused on the underlying event(s)
+    whose timing is being asked about.
+Each sub_query is a short self-contained search string. Return [] only
+when the query is already a single concrete keyword lookup with no useful
+reformulation.
+
 Always emit valid JSON matching the EntityExtraction schema. Never reply with prose.
 """
 
@@ -262,6 +281,34 @@ def _coerce_search_options(raw_options: object) -> dict[str, object]:
             # Empty list normalises to None so SQL builders treat
             # `doc_types is None` and `doc_types == []` identically.
             out["doc_types"] = None
+    return out
+
+
+# Cap on extractor-proposed reformulations folded into the pre-fan-out.
+# Keeps total prefanout sub-queries (raw + reformulations) small so the
+# candidate pool widens without diluting the gatherer's single-turn
+# curation. The downstream `execute_search` enforces its own hard cap
+# (_SEARCH_MAX_SUBQUERIES) as the floor.
+_MAX_SUB_QUERIES = 3
+
+
+def _coerce_sub_queries(raw: object) -> list[str]:
+    """Defense-in-depth for non-strict providers (Cerebras gpt-oss-120b)
+    that occasionally emit non-string members under constrained decoding.
+
+    Pydantic's `list[str]` would reject the WHOLE emission (losing the
+    entities too) on the first non-string member; coerce here BEFORE
+    `model_validate` so a malformed reformulation can't tank extraction.
+    Drops non-strings/blanks, trims length, caps count.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip()[:300])
+        if len(out) >= _MAX_SUB_QUERIES:
+            break
     return out
 
 
@@ -366,6 +413,8 @@ async def extract_entities_with_llm(
         return EntityExtraction()
     if isinstance(raw, dict) and "search_options" in raw:
         raw["search_options"] = _coerce_search_options(raw.get("search_options"))
+    if isinstance(raw, dict) and "sub_queries" in raw:
+        raw["sub_queries"] = _coerce_sub_queries(raw.get("sub_queries"))
     try:
         parsed = EntityExtraction.model_validate(raw)
     except Exception as exc:
@@ -385,6 +434,7 @@ async def extract_entities_with_llm(
         count=len(parsed.entities),
         sort=parsed.search_options.sort,
         doc_types=parsed.search_options.doc_types,
+        sub_queries=parsed.sub_queries,
         entities=[
             f"{e.entity_type}:{e.canonical_id}({round(e.confidence, 2)})"
             for e in parsed.entities[:10]

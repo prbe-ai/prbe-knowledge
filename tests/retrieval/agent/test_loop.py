@@ -944,7 +944,9 @@ async def test_terminal_on_turn_1_is_happy_path(
     ) as mock_acomp:
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
-    assert resp.total_candidates == 2
+    # 2 emitted chunks + 1 recall-floor backfill doc from the stubbed
+    # pre-fan-out pool (stub:0) the gatherer didn't emit.
+    assert resp.total_candidates == 3
     assert resp.gatherer_notes is not None
     assert resp.gatherer_notes["confidence"] == "high"
     # Telemetry
@@ -984,7 +986,8 @@ async def test_exploration_then_terminal(
     ) as mock_dispatch:
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
-    assert resp.total_candidates == 3
+    # 3 emitted chunks + 1 recall-floor backfill doc from the pre-fan-out pool.
+    assert resp.total_candidates == 4
     assert fake_request.state.tool_calls_count == 1  # one search call
     mock_dispatch.assert_called_once()
     assert mock_dispatch.call_args.kwargs["tool_name"] == "search"
@@ -1007,21 +1010,26 @@ async def test_no_tool_calls_returns_schema_violation(
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
     assert fake_request.state.gatherer_status == "schema_violation"
-    assert resp.total_candidates == 0
+    # Status stays schema_violation, but the recall-floor backfill now
+    # surfaces the pre-fan-out pool doc the gatherer never emitted
+    # (graceful degradation — see loop._backfill_recall_floor).
+    assert resp.total_candidates == 1
     assert resp.gatherer_notes["confidence"] == "low"
 
 
 @pytest.mark.asyncio
-async def test_wrong_shape_terminal_args_degrades_to_empty_output(
+async def test_wrong_shape_terminal_args_recovers_via_recall_floor(
     fake_request: SimpleNamespace,
 ) -> None:
     """Model calls emit_gatherer_output with args that don't match the
     GathererOutput schema (e.g. Cerebras gpt-oss-120b emitting input-
     shaped fields like title/source/url). Tolerant parser absorbs the
-    drift: parses as empty GathererOutput, status='ok', 0 results.
-    Effect on the user is identical to the old `schema_violation`
-    branch (no results returned), but the loop trace records the
-    model DID emit rather than treating it as a parse failure."""
+    drift: parses as empty GathererOutput, status='ok'. The gatherer
+    itself emitted nothing, but the recall-floor backfill then surfaces
+    the pre-fan-out pool docs it never picked up, so the user gets
+    candidates instead of an empty response (graceful degradation —
+    see loop._backfill_recall_floor). The loop trace still records that
+    the model DID emit, rather than treating it as a parse failure."""
     req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
     bad_terminal = _terminal_call({"completely": "wrong shape"})
 
@@ -1032,7 +1040,9 @@ async def test_wrong_shape_terminal_args_degrades_to_empty_output(
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
     assert fake_request.state.gatherer_status == "ok"
-    assert resp.total_candidates == 0
+    # Gatherer emitted 0 chunks; recall-floor backfill surfaces the 1
+    # stubbed pre-fan-out pool doc.
+    assert resp.total_candidates == 1
 
 
 @pytest.mark.asyncio
@@ -1059,7 +1069,8 @@ async def test_bad_confidence_literal_clamps_to_medium(
     ) as mock_acomp:
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
     assert fake_request.state.gatherer_status == "ok"
-    assert resp.total_candidates == 3
+    # 3 emitted + 1 recall-floor backfill doc from the pre-fan-out pool.
+    assert resp.total_candidates == 4
     assert resp.gatherer_notes["confidence"] == "medium"
     # No retry: single LLM round-trip per the new design.
     assert mock_acomp.await_count == 1
@@ -1083,7 +1094,8 @@ async def test_explicit_null_confidence_clamps_to_medium(
     ):
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
     assert fake_request.state.gatherer_status == "ok"
-    assert resp.total_candidates == 1
+    # 1 emitted + 1 recall-floor backfill doc from the pre-fan-out pool.
+    assert resp.total_candidates == 2
     assert resp.gatherer_notes["confidence"] == "medium"
 
 
@@ -1106,7 +1118,8 @@ async def test_non_string_matched_via_member_does_not_crash(
     ):
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
     assert fake_request.state.gatherer_status == "ok"
-    assert resp.total_candidates == 1
+    # 1 emitted + 1 recall-floor backfill doc from the pre-fan-out pool.
+    assert resp.total_candidates == 2
 
 
 @pytest.mark.asyncio
@@ -1132,7 +1145,8 @@ async def test_bad_matched_via_values_are_filtered(
     ) as mock_acomp:
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
     assert fake_request.state.gatherer_status == "ok"
-    assert resp.total_candidates == 2
+    # 2 emitted + 1 recall-floor backfill doc from the pre-fan-out pool.
+    assert resp.total_candidates == 3
     assert mock_acomp.await_count == 1
 
 
