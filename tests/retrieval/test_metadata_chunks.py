@@ -121,7 +121,7 @@ def test_metadata_text_includes_full_session_uuid() -> None:
     `id:` line — title only carries the 8-char prefix, so without this
     line a query naming the full UUID would have no lexical anchor."""
     doc = _doc(
-        doc_id="claude_code:probe-founders:3c325e11-2008-46a9-83f7-fc40d11eaf82",
+        doc_id="claude_code:acme:3c325e11-2008-46a9-83f7-fc40d11eaf82",
         source_id="3c325e11-2008-46a9-83f7-fc40d11eaf82",
         title="Richard Wei's Claude Code session 3c325e11",
         source_url="https://prbe.ai/dashboard/agent-sessions/3c325e11-2008-46a9-83f7-fc40d11eaf82",

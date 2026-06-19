@@ -8,7 +8,7 @@ POST /graph/explore (default mode) selects the top-N graph_nodes per tenant
 ordered by `degree DESC`. Without a matching index the planner falls back
 to a sequential scan over (customer_id, ...) and sorts in memory --
 tolerable on small tenants, expensive once a customer crosses the
-~100k-node mark (probe-founders is already there for code_graph nodes).
+~100k-node mark (acme is already there for code_graph nodes).
 
 `(customer_id, degree DESC)` matches the WHERE + ORDER BY shape exactly:
   WHERE customer_id = $1 ORDER BY degree DESC LIMIT $N

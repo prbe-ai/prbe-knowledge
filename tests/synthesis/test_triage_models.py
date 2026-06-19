@@ -2,7 +2,7 @@
 
 Pinning the `TriageVerdict.reason` truncate-before-validate behavior.
 
-Production hot bug (probe-founders, 2026-05-08): Haiku returned a
+Production hot bug (acme, 2026-05-08): Haiku returned a
 verdict with `reason` ~300 chars while the schema caps it at 240. The
 batch-wide `TriageOutput(**payload)` parse raised
 `string_too_long`, the provider wrapped it as `TriageParseError`, the
@@ -81,7 +81,7 @@ def test_verdict_reason_short_passes_through() -> None:
 
 
 def test_triage_output_parses_with_overlong_nested_reason() -> None:
-    """Reproduction of the probe-founders DLQ.
+    """Reproduction of the acme DLQ.
 
     Before the fix, `TriageOutput(**payload)` raised
     `1 validation error for TriageOutput verdicts.42.reason

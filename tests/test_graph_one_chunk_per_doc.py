@@ -105,7 +105,7 @@ async def test_graph_search_issues_per_doc_cap_sql() -> None:
         await graph_module.graph_search(
             customer_id="cust-test",
             entities=[
-                ("session", "claude_code:probe-founders:1b39163a-...")
+                ("session", "claude_code:acme:1b39163a-...")
             ],
             top_k=20,
         )

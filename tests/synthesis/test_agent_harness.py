@@ -204,7 +204,7 @@ async def test_stall_threshold_tolerates_realistic_read_exploration(
 
     That's 7 non-consequential turns before the first decision. The
     production stall threshold (15) must NOT halt this — that's what
-    bit run 105 on probe-founders when STALL_TURNS=3 was the default.
+    bit run 105 on acme when STALL_TURNS=3 was the default.
     """
     import services.synthesis.agent_harness as h
 

@@ -15,17 +15,17 @@ diverged across sources.
 Usage::
 
     # Suggestion-only (safe, write to entity_merge_suggestions)
-    .venv/bin/python -m scripts.run_auto_merge_backfill --customer probe-founders
+    .venv/bin/python -m scripts.run_auto_merge_backfill --customer acme
 
     # Execute high-confidence merges directly
-    .venv/bin/python -m scripts.run_auto_merge_backfill --customer probe-founders --execute
+    .venv/bin/python -m scripts.run_auto_merge_backfill --customer acme --execute
 
     # Limit scope for testing
-    .venv/bin/python -m scripts.run_auto_merge_backfill --customer probe-founders --limit 50
-    .venv/bin/python -m scripts.run_auto_merge_backfill --customer probe-founders --label Person
+    .venv/bin/python -m scripts.run_auto_merge_backfill --customer acme --limit 50
+    .venv/bin/python -m scripts.run_auto_merge_backfill --customer acme --label Person
 
 Each row gets one LLM call. At ~$0.001 per gpt-oss-120b call on Cerebras and
-~6000 nodes per customer at probe-founders scale, full backfill is < $10.
+~6000 nodes per customer at acme scale, full backfill is < $10.
 """
 
 from __future__ import annotations

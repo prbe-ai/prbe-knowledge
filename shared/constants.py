@@ -166,7 +166,7 @@ class NodeLabel(StrEnum):
 
     Other domain labels (SERVICE, SERVICE_CARD, DECISION, RUNBOOK,
     ERROR_GROUP, AGENT, WORKFLOW, FIX_ARTIFACT, VERIFICATION_RESULT) are
-    out of scope for the collapse — they're either unused for probe-founders
+    out of scope for the collapse — they're either unused for acme
     today or carry distinct semantics worth preserving.
     """
 
@@ -612,7 +612,7 @@ SOURCE_SCORE_MULTIPLIERS: dict[SourceSystem, float] = {
     # Slack/Linear/PR docs at equal vector relevance.
     SourceSystem.CODEX: 0.5,
     # CODE_GRAPH chunks are over-represented in top-K relative to their
-    # signal strength: production query_traces (7d, probe-founders) show
+    # signal strength: production query_traces (7d, acme) show
     # code_graph at 36.5% of top-5 results despite an avg post-fusion score
     # ~3.4x lower than github and ~4.1x lower than claude_code. BM25 fires
     # on common identifier tokens ("session", "tenant", "customer"),
@@ -1014,7 +1014,7 @@ WIKI_AGENT_UPDATE_CAP = 30
 # Stall threshold. If the agent makes no consequential tool call (no
 # page update / create / skip) for this many consecutive turns, halt.
 #
-# Bumped from 3 to 15 after probe-founders' run 105 stalled with 200
+# Bumped from 3 to 15 after acme' run 105 stalled with 200
 # events DLQ'd despite the agent making real progress on reads. The
 # old "one read-page, one read-event, one think" math was wrong — a
 # realistic decision flow on a chunk of 200 events looks like:

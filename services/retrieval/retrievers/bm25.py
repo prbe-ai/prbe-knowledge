@@ -6,7 +6,7 @@ GIN index over the stored `chunks.content_tsv` column (migration 0062).
 The column is `GENERATED ALWAYS AS (to_tsvector('english', content)) STORED`,
 so the bitmap-heap recheck and `ts_rank_cd` both read the precomputed
 lexeme array off the heap instead of re-tokenizing `content` on every one
-of the ~10k+ candidate rows. EXPLAIN ANALYZE on probe-founders showed the
+of the ~10k+ candidate rows. EXPLAIN ANALYZE on acme showed the
 old expression-based path spent ~5.7s of a 5.9s query in per-row
 tokenization; the materialized column reduces that to score math + heap
 reads. For Phase 1 we can still swap this to pg_bm25 or a real BM25 lib

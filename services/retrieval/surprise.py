@@ -45,7 +45,7 @@ so even extreme hubs aren't completely flattened.
 AMBIGUOUS gating
 ----------------
 Components 2 (cross-source) and 3 (cross-community) are SKIPPED for
-AMBIGUOUS edges. Empirical analysis on probe-founders showed that
+AMBIGUOUS edges. Empirical analysis on acme showed that
 AMBIGUOUS authorship edges between connectors (e.g. Granola Person ->
 Claude Code session) are *structurally guaranteed* to be cross-source
 and usually cross-community -- those signals fire automatically rather

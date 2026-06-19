@@ -18,7 +18,7 @@ This loop ONLY downgrades. It never re-promotes `auth_failed` rows back to
 re-install.
 
 Why this exists: Linear's API silently started returning 401 to
-probe-founders' token after 4 days of normal operation in May 2026. The
+acme' token after 4 days of normal operation in May 2026. The
 DB row stayed `active`, webhooks stopped flowing, and nothing alerted —
 because no code path was checking the credential's actual liveness. This
 cron is the missing observability hook.

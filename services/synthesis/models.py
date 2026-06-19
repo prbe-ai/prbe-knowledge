@@ -85,7 +85,7 @@ class TriageVerdict(BaseModel):
     @classmethod
     def _truncate_overlong_reason(cls, v: object) -> object:
         # Haiku occasionally writes longer reasons than the schema asks
-        # for. Production hot bug (probe-founders, 2026-05-08): one
+        # for. Production hot bug (acme, 2026-05-08): one
         # verdict's reason was 300+ chars, Pydantic raised
         # string_too_long on the batch-wide TriageOutput parse, the
         # provider wrapped it as TriageParseError, the split-retry

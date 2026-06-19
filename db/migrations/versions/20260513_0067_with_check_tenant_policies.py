@@ -81,7 +81,7 @@ depends_on: str | Sequence[str] | None = None
 # Per-table tuple: (policy_name, table_name).
 # The USING/WITH CHECK expression is identical across all five policies, so
 # the migration body inlines it once. customer_id is TEXT in this schema --
-# do NOT cast to uuid (it's an opaque slug like ``probe-founders``).
+# do NOT cast to uuid (it's an opaque slug like ``acme``).
 _TARGETS: tuple[tuple[str, str], ...] = (
     ("tenant_isolation", "graph_nodes"),
     ("tenant_isolation", "graph_edges"),

@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a problem with the Probe knowledge engine
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please do **not** include secrets, API keys, or
+        private data in anything you paste below.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: How are you running it? (docker compose / Helm, OS + arch, commit SHA)
+      placeholder: "docker compose, linux/amd64, <commit sha>"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste only the relevant lines (redact secrets). `make health` output helps.
+      render: shell
+    validations:
+      required: false

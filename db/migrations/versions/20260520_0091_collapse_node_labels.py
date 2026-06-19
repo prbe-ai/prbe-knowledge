@@ -14,7 +14,7 @@ Label remap:
 
 Phase 0 — handle WikiPerson ↔ Person canonical_id collisions
   Unique constraint graph_nodes_customer_id_label_canonical_id_key permits the
-  same canonical_id under two labels today (e.g. probe-founders has
+  same canonical_id under two labels today (e.g. acme has
   `AshwaryeYadav` as both Person and WikiPerson). After the Phase 1 relabel
   both rows would key to (customer_id, 'Person', 'AshwaryeYadav') and violate
   the constraint. Phase 0 resolves these by promoting the WikiPerson row's

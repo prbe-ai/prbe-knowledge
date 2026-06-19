@@ -6,7 +6,7 @@ Create Date: 2026-05-10
 
 Materialize to_tsvector('english', content) as a STORED generated column on
 chunks so BM25 stops re-tokenizing on every query. EXPLAIN ANALYZE on a
-representative production query against probe-founders showed ~5.7s of a
+representative production query against acme showed ~5.7s of a
 5.9s BM25 query was per-row tokenization in the Bitmap Heap Scan recheck +
 ts_rank_cd. The expression-based index `idx_chunks_fts_content` finds
 candidates fast (~110ms) but tokenization is still done per row at recheck

@@ -345,7 +345,7 @@ pages, and **typed links** between them.
 | person | `person/maison` | NEW: extracted from any source mentioning a person |
 | company | `company/probe` | NEW: customer/vendor/competitor |
 | vendor | `vendor/anthropic` | NEW: tool/service supplier |
-| customer | `customer/willow-voice` | NEW: a customer of the customer |
+| customer | `customer/demo-tenant` | NEW: a customer of the customer |
 | project | `project/q3-roadmap` | NEW: cross-cutting initiative |
 | event | `event/2026-05-05-1on1` | NEW: meeting / incident / launch |
 
@@ -449,8 +449,8 @@ Rough estimates per customer one-time bootstrap:
 | Customer size | Slack | GitHub | Linear | Notion | Codebase | Total |
 |---|---:|---:|---:|---:|---:|---:|
 | Small (mahits-workspace) | $1 | $2 | $0.50 | $0.50 | $1 | ~$5 |
-| Medium (probe-founders) | $5 | $10 | $2 | $2 | $5 | ~$25 |
-| Large (willow-voice) | $20 | $40 | $10 | $10 | $20 | ~$100 |
+| Medium (acme) | $5 | $10 | $2 | $2 | $5 | ~$25 |
+| Large (demo-tenant) | $20 | $40 | $10 | $10 | $20 | ~$100 |
 | Pebble | $100 | $300 | $50 | $50 | $100 | ~$600 |
 
 One-time cost. Ongoing is the v4 daily loop (~$30/drain pebble).

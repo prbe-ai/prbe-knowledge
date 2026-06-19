@@ -8,7 +8,7 @@ more rotation), sub-agents invoke this module via:
 
     kubectl exec deploy/managed-retrieval -- python -m \
       services.retrieval.agent.trace_analyzer.fetch_one \
-      --bucket prbe-probe-founders \
+      --bucket prbe-acme \
       --key search-traces/2026-05-17/q-1779062199597.json.gz
 
 The output is pretty-printed JSON (the gunzipped blob), written to
@@ -41,7 +41,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--bucket",
         required=True,
-        help="R2 bucket name, e.g. prbe-probe-founders",
+        help="R2 bucket name, e.g. prbe-acme",
     )
     parser.add_argument(
         "--key",

@@ -12,7 +12,7 @@ single ``DELETE FROM customers WHERE customer_id = $1`` cascading through
 those FKs — quietly leaves ``code_repo_state`` rows behind on every
 tenant teardown.
 
-Hit in prod 2026-05-14 against the probe-founders teardown: the CP
+Hit in prod 2026-05-14 against the acme teardown: the CP
 ``delete_team`` endpoint (prbe-backend PR #276 fixes the missing DP
 mirror call) cascades the rest of the schema fine, but
 ``code_repo_state`` orphans because it never had the cascade FK.

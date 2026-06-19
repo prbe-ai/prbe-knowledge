@@ -298,7 +298,7 @@ async def render_index_via_llm(
                 config={
                     "system_instruction": _INDEX_SYSTEM_PROMPT,
                     # 16k accommodates a 50-page index with summaries
-                    # comfortably. Bumped from 4096 after a probe-founders
+                    # comfortably. Bumped from 4096 after a acme
                     # run truncated mid-block — page list never landed in
                     # the body, leaving only the intro + a half-written
                     # Mermaid attempt.
@@ -335,7 +335,7 @@ async def render_index_via_llm(
                     {"role": "user", "content": user_prompt},
                 ],
                 # 16k accommodates a 50-page index with summaries
-                # comfortably. Bumped from 4096 after a probe-founders
+                # comfortably. Bumped from 4096 after a acme
                 # run truncated mid-block — page list never landed in
                 # the body, leaving only the intro + a half-written
                 # Mermaid attempt.
