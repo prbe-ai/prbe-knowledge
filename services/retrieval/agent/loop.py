@@ -81,7 +81,8 @@ from shared.constants import (
     SourceSystem,
 )
 from shared.db import with_tenant
-from shared.llm import LLMError, acompletion, is_context_window_error
+from shared.llm import LLMError, acompletion
+from shared.llm_tools import is_context_overflow
 from shared.logging import get_logger
 from shared.models import QueryRequest, RetrieveResponse
 
@@ -220,48 +221,86 @@ def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
     if not prefanout or not prefanout.get("sub_queries"):
         return "(no pre-fan-out hits)"
 
-    # Rank docs by fused RRF (deterministic), keep docs until the token budget
-    # of their content fills. Content is counted once per doc even though it
-    # may repeat across channels; the mild undercount is absorbed by the
-    # running context gate (_enforce_context_budget).
-    fused = _fuse_prefanout_docs(prefanout)
-    total_docs = len(fused)
+    sub_queries = prefanout.get("sub_queries") or []
+
+    # Charge each doc its content tokens times how many times it will actually
+    # be RENDERED in the two channels we trim — a doc in both vector and bm25
+    # renders twice — so the budget matches the real dumped size instead of
+    # under-counting. Metadata-only hits (no content body) are ~free and always
+    # kept. graph + inferred_edge hits are always kept whole (small, and they
+    # carry the why-chains), so their content is a fixed baseline: this is why
+    # selection is scoped to vector/bm25 only — ranking across all four
+    # channels would let high-fused graph docs consume the budget and starve
+    # the vector/bm25 content the filter then wipes.
+    trim_occurrences: dict[str, int] = {}
+    baseline_tokens = 0
+    for sq in sub_queries:
+        if not isinstance(sq, dict):
+            continue
+        for channel in ("vector", "bm25"):
+            for hit in sq.get(channel) or []:
+                if not isinstance(hit, dict):
+                    continue
+                content = hit.get("content")
+                doc_id = hit.get("doc_id")
+                if doc_id and isinstance(content, str) and content.strip():
+                    trim_occurrences[doc_id] = trim_occurrences.get(doc_id, 0) + 1
+        for channel in ("graph", "inferred_edge"):
+            for hit in sq.get(channel) or []:
+                if isinstance(hit, dict):
+                    baseline_tokens += _count_tokens(hit.get("content") or "")
+
+    total_trim_docs = len(trim_occurrences)
+    # Rank content docs by fused RRF (deterministic) and keep them, cheapest-
+    # rank-first, until the budget fills. graph/inferred content is pre-charged
+    # as the baseline so the total rendered size — not just vector/bm25 —
+    # respects the cap.
     kept_docs: set[str] = set()
-    budget_used = 0
-    for entry in fused:
-        cost = _count_tokens(entry["hit"].get("content") or "")
+    budget_used = baseline_tokens
+    for entry in _fuse_prefanout_docs(prefanout):
+        doc_id = entry["doc_id"]
+        occ = trim_occurrences.get(doc_id, 0)
+        if occ == 0:
+            continue  # graph/inferred-only doc — already in the baseline
+        cost = _count_tokens(entry["hit"].get("content") or "") * occ
         if kept_docs and budget_used + cost > SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET:
             break
-        kept_docs.add(entry["doc_id"])
+        kept_docs.add(doc_id)
         budget_used += cost
 
-    if len(kept_docs) >= total_docs:
-        # Everything fits — original behaviour, no filtering overhead.
+    if len(kept_docs) >= total_trim_docs:
+        # Every content doc fits — original behaviour, no filtering overhead.
         return json.dumps(prefanout, default=str, indent=2)
 
-    # Trim only the content-heavy channels; keep graph + inferred_edge whole.
+    # Trim vector + bm25 to kept docs. Keep every metadata-only hit (no content
+    # body -> ~free, and dropping it would narrow PR#328's "show every hit"
+    # guarantee) and every graph/inferred hit (why-chains).
+    def _keep(h: Any) -> bool:
+        if not isinstance(h, dict):
+            return True
+        content = h.get("content")
+        if not (isinstance(content, str) and content.strip()):
+            return True  # metadata-only, ~free
+        return h.get("doc_id") in kept_docs
+
     filtered_sqs: list[dict[str, Any]] = []
-    for sq in prefanout.get("sub_queries") or []:
+    for sq in sub_queries:
         if not isinstance(sq, dict):
             continue
         new_sq = dict(sq)
         for channel in ("vector", "bm25"):
             hits = sq.get(channel)
             if isinstance(hits, list):
-                new_sq[channel] = [
-                    h
-                    for h in hits
-                    if isinstance(h, dict) and h.get("doc_id") in kept_docs
-                ]
+                new_sq[channel] = [h for h in hits if _keep(h)]
         filtered_sqs.append(new_sq)
     filtered = dict(prefanout)
     filtered["sub_queries"] = filtered_sqs
-    dropped = total_docs - len(kept_docs)
+    dropped = total_trim_docs - len(kept_docs)
     note = (
         f"\n(pre-fan-out trimmed to fit context: showing the top "
-        f"{len(kept_docs)} of {total_docs} docs by fused relevance across all "
-        f"sources; {dropped} lower-ranked docs omitted. Call `search` with a "
-        f"reformulated query if you need something not shown.)"
+        f"{len(kept_docs)} of {total_trim_docs} content docs by fused relevance "
+        f"across all sources; {dropped} lower-ranked docs omitted. Call `search` "
+        f"with a reformulated query if you need something not shown.)"
     )
     return json.dumps(filtered, default=str, indent=2) + note
 
@@ -699,20 +738,20 @@ def _enforce_context_budget(state: LoopState) -> None:
     stubbing every tool message can't get under budget, the next LLM call may
     still 400 — caught by the context_overflow handler and degraded to 200.
     """
-    total = sum(_message_tokens(m) for m in state.messages)
+    # One tokenizer pass over the history; reuse the per-message counts in the
+    # eviction loop so tool bodies aren't encoded twice.
+    per_msg = [_message_tokens(m) for m in state.messages]
+    total = sum(per_msg)
     if total <= SEARCH_AGENT_MAX_CONTEXT_TOKENS:
         return
     stub_cost = _count_tokens(_EVICTED_TOOL_CONTENT)
     evicted = 0
-    for m in state.messages:
+    for idx, m in enumerate(state.messages):
         if total <= SEARCH_AGENT_MAX_CONTEXT_TOKENS:
             break
-        if m.get("role") != "tool":
+        if m.get("role") != "tool" or not isinstance(m.get("content"), str):
             continue
-        content = m.get("content")
-        if not isinstance(content, str):
-            continue
-        cur = _count_tokens(content)
+        cur = per_msg[idx]  # already counted above — a tool message is content-only
         if cur <= stub_cost:
             continue
         m["content"] = _EVICTED_TOOL_CONTENT
@@ -1723,7 +1762,7 @@ async def run_gatherer(
         status = "loop_timeout"
         gathered = _empty_passthrough("loop_timeout")
     except LLMError as exc:
-        if is_context_window_error(exc):
+        if is_context_overflow(exc):
             # Deterministic input-too-large (provider 400), NOT an outage —
             # retrying the identical request always fails. Degrade to a 200
             # passthrough: the recall-floor backfill below fills `gathered`

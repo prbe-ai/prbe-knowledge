@@ -733,7 +733,11 @@ async def execute_fetch_doc(
             for r in rows
         ]
 
-        if with_inferred_edges:
+        # Doc-level edges/evidence are independent of the page — only attach
+        # them to the FIRST page so paging a long doc doesn't re-inject the
+        # (potentially large) evidence blob into the message history on every
+        # call, defeating the context budget this change protects.
+        if with_inferred_edges and off == 0:
             try:
                 hits = await _inferred(
                     customer_id=customer_id,

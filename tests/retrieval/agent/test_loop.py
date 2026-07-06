@@ -45,7 +45,8 @@ from services.retrieval.agent.models import (
 )
 from services.retrieval.agent.tools import TERMINAL_TOOL_NAME
 from services.retrieval.grounding import GroundingBundle
-from shared.llm import LLMError, is_context_window_error
+from shared.llm import LLMError
+from shared.llm_tools import is_context_overflow
 from shared.models import QueryRequest
 
 # ============================================================
@@ -1524,15 +1525,20 @@ def test_prefanout_budget_no_source_masking() -> None:
     another source dominates by volume. Guards the PR#307/#328 'GitHub-only
     chunks' masking that got a per-channel cap reverted: this is global
     Top-N by fused rank, not per-channel."""
-    github = [_big_hit(f"github:doc:{i}") for i in range(20)]
-    # Slack doc at bm25 rank 0 fuses as high as the top github vector hit.
-    slack = _big_hit("slack:thread:T1", source_system="slack")
+    # Smaller bodies so a handful of docs fit the budget (this tests ranking,
+    # not raw capacity): 20 github hits fill the vector channel, one slack hit
+    # sits at bm25 rank 0 so it fuses as high as the top github vector hit.
+    github = [_big_hit(f"github:doc:{i}", content_reps=100) for i in range(20)]
+    slack = _big_hit("slack:thread:T1", source_system="slack", content_reps=100)
     prefanout = {"sub_queries": [{
         "query": "q", "vector": github, "bm25": [slack], "graph": [], "inferred_edge": [],
     }]}
     with patch("services.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 2500):
         out = _render_prefanout_budgeted(prefanout)
-    assert "trimmed to fit context" in out  # budget did bite
+    assert "trimmed to fit context" in out  # budget did bite (github tail dropped)
+    present_github = sum(1 for i in range(20) if f"github:doc:{i}" in out)
+    assert present_github < 20  # some github docs were trimmed
+    # ...but the high-fused minority source survived the trim (the reverted bug).
     assert "slack:thread:T1" in out, "minority source masked out — the reverted bug"
 
 
@@ -1594,24 +1600,30 @@ def test_enforce_context_budget_stubs_oldest_tool_results() -> None:
     assert total < 50_000  # materially smaller than the ~100K we started with
 
 
-def test_is_context_window_error_classifies_overflow_vs_outage() -> None:
-    """ContextWindowExceededError -> degrade to 200 (True). A real outage
-    -> still 503 (False)."""
+def test_is_context_overflow_classifies_overflow_vs_outage() -> None:
+    """The gatherer degrades to 200 when the shared `is_context_overflow`
+    predicate (shared/llm_tools) is True, and 503s otherwise. Lock the two
+    real shapes: the typed ContextWindowExceededError cause, and the actual
+    Cerebras message string from the gatherer-503 investigation."""
     import litellm
 
+    # Typed cause path (status 400 required).
     cwe = litellm.ContextWindowExceededError(
         message="reduce the length", model="cerebras/gpt-oss-120b", llm_provider="cerebras"
     )
     wrapped = LLMError("wrapped", status_code=400)
     wrapped.__cause__ = cwe
-    assert is_context_window_error(wrapped) is True
+    assert is_context_overflow(wrapped) is True
 
-    # Message-heuristic path (no typed cause) also classifies as overflow.
-    msg_only = LLMError(
-        "litellm.ContextWindowExceededError: please reduce the length of the messages"
+    # The verbatim production error string (message-regex path), status 400.
+    real = LLMError(
+        "litellm.ContextWindowExceededError: CerebrasException - Please reduce "
+        "the length of the messages or completion. Current length is 229718 "
+        "while limit is 131000",
+        status_code=400,
     )
-    assert is_context_window_error(msg_only) is True
+    assert is_context_overflow(real) is True
 
-    # A genuine provider outage is NOT a context overflow.
+    # A genuine provider outage is NOT a context overflow -> stays a 503.
     outage = LLMError("connection reset by peer", status_code=503)
-    assert is_context_window_error(outage) is False
+    assert is_context_overflow(outage) is False

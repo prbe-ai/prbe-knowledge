@@ -184,29 +184,6 @@ def _wrap_litellm_error(exc: BaseException) -> LLMError:
     return LLMError(str(exc), status_code=status, provider=provider)
 
 
-def is_context_window_error(exc: LLMError) -> bool:
-    """True when ``exc`` wraps a provider "context window exceeded" rejection.
-
-    A context overflow is a deterministic input-too-large error (HTTP 400
-    class), NOT a transient outage — retrying the identical request always
-    fails the same way. Callers use this to degrade gracefully (return
-    partial results at 200) instead of surfacing a 503 that would falsely
-    signal "retryable".
-
-    Checks the preserved LiteLLM cause first (authoritative — LiteLLM raises
-    ``ContextWindowExceededError`` for this class across providers), then
-    falls back to a message heuristic for the rare SDK path that re-raises a
-    bare ``BadRequestError`` without the typed subclass.
-    """
-    if isinstance(exc.__cause__, litellm.ContextWindowExceededError):
-        return True
-    msg = str(exc).lower()
-    return (
-        "contextwindowexceeded" in msg
-        or "reduce the length of the messages" in msg
-    )
-
-
 def _maybe_inject_gateway(kwargs: dict[str, Any]) -> dict[str, Any]:
     """If ``LLM_GATEWAY_URL`` is set and the caller didn't override
     ``api_base``, inject it; and inject ``api_key`` (in precedence order:
