@@ -54,6 +54,13 @@ GathererStatus = Literal[
     # nothing; the harness returns an empty GathererOutput without
     # entering the loop, saving 3-5s on truly hopeless queries.
     "zero_recall_short_circuit",
+    # The gatherer's message history exceeded the model's context window
+    # (ContextWindowExceededError from the provider). Unlike
+    # fatal_provider_error this is a DETERMINISTIC input-too-large 400, not
+    # an outage — retrying can't help — so the loop degrades to a 200
+    # passthrough over the pre-fan-out pool instead of raising 503. See
+    # loop.run_gatherer's LLMError handler + is_context_window_error.
+    "context_overflow",
 ]
 
 

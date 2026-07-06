@@ -30,21 +30,53 @@ from services.retrieval.agent.tools import (
 # Tool definitions: schema sanity
 # ============================================================
 
-def test_tool_definitions_contains_4_fat_plus_terminal() -> None:
+def test_tool_definitions_contains_fat_tools_plus_terminal() -> None:
     """tool_definitions() exposes exactly: search, subgraph, fetch_doc,
-    need_deeper, emit_gatherer_output. Drift breaks the prompt contract."""
+    fetch_chunk_window, need_deeper, emit_gatherer_output. Drift breaks the
+    prompt contract."""
     defs = tool_definitions()
     names = {d["function"]["name"] for d in defs}
-    assert names == {"search", "subgraph", "fetch_doc", NEED_DEEPER_TOOL_NAME, TERMINAL_TOOL_NAME}
+    assert names == {
+        "search",
+        "subgraph",
+        "fetch_doc",
+        "fetch_chunk_window",
+        NEED_DEEPER_TOOL_NAME,
+        TERMINAL_TOOL_NAME,
+    }
 
 
 def test_registry_only_has_retrieval_tools() -> None:
     """TOOL_REGISTRY is the dispatcher table. need_deeper +
     emit_gatherer_output are handled by the loop itself and must NOT be
     in the registry (otherwise terminal-call detection breaks)."""
-    assert set(TOOL_REGISTRY.keys()) == {"search", "subgraph", "fetch_doc"}
+    assert set(TOOL_REGISTRY.keys()) == {
+        "search",
+        "subgraph",
+        "fetch_doc",
+        "fetch_chunk_window",
+    }
     assert TERMINAL_TOOL_NAME not in TOOL_REGISTRY
     assert NEED_DEEPER_TOOL_NAME not in TOOL_REGISTRY
+
+
+def test_fetch_doc_schema_has_offset_for_pagination() -> None:
+    """fetch_doc is now a paginated reader — the `offset` param MUST be in
+    the schema or the model can never page past the first chunk window."""
+    defs = {d["function"]["name"]: d for d in tool_definitions()}
+    props = defs["fetch_doc"]["function"]["parameters"]["properties"]
+    assert "offset" in props
+    assert props["offset"]["minimum"] == 0
+
+
+def test_fetch_chunk_window_schema_shape() -> None:
+    """fetch_chunk_window keys off the matched chunk_id (already in hand)
+    and takes before/after neighbour counts."""
+    defs = {d["function"]["name"]: d for d in tool_definitions()}
+    fn = defs["fetch_chunk_window"]["function"]
+    props = fn["parameters"]["properties"]
+    assert set(fn["parameters"]["required"]) == {"chunk_id"}
+    assert "before" in props and "after" in props
 
 
 def test_tool_definitions_shape_is_openai_compatible() -> None:

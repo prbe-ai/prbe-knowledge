@@ -22,15 +22,18 @@ import pytest
 from fastapi import HTTPException
 
 from services.retrieval.agent.loop import (
+    LoopState,
     _affinity_key,
     _build_prefanout_doc_meta,
     _build_user_message,
+    _count_tokens,
     _derive_source_system_from_doc_id,
     _empty_passthrough,
+    _enforce_context_budget,
     _extract_cache_hit_rate,
     _format_inferred_chains,
-    _format_prefanout_compact,
     _parse_terminal_args,
+    _render_prefanout_budgeted,
     _seed_for_query,
     run_gatherer,
 )
@@ -42,6 +45,7 @@ from services.retrieval.agent.models import (
 )
 from services.retrieval.agent.tools import TERMINAL_TOOL_NAME
 from services.retrieval.grounding import GroundingBundle
+from shared.llm import LLMError, is_context_window_error
 from shared.models import QueryRequest
 
 # ============================================================
@@ -447,7 +451,7 @@ def test_prefanout_full_dump_includes_all_doc_fields() -> None:
         "vector": [_mk_hit()],
         "bm25": [], "graph": [], "inferred_edge": [],
     }]}
-    out = _format_prefanout_compact(prefanout)
+    out = _render_prefanout_budgeted(prefanout)
     assert "github:owner/repo:pr:42" in out
     assert "self-host docs" in out
     assert "0.87" in out
@@ -469,7 +473,7 @@ def test_prefanout_full_dump_shows_every_hit_no_cap() -> None:
     prefanout = {"sub_queries": [{
         "query": "q", "vector": hits, "bm25": [], "graph": [], "inferred_edge": [],
     }]}
-    out = _format_prefanout_compact(prefanout)
+    out = _render_prefanout_budgeted(prefanout)
     for i in range(n_hits):
         assert f"doc:{i}" in out, f"hit {i}/{n_hits} not in LLM input"
 
@@ -492,7 +496,7 @@ def test_prefanout_full_dump_preserves_inferred_edge_why() -> None:
     prefanout = {"sub_queries": [{
         "query": "q", "vector": [], "bm25": [], "graph": [], "inferred_edge": [inf_hit],
     }]}
-    out = _format_prefanout_compact(prefanout)
+    out = _render_prefanout_budgeted(prefanout)
     assert "references_pr" in out
     # Why is preserved in full — no 200-char truncate
     assert long_why.strip() in out
@@ -500,8 +504,8 @@ def test_prefanout_full_dump_preserves_inferred_edge_why() -> None:
 
 def test_prefanout_full_dump_handles_empty_prefanout() -> None:
     """Edge case: pre-fan-out returned nothing on any channel."""
-    assert _format_prefanout_compact({"sub_queries": []}) == "(no pre-fan-out hits)"
-    assert _format_prefanout_compact({}) == "(no pre-fan-out hits)"
+    assert _render_prefanout_budgeted({"sub_queries": []}) == "(no pre-fan-out hits)"
+    assert _render_prefanout_budgeted({}) == "(no pre-fan-out hits)"
 
 
 def test_derive_source_system_from_doc_id_known_prefixes() -> None:
@@ -1475,3 +1479,139 @@ async def test_system_fingerprint_none_when_provider_omits(
     assert loop_state is not None
     assert loop_state.system_fingerprints_per_turn == [None]
     assert len(loop_state.system_fingerprints_per_turn) == loop_state.turn_count
+
+
+# ============================================================
+# Context-overflow protection (this PR): budgeted prefanout render,
+# running context gate, and the 200-not-503 degrade classification.
+# ============================================================
+
+def _big_hit(
+    doc_id: str,
+    source_system: str = "github",
+    content_reps: int = 400,
+    chunk_id: str | None = None,
+) -> dict[str, Any]:
+    """A prefanout hit with a chunky ~content_reps-token body."""
+    return {
+        "channel": "vector",
+        "chunk_id": chunk_id or f"{doc_id}:chunk:0",
+        "doc_id": doc_id,
+        "source_system": source_system,
+        "source_url": f"https://example/{doc_id}",
+        "title": f"title {doc_id}",
+        "content": "lorem ipsum " * content_reps,
+        "score": 0.9,
+    }
+
+
+def test_prefanout_budget_trims_when_over_budget() -> None:
+    """Over-budget pre-fan-out is trimmed and the agent is told docs were
+    omitted. This is the turn-1 half of the 131K overflow fix."""
+    hits = [_big_hit(f"github:doc:{i}") for i in range(30)]
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": hits, "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    with patch("services.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 2000):
+        out = _render_prefanout_budgeted(prefanout)
+    assert "trimmed to fit context" in out
+    present = sum(1 for i in range(30) if f"github:doc:{i}" in out)
+    assert 1 <= present < 30
+
+
+def test_prefanout_budget_no_source_masking() -> None:
+    """A minority-source doc that RANKS well survives the budget even when
+    another source dominates by volume. Guards the PR#307/#328 'GitHub-only
+    chunks' masking that got a per-channel cap reverted: this is global
+    Top-N by fused rank, not per-channel."""
+    github = [_big_hit(f"github:doc:{i}") for i in range(20)]
+    # Slack doc at bm25 rank 0 fuses as high as the top github vector hit.
+    slack = _big_hit("slack:thread:T1", source_system="slack")
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": github, "bm25": [slack], "graph": [], "inferred_edge": [],
+    }]}
+    with patch("services.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 2500):
+        out = _render_prefanout_budgeted(prefanout)
+    assert "trimmed to fit context" in out  # budget did bite
+    assert "slack:thread:T1" in out, "minority source masked out — the reverted bug"
+
+
+def test_prefanout_budget_deterministic_for_cache() -> None:
+    """Same input -> byte-identical render, so the Cerebras prefix cache
+    stays warm turn to turn."""
+    hits = [_big_hit(f"github:doc:{i}") for i in range(15)]
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": hits, "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    with patch("services.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 1500):
+        a = _render_prefanout_budgeted(prefanout)
+        b = _render_prefanout_budgeted(prefanout)
+    assert a == b
+
+
+def test_prefanout_budget_small_input_unchanged() -> None:
+    """Under-budget input is dumped in full (no trim, no note) — normal
+    queries are unaffected."""
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": [_mk_hit()], "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    out = _render_prefanout_budgeted(prefanout)
+    assert "trimmed to fit context" not in out
+    assert "github:owner/repo:pr:42" in out
+
+
+def test_enforce_context_budget_stubs_oldest_tool_results() -> None:
+    """Over-window history: oldest tool results get stubbed in place;
+    system / user / assistant messages and tool_call_id pairing survive
+    (an orphaned pair would 400)."""
+    big = "x " * 100_000  # ~50K tokens each
+    state = LoopState(
+        customer_id="c", trace_id="t", query="q",
+        messages=[
+            {"role": "system", "content": [{"type": "text", "text": "sys"}]},
+            {"role": "user", "content": "the query evidence"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "call_1", "type": "function",
+                             "function": {"name": "fetch_doc", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": big},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "call_2", "type": "function",
+                             "function": {"name": "fetch_doc", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "call_2", "content": big},
+        ],
+    )
+    with patch("services.retrieval.agent.loop.SEARCH_AGENT_MAX_CONTEXT_TOKENS", 10_000):
+        _enforce_context_budget(state)
+    # System / user / assistant untouched; tool_call_id linkage intact.
+    assert state.messages[0]["content"][0]["text"] == "sys"
+    assert state.messages[1]["content"] == "the query evidence"
+    assert state.messages[2]["tool_calls"][0]["id"] == "call_1"
+    assert state.messages[3]["tool_call_id"] == "call_1"  # pairing preserved
+    assert '"truncated": true' in state.messages[3]["content"]  # oldest stubbed
+    total = sum(
+        _count_tokens(m["content"]) for m in state.messages if isinstance(m.get("content"), str)
+    )
+    assert total < 50_000  # materially smaller than the ~100K we started with
+
+
+def test_is_context_window_error_classifies_overflow_vs_outage() -> None:
+    """ContextWindowExceededError -> degrade to 200 (True). A real outage
+    -> still 503 (False)."""
+    import litellm
+
+    cwe = litellm.ContextWindowExceededError(
+        message="reduce the length", model="cerebras/gpt-oss-120b", llm_provider="cerebras"
+    )
+    wrapped = LLMError("wrapped", status_code=400)
+    wrapped.__cause__ = cwe
+    assert is_context_window_error(wrapped) is True
+
+    # Message-heuristic path (no typed cause) also classifies as overflow.
+    msg_only = LLMError(
+        "litellm.ContextWindowExceededError: please reduce the length of the messages"
+    )
+    assert is_context_window_error(msg_only) is True
+
+    # A genuine provider outage is NOT a context overflow.
+    outage = LLMError("connection reset by peer", status_code=503)
+    assert is_context_window_error(outage) is False

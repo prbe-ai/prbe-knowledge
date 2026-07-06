@@ -785,7 +785,42 @@ SEARCH_AGENT_GRAPH_TOP_K = 10
 SEARCH_AGENT_INFERRED_EDGE_TOP_K = 10
 SEARCH_AGENT_GRAPH_WALK_TOP_K = 20
 SEARCH_AGENT_EXPAND_NEIGHBORS_TOP_K = 10
+# fetch_doc page size. fetch_doc is now a PAGINATED whole-doc reader
+# (doc_id, offset, limit): each call returns at most this many chunks
+# starting at `offset` in chunk_index order, so the agent walks a long doc
+# deliberately instead of one call hauling the whole thing. The `offset`
+# also fixes the prior bug where `ORDER BY chunk_index ASC LIMIT 10` could
+# never reach a matched chunk past index 9 on a long doc.
 SEARCH_AGENT_FETCH_CHUNKS_MAX = 10
+
+# ---- Context-overflow protection (gatherer) ---------------------------------
+# The gatherer sends its whole growing message history (turn-1 pre-fan-out
+# dump + every tool result) to Cerebras gpt-oss-120b on EVERY turn. The
+# model's hard context window is 131,072 tokens; exceeding it is a provider
+# 400 (ContextWindowExceededError), which the loop now degrades to a 200
+# passthrough rather than a 503. Two independent guards keep the payload
+# under the ceiling (see loop._render_prefanout_budgeted and
+# _enforce_context_budget):
+#
+#  1. PREFANOUT_TOKEN_BUDGET caps the turn-1 <channel_results> dump, which
+#     was previously an uncapped json.dumps of every hit with full content.
+#     Docs are kept in fused-RRF order until the budget fills (Top-N, no
+#     per-source floor — the recall eval guards against source masking; add
+#     a floor only if it regresses). ~80 chunks fit at the 512-tok chunk size.
+#  2. MAX_CONTEXT_TOKENS is the running backstop enforced before every LLM
+#     turn: if accumulated messages exceed it, the oldest tool results are
+#     truncated in place (message pairing preserved) until the payload fits.
+#     Set well under 131,072 because the cl100k count we estimate with
+#     diverges from gpt-oss's true tokenizer — headroom absorbs the drift.
+SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET = 40_000
+SEARCH_AGENT_MAX_CONTEXT_TOKENS = 115_000
+
+# fetch_chunk_window: neighbors returned on each side of a matched chunk.
+# The matched chunk is already surfaced by the pre-fan-out, so this pulls
+# just enough adjacent context to repair fixed-window chunk fragmentation
+# without hauling the whole doc. Total chunks returned = 2*N + 1.
+SEARCH_AGENT_CHUNK_WINDOW_DEFAULT = 1
+SEARCH_AGENT_CHUNK_WINDOW_MAX = 5
 
 # Per-channel result byte cap. Node properties / chunk content trimmed to
 # this when assembled into a tool return. Keeps the per-turn evidence pack

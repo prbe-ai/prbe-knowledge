@@ -66,6 +66,8 @@ from services.retrieval.router import (
 from shared.constants import (
     INFERRED_EDGE_HYDRATION_CHUNKS,
     SEARCH_AGENT_BM25_TOP_K,
+    SEARCH_AGENT_CHUNK_WINDOW_DEFAULT,
+    SEARCH_AGENT_CHUNK_WINDOW_MAX,
     SEARCH_AGENT_FETCH_CHUNKS_MAX,
     SEARCH_AGENT_GRAPH_TOP_K,
     SEARCH_AGENT_GRAPH_WALK_TOP_K,
@@ -680,14 +682,25 @@ async def execute_fetch_doc(
     *,
     doc_id: str,
     max_chunks: int | None = None,
+    offset: int | None = None,
     with_inferred_edges: bool | None = None,
     with_evidence: bool | None = None,
 ) -> dict[str, Any]:
-    """Pull a doc's chunks plus optional inferred-edge context in ONE call.
+    """Paginate a doc's chunks plus optional inferred-edge context in ONE call.
 
-    Returns: {doc_id, chunks[], outbound_inferred_edges[], evidence_by_edge_id{}}
+    Returns at most `max_chunks` (default `SEARCH_AGENT_FETCH_CHUNKS_MAX`)
+    chunks starting at `offset` in chunk_index order, so a long doc is walked
+    a page at a time rather than one call hauling the whole thing. `offset`
+    also lets the agent reach a chunk past the first page — the prior
+    `LIMIT`-only query could never return a matched chunk at index >= 10.
+
+    Returns: {doc_id, chunks[], offset, limit, next_offset,
+              outbound_inferred_edges[], evidence_by_edge_id{}}
+    `next_offset` is the offset to pass for the next page, or None when this
+    page reached the end of the doc.
     """
     n = _clamp_top_k(max_chunks, SEARCH_AGENT_FETCH_CHUNKS_MAX)
+    off = max(0, int(offset)) if offset is not None else 0
     if with_inferred_edges is None:
         with_inferred_edges = False
     if with_evidence is None:
@@ -701,14 +714,14 @@ async def execute_fetch_doc(
         WHERE customer_id = $1 AND doc_id = $2
           AND visibility = 'approved'
         ORDER BY chunk_index ASC
-        LIMIT $3
+        LIMIT $3 OFFSET $4
     """
 
     inferred_edges: list[dict[str, Any]] = []
     evidence_by_edge: dict[str, list[dict[str, Any]]] = {}
 
     async with with_tenant(customer_id) as conn:
-        rows = await conn.fetch(chunks_sql, customer_id, doc_id, n)
+        rows = await conn.fetch(chunks_sql, customer_id, doc_id, n, off)
         chunks = [
             {
                 "chunk_id": r["chunk_id"],
@@ -788,11 +801,79 @@ async def execute_fetch_doc(
                 for edge_id, cids in edge_to_chunk_ids.items():
                     evidence_by_edge[edge_id] = [ev_by_id[c] for c in cids if c in ev_by_id]
 
+    # A full page (len == n) may have more chunks after it; a short page is
+    # the end of the doc. Deliberately avoids a COUNT(*) round-trip.
+    next_offset = off + len(chunks) if len(chunks) == n else None
     return {
         "doc_id": doc_id,
         "chunks": chunks,
+        "offset": off,
+        "limit": n,
+        "next_offset": next_offset,
         "outbound_inferred_edges": inferred_edges,
         "evidence_by_edge_id": evidence_by_edge,
+    }
+
+
+async def execute_fetch_chunk_window(
+    customer_id: str,
+    *,
+    chunk_id: str,
+    before: int | None = None,
+    after: int | None = None,
+) -> dict[str, Any]:
+    """Return a matched chunk plus its immediate neighbours in the same doc.
+
+    The pre-fan-out already surfaced the specific relevant chunk (vector /
+    BM25 match). This pulls just enough adjacent context — `before` chunks
+    before it and `after` chunks after it by chunk_index — to repair the
+    fixed-window fragmentation of the 512-token chunker, WITHOUT hauling the
+    whole doc. Total chunks returned <= before + 1 + after.
+
+    Returns: {chunk_id, doc_id, chunks[], window: {before, after}}. When the
+    chunk_id is unknown (or draft-only), `chunks` is empty and `doc_id` None.
+    """
+    b = SEARCH_AGENT_CHUNK_WINDOW_DEFAULT if before is None else max(0, int(before))
+    a = SEARCH_AGENT_CHUNK_WINDOW_DEFAULT if after is None else max(0, int(after))
+    b = min(b, SEARCH_AGENT_CHUNK_WINDOW_MAX)
+    a = min(a, SEARCH_AGENT_CHUNK_WINDOW_MAX)
+
+    # One query: resolve the target chunk's (doc_id, chunk_index) in a CTE,
+    # then return the approved chunks in [idx - before, idx + after]. Draft
+    # chunks stay hidden (Plan A Component 6), same as fetch_doc.
+    window_sql = """
+        WITH target AS (
+            SELECT doc_id, chunk_index
+            FROM chunks
+            WHERE customer_id = $1 AND chunk_id = $2 AND visibility = 'approved'
+            LIMIT 1
+        )
+        SELECT c.chunk_id, c.doc_id, c.content, c.kind, c.chunk_index
+        FROM chunks c, target t
+        WHERE c.customer_id = $1
+          AND c.doc_id = t.doc_id
+          AND c.visibility = 'approved'
+          AND c.chunk_index BETWEEN t.chunk_index - $3 AND t.chunk_index + $4
+        ORDER BY c.chunk_index ASC
+    """
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(window_sql, customer_id, chunk_id, b, a)
+
+    chunks = [
+        {
+            "chunk_id": r["chunk_id"],
+            "doc_id": r["doc_id"],
+            "content": r["content"],
+            "kind": r["kind"],
+            "chunk_index": int(r["chunk_index"]),
+        }
+        for r in rows
+    ]
+    return {
+        "chunk_id": chunk_id,
+        "doc_id": chunks[0]["doc_id"] if chunks else None,
+        "chunks": chunks,
+        "window": {"before": b, "after": a},
     }
 
 
@@ -897,19 +978,60 @@ def tool_definitions() -> list[dict[str, Any]]:
             "function": {
                 "name": "fetch_doc",
                 "description": (
-                    "Pull a doc's chunks plus optional outbound inferred-edges and per-edge "
-                    "evidence chunks. ONE call replaces fetch_doc_chunks + "
-                    "read_inferred_edge_evidence."
+                    "Paginate a whole doc when you need MORE than the matched chunk you "
+                    "already have — the answer spans several of its sections. Returns "
+                    "`limit` chunks (default 10) starting at `offset` in document order; "
+                    "pass the returned `next_offset` to read the next page. Optional "
+                    "outbound inferred-edges + per-edge evidence. For just the context "
+                    "AROUND a specific matched chunk, prefer `fetch_chunk_window`."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "doc_id": {"type": "string"},
                         "max_chunks": {"type": "integer", "minimum": 1, "maximum": _HARD_TOP_K_CAP},
+                        "offset": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "description": "Chunk index to start this page at. Default 0. Use next_offset to page.",
+                        },
                         "with_inferred_edges": {"type": "boolean"},
                         "with_evidence": {"type": "boolean"},
                     },
                     "required": ["doc_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "fetch_chunk_window",
+                "description": (
+                    "Return a matched chunk plus its immediate neighbours in the same doc. "
+                    "The pre-fan-out already gave you the specific relevant chunk; call this "
+                    "only to pull a little surrounding context when that chunk reads like a "
+                    "fragment (starts mid-thought, references something just before it). "
+                    "Pass the chunk_id you already have. Cheaper than fetch_doc; does not "
+                    "haul the whole document."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "chunk_id": {"type": "string"},
+                        "before": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": SEARCH_AGENT_CHUNK_WINDOW_MAX,
+                            "description": "Chunks to include before the matched one. Default 1.",
+                        },
+                        "after": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": SEARCH_AGENT_CHUNK_WINDOW_MAX,
+                            "description": "Chunks to include after the matched one. Default 1.",
+                        },
+                    },
+                    "required": ["chunk_id"],
                 },
             },
         },
@@ -956,6 +1078,7 @@ TOOL_REGISTRY: dict[str, Callable[..., Awaitable[dict[str, Any]]]] = {
     "search": execute_search,
     "subgraph": execute_subgraph,
     "fetch_doc": execute_fetch_doc,
+    "fetch_chunk_window": execute_fetch_chunk_window,
 }
 
 
@@ -996,6 +1119,7 @@ __all__ = [
     "TERMINAL_TOOL_NAME",
     "TOOL_REGISTRY",
     "dispatch_tool_call",
+    "execute_fetch_chunk_window",
     "execute_fetch_doc",
     "execute_search",
     "execute_subgraph",
