@@ -71,7 +71,9 @@ from shared.constants import (
     SEARCH_AGENT_HARD_CAP,
     SEARCH_AGENT_INFERENCE_MODEL,
     SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
+    SEARCH_AGENT_MAX_CONTEXT_TOKENS,
     SEARCH_AGENT_MAX_EXTENSIONS,
+    SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET,
     SEARCH_AGENT_SOFT_TURN_CAP,
     SEARCH_AGENT_TOOL_BUDGET,
     SEARCH_AGENT_TRACE_SAMPLE_RATE,
@@ -80,6 +82,7 @@ from shared.constants import (
 )
 from shared.db import with_tenant
 from shared.llm import LLMError, acompletion
+from shared.llm_tools import is_context_overflow
 from shared.logging import get_logger
 from shared.models import QueryRequest, RetrieveResponse
 
@@ -167,34 +170,147 @@ class LoopState:
 # Message + helpers
 # ============================================================
 
-def _format_prefanout_compact(prefanout: dict[str, Any]) -> str:
-    """Render `execute_search` result as a full JSON dump for the LLM.
+# Lazy cl100k tokenizer, shared across calls. False = tiktoken unavailable
+# (fall back to a chars/4 heuristic). cl100k is an ESTIMATE for gpt-oss
+# (different tokenizer); every budget that uses it carries headroom.
+_TOKEN_ENCODING: Any = None
 
-    History: PR #307 introduced a compact rendering (top-10 per channel,
-    150-char snippet truncation, fields stripped) because Fireworks
-    gpt-oss-120b deterministically blew past the 90s loop timeout on
-    cold-cache 15K-token inputs. Cerebras's higher input throughput
-    removed that constraint — and the cap was masking non-GitHub hits
-    from the LLM whenever bm25/vector's top 10 happened to be all
-    GitHub. Same query, same corpus → "GitHub-only chunks" symptom.
 
-    Full uncompress: dump every channel hit with every field. The agent
-    now sees the complete pre-fan-out, can curate freely across all
-    sources, and only the LLM-emitted final selection feeds downstream
-    consumers. Function name kept (callsite stability) but the
-    "compact" semantic is gone.
+def _count_tokens(text: str) -> int:
+    """Approximate token count via cl100k_base (lazy-loaded).
+
+    Budgeting only (prefanout render + running context gate), never exact
+    accounting — gpt-oss's tokenizer differs, so callers leave headroom.
+    Falls back to chars/4 if tiktoken can't load.
+    """
+    global _TOKEN_ENCODING
+    if not text:
+        return 0
+    if _TOKEN_ENCODING is None:
+        try:
+            import tiktoken
+
+            _TOKEN_ENCODING = tiktoken.get_encoding("cl100k_base")
+        except Exception:  # pragma: no cover - tiktoken is a hard dep in prod
+            _TOKEN_ENCODING = False
+    if _TOKEN_ENCODING is False:
+        return (len(text) + 3) // 4
+    return len(_TOKEN_ENCODING.encode(text))
+
+
+def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
+    """Render the pre-fan-out for the LLM, capped at a token budget.
+
+    Previously an UNCAPPED `json.dumps` of every hit with full content. That
+    dump rides in the message history on every turn and was the primary
+    driver of the Cerebras 131K context overflow.
+
+    History: PR #307 added a top-10-PER-CHANNEL cap for Fireworks timeouts;
+    PR #328 reverted it because per-channel capping masked non-GitHub sources
+    whenever bm25/vector's top slots were all GitHub ("GitHub-only chunks").
+    This cap avoids that trap: it keeps the full nested {sub_queries:
+    [{vector,bm25,graph,inferred_edge}]} shape, but drops the lowest-value
+    CONTENT hits (vector + bm25 only) until they fit
+    `SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET`. "Value" is the doc's fused RRF
+    rank across ALL (sub_query, channel) lists — a global Top-N, so no single
+    source is masked by another filling a channel. graph + inferred_edge hits
+    are left intact (small, and they carry the why-chain context). Output is
+    deterministic (fused-score order) so the cached prompt prefix stays
+    stable turn to turn.
     """
     if not prefanout or not prefanout.get("sub_queries"):
         return "(no pre-fan-out hits)"
-    return json.dumps(prefanout, default=str, indent=2)
+
+    sub_queries = prefanout.get("sub_queries") or []
+
+    # Charge each doc its content tokens times how many times it will actually
+    # be RENDERED in the two channels we trim — a doc in both vector and bm25
+    # renders twice — so the budget matches the real dumped size instead of
+    # under-counting. Metadata-only hits (no content body) are ~free and always
+    # kept. graph + inferred_edge hits are always kept whole (small, and they
+    # carry the why-chains), so their content is a fixed baseline: this is why
+    # selection is scoped to vector/bm25 only — ranking across all four
+    # channels would let high-fused graph docs consume the budget and starve
+    # the vector/bm25 content the filter then wipes.
+    trim_occurrences: dict[str, int] = {}
+    baseline_tokens = 0
+    for sq in sub_queries:
+        if not isinstance(sq, dict):
+            continue
+        for channel in ("vector", "bm25"):
+            for hit in sq.get(channel) or []:
+                if not isinstance(hit, dict):
+                    continue
+                content = hit.get("content")
+                doc_id = hit.get("doc_id")
+                if doc_id and isinstance(content, str) and content.strip():
+                    trim_occurrences[doc_id] = trim_occurrences.get(doc_id, 0) + 1
+        for channel in ("graph", "inferred_edge"):
+            for hit in sq.get(channel) or []:
+                if isinstance(hit, dict):
+                    baseline_tokens += _count_tokens(hit.get("content") or "")
+
+    total_trim_docs = len(trim_occurrences)
+    # Rank content docs by fused RRF (deterministic) and keep them, cheapest-
+    # rank-first, until the budget fills. graph/inferred content is pre-charged
+    # as the baseline so the total rendered size — not just vector/bm25 —
+    # respects the cap.
+    kept_docs: set[str] = set()
+    budget_used = baseline_tokens
+    for entry in _fuse_prefanout_docs(prefanout):
+        doc_id = entry["doc_id"]
+        occ = trim_occurrences.get(doc_id, 0)
+        if occ == 0:
+            continue  # graph/inferred-only doc — already in the baseline
+        cost = _count_tokens(entry["hit"].get("content") or "") * occ
+        if kept_docs and budget_used + cost > SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET:
+            break
+        kept_docs.add(doc_id)
+        budget_used += cost
+
+    if len(kept_docs) >= total_trim_docs:
+        # Every content doc fits — original behaviour, no filtering overhead.
+        return json.dumps(prefanout, default=str, indent=2)
+
+    # Trim vector + bm25 to kept docs. Keep every metadata-only hit (no content
+    # body -> ~free, and dropping it would narrow PR#328's "show every hit"
+    # guarantee) and every graph/inferred hit (why-chains).
+    def _keep(h: Any) -> bool:
+        if not isinstance(h, dict):
+            return True
+        content = h.get("content")
+        if not (isinstance(content, str) and content.strip()):
+            return True  # metadata-only, ~free
+        return h.get("doc_id") in kept_docs
+
+    filtered_sqs: list[dict[str, Any]] = []
+    for sq in sub_queries:
+        if not isinstance(sq, dict):
+            continue
+        new_sq = dict(sq)
+        for channel in ("vector", "bm25"):
+            hits = sq.get(channel)
+            if isinstance(hits, list):
+                new_sq[channel] = [h for h in hits if _keep(h)]
+        filtered_sqs.append(new_sq)
+    filtered = dict(prefanout)
+    filtered["sub_queries"] = filtered_sqs
+    dropped = total_trim_docs - len(kept_docs)
+    note = (
+        f"\n(pre-fan-out trimmed to fit context: showing the top "
+        f"{len(kept_docs)} of {total_trim_docs} content docs by fused relevance "
+        f"across all sources; {dropped} lower-ranked docs omitted. Call `search` "
+        f"with a reformulated query if you need something not shown.)"
+    )
+    return json.dumps(filtered, default=str, indent=2) + note
 
 
 # Total chain-line cap. Each line ~100-300 chars; capping ~30 keeps the
 # section under ~10KB on the worst-case 5-sub_query x 10-hit fan-out.
-# The full JSON dump in `_format_prefanout_compact` is the source of truth
-# for raw hits; this section is a complementary structural view (grouped
-# by anchor) — its job is making chain shape visible, not exhaustively
-# enumerating hits.
+# The (budgeted) JSON dump in `_render_prefanout_budgeted` is the source of
+# truth for raw hits; this section is a complementary structural view
+# (grouped by anchor) — its job is making chain shape visible, not
+# exhaustively enumerating hits.
 _PREFANOUT_INFERRED_CHAINS_CAP = 30
 
 
@@ -423,7 +539,7 @@ def _build_user_message(
             f"detail on any doc_id, call `fetch_doc(doc_id)`. For exploration, "
             f"call `search` with REFORMULATED queries or `subgraph(anchor)`. "
             f"When you've curated the answer, call `emit_gatherer_output`.\n"
-            f"{_format_prefanout_compact(prefanout)}\n"
+            f"{_render_prefanout_budgeted(prefanout)}\n"
             f"</channel_results>"
         )
         chains_block = _format_inferred_chains(prefanout)
@@ -585,9 +701,80 @@ def _no_llm_configured() -> bool:
 # Per-turn LLM call + dispatcher
 # ============================================================
 
+def _message_tokens(m: dict[str, Any]) -> int:
+    """Approximate token cost of one chat message (content + tool_calls)."""
+    total = 0
+    content = m.get("content")
+    if isinstance(content, str):
+        total += _count_tokens(content)
+    elif isinstance(content, list):
+        # system prompt shape: [{"type": "text", "text": ...}]
+        total += sum(
+            _count_tokens(p.get("text", "")) for p in content if isinstance(p, dict)
+        )
+    tool_calls = m.get("tool_calls")
+    if tool_calls:
+        total += _count_tokens(json.dumps(tool_calls, default=str))
+    return total
+
+
+# Stub that replaces an evicted tool result. Keeps the `tool` message (and
+# its tool_call_id linkage) so the assistant<->tool pairing the OpenAI
+# contract requires stays intact — only the bulky content is dropped.
+_EVICTED_TOOL_CONTENT = json.dumps(
+    {"truncated": True, "reason": "older tool result trimmed to fit context window"}
+)
+
+
+def _enforce_context_budget(state: LoopState) -> None:
+    """Trim the oldest tool results in place until the history fits the window.
+
+    Backstop for the context overflow: the prefanout render is budgeted and
+    fetch_doc is paginated, but an agent can still page several long docs past
+    `SEARCH_AGENT_MAX_CONTEXT_TOKENS`. Rather than DELETE messages (which would
+    orphan an assistant tool_call from its tool response and 400), this shrinks
+    the CONTENT of the oldest `tool`-role messages to a stub. System prompt,
+    turn-1 evidence, and assistant tool_calls are never touched. If even
+    stubbing every tool message can't get under budget, the next LLM call may
+    still 400 — caught by the context_overflow handler and degraded to 200.
+    """
+    # One tokenizer pass over the history; reuse the per-message counts in the
+    # eviction loop so tool bodies aren't encoded twice.
+    per_msg = [_message_tokens(m) for m in state.messages]
+    total = sum(per_msg)
+    if total <= SEARCH_AGENT_MAX_CONTEXT_TOKENS:
+        return
+    stub_cost = _count_tokens(_EVICTED_TOOL_CONTENT)
+    evicted = 0
+    for idx, m in enumerate(state.messages):
+        if total <= SEARCH_AGENT_MAX_CONTEXT_TOKENS:
+            break
+        if m.get("role") != "tool" or not isinstance(m.get("content"), str):
+            continue
+        cur = per_msg[idx]  # already counted above — a tool message is content-only
+        if cur <= stub_cost:
+            continue
+        m["content"] = _EVICTED_TOOL_CONTENT
+        total -= cur - stub_cost
+        evicted += 1
+    if evicted:
+        log.info(
+            "agent.context_budget_evicted",
+            customer_id=state.customer_id,
+            trace_id=state.trace_id,
+            turn=state.turn_count,
+            evicted_tool_results=evicted,
+            approx_tokens_after=total,
+        )
+
+
 async def _run_turn(state: LoopState) -> Any:
     """Run one LLM turn with tool_choice='required'. Records latency +
     cache hit rate on state. Returns the raw response."""
+    # Backstop: keep the accumulated history under the model's context window
+    # before every call (prefanout budget + fetch pagination handle the common
+    # case; this catches deep multi-doc paging).
+    _enforce_context_budget(state)
     call_kwargs: dict[str, Any] = {
         "model": SEARCH_AGENT_INFERENCE_MODEL,
         "messages": state.messages,
@@ -1575,25 +1762,44 @@ async def run_gatherer(
         status = "loop_timeout"
         gathered = _empty_passthrough("loop_timeout")
     except LLMError as exc:
-        log.error(
-            "agent.fatal_provider_error",
-            customer_id=customer_id,
-            trace_id=trace_id,
-            error=str(exc),
-        )
-        if request is not None:
-            request.state.full_failure = True
-        _stash_for_trace_persist(
-            request,
-            customer_id=customer_id,
-            trace_id=trace_id,
-            query=req.query,
-            state=state,
-            gathered=None,
-            status="fatal_provider_error",
-            timing=timing,
-        )
-        raise HTTPException(status_code=503, detail="search agent unavailable") from exc
+        if is_context_overflow(exc):
+            # Deterministic input-too-large (provider 400), NOT an outage —
+            # retrying the identical request always fails. Degrade to a 200
+            # passthrough: the recall-floor backfill below fills `gathered`
+            # from state.prefanout, so the caller still gets relevant results
+            # (minus the agent's curation) instead of a 503 that falsely reads
+            # as "retryable". The prefanout budget + context gate make this
+            # rare; this is the last-resort net.
+            log.warning(
+                "agent.context_overflow",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                turn=state.turn_count,
+                tool_calls=state.tool_calls_count,
+                error=str(exc),
+            )
+            status = "context_overflow"
+            gathered = _empty_passthrough("context_overflow")
+        else:
+            log.error(
+                "agent.fatal_provider_error",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                error=str(exc),
+            )
+            if request is not None:
+                request.state.full_failure = True
+            _stash_for_trace_persist(
+                request,
+                customer_id=customer_id,
+                trace_id=trace_id,
+                query=req.query,
+                state=state,
+                gathered=None,
+                status="fatal_provider_error",
+                timing=timing,
+            )
+            raise HTTPException(status_code=503, detail="search agent unavailable") from exc
 
     # Recall-floor backfill. The single-turn gatherer curates the wide
     # pre-fan-out pool by hand and under-emits on breadth questions; append

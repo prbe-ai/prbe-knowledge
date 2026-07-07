@@ -43,6 +43,7 @@ def test_prompt_lists_all_fat_tools() -> None:
         "search",
         "subgraph",
         "fetch_doc",
+        "fetch_chunk_window",
         "need_deeper",
         "emit_gatherer_output",
     ):

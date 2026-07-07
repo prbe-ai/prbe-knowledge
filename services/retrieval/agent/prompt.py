@@ -17,6 +17,7 @@ _TOOLS = (
     "search",
     "subgraph",
     "fetch_doc",
+    "fetch_chunk_window",
     "need_deeper",
     "emit_gatherer_output",
 )
@@ -92,13 +93,22 @@ EXPLORATION TOOLS
   entities. Use this to traverse the knowledge graph instead of
   multiple thin 1-hop calls.
 
-• `fetch_doc(doc_id, max_chunks?, with_inferred_edges?, with_evidence?)`
-  Full doc detail in ONE call. Returns the chunks (default 10), plus
-  optional outbound inferred edges (`with_inferred_edges=true`) and the
-  chunks the LLM was reasoning over when producing each `why` string
-  (`with_evidence=true`). Use when one specific doc in
-  `<channel_results>` looks important and you need the full body or
-  the cross-references.
+• `fetch_chunk_window(chunk_id, before?, after?)`
+  The matched chunk you already have in `<channel_results>` plus its
+  immediate neighbours in the same doc (default 1 each side). Use this —
+  NOT `fetch_doc` — when a matched chunk reads like a fragment (starts
+  mid-thought, refers to something just before it) and you want a little
+  surrounding context. Cheap; does not pull the whole document.
+
+• `fetch_doc(doc_id, offset?, max_chunks?, with_inferred_edges?, with_evidence?)`
+  Paginate a whole doc when the answer spans SEVERAL of its sections, not
+  just the matched chunk. Returns `max_chunks` chunks (default 10) starting
+  at `offset` in document order, plus optional outbound inferred edges
+  (`with_inferred_edges=true`) and the evidence chunks behind each `why`
+  string (`with_evidence=true`). Pass the returned `next_offset` to read
+  the next page. Reach for this only when one chunk plus its window is not
+  enough — most queries are answered by the chunks already in
+  `<channel_results>`.
 
 BUDGET
 ──────
@@ -119,6 +129,13 @@ HAPPY PATH
 Turn 1: read `<channel_results>` (and `<inferred_chains>` when present).
 If it answers the query → call `emit_gatherer_output` with the curated
 entities + chunks. Done in one turn — this is the common case.
+
+The chunks in `<channel_results>` ARE the matched passages — the search
+already found the specific relevant chunk of each doc. Default to emitting
+those directly. You rarely need to fetch more: reach for `fetch_chunk_window`
+only when a matched chunk is a fragment, and `fetch_doc` only when the answer
+truly spans multiple sections of one doc. Do not fetch a whole doc just to
+re-read a chunk you already have.
 
 Explore further only when:
   - Pre-fan-out is thin AND the query is specific → `search` with a
