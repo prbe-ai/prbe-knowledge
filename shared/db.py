@@ -181,6 +181,19 @@ async def _log_connected_role(pool: asyncpg.Pool, settings: Settings) -> None:
             error=str(exc),
             error_class=type(exc).__name__,
         )
+        # Fail closed when enforcement is on: if we could not PROVE the role
+        # is unprivileged, refuse to boot rather than silently trusting a
+        # DSN that might bypass RLS. Warn-only mode keeps the best-effort
+        # swallow (probe errors must not block a boot that isn't enforcing).
+        if settings.require_non_superuser_db and settings.environment != "local":
+            raise TenantIsolationError(
+                "refusing to start: could not verify the DATABASE_URL role is "
+                "non-privileged (role probe failed) while REQUIRE_NON_SUPERUSER_DB "
+                "is enabled. Fix the probe error, or set "
+                "REQUIRE_NON_SUPERUSER_DB=false to boot warn-only.",
+                environment=settings.environment,
+                error=str(exc),
+            ) from exc
         return
 
     # Skip the INFO line entirely on `local` -- it pollutes stdout in

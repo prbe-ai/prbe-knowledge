@@ -12,6 +12,7 @@ one source of truth.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -165,6 +166,17 @@ def build_triage_prompt(
     }
 
 
+def _defuse_delimiter(text: str, tag: str) -> str:
+    """Stop untrusted content from forging the <tag>/</tag> boundary the model
+    relies on to separate data from instructions (a chunk/event body could
+    otherwise embed a literal ``</body>`` to close the region and present
+    following text as instructions). Renders forged tags as ``[body]`` /
+    ``[/body]`` — harmless and still readable. Defense-in-depth, not a
+    complete injection defense.
+    """
+    return re.sub(rf"<(/?){tag}>", rf"[\1{tag}]", text, flags=re.IGNORECASE)
+
+
 def _format_triage_user_message(events: list[TriageInput]) -> str:
     parts: list[str] = ["Triage the following events. Return one verdict per queue_id."]
     for event in events:
@@ -179,7 +191,7 @@ def _format_triage_user_message(events: list[TriageInput]) -> str:
             f"title: {title}\n"
             f"author: {author}\n"
             "body:\n"
-            f"<body>\n{event.body}\n</body>"
+            f"<body>\n{_defuse_delimiter(event.body, 'body')}\n</body>"
         )
     return "\n".join(parts)
 

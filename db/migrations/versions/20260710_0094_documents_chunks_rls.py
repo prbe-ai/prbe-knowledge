@@ -87,6 +87,12 @@ _TABLES: tuple[str, ...] = ("documents", "chunks", "failed_chunks")
 
 
 def upgrade() -> None:
+    # These DDLs are catalog-only (no table scan/rewrite) so they are
+    # near-instant, but each ALTER TABLE grabs a brief ACCESS EXCLUSIVE lock
+    # on documents/chunks — the two hottest tables. Bound the wait so the
+    # migration fails fast and retries (idempotent) instead of queueing
+    # behind a long retrieval scan and stalling new queries on those tables.
+    op.execute("SET lock_timeout = '5s'")
     for table in _TABLES:
         # ENABLE + FORCE RLS. Both are idempotent at the catalog level
         # (Postgres no-ops if already on). FORCE matters: the app roles
