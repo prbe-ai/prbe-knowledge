@@ -77,8 +77,10 @@ def test_coerce_search_options_handles_missing_sort_key() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("gateway_enabled", [True, False])
 async def test_extract_returns_entity_extraction_with_search_options(
     monkeypatch: pytest.MonkeyPatch,
+    gateway_enabled: bool,
 ) -> None:
     """End-to-end: extractor returns the parsed EntityExtraction object
     carrying both entities and the sort directive."""
@@ -93,9 +95,14 @@ async def test_extract_returns_entity_extraction_with_search_options(
         ],
         "search_options": {"sort": "recency"},
     })
+    mock_acompletion = AsyncMock(return_value=_fake_completion(payload))
+    if gateway_enabled:
+        monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.example")
+    else:
+        monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
     monkeypatch.setattr(
         "services.retrieval.agent.extractor.acompletion",
-        AsyncMock(return_value=_fake_completion(payload)),
+        mock_acompletion,
     )
 
     result = await extract_entities_with_llm(
@@ -108,6 +115,11 @@ async def test_extract_returns_entity_extraction_with_search_options(
     assert len(result.entities) == 1
     assert result.entities[0].canonical_id == "mahit@prbe.ai"
     assert result.search_options.sort == "recency"
+    call_kwargs = mock_acompletion.await_args.kwargs
+    if gateway_enabled:
+        assert call_kwargs["max_retries"] == 0
+    else:
+        assert "max_retries" not in call_kwargs
 
 
 @pytest.mark.asyncio

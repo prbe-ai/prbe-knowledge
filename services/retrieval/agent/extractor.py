@@ -35,7 +35,7 @@ from shared.constants import (
     SEARCH_AGENT_INFERENCE_MODEL,
     SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
 )
-from shared.llm import LLMError, acompletion
+from shared.llm import LLMError, acompletion, gateway_url
 from shared.logging import get_logger
 
 log = get_logger(__name__)
@@ -365,6 +365,11 @@ async def extract_entities_with_llm(
             "max_tokens": 600,
             "timeout": SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
         }
+        if gateway_url():
+            # The managed proxy owns Cerebras -> Fireworks failover. Do not
+            # replay its full route chain after every provider fails. Direct
+            # self-hosted calls keep LiteLLM's normal transient retries.
+            call_kwargs["max_retries"] = 0
         if seed is not None:
             call_kwargs["seed"] = seed
         resp = await acompletion(**call_kwargs)
