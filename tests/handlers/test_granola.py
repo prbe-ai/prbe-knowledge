@@ -675,6 +675,73 @@ async def test_backfill_no_checkpoint_when_nothing_seen() -> None:
     assert events == []
 
 
+# ---------------------------------------------------------------------------
+# verify_token_health — periodic liveness probe consumed by
+# scripts/cron_token_health_check.py. True → still healthy. False → flip
+# integration_tokens.status to 'auth_failed'. TransientSourceError → leave
+# the row active, retry next cron tick.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_granola_verify_token_health_returns_true_on_200() -> None:
+    """200 from /v1/notes?limit=1 means the API key is still alive."""
+    seen: list[httpx.Request] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen.append(req)
+        assert req.url.path == "/v1/notes"
+        assert req.url.params.get("limit") == "1"
+        return httpx.Response(200, json={"notes": [], "hasMore": False})
+
+    async with httpx.AsyncClient(transport=_granola_transport(handler)) as http:
+        granola = GranolaConnector(_make_ctx(http=http))
+        assert await granola.verify_token_health(_token()) is True
+
+    assert len(seen) == 1
+    assert seen[0].headers.get("Authorization") == "Bearer grn_test_TOKEN"
+
+
+@pytest.mark.asyncio
+async def test_granola_verify_token_health_returns_false_on_401() -> None:
+    """HTTP 401 is the definitive "this token is dead" signal. The cron
+    flips the row to auth_failed on this return value."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"message": "invalid api key"})
+
+    async with httpx.AsyncClient(transport=_granola_transport(handler)) as http:
+        granola = GranolaConnector(_make_ctx(http=http))
+        assert await granola.verify_token_health(_token()) is False
+
+
+@pytest.mark.asyncio
+async def test_granola_verify_token_health_5xx_raises_transient() -> None:
+    """5xx is inconclusive — don't poison the row over a Granola edge blip."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="down")
+
+    async with httpx.AsyncClient(transport=_granola_transport(handler)) as http:
+        granola = GranolaConnector(_make_ctx(http=http))
+        with pytest.raises(TransientSourceError):
+            await granola.verify_token_health(_token())
+
+
+@pytest.mark.asyncio
+async def test_granola_verify_token_health_network_error_raises_transient() -> None:
+    """A network-level exception is inconclusive — wrap as TransientSourceError
+    so the cron treats it like a 5xx (skip, leave row active)."""
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    async with httpx.AsyncClient(transport=_granola_transport(handler)) as http:
+        granola = GranolaConnector(_make_ctx(http=http))
+        with pytest.raises(TransientSourceError):
+            await granola.verify_token_health(_token())
+
+
 def test_watermark_step_back_1ms_helper() -> None:
     """Helper produces ISO 1ms earlier; returns None on unparseable input."""
     from services.ingestion.handlers.granola import _watermark_step_back_1ms
