@@ -8,6 +8,8 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- Gatherer responses now honor `top_k_related`, including returning no related
+  entity payload when callers set it to zero.
 - Gateway-routed retrieval entity extraction and gatherer turns now make a
   single client attempt, so a failed provider chain is not replayed after the
   LiteLLM gateway has exhausted its configured failover routes. Direct

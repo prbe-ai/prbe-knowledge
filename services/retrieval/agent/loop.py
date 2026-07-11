@@ -1704,6 +1704,7 @@ async def run_gatherer(
             timing_ms=timing,
             prefanout=state.prefanout,
             customer_id=customer_id,
+            top_k_related=req.top_k_related,
         )
 
     if _no_llm_configured():
@@ -1742,6 +1743,7 @@ async def run_gatherer(
             timing_ms=timing,
             prefanout=state.prefanout,
             customer_id=customer_id,
+            top_k_related=req.top_k_related,
         )
 
     gathered: GathererOutput | None = None
@@ -1885,6 +1887,7 @@ async def run_gatherer(
         timing_ms=timing,
         prefanout=state.prefanout,
         customer_id=customer_id,
+        top_k_related=req.top_k_related,
     )
 
 

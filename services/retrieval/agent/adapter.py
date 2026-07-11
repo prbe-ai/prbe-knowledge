@@ -355,6 +355,7 @@ async def to_query_response(
     timing_ms: dict[str, float],
     prefanout: dict[str, Any] | None = None,
     customer_id: str | None = None,
+    top_k_related: int = 10,
 ) -> RetrieveResponse:
     """Wrap a GathererOutput in the existing RetrieveResponse shape.
 
@@ -381,6 +382,10 @@ async def to_query_response(
     missed them because none was the grounded anchor, but the graph
     *does* have edges between them. None preserves the pre-enrichment
     behaviour for tests / harness-passthrough.
+
+    `top_k_related` controls only the optional crawl-candidate projection.
+    Zero disables it; positive values cap it without removing gathered entity
+    rows or `extracted_entities` from the core response.
     """
     doc_evidence = _build_doc_to_graph_evidence(prefanout)
 
@@ -545,7 +550,7 @@ async def to_query_response(
             member_count=1,
             member_sources=[],
         )
-        for e in gathered.entities
+        for e in gathered.entities[:top_k_related]
     ]
 
     # Explicit query root — the doc the query is most about. Surfaced so

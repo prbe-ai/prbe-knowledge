@@ -228,6 +228,46 @@ async def test_related_entities_populated_from_gathered_entities() -> None:
     assert re.max_confidence == "EXTRACTED"
 
 
+async def test_top_k_related_zero_disables_gatherer_projection() -> None:
+    gathered = GathererOutput(
+        entities=[GatheredEntity(canonical_id="pr-72", label="PR")],
+        chunks=[],
+        gatherer_notes=GathererNotes(),
+    )
+
+    resp = await to_query_response(
+        query="q",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        top_k_related=0,
+    )
+
+    assert resp.related_entities is None
+
+
+async def test_top_k_related_caps_gatherer_projection() -> None:
+    gathered = GathererOutput(
+        entities=[
+            GatheredEntity(canonical_id="pr-72", label="PR"),
+            GatheredEntity(canonical_id="pr-73", label="PR"),
+        ],
+        chunks=[],
+        gatherer_notes=GathererNotes(),
+    )
+
+    resp = await to_query_response(
+        query="q",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        top_k_related=1,
+    )
+
+    assert resp.related_entities is not None
+    assert [entity.canonical_id for entity in resp.related_entities] == ["pr-72"]
+
+
 async def test_related_entities_label_falls_back_to_canonical_prefix() -> None:
     """Empty `label` (Cerebras provider drift — schema-tolerant default
     on GatheredEntity is ""). The dashboard panel renders the label
