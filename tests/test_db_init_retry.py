@@ -20,11 +20,11 @@ from shared.constants import (
     DB_INIT_RETRY_BACKOFF_CAP_SECONDS,
     DB_INIT_RETRY_BASE_SECONDS,
 )
-from shared.exceptions import DatabaseUnavailable
+from shared.exceptions import DatabaseUnavailable, TenantIsolationError
 
 
 class _FakePool:
-    async def close(self) -> None:  # pragma: no cover — never called in these tests
+    async def close(self) -> None:
         return None
 
 
@@ -162,11 +162,14 @@ async def test_init_pool_passes_connect_timeout(monkeypatch: pytest.MonkeyPatch)
 
 
 class _FakeConn:
-    def __init__(self, role: str, is_superuser: bool) -> None:
+    def __init__(self, role: str, is_superuser: bool, bypass_rls: bool = False) -> None:
         self._role = role
         self._is_superuser = is_superuser
+        self._bypass_rls = bypass_rls
 
     async def fetchval(self, query: str, *args: object) -> object:
+        if "rolbypassrls" in query:
+            return self._bypass_rls
         if "current_user" in query:
             return self._role
         if "is_superuser" in query:
@@ -186,10 +189,10 @@ class _FakeAcquireCtx:
 
 
 class _RoleProbePool(_FakePool):
-    """FakePool that answers the role probe with a fixed role + flag."""
+    """FakePool that answers the role probe with a fixed role + flags."""
 
-    def __init__(self, role: str, is_superuser: bool) -> None:
-        self._conn = _FakeConn(role, is_superuser)
+    def __init__(self, role: str, is_superuser: bool, bypass_rls: bool = False) -> None:
+        self._conn = _FakeConn(role, is_superuser, bypass_rls)
 
     def acquire(self) -> _FakeAcquireCtx:
         return _FakeAcquireCtx(self._conn)
@@ -213,12 +216,69 @@ async def test_init_pool_warns_when_superuser_in_non_local_env(
         environment="main",
         db_init_retry_attempts=1,
         db_init_retry_base_seconds=0.01,
+        require_non_superuser_db=False,  # pin the warn-only escape hatch
     )
     with structlog.testing.capture_logs() as logs:
         await db_module.init_pool(settings)
 
     events = [entry.get("event") for entry in logs]
     assert "db.superuser_in_managed_env" in events, events
+    db_module.reset_pool()
+
+
+@pytest.mark.asyncio
+async def test_init_pool_refuses_superuser_when_guard_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opt-in fail-closed: with require_non_superuser_db=True, a superuser DSN
+    in a non-local env refuses to boot and closes the pool. (The default is
+    warn-only — see test_init_pool_warns_when_superuser_in_non_local_env.)"""
+    db_module.reset_pool()
+
+    async def fake_create_pool(*_args: object, **_kwargs: object) -> _RoleProbePool:
+        return _RoleProbePool(role="probe", is_superuser=True)
+
+    monkeypatch.setattr(db_module.asyncpg, "create_pool", fake_create_pool)
+
+    settings = Settings(
+        database_url="postgresql://probe:guard@neon/prbe",
+        environment="main",
+        require_non_superuser_db=True,
+        db_init_retry_attempts=1,
+        db_init_retry_base_seconds=0.01,
+    )
+    with pytest.raises(TenantIsolationError):
+        await db_module.init_pool(settings)
+
+    # The guard must not leave a live pool behind.
+    assert db_module._pool is None
+    db_module.reset_pool()
+
+
+@pytest.mark.asyncio
+async def test_init_pool_refuses_bypassrls_non_superuser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BYPASSRLS bypasses FORCE RLS without rolsuper — the guard must
+    catch it too (e.g. a probe_admin-shaped role in DATABASE_URL)."""
+    db_module.reset_pool()
+
+    async def fake_create_pool(*_args: object, **_kwargs: object) -> _RoleProbePool:
+        return _RoleProbePool(role="probe_admin", is_superuser=False, bypass_rls=True)
+
+    monkeypatch.setattr(db_module.asyncpg, "create_pool", fake_create_pool)
+
+    settings = Settings(
+        database_url="postgresql://probe_admin:guard@neon/prbe",
+        environment="main",
+        require_non_superuser_db=True,
+        db_init_retry_attempts=1,
+        db_init_retry_base_seconds=0.01,
+    )
+    with pytest.raises(TenantIsolationError):
+        await db_module.init_pool(settings)
+
+    assert db_module._pool is None
     db_module.reset_pool()
 
 

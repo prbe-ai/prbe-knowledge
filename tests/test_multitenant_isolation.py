@@ -1,8 +1,10 @@
 """RLS + explicit-filter isolation: customer A must never see customer B data.
 
-The graph tables enforce tenant isolation via RLS. Documents/chunks rely on
-explicit `customer_id = $1` filters in every query. This test asserts both
-layers: bind tenant A, insert a graph row, bind tenant B, confirm zero rows.
+The graph tables enforce tenant isolation via RLS. Documents / chunks /
+failed_chunks carry the same FORCE-RLS tenant policy since migration 0094
+AND keep explicit `customer_id = $1` filters in every query (defense in
+depth). This test asserts both layers: bind tenant A, insert a graph row,
+bind tenant B, confirm zero rows.
 """
 
 from __future__ import annotations
@@ -87,7 +89,9 @@ async def test_documents_filter_isolation(live_db) -> None:
             )
 
     async with raw_conn() as conn:
-        # Without explicit filter — returns both (vulnerable shape)
+        # Without explicit filter — returns both. raw_conn here runs as
+        # the local `prbe` superuser, which bypasses the 0094 FORCE-RLS
+        # policy; a non-superuser role without the tenant GUC would see 0.
         rows = await conn.fetch("SELECT doc_id FROM documents")
         assert len(rows) == 2
 

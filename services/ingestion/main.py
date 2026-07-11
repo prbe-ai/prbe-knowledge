@@ -22,6 +22,7 @@ do the per-source token exchange + storage. See admin_routes.py.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import hmac
@@ -71,7 +72,7 @@ from shared.constants import (
     SOURCE_INGESTION_PRIORITY,
     SourceSystem,
 )
-from shared.db import get_pool, health_check, init_pool
+from shared.db import get_pool, health_check, init_pool, with_tenant
 from shared.exceptions import (
     HandlerNotFound,
     InvalidWebhookPayload,
@@ -246,7 +247,7 @@ async def create_manual_uploads(
             raise HTTPException(status_code=503, detail="storage unavailable") from exc
 
         try:
-            parsed = parse_manual_upload(filename, content_type, body)
+            parsed = await asyncio.to_thread(parse_manual_upload, filename, content_type, body)
         except ManualUploadParseError as exc:
             with contextlib.suppress(PrbeError):
                 await store.delete(bucket, staging_key)
@@ -375,7 +376,11 @@ async def list_manual_uploads(
     if not x_prbe_customer:
         raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
 
-    async with get_pool().acquire() as conn:
+    # with_tenant (not a bare pool conn): the correlated chunk_count
+    # subquery reads `chunks`, which is FORCE-RLS'd as of migration 0094.
+    # Without the tenant GUC the count would silently be 0 under the
+    # non-superuser probe_app role.
+    async with with_tenant(x_prbe_customer) as conn:
         rows = await conn.fetch(
             """
             SELECT mu.upload_id, mu.filename, mu.content_type, mu.file_size_bytes,

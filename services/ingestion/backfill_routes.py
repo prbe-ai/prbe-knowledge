@@ -1,25 +1,37 @@
-"""Backfill status endpoint.
+"""Backfill status endpoint — internal API.
 
-    GET /backfill/status?customer_id=<id>
-    GET /backfill/status?customer_id=<id>&source=<slack|linear|...>
+    GET /backfill/status
+    GET /backfill/status?source=<slack|linear|...>
 
-Returns per-source backfill progress (status, events enqueued, cursor,
-last heartbeat). Useful for a dashboard onboarding progress bar.
+Gated by X-Internal-Knowledge-Key (caller is the prbe-backend gateway);
+the tenant comes from the X-Prbe-Customer header the gateway sets —
+never from the client. Returns per-source backfill progress (status,
+events enqueued, cursor, last heartbeat). Useful for a dashboard
+onboarding progress bar.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
+from services.ingestion.admin_routes import verify_internal_knowledge_key
 from shared.constants import SourceSystem
-from shared.db import raw_conn
+from shared.db import with_tenant
 
 router = APIRouter(prefix="/backfill", tags=["backfill"])
 
 
-@router.get("/status")
+def _require_customer(
+    x_prbe_customer: str | None = Header(default=None, alias="X-Prbe-Customer"),
+) -> str:
+    if not x_prbe_customer:
+        raise HTTPException(status_code=400, detail="missing X-Prbe-Customer")
+    return x_prbe_customer
+
+
+@router.get("/status", dependencies=[Depends(verify_internal_knowledge_key)])
 async def backfill_status(
-    customer_id: str = Query(...),
+    customer_id: str = Depends(_require_customer),
     source: str | None = Query(default=None),
 ) -> dict:
     if source is not None:
@@ -28,7 +40,7 @@ async def backfill_status(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"unknown source '{source}'") from exc
 
-    async with raw_conn() as conn:
+    async with with_tenant(customer_id) as conn:
         if source:
             rows = await conn.fetch(
                 """

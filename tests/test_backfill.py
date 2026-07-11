@@ -2563,11 +2563,15 @@ async def test_github_graphql_snapshot_lock_serializes_cursor_writes(
 
 
 @pytest.mark.asyncio
-async def test_backfill_status_endpoint(live_db) -> None:
-    """GET /backfill/status returns per-source rows for a customer."""
+async def test_backfill_status_endpoint(live_db, monkeypatch) -> None:
+    """GET /backfill/status requires the internal key + gateway customer
+    header; the tenant comes from X-Prbe-Customer, never from the client."""
     from httpx import ASGITransport
 
     from shared.db import close_pool, init_pool
+
+    monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", "test-internal-key")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
 
     async with raw_conn() as conn:
         await conn.execute(
@@ -2585,9 +2589,24 @@ async def test_backfill_status_endpoint(live_db) -> None:
         httpx.AsyncClient(transport=transport, base_url="http://t") as client,
         ingestion_app.router.lifespan_context(ingestion_app),
     ):
-        resp = await client.get("/backfill/status?customer_id=cust-s")
+        # No internal key -> 401 (a client-supplied customer_id is ignored).
+        unauth = await client.get("/backfill/status?customer_id=cust-s")
+        # Internal key but no X-Prbe-Customer -> 400.
+        no_customer = await client.get(
+            "/backfill/status",
+            headers={"X-Internal-Knowledge-Key": "test-internal-key"},
+        )
+        resp = await client.get(
+            "/backfill/status",
+            headers={
+                "X-Internal-Knowledge-Key": "test-internal-key",
+                "X-Prbe-Customer": "cust-s",
+            },
+        )
     await init_pool(settings=None)
 
+    assert unauth.status_code == 401, unauth.text
+    assert no_customer.status_code == 400, no_customer.text
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["customer_id"] == "cust-s"

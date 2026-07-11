@@ -183,6 +183,12 @@ CREATE INDEX idx_documents_doc_id_trgm ON documents USING GIN (doc_id gin_trgm_o
 CREATE INDEX IF NOT EXISTS documents_visibility_approved_idx
     ON documents (customer_id, doc_type) WHERE visibility = 'approved';
 
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE documents FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON documents
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
 -- ---------------------------------------------------------------------------
 -- chunks: content-addressable retrieval units.
 -- Identity is (doc_id, content_hash) — a chunk with the same content across
@@ -283,6 +289,12 @@ CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kin
 -- See migration 0082.
 CREATE INDEX IF NOT EXISTS chunks_visibility_approved_idx
     ON chunks (customer_id, doc_id) WHERE visibility = 'approved';
+
+ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chunks FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON chunks
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
 -- directed_vectors: per-document trigger phrases used as a doc-level
@@ -526,6 +538,12 @@ CREATE TABLE failed_chunks (
     failed_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_failed_chunks_customer ON failed_chunks (customer_id, failed_at DESC);
+
+ALTER TABLE failed_chunks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE failed_chunks FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON failed_chunks
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
 -- ingestion_events: replay / debug log

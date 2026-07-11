@@ -18,7 +18,11 @@ from shared.constants import (
     DB_INIT_RETRY_BASE_SECONDS,
 )
 
-Environment = Literal["local", "dev", "staging", "main"]
+# "self-host" is what the community Helm chart ships as its default
+# ENVIRONMENT (deploy/helm/values.yaml `config.environment`). It behaves
+# like any other non-local environment (signature dev-bypasses stay off,
+# boot-secret validation applies).
+Environment = Literal["local", "dev", "staging", "main", "self-host"]
 
 
 class Settings(BaseSettings):
@@ -53,6 +57,22 @@ class Settings(BaseSettings):
     # efficiency. If unset, listeners fall back to database_url, preserving
     # local-dev + non-pooler deploys without a config burden.
     database_url_unpooled: str | None = None
+    # RLS role guard (bug #46 follow-up). ``shared.db.init_pool`` always
+    # WARN-logs in any non-local environment if DATABASE_URL connects as a
+    # superuser OR a BYPASSRLS role — either one silently disables FORCE RLS
+    # tenant isolation. When this flag is True it additionally FAILS CLOSED
+    # (refuses to start) on such a role.
+    #
+    # Default is False (warn-only) deliberately: on 2026-07-10 the live
+    # managed cluster showed the data-plane pools on the non-privileged
+    # ``probe_app`` role (36 conns, rolsuper=f/rolbypassrls=f) BUT also 21
+    # live connections as the ``probe`` superuser (idle health/auth probes —
+    # `SELECT 1`, pgbouncer rolvaliduntil auth_query). Until every process
+    # that calls init_pool (incl. the token-health CronJob) is confirmed to
+    # use probe_app, a fail-closed default could crash-loop a pooled service.
+    # Flip to enforcement per-env with REQUIRE_NON_SUPERUSER_DB=true once
+    # that trace is done — the warn line is the signal to watch first.
+    require_non_superuser_db: bool = False
     db_pool_min_size: int = 2
     # >= machine_count * WORKER_MAX_CONCURRENT so claim loops never queue on
     # the pool. 18 * 6 = 108 slots; 30 covers the steady-state working set
@@ -269,6 +289,54 @@ class Settings(BaseSettings):
     def bucket_for(self, customer_id: str) -> str:
         """Per-tenant bucket naming. Kept in one place so bootstrap + runtime agree."""
         return f"{self.r2_bucket_prefix}-{customer_id}"
+
+
+# Placeholder secret values shipped in deploy/helm/values.yaml. Empty/unset
+# secrets are allowed (they disable the corresponding feature); a placeholder
+# silently *enables* the feature with a publicly-known credential, which is
+# strictly worse — refuse to boot instead. Deliberately NOT included:
+# docker-compose defaults ("minioadmin", "local-internal-key", ...) — the
+# compose stack pins ENVIRONMENT=local, where this check never runs.
+_PLACEHOLDER_SECRET_VALUES = frozenset({"CHANGEME", "changeme"})
+
+
+def validate_boot_secrets(settings: Settings) -> None:
+    """Refuse to boot outside ``local`` when a security-critical secret is
+    still a known shipped placeholder (helm values.yaml "CHANGEME").
+
+    Called from ``shared.db.init_pool`` so every service entrypoint gets it
+    without per-lifespan wiring. Managed-shared / hosted deployments set
+    real values via operator-managed Secrets (never these placeholders),
+    so this cannot fire there.
+    """
+    if settings.environment == "local":
+        return
+    checked: dict[str, str] = {
+        "KNOWLEDGE_API_TOKEN": settings.knowledge_api_token.get_secret_value(),
+        "TOKEN_ENCRYPTION_KEY": settings.token_encryption_key.get_secret_value(),
+        "INTERNAL_KNOWLEDGE_API_KEY": (
+            settings.internal_knowledge_api_key.get_secret_value()
+            if settings.internal_knowledge_api_key is not None
+            else ""
+        ),
+        "R2_ACCESS_KEY_ID": settings.r2_access_key_id,
+        "R2_SECRET_ACCESS_KEY": settings.r2_secret_access_key.get_secret_value(),
+        "GOOGLE_API_KEY": settings.google_api_key.get_secret_value(),
+    }
+    offending = sorted(
+        name
+        for name, value in checked.items()
+        if value.strip() in _PLACEHOLDER_SECRET_VALUES
+    )
+    if offending:
+        raise RuntimeError(
+            "refusing to start: placeholder value(s) still set for "
+            f"security-critical secret(s) {', '.join(offending)} in "
+            f"environment '{settings.environment}'. Replace the CHANGEME "
+            "defaults from deploy/helm/values.yaml with real secrets "
+            "(see .env.example for how to generate each), or set "
+            "ENVIRONMENT=local for local development."
+        )
 
 
 @lru_cache(maxsize=1)

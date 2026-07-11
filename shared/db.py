@@ -17,10 +17,15 @@ role whose default search_path hasn't been pre-set
 
 Role discipline (RLS non-superuser cutover, bug #46): in production the
 ``DATABASE_URL`` should point at the non-privileged ``probe_app`` role,
-NOT the ``probe`` superuser. Superuser connections silently bypass RLS,
-which would defeat the whole tenant-isolation story. ``init_pool`` logs
-a warning at startup if it lands on a superuser in any non-local env; see
-``docs/database-url-cutover.md`` for the operator switch.
+NOT the ``probe`` superuser. Superuser (and BYPASSRLS) connections
+silently bypass FORCE RLS, which would defeat the whole tenant-isolation
+story. ``init_pool`` probes the connected role at startup: in any
+non-local env a privileged role WARN-logs ``db.superuser_in_managed_env``
+and — when ``settings.require_non_superuser_db`` is enabled (opt-in;
+the default is warn-only, because the live managed cluster still has
+privileged infra connections in flight) — refuses to start
+(TenantIsolationError). Flip ``REQUIRE_NON_SUPERUSER_DB=true`` to enforce
+fail-closed; see ``docs/database-url-cutover.md`` for the operator switch.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from contextlib import asynccontextmanager
 
 import asyncpg
 
-from shared.config import Settings, get_settings
+from shared.config import Settings, get_settings, validate_boot_secrets
 from shared.exceptions import DatabaseUnavailable, TenantIsolationError
 from shared.logging import get_logger
 
@@ -81,6 +86,10 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
         return _pool
 
     settings = settings or get_settings()
+    # Fail fast on shipped placeholder secrets in any non-local env —
+    # init_pool is the one choke point every service entrypoint passes
+    # through (same rationale as the superuser probe below).
+    validate_boot_secrets(settings)
     attempts = max(1, settings.db_init_retry_attempts)
     base = settings.db_init_retry_base_seconds
     backoff_cap = settings.db_init_retry_backoff_cap_seconds
@@ -99,7 +108,15 @@ async def init_pool(settings: Settings | None = None) -> asyncpg.Pool:
                 statement_cache_size=0,  # pgbouncer-compatible
                 init=_setup_connection,
             )
-            await _log_connected_role(_pool, settings)
+            try:
+                await _log_connected_role(_pool, settings)
+            except TenantIsolationError:
+                # Fail-closed role guard tripped: don't leave a live pool
+                # behind, and don't retry — a privileged DSN is a
+                # misconfiguration, not a transient blip.
+                guard_failed_pool, _pool = _pool, None
+                await guard_failed_pool.close()
+                raise
             return _pool
         except (OSError, asyncpg.PostgresError, TimeoutError) as exc:
             last_exc = exc
@@ -129,13 +146,20 @@ async def _log_connected_role(pool: asyncpg.Pool, settings: Settings) -> None:
     DSN would produce zero RLS enforcement with no other visible signal.
 
     Behavior:
-    - Always logs ``db.role`` at INFO with role + is_superuser.
+    - Always logs ``db.role`` at INFO with role + is_superuser + bypass_rls.
     - WARN-logs ``db.superuser_in_managed_env`` when running on a
-      non-local environment as a superuser — the operator-visible
-      signal that the cutover hasn't happened yet (or has regressed).
+      non-local environment as a superuser OR a BYPASSRLS role — the
+      operator-visible signal that the cutover hasn't happened yet (or
+      has regressed).
+    - When ``settings.require_non_superuser_db`` is enabled (opt-in;
+      warn-only by default), that same privileged-role detection raises
+      TenantIsolationError so the process refuses to boot with RLS
+      silently disabled. Enable with REQUIRE_NON_SUPERUSER_DB=true once
+      every pooled service is confirmed on a non-privileged role.
 
-    Best-effort: any failure is swallowed (the boot path mustn't block
-    on a probe). Local dev runs as superuser by design, so no warning
+    The probe itself stays best-effort: any probe failure is swallowed
+    (the boot path mustn't block on a probe). Local dev runs as
+    superuser by design, so neither the warning nor the guard fires
     there.
     """
     try:
@@ -143,6 +167,13 @@ async def _log_connected_role(pool: asyncpg.Pool, settings: Settings) -> None:
             role = await conn.fetchval("SELECT current_user")
             is_superuser = await conn.fetchval(
                 "SELECT current_setting('is_superuser', true)::bool"
+            )
+            # BYPASSRLS is a separate role attribute: a non-superuser role
+            # can still bypass FORCE RLS with it (e.g. probe_admin).
+            # session_user == the authenticated role (the pool's on_connect
+            # never SET ROLEs), and pg_roles is world-readable.
+            bypass_rls = await conn.fetchval(
+                "SELECT rolbypassrls FROM pg_roles WHERE rolname = session_user"
             )
     except Exception as exc:  # pragma: no cover — best-effort probe
         log.debug(
@@ -155,19 +186,40 @@ async def _log_connected_role(pool: asyncpg.Pool, settings: Settings) -> None:
     # Skip the INFO line entirely on `local` -- it pollutes stdout in
     # subprocess-based CLI tests (`tests/synth/test_seed_db.py` asserts empty
     # stdout). Local dev doesn't need the cutover signal anyway.
+    privileged = bool(is_superuser) or bool(bypass_rls)
     if settings.environment != "local":
-        log.info("db.role", role=role, is_superuser=bool(is_superuser))
-    if is_superuser and settings.environment != "local":
+        log.info(
+            "db.role",
+            role=role,
+            is_superuser=bool(is_superuser),
+            bypass_rls=bool(bypass_rls),
+        )
+    if privileged and settings.environment != "local":
         log.warning(
             "db.superuser_in_managed_env",
             role=role,
             environment=settings.environment,
+            is_superuser=bool(is_superuser),
+            bypass_rls=bool(bypass_rls),
+            enforced=settings.require_non_superuser_db,
             remediation=(
-                "DATABASE_URL connects as a superuser, which bypasses RLS. "
-                "Switch to the non-privileged probe_app role — see "
-                "docs/database-url-cutover.md."
+                "DATABASE_URL connects as a superuser or BYPASSRLS role, "
+                "which bypasses FORCE RLS. Switch to the non-privileged "
+                "probe_app role — see docs/database-url-cutover.md."
             ),
         )
+        if settings.require_non_superuser_db:
+            raise TenantIsolationError(
+                "refusing to start: DATABASE_URL connects as a privileged "
+                "role (superuser or BYPASSRLS), which silently disables "
+                "FORCE RLS tenant isolation. Switch to the non-privileged "
+                "probe_app role, or set REQUIRE_NON_SUPERUSER_DB=false to "
+                "boot warn-only.",
+                role=str(role),
+                environment=settings.environment,
+                is_superuser=bool(is_superuser),
+                bypass_rls=bool(bypass_rls),
+            )
 
 
 async def close_pool() -> None:
