@@ -8,6 +8,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- Gateway-routed retrieval entity extraction and gatherer turns now make a
+  single client attempt, so a failed provider chain is not replayed after the
+  LiteLLM gateway has exhausted its configured failover routes. Direct
+  self-hosted provider calls retain their normal transient retries.
 - Probe MCP retrieval calls now preserve upstream and transport diagnostics,
   use phase-specific HTTP timeouts with enough read headroom for the search
   agent, and return failures with the MCP error flag plus a trace ID.

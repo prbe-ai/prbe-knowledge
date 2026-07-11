@@ -81,7 +81,7 @@ from shared.constants import (
     SourceSystem,
 )
 from shared.db import with_tenant
-from shared.llm import LLMError, acompletion
+from shared.llm import LLMError, acompletion, gateway_url
 from shared.llm_tools import is_context_overflow
 from shared.logging import get_logger
 from shared.models import QueryRequest, RetrieveResponse
@@ -808,6 +808,11 @@ async def _run_turn(state: LoopState) -> Any:
         "extra_headers": {"x-session-affinity": _affinity_key(state.customer_id, state.query)},
         "timeout": SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
     }
+    if gateway_url():
+        # The managed proxy owns provider retries and failover. If it exhausts
+        # both routes, the client must not replay this high-token turn through
+        # the full chain. Direct self-hosted calls retain normal retries.
+        call_kwargs["max_retries"] = 0
 
     t_turn = time.perf_counter()
     try:

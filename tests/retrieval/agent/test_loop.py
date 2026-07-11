@@ -933,12 +933,19 @@ async def test_extracted_search_options_flow_into_execute_search(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("gateway_enabled", [True, False])
 async def test_terminal_on_turn_1_is_happy_path(
     fake_request: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway_enabled: bool,
 ) -> None:
     """The model calls emit_gatherer_output on turn 1 → loop ends, args
     become the final GathererOutput, telemetry recorded."""
     req = QueryRequest(query="what is PRB-17", customer_id="cust-1", top_k=5)
+    if gateway_enabled:
+        monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.example")
+    else:
+        monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
 
     with patch(
         "services.retrieval.agent.loop.acompletion",
@@ -964,6 +971,10 @@ async def test_terminal_on_turn_1_is_happy_path(
     call_kwargs = mock_acomp.call_args.kwargs
     assert call_kwargs.get("tool_choice") == "required"
     assert call_kwargs.get("custom_llm_provider") == "openai"
+    if gateway_enabled:
+        assert call_kwargs.get("max_retries") == 0
+    else:
+        assert "max_retries" not in call_kwargs
     assert "extra_headers" in call_kwargs
     assert "x-session-affinity" in call_kwargs["extra_headers"]
 
