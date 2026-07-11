@@ -980,6 +980,40 @@ async def test_terminal_on_turn_1_is_happy_path(
 
 
 @pytest.mark.asyncio
+async def test_run_gatherer_forwards_top_k_related_to_adapter(
+    fake_request: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    req = QueryRequest(
+        query="what is PRB-17",
+        customer_id="cust-1",
+        top_k=5,
+        top_k_related=0,
+    )
+    sentinel = object()
+    mock_adapter = AsyncMock(return_value=sentinel)
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop.to_query_response",
+        mock_adapter,
+    )
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args())],
+        )),
+    ):
+        response = await run_gatherer(
+            req,
+            customer_id="cust-1",
+            request=fake_request,
+        )
+
+    assert response is sentinel
+    assert mock_adapter.await_args.kwargs["top_k_related"] == 0
+
+
+@pytest.mark.asyncio
 async def test_exploration_then_terminal(
     fake_request: SimpleNamespace,
 ) -> None:
