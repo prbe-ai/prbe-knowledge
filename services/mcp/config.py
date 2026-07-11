@@ -73,8 +73,23 @@ class Settings(BaseSettings):
         description="prbe-knowledge retrieval base URL (serves /retrieve, /query, /sources)",
     )
     knowledge_timeout_s: float = Field(
-        default=60.0,
-        description="HTTP timeout for retrieval calls (LLM synthesis dominates /query)",
+        # The upstream envelope can spend 30s extracting entities, 90s in
+        # the gatherer loop, and another 30s synthesizing /query responses.
+        # Leave headroom for grounding, fan-out, and response serialization.
+        default=180.0,
+        description="HTTP read timeout for retrieval calls; exceeds upstream LLM budgets",
+    )
+    knowledge_connect_timeout_s: float = Field(
+        default=10.0,
+        description="HTTP connect timeout for retrieval calls",
+    )
+    knowledge_write_timeout_s: float = Field(
+        default=30.0,
+        description="HTTP request-body write timeout for retrieval calls",
+    )
+    knowledge_pool_timeout_s: float = Field(
+        default=10.0,
+        description="HTTP connection-pool wait timeout for retrieval calls",
     )
     internal_knowledge_api_key: str = Field(
         default="",

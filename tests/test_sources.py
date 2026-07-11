@@ -59,10 +59,15 @@ async def _seed_doc_with_chunks(
     chunks: list[str],
     version: int = 1,
     title: str | None = "Test Doc",
+    recorded_body_size_bytes: int | None = None,
 ) -> None:
     """Insert a single-version document and N ordered chunks."""
     now = datetime.now(UTC)
-    body_size = sum(len(c.encode()) for c in chunks)
+    body_size = (
+        recorded_body_size_bytes
+        if recorded_body_size_bytes is not None
+        else sum(len(c.encode()) for c in chunks)
+    )
     async with raw_conn() as conn:
         await conn.execute(
             """
@@ -364,7 +369,10 @@ async def test_source_view_full_mode_returns_whole_doc(live_db, settings) -> Non
 
     resp = await _get_source_view(
         "slack:T1:C1:full",
-        headers={"Authorization": f"Bearer {api_key}"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "X-Caller-Kind": "mcp",
+        },
         query="?mode=full",
     )
     await init_pool(settings)
@@ -379,7 +387,7 @@ async def test_source_view_full_mode_returns_whole_doc(live_db, settings) -> Non
     )
     assert body["truncated"] is False
     assert body["next_cursor"] is None
-    assert body["max_bytes"] == 100_000_000
+    assert body["max_bytes"] == 12_000
 
 
 @pytest.mark.asyncio
@@ -413,6 +421,42 @@ async def test_source_view_full_mode_ignores_limit_and_byte_caps(live_db, settin
     assert "line 250" in body["content"]
     assert body["truncated"] is False
     assert body["max_bytes"] == 100_000_000
+
+
+@pytest.mark.asyncio
+async def test_source_view_full_mode_rejects_oversized_mcp_document(
+    live_db,
+    settings,
+) -> None:
+    api_key = await _seed_customer("cust-full-mcp")
+    body_text = "\n".join(
+        f"line {index}: " + "x" * 100
+        for index in range(1, 301)
+    )
+    await _seed_doc_with_chunks(
+        "cust-full-mcp",
+        "slack:T1:C1:full-mcp",
+        chunks=[body_text],
+        # Some pre-chunked sources record only a small metadata chunk here.
+        # The endpoint must measure actual content rows before fetching them.
+        recorded_body_size_bytes=100,
+    )
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "X-Caller-Kind": "mcp",
+    }
+
+    response = await _get_source_view(
+        "slack:T1:C1:full-mcp",
+        headers=headers,
+        query="?mode=full",
+    )
+    await init_pool(settings)
+    assert response.status_code == 413
+    assert response.json()["detail"] == (
+        "full source exceeds the MCP response limit; use preview, search, "
+        "grep, range, or chunk mode"
+    )
 
 
 @pytest.mark.asyncio

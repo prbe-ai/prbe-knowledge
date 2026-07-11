@@ -117,7 +117,7 @@ Planning gate:
 NOT for source-code search. Read the repo directly for that.
 
 Tool guide:
-- search_knowledge (default) — doc-grouped evidence (each `documents[]`
+- search_knowledge (default) — doc-grouped evidence (each Document in `results[]`
   entry carries doc-level metadata and a nested `chunks[]` array of
   matching spans) for you to quote and reason over. Pass `source` to
   scope when the user names a system ("check Linear", "find the Slack
@@ -128,10 +128,10 @@ Tool guide:
   context from the same source by doc_id. Defaults to a preview. Use `mode="search"`
   with `query`, `mode="grep"` with `pattern`, `mode="range"` with
   `start_line`/`cursor`, `mode="chunk"` with `chunk_index`, or
-  `mode="tail"`. `mode="full"` returns the entire document — use only
-  to avoid chaining `range`/`chunk` calls when you genuinely need the
-  whole doc, or when the user asks. Pulling a multi-megabyte session
-  log into context is rarely the right call.
+  `mode="tail"`. `mode="full"` returns the whole document only when it
+  fits the MCP response budget; oversized documents return a 413 and
+  should be read with a bounded mode. Use it only when you genuinely need
+  broad context or the user asks.
 """
 
 

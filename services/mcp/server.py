@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import CallToolResult, TextContent
 
 from services.mcp.clients.knowledge import KnowledgeError, get_client
 from services.mcp.consts import (
@@ -22,7 +23,10 @@ from services.mcp.consts import (
     PROBE_PROMPT_TEMPLATE,
 )
 from services.mcp.dependencies.auth_context import get_current_customer
-from services.mcp.services.response_budget import fit_response_to_budget
+from services.mcp.services.response_budget import (
+    fit_response_to_budget,
+    serialize_tool_response,
+)
 
 mcp = FastMCP(
     MCP_SERVER_NAME,
@@ -41,8 +45,41 @@ mcp = FastMCP(
     ),
 )
 
+# FastMCP 1.27 serializes structured dict returns twice: once as JSON text
+# in ``content`` and again in ``structuredContent``. These evidence-heavy
+# tools intentionally advertise unstructured output and return pre-serialized
+# compact JSON so clients receive one copy whose wire size exactly matches the
+# response budget.
 
-@mcp.tool()
+
+def _tool_result(payload: dict[str, Any], *, is_error: bool = False) -> CallToolResult:
+    """Emit exactly one compact JSON payload with explicit MCP error state."""
+    return CallToolResult(
+        content=[
+            TextContent(
+                type="text",
+                text=serialize_tool_response(payload),
+            )
+        ],
+        structuredContent=None,
+        isError=is_error,
+    )
+
+
+def _error_response(exc: KnowledgeError) -> CallToolResult:
+    payload: dict[str, Any] = {"error": str(exc), "status": exc.status}
+    if exc.trace_id:
+        payload["trace_id"] = exc.trace_id
+    return _tool_result(payload, is_error=True)
+
+
+def _budgeted_response(response: dict[str, Any]) -> CallToolResult:
+    fitted = fit_response_to_budget(response)
+    is_error = fitted.get("error_code") == "response_too_large"
+    return _tool_result(fitted, is_error=is_error)
+
+
+@mcp.tool(structured_output=False)
 async def search_knowledge(
     query: str,
     top_k: int = 5,
@@ -51,7 +88,7 @@ async def search_knowledge(
     top_k_related: int = 10,
     discovery: bool = False,
     verbose: bool = False,
-) -> dict[str, Any]:
+) -> CallToolResult:
     """Call BEFORE making design decisions, debugging unfamiliar systems,
     producing an implementation/architecture/refactor plan, or answering
     "how do we / why did we / what about" questions.
@@ -72,7 +109,7 @@ async def search_knowledge(
 
     NOT source-code search. For code, read the repo directly.
 
-    Response shape: `documents[]`, each with doc-level metadata
+    Response shape: `results[]`, each Document result carrying doc-level metadata
     (`doc_id`, `source_system`, `source_url`, `title`, `author_id`,
     `created_at`, `updated_at`, `score`, `chunk_count`) and a nested
     `chunks[]` array of the matching spans within that document. Each
@@ -110,11 +147,11 @@ async def search_knowledge(
     The response is byte-budgeted (~20KB target, 24KB hard) so it
     never trips the MCP harness disk-spill fallback. If the underlying
     retrieval would have returned more, you'll see `truncated: true`
-    and `dropped_chunk_count: N` — the dropped chunks were the
-    lowest-ranked, usually safe to ignore. If you need them anyway,
-    lower `top_k` for a tighter focused query, or call `get_source`
-    on specific `doc_id`s. `cursor` is reserved for future stateful
-    continuation; today it's always null.
+    plus counts for dropped chunks, whole results, and related entities.
+    Those were removed from the lowest-ranked tail first. If you need
+    them anyway, lower `top_k` for a tighter focused query, or call
+    `get_source` on specific `doc_id`s. `cursor` is reserved for future
+    stateful continuation; today it's always null.
 
     Each document carries `author_id` — the raw author identifier from
     the source system (GitHub login, commit-author email, Slack user
@@ -209,7 +246,8 @@ async def search_knowledge(
             Cheap to flip and retry.
         verbose: Default False — strips diagnostic fields agents
             don't reason over (timing, ranks, per-retriever score
-            breakdown, trace ids). Top-line `score`,
+            breakdown). The opaque `trace_id` stays for log correlation.
+            Top-line `score`,
             `total_candidates`, `extracted_entities`, and
             `applied_temporal` stay so the caller can tell when to
             raise top_k or when the router misinterpreted the query.
@@ -230,11 +268,11 @@ async def search_knowledge(
             verbose=verbose,
         )
     except KnowledgeError as exc:
-        return {"error": str(exc), "status": exc.status}
-    return fit_response_to_budget(response)
+        return _error_response(exc)
+    return _budgeted_response(response)
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def query_knowledge(
     question: str,
     top_k: int = 5,
@@ -242,7 +280,7 @@ async def query_knowledge(
     discovery: bool = False,
     top_k_related: int = 0,
     verbose: bool = False,
-) -> dict[str, Any]:
+) -> CallToolResult:
     """Use when the user asks a direct question and wants a synthesized
     answer with citations — not evidence for you to reason over.
 
@@ -259,7 +297,7 @@ async def query_knowledge(
     underlying documents), `insufficient_context` (bool — true when the
     LLM couldn't find enough grounded evidence and refused to guess),
     `model` (which LLM produced the answer), and the full retrieval
-    payload as `search_knowledge` (doc-grouped `documents[]` with nested
+    payload as `search_knowledge` (doc-grouped `results[]` with nested
     `chunks[]`, each chunk carrying `score`, `content`, `graph_evidence`,
     `why_relevant` (the gatherer's per-chunk rationale), and
     chunk-level `matched_via`). When `top_k_related >= 1`, also carries
@@ -307,9 +345,9 @@ async def query_knowledge(
             Set >= 1 to populate `related_entities` (graph nodes
             attached to result docs, useful for the agent to crawl
             laterally) alongside the synthesized answer. Max 50.
-        verbose: Default False — strips diagnostic fields (timing,
-            applied filters, trace ids) from the response. Set True
-            only when debugging.
+        verbose: Default False — strips diagnostic fields (timing and
+            applied filters) from the response. The opaque `trace_id`
+            stays for log correlation. Set True only when debugging.
     """
     customer_id = get_current_customer()
     client = get_client()
@@ -324,12 +362,12 @@ async def query_knowledge(
             verbose=verbose,
         )
     except KnowledgeError as exc:
-        return {"error": str(exc), "status": exc.status}
+        return _error_response(exc)
     # Same byte cap as search_knowledge: query_knowledge returns the
-    # same `documents[]` evidence shape (alongside `answer` + `citations`).
+    # same `results[]` evidence shape (alongside `answer` + `citations`).
     # The synthesized `answer` field is bounded by the LLM; the heavy
     # part is the documents.
-    return fit_response_to_budget(response)
+    return _budgeted_response(response)
 
 
 SourceViewMode = Literal[
@@ -337,7 +375,7 @@ SourceViewMode = Literal[
 ]
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def get_source(
     doc_id: str,
     mode: SourceViewMode = "preview",
@@ -350,7 +388,7 @@ async def get_source(
     max_matches: int = 20,
     cursor: str | None = None,
     verbose: bool = False,
-) -> dict[str, Any]:
+) -> CallToolResult:
     """Use AFTER `search_knowledge` when a returned chunk looks relevant and
     you need broader context from the same source.
 
@@ -361,20 +399,18 @@ async def get_source(
     - range: read up to `limit_lines` from `start_line` or `cursor`
     - chunk: read one ingested chunk; requires `chunk_index`
     - tail: last lines of the source
-    - full: entire document in one call. Use only to avoid chaining
-      `range`/`chunk` calls when you genuinely need the whole doc, or
-      when the user asks. Most documents do not need the full content;
-      a preview + targeted `search`/`grep` is almost always enough.
-      Other params are ignored in `full` mode (only `cursor` is honored
-      for the rare case where the doc exceeds the OOM-defense ceiling).
+    - full: whole document only when it fits the MCP response budget.
+      Oversized documents return a 413 with guidance to use a bounded mode.
+      Use only when you genuinely need broad context or the user asks. A
+      preview + targeted `search`/`grep` is usually enough.
 
     The `doc_id` is the value `search_knowledge` returned in
-    `documents[].doc_id` — typically a string like
+    a Document entry under `results[].doc_id` — typically a string like
     "linear:org-acme:issue:uuid-9821" or
     "slack:T_ACME:C_GENERAL:1714000000.123".
 
     Includes `author_id` at the top level (same raw form as on
-    `search_knowledge` documents). The response includes navigation
+    `search_knowledge` Document results). The response includes navigation
     metadata such as `sections`, `line_start`, `line_end`,
     `total_lines`, `next_cursor`, `truncated`, `chunk_count`, and
     `body_size_bytes`.
@@ -397,7 +433,7 @@ async def get_source(
     customer_id = get_current_customer()
     client = get_client()
     try:
-        return await client.get_source(
+        response = await client.get_source(
             doc_id=doc_id,
             customer_id=customer_id,
             mode=mode,
@@ -411,8 +447,9 @@ async def get_source(
             cursor=cursor,
             verbose=verbose,
         )
+        return _budgeted_response(response)
     except KnowledgeError as exc:
-        return {"error": str(exc), "status": exc.status}
+        return _error_response(exc)
 
 
 # ---------------------------------------------------------------------------

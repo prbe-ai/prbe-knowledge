@@ -4,7 +4,8 @@ recall hints, router decisions).
 
 Compaction is on by default; tools expose `verbose=True` for the rare
 case the caller needs the raw upstream payload (full retriever-score
-breakdown, timing, trace ids).
+breakdown and timing). The opaque `trace_id` stays in compact responses
+so failed and successful calls can be correlated with upstream logs.
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ _TOP_LEVEL_DROP = frozenset(
         "applied_doc_types",
         "aggregation",
         "router_hit_cache",
-        "trace_id",
     }
 )
 
