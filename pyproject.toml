@@ -47,6 +47,8 @@ dependencies = [
 
     "cryptography>=43.0.0",
     "python-jose[cryptography]>=3.3.0",
+    # Hardened XML parsing for manual .docx uploads (entity/DTD/XXE defense).
+    "defusedxml>=0.7.1",
     "orjson>=3.10.0",
     "pyyaml>=6.0",
     "tiktoken>=0.8.0",

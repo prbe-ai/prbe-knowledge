@@ -9,10 +9,12 @@ dispatches by `kind`:
   disconnect        — soft-delete code.symbol Documents for the affected
                       repos; close graph_node_provenance for code_graph.
 
-verify_signature is a no-op return-True — events arrive only from the
-internal bridge (which is invoked from already-authenticated source
-connector code, e.g., handlers/github.py after HMAC-verified push).
-There is no public webhook surface for code_graph.
+verify_signature returns False — events arrive only from the internal
+bridge (which is invoked from already-authenticated source connector
+code, e.g., handlers/github.py after HMAC-verified push) and are written
+straight to the ingestion queue. There is no public webhook surface for
+code_graph, so standalone /webhooks/code_graph must hard-401 (hosted
+gateway mode never calls verify_signature).
 """
 
 from __future__ import annotations
@@ -87,7 +89,12 @@ class CodeGraphConnector(Connector):
         headers: Mapping[str, str],
         raw_body: bytes,
     ) -> bool:
-        return True
+        # No public webhook surface — events are enqueued in-process by
+        # code_graph/bridge.py from already-verified source connectors.
+        # Returning False keeps standalone /webhooks/code_graph a hard 401
+        # (hosted gateway mode never calls verify_signature). Mirrors
+        # handlers/wiki.py.
+        return False
 
     # ---- 2. event parsing -----------------------------------------------
 

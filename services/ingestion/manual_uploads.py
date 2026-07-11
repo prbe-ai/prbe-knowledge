@@ -12,12 +12,18 @@ import re
 import zipfile
 from dataclasses import dataclass
 from pathlib import PurePath
-from xml.etree import ElementTree
+
+from defusedxml import ElementTree as SafeElementTree
+from defusedxml.common import DefusedXmlException
 
 from shared.constants import DocType
 
 MAX_MANUAL_UPLOAD_FILES = 10
 MAX_MANUAL_UPLOAD_BYTES = 10 * 1024 * 1024
+# MAX_MANUAL_UPLOAD_BYTES bounds only the COMPRESSED upload; DEFLATE ratios
+# above 1000x turn a 10 MB .docx into multi-GB XML (decompression bomb). This
+# caps the total DECOMPRESSED bytes read across all XML parts of one archive.
+MAX_DOCX_DECOMPRESSED_BYTES = 32 * 1024 * 1024
 MAX_EXTRACTED_CHARS = 2_000_000
 
 _DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -152,7 +158,26 @@ def _is_known_unsupported_binary(filename: str, content_type: str) -> bool:
     )
 
 
+def _read_bounded_entry(
+    archive: zipfile.ZipFile, info: zipfile.ZipInfo, budget: int
+) -> bytes:
+    if info.file_size > budget:
+        raise ManualUploadParseError(
+            f"docx decompresses beyond {MAX_DOCX_DECOMPRESSED_BYTES} byte limit"
+        )
+    # ZipInfo.file_size comes from the attacker-controlled header, so bound the
+    # actual decompressed read too instead of trusting the declared size.
+    with archive.open(info) as entry:
+        data = entry.read(budget + 1)
+    if len(data) > budget:
+        raise ManualUploadParseError(
+            f"docx decompresses beyond {MAX_DOCX_DECOMPRESSED_BYTES} byte limit"
+        )
+    return data
+
+
 def _extract_docx(body: bytes) -> str:
+    budget = MAX_DOCX_DECOMPRESSED_BYTES
     try:
         with zipfile.ZipFile(io.BytesIO(body)) as archive:
             xml_names = [
@@ -169,11 +194,18 @@ def _extract_docx(body: bytes) -> str:
             paragraphs: list[str] = []
             for xml_name in xml_names:
                 try:
-                    raw_xml = archive.read(xml_name)
+                    info = archive.getinfo(xml_name)
                 except KeyError:
                     continue
+                raw_xml = _read_bounded_entry(archive, info, budget)
+                budget -= len(raw_xml)
                 paragraphs.extend(_paragraphs_from_word_xml(raw_xml))
-    except (zipfile.BadZipFile, ElementTree.ParseError, KeyError) as exc:
+    except (
+        zipfile.BadZipFile,
+        SafeElementTree.ParseError,
+        DefusedXmlException,
+        KeyError,
+    ) as exc:
         raise ManualUploadParseError("docx text extraction failed") from exc
 
     text = "\n\n".join(p for p in paragraphs if p.strip())
@@ -183,7 +215,7 @@ def _extract_docx(body: bytes) -> str:
 
 
 def _paragraphs_from_word_xml(raw_xml: bytes) -> list[str]:
-    root = ElementTree.fromstring(raw_xml)
+    root = SafeElementTree.fromstring(raw_xml, forbid_dtd=True)
     paragraphs: list[str] = []
     for paragraph in root.iter(f"{_DOCX_NS}p"):
         pieces: list[str] = []

@@ -28,11 +28,13 @@ def _connector() -> CodeGraphConnector:
     return CodeGraphConnector(ctx)
 
 
-def test_verify_signature_always_true() -> None:
-    """code_graph has no public webhook surface — signature is unused."""
+def test_verify_signature_always_false() -> None:
+    """code_graph has no public webhook surface — verify_signature returns
+    False so standalone /webhooks/code_graph hard-401s. Events are enqueued
+    in-process by code_graph/bridge.py, never over HTTP."""
     c = _connector()
-    assert c.verify_signature({}, b"") is True
-    assert c.verify_signature({"x-github-event": "push"}, b"junk") is True
+    assert c.verify_signature({}, b"") is False
+    assert c.verify_signature({"x-github-event": "push"}, b"junk") is False
 
 
 def test_parse_recognizes_initial_backfill_kind() -> None:

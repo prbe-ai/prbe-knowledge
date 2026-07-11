@@ -1,8 +1,10 @@
 """RLS + explicit-filter isolation: customer A must never see customer B data.
 
-The graph tables enforce tenant isolation via RLS. Documents/chunks rely on
-explicit `customer_id = $1` filters in every query. This test asserts both
-layers: bind tenant A, insert a graph row, bind tenant B, confirm zero rows.
+The graph tables enforce tenant isolation via RLS. Documents / chunks /
+failed_chunks carry the same FORCE-RLS tenant policy since migration 0094
+AND keep explicit `customer_id = $1` filters in every query (defense in
+depth). This test asserts both layers: bind tenant A, insert a graph row,
+bind tenant B, confirm zero rows.
 """
 
 from __future__ import annotations
@@ -87,7 +89,9 @@ async def test_documents_filter_isolation(live_db) -> None:
             )
 
     async with raw_conn() as conn:
-        # Without explicit filter — returns both (vulnerable shape)
+        # Without explicit filter — returns both. raw_conn here runs as
+        # the local `prbe` superuser, which bypasses the 0094 FORCE-RLS
+        # policy; a non-superuser role without the tenant GUC would see 0.
         rows = await conn.fetch("SELECT doc_id FROM documents")
         assert len(rows) == 2
 
@@ -95,6 +99,61 @@ async def test_documents_filter_isolation(live_db) -> None:
         rows = await conn.fetch("SELECT doc_id FROM documents WHERE customer_id=$1", "cust-A")
         assert len(rows) == 1
         assert rows[0]["doc_id"] == "doc-cust-A"
+
+
+@pytest.mark.asyncio
+async def test_rls_documents_isolation(live_db) -> None:
+    """RLS enforcement (migration 0094) on the content tables.
+
+    Same shape as test_rls_graph_isolation but for `documents` — the headline
+    of the migration. Under a non-superuser role, tenant B must NOT see
+    tenant A's document even with NO explicit customer_id filter, proving the
+    FORCE-RLS policy (not just the app-layer WHERE) enforces isolation.
+    chunks/failed_chunks carry the identical policy DDL, so this exercises the
+    same mechanism; failed_chunks' WITH CHECK is covered in the matrix above.
+    """
+    from datetime import datetime
+
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO customers (customer_id, display_name, api_key_hash) VALUES ($1,'A','x'), ($2,'B','x') ON CONFLICT DO NOTHING",
+            "rls-doc-A",
+            "rls-doc-B",
+        )
+        await conn.execute(
+            """
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'prbe_rls_test') THEN
+                    CREATE ROLE prbe_rls_test NOSUPERUSER NOBYPASSRLS;
+                END IF;
+            END $$;
+            """
+        )
+        await conn.execute("GRANT USAGE ON SCHEMA public TO prbe_rls_test")
+        await conn.execute("GRANT ALL ON ALL TABLES IN SCHEMA public TO prbe_rls_test")
+        await conn.execute("GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO prbe_rls_test")
+
+    now = datetime.now(UTC)
+    async with with_tenant("rls-doc-A") as conn:
+        await conn.execute("SET LOCAL ROLE prbe_rls_test")
+        await conn.execute(
+            """
+            INSERT INTO documents
+                (doc_id, version, customer_id, source_system, source_id, source_url,
+                 doc_type, content_hash, created_at, updated_at, valid_from, ingested_at, acl)
+            VALUES ('rls-doc-A:1', 1, 'rls-doc-A', 'slack', 'rls-doc-A:1', 'u',
+                    'slack.message', 'h', $1, $1, $1, $1, '{}'::jsonb)
+            """,
+            now,
+        )
+        rows_a = await conn.fetch("SELECT doc_id FROM documents")
+    assert len(rows_a) == 1
+
+    async with with_tenant("rls-doc-B") as conn:
+        await conn.execute("SET LOCAL ROLE prbe_rls_test")
+        rows_b = await conn.fetch("SELECT doc_id FROM documents")
+    assert len(rows_b) == 0  # RLS hides tenant A's document
 
 
 # WITH CHECK enforcement matrix. Each tuple is
@@ -130,6 +189,23 @@ _WITH_CHECK_INSERTS: tuple[tuple[str, str], ...] = (
         "INSERT INTO code_repo_state "
         "(customer_id, repo, file_path, content_hash, language, last_extractor_version) "
         "VALUES ('{cid}', 'r', 'f.py', 'h', 'python', 'v0')",
+    ),
+    # documents/failed_chunks gained FORCE RLS + WITH CHECK in migration 0094.
+    # (chunks needs a documents FK first, so it is covered by the dedicated
+    # read-isolation test rather than this table-agnostic matrix.)
+    (
+        "documents",
+        "INSERT INTO documents "
+        "(doc_id, version, customer_id, source_system, source_id, source_url, "
+        "doc_type, content_hash, created_at, updated_at, valid_from, ingested_at, acl) "
+        "VALUES ('wc-doc-x', 1, '{cid}', 'slack', 'wc-doc-x', 'u', 'slack.message', "
+        "'h', now(), now(), now(), now(), '{{}}'::jsonb)",
+    ),
+    (
+        "failed_chunks",
+        "INSERT INTO failed_chunks "
+        "(customer_id, doc_id, doc_version, chunk_index, error) "
+        "VALUES ('{cid}', 'wc-doc-x', 1, 0, 'e')",
     ),
 )
 

@@ -45,7 +45,12 @@ class CustomIngestConnector(Connector):
         headers: Mapping[str, str],
         raw_body: bytes,
     ) -> bool:
-        return True
+        # No public webhook surface — documents land via the authenticated
+        # /api/custom-ingest/documents route (X-Internal-Knowledge-Key in
+        # hosted mode, KNOWLEDGE_API_TOKEN bearer in standalone; see
+        # custom_ingest_routes.py). Returning False keeps standalone
+        # /webhooks/custom_ingest a hard 401. Mirrors handlers/wiki.py.
+        return False
 
     def parse_webhook_event(
         self,

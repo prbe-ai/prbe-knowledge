@@ -10,6 +10,7 @@ import pytest
 from services.ingestion.handlers.base import ConnectorContext
 from services.ingestion.handlers.manual_upload import ManualUploadConnector
 from services.ingestion.manual_uploads import (
+    MAX_DOCX_DECOMPRESSED_BYTES,
     ManualUploadParseError,
     parse_manual_upload,
 )
@@ -64,6 +65,43 @@ def test_parse_manual_upload_docx() -> None:
     assert parsed.doc_type == DocType.MANUAL_UPLOAD_DOCX
     assert "Manual plan" in parsed.text
     assert "Index this text." in parsed.text
+
+
+def test_parse_manual_upload_docx_rejects_decompression_bomb() -> None:
+    body = io.BytesIO()
+    huge = "A" * (MAX_DOCX_DECOMPRESSED_BYTES + 1)
+    with zipfile.ZipFile(body, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "word/document.xml",
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f"<w:body><w:p><w:r><w:t>{huge}</w:t></w:r></w:p></w:body></w:document>",
+        )
+
+    with pytest.raises(ManualUploadParseError):
+        parse_manual_upload(
+            "bomb.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            body.getvalue(),
+        )
+
+
+def test_parse_manual_upload_docx_rejects_xml_entities() -> None:
+    body = io.BytesIO()
+    with zipfile.ZipFile(body, "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE r [<!ENTITY a "aaaa"><!ENTITY b "&a;&a;&a;&a;">]>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            "<w:body><w:p><w:r><w:t>&b;</w:t></w:r></w:p></w:body></w:document>",
+        )
+
+    with pytest.raises(ManualUploadParseError):
+        parse_manual_upload(
+            "entities.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            body.getvalue(),
+        )
 
 
 @pytest.mark.asyncio
