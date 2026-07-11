@@ -15,29 +15,12 @@ from __future__ import annotations
 
 from typing import Any
 
-# Mandatory turn-1 channels per the agent prompt. Anything missing from
-# `turn_1_tools_fired` is logged as `turn_1_missed_channels` so the
-# nightly orchestrator can cluster on "agent skipped the recall
-# guarantee" failures. (Note: with the prefanout cutover, this may now
-# fire on every trace because the channels run pre-loop; review and
-# retire the signal if so.)
-_REQUIRED_TURN_1_CHANNELS = frozenset({
-    "vector_search",
-    "bm25_search",
-    "graph_search",
-    "inferred_edge_search",
-})
-
 
 def _mean_or_none(values: list[float | None]) -> float | None:
     filtered = [v for v in values if v is not None]
     if not filtered:
         return None
     return sum(filtered) / len(filtered)
-
-
-def _has_tool(tools_fired: list[str], name: str) -> bool:
-    return name in tools_fired
 
 
 def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
@@ -59,8 +42,6 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
     fingerprints_per_turn: list[str | None] = list(
         blob.get("system_fingerprints_per_turn") or []
     )
-
-    missed = sorted(_REQUIRED_TURN_1_CHANNELS - set(turn_1_tools))
 
     return {
         # Identity + routing
@@ -94,12 +75,7 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
         # Tool sequence (ordered) — the analyzer clusters on this shape
         "tool_call_sequence": tools_fired,
         "turn_1_tools_fired": turn_1_tools,
-        "turn_1_missed_channels": missed,
         # Exploration signals — useful binary clusters
-        "had_reissue_query": _has_tool(tools_fired, "reissue_query"),
-        "had_expand_inferred_neighbors": _has_tool(
-            tools_fired, "expand_inferred_neighbors"
-        ),
         "had_need_deeper": blob.get("extensions_used", 0) > 0,
         "had_reasoning_per_turn": any(r for r in reasoning_per_turn),
         # Latency
