@@ -793,9 +793,9 @@ class SourceViewResponse(BaseModel):
 
     Unlike SourceResponse, this never returns a full document by default.
     Callers pick a mode (preview/search/grep/range/chunk/tail/full) and the
-    service enforces max line/byte ceilings. mode="full" is the explicit
-    opt-in for whole-document retrieval, gated only by a high
-    OOM-defense cap.
+    service enforces max line/byte ceilings. mode="full" is an explicit
+    opt-in: MCP callers must fit the MCP source limit, while non-MCP callers
+    retain the high OOM-defense cap.
     """
 
     doc_id: str

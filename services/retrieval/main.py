@@ -90,6 +90,7 @@ _SOURCE_VIEW_DEFAULT_LIMIT_LINES = 80
 _SOURCE_VIEW_MAX_LIMIT_LINES = 100
 _SOURCE_VIEW_DEFAULT_MAX_BYTES = 12_000
 _SOURCE_VIEW_MAX_BYTES = 20_000
+_SOURCE_VIEW_MCP_FULL_MAX_BYTES = _SOURCE_VIEW_DEFAULT_MAX_BYTES
 _SOURCE_VIEW_MAX_CONTEXT_LINES = 20
 _SOURCE_VIEW_MAX_MATCHES = 50
 # OOM-defense ceiling for mode="full". Real-world docs are <1MB; 100MB
@@ -758,6 +759,16 @@ def _bounded_lines(
     return content, start, end, next_cursor, byte_truncated or end < total_lines
 
 
+def _mcp_full_source_too_large() -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail=(
+            "full source exceeds the MCP response limit; use "
+            "preview, search, grep, range, or chunk mode"
+        ),
+    )
+
+
 def _chunk_line_offsets(chunk_rows: list[object]) -> dict[int, tuple[int, int]]:
     offsets: dict[int, tuple[int, int]] = {}
     current_line = 1
@@ -826,6 +837,7 @@ async def _load_source_doc_and_chunks(
     doc_id: str,
     version: int | None,
     include_drafts: bool = False,
+    max_body_size_bytes: int | None = None,
 ) -> tuple[object, list[object]]:
     """Direct doc-by-id fetch + its chunks.
 
@@ -838,6 +850,19 @@ async def _load_source_doc_and_chunks(
     # the retriever chokepoints.
     doc_visibility_filter = "" if include_drafts else "AND visibility = 'approved'"
     chunk_visibility_filter = "" if include_drafts else "AND visibility = 'approved'"
+    chunk_scope_sql = f"""
+        FROM chunks
+        WHERE customer_id = $1
+          AND doc_id = $2
+          AND valid_to IS NULL
+          AND kind = 'content'
+          AND $3 BETWEEN first_seen_version AND last_seen_version
+          {chunk_visibility_filter}
+    """
+    # Same-version coalescing updates the document row before diffing chunks in
+    # the same transaction. A shared lock makes the size preflight + content
+    # fetch one stable view for bounded full-source reads.
+    doc_lock_clause = "FOR SHARE" if max_body_size_bytes is not None else ""
     async with with_tenant(customer_id) as conn:
         if version is not None:
             doc = await conn.fetchrow(
@@ -848,6 +873,7 @@ async def _load_source_doc_and_chunks(
                 FROM documents
                 WHERE customer_id = $1 AND doc_id = $2 AND version = $3
                   {doc_visibility_filter}
+                {doc_lock_clause}
                 """,
                 customer_id,
                 doc_id,
@@ -864,29 +890,48 @@ async def _load_source_doc_and_chunks(
                   {doc_visibility_filter}
                 ORDER BY version DESC
                 LIMIT 1
+                {doc_lock_clause}
                 """,
                 customer_id,
                 doc_id,
             )
         if doc is None:
             raise HTTPException(status_code=404, detail=f"document not found: {doc_id}")
+        if max_body_size_bytes is not None:
+            # documents.body_size_bytes is not authoritative for pre-chunked
+            # sources such as code_graph. Measure the actual content rows before
+            # fetching them so an undersized metadata value cannot permit a
+            # multi-megabyte MCP full response.
+            reassembled_size = await conn.fetchval(
+                f"""
+                SELECT COALESCE(SUM(octet_length(content)), 0)
+                       + GREATEST(COUNT(*) - 1, 0) * 2
+                {chunk_scope_sql}
+                """,
+                customer_id,
+                doc_id,
+                doc["version"],
+            )
+            if int(reassembled_size or 0) > max_body_size_bytes:
+                raise _mcp_full_source_too_large()
 
         chunk_rows = await conn.fetch(
             f"""
             SELECT content, chunk_index
-            FROM chunks
-            WHERE customer_id = $1
-              AND doc_id = $2
-              AND valid_to IS NULL
-              AND kind = 'content'
-              AND $3 BETWEEN first_seen_version AND last_seen_version
-              {chunk_visibility_filter}
+            {chunk_scope_sql}
             ORDER BY chunk_index
             """,
             customer_id,
             doc_id,
             doc["version"],
         )
+        if max_body_size_bytes is not None:
+            fetched_size = sum(
+                len(str(row["content"]).encode("utf-8"))
+                for row in chunk_rows
+            ) + max(len(chunk_rows) - 1, 0) * 2
+            if fetched_size > max_body_size_bytes:
+                raise _mcp_full_source_too_large()
     return doc, list(chunk_rows)
 
 
@@ -1078,10 +1123,17 @@ async def get_source_view(
         "max_bytes": max_bytes,
     }
 
+    is_mcp_full = (
+        mode == "full"
+        and request.headers.get("X-Caller-Kind", "").casefold() == "mcp"
+    )
     doc, chunk_rows = await _load_source_doc_and_chunks(
         customer_id=customer_id,
         doc_id=doc_id,
         version=version,
+        max_body_size_bytes=(
+            _SOURCE_VIEW_MCP_FULL_MAX_BYTES if is_mcp_full else None
+        ),
     )
     full_content = "\n\n".join(str(c["content"]) for c in chunk_rows)  # type: ignore[index]
     full_lines = full_content.splitlines()
@@ -1114,16 +1166,20 @@ async def get_source_view(
             max_matches=max_matches,
         )
     elif mode == "full":
-        # Explicit opt-in for whole-document retrieval. limit_lines /
-        # max_bytes / start_line params are ignored — the only ceiling
-        # is the OOM-defense cap. cursor is honored so a doc that
-        # exceeds the cap (rare) can still be paginated.
+        # Explicit opt-in for whole-document retrieval. MCP callers are
+        # rejected above when the body cannot fit safely in one tool result;
+        # other callers retain the 100MB OOM-defense ceiling.
         start = _parse_cursor(cursor) or 1
+        full_max_bytes = (
+            _SOURCE_VIEW_MCP_FULL_MAX_BYTES
+            if is_mcp_full
+            else _SOURCE_VIEW_MAX_FULL_BYTES
+        )
         content, line_start, line_end, next_cursor, truncated = _bounded_lines(
             full_lines,
             start_line=start,
             limit_lines=max(total_lines, 1),
-            max_bytes=_SOURCE_VIEW_MAX_FULL_BYTES,
+            max_bytes=full_max_bytes,
         )
         if line_start is not None and line_end is not None:
             sections.append(SourceViewSection(line_start=line_start, line_end=line_end))
@@ -1138,7 +1194,7 @@ async def get_source_view(
             total_lines=total_lines,
             next_cursor=next_cursor,
             truncated=truncated,
-            max_bytes=_SOURCE_VIEW_MAX_FULL_BYTES,
+            max_bytes=full_max_bytes,
             limit_lines=total_lines,
         )
     elif mode == "chunk":

@@ -8,6 +8,7 @@ to that tenant. Internal-key auth lives on the same call.
 from __future__ import annotations
 
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
@@ -16,16 +17,17 @@ from services.mcp.clients._responses import (
     compact_search,
     compact_source_view,
 )
-from services.mcp.config import get_settings
+from services.mcp.config import Settings, get_settings
 
 CALLER_KIND = "mcp"
 
 
 class KnowledgeError(Exception):
-    def __init__(self, status: int, body: str) -> None:
+    def __init__(self, status: int, body: str, *, trace_id: str | None = None) -> None:
         super().__init__(f"prbe-knowledge http {status}: {body[:200]}")
         self.status = status
         self.body = body
+        self.trace_id = trace_id
 
 
 class KnowledgeClient:
@@ -43,6 +45,65 @@ class KnowledgeClient:
             "Content-Type": "application/json",
         }
 
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        trace_id: str | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
+        """Send one retrieval request and preserve transport diagnostics.
+
+        httpx timeout exceptions can have an empty string representation.
+        Letting one escape into FastMCP produces the useless tool error
+        ``Error executing tool <name>: ``. Map transport failures into the
+        same structured error envelope used for upstream HTTP failures.
+        """
+        try:
+            response = await self._http.request(method, path, **kwargs)
+        except httpx.TimeoutException as exc:
+            raise KnowledgeError(
+                504,
+                f"{path} timed out ({type(exc).__name__})",
+                trace_id=trace_id,
+            ) from exc
+        except httpx.RequestError as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            raise KnowledgeError(
+                502,
+                f"{path} transport error: {detail}",
+                trace_id=trace_id,
+            ) from exc
+
+        if response.status_code >= 400:
+            raise KnowledgeError(response.status_code, response.text, trace_id=trace_id)
+        return response
+
+    @staticmethod
+    def _decode_payload(
+        response: httpx.Response,
+        *,
+        path: str,
+        trace_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Decode an upstream JSON object into the standard error envelope."""
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise KnowledgeError(
+                502,
+                f"{path} returned invalid JSON ({type(exc).__name__})",
+                trace_id=trace_id,
+            ) from exc
+        if not isinstance(payload, dict):
+            raise KnowledgeError(
+                502,
+                f"{path} returned {type(payload).__name__}; expected JSON object",
+                trace_id=trace_id,
+            )
+        return payload
+
     async def retrieve(
         self,
         *,
@@ -55,10 +116,12 @@ class KnowledgeClient:
         discovery: bool = False,
         verbose: bool = False,
     ) -> dict[str, Any]:
+        trace_id = f"q-mcp-{uuid4().hex}"
         body: dict[str, Any] = {
             "query": query,
             "top_k": top_k,
             "top_k_related": top_k_related,
+            "trace_id": trace_id,
         }
         if sources:
             body["sources"] = sources
@@ -68,10 +131,14 @@ class KnowledgeClient:
         # that don't recognise the field aren't sent unknown keys.
         if discovery:
             body["discovery"] = True
-        resp = await self._http.post("/retrieve", json=body, headers=self._headers(customer_id))
-        if resp.status_code >= 400:
-            raise KnowledgeError(resp.status_code, resp.text)
-        payload = resp.json()
+        resp = await self._request(
+            "POST",
+            "/retrieve",
+            trace_id=trace_id,
+            json=body,
+            headers=self._headers(customer_id),
+        )
+        payload = self._decode_payload(resp, path="/retrieve", trace_id=trace_id)
         return payload if verbose else compact_search(payload)
 
     async def query(
@@ -85,19 +152,25 @@ class KnowledgeClient:
         top_k_related: int = 0,
         verbose: bool = False,
     ) -> dict[str, Any]:
+        trace_id = f"q-mcp-{uuid4().hex}"
         body: dict[str, Any] = {
             "query": question,
             "top_k": top_k,
             "top_k_related": top_k_related,
+            "trace_id": trace_id,
         }
         if entity_must_match is not None:
             body["entity_must_match"] = entity_must_match
         if discovery:
             body["discovery"] = True
-        resp = await self._http.post("/query", json=body, headers=self._headers(customer_id))
-        if resp.status_code >= 400:
-            raise KnowledgeError(resp.status_code, resp.text)
-        payload = resp.json()
+        resp = await self._request(
+            "POST",
+            "/query",
+            trace_id=trace_id,
+            json=body,
+            headers=self._headers(customer_id),
+        )
+        payload = self._decode_payload(resp, path="/query", trace_id=trace_id)
         return payload if verbose else compact_query(payload)
 
     async def get_source(
@@ -138,16 +211,27 @@ class KnowledgeClient:
             params["chunk_index"] = chunk_index
         if cursor is not None:
             params["cursor"] = cursor
-        resp = await self._http.get(
-            path, params=params, headers=self._headers(customer_id)
+        resp = await self._request(
+            "GET",
+            path,
+            params=params,
+            headers=self._headers(customer_id),
         )
-        if resp.status_code >= 400:
-            raise KnowledgeError(resp.status_code, resp.text)
-        payload = resp.json()
+        payload = self._decode_payload(resp, path=path)
         return payload if verbose else compact_source_view(payload)
 
 
 _client: KnowledgeClient | None = None
+
+
+def _build_http_timeout(settings: Settings) -> httpx.Timeout:
+    """Keep slow reads independent from outage-sensitive timeout phases."""
+    return httpx.Timeout(
+        connect=settings.knowledge_connect_timeout_s,
+        read=settings.knowledge_timeout_s,
+        write=settings.knowledge_write_timeout_s,
+        pool=settings.knowledge_pool_timeout_s,
+    )
 
 
 def get_client() -> KnowledgeClient:
@@ -160,7 +244,7 @@ def get_client() -> KnowledgeClient:
             raise RuntimeError("INTERNAL_KNOWLEDGE_API_KEY is not set")
         http = httpx.AsyncClient(
             base_url=settings.knowledge_query_url.rstrip("/"),
-            timeout=settings.knowledge_timeout_s,
+            timeout=_build_http_timeout(settings),
         )
         _client = KnowledgeClient(http=http, internal_key=settings.internal_knowledge_api_key)
     return _client

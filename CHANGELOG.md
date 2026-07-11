@@ -6,6 +6,16 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- Probe MCP retrieval calls now preserve upstream and transport diagnostics,
+  use phase-specific HTTP timeouts with enough read headroom for the search
+  agent, and return failures with the MCP error flag plus a trace ID.
+- Large MCP retrieval responses now emit one compact JSON payload, enforce a
+  24 KB hard wire limit, and reject oversized `get_source(mode="full")` calls
+  with bounded-mode guidance instead of allowing responses up to the retrieval
+  service's 100 MB ceiling.
+
 ## [0.1.0] - 2026-06-18
 
 Initial public release of the open-source community edition.
