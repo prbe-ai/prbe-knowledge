@@ -31,6 +31,7 @@ from services.retrieval.agent.loop import (
     _empty_passthrough,
     _enforce_context_budget,
     _extract_cache_hit_rate,
+    _extract_response_headers,
     _format_inferred_chains,
     _parse_terminal_args,
     _render_prefanout_budgeted,
@@ -224,6 +225,60 @@ def test_extract_cache_hit_rate_handles_missing() -> None:
     assert _extract_cache_hit_rate(resp) is None
     resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=0))
     assert _extract_cache_hit_rate(resp) is None
+
+
+def test_extract_response_headers_captures_x_replica_from_hidden_params() -> None:
+    """LiteLLM newer versions surface raw provider headers under
+    `_hidden_params["additional_headers"]`. We must capture x-* entries
+    so the nightly analyzer can correlate cache_hit_rate with replica
+    assignment on Cerebras."""
+    resp = SimpleNamespace(
+        _hidden_params={
+            "additional_headers": {
+                "x-replica-id": "cb-a7",
+                "x-served-by": "cerebras-edge-3",
+                "Content-Type": "application/json",  # not x-*, filtered
+            }
+        },
+    )
+    headers = _extract_response_headers(resp)
+    assert headers is not None
+    assert headers["x-replica-id"] == "cb-a7"
+    assert headers["x-served-by"] == "cerebras-edge-3"
+    assert "content-type" not in headers
+
+
+def test_extract_response_headers_returns_none_when_no_attr() -> None:
+    """No headers attribute at all → return None so the per-turn list
+    explicitly records 'no signal' (parallels system_fingerprint=None)."""
+    resp = SimpleNamespace(usage=None)
+    assert _extract_response_headers(resp) is None
+
+
+def test_extract_response_headers_filters_non_x_prefixed() -> None:
+    """Allowlist semantics: only `x-*` headers survive. Server/date/etc
+    are noise for this diagnostic and would bloat the trace blob."""
+    resp = SimpleNamespace(
+        _response_headers={
+            "Date": "Thu, 21 May 2026 00:00:00 GMT",
+            "Server": "envoy",
+            "X-Request-Id": "req_abc",
+        },
+    )
+    headers = _extract_response_headers(resp)
+    assert headers == {"x-request-id": "req_abc"}
+
+
+def test_extract_response_headers_caps_total_bytes() -> None:
+    """The byte cap must prevent a chatty provider from inflating the
+    blob. With 20 x-headers of ~50 bytes each (~1000 bytes) we should
+    truncate well before all 20 land."""
+    raw = {f"x-header-{i:02d}": "v" * 50 for i in range(20)}
+    resp = SimpleNamespace(_hidden_params={"additional_headers": raw})
+    headers = _extract_response_headers(resp)
+    assert headers is not None
+    # Total budget is 512 bytes; we should have far fewer than 20 entries.
+    assert len(headers) < 20
 
 
 def test_parse_terminal_args_valid_dict() -> None:

@@ -46,7 +46,7 @@ log = logging.getLogger(__name__)
 # Bumped when the blob JSON shape changes in a way that breaks the
 # nightly trace-analyzer (renamed/restructured fields). Old blobs stay
 # readable indefinitely; the analyzer filters by version when needed.
-TRACE_BLOB_SCHEMA_VERSION = 1
+TRACE_BLOB_SCHEMA_VERSION = 2
 
 
 def build_trace_blob(
@@ -113,6 +113,11 @@ def build_trace_blob(
         # is the documented reproducibility-breaker on Cerebras.
         blob["seed"] = state.seed
         blob["system_fingerprints_per_turn"] = list(state.system_fingerprints_per_turn)
+        # Per-turn provider response headers (filtered `x-*` allowlist).
+        # Schema v2 addition — lets the nightly analyzer correlate
+        # cache_hit_rate with replica assignment so we can verify
+        # whether Cerebras is honoring the outbound `x-session-affinity`.
+        blob["response_headers_per_turn"] = list(state.response_headers_per_turn)
     else:
         # Pre-loop failure (e.g. grounding raised before state was constructed
         # in a future refactor). Keep the keys present so analyzer schema
@@ -137,6 +142,7 @@ def build_trace_blob(
         # seed=0 (0 is a valid hash output in the live path too).
         blob["seed"] = None
         blob["system_fingerprints_per_turn"] = []
+        blob["response_headers_per_turn"] = []
 
     if gathered is not None:
         blob["gathered"] = gathered.model_dump(mode="json")

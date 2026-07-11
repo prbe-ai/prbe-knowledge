@@ -158,6 +158,17 @@ class LoopState:
     # smoking gun, but no fingerprint was captured). None when the
     # provider omits it for that turn.
     system_fingerprints_per_turn: list[str | None] = field(default_factory=list)
+    # Per-turn provider response headers (filtered allowlist). We send
+    # `x-session-affinity` outbound to pin Cerebras requests to a single
+    # replica (PR #372), but cache_hit_rate stayed at median 0.078 in the
+    # 2026-05-21 nightly digest — meaning we can't tell whether Cerebras
+    # is honoring the header, ignoring it, or surfacing the replica
+    # under a name we don't yet know. Capturing the response side lets
+    # the nightly analyzer correlate cache_hit_rate with replica
+    # assignment. None when the response carried no headers we could
+    # extract; entries are dicts limited to safe `x-*` diagnostic
+    # headers (see `_extract_response_headers` for the cap).
+    response_headers_per_turn: list[dict[str, str] | None] = field(default_factory=list)
     # Resolved search_options from the LLM extractor — sort directive +
     # downstream filter args the harness applied to the pre-fan-out. Kept
     # on state so the trace blob captures intent without re-running the
@@ -635,6 +646,77 @@ def _seed_for_query(customer_id: str, query: str) -> int:
     return int.from_bytes(h.digest()[:4], "big") & 0x7FFFFFFF
 
 
+# Per-turn response-header capture caps. The point of this field is
+# replica visibility (which `x-*` header Cerebras uses to identify the
+# backend), NOT a full mirror of the response surface. Bound the blob
+# growth so a chatty provider can't bloat the per-trace R2 payload.
+_RESPONSE_HEADERS_MAX_COUNT = 20
+_RESPONSE_HEADERS_MAX_TOTAL_BYTES = 512
+_RESPONSE_HEADERS_MAX_VALUE_BYTES = 200
+
+
+def _extract_response_headers(resp: Any) -> dict[str, str] | None:
+    """Pull provider response headers off a LiteLLM completion.
+
+    LiteLLM surfaces raw provider headers under one of a few attribute
+    names depending on version: `_hidden_params["additional_headers"]`
+    (newer), `_response_headers` (older), or `response_ms_headers`. We
+    try each in order and return the first dict we can read.
+
+    Filtered to `x-*` headers only — anything else (date, content-type,
+    server) is noise for this diagnostic and would bloat the trace blob.
+    Hard caps on count + per-value length + total bytes keep the
+    captured map small regardless of what the provider sends.
+
+    Returns None when no headers could be extracted; an empty dict when
+    headers existed but none matched the filter.
+    """
+    raw: Any = None
+    hidden = getattr(resp, "_hidden_params", None)
+    if isinstance(hidden, dict):
+        candidate = hidden.get("additional_headers")
+        if candidate:
+            raw = candidate
+    if raw is None:
+        for attr in ("_response_headers", "response_ms_headers", "headers"):
+            candidate = getattr(resp, attr, None)
+            if candidate:
+                raw = candidate
+                break
+    if raw is None:
+        return None
+    try:
+        items = list(raw.items()) if hasattr(raw, "items") else list(raw)
+    except (AttributeError, TypeError):
+        return None
+
+    out: dict[str, str] = {}
+    total = 0
+    for entry in items:
+        if len(out) >= _RESPONSE_HEADERS_MAX_COUNT:
+            break
+        try:
+            k, v = entry
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(k, str):
+            continue
+        key = k.lower()
+        if not key.startswith("x-"):
+            continue
+        value = str(v) if v is not None else ""
+        if len(value) > _RESPONSE_HEADERS_MAX_VALUE_BYTES:
+            value = value[:_RESPONSE_HEADERS_MAX_VALUE_BYTES]
+        # +2 accounts for the key/value separators in the budget; we're
+        # bounding payload growth, not computing exact JSON size.
+        cost = len(key) + len(value) + 2
+        if total + cost > _RESPONSE_HEADERS_MAX_TOTAL_BYTES:
+            break
+        out[key] = value
+        total += cost
+    return out
+
+
 def _extract_cache_hit_rate(resp: Any) -> float | None:
     """Compute cache_read_input_tokens / prompt_tokens for one response."""
     try:
@@ -836,6 +918,10 @@ async def _run_turn(state: LoopState) -> Any:
     # response; pairs with `seed` to make replica drift visible.
     fingerprint = getattr(resp, "system_fingerprint", None)
     state.system_fingerprints_per_turn.append(fingerprint if fingerprint else None)
+    # Provider response headers — `x-*` allowlist, capped. Lets the
+    # nightly analyzer verify whether Cerebras is honoring the outbound
+    # `x-session-affinity` and identify the response-side replica key.
+    state.response_headers_per_turn.append(_extract_response_headers(resp))
 
     choices = getattr(resp, "choices", None) or []
     msg = getattr(choices[0], "message", None) if choices else None
