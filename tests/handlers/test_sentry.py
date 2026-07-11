@@ -285,6 +285,108 @@ async def test_exchange_oauth_code_requires_installation_id() -> None:
 
 
 # ---------------------------------------------------------------------------
+# verify_token_health
+# ---------------------------------------------------------------------------
+
+
+def _make_org_probe_ctx(
+    status_code: int,
+    body: str | list | dict,
+    *,
+    requests: list[httpx.Request] | None = None,
+) -> ConnectorContext:
+    settings = Settings(environment="local")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if requests is not None:
+            requests.append(request)
+        assert str(request.url) == "https://sentry.io/api/0/organizations/"
+        if isinstance(body, str):
+            return httpx.Response(status_code, text=body)
+        return httpx.Response(status_code, json=body)
+
+    return ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_sentry_verify_token_health_returns_true_on_200() -> None:
+    """200 from /api/0/organizations/ — the bearer token still works."""
+    requests: list[httpx.Request] = []
+    ctx = _make_org_probe_ctx(
+        200,
+        [{"id": "12345", "slug": "acme", "name": "Acme"}],
+        requests=requests,
+    )
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.SENTRY,
+        access_token="sntrys_access",
+    )
+
+    assert await sentry.verify_token_health(token) is True
+    assert requests[0].headers["authorization"] == "Bearer sntrys_access"
+
+
+@pytest.mark.asyncio
+async def test_sentry_verify_token_health_returns_false_on_401() -> None:
+    """HTTP 401 is the definitive "this installation token is dead" signal.
+    The cron flips the row to auth_failed on this return value."""
+    ctx = _make_org_probe_ctx(401, {"detail": "Authentication credentials were not provided."})
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.SENTRY,
+        access_token="sntrys_access",
+    )
+
+    assert await sentry.verify_token_health(token) is False
+
+
+@pytest.mark.asyncio
+async def test_sentry_verify_token_health_5xx_raises_transient() -> None:
+    """5xx is inconclusive — don't poison the row over a Sentry edge blip."""
+    ctx = _make_org_probe_ctx(503, "temporarily unavailable")
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.SENTRY,
+        access_token="sntrys_access",
+    )
+
+    with pytest.raises(TransientSourceError) as exc_info:
+        await sentry.verify_token_health(token)
+    assert exc_info.value.context["status"] == 503
+
+
+@pytest.mark.asyncio
+async def test_sentry_verify_token_health_network_error_raises_transient() -> None:
+    """A connection-level failure is inconclusive — caller must not flip the
+    row to auth_failed on a DNS hiccup or socket reset."""
+    settings = Settings(environment="local")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    ctx = ConnectorContext(
+        settings=settings,
+        http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    sentry = build_connector(SourceSystem.SENTRY, ctx)
+    token = IntegrationToken(
+        customer_id="cust-1",
+        source_system=SourceSystem.SENTRY,
+        access_token="sntrys_access",
+    )
+
+    with pytest.raises(TransientSourceError):
+        await sentry.verify_token_health(token)
+
+
+# ---------------------------------------------------------------------------
 # identify_workspaces
 # ---------------------------------------------------------------------------
 

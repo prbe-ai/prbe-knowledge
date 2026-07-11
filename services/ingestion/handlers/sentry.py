@@ -723,6 +723,44 @@ class SentryConnector(Connector):
             scope=_oauth_scope(body.get("scope")),
         )
 
+    async def verify_token_health(self, token: IntegrationToken) -> bool:
+        """Liveness probe: hit `GET /api/0/organizations/` and return True on 200.
+
+        Returns False when Sentry responds 401 (the installation token was
+        revoked out of band — typically because a workspace admin uninstalled
+        the Sentry app, or the token's parent installation was rotated). Any
+        other status — including transient 5xx and network errors —
+        propagates as a raised `TransientSourceError` so the caller can
+        distinguish "definitely-bad" from "we-don't-know". Used by the
+        periodic token-health job (`scripts/cron_token_health_check.py`) to
+        flip `integration_tokens.status` from `active` to `auth_failed`
+        without waiting for the next webhook delivery to fail.
+
+        We reuse the `/organizations/` endpoint because `identify_workspaces`
+        already proves it accepts the same bearer token, it returns 401 on
+        revocation, and it's the cheapest authenticated read in the Sentry
+        API surface.
+        """
+        try:
+            resp = await self.http.get(
+                f"{_SENTRY_API}/organizations/",
+                headers={"Authorization": f"Bearer {token.access_token}"},
+            )
+        except Exception as exc:
+            raise TransientSourceError(
+                "sentry organizations probe network failure",
+                error=str(exc),
+            ) from exc
+        if resp.status_code == 401:
+            return False
+        if resp.status_code != 200:
+            raise TransientSourceError(
+                f"sentry organizations probe returned {resp.status_code}",
+                status=resp.status_code,
+                body=resp.text[:500],
+            )
+        return True
+
     # ------------------------------------------------------------------
     # 7. workspace identification
     # ------------------------------------------------------------------
