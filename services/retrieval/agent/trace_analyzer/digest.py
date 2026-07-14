@@ -90,7 +90,6 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
         "turn_count": blob.get("turn_count") or 0,
         "tool_calls_count": blob.get("tool_calls_count") or db.get("tool_calls_count") or 0,
         "extensions_used": blob.get("extensions_used") or db.get("need_deeper_extensions") or 0,
-        "prose_retries": blob.get("prose_retries") or 0,
         # Tool sequence (ordered) — the analyzer clusters on this shape
         "tool_call_sequence": tools_fired,
         "turn_1_tools_fired": turn_1_tools,

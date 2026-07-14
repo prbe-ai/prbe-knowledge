@@ -54,7 +54,6 @@ def _mk_state(**overrides: Any) -> LoopState:
         "turn_1_tools_fired": ["vector_search", "bm25_search", "graph_search", "inferred_edge_search"],
         "turn_latencies_ms": [510.2, 420.7],
         "tool_latencies_ms": [120.0, 95.5, 80.3],
-        "prose_retries": 0,
         "prefanout": {"vector": {"hits": []}, "bm25": {"hits": []}},
         "prefanout_hit_counts": {"vector": 3, "bm25": 2, "graph": 0, "inferred_edge": 1},
         "reasoning_per_turn": [
@@ -127,7 +126,6 @@ def test_build_trace_blob_includes_all_fields() -> None:
     assert blob["cache_hit_rates"] == [0.0, 0.8]
     assert blob["turn_latencies_ms"] == [510.2, 420.7]
     assert blob["tool_latencies_ms"] == [120.0, 95.5, 80.3]
-    assert blob["prose_retries"] == 0
     assert blob["prefanout"] == state.prefanout
     assert blob["prefanout_hit_counts"]["graph"] == 0
     # reasoning_per_turn from message.reasoning_content
