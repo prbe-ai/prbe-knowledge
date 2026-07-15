@@ -87,6 +87,7 @@ __all__ = [
     "forced_response_schema",
     "forced_tool_call",
     "is_context_overflow",
+    "is_transient_provider_error",
     "usage_tokens",
 ]
 
@@ -504,4 +505,59 @@ def is_context_overflow(exc: BaseException) -> bool:
         if type(cause).__name__ == "ContextWindowExceededError":
             return True
         cause = cause.__cause__
+    return False
+
+
+# Exact exception-base names used by LiteLLM/OpenAI and the underlying HTTP
+# transports. Inspecting the typed cause chain avoids treating an arbitrary
+# provider message containing words like "timeout" or "unavailable" as a
+# retryable outage. The built-in bases cover asyncio/socket failures; the
+# library names cover LiteLLM's stable wrappers and httpx/httpcore errors.
+_TRANSIENT_TRANSPORT_BASE_NAMES = frozenset(
+    {
+        "TimeoutError",
+        "ConnectionError",
+        "Timeout",
+        "APITimeoutError",
+        "APIConnectionError",
+        "TimeoutException",
+        "NetworkError",
+        "RemoteProtocolError",
+    }
+)
+
+
+def is_transient_provider_error(exc: BaseException) -> bool:
+    """Return whether an ``LLMError`` represents a transient provider failure.
+
+    Classification is intentionally narrow and machine-readable:
+
+    * HTTP 408, 429, and all 5xx statuses are transient.
+    * A typed timeout/connection error in the exception cause chain is
+      transient even when the transport supplied no HTTP status.
+    * Authentication, validation/configuration, context-overflow, and unknown
+      untyped errors are not transient.
+
+    The managed proxy owns retries and Cerebras -> Fireworks failover; direct
+    mode retains the SDK's configured provider behavior. This predicate only
+    decides whether a completed provider call/chain may degrade to
+    already-retrieved evidence; it never initiates another provider call.
+    """
+    if not isinstance(exc, LLMError):
+        return False
+    status = exc.status_code
+    # A concrete HTTP status is authoritative. In particular, never let a
+    # nested connection-ish cause turn an auth/config/validation 4xx into a
+    # recoverable outage.
+    if isinstance(status, int):
+        return status in {408, 429} or status >= 500
+
+    current: BaseException | None = exc.__cause__
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        type_names = {base.__name__ for base in type(current).__mro__}
+        if type_names & _TRANSIENT_TRANSPORT_BASE_NAMES:
+            return True
+        current = current.__cause__
     return False

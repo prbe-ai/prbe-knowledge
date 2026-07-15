@@ -68,6 +68,7 @@ from services.retrieval.router import (
 )
 from shared.constants import (
     SEARCH_AGENT_EXTENSION_GRANT,
+    SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
     SEARCH_AGENT_HARD_CAP,
     SEARCH_AGENT_INFERENCE_MODEL,
     SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
@@ -77,12 +78,11 @@ from shared.constants import (
     SEARCH_AGENT_SOFT_TURN_CAP,
     SEARCH_AGENT_TOOL_BUDGET,
     SEARCH_AGENT_TRACE_SAMPLE_RATE,
-    SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
     SourceSystem,
 )
 from shared.db import with_tenant
 from shared.llm import LLMError, acompletion, gateway_url
-from shared.llm_tools import is_context_overflow
+from shared.llm_tools import is_context_overflow, is_transient_provider_error
 from shared.logging import get_logger
 from shared.models import QueryRequest, RetrieveResponse
 
@@ -126,6 +126,11 @@ class LoopState:
     started_at: float = field(default_factory=time.perf_counter)
     # Per-turn LLM call latencies (ms).
     turn_latencies_ms: list[float] = field(default_factory=list)
+    # Failed LLM-call latencies (ms), kept separate from the successful-turn
+    # arrays above. A failed provider attempt has no cache/fingerprint/
+    # reasoning response with which to preserve the per-turn cardinality
+    # contract, but its wall time still belongs in query/trace telemetry.
+    failed_turn_latencies_ms: list[float] = field(default_factory=list)
     # Per-tool execution latencies (ms).
     tool_latencies_ms: list[float] = field(default_factory=list)
     # Retained for trace_blob schema compat. Always 0 under the
@@ -655,15 +660,22 @@ def _extract_cache_hit_rate(resp: Any) -> float | None:
         return None
 
 
-def _empty_passthrough(reason: GathererStatus) -> GathererOutput:
-    """Synthesise an empty GathererOutput for fallback paths
-    (no_llm_configured, loop_timeout, terminal_args_invalid)."""
+def _empty_passthrough(
+    reason: GathererStatus,
+    state: LoopState | None = None,
+) -> GathererOutput:
+    """Synthesize an empty, low-confidence output for degraded paths.
+
+    Recall-floor backfill may subsequently populate its chunks from citable
+    pre-fan-out evidence. When the loop already ran, preserve its
+    harness-authoritative turn/tool ledger in the response metadata.
+    """
     return GathererOutput(
         entities=[],
         chunks=[],
         gatherer_notes=GathererNotes(
-            turns_used=0,
-            tools_called=[],
+            turns_used=state.turn_count if state is not None else 0,
+            tools_called=list(state.tools_fired) if state is not None else [],
             confidence="low",
             dropped=[
                 DroppedCandidate(
@@ -806,7 +818,11 @@ async def _run_turn(state: LoopState) -> Any:
         # gotcha memory for why this is per-call rather than global.
         "custom_llm_provider": "openai",
         "extra_headers": {"x-session-affinity": _affinity_key(state.customer_id, state.query)},
-        "timeout": SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
+        # LiteLLM's SDK treats this as a client transport deadline (the OpenAI
+        # client sends x-stainless-read-timeout); it is not the proxy request
+        # body's provider timeout. Per-deployment limits remain gateway-owned
+        # and can therefore trigger Cerebras -> Fireworks.
+        "timeout": SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
     }
     if gateway_url():
         # The managed proxy owns provider retries and failover. If it exhausts
@@ -819,6 +835,7 @@ async def _run_turn(state: LoopState) -> Any:
         resp = await acompletion(**call_kwargs)
     except LLMError as exc:
         elapsed_ms = (time.perf_counter() - t_turn) * 1000
+        state.failed_turn_latencies_ms.append(elapsed_ms)
         log.warning(
             "agent.turn_llm_error",
             customer_id=state.customer_id,
@@ -1079,6 +1096,17 @@ def _fuse_prefanout_docs(prefanout: dict[str, Any] | None) -> list[dict[str, Any
         {"doc_id": d, "hit": best_hit[d], "channel": best_channel[d]}
         for d, _ in ranked
     ]
+
+
+def _has_citable_prefanout_evidence(prefanout: dict[str, Any] | None) -> bool:
+    """Whether pre-fan-out contains a document safe to return without the LLM.
+
+    ``_fuse_prefanout_docs`` already enforces the citation boundary used by
+    recall-floor backfill: a non-empty ``doc_id`` plus nonblank ``content``.
+    Reusing it here keeps the provider-error gate and response construction in
+    lockstep, including inferred-edge hits that carry no citable body.
+    """
+    return bool(_fuse_prefanout_docs(prefanout))
 
 
 def _backfill_recall_floor(
@@ -1454,6 +1482,21 @@ def _stash_for_trace_persist(
         )
 
 
+def _finalize_agent_timing(
+    timing: dict[str, float],
+    state: LoopState,
+    *,
+    started_at: float,
+) -> None:
+    """Populate aggregate agent timing for both success and failure exits."""
+    timing["agent_ms"] = (time.perf_counter() - started_at) * 1000
+    timing["agent_failed_llm_ms"] = sum(state.failed_turn_latencies_ms)
+    timing["agent_loop_ms"] = (
+        sum(state.turn_latencies_ms) + timing["agent_failed_llm_ms"]
+    )
+    timing["agent_tools_ms"] = sum(state.tool_latencies_ms)
+
+
 # ============================================================
 # Top-level entry point
 # ============================================================
@@ -1465,7 +1508,9 @@ async def run_gatherer(
 ) -> RetrieveResponse:
     """Run the gatherer agent against `req.query` and return a RetrieveResponse.
 
-    Raises HTTPException(503) on fatal LLM/provider failures (no fallback).
+    Raises HTTPException(503) on fatal LLM/provider failures. Transient
+    provider-chain exhaustion degrades to citable pre-fan-out evidence when
+    available; provider routing and failover remain owned by LiteLLM.
     """
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="empty query")
@@ -1675,7 +1720,7 @@ async def run_gatherer(
             prefanout_hit_counts=prefanout_hit_counts,
         )
         status = "zero_recall_short_circuit"
-        gathered = _empty_passthrough("zero_recall_short_circuit")
+        gathered = _empty_passthrough("zero_recall_short_circuit", state)
         timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
         if request is not None:
             request.state.gatherer_status = status
@@ -1714,7 +1759,7 @@ async def run_gatherer(
             trace_id=trace_id,
         )
         status = "no_llm_configured"
-        gathered = _empty_passthrough("no_llm_configured")
+        gathered = _empty_passthrough("no_llm_configured", state)
         timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
         if request is not None:
             request.state.gatherer_status = status
@@ -1754,7 +1799,7 @@ async def run_gatherer(
         )
         if gathered is None:
             status = "schema_violation"
-            gathered = _empty_passthrough("schema_violation")
+            gathered = _empty_passthrough("schema_violation", state)
         else:
             if state.tool_calls_count >= SEARCH_AGENT_HARD_CAP and not gathered.chunks and not gathered.entities:
                 status = "tool_budget_exceeded"
@@ -1767,7 +1812,7 @@ async def run_gatherer(
             tool_calls=state.tool_calls_count,
         )
         status = "loop_timeout"
-        gathered = _empty_passthrough("loop_timeout")
+        gathered = _empty_passthrough("loop_timeout", state)
     except LLMError as exc:
         if is_context_overflow(exc):
             # Deterministic input-too-large (provider 400), NOT an outage —
@@ -1786,7 +1831,32 @@ async def run_gatherer(
                 error=str(exc),
             )
             status = "context_overflow"
-            gathered = _empty_passthrough("context_overflow")
+            gathered = _empty_passthrough("context_overflow", state)
+        elif is_transient_provider_error(exc) and _has_citable_prefanout_evidence(
+            state.prefanout
+        ):
+            # The configured provider call/chain has already ended. Do not
+            # replay this high-token turn in-process. In managed mode the
+            # gateway owns Cerebras -> Fireworks; direct mode retains SDK
+            # behavior. The recall-floor backfill below converts the citable
+            # pre-fan-out pool into a low-confidence response without masking
+            # fatal auth, configuration, validation, or unknown errors.
+            log.warning(
+                "agent.provider_error_prefanout_fallback",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                turn=state.turn_count,
+                tool_calls=state.tool_calls_count,
+                status_code=exc.status_code,
+                provider=exc.provider,
+                gateway_enabled=gateway_url() is not None,
+                error=str(exc),
+            )
+            status = "provider_error_prefanout_fallback"
+            gathered = _empty_passthrough(
+                "provider_error_prefanout_fallback",
+                state,
+            )
         else:
             log.error(
                 "agent.fatal_provider_error",
@@ -1796,6 +1866,21 @@ async def run_gatherer(
             )
             if request is not None:
                 request.state.full_failure = True
+                request.state.gatherer_status = "fatal_provider_error"
+                request.state.tool_calls_count = state.tool_calls_count
+                request.state.need_deeper_extensions = state.extensions_used
+                # No GathererOutput exists on a fatal path, so final-output
+                # fields stay NULL instead of fabricating confidence/drop data.
+                request.state.confidence = None
+                request.state.dropped_count = None
+                _rates = [r for r in state.cache_hit_rates if r is not None]
+                request.state.cache_hit_rate = (
+                    sum(_rates) / len(_rates) if _rates else None
+                )
+                request.state.intents_count = 1
+                request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
+                request.state.failure_recovered = False
+            _finalize_agent_timing(timing, state, started_at=t_agent)
             _stash_for_trace_persist(
                 request,
                 customer_id=customer_id,
@@ -1825,9 +1910,7 @@ async def run_gatherer(
             total_chunks=len(gathered.chunks),
         )
 
-    timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
-    timing["agent_loop_ms"] = sum(state.turn_latencies_ms)
-    timing["agent_tools_ms"] = sum(state.tool_latencies_ms)
+    _finalize_agent_timing(timing, state, started_at=t_agent)
 
     log.info(
         "agent.query_summary",
@@ -1844,8 +1927,10 @@ async def run_gatherer(
         prefanout_ms=round(timing.get("prefanout_ms", 0), 1),
         agent_total_ms=round(timing.get("agent_ms", 0), 1),
         agent_llm_ms=round(timing["agent_loop_ms"], 1),
+        failed_llm_ms=round(timing["agent_failed_llm_ms"], 1),
         agent_tool_ms=round(timing["agent_tools_ms"], 1),
         per_turn_ms=[round(t, 1) for t in state.turn_latencies_ms],
+        failed_turn_ms=[round(t, 1) for t in state.failed_turn_latencies_ms],
         per_tool_ms=[round(t, 1) for t in state.tool_latencies_ms],
         cache_hit_rate=(
             round(sum(_r) / len(_r), 3)

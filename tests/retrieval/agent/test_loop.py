@@ -5,7 +5,8 @@ no live DB. Covers:
 - Happy path: terminal tool call on turn 1 → GathererOutput → QueryResponse adapter
 - Multi-turn: exploration tool call → terminal on next turn
 - Budget exhaustion: harness forces a final terminal turn
-- LLMError → HTTPException(503) (no fallback by design)
+- Transient LLMError + citable pre-fan-out → low-confidence fallback
+- Fatal/unknown LLMError → HTTPException(503)
 - No tool calls (provider violated tool_choice=required) → schema_violation
 - No-LLM-configured short-circuit (test env / bootstrap / self-host without keys)
 - Per-stage latency telemetry: turn_latencies_ms, tool_latencies_ms
@@ -32,6 +33,7 @@ from services.retrieval.agent.loop import (
     _enforce_context_budget,
     _extract_cache_hit_rate,
     _format_inferred_chains,
+    _has_citable_prefanout_evidence,
     _parse_terminal_args,
     _render_prefanout_budgeted,
     _seed_for_query,
@@ -45,8 +47,9 @@ from services.retrieval.agent.models import (
 )
 from services.retrieval.agent.tools import TERMINAL_TOOL_NAME
 from services.retrieval.grounding import GroundingBundle
+from shared.constants import SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS
 from shared.llm import LLMError
-from shared.llm_tools import is_context_overflow
+from shared.llm_tools import is_context_overflow, is_transient_provider_error
 from shared.models import QueryRequest
 
 # ============================================================
@@ -224,6 +227,37 @@ def test_extract_cache_hit_rate_handles_missing() -> None:
     assert _extract_cache_hit_rate(resp) is None
     resp = SimpleNamespace(usage=SimpleNamespace(prompt_tokens=0))
     assert _extract_cache_hit_rate(resp) is None
+
+
+def test_citable_prefanout_evidence_requires_doc_id_and_content() -> None:
+    citable = {
+        "sub_queries": [{
+            "vector": [{"doc_id": "github:doc:1", "content": "evidence"}],
+            "bm25": [],
+            "graph": [],
+            "inferred_edge": [],
+        }]
+    }
+    missing_doc_id = {
+        "sub_queries": [{
+            "vector": [{"content": "orphaned evidence"}],
+            "bm25": [],
+            "graph": [],
+            "inferred_edge": [],
+        }]
+    }
+    blank_content = {
+        "sub_queries": [{
+            "vector": [{"doc_id": "github:doc:1", "content": "   "}],
+            "bm25": [],
+            "graph": [],
+            "inferred_edge": [],
+        }]
+    }
+
+    assert _has_citable_prefanout_evidence(citable) is True
+    assert _has_citable_prefanout_evidence(missing_doc_id) is False
+    assert _has_citable_prefanout_evidence(blank_content) is False
 
 
 def test_parse_terminal_args_valid_dict() -> None:
@@ -971,6 +1005,7 @@ async def test_terminal_on_turn_1_is_happy_path(
     call_kwargs = mock_acomp.call_args.kwargs
     assert call_kwargs.get("tool_choice") == "required"
     assert call_kwargs.get("custom_llm_provider") == "openai"
+    assert call_kwargs.get("timeout") == SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS
     if gateway_enabled:
         assert call_kwargs.get("max_retries") == 0
     else:
@@ -1201,10 +1236,10 @@ async def test_bad_matched_via_values_are_filtered(
 
 
 @pytest.mark.asyncio
-async def test_llm_error_raises_503(
+async def test_unknown_llm_error_raises_503(
     fake_request: SimpleNamespace,
 ) -> None:
-    """Fatal provider error → HTTPException(503). No fallback by design."""
+    """An untyped/unknown provider error stays fatal despite pre-fan-out."""
     from shared.llm import LLMError
     req = QueryRequest(query="boom", customer_id="cust-1", top_k=5)
 
@@ -1213,6 +1248,216 @@ async def test_llm_error_raises_503(
         new=AsyncMock(side_effect=LLMError("fireworks down")),
     ), pytest.raises(HTTPException) as exc_info:
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert exc_info.value.status_code == 503
+    assert fake_request.state.full_failure is True
+    assert fake_request.state.gatherer_status == "fatal_provider_error"
+    assert fake_request.state.tool_calls_count == 0
+    assert fake_request.state.need_deeper_extensions == 0
+    assert fake_request.state.confidence is None
+    assert fake_request.state.dropped_count is None
+    assert fake_request.state.cache_hit_rate is None
+    assert fake_request.state.failure_recovered is False
+
+
+@pytest.mark.asyncio
+async def test_fatal_error_after_exploration_stashes_query_trace_summary(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Fatal 503s still expose partial loop metrics to QueryTrace middleware."""
+    req = QueryRequest(query="fatal provider", customer_id="cust-1", top_k=5)
+    turn_1 = _mk_resp(
+        tool_calls=[{
+            "id": "s1",
+            "name": "search",
+            "arguments": {"queries": ["fatal provider evidence"]},
+        }],
+        prompt_tokens=100,
+        cached_tokens=75,
+    )
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1, LLMError("unknown provider failure")]),
+    ), patch(
+        "services.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ), pytest.raises(HTTPException) as exc_info:
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert exc_info.value.status_code == 503
+    assert fake_request.state.full_failure is True
+    assert fake_request.state.gatherer_status == "fatal_provider_error"
+    assert fake_request.state.tool_calls_count == 1
+    assert fake_request.state.need_deeper_extensions == 0
+    assert fake_request.state.confidence is None
+    assert fake_request.state.dropped_count is None
+    assert fake_request.state.cache_hit_rate == pytest.approx(0.75)
+    assert fake_request.state.failure_recovered is False
+    assert fake_request.state.search_agent_status == "fatal_provider_error"
+    assert fake_request.state.search_agent_gathered is None
+    assert len(
+        fake_request.state.search_agent_loop_state.failed_turn_latencies_ms
+    ) == 1
+    state = fake_request.state.search_agent_loop_state
+    timing = fake_request.state.search_agent_timing
+    assert timing["agent_failed_llm_ms"] == pytest.approx(
+        sum(state.failed_turn_latencies_ms)
+    )
+    assert timing["agent_loop_ms"] == pytest.approx(
+        sum(state.turn_latencies_ms) + sum(state.failed_turn_latencies_ms)
+    )
+    assert timing["agent_tools_ms"] == pytest.approx(
+        sum(state.tool_latencies_ms)
+    )
+    assert timing["agent_ms"] >= timing["agent_loop_ms"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [408, 429, 500, 503])
+async def test_transient_http_error_degrades_to_citable_prefanout(
+    fake_request: SimpleNamespace,
+    status_code: int,
+) -> None:
+    """Exhausted transient provider chain returns the already-fetched docs."""
+    req = QueryRequest(query="provider tail", customer_id="cust-1", top_k=5)
+    error = LLMError(
+        "gateway provider chain exhausted",
+        status_code=status_code,
+        provider="fireworks_ai",
+    )
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=error),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert resp.total_candidates == 1
+    assert resp.results[0].doc_id == "stub:0"
+    assert resp.results[0].chunks[0].content == "stub"
+    assert resp.gatherer_notes["confidence"] == "low"
+    assert fake_request.state.gatherer_status == "provider_error_prefanout_fallback"
+    assert fake_request.state.failure_recovered is True
+    assert getattr(fake_request.state, "full_failure", False) is False
+    assert fake_request.state.search_agent_status == "provider_error_prefanout_fallback"
+    assert fake_request.state.search_agent_gathered.chunks[0].doc_id == "stub:0"
+
+
+@pytest.mark.asyncio
+async def test_transient_error_after_exploration_preserves_loop_ledger_and_latency(
+    fake_request: SimpleNamespace,
+) -> None:
+    """A failed second turn keeps completed work and records outage latency."""
+    req = QueryRequest(query="provider tail", customer_id="cust-1", top_k=5)
+    turn_1 = _mk_resp(tool_calls=[{
+        "id": "s1",
+        "name": "search",
+        "arguments": {"queries": ["provider tail evidence"]},
+    }])
+    provider_error = LLMError(
+        "gateway provider chain exhausted",
+        status_code=503,
+        provider="fireworks_ai",
+    )
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1, provider_error]),
+    ), patch(
+        "services.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert resp.gatherer_notes["confidence"] == "low"
+    assert resp.gatherer_notes["turns_used"] == 1
+    assert resp.gatherer_notes["tools_called"] == ["search"]
+    state = fake_request.state.search_agent_loop_state
+    assert state.turn_count == 1
+    assert state.tools_fired == ["search"]
+    assert len(state.turn_latencies_ms) == 1
+    assert len(state.failed_turn_latencies_ms) == 1
+    timing = fake_request.state.search_agent_timing
+    assert timing["agent_failed_llm_ms"] == pytest.approx(
+        sum(state.failed_turn_latencies_ms)
+    )
+    assert timing["agent_loop_ms"] == pytest.approx(
+        sum(state.turn_latencies_ms) + sum(state.failed_turn_latencies_ms)
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cause", [TimeoutError("late"), ConnectionError("reset")])
+async def test_typed_transport_error_degrades_without_http_status(
+    fake_request: SimpleNamespace,
+    cause: BaseException,
+) -> None:
+    """Typed timeout/connection causes are transient without message matching."""
+    req = QueryRequest(query="provider transport", customer_id="cust-1", top_k=5)
+    error = LLMError("opaque transport failure", provider="cerebras")
+    error.__cause__ = cause
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=error),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert resp.total_candidates == 1
+    assert fake_request.state.gatherer_status == "provider_error_prefanout_fallback"
+    assert fake_request.state.failure_recovered is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 422])
+async def test_non_transient_http_error_remains_fatal(
+    fake_request: SimpleNamespace,
+    status_code: int,
+) -> None:
+    """Auth/config/validation errors must never be hidden by pre-fan-out."""
+    req = QueryRequest(query="bad configuration", customer_id="cust-1", top_k=5)
+    error = LLMError("request rejected", status_code=status_code)
+    if status_code == 401:
+        # A hard status is authoritative even when the transport attaches a
+        # connection-ish nested cause after receiving the rejection.
+        error.__cause__ = ConnectionError("connection closed after response")
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=error),
+    ), pytest.raises(HTTPException) as exc_info:
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert exc_info.value.status_code == 503
+    assert fake_request.state.full_failure is True
+
+
+@pytest.mark.asyncio
+async def test_transient_error_without_citable_prefanout_remains_fatal(
+    fake_request: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hit lacking content cannot support a citation, so preserve the 503."""
+    req = QueryRequest(query="uncitable evidence", customer_id="cust-1", top_k=5)
+    monkeypatch.setattr(
+        "services.retrieval.agent.loop.execute_search",
+        AsyncMock(return_value={
+            "sub_queries": [{
+                "query": "uncitable evidence",
+                "vector": [{"doc_id": "github:doc:1", "content": "   "}],
+                "bm25": [],
+                "graph": [],
+                "inferred_edge": [],
+            }]
+        }),
+    )
+
+    with patch(
+        "services.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=LLMError("busy", status_code=429)),
+    ), pytest.raises(HTTPException) as exc_info:
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
     assert exc_info.value.status_code == 503
     assert fake_request.state.full_failure is True
 
@@ -1672,3 +1917,43 @@ def test_is_context_overflow_classifies_overflow_vs_outage() -> None:
     # A genuine provider outage is NOT a context overflow -> stays a 503.
     outage = LLMError("connection reset by peer", status_code=503)
     assert is_context_overflow(outage) is False
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [(408, True), (429, True), (500, True), (503, True), (400, False), (401, False)],
+)
+def test_is_transient_provider_error_classifies_http_statuses(
+    status_code: int,
+    expected: bool,
+) -> None:
+    assert (
+        is_transient_provider_error(LLMError("opaque", status_code=status_code))
+        is expected
+    )
+
+
+def test_is_transient_provider_error_requires_typed_statusless_cause() -> None:
+    message_only = LLMError("timeout connecting to unavailable provider")
+    assert is_transient_provider_error(message_only) is False
+
+    typed = LLMError("opaque")
+    typed.__cause__ = TimeoutError("late")
+    assert is_transient_provider_error(typed) is True
+
+
+def test_non_transient_http_status_overrides_connection_cause() -> None:
+    auth_error = LLMError("authentication rejected", status_code=401)
+    auth_error.__cause__ = ConnectionError("connection closed after response")
+    assert is_transient_provider_error(auth_error) is False
+
+
+def test_transient_provider_error_cause_cycle_terminates() -> None:
+    first = RuntimeError("first")
+    second = RuntimeError("second")
+    first.__cause__ = second
+    second.__cause__ = first
+    wrapped = LLMError("opaque")
+    wrapped.__cause__ = first
+
+    assert is_transient_provider_error(wrapped) is False

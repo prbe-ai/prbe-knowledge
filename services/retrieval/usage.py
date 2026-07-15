@@ -24,6 +24,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -261,6 +262,15 @@ class QueryTrace:
     cache_tokens: dict[str, Any] | None = None
     router_model: str | None = None
     failure_recovered: bool = False
+    # Search-agent summary columns added by migration 0078. These are copied
+    # from request.state by the middleware so the nightly analyzer can query
+    # degraded/fallback behavior without downloading every R2 trace blob.
+    gatherer_status: str | None = None
+    tool_calls_count: int | None = None
+    need_deeper_extensions: int | None = None
+    confidence: str | None = None
+    dropped_count: int | None = None
+    cache_hit_rate: float | None = None
     # Pointer to the per-turn R2 transcript (migration 0079). Nullable:
     # sampled-out rows + R2-write-failure rows still get the summary
     # row, just without the blob pointer. Lookup-by-request_id via
@@ -407,12 +417,15 @@ async def write_query_trace(trace: QueryTrace) -> None:
                     response_size_bytes, response_truncated,
                     grounding_bundle, router_raw, intents_count,
                     intent_dispatch, cache_tokens, router_model, failure_recovered,
+                    gatherer_status, tool_calls_count, need_deeper_extensions,
+                    confidence, dropped_count, cache_hit_rate,
                     trace_blob_key
                 ) VALUES (
                     $1, $2, $3::uuid, $4, $5, $6::jsonb, $7::jsonb, $8, $9,
                     $10::jsonb, $11::jsonb, $12,
                     $13::jsonb, $14::jsonb, $15, $16,
-                    $17
+                    $17, $18, $19, $20, $21, $22,
+                    $23
                 )
                 """,
                 trace.customer_id,
@@ -431,6 +444,16 @@ async def write_query_trace(trace: QueryTrace) -> None:
                 cache_tokens_json,
                 trace.router_model,
                 trace.failure_recovered,
+                trace.gatherer_status,
+                trace.tool_calls_count,
+                trace.need_deeper_extensions,
+                trace.confidence,
+                trace.dropped_count,
+                (
+                    Decimal(str(trace.cache_hit_rate))
+                    if trace.cache_hit_rate is not None
+                    else None
+                ),
                 trace.trace_blob_key,
             )
     except (Exception, asyncio.CancelledError) as exc:

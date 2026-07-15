@@ -931,6 +931,12 @@ CREATE TABLE query_traces (
     cache_tokens        JSONB,
     router_model        TEXT,
     failure_recovered   BOOLEAN NOT NULL DEFAULT FALSE,
+    gatherer_status     TEXT,
+    tool_calls_count    INT,
+    need_deeper_extensions INT,
+    confidence          TEXT,
+    dropped_count       INT,
+    cache_hit_rate      NUMERIC(4, 3),
     trace_blob_key      TEXT
 );
 
@@ -1444,4 +1450,3 @@ CREATE POLICY entity_merge_suggestions_tenant_isolation
     ON entity_merge_suggestions
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
-
