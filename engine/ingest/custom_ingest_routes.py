@@ -33,6 +33,7 @@ from engine.shared.constants import SourceSystem
 from engine.shared.custom_ingest import (
     CustomIngestDocument,
     CustomIngestEnvelope,
+    custom_ingest_doc_id,
     document_content_hash,
     document_payload_key,
     is_valid_source_key,
@@ -229,7 +230,9 @@ async def list_custom_ingest_documents(
     has_more = len(rows) > limit
     rows = rows[:limit]
 
-    doc_id_prefix = f"custom_ingest:{customer_id}:{key}:"
+    # Mirror the handler's injective composition (':' in the source_key is
+    # percent-encoded inside doc ids -- see shared.custom_ingest).
+    doc_id_prefix = custom_ingest_doc_id(customer_id, key, "")
     documents: list[dict[str, Any]] = []
     for row in rows:
         metadata = _coerce_metadata(row["metadata"])

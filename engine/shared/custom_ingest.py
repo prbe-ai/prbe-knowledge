@@ -112,6 +112,42 @@ class CustomIngestEnvelope(BaseModel):
         return value
 
 
+def encode_source_key_for_doc_id(source_key: str) -> str:
+    """Percent-encode ':' in a source_key for use as a doc-id segment.
+
+    Internal doc ids are colon-delimited
+    (``custom_ingest:{customer}:{source_key}:{document_id}``). Since the
+    source_key charset admits ':' (workspace:<uuid> namespacing) and the
+    caller's document id is unrestricted, naive concatenation is not
+    injective: (source_key='workspace:abc', id='doc1') would collide with
+    (source_key='workspace', id='abc:doc1'). Encoding ':' -> '%3A' in the
+    source_key segment restores injectivity: the encoded segment contains
+    no ':' so ``doc_id.split(':', 3)`` recovers (system, customer,
+    encoded_key, document_id) unambiguously, and the map is reversible
+    because '%' is outside the source_key charset (_SOURCE_KEY_RE), so
+    '%3A' can never occur in a raw key. Keys without ':' are byte-
+    identical under this encoding -- zero impact on existing doc ids.
+    """
+    return source_key.replace(":", "%3A")
+
+
+def custom_ingest_doc_id(customer_id: str, source_key: str, document_id: str) -> str:
+    """Compose the internal documents.doc_id for a custom-ingest document.
+
+    Format (the ONLY blessed shape -- consumers parse source_key back out
+    of doc_id client-side, so any change here is a cross-repo contract
+    change):
+
+        custom_ingest:{customer_id}:{encoded_source_key}:{document_id}
+
+    where encoded_source_key = source_key with ':' -> '%3A' (see
+    encode_source_key_for_doc_id). document_id is the caller's raw id and
+    is the final segment, so it may itself contain ':'.
+    """
+    encoded = encode_source_key_for_doc_id(source_key)
+    return f"custom_ingest:{customer_id}:{encoded}:{document_id}"
+
+
 def json_size(value: object) -> int:
     return len(orjson.dumps(value))
 

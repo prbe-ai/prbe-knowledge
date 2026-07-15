@@ -20,7 +20,7 @@ from engine.shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from engine.shared.custom_ingest import CustomIngestEnvelope
+from engine.shared.custom_ingest import CustomIngestEnvelope, custom_ingest_doc_id
 from engine.shared.exceptions import InvalidWebhookPayload
 from engine.shared.models import (
     ACLPrincipal,
@@ -98,7 +98,9 @@ class CustomIngestConnector(Connector):
         received_at = event.received_at
         created_at = document.created_at or received_at
         updated_at = document.updated_at or created_at
-        doc_id = f"custom_ingest:{event.customer_id}:{source_key}:{document.id}"
+        # Injective composition -- ':' in source_key is percent-encoded so
+        # (source_key, id) pairs can never collide. See custom_ingest_doc_id.
+        doc_id = custom_ingest_doc_id(event.customer_id, source_key, document.id)
         source_id = f"{source_key}:{document.id}"
         source_url = document.url or _dashboard_source_url(event.customer_id, source_key)
         title = document.title or f"{source_key}/{document.id}"
