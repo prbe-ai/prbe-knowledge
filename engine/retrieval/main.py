@@ -114,11 +114,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # fusion decay and the doc-type resolver see them. engine/ never
     # imports kb/ itself — count 0 here means someone launched this module
     # directly and per-source ranking is running on defaults.
+    registered = len(registered_source_keys())
     log.info(
         "retrieval.boot",
         environment=settings.environment,
-        registered_sources=len(registered_source_keys()),
+        registered_sources=registered,
     )
+    if registered == 0:
+        # Loud, impossible-to-miss boot signal. Serving continues (a pure
+        # engine deployment without a connector pack is legal), but every
+        # per-source ranking knob is silently running on defaults, which
+        # is almost never what an operator intended.
+        log.error(
+            "retrieval.boot.source_registry_empty",
+            hint=(
+                "no source profiles are registered -- per-source score "
+                "multipliers, recency half-lives, and doc_type prefixes "
+                "are all falling back to defaults. Launch via the deploy "
+                "wrapper (uvicorn services.retrieval.main:app) or import "
+                "kb.handlers (or your connector pack) before this app."
+            ),
+        )
     yield
 
 

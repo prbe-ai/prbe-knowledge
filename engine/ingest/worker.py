@@ -58,6 +58,24 @@ class Worker:
             concurrency=self._concurrency,
             per_customer_max_inflight=self._per_customer_max_inflight,
         )
+        # Loud boot signal when the connector registry is empty. engine/
+        # never imports kb/ itself; the deploy wrapper (python -m
+        # services.ingestion.worker -> kb.worker) imports kb.handlers. A
+        # direct engine launch without a connector pack would otherwise
+        # sit "healthy" while every claimed row DLQs with HandlerNotFound.
+        from engine.ingest.handlers.registry import list_registered
+
+        if not list_registered():
+            log.error(
+                "worker.boot.connector_registry_empty",
+                hint=(
+                    "no connectors are registered -- every queue row will "
+                    "fail with HandlerNotFound. Launch via the deploy "
+                    "wrapper (python -m services.ingestion.worker) or "
+                    "import kb.handlers (or your connector pack) before "
+                    "starting the worker."
+                ),
+            )
         # Each loop independently claims via FOR UPDATE SKIP LOCKED, so N
         # parallel loops in the same process safely share the queue.
         await asyncio.gather(*(self._claim_loop(poll_interval) for _ in range(self._concurrency)))

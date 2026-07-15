@@ -14,6 +14,11 @@ import asyncio
 import json
 from datetime import UTC, datetime
 
+# Composition root: engine/ never imports kb/ itself, so operator entry
+# points must load the connector pack explicitly or the handler registry
+# is EMPTY (build_connector raises HandlerNotFound; list_registered
+# silently yields nothing). Same line the services/* deploy wrappers use.
+import kb.handlers  # noqa: F401  (connector-registration side effect)
 from engine.ingest.handlers.base import make_default_context
 from engine.ingest.handlers.registry import build_connector
 from engine.shared.config import get_settings
