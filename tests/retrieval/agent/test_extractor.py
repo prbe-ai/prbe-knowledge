@@ -23,6 +23,7 @@ from engine.retrieval.agent.extractor import (
 )
 from engine.retrieval.agent.models import EntityExtraction, SearchOptions
 from engine.retrieval.grounding import GroundingBundle
+from engine.shared.constants import SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS
 
 
 def _fake_completion(content: str) -> SimpleNamespace:
@@ -116,6 +117,7 @@ async def test_extract_returns_entity_extraction_with_search_options(
     assert result.entities[0].canonical_id == "mahit@prbe.ai"
     assert result.search_options.sort == "recency"
     call_kwargs = mock_acompletion.await_args.kwargs
+    assert call_kwargs["timeout"] == SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS
     if gateway_enabled:
         assert call_kwargs["max_retries"] == 0
     else:

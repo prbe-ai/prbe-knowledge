@@ -8,6 +8,11 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- Retrieval queries now return citable pre-fan-out evidence with low
+  confidence when the gateway exhausts its providers on a transient timeout,
+  rate limit, or server error. Permanent provider failures and responses
+  without citable evidence continue to fail closed, while phase-specific
+  deadlines keep the fallback inside the MCP request envelope.
 - Gatherer responses now honor `top_k_related`, including returning no related
   entity payload when callers set it to zero.
 - Gateway-routed retrieval entity extraction and gatherer turns now make a

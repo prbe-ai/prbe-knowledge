@@ -26,8 +26,9 @@ from engine.mcp.services.response_budget import (
 )
 from engine.retrieval.synthesis import SYNTHESIS_TIMEOUT_SECONDS
 from engine.shared.constants import (
+    SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS,
+    SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
     SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
-    SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
 )
 
 
@@ -156,12 +157,15 @@ async def test_successful_client_calls_share_transport_and_compact_payloads() ->
 def test_default_timeout_exceeds_upstream_search_and_synthesis_budgets() -> None:
     default_timeout = Settings.model_fields["knowledge_timeout_s"].default
     upstream_timeout_envelope = (
-        SEARCH_AGENT_TURN_TIMEOUT_SECONDS
+        SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS
         + SEARCH_AGENT_LOOP_TIMEOUT_SECONDS
         + SYNTHESIS_TIMEOUT_SECONDS
     )
 
     assert isinstance(default_timeout, (int, float))
+    # A provider-chain turn is nested inside (and must finish before) the
+    # gatherer loop; it is not double-counted in the end-to-end envelope.
+    assert SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS < SEARCH_AGENT_LOOP_TIMEOUT_SECONDS
     assert default_timeout > upstream_timeout_envelope
 
 

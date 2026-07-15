@@ -53,6 +53,7 @@ def _mk_state(**overrides: Any) -> LoopState:
         "cache_hit_rates": [0.0, 0.8],
         "turn_1_tools_fired": ["vector_search", "bm25_search", "graph_search", "inferred_edge_search"],
         "turn_latencies_ms": [510.2, 420.7],
+        "failed_turn_latencies_ms": [1200.4],
         "tool_latencies_ms": [120.0, 95.5, 80.3],
         "prose_retries": 0,
         "prefanout": {"vector": {"hits": []}, "bm25": {"hits": []}},
@@ -126,6 +127,7 @@ def test_build_trace_blob_includes_all_fields() -> None:
     assert blob["extensions_used"] == 0
     assert blob["cache_hit_rates"] == [0.0, 0.8]
     assert blob["turn_latencies_ms"] == [510.2, 420.7]
+    assert blob["failed_turn_latencies_ms"] == [1200.4]
     assert blob["tool_latencies_ms"] == [120.0, 95.5, 80.3]
     assert blob["prose_retries"] == 0
     assert blob["prefanout"] == state.prefanout
@@ -189,6 +191,7 @@ def test_build_trace_blob_handles_none_state() -> None:
     assert blob["reasoning_per_turn"] == []
     assert blob["seed"] is None
     assert blob["system_fingerprints_per_turn"] == []
+    assert blob["failed_turn_latencies_ms"] == []
 
 
 def test_build_trace_blob_handles_none_gathered() -> None:

@@ -20,7 +20,9 @@ import hashlib
 import json
 import secrets
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -182,6 +184,49 @@ async def _wait_for_traces(
             return rows
         await asyncio.sleep(0.05)
     return rows
+
+
+@pytest.mark.asyncio
+async def test_trace_builder_copies_search_agent_summary_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Migration-0078 state reaches QueryTrace before the DB writer runs."""
+    from engine.retrieval.middleware import _build_and_write_trace
+
+    write_mock = AsyncMock()
+    monkeypatch.setattr(
+        "engine.retrieval.middleware.write_query_trace",
+        write_mock,
+    )
+    request = SimpleNamespace(state=SimpleNamespace(
+        customer_id="cust-summary",
+        usage_request_payload={"query": "fallback"},
+        usage_response_payload={"results": []},
+        gatherer_status="provider_error_prefanout_fallback",
+        tool_calls_count=3,
+        need_deeper_extensions=1,
+        confidence="low",
+        dropped_count=2,
+        cache_hit_rate=0.875,
+        failure_recovered=True,
+    ))
+
+    await _build_and_write_trace(
+        request,
+        path="/retrieve",
+        request_id="8d85598e-4d6d-46f7-ab45-26db199793da",
+        error_class=None,
+        error_message=None,
+    )
+
+    trace = write_mock.await_args.args[0]
+    assert trace.gatherer_status == "provider_error_prefanout_fallback"
+    assert trace.tool_calls_count == 3
+    assert trace.need_deeper_extensions == 1
+    assert trace.confidence == "low"
+    assert trace.dropped_count == 2
+    assert trace.cache_hit_rate == pytest.approx(0.875)
+    assert trace.failure_recovered is True
 
 
 @pytest.mark.asyncio

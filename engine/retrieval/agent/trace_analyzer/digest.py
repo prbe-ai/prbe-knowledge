@@ -55,6 +55,9 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
     turn_1_tools: list[str] = list(blob.get("turn_1_tools_fired") or [])
     cache_rates: list[float | None] = list(blob.get("cache_hit_rates") or [])
     turn_latencies: list[float] = list(blob.get("turn_latencies_ms") or [])
+    failed_turn_latencies: list[float] = list(
+        blob.get("failed_turn_latencies_ms") or []
+    )
     reasoning_per_turn = list(blob.get("reasoning_per_turn") or [])
     fingerprints_per_turn: list[str | None] = list(
         blob.get("system_fingerprints_per_turn") or []
@@ -107,6 +110,7 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
         "prefanout_ms": timing.get("prefanout_ms"),
         "agent_ms": timing.get("agent_ms"),
         "agent_loop_ms": timing.get("agent_loop_ms"),
+        "agent_failed_llm_ms": timing.get("agent_failed_llm_ms"),
         "agent_tools_ms": timing.get("agent_tools_ms"),
         "extraction_ms": timing.get("extraction_ms"),
         # Cache
@@ -123,6 +127,7 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
         ),
         # Per-turn LLM latency — slow turns surface model-side issues
         "turn_latencies_ms": turn_latencies,
+        "failed_turn_latencies_ms": failed_turn_latencies,
         # Prefanout coverage
         "prefanout_hit_counts": dict(blob.get("prefanout_hit_counts") or {}),
         # Response sizing (from DB summary)

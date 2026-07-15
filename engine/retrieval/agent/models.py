@@ -44,11 +44,16 @@ GathererStatus = Literal[
     # router's `_call_haiku` short-circuit when neither Anthropic key nor
     # LLM gateway URL was set.
     "no_llm_configured",
-    # LLMError raised mid-loop (provider 5xx, network, etc). The
-    # harness re-raises as HTTPException(503), but we still capture the
-    # trace blob with this status — the partial transcript is exactly
-    # the artifact we need to debug provider-side regressions.
+    # Non-recoverable LLMError raised mid-loop (auth/config/validation/unknown,
+    # or a transient provider failure without citable pre-fan-out evidence).
+    # The harness re-raises as HTTPException(503), but still captures the trace
+    # blob with this status for provider-side regression diagnosis.
     "fatal_provider_error",
+    # The configured provider call/chain ended with a transient failure, but
+    # the harness had already retrieved at least one citable, content-bearing
+    # pre-fan-out document. Return that evidence at low confidence instead of
+    # turning a provider outage into a user-visible 503.
+    "provider_error_prefanout_fallback",
     # Grounding+extraction surfaced no entities AND all 4 pre-fan-out
     # channels returned 0 hits. The LLM cannot synthesize results from
     # nothing; the harness returns an empty GathererOutput without

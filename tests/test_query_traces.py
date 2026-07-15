@@ -23,6 +23,8 @@ import json
 import secrets
 import uuid
 from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -137,6 +139,83 @@ async def _fetch_traces(customer_id: str) -> list[Any]:
     return rows
 
 
+def test_canonical_schema_includes_search_agent_summary_columns() -> None:
+    """Fresh installs use schema.sql rather than replaying migration 0078."""
+    schema = (
+        Path(__file__).resolve().parents[1] / "db" / "schema.sql"
+    ).read_text()
+
+    for column in (
+        "gatherer_status",
+        "tool_calls_count",
+        "need_deeper_extensions",
+        "confidence",
+        "dropped_count",
+        "cache_hit_rate",
+    ):
+        assert column in schema
+
+
+@pytest.mark.asyncio
+async def test_write_query_trace_includes_search_agent_summary_columns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The existing migration-0078 columns are present in the INSERT."""
+    captured: list[tuple[str, tuple[Any, ...]]] = []
+
+    class _CaptureConn:
+        async def execute(self, statement: str, *args: Any) -> None:
+            captured.append((statement, args))
+
+    class _CaptureContext:
+        async def __aenter__(self) -> _CaptureConn:
+            return _CaptureConn()
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "engine.retrieval.usage.with_tenant",
+        lambda _customer_id: _CaptureContext(),
+    )
+
+    await write_query_trace(QueryTrace(
+        customer_id="cust-summary",
+        request_id=str(uuid.uuid4()),
+        event_type=EVENT_TYPE_RETRIEVE,
+        request_payload={"query": "fallback"},
+        response_payload={"results": []},
+        gatherer_status="provider_error_prefanout_fallback",
+        tool_calls_count=3,
+        need_deeper_extensions=1,
+        confidence="low",
+        dropped_count=2,
+        cache_hit_rate=0.875,
+        trace_blob_key="search-traces/2026-07-15/trace.json.gz",
+    ))
+
+    assert len(captured) == 1
+    statement, args = captured[0]
+    for column in (
+        "gatherer_status",
+        "tool_calls_count",
+        "need_deeper_extensions",
+        "confidence",
+        "dropped_count",
+        "cache_hit_rate",
+    ):
+        assert column in statement
+    assert args[-7:] == (
+        "provider_error_prefanout_fallback",
+        3,
+        1,
+        "low",
+        2,
+        Decimal("0.875"),
+        "search-traces/2026-07-15/trace.json.gz",
+    )
+
+
 @pytest.mark.asyncio
 async def test_write_query_trace_persists_row(live_db) -> None:
     """Happy path: a retrieve trace lands with all fields populated."""
@@ -152,6 +231,12 @@ async def test_write_query_trace_persists_row(live_db) -> None:
             event_type=EVENT_TYPE_RETRIEVE,
             request_payload=req,
             response_payload=resp,
+            gatherer_status="ok",
+            tool_calls_count=2,
+            need_deeper_extensions=0,
+            confidence="high",
+            dropped_count=1,
+            cache_hit_rate=0.875,
         )
     )
 
@@ -164,6 +249,12 @@ async def test_write_query_trace_persists_row(live_db) -> None:
     assert row["schema_version"] == QUERY_TRACE_SCHEMA_VERSION
     assert row["response_truncated"] is False
     assert row["response_size_bytes"] > 0
+    assert row["gatherer_status"] == "ok"
+    assert row["tool_calls_count"] == 2
+    assert row["need_deeper_extensions"] == 0
+    assert row["confidence"] == "high"
+    assert row["dropped_count"] == 1
+    assert row["cache_hit_rate"] == Decimal("0.875")
     # The request column round-trips the parsed pydantic model.
     request = _jsonb(row["request"])
     assert request is not None

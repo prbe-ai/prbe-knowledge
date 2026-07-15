@@ -87,6 +87,7 @@ def build_trace_blob(
         blob["extensions_used"] = state.extensions_used
         blob["cache_hit_rates"] = list(state.cache_hit_rates)
         blob["turn_latencies_ms"] = list(state.turn_latencies_ms)
+        blob["failed_turn_latencies_ms"] = list(state.failed_turn_latencies_ms)
         blob["tool_latencies_ms"] = list(state.tool_latencies_ms)
         blob["prose_retries"] = state.prose_retries
         # Pre-fan-out captured on LoopState by run_gatherer so the
@@ -125,6 +126,7 @@ def build_trace_blob(
         blob["extensions_used"] = 0
         blob["cache_hit_rates"] = []
         blob["turn_latencies_ms"] = []
+        blob["failed_turn_latencies_ms"] = []
         blob["tool_latencies_ms"] = []
         blob["prose_retries"] = 0
         blob["prefanout"] = {}

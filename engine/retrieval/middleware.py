@@ -316,6 +316,17 @@ async def _build_and_write_trace(
             cache_tokens=getattr(request.state, "cache_tokens", None),
             router_model=getattr(request.state, "router_model", None),
             failure_recovered=getattr(request.state, "failure_recovered", False),
+            # Search-agent summary telemetry (migration 0078 columns).
+            gatherer_status=getattr(request.state, "gatherer_status", None),
+            tool_calls_count=getattr(request.state, "tool_calls_count", None),
+            need_deeper_extensions=getattr(
+                request.state,
+                "need_deeper_extensions",
+                None,
+            ),
+            confidence=getattr(request.state, "confidence", None),
+            dropped_count=getattr(request.state, "dropped_count", None),
+            cache_hit_rate=getattr(request.state, "cache_hit_rate", None),
             # Pointer to the per-turn R2 transcript. Set by
             # _persist_trace_blob_r2 above us in the BackgroundTasks chain;
             # NULL when sampling skipped the run or R2 PUT failed.

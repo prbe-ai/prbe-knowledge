@@ -786,12 +786,19 @@ SEARCH_AGENT_PER_HIT_PROPERTIES_CAP = 2048
 # hard-query cost roughly doubles. See `loop._affinity_key`.
 SEARCH_AGENT_CACHE_HIT_RATE_FLOOR = 0.7
 
-# Wall-clock cap on a single agent turn (model + tool execution combined).
-# Aborts a stuck turn loudly rather than waiting on the LiteLLM default.
-SEARCH_AGENT_TURN_TIMEOUT_SECONDS = 30.0
+# Wall-clock cap on entity extraction. Extraction is optional enrichment and
+# retains the original 30s bound; failure falls back to grounding-only anchors.
+SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS = 30.0
+
+# Client-side cap on one gatherer model turn. The managed LiteLLM gateway owns
+# the Cerebras -> Fireworks provider chain, so this must leave enough time for
+# both routes to run before the retrieval client gives up. It remains nested
+# inside SEARCH_AGENT_LOOP_TIMEOUT_SECONDS, which bounds the complete loop.
+SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 60.0
 
 # Overall agent loop cap. Prevents pathological queries from monopolising
-# a worker. p99 should land far below this; trip = log + 503.
+# a worker. p99 should land far below this; timeout degrades to the citable
+# pre-fan-out evidence already retrieved by the harness.
 SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 90.0
 
 # Fraction of gatherer runs whose full per-turn transcript gets persisted
