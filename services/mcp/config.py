@@ -74,8 +74,9 @@ class Settings(BaseSettings):
     )
     knowledge_timeout_s: float = Field(
         # The upstream envelope can spend 30s extracting entities, 90s in
-        # the gatherer loop, and another 30s synthesizing /query responses.
-        # Leave headroom for grounding, fan-out, and response serialization.
+        # the gatherer loop (including each 60s provider-chain client call),
+        # and another 30s synthesizing /query responses. Leave headroom for
+        # grounding, fan-out, and response serialization.
         default=180.0,
         description="HTTP read timeout for retrieval calls; exceeds upstream LLM budgets",
     )

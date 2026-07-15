@@ -90,6 +90,7 @@ def _mk_blob(**overrides: Any) -> dict[str, Any]:
             "prefanout_ms": 400.0,
             "agent_ms": 5000.0,
             "agent_loop_ms": 4500.0,
+            "agent_failed_llm_ms": 0.0,
             "agent_tools_ms": 500.0,
         },
         "messages": [
@@ -104,6 +105,7 @@ def _mk_blob(**overrides: Any) -> dict[str, Any]:
         "extensions_used": 0,
         "cache_hit_rates": [0.4, 0.8],
         "turn_latencies_ms": [1500.0, 3000.0],
+        "failed_turn_latencies_ms": [],
         "tool_latencies_ms": [50.0, 80.0],
         "prose_retries": 0,
         "prefanout": {},
@@ -157,6 +159,8 @@ def test_summarize_trace_happy_path_extracts_all_fields() -> None:
     assert set(out["turn_1_missed_channels"]) == {"graph_search", "inferred_edge_search"}
     assert out["cache_hit_rate_mean"] == pytest.approx(0.6)
     assert out["turn_latencies_ms"] == [1500.0, 3000.0]
+    assert out["failed_turn_latencies_ms"] == []
+    assert out["agent_failed_llm_ms"] == 0.0
     assert out["agent_ms"] == 5000.0
     assert out["had_reasoning_per_turn"] is True
     # bucket_name + blob_key flow through from _db
@@ -188,6 +192,25 @@ def test_summarize_trace_handles_failure_status() -> None:
         "graph_search",
         "inferred_edge_search",
     }
+
+
+def test_summarize_trace_exposes_failed_provider_latency() -> None:
+    blob = _mk_blob(
+        status="provider_error_prefanout_fallback",
+        failed_turn_latencies_ms=[1200.0],
+        timing_ms={
+            "agent_ms": 5800.0,
+            "agent_loop_ms": 5700.0,
+            "agent_failed_llm_ms": 1200.0,
+            "agent_tools_ms": 100.0,
+        },
+    )
+
+    out = summarize_trace(blob)
+
+    assert out["status"] == "provider_error_prefanout_fallback"
+    assert out["failed_turn_latencies_ms"] == [1200.0]
+    assert out["agent_failed_llm_ms"] == 1200.0
 
 
 def test_summarize_trace_handles_zero_turns() -> None:

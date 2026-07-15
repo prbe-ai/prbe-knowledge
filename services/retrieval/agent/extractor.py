@@ -32,8 +32,8 @@ from services.retrieval.agent.models import (
 from services.retrieval.grounding import GroundingBundle
 from services.retrieval.router import _escape_query_for_xml
 from shared.constants import (
+    SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS,
     SEARCH_AGENT_INFERENCE_MODEL,
-    SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
 )
 from shared.llm import LLMError, acompletion, gateway_url
 from shared.logging import get_logger
@@ -363,7 +363,7 @@ async def extract_entities_with_llm(
             # entities run-to-run. See loop.py _run_turn for the same fix.
             "temperature": 0,
             "max_tokens": 600,
-            "timeout": SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
+            "timeout": SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS,
         }
         if gateway_url():
             # The managed proxy owns Cerebras -> Fireworks failover. Do not
