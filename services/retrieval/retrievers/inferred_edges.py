@@ -259,7 +259,7 @@ async def inferred_edge_search(
         doc_id = r["doc_id"]
         anchor_rank = int(r["anchor_rank"])
         # Raw score: dampened reciprocal of anchor_rank. The wrapper layers
-        # SOURCE_SCORE_MULTIPLIERS and the fan-out penalty on top so all
+        # per-source score multipliers and the fan-out penalty on top so all
         # cross-channel score policy lives in one place (search_pipeline).
         score = dampening * (1.0 / (1.0 + anchor_rank))
         candidate = InferredEdgeHit(

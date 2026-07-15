@@ -67,11 +67,7 @@ from services.ingestion.wiki_routes import router as wiki_router
 from services.system_settings import get_ingestion_killswitch
 from shared.community import ensure_default_customer
 from shared.config import get_settings
-from shared.constants import (
-    DEFAULT_INGESTION_PRIORITY,
-    SOURCE_INGESTION_PRIORITY,
-    SourceSystem,
-)
+from shared.constants import SourceSystem
 from shared.db import get_pool, health_check, init_pool, with_tenant
 from shared.exceptions import (
     HandlerNotFound,
@@ -79,6 +75,7 @@ from shared.exceptions import (
     PrbeError,
 )
 from shared.logging import bind_trace, configure_logging, get_logger
+from shared.source_registry import ingestion_priority_for
 from shared.storage import get_store
 
 log = get_logger(__name__)
@@ -858,7 +855,7 @@ async def _enqueue(
         )
         return False
 
-    priority = SOURCE_INGESTION_PRIORITY.get(source, DEFAULT_INGESTION_PRIORITY)
+    priority = ingestion_priority_for(source.value)
 
     if source in (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX):
         # Session-keyed UPSERT: append to array, bump version, refresh

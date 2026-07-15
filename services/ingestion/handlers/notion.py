@@ -401,6 +401,7 @@ def _title_from_properties(properties: Mapping[str, Any]) -> str | None:
 class NotionConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.NOTION
     display_name: ClassVar[str] = "Notion"
+    doc_type_prefix: ClassVar[str] = "notion."
 
     # ------------------------------------------------------------------
     # 1. signature verification

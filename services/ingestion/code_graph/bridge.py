@@ -32,13 +32,10 @@ from typing import Any
 
 import orjson
 
-from shared.constants import (
-    DEFAULT_INGESTION_PRIORITY,
-    SOURCE_INGESTION_PRIORITY,
-    SourceSystem,
-)
+from shared.constants import SourceSystem
 from shared.db import get_pool
 from shared.logging import get_logger
+from shared.source_registry import ingestion_priority_for
 from shared.storage import get_store
 
 log = get_logger(__name__)
@@ -197,9 +194,7 @@ async def _put_and_enqueue(
     body = orjson.dumps(payload)
     await store.put(bucket, key, body)
 
-    priority = SOURCE_INGESTION_PRIORITY.get(
-        SourceSystem.CODE_GRAPH, DEFAULT_INGESTION_PRIORITY
-    )
+    priority = ingestion_priority_for(SourceSystem.CODE_GRAPH.value)
     # Intentionally NOT gated by services.ingestion.connectedness:
     # CODE_GRAPH is derived from already-ingested github content; the
     # upstream github enqueue gate stops new work when github is

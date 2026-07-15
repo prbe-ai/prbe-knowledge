@@ -92,7 +92,7 @@ class Worker:
         attempts.
 
         Higher `priority` claims first. Tier order at insert time
-        (shared/constants.py:SOURCE_INGESTION_PRIORITY): live(100) >
+        (shared.source_registry, registered per connector): live(100) >
         claude_code(75) > backfill(50). One chatty CC user can't block
         github/slack/notion/linear/granola/sentry traffic.
 

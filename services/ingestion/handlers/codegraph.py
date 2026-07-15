@@ -81,6 +81,26 @@ _SUPPORTED_EXTENSIONS: tuple[str, ...] = (
 class CodeGraphConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.CODE_GRAPH
     display_name: ClassVar[str] = "code-graph"
+    doc_type_prefix: ClassVar[str] = "code."
+    # Queue priority 50: bursty (initial-backfill batches) and
+    # search-indexable, not user-facing latency-critical — sits in the same
+    # tier as backfill rows so a large repo onboarding can't block live
+    # webhooks.
+    ingestion_priority: ClassVar[int] = 50
+    # CODE_GRAPH chunks are over-represented in top-K relative to their
+    # signal strength: production query_traces (7d, acme) showed code_graph
+    # at 36.5% of top-5 results despite an avg post-fusion score ~3.4x lower
+    # than github and ~4.1x lower than claude_code. BM25 fires on common
+    # identifier tokens ("session", "tenant", "customer"), surfacing weak
+    # code matches above genuine non-code answers. 0.3 ~= inverse of the
+    # avg-score ratio: a code_graph chunk now needs to be ~3x stronger than
+    # the code_graph average to compete with an average non-code hit.
+    # Validated via offline replay at [1.0, 0.7, 0.5, 0.3, 0.2]: knee at 0.3
+    # (top-5 share 36.5% -> 24.4%); 0.2 only buys 1.3pp more.
+    score_multiplier: ClassVar[float] = 0.3
+    # Code symbols decay slower than CC/Codex transcripts (a function still
+    # exists weeks later) but faster than authored docs (refactors happen).
+    half_life_days: ClassVar[float | None] = 30.0
 
     # ---- 1. signature verification --------------------------------------
 

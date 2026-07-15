@@ -107,6 +107,7 @@ _LINK_NODE_MAP: dict[str, tuple[NodeLabel, EdgeType]] = {
 class WikiConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.WIKI
     display_name: ClassVar[str] = "Wiki"
+    doc_type_prefix: ClassVar[str] = "wiki."
 
     def verify_signature(
         self,

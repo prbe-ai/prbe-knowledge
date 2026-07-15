@@ -103,6 +103,7 @@ _MAX_FRAMES_IN_BODY = 10
 class SentryConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.SENTRY
     display_name: ClassVar[str] = "Sentry"
+    doc_type_prefix: ClassVar[str] = "sentry."
 
     # ------------------------------------------------------------------
     # 1. signature verification

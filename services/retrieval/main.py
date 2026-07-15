@@ -106,6 +106,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_logging(settings.log_level)
     await init_pool(settings)
     await ensure_default_customer()  # no-op unless DEFAULT_CUSTOMER_ID set
+
+    # Populate shared.source_registry: fusion decay and the doc-type
+    # resolver read per-source profiles (score multiplier, half-life,
+    # doc_type prefix) registered by the connector modules' decorators.
+    import services.ingestion.handlers  # noqa: F401
+
     log.info("retrieval.boot", environment=settings.environment)
     yield
 

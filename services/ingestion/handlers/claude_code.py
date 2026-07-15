@@ -70,6 +70,18 @@ def _nonempty_str(value: object) -> str | None:
 class ClaudeCodeConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.CLAUDE_CODE
     display_name: ClassVar[str] = "Claude Code"
+    doc_type_prefix: ClassVar[str] = "claude_code."
+    # Queue priority 75: bursty, deprioritized vs interactive webhooks (100).
+    # Sessions are search-indexable, not user-blocking; one chatty CC user
+    # shouldn't block other connectors at the queue claim layer.
+    ingestion_priority: ClassVar[int] = 75
+    # CC transcripts are high-volume and lower-signal-density than authored
+    # team artifacts (Slack threads, Linear tickets, PR descriptions); the
+    # 0.5 post-RRF demotion keeps authored content surfacing first.
+    score_multiplier: ClassVar[float] = 0.5
+    # A CC session is a point-in-time scratchpad — by week two it's almost
+    # always stale or contradicted by something authored elsewhere.
+    half_life_days: ClassVar[float | None] = 7.0
     # Per-source identifiers used to tag persisted artifacts. Subclasses
     # (e.g. CodexConnector below) override these so docs/edges/ACL rows
     # carry the correct provenance label even though the doc shape and
@@ -932,6 +944,10 @@ class CodexConnector(ClaudeCodeConnector):
     """
     source_system: ClassVar[SourceSystem] = SourceSystem.CODEX
     display_name: ClassVar[str] = "Codex"
+    # Source profile (doc_type_prefix "claude_code.", priority 75, 0.5
+    # multiplier, 7d half-life) is inherited from ClaudeCodeConnector on
+    # purpose: same doc shape, same coalescing semantics, same staleness
+    # curve — only the provenance label differs.
     _doc_id_prefix: ClassVar[str] = "codex"
     _agent_label: ClassVar[str] = "codex"
     _session_title_prefix: ClassVar[str] = "Codex session"

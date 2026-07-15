@@ -508,34 +508,17 @@ MAX_WEBHOOK_ATTEMPTS = 5
 QUEUE_HEARTBEAT_INTERVAL_SECONDS = 30
 QUEUE_RECLAIM_THRESHOLD_SECONDS = 300
 
-# Per-source-system queue priority at enqueue time. Worker._claim_one
-# orders by priority DESC, so higher numbers claim first. Tiers:
+# Default queue priority at enqueue time. Worker._claim_one orders by
+# priority DESC, so higher numbers claim first. Tiers:
 #
 #   100  — interactive webhooks: github, slack, notion, linear, granola, sentry
-#    75  — claude_code: bursty, deprioritized vs interactive (search-indexable,
-#          not user-blocking; one chatty CC user shouldn't block other connectors)
+#    75  — bursty agent/custom batches (claude_code, codex, custom_ingest)
 #    50  — backfill rows (set in backfill_runner.py); never blocks live work
 #
-# Sources not in this map fall back to DEFAULT_INGESTION_PRIORITY.
+# Per-source overrides live on the connector classes and are read through
+# shared.source_registry (see SourceProfile.ingestion_priority); sources
+# without a registered profile fall back to this default.
 DEFAULT_INGESTION_PRIORITY = 100
-SOURCE_INGESTION_PRIORITY: dict[SourceSystem, int] = {
-    SourceSystem.CLAUDE_CODE: 75,
-    # CODEX is the OpenAI Codex CLI sibling source — same coalescing
-    # semantics + doc shape as CLAUDE_CODE, so it gets the same priority
-    # tier. Keeps a chatty Codex user from preempting interactive
-    # webhooks at the queue claim layer.
-    SourceSystem.CODEX: 75,
-    SourceSystem.CUSTOM_INGEST: 75,
-    # CODE_GRAPH is bursty (initial-backfill batches) and search-indexable,
-    # not user-facing latency-critical — sits in the same tier as backfill
-    # rows so a large repo onboarding can't block live webhooks.
-    SourceSystem.CODE_GRAPH: 50,
-    # Incident sources are first-class authored signals (same tier as Slack /
-    # Linear / GitHub webhooks). Sentry is unlisted (defaults to 100); these
-    # are explicit so the intent is obvious to future readers.
-    SourceSystem.PAGERDUTY: 100,
-    SourceSystem.INCIDENT_IO: 100,
-}
 
 TOP_K_VECTOR = 50
 TOP_K_BM25 = 50
@@ -597,35 +580,10 @@ DIRECTED_DEDUPE_COSINE_THRESHOLD: float = 0.05
 # best-chunk-wins-ties; rewards docs whose multiple chunks all matched.
 RRF_BREADTH_ALPHA = 0.3
 
-# Per-source-system score multiplier applied AFTER RRF fusion. Values < 1.0
-# demote a source's docs so they rank below other sources at equal vector
-# relevance. Defaults to 1.0 (no change) for any source not listed.
-#
-# Rationale: claude_code transcripts are high-volume and lower-signal-density
-# than authored team artifacts (Slack threads, Linear tickets, PR descriptions),
-# so we down-weight them to keep authored content surfacing first.
-SOURCE_SCORE_MULTIPLIERS: dict[SourceSystem, float] = {
-    SourceSystem.CLAUDE_CODE: 0.5,
-    # CODEX docs are the same shape and signal density as CLAUDE_CODE --
-    # both are agent transcripts, not authored team artifacts. Apply the
-    # same demotion so they rank consistently with each other below
-    # Slack/Linear/PR docs at equal vector relevance.
-    SourceSystem.CODEX: 0.5,
-    # CODE_GRAPH chunks are over-represented in top-K relative to their
-    # signal strength: production query_traces (7d, acme) show
-    # code_graph at 36.5% of top-5 results despite an avg post-fusion score
-    # ~3.4x lower than github and ~4.1x lower than claude_code. BM25 fires
-    # on common identifier tokens ("session", "tenant", "customer"),
-    # surfacing weak code matches above genuine non-code answers (e.g. a
-    # "lindy.ai onboarding pilot" query returning triage_worker.py at rank 1).
-    # 0.3 ~= inverse of the avg-score ratio: a code_graph chunk now needs to
-    # be ~3x stronger than the code_graph average to compete with an average
-    # non-code hit, so genuinely strong vector matches still survive while
-    # keyword-noise chunks fall out of top-K. Validated via offline replay
-    # at multipliers [1.0, 0.7, 0.5, 0.3, 0.2]: knee at 0.3 (top-5 share
-    # 36.5% -> 24.4%); 0.2 only buys 1.3pp more.
-    SourceSystem.CODE_GRAPH: 0.3,
-}
+# Per-source post-RRF score multipliers moved to the source registry:
+# each connector declares `score_multiplier` where the source is defined
+# (services/ingestion/handlers/<source>.py) and fusion reads it through
+# shared.source_registry. Unregistered sources get the neutral 1.0.
 
 # Baseline recency half-life (days) applied to every source. Smaller = faster
 # decay. Acts as the universal floor so backfilled tenants don't see 8-12 month
@@ -637,27 +595,10 @@ SOURCE_SCORE_MULTIPLIERS: dict[SourceSystem, float] = {
 # to the fresher one.
 DEFAULT_RECENCY_HALF_LIFE_DAYS = 120.0
 
-# Per-source-system half-life (days) overrides for recency decay applied after
-# the multiplier. Smaller = faster decay. Sources not listed fall back to the
-# caller-supplied global half_life_days if set, else DEFAULT_RECENCY_HALF_LIFE_DAYS.
-#
-# Rationale: a CC session is a point-in-time scratchpad — by week two it's
-# almost always stale or contradicted by something authored elsewhere. Slack/
-# Linear/PR docs stay relevant for months and ride the baseline by design.
-SOURCE_HALF_LIFE_DAYS: dict[SourceSystem, float] = {
-    SourceSystem.CLAUDE_CODE: 7.0,
-    # CODEX transcripts are scratchpads with the same staleness curve as
-    # CLAUDE_CODE -- both lose relevance fast as authored docs catch up.
-    SourceSystem.CODEX: 7.0,
-    # Code symbols decay slower than CC/Codex transcripts (a function still
-    # exists weeks later) but faster than authored docs (refactors happen).
-    SourceSystem.CODE_GRAPH: 30.0,
-    # Incident records remain relevant for post-mortems and pattern-matching
-    # for months; 200d keeps them well above the 120d baseline while still
-    # allowing slow decay relative to very recent incidents.
-    SourceSystem.PAGERDUTY: 200.0,
-    SourceSystem.INCIDENT_IO: 200.0,
-}
+# Per-source half-life overrides moved to the source registry: connectors
+# declare `half_life_days` where the source is defined and fusion resolves
+# per-source override > caller-supplied baseline > the default above via
+# shared.source_registry.half_life_days_for.
 
 # Inferred-edge retrieval channel tuning. The channel walks INFERRED Doc-Doc
 # edges from top-K primary docs and surfaces the linked docs as additional
@@ -670,7 +611,7 @@ SOURCE_HALF_LIFE_DAYS: dict[SourceSystem, float] = {
 INFERRED_EDGE_TOP_K = 5
 
 # Per-hop dampening applied to inferred-edge results. The final score is:
-#   dampening * 1/(1 + anchor_rank) * SOURCE_SCORE_MULTIPLIERS[src]
+#   dampening * 1/(1 + anchor_rank) * score_multiplier(src)
 #                                  / (1 + ln(linked_edge_count))
 # 0.2 keeps a 2-hop result (anchor at rank 1) at base score 0.10 -- well
 # below direct vector hits but still surfacing above weakly-matched primary

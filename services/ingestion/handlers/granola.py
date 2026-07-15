@@ -106,6 +106,7 @@ _MAX_PAGES_PER_TICK = 1000
 class GranolaConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.GRANOLA
     display_name: ClassVar[str] = "Granola"
+    doc_type_prefix: ClassVar[str] = "granola."
     # Granola has no inbound webhooks, so the integration poller re-enqueues
     # the backfill on a cadence. FAILED is in the eligible set so transient
     # upstream errors (R2 5xx etc.) auto-retry on the next tick.

@@ -39,6 +39,11 @@ from shared.models import (
 class CustomIngestConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.CUSTOM_INGEST
     display_name: ClassVar[str] = "Custom ingest"
+    doc_type_prefix: ClassVar[str] = "custom."
+    # Queue priority 75: customer batches are bursty and search-indexable,
+    # not user-blocking — same tier as agent-session sources so a large
+    # custom push can't preempt interactive webhooks (100).
+    ingestion_priority: ClassVar[int] = 75
 
     def verify_signature(
         self,

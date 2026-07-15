@@ -108,6 +108,7 @@ _URL_RE = re.compile(r"https?://\S+")
 class LinearConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.LINEAR
     display_name: ClassVar[str] = "Linear"
+    doc_type_prefix: ClassVar[str] = "linear."
 
     # ------------------------------------------------------------------
     # 1. signature verification

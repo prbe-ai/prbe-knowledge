@@ -37,7 +37,8 @@ chunk surfaced from any retriever) is dropped unless the caller supplies a
 Recency decay is always-on: every doc is multiplied by
 exp(-ln2 * age_days / half_life). Half-life resolution order:
 
-  1. Per-source override in SOURCE_HALF_LIFE_DAYS.
+  1. Per-source override from the source registry (each connector
+     registers its half_life_days in shared.source_registry).
   2. Caller-supplied `recency_half_life_days` if not None.
   3. DEFAULT_RECENCY_HALF_LIFE_DAYS.
 
@@ -62,9 +63,8 @@ from shared.constants import (
     DIRECTED_RETRIEVAL_WEIGHT,
     RRF_BREADTH_ALPHA,
     RRF_K,
-    SOURCE_HALF_LIFE_DAYS,
-    SOURCE_SCORE_MULTIPLIERS,
 )
+from shared.source_registry import half_life_days_for, score_multiplier_for
 
 
 @dataclass(slots=True)
@@ -130,10 +130,10 @@ def _apply_source_decay(
     otherwise zero-decay at age=0 would bypass it. Half-life resolves via
     per-source override > caller-supplied baseline > universal default.
     """
-    multiplier = SOURCE_SCORE_MULTIPLIERS.get(source_system, 1.0)
+    multiplier = score_multiplier_for(source_system)
     if multiplier != 1.0:
         score *= multiplier
-    half_life = SOURCE_HALF_LIFE_DAYS.get(source_system, baseline_half_life)
+    half_life = half_life_days_for(source_system, baseline_half_life)
     age_days = (ref_now - updated_at).total_seconds() / 86400.0
     if age_days >= 0:
         score *= math.exp(-_LN2 * age_days / half_life)

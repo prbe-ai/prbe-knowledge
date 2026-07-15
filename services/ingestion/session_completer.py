@@ -21,13 +21,10 @@ from __future__ import annotations
 
 import orjson
 
-from shared.constants import (
-    DEFAULT_INGESTION_PRIORITY,
-    SOURCE_INGESTION_PRIORITY,
-    SourceSystem,
-)
+from shared.constants import SourceSystem
 from shared.db import get_pool
 from shared.logging import get_logger
+from shared.source_registry import ingestion_priority_for
 from shared.storage import get_store
 
 log = get_logger(__name__)
@@ -104,7 +101,7 @@ async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
     async with get_pool().acquire() as conn:
         seen_buckets: set[str] = set()
         for source in AGENT_SOURCES:
-            priority = SOURCE_INGESTION_PRIORITY.get(source, DEFAULT_INGESTION_PRIORITY)
+            priority = ingestion_priority_for(source.value)
             rows = await conn.fetch(find_sql, source.value, idle_minutes)
             total_candidates += len(rows)
             for r in rows:

@@ -13,6 +13,7 @@ from typing import TypeVar
 from services.ingestion.handlers.base import Connector, ConnectorContext
 from shared.constants import SourceSystem
 from shared.exceptions import HandlerNotFound
+from shared.source_registry import SourceProfile, register_source
 
 _registry: dict[SourceSystem, type[Connector]] = {}
 
@@ -26,6 +27,11 @@ def register_connector(source: SourceSystem) -> Callable[[type[C]], type[C]]:
         class SlackConnector(Connector):
             source_system = SourceSystem.SLACK
             ...
+
+    Also registers the connector's SourceProfile (doc_type_prefix,
+    ingestion_priority, score_multiplier, half_life_days class attributes)
+    into shared.source_registry, so generic consumers can resolve per-source
+    metadata without hardcoding it.
     """
 
     def decorator(cls: type[C]) -> type[C]:
@@ -34,6 +40,15 @@ def register_connector(source: SourceSystem) -> Callable[[type[C]], type[C]]:
                 f"register_connector({source}) but class declares {cls.source_system}"
             )
         _registry[source] = cls
+        register_source(
+            SourceProfile(
+                source_key=source.value,
+                doc_type_prefix=cls.doc_type_prefix,
+                ingestion_priority=cls.ingestion_priority,
+                score_multiplier=cls.score_multiplier,
+                half_life_days=cls.half_life_days,
+            )
+        )
         return cls
 
     return decorator

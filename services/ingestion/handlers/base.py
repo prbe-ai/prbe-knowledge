@@ -47,7 +47,7 @@ from typing import Any, ClassVar
 import httpx
 
 from shared.config import Settings, get_settings
-from shared.constants import BackfillStatus, SourceSystem
+from shared.constants import DEFAULT_INGESTION_PRIORITY, BackfillStatus, SourceSystem
 from shared.exceptions import NotSupportedByConnector
 from shared.models import (
     ExternalWorkspaceRef,
@@ -56,6 +56,7 @@ from shared.models import (
     WebhookEvent,
     WebhookParseResult,
 )
+from shared.source_registry import DEFAULT_DOC_TYPE_PREFIX, DEFAULT_SCORE_MULTIPLIER
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +111,22 @@ class Connector(ABC):
 
     # Display name used in logs / error messages. Defaults to the enum value.
     display_name: ClassVar[str] = ""
+
+    # ---- source profile (registered into shared.source_registry) ----------
+    # Generic engine code (queue priority at enqueue, fusion decay, the
+    # retrieval doc-type resolver) reads these through the source registry
+    # instead of hardcoded per-source dicts. @register_connector registers
+    # them; defaults below match the registry's unregistered-key fallbacks.
+    #
+    # Dotted prefix of this source's DocType family ("slack.", "github.", ...).
+    doc_type_prefix: ClassVar[str] = DEFAULT_DOC_TYPE_PREFIX
+    # Queue priority at enqueue time (worker claims priority DESC): 100
+    # interactive webhooks, 75 bursty agent/custom batches, 50 backfill-tier.
+    ingestion_priority: ClassVar[int] = DEFAULT_INGESTION_PRIORITY
+    # Post-RRF doc-score multiplier (< 1.0 demotes at equal relevance).
+    score_multiplier: ClassVar[float] = DEFAULT_SCORE_MULTIPLIER
+    # Recency half-life override (days) for fusion decay; None = baseline.
+    half_life_days: ClassVar[float | None] = None
 
     # Set on poll-only connectors (Granola etc.) — IntegrationPoller reads
     # this to know how often to re-enqueue stale backfills. None means the

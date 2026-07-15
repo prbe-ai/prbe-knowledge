@@ -180,6 +180,7 @@ _COAUTHOR_TRAILER = re.compile(
 class GitHubConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.GITHUB
     display_name: ClassVar[str] = "GitHub"
+    doc_type_prefix: ClassVar[str] = "github."
 
     # ------------------------------------------------------------------
     # 1. signature verification

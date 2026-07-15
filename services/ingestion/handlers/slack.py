@@ -609,6 +609,7 @@ def _get_history_limiter() -> AsyncLimiter:
 class SlackConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.SLACK
     display_name: ClassVar[str] = "Slack"
+    doc_type_prefix: ClassVar[str] = "slack."
 
     def __init__(self, ctx: ConnectorContext) -> None:
         super().__init__(ctx)

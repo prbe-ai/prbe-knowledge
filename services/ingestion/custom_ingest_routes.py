@@ -19,11 +19,7 @@ from pydantic import ValidationError
 
 from services.system_settings import get_ingestion_killswitch
 from shared.config import get_settings
-from shared.constants import (
-    DEFAULT_INGESTION_PRIORITY,
-    SOURCE_INGESTION_PRIORITY,
-    SourceSystem,
-)
+from shared.constants import SourceSystem
 from shared.custom_ingest import (
     CustomIngestDocument,
     CustomIngestEnvelope,
@@ -35,6 +31,7 @@ from shared.custom_ingest import (
 from shared.db import get_pool, raw_conn
 from shared.exceptions import PrbeError
 from shared.logging import bind_trace, get_logger
+from shared.source_registry import ingestion_priority_for
 from shared.storage import get_store
 
 router = APIRouter()
@@ -287,10 +284,7 @@ async def _enqueue_custom_document(
     source_event_id: str,
     payload_s3_key: str,
 ) -> bool:
-    priority = SOURCE_INGESTION_PRIORITY.get(
-        SourceSystem.CUSTOM_INGEST,
-        DEFAULT_INGESTION_PRIORITY,
-    )
+    priority = ingestion_priority_for(SourceSystem.CUSTOM_INGEST.value)
     # Intentionally NOT gated by services.ingestion.connectedness:
     # CUSTOM_INGEST uses BYO signed tokens (custom_ingest_tokens table,
     # validated upstream at the API boundary), not integration_tokens.

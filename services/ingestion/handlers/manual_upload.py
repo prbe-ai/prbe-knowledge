@@ -41,6 +41,7 @@ from shared.models import (
 class ManualUploadConnector(Connector):
     source_system: ClassVar[SourceSystem] = SourceSystem.MANUAL_UPLOAD
     display_name: ClassVar[str] = "Manual uploads"
+    doc_type_prefix: ClassVar[str] = "manual_upload."
 
     def verify_signature(
         self,

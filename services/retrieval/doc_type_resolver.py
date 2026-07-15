@@ -12,6 +12,7 @@ GitHub, Sentry) and the SQL retriever ANYs them.
 from __future__ import annotations
 
 from shared.constants import DocType, SourceSystem
+from shared.source_registry import doc_type_prefix_for
 
 # Token → unqualified bucket. The dotted DocType values that match.
 # Keys MUST match shared/services/retrieval/router.py::DOC_TYPE_TOKENS.
@@ -34,22 +35,16 @@ _TOKEN_TO_DOC_TYPES: dict[str, tuple[DocType, ...]] = {
 }
 
 
-# Source prefix → dotted DocType set, used to narrow by sources filter.
-# CODEX shares the `claude_code.` doc_type prefix because the connector
+# Source → dotted-prefix narrowing reads shared.source_registry (each
+# connector registers its doc_type_prefix where the source is defined).
+# CODEX registers the `claude_code.` doc_type prefix because the connector
 # emits CLAUDE_CODE_SESSION docs for both — provenance differs at
-# `source_system`, doc shape is identical. Mapping CODEX here lets a
-# `sources=[codex]` retrieval filter resolve a token like "session" to
-# `claude_code.session` without dropping zero results.
-_SOURCE_PREFIX: dict[SourceSystem, str] = {
-    SourceSystem.SLACK: "slack.",
-    SourceSystem.LINEAR: "linear.",
-    SourceSystem.GITHUB: "github.",
-    SourceSystem.NOTION: "notion.",
-    SourceSystem.SENTRY: "sentry.",
-    SourceSystem.GRANOLA: "granola.",
-    SourceSystem.CLAUDE_CODE: "claude_code.",
-    SourceSystem.CODEX: "claude_code.",
-}
+# `source_system`, doc shape is identical — so a `sources=[codex]` filter
+# resolves a token like "session" to `claude_code.session` without dropping
+# zero results. Sources without a registered profile resolve to the
+# `custom.` default prefix, which no resolver token maps to — they narrow
+# to nothing, exactly like the pre-registry behavior of sources missing
+# from the old hardcoded map.
 
 
 def resolve_doc_type_token(
@@ -74,7 +69,7 @@ def resolve_doc_type_token(
         return None
 
     if sources:
-        allowed_prefixes = {_SOURCE_PREFIX[s] for s in sources if s in _SOURCE_PREFIX}
+        allowed_prefixes = {doc_type_prefix_for(s.value) for s in sources}
         narrowed = [
             dt.value for dt in matches if any(dt.value.startswith(p) for p in allowed_prefixes)
         ]

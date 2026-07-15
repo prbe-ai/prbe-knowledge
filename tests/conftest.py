@@ -36,6 +36,11 @@ _TEST_ENV = {
 for _k, _v in _TEST_ENV.items():
     os.environ[_k] = _v
 
+# Mirror service boot: importing the handlers package fires the
+# @register_connector decorators, which also populate shared.source_registry
+# (per-source doc_type prefix / priority / decay profiles). Retrieval tests
+# (fusion decay, doc-type resolver) read those profiles.
+import services.ingestion.handlers  # noqa: E402,F401
 from shared import db as db_module  # noqa: E402
 from shared.config import Settings, get_settings  # noqa: E402
 
