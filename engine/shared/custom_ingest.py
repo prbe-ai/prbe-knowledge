@@ -8,10 +8,20 @@ from datetime import datetime
 from typing import Any
 
 import orjson
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-_SOURCE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
+# Colon allowed (after the first char) so consumers can namespace dynamic
+# source keys, e.g. research-os pushes workspace files under
+# `workspace:<uuid>`. The key is treated as opaque everywhere it flows
+# (R2 payload path, doc_id, source_event_id), so widening the charset is
+# additive-only.
+_SOURCE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9:_-]{0,127}$")
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def is_valid_source_key(value: str) -> bool:
+    """Shared source_key validation for the envelope and query params."""
+    return bool(_SOURCE_KEY_RE.match(value))
 
 
 class CustomIngestAuthor(BaseModel):
@@ -28,12 +38,18 @@ class CustomIngestDocument(BaseModel):
     id: str = Field(min_length=1, max_length=256)
     type: str | None = Field(default=None, min_length=1, max_length=128)
     title: str | None = Field(default=None, min_length=1, max_length=512)
-    body: str = Field(min_length=1)
+    # Optional ONLY for delete entries (`deleted: true`); enforced non-empty
+    # for upserts by _require_body_unless_deleted below.
+    body: str = ""
     url: str | None = Field(default=None, min_length=1, max_length=2048)
     author: CustomIngestAuthor | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Tombstone flag: `{"id": ..., "deleted": true}` (body optional) closes
+    # the document's live version + chunks with the same semantics as a
+    # connector-originated delete (linear/github/slack tombstones).
+    deleted: bool = False
     # Accepted for backward compatibility with the original v1 payload shape,
     # but intentionally ignored until document-level permissions are built.
     acl: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
@@ -51,11 +67,15 @@ class CustomIngestDocument(BaseModel):
         if not isinstance(value, str):
             raise ValueError("body must be text")
         body = value.strip()
-        if not body:
-            raise ValueError("body is required")
         if _CONTROL_CHAR_RE.search(body):
             raise ValueError("body contains binary/control characters")
         return body
+
+    @model_validator(mode="after")
+    def _require_body_unless_deleted(self) -> CustomIngestDocument:
+        if not self.deleted and not self.body:
+            raise ValueError("body is required")
+        return self
 
     @field_validator("metadata", mode="before")
     @classmethod
@@ -81,7 +101,7 @@ class CustomIngestEnvelope(BaseModel):
     def _validate_source_key(cls, value: str) -> str:
         source_key = value.strip()
         if not _SOURCE_KEY_RE.match(source_key):
-            raise ValueError("source_key must match ^[a-z0-9][a-z0-9_-]{0,127}$")
+            raise ValueError("source_key must match ^[a-z0-9][a-z0-9:_-]{0,127}$")
         return source_key
 
     @field_validator("batch_id", mode="before")
@@ -97,8 +117,15 @@ def json_size(value: object) -> int:
 
 
 def document_content_hash(source_key: str, document: CustomIngestDocument) -> str:
-    """Stable digest of the source-visible document content."""
-    payload = {
+    """Stable digest of the source-visible document content.
+
+    This is the hash the enumeration endpoint reports back per document, so
+    a consumer-side reconciler can recompute it from its own source of truth
+    and diff. The `deleted` key participates only when True — keeping every
+    pre-existing upsert hash byte-identical while a delete for the same id
+    always hashes differently from the upsert that preceded it.
+    """
+    payload: dict[str, Any] = {
         "source_key": source_key,
         "id": document.id,
         "type": document.type,
@@ -110,6 +137,8 @@ def document_content_hash(source_key: str, document: CustomIngestDocument) -> st
         "updated_at": _iso_or_none(document.updated_at),
         "metadata": document.metadata,
     }
+    if document.deleted:
+        payload["deleted"] = True
     return hashlib.sha256(orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)).hexdigest()
 
 

@@ -102,10 +102,22 @@ class CustomIngestConnector(Connector):
         source_id = f"{source_key}:{document.id}"
         source_url = document.url or _dashboard_source_url(event.customer_id, source_key)
         title = document.title or f"{source_key}/{document.id}"
-        content_hash = _sha256(
-            f"{doc_id}|{document.type or ''}|{title}|{document.body}|"
-            f"{payload.get('content_hash') or ''}"
-        )
+        is_delete = document.deleted
+        # For a delete, body is empty and we write a tombstone. The
+        # content_hash must differ from the prior live version so the
+        # normalizer bumps the version and the chunk diff marks all previous
+        # chunks stale — same shape as the linear/github connector deletes.
+        deleted_at = received_at if is_delete else None
+        body = "" if is_delete else document.body
+        if is_delete:
+            content_hash = _sha256(
+                f"{doc_id}|__deleted__|{payload.get('content_hash') or ''}"
+            )
+        else:
+            content_hash = _sha256(
+                f"{doc_id}|{document.type or ''}|{title}|{document.body}|"
+                f"{payload.get('content_hash') or ''}"
+            )
         author = document.author
         author_id = author.id if author and author.id else author.email if author else None
 
@@ -133,6 +145,11 @@ class CustomIngestConnector(Connector):
                 "batch_id": payload.get("batch_id"),
                 "provided_url": document.url,
                 "author": author.model_dump(mode="json") if author else None,
+                # Envelope-level content hash (shared.custom_ingest.
+                # document_content_hash) — surfaced by the enumeration
+                # endpoint so a consumer-side reconciler can diff its source
+                # of truth against the index without re-pushing everything.
+                "content_hash": payload.get("content_hash"),
             }
         )
 
@@ -147,18 +164,26 @@ class CustomIngestConnector(Connector):
             content_type="text/plain",
             content_hash=content_hash,
             title=title[:240],
-            body_preview=document.body[:280],
-            body_size_bytes=len(document.body.encode("utf-8")),
-            body_token_count=count_tokens(document.body),
+            body_preview=body[:280] if body else None,
+            body_size_bytes=len(body.encode("utf-8")),
+            body_token_count=count_tokens(body),
             author_id=author_id,
             created_at=created_at,
             updated_at=updated_at,
             valid_from=updated_at,
+            deleted_at=deleted_at,
             ingested_at=datetime.now(UTC),
             acl=ACLSnapshot(principals=acl_principals, captured_at=received_at),
             metadata=metadata,
-            body=document.body,
+            body=body,
         )
+
+        # Tombstones carry no graph payload: there is nothing new to assert
+        # about a deleted document, and the normalizer's chunk diff already
+        # removes every live chunk (deleted_at is set), which drops the doc
+        # from retrieval.
+        if is_delete:
+            return NormalizationResult(documents=[doc], acl_snapshots=acl_rows)
 
         graph_nodes = [
             GraphNodeSpec(

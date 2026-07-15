@@ -1,19 +1,30 @@
-"""Internal custom-ingest route used by prbe-backend.
+"""Custom-ingest routes: push (upsert + delete) and enumeration.
 
-The public bearer-token check lives in prbe-backend. This service only trusts
-the backend's internal key and tenant header, then stores raw payloads and
-queues one document per row for the existing normalizer pipeline.
+Auth is dual-mode (see _resolve_custom_ingest_customer): hosted deployments
+trust the gateway's X-Internal-Knowledge-Key + X-Prbe-Customer headers;
+standalone (community) accepts the static KNOWLEDGE_API_TOKEN bearer scoped
+to the single configured tenant.
+
+POST /api/custom-ingest/documents  — batch upserts; a document entry with
+    `"deleted": true` (body optional) tombstones the doc: the live version
+    and its chunks are closed (valid_to), same semantics as connector
+    deletes.
+GET  /api/custom-ingest/documents  — keyset-paginated enumeration for
+    consumer-side reconcilers: per document the caller's original id, the
+    envelope content hash, deleted flag, updated_at, and stored metadata.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 from datetime import UTC, datetime
 from typing import Any
 
 import orjson
-from fastapi import APIRouter, Header, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
@@ -24,10 +35,11 @@ from engine.shared.custom_ingest import (
     CustomIngestEnvelope,
     document_content_hash,
     document_payload_key,
+    is_valid_source_key,
     json_size,
     source_event_id,
 )
-from engine.shared.db import get_pool, raw_conn
+from engine.shared.db import get_pool, raw_conn, with_tenant
 from engine.shared.exceptions import PrbeError
 from engine.shared.logging import bind_trace, get_logger
 from engine.shared.source_registry import ingestion_priority_for
@@ -36,6 +48,12 @@ from engine.system_settings import get_ingestion_killswitch
 
 router = APIRouter()
 log = get_logger(__name__)
+
+# Enumeration page-size bounds. The reconciler walks the whole corpus in
+# pages; 100 default / 500 cap keeps a page comfortably under response-size
+# limits even with fat per-document metadata.
+ENUMERATION_DEFAULT_LIMIT = 100
+ENUMERATION_MAX_LIMIT = 500
 
 
 @router.post("/api/custom-ingest/documents")
@@ -143,6 +161,120 @@ async def custom_ingest_documents(
         },
         status_code=202,
     )
+
+
+@router.get("/api/custom-ingest/documents")
+async def list_custom_ingest_documents(
+    request: Request,
+    source_key: str = Query(min_length=1, max_length=128),
+    cursor: str | None = Query(default=None, max_length=512),
+    limit: int = Query(default=ENUMERATION_DEFAULT_LIMIT, ge=1, le=ENUMERATION_MAX_LIMIT),
+    x_prbe_customer: str | None = Header(default=None),
+) -> JSONResponse:
+    """Enumerate the live custom-ingest documents under one source_key.
+
+    Built for the consumer-side reconciler (research-os index_outbox
+    reconciliation): the caller diffs `content_hash` against its own source
+    of truth and re-pushes / tombstones drift. Tombstoned documents are
+    included with `deleted: true` until a later upsert revives them.
+
+    Response shape:
+        {
+          "documents": [
+            {"id": "<caller's original document id>",
+             "content_hash": "<envelope content hash>" | null,   # null = pre-hash-stamping ingest
+             "deleted": bool,
+             "updated_at": "<ISO 8601>",
+             "metadata": {...}},                                 # stored metadata (caller keys + engine keys)
+            ...
+          ],
+          "next_cursor": "<opaque>" | null
+        }
+
+    Keyset pagination: results are ordered by internal doc id; pass
+    `next_cursor` back verbatim to fetch the next page. Same auth as the
+    POST route (hosted internal-key headers or standalone bearer).
+    """
+    customer_id = await _resolve_custom_ingest_customer(request, x_prbe_customer)
+
+    key = source_key.strip()
+    if not is_valid_source_key(key):
+        raise HTTPException(status_code=422, detail="invalid source_key")
+
+    after_doc_id = _decode_enumeration_cursor(cursor)
+
+    # Live version per doc_id = the single row with valid_to IS NULL
+    # (bitemporal invariant); tombstones keep a live row with deleted_at
+    # set. Tenant scoping via the RLS GUC (documents are RLS-protected).
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT doc_id, metadata, deleted_at, updated_at
+            FROM documents
+            WHERE customer_id = $1
+              AND source_system = $2
+              AND valid_to IS NULL
+              AND metadata->>'source_key' = $3
+              AND ($4::text IS NULL OR doc_id > $4)
+            ORDER BY doc_id
+            LIMIT $5
+            """,
+            customer_id,
+            SourceSystem.CUSTOM_INGEST.value,
+            key,
+            after_doc_id,
+            limit + 1,
+        )
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    doc_id_prefix = f"custom_ingest:{customer_id}:{key}:"
+    documents: list[dict[str, Any]] = []
+    for row in rows:
+        metadata = _coerce_metadata(row["metadata"])
+        original_id = metadata.get("custom_document_id") or row["doc_id"].removeprefix(
+            doc_id_prefix
+        )
+        updated_at = row["updated_at"]
+        documents.append(
+            {
+                "id": original_id,
+                "content_hash": metadata.get("content_hash"),
+                "deleted": row["deleted_at"] is not None,
+                "updated_at": updated_at.isoformat() if updated_at else None,
+                "metadata": metadata,
+            }
+        )
+
+    next_cursor = _encode_enumeration_cursor(rows[-1]["doc_id"]) if has_more else None
+    return JSONResponse({"documents": documents, "next_cursor": next_cursor})
+
+
+def _encode_enumeration_cursor(doc_id: str) -> str:
+    return base64.urlsafe_b64encode(doc_id.encode("utf-8")).decode("ascii")
+
+
+def _decode_enumeration_cursor(cursor: str | None) -> str | None:
+    if cursor is None or not cursor.strip():
+        return None
+    try:
+        return base64.urlsafe_b64decode(cursor.strip().encode("ascii")).decode("utf-8")
+    except (binascii.Error, UnicodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid cursor") from exc
+
+
+def _coerce_metadata(value: object) -> dict[str, Any]:
+    """documents.metadata is JSONB; asyncpg hands it back as a str."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = orjson.loads(value)
+        except orjson.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _verify_internal_key(request: Request) -> None:
