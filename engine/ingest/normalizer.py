@@ -57,6 +57,7 @@ from engine.shared.exceptions import (
     TenantIsolationError,
     UnsupportedEventType,
 )
+from engine.shared.locks import advisory_lock_key
 from engine.shared.logging import get_logger
 from engine.shared.models import (
     METADATA_CHUNK_INDEX,
@@ -175,7 +176,7 @@ class Normalizer:
                 raise DuplicateEventIgnored(result.skipped_reason)
             raise NormalizationError("connector produced no documents and no reason")
 
-        return await self._persist(customer_id, source_system, result)
+        return await self._persist(customer_id, source_system, result, queue_id=queue_id)
 
     # ---- persistence --------------------------------------------------------
 
@@ -184,9 +185,11 @@ class Normalizer:
         customer_id: str,
         source_system: SourceSystem,
         result: NormalizationResult,
+        queue_id: int | None = None,
     ) -> NormalizeOutcome:
         doc_ids: list[str] = []
         quarantined: list[str] = []
+        stale_skipped: list[str] = []
         total_live_chunks = 0
         total_added = 0
         total_reused = 0
@@ -271,6 +274,16 @@ class Normalizer:
                 sp = f"doc_{idx}"
                 await conn.execute(f"SAVEPOINT {sp}")
                 try:
+                    if not await _admit_ordered_write(
+                        conn,
+                        customer_id=customer_id,
+                        source_system=source_system,
+                        doc=doc,
+                        queue_id=queue_id,
+                    ):
+                        stale_skipped.append(doc.doc_id)
+                        await conn.execute(f"RELEASE SAVEPOINT {sp}")
+                        continue
                     persisted = await _upsert_document(conn, doc)
                     if persisted:
                         doc_ids.append(doc.doc_id)
@@ -366,6 +379,7 @@ class Normalizer:
             customer=customer_id,
             docs=len(doc_ids),
             quarantined=len(quarantined),
+            stale_skipped=len(stale_skipped),
             live_chunks=total_live_chunks,
             added=total_added,
             reused=total_reused,
@@ -742,6 +756,79 @@ class _ChunkPlan:
 
 
 # ---- SQL helpers (module-level so tests can unit-test them) ---------------
+
+
+# Metadata key stamped on every custom-ingest document version, recording the
+# ingestion_queue.queue_id (a bigserial, i.e. enqueue order) of the row that
+# produced it. The monotonic guard in _admit_ordered_write compares incoming
+# rows against it so out-of-order application -- an earlier upsert that
+# finishes its Phase-A embedding AFTER a later delete already committed --
+# is a no-op instead of a tombstone-clobbering resurrection. Underscore
+# prefix marks it engine-internal: the enumeration endpoint strips
+# underscore-prefixed keys before returning caller metadata.
+_CI_QUEUE_SEQ_KEY = "_ci_queue_seq"
+
+
+async def _admit_ordered_write(
+    conn: asyncpg.Connection,
+    *,
+    customer_id: str,
+    source_system: SourceSystem,
+    doc: Document,
+    queue_id: int | None,
+) -> bool:
+    """Serialize and order same-document writes for custom-ingest rows.
+
+    Returns False when this queue row is STALE for the doc (an equal-or-
+    newer row already applied) -- the caller must skip the write entirely.
+    Non-custom-ingest sources and queue-less callers (persist_single_document)
+    are always admitted unchanged.
+
+    Two pieces, defense in depth against upsert/delete reordering across
+    concurrent worker claim loops:
+
+    1. ``pg_advisory_xact_lock`` on (customer_id, doc_id): concurrent
+       Phase-B transactions touching the same doc apply strictly one at a
+       time, closing the read-check-write race window.
+    2. Monotonic guard: each applied version stamps its queue row's id into
+       ``metadata[_CI_QUEUE_SEQ_KEY]``; an incoming row whose id is <= the
+       stamp is older than (or a heartbeat-reclaim replay of) what already
+       applied, and skipping it is the correct order-preserving outcome.
+       ``<=`` rather than ``<`` makes reclaim replays of an already-
+       committed row idempotent.
+
+    Deliberately scoped to CUSTOM_INGEST: its queue rows are single-doc, so
+    each transaction takes exactly one advisory lock and deadlock is
+    impossible. Multi-doc connectors would need ordered lock acquisition
+    and have their own upstream event-ordering semantics.
+    """
+    if source_system != SourceSystem.CUSTOM_INGEST or queue_id is None:
+        return True
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        advisory_lock_key("custom-ingest-doc", customer_id, doc.doc_id),
+    )
+    applied_seq = await conn.fetchval(
+        """
+        SELECT (metadata->>$3)::bigint
+        FROM documents
+        WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+        """,
+        customer_id,
+        doc.doc_id,
+        _CI_QUEUE_SEQ_KEY,
+    )
+    if applied_seq is not None and applied_seq >= queue_id:
+        log.info(
+            "normalizer.stale_row_skipped",
+            customer=customer_id,
+            doc_id=doc.doc_id,
+            queue_id=queue_id,
+            applied_seq=applied_seq,
+        )
+        return False
+    doc.metadata[_CI_QUEUE_SEQ_KEY] = queue_id
+    return True
 
 
 # Bounded retry budget for the version-compute + INSERT loop. Five is high

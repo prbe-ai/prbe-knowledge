@@ -29,7 +29,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from engine.shared.config import get_settings
-from engine.shared.constants import SourceSystem
+from engine.shared.constants import QueueStatus, SourceSystem
 from engine.shared.custom_ingest import (
     CustomIngestDocument,
     CustomIngestEnvelope,
@@ -144,6 +144,9 @@ async def custom_ingest_documents(
 
         inserted = await _enqueue_custom_document(
             customer_id=customer_id,
+            source_key=envelope.source_key,
+            document=document,
+            content_hash=content_hash,
             source_event_id=source_event,
             payload_s3_key=payload_key,
         )
@@ -186,11 +189,18 @@ async def list_custom_ingest_documents(
              "content_hash": "<envelope content hash>" | null,   # null = pre-hash-stamping ingest
              "deleted": bool,
              "updated_at": "<ISO 8601>",
-             "metadata": {...}},                                 # stored metadata (caller keys + engine keys)
+             "metadata": {...}},
             ...
           ],
           "next_cursor": "<opaque>" | null
         }
+
+    `metadata` is the RAW stored documents.metadata dict: the caller's own
+    keys merged with the engine-stamped keys (source_key,
+    custom_document_id, custom_document_type, batch_id, provided_url,
+    author, content_hash), minus engine-internal bookkeeping keys --
+    anything underscore-prefixed (e.g. the normalizer's ordering stamp
+    `_ci_queue_seq`) is stripped before the response is built.
 
     Keyset pagination: results are ordered by internal doc id; pass
     `next_cursor` back verbatim to fetch the next page. Same auth as the
@@ -236,6 +246,10 @@ async def list_custom_ingest_documents(
     documents: list[dict[str, Any]] = []
     for row in rows:
         metadata = _coerce_metadata(row["metadata"])
+        # Engine-internal bookkeeping keys are underscore-prefixed by
+        # convention (see normalizer._CI_QUEUE_SEQ_KEY); strip them so the
+        # reconciler sees only its own keys + the documented engine keys.
+        metadata = {k: v for k, v in metadata.items() if not k.startswith("_")}
         original_id = metadata.get("custom_document_id") or row["doc_id"].removeprefix(
             doc_id_prefix
         )
@@ -416,6 +430,9 @@ def _raw_document_envelope(
 async def _enqueue_custom_document(
     *,
     customer_id: str,
+    source_key: str,
+    document: CustomIngestDocument,
+    content_hash: str,
     source_event_id: str,
     payload_s3_key: str,
 ) -> bool:
@@ -425,14 +442,123 @@ async def _enqueue_custom_document(
     # validated upstream at the API boundary), not integration_tokens.
     async with get_pool().acquire() as conn:
         row = await conn.fetchrow(
+            _ENQUEUE_SQL,
+            customer_id,
+            SourceSystem.CUSTOM_INGEST.value,
+            source_event_id,
+            payload_s3_key,
+            priority,
+        )
+    if row is not None:
+        return True
+
+    # Dedupe hit. Queue rows persist at status='done', so without a
+    # liveness check a dedupe-key match is forever: delete -> identical
+    # re-upsert (the reconciler's resurrection flow) or resurrect-with-
+    # new-content -> identical re-delete would 202-duplicate eternally
+    # and never converge the index. A duplicate is only a genuine no-op
+    # when the doc's CURRENT live state already matches this entry's
+    # desired end state; otherwise retire the stale terminal row and
+    # re-enqueue with a fresh queue_id (fresh id keeps the normalizer's
+    # per-doc monotonic guard ordering intact -- resetting the old row
+    # to pending would make it forever-stale instead).
+    if await _live_state_matches(customer_id, source_key, document, content_hash):
+        return False
+    return await _retire_and_reenqueue(
+        customer_id=customer_id,
+        source_event_id=source_event_id,
+        payload_s3_key=payload_s3_key,
+        priority=priority,
+    )
+
+
+_ENQUEUE_SQL = """
+    INSERT INTO ingestion_queue
+        (customer_id, source_system, source_event_id,
+         payload_s3_key, payload_s3_keys, priority)
+    VALUES ($1, $2, $3, $4, ARRAY[$4], $5)
+    ON CONFLICT (customer_id, source_system, source_event_id) DO NOTHING
+    RETURNING queue_id
+"""
+
+
+async def _live_state_matches(
+    customer_id: str,
+    source_key: str,
+    document: CustomIngestDocument,
+    content_hash: str,
+) -> bool:
+    """Does the doc's current live version already reflect this entry?
+
+    Delete entry  -> matches when the doc is missing or its live version
+                     is a tombstone (nothing left to delete).
+    Upsert entry  -> matches only when a live, non-tombstoned version
+                     exists AND its stamped envelope content_hash equals
+                     this push's hash (covers the stale-done-row case
+                     where the same bytes were once enqueued, later
+                     superseded, and are now being pushed again).
+    """
+    doc_id = custom_ingest_doc_id(customer_id, source_key, document.id)
+    async with with_tenant(customer_id) as conn:
+        live = await conn.fetchrow(
             """
-            INSERT INTO ingestion_queue
-                (customer_id, source_system, source_event_id,
-                 payload_s3_key, payload_s3_keys, priority)
-            VALUES ($1, $2, $3, $4, ARRAY[$4], $5)
-            ON CONFLICT (customer_id, source_system, source_event_id) DO NOTHING
+            SELECT deleted_at, metadata->>'content_hash' AS content_hash
+            FROM documents
+            WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+            """,
+            customer_id,
+            doc_id,
+        )
+    if document.deleted:
+        return live is None or live["deleted_at"] is not None
+    return (
+        live is not None
+        and live["deleted_at"] is None
+        and live["content_hash"] == content_hash
+    )
+
+
+async def _retire_and_reenqueue(
+    *,
+    customer_id: str,
+    source_event_id: str,
+    payload_s3_key: str,
+    priority: int,
+) -> bool:
+    """Retire a TERMINAL (done/dlq) dedupe row and insert a fresh one.
+
+    pending/processing rows are left alone -- the same content is already
+    in flight and will converge (and if it gets stale-skipped by the
+    monotonic guard, the reconciler's next diff cycle lands here again
+    once the row is terminal). The DELETE's status guard makes the
+    retire race-safe against a concurrent claim; a concurrent identical
+    push racing the re-insert simply loses the ON CONFLICT and reports
+    duplicate.
+    """
+    async with get_pool().acquire() as conn:
+        retired = await conn.fetchrow(
+            """
+            DELETE FROM ingestion_queue
+            WHERE customer_id = $1 AND source_system = $2
+              AND source_event_id = $3
+              AND status = ANY($4::text[])
             RETURNING queue_id
             """,
+            customer_id,
+            SourceSystem.CUSTOM_INGEST.value,
+            source_event_id,
+            [QueueStatus.DONE.value, QueueStatus.DLQ.value],
+        )
+        if retired is None:
+            return False
+        log.info(
+            "custom_ingest.dedupe_row_retired",
+            customer=customer_id,
+            source_event_id=source_event_id,
+            retired_queue_id=retired["queue_id"],
+        )
+        row = await conn.fetchrow(
+            _ENQUEUE_SQL,
             customer_id,
             SourceSystem.CUSTOM_INGEST.value,
             source_event_id,
