@@ -63,6 +63,15 @@ async def custom_ingest_documents(
     x_trace_id: str | None = Header(default=None),
     x_prbe_customer: str | None = Header(default=None),
 ) -> JSONResponse:
+    """Accept upsert/delete entries for a source_key namespace.
+
+    Delivery-order contract: entries for the SAME document must arrive in
+    intent order. The resurrection guard compares a dedupe hit against the
+    doc's live end-state, so a superseded upsert REDELIVERED after a delete
+    re-enqueues and un-deletes the doc. Callers with at-least-once relays
+    must serialize per-document delivery (the research-os outbox drains in
+    enqueue order within one envelope, which satisfies this).
+    """
     customer_id = await _resolve_custom_ingest_customer(request, x_prbe_customer)
 
     settings = get_settings()
