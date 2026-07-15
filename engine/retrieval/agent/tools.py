@@ -146,6 +146,38 @@ def _trim_properties(props: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _doc_scope_sql(
+    params: list[Any],
+    *,
+    alias: str,
+    source_keys: list[str] | None,
+    doc_types: list[str] | None,
+) -> str:
+    """Append scope params and return AND-predicates against a documents alias.
+
+    Same predicates the retrieval channels apply (request-level
+    QueryRequest.source_keys / .doc_types hard scope). Mutates `params`
+    in place; returns '' when no scope is set.
+    """
+    parts: list[str] = []
+    if source_keys:
+        params.append(source_keys)
+        parts.append(f"AND {alias}.metadata->>'source_key' = ANY(${len(params)}::text[])")
+    if doc_types:
+        params.append(doc_types)
+        parts.append(f"AND {alias}.doc_type = ANY(${len(params)}::text[])")
+    return " ".join(parts)
+
+
+# Tool-result note attached when a fetch is refused because the target
+# document sits outside the caller's request-level scope. Rendered to the
+# model so it stops re-fetching instead of retrying variants.
+_SCOPE_REFUSAL_NOTE = (
+    "document is outside the caller-enforced source_keys/doc_types scope; "
+    "do not retry -- curate from in-scope results only"
+)
+
+
 def _hit_to_chunk_dict(hit: Any, channel: str) -> dict[str, Any]:
     """Normalize a channel hit (VectorHit / BM25Hit / GraphHit) to a
     chunk-shaped dict the agent reads."""
@@ -561,6 +593,8 @@ async def execute_subgraph(
     include_inferred: bool | None = None,
     include_aliases: bool | None = None,
     top_k_per_hop: int | None = None,
+    source_keys: list[str] | None = None,
+    doc_types: list[str] | None = None,
 ) -> dict[str, Any]:
     """Multi-hop BFS from an anchor node in ONE tool call.
 
@@ -569,6 +603,15 @@ async def execute_subgraph(
     INFERRED Doc-Doc edges (`include_inferred=True`) so the LLM `why`
     strings surface inline. Optionally expands entity aliases
     (`include_aliases=True`) so Person/Repo clusters are visible.
+
+    `source_keys` / `doc_types` (harness-injected request scope): applied
+    to the inferred-edge CONTENT enrichment only. The node walk itself is
+    deliberately unconstrained -- it returns graph structure (labels,
+    canonical ids, trimmed properties), not document content, and entity
+    neighborhoods legitimately span sources. Content retrieval on any
+    surfaced Document node still goes through fetch_doc /
+    fetch_chunk_window, which enforce the scope, and the adapter's final
+    gate re-verifies every emitted chunk.
 
     Returns: {anchor, depth, nodes[], inferred_edges[], alias_clusters{}}
     """
@@ -643,6 +686,8 @@ async def execute_subgraph(
                     top_doc_ids=doc_ids,
                     top_k=10,
                     dampening=1.0,
+                    source_keys=source_keys,
+                    doc_types=doc_types,
                 )
                 inferred_edges = [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:
@@ -696,6 +741,8 @@ async def execute_fetch_doc(
     offset: int | None = None,
     with_inferred_edges: bool | None = None,
     with_evidence: bool | None = None,
+    source_keys: list[str] | None = None,
+    doc_types: list[str] | None = None,
 ) -> dict[str, Any]:
     """Paginate a doc's chunks plus optional inferred-edge context in ONE call.
 
@@ -704,6 +751,13 @@ async def execute_fetch_doc(
     a page at a time rather than one call hauling the whole thing. `offset`
     also lets the agent reach a chunk past the first page — the prior
     `LIMIT`-only query could never return a matched chunk at index >= 10.
+
+    `source_keys` / `doc_types` (harness-injected request scope, never on
+    the agent tool schema): when set, a doc outside the scope returns an
+    empty page with a refusal note instead of content, and any evidence
+    chunks hydrated from OTHER docs are scope-filtered too. Closes the
+    navigation bypass where `subgraph` surfaces an out-of-scope Document
+    node id and fetch_doc would haul its content into the loop.
 
     Returns: {doc_id, chunks[], offset, limit, next_offset,
               outbound_inferred_edges[], evidence_by_edge_id{}}
@@ -732,6 +786,39 @@ async def execute_fetch_doc(
     evidence_by_edge: dict[str, list[dict[str, Any]]] = {}
 
     async with with_tenant(customer_id) as conn:
+        # Request-scope gate: refuse the whole fetch when the target doc's
+        # live version is outside the caller's scope (fail closed on a
+        # missing live row too -- an unverifiable doc is treated the same).
+        if source_keys or doc_types:
+            scope_params: list[Any] = [customer_id, doc_id]
+            scope_preds = _doc_scope_sql(
+                scope_params, alias="d", source_keys=source_keys, doc_types=doc_types
+            )
+            visible = await conn.fetchval(
+                f"""
+                SELECT 1 FROM documents d
+                WHERE d.customer_id = $1 AND d.doc_id = $2 AND d.valid_to IS NULL
+                  {scope_preds}
+                """,
+                *scope_params,
+            )
+            if visible is None:
+                log.info(
+                    "agent.fetch_doc_scope_refused",
+                    customer_id=customer_id,
+                    doc_id=doc_id,
+                )
+                return {
+                    "doc_id": doc_id,
+                    "chunks": [],
+                    "offset": off,
+                    "limit": n,
+                    "next_offset": None,
+                    "outbound_inferred_edges": [],
+                    "evidence_by_edge_id": {},
+                    "note": _SCOPE_REFUSAL_NOTE,
+                }
+
         rows = await conn.fetch(chunks_sql, customer_id, doc_id, n, off)
         chunks = [
             {
@@ -755,6 +842,8 @@ async def execute_fetch_doc(
                     top_doc_ids=[doc_id],
                     top_k=10,
                     dampening=1.0,
+                    source_keys=source_keys,
+                    doc_types=doc_types,
                 )
                 inferred_edges = [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:
@@ -793,16 +882,29 @@ async def execute_fetch_doc(
                 all_chunk_ids.update(cids)
             if all_chunk_ids:
                 # Hide drafts (Plan A Component 6): evidence chunks the
-                # agent surfaces must be approved content.
+                # agent surfaces must be approved content. Evidence chunks
+                # hydrate from OTHER documents (the edge's far endpoint),
+                # so the request scope applies to their parent docs too.
+                ev_params: list[Any] = [customer_id, list(all_chunk_ids)]
+                ev_scope = ""
+                if source_keys or doc_types:
+                    preds = _doc_scope_sql(
+                        ev_params, alias="d", source_keys=source_keys, doc_types=doc_types
+                    )
+                    ev_scope = f"""
+                      AND EXISTS (
+                          SELECT 1 FROM documents d
+                          WHERE d.customer_id = $1 AND d.doc_id = c.doc_id
+                            AND d.valid_to IS NULL {preds}
+                      )"""
                 ev_rows = await conn.fetch(
-                    """
-                    SELECT chunk_id, doc_id, content, kind
-                    FROM chunks
-                    WHERE customer_id = $1 AND chunk_id = ANY($2::text[])
-                      AND visibility = 'approved'
+                    f"""
+                    SELECT c.chunk_id, c.doc_id, c.content, c.kind
+                    FROM chunks c
+                    WHERE c.customer_id = $1 AND c.chunk_id = ANY($2::text[])
+                      AND c.visibility = 'approved'{ev_scope}
                     """,
-                    customer_id,
-                    list(all_chunk_ids),
+                    *ev_params,
                 )
                 ev_by_id = {
                     r["chunk_id"]: {
@@ -836,6 +938,8 @@ async def execute_fetch_chunk_window(
     chunk_id: str,
     before: int | None = None,
     after: int | None = None,
+    source_keys: list[str] | None = None,
+    doc_types: list[str] | None = None,
 ) -> dict[str, Any]:
     """Return a matched chunk plus its immediate neighbours in the same doc.
 
@@ -844,6 +948,11 @@ async def execute_fetch_chunk_window(
     before it and `after` chunks after it by chunk_index — to repair the
     fixed-window fragmentation of the 512-token chunker, WITHOUT hauling the
     whole doc. Total chunks returned <= before + 1 + after.
+
+    `source_keys` / `doc_types` (harness-injected request scope): the
+    target chunk's parent document must pass the scope or the window
+    comes back empty — the whole window shares that doc, so gating the
+    target CTE gates everything.
 
     Returns: {chunk_id, doc_id, chunks[], window: {before, after}}. When the
     chunk_id is unknown (or draft-only), `chunks` is empty and `doc_id` None.
@@ -855,12 +964,27 @@ async def execute_fetch_chunk_window(
 
     # One query: resolve the target chunk's (doc_id, chunk_index) in a CTE,
     # then return the approved chunks in [idx - before, idx + after]. Draft
-    # chunks stay hidden (Plan A Component 6), same as fetch_doc.
-    window_sql = """
+    # chunks stay hidden (Plan A Component 6), same as fetch_doc. The
+    # request scope (when injected) gates the target CTE via its parent
+    # document — every window row shares the target's doc_id.
+    params: list[Any] = [customer_id, chunk_id, b, a]
+    scope_sql = ""
+    if source_keys or doc_types:
+        preds = _doc_scope_sql(
+            params, alias="d", source_keys=source_keys, doc_types=doc_types
+        )
+        scope_sql = f"""
+              AND EXISTS (
+                  SELECT 1 FROM documents d
+                  WHERE d.customer_id = $1 AND d.doc_id = c0.doc_id
+                    AND d.valid_to IS NULL {preds}
+              )"""
+    window_sql = f"""
         WITH target AS (
-            SELECT doc_id, chunk_index
-            FROM chunks
-            WHERE customer_id = $1 AND chunk_id = $2 AND visibility = 'approved'
+            SELECT c0.doc_id, c0.chunk_index
+            FROM chunks c0
+            WHERE c0.customer_id = $1 AND c0.chunk_id = $2
+              AND c0.visibility = 'approved'{scope_sql}
             LIMIT 1
         )
         SELECT c.chunk_id, c.doc_id, c.content, c.kind, c.chunk_index
@@ -872,7 +996,7 @@ async def execute_fetch_chunk_window(
         ORDER BY c.chunk_index ASC
     """
     async with with_tenant(customer_id) as conn:
-        rows = await conn.fetch(window_sql, customer_id, chunk_id, b, a)
+        rows = await conn.fetch(window_sql, *params)
 
     chunks = [
         {

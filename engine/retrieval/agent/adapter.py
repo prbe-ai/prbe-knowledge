@@ -347,6 +347,63 @@ def _chunk_to_query_chunk(
     )
 
 
+async def _enforce_scope_on_chunks(
+    customer_id: str,
+    gathered: GathererOutput,
+    *,
+    source_keys: list[str] | None,
+    doc_types: list[str] | None,
+    trace_id: str,
+) -> None:
+    """Hard scope gate at the response choke point. Mutates gathered.chunks.
+
+    The request-level source_keys / doc_types scope is enforced in every
+    retrieval channel's SQL and injected into the agent's content tools,
+    but the gatherer is an LLM loop: navigation surfaces (subgraph node
+    metadata, grounding, its own prior context) can still hand it an
+    out-of-scope doc_id to emit. This recheck is the guarantee the
+    consumer actually relies on -- every chunk admitted to the final
+    RetrieveResponse is re-verified against the LIVE documents row, and
+    anything out of scope (or unverifiable: no doc_id, or no live row)
+    is dropped. Fail closed.
+    """
+    if not gathered.chunks:
+        return
+    doc_ids = sorted({c.doc_id for c in gathered.chunks if c.doc_id})
+    allowed: set[str] = set()
+    if doc_ids:
+        async with with_tenant(customer_id) as conn:
+            rows = await conn.fetch(
+                """
+                SELECT doc_id, doc_type, metadata->>'source_key' AS source_key
+                FROM documents
+                WHERE customer_id = $1 AND doc_id = ANY($2::text[])
+                  AND valid_to IS NULL
+                """,
+                customer_id,
+                doc_ids,
+            )
+        for r in rows:
+            if source_keys and r["source_key"] not in source_keys:
+                continue
+            if doc_types and r["doc_type"] not in doc_types:
+                continue
+            allowed.add(r["doc_id"])
+    kept = [c for c in gathered.chunks if c.doc_id and c.doc_id in allowed]
+    dropped = len(gathered.chunks) - len(kept)
+    if dropped:
+        log.warning(
+            "adapter.scope_gate_dropped_chunks",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            dropped=dropped,
+            kept=len(kept),
+            source_keys=source_keys,
+            doc_types=doc_types,
+        )
+    gathered.chunks = kept
+
+
 async def to_query_response(
     *,
     query: str,
@@ -356,6 +413,8 @@ async def to_query_response(
     prefanout: dict[str, Any] | None = None,
     customer_id: str | None = None,
     top_k_related: int = 10,
+    source_keys: list[str] | None = None,
+    doc_types: list[str] | None = None,
 ) -> RetrieveResponse:
     """Wrap a GathererOutput in the existing RetrieveResponse shape.
 
@@ -386,7 +445,23 @@ async def to_query_response(
     `top_k_related` controls only the optional crawl-candidate projection.
     Zero disables it; positive values cap it without removing gathered entity
     rows or `extracted_entities` from the core response.
+
+    `source_keys` / `doc_types` (optional): the caller's request-level hard
+    scope. When either is set (and customer_id is available), every gathered
+    chunk is re-verified against the live documents row and out-of-scope /
+    unverifiable chunks are dropped BEFORE the response is assembled -- see
+    _enforce_scope_on_chunks. This is the final gate behind the per-channel
+    SQL filters and the tool-dispatch injection.
     """
+    if (source_keys or doc_types) and customer_id:
+        await _enforce_scope_on_chunks(
+            customer_id,
+            gathered,
+            source_keys=source_keys,
+            doc_types=doc_types,
+            trace_id=trace_id,
+        )
+
     doc_evidence = _build_doc_to_graph_evidence(prefanout)
 
     # Post-hoc enrichment from graph_edges. Merged into the prefanout-

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+import asyncpg
+
 from engine.retrieval.temporal import build_predicate
 from engine.shared.constants import TOP_K_VECTOR
 from engine.shared.db import with_tenant
@@ -76,8 +78,18 @@ async def vector_search(
     `source_keys`, when set, hard-filters by
     `documents.metadata->>'source_key' = ANY(...)` -- the key the
     custom-ingest door stamps per document. Docs without a source_key
-    (connector-ingested) drop out. Predicate applies BEFORE the LIMIT so
-    the caller's top_k is filled entirely with in-scope hits.
+    (connector-ingested) drop out. The predicate applies BEFORE the LIMIT
+    (never post-trim), but note the HNSW caveat: pgvector evaluates
+    filters on rows the ANN scan visits, so a highly selective scope can
+    UNDER-RETURN (fewer than top_k in-scope hits exist among the scanned
+    candidates even though more exist in the table). We mitigate by
+    enabling pgvector's iterative scan (`hnsw.iterative_scan =
+    relaxed_order`, pgvector >= 0.8) for source_keys queries so the scan
+    keeps widening until enough in-scope rows are found; on older
+    pgvector builds the SET fails softly (savepoint rollback) and the
+    pre-mitigation under-return behavior remains. relaxed_order may
+    return near-ties slightly out of distance order -- acceptable for a
+    fused retrieval channel.
     """
     embedder = get_embedder_v2()
     query_vec = await embedder.embed_query(query_text)
@@ -86,6 +98,18 @@ async def vector_search(
     spec = temporal or TemporalSpec()
 
     async with with_tenant(customer_id) as conn:
+        if source_keys:
+            # Selective post-filter mitigation (see docstring). with_tenant
+            # runs inside a transaction, so SET LOCAL scopes to this query
+            # and the savepoint makes the missing-GUC case (pgvector < 0.8)
+            # a soft no-op instead of poisoning the transaction.
+            await conn.execute("SAVEPOINT iterscan")
+            try:
+                await conn.execute("SET LOCAL hnsw.iterative_scan = 'relaxed_order'")
+                await conn.execute("RELEASE SAVEPOINT iterscan")
+            except asyncpg.PostgresError:
+                await conn.execute("ROLLBACK TO SAVEPOINT iterscan")
+
         params: list = [customer_id, literal, top_k]
         source_filter = ""
         if sources:

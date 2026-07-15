@@ -960,12 +960,16 @@ async def _execute_tool_call(
             "reason_logged": reason,
         }
 
-    # Enforce the caller's request-level scope on every in-loop search.
-    # `source_keys` / `doc_types` are not on the agent-facing tool schema,
-    # so this never overwrites a model-provided value -- it re-applies the
-    # QueryRequest scope the prefanout already ran under. Without this, a
-    # reformulated in-loop `search` would silently escape the scope.
-    if name == "search":
+    # Enforce the caller's request-level scope on every in-loop content
+    # tool. `source_keys` / `doc_types` are not on the agent-facing tool
+    # schema, so this never overwrites a model-provided value -- it
+    # re-applies the QueryRequest scope the prefanout already ran under.
+    # Covers the navigation bypass: without this, `subgraph` can surface
+    # an out-of-scope Document node and `fetch_doc` / `fetch_chunk_window`
+    # would happily haul its content into the agent's context. (The
+    # adapter's scope gate re-verifies the final output regardless --
+    # this keeps out-of-scope content from ever entering the loop.)
+    if name in ("search", "fetch_doc", "fetch_chunk_window", "subgraph"):
         if state.request_source_keys:
             arguments["source_keys"] = state.request_source_keys
         if state.request_doc_types:
@@ -1761,6 +1765,8 @@ async def run_gatherer(
             prefanout=state.prefanout,
             customer_id=customer_id,
             top_k_related=req.top_k_related,
+            source_keys=request_source_keys,
+            doc_types=request_doc_types,
         )
 
     if _no_llm_configured():
@@ -1800,6 +1806,8 @@ async def run_gatherer(
             prefanout=state.prefanout,
             customer_id=customer_id,
             top_k_related=req.top_k_related,
+            source_keys=request_source_keys,
+            doc_types=request_doc_types,
         )
 
     gathered: GathererOutput | None = None
@@ -1944,6 +1952,8 @@ async def run_gatherer(
         prefanout=state.prefanout,
         customer_id=customer_id,
         top_k_related=req.top_k_related,
+        source_keys=request_source_keys,
+        doc_types=request_doc_types,
     )
 
 
