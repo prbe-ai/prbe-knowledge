@@ -36,11 +36,11 @@ import httpx
 import pytest
 import respx
 
-from services.synthesis.crawlers.github import (
+from kb.synthesis.crawlers.github import (
     BackfillWikiRuntime,
     GitHubCrawlerAgent,
 )
-from services.synthesis.wiki_links import extract_links
+from kb.synthesis.wiki_links import extract_links
 
 # These snapshots encode the OLD wiki taxonomy (`service_card`,
 # `decision`, `feature` page kinds, plus `_KNOWN_KINDS`-gated link
@@ -522,7 +522,7 @@ class _InMemoryBootstrapRuntime(BackfillWikiRuntime):
     async def _tool_create_page(self, args: Any) -> dict[str, Any]:
         # Skip the DB existence check the parent does — bootstrap-test starts
         # with an empty wiki, and the test runtime tracks pages in memory.
-        from services.synthesis.wiki_agent import _StagedCreate
+        from kb.synthesis.wiki_agent import _StagedCreate
 
         key = (args.wiki_type, args.slug)
         merged_qids = sorted(set(args.applied_queue_ids))
@@ -545,7 +545,7 @@ class _InMemoryBootstrapRuntime(BackfillWikiRuntime):
 
     async def _tool_update_page(self, args: Any) -> dict[str, Any]:
         # Same simplification — go straight to the staged map.
-        from services.synthesis.wiki_agent import _StagedUpdate
+        from kb.synthesis.wiki_agent import _StagedUpdate
 
         key = (args.wiki_type, args.slug)
         merged_qids = sorted(set(args.applied_queue_ids))

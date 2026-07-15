@@ -2,7 +2,7 @@
 
 Phase-0b: Both Anthropic and Gemini paths now route through
 `shared.llm.acompletion`. Tests patch the wrapper (referenced via
-`services.ingestion.inferred_edges.extractor.acompletion`) rather than
+`engine.ingest.inferred_edges.extractor.acompletion`) rather than
 the provider SDKs.
 
 All tests mock the LLM call -- we test the validation logic, not the
@@ -21,12 +21,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.ingestion.inferred_edges.bundle import Bundle, BundleDoc
-from services.ingestion.inferred_edges.extractor import (
+from engine.ingest.inferred_edges.bundle import Bundle, BundleDoc
+from engine.ingest.inferred_edges.extractor import (
     _estimate_cost,
     extract_edges,
 )
-from shared.constants import HAIKU_MODEL
+from engine.shared.constants import HAIKU_MODEL
 
 
 @pytest.fixture(autouse=True)
@@ -35,7 +35,7 @@ def _pin_to_haiku(monkeypatch: pytest.MonkeyPatch) -> None:
     code path runs. Tests that need the Gemini path override this
     fixture's setattr with their own."""
     monkeypatch.setattr(
-        "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
+        "engine.ingest.inferred_edges.extractor.INFERRED_EDGES_MODEL",
         HAIKU_MODEL,
     )
 
@@ -142,7 +142,7 @@ def _mock_anthropic_response(edges: list[dict]) -> SimpleNamespace:
 def _patch_acompletion(side_effect):
     """Patch the `acompletion` symbol imported by the extractor module."""
     return patch(
-        "services.ingestion.inferred_edges.extractor.acompletion",
+        "engine.ingest.inferred_edges.extractor.acompletion",
         side_effect=side_effect,
     )
 
@@ -888,7 +888,7 @@ async def test_rate_limit_then_success_does_not_fail_bundle() -> None:
         patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
         _patch_acompletion(rate_limit_then_success),
         patch(
-            "services.ingestion.inferred_edges.extractor.asyncio.sleep",
+            "engine.ingest.inferred_edges.extractor.asyncio.sleep",
             new_callable=AsyncMock,
         ),
     ):
@@ -911,7 +911,7 @@ async def test_rate_limit_exhausted_marks_bundle_failed() -> None:
         patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
         _patch_acompletion(always_rate_limited),
         patch(
-            "services.ingestion.inferred_edges.extractor.asyncio.sleep",
+            "engine.ingest.inferred_edges.extractor.asyncio.sleep",
             new_callable=AsyncMock,
         ),
     ):
@@ -938,7 +938,7 @@ async def test_non_rate_limit_error_does_not_retry() -> None:
         patch.dict("os.environ", {"ANTHROPIC_API_KEY": "test-key"}),
         _patch_acompletion(once_then_dies),
         patch(
-            "services.ingestion.inferred_edges.extractor.asyncio.sleep",
+            "engine.ingest.inferred_edges.extractor.asyncio.sleep",
             new_callable=AsyncMock,
         ) as mock_sleep,
     ):
@@ -969,7 +969,7 @@ async def test_gemini_path_extracts_valid_edge(monkeypatch: pytest.MonkeyPatch) 
     full-array JSON response (no `[` prefill). The validation pipeline
     runs the same way -- the model ends up tagged on the InferredEdge."""
     monkeypatch.setattr(
-        "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
+        "engine.ingest.inferred_edges.extractor.INFERRED_EDGES_MODEL",
         "gemini-3.1-flash-lite",
     )
     edges = [
@@ -1014,7 +1014,7 @@ async def test_gemini_path_skips_when_google_api_key_unset(
     LLM call. Mirrors the Haiku-no-ANTHROPIC-key safety hatch so the
     worker doesn't crash in credential-less environments."""
     monkeypatch.setattr(
-        "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
+        "engine.ingest.inferred_edges.extractor.INFERRED_EDGES_MODEL",
         "gemini-3.1-flash-lite",
     )
     bundle = _make_bundle()
@@ -1040,7 +1040,7 @@ async def test_explicit_model_override_wins_over_default(
     """Caller can pass `model=` explicitly to force a specific provider,
     overriding INFERRED_EDGES_MODEL."""
     monkeypatch.setattr(
-        "services.ingestion.inferred_edges.extractor.INFERRED_EDGES_MODEL",
+        "engine.ingest.inferred_edges.extractor.INFERRED_EDGES_MODEL",
         "gemini-3.1-flash-lite",
     )
     edges = [

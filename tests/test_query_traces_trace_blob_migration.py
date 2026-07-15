@@ -13,12 +13,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.usage import (
+from engine.retrieval.usage import (
     EVENT_TYPE_QUERY,
     QueryTrace,
     write_query_trace,
 )
-from shared.db import raw_conn, with_tenant
+from engine.shared.db import raw_conn, with_tenant
 
 
 @pytest.mark.asyncio

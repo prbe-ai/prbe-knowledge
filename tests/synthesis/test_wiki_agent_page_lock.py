@@ -17,9 +17,9 @@ from collections.abc import AsyncIterator
 import pytest
 import pytest_asyncio
 
-from shared.config import Settings
-from shared.db import raw_conn
-from shared.locks import advisory_lock_key
+from engine.shared.config import Settings
+from engine.shared.db import raw_conn
+from engine.shared.locks import advisory_lock_key
 
 CUSTOMER = "wiki-page-lock-cust"
 

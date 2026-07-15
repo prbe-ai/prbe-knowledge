@@ -23,8 +23,8 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from shared.config import Settings, get_settings
-from shared.db import close_pool, init_pool, raw_conn
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn
 
 INTERNAL_KEY = "test-internal-knowledge-key"
 
@@ -62,8 +62,8 @@ def _stub_pipeline(monkeypatch, *, chunk_count: int = 3) -> None:
     `len(resp.results)`."""
     from datetime import UTC, datetime
 
-    from shared.constants import SourceSystem
-    from shared.models import QueryChunk, QueryDocumentResult, QueryResponse
+    from engine.shared.constants import SourceSystem
+    from engine.shared.models import QueryChunk, QueryDocumentResult, QueryResponse
 
     async def fake_run_retrieval(req, customer_id, request=None):
         now = datetime.now(UTC)
@@ -100,7 +100,7 @@ def _stub_pipeline(monkeypatch, *, chunk_count: int = 3) -> None:
             trace_id="trace-test",
         )
 
-    import services.retrieval.main as main_mod
+    import engine.retrieval.main as main_mod
 
     monkeypatch.setattr(main_mod, "run_retrieval", fake_run_retrieval)
 
@@ -112,7 +112,7 @@ async def _post_retrieve(
     path: str = "/retrieve",
     raise_app_exceptions: bool = False,
 ) -> httpx.Response:
-    from services.retrieval.main import app
+    from engine.retrieval.main import app
 
     await close_pool()
     # raise_app_exceptions=False so a handler RuntimeError surfaces as a
@@ -185,7 +185,7 @@ async def test_middleware_records_error_when_handler_raises(live_db, settings, m
     async def boom(req, customer_id, request=None):
         raise RuntimeError("pipeline kaboom")
 
-    import services.retrieval.main as main_mod
+    import engine.retrieval.main as main_mod
 
     monkeypatch.setattr(main_mod, "run_retrieval", boom)
 
@@ -226,7 +226,7 @@ async def test_middleware_skips_health_and_usage_paths(live_db, settings, monkey
     api_key = await _seed_customer("cust-mw-skip")
     _stub_pipeline(monkeypatch)
 
-    from services.retrieval.main import app
+    from engine.retrieval.main import app
 
     await close_pool()
     transport = ASGITransport(app=app)
@@ -272,8 +272,8 @@ async def test_middleware_write_failure_does_not_500_request(live_db, settings, 
         raise RuntimeError("db simulated outage")
 
     # Patch the symbol the middleware imported — middleware.py did
-    # `from services.retrieval.usage import write_usage_event`.
-    import services.retrieval.middleware as mw_mod
+    # `from engine.retrieval.usage import write_usage_event`.
+    import engine.retrieval.middleware as mw_mod
 
     monkeypatch.setattr(mw_mod, "write_usage_event", explode)
 

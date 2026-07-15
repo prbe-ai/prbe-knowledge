@@ -19,11 +19,11 @@ from unittest.mock import patch
 import pytest
 import pytest_asyncio
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.normalizer import Normalizer
-from shared.constants import DocClass, DocType, Permission, PrincipalType, SourceSystem
-from shared.db import raw_conn
-from shared.models import (
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.normalizer import Normalizer
+from engine.shared.constants import DocClass, DocType, Permission, PrincipalType, SourceSystem
+from engine.shared.db import raw_conn
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,

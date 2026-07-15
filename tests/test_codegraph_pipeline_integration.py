@@ -17,15 +17,15 @@ from dataclasses import dataclass
 import httpx
 import pytest
 
-from services.ingestion.code_graph.pipeline import extract_files_to_result
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.codegraph import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.shared.config import Settings
+from engine.shared.constants import EdgeType, NodeLabel
+from engine.shared.models import WebhookEvent
+from kb.code_graph.pipeline import extract_files_to_result
+from kb.handlers.codegraph import (
     KIND_DISCONNECT,
     CodeGraphConnector,
 )
-from shared.config import Settings
-from shared.constants import EdgeType, NodeLabel
-from shared.models import WebhookEvent
 
 
 @dataclass
@@ -147,7 +147,7 @@ async def test_disconnect_returns_skipped_reason() -> None:
         # at the module's import site so the SQL UPDATEs no-op.
         from contextlib import asynccontextmanager
 
-        from services.ingestion.handlers import codegraph as cg_module
+        from kb.handlers import codegraph as cg_module
 
         class _StubConn:
             async def execute(self, *args, **kwargs):

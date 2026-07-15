@@ -24,16 +24,16 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from services.ingestion.polling import sentry as sentry_poller
-from services.ingestion.polling.base import PollResult
-from services.ingestion.polling.sentry import (
+from engine.shared.constants import SourceSystem
+from engine.shared.models import IntegrationToken
+from kb.polling import sentry as sentry_poller
+from kb.polling.base import PollResult
+from kb.polling.sentry import (
     SentryPoller,
     _parse_next_cursor,
     _parse_next_link,
     _parse_resource_id,
 )
-from shared.constants import SourceSystem
-from shared.models import IntegrationToken
 
 # --- shared fixtures ------------------------------------------------------
 
@@ -473,6 +473,6 @@ async def test_events_missing_ids_are_dropped(
 async def test_registered_for_sentry_source() -> None:
     """The module's import-time ``register_poller`` call must wire
     SentryPoller to SourceSystem.SENTRY so the scheduler resolves it."""
-    from services.ingestion.polling.base import get_poller
+    from kb.polling.base import get_poller
 
     assert get_poller(SourceSystem.SENTRY) is SentryPoller

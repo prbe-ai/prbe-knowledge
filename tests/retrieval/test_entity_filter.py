@@ -18,15 +18,15 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from services.retrieval.retrievers.sql import (
+from engine.retrieval.retrievers.sql import (
     GraphEntityFilter,
     sql_count,
     sql_list,
 )
-from shared.config import Settings, get_settings
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.storage import reset_store
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.storage import reset_store
 
 pytestmark = pytest.mark.asyncio
 

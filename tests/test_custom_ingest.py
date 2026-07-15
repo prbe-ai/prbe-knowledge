@@ -6,16 +6,16 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from services.ingestion.handlers.base import ConnectorContext, make_default_context
-from services.ingestion.handlers.custom_ingest import CustomIngestConnector
-from services.ingestion.normalizer import Normalizer
-from shared.config import Settings, get_settings
-from shared.constants import DocType, Permission, PrincipalType, SourceSystem
-from shared.custom_ingest import CustomIngestEnvelope, document_content_hash, source_event_id
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.models import WebhookEvent
-from shared.storage import reset_store
+from engine.ingest.handlers.base import ConnectorContext, make_default_context
+from engine.ingest.handlers.custom_ingest import CustomIngestConnector
+from engine.ingest.normalizer import Normalizer
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import DocType, Permission, PrincipalType, SourceSystem
+from engine.shared.custom_ingest import CustomIngestEnvelope, document_content_hash, source_event_id
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.models import WebhookEvent
+from engine.shared.storage import reset_store
 
 CUSTOMER = "cust-custom-ingest"
 INTERNAL_KEY = "test-internal-key-32bytes-padding-padding"
@@ -75,7 +75,7 @@ def _patch_env(monkeypatch: pytest.MonkeyPatch, settings: Settings) -> None:
 
 @pytest.mark.asyncio
 async def test_custom_ingest_route_requires_internal_key() -> None:
-    from services.ingestion.main import app
+    from kb.ingestion_app import app
 
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
@@ -90,7 +90,7 @@ async def test_custom_ingest_route_requires_internal_key() -> None:
 
 @pytest.mark.asyncio
 async def test_custom_ingest_route_validates_source_key() -> None:
-    from services.ingestion.main import app
+    from kb.ingestion_app import app
 
     body = _payload()
     body["source_key"] = "Bad Source Key"
@@ -107,7 +107,7 @@ async def test_custom_ingest_route_validates_source_key() -> None:
 
 @pytest.mark.asyncio
 async def test_custom_ingest_route_rejects_reserved_metadata_body() -> None:
-    from services.ingestion.main import app
+    from kb.ingestion_app import app
 
     body = _payload()
     body["documents"][0]["metadata"]["body"] = "do not duplicate body here"
@@ -142,7 +142,7 @@ def test_custom_ingest_hash_includes_timestamps() -> None:
 async def test_custom_ingest_route_enqueues_and_dedupes_retries(
     live_db,
 ) -> None:
-    from services.ingestion.main import app
+    from kb.ingestion_app import app
 
     async with raw_conn() as conn:
         await conn.execute(
@@ -245,7 +245,7 @@ async def test_custom_ingest_connector_normalization() -> None:
 async def test_custom_ingest_idempotency_versioning_and_chunks(
     live_db,
 ) -> None:
-    from services.ingestion.main import app
+    from kb.ingestion_app import app
 
     async with raw_conn() as conn:
         await conn.execute(

@@ -21,9 +21,9 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
-from shared.config import get_settings
-from shared.constants import DocClass, DocType, Permission, PrincipalType, SourceSystem
-from shared.models import (
+from engine.shared.config import get_settings
+from engine.shared.constants import DocClass, DocType, Permission, PrincipalType, SourceSystem
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ChunkPiece,
@@ -74,7 +74,7 @@ def test_pre_chunked_document_round_trips_through_normalization_result() -> None
     optional metadata chunk. NormalizationResult.is_empty respects this
     new path (was missed in PR-A's is_empty when the field shipped).
     """
-    from shared.models import NormalizationResult
+    from engine.shared.models import NormalizationResult
 
     doc = _make_doc()
     pre = PreChunkedDocument(
@@ -96,7 +96,7 @@ def test_pre_chunked_path_skips_chunk_text(monkeypatch) -> None:
     connector-supplied pieces flow through the same diff-and-reuse logic
     instead.
     """
-    import services.ingestion.normalizer as norm_mod
+    import engine.ingest.normalizer as norm_mod
 
     sentinel = []
 
@@ -126,14 +126,14 @@ def test_pre_chunked_path_skips_chunk_text(monkeypatch) -> None:
     # Mock the embedder so we don't need OpenAI. Returns the real
     # EmbedResult shape (.embedded list of (input_index, vector) tuples,
     # .failed list) so _plan_chunks can iterate it.
-    from shared.embeddings import EmbedResult
+    from engine.shared.embeddings import EmbedResult
 
     embedder = AsyncMock()
     embedder.embed_many = AsyncMock(
         return_value=EmbedResult(embedded=[], failed=[])
     )
 
-    from services.ingestion.handlers.base import ConnectorContext
+    from engine.ingest.handlers.base import ConnectorContext
 
     settings = get_settings()
     import httpx
@@ -163,7 +163,7 @@ def test_pre_chunked_doc_with_body_raises_in_persist() -> None:
     """body + pre_chunked is ambiguous; the normalizer must reject it
     upfront instead of silently picking one path.
     """
-    from shared.models import NormalizationResult
+    from engine.shared.models import NormalizationResult
 
     doc = _make_doc(body="i should not be here")
     pre = PreChunkedDocument(

@@ -20,8 +20,8 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from shared.config import Settings, get_settings
-from shared.db import close_pool, init_pool, raw_conn
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn
 
 INTERNAL_KEY = "test-internal-knowledge-key"
 
@@ -90,7 +90,7 @@ async def _insert_event(
 
 
 async def _client_get(path: str, *, headers: dict[str, str]) -> httpx.Response:
-    from services.retrieval.main import app
+    from engine.retrieval.main import app
 
     await close_pool()
     transport = ASGITransport(app=app)

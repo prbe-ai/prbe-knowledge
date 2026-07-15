@@ -15,14 +15,14 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from services.ingestion.handlers import github as github_mod
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.github import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.shared.config import Settings
+from engine.shared.models import WebhookEvent
+from kb.handlers import github as github_mod
+from kb.handlers.github import (
     GitHubConnector,
     _push_branch_from_ref,
 )
-from shared.config import Settings
-from shared.models import WebhookEvent
 
 
 def _connector() -> GitHubConnector:

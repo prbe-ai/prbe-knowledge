@@ -39,12 +39,12 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
-from services.ingestion.graph_writer import upsert_nodes
-from services.ingestion.main import app
-from shared.config import Settings, get_settings
-from shared.constants import DocType, NodeLabel, SourceSystem
-from shared.db import close_pool, init_pool, raw_conn, with_tenant
-from shared.models import GraphNodeSpec
+from engine.ingest.graph_writer import upsert_nodes
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import DocType, NodeLabel, SourceSystem
+from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
+from engine.shared.models import GraphNodeSpec
+from kb.ingestion_app import app
 
 CUSTOMER_ID = "cust-feature-nodes"
 INTERNAL_KEY = "test-internal-key"

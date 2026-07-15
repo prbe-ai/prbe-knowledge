@@ -11,12 +11,22 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.registry import build_connector
-from shared.db import close_pool, init_pool
-from shared.logging import configure_logging, get_logger
-from shared.metrics import counter
-from shared.tokens import list_tokens_expiring_within, load_token, mark_refresh_error, save_token
+# Composition root: engine/ never imports kb/ itself, so operator entry
+# points must load the connector pack explicitly or the handler registry
+# is EMPTY (build_connector raises HandlerNotFound; list_registered
+# silently yields nothing). Same line the services/* deploy wrappers use.
+import kb.handlers  # noqa: F401  (connector-registration side effect)
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.db import close_pool, init_pool
+from engine.shared.logging import configure_logging, get_logger
+from engine.shared.metrics import counter
+from engine.shared.tokens import (
+    list_tokens_expiring_within,
+    load_token,
+    mark_refresh_error,
+    save_token,
+)
 
 log = get_logger(__name__)
 

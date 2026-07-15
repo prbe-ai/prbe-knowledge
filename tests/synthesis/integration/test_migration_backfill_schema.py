@@ -18,7 +18,7 @@ import json
 import pytest
 from asyncpg.exceptions import CheckViolationError, UniqueViolationError
 
-from shared.db import raw_conn
+from engine.shared.db import raw_conn
 
 
 @pytest.mark.asyncio

@@ -15,16 +15,10 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.registry import build_connector
-from services.ingestion.handlers.wiki import (  # noqa: F401 — registers the connector
-    WIKI_PAYLOAD_KEY,
-    WikiConnector,
-    build_normalization_result,
-)
-from services.ingestion.wiki_links import parse_page_links, slugify
-from shared.config import Settings
-from shared.constants import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.config import Settings
+from engine.shared.constants import (
     CompileTrigger,
     DocClass,
     EdgeType,
@@ -34,8 +28,14 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
-from shared.models import WebhookEvent
+from engine.shared.exceptions import InvalidWebhookPayload
+from engine.shared.models import WebhookEvent
+from kb.handlers.wiki import (  # noqa: F401 — registers the connector
+    WIKI_PAYLOAD_KEY,
+    WikiConnector,
+    build_normalization_result,
+)
+from kb.wiki_links import parse_page_links, slugify
 
 
 def _make_ctx() -> ConnectorContext:

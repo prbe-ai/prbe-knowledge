@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 
-from shared.db import close_pool, init_pool, raw_conn
+from engine.shared.db import close_pool, init_pool, raw_conn
 
 CUSTOMER = "smoke-phase2-cust"
 NOW = datetime(2026, 5, 15, 12, 0, tzinfo=UTC)

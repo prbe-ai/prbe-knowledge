@@ -1,9 +1,9 @@
 import pytest
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.claude_code import ClaudeCodeConnector
-from shared.constants import SourceSystem
-from shared.models import IntegrationToken
+from engine.ingest.handlers.base import make_default_context
+from engine.shared.constants import SourceSystem
+from engine.shared.models import IntegrationToken
+from kb.handlers.claude_code import ClaudeCodeConnector
 
 
 @pytest.mark.asyncio

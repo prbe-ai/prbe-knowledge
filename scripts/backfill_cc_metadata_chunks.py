@@ -34,14 +34,14 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
-from services.ingestion.normalizer import (
+from engine.ingest.normalizer import (
     METADATA_CHUNK_INDEX,
     _chunk_hash,
     _metadata_text,
     _pg_vector,
 )
-from shared.config import get_settings
-from shared.constants import (
+from engine.shared.config import get_settings
+from engine.shared.constants import (
     CHUNKER_VERSION,
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
@@ -49,14 +49,14 @@ from shared.constants import (
     DocType,
     SourceSystem,
 )
-from shared.db import close_pool, init_pool, raw_conn, with_tenant
-from shared.embeddings import (
+from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
+from engine.shared.embeddings import (
     DocItem,
     GeminiEmbedder,
     get_embedder_v2,
 )
-from shared.logging import configure_logging, get_logger
-from shared.models import (
+from engine.shared.logging import configure_logging, get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     Document,

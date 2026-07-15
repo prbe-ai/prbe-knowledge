@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.retrieval.synthesis import (
+from engine.retrieval.synthesis import (
     ANSWER_SCHEMA,
     StreamDelta,
     StreamFinal,
@@ -112,7 +112,7 @@ def test_format_user_prompt_renders_chain_section_when_graph_evidence_present() 
     the Linear ticket was in the chunks but the synthesized answer said
     "no explicit ticket triggered the PR" because the edge rationale
     wasn't in its prompt. Lock the rendering so we don't regress."""
-    from shared.models import GraphEvidence
+    from engine.shared.models import GraphEvidence
 
     chunk = SynthesisChunk(
         chunk_id="c-linear",
@@ -143,7 +143,7 @@ def test_format_user_prompt_truncates_long_chain_reasons() -> None:
     the LLM-derived `why` string is long. The cap lives on the rendering
     side, not the wire — full `why` survives in graph_evidence for
     other consumers (dashboard chain panel, MCP graph_evidence field)."""
-    from shared.models import GraphEvidence
+    from engine.shared.models import GraphEvidence
 
     long_why = "a" * 5000
     chunk = SynthesisChunk(
@@ -231,7 +231,7 @@ def test_format_user_prompt_renders_neighbor_metadata_for_chronology() -> None:
     the LLM has the temporal + provenance grounding it needs."""
     from datetime import UTC, datetime
 
-    from shared.models import GraphEvidence
+    from engine.shared.models import GraphEvidence
 
     chunk = SynthesisChunk(
         chunk_id="c-linear",
@@ -422,7 +422,7 @@ async def test_synthesize_anthropic_path(monkeypatch) -> None:
             "insufficient_context": False,
         }
 
-    monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
+    monkeypatch.setattr("engine.retrieval.synthesis._dispatch", fake_call)
     chunks = [
         _chunk(1, content="Klavis went live Tuesday"),
         _chunk(2, content="Built on top of MCP"),
@@ -455,7 +455,7 @@ async def test_synthesize_routes_haiku(monkeypatch) -> None:
             "insufficient_context": False,
         }
 
-    monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
+    monkeypatch.setattr("engine.retrieval.synthesis._dispatch", fake_call)
     await synthesize("q", [_chunk(1)], model="anthropic/claude-haiku-4-5-20251001")
     assert captured["provider"] == "anthropic"
     assert captured["model"] == "claude-haiku-4-5-20251001"
@@ -470,7 +470,7 @@ async def test_synthesize_propagates_insufficient_context(monkeypatch) -> None:
             "insufficient_context": True,
         }
 
-    monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
+    monkeypatch.setattr("engine.retrieval.synthesis._dispatch", fake_call)
     result = await synthesize(
         "obscure question",
         [_chunk(1, content="totally unrelated")],
@@ -490,7 +490,7 @@ async def test_synthesize_normalizes_bare_citations(monkeypatch) -> None:
             "insufficient_context": False,
         }
 
-    monkeypatch.setattr("services.retrieval.synthesis._dispatch", fake_call)
+    monkeypatch.setattr("engine.retrieval.synthesis._dispatch", fake_call)
     chunks = [_chunk(1), _chunk(2)]
     result = await synthesize(
         "what is klavis?",
@@ -597,7 +597,7 @@ async def test_synthesize_stream_rejects_unsupported_provider(monkeypatch) -> No
     branch fires.
     """
     monkeypatch.setitem(
-        __import__("services.retrieval.synthesis", fromlist=["SYNTHESIS_MODELS"])
+        __import__("engine.retrieval.synthesis", fromlist=["SYNTHESIS_MODELS"])
         .SYNTHESIS_MODELS,
         "openai/gpt-4o-mini",
         "openai",
@@ -628,7 +628,7 @@ async def test_synthesize_stream_yields_deltas_then_final_anthropic(
             "It uses MCP [chunk:2].",
         ]
     )
-    monkeypatch.setattr("services.retrieval.synthesis.shared_llm.acompletion", fake)
+    monkeypatch.setattr("engine.retrieval.synthesis.shared_llm.acompletion", fake)
 
     chunks = [
         _chunk(1, content="Klavis went live Tuesday"),
@@ -682,7 +682,7 @@ async def test_synthesize_stream_yields_deltas_then_final_google(
     fake = _AcompletionRecorder(
         texts=["Gemini ", "answered [chunk:1]."]
     )
-    monkeypatch.setattr("services.retrieval.synthesis.shared_llm.acompletion", fake)
+    monkeypatch.setattr("engine.retrieval.synthesis.shared_llm.acompletion", fake)
 
     chunks = [_chunk(1, content="some context")]
 
@@ -725,7 +725,7 @@ async def test_synthesize_stream_strips_insufficient_sentinel(monkeypatch) -> No
             "The chunks don't mention Klavis at all.",
         ]
     )
-    monkeypatch.setattr("services.retrieval.synthesis.shared_llm.acompletion", fake)
+    monkeypatch.setattr("engine.retrieval.synthesis.shared_llm.acompletion", fake)
 
     events = []
     async for evt in synthesize_stream(
@@ -746,13 +746,13 @@ async def test_synthesize_stream_wraps_litellm_error(monkeypatch) -> None:
     """`shared.llm.LLMError` raised during streaming surfaces as
     SynthesisError so the retrieval route handler can convert to 502.
     """
-    from shared.llm import LLMError
+    from engine.shared.llm import LLMError
 
     async def raising_acompletion(**_kwargs: object):
         raise LLMError("upstream 429", status_code=429, provider="anthropic")
 
     monkeypatch.setattr(
-        "services.retrieval.synthesis.shared_llm.acompletion",
+        "engine.retrieval.synthesis.shared_llm.acompletion",
         raising_acompletion,
     )
 
@@ -775,7 +775,7 @@ async def test_synthesize_stream_tolerates_none_content_chunks(
     StreamDelta) and still emit exactly one StreamFinal.
     """
     fake = _AcompletionRecorder(texts=["Only ", "two ", "real ", "deltas."])
-    monkeypatch.setattr("services.retrieval.synthesis.shared_llm.acompletion", fake)
+    monkeypatch.setattr("engine.retrieval.synthesis.shared_llm.acompletion", fake)
 
     events = []
     async for evt in synthesize_stream(

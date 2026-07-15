@@ -1,4 +1,4 @@
-from shared.constants import DocType, SourceSystem
+from engine.shared.constants import DocType, SourceSystem
 
 
 def test_claude_code_source_system_exists() -> None:

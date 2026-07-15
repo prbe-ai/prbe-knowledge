@@ -1,6 +1,6 @@
 import pytest
 
-from shared.storage import get_store
+from engine.shared.storage import get_store
 
 
 @pytest.mark.asyncio

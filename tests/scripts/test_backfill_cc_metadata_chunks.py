@@ -14,9 +14,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from engine.ingest.normalizer import _chunk_hash, _metadata_text
+from engine.shared.constants import DocClass, DocType, SourceSystem
 from scripts.backfill_cc_metadata_chunks import _doc_from_row
-from services.ingestion.normalizer import _chunk_hash, _metadata_text
-from shared.constants import DocClass, DocType, SourceSystem
 
 
 def _row(

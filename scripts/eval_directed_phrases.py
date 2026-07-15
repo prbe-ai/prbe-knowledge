@@ -49,8 +49,8 @@ import google.genai as genai  # type: ignore[import-untyped]
 from anthropic import AsyncAnthropic
 from google.genai import types as genai_types  # type: ignore[import-untyped]
 
+from engine.shared.embeddings import GeminiEmbedder
 from scripts.eval_data.fixtures import FIXTURES, Fixture
-from shared.embeddings import GeminiEmbedder
 
 # ---- Models under test ----------------------------------------------------
 

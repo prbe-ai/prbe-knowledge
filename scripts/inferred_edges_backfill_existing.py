@@ -48,10 +48,10 @@ import argparse
 import asyncio
 import sys
 
-from services.ingestion.inferred_edges.prompts.v1 import PROMPT_VERSION
-from shared.config import get_settings
-from shared.db import close_pool, init_pool, raw_conn
-from shared.logging import configure_logging, get_logger
+from engine.ingest.inferred_edges.prompts.v1 import PROMPT_VERSION
+from engine.shared.config import get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
 

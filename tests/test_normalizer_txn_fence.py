@@ -27,13 +27,13 @@ from typing import Any
 import httpx
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.slack import SlackConnector  # noqa: F401 — registers
-from services.ingestion.normalizer import Normalizer
-from shared import db as db_module
-from shared.config import Settings
-from shared.constants import EMBEDDING_V2_DIM, SourceSystem
-from shared.embeddings import EmbeddedChunk, EmbedResult
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.normalizer import Normalizer
+from engine.shared import db as db_module
+from engine.shared.config import Settings
+from engine.shared.constants import EMBEDDING_V2_DIM, SourceSystem
+from engine.shared.embeddings import EmbeddedChunk, EmbedResult
+from kb.handlers.slack import SlackConnector  # noqa: F401 — registers
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "slack" / "message_simple.json"
 

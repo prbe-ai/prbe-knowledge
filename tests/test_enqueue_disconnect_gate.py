@@ -11,15 +11,15 @@ from __future__ import annotations
 
 import pytest
 
-from services.ingestion.connectedness import (
+from engine.ingest.connectedness import (
     _OAUTH_SOURCES,
     _UNGATED_SOURCES,
     is_source_connected,
 )
-from services.ingestion.main import _enqueue
-from shared.constants import SourceSystem
-from shared.db import raw_conn
-from shared.encryption import encrypt_token
+from engine.shared.constants import SourceSystem
+from engine.shared.db import raw_conn
+from engine.shared.encryption import encrypt_token
+from kb.ingestion_app import _enqueue
 
 CUSTOMER_ID = "test-gate-customer"
 SOURCE = SourceSystem.GITHUB

@@ -13,8 +13,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.fusion import fuse
-from shared import constants as constants_module
+from engine.retrieval.fusion import fuse
+from engine.shared import constants as constants_module
 
 _NOW = datetime(2026, 5, 8, tzinfo=UTC)
 
@@ -88,7 +88,7 @@ def test_fuse_with_directed_weight_zero_unchanged(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(constants_module, "DIRECTED_RETRIEVAL_WEIGHT", 0.0)
     # We need fusion to re-import after the patch — but it imports the
     # name, not the module attribute. Patch at the import site.
-    from services.retrieval import fusion as fusion_module
+    from engine.retrieval import fusion as fusion_module
 
     monkeypatch.setattr(fusion_module, "DIRECTED_RETRIEVAL_WEIGHT", 0.0)
 
@@ -139,7 +139,7 @@ def test_fuse_directed_score_in_retriever_breakdown() -> None:
     DIRECTED_RETRIEVAL_WEIGHT=1.0 is a peer-of-other-retrievers, not a
     50x dominator.
     """
-    from shared.constants import RRF_K
+    from engine.shared.constants import RRF_K
 
     hits = [FakeHit(chunk_id="c1", doc_id="d1")]
     fused = fuse(
@@ -175,7 +175,7 @@ def test_fuse_directed_first_occurrence_wins_per_doc() -> None:
     The retriever guarantees list order = similarity-rank, so first
     occurrence == best similarity by construction.
     """
-    from shared.constants import RRF_K
+    from engine.shared.constants import RRF_K
 
     hits = [FakeHit(chunk_id="c1", doc_id="d1")]
     fused = fuse(
@@ -199,7 +199,7 @@ def test_fuse_directed_rank_2_smaller_than_rank_1() -> None:
     Without RRF conversion, DIRECTED_RETRIEVAL_WEIGHT=1.0 dominated
     ranking by 50x; this pins the magnitude contract.
     """
-    from shared.constants import RRF_K
+    from engine.shared.constants import RRF_K
 
     hits = [
         FakeHit(chunk_id="c1", doc_id="d1"),
@@ -232,7 +232,7 @@ def test_fuse_directed_zero_similarity_still_contributes_when_listed() -> None:
     contribution. The retriever's DISTINCT ON + dist ASC ordering ensures
     list membership only includes actual matches.
     """
-    from shared.constants import RRF_K
+    from engine.shared.constants import RRF_K
 
     hits = [FakeHit(chunk_id="c1", doc_id="d1")]
     fused = fuse(

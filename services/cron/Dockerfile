@@ -22,7 +22,8 @@ WORKDIR /app
 # cron commands land here too. Trade a slightly bigger image for one
 # fly app instead of N.
 COPY pyproject.toml ./
-COPY shared/ ./shared/
+COPY engine/ ./engine/
+COPY kb/ ./kb/
 COPY services/ ./services/
 COPY db/ ./db/
 COPY scripts/ ./scripts/

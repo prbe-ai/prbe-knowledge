@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from services.ingestion.session_completer import enqueue_idle_session_finalizers
-from shared.db import get_pool
+from engine.shared.db import get_pool
+from kb.session_completer import enqueue_idle_session_finalizers
 
 
 @pytest.mark.asyncio
@@ -117,15 +117,15 @@ async def test_finalize_event_processes_through_normalizer(
     """
     import orjson
 
-    from services.ingestion.handlers.base import make_default_context
-    from services.ingestion.normalizer import Normalizer
-    from shared import claude_code_extraction as _ext
-    from shared.claude_code_extraction import UnitBundle
-    from shared.constants import SourceSystem
-    from shared.customer_mapping import record_mapping
-    from shared.models import IntegrationToken
-    from shared.storage import get_store
-    from shared.tokens import save_device_token
+    from engine.ingest.handlers.base import make_default_context
+    from engine.ingest.normalizer import Normalizer
+    from engine.shared import claude_code_extraction as _ext
+    from engine.shared.claude_code_extraction import UnitBundle
+    from engine.shared.constants import SourceSystem
+    from engine.shared.customer_mapping import record_mapping
+    from engine.shared.models import IntegrationToken
+    from engine.shared.storage import get_store
+    from engine.shared.tokens import save_device_token
 
     customer = "completer-e2e-cust"
     session_id = "sess-e2e-final"

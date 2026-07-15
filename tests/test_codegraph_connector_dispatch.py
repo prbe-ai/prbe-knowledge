@@ -10,16 +10,16 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.codegraph import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.shared.config import Settings
+from engine.shared.exceptions import InvalidWebhookPayload
+from kb.handlers.codegraph import (
     KIND_DISCONNECT,
     KIND_INCREMENTAL,
     KIND_INITIAL_BACKFILL,
     CodeGraphConnector,
     _recompute_event_id,
 )
-from shared.config import Settings
-from shared.exceptions import InvalidWebhookPayload
 
 
 def _connector() -> CodeGraphConnector:

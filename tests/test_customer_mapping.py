@@ -11,17 +11,17 @@ from __future__ import annotations
 
 import pytest
 
-from shared.config import Settings, get_settings
-from shared.constants import SourceSystem
-from shared.customer_mapping import (
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import SourceSystem
+from engine.shared.customer_mapping import (
     record_mapping,
     resolve_customer,
     single_customer_fallback,
 )
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.exceptions import SourceAlreadyConnectedError
-from shared.storage import reset_store
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.exceptions import SourceAlreadyConnectedError
+from engine.shared.storage import reset_store
 
 
 @pytest.fixture(autouse=True)
@@ -147,13 +147,13 @@ async def test_single_customer_fallback(live_db) -> None:
 def _dummy_ctx():
     import httpx as _h
 
-    from services.ingestion.handlers.base import ConnectorContext
+    from engine.ingest.handlers.base import ConnectorContext
 
     return ConnectorContext(settings=Settings(), http=_h.AsyncClient())
 
 
 def test_slack_extract_external_id() -> None:
-    from services.ingestion.handlers.registry import build_connector
+    from engine.ingest.handlers.registry import build_connector
 
     c = build_connector(SourceSystem.SLACK, _dummy_ctx())
     assert c.extract_external_id_from_payload({}, {"team_id": "T_X"}) == "T_X"
@@ -162,7 +162,7 @@ def test_slack_extract_external_id() -> None:
 
 
 def test_linear_extract_external_id() -> None:
-    from services.ingestion.handlers.registry import build_connector
+    from engine.ingest.handlers.registry import build_connector
 
     c = build_connector(SourceSystem.LINEAR, _dummy_ctx())
     assert c.extract_external_id_from_payload({}, {"organizationId": "O_1"}) == "O_1"
@@ -170,7 +170,7 @@ def test_linear_extract_external_id() -> None:
 
 
 def test_github_extract_external_id() -> None:
-    from services.ingestion.handlers.registry import build_connector
+    from engine.ingest.handlers.registry import build_connector
 
     c = build_connector(SourceSystem.GITHUB, _dummy_ctx())
     assert (
@@ -180,7 +180,7 @@ def test_github_extract_external_id() -> None:
 
 
 def test_notion_extract_external_id() -> None:
-    from services.ingestion.handlers.registry import build_connector
+    from engine.ingest.handlers.registry import build_connector
 
     c = build_connector(SourceSystem.NOTION, _dummy_ctx())
     assert (
@@ -193,7 +193,7 @@ def test_notion_extract_external_id() -> None:
 
 
 def test_sentry_extract_external_id() -> None:
-    from services.ingestion.handlers.registry import build_connector
+    from engine.ingest.handlers.registry import build_connector
 
     c = build_connector(SourceSystem.SENTRY, _dummy_ctx())
     assert (

@@ -46,12 +46,12 @@ from typing import Any
 
 import asyncpg
 
-from services.ingestion.normalizer import _pg_vector
-from shared.config import get_settings
-from shared.constants import EMBEDDING_V2_DIM, EMBEDDING_V2_MODEL
-from shared.db import close_pool, init_pool, raw_conn
-from shared.embeddings import DocItem, get_embedder_v2
-from shared.logging import configure_logging, get_logger
+from engine.ingest.normalizer import _pg_vector
+from engine.shared.config import get_settings
+from engine.shared.constants import EMBEDDING_V2_DIM, EMBEDDING_V2_MODEL
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.embeddings import DocItem, get_embedder_v2
+from engine.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
 

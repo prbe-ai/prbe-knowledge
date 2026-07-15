@@ -23,10 +23,10 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.ingestion.normalizer import _upsert_document
-from shared.constants import DocClass, DocType, SourceSystem
-from shared.db import raw_conn, with_tenant
-from shared.models import ACLSnapshot, Document
+from engine.ingest.normalizer import _upsert_document
+from engine.shared.constants import DocClass, DocType, SourceSystem
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.models import ACLSnapshot, Document
 
 
 def _make_doc(*, customer_id: str, doc_id: str, body: str) -> Document:

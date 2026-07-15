@@ -20,14 +20,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.notion import (  # noqa: F401 — registers
-    NotionConnector,
-    blocks_to_markdown,
-)
-from services.ingestion.handlers.registry import build_connector
-from shared.config import Settings
-from shared.constants import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.config import Settings
+from engine.shared.constants import (
     DocType,
     EdgeType,
     IngestionEventType,
@@ -36,7 +32,11 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.models import WebhookEvent
+from engine.shared.models import WebhookEvent
+from kb.handlers.notion import (  # noqa: F401 — registers
+    NotionConnector,
+    blocks_to_markdown,
+)
 
 FIXTURES = Path(__file__).resolve().parents[1].parent / "fixtures" / "notion"
 
@@ -260,7 +260,7 @@ def test_parse_synthetic_poll_shape() -> None:
 def test_parse_rejects_unknown_shape() -> None:
     ctx = _make_ctx()
     notion = build_connector(SourceSystem.NOTION, ctx)
-    from shared.exceptions import InvalidWebhookPayload
+    from engine.shared.exceptions import InvalidWebhookPayload
 
     with pytest.raises(InvalidWebhookPayload):
         notion.parse_webhook_event("cust-1", {}, {"foo": "bar"})
@@ -388,7 +388,7 @@ def test_blocks_to_markdown_child_page_placeholder_no_recursion() -> None:
 def test_extract_mentioned_user_ids_descends_into_children() -> None:
     """Mentions inside toggle/column children must still surface as PERSON
     nodes — otherwise nested @mentions silently vanish from the graph."""
-    from services.ingestion.handlers.notion import _extract_mentioned_user_ids
+    from kb.handlers.notion import _extract_mentioned_user_ids
 
     blocks = [
         {
@@ -426,7 +426,7 @@ async def test_fetch_all_blocks_recurses_into_has_children() -> None:
     """Nested blocks (has_children=true) must be fetched and attached as
     `_children`. The original implementation only fetched direct children,
     which is the bulk of the "missing docs" the user reported."""
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     calls: list[str] = []
 
@@ -519,7 +519,7 @@ async def test_fetch_entity_dispatches_data_source_to_new_endpoint() -> None:
     """In 2026-03-11, `data_source.*` events must hit /v1/data_sources/{id},
     not the legacy /v1/databases/{id}. The schema/properties live on the
     data source record now, not on the parent database."""
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     calls: list[str] = []
 
@@ -563,7 +563,7 @@ async def test_fetch_entity_dispatches_data_source_to_new_endpoint() -> None:
 async def test_fetch_entity_database_uses_databases_endpoint() -> None:
     """Sanity: database events still hit /v1/databases/{id}; only the
     response shape (now a container with data_sources) changed."""
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     calls: list[str] = []
 
@@ -696,7 +696,7 @@ async def test_normalize_with_hydrated_content() -> None:
     entity = _load("page_metadata.json")
     blocks = _load("blocks.json")["results"]
 
-    from services.ingestion.handlers.notion import _extract_mentioned_user_ids
+    from kb.handlers.notion import _extract_mentioned_user_ids
 
     hydrated = {
         "entity": entity,
@@ -778,7 +778,7 @@ def test_database_schema_summary_renders_2026_container_shape() -> None:
     """`GET /v1/databases/{id}` in 2026-03-11 returns a container with
     `data_sources: [...]` (no top-level properties). The summary must
     include the data_sources list rather than fall back to an empty body."""
-    from services.ingestion.handlers.notion import _database_schema_summary
+    from kb.handlers.notion import _database_schema_summary
 
     container_entity = {
         "object": "database",
@@ -799,7 +799,7 @@ def test_database_schema_summary_renders_2026_container_shape() -> None:
 def test_database_schema_summary_renders_data_source_properties() -> None:
     """A data_source record (or a legacy database) carries `properties`
     directly — summarize them as before."""
-    from services.ingestion.handlers.notion import _database_schema_summary
+    from kb.handlers.notion import _database_schema_summary
 
     ds_entity = {
         "object": "data_source",
@@ -989,7 +989,7 @@ async def test_exchange_oauth_code_happy() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_oauth_code_4xx_raises_permanent() -> None:
-    from shared.exceptions import PermanentSourceError
+    from engine.shared.exceptions import PermanentSourceError
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"error": "invalid_grant"})
@@ -1005,7 +1005,7 @@ async def test_exchange_oauth_code_4xx_raises_permanent() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_oauth_code_missing_code_raises() -> None:
-    from shared.exceptions import InvalidWebhookPayload
+    from engine.shared.exceptions import InvalidWebhookPayload
 
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail("HTTP should not be called when code is None")
@@ -1021,7 +1021,7 @@ async def test_exchange_oauth_code_missing_code_raises() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_oauth_code_missing_secret_raises() -> None:
-    from shared.exceptions import MissingSecret
+    from engine.shared.exceptions import MissingSecret
 
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail("HTTP should not be called when secret is missing")
@@ -1070,7 +1070,7 @@ async def test_exchange_oauth_code_malformed_200_raises_permanent() -> None:
     """Defensive: a Notion 200 that's missing the documented non-null
     `access_token` / `workspace_id` fields shouldn't be an unhandled
     KeyError → 500. Map to PermanentSourceError → 502."""
-    from shared.exceptions import PermanentSourceError
+    from engine.shared.exceptions import PermanentSourceError
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"token_type": "bearer"})
@@ -1091,7 +1091,7 @@ async def test_exchange_oauth_code_malformed_200_raises_permanent() -> None:
 
 @pytest.mark.asyncio
 async def test_identify_workspaces_from_install_metadata() -> None:
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail(
@@ -1137,7 +1137,7 @@ async def test_identify_workspaces_returns_empty_when_metadata_missing() -> None
     """A token loaded from DB doesn't have install_metadata (it's transient).
     Connector must return [] instead of crashing — the exchange caller
     already swallows that case (logs a warning, no mapping recorded)."""
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         pytest.fail("identify_workspaces must not hit the network on missing metadata")
@@ -1226,8 +1226,8 @@ async def test_exchange_oauth_code_legacy_long_lived_no_expires_at() -> None:
 async def test_exchange_refresh_token_no_refresh_token_raises_permanent() -> None:
     """Legacy tokens minted before rotation have no refresh_token; caller
     flips auth_failed and prompts reconnect."""
-    from shared.exceptions import PermanentSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import PermanentSourceError
+    from engine.shared.models import IntegrationToken
 
     ctx = _oauth_ctx_with_secret(handler=lambda req: httpx.Response(200, json={}))
     notion = build_connector(SourceSystem.NOTION, ctx)
@@ -1243,7 +1243,7 @@ async def test_exchange_refresh_token_no_refresh_token_raises_permanent() -> Non
 
 @pytest.mark.asyncio
 async def test_exchange_refresh_token_success_rotates() -> None:
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     seen: dict = {}
 
@@ -1280,8 +1280,8 @@ async def test_exchange_refresh_token_success_rotates() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_refresh_token_4xx_raises_permanent() -> None:
-    from shared.exceptions import PermanentSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import PermanentSourceError
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={"error": "invalid_grant"})
@@ -1300,8 +1300,8 @@ async def test_exchange_refresh_token_4xx_raises_permanent() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_refresh_token_5xx_raises_transient() -> None:
-    from shared.exceptions import TransientSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import TransientSourceError
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, text="down")
@@ -1325,7 +1325,7 @@ async def test_exchange_refresh_token_5xx_raises_transient() -> None:
 
 @pytest.mark.asyncio
 async def test_verify_token_health_healthy_returns_true() -> None:
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/users/me"
@@ -1341,7 +1341,7 @@ async def test_verify_token_health_healthy_returns_true() -> None:
 
 @pytest.mark.asyncio
 async def test_verify_token_health_401_returns_false() -> None:
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1358,8 +1358,8 @@ async def test_verify_token_health_401_returns_false() -> None:
 
 @pytest.mark.asyncio
 async def test_verify_token_health_5xx_raises_transient() -> None:
-    from shared.exceptions import TransientSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import TransientSourceError
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, json={})

@@ -10,10 +10,10 @@ from datetime import UTC, datetime
 import orjson
 import pytest
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.claude_code import ClaudeCodeConnector
-from shared.constants import SourceSystem
-from shared.models import WebhookEvent
+from engine.ingest.handlers.base import make_default_context
+from engine.shared.constants import SourceSystem
+from engine.shared.models import WebhookEvent
+from kb.handlers.claude_code import ClaudeCodeConnector
 
 
 class _StubStore:
@@ -41,7 +41,7 @@ class _StubStore:
 @pytest.fixture
 def stub_store(monkeypatch: pytest.MonkeyPatch) -> _StubStore:
     store = _StubStore()
-    from services.ingestion.handlers import claude_code as cc_mod
+    from kb.handlers import claude_code as cc_mod
 
     monkeypatch.setattr(cc_mod, "get_store", lambda: store)
     return store

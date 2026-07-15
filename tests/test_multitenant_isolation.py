@@ -13,7 +13,7 @@ from datetime import UTC
 
 import pytest
 
-from shared.db import raw_conn, with_tenant
+from engine.shared.db import raw_conn, with_tenant
 
 
 @pytest.mark.asyncio

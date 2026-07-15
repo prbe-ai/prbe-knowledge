@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.embeddings import (
+from engine.shared.embeddings import (
     _GEMINI_QUERY_PREFIX,
     DocItem,
     EmbeddedChunk,
@@ -30,7 +30,7 @@ from shared.embeddings import (
     get_embedder_v2,
     reset_embedder,
 )
-from shared.exceptions import (
+from engine.shared.exceptions import (
     EmbeddingBatchRejected,
     EmbeddingContextLengthExceeded,
     EmbeddingProviderUnavailable,
@@ -307,7 +307,7 @@ async def test_gemini_embedder_routes_through_shared_llm_aembedding_in_gateway_m
     base_url knob on google-genai). Model id is sent as the bare alias so
     it matches the LiteLLM proxy's `gemini-embedding-*` model_name."""
 
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.litellm.svc:4000")
     monkeypatch.setenv("LLM_GATEWAY_KEY", "sk-virtual")
@@ -333,7 +333,7 @@ async def test_gemini_embedder_routes_through_shared_llm_aembedding_in_gateway_m
         captured["input"] = list(input)
         return _Resp(len(input))
 
-    import shared.llm as shared_llm
+    import engine.shared.llm as shared_llm
 
     monkeypatch.setattr(shared_llm, "aembedding", fake_aembedding)
 
@@ -355,8 +355,8 @@ def test_gateway_embedding_error_translation_covers_taxonomy() -> None:
     """LLMError → embedding error taxonomy mapping. Mirrors the direct-SDK
     translations so the recursive half-split treats both transports the same.
     """
-    from shared.embeddings import _translate_gateway_embedding_error
-    from shared.llm import LLMError
+    from engine.shared.embeddings import _translate_gateway_embedding_error
+    from engine.shared.llm import LLMError
 
     # status-code-driven
     assert isinstance(

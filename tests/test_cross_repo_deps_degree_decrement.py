@@ -17,7 +17,7 @@ from __future__ import annotations
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parent.parent / (
-    "services/ingestion/code_graph/cross_repo_deps.py"
+    "kb/code_graph/cross_repo_deps.py"
 )
 
 

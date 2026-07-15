@@ -29,10 +29,10 @@ from typing import Any
 import httpx
 import pytest
 
-from services.ingestion.polling import slack as slack_poller_mod
-from services.ingestion.polling.slack import SlackPoller
-from shared.constants import SourceSystem
-from shared.models import IntegrationToken
+from engine.shared.constants import SourceSystem
+from engine.shared.models import IntegrationToken
+from kb.polling import slack as slack_poller_mod
+from kb.polling.slack import SlackPoller
 
 # Asyncio mode is "auto" in pyproject; explicit decorators are still OK
 # and make the test surface obvious to readers.

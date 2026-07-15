@@ -18,7 +18,7 @@ import os
 import asyncpg
 import pytest
 
-from shared.db import raw_conn, with_tenant
+from engine.shared.db import raw_conn, with_tenant
 
 
 def _vec_literal(dim: int = 3072, fill: float = 0.001) -> str:

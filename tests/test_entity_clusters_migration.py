@@ -24,7 +24,7 @@ import uuid
 import asyncpg
 import pytest
 
-from shared.db import raw_conn, with_tenant
+from engine.shared.db import raw_conn, with_tenant
 
 
 async def _skip_if_superuser(conn: asyncpg.Connection) -> None:

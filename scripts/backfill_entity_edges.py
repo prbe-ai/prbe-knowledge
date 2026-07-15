@@ -44,10 +44,10 @@ import asyncio
 import sys
 from dataclasses import dataclass
 
-from shared.config import get_settings
-from shared.constants import EdgeType, NodeLabel, SourceSystem
-from shared.db import close_pool, init_pool, raw_conn, with_tenant
-from shared.logging import configure_logging, get_logger
+from engine.shared.config import get_settings
+from engine.shared.constants import EdgeType, NodeLabel, SourceSystem
+from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
+from engine.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
 

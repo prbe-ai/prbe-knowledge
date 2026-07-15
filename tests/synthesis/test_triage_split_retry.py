@@ -33,15 +33,15 @@ from unittest.mock import AsyncMock
 import orjson
 import pytest
 
-from services.synthesis.models import TriageInput, TriageOutput
-from services.synthesis.triage import (
+from engine.shared.llm import LLMError
+from kb.synthesis.models import TriageInput, TriageOutput
+from kb.synthesis.triage import (
     OVERSIZED_AT_CALL_TIME_REASON,
     TRIAGE_FINAL_MILE_SYNTHESIS_REASON,
     TRIAGE_RECURSION_FAILED_REASON,
     call_triage_with_split_retry,
     is_anthropic_oversize_error,
 )
-from shared.llm import LLMError
 
 NOW = datetime(2026, 5, 5, tzinfo=UTC)
 
@@ -212,7 +212,7 @@ def _patch_acompletion(monkeypatch, responses: list[object]) -> AsyncMock:
         return item
 
     fake = AsyncMock(side_effect=_create)
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     return fake
 
 
@@ -227,7 +227,7 @@ def _patch_shared_acompletion(monkeypatch, responses: list[object]) -> AsyncMock
         return item
 
     fake = AsyncMock(side_effect=_create)
-    monkeypatch.setattr("shared.llm.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm.acompletion", fake)
     return fake
 
 
@@ -238,7 +238,7 @@ def _force_anthropic_triage_for_split_retry(monkeypatch) -> None:
     The production default is Gemini now, so pin Haiku for the legacy
     split-retry cases and override explicitly in Gemini-specific tests.
     """
-    monkeypatch.setattr("services.synthesis.providers.WIKI_TRIAGE_MODEL", "haiku")
+    monkeypatch.setattr("kb.synthesis.providers.WIKI_TRIAGE_MODEL", "haiku")
 
 
 # ---------------------------------------------------------------------------
@@ -550,8 +550,8 @@ async def test_dict_type_pydantic_error_triggers_split(monkeypatch) -> None:
 def test_parse_overflow_matches_string_too_long_type_tag() -> None:
     """The literal `type=string_too_long` tag in a Pydantic v2 error
     message is recognized as overflow-shaped."""
-    from services.synthesis.providers import TriageParseError
-    from services.synthesis.triage import _is_parse_overflow_error
+    from kb.synthesis.providers import TriageParseError
+    from kb.synthesis.triage import _is_parse_overflow_error
 
     msg = (
         "triage tool input failed validation: 1 validation error for "
@@ -568,8 +568,8 @@ def test_parse_overflow_matches_string_should_have_at_most_phrasing() -> None:
     """Match the human-readable phrasing too — Pydantic occasionally
     surfaces the constraint message without the `type=` tag depending on
     surrounding context."""
-    from services.synthesis.providers import TriageParseError
-    from services.synthesis.triage import _is_parse_overflow_error
+    from kb.synthesis.providers import TriageParseError
+    from kb.synthesis.triage import _is_parse_overflow_error
 
     err = TriageParseError(
         "validation failed: String should have at most 240 characters"
@@ -579,8 +579,8 @@ def test_parse_overflow_matches_string_should_have_at_most_phrasing() -> None:
 
 def test_parse_overflow_matches_gemini_json_decode_error() -> None:
     """Malformed Gemini JSON should trigger split-retry, not DLQ."""
-    from services.synthesis.providers import TriageParseError
-    from services.synthesis.triage import _is_parse_overflow_error
+    from kb.synthesis.providers import TriageParseError
+    from kb.synthesis.triage import _is_parse_overflow_error
 
     err = TriageParseError(
         "gemini triage call failed: gemini response was not JSON: "
@@ -591,8 +591,8 @@ def test_parse_overflow_matches_gemini_json_decode_error() -> None:
 
 def test_parse_overflow_matches_gemini_timeout() -> None:
     """A stalled Gemini structured-output call should split-retry."""
-    from services.synthesis.providers import TriageParseError
-    from services.synthesis.triage import _is_parse_overflow_error
+    from kb.synthesis.providers import TriageParseError
+    from kb.synthesis.triage import _is_parse_overflow_error
 
     err = TriageParseError(
         "gemini triage call failed: gemini call timed out after 120s"
@@ -604,8 +604,8 @@ def test_parse_overflow_skips_unrelated_parse_error() -> None:
     """Sanity: an unrelated TriageParseError (e.g. wrong tool name) MUST
     NOT be classified as overflow-shaped — those errors should propagate
     instead of triggering a wasteful split-retry."""
-    from services.synthesis.providers import TriageParseError
-    from services.synthesis.triage import _is_parse_overflow_error
+    from kb.synthesis.providers import TriageParseError
+    from kb.synthesis.triage import _is_parse_overflow_error
 
     err = TriageParseError("response had unexpected tool name 'foo'")
     assert _is_parse_overflow_error(err) is False
@@ -620,7 +620,7 @@ async def test_gemini_malformed_json_triggers_split_retry(monkeypatch) -> None:
     the whole customer.
     """
     monkeypatch.setattr(
-        "services.synthesis.providers.WIKI_TRIAGE_MODEL",
+        "kb.synthesis.providers.WIKI_TRIAGE_MODEL",
         "gemini-3.5-flash",
     )
     events = [_ev(i) for i in range(4)]
@@ -643,7 +643,7 @@ async def test_gemini_malformed_json_triggers_split_retry(monkeypatch) -> None:
 async def test_gemini_timeout_triggers_split_retry(monkeypatch) -> None:
     """A timed-out Gemini full batch should split instead of DLQ."""
     monkeypatch.setattr(
-        "services.synthesis.providers.WIKI_TRIAGE_MODEL",
+        "kb.synthesis.providers.WIKI_TRIAGE_MODEL",
         "gemini-3.5-flash",
     )
     events = [_ev(i) for i in range(4)]
@@ -748,9 +748,9 @@ async def test_final_mile_guard_fires_when_recurse_returns_wrong_keys(
     from the recurse may still be in the merged output (the worker
     filters by input qid downstream).
     """
-    from services.synthesis import triage as triage_module
-    from services.synthesis.models import TriageOutput as TO
-    from services.synthesis.models import TriageVerdict as TV
+    from kb.synthesis import triage as triage_module
+    from kb.synthesis.models import TriageOutput as TO
+    from kb.synthesis.models import TriageVerdict as TV
 
     events = [_ev(i) for i in range(3)]
     # Parent call_triage returns partial: verdicts for 0,1; missing 2.

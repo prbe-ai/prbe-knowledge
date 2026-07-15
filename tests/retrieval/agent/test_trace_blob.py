@@ -16,19 +16,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.retrieval.agent.loop import LoopState
-from services.retrieval.agent.models import (
+from engine.retrieval.agent.loop import LoopState
+from engine.retrieval.agent.models import (
     GatheredChunk,
     GathererNotes,
     GathererOutput,
 )
-from services.retrieval.agent.trace_blob import (
+from engine.retrieval.agent.trace_blob import (
     TRACE_BLOB_SCHEMA_VERSION,
     build_trace_blob,
     compute_blob_key,
     persist_trace_blob_to_r2,
 )
-from shared.exceptions import StorageUnavailable
+from engine.shared.exceptions import StorageUnavailable
 
 # ============================================================
 # Fixtures
@@ -273,7 +273,7 @@ class _FakeStore:
 async def test_persist_trace_blob_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeStore()
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_blob.get_store", lambda: fake
+        "engine.retrieval.agent.trace_blob.get_store", lambda: fake
     )
     payload = {"schema_version": 1, "trace_id": "t", "messages": [{"a": "b"}]}
     result = await persist_trace_blob_to_r2(
@@ -298,7 +298,7 @@ async def test_persist_trace_blob_swallows_storage_unavailable(
     fake = _FakeStore()
     fake.put = AsyncMock(side_effect=StorageUnavailable("R2 down"))  # type: ignore[assignment]
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_blob.get_store", lambda: fake
+        "engine.retrieval.agent.trace_blob.get_store", lambda: fake
     )
     result = await persist_trace_blob_to_r2("cust-1", "key", {"a": 1})
     assert result is None
@@ -314,7 +314,7 @@ async def test_persist_trace_blob_swallows_arbitrary_exception(
     fake = _FakeStore()
     fake.put = AsyncMock(side_effect=RuntimeError("unexpected"))  # type: ignore[assignment]
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_blob.get_store", lambda: fake
+        "engine.retrieval.agent.trace_blob.get_store", lambda: fake
     )
     result = await persist_trace_blob_to_r2("cust-1", "key", {"a": 1})
     assert result is None
@@ -330,7 +330,7 @@ async def test_persist_trace_blob_bucket_lookup_failure(
         side_effect=StorageUnavailable("no customers row")
     )
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_blob.get_store", lambda: fake
+        "engine.retrieval.agent.trace_blob.get_store", lambda: fake
     )
     result = await persist_trace_blob_to_r2("cust-1", "key", {"a": 1})
     assert result is None

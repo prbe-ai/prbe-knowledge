@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 import orjson
 import pytest
 
-from shared.claude_code_extraction import (
+from engine.shared.claude_code_extraction import (
     QA,
     CodeChange,
     Decision,
@@ -78,7 +78,7 @@ async def test_extract_units_dispatches_via_litellm_and_parses_tool_call(
         ],
     }
     fake = AsyncMock(return_value=_litellm_tool_response("emit_units", fake_tool_input))
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
 
     bundle = await extract_units_from_session(
         session_id="s1",
@@ -105,7 +105,7 @@ async def test_extract_units_truncates_oversized_event_list(monkeypatch) -> None
     """Defensive guard: events lists larger than _MAX_EVENTS are truncated to
     the most recent slice before being sent to the LLM. Prevents context
     overflow from blowing up the worker."""
-    from shared import claude_code_extraction as ext_mod
+    from engine.shared import claude_code_extraction as ext_mod
 
     empty_payload = {"qa": [], "code_change": [], "decision": [], "file_ref": []}
     captured: dict = {}
@@ -114,7 +114,7 @@ async def test_extract_units_truncates_oversized_event_list(monkeypatch) -> None
         captured["messages"] = kwargs["messages"]
         return _litellm_tool_response("emit_units", empty_payload)
 
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake_acompletion)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
 
     huge_events = [{"line_no": i, "raw": {}} for i in range(ext_mod._MAX_EVENTS + 500)]
     await ext_mod.extract_units_from_session(

@@ -22,7 +22,7 @@ These tests pin:
 
 from __future__ import annotations
 
-from services.synthesis.models import TriageOutput, TriageVerdict
+from kb.synthesis.models import TriageOutput, TriageVerdict
 
 # ---------------------------------------------------------------------------
 # TriageVerdict.reason — direct construction

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.retrieval.grounding import (
+from engine.retrieval.grounding import (
     GroundingBundle,
     GroundingCandidate,
     _detect_bare_ids,
@@ -147,7 +147,7 @@ def test_grounding_candidate_roundtrip():
 
 # ---- Integration tests --------------------------------------------------
 
-from services.retrieval.grounding import (  # noqa: E402
+from engine.retrieval.grounding import (  # noqa: E402
     _connected_sources,
     _fuzzy_match_entities,
     _lookup_bare_id_matches,
@@ -232,7 +232,7 @@ async def test_build_bundle_partial_failure_returns_other_fields(seeded_customer
     async def boom(*_args, **_kwargs):
         raise RuntimeError("simulated graph_nodes failure")
 
-    monkeypatch.setattr("services.retrieval.grounding._fuzzy_match_entities", boom)
+    monkeypatch.setattr("engine.retrieval.grounding._fuzzy_match_entities", boom)
     bundle = await build_bundle(seeded_customer.customer_id, "auth ABC-123")
     assert bundle.candidates == []
     assert any(m.canonical_id == "ABC-123" for m in bundle.bare_id_matches)
@@ -244,9 +244,9 @@ async def test_build_bundle_total_failure_returns_empty(seeded_customer, monkeyp
     async def boom(*_args, **_kwargs):
         raise RuntimeError("simulated")
 
-    monkeypatch.setattr("services.retrieval.grounding._fuzzy_match_entities", boom)
-    monkeypatch.setattr("services.retrieval.grounding._lookup_bare_id_matches", boom)
-    monkeypatch.setattr("services.retrieval.grounding._connected_sources", boom)
+    monkeypatch.setattr("engine.retrieval.grounding._fuzzy_match_entities", boom)
+    monkeypatch.setattr("engine.retrieval.grounding._lookup_bare_id_matches", boom)
+    monkeypatch.setattr("engine.retrieval.grounding._connected_sources", boom)
 
     bundle = await build_bundle(seeded_customer.customer_id, "auth")
     assert bundle.candidates == []
@@ -284,7 +284,7 @@ async def test_build_bundle_handles_operator_chars_in_query(seeded_customer):
 
 # ---- Doc-title channel (channel 4) --------------------------------------
 
-from services.retrieval.grounding import (  # noqa: E402
+from engine.retrieval.grounding import (  # noqa: E402
     _doc_id_to_entity_type,
     _fuzzy_match_document_titles,
 )

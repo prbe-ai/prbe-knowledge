@@ -11,8 +11,8 @@ import uuid
 
 import pytest
 
-from services.retrieval.helpers import expand_to_cluster_members
-from shared.db import raw_conn, with_tenant
+from engine.retrieval.helpers import expand_to_cluster_members
+from engine.shared.db import raw_conn, with_tenant
 
 pytestmark = pytest.mark.asyncio
 

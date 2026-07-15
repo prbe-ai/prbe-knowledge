@@ -1,8 +1,8 @@
 """Unit tests for per-source-system weighting in fuse().
 
 Two knobs covered:
-  - SOURCE_SCORE_MULTIPLIERS — post-RRF score multiplier per source.
-  - SOURCE_HALF_LIFE_DAYS — per-source recency half-life override.
+  - per-source post-RRF score multipliers (shared.source_registry).
+  - per-source recency half-life overrides (shared.source_registry).
 
 Multiplier applies first, then recency decay. Resolution order for
 half-life: per-source override > caller global > universal baseline
@@ -18,8 +18,8 @@ import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from services.retrieval.fusion import fuse
-from shared.constants import DEFAULT_RECENCY_HALF_LIFE_DAYS, SourceSystem
+from engine.retrieval.fusion import fuse
+from engine.shared.constants import DEFAULT_RECENCY_HALF_LIFE_DAYS, SourceSystem
 
 _NOW = datetime(2026, 4, 28, tzinfo=UTC)
 
@@ -94,7 +94,7 @@ def test_non_claude_code_source_uses_baseline_when_global_none() -> None:
 
 
 def test_per_source_override_beats_explicit_caller_global() -> None:
-    """Precedence: SOURCE_HALF_LIFE_DAYS override wins over a non-None caller
+    """Precedence: registered per-source half-life wins over a non-None caller
     global. A 7-day-old CC hit decays at the 7d override, not the caller's 365d."""
     cc = FakeHit(
         chunk_id="cc",

@@ -11,21 +11,21 @@ import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
 
-from services.mcp import server
-from services.mcp.clients.knowledge import (
+from engine.mcp import server
+from engine.mcp.clients.knowledge import (
     KnowledgeClient,
     KnowledgeError,
     _build_http_timeout,
 )
-from services.mcp.config import Settings
-from services.mcp.services import response_budget
-from services.mcp.services.response_budget import (
+from engine.mcp.config import Settings
+from engine.mcp.services import response_budget
+from engine.mcp.services.response_budget import (
     MAX_RESPONSE_BYTES_HARD,
     fit_response_to_budget,
     serialize_tool_response,
 )
-from services.retrieval.synthesis import SYNTHESIS_TIMEOUT_SECONDS
-from shared.constants import (
+from engine.retrieval.synthesis import SYNTHESIS_TIMEOUT_SECONDS
+from engine.shared.constants import (
     SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS,
     SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
     SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,

@@ -28,10 +28,10 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from shared.config import Settings, get_settings
-from shared.constants import SourceSystem
-from shared.db import close_pool, init_pool, raw_conn
-from shared.models import QueryChunk, QueryResponse
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import SourceSystem
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.models import QueryChunk, QueryResponse
 
 INTERNAL_KEY = "test-internal-knowledge-key"
 
@@ -82,7 +82,7 @@ def _stub_pipeline(monkeypatch, *, chunk_count: int = 2) -> None:
     Document in this stub has a single QueryChunk so the trace-row size
     test still gets a representative payload.
     """
-    from shared.models import QueryDocumentResult
+    from engine.shared.models import QueryDocumentResult
 
     async def fake_run_retrieval(req, customer_id, request=None):
         now = datetime.now(UTC)
@@ -119,7 +119,7 @@ def _stub_pipeline(monkeypatch, *, chunk_count: int = 2) -> None:
             trace_id="trace-test",
         )
 
-    import services.retrieval.main as main_mod
+    import engine.retrieval.main as main_mod
 
     monkeypatch.setattr(main_mod, "run_retrieval", fake_run_retrieval)
 
@@ -131,7 +131,7 @@ async def _post(
     body: dict[str, Any] | None = None,
     raise_app_exceptions: bool = False,
 ) -> httpx.Response:
-    from services.retrieval.main import app
+    from engine.retrieval.main import app
 
     await close_pool()
     transport = ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions)
@@ -148,7 +148,7 @@ async def _get(
     path: str,
     headers: dict[str, str] | None = None,
 ) -> httpx.Response:
-    from services.retrieval.main import app
+    from engine.retrieval.main import app
 
     await close_pool()
     transport = ASGITransport(app=app)
@@ -191,11 +191,11 @@ async def test_trace_builder_copies_search_agent_summary_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Migration-0078 state reaches QueryTrace before the DB writer runs."""
-    from services.retrieval.middleware import _build_and_write_trace
+    from engine.retrieval.middleware import _build_and_write_trace
 
     write_mock = AsyncMock()
     monkeypatch.setattr(
-        "services.retrieval.middleware.write_query_trace",
+        "engine.retrieval.middleware.write_query_trace",
         write_mock,
     )
     request = SimpleNamespace(state=SimpleNamespace(
@@ -286,7 +286,7 @@ async def test_middleware_query_trace_write_failure_does_not_affect_response(
     async def boom(_trace: Any) -> None:
         raise RuntimeError("simulated trace write failure")
 
-    monkeypatch.setattr("services.retrieval.middleware.write_query_trace", boom)
+    monkeypatch.setattr("engine.retrieval.middleware.write_query_trace", boom)
 
     resp = await _post(
         headers={"Authorization": f"Bearer {api_key}", "X-Caller-Kind": "mcp"},
@@ -319,7 +319,7 @@ async def test_middleware_handler_raises_emits_error_trace(
     async def boom_pipeline(req, customer_id, request=None):
         raise RuntimeError("retrieval blew up")
 
-    import services.retrieval.main as main_mod
+    import engine.retrieval.main as main_mod
 
     monkeypatch.setattr(main_mod, "run_retrieval", boom_pipeline)
 
@@ -364,11 +364,11 @@ async def test_middleware_query_stream_captures_response(
     from datetime import UTC
     from datetime import datetime as _dt
 
-    from services.retrieval.grounding import GroundingBundle
-    from services.retrieval.pipeline import ResolvedIntent, RouterPhaseResult
-    from services.retrieval.router import Intent, RouterOutput
-    from services.retrieval.synthesis import StreamDelta, StreamFinal
-    from shared.models import QueryResponse, TemporalSpec
+    from engine.retrieval.grounding import GroundingBundle
+    from engine.retrieval.pipeline import ResolvedIntent, RouterPhaseResult
+    from engine.retrieval.router import Intent, RouterOutput
+    from engine.retrieval.synthesis import StreamDelta, StreamFinal
+    from engine.shared.models import QueryResponse, TemporalSpec
 
     async def _async_return(value):  # type: ignore[no-untyped-def]
         return value
@@ -392,7 +392,7 @@ async def test_middleware_query_stream_captures_response(
         trace_id="trace-stream-1",
         timing={"router_ms": 5.0},
     )
-    from shared.models import QueryDocumentResult
+    from engine.shared.models import QueryDocumentResult
 
     chunk = QueryChunk(
         chunk_id="c0",
@@ -434,7 +434,7 @@ async def test_middleware_query_stream_captures_response(
             model=model,
         )
 
-    import services.retrieval.main as main_mod
+    import engine.retrieval.main as main_mod
 
     monkeypatch.setattr(
         main_mod, "run_router_phase", lambda req, cid, request=None: _async_return(phase)
@@ -501,9 +501,9 @@ def _stub_router_pipeline(monkeypatch) -> None:
     reads request.state exactly as it would in production. /retrieve calls
     run_retrieval — not the phase functions — so we stub that.
     """
-    from services.retrieval.grounding import GroundingBundle, GroundingCandidate
-    from shared.constants import HAIKU_MODEL, SourceSystem
-    from shared.models import QueryDocumentResult, QueryResponse
+    from engine.retrieval.grounding import GroundingBundle, GroundingCandidate
+    from engine.shared.constants import HAIKU_MODEL, SourceSystem
+    from engine.shared.models import QueryDocumentResult, QueryResponse
 
     _bundle = GroundingBundle(
         candidates=[
@@ -550,7 +550,7 @@ def _stub_router_pipeline(monkeypatch) -> None:
 
     async def fake_run_retrieval(req, customer_id, request=None):
         if request is not None:
-            from services.retrieval.pipeline import _bundle_to_jsonable
+            from engine.retrieval.pipeline import _bundle_to_jsonable
             request.state.grounding_bundle = _bundle_to_jsonable(_bundle)
             request.state.router_raw = {"intents": [{"query_text": "hello world", "mode": "search"}]}
             request.state.intents_count = 1
@@ -568,7 +568,7 @@ def _stub_router_pipeline(monkeypatch) -> None:
             ]
         return _rresp
 
-    import services.retrieval.main as main_mod
+    import engine.retrieval.main as main_mod
     monkeypatch.setattr(main_mod, "run_retrieval", fake_run_retrieval)
 
 
@@ -597,7 +597,7 @@ async def test_trace_records_router_intelligence_columns(
     assert trace["intents_count"] == 1
 
     # router_model
-    from shared.constants import HAIKU_MODEL
+    from engine.shared.constants import HAIKU_MODEL
     assert trace["router_model"] == HAIKU_MODEL
 
     # grounding_bundle — should be a non-null JSONB dict
@@ -645,8 +645,8 @@ async def test_trace_records_failure_recovered_on_haiku_failure(
     from datetime import UTC
     from datetime import datetime as _dt
 
-    from shared.constants import HAIKU_MODEL, SourceSystem
-    from shared.models import QueryDocumentResult, QueryResponse
+    from engine.shared.constants import HAIKU_MODEL, SourceSystem
+    from engine.shared.models import QueryDocumentResult, QueryResponse
 
     now = _dt.now(UTC)
     _rresp = QueryResponse(
@@ -694,7 +694,7 @@ async def test_trace_records_failure_recovered_on_haiku_failure(
             ]
         return _rresp
 
-    import services.retrieval.main as main_mod
+    import engine.retrieval.main as main_mod
     monkeypatch.setattr(main_mod, "run_retrieval", fake_run_retrieval)
 
     resp = await _post(
@@ -725,8 +725,8 @@ async def test_trace_records_failure_recovered_on_all_intents_failing(
     from datetime import UTC
     from datetime import datetime as _dt
 
-    from shared.constants import HAIKU_MODEL, SourceSystem
-    from shared.models import QueryDocumentResult, QueryResponse
+    from engine.shared.constants import HAIKU_MODEL, SourceSystem
+    from engine.shared.models import QueryDocumentResult, QueryResponse
 
     now = _dt.now(UTC)
     _rresp = QueryResponse(
@@ -774,7 +774,7 @@ async def test_trace_records_failure_recovered_on_all_intents_failing(
             ]
         return _rresp
 
-    import services.retrieval.main as main_mod
+    import engine.retrieval.main as main_mod
     monkeypatch.setattr(main_mod, "run_retrieval", fake_run_retrieval)
 
     resp = await _post(

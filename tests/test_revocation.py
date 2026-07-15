@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from services.mcp.dependencies import revocation
-from services.mcp.dependencies.jwks import AccessClaims, JwtAuthError
+from engine.mcp.dependencies import revocation
+from engine.mcp.dependencies.jwks import AccessClaims, JwtAuthError
 
 
 def _claims(sid: str | None) -> AccessClaims:

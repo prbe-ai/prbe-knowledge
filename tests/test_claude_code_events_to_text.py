@@ -7,7 +7,7 @@ output shape per event/block type.
 
 from __future__ import annotations
 
-from services.ingestion.handlers.claude_code import (
+from kb.handlers.claude_code import (
     _events_to_text,
     _render_event,
 )

@@ -1,86 +1,12 @@
-"""Trace analyzer CLI: build a JSONL digest of yesterday's traces.
+"""Thin deploy wrapper — canonical module: engine.retrieval.agent.trace_analyzer.
 
-Invocation (from the in-cluster K8s Job, see
-k8s/jobs/nightly-trace-digest.yaml):
-
-    uv run python -m services.retrieval.agent.trace_analyzer \
-        --date 2026-05-17 \
-        --out /tmp/digests.jsonl
-
-The job redirects stdout to a file inside the pod and the workflow
-streams it back with `kubectl logs`. No new R2 bucket is needed; the
-digest is workflow-ephemeral.
-
-One JSONL line per trace. See `digest.summarize_trace` for the shape.
+Kept so `python -m services.retrieval.agent.trace_analyzer` (the nightly
+trace-digest K8s Job) keeps working unchanged.
 """
 
-from __future__ import annotations
-
-import argparse
-import asyncio
-import json
 import sys
-from datetime import date as date_cls
 
-from services.retrieval.agent.trace_analyzer.digest import summarize_trace
-from services.retrieval.agent.trace_analyzer.loader import iter_trace_blobs
-from shared.config import get_settings
-from shared.db import close_pool, init_pool
-
-
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="trace_analyzer")
-    parser.add_argument(
-        "--date",
-        required=True,
-        help="UTC date to digest, e.g. 2026-05-17",
-    )
-    parser.add_argument(
-        "--out",
-        default="-",
-        help="Output JSONL path. '-' (default) writes to stdout.",
-    )
-    return parser.parse_args(argv)
-
-
-async def _run(args: argparse.Namespace) -> int:
-    try:
-        target = date_cls.fromisoformat(args.date)
-    except ValueError as exc:
-        print(f"error: invalid --date: {exc}", file=sys.stderr)
-        return 2
-
-    out_stream = sys.stdout
-    file_handle = None
-    if args.out != "-":
-        # Context manager doesn't fit here because the open is
-        # conditional and the close needs to be skipped for stdout.
-        file_handle = open(args.out, "w", encoding="utf-8")  # noqa: SIM115
-        out_stream = file_handle
-
-    # The CLI runs outside FastAPI's lifespan, so the DB pool isn't
-    # initialized by the app's startup hook. The loader uses raw_conn()
-    # which expects an active pool — init it here, tear down on exit.
-    await init_pool(get_settings())
-    yielded = 0
-    try:
-        async for blob in iter_trace_blobs(target):
-            digest = summarize_trace(blob)
-            out_stream.write(json.dumps(digest, default=str) + "\n")
-            yielded += 1
-    finally:
-        await close_pool()
-        if file_handle is not None:
-            file_handle.close()
-
-    print(f"trace_analyzer: wrote {yielded} digest line(s) for {target}", file=sys.stderr)
-    return 0
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
-    return asyncio.run(_run(args))
-
+from engine.retrieval.agent.trace_analyzer.__main__ import main
 
 if __name__ == "__main__":
     sys.exit(main())

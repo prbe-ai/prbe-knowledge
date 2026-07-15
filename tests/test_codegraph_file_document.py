@@ -12,12 +12,19 @@ from dataclasses import dataclass
 
 import pytest
 
-from services.ingestion.code_graph.pipeline import (
+from engine.shared.constants import (
+    CodeSymbolKind,
+    DocClass,
+    DocType,
+    EdgeType,
+    NodeLabel,
+    SourceSystem,
+)
+from kb.code_graph.pipeline import (
     _build_file_document_with_symbol_chunks,
     extract_files_to_result,
 )
-from services.ingestion.code_graph.types import Symbol
-from shared.constants import CodeSymbolKind, DocClass, DocType, EdgeType, NodeLabel, SourceSystem
+from kb.code_graph.types import Symbol
 
 
 @dataclass
@@ -201,8 +208,8 @@ def test_oversized_symbol_splits_into_multiple_chunks() -> None:
     """
     from datetime import UTC, datetime
 
-    from services.ingestion.chunker import count_tokens
-    from shared.constants import MAX_SYMBOL_CHUNK_TOKENS
+    from engine.ingest.chunker import count_tokens
+    from engine.shared.constants import MAX_SYMBOL_CHUNK_TOKENS
 
     method = (
         "    def {name}(self, x):\n"

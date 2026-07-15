@@ -11,8 +11,8 @@ import uuid
 
 import pytest
 
-from services.retrieval.helpers import resolve_aliases
-from shared.db import raw_conn, with_tenant
+from engine.retrieval.helpers import resolve_aliases
+from engine.shared.db import raw_conn, with_tenant
 
 pytestmark = pytest.mark.asyncio
 

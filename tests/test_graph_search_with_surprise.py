@@ -78,7 +78,7 @@ def _patched_conn(rows: list) -> MagicMock:
 @pytest.mark.asyncio
 async def test_cross_source_hits_rank_above_same_source() -> None:
     """Cross-source edge ranks higher than same-source edge."""
-    import services.retrieval.retrievers.graph as graph_mod
+    import engine.retrieval.retrievers.graph as graph_mod
 
     same_source_row = _make_row(
         chunk_id="same_source",
@@ -98,7 +98,7 @@ async def test_cross_source_hits_rank_above_same_source() -> None:
     )
 
     ctx = _patched_conn([same_source_row, cross_source_row])
-    with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+    with patch("engine.retrieval.retrievers.graph.with_tenant", return_value=ctx):
         hits = await graph_mod.graph_search(
             customer_id="cust-test",
             entities=[("service", "svc-a")],
@@ -121,7 +121,7 @@ async def test_cross_source_hits_rank_above_same_source() -> None:
 @pytest.mark.asyncio
 async def test_all_hits_have_retriever_scores_set() -> None:
     """Every hit carries retriever_scores['surprise'] for telemetry."""
-    import services.retrieval.retrievers.graph as graph_mod
+    import engine.retrieval.retrievers.graph as graph_mod
 
     rows = [
         _make_row(chunk_id="c1", confidence="INFERRED"),
@@ -129,7 +129,7 @@ async def test_all_hits_have_retriever_scores_set() -> None:
     ]
 
     ctx = _patched_conn(rows)
-    with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+    with patch("engine.retrieval.retrievers.graph.with_tenant", return_value=ctx):
         hits = await graph_mod.graph_search(
             customer_id="cust-test",
             entities=[("service", "svc-a")],
@@ -147,7 +147,7 @@ async def test_all_hits_have_retriever_scores_set() -> None:
 @pytest.mark.asyncio
 async def test_tenant_isolation_retriever_scores_use_row_data_only() -> None:
     """Scores are computed purely from per-row data; no shared global state."""
-    import services.retrieval.retrievers.graph as graph_mod
+    import engine.retrieval.retrievers.graph as graph_mod
 
     # Tenant A: cross-source, cross-community.
     tenant_a_row = _make_row(
@@ -173,7 +173,7 @@ async def test_tenant_isolation_retriever_scores_use_row_data_only() -> None:
         ("cust-b", tenant_b_row, False),
     ]:
         ctx = _patched_conn([row])
-        with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+        with patch("engine.retrieval.retrievers.graph.with_tenant", return_value=ctx):
             hits = await graph_mod.graph_search(
                 customer_id=customer_id,
                 entities=[("service", "svc-a")],
@@ -192,7 +192,7 @@ async def test_tenant_isolation_retriever_scores_use_row_data_only() -> None:
 @pytest.mark.asyncio
 async def test_cross_community_adds_bonus_on_top_of_cross_source() -> None:
     """Cross-community adds 1.4x on top of cross-source bonus."""
-    import services.retrieval.retrievers.graph as graph_mod
+    import engine.retrieval.retrievers.graph as graph_mod
 
     no_community_row = _make_row(
         chunk_id="same_comm",
@@ -212,7 +212,7 @@ async def test_cross_community_adds_bonus_on_top_of_cross_source() -> None:
     )
 
     ctx = _patched_conn([no_community_row, cross_community_row])
-    with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+    with patch("engine.retrieval.retrievers.graph.with_tenant", return_value=ctx):
         hits = await graph_mod.graph_search(
             customer_id="cust-test",
             entities=[("service", "svc-a")],

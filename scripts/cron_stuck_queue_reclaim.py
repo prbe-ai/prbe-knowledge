@@ -12,10 +12,10 @@ from __future__ import annotations
 
 import asyncio
 
-from shared.constants import QUEUE_RECLAIM_THRESHOLD_SECONDS, QueueStatus
-from shared.db import close_pool, init_pool, raw_conn
-from shared.logging import configure_logging, get_logger
-from shared.metrics import counter
+from engine.shared.constants import QUEUE_RECLAIM_THRESHOLD_SECONDS, QueueStatus
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.logging import configure_logging, get_logger
+from engine.shared.metrics import counter
 
 log = get_logger(__name__)
 

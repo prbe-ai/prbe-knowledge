@@ -1,15 +1,15 @@
 import pytest
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.claude_code import ClaudeCodeConnector
-from shared.constants import (
+from engine.ingest.handlers.base import make_default_context
+from engine.shared.constants import (
     DocClass,
     DocType,
     EdgeType,
     PrincipalType,
     SourceSystem,
 )
-from shared.models import WebhookEvent
+from engine.shared.models import WebhookEvent
+from kb.handlers.claude_code import ClaudeCodeConnector
 
 
 def _event(customer_id: str = "cust-1", session_id: str = "s-1") -> WebhookEvent:
@@ -67,7 +67,7 @@ async def test_normalize_complete_emits_session_plus_units(monkeypatch) -> None:
     and emits one Document per returned unit, each with parent_doc_id pointing at
     the session doc.
     """
-    import services.ingestion.handlers.claude_code as cc_mod
+    import kb.handlers.claude_code as cc_mod
     ext_mod = cc_mod._ext
 
     bundle = ext_mod.UnitBundle(
@@ -81,7 +81,7 @@ async def test_normalize_complete_emits_session_plus_units(monkeypatch) -> None:
         return bundle
 
     # The connector calls await _ext.extract_units_from_session(...) where _ext
-    # is `import shared.claude_code_extraction as _ext`. Patch the function on the
+    # is `import engine.shared.claude_code_extraction as _ext`. Patch the function on the
     # aliased module directly so future import-style refactors don't silently
     # break the test.
     monkeypatch.setattr(cc_mod._ext, "extract_units_from_session", fake_extract)
@@ -117,7 +117,7 @@ async def test_normalize_complete_emits_session_plus_units(monkeypatch) -> None:
 async def test_normalize_raises_on_missing_employee_id() -> None:
     """employee_id is required to populate Document.author_id and the ACL.
     Missing field must raise InvalidWebhookPayload, not silently default."""
-    from shared.exceptions import InvalidWebhookPayload
+    from engine.shared.exceptions import InvalidWebhookPayload
 
     c = ClaudeCodeConnector(make_default_context())
     ev = _event()
@@ -308,7 +308,7 @@ _HOSTNAME = "Richards-Macbook-Pro"
 
 
 def _session_doc(result):
-    from shared.constants import DocType
+    from engine.shared.constants import DocType
 
     docs = [d for d in result.documents if d.doc_type == DocType.CLAUDE_CODE_SESSION]
     assert len(docs) == 1
@@ -357,7 +357,7 @@ def test_format_session_title_all_combinations(
 ) -> None:
     """Direct unit test on the title formatter — exercises every presence
     combination so future changes to the format are explicit."""
-    from services.ingestion.handlers.claude_code import _format_session_title
+    from kb.handlers.claude_code import _format_session_title
 
     assert (
         _format_session_title("s-1", name, email, hostname) == expected_title
@@ -365,7 +365,7 @@ def test_format_session_title_all_combinations(
 
 
 def test_format_session_title_uses_kind_for_unit_docs() -> None:
-    from services.ingestion.handlers.claude_code import _format_session_title
+    from kb.handlers.claude_code import _format_session_title
 
     title = _format_session_title("abcd1234", "Ada", None, None, kind="decision")
     assert title == "Ada's decision abcd1234"
@@ -481,7 +481,7 @@ async def test_normalize_unit_doc_title_uses_identity(monkeypatch) -> None:
     """Unit docs (qa/code_change/decision/file_ref) reuse the same
     identity-bearing title shape, with their unit_kind in place of the
     session prefix."""
-    import services.ingestion.handlers.claude_code as cc_mod
+    import kb.handlers.claude_code as cc_mod
 
     ext_mod = cc_mod._ext
     bundle = ext_mod.UnitBundle(
@@ -519,7 +519,7 @@ async def test_normalize_unit_doc_title_uses_identity(monkeypatch) -> None:
         },
     )
 
-    from shared.constants import DocType
+    from engine.shared.constants import DocType
 
     decisions = [d for d in result.documents if d.doc_type == DocType.CLAUDE_CODE_DECISION]
     assert len(decisions) == 1

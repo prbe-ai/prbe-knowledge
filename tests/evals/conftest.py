@@ -37,7 +37,7 @@ def _restore_anthropic_key_from_env_file() -> None:
                         # with the empty key — invalidate so the next call
                         # to get_settings() picks up the restored value.
                         try:
-                            from shared.config import get_settings
+                            from engine.shared.config import get_settings
                             get_settings.cache_clear()  # type: ignore[attr-defined]
                         except Exception:
                             pass
@@ -46,7 +46,7 @@ def _restore_anthropic_key_from_env_file() -> None:
 
 _restore_anthropic_key_from_env_file()
 
-import shared.db as db_module  # noqa: E402
+import engine.shared.db as db_module  # noqa: E402
 
 
 @dataclass

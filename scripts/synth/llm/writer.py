@@ -14,10 +14,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from engine.shared.logging import get_logger
 from scripts.synth.archetypes.base import DocSpec, ScenarioSpec, Source
 from scripts.synth.llm.base import LlmClientProtocol, LlmRequest
 from scripts.synth.output.base import SynthDoc
-from shared.logging import get_logger
 
 if TYPE_CHECKING:
     from scripts.synth.company_context import CompanyContext

@@ -1,12 +1,12 @@
 """Tests for PagerDuty + incident.io SourceSystem and DocType constants."""
 
-from shared.constants import (
+import kb.handlers  # noqa: F401  (registers source profiles)
+from engine.shared.constants import (
     SOURCE_DISPLAY_NAMES,
-    SOURCE_HALF_LIFE_DAYS,
-    SOURCE_INGESTION_PRIORITY,
     DocType,
     SourceSystem,
 )
+from engine.shared.source_registry import get_source_profile
 
 
 def test_pagerduty_source_system_value() -> None:
@@ -31,13 +31,13 @@ def test_new_sources_in_display_names() -> None:
 
 
 def test_new_sources_in_ingestion_priority() -> None:
-    assert SOURCE_INGESTION_PRIORITY[SourceSystem.PAGERDUTY] == 100
-    assert SOURCE_INGESTION_PRIORITY[SourceSystem.INCIDENT_IO] == 100
+    assert get_source_profile(SourceSystem.PAGERDUTY.value).ingestion_priority == 100
+    assert get_source_profile(SourceSystem.INCIDENT_IO.value).ingestion_priority == 100
 
 
 def test_pagerduty_half_life_days() -> None:
-    assert SOURCE_HALF_LIFE_DAYS[SourceSystem.PAGERDUTY] == 200.0
+    assert get_source_profile(SourceSystem.PAGERDUTY.value).half_life_days == 200.0
 
 
 def test_incident_io_half_life_days() -> None:
-    assert SOURCE_HALF_LIFE_DAYS[SourceSystem.INCIDENT_IO] == 200.0
+    assert get_source_profile(SourceSystem.INCIDENT_IO.value).half_life_days == 200.0

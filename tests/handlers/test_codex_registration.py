@@ -4,14 +4,14 @@ even though the doc shape and unit extraction are shared via subclassing."""
 
 import pytest
 
-from services.ingestion.handlers import registry
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.claude_code import (
+from engine.ingest.handlers import registry
+from engine.ingest.handlers.base import make_default_context
+from engine.shared.constants import DocType, SourceSystem
+from engine.shared.models import WebhookEvent
+from kb.handlers.claude_code import (
     ClaudeCodeConnector,
     CodexConnector,
 )
-from shared.constants import DocType, SourceSystem
-from shared.models import WebhookEvent
 
 
 def test_codex_connector_is_registered() -> None:

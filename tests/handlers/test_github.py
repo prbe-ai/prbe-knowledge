@@ -18,15 +18,10 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.github import (
-    GitHubConnector,
-    _parse_co_authors,
-    parse_codeowners,
-)
-from services.ingestion.handlers.registry import build_connector
-from shared.config import Settings
-from shared.constants import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.config import Settings
+from engine.shared.constants import (
     GITHUB_INSTALLATION_SCOPE_PREFIX,
     DocType,
     EdgeType,
@@ -35,8 +30,13 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
-from shared.models import IntegrationToken, WebhookEvent
+from engine.shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
+from engine.shared.models import IntegrationToken, WebhookEvent
+from kb.handlers.github import (
+    GitHubConnector,
+    _parse_co_authors,
+    parse_codeowners,
+)
 
 FIXTURES = Path(__file__).resolve().parents[1].parent / "fixtures" / "github"
 
@@ -823,11 +823,11 @@ def _make_bridge_mocks(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
     backfill = AsyncMock(return_value=True)
     disconnect = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        "services.ingestion.handlers.github.code_graph_bridge.enqueue_initial_backfill",
+        "kb.handlers.github.code_graph_bridge.enqueue_initial_backfill",
         backfill,
     )
     monkeypatch.setattr(
-        "services.ingestion.handlers.github.code_graph_bridge.enqueue_disconnect",
+        "kb.handlers.github.code_graph_bridge.enqueue_disconnect",
         disconnect,
     )
     return backfill, disconnect
@@ -1021,11 +1021,11 @@ async def test_normalize_repository_renamed_backfills_before_disconnect(
         return True
 
     monkeypatch.setattr(
-        "services.ingestion.handlers.github.code_graph_bridge.enqueue_initial_backfill",
+        "kb.handlers.github.code_graph_bridge.enqueue_initial_backfill",
         AsyncMock(side_effect=_track_backfill),
     )
     monkeypatch.setattr(
-        "services.ingestion.handlers.github.code_graph_bridge.enqueue_disconnect",
+        "kb.handlers.github.code_graph_bridge.enqueue_disconnect",
         AsyncMock(side_effect=_track_disconnect),
     )
 

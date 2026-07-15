@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from services.ingestion.code_graph.qualifier import promote_single_match
-from services.ingestion.code_graph.types import CodeEdge, ExtractResult, Symbol
-from shared.constants import EdgeType, NodeLabel
+from engine.shared.constants import EdgeType, NodeLabel
+from kb.code_graph.qualifier import promote_single_match
+from kb.code_graph.types import CodeEdge, ExtractResult, Symbol
 
 
 def _sym(qname: str, kind: NodeLabel = NodeLabel.CODE_SYMBOL) -> Symbol:

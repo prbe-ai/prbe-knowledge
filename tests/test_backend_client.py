@@ -15,9 +15,9 @@ import pytest
 import respx
 from pydantic import SecretStr
 
-from shared.backend_client import fetch_github_installation_token
-from shared.config import Settings, get_settings
-from shared.exceptions import GitHubAuthError
+from engine.shared.backend_client import fetch_github_installation_token
+from engine.shared.config import Settings, get_settings
+from engine.shared.exceptions import GitHubAuthError
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +32,7 @@ def _patch_settings(monkeypatch):
             internal_backend_api_key=SecretStr("test-internal-key"),
         )
 
-    monkeypatch.setattr("shared.backend_client.get_settings", _settings)
+    monkeypatch.setattr("engine.shared.backend_client.get_settings", _settings)
     yield
     get_settings.cache_clear()
 
@@ -157,7 +157,7 @@ async def test_missing_base_url_raises_before_http_call(monkeypatch) -> None:
             internal_backend_api_key=SecretStr("test-internal-key"),
         )
 
-    monkeypatch.setattr("shared.backend_client.get_settings", _settings)
+    monkeypatch.setattr("engine.shared.backend_client.get_settings", _settings)
 
     with respx.mock(assert_all_called=False) as router:
         # No request should be issued at all.
@@ -180,7 +180,7 @@ async def test_missing_api_key_raises_before_http_call(monkeypatch) -> None:
             internal_backend_api_key=SecretStr(""),
         )
 
-    monkeypatch.setattr("shared.backend_client.get_settings", _settings)
+    monkeypatch.setattr("engine.shared.backend_client.get_settings", _settings)
 
     with respx.mock(assert_all_called=False) as router:
         route = router.post(

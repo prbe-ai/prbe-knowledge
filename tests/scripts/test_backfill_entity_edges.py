@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+from engine.shared.constants import EdgeType, NodeLabel, SourceSystem
 from scripts.backfill_entity_edges import _edges_for_doc
-from shared.constants import EdgeType, NodeLabel, SourceSystem
 
 
 def test_github_commit_yields_doc_to_repo() -> None:

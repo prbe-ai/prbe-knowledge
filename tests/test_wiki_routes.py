@@ -20,9 +20,9 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
-from services.ingestion.main import app
-from shared.config import Settings, get_settings
-from shared.db import close_pool, init_pool, raw_conn
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn
+from kb.ingestion_app import app
 
 CUSTOMER = "wiki-test-cust"
 
@@ -377,7 +377,7 @@ def _stub_bootstrap_registry(monkeypatch) -> None:
     sources during tests. Lane C ships the registry empty, so without
     this any /bootstrap/trigger payload with `sources=[...]` would 400.
     Lane D will register real crawlers; tests can then drop this stub."""
-    from services.ingestion import wiki_routes as _wr
+    from kb import wiki_routes as _wr
 
     monkeypatch.setattr(
         _wr,
@@ -399,8 +399,8 @@ async def test_bootstrap_trigger_fires_pg_notify(
 
     import asyncpg
 
-    from shared.config import get_settings as _get_settings
-    from shared.constants import WIKI_BACKFILL_CHANNEL
+    from engine.shared.config import get_settings as _get_settings
+    from engine.shared.constants import WIKI_BACKFILL_CHANNEL
 
     notifications: list[str] = []
     listen_dsn = _get_settings().database_url
@@ -547,7 +547,7 @@ async def test_bootstrap_trigger_force_proceeds_after_drain_timeout(
     proceeds with wipe + new pending insert.
 
     Drain timeout patched down so the test runs fast."""
-    from services.ingestion import wiki_routes as _wr
+    from kb import wiki_routes as _wr
 
     monkeypatch.setattr(_wr, "BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
 
@@ -600,9 +600,9 @@ async def test_bootstrap_trigger_force_fires_cancel_notify(
 
     import asyncpg
 
-    from services.ingestion import wiki_routes as _wr
-    from shared.config import get_settings as _get_settings
-    from shared.constants import WIKI_BACKFILL_CANCEL_CHANNEL
+    from engine.shared.config import get_settings as _get_settings
+    from engine.shared.constants import WIKI_BACKFILL_CANCEL_CHANNEL
+    from kb import wiki_routes as _wr
 
     monkeypatch.setattr(_wr, "BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
 

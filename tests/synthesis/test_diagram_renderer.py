@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from services.synthesis.diagram_renderer import _build_mermaid_block
-from services.synthesis.index_renderer import _RepoEdge
+from kb.synthesis.diagram_renderer import _build_mermaid_block
+from kb.synthesis.index_renderer import _RepoEdge
 
 
 def test_build_mermaid_block_empty_returns_empty_string() -> None:

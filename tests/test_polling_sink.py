@@ -18,12 +18,12 @@ from typing import Any
 import orjson
 import pytest
 
-from services.ingestion.polling.sink import (
+from engine.shared.constants import SourceSystem
+from kb.polling.sink import (
     PollDocumentSink,
     _resolve_received_at,
     _resolve_source_event_id,
 )
-from shared.constants import SourceSystem
 
 
 class _FakeStore:
@@ -111,7 +111,7 @@ async def test_sink_uploads_envelope_and_enqueues(monkeypatch) -> None:
         )
         return True
 
-    monkeypatch.setattr("services.ingestion.polling.sink._enqueue", _fake_enqueue)
+    monkeypatch.setattr("kb.polling.sink._enqueue", _fake_enqueue)
 
     doc = {
         "source_event_id": "pr:acme/repo:7:opened:2026-05-15T00:00:00Z",
@@ -158,7 +158,7 @@ async def test_sink_skips_dedupe_when_doc_lacks_explicit_id(monkeypatch) -> None
         enqueue_ids.append(source_event_id)
         return True
 
-    monkeypatch.setattr("services.ingestion.polling.sink._enqueue", _fake_enqueue)
+    monkeypatch.setattr("kb.polling.sink._enqueue", _fake_enqueue)
 
     doc = {"type": "Issue", "data": {"id": "lin-1"}}
     await sink("cust-xyz", SourceSystem.LINEAR, [doc])
@@ -192,7 +192,7 @@ async def test_sink_continues_on_r2_failure(monkeypatch) -> None:
         accepted.append(source_event_id)
         return True
 
-    monkeypatch.setattr("services.ingestion.polling.sink._enqueue", _fake_enqueue)
+    monkeypatch.setattr("kb.polling.sink._enqueue", _fake_enqueue)
 
     docs = [
         {"source_event_id": "evt-1", "raw_payload": {"x": 1}},
@@ -217,7 +217,7 @@ async def test_sink_continues_on_enqueue_failure(monkeypatch) -> None:
         accepted.append(source_event_id)
         return True
 
-    monkeypatch.setattr("services.ingestion.polling.sink._enqueue", _fake_enqueue)
+    monkeypatch.setattr("kb.polling.sink._enqueue", _fake_enqueue)
 
     docs = [
         {"source_event_id": "evt-1", "raw_payload": {"x": 1}},
@@ -237,6 +237,6 @@ async def test_sink_empty_batch_is_noop(monkeypatch) -> None:
         called = True
         return True
 
-    monkeypatch.setattr("services.ingestion.polling.sink._enqueue", _fake_enqueue)
+    monkeypatch.setattr("kb.polling.sink._enqueue", _fake_enqueue)
     await sink("cust-xyz", SourceSystem.GITHUB, [])
     assert called is False

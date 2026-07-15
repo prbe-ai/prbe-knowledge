@@ -36,10 +36,13 @@ ENV PATH="/opt/venv/bin:${PATH}"
 
 WORKDIR /app
 
-# Project metadata + source (mirrors services/retrieval/Dockerfile:14-20) plus the
-# sandbox/ harness scripts themselves.
+# Project metadata + source (mirrors services/retrieval/Dockerfile:14-19) plus the
+# sandbox/ harness scripts themselves. Post engine/kb split the source tree is
+# engine/ + kb/ + the thin services/ deploy wrappers (shared/ moved to
+# engine/shared).
 COPY pyproject.toml ./
-COPY shared/ ./shared/
+COPY engine/ ./engine/
+COPY kb/ ./kb/
 COPY services/ ./services/
 COPY db/ ./db/
 COPY alembic.ini ./

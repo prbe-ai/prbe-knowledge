@@ -22,9 +22,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.ingestion.inferred_edges.bundle import Bundle, BundleDoc
-from services.ingestion.inferred_edges.extractor import extract_edges
-from services.ingestion.inferred_edges.prompts.v1 import PROMPT_VERSION
+from engine.ingest.inferred_edges.bundle import Bundle, BundleDoc
+from engine.ingest.inferred_edges.extractor import extract_edges
+from engine.ingest.inferred_edges.prompts.v1 import PROMPT_VERSION
 
 GOLDEN_DIR = Path(__file__).parent / "inferred_edges" / "golden"
 

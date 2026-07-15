@@ -1,7 +1,7 @@
-from services.ingestion.handlers import registry
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.claude_code import ClaudeCodeConnector
-from shared.constants import SourceSystem
+from engine.ingest.handlers import registry
+from engine.ingest.handlers.base import make_default_context
+from engine.shared.constants import SourceSystem
+from kb.handlers.claude_code import ClaudeCodeConnector
 
 
 def test_claude_code_connector_is_registered() -> None:

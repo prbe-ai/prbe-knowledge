@@ -24,13 +24,13 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 
-from services.synthesis import backfill_reclaim
-from services.synthesis.backfill_reclaim import (
+from engine.shared.config import Settings
+from engine.shared.db import raw_conn
+from kb.synthesis import backfill_reclaim
+from kb.synthesis.backfill_reclaim import (
     BackfillReclaimLoop,
     reclaim_stale_backfill_runs,
 )
-from shared.config import Settings
-from shared.db import raw_conn
 
 CUSTOMER = "wiki-bootstrap-reclaim-cust"
 

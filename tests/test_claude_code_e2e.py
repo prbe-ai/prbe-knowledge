@@ -13,12 +13,12 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from services.ingestion.main import app
-from shared.config import Settings, get_settings
-from shared.constants import SourceSystem
-from shared.db import close_pool, init_pool, raw_conn
-from shared.embeddings import reset_embedder
-from shared.storage import reset_store
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import SourceSystem
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.storage import reset_store
+from kb.ingestion_app import app
 
 CUSTOMER = "e2e-cust"
 EMPLOYEE = "emp-e2e"
@@ -51,7 +51,7 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
             CUSTOMER,
         )
 
-    from shared.storage import get_store
+    from engine.shared.storage import get_store
 
     store = get_store()
     await store.ensure_bucket(await store.bucket_for(CUSTOMER))
@@ -105,8 +105,8 @@ async def test_e2e_register_then_gateway_forwarded_webhook_then_docs(
 
     # 3. Drive the worker for this queue row directly (matches the pattern
     # used by test_session_completer / test_idempotency).
-    from services.ingestion.handlers.base import make_default_context
-    from services.ingestion.normalizer import Normalizer
+    from engine.ingest.handlers.base import make_default_context
+    from engine.ingest.normalizer import Normalizer
 
     async with raw_conn() as conn:
         row = await conn.fetchrow(

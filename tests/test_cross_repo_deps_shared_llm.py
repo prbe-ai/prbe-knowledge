@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.ingestion.code_graph.cross_repo_deps import _call_classifier_llm
+from kb.code_graph.cross_repo_deps import _call_classifier_llm
 
 
 def _stub_acompletion_response(text: str):
@@ -30,7 +30,7 @@ async def test_classifier_returns_none_when_no_key_or_gateway(monkeypatch) -> No
     that as ClassifierUnavailable."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
@@ -48,7 +48,7 @@ async def test_classifier_routes_through_shared_llm(monkeypatch) -> None:
     and returns the parsed `verdicts` list."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
@@ -63,7 +63,7 @@ async def test_classifier_routes_through_shared_llm(monkeypatch) -> None:
             '{"verdicts": [{"number": 1, "real": true, "reason": "import"}]}'
         )
 
-    from shared import llm as shared_llm
+    from engine.shared import llm as shared_llm
 
     monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
 
@@ -88,14 +88,14 @@ async def test_classifier_uses_gateway_without_google_key(monkeypatch) -> None:
     is set — the classifier must still call shared.llm.acompletion."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.litellm.svc.cluster.local:4000")
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
     async def fake_acompletion(*, model, messages, **kwargs):
         return _stub_acompletion_response('{"verdicts": []}')
 
-    from shared import llm as shared_llm
+    from engine.shared import llm as shared_llm
 
     monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
 
@@ -112,11 +112,11 @@ async def test_classifier_returns_none_on_llm_error(monkeypatch) -> None:
     """An LLMError from the wrapper translates to None (LLM failure)."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
-    from shared import llm as shared_llm
+    from engine.shared import llm as shared_llm
 
     async def fake_acompletion(*, model, messages, **kwargs):
         raise shared_llm.LLMError(
@@ -137,14 +137,14 @@ async def test_classifier_returns_none_on_malformed_json(monkeypatch) -> None:
     """Non-JSON content → caller-side parser returns None."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
     async def fake_acompletion(*, model, messages, **kwargs):
         return _stub_acompletion_response("not actually json")
 
-    from shared import llm as shared_llm
+    from engine.shared import llm as shared_llm
 
     monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
 

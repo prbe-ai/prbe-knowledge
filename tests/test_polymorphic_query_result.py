@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from shared.constants import SourceSystem
-from shared.models import (
+from engine.shared.constants import SourceSystem
+from engine.shared.models import (
     GraphEvidence,
     MatchProvenance,
     QueryChunk,

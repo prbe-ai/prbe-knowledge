@@ -13,25 +13,25 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.normalizer import Normalizer
-from services.synthesis.wiki_agent import WikiAgentRuntime
-from shared.config import Settings, get_settings
-from shared.constants import (
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.normalizer import Normalizer
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import (
     DocClass,
     DocType,
     Permission,
     PrincipalType,
     SourceSystem,
 )
-from shared.db import raw_conn
-from shared.models import (
+from engine.shared.db import raw_conn
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
     Document,
     NormalizationResult,
 )
+from kb.synthesis.wiki_agent import WikiAgentRuntime
 
 CUSTOMER = "wiki-agent-int-cust"
 
@@ -255,8 +255,8 @@ async def test_tool_next_events_ordered_by_source_ts_asc(reset_db: None) -> None
 async def test_tool_read_page_on_disk_returns_db_row(reset_db: None) -> None:
     """Seed a manual-entry wiki page directly via Normalizer, then
     read_page should return its body."""
-    from services.ingestion.handlers.wiki import build_normalization_result
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
+    from kb.handlers.wiki import build_normalization_result
 
     received_at = datetime.now(UTC)
     payload = {
@@ -613,7 +613,7 @@ async def test_discard_dlqs_triaged_rows_with_reason(reset_db: None) -> None:
     """The runtime's discard() drops in-memory state; the worker calls
     dlq_agent_synthesizing_rows separately to flip rows to DLQ. This
     test exercises both halves end-to-end."""
-    from services.synthesis import persistence
+    from kb.synthesis import persistence
 
     qid = await _seed_synthesizing("github:commit:dlq", "body")
     run_id = await _open_run()

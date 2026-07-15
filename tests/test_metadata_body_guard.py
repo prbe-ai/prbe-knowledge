@@ -22,24 +22,24 @@ from typing import Any
 
 import pytest
 
-from services.ingestion import handlers as handlers_pkg
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.normalizer import Normalizer
-from shared.config import Settings
-from shared.constants import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.normalizer import Normalizer
+from engine.shared.config import Settings
+from engine.shared.constants import (
     DocClass,
     DocType,
     Permission,
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import NormalizationError
-from shared.models import (
+from engine.shared.exceptions import NormalizationError
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     Document,
     NormalizationResult,
 )
+from kb import handlers as handlers_pkg
 
 
 def _bare_doc(*, metadata: dict[str, Any]) -> Document:
@@ -149,9 +149,20 @@ def test_no_handler_writes_body_into_metadata() -> None:
     import pkgutil
     from pathlib import Path
 
-    pkg_dir = Path(handlers_pkg.__file__).parent
+    import engine.ingest.handlers as engine_handlers_pkg
+
+    # Connectors live in two packages since the engine/kb split: the kb
+    # integration connectors plus the engine-door connectors
+    # (custom_ingest, manual_upload). Scan both so the guard keeps full
+    # coverage.
+    pkg_dirs = [
+        Path(handlers_pkg.__file__).parent,
+        Path(engine_handlers_pkg.__file__).parent,
+    ]
     offenders: list[tuple[str, int, str]] = []
-    for mod_info in pkgutil.iter_modules([str(pkg_dir)]):
+    for pkg_dir, mod_info in (
+        (d, m) for d in pkg_dirs for m in pkgutil.iter_modules([str(d)])
+    ):
         if mod_info.name in {"__init__", "base", "registry"}:
             continue
         path = pkg_dir / f"{mod_info.name}.py"
@@ -188,7 +199,7 @@ def test_stringify_body_prefers_doc_body_over_legacy_metadata() -> None:
     fallback exists only as a safety net for in-flight queue rows that
     predate the storage-cleanup deploy.
     """
-    from services.ingestion.normalizer import _stringify_body
+    from engine.ingest.normalizer import _stringify_body
 
     doc = _bare_doc(metadata={})
     doc.body = "from-body-field"
@@ -201,7 +212,7 @@ def test_stringify_body_falls_back_to_legacy_metadata_body() -> None:
     they still need to chunk correctly. This test pins that fallback
     so removing it later is an explicit decision.
     """
-    from services.ingestion.normalizer import _stringify_body
+    from engine.ingest.normalizer import _stringify_body
 
     doc = _bare_doc(metadata={"body": "legacy-from-metadata"})
     doc.body = None

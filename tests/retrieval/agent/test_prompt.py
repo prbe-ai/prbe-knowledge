@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from hashlib import sha256
 
-from services.retrieval.agent.prompt import build_system_prompt
+from engine.retrieval.agent.prompt import build_system_prompt
 
 _EXPECTED_PROMPT_PREFIX = "You are a retrieval gatherer for a knowledge graph search system."
 

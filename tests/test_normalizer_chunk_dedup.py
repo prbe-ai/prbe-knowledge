@@ -8,8 +8,8 @@ cases below are scaffolding.
 
 from __future__ import annotations
 
-from services.ingestion.chunker import _enc, chunk_text
-from services.ingestion.normalizer import _skip_chunk_overlap_tokens
+from engine.ingest.chunker import _enc, chunk_text
+from engine.ingest.normalizer import _skip_chunk_overlap_tokens
 
 
 def test_no_token_overlap_returns_curr_unchanged() -> None:

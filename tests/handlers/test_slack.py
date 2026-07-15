@@ -15,17 +15,17 @@ from typing import Any
 import httpx
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.registry import build_connector
-from services.ingestion.handlers.slack import (  # noqa: F401 - registers
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.config import Settings
+from engine.shared.constants import DocType, NodeLabel, SourceSystem
+from kb.handlers.slack import (  # noqa: F401 - registers
     SlackConnector,
     _decode_slack_cursor,
     _SlackChannelCache,
     _SlackUserCache,
     expand_slack_markup,
 )
-from shared.config import Settings
-from shared.constants import DocType, NodeLabel, SourceSystem
 
 
 def _make_ctx(*, signing_secret: str | None = None, env: str = "local") -> ConnectorContext:
@@ -181,7 +181,7 @@ async def test_normalize_produces_document_and_graph() -> None:
 
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     event = WebhookEvent(
         customer_id="cust-1",
@@ -372,10 +372,10 @@ def _fake_metadata_store(monkeypatch):
         existing.update(patch)
 
     monkeypatch.setattr(
-        "services.ingestion.handlers.slack.load_source_metadata", fake_load
+        "kb.handlers.slack.load_source_metadata", fake_load
     )
     monkeypatch.setattr(
-        "services.ingestion.handlers.slack.patch_source_metadata", fake_patch
+        "kb.handlers.slack.patch_source_metadata", fake_patch
     )
     yield store
 
@@ -805,7 +805,7 @@ async def test_cache_load_failure_degrades_to_in_memory(_fake_metadata_store, fa
         raise RuntimeError("simulated db outage")
 
     monkeypatch.setattr(
-        "services.ingestion.handlers.slack.load_source_metadata", boom
+        "kb.handlers.slack.load_source_metadata", boom
     )
 
     def users_info(req):
@@ -829,7 +829,7 @@ async def test_normalize_prefixes_body_with_display_name() -> None:
     'Richard Wei: deploying...' so semantic + BM25 retrieval match the name."""
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     ctx = _make_ctx()
     slack = build_connector(SourceSystem.SLACK, ctx)
@@ -870,7 +870,7 @@ async def test_normalize_falls_back_to_no_prefix_when_user_unknown() -> None:
     Critical: must NOT prefix with the raw U_ID — that pollutes embeddings."""
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     ctx = _make_ctx()
     slack = build_connector(SourceSystem.SLACK, ctx)
@@ -910,7 +910,7 @@ async def test_normalize_attaches_display_name_to_person_node() -> None:
     consumers (entity-filtered retrieval, alias resolution) can match by name."""
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     ctx = _make_ctx()
     slack = build_connector(SourceSystem.SLACK, ctx)
@@ -950,7 +950,7 @@ async def test_normalize_user_id_still_authoritative_in_author_id() -> None:
     only; never replace the structured ID."""
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     ctx = _make_ctx()
     slack = build_connector(SourceSystem.SLACK, ctx)
@@ -994,7 +994,7 @@ async def test_normalize_bot_message_gets_no_prefix_and_no_person_name() -> None
     node (whose canonical_id would be the bot_id, not a human identity)."""
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     ctx = _make_ctx()
     slack = build_connector(SourceSystem.SLACK, ctx)
@@ -1036,7 +1036,7 @@ async def test_fetch_supplementary_resolves_user_for_webhook() -> None:
     can stamp it into the chunk text."""
     from datetime import datetime
 
-    from shared.models import IntegrationToken, WebhookEvent
+    from engine.shared.models import IntegrationToken, WebhookEvent
 
     def users_info(req):
         assert req.url.params["user"] == "U1"
@@ -1218,7 +1218,7 @@ async def test_normalize_stamps_person_name_when_display_known() -> None:
 
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     event = WebhookEvent(
         customer_id="cust-1",
@@ -1251,7 +1251,7 @@ async def test_normalize_stamps_channel_display_name_from_hydrated() -> None:
 
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     event = WebhookEvent(
         customer_id="cust-1",
@@ -1285,7 +1285,7 @@ async def test_normalize_no_channel_display_name_when_unresolved() -> None:
 
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     event = WebhookEvent(
         customer_id="cust-1",
@@ -1317,7 +1317,7 @@ async def test_normalize_channel_name_falls_back_to_msg_inline() -> None:
 
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     payload = {
         **SAMPLE_EVENT,
@@ -1346,7 +1346,7 @@ async def test_fetch_supplementary_resolves_channel_name(fast_flush) -> None:
     name onto the hydrated dict, where normalize() will pick it up."""
     from datetime import datetime
 
-    from shared.models import IntegrationToken, WebhookEvent
+    from engine.shared.models import IntegrationToken, WebhookEvent
 
     ctx = _make_ctx()
     slack = build_connector(SourceSystem.SLACK, ctx)
@@ -1519,7 +1519,7 @@ async def test_normalize_expands_mentions_in_title_and_body() -> None:
 
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     event = WebhookEvent(
         customer_id="cust-1",
@@ -1567,7 +1567,7 @@ async def test_normalize_falls_back_when_cache_cold() -> None:
 
     from datetime import datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     event = WebhookEvent(
         customer_id="cust-1",
@@ -1603,9 +1603,9 @@ def test_metadata_chunk_renders_author_display_name() -> None:
     author_id so chunks emit `author: Richard Wei` instead of `author: U…`."""
     from datetime import UTC, datetime
 
-    from services.ingestion.normalizer import _metadata_text
-    from shared.constants import DocClass, DocType, SourceSystem
-    from shared.models import ACLSnapshot, Document
+    from engine.ingest.normalizer import _metadata_text
+    from engine.shared.constants import DocClass, DocType, SourceSystem
+    from engine.shared.models import ACLSnapshot, Document
 
     doc = Document(
         doc_id="slack:T1:C1:1.2",
@@ -1641,9 +1641,9 @@ def test_metadata_chunk_falls_back_to_author_id_when_no_display_name() -> None:
     behavior is opt-in via metadata.author_display_name."""
     from datetime import UTC, datetime
 
-    from services.ingestion.normalizer import _metadata_text
-    from shared.constants import DocClass, DocType, SourceSystem
-    from shared.models import ACLSnapshot, Document
+    from engine.ingest.normalizer import _metadata_text
+    from engine.shared.constants import DocClass, DocType, SourceSystem
+    from engine.shared.models import ACLSnapshot, Document
 
     doc = Document(
         doc_id="github:org/repo:pr:1",
@@ -1738,8 +1738,8 @@ async def test_exchange_oauth_code_legacy_no_rotation_no_expires_at() -> None:
 
 @pytest.mark.asyncio
 async def test_slack_exchange_refresh_token_no_refresh_token_raises_permanent() -> None:
-    from shared.exceptions import PermanentSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import PermanentSourceError
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_slack_oauth_ctx(lambda req: httpx.Response(200, json={}))
     slack = build_connector(SourceSystem.SLACK, ctx)
@@ -1755,7 +1755,7 @@ async def test_slack_exchange_refresh_token_no_refresh_token_raises_permanent() 
 
 @pytest.mark.asyncio
 async def test_slack_exchange_refresh_token_success_rotates() -> None:
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -1791,8 +1791,8 @@ async def test_slack_exchange_refresh_token_ok_false_raises_permanent() -> None:
     """Slack's quirk: HTTP 200 with `ok=false` on permanent failures like
     `invalid_refresh_token`. Treat as permanent so the cron flips
     auth_failed."""
-    from shared.exceptions import PermanentSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import PermanentSourceError
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": False, "error": "invalid_refresh_token"})
@@ -1811,7 +1811,7 @@ async def test_slack_exchange_refresh_token_ok_false_raises_permanent() -> None:
 
 @pytest.mark.asyncio
 async def test_slack_verify_token_health_ok_returns_true() -> None:
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/api/auth.test"
@@ -1829,7 +1829,7 @@ async def test_slack_verify_token_health_ok_returns_true() -> None:
 async def test_slack_verify_token_health_token_revoked_returns_false() -> None:
     """Slack returns HTTP 200 with ok=false + error='token_revoked' when the
     user explicitly revokes. The cron must flip auth_failed on this signal."""
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": False, "error": "token_revoked"})
@@ -1844,7 +1844,7 @@ async def test_slack_verify_token_health_token_revoked_returns_false() -> None:
 
 @pytest.mark.asyncio
 async def test_slack_verify_token_health_account_inactive_returns_false() -> None:
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": False, "error": "account_inactive"})
@@ -1859,7 +1859,7 @@ async def test_slack_verify_token_health_account_inactive_returns_false() -> Non
 
 @pytest.mark.asyncio
 async def test_slack_verify_token_health_invalid_auth_returns_false() -> None:
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": False, "error": "invalid_auth"})
@@ -1876,8 +1876,8 @@ async def test_slack_verify_token_health_invalid_auth_returns_false() -> None:
 async def test_slack_verify_token_health_rate_limited_raises_transient() -> None:
     """ok=false with a transient error (rate_limited) must NOT flip
     auth_failed — those are recoverable."""
-    from shared.exceptions import TransientSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import TransientSourceError
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": False, "error": "rate_limited"})
@@ -1893,8 +1893,8 @@ async def test_slack_verify_token_health_rate_limited_raises_transient() -> None
 
 @pytest.mark.asyncio
 async def test_slack_verify_token_health_5xx_raises_transient() -> None:
-    from shared.exceptions import TransientSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import TransientSourceError
+    from engine.shared.models import IntegrationToken
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, text="down")

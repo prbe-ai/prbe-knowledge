@@ -26,10 +26,10 @@ import argparse
 import asyncio
 import sys
 
-from services.community.leiden import MIN_EDGES_FOR_LEIDEN, run_leiden_for_tenant
-from shared.config import get_settings
-from shared.db import close_pool, init_pool, with_tenant
-from shared.logging import configure_logging, get_logger
+from engine.community.leiden import MIN_EDGES_FOR_LEIDEN, run_leiden_for_tenant
+from engine.shared.config import get_settings
+from engine.shared.db import close_pool, init_pool, with_tenant
+from engine.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
 
@@ -101,12 +101,12 @@ def main() -> int:
         customer_ids = [args.customer_id]
     else:
         # Load all customer IDs synchronously before kicking off async
-        from shared.config import get_settings as _gs
+        from engine.shared.config import get_settings as _gs
 
         async def _list() -> list[str]:
-            from shared.db import close_pool as _cp
-            from shared.db import init_pool as _ip
-            from shared.db import raw_conn as _rc
+            from engine.shared.db import close_pool as _cp
+            from engine.shared.db import init_pool as _ip
+            from engine.shared.db import raw_conn as _rc
 
             await _ip(_gs())
             try:

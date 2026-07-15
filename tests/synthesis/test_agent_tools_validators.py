@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.synthesis.agent_tools import (
+from kb.synthesis.agent_tools import (
     CreatePageArgs,
     UpdatePageArgs,
     _normalize_slug,

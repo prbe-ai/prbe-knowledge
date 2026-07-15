@@ -44,15 +44,15 @@ import argparse
 import asyncio
 import sys
 
-from services.synthesis.directed_phrases import persist_directed_vectors
-from services.synthesis.providers import get_directed_phrases_provider
-from shared.constants import (
+from engine.shared.constants import (
     DIRECTED_PHRASES_MODEL,
     WIKI_DOC_TYPE_PREFIX,
     WIKI_INDEX_DOC_TYPE,
 )
-from shared.db import close_pool, init_pool, raw_conn, with_tenant
-from shared.logging import get_logger
+from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
+from engine.shared.logging import get_logger
+from kb.synthesis.directed_phrases import persist_directed_vectors
+from kb.synthesis.providers import get_directed_phrases_provider
 
 log = get_logger(__name__)
 

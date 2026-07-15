@@ -13,10 +13,10 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.retrievers.related_entities import (
+from engine.retrieval.retrievers.related_entities import (
     walk_result_doc_neighbors,
 )
-from shared.db import raw_conn
+from engine.shared.db import raw_conn
 
 pytestmark = pytest.mark.asyncio
 
@@ -318,7 +318,7 @@ async def test_walker_excludes_primary_when_alias_in_exclude_keys(live_db):
     so the walker doesn't recommend the cluster the user just typed.
     """
     await _seed_full_cluster(CUSTOMER_ID)
-    from services.retrieval.retrievers.related_entities import (
+    from engine.retrieval.retrievers.related_entities import (
         expand_exclude_keys_with_aliases,
     )
 

@@ -9,8 +9,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
-from services.synthesis.source_ts import extract_source_ts
-from shared.constants import SourceSystem
+from engine.ingest.source_ts import extract_source_ts
+from engine.shared.constants import SourceSystem
 
 
 def _doc(

@@ -24,14 +24,14 @@ from datetime import UTC, datetime
 import pytest
 import pytest_asyncio  # noqa: F401  # required for live_db fixture
 
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
 from scripts.backfill_embedding_v2 import (
     RC_CAP_HIT_REMAINING,
     RC_CLEAN,
     _estimate_tokens,
     main,
 )
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
 
 # ---------------------------------------------------------------------------
 # Unit tests (no DB)

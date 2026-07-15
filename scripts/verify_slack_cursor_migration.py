@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import sys
 
-from services.ingestion.handlers.slack import _decode_slack_cursor
+from kb.handlers.slack import _decode_slack_cursor
 
 
 def main() -> int:

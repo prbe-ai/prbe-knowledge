@@ -9,8 +9,8 @@ import secrets
 
 import pytest
 
+from engine.shared.db import get_pool, raw_conn
 from scripts.synth.seed import set_allow_synth_seed
-from shared.db import get_pool, raw_conn
 
 
 async def _seed_customer(customer_id: str, metadata: dict | None = None) -> None:

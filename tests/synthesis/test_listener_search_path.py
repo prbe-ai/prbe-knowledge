@@ -19,7 +19,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from services.synthesis import listeners
+from kb.synthesis import listeners
 
 
 @pytest.mark.asyncio

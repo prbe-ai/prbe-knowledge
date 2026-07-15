@@ -16,9 +16,9 @@ from datetime import UTC, datetime, timedelta
 import pytest
 import pytest_asyncio
 
-from services.synthesis import persistence
-from shared.config import Settings
-from shared.db import raw_conn
+from engine.shared.config import Settings
+from engine.shared.db import raw_conn
+from kb.synthesis import persistence
 
 CUSTOMER = "wiki-reclaim-cust"
 

@@ -148,7 +148,7 @@ def fake_genai(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 @pytest.fixture()
 def patched_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """Replace `get_settings` so `_ensure_client` finds an API key."""
-    import services.synthesis.gemini_agent_client as mod
+    import kb.synthesis.gemini_agent_client as mod
 
     fake_settings = SimpleNamespace(
         google_api_key=SimpleNamespace(get_secret_value=lambda: "fake-key")
@@ -183,7 +183,7 @@ async def test_generate_with_cache_omits_tools_when_cache_set(
     When cache_name is set, the per-call GenerateContentConfig must
     NOT carry tools (Gemini 400s the request otherwise).
     """
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()
     await client.generate_with_cache(
@@ -225,7 +225,7 @@ async def test_afc_disabled_on_cache_path(
     EVERY generate_content call. This test pins the config carries
     that knob with disable=True.
     """
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()
     await client.generate_with_cache(
@@ -251,7 +251,7 @@ async def test_afc_disabled_on_cache_miss_fallback(
     re-introducing the same multi-turn 400 failure. Disable must
     apply to BOTH config branches.
     """
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()
     await client.generate_with_cache(
@@ -270,7 +270,7 @@ async def test_generate_with_cache_attaches_tools_when_no_cache(
     fake_genai: SimpleNamespace, patched_settings: None
 ) -> None:
     """Cache-miss fallback path: tools must be on every call."""
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()
     await client.generate_with_cache(
@@ -292,7 +292,7 @@ async def test_generate_with_cache_empty_contents_uses_nudge(
 ) -> None:
     """Turn 0 has empty conversation tail; we must inject a non-empty
     user message so Gemini doesn't reject the request."""
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()
     await client.generate_with_cache(
@@ -311,7 +311,7 @@ async def test_generate_with_cache_passes_through_non_empty_contents(
     fake_genai: SimpleNamespace, patched_settings: None
 ) -> None:
     """Non-empty `contents` is sent as-is — no nudge prepended."""
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()
     msgs = [
@@ -332,7 +332,7 @@ async def test_generate_with_cache_returns_normalized_dict(
     fake_genai: SimpleNamespace, patched_settings: None
 ) -> None:
     """Response shape: text + tool_calls + usage_metadata, all flat dicts."""
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     fake_genai.generate_response = SimpleNamespace(
         text=None,
@@ -388,7 +388,7 @@ async def test_thought_signature_extracted_from_part(
     `_extract_response` must capture the signature off the SDK's
     Part so the harness can round-trip it.
     """
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     sig_bytes = b"opaque-sdk-bytes-for-this-call"
     fake_genai.generate_response = SimpleNamespace(
@@ -430,7 +430,7 @@ async def test_create_cache_attaches_tools_and_system_instruction(
     fake_genai: SimpleNamespace, patched_settings: None
 ) -> None:
     """Tools + system_instruction belong on the cache, not on per-call."""
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()
     name = await client.create_cache(
@@ -451,7 +451,7 @@ async def test_create_cache_strips_unsupported_schema_keys(
 ) -> None:
     """`additionalProperties` and `$ref` would 400 the schema validator;
     sanitize them out before handing to FunctionDeclaration."""
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     schema = {
         "type": "object",
@@ -479,7 +479,7 @@ async def test_create_cache_empty_parameters_becomes_object_schema(
     fake_genai: SimpleNamespace, patched_settings: None
 ) -> None:
     """Tool with empty/None parameters produces a valid object schema."""
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()
     await client.create_cache(
@@ -504,7 +504,7 @@ async def test_first_turn_request_shape_is_well_formed(
     generate_with_cache with empty contents (turn 0). Verify the
     final per-call config has cached_content, no tools, no
     system_instruction, and non-empty contents."""
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()
     cache_name = await client.create_cache(
@@ -539,7 +539,7 @@ async def test_first_turn_request_shape_is_well_formed(
 
 
 def test_sanitize_parameters_handles_none() -> None:
-    from services.synthesis.gemini_agent_client import _sanitize_parameters
+    from kb.synthesis.gemini_agent_client import _sanitize_parameters
 
     assert _sanitize_parameters(None) == {"type": "object", "properties": {}}
     assert _sanitize_parameters({}) == {"type": "object", "properties": {}}
@@ -547,7 +547,7 @@ def test_sanitize_parameters_handles_none() -> None:
 
 def test_sanitize_parameters_preserves_supported_keys() -> None:
     """default, minimum, maximum, enum, required — all kept."""
-    from services.synthesis.gemini_agent_client import _sanitize_parameters
+    from kb.synthesis.gemini_agent_client import _sanitize_parameters
 
     schema = {
         "type": "object",
@@ -571,7 +571,7 @@ def test_sanitize_parameters_preserves_supported_keys() -> None:
 
 
 def test_sanitize_parameters_strips_rejected_keys_recursively() -> None:
-    from services.synthesis.gemini_agent_client import _sanitize_parameters
+    from kb.synthesis.gemini_agent_client import _sanitize_parameters
 
     schema = {
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -603,8 +603,8 @@ async def test_client_is_loop_compatible(
     fake_genai: SimpleNamespace, patched_settings: None
 ) -> None:
     """Surface check: AgentLoop.run() drives create_cache + generate_with_cache."""
-    from services.synthesis.agent_harness import AgentLoop
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.agent_harness import AgentLoop
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     # Make the model return a `done` tool call so the loop terminates.
     fake_genai.generate_response = SimpleNamespace(
@@ -686,7 +686,7 @@ async def test_gateway_mode_blocks_client_construction(
     """
     monkeypatch.setenv("LLM_GATEWAY_URL", "https://litellm.example/v1")
 
-    from services.synthesis.gemini_agent_client import GeminiAgentClient
+    from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
     client = GeminiAgentClient()  # construction itself is fine
     with pytest.raises(RuntimeError) as exc_info:

@@ -7,16 +7,16 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.manual_upload import ManualUploadConnector
-from services.ingestion.manual_uploads import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.manual_upload import ManualUploadConnector
+from engine.ingest.manual_uploads import (
     MAX_DOCX_DECOMPRESSED_BYTES,
     ManualUploadParseError,
     parse_manual_upload,
 )
-from shared.config import get_settings
-from shared.constants import DocClass, DocType, SourceSystem
-from shared.models import WebhookEvent
+from engine.shared.config import get_settings
+from engine.shared.constants import DocClass, DocType, SourceSystem
+from engine.shared.models import WebhookEvent
 
 
 def test_parse_manual_upload_plain_text() -> None:

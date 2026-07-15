@@ -5,7 +5,7 @@ device_id field into metadata, per-device stats break silently. This test
 catches that drift.
 """
 
-from services.ingestion.handlers.claude_code import (
+from kb.handlers.claude_code import (
     ClaudeCodeConnector,
     CodexConnector,
 )

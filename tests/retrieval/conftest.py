@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import pytest_asyncio
 
-import shared.db as db_module
+import engine.shared.db as db_module
 
 
 @dataclass

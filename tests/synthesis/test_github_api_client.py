@@ -16,7 +16,7 @@ import httpx
 import pytest
 import respx
 
-from services.synthesis.api_clients.github import (
+from kb.synthesis.api_clients.github import (
     GitHubAPIClient,
     GitHubAPIError,
     GitHubRateLimitExhausted,
@@ -421,7 +421,7 @@ def test_get_shared_bucket_returns_same_instance_per_customer() -> None:
     share one ``_AsyncTokenBucket`` per (customer, source) so aggregate
     request rate stays at target_rps regardless of parallelism. The
     registry returns the same instance for repeated calls."""
-    from services.synthesis.api_clients.github import (
+    from kb.synthesis.api_clients.github import (
         _SHARED_BUCKETS,
         _AsyncTokenBucket,
         get_shared_bucket,
@@ -443,7 +443,7 @@ def test_get_shared_bucket_ignores_target_rps_after_first_call() -> None:
     """The rate envelope is set on first creation; subsequent calls
     return the existing bucket as-is. A change to target_rps mid-run
     shouldn't shift an in-flight customer's quota."""
-    from services.synthesis.api_clients.github import _SHARED_BUCKETS, get_shared_bucket
+    from kb.synthesis.api_clients.github import _SHARED_BUCKETS, get_shared_bucket
 
     _SHARED_BUCKETS.clear()
     b1 = get_shared_bucket("cust-X", target_rps=2.0)

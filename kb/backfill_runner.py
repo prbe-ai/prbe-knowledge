@@ -1,0 +1,1081 @@
+"""Reusable backfill runner.
+
+One function, used by two callers:
+  - `BackfillWorker` (services/ingestion/worker.py) — runs in the worker process,
+    drains `backfill_state` rows with status='pending'.
+  - `scripts/backfill.py` CLI — operator-triggered ad-hoc runs.
+
+Responsibilities:
+  - Resolve the integration token for the (customer, source)
+  - Call `connector.backfill(customer_id, token, cursor)`
+  - For each yielded WebhookEvent: put raw envelope to R2, insert into
+    ingestion_queue. The regular ingestion worker picks it up like any webhook.
+  - Update progress (`last_cursor`, `events_enqueued`, `last_progress_at`,
+    `heartbeat_at`) every N events.
+  - Mark done / failed at the end.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
+from engine.ingest.connectedness import is_source_connected
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.config import get_settings
+from engine.shared.constants import BackfillStatus, QueueStatus, SourceSystem
+from engine.shared.db import get_pool, raw_conn
+from engine.shared.encryption import decrypt_token
+from engine.shared.exceptions import NotSupportedByConnector, PermanentSourceError
+from engine.shared.logging import get_logger
+from engine.shared.metrics import counter
+from engine.shared.models import IntegrationToken
+from engine.shared.storage import ObjectStore, get_store
+
+log = get_logger(__name__)
+
+# Tracks release Tasks spawned from run_backfill's CancelledError handler so
+# the worker can drain them before asyncio.run cancels everything else (which
+# would interrupt the asyncpg UPDATE roundtrip mid-flight). See PR #210.
+_PENDING_RELEASE_TASKS: set[asyncio.Task[bool]] = set()
+
+PROGRESS_EVERY_N_EVENTS = 25
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 30.0
+# Bounded concurrency for R2 puts within a batch. R2 is throughput-friendly;
+# fanning out 16 puts in parallel hides per-put latency without pushing the
+# remote into rate-limited territory.
+R2_PUT_CONCURRENCY = 16
+
+
+class BackfillReclaimedError(Exception):
+    """The runner's claim was preempted (status flipped or started_at advanced).
+
+    Raised when an in-loop UPDATE matches 0 rows, meaning the reaper or another
+    worker now owns this (customer, source). The run loop bails without calling
+    _mark_failed since the row is no longer ours to mutate.
+    """
+
+
+@dataclass(frozen=True)
+class _ResumeState:
+    cursor: str | None
+    events_enqueued: int
+    started_at: datetime | None
+
+
+@dataclass(frozen=True)
+class ChannelBackfillEnqueueResult:
+    queued: bool
+    reason: str
+
+
+def _affected(command_tag: str) -> int:
+    # asyncpg execute() returns e.g. "UPDATE 1" / "UPDATE 0"; last token is rowcount.
+    parts = command_tag.split()
+    return int(parts[-1]) if parts and parts[-1].isdigit() else 0
+
+
+def _decode_json_object(raw: str | None) -> dict:
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _slack_state_from_cursor(raw: str | None) -> dict:
+    data = _decode_json_object(raw)
+    if isinstance(data.get("active"), dict):
+        return {
+            "active": dict(data["active"]),
+            "done": list(data.get("done", [])),
+        }
+
+    if "channels_remaining" in data or "current_channel" in data:
+        active = {ch: None for ch in (data.get("channels_remaining") or []) if ch}
+        current = data.get("current_channel")
+        if current:
+            active[current] = data.get("history_cursor")
+        return {"active": active, "done": []}
+
+    return {"active": {}, "done": []}
+
+
+def _slack_deferred_channels(raw: str | None) -> dict[str, str | None]:
+    data = _decode_json_object(raw)
+    pending = data.get("pending_channels")
+    if not isinstance(pending, dict):
+        return {}
+    return {str(ch): cursor for ch, cursor in pending.items() if ch}
+
+
+def _slack_channel_cursor(channels: dict[str, str | None]) -> str:
+    return json.dumps(
+        {
+            "active": channels,
+            "done": [],
+            "mode": "channel_join",
+        },
+        sort_keys=True,
+    )
+
+
+async def _flush_batch(
+    store: ObjectStore,
+    bucket: str,
+    customer_id: str,
+    source: SourceSystem,
+    batch: list[tuple[str, bytes, str]],
+    sem: asyncio.Semaphore,
+) -> None:
+    """Coalesced flush: parallel R2 puts + one executemany for queue rows.
+
+    `batch` is a list of (key, envelope_bytes, source_event_id). All puts run
+    concurrently under a Semaphore so we don't blow the per-process socket
+    budget. Once R2 succeeds for every put, the queue rows go in via a single
+    pipelined executemany. ON CONFLICT DO NOTHING preserves the per-row dedup
+    semantics of the old single-row path.
+
+    Crash recovery invariant: the R2 key is deterministic from
+    source_event_id (see caller). If executemany raises after R2 puts
+    succeeded, the orphaned objects are overwritten idempotently on retry,
+    and ON CONFLICT DO NOTHING admits duplicate queue rows safely. Callers
+    MUST NOT change the key scheme away from source_event_id without
+    revisiting this property.
+
+    Raises on first failure. Caller is responsible for routing the exception
+    to _mark_failed so the run flips to status='failed' rather than silently
+    swallowing a partial batch.
+    """
+    if not batch:
+        return
+
+    async def _bounded_put(key: str, envelope: bytes) -> None:
+        async with sem:
+            await store.put(bucket, key, envelope)
+
+    await asyncio.gather(
+        *(_bounded_put(key, envelope) for key, envelope, _ in batch)
+    )
+
+    rows = [
+        (customer_id, source.value, source_event_id, key, QueueStatus.PENDING.value)
+        for key, _, source_event_id in batch
+    ]
+    async with get_pool().acquire() as conn:
+        # Backfill rows always land at priority 50 (never block live).
+        # Both columns are populated for the migration window:
+        # `payload_s3_key` for back-compat readers, `payload_s3_keys`
+        # for the new array-based normalizer/worker path.
+        await conn.executemany(
+            """
+            INSERT INTO ingestion_queue
+                (customer_id, source_system, source_event_id,
+                 payload_s3_key, payload_s3_keys, status, priority)
+            VALUES ($1, $2, $3, $4, ARRAY[$4], $5, 50)
+            ON CONFLICT DO NOTHING
+            """,
+            rows,
+        )
+
+
+async def run_backfill(
+    ctx: ConnectorContext,
+    customer_id: str,
+    source: SourceSystem,
+    heartbeat_interval_seconds: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+) -> int:
+    """Execute a backfill for (customer, source). Returns events enqueued.
+
+    Assumes backfill_state row already exists (status='pending' or 'running').
+    Responsible for marking it complete/failed.
+    """
+    state = await _load_resume_state(customer_id, source)
+    cursor = state.cursor if state else None
+    initial_enqueued = state.events_enqueued if state else 0
+
+    token = await _load_token(customer_id, source)
+    if token is None:
+        # Mark failed against the existing claim if there is one. If the row
+        # has no started_at (CLI fresh enqueue without claim), skip the mark
+        # — there's no claim to invalidate.
+        if state is not None and state.started_at is not None:
+            await _mark_failed(
+                customer_id,
+                source,
+                "no active integration_tokens row",
+                claim_token=state.started_at,
+            )
+        return 0
+
+    store = get_store()
+    bucket = await store.bucket_for(customer_id)
+    # Bucket ensure used to live OUTSIDE the try/except — a 403 from R2
+    # (per-tenant bucket never created, e.g. a slug/UUID mismatch in the
+    # provisioning path) would raise out of run_backfill BEFORE
+    # _mark_running ever fired, leaving the backfill_state row in
+    # 'pending' for the reaper to reclaim ad infinitum.
+    # ``events_enqueued`` stayed at 0 forever and ops saw "wedged at zero".
+    # Claim the row FIRST, then ensure the bucket inside the try so a 403
+    # flips the row to 'failed' with the StorageUnavailable message.
+
+    connector = build_connector(source, ctx)
+
+    claim_token = await _mark_running(customer_id, source)
+    log.info(
+        "backfill.start",
+        customer=customer_id,
+        source=source.value,
+        resume_cursor=bool(cursor),
+        resume_events_enqueued=initial_enqueued,
+    )
+
+    # Liveness ping is decoupled from progress writes. The reaper looks at
+    # heartbeat_at; if we only updated it on enqueue (every 25 events), a
+    # healthy runner blocked on a slow Slack page would look dead.
+    heartbeat_task = asyncio.create_task(
+        _heartbeat_loop(
+            customer_id, source, heartbeat_interval_seconds, claim_token
+        )
+    )
+
+    # Cumulative across resumes: a reclaimed run continues incrementing the
+    # prior run's count rather than starting from zero.
+    enqueued = initial_enqueued
+    try:
+        # Inside the try so a HeadBucket 403 / bucket-missing surfaces via
+        # _mark_failed below (StorageUnavailable -> generic Exception
+        # branch) instead of bubbling up past the claim. See above comment.
+        await store.ensure_bucket(bucket)
+
+        try:
+            events = connector.backfill(customer_id, token, cursor)
+        except NotSupportedByConnector as exc:
+            # Not auth-related; passing exc is harmless since _mark_failed
+            # only flips the token on PermanentSourceError with 401/403.
+            await _mark_failed(
+                customer_id,
+                source,
+                f"not supported: {exc}",
+                exc=exc,
+                claim_token=claim_token,
+            )
+            return enqueued
+
+        latest_cursor = cursor
+        # Batched flush state. Events accumulate here and get flushed (R2
+        # puts in parallel + one executemany) on batch full / checkpoint /
+        # end-of-stream. `last_progress_at_enqueued` tracks the value of
+        # `enqueued` at the last progress write so we only checkpoint once
+        # per PROGRESS_EVERY_N_EVENTS window even if a batch crosses several
+        # multiples at once.
+        batch_size = get_settings().backfill_batch_size
+        r2_sem = asyncio.Semaphore(R2_PUT_CONCURRENCY)
+        # 4-tuple: (key, envelope_bytes, source_event_id, cursor_or_None).
+        # The trailing cursor is the value latest_cursor SHOULD advance to
+        # after this event's batch is durably persisted. Holding it on the
+        # batch tuple (instead of mutating latest_cursor at append-time)
+        # ensures _mark_failed reads the cursor of the last successfully
+        # flushed batch — not one that crashed half-way through.
+        batch: list[tuple[str, bytes, str, str | None]] = []
+        last_progress_at_enqueued = enqueued
+
+        async def _flush_now() -> None:
+            nonlocal batch, enqueued, latest_cursor, last_progress_at_enqueued
+            if not batch:
+                return
+            # The latest non-None cursor in the batch becomes the new
+            # watermark — but only AFTER _flush_batch succeeds.
+            pending_cursor = next(
+                (c for _, _, _, c in reversed(batch) if c is not None),
+                None,
+            )
+            await _flush_batch(
+                store,
+                bucket,
+                customer_id,
+                source,
+                [(k, e, sid) for k, e, sid, _ in batch],
+                r2_sem,
+            )
+            enqueued += len(batch)
+            batch = []
+            if pending_cursor is not None:
+                latest_cursor = pending_cursor
+            # Write a progress checkpoint at most once per batch, gated on
+            # crossing a PROGRESS_EVERY_N_EVENTS boundary since the last
+            # write. Use floor-division: a single 100-event batch crossing
+            # four 25-event boundaries still only writes once.
+            if (
+                enqueued // PROGRESS_EVERY_N_EVENTS
+                > last_progress_at_enqueued // PROGRESS_EVERY_N_EVENTS
+            ):
+                await _update_progress(
+                    customer_id, source, latest_cursor, enqueued, claim_token
+                )
+                last_progress_at_enqueued = enqueued
+
+        async for event in events:
+            # Disconnect race: if the user disconnected mid-backfill, the
+            # integration_tokens row was deleted (or status flipped). Bail
+            # before writing more rows so we don't leave zombie R2 objects +
+            # ingestion_queue entries for a now-disconnected source.
+            #
+            # Per-event check (added in #278): the acme/github
+            # incident saw a ~180ms race after disconnect, so checking once
+            # per N events was too coarse. is_source_connected is one
+            # indexed SELECT (~0.3ms) and short-circuits for non-OAuth
+            # sources. Under batching, the pending `batch` is dropped on
+            # disconnect — preserving #278's intent that NO new rows land
+            # for a disconnected source, including events the connector
+            # already streamed into our buffer.
+            if not await is_source_connected(customer_id, source):
+                batch = []
+                log.info(
+                    "backfill.aborted_disconnect",
+                    customer=customer_id,
+                    source=source.value,
+                    enqueued=enqueued,
+                )
+                # Do NOT call _mark_done — leave backfill_state for cleanup.
+                return enqueued
+
+            # Cursor-only checkpoint event (e.g. Granola end-of-pagination).
+            # The connector is telling us the watermark may safely advance now
+            # that pagination completed cleanly. Flush the pending batch
+            # FIRST; only advance latest_cursor after the flush succeeds so a
+            # crash in _flush_now doesn't persist a cursor past dropped
+            # events. Checkpoint event itself is NOT enqueued into
+            # ingestion_queue or R2. `payload.get(...)` is defensive against
+            # `raw_payload=None` or missing key.
+            payload = event.raw_payload or {}
+            if payload.get("_checkpoint"):
+                cursor_str = payload.get("_cursor")
+                await _flush_now()
+                if cursor_str is not None:
+                    latest_cursor = str(cursor_str)
+                    await _update_progress(
+                        customer_id, source, latest_cursor, enqueued, claim_token
+                    )
+                    last_progress_at_enqueued = enqueued
+                continue
+
+            envelope = json.dumps(
+                {
+                    "_headers": event.headers,
+                    "payload": event.raw_payload,
+                    "received_at": event.received_at.isoformat(),
+                    "trace_id": (
+                        f"backfill-{customer_id}-{source.value}-"
+                        f"{enqueued + len(batch)}"
+                    ),
+                    "_backfill": True,
+                }
+            ).encode()
+            key = (
+                f"raw/{source.value}/{customer_id}/backfill/"
+                f"{event.source_event_id.replace('/', '_')}.json"
+            )
+            # The runner can discover a new cursor via the event's parse_hint
+            # or via the connector yielding a tuple — keep it simple for now:
+            # most connectors set a `_cursor` on their synthesized events
+            # specifically so the runner can persist it. Carry the cursor on
+            # the batch tuple instead of mutating latest_cursor here, so the
+            # watermark only advances after _flush_now durably persists this
+            # event.
+            possible_cursor = payload.get("_cursor")
+            pending_cursor = (
+                str(possible_cursor) if possible_cursor is not None else None
+            )
+            batch.append((key, envelope, event.source_event_id, pending_cursor))
+
+            if len(batch) >= batch_size:
+                await _flush_now()
+
+        # Flush trailing partial batch so the tail of the stream lands.
+        await _flush_now()
+
+        await _mark_done(
+            customer_id, source, enqueued, latest_cursor, claim_token
+        )
+        counter(
+            "backfill.completed",
+            1,
+            source=source.value,
+            events=enqueued,
+        )
+        log.info(
+            "backfill.done", customer=customer_id, source=source.value, events=enqueued
+        )
+    except BackfillReclaimedError:
+        # Reaper or a competing claim took the row. The new owner is responsible
+        # for it now; do NOT call _mark_failed (would clobber their state).
+        log.warning(
+            "backfill.preempted_by_reclaim",
+            customer=customer_id,
+            source=source.value,
+            enqueued=enqueued,
+        )
+        counter("backfill.preempted", 1, source=source.value)
+    except asyncio.CancelledError:
+        # SIGTERM during deploy. Spawn release as a tracked top-level task so
+        # it survives the re-raise; drain_pending_release_tasks() (called from
+        # the worker's outer finally) awaits it before asyncio.run teardown
+        # cancels everything.
+        log.warning(
+            "backfill.released_on_cancel",
+            customer=customer_id,
+            source=source.value,
+            enqueued=enqueued,
+        )
+        counter("backfill.released_on_cancel", 1, source=source.value)
+        release_task = asyncio.create_task(
+            _release_for_resume(customer_id, source, claim_token)
+        )
+        _PENDING_RELEASE_TASKS.add(release_task)
+        release_task.add_done_callback(_PENDING_RELEASE_TASKS.discard)
+        try:
+            await asyncio.shield(release_task)
+        except (Exception, asyncio.CancelledError):
+            log.exception(
+                "backfill.release_on_cancel_failed",
+                customer=customer_id,
+                source=source.value,
+            )
+        raise
+    except Exception as exc:
+        # Pass exc so _mark_failed can detect PermanentSourceError(401/403)
+        # raised by a connector mid-backfill (e.g. Granola key revoked) and
+        # flip integration_tokens.status='auth_failed' atomically.
+        await _mark_failed(
+            customer_id, source, str(exc), exc=exc, claim_token=claim_token
+        )
+        counter("backfill.failed", 1, source=source.value)
+        log.exception("backfill.failed", customer=customer_id, source=source.value)
+        raise
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+
+    return enqueued
+
+
+async def _heartbeat_loop(
+    customer_id: str,
+    source: SourceSystem,
+    interval_seconds: float,
+    claim_token: datetime,
+) -> None:
+    """Unconditionally ping heartbeat_at every interval_seconds while running.
+
+    The WHERE clause is gated on (status='running' AND started_at = claim_token)
+    so a row that's been marked done/failed/reclaimed or re-claimed by another
+    worker won't get a stale heartbeat written. DB errors are logged and
+    swallowed: a transient blip should not kill the only liveness signal — if
+    Postgres is truly down, the next reaper tick will catch it via the stale
+    heartbeat anyway.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+            async with raw_conn() as conn:
+                await conn.execute(
+                    """
+                    UPDATE backfill_state
+                       SET heartbeat_at = NOW()
+                     WHERE customer_id   = $1
+                       AND source_system = $2
+                       AND status        = $3
+                       AND started_at    = $4
+                    """,
+                    customer_id,
+                    source.value,
+                    BackfillStatus.RUNNING.value,
+                    claim_token,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "backfill.heartbeat_loop.error",
+                customer=customer_id,
+                source=source.value,
+            )
+
+
+# ---- backfill_state writes -----------------------------------------------
+
+
+async def enqueue_backfill(customer_id: str, source: SourceSystem) -> None:
+    """Insert a `pending` backfill_state row so a worker picks it up.
+
+    Resets cursor to NULL — use for INITIAL syncs only. For incremental
+    re-polls of already-synced integrations (Granola steady-state), use
+    `re_enqueue_for_polling` to preserve the cursor watermark.
+    """
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO backfill_state
+                (customer_id, source_system, status, started_at, events_enqueued)
+            VALUES ($1, $2, $3, NULL, 0)
+            ON CONFLICT (customer_id, source_system)
+            DO UPDATE SET status          = EXCLUDED.status,
+                          last_cursor     = NULL,
+                          last_error      = NULL,
+                          events_enqueued = 0,
+                          started_at      = NULL,
+                          heartbeat_at    = NULL,
+                          completed_at    = NULL
+            """,
+            customer_id,
+            source.value,
+            BackfillStatus.PENDING.value,
+        )
+
+
+async def enqueue_slack_channel_backfill(
+    customer_id: str,
+    channel_id: str,
+) -> ChannelBackfillEnqueueResult:
+    """Queue a Slack backfill for one newly visible channel.
+
+    Slack has a singleton backfill_state row per customer/source. For normal
+    idle/complete/failed states we can replace that row with a channel-scoped
+    cursor. If the source-wide Slack backfill is currently running, defer the
+    channel in `pending_channels`; `_mark_done` will immediately requeue a
+    follow-up channel run instead of marking the row complete.
+    """
+    if not channel_id:
+        return ChannelBackfillEnqueueResult(queued=False, reason="missing_channel")
+
+    async with raw_conn() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            """
+            SELECT status, last_cursor
+            FROM backfill_state
+            WHERE customer_id = $1 AND source_system = $2
+            FOR UPDATE
+            """,
+            customer_id,
+            SourceSystem.SLACK.value,
+        )
+
+        if row is None:
+            await conn.execute(
+                """
+                INSERT INTO backfill_state
+                    (customer_id, source_system, status, last_cursor,
+                     started_at, events_enqueued)
+                VALUES ($1, $2, $3, $4, NULL, 0)
+                """,
+                customer_id,
+                SourceSystem.SLACK.value,
+                BackfillStatus.PENDING.value,
+                _slack_channel_cursor({channel_id: None}),
+            )
+            return ChannelBackfillEnqueueResult(queued=True, reason="inserted")
+
+        status = row["status"]
+        last_cursor = row["last_cursor"]
+
+        if status == BackfillStatus.PENDING.value and last_cursor is None:
+            return ChannelBackfillEnqueueResult(
+                queued=False,
+                reason="covered_by_full_backfill",
+            )
+
+        if status == BackfillStatus.RUNNING.value:
+            data = _decode_json_object(last_cursor)
+            pending = _slack_deferred_channels(last_cursor)
+            if channel_id in pending:
+                return ChannelBackfillEnqueueResult(
+                    queued=False,
+                    reason="already_deferred",
+                )
+            pending[channel_id] = None
+            data["pending_channels"] = pending
+            await conn.execute(
+                """
+                UPDATE backfill_state
+                SET last_cursor = $1,
+                    last_error = NULL,
+                    heartbeat_at = NOW()
+                WHERE customer_id = $2 AND source_system = $3
+                """,
+                json.dumps(data, sort_keys=True),
+                customer_id,
+                SourceSystem.SLACK.value,
+            )
+            return ChannelBackfillEnqueueResult(
+                queued=True,
+                reason="deferred_until_running_backfill_finishes",
+            )
+
+        state = _slack_state_from_cursor(last_cursor)
+        active: dict[str, str | None] = {
+            str(ch): cursor for ch, cursor in state["active"].items() if ch
+        }
+        if channel_id in active and status == BackfillStatus.PENDING.value:
+            return ChannelBackfillEnqueueResult(queued=False, reason="already_pending")
+        active[channel_id] = None
+
+        await conn.execute(
+            """
+            UPDATE backfill_state
+            SET status = $1,
+                last_cursor = $2,
+                last_error = NULL,
+                events_enqueued = 0,
+                started_at = NULL,
+                heartbeat_at = NULL,
+                completed_at = NULL
+            WHERE customer_id = $3 AND source_system = $4
+            """,
+            BackfillStatus.PENDING.value,
+            _slack_channel_cursor(active),
+            customer_id,
+            SourceSystem.SLACK.value,
+        )
+        return ChannelBackfillEnqueueResult(queued=True, reason="queued")
+
+
+async def _release_for_resume(
+    customer_id: str,
+    source: SourceSystem,
+    claim_token: datetime,
+) -> bool:
+    """Flip the row back to 'pending' so the next worker resumes immediately.
+
+    Used when this process is shutting down mid-backfill (SIGTERM during a
+    rolling deploy). Releasing the claim now means the next worker can
+    re-claim within seconds instead of waiting for the 5-min stale-heartbeat
+    reclaim threshold.
+
+    Fenced on (status='running' AND started_at = claim_token) so we don't
+    clobber a row that was already reclaimed or re-claimed by a competing
+    worker. last_cursor and events_enqueued are preserved so the resume
+    continues exactly where we stopped.
+
+    Returns True if a row was released, False if already preempted / not ours.
+    """
+    async with raw_conn() as conn:
+        tag = await conn.execute(
+            """
+            UPDATE backfill_state
+            SET status       = $1,
+                started_at   = NULL,
+                heartbeat_at = NULL
+            WHERE customer_id   = $2
+              AND source_system = $3
+              AND status        = $4
+              AND started_at    = $5
+            """,
+            BackfillStatus.PENDING.value,
+            customer_id,
+            source.value,
+            BackfillStatus.RUNNING.value,
+            claim_token,
+        )
+    return _affected(tag) > 0
+
+
+async def re_enqueue_for_polling(customer_id: str, source: SourceSystem) -> bool:
+    """Mark a backfill_state row pending again WITHOUT clearing the cursor.
+
+    Used for incremental polling on connectors with no webhooks (Granola).
+    Preserves last_cursor so the connector resumes from its watermark.
+
+    No-ops if the row is already pending or running (don't restart in-flight
+    work). Returns True if a re-enqueue actually happened, False if it was
+    a no-op or no row existed.
+    """
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE backfill_state
+            SET status = $1,
+                last_error = NULL,
+                started_at = NULL,
+                heartbeat_at = NULL,
+                completed_at = NULL
+            WHERE customer_id = $2 AND source_system = $3
+              AND status NOT IN ($4, $5)
+            RETURNING customer_id
+            """,
+            BackfillStatus.PENDING.value,
+            customer_id,
+            source.value,
+            BackfillStatus.PENDING.value,
+            BackfillStatus.RUNNING.value,
+        )
+    return row is not None
+
+
+async def _mark_running(customer_id: str, source: SourceSystem) -> datetime:
+    """Flip to running and return started_at — the claim ownership token.
+
+    started_at uniquely identifies this claim because every fresh claim
+    (claim_pending_backfill, reaper-then-claim, fresh enqueue-then-mark_running)
+    sets it to NOW() at claim time. All in-loop UPDATEs filter on this value
+    to detect preemption by the reaper or a competing claim.
+    """
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE backfill_state
+            SET status = $1, started_at = COALESCE(started_at, NOW()), heartbeat_at = NOW()
+            WHERE customer_id = $2 AND source_system = $3
+            RETURNING started_at
+            """,
+            BackfillStatus.RUNNING.value,
+            customer_id,
+            source.value,
+        )
+    if row is None or row["started_at"] is None:
+        raise BackfillReclaimedError(
+            f"backfill_state row vanished or has NULL started_at: "
+            f"{customer_id}/{source.value}"
+        )
+    return row["started_at"]
+
+
+async def _update_progress(
+    customer_id: str,
+    source: SourceSystem,
+    cursor: str | None,
+    enqueued: int,
+    claim_token: datetime,
+) -> None:
+    """Write progress, gated on the row still being ours.
+
+    Filters on (status='running' AND started_at = claim_token). If the reaper
+    already flipped the row to 'pending' or another worker has re-claimed it
+    (advancing started_at), the UPDATE matches 0 rows and we raise so the
+    run loop can bail without overwriting the new owner's state.
+    """
+    async with raw_conn() as conn, conn.transaction():
+        if source == SourceSystem.SLACK and cursor is not None:
+            row = await conn.fetchrow(
+                """
+                SELECT last_cursor
+                FROM backfill_state
+                WHERE customer_id   = $1
+                  AND source_system = $2
+                  AND status        = $3
+                  AND started_at    = $4
+                FOR UPDATE
+                """,
+                customer_id,
+                source.value,
+                BackfillStatus.RUNNING.value,
+                claim_token,
+            )
+            if row is not None:
+                pending = _slack_deferred_channels(row["last_cursor"])
+                if pending:
+                    data = _decode_json_object(cursor)
+                    data["pending_channels"] = {
+                        **_slack_deferred_channels(cursor),
+                        **pending,
+                    }
+                    cursor = json.dumps(data, sort_keys=True)
+
+        tag = await conn.execute(
+            """
+            UPDATE backfill_state
+            SET last_cursor      = $1,
+                events_enqueued  = $2,
+                last_progress_at = NOW(),
+                heartbeat_at     = NOW()
+            WHERE customer_id   = $3
+              AND source_system = $4
+              AND status        = $5
+              AND started_at    = $6
+            """,
+            cursor,
+            enqueued,
+            customer_id,
+            source.value,
+            BackfillStatus.RUNNING.value,
+            claim_token,
+        )
+    if _affected(tag) == 0:
+        raise BackfillReclaimedError(
+            f"progress write preempted: {customer_id}/{source.value}"
+        )
+
+
+async def _mark_done(
+    customer_id: str,
+    source: SourceSystem,
+    enqueued: int,
+    cursor: str | None,
+    claim_token: datetime,
+) -> None:
+    """Mark complete only if the row is still ours. No-op silently otherwise."""
+    async with raw_conn() as conn, conn.transaction():
+        if source == SourceSystem.SLACK:
+            row = await conn.fetchrow(
+                """
+                SELECT last_cursor
+                FROM backfill_state
+                WHERE customer_id   = $1
+                  AND source_system = $2
+                  AND status        = $3
+                  AND started_at    = $4
+                FOR UPDATE
+                """,
+                customer_id,
+                source.value,
+                BackfillStatus.RUNNING.value,
+                claim_token,
+            )
+            pending = _slack_deferred_channels(row["last_cursor"] if row else None)
+            if pending:
+                await conn.execute(
+                    """
+                    UPDATE backfill_state
+                    SET status           = $1,
+                        last_cursor      = $2,
+                        events_enqueued  = 0,
+                        last_progress_at = NOW(),
+                        heartbeat_at     = NULL,
+                        started_at       = NULL,
+                        completed_at     = NULL
+                    WHERE customer_id   = $3
+                      AND source_system = $4
+                      AND status        = $5
+                      AND started_at    = $6
+                    """,
+                    BackfillStatus.PENDING.value,
+                    _slack_channel_cursor(pending),
+                    customer_id,
+                    source.value,
+                    BackfillStatus.RUNNING.value,
+                    claim_token,
+                )
+                return
+
+        await conn.execute(
+            """
+            UPDATE backfill_state
+            SET status           = $1,
+                last_cursor      = $2,
+                events_enqueued  = $3,
+                last_progress_at = NOW(),
+                heartbeat_at     = NOW(),
+                completed_at     = NOW()
+            WHERE customer_id   = $4
+              AND source_system = $5
+              AND status        = $6
+              AND started_at    = $7
+            """,
+            BackfillStatus.COMPLETE.value,
+            cursor,
+            enqueued,
+            customer_id,
+            source.value,
+            BackfillStatus.RUNNING.value,
+            claim_token,
+        )
+
+
+async def _mark_failed(
+    customer_id: str,
+    source: SourceSystem,
+    error: str,
+    *,
+    exc: Exception | None = None,
+    claim_token: datetime,
+) -> None:
+    """Mark a backfill_state row as failed, gated on it still being ours.
+
+    The backfill_state UPDATE filters on (status='running' AND started_at =
+    claim_token). If the row was reclaimed and another worker has re-claimed
+    it, we no-op silently — the new owner's run is independent of our error.
+
+    When `exc` is a `PermanentSourceError` carrying a 401/403 status AND the
+    backfill_state UPDATE actually fired, we ALSO flip the active
+    integration_tokens row to status='auth_failed'. Sequencing these together
+    surfaces "Reconnect" in the dashboard for revoked Granola keys without
+    flipping on transient errors or on rows we don't own anymore.
+    """
+    # PermanentSourceError stores kwargs in `self.context`, not as attributes
+    # (see shared/exceptions.PrbeError). Granola raises with status=401/403.
+    is_auth_failure = False
+    if isinstance(exc, PermanentSourceError):
+        status_val = exc.context.get("status", 0) if exc.context else 0
+        is_auth_failure = status_val in {401, 403}
+
+    async with raw_conn() as conn, conn.transaction():
+        tag = await conn.execute(
+            """
+                UPDATE backfill_state
+                SET status       = $1,
+                    last_error   = $2,
+                    heartbeat_at = NOW()
+                WHERE customer_id   = $3
+                  AND source_system = $4
+                  AND status        = $5
+                  AND started_at    = $6
+                """,
+            BackfillStatus.FAILED.value,
+            error[:1000],
+            customer_id,
+            source.value,
+            BackfillStatus.RUNNING.value,
+            claim_token,
+        )
+        # Token flip is gated on backfill_state actually flipping. If we
+        # were preempted, the row belongs to a new claim; their fate is
+        # not ours to decide.
+        if is_auth_failure and _affected(tag) > 0:
+            # The status='active' filter means a concurrent disconnect
+            # (DELETE FROM integration_tokens) leaves this UPDATE matching
+            # 0 rows — safe no-op, no error raised.
+            await conn.execute(
+                """
+                    UPDATE integration_tokens
+                    SET status             = 'auth_failed',
+                        last_refresh_error = $1,
+                        updated_at         = NOW()
+                    WHERE customer_id   = $2
+                      AND source_system = $3
+                      AND status        = 'active'
+                    """,
+                error[:500],
+                customer_id,
+                source.value,
+            )
+
+
+
+
+async def _load_resume_state(
+    customer_id: str, source: SourceSystem
+) -> _ResumeState | None:
+    """Load the cursor + cumulative event count + current ownership token.
+
+    events_enqueued is cumulative across resumes — the run loop initializes
+    its local counter from this value so that progress writes after a reclaim
+    or restart preserve the running total instead of clobbering it with a
+    fresh-from-zero count.
+
+    Returns None if no row exists (caller should treat as fresh state).
+    """
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT last_cursor, events_enqueued, started_at
+              FROM backfill_state
+             WHERE customer_id = $1 AND source_system = $2
+            """,
+            customer_id,
+            source.value,
+        )
+    if row is None:
+        return None
+    return _ResumeState(
+        cursor=row["last_cursor"],
+        events_enqueued=row["events_enqueued"],
+        started_at=row["started_at"],
+    )
+
+
+async def _load_token(
+    customer_id: str, source: SourceSystem
+) -> IntegrationToken | None:
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT access_token_encrypted, refresh_token_encrypted, expires_at, scope,
+                   webhook_secret
+            FROM integration_tokens
+            WHERE customer_id=$1 AND source_system=$2 AND status='active'
+            """,
+            customer_id,
+            source.value,
+        )
+    if row is None:
+        return None
+    return IntegrationToken(
+        customer_id=customer_id,
+        source_system=source,
+        access_token=decrypt_token(row["access_token_encrypted"]),
+        refresh_token=(
+            decrypt_token(row["refresh_token_encrypted"])
+            if row["refresh_token_encrypted"]
+            else None
+        ),
+        expires_at=row["expires_at"],
+        scope=row["scope"],
+        webhook_secret=row["webhook_secret"],
+    )
+
+
+async def claim_pending_backfill() -> tuple[str, SourceSystem] | None:
+    """Pick up one pending backfill_state row atomically. SKIP LOCKED for concurrency."""
+    async with get_pool().acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            """
+            SELECT customer_id, source_system
+            FROM backfill_state
+            WHERE status = 'pending'
+            ORDER BY customer_id, source_system
+            FOR UPDATE SKIP LOCKED
+            LIMIT 1
+            """
+        )
+        if row is None:
+            return None
+        # Claim it by setting status=running immediately (inside the same tx).
+        await conn.execute(
+            """
+            UPDATE backfill_state
+            SET status = $1, started_at = NOW(), heartbeat_at = NOW()
+            WHERE customer_id = $2 AND source_system = $3
+            """,
+            BackfillStatus.RUNNING.value,
+            row["customer_id"],
+            row["source_system"],
+        )
+    return row["customer_id"], SourceSystem(row["source_system"])
+
+
+async def drain_pending_release_tasks(timeout_seconds: float = 20.0) -> int:
+    """Await any in-flight release tasks before loop teardown. Called from
+    the worker's outer finally so asyncio.run's task-cancel sweep can't
+    abort the asyncpg UPDATE mid-roundtrip.
+
+    Returns the number of tasks drained. Tasks that don't finish within
+    timeout_seconds are abandoned (they'll be cancelled by asyncio.run,
+    same as today).
+    """
+    if not _PENDING_RELEASE_TASKS:
+        return 0
+    pending = list(_PENDING_RELEASE_TASKS)
+    log.info("backfill.draining_release_tasks", count=len(pending))
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True),
+            timeout=timeout_seconds,
+        )
+    except TimeoutError:
+        log.warning(
+            "backfill.drain_release_timeout",
+            count=len(_PENDING_RELEASE_TASKS),
+        )
+    return len(pending)
+
+
+# Date/time helpers used in tests.
+def utcnow() -> datetime:
+    return datetime.now(UTC)

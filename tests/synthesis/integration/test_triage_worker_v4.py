@@ -17,25 +17,25 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.normalizer import Normalizer
-from services.synthesis.triage_worker import TriageWorker
-from shared.config import Settings
-from shared.constants import (
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.normalizer import Normalizer
+from engine.shared.config import Settings
+from engine.shared.constants import (
     DocClass,
     DocType,
     Permission,
     PrincipalType,
     SourceSystem,
 )
-from shared.db import raw_conn
-from shared.models import (
+from engine.shared.db import raw_conn
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
     Document,
     NormalizationResult,
 )
+from kb.synthesis.triage_worker import TriageWorker
 
 CUSTOMER = "wiki-triage-v4-cust"
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from services.ingestion.code_graph.cross_repo_deps import (
+from kb.code_graph.cross_repo_deps import (
     VerifiedMatch,
     _filter_wrong_direction_evidence,
     _is_wrong_direction_snippet,

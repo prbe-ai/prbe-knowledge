@@ -20,13 +20,10 @@ from typing import Any
 import httpx
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.granola import (
-    GranolaConnector,
-)
-from services.ingestion.handlers.registry import build_connector
-from shared.config import Settings
-from shared.constants import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.config import Settings
+from engine.shared.constants import (
     DocClass,
     DocType,
     EdgeType,
@@ -35,8 +32,11 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import PermanentSourceError, RateLimited, TransientSourceError
-from shared.models import IntegrationToken, WebhookEvent
+from engine.shared.exceptions import PermanentSourceError, RateLimited, TransientSourceError
+from engine.shared.models import IntegrationToken, WebhookEvent
+from kb.handlers.granola import (
+    GranolaConnector,
+)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -556,7 +556,7 @@ async def test_backfill_checkpoint_on_clean_run_advances_watermark() -> None:
 async def test_backfill_no_checkpoint_when_max_pages_hit(monkeypatch) -> None:
     """If we hit _MAX_PAGES_PER_TICK with has_more still true, don't checkpoint —
     next tick must keep the same created_after filter."""
-    import services.ingestion.handlers.granola as granola_mod
+    import kb.handlers.granola as granola_mod
 
     monkeypatch.setattr(granola_mod, "_MAX_PAGES_PER_TICK", 1)
 
@@ -677,7 +677,7 @@ async def test_backfill_no_checkpoint_when_nothing_seen() -> None:
 
 def test_watermark_step_back_1ms_helper() -> None:
     """Helper produces ISO 1ms earlier; returns None on unparseable input."""
-    from services.ingestion.handlers.granola import _watermark_step_back_1ms
+    from kb.handlers.granola import _watermark_step_back_1ms
 
     assert (
         _watermark_step_back_1ms("2026-04-28T19:03:26.314Z")

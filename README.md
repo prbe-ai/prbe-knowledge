@@ -148,15 +148,24 @@ nDCG@10 also rose, 0.459 → 0.556.)
 
 ```
 prbe-knowledge/
-├── services/
-│   ├── ingestion/      webhook + custom-ingest API (:8080)
-│   │   └── handlers/   one connector per source
-│   ├── worker/         queue drain: normalize · chunk · embed
-│   ├── retrieval/      /retrieve + /query (:8081)
+├── engine/             content-agnostic core (never imports kb/)
+│   ├── ingest/         queue drain · normalize · chunk · embed, plus the
+│   │   │               generic ingest doors (custom-ingest API, manual
+│   │   │               uploads) and the connector contract + registry
+│   │   └── handlers/   Connector ABC, registry, engine-door connectors
+│   ├── retrieval/      /retrieve + /query (:8081): retrievers + RRF fusion
 │   ├── mcp/            MCP server: agent tool surface (:8084)
-│   ├── synthesis/      knowledge-page generation
-│   └── ...
-├── shared/             config, db, storage, models, enums
+│   ├── community/      Leiden graph clustering
+│   └── shared/         config, db/tenancy, storage, models, enums,
+│                       source registry
+├── kb/                 integrations domain (imports engine/)
+│   ├── handlers/       one connector per source (Slack, GitHub, ...)
+│   ├── polling/        outbound pollers (self-host mode)
+│   ├── ingestion_app.py  webhook + ingest HTTP app (:8080)
+│   ├── worker.py       composed worker process (drain + backfills + pollers)
+│   └── synthesis/      knowledge-page (wiki) generation
+├── services/           thin deploy wrappers — compose/Helm entrypoints
+│                       (services.ingestion.main:app etc.) stay stable
 ├── db/
 │   └── schema.sql      canonical Postgres schema (source of truth)
 ├── scripts/

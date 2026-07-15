@@ -25,9 +25,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from services.retrieval.list_pipeline import run_list
-from services.retrieval.router import Intent, RouterEntity
-from shared.models import QueryRequest, TemporalSpec
+from engine.retrieval.list_pipeline import run_list
+from engine.retrieval.router import Intent, RouterEntity
+from engine.shared.models import QueryRequest, TemporalSpec
 
 pytestmark = pytest.mark.asyncio
 
@@ -78,9 +78,9 @@ class TestListPipelineEntityGating:
             return keys
 
         with patch(
-            "services.retrieval.list_pipeline.sql_list", new=AsyncMock(return_value=[])
+            "engine.retrieval.list_pipeline.sql_list", new=AsyncMock(return_value=[])
         ) as m_list, patch(
-            "services.retrieval.list_pipeline.expand_exclude_keys_with_aliases",
+            "engine.retrieval.list_pipeline.expand_exclude_keys_with_aliases",
             new=AsyncMock(side_effect=_passthrough_exclude),
         ):
             await run_list(
@@ -124,14 +124,14 @@ class TestListPipelineEntityGating:
             return keys
 
         with patch(
-            "services.retrieval.list_pipeline.sql_list", new=AsyncMock(return_value=[])
+            "engine.retrieval.list_pipeline.sql_list", new=AsyncMock(return_value=[])
         ) as m_list, patch(
-            "services.retrieval.list_pipeline.with_tenant"
+            "engine.retrieval.list_pipeline.with_tenant"
         ) as m_with_tenant, patch(
-            "services.retrieval.list_pipeline.expand_to_author_id_set",
+            "engine.retrieval.list_pipeline.expand_to_author_id_set",
             new=AsyncMock(return_value=["user:alice"]),
         ), patch(
-            "services.retrieval.list_pipeline.expand_exclude_keys_with_aliases",
+            "engine.retrieval.list_pipeline.expand_exclude_keys_with_aliases",
             new=AsyncMock(side_effect=_passthrough_exclude),
         ):
             m_with_tenant.return_value.__aenter__ = AsyncMock(return_value=None)
@@ -167,7 +167,7 @@ class TestListPipelineEntityGating:
         intent.operation = "count"
 
         with patch(
-            "services.retrieval.list_pipeline.sql_count", new=AsyncMock(return_value=0)
+            "engine.retrieval.list_pipeline.sql_count", new=AsyncMock(return_value=0)
         ) as m_count:
             await run_list(
                 req=req,
@@ -195,7 +195,7 @@ class TestListPipelineEntityGating:
         intent.group_by_key = "author_id"
 
         with patch(
-            "services.retrieval.list_pipeline.sql_group_by",
+            "engine.retrieval.list_pipeline.sql_group_by",
             new=AsyncMock(return_value=[]),
         ) as m_group:
             await run_list(

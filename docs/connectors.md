@@ -152,6 +152,32 @@ Each document requires `id` and `body`; `title`, `type`, `url`, `metadata`, and
 `acl` are optional. The envelope requires a `source_key` naming the logical
 source and a non-empty `documents` array (up to 100 per request).
 
+To delete a document, send an entry with `"deleted": true` (the `body` is
+optional for deletes). This tombstones the document — its live version and
+chunks are closed and it drops out of retrieval — with the same semantics as a
+connector-originated delete:
+
+```bash
+curl -X POST http://localhost:8080/api/custom-ingest/documents \
+  -H "Authorization: Bearer $KNOWLEDGE_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"source_key": "my-docs", "documents": [{"id": "seed:1", "deleted": true}]}'
+```
+
+To enumerate what the engine currently holds under a `source_key` (for
+consumer-side reconciliation), page through:
+
+```
+GET /api/custom-ingest/documents?source_key=my-docs&limit=100[&cursor=<next_cursor>]
+```
+
+Same auth as the POST route. Each page returns
+`{"documents": [{"id", "content_hash", "deleted", "updated_at", "metadata"}],
+"next_cursor"}` where `id` is your original document id, `content_hash` is the
+engine-computed hash of the pushed document (recomputable client-side; `null`
+for documents ingested before hash stamping), and `next_cursor` is an opaque
+keyset cursor (`null` on the last page).
+
 ## Token encryption
 
 Any connector that stores credentials (OAuth tokens) encrypts them at rest with

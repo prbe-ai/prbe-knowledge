@@ -6,9 +6,9 @@ import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from services.retrieval.dedup import cosine, dedupe
-from services.retrieval.fusion import fuse
-from shared.constants import DEFAULT_RECENCY_HALF_LIFE_DAYS
+from engine.retrieval.dedup import cosine, dedupe
+from engine.retrieval.fusion import fuse
+from engine.shared.constants import DEFAULT_RECENCY_HALF_LIFE_DAYS
 
 _NOW = datetime(2026, 4, 24, tzinfo=UTC)
 

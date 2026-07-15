@@ -19,7 +19,7 @@ from httpx import ASGITransport
 def _internal_key(monkeypatch):
     """Match the live config helper — set the shared secret."""
     monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", "test-internal-key")
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()  # type: ignore[attr-defined]
     yield "test-internal-key"
@@ -29,8 +29,8 @@ def _internal_key(monkeypatch):
 async def test_webhook_returns_503_when_killswitch_disabled(_internal_key) -> None:
     """Operator flips the killswitch off → all webhooks 503 with Retry-After.
     R2 is never touched, queue insert is never attempted."""
-    from services.ingestion.main import app
-    from services.system_settings.store import IngestionKillswitch
+    from engine.system_settings.store import IngestionKillswitch
+    from kb.ingestion_app import app
 
     fake_ks = IngestionKillswitch(
         enabled=False, reason="maintenance window", fetched_at=0.0
@@ -42,7 +42,7 @@ async def test_webhook_returns_503_when_killswitch_disabled(_internal_key) -> No
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         with mock.patch(
-            "services.ingestion.main.get_ingestion_killswitch", side_effect=fake_get
+            "kb.ingestion_app.get_ingestion_killswitch", side_effect=fake_get
         ):
             resp = await client.post(
                 "/webhooks/claude_code",
@@ -62,8 +62,8 @@ async def test_webhook_returns_503_when_killswitch_disabled(_internal_key) -> No
 
 @pytest.mark.asyncio
 async def test_webhook_503_default_reason_when_none(_internal_key) -> None:
-    from services.ingestion.main import app
-    from services.system_settings.store import IngestionKillswitch
+    from engine.system_settings.store import IngestionKillswitch
+    from kb.ingestion_app import app
 
     fake_ks = IngestionKillswitch(enabled=False, reason=None, fetched_at=0.0)
 
@@ -73,7 +73,7 @@ async def test_webhook_503_default_reason_when_none(_internal_key) -> None:
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         with mock.patch(
-            "services.ingestion.main.get_ingestion_killswitch", side_effect=fake_get
+            "kb.ingestion_app.get_ingestion_killswitch", side_effect=fake_get
         ):
             resp = await client.post(
                 "/webhooks/claude_code",
@@ -96,8 +96,8 @@ async def test_webhook_killswitch_runs_before_internal_key_check_NOT(
     """Confirms ordering: an unauthorized request still gets 401, NOT 503,
     even when killswitch is off. Auth is the outer ring; killswitch is just
     inside it. (We don't want to leak killswitch state to anonymous callers.)"""
-    from services.ingestion.main import app
-    from services.system_settings.store import IngestionKillswitch
+    from engine.system_settings.store import IngestionKillswitch
+    from kb.ingestion_app import app
 
     fake_ks = IngestionKillswitch(enabled=False, reason="x", fetched_at=0.0)
 
@@ -107,7 +107,7 @@ async def test_webhook_killswitch_runs_before_internal_key_check_NOT(
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         with mock.patch(
-            "services.ingestion.main.get_ingestion_killswitch", side_effect=fake_get
+            "kb.ingestion_app.get_ingestion_killswitch", side_effect=fake_get
         ):
             resp = await client.post(
                 "/webhooks/claude_code",
@@ -126,8 +126,8 @@ async def test_webhook_killswitch_runs_before_internal_key_check_NOT(
 async def test_internal_status_endpoint_returns_killswitch(_internal_key) -> None:
     """Admin/proxy reads via the internal endpoint; force_refresh=True
     bypasses the cache so flips show up immediately."""
-    from services.ingestion.main import app
-    from services.system_settings.store import IngestionKillswitch
+    from engine.system_settings.store import IngestionKillswitch
+    from kb.ingestion_app import app
 
     fake_ks = IngestionKillswitch(
         enabled=False, reason="testing", fetched_at=0.0
@@ -141,7 +141,7 @@ async def test_internal_status_endpoint_returns_killswitch(_internal_key) -> Non
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
         with mock.patch(
-            "services.ingestion.main.get_ingestion_killswitch", side_effect=fake_get
+            "kb.ingestion_app.get_ingestion_killswitch", side_effect=fake_get
         ):
             resp = await client.get(
                 "/api/internal/ingestion-status",
@@ -155,7 +155,7 @@ async def test_internal_status_endpoint_returns_killswitch(_internal_key) -> Non
 
 @pytest.mark.asyncio
 async def test_internal_status_endpoint_requires_internal_key(_internal_key) -> None:
-    from services.ingestion.main import app
+    from kb.ingestion_app import app
 
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:

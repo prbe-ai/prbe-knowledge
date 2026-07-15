@@ -10,9 +10,9 @@ import json
 
 import pytest
 
-from services.retrieval.graph_explore import graph_search_query
-from shared.constants import GRAPH_SEARCH_MAX_LIMIT, NodeLabel
-from shared.db import raw_conn
+from engine.retrieval.graph_explore import graph_search_query
+from engine.shared.constants import GRAPH_SEARCH_MAX_LIMIT, NodeLabel
+from engine.shared.db import raw_conn
 
 pytestmark = pytest.mark.asyncio
 
