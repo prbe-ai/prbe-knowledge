@@ -139,6 +139,7 @@ async def bm25_search(
     include_drafts: bool = False,
     author_ids: list[str] | None = None,
     sort_by: Literal["relevance", "recency"] = "relevance",
+    source_keys: list[str] | None = None,
 ) -> list[BM25Hit]:
     """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
     rows (see migration 0082 + Plan A Component 6). Reviewer surfaces pass
@@ -151,6 +152,10 @@ async def bm25_search(
     `ORDER BY d.updated_at DESC`. The `content_tsv @@ to_tsquery` filter
     still narrows the pool to query-token matches; only the final ordering
     flips. Used by the gatherer when the extractor flagged temporal intent.
+
+    `source_keys`, when set, hard-filters by
+    `documents.metadata->>'source_key' = ANY(...)` (custom-ingest scope
+    key). Applied BEFORE the LIMIT -- mirrors vector_search.
     """
     spec = temporal or TemporalSpec()
     or_query = _build_or_tsquery_string(query_text)
@@ -173,6 +178,13 @@ async def bm25_search(
         if author_ids:
             params.append(author_ids)
             author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
+
+        source_key_filter = ""
+        if source_keys:
+            params.append(source_keys)
+            source_key_filter = (
+                f"AND d.metadata->>'source_key' = ANY(${len(params)}::text[])"
+            )
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -220,6 +232,7 @@ async def bm25_search(
               {doc_type_filter}
               {visibility_filter}
               {author_filter}
+              {source_key_filter}
             ORDER BY {order_by_sql}
             LIMIT $3
             """,

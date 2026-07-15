@@ -43,6 +43,7 @@ async def vector_search(
     include_drafts: bool = False,
     author_ids: list[str] | None = None,
     sort_by: Literal["relevance", "recency"] = "relevance",
+    source_keys: list[str] | None = None,
 ) -> list[VectorHit]:
     """Embed `query_text`, ANN-search against chunks, return top_k hits.
 
@@ -71,6 +72,12 @@ async def vector_search(
     matching the query) still narrows the pool, but final order is by
     recency. Used by the gatherer when the extractor flagged temporal
     intent.
+
+    `source_keys`, when set, hard-filters by
+    `documents.metadata->>'source_key' = ANY(...)` -- the key the
+    custom-ingest door stamps per document. Docs without a source_key
+    (connector-ingested) drop out. Predicate applies BEFORE the LIMIT so
+    the caller's top_k is filled entirely with in-scope hits.
     """
     embedder = get_embedder_v2()
     query_vec = await embedder.embed_query(query_text)
@@ -94,6 +101,13 @@ async def vector_search(
         if author_ids:
             params.append(author_ids)
             author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
+
+        source_key_filter = ""
+        if source_keys:
+            params.append(source_keys)
+            source_key_filter = (
+                f"AND d.metadata->>'source_key' = ANY(${len(params)}::text[])"
+            )
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -146,6 +160,7 @@ async def vector_search(
               {doc_type_filter}
               {visibility_filter}
               {author_filter}
+              {source_key_filter}
             ORDER BY {order_by_sql}
             LIMIT $3
             """,

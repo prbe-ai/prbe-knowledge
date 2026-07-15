@@ -8,6 +8,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from engine.shared.constants import (
+    MAX_REQUEST_SOURCE_KEYS,
     AttachmentKind,
     CodeSymbolKind,
     CompileTrigger,
@@ -282,8 +283,23 @@ class QueryRequest(BaseModel):
         description=(
             "Optional caller-provided doc_type filter. Values are dotted "
             "DocType strings (e.g. 'github.commit'). When set, overrides "
-            "any doc_type the router would have inferred from the query. "
-            "Hard filter on list mode; soft RRF boost on search mode."
+            "any doc_type the extractor would have inferred from the query "
+            "and hard-filters `documents.doc_type = ANY(...)` in every "
+            "retrieval channel (pre-fan-out AND the agent's in-loop "
+            "searches). Unknown values simply match nothing."
+        ),
+    )
+    source_keys: list[str] | None = Field(
+        default=None,
+        max_length=MAX_REQUEST_SOURCE_KEYS,
+        description=(
+            "Optional caller-provided source_key scope. Values match "
+            "`documents.metadata->>'source_key'` as stamped by the "
+            "custom-ingest door (e.g. 'workspace:<uuid>'). When set, every "
+            "retrieval channel hard-filters to documents carrying one of "
+            "these keys BEFORE ranking/limits -- documents without a "
+            "source_key (connector-ingested content) drop out entirely. "
+            f"Cap {MAX_REQUEST_SOURCE_KEYS} keys."
         ),
     )
     requesting_user_id: str | None = None

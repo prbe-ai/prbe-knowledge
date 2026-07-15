@@ -83,6 +83,7 @@ async def inferred_edge_search(
     author_ids: list[str] | None = None,
     sort_by: Literal["relevance", "recency"] = "relevance",
     doc_types: list[str] | None = None,
+    source_keys: list[str] | None = None,
 ) -> list[InferredEdgeHit]:
     """Walk INFERRED Doc-Doc edges from `top_doc_ids` and return up to
     `top_k` linked documents.
@@ -106,6 +107,10 @@ async def inferred_edge_search(
     still narrow the pool; only the final ordering flips so the gatherer
     sees the freshest inferred-edge-linked docs first when temporal
     intent was flagged.
+
+    `source_keys`, when set, hard-filters the joined documents by
+    `metadata->>'source_key' = ANY(...)` (custom-ingest scope key),
+    BEFORE the LIMIT -- neighbors outside the scope drop out.
     """
     if not top_doc_ids:
         return []
@@ -126,6 +131,13 @@ async def inferred_edge_search(
     if doc_types:
         params.append(doc_types)
         doc_type_filter_sql = f"AND d.doc_type = ANY(${len(params)}::text[])"
+
+    source_key_filter_sql = ""
+    if source_keys:
+        params.append(source_keys)
+        source_key_filter_sql = (
+            f"AND d.metadata->>'source_key' = ANY(${len(params)}::text[])"
+        )
 
     # Default order: edge-type priority then recency within tier.
     # sort_by="recency": pure recency first (still tie-broken by edge-type
@@ -242,6 +254,7 @@ async def inferred_edge_search(
         WHERE nd.doc_id <> ALL($2::text[])  -- exclude top_doc_ids themselves
           {author_filter_sql}
           {doc_type_filter_sql}
+          {source_key_filter_sql}
         ORDER BY {order_by_sql}
         LIMIT $3
     """

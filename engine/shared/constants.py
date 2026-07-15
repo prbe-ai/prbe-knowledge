@@ -527,6 +527,13 @@ TOP_K_DIRECTED = 20
 RRF_K = 60
 DEDUP_COSINE_THRESHOLD = 0.95
 
+# Cap on caller-provided `source_keys` in QueryRequest. Each key becomes a
+# `documents.metadata->>'source_key' = ANY(...)` array member in every
+# retrieval channel's SQL; the cap bounds both the array size and the
+# request payload. Consumers scoping to a workspace lens pass 1-2 keys;
+# 50 leaves generous headroom for multi-corpus callers.
+MAX_REQUEST_SOURCE_KEYS = 50
+
 # Graph-explore endpoint (POST /graph/explore + /graph/search) caps. These
 # bound the visualization payload that the dashboard renders client-side --
 # force-directed layout starts to crawl above a few thousand nodes, and the

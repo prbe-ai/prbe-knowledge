@@ -164,6 +164,13 @@ class LoopState:
     # extractor at inspection time.
     search_options: SearchOptions = field(default_factory=SearchOptions)
     pre_fanout_author_ids: list[str] = field(default_factory=list)
+    # Caller-provided hard scope from QueryRequest. When set, the loop
+    # injects these into every in-loop `search` dispatch (the tool schema
+    # deliberately does not expose them) so the agent can reformulate
+    # queries but never widen the caller's scope. None = unscoped, which
+    # keeps the dispatch arguments byte-identical to pre-filter behavior.
+    request_source_keys: list[str] | None = None
+    request_doc_types: list[str] | None = None
 
 
 # ============================================================
@@ -465,6 +472,8 @@ def _build_user_message(
     *,
     options: SearchOptions | None = None,
     author_ids: list[str] | None = None,
+    source_keys: list[str] | None = None,
+    doc_types: list[str] | None = None,
 ) -> str:
     """Render the per-query user message.
 
@@ -504,7 +513,8 @@ def _build_user_message(
     options_block = ""
     sort_nondefault = options is not None and options.sort != "relevance"
     has_author_filter = bool(author_ids)
-    if sort_nondefault or has_author_filter:
+    has_scope_filter = bool(source_keys) or bool(doc_types)
+    if sort_nondefault or has_author_filter or has_scope_filter:
         # Render each option INDEPENDENTLY — only emit `sort=...` when the
         # sort directive deviates from the default; only emit `author_ids=...`
         # when the harness actually applied one. Without this guard, a
@@ -517,6 +527,23 @@ def _build_user_message(
             parts.append(f"sort={options.sort}")  # type: ignore[union-attr]
         if has_author_filter:
             parts.append(f"author_ids={list(author_ids)}")
+        # Caller-enforced scope (QueryRequest.source_keys / .doc_types).
+        # Rendered so the model understands WHY channels look narrow and
+        # doesn't burn tool calls hunting for out-of-scope sources. The
+        # harness re-applies this scope to every in-loop `search`, so the
+        # model cannot widen it -- say so explicitly.
+        scope_note = ""
+        if has_scope_filter:
+            if source_keys:
+                parts.append(f"source_keys={list(source_keys)}")
+            if doc_types:
+                parts.append(f"doc_types={list(doc_types)}")
+            scope_note = (
+                " The `source_keys` / `doc_types` scope is caller-enforced: "
+                "every `search` you issue is automatically constrained to "
+                "it, so do not retry searches hoping to reach other "
+                "sources — curate from what the scope returns."
+            )
         options_block = (
             f"\n\n<search_options>\n"
             f"The harness applied these options to the pre-fan-out below: "
@@ -524,7 +551,8 @@ def _build_user_message(
             f"are ordered by `updated_at DESC` after entity / token / "
             f"embedding narrowing. When `author_ids` is set, all channels "
             f"hard-filter `documents.author_id = ANY(...)`. Trust the "
-            f"channel ordering — don't re-rank by your own intuition.\n"
+            f"channel ordering — don't re-rank by your own intuition."
+            f"{scope_note}\n"
             f"</search_options>"
         )
 
@@ -931,6 +959,17 @@ async def _execute_tool_call(
             "new_budget": state.budget,
             "reason_logged": reason,
         }
+
+    # Enforce the caller's request-level scope on every in-loop search.
+    # `source_keys` / `doc_types` are not on the agent-facing tool schema,
+    # so this never overwrites a model-provided value -- it re-applies the
+    # QueryRequest scope the prefanout already ran under. Without this, a
+    # reformulated in-loop `search` would silently escape the scope.
+    if name == "search":
+        if state.request_source_keys:
+            arguments["source_keys"] = state.request_source_keys
+        if state.request_doc_types:
+            arguments["doc_types"] = state.request_doc_types
 
     t_tool = time.perf_counter()
     result = await dispatch_tool_call(
@@ -1544,6 +1583,17 @@ async def run_gatherer(
     # the retrievers treat that as "no filter."
     author_ids = await _resolve_person_author_ids(customer_id, entity_dicts)
 
+    # Caller-provided hard scope from QueryRequest. `req.doc_types`
+    # OVERRIDES the extractor's inferred doc_types (the documented
+    # QueryRequest contract); `req.source_keys` has no extractor
+    # counterpart. Both thread into the prefanout below and into every
+    # in-loop `search` dispatch via LoopState. When neither is set the
+    # values collapse to exactly what the extractor produced, keeping
+    # unfiltered requests byte-identical to pre-scope behavior.
+    request_source_keys = req.source_keys or None
+    request_doc_types = req.doc_types or None
+    effective_doc_types = request_doc_types or search_options.doc_types or None
+
     log.info(
         "agent.entity_bag_assembled",
         customer_id=customer_id,
@@ -1552,7 +1602,8 @@ async def run_gatherer(
         extracted=len(extracted_entities),
         final=len(entity_dicts),
         sort=search_options.sort,
-        doc_types=search_options.doc_types,
+        doc_types=effective_doc_types,
+        source_keys=request_source_keys,
         author_id_count=len(author_ids),
         grounding_ms=round(timing["grounding_ms"], 1),
         extraction_ms=round(timing["extraction_ms"], 1),
@@ -1585,7 +1636,8 @@ async def run_gatherer(
         entity_ids=entity_dicts or None,
         author_ids=author_ids or None,
         sort_by=search_options.sort,
-        doc_types=search_options.doc_types or None,
+        doc_types=effective_doc_types,
+        source_keys=request_source_keys,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
@@ -1612,6 +1664,8 @@ async def run_gatherer(
         prefanout_result,
         options=search_options,
         author_ids=author_ids,
+        source_keys=request_source_keys,
+        doc_types=request_doc_types,
     )
     system_prompt = build_system_prompt(datetime.now(UTC))
 
@@ -1624,6 +1678,8 @@ async def run_gatherer(
         prefanout_hit_counts=prefanout_hit_counts,
         search_options=search_options,
         pre_fanout_author_ids=list(author_ids),
+        request_source_keys=request_source_keys,
+        request_doc_types=request_doc_types,
         messages=[
             {
                 "role": "system",

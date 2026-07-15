@@ -277,6 +277,7 @@ async def execute_search(
     author_ids: list[str] | None = None,
     sort_by: Literal["relevance", "recency"] = "relevance",
     doc_types: list[str] | None = None,
+    source_keys: list[str] | None = None,
 ) -> dict[str, Any]:
     """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
     inferred_edge) in parallel — same shape the harness runs on turn 0.
@@ -299,6 +300,12 @@ async def execute_search(
     progress") so the channels return the top-K by recency/relevance
     from the matching class instead of being anchored on whatever
     specific entity the extractor picked from its candidates list.
+
+    `source_keys`, when set, hard-filters every channel by
+    `documents.metadata->>'source_key' = ANY(...)` (custom-ingest scope
+    key, e.g. 'workspace:<uuid>'). NOT exposed on the agent's tool
+    schema -- the loop injects the request-level scope into every in-loop
+    `search` dispatch so the agent cannot widen it.
 
     Use cases:
       - Reformulate the original query (one new sub-query).
@@ -353,6 +360,7 @@ async def execute_search(
                     author_ids=author_ids,
                     sort_by=sort_by,
                     doc_types=doc_types,
+                    source_keys=source_keys,
                 )
                 return [_hit_to_chunk_dict(h, "vector") for h in hits]
             except Exception as exc:
@@ -367,6 +375,7 @@ async def execute_search(
                     author_ids=author_ids,
                     sort_by=sort_by,
                     doc_types=doc_types,
+                    source_keys=source_keys,
                 )
                 return [_hit_to_chunk_dict(h, "bm25") for h in hits]
             except Exception as exc:
@@ -383,6 +392,7 @@ async def execute_search(
                     author_ids=author_ids,
                     sort_by=sort_by,
                     doc_types=doc_types,
+                    source_keys=source_keys,
                 )
                 return [
                     {
@@ -413,6 +423,7 @@ async def execute_search(
                     author_ids=author_ids,
                     sort_by=sort_by,
                     doc_types=doc_types,
+                    source_keys=source_keys,
                 )
                 return [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:

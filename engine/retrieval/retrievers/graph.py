@@ -106,6 +106,7 @@ async def graph_search(
     include_drafts: bool = False,
     author_ids: list[str] | None = None,
     sort_by: Literal["relevance", "recency"] = "relevance",
+    source_keys: list[str] | None = None,
 ) -> list[GraphHit]:
     """Return chunks from documents within 1 hop of any matching entity node.
 
@@ -124,6 +125,12 @@ async def graph_search(
     (entity-anchored joins) is unchanged; only the order returned to the
     caller flips, so downstream fusion sees recency-ordered hits for this
     channel when the gatherer flagged temporal intent.
+
+    `source_keys`, when set, hard-filters the joined documents by
+    `metadata->>'source_key' = ANY(...)` (custom-ingest scope key) inside
+    the SQL, BEFORE the LIMIT -- same discipline as vector/bm25. The graph
+    walk itself is unconstrained; only the neighbor documents that come
+    back are scoped.
     """
     if not entities:
         return []
@@ -183,6 +190,13 @@ async def graph_search(
         if author_ids:
             params.append(author_ids)
             author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
+
+        source_key_filter = ""
+        if source_keys:
+            params.append(source_keys)
+            source_key_filter = (
+                f"AND d.metadata->>'source_key' = ANY(${len(params)}::text[])"
+            )
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -327,6 +341,7 @@ async def graph_search(
               {doc_type_filter}
               {visibility_filter}
               {author_filter}
+              {source_key_filter}
             GROUP BY c.chunk_id, c.doc_id, c.chunk_index, d.version,
                      d.source_system, d.source_url, d.title, d.author_id,
                      c.content, d.created_at, d.updated_at
