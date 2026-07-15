@@ -10,7 +10,7 @@ from datetime import datetime
 import asyncpg
 import orjson
 
-from shared.models import GraphEdgeSpec, GraphNodeSpec
+from engine.shared.models import GraphEdgeSpec, GraphNodeSpec
 
 
 async def _fetch_aliases(

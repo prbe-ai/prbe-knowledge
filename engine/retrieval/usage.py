@@ -29,11 +29,11 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-from services.retrieval.auth import authenticate_query
-from shared.db import with_tenant
-from shared.logging import get_logger
-from shared.metrics import counter
-from shared.models import (
+from engine.retrieval.auth import authenticate_query
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
+from engine.shared.metrics import counter
+from engine.shared.models import (
     UsageEventOut,
     UsageFeedResponse,
     UsageStatsResponse,

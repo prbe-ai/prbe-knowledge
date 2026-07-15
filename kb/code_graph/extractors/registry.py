@@ -8,7 +8,7 @@ extract() call.
 
 from __future__ import annotations
 
-from services.ingestion.code_graph.types import Extractor
+from kb.code_graph.types import Extractor
 
 _BY_EXTENSION: dict[str, Extractor] = {}
 _ALL: list[Extractor] = []

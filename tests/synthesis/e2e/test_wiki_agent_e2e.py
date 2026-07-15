@@ -18,25 +18,25 @@ from datetime import UTC, datetime
 import pytest
 import pytest_asyncio
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.normalizer import Normalizer
-from services.synthesis.synthesis_worker import SynthesisWorker
-from shared.config import Settings, get_settings
-from shared.constants import (
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.normalizer import Normalizer
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import (
     DocClass,
     DocType,
     Permission,
     PrincipalType,
     SourceSystem,
 )
-from shared.db import raw_conn
-from shared.models import (
+from engine.shared.db import raw_conn
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
     Document,
     NormalizationResult,
 )
+from kb.synthesis.synthesis_worker import SynthesisWorker
 
 CUSTOMER = "wiki-e2e-cust"
 

@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import asyncio
 
-from services.ingestion.session_completer import enqueue_idle_session_finalizers
-from shared.config import get_settings
-from shared.db import init_pool
+from engine.shared.config import get_settings
+from engine.shared.db import init_pool
+from kb.session_completer import enqueue_idle_session_finalizers
 
 
 async def _main() -> None:
@@ -21,7 +21,7 @@ async def _main() -> None:
         n = await enqueue_idle_session_finalizers(settings.claude_code_session_idle_minutes)
         print(f"enqueued {n} finalize events")
     finally:
-        from shared.db import close_pool
+        from engine.shared.db import close_pool
         await close_pool()
 
 

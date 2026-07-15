@@ -28,9 +28,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from shared.constants import INFERRED_EDGE_DAMPENING, INFERRED_EDGE_TOP_K, NodeLabel
-from shared.db import with_tenant
-from shared.models import normalize_author_id
+from engine.shared.constants import INFERRED_EDGE_DAMPENING, INFERRED_EDGE_TOP_K, NodeLabel
+from engine.shared.db import with_tenant
+from engine.shared.models import normalize_author_id
 
 # Tag the inferred-edges extractor writes onto each row. Lives here as a
 # constant so this retriever doesn't need to import the producer module

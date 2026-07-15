@@ -45,7 +45,7 @@ from collections.abc import AsyncIterator
 import pytest
 import pytest_asyncio
 
-from shared.db import raw_conn, with_tenant
+from engine.shared.db import raw_conn, with_tenant
 
 TENANT_A = "cust-rls-tenant-a"
 TENANT_B = "cust-rls-tenant-b"

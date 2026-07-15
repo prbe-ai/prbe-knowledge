@@ -45,7 +45,7 @@ Splitter algorithm
 
 from __future__ import annotations
 
-from services.ingestion.chunker import chunk_text, count_tokens
+from engine.ingest.chunker import chunk_text, count_tokens
 
 
 def split_symbol_body(

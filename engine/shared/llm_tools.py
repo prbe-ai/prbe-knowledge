@@ -80,7 +80,7 @@ from typing import Any
 
 import orjson
 
-from shared.llm import LLMError, acompletion
+from engine.shared.llm import LLMError, acompletion
 
 __all__ = [
     "ToolCallParseError",

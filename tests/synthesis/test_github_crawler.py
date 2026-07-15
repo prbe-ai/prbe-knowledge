@@ -17,16 +17,16 @@ import httpx
 import pytest
 import respx
 
-from services.synthesis.api_clients.github import (
+from engine.shared.exceptions import ToolValidationError
+from kb.synthesis.api_clients.github import (
     GitHubAPIClient,
     GitHubRateLimitExhausted,
 )
-from services.synthesis.crawlers.github import (
+from kb.synthesis.crawlers.github import (
     BackfillWikiRuntime,
     GitHubCrawlerAgent,
     _Cursor,
 )
-from shared.exceptions import ToolValidationError
 
 # ---------------------------------------------------------------------------
 # Test fixtures
@@ -374,6 +374,6 @@ async def test_dispatch_source_tool_invalid_args_raise(
 
 
 def test_registry_includes_github_crawler() -> None:
-    from services.synthesis.crawlers import REGISTRY
+    from kb.synthesis.crawlers import REGISTRY
 
     assert REGISTRY.get("github") is GitHubCrawlerAgent

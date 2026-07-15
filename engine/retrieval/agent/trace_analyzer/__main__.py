@@ -3,7 +3,7 @@
 Invocation (from the in-cluster K8s Job, see
 k8s/jobs/nightly-trace-digest.yaml):
 
-    uv run python -m services.retrieval.agent.trace_analyzer \
+    uv run python -m engine.retrieval.agent.trace_analyzer \
         --date 2026-05-17 \
         --out /tmp/digests.jsonl
 
@@ -22,10 +22,10 @@ import json
 import sys
 from datetime import date as date_cls
 
-from services.retrieval.agent.trace_analyzer.digest import summarize_trace
-from services.retrieval.agent.trace_analyzer.loader import iter_trace_blobs
-from shared.config import get_settings
-from shared.db import close_pool, init_pool
+from engine.retrieval.agent.trace_analyzer.digest import summarize_trace
+from engine.retrieval.agent.trace_analyzer.loader import iter_trace_blobs
+from engine.shared.config import get_settings
+from engine.shared.db import close_pool, init_pool
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

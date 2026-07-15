@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 
-from shared.logging import get_logger
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

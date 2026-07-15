@@ -38,8 +38,8 @@ from typing import Any
 import asyncpg
 import orjson
 
-from shared.db import with_tenant
-from shared.logging import get_logger
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -385,8 +385,8 @@ async def _call_classifier_llm(
             return None
         text = (getattr(resp, "text", None) or "").strip()
     else:
-        from shared import llm as shared_llm
-        from shared.config import get_settings
+        from engine.shared import llm as shared_llm
+        from engine.shared.config import get_settings
 
         if not (
             shared_llm.gateway_url()

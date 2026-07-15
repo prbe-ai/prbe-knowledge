@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.synthesis.index_renderer import (
+from kb.synthesis.index_renderer import (
     _fallback_flat_list,
     _PageRow,
     render_index_via_llm,
@@ -55,7 +55,7 @@ async def test_render_index_falls_back_without_key_or_gateway(monkeypatch) -> No
     list (the index page must always render)."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
@@ -73,7 +73,7 @@ async def test_render_index_via_shared_llm_happy_path(monkeypatch) -> None:
     system + user messages) and returns its content."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
@@ -87,14 +87,14 @@ async def test_render_index_via_shared_llm_happy_path(monkeypatch) -> None:
             "# Probe\n\nIntro paragraph.\n\n## Pages\n\n- [[Title A]] — Summary A\n"
         )
 
-    from shared import llm as shared_llm
+    from engine.shared import llm as shared_llm
 
     monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
 
     rows = [_row("decision:abc", "Title A", summary="Summary A")]
     out = await render_index_via_llm(rows, client=None)
 
-    from shared.constants import WIKI_AGENT_MODEL
+    from engine.shared.constants import WIKI_AGENT_MODEL
 
     assert captured["model"] == f"gemini/{WIKI_AGENT_MODEL}"
     assert [m["role"] for m in captured["messages"]] == ["system", "user"]
@@ -113,14 +113,14 @@ async def test_render_index_uses_gateway_without_google_key(monkeypatch) -> None
     handles api_base/api_key injection)."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("LLM_GATEWAY_URL", "http://litellm.litellm.svc.cluster.local:4000")
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
     async def fake_acompletion(*, model, messages, **kwargs):
         return _stub_acompletion_response("# Probe\n\nGateway intro.\n")
 
-    from shared import llm as shared_llm
+    from engine.shared import llm as shared_llm
 
     monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
 
@@ -135,11 +135,11 @@ async def test_render_index_falls_back_on_llm_error(monkeypatch) -> None:
     the function falls back to the flat list."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
-    from shared import llm as shared_llm
+    from engine.shared import llm as shared_llm
 
     async def fake_acompletion(*, model, messages, **kwargs):
         raise shared_llm.LLMError("upstream timeout", status_code=504, provider="google")
@@ -158,11 +158,11 @@ async def test_render_index_falls_back_on_empty_response(monkeypatch) -> None:
     """Empty LLM content → flat-list fallback."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
-    from shared import llm as shared_llm
+    from engine.shared import llm as shared_llm
 
     async def fake_acompletion(*, model, messages, **kwargs):
         return _stub_acompletion_response("")

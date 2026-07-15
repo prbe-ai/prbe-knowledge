@@ -23,36 +23,36 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
-from services.ingestion.code_graph.clone import (
+from engine.ingest.handlers.base import Connector
+from engine.ingest.handlers.registry import register_connector
+from engine.shared.backend_client import fetch_github_installation_token
+from engine.shared.constants import SourceSystem
+from engine.shared.db import with_tenant
+from engine.shared.exceptions import (
+    GitHubAuthError,
+    InvalidWebhookPayload,
+)
+from engine.shared.logging import get_logger
+from engine.shared.models import (
+    IntegrationToken,
+    NormalizationResult,
+    WebhookEvent,
+    WebhookParseResult,
+)
+from kb.code_graph.clone import (
     FileEntry,
     prune_scratch,
     repo_dir,
     shallow_clone,
     walk_files,
 )
-from services.ingestion.code_graph.cross_repo_deps import (
+from kb.code_graph.cross_repo_deps import (
     extract_cross_repo_deps,  # noqa: F401  # Re-imported when CROSS-REPO DEPS DISABLED block is revived
     persist_cross_repo_edges,  # noqa: F401  # Re-imported when CROSS-REPO DEPS DISABLED block is revived
     update_edges_after_push,
 )
-from services.ingestion.code_graph.fetch import fetch_files_at_sha
-from services.ingestion.code_graph.pipeline import extract_files_to_result
-from services.ingestion.handlers.base import Connector
-from services.ingestion.handlers.registry import register_connector
-from shared.backend_client import fetch_github_installation_token
-from shared.constants import SourceSystem
-from shared.db import with_tenant
-from shared.exceptions import (
-    GitHubAuthError,
-    InvalidWebhookPayload,
-)
-from shared.logging import get_logger
-from shared.models import (
-    IntegrationToken,
-    NormalizationResult,
-    WebhookEvent,
-    WebhookParseResult,
-)
+from kb.code_graph.fetch import fetch_files_at_sha
+from kb.code_graph.pipeline import extract_files_to_result
 
 log = get_logger(__name__)
 
@@ -512,7 +512,7 @@ def _row_to_tombstone(row, customer_id: str, now: datetime):
     """
     import orjson
 
-    from shared.models import ACLSnapshot, Document  # local import to avoid cycle
+    from engine.shared.models import ACLSnapshot, Document  # local import to avoid cycle
 
     def _decode(field: str):
         v = row[field]

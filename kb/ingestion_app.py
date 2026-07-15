@@ -37,46 +37,46 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, 
 from fastapi.responses import JSONResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from services.ingestion.admin_routes import router as admin_router
-from services.ingestion.backfill_routes import router as backfill_router
-from services.ingestion.connectedness import is_source_connected
-from services.ingestion.custom_ingest_routes import router as custom_ingest_router
-from services.ingestion.entity_clusters_routes import (
+from engine.ingest.connectedness import is_source_connected
+from engine.ingest.custom_ingest_routes import router as custom_ingest_router
+from engine.ingest.entity_clusters_routes import (
     router as entity_clusters_router,
 )
-from services.ingestion.entity_merge_suggestions_routes import (
+from engine.ingest.entity_merge_suggestions_routes import (
     router as entity_merge_suggestions_router,
 )
-from services.ingestion.feature_nodes_routes import router as feature_nodes_router
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.registry import (
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.handlers.registry import (
     build_connector,
     get_connector_class,
     list_registered,
 )
-from services.ingestion.internal_devices import router as devices_router
-from services.ingestion.manual_uploads import (
+from engine.ingest.manual_uploads import (
     MAX_MANUAL_UPLOAD_BYTES,
     MAX_MANUAL_UPLOAD_FILES,
     ManualUploadParseError,
     parse_manual_upload,
     safe_filename,
 )
-from services.ingestion.slack_lifecycle import handle_slack_lifecycle_event
-from services.ingestion.wiki_routes import router as wiki_router
-from services.system_settings import get_ingestion_killswitch
-from shared.community import ensure_default_customer
-from shared.config import get_settings
-from shared.constants import SourceSystem
-from shared.db import get_pool, health_check, init_pool, with_tenant
-from shared.exceptions import (
+from engine.shared.community import ensure_default_customer
+from engine.shared.config import get_settings
+from engine.shared.constants import SourceSystem
+from engine.shared.db import get_pool, health_check, init_pool, with_tenant
+from engine.shared.exceptions import (
     HandlerNotFound,
     InvalidWebhookPayload,
     PrbeError,
 )
-from shared.logging import bind_trace, configure_logging, get_logger
-from shared.source_registry import ingestion_priority_for
-from shared.storage import get_store
+from engine.shared.logging import bind_trace, configure_logging, get_logger
+from engine.shared.source_registry import ingestion_priority_for
+from engine.shared.storage import get_store
+from engine.system_settings import get_ingestion_killswitch
+from kb.admin_routes import router as admin_router
+from kb.backfill_routes import router as backfill_router
+from kb.feature_nodes_routes import router as feature_nodes_router
+from kb.internal_devices import router as devices_router
+from kb.slack_lifecycle import handle_slack_lifecycle_event
+from kb.wiki_routes import router as wiki_router
 
 log = get_logger(__name__)
 
@@ -89,11 +89,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await ensure_default_customer()  # no-op unless DEFAULT_CUSTOMER_ID set
 
     # Trigger @register_connector decorators.
-    import services.ingestion.handlers  # noqa: F401
+    import kb.handlers  # noqa: F401
 
     app.state.ctx = make_default_context()
     app.state.store = get_store()
-    from services.ingestion.normalizer import Normalizer
+    from engine.ingest.normalizer import Normalizer
     app.state.normalizer = Normalizer(app.state.ctx)
     log.info(
         "ingestion.boot",
@@ -918,7 +918,7 @@ if __name__ == "__main__":  # pragma: no cover
     import uvicorn
 
     uvicorn.run(
-        "services.ingestion.main:app",
+        "kb.ingestion_app:app",
         host="0.0.0.0",
         port=8080,
         reload=False,

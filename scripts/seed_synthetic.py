@@ -16,13 +16,13 @@ import random
 import time
 from datetime import UTC, datetime
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.normalizer import Normalizer
-from shared.config import get_settings
-from shared.constants import QueueStatus, SourceSystem
-from shared.db import close_pool, init_pool, raw_conn
-from shared.logging import configure_logging, get_logger
-from shared.storage import get_store
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.normalizer import Normalizer
+from engine.shared.config import get_settings
+from engine.shared.constants import QueueStatus, SourceSystem
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.logging import configure_logging, get_logger
+from engine.shared.storage import get_store
 
 log = get_logger(__name__)
 

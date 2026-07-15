@@ -34,12 +34,12 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from shared.exceptions import StorageUnavailable
-from shared.storage import get_store
+from engine.shared.exceptions import StorageUnavailable
+from engine.shared.storage import get_store
 
 if TYPE_CHECKING:
-    from services.retrieval.agent.loop import LoopState
-    from services.retrieval.agent.models import GathererOutput, GathererStatus
+    from engine.retrieval.agent.loop import LoopState
+    from engine.retrieval.agent.models import GathererOutput, GathererStatus
 
 log = logging.getLogger(__name__)
 

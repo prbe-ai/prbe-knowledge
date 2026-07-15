@@ -28,8 +28,8 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
-from shared.constants import SourceSystem
-from shared.logging import get_logger
+from engine.shared.constants import SourceSystem
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -39,7 +39,7 @@ __all__ = ["extract_source_ts"]
 def extract_source_ts(doc: Any) -> datetime:
     """Return the best-effort source-side timestamp for `doc`.
 
-    `doc` is the persisted shape from `services.ingestion.normalizer` — a
+    `doc` is the persisted shape from `engine.ingest.normalizer` — a
     pydantic Document model with `source_system`, `metadata`, and
     `created_at`. Falls back to `created_at` for any source we don't
     recognize, the metadata is missing the expected key, or the value

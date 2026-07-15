@@ -39,13 +39,13 @@ import uuid
 
 import asyncpg
 
+from engine.ingest.auto_merge import AutoMergeAnalyzer
+from engine.ingest.normalizer import _pg_vector
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.embeddings import get_embedder_v2
+from engine.shared.logging import get_logger
+from engine.shared.metrics import counter
 from scripts.backfill_graph_node_embeddings import _embedding_text
-from services.ingestion.auto_merge import AutoMergeAnalyzer
-from services.ingestion.normalizer import _pg_vector
-from shared.db import raw_conn, with_tenant
-from shared.embeddings import get_embedder_v2
-from shared.logging import get_logger
-from shared.metrics import counter
 
 log = get_logger(__name__)
 
@@ -272,9 +272,9 @@ async def run_worker_forever() -> None:
     inferred-edges worker process gather()s both workers into one event loop
     (see post_write integration in inferred_edges/worker.py).
     """
-    from shared.config import get_settings
-    from shared.db import close_pool, init_pool
-    from shared.logging import configure_logging
+    from engine.shared.config import get_settings
+    from engine.shared.db import close_pool, init_pool
+    from engine.shared.logging import configure_logging
 
     settings = get_settings()
     configure_logging(settings.log_level)

@@ -16,8 +16,8 @@ from typing import Any
 
 import orjson
 
-from shared.config import get_settings
-from shared.llm_tools import ToolCallParseError, forced_tool_call
+from engine.shared.config import get_settings
+from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
 
 
 @dataclass(slots=True)

@@ -34,7 +34,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from services.synthesis.models import WikiType
+from kb.synthesis.models import WikiType
 
 # Slug normalization: collapse `/`, whitespace, and dots into `-`, drop any
 # remaining chars outside `[a-z0-9_-]`, collapse hyphen runs, trim leading/

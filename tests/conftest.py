@@ -40,9 +40,9 @@ for _k, _v in _TEST_ENV.items():
 # @register_connector decorators, which also populate shared.source_registry
 # (per-source doc_type prefix / priority / decay profiles). Retrieval tests
 # (fusion decay, doc-type resolver) read those profiles.
-import services.ingestion.handlers  # noqa: E402,F401
-from shared import db as db_module  # noqa: E402
-from shared.config import Settings, get_settings  # noqa: E402
+import kb.handlers  # noqa: E402,F401
+from engine.shared import db as db_module  # noqa: E402
+from engine.shared.config import Settings, get_settings  # noqa: E402
 
 
 @pytest.fixture(scope="session")

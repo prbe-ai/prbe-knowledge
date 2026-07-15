@@ -29,23 +29,23 @@ import contextlib
 import hashlib
 from datetime import UTC, datetime
 
-from services.ingestion.handlers.base import ConnectorContext, make_default_context
-from services.synthesis import persistence
-from services.synthesis.agent_harness import AgentLoop, new_agent_run_id
-from services.synthesis.agent_tools import ALL_TOOLS
-from services.synthesis.prompts import wiki_agent_system_prompt
-from services.synthesis.wiki_agent import WikiAgentRuntime
-from shared.constants import (
+from engine.ingest.handlers.base import ConnectorContext, make_default_context
+from engine.shared.constants import (
     WIKI_AGENT_GLOBAL_CONCURRENCY,
     WIKI_AGENT_MODEL,
     WIKI_SYNTHESIS_CLAIM_BATCH,
     WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
 )
-from shared.db import raw_conn
-from shared.embeddings import GeminiEmbedder
-from shared.exceptions import AgentHaltError
-from shared.logging import get_logger
-from shared.storage import ObjectStore, get_store
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import GeminiEmbedder
+from engine.shared.exceptions import AgentHaltError
+from engine.shared.logging import get_logger
+from engine.shared.storage import ObjectStore, get_store
+from kb.synthesis import persistence
+from kb.synthesis.agent_harness import AgentLoop, new_agent_run_id
+from kb.synthesis.agent_tools import ALL_TOOLS
+from kb.synthesis.prompts import wiki_agent_system_prompt
+from kb.synthesis.wiki_agent import WikiAgentRuntime
 
 log = get_logger(__name__)
 
@@ -247,7 +247,7 @@ class SynthesisWorker:
             embedder=self._embedder,
         )
         llm = self._resolve_llm_client()
-        from services.synthesis.agent_compactor import call_summarizer
+        from kb.synthesis.agent_compactor import call_summarizer
 
         loop = AgentLoop(
             runtime=runtime,
@@ -269,7 +269,7 @@ class SynthesisWorker:
         # Lazy build the production Gemini wrapper. Imported here to
         # keep the test path (which always passes llm_client) free of
         # the SDK requirement.
-        from services.synthesis.gemini_agent_client import GeminiAgentClient
+        from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
         return GeminiAgentClient()
 

@@ -29,11 +29,11 @@ from typing import Any, ClassVar
 
 import httpx
 
-from services.ingestion.polling.base import BasePoller, PollResult, register_poller
-from shared.constants import SourceSystem
-from shared.db import raw_conn
-from shared.encryption import decrypt_token
-from shared.logging import get_logger
+from engine.shared.constants import SourceSystem
+from engine.shared.db import raw_conn
+from engine.shared.encryption import decrypt_token
+from engine.shared.logging import get_logger
+from kb.polling.base import BasePoller, PollResult, register_poller
 
 log = get_logger(__name__)
 

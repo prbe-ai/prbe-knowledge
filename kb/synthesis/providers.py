@@ -6,7 +6,7 @@ Two abstractions live here:
   DIRECTED PHRASES    -> shared.constants.DIRECTED_PHRASES_MODEL
 
 Both stages support Anthropic Haiku and Gemini variants. The wiki agent
-itself goes through `services.synthesis.gemini_agent_client` and does
+itself goes through `kb.synthesis.gemini_agent_client` and does
 not use this module — its surface (CachedContent + cached generate
 calls) doesn't translate to Anthropic's prompt-cache model.
 
@@ -29,25 +29,25 @@ import json
 from datetime import datetime
 from typing import Any, Protocol
 
-from services.synthesis.models import (
-    TriageInput,
-    TriageOutput,
-)
-from services.synthesis.prompts import (
-    build_directed_phrases_prompt,
-    build_triage_prompt,
-    directed_tool_name,
-)
-from shared.constants import (
+from engine.shared.constants import (
     DIRECTED_PHRASES_MODEL,
     HAIKU_MODEL,
     MAX_DIRECTED_PHRASE_CHARS,
     MAX_DIRECTED_VECTORS_PER_DOC,
     WIKI_TRIAGE_MODEL,
 )
-from shared.llm import LLMError
-from shared.llm_tools import ToolCallParseError, forced_tool_call
-from shared.logging import get_logger
+from engine.shared.llm import LLMError
+from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
+from engine.shared.logging import get_logger
+from kb.synthesis.models import (
+    TriageInput,
+    TriageOutput,
+)
+from kb.synthesis.prompts import (
+    build_directed_phrases_prompt,
+    build_triage_prompt,
+    directed_tool_name,
+)
 
 log = get_logger(__name__)
 
@@ -106,7 +106,7 @@ def _anthropic_kwargs_to_messages_and_schema(
     int,                    # max_tokens
 ]:
     """Translate the Anthropic-`messages.create` kwargs dict (produced by
-    `services.synthesis.prompts.build_*_prompt`) into LiteLLM-compatible
+    `kb.synthesis.prompts.build_*_prompt`) into LiteLLM-compatible
     arguments for `shared.llm_tools.forced_tool_call`.
 
     The translation:
@@ -249,7 +249,7 @@ class _AnthropicTriage:
             # Same failure mode as the old "no record_triage tool_use
             # block" path. Preserve the message phrasing so the
             # split-retry parse-overflow regex
-            # `services.synthesis.triage._PARSE_OVERFLOW_REGEXES`
+            # `kb.synthesis.triage._PARSE_OVERFLOW_REGEXES`
             # ("no <name> tool_use block") still matches.
             raise TriageParseError(
                 f"response had no {tool_name} tool_use block: {exc}"
@@ -388,7 +388,7 @@ async def _gemini_call_json(
         "thinking_config": {"thinking_budget": _thinking_budget_for(model)},
     }
 
-    from shared.llm import acompletion
+    from engine.shared.llm import acompletion
 
     try:
         resp = await asyncio.wait_for(

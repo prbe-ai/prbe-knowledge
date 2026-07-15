@@ -10,8 +10,8 @@ delete the explicit registration here.
 
 from __future__ import annotations
 
-from shared.constants import SourceSystem
-from shared.source_registry import SourceProfile, register_source
+from engine.shared.constants import SourceSystem
+from engine.shared.source_registry import SourceProfile, register_source
 
 # Incident sources are first-class authored signals: same queue tier as
 # Slack / Linear / GitHub webhooks (100, the default — explicit here so the

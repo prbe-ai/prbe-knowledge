@@ -13,14 +13,14 @@ from __future__ import annotations
 
 import pytest
 
-from shared import db as db_module
-from shared.config import Settings
-from shared.constants import (
+from engine.shared import db as db_module
+from engine.shared.config import Settings
+from engine.shared.constants import (
     DB_INIT_RETRY_ATTEMPTS,
     DB_INIT_RETRY_BACKOFF_CAP_SECONDS,
     DB_INIT_RETRY_BASE_SECONDS,
 )
-from shared.exceptions import DatabaseUnavailable, TenantIsolationError
+from engine.shared.exceptions import DatabaseUnavailable, TenantIsolationError
 
 
 class _FakePool:

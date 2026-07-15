@@ -27,9 +27,9 @@ from dataclasses import dataclass, field
 
 import httpx
 
-from shared.backend_client import fetch_github_installation_token
-from shared.exceptions import RateLimited, SourceAPIError
-from shared.logging import get_logger
+from engine.shared.backend_client import fetch_github_installation_token
+from engine.shared.exceptions import RateLimited, SourceAPIError
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

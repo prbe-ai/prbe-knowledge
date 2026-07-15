@@ -13,13 +13,13 @@ from typing import Any
 
 import httpx
 
-from services.ingestion.backfill_runner import enqueue_slack_channel_backfill
-from services.ingestion.handlers.base import ConnectorContext
-from shared.constants import SourceSystem
-from shared.customer_mapping import load_source_metadata, patch_source_metadata
-from shared.logging import get_logger
-from shared.models import IntegrationToken
-from shared.tokens import load_token
+from engine.ingest.handlers.base import ConnectorContext
+from engine.shared.constants import SourceSystem
+from engine.shared.customer_mapping import load_source_metadata, patch_source_metadata
+from engine.shared.logging import get_logger
+from engine.shared.models import IntegrationToken
+from engine.shared.tokens import load_token
+from kb.backfill_runner import enqueue_slack_channel_backfill
 
 log = get_logger(__name__)
 

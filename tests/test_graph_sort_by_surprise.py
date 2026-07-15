@@ -82,7 +82,7 @@ async def test_sorts_by_surprise_score_desc() -> None:
     contribution to the most informative cross-source/cross-community
     edge.
     """
-    import services.retrieval.retrievers.graph as graph_mod
+    import engine.retrieval.retrievers.graph as graph_mod
 
     low_surprise = _make_row(
         chunk_id="low",
@@ -103,7 +103,7 @@ async def test_sorts_by_surprise_score_desc() -> None:
 
     # DB delivers low BEFORE high; sort must flip that.
     ctx = _patched_conn([low_surprise, high_surprise])
-    with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+    with patch("engine.retrieval.retrievers.graph.with_tenant", return_value=ctx):
         hits = await graph_mod.graph_search(
             customer_id="cust-test",
             entities=[("service", "svc-a")],
@@ -125,7 +125,7 @@ async def test_score_field_is_unconditional_surprise() -> None:
     The flag was removed; score is now always the surprise value, so
     fusion (focus or discovery mode) gets the same input.
     """
-    import services.retrieval.retrievers.graph as graph_mod
+    import engine.retrieval.retrievers.graph as graph_mod
 
     cross_source = _make_row(
         chunk_id="cross",
@@ -137,7 +137,7 @@ async def test_score_field_is_unconditional_surprise() -> None:
     )
 
     ctx = _patched_conn([cross_source])
-    with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+    with patch("engine.retrieval.retrievers.graph.with_tenant", return_value=ctx):
         hits = await graph_mod.graph_search(
             customer_id="cust-test",
             entities=[("service", "svc-a")],
@@ -160,7 +160,7 @@ async def test_tie_break_by_chunk_id() -> None:
     across runs of the same query, jittering retriever_scores in
     user-visible MCP responses.
     """
-    import services.retrieval.retrievers.graph as graph_mod
+    import engine.retrieval.retrievers.graph as graph_mod
 
     # Identical surprise inputs -> exactly equal scores.
     row_b = _make_row(
@@ -182,7 +182,7 @@ async def test_tie_break_by_chunk_id() -> None:
 
     # DB returns b BEFORE a; deterministic sort must flip to alphabetical.
     ctx = _patched_conn([row_b, row_a])
-    with patch("services.retrieval.retrievers.graph.with_tenant", return_value=ctx):
+    with patch("engine.retrieval.retrievers.graph.with_tenant", return_value=ctx):
         hits = await graph_mod.graph_search(
             customer_id="cust-test",
             entities=[("service", "svc-a")],

@@ -41,10 +41,10 @@ import asyncpg
 import igraph
 import leidenalg
 
-from shared.config import get_settings
-from shared.db import close_pool, init_pool, raw_conn, with_tenant
-from shared.locks import advisory_lock_key
-from shared.logging import configure_logging, get_logger
+from engine.shared.config import get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
+from engine.shared.locks import advisory_lock_key
+from engine.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
 

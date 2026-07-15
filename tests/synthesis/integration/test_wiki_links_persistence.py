@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import pytest
 
-from services.synthesis.wiki_links import (
+from engine.shared.db import raw_conn, with_tenant
+from kb.synthesis.wiki_links import (
     ExtractedLink,
     persist_links_for_page,
 )
-from shared.db import raw_conn, with_tenant
 
 _CUSTOMER = "lane-b-cust"
 _SRC_TYPE = "service_card"

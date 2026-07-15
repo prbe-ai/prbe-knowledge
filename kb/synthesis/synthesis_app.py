@@ -16,13 +16,13 @@ from datetime import UTC, datetime
 
 import uvicorn
 
-from services.synthesis.listeners import NotifyListener
-from services.synthesis.reclaim import WikiReclaimLoop
-from services.synthesis.synthesis_worker import SynthesisWorker
-from shared.config import get_settings
-from shared.constants import WIKI_SYNTHESIS_MAX_ATTEMPTS, WIKI_TRIAGED_CHANNEL
-from shared.db import init_pool
-from shared.logging import configure_logging, get_logger
+from engine.shared.config import get_settings
+from engine.shared.constants import WIKI_SYNTHESIS_MAX_ATTEMPTS, WIKI_TRIAGED_CHANNEL
+from engine.shared.db import init_pool
+from engine.shared.logging import configure_logging, get_logger
+from kb.synthesis.listeners import NotifyListener
+from kb.synthesis.reclaim import WikiReclaimLoop
+from kb.synthesis.synthesis_worker import SynthesisWorker
 
 log = get_logger(__name__)
 
@@ -31,7 +31,7 @@ def _build_health_app():
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
-    from shared.db import health_check
+    from engine.shared.db import health_check
 
     app = FastAPI(
         title="prbe-knowledge-wiki-synthesis health",
@@ -56,7 +56,7 @@ async def run_synthesis_app_forever() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     await init_pool(settings)
-    import services.ingestion.handlers  # noqa: F401
+    import kb.handlers  # noqa: F401
 
     wake_event = asyncio.Event()
     # LISTEN must run on a direct (non-pooler) DSN. Neon's pgbouncer

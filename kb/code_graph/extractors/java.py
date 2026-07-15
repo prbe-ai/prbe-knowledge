@@ -12,15 +12,15 @@ from typing import ClassVar
 import tree_sitter_java as tsjava
 from tree_sitter import Language, Parser
 
-from services.ingestion.code_graph.extractors._common import module_qname_from_path
-from services.ingestion.code_graph.extractors.registry import register
-from services.ingestion.code_graph.types import (
+from engine.shared.constants import CodeSymbolKind, EdgeType
+from kb.code_graph.extractors._common import module_qname_from_path
+from kb.code_graph.extractors.registry import register
+from kb.code_graph.types import (
     CodeEdge,
     Extractor,
     ExtractResult,
     Symbol,
 )
-from shared.constants import CodeSymbolKind, EdgeType
 
 _JAVA_LANGUAGE = Language(tsjava.language())
 

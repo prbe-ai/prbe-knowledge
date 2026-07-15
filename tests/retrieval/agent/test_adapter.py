@@ -8,11 +8,11 @@ test_loop.py end-to-end runs.
 
 from __future__ import annotations
 
-from services.retrieval.agent.adapter import (
+from engine.retrieval.agent.adapter import (
     _build_doc_to_graph_evidence,
     to_query_response,
 )
-from services.retrieval.agent.models import (
+from engine.retrieval.agent.models import (
     GatheredChunk,
     GatheredEntity,
     GathererNotes,
@@ -302,7 +302,7 @@ async def test_enrichment_merges_db_edges_with_prefanout(monkeypatch) -> None:
         gatherer_notes=GathererNotes(),
     )
 
-    from shared.models import GraphEvidence as GE
+    from engine.shared.models import GraphEvidence as GE
     async def fake_enrich(customer_id, doc_ids):
         # Two INFERRED edges between the curated docs.
         return {
@@ -318,7 +318,7 @@ async def test_enrichment_merges_db_edges_with_prefanout(monkeypatch) -> None:
             ],
         }
     monkeypatch.setattr(
-        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        "engine.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
         fake_enrich,
     )
 
@@ -350,7 +350,7 @@ async def test_enrichment_skipped_when_no_customer_id(monkeypatch) -> None:
         called["n"] += 1
         return {}
     monkeypatch.setattr(
-        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        "engine.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
         fake_enrich,
     )
     gathered = GathererOutput(
@@ -384,7 +384,7 @@ async def test_enrichment_fires_on_single_doc_result(monkeypatch) -> None:
         return {}
 
     monkeypatch.setattr(
-        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        "engine.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
         fake_enrich,
     )
     gathered = GathererOutput(
@@ -411,7 +411,7 @@ async def test_enrichment_carries_via_entity_title_through_to_response(monkeypat
         gatherer_notes=GathererNotes(),
     )
 
-    from shared.models import GraphEvidence as GE
+    from engine.shared.models import GraphEvidence as GE
 
     async def fake_enrich(customer_id, doc_ids):
         return {
@@ -427,7 +427,7 @@ async def test_enrichment_carries_via_entity_title_through_to_response(monkeypat
         }
 
     monkeypatch.setattr(
-        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        "engine.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
         fake_enrich,
     )
 
@@ -456,7 +456,7 @@ async def test_enrichment_carries_neighbor_metadata_through_to_response(monkeypa
     """
     from datetime import UTC, datetime
 
-    from shared.models import GraphEvidence as GE
+    from engine.shared.models import GraphEvidence as GE
 
     fixed_ts = datetime(2026, 5, 5, 16, 6, 56, tzinfo=UTC)
 
@@ -477,7 +477,7 @@ async def test_enrichment_carries_neighbor_metadata_through_to_response(monkeypa
         }
 
     monkeypatch.setattr(
-        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        "engine.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
         fake_enrich,
     )
 
@@ -523,7 +523,7 @@ async def test_enrichment_dedupes_against_prefanout_evidence(monkeypatch) -> Non
             "why": "from prefanout",
         }],
     }]}
-    from shared.models import GraphEvidence as GE
+    from engine.shared.models import GraphEvidence as GE
     async def fake_enrich(customer_id, doc_ids):
         # Same (anchor, edge_type) tuple — should NOT re-add to d2.
         return {
@@ -531,7 +531,7 @@ async def test_enrichment_dedupes_against_prefanout_evidence(monkeypatch) -> Non
                      via_entity="d1", reason="from db enrichment")]
         }
     monkeypatch.setattr(
-        "services.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
+        "engine.retrieval.agent.adapter._enrich_graph_evidence_from_result_set",
         fake_enrich,
     )
     resp = await to_query_response(
@@ -634,7 +634,7 @@ async def test_display_name_enriched_from_graph_nodes_lookup(monkeypatch) -> Non
         }
 
     monkeypatch.setattr(
-        "services.retrieval.agent.adapter._fetch_entity_names_from_graph",
+        "engine.retrieval.agent.adapter._fetch_entity_names_from_graph",
         fake_lookup,
     )
 
@@ -686,7 +686,7 @@ async def test_display_name_enrichment_prefers_db_over_emitted_properties(
         return {"C0B1T8PPK0D": "engineering"}
 
     monkeypatch.setattr(
-        "services.retrieval.agent.adapter._fetch_entity_names_from_graph",
+        "engine.retrieval.agent.adapter._fetch_entity_names_from_graph",
         fake_lookup,
     )
 
@@ -719,7 +719,7 @@ async def test_display_name_enrichment_skipped_when_no_customer_id(monkeypatch) 
         return {}
 
     monkeypatch.setattr(
-        "services.retrieval.agent.adapter._fetch_entity_names_from_graph",
+        "engine.retrieval.agent.adapter._fetch_entity_names_from_graph",
         fake_lookup,
     )
 
@@ -747,7 +747,7 @@ async def test_display_name_enrichment_handles_db_failure_gracefully(monkeypatch
     """DB outage / query timeout returns {} — response still renders
     with the pre-enrichment fallback chain. The dashboard sees readable
     text (the gatherer-emitted label) rather than a 500."""
-    from services.retrieval.agent import adapter as adapter_mod
+    from engine.retrieval.agent import adapter as adapter_mod
 
     async def boom(customer_id, canonical_ids):
         # Simulate the underlying with_tenant path raising. The wrapper

@@ -14,10 +14,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from engine.shared.logging import get_logger
 from scripts.synth.archetypes.base import DocSpec, ScenarioSpec, Source
 from scripts.synth.eval_question import EvalQuestion
 from scripts.synth.output.base import SynthDoc
-from shared.logging import get_logger
 
 # Re-export so downstream code can do:
 #   from scripts.synth.scenarios import ScenarioSpec, EvalQuestion

@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from services.retrieval.helpers import apply_entity_filter as _apply_entity_filter
-from services.retrieval.router import RouterEntity
+from engine.retrieval.helpers import apply_entity_filter as _apply_entity_filter
+from engine.retrieval.router import RouterEntity
 
 _NOW = datetime(2026, 4, 24, tzinfo=UTC)
 

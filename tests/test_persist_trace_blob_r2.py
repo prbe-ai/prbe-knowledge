@@ -22,12 +22,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.retrieval.agent.models import (
+from engine.retrieval.agent.models import (
     DroppedCandidate,
     GathererNotes,
     GathererOutput,
 )
-from services.retrieval.middleware import _persist_trace_blob_r2
+from engine.retrieval.middleware import _persist_trace_blob_r2
 
 
 def _mk_request(**state_attrs: Any) -> SimpleNamespace:
@@ -97,11 +97,11 @@ async def test_happy_path_sets_trace_blob_key(monkeypatch: pytest.MonkeyPatch) -
     canned_key = "search-traces/2026-05-17/abc.json.gz"
     persist_mock = AsyncMock(return_value=canned_key)
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_blob.persist_trace_blob_to_r2",
+        "engine.retrieval.agent.trace_blob.persist_trace_blob_to_r2",
         persist_mock,
     )
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_blob.compute_blob_key",
+        "engine.retrieval.agent.trace_blob.compute_blob_key",
         lambda trace_id, now: canned_key,
     )
 
@@ -137,7 +137,7 @@ async def test_r2_failure_does_not_set_trace_blob_key(
     the DB row must still be writable — trace_blob_key stays unset so
     _build_and_write_trace's `getattr(..., None)` writes NULL."""
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_blob.persist_trace_blob_to_r2",
+        "engine.retrieval.agent.trace_blob.persist_trace_blob_to_r2",
         AsyncMock(return_value=None),
     )
     request = _mk_request(
@@ -163,7 +163,7 @@ async def test_swallows_exceptions_from_build_trace_blob(
     must NOT propagate — would break the BackgroundTask chain and lose
     the query_traces row too."""
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_blob.build_trace_blob",
+        "engine.retrieval.agent.trace_blob.build_trace_blob",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("kaboom")),
     )
     request = _mk_request(
@@ -192,7 +192,7 @@ async def test_swallows_cancelled_error(monkeypatch: pytest.MonkeyPatch) -> None
         raise asyncio.CancelledError()
 
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_blob.persist_trace_blob_to_r2",
+        "engine.retrieval.agent.trace_blob.persist_trace_blob_to_r2",
         cancel,
     )
     request = _mk_request(

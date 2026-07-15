@@ -24,9 +24,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.retrievers.bm25 import bm25_search
-from shared.db import raw_conn
-from shared.models import TemporalSpec
+from engine.retrieval.retrievers.bm25 import bm25_search
+from engine.shared.db import raw_conn
+from engine.shared.models import TemporalSpec
 
 # Use wall-clock so seeded docs stay "recent" no matter when CI runs --
 # avoids a future temporal-default change quietly hiding the test corpus.

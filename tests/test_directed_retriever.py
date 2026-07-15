@@ -14,9 +14,9 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.retrievers.directed import directed_search
-from shared.db import raw_conn, with_tenant
-from shared.embeddings import get_embedder_v2, reset_embedder
+from engine.retrieval.retrievers.directed import directed_search
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.embeddings import get_embedder_v2, reset_embedder
 
 _NOW = datetime(2026, 5, 8, tzinfo=UTC)
 

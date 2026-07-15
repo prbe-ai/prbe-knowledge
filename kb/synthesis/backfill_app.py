@@ -36,24 +36,24 @@ import httpx
 import orjson
 import uvicorn
 
-from services.synthesis.backfill_reclaim import BackfillReclaimLoop
-from services.synthesis.crawlers import REGISTRY
-from services.synthesis.crawlers.base import (
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import (
+    BACKFILL_PARALLELISM,
+    WIKI_BACKFILL_CANCEL_CHANNEL,
+    WIKI_BACKFILL_CHANNEL,
+)
+from engine.shared.db import apply_connection_setup, init_pool, raw_conn
+from engine.shared.locks import advisory_lock_key
+from engine.shared.logging import configure_logging, get_logger
+from kb.synthesis.backfill_reclaim import BackfillReclaimLoop
+from kb.synthesis.crawlers import REGISTRY
+from kb.synthesis.crawlers.base import (
     BackfillAgent,
     BackfillAgentResult,
     BearerResolver,
     empty_result,
 )
-from services.synthesis.listeners import NotifyListener
-from shared.config import Settings, get_settings
-from shared.constants import (
-    BACKFILL_PARALLELISM,
-    WIKI_BACKFILL_CANCEL_CHANNEL,
-    WIKI_BACKFILL_CHANNEL,
-)
-from shared.db import apply_connection_setup, init_pool, raw_conn
-from shared.locks import advisory_lock_key
-from shared.logging import configure_logging, get_logger
+from kb.synthesis.listeners import NotifyListener
 
 log = get_logger(__name__)
 
@@ -172,7 +172,7 @@ def _make_default_bearer_factory(http: httpx.AsyncClient) -> Any:
     linear, ...) return None — their crawler will halt with
     ``auth.missing`` until a resolver lands.
     """
-    from shared.backend_client import fetch_github_installation_token
+    from engine.shared.backend_client import fetch_github_installation_token
 
     def factory(customer_id: str, source: str) -> BearerResolver:
         if source == "github":
@@ -659,7 +659,7 @@ class BackfillWorker:
           - discoverer returns empty list (no targets)
         """
         try:
-            from services.synthesis.fanout import REGISTRY as FANOUT_REGISTRY
+            from kb.synthesis.fanout import REGISTRY as FANOUT_REGISTRY
 
             fanout = FANOUT_REGISTRY.get(claim.source)
             if fanout is None:
@@ -869,7 +869,7 @@ def _build_health_app():
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
-    from shared.db import health_check
+    from engine.shared.db import health_check
 
     app = FastAPI(
         title="prbe-knowledge-wiki-backfill health",
@@ -916,7 +916,7 @@ async def run_backfill_app_forever() -> None:
     # Import handlers package so any decorators run (mirror the other
     # wiki apps; backfill reuses the same Normalizer write path inside
     # the wiki tools).
-    import services.ingestion.handlers  # noqa: F401
+    import kb.handlers  # noqa: F401
 
     # LISTEN must run on a direct (non-pooler) DSN. Neon's pgbouncer
     # transaction-pooler resets `LISTEN *` between txns, so a listener

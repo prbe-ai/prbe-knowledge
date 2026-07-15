@@ -1,6 +1,6 @@
 """Per-source backfill crawler agents.
 
-The ``BackfillWorker`` (``services.synthesis.backfill_app``) claims
+The ``BackfillWorker`` (``kb.synthesis.backfill_app``) claims
 ``wiki_synthesis_runs`` rows at ``status='pending'`` and instantiates
 one ``BackfillAgent`` per claim from this REGISTRY. Each subclass
 lives in its own module here (``github_agent.py``, ``slack_agent.py``,
@@ -12,7 +12,7 @@ lanes add Slack, Linear, Notion, Granola, Claude Code, codebase.
 
 from __future__ import annotations
 
-from services.synthesis.crawlers.base import (
+from kb.synthesis.crawlers.base import (
     BackfillAgent,
     BackfillAgentResult,
     BearerResolver,
@@ -33,7 +33,7 @@ def _register_default_crawlers() -> None:
     monkeypatch REGISTRY don't have to drag a real GitHub client through
     test collection.
     """
-    from services.synthesis.crawlers.github import GitHubCrawlerAgent
+    from kb.synthesis.crawlers.github import GitHubCrawlerAgent
 
     REGISTRY[GitHubCrawlerAgent.source] = GitHubCrawlerAgent
 

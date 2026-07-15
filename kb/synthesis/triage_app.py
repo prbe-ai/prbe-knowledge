@@ -5,7 +5,7 @@ Runs three concurrent asyncio tasks:
   - TriageWorker.run (drains pending → triaged on wake / periodic timer).
   - tiny health server (so Fly's HTTP probe has something to hit).
 
-Mirrors `services.ingestion.worker.run_worker_forever` shape — same
+Mirrors `engine.ingest.worker.run_worker_forever` shape — same
 graceful-shutdown signal handling, same uvicorn health server.
 """
 
@@ -19,13 +19,13 @@ from datetime import UTC, datetime
 
 import uvicorn
 
-from services.synthesis.listeners import NotifyListener
-from services.synthesis.reclaim import WikiReclaimLoop
-from services.synthesis.triage_worker import TriageWorker
-from shared.config import get_settings
-from shared.constants import WIKI_PENDING_CHANNEL, WIKI_SYNTHESIS_MAX_ATTEMPTS
-from shared.db import init_pool
-from shared.logging import configure_logging, get_logger
+from engine.shared.config import get_settings
+from engine.shared.constants import WIKI_PENDING_CHANNEL, WIKI_SYNTHESIS_MAX_ATTEMPTS
+from engine.shared.db import init_pool
+from engine.shared.logging import configure_logging, get_logger
+from kb.synthesis.listeners import NotifyListener
+from kb.synthesis.reclaim import WikiReclaimLoop
+from kb.synthesis.triage_worker import TriageWorker
 
 log = get_logger(__name__)
 
@@ -34,7 +34,7 @@ def _build_health_app():
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
-    from shared.db import health_check
+    from engine.shared.db import health_check
 
     app = FastAPI(
         title="prbe-knowledge-wiki-worker health",
@@ -62,7 +62,7 @@ async def run_triage_app_forever() -> None:
     # Import handlers package so any decorators run (the triage worker
     # doesn't itself import handlers, but the persistence layer's
     # body-fetch path uses the same chunks join the connectors set up).
-    import services.ingestion.handlers  # noqa: F401
+    import kb.handlers  # noqa: F401
 
     wake_event = asyncio.Event()
     # LISTEN must run on a direct (non-pooler) DSN. Neon's pgbouncer

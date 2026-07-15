@@ -36,9 +36,9 @@ from contextlib import asynccontextmanager
 
 import asyncpg
 
-from shared.config import Settings, get_settings, validate_boot_secrets
-from shared.exceptions import DatabaseUnavailable, TenantIsolationError
-from shared.logging import get_logger
+from engine.shared.config import Settings, get_settings, validate_boot_secrets
+from engine.shared.exceptions import DatabaseUnavailable, TenantIsolationError
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

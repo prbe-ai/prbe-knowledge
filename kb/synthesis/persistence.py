@@ -31,11 +31,11 @@ from typing import Any
 
 import asyncpg
 
-from services.ingestion.normalizer import fetch_body_from_chunks_for_version
-from services.synthesis.models import TriageInput, TriageVerdict
-from shared.constants import WIKI_SYNTHESIS_MAX_ATTEMPTS
-from shared.db import raw_conn, with_tenant
-from shared.logging import get_logger
+from engine.ingest.normalizer import fetch_body_from_chunks_for_version
+from engine.shared.constants import WIKI_SYNTHESIS_MAX_ATTEMPTS
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.logging import get_logger
+from kb.synthesis.models import TriageInput, TriageVerdict
 
 log = get_logger(__name__)
 
@@ -694,7 +694,7 @@ async def fetch_existing_page(
     MANUAL_ENTRY pages are read-only; only COMPILED_WIKI / AGENT_ARTIFACT
     pages are open for regeneration.
     """
-    from services.ingestion.normalizer import fetch_live_body_from_chunks
+    from engine.ingest.normalizer import fetch_live_body_from_chunks
 
     doc_id = f"wiki:{wiki_type}:{slug}"
     async with with_tenant(customer_id) as conn:
@@ -742,7 +742,7 @@ async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:
     Includes only user-authored types (no auto-index page); the agent
     can call read_page(...) for any individual body.
     """
-    from shared.constants import (
+    from engine.shared.constants import (
         WIKI_DOC_TYPE_PREFIX,
         WIKI_INDEX_DOC_TYPE,
         SourceSystem,

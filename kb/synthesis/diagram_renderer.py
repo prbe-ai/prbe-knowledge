@@ -33,26 +33,26 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.wiki import (
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.normalizer import (
+    Normalizer,
+    fetch_live_body_from_chunks,
+)
+from engine.shared.constants import DocClass, SourceSystem
+from engine.shared.db import with_tenant
+from engine.shared.embeddings import get_embedder_v2
+from engine.shared.logging import get_logger
+from engine.shared.models import NormalizationResult, WebhookEvent
+from engine.shared.storage import get_store
+from kb.handlers.wiki import (
     INDEX_SLUG,
     WIKI_PAYLOAD_KEY,
     build_normalization_result,
 )
-from services.ingestion.normalizer import (
-    Normalizer,
-    fetch_live_body_from_chunks,
-)
-from services.synthesis.index_renderer import (
+from kb.synthesis.index_renderer import (
     _RepoEdge,
     fetch_verified_repo_edges,
 )
-from shared.constants import DocClass, SourceSystem
-from shared.db import with_tenant
-from shared.embeddings import get_embedder_v2
-from shared.logging import get_logger
-from shared.models import NormalizationResult, WebhookEvent
-from shared.storage import get_store
 
 log = get_logger(__name__)
 

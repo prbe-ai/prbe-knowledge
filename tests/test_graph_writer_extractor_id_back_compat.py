@@ -16,9 +16,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.ingestion.graph_writer import upsert_edges
-from shared.constants import EdgeType, NodeLabel
-from shared.models import GraphEdgeSpec
+from engine.ingest.graph_writer import upsert_edges
+from engine.shared.constants import EdgeType, NodeLabel
+from engine.shared.models import GraphEdgeSpec
 
 # ---------------------------------------------------------------------------
 # Helpers

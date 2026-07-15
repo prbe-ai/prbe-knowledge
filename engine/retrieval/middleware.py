@@ -40,7 +40,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import Response
 
-from services.retrieval.usage import (
+from engine.retrieval.usage import (
     CALLER_KIND_UNKNOWN,
     STATUS_ERROR,
     STATUS_OK,
@@ -50,7 +50,7 @@ from services.retrieval.usage import (
     write_query_trace,
     write_usage_event,
 )
-from shared.logging import get_logger
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -356,7 +356,7 @@ async def _persist_trace_blob_r2(request: Request) -> None:
 
         # Lazy imports to avoid pulling the retrieval-agent stack into
         # processes that don't need it (e.g. /sources-only deployments).
-        from services.retrieval.agent.trace_blob import (
+        from engine.retrieval.agent.trace_blob import (
             build_trace_blob,
             compute_blob_key,
             persist_trace_blob_to_r2,

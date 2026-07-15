@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from shared import customer_prefs
+from engine.shared import customer_prefs
 
 
 def _patch_raw_conn(monkeypatch, fetchval_return) -> MagicMock:

@@ -21,29 +21,29 @@ from typing import Any
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from services.ingestion.backfill_runner import enqueue_backfill
-from services.ingestion.code_graph.reindex import (
-    ReindexNotConnected,
-    ReindexResult,
-    reindex_customer,
-)
-from services.ingestion.handlers.registry import (
+from engine.ingest.handlers.registry import (
     build_connector,
     get_connector_class,
 )
-from shared.config import get_settings
-from shared.constants import QueueStatus, SourceSystem
-from shared.customer_mapping import record_mapping, resolve_customer
-from shared.db import raw_conn
-from shared.exceptions import (
+from engine.shared.config import get_settings
+from engine.shared.constants import QueueStatus, SourceSystem
+from engine.shared.customer_mapping import record_mapping, resolve_customer
+from engine.shared.db import raw_conn
+from engine.shared.exceptions import (
     GitHubAuthError,
     HandlerNotFound,
     NotSupportedByConnector,
     PrbeError,
     SourceAlreadyConnectedError,
 )
-from shared.logging import get_logger
-from shared.tokens import save_token
+from engine.shared.logging import get_logger
+from engine.shared.tokens import save_token
+from kb.backfill_runner import enqueue_backfill
+from kb.code_graph.reindex import (
+    ReindexNotConnected,
+    ReindexResult,
+    reindex_customer,
+)
 
 log = get_logger(__name__)
 

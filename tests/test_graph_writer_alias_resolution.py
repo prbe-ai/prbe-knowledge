@@ -22,10 +22,10 @@ import uuid
 
 import pytest
 
-from services.ingestion.graph_writer import upsert_edges, upsert_nodes
-from shared.constants import EdgeType, NodeLabel
-from shared.db import raw_conn, with_tenant
-from shared.models import GraphEdgeSpec, GraphNodeSpec
+from engine.ingest.graph_writer import upsert_edges, upsert_nodes
+from engine.shared.constants import EdgeType, NodeLabel
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.models import GraphEdgeSpec, GraphNodeSpec
 
 
 async def _seed_customer(conn, customer_id: str) -> None:

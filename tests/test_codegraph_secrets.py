@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.ingestion.code_graph.secrets import (
+from kb.code_graph.secrets import (
     SKIPPED_LANGUAGE_SENTINEL,
     looks_like_secret_dump,
 )

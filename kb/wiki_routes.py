@@ -47,21 +47,12 @@ import orjson
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, Field, field_validator
 
-from services.ingestion.admin_routes import verify_internal_knowledge_key
-from services.ingestion.handlers.wiki import (
-    INDEX_SLUG,
-    WIKI_PAYLOAD_KEY,
-    build_normalization_result,
-    is_valid_wiki_type,
-)
-from services.ingestion.normalizer import (
+from engine.ingest.normalizer import (
     Normalizer,
     fetch_body_from_chunks_for_version,
     fetch_live_body_from_chunks,
 )
-from services.ingestion.wiki_links import parse_page_links
-from services.synthesis.crawlers import REGISTRY as BACKFILL_CRAWLER_REGISTRY
-from shared.constants import (
+from engine.shared.constants import (
     BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS,
     WIKI_BACKFILL_CANCEL_CHANNEL,
     WIKI_BACKFILL_CHANNEL,
@@ -71,11 +62,20 @@ from shared.constants import (
     DocClass,
     SourceSystem,
 )
-from shared.db import raw_conn, with_tenant
-from shared.exceptions import InvalidWebhookPayload
-from shared.locks import advisory_lock_key
-from shared.logging import get_logger
-from shared.models import WebhookEvent
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.exceptions import InvalidWebhookPayload
+from engine.shared.locks import advisory_lock_key
+from engine.shared.logging import get_logger
+from engine.shared.models import WebhookEvent
+from kb.admin_routes import verify_internal_knowledge_key
+from kb.handlers.wiki import (
+    INDEX_SLUG,
+    WIKI_PAYLOAD_KEY,
+    build_normalization_result,
+    is_valid_wiki_type,
+)
+from kb.synthesis.crawlers import REGISTRY as BACKFILL_CRAWLER_REGISTRY
+from kb.wiki_links import parse_page_links
 
 log = get_logger(__name__)
 

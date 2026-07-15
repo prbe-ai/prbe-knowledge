@@ -26,9 +26,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from services.retrieval.temporal import build_predicate
-from shared.db import with_tenant
-from shared.models import TemporalSpec, normalize_author_id
+from engine.retrieval.temporal import build_predicate
+from engine.shared.db import with_tenant
+from engine.shared.models import TemporalSpec, normalize_author_id
 
 # A canonical_id qualifies for exact-id lookup when it looks like a stable
 # identifier: a UUID, a ticket code (LETTERS-DIGITS), a #-prefixed issue/PR

@@ -82,10 +82,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from shared import llm as shared_llm
-from shared.config import get_settings
-from shared.constants import WIKI_AGENT_CACHE_TTL, WIKI_AGENT_MODEL
-from shared.logging import get_logger
+from engine.shared import llm as shared_llm
+from engine.shared.config import get_settings
+from engine.shared.constants import WIKI_AGENT_CACHE_TTL, WIKI_AGENT_MODEL
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

@@ -12,10 +12,10 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.handlers.base import Connector
-from services.ingestion.handlers.registry import register_connector
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.ingest.handlers.base import Connector
+from engine.ingest.handlers.registry import register_connector
+from engine.shared.constants import (
     DocClass,
     DocType,
     IngestionEventType,
@@ -24,8 +24,8 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
-from shared.models import (
+from engine.shared.exceptions import InvalidWebhookPayload
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,

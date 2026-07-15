@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import pytest
 
-from shared.db import raw_conn
-from shared.exceptions import StorageUnavailable
-from shared.storage import _reset_bucket_cache_for_tests, get_store
+from engine.shared.db import raw_conn
+from engine.shared.exceptions import StorageUnavailable
+from engine.shared.storage import _reset_bucket_cache_for_tests, get_store
 
 
 async def _seed_customer(customer_id: str, r2_bucket: str) -> None:

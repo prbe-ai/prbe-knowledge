@@ -34,19 +34,19 @@ import orjson
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from services.ingestion.admin_routes import verify_internal_knowledge_key
-from shared.config import get_settings
-from shared.constants import IntegrationStatus, SourceSystem
-from shared.customer_mapping import record_mapping
-from shared.db import get_pool
-from shared.logging import get_logger
-from shared.models import IntegrationToken
-from shared.tokens import (
+from engine.shared.config import get_settings
+from engine.shared.constants import IntegrationStatus, SourceSystem
+from engine.shared.customer_mapping import record_mapping
+from engine.shared.db import get_pool
+from engine.shared.logging import get_logger
+from engine.shared.models import IntegrationToken
+from engine.shared.tokens import (
     list_devices_for_customer,
     revoke_device_token,
     save_device_token,
     update_device_heartbeat,
 )
+from kb.admin_routes import verify_internal_knowledge_key
 
 log = get_logger(__name__)
 

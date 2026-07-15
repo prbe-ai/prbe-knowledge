@@ -1,6 +1,6 @@
 """Real document sink for the polling scheduler.
 
-Wires :class:`services.ingestion.polling.scheduler.PollScheduler` into the
+Wires :class:`kb.polling.scheduler.PollScheduler` into the
 existing webhook-ingestion path so polled documents land in the same
 ``ingestion_queue`` rows the inbound-webhook HTTP handlers produce. The
 downstream normalizer treats poll-sourced and webhook-sourced events
@@ -16,9 +16,9 @@ identically because the envelope shape on disk is identical:
 Each polled document is uploaded as one R2 object (keyed by
 ``_payload_key(source, customer_id, source_event_id)`` — the same helper
 the FastAPI webhook handler uses, kept in sync) and one row is INSERTed
-into ``ingestion_queue`` via :func:`services.ingestion.main._enqueue`.
+into ``ingestion_queue`` via :func:`kb.ingestion_app._enqueue`.
 
-The sink lives here (not in :mod:`services.ingestion.main`) because:
+The sink lives here (not in :mod:`kb.ingestion_app`) because:
 
 1. The worker process owns the polling loop; pulling main.py's FastAPI
    app into the worker would drag in route registration we don't need.
@@ -42,10 +42,10 @@ from typing import Any
 
 import orjson
 
-from services.ingestion.main import _enqueue, _payload_key
-from shared.constants import SourceSystem
-from shared.logging import get_logger
-from shared.storage import ObjectStore, get_store
+from engine.shared.constants import SourceSystem
+from engine.shared.logging import get_logger
+from engine.shared.storage import ObjectStore, get_store
+from kb.ingestion_app import _enqueue, _payload_key
 
 log = get_logger(__name__)
 

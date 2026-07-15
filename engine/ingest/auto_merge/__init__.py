@@ -15,10 +15,10 @@ Real-time integration into graph_writer.upsert_nodes is a follow-up PR.
 See: entity auto-merge plan, /plan-eng-review 2026-05-19.
 """
 
-from services.ingestion.auto_merge.analyzer import (
+from engine.ingest.auto_merge.analyzer import (
     AutoMergeAnalyzer,
     AutoMergeResult,
 )
-from services.ingestion.auto_merge.models import AutoMergeVerdict
+from engine.ingest.auto_merge.models import AutoMergeVerdict
 
 __all__ = ["AutoMergeAnalyzer", "AutoMergeResult", "AutoMergeVerdict"]

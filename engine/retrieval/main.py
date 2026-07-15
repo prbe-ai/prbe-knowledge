@@ -38,8 +38,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
-from services.retrieval.auth import authenticate_query
-from services.retrieval.graph_explore import (
+from engine.retrieval.auth import authenticate_query
+from engine.retrieval.graph_explore import (
     EXPLORE_CONFIDENCES,
     EXPLORE_EDGE_TYPES,
     ExploreFilters,
@@ -48,13 +48,13 @@ from services.retrieval.graph_explore import (
     default_graph_query,
     graph_search_query,
 )
-from services.retrieval.middleware import UsageLoggingMiddleware
-from services.retrieval.pipeline import (
+from engine.retrieval.middleware import UsageLoggingMiddleware
+from engine.retrieval.pipeline import (
     run_retrieval,
     run_router_phase,
     run_search_phase,
 )
-from services.retrieval.synthesis import (
+from engine.retrieval.synthesis import (
     StreamDelta,
     StreamFinal,
     SynthesisError,
@@ -62,18 +62,18 @@ from services.retrieval.synthesis import (
     synthesize,
     synthesize_stream,
 )
-from services.retrieval.usage import usage_router
-from shared.community import ensure_default_customer
-from shared.config import get_settings
-from shared.constants import (
+from engine.retrieval.usage import usage_router
+from engine.shared.community import ensure_default_customer
+from engine.shared.config import get_settings
+from engine.shared.constants import (
     DEFAULT_SYNTHESIS_MODEL,
     GRAPH_SEARCH_DEFAULT_LIMIT,
     GRAPH_SEARCH_MAX_LIMIT,
     SourceSystem,
 )
-from shared.db import health_check, init_pool, with_tenant
-from shared.logging import configure_logging, get_logger
-from shared.models import (
+from engine.shared.db import health_check, init_pool, with_tenant
+from engine.shared.logging import configure_logging, get_logger
+from engine.shared.models import (
     AnswerRequest,
     AnswerResponse,
     QueryRequest,
@@ -82,6 +82,7 @@ from shared.models import (
     SourceViewResponse,
     SourceViewSection,
 )
+from engine.shared.source_registry import registered_source_keys
 
 log = get_logger(__name__)
 
@@ -107,12 +108,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await init_pool(settings)
     await ensure_default_customer()  # no-op unless DEFAULT_CUSTOMER_ID set
 
-    # Populate shared.source_registry: fusion decay and the doc-type
-    # resolver read per-source profiles (score multiplier, half-life,
-    # doc_type prefix) registered by the connector modules' decorators.
-    import services.ingestion.handlers  # noqa: F401
-
-    log.info("retrieval.boot", environment=settings.environment)
+    # Source profiles (score multiplier, half-life, doc_type prefix) are
+    # registered by the connector modules; the deploy entrypoint
+    # (services/retrieval/main.py) imports kb.handlers before this app so
+    # fusion decay and the doc-type resolver see them. engine/ never
+    # imports kb/ itself — count 0 here means someone launched this module
+    # directly and per-source ranking is running on defaults.
+    log.info(
+        "retrieval.boot",
+        environment=settings.environment,
+        registered_sources=len(registered_source_keys()),
+    )
     yield
 
 
@@ -1415,7 +1421,7 @@ if __name__ == "__main__":  # pragma: no cover
     import uvicorn
 
     uvicorn.run(
-        "services.retrieval.main:app",
+        "engine.retrieval.main:app",
         host="0.0.0.0",
         port=8081,
         reload=False,

@@ -12,11 +12,11 @@ without the orchestrator needing to know source-specific details.
 
 from __future__ import annotations
 
-from services.synthesis.fanout.base import REGISTRY, BackfillFanout
+from kb.synthesis.fanout.base import REGISTRY, BackfillFanout
 
 # Eager registration so importing this module wires up every source
 # discoverer at process start. Mirrors ``services/synthesis/crawlers/__init__.py``.
-from services.synthesis.fanout.github import GitHubBackfillFanout
+from kb.synthesis.fanout.github import GitHubBackfillFanout
 
 REGISTRY[GitHubBackfillFanout.source] = GitHubBackfillFanout()
 

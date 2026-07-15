@@ -14,9 +14,9 @@ from typing import ClassVar
 
 import httpx
 
-from services.synthesis.api_clients.github import GitHubAPIClient, get_shared_bucket
-from shared.constants import BACKFILL_MAX_TARGETS_PER_SOURCE
-from shared.logging import get_logger
+from engine.shared.constants import BACKFILL_MAX_TARGETS_PER_SOURCE
+from engine.shared.logging import get_logger
+from kb.synthesis.api_clients.github import GitHubAPIClient, get_shared_bucket
 
 log = get_logger(__name__)
 

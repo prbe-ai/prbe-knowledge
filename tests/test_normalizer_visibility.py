@@ -23,10 +23,10 @@ from datetime import UTC, datetime
 import pytest
 import pytest_asyncio
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.normalizer import Normalizer
-from shared import db as db_module
-from shared.constants import (
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.normalizer import Normalizer
+from engine.shared import db as db_module
+from engine.shared.constants import (
     EMBEDDING_V2_DIM,
     DocClass,
     DocType,
@@ -35,8 +35,8 @@ from shared.constants import (
     SourceSystem,
     Visibility,
 )
-from shared.embeddings import EmbeddedChunk, EmbedResult
-from shared.models import ACLPrincipal, ACLSnapshot, Document
+from engine.shared.embeddings import EmbeddedChunk, EmbedResult
+from engine.shared.models import ACLPrincipal, ACLSnapshot, Document
 
 pytestmark = pytest.mark.asyncio
 

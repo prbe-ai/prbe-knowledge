@@ -11,10 +11,10 @@ from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
-from services.mcp.clients.knowledge import close_client, get_client
-from services.mcp.config import get_settings
-from services.mcp.dependencies.auth_context import McpAuthMiddleware
-from services.mcp.server import mcp
+from engine.mcp.clients.knowledge import close_client, get_client
+from engine.mcp.config import get_settings
+from engine.mcp.dependencies.auth_context import McpAuthMiddleware
+from engine.mcp.server import mcp
 
 # Read the install script once at startup. Served at /install so the
 # one-liner `curl -fsSL https://mcp.knowledge.prbe.ai/install | bash` works.

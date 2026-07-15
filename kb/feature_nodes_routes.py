@@ -103,10 +103,10 @@ from datetime import UTC, datetime
 from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import AwareDatetime, BaseModel, Field, field_validator
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.graph_writer import upsert_edges, upsert_nodes
-from shared.config import get_settings
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.ingest.graph_writer import upsert_edges, upsert_nodes
+from engine.shared.config import get_settings
+from engine.shared.constants import (
     DocClass,
     DocType,
     DocumentKind,
@@ -116,9 +116,9 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.db import with_tenant
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     Document,
@@ -290,7 +290,7 @@ class FeatureNodeUpsertRequest(BaseModel):
         description=(
             "doc_ids of Documents the rationale cited (Slack threads, "
             "Notion pages, Linear tickets, etc.). The shape matches "
-            "shared.models.Document.doc_id (`<source>:<...>`). "
+            "engine.shared.models.Document.doc_id (`<source>:<...>`). "
             f"Capped at {MAX_EVIDENCE_DOC_IDS} entries."
         ),
     )

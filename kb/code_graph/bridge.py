@@ -32,11 +32,11 @@ from typing import Any
 
 import orjson
 
-from shared.constants import SourceSystem
-from shared.db import get_pool
-from shared.logging import get_logger
-from shared.source_registry import ingestion_priority_for
-from shared.storage import get_store
+from engine.shared.constants import SourceSystem
+from engine.shared.db import get_pool
+from engine.shared.logging import get_logger
+from engine.shared.source_registry import ingestion_priority_for
+from engine.shared.storage import get_store
 
 log = get_logger(__name__)
 
@@ -195,7 +195,7 @@ async def _put_and_enqueue(
     await store.put(bucket, key, body)
 
     priority = ingestion_priority_for(SourceSystem.CODE_GRAPH.value)
-    # Intentionally NOT gated by services.ingestion.connectedness:
+    # Intentionally NOT gated by engine.ingest.connectedness:
     # CODE_GRAPH is derived from already-ingested github content; the
     # upstream github enqueue gate stops new work when github is
     # disconnected, so this path has nothing left to do downstream.

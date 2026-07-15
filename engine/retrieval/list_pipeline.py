@@ -19,19 +19,19 @@ from __future__ import annotations
 
 import time
 
-from services.retrieval.acl import filter_by_acl
-from services.retrieval.helpers import expand_to_author_id_set
-from services.retrieval.retrievers.related_entities import (
+from engine.retrieval.acl import filter_by_acl
+from engine.retrieval.helpers import expand_to_author_id_set
+from engine.retrieval.retrievers.related_entities import (
     build_exclude_node_keys,
     expand_exclude_keys_with_aliases,
     walk_result_doc_neighbors,
 )
-from services.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
-from services.retrieval.router import Intent
-from shared.constants import SourceSystem
-from shared.db import with_tenant
-from shared.logging import get_logger
-from shared.models import (
+from engine.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
+from engine.retrieval.router import Intent
+from engine.shared.constants import SourceSystem
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     MatchProvenance,
     QueryChunk,
     QueryDocumentResult,
@@ -103,7 +103,7 @@ def _graph_entity_filters_from_intent(
     Returns an empty list when there are no qualifying entities — caller
     treats it as "no entity filter" (existing behavior preserved).
     """
-    from services.retrieval.retrievers.sql import GraphEntityFilter
+    from engine.retrieval.retrievers.sql import GraphEntityFilter
 
     filters: list[GraphEntityFilter] = []
     for e in intent.entities:

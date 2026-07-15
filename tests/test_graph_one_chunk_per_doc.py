@@ -26,7 +26,7 @@ import pytest
 
 _GRAPH_PY = (
     Path(__file__).resolve().parent.parent
-    / "services/retrieval/retrievers/graph.py"
+    / "engine/retrieval/retrievers/graph.py"
 )
 
 
@@ -81,7 +81,7 @@ async def test_graph_search_issues_per_doc_cap_sql() -> None:
     """End-to-end through graph_search(): the SQL the connection receives
     must contain the per-doc cap pattern, and the right top_k flows through
     to the LIMIT."""
-    from services.retrieval.retrievers import graph as graph_module
+    from engine.retrieval.retrievers import graph as graph_module
 
     captured_sql: list[str] = []
     captured_params: list[tuple] = []
@@ -127,7 +127,7 @@ async def test_graph_search_param_order_unchanged() -> None:
     must remain (customer_id, labels, cids, top_k, fallback_cids, ...). The
     per-doc cap is added entirely inside the SQL; positional params are
     untouched. Tests that depend on this order keep passing."""
-    from services.retrieval.retrievers import graph as graph_module
+    from engine.retrieval.retrievers import graph as graph_module
 
     captured_params: list[tuple] = []
 

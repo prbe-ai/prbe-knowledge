@@ -12,14 +12,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from services.ingestion.handlers.base import PollConfig
-from services.ingestion.poller import IntegrationPoller
-from shared.constants import (
+from engine.ingest.handlers.base import PollConfig
+from engine.shared.constants import (
     BackfillStatus,
     IntegrationStatus,
     SourceSystem,
 )
-from shared.db import raw_conn
+from engine.shared.db import raw_conn
+from kb.poller import IntegrationPoller
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -104,7 +104,7 @@ async def _seed_integration(
 
 def test_discover_empty_when_no_connectors_have_poll_config() -> None:
     """If list_registered() returns nothing, _discover returns an empty dict."""
-    with patch("services.ingestion.poller.list_registered", return_value=[]):
+    with patch("kb.poller.list_registered", return_value=[]):
         assert IntegrationPoller._discover() == {}
 
 
@@ -116,11 +116,11 @@ def test_discover_skips_connectors_with_none_poll_config() -> None:
 
     with (
         patch(
-            "services.ingestion.poller.list_registered",
+            "kb.poller.list_registered",
             return_value=[SourceSystem.SLACK],
         ),
         patch(
-            "services.ingestion.poller.get_connector_class",
+            "kb.poller.get_connector_class",
             return_value=_NullCfg,
         ),
     ):
@@ -136,11 +136,11 @@ def test_discover_includes_connectors_with_set_poll_config() -> None:
 
     with (
         patch(
-            "services.ingestion.poller.list_registered",
+            "kb.poller.list_registered",
             return_value=[SourceSystem.GRANOLA],
         ),
         patch(
-            "services.ingestion.poller.get_connector_class",
+            "kb.poller.get_connector_class",
             return_value=_GranolaLike,
         ),
     ):
@@ -151,7 +151,7 @@ def test_discover_picks_up_real_granola_connector() -> None:
     """Smoke: the real GranolaConnector subclass exposes poll_config so the
     registry-walk discovers it without any explicit wiring."""
     # Import side effect populates the connector registry.
-    import services.ingestion.handlers  # noqa: F401
+    import kb.handlers  # noqa: F401
 
     discovered = IntegrationPoller._discover()
     assert SourceSystem.GRANOLA in discovered
@@ -171,10 +171,10 @@ async def test_tick_source_empty_customers_is_noop() -> None:
     with (
         patch.object(poller, "_fetch_due_customers", AsyncMock(return_value=[])),
         patch(
-            "services.ingestion.poller.re_enqueue_for_polling",
+            "kb.poller.re_enqueue_for_polling",
             new=AsyncMock(),
         ) as mock_re,
-        patch("services.ingestion.poller.get_pool") as mock_pool,
+        patch("kb.poller.get_pool") as mock_pool,
     ):
         await poller._tick_source(SourceSystem.GRANOLA, _granola_config())
         mock_re.assert_not_awaited()
@@ -219,10 +219,10 @@ async def test_tick_source_skips_notify_when_re_enqueue_returns_false() -> None:
     with (
         patch.object(poller, "_fetch_due_customers", AsyncMock(return_value=["c1"])),
         patch(
-            "services.ingestion.poller.re_enqueue_for_polling",
+            "kb.poller.re_enqueue_for_polling",
             new=AsyncMock(return_value=False),
         ),
-        patch("services.ingestion.poller.get_pool", return_value=_FakePool()),
+        patch("kb.poller.get_pool", return_value=_FakePool()),
     ):
         await poller._tick_source(SourceSystem.GRANOLA, _granola_config())
 
@@ -255,10 +255,10 @@ async def test_tick_source_notifies_on_successful_re_enqueue() -> None:
     with (
         patch.object(poller, "_fetch_due_customers", AsyncMock(return_value=["c1", "c2"])),
         patch(
-            "services.ingestion.poller.re_enqueue_for_polling",
+            "kb.poller.re_enqueue_for_polling",
             new=AsyncMock(return_value=True),
         ),
-        patch("services.ingestion.poller.get_pool", return_value=_FakePool()),
+        patch("kb.poller.get_pool", return_value=_FakePool()),
     ):
         await poller._tick_source(SourceSystem.GRANOLA, _granola_config())
 
@@ -294,10 +294,10 @@ async def test_tick_source_continues_past_per_customer_error() -> None:
     with (
         patch.object(poller, "_fetch_due_customers", AsyncMock(return_value=["c1", "c2"])),
         patch(
-            "services.ingestion.poller.re_enqueue_for_polling",
+            "kb.poller.re_enqueue_for_polling",
             new=re_enqueue_mock,
         ),
-        patch("services.ingestion.poller.get_pool", return_value=_FakePool()),
+        patch("kb.poller.get_pool", return_value=_FakePool()),
     ):
         await poller._tick_source(SourceSystem.GRANOLA, _granola_config())
 

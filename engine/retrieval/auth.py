@@ -19,8 +19,8 @@ import hmac
 
 from fastapi import HTTPException, Request
 
-from shared.config import get_settings
-from shared.db import raw_conn
+from engine.shared.config import get_settings
+from engine.shared.db import raw_conn
 
 UNAUTHORIZED_HEADERS = {"WWW-Authenticate": "Bearer"}
 

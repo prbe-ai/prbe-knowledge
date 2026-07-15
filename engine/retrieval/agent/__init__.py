@@ -7,12 +7,12 @@ mandatorily fanning out the four channels on turn 1, exploring further
 in parallel on subsequent turns, and emitting a `GathererOutput` Pydantic
 payload (`response_format`-enforced).
 
-Entry point: `services.retrieval.agent.loop.run_gatherer`.
+Entry point: `engine.retrieval.agent.loop.run_gatherer`.
 
 Plan: docs/specs/agentic-search.md.
 """
 
-from services.retrieval.agent.models import (
+from engine.retrieval.agent.models import (
     DroppedCandidate,
     GatheredChunk,
     GatheredEntity,

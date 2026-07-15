@@ -34,17 +34,17 @@ from fastapi import HTTPException
 if TYPE_CHECKING:
     from starlette.requests import Request
 
-from services.retrieval.agent.loop import run_gatherer
-from services.retrieval.grounding import GroundingBundle, GroundingCandidate
-from services.retrieval.router import (
+from engine.retrieval.agent.loop import run_gatherer
+from engine.retrieval.grounding import GroundingBundle, GroundingCandidate
+from engine.retrieval.router import (
     Intent,
     RouterOutput,
     _build_bundle_with_token_fallback,
     _fallback_intent,
 )
-from shared.constants import SEARCH_AGENT_INFERENCE_MODEL
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.constants import SEARCH_AGENT_INFERENCE_MODEL
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     QueryRequest,
     RetrieveResponse,
     TemporalMode,

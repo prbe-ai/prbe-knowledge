@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import hashlib
 
-from shared.config import get_settings
-from shared.db import raw_conn
-from shared.logging import get_logger
+from engine.shared.config import get_settings
+from engine.shared.db import raw_conn
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

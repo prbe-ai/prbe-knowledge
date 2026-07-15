@@ -42,10 +42,10 @@ from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.handlers.base import Connector
-from services.ingestion.handlers.registry import register_connector
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.ingest.handlers.base import Connector
+from engine.ingest.handlers.registry import register_connector
+from engine.shared.constants import (
     DocClass,
     DocType,
     EdgeType,
@@ -56,9 +56,9 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.exceptions import InvalidWebhookPayload
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
@@ -953,7 +953,7 @@ class NotionConnector(Connector):
         redirect_uri: str,
         extra_params: dict[str, str] | None = None,
     ) -> IntegrationToken:
-        from shared.exceptions import (
+        from engine.shared.exceptions import (
             InvalidWebhookPayload,
             MissingSecret,
             PermanentSourceError,
@@ -1028,7 +1028,7 @@ class NotionConnector(Connector):
         integrations have no refresh_token; this method raises
         PermanentSourceError so the caller can flag auth_failed.
         """
-        from shared.exceptions import (
+        from engine.shared.exceptions import (
             MissingSecret,
             PermanentSourceError,
             TransientSourceError,
@@ -1108,7 +1108,7 @@ class NotionConnector(Connector):
         if resp.status_code == 401:
             return False
         if resp.status_code != 200:
-            from shared.exceptions import TransientSourceError
+            from engine.shared.exceptions import TransientSourceError
 
             raise TransientSourceError(
                 f"notion users/me probe returned {resp.status_code}",
@@ -1134,8 +1134,8 @@ class NotionConnector(Connector):
         already handles that case by skipping `record_mapping` and
         logging a warning.
         """
-        from shared.logging import get_logger
-        from shared.models import ExternalWorkspaceRef
+        from engine.shared.logging import get_logger
+        from engine.shared.models import ExternalWorkspaceRef
 
         lg = get_logger(__name__)
         meta = token.install_metadata or {}
@@ -1197,7 +1197,7 @@ class NotionConnector(Connector):
         returned by `/search` unless individually shared with the integration,
         so without this enumeration every database's contents are invisible.
         """
-        from shared.models import WebhookEvent
+        from engine.shared.models import WebhookEvent
 
         workspace_id = await _fetch_workspace_id(self.http, token.access_token) or "unknown"
         next_cursor = cursor

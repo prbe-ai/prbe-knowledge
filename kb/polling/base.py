@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
 
-from shared.constants import SourceSystem
+from engine.shared.constants import SourceSystem
 
 
 @dataclass

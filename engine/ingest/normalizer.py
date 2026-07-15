@@ -31,41 +31,41 @@ from typing import Any
 import asyncpg
 import orjson
 
-from services.ingestion.chunker import DEFAULT_CHUNK_OVERLAP, ChunkPiece, _enc, chunk_text
-from services.ingestion.graph_writer import upsert_edges, upsert_nodes
-from services.ingestion.handlers.base import Connector, ConnectorContext
-from services.ingestion.handlers.registry import build_connector
-from shared.constants import (
+from engine.ingest.chunker import DEFAULT_CHUNK_OVERLAP, ChunkPiece, _enc, chunk_text
+from engine.ingest.graph_writer import upsert_edges, upsert_nodes
+from engine.ingest.handlers.base import Connector, ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.constants import (
     CHUNKER_VERSION,
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
     NORMALIZER_VERSION,
     SourceSystem,
 )
-from shared.customer_prefs import is_wiki_generation_enabled
-from shared.db import get_pool, with_tenant
-from shared.embeddings import (
+from engine.shared.customer_prefs import is_wiki_generation_enabled
+from engine.shared.db import get_pool, with_tenant
+from engine.shared.embeddings import (
     DocItem,
     GeminiEmbedder,
     get_embedder_v2,
 )
-from shared.encryption import decrypt_token
-from shared.exceptions import (
+from engine.shared.encryption import decrypt_token
+from engine.shared.exceptions import (
     DuplicateEventIgnored,
     NormalizationError,
     PrbeError,
     TenantIsolationError,
     UnsupportedEventType,
 )
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     METADATA_CHUNK_INDEX,
     Document,
     IntegrationToken,
     NormalizationResult,
     WebhookEvent,
 )
-from shared.storage import ObjectStore, get_store
+from engine.shared.storage import ObjectStore, get_store
 
 log = get_logger(__name__)
 
@@ -429,7 +429,7 @@ class Normalizer:
         wiki-cron fly app, not realtime. See the comment block in
         `_persist` for the why.
         """
-        from services.synthesis.source_ts import extract_source_ts
+        from engine.ingest.source_ts import extract_source_ts
 
         if not docs:
             return
@@ -482,7 +482,7 @@ class Normalizer:
         CRITICAL: any exception from this method is caught by the caller
         (_persist) which logs it and continues. This must never block ingestion.
         """
-        from services.ingestion.inferred_edges.prompts.v1 import PROMPT_VERSION
+        from engine.ingest.inferred_edges.prompts.v1 import PROMPT_VERSION
 
         if not doc_ids:
             return
@@ -1413,7 +1413,7 @@ def _metadata_piece(doc: Document) -> ChunkPiece | None:
     text = _metadata_text(doc)
     if not text.strip():
         return None
-    from services.ingestion.chunker import count_tokens
+    from engine.ingest.chunker import count_tokens
 
     return ChunkPiece(
         chunk_index=METADATA_CHUNK_INDEX,

@@ -6,12 +6,12 @@ is fast-follow once a real customer repo exercises them.
 
 from __future__ import annotations
 
-from services.ingestion.code_graph.extractors import get_extractor_for_file
-from services.ingestion.code_graph.extractors.go import GoExtractor
-from services.ingestion.code_graph.extractors.java import JavaExtractor
-from services.ingestion.code_graph.extractors.javascript import JavaScriptExtractor
-from services.ingestion.code_graph.extractors.typescript import TypeScriptExtractor
-from shared.constants import EdgeType, NodeLabel
+from engine.shared.constants import EdgeType, NodeLabel
+from kb.code_graph.extractors import get_extractor_for_file
+from kb.code_graph.extractors.go import GoExtractor
+from kb.code_graph.extractors.java import JavaExtractor
+from kb.code_graph.extractors.javascript import JavaScriptExtractor
+from kb.code_graph.extractors.typescript import TypeScriptExtractor
 
 
 def test_typescript_extracts_function_class_and_imports() -> None:
@@ -151,7 +151,7 @@ def test_unsupported_extension_returns_none() -> None:
 
 def test_module_node_emitted_for_each_file() -> None:
     """Every extractor produces exactly one Module symbol per file."""
-    from services.ingestion.code_graph.extractors.python import PythonExtractor
+    from kb.code_graph.extractors.python import PythonExtractor
 
     fixtures = [
         ("src/x.py", PythonExtractor()),

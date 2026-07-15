@@ -37,14 +37,14 @@ from __future__ import annotations
 # ``register_poller(...)`` side effect so the scheduler's registry
 # resolves SourceSystem -> poller-class without any extra wiring at
 # the boot site.
-from services.ingestion.polling import sentry as _sentry_poller  # noqa: F401
-from services.ingestion.polling.base import BasePoller, get_poller, register_poller
-from services.ingestion.polling.cursors import (
+from kb.polling import sentry as _sentry_poller  # noqa: F401
+from kb.polling.base import BasePoller, get_poller, register_poller
+from kb.polling.cursors import (
     advance_cursor,
     load_cursor,
     stamp_error,
 )
-from services.ingestion.polling.scheduler import PollScheduler
+from kb.polling.scheduler import PollScheduler
 
 __all__ = [
     "BasePoller",

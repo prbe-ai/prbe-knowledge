@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 
-from services.ingestion.code_graph.types import ExtractResult
+from kb.code_graph.types import ExtractResult
 
 
 def promote_single_match(results: list[ExtractResult]) -> list[ExtractResult]:

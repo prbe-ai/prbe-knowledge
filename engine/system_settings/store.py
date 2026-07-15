@@ -24,7 +24,7 @@ import logging
 import time
 from dataclasses import dataclass
 
-from shared.db import get_pool
+from engine.shared.db import get_pool
 
 log = logging.getLogger("prbe-knowledge.system_settings")
 

@@ -12,13 +12,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.list_pipeline import run_list
-from services.retrieval.router import Intent, RouterEntity
-from shared.config import Settings, get_settings
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.models import QueryRequest, TemporalSpec
-from shared.storage import reset_store
+from engine.retrieval.list_pipeline import run_list
+from engine.retrieval.router import Intent, RouterEntity
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.models import QueryRequest, TemporalSpec
+from engine.shared.storage import reset_store
 
 pytestmark = pytest.mark.asyncio
 

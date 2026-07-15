@@ -25,18 +25,18 @@ from datetime import UTC, datetime
 from typing import Any
 from typing import get_args as _get_args
 
-from services.retrieval.agent.models import (
+from engine.retrieval.agent.models import (
     EntityExtraction,
     SortMode,
 )
-from services.retrieval.grounding import GroundingBundle
-from services.retrieval.router import _escape_query_for_xml
-from shared.constants import (
+from engine.retrieval.grounding import GroundingBundle
+from engine.retrieval.router import _escape_query_for_xml
+from engine.shared.constants import (
     SEARCH_AGENT_INFERENCE_MODEL,
     SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
 )
-from shared.llm import LLMError, acompletion, gateway_url
-from shared.logging import get_logger
+from engine.shared.llm import LLMError, acompletion, gateway_url
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

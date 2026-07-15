@@ -28,12 +28,11 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.code_graph import bridge as code_graph_bridge
-from services.ingestion.handlers.base import Connector
-from services.ingestion.handlers.registry import register_connector
-from shared.backend_client import fetch_github_installation_token
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.ingest.handlers.base import Connector
+from engine.ingest.handlers.registry import register_connector
+from engine.shared.backend_client import fetch_github_installation_token
+from engine.shared.constants import (
     GITHUB_INSTALLATION_SCOPE_PREFIX,
     DocClass,
     DocType,
@@ -46,13 +45,13 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
-from shared.customer_prefs import code_graph_indexed_branch
-from shared.exceptions import (
+from engine.shared.customer_prefs import code_graph_indexed_branch
+from engine.shared.exceptions import (
     InvalidWebhookPayload,
     NotSupportedByConnector,
 )
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
@@ -68,6 +67,7 @@ from shared.models import (
     make_document,
     make_person,
 )
+from kb.code_graph import bridge as code_graph_bridge
 
 log = get_logger(__name__)
 
@@ -845,7 +845,8 @@ class GitHubConnector(Connector):
         """
         import asyncio as _asyncio
 
-        from services.ingestion.handlers._github_graphql import (
+        from engine.shared.models import WebhookEvent
+        from kb.handlers._github_graphql import (
             BACKFILL_COMMITS_QUERY,
             BACKFILL_ISSUES_QUERY,
             BACKFILL_PULLS_QUERY,
@@ -857,7 +858,6 @@ class GitHubConnector(Connector):
             normalize_review_node,
             run_graphql,
         )
-        from shared.models import WebhookEvent
 
         state = _decode_github_cursor(cursor)
         bearer = await self._resolve_installation_bearer(token, customer_id=customer_id)

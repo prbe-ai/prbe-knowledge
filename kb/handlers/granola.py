@@ -56,10 +56,10 @@ from typing import Any, ClassVar
 
 import httpx
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.handlers.base import Connector, PollConfig
-from services.ingestion.handlers.registry import register_connector
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.ingest.handlers.base import Connector, PollConfig
+from engine.ingest.handlers.registry import register_connector
+from engine.shared.constants import (
     GRANOLA_POLL_INTERVAL_SECONDS,
     GRANOLA_REFRESH_CHANNEL,
     GRANOLA_REQUEST_INTERVAL_SECONDS,
@@ -72,14 +72,14 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import (
+from engine.shared.exceptions import (
     InvalidWebhookPayload,
     PermanentSourceError,
     RateLimited,
     TransientSourceError,
 )
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,

@@ -13,7 +13,7 @@ consume responses with or without the new field. The model contract is:
 
 from __future__ import annotations
 
-from shared.models import AnswerRequest, QueryRequest, QueryResponse, RelatedEntity
+from engine.shared.models import AnswerRequest, QueryRequest, QueryResponse, RelatedEntity
 
 
 def _base_payload() -> dict:

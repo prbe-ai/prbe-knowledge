@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from shared.models import TemporalMode, TemporalSpec
+from engine.shared.models import TemporalMode, TemporalSpec
 
 
 @dataclass(slots=True)

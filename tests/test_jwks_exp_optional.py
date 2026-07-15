@@ -14,8 +14,8 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
 from jwt import PyJWK
 
-from services.mcp.dependencies import jwks as jwks_mod
-from services.mcp.dependencies.jwks import JwtAuthError, verify_access_token
+from engine.mcp.dependencies import jwks as jwks_mod
+from engine.mcp.dependencies.jwks import JwtAuthError, verify_access_token
 
 ISS = "https://api.knowledge.prbe.ai"
 AUD = "https://mcp.knowledge.prbe.ai"

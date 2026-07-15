@@ -15,16 +15,16 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from services.ingestion.backfill_runner import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import BackfillStatus, SourceSystem
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.storage import reset_store
+from kb.backfill_runner import (
     claim_pending_backfill,
     enqueue_backfill,
 )
-from services.ingestion.handlers.base import ConnectorContext
-from shared.config import Settings, get_settings
-from shared.constants import BackfillStatus, SourceSystem
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.storage import reset_store
 
 
 @pytest.fixture(autouse=True)
@@ -51,14 +51,14 @@ def _stub_slack_metadata_store(monkeypatch):
         existing.update(patch)
 
     monkeypatch.setattr(
-        "services.ingestion.handlers.slack.load_source_metadata", fake_load
+        "kb.handlers.slack.load_source_metadata", fake_load
     )
     monkeypatch.setattr(
-        "services.ingestion.handlers.slack.patch_source_metadata", fake_patch
+        "kb.handlers.slack.patch_source_metadata", fake_patch
     )
     # Shrink the flush debounce so tests that trigger writes don't dangle a
     # 30-second background task past test teardown.
-    from services.ingestion.handlers.slack import _SlackUserCache
+    from kb.handlers.slack import _SlackUserCache
 
     monkeypatch.setattr(_SlackUserCache, "FLUSH_DEBOUNCE_S", 0.05)
     return store
@@ -111,7 +111,7 @@ def _mock_transport(routes: dict) -> httpx.MockTransport:
 
 
 def _ctx_with_transport(transport: httpx.MockTransport) -> ConnectorContext:
-    from shared.config import Settings as _S
+    from engine.shared.config import Settings as _S
 
     return ConnectorContext(
         settings=_S(),
@@ -162,8 +162,8 @@ async def test_slack_backfill_paginates_channels_and_history() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -253,8 +253,8 @@ async def test_slack_backfill_auto_joins_public_channels_when_scope_present() ->
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -311,8 +311,8 @@ async def test_slack_backfill_skips_auto_join_without_scope() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -392,8 +392,8 @@ async def test_slack_backfill_round_robin_interleaves_pages() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -463,8 +463,8 @@ async def test_slack_backfill_ranks_channels_by_num_members_desc() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -516,8 +516,8 @@ async def test_slack_backfill_resumes_from_new_shape_cursor() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -579,8 +579,8 @@ async def test_slack_backfill_one_channel_500s_others_continue() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -639,8 +639,8 @@ async def test_slack_backfill_drops_channel_on_ok_false() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -716,8 +716,8 @@ async def test_slack_backfill_429_pauses_and_breaks_round(monkeypatch) -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -778,8 +778,8 @@ async def test_slack_backfill_skips_non_message_types() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -833,8 +833,8 @@ async def test_slack_backfill_message_events_omit_cursor_field() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -927,8 +927,8 @@ async def test_slack_backfill_primes_user_cache_via_users_list() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -1003,8 +1003,8 @@ async def test_slack_backfill_event_carries_user_profile_when_cached() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     slack = build_connector(SourceSystem.SLACK, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -1100,8 +1100,8 @@ async def test_linear_backfill_paginates_issues() -> None:
 
     transport = _mock_transport({("POST", "/graphql"): graphql})
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     linear = build_connector(SourceSystem.LINEAR, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -1169,8 +1169,8 @@ async def test_notion_backfill_paginates_search() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     notion = build_connector(SourceSystem.NOTION, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -1263,8 +1263,8 @@ async def test_notion_backfill_enumerates_database_rows() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     notion = build_connector(SourceSystem.NOTION, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -1332,8 +1332,8 @@ async def test_sentry_backfill_paginates_issues() -> None:
         }
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     sentry = build_connector(SourceSystem.SENTRY, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -1670,8 +1670,8 @@ async def test_github_backfill_paginates_all_phases() -> None:
         on_graphql=_capture,
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -1781,14 +1781,14 @@ async def test_github_backfill_with_installation_scope_fetches_token_from_backen
         return "ghs_fresh_bearer", datetime(2026, 12, 31, tzinfo=UTC)
 
     monkeypatch.setattr(
-        "services.ingestion.handlers.github.fetch_github_installation_token",
+        "kb.handlers.github.fetch_github_installation_token",
         fake_fetch,
     )
 
-    from services.ingestion.handlers.base import ConnectorContext
-    from services.ingestion.handlers.registry import build_connector
-    from shared.config import Settings as _S
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.base import ConnectorContext
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.config import Settings as _S
+    from engine.shared.models import IntegrationToken
 
     ctx = ConnectorContext(
         settings=_S(),
@@ -1828,7 +1828,7 @@ async def test_github_graphql_rate_limit_backoff(monkeypatch) -> None:
         await real_sleep(0)
 
     monkeypatch.setattr(
-        "services.ingestion.handlers._github_graphql.asyncio.sleep", fake_sleep
+        "kb.handlers._github_graphql.asyncio.sleep", fake_sleep
     )
 
     def on_graphql(query, variables):
@@ -1868,8 +1868,8 @@ async def test_github_graphql_rate_limit_backoff(monkeypatch) -> None:
         on_graphql=on_graphql,
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -1887,7 +1887,7 @@ async def test_github_graphql_parallel_repos(monkeypatch) -> None:
     """With semaphore=2 and 3 repos, all events still flow through the queue."""
     # Cap parallelism at 2 via the settings.
     monkeypatch.setenv("GITHUB_BACKFILL_REPO_CONCURRENCY", "2")
-    from shared.config import get_settings as _gs
+    from engine.shared.config import get_settings as _gs
 
     _gs.cache_clear()  # type: ignore[attr-defined]
 
@@ -1910,8 +1910,8 @@ async def test_github_graphql_parallel_repos(monkeypatch) -> None:
         },
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -1958,8 +1958,8 @@ async def test_github_graphql_reviews_emitted_inline() -> None:
         pulls_by_repo={"acme/api": [pr]},
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -2024,8 +2024,8 @@ async def test_github_graphql_commits_phase() -> None:
         default_branch_by_repo={"acme/api": "develop"},
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -2068,8 +2068,8 @@ async def test_github_graphql_releases_phase() -> None:
         },
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -2126,8 +2126,8 @@ async def test_github_graphql_cursor_resume() -> None:
         on_graphql=on_graphql,
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -2165,7 +2165,7 @@ async def test_github_graphql_review_uses_database_id() -> None:
     id). Without this, backfill dedupes review docs on a different key than
     live webhooks, producing two pgvector rows per review.
     """
-    from services.ingestion.handlers._github_graphql import (
+    from kb.handlers._github_graphql import (
         normalize_review_node,
     )
 
@@ -2231,7 +2231,7 @@ async def test_github_graphql_retries_on_5xx(monkeypatch) -> None:
         await real_sleep(0)
 
     monkeypatch.setattr(
-        "services.ingestion.handlers._github_graphql.asyncio.sleep", fake_sleep
+        "kb.handlers._github_graphql.asyncio.sleep", fake_sleep
     )
 
     call_count = {"pulls": 0}
@@ -2263,8 +2263,8 @@ async def test_github_graphql_retries_on_5xx(monkeypatch) -> None:
         on_graphql=on_graphql,
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -2293,7 +2293,7 @@ async def test_github_graphql_partial_data_with_errors(monkeypatch) -> None:
         await real_sleep(0)
 
     monkeypatch.setattr(
-        "services.ingestion.handlers._github_graphql.asyncio.sleep", fake_sleep
+        "kb.handlers._github_graphql.asyncio.sleep", fake_sleep
     )
 
     call_count = {"pulls": 0}
@@ -2342,8 +2342,8 @@ async def test_github_graphql_partial_data_with_errors(monkeypatch) -> None:
         on_graphql=on_graphql,
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -2372,7 +2372,7 @@ async def test_github_graphql_walker_exception_propagates(monkeypatch) -> None:
         await real_sleep(0)
 
     monkeypatch.setattr(
-        "services.ingestion.handlers._github_graphql.asyncio.sleep", fake_sleep
+        "kb.handlers._github_graphql.asyncio.sleep", fake_sleep
     )
 
     async def boom_run_graphql(http, headers, query, variables):
@@ -2451,7 +2451,7 @@ async def test_github_graphql_walker_exception_propagates(monkeypatch) -> None:
 
     # Patch the run_graphql symbol the connector imports inside backfill().
     monkeypatch.setattr(
-        "services.ingestion.handlers._github_graphql.run_graphql",
+        "kb.handlers._github_graphql.run_graphql",
         boom_run_graphql,
     )
 
@@ -2462,8 +2462,8 @@ async def test_github_graphql_walker_exception_propagates(monkeypatch) -> None:
         ],
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -2504,7 +2504,7 @@ async def test_github_graphql_snapshot_lock_serializes_cursor_writes(
     import json as _json
 
     monkeypatch.setenv("GITHUB_BACKFILL_REPO_CONCURRENCY", "2")
-    from shared.config import get_settings as _gs
+    from engine.shared.config import get_settings as _gs
 
     _gs.cache_clear()  # type: ignore[attr-defined]
 
@@ -2525,8 +2525,8 @@ async def test_github_graphql_snapshot_lock_serializes_cursor_writes(
         issues_by_repo={"acme/r0": [], "acme/r1": []},
     )
 
-    from services.ingestion.handlers.registry import build_connector
-    from shared.models import IntegrationToken
+    from engine.ingest.handlers.registry import build_connector
+    from engine.shared.models import IntegrationToken
 
     gh = build_connector(SourceSystem.GITHUB, _ctx_with_transport(transport))
     token = IntegrationToken(
@@ -2568,7 +2568,7 @@ async def test_backfill_status_endpoint(live_db, monkeypatch) -> None:
     header; the tenant comes from X-Prbe-Customer, never from the client."""
     from httpx import ASGITransport
 
-    from shared.db import close_pool, init_pool
+    from engine.shared.db import close_pool, init_pool
 
     monkeypatch.setenv("INTERNAL_KNOWLEDGE_API_KEY", "test-internal-key")
     get_settings.cache_clear()  # type: ignore[attr-defined]
@@ -2581,7 +2581,7 @@ async def test_backfill_status_endpoint(live_db, monkeypatch) -> None:
     await enqueue_backfill("cust-s", SourceSystem.SLACK)
     await enqueue_backfill("cust-s", SourceSystem.LINEAR)
 
-    from services.ingestion.main import app as ingestion_app
+    from kb.ingestion_app import app as ingestion_app
 
     await close_pool()
     transport = ASGITransport(app=ingestion_app)
@@ -2628,14 +2628,14 @@ async def test_backfill_status_endpoint(live_db, monkeypatch) -> None:
 from collections.abc import AsyncIterator  # noqa: E402
 from datetime import UTC, datetime  # noqa: E402
 
-from services.ingestion import backfill_runner as _bf_runner  # noqa: E402
-from services.ingestion.backfill_runner import (  # noqa: E402
+from engine.ingest.handlers.base import Connector  # noqa: E402
+from engine.shared.encryption import encrypt_token  # noqa: E402
+from engine.shared.models import IntegrationToken, WebhookEvent  # noqa: E402
+from kb import backfill_runner as _bf_runner  # noqa: E402
+from kb.backfill_runner import (  # noqa: E402
     PROGRESS_EVERY_N_EVENTS,
     run_backfill,
 )
-from services.ingestion.handlers.base import Connector  # noqa: E402
-from shared.encryption import encrypt_token  # noqa: E402
-from shared.models import IntegrationToken, WebhookEvent  # noqa: E402
 
 _BATCH_CUSTOMER = "cust-bf-batch"
 _BATCH_SOURCE = SourceSystem.GRANOLA
@@ -2746,11 +2746,11 @@ async def test_backfill_batches_r2_and_db(live_db, monkeypatch) -> None:
     round-trips. Count R2 puts via store.put monkeypatch; count executemany
     calls via asyncpg Connection.executemany monkeypatch.
     """
-    from shared.config import get_settings as _get_settings
+    from engine.shared.config import get_settings as _get_settings
 
     await _seed_batch_customer_and_token()
 
-    from services.ingestion.backfill_runner import enqueue_backfill as _eq
+    from kb.backfill_runner import enqueue_backfill as _eq
     await _eq(_BATCH_CUSTOMER, _BATCH_SOURCE)
 
     batch_size = _get_settings().backfill_batch_size  # default 100
@@ -2782,7 +2782,7 @@ async def test_backfill_batches_r2_and_db(live_db, monkeypatch) -> None:
 
     fake = _BatchConnector(_bf_ctx(), total=total)
     monkeypatch.setattr(
-        "services.ingestion.backfill_runner.build_connector",
+        "kb.backfill_runner.build_connector",
         lambda src, ctx: fake,
     )
 
@@ -2805,7 +2805,7 @@ async def test_backfill_partial_batch_flushed_at_end(live_db, monkeypatch) -> No
     still flush at end-of-stream — one executemany with 23 rows, not zero."""
     await _seed_batch_customer_and_token()
 
-    from services.ingestion.backfill_runner import enqueue_backfill as _eq
+    from kb.backfill_runner import enqueue_backfill as _eq
     await _eq(_BATCH_CUSTOMER, _BATCH_SOURCE)
 
     total = 23  # well below default batch_size=100
@@ -2825,7 +2825,7 @@ async def test_backfill_partial_batch_flushed_at_end(live_db, monkeypatch) -> No
 
     fake = _BatchConnector(_bf_ctx(), total=total)
     monkeypatch.setattr(
-        "services.ingestion.backfill_runner.build_connector",
+        "kb.backfill_runner.build_connector",
         lambda src, ctx: fake,
     )
 
@@ -2849,7 +2849,7 @@ async def test_backfill_cursor_checkpoint_every_25(live_db, monkeypatch) -> None
     → 2 progress writes (not 8, which the old per-event path would produce)."""
     await _seed_batch_customer_and_token()
 
-    from services.ingestion.backfill_runner import enqueue_backfill as _eq
+    from kb.backfill_runner import enqueue_backfill as _eq
     await _eq(_BATCH_CUSTOMER, _BATCH_SOURCE)
 
     total = 200
@@ -2865,7 +2865,7 @@ async def test_backfill_cursor_checkpoint_every_25(live_db, monkeypatch) -> None
 
     fake = _BatchConnector(_bf_ctx(), total=total)
     monkeypatch.setattr(
-        "services.ingestion.backfill_runner.build_connector",
+        "kb.backfill_runner.build_connector",
         lambda src, ctx: fake,
     )
 
@@ -2897,7 +2897,7 @@ async def test_backfill_batch_exception_marks_failed(live_db, monkeypatch) -> No
     silently drop the partial batch."""
     await _seed_batch_customer_and_token()
 
-    from services.ingestion.backfill_runner import enqueue_backfill as _eq
+    from kb.backfill_runner import enqueue_backfill as _eq
     await _eq(_BATCH_CUSTOMER, _BATCH_SOURCE)
 
     # Make every executemany on ingestion_queue raise.
@@ -2914,7 +2914,7 @@ async def test_backfill_batch_exception_marks_failed(live_db, monkeypatch) -> No
 
     fake = _BatchConnector(_bf_ctx(), total=150)  # crosses a batch boundary
     monkeypatch.setattr(
-        "services.ingestion.backfill_runner.build_connector",
+        "kb.backfill_runner.build_connector",
         lambda src, ctx: fake,
     )
 

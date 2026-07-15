@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncpg
 import pytest
 
-from shared.config import get_settings
+from engine.shared.config import get_settings
 
 
 @pytest.mark.asyncio

@@ -28,12 +28,12 @@ from typing import Any
 
 import httpx
 
-from services.ingestion.polling.base import BasePoller, PollResult, register_poller
-from shared.backend_client import fetch_github_installation_token
-from shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
-from shared.exceptions import GitHubAuthError
-from shared.logging import get_logger
-from shared.tokens import load_token
+from engine.shared.backend_client import fetch_github_installation_token
+from engine.shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
+from engine.shared.exceptions import GitHubAuthError
+from engine.shared.logging import get_logger
+from engine.shared.tokens import load_token
+from kb.polling.base import BasePoller, PollResult, register_poller
 
 log = get_logger(__name__)
 

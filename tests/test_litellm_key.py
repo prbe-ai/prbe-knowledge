@@ -18,9 +18,9 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from shared import litellm_key as litellm_key_mod
-from shared import llm
-from shared.litellm_key import (
+from engine.shared import litellm_key as litellm_key_mod
+from engine.shared import llm
+from engine.shared.litellm_key import (
     LiteLLMKeyUnavailable,
     current_tenant_virtual_key,
     get_tenant_virtual_key,
@@ -38,7 +38,7 @@ def _clear_cache_and_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_KEY", raising=False)
     # Clear the pydantic-settings cache so the new env vars are picked up.
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
     yield
@@ -131,7 +131,7 @@ async def test_fetch_5xx_raises_unavailable() -> None:
 async def test_fetch_missing_config_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BACKEND_BASE_URL", "")
     monkeypatch.setenv("INTERNAL_BACKEND_API_KEY", "")
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 

@@ -23,9 +23,9 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
-from services.retrieval.main import app
-from shared.config import get_settings
-from shared.db import raw_conn
+from engine.retrieval.main import app
+from engine.shared.config import get_settings
+from engine.shared.db import raw_conn
 
 pytestmark = pytest.mark.asyncio
 

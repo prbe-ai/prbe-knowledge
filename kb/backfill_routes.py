@@ -14,9 +14,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
-from services.ingestion.admin_routes import verify_internal_knowledge_key
-from shared.constants import SourceSystem
-from shared.db import with_tenant
+from engine.shared.constants import SourceSystem
+from engine.shared.db import with_tenant
+from kb.admin_routes import verify_internal_knowledge_key
 
 router = APIRouter(prefix="/backfill", tags=["backfill"])
 

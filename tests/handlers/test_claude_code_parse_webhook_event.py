@@ -1,8 +1,8 @@
 import pytest
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.claude_code import ClaudeCodeConnector
-from shared.exceptions import InvalidWebhookPayload
+from engine.ingest.handlers.base import make_default_context
+from engine.shared.exceptions import InvalidWebhookPayload
+from kb.handlers.claude_code import ClaudeCodeConnector
 
 
 def _make() -> ClaudeCodeConnector:

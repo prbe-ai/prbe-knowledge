@@ -24,17 +24,17 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator
 
-from services.ingestion.normalizer import (
+from engine.ingest.normalizer import (
     _insert_chunk,
     _insert_failed_chunk,
     _metadata_piece,
 )
-from shared.config import get_settings
-from shared.db import close_pool, init_pool, raw_conn, with_tenant
-from shared.embeddings import get_embedder_v2
-from shared.exceptions import EmbeddingError
-from shared.logging import configure_logging, get_logger
-from shared.models import (
+from engine.shared.config import get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
+from engine.shared.embeddings import get_embedder_v2
+from engine.shared.exceptions import EmbeddingError
+from engine.shared.logging import configure_logging, get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     DocClass,
@@ -164,7 +164,7 @@ async def _backfill_tenant(
         # Use embed_documents (not embed_many) so the Gemini doc-side prefix
         # is applied — keeps these metadata-chunk vectors in the same
         # subspace as content chunks the normalizer writes.
-        from shared.embeddings import DocItem
+        from engine.shared.embeddings import DocItem
         try:
             embeds = await embedder.embed_documents(
                 [DocItem(content=piece.content, title=doc.title)]

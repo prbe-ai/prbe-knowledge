@@ -1,7 +1,7 @@
 """Connector registry.
 
 Connector classes register via decorator at module import. The ingestion
-service imports `services.ingestion.handlers` (the package) once at startup,
+service imports `kb.handlers` (the package) once at startup,
 which triggers all per-source modules to register themselves.
 """
 
@@ -10,10 +10,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TypeVar
 
-from services.ingestion.handlers.base import Connector, ConnectorContext
-from shared.constants import SourceSystem
-from shared.exceptions import HandlerNotFound
-from shared.source_registry import SourceProfile, register_source
+from engine.ingest.handlers.base import Connector, ConnectorContext
+from engine.shared.constants import SourceSystem
+from engine.shared.exceptions import HandlerNotFound
+from engine.shared.source_registry import SourceProfile, register_source
 
 _registry: dict[SourceSystem, type[Connector]] = {}
 

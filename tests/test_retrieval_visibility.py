@@ -31,22 +31,22 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.agent.tools import execute_fetch_doc
-from services.retrieval.main import _load_source_doc_and_chunks
-from services.retrieval.retrievers.bm25 import bm25_search
-from services.retrieval.retrievers.directed import directed_search
-from services.retrieval.retrievers.graph import graph_search
-from services.retrieval.retrievers.id_lookup import id_lookup_search
-from services.retrieval.retrievers.inferred_edges import (
+from engine.retrieval.agent.tools import execute_fetch_doc
+from engine.retrieval.main import _load_source_doc_and_chunks
+from engine.retrieval.retrievers.bm25 import bm25_search
+from engine.retrieval.retrievers.directed import directed_search
+from engine.retrieval.retrievers.graph import graph_search
+from engine.retrieval.retrievers.id_lookup import id_lookup_search
+from engine.retrieval.retrievers.inferred_edges import (
     INFERRED_EDGES_EXTRACTOR_ID,
     inferred_edge_search,
 )
-from services.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
-from services.retrieval.retrievers.vector import vector_search
-from services.synthesis.persistence import fetch_wiki_index
-from shared.constants import NodeLabel
-from shared.db import raw_conn
-from shared.embeddings import get_embedder_v2, reset_embedder
+from engine.retrieval.retrievers.sql import sql_count, sql_group_by, sql_list
+from engine.retrieval.retrievers.vector import vector_search
+from engine.shared.constants import NodeLabel
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import get_embedder_v2, reset_embedder
+from kb.synthesis.persistence import fetch_wiki_index
 
 pytestmark = pytest.mark.asyncio
 
@@ -875,12 +875,12 @@ async def test_wiki_route_index_excludes_drafts(live_db) -> None:
     await _seed_wiki_doc(cid, "wiki:postmortem:approved-pm", visibility="approved")
     await _seed_wiki_doc(cid, "wiki:postmortem:draft-pm", visibility="draft")
 
-    from shared.constants import (
+    from engine.shared.constants import (
         WIKI_DOC_TYPE_PREFIX,
         WIKI_INDEX_DOC_TYPE,
         SourceSystem,
     )
-    from shared.db import with_tenant
+    from engine.shared.db import with_tenant
 
     async with with_tenant(cid) as conn:
         rows = await conn.fetch(
@@ -918,12 +918,12 @@ async def test_wiki_agent_drain_index_excludes_drafts(live_db) -> None:
     await _seed_wiki_doc(cid, "wiki:postmortem:approved-pm", visibility="approved")
     await _seed_wiki_doc(cid, "wiki:postmortem:draft-pm", visibility="draft")
 
-    from shared.constants import (
+    from engine.shared.constants import (
         WIKI_DOC_TYPE_PREFIX,
         WIKI_INDEX_DOC_TYPE,
         SourceSystem,
     )
-    from shared.db import with_tenant
+    from engine.shared.db import with_tenant
 
     async with with_tenant(cid) as conn:
         rows = await conn.fetch(

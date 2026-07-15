@@ -11,8 +11,8 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from services.ingestion.code_graph import fetch as fetch_mod
-from shared.exceptions import SourceAPIError
+from engine.shared.exceptions import SourceAPIError
+from kb.code_graph import fetch as fetch_mod
 
 
 def _make_response(status: int, *, body: dict | None = None) -> httpx.Response:

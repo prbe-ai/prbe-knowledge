@@ -37,8 +37,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Final
 
-from shared.db import with_tenant
-from shared.logging import get_logger
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

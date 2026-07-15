@@ -12,8 +12,8 @@ Covers the spec's required Python paths:
 
 from __future__ import annotations
 
-from services.ingestion.code_graph.extractors.python import PythonExtractor
-from shared.constants import EdgeType, NodeLabel
+from engine.shared.constants import EdgeType, NodeLabel
+from kb.code_graph.extractors.python import PythonExtractor
 
 
 def _extract(source: str, file_path: str = "pkg/mod.py"):

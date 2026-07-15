@@ -33,8 +33,8 @@ import asyncpg
 from fastapi import APIRouter, Depends, Header, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from shared.config import get_settings
-from shared.db import with_tenant
+from engine.shared.config import get_settings
+from engine.shared.db import with_tenant
 
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/entity-clusters", tags=["internal-api"])

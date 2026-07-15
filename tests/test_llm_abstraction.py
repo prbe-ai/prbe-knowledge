@@ -22,8 +22,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from litellm.exceptions import APIError, RateLimitError
 
-from shared import llm
-from shared.llm import LLMError, acompletion, aembedding, gateway_url
+from engine.shared import llm
+from engine.shared.llm import LLMError, acompletion, aembedding, gateway_url
 
 # ---------------------------------------------------------------------------
 # acompletion

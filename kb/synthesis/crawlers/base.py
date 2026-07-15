@@ -37,7 +37,7 @@ from typing import Any, ClassVar, Protocol
 import httpx
 from pydantic import BaseModel, Field
 
-from shared.config import Settings
+from engine.shared.config import Settings
 
 
 class BearerResolver(Protocol):

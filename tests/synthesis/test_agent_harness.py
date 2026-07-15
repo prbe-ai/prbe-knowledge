@@ -12,13 +12,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.synthesis.agent_harness import AgentLoop, AgentMetrics
-from shared.constants import (
+from engine.shared.constants import (
     WIKI_AGENT_STALL_TURNS,
     WIKI_AGENT_TURN_CAP,
     WIKI_AGENT_UPDATE_CAP,
 )
-from shared.exceptions import AgentCompactionError, AgentHaltError, ToolValidationError
+from engine.shared.exceptions import AgentCompactionError, AgentHaltError, ToolValidationError
+from kb.synthesis.agent_harness import AgentLoop, AgentMetrics
 
 # ---------------------------------------------------------------------------
 # Stub runtime + LLM
@@ -148,7 +148,7 @@ async def test_run_happy_done() -> None:
 @pytest.mark.asyncio
 async def test_run_turn_cap_halts(monkeypatch) -> None:
     """Lower the turn cap so we can hit it cheaply."""
-    import services.synthesis.agent_harness as h
+    import kb.synthesis.agent_harness as h
 
     monkeypatch.setattr(h, "WIKI_AGENT_TURN_CAP", 2)
 
@@ -174,7 +174,7 @@ async def test_run_stall_halts_after_threshold(monkeypatch) -> None:
     exploration before a decision. The behaviour we're pinning is
     threshold-relative, not the specific number.
     """
-    import services.synthesis.agent_harness as h
+    import kb.synthesis.agent_harness as h
 
     monkeypatch.setattr(h, "WIKI_AGENT_STALL_TURNS", 3)
     runtime = StubRuntime()
@@ -206,7 +206,7 @@ async def test_stall_threshold_tolerates_realistic_read_exploration(
     production stall threshold (15) must NOT halt this — that's what
     bit run 105 on acme when STALL_TURNS=3 was the default.
     """
-    import services.synthesis.agent_harness as h
+    import kb.synthesis.agent_harness as h
 
     # Production value 15. Don't patch — exercise the real default.
     assert h.WIKI_AGENT_STALL_TURNS >= 10, (
@@ -267,7 +267,7 @@ async def test_stall_threshold_tolerates_realistic_read_exploration(
 
 @pytest.mark.asyncio
 async def test_run_update_cap_halts(monkeypatch) -> None:
-    import services.synthesis.agent_harness as h
+    import kb.synthesis.agent_harness as h
 
     monkeypatch.setattr(h, "WIKI_AGENT_UPDATE_CAP", 1)
 
@@ -602,7 +602,7 @@ async def test_maybe_compact_below_threshold_no_op() -> None:
 @pytest.mark.asyncio
 async def test_maybe_compact_above_threshold_triggers(monkeypatch) -> None:
     """Force the threshold low so the very-empty conversation crosses it."""
-    import services.synthesis.agent_harness as h
+    import kb.synthesis.agent_harness as h
 
     monkeypatch.setattr(h, "_MODEL_CONTEXT_TOKENS", 100)
     monkeypatch.setattr(h, "WIKI_AGENT_COMPACT_THRESHOLD", 0.0)
@@ -625,7 +625,7 @@ async def test_maybe_compact_above_threshold_triggers(monkeypatch) -> None:
 async def test_maybe_compact_preserves_staged_state(monkeypatch) -> None:
     """Summarizer receives runtime_state; replacement conversation
     starts with the compacted text."""
-    import services.synthesis.agent_harness as h
+    import kb.synthesis.agent_harness as h
 
     monkeypatch.setattr(h, "_MODEL_CONTEXT_TOKENS", 100)
     monkeypatch.setattr(h, "WIKI_AGENT_COMPACT_THRESHOLD", 0.0)
@@ -652,7 +652,7 @@ async def test_maybe_compact_preserves_staged_state(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_maybe_compact_summarizer_fails_raises_AgentHaltError(monkeypatch) -> None:
-    import services.synthesis.agent_harness as h
+    import kb.synthesis.agent_harness as h
 
     monkeypatch.setattr(h, "_MODEL_CONTEXT_TOKENS", 100)
     monkeypatch.setattr(h, "WIKI_AGENT_COMPACT_THRESHOLD", 0.0)

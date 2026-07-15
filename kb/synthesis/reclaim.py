@@ -24,8 +24,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 
-from services.synthesis import persistence
-from shared.logging import get_logger
+from engine.shared.logging import get_logger
+from kb.synthesis import persistence
 
 log = get_logger(__name__)
 

@@ -36,16 +36,16 @@ from typing import Final
 
 import asyncpg
 
-from services.ingestion.inferred_edges.bundle import Bundle
-from services.ingestion.inferred_edges.prompts.v1 import PROMPT_VERSION, SYSTEM_PROMPT
-from shared.constants import (
+from engine.ingest.inferred_edges.bundle import Bundle
+from engine.ingest.inferred_edges.prompts.v1 import PROMPT_VERSION, SYSTEM_PROMPT
+from engine.shared.constants import (
     INFERRED_EDGES_MODEL,
     INFERRED_EDGES_MODEL_PRICES,
     EdgeType,
 )
-from shared.llm import LLMError, acompletion, gateway_url
-from shared.llm_tools import usage_tokens
-from shared.logging import get_logger
+from engine.shared.llm import LLMError, acompletion, gateway_url
+from engine.shared.llm_tools import usage_tokens
+from engine.shared.logging import get_logger
 
 # Pre-migration this module imported `anthropic` and `google.genai` at
 # load time. After Phase-0b chunk C the production path goes through
@@ -457,7 +457,7 @@ async def extract_edges(
     `conn` must be a tenant-scoped connection (with_tenant already called)
     for the endpoint existence checks in validation.
 
-    `model` defaults to `INFERRED_EDGES_MODEL` from shared.constants. Tests
+    `model` defaults to `INFERRED_EDGES_MODEL` from engine.shared.constants. Tests
     can override per-call (e.g. force Haiku for a regression case). The
     provider SDK is picked by prefix -- "claude-*" -> anthropic,
     "gemini-*" -> google-genai.

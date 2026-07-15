@@ -26,15 +26,10 @@ import orjson
 import pytest
 import pytest_asyncio
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.normalizer import Normalizer
-from services.synthesis.models import TriageInput
-from services.synthesis.triage_worker import (
-    TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON,
-    TriageWorker,
-)
-from shared.config import Settings
-from shared.constants import (
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.normalizer import Normalizer
+from engine.shared.config import Settings
+from engine.shared.constants import (
     WIKI_TRIAGED_CHANNEL,
     DocClass,
     DocType,
@@ -42,13 +37,18 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.db import raw_conn
-from shared.models import (
+from engine.shared.db import raw_conn
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
     Document,
     NormalizationResult,
+)
+from kb.synthesis.models import TriageInput
+from kb.synthesis.triage_worker import (
+    TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON,
+    TriageWorker,
 )
 
 CUSTOMER = "wiki-triage-cust"
@@ -172,7 +172,7 @@ def _patch_acompletion(monkeypatch) -> None:
     async def _fake(**kwargs):
         return _tool_use_response("record_triage", _TRIAGE_PAYLOAD)
 
-    monkeypatch.setattr("shared.llm_tools.acompletion", _fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", _fake)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
 
@@ -412,8 +412,8 @@ async def test_orphan_superseded_row_marked_rejected_not_retried(
     superseded). Assert: mark_orphans_rejected is called for the third
     qid; mark_for_retry is NEVER called for it; _apply_verdicts only
     sees the 2 non-orphan rows."""
-    from services.synthesis import triage_worker as tw_mod
-    from services.synthesis.models import TriageVerdict
+    from kb.synthesis import triage_worker as tw_mod
+    from kb.synthesis.models import TriageVerdict
 
     customer = "cust-orphan-1"
     queue_rows = [_qrow(1), _qrow(2), _qrow(3)]
@@ -499,7 +499,7 @@ async def test_oversized_rows_not_misclassified_as_orphans(
     as an orphan. Otherwise a giant body would yield a generic
     'doc_superseded_or_deleted' tag instead of the precise oversized
     diagnostic."""
-    from services.synthesis import triage_worker as tw_mod
+    from kb.synthesis import triage_worker as tw_mod
 
     customer = "cust-oversized-1"
     queue_rows = [_qrow(1), _qrow(2)]
@@ -544,7 +544,7 @@ async def test_oversized_rows_not_misclassified_as_orphans(
     )
 
     async def fake_call_batches(self, client, batches, customer_id):
-        from services.synthesis.models import TriageVerdict
+        from kb.synthesis.models import TriageVerdict
 
         return {
             ev.queue_id: TriageVerdict(important=True, score=9.0, reason="ok")
@@ -574,7 +574,7 @@ async def test_mark_orphans_rejected_sets_status_and_reason(
     'rejected' with the reason set; a row at status='pending' is left
     alone (defensive WHERE clause guards against racing with reclaim or
     a concurrent path that already moved the row)."""
-    from services.synthesis import persistence
+    from kb.synthesis import persistence
 
     async with raw_conn() as conn:
         # Two rows: one currently 'triaging' (the normal post-claim
@@ -643,7 +643,7 @@ async def test_mark_orphans_rejected_empty_list_is_noop() -> None:
     """Empty input -> no SQL fired (the function returns immediately).
     Cheap regression guard: don't accidentally fire an UPDATE that
     matches every customer row."""
-    from services.synthesis import persistence
+    from kb.synthesis import persistence
 
     # No DB needed — empty queue_ids returns before opening a tenant
     # connection. Just confirm it doesn't raise.

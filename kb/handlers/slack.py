@@ -28,10 +28,10 @@ from typing import Any, ClassVar
 import httpx
 from aiolimiter import AsyncLimiter
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.handlers.base import Connector, ConnectorContext
-from services.ingestion.handlers.registry import register_connector
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.ingest.handlers.base import Connector, ConnectorContext
+from engine.ingest.handlers.registry import register_connector
+from engine.shared.constants import (
     DocClass,
     DocType,
     DocumentKind,
@@ -43,10 +43,10 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
-from shared.customer_mapping import load_source_metadata, patch_source_metadata
-from shared.exceptions import InvalidWebhookPayload
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.customer_mapping import load_source_metadata, patch_source_metadata
+from engine.shared.exceptions import InvalidWebhookPayload
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
@@ -1143,7 +1143,7 @@ class SlackConnector(Connector):
     def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
         cid = self.settings.slack_client_id
         if not cid:
-            from shared.exceptions import MissingSecret
+            from engine.shared.exceptions import MissingSecret
 
             raise MissingSecret("SLACK_CLIENT_ID not configured")
         scopes = ",".join(
@@ -1172,7 +1172,7 @@ class SlackConnector(Connector):
         cid = self.settings.slack_client_id
         secret = self.settings.slack_client_secret
         if not cid or secret is None:
-            from shared.exceptions import MissingSecret
+            from engine.shared.exceptions import MissingSecret
 
             raise MissingSecret("SLACK_CLIENT_ID / SLACK_CLIENT_SECRET not configured")
 
@@ -1188,7 +1188,7 @@ class SlackConnector(Connector):
         resp.raise_for_status()
         body = resp.json()
         if not body.get("ok"):
-            from shared.exceptions import PermanentSourceError
+            from engine.shared.exceptions import PermanentSourceError
 
             raise PermanentSourceError(f"slack oauth failed: {body.get('error')}")
 
@@ -1221,7 +1221,7 @@ class SlackConnector(Connector):
         refresh_token; this method raises PermanentSourceError so the
         caller flags auth_failed.
         """
-        from shared.exceptions import (
+        from engine.shared.exceptions import (
             MissingSecret,
             PermanentSourceError,
             TransientSourceError,
@@ -1301,7 +1301,7 @@ class SlackConnector(Connector):
         200 even for revoked tokens (the body's `error` field carries the
         signal). We branch on `error` membership rather than status code.
         """
-        from shared.exceptions import TransientSourceError
+        from engine.shared.exceptions import TransientSourceError
 
         resp = await self.http.post(
             f"{_SLACK_API}/auth.test",
@@ -1358,7 +1358,7 @@ class SlackConnector(Connector):
         team_id = body.get("team_id")
         if not team_id:
             return []
-        from shared.models import ExternalWorkspaceRef
+        from engine.shared.models import ExternalWorkspaceRef
 
         return [
             ExternalWorkspaceRef(
@@ -1416,7 +1416,7 @@ class SlackConnector(Connector):
         import asyncio as _asyncio
         import json as _json
 
-        from shared.models import WebhookEvent
+        from engine.shared.models import WebhookEvent
 
         state = _decode_slack_cursor(cursor)
 

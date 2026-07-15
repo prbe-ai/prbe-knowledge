@@ -15,11 +15,10 @@ from pathlib import Path
 import httpx
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.linear import LinearConnector  # noqa: F401 — registers
-from services.ingestion.handlers.registry import build_connector
-from shared.config import Settings
-from shared.constants import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.config import Settings
+from engine.shared.constants import (
     DocType,
     EdgeType,
     NodeLabel,
@@ -27,7 +26,8 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
+from engine.shared.exceptions import InvalidWebhookPayload
+from kb.handlers.linear import LinearConnector  # noqa: F401 — registers
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[2] / "fixtures" / "linear"
 
@@ -160,7 +160,7 @@ async def test_normalize_issue_produces_document_and_graph() -> None:
 
     from datetime import UTC, datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     event = WebhookEvent(
         customer_id="cust-1",
@@ -232,7 +232,7 @@ async def test_normalize_comment_links_to_parent_issue() -> None:
 
     from datetime import UTC, datetime
 
-    from shared.models import WebhookEvent
+    from engine.shared.models import WebhookEvent
 
     comment_payload = {
         "action": "create",
@@ -315,7 +315,7 @@ def _make_oauth_ctx(status_code: int, body: str | dict) -> ConnectorContext:
 
 @pytest.mark.asyncio
 async def test_exchange_oauth_code_5xx_raises_transient() -> None:
-    from shared.exceptions import TransientSourceError
+    from engine.shared.exceptions import TransientSourceError
 
     ctx = _make_oauth_ctx(503, "upstream temporarily unavailable")
     linear = build_connector(SourceSystem.LINEAR, ctx)
@@ -329,7 +329,7 @@ async def test_exchange_oauth_code_5xx_raises_transient() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_oauth_code_4xx_raises_permanent() -> None:
-    from shared.exceptions import PermanentSourceError
+    from engine.shared.exceptions import PermanentSourceError
 
     ctx = _make_oauth_ctx(
         400, {"error": "invalid_grant", "error_description": "code expired"}
@@ -345,7 +345,7 @@ async def test_exchange_oauth_code_4xx_raises_permanent() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_oauth_code_missing_access_token_raises_permanent() -> None:
-    from shared.exceptions import PermanentSourceError
+    from engine.shared.exceptions import PermanentSourceError
 
     ctx = _make_oauth_ctx(200, {"scope": "read,write"})  # no access_token
     linear = build_connector(SourceSystem.LINEAR, ctx)
@@ -477,8 +477,8 @@ def _make_refresh_ctx(status_code: int, body: str | dict) -> ConnectorContext:
 async def test_exchange_refresh_token_no_refresh_token_raises_permanent() -> None:
     """Tokens minted before prompt=consent has no refresh_token. Caller is
     expected to flag the row auth_failed and prompt re-OAuth."""
-    from shared.exceptions import PermanentSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import PermanentSourceError
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_refresh_ctx(200, {})
     linear = build_connector(SourceSystem.LINEAR, ctx)
@@ -499,7 +499,7 @@ async def test_exchange_refresh_token_success_rotates_credential() -> None:
     """Linear may issue a new refresh_token on each refresh (rotation). The
     handler must surface the new one and preserve scope when the response
     omits it."""
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_refresh_ctx(
         200,
@@ -532,7 +532,7 @@ async def test_exchange_refresh_token_echoes_existing_refresh_when_omitted() -> 
     """Some OAuth providers don't rotate refresh_tokens; they echo back the
     existing one or omit it entirely. The handler must keep using the
     persisted refresh_token in the latter case."""
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_refresh_ctx(200, {"access_token": "lin_oauth_new", "expires_in": 3600})
     linear = build_connector(SourceSystem.LINEAR, ctx)
@@ -553,8 +553,8 @@ async def test_exchange_refresh_token_4xx_raises_permanent() -> None:
     """Linear returns 400/401 when the refresh_token has been invalidated
     server-side (user revoked grant, secret rotated, etc.). No retry will
     help; cron should mark the row auth_failed."""
-    from shared.exceptions import PermanentSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import PermanentSourceError
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_refresh_ctx(400, {"error": "invalid_grant"})
     linear = build_connector(SourceSystem.LINEAR, ctx)
@@ -571,8 +571,8 @@ async def test_exchange_refresh_token_4xx_raises_permanent() -> None:
 
 @pytest.mark.asyncio
 async def test_exchange_refresh_token_5xx_raises_transient() -> None:
-    from shared.exceptions import TransientSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import TransientSourceError
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_refresh_ctx(503, "down")
     linear = build_connector(SourceSystem.LINEAR, ctx)
@@ -615,7 +615,7 @@ def _make_viewer_ctx(status_code: int, body: dict) -> ConnectorContext:
 
 @pytest.mark.asyncio
 async def test_verify_token_health_returns_true_for_healthy_viewer() -> None:
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_viewer_ctx(200, {"data": {"viewer": {"id": "uuid-x"}}})
     linear = build_connector(SourceSystem.LINEAR, ctx)
@@ -630,7 +630,7 @@ async def test_verify_token_health_returns_true_for_healthy_viewer() -> None:
 async def test_verify_token_health_returns_false_on_401() -> None:
     """HTTP 401 is the definitive "this token is dead" signal. The cron
     flips the row to auth_failed on this return value."""
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_viewer_ctx(
         401,
@@ -650,7 +650,7 @@ async def test_verify_token_health_returns_false_on_graphql_auth_error_200() -> 
     in the GraphQL errors array (observed when the token is partially
     valid — e.g. expired but not yet purged). Treat that as a definite
     negative health signal too."""
-    from shared.models import IntegrationToken
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_viewer_ctx(
         200,
@@ -674,8 +674,8 @@ async def test_verify_token_health_returns_false_on_graphql_auth_error_200() -> 
 @pytest.mark.asyncio
 async def test_verify_token_health_5xx_raises_transient() -> None:
     """5xx is inconclusive — don't poison the row over a Linear edge blip."""
-    from shared.exceptions import TransientSourceError
-    from shared.models import IntegrationToken
+    from engine.shared.exceptions import TransientSourceError
+    from engine.shared.models import IntegrationToken
 
     ctx = _make_viewer_ctx(503, {})
     linear = build_connector(SourceSystem.LINEAR, ctx)

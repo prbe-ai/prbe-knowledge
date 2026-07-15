@@ -6,6 +6,6 @@ Currently runs one analyzer — `AutoMergeAnalyzer` — but the queue schema
 unified-pipeline plan).
 """
 
-from services.ingestion.post_write.worker import PostWriteWorker
+from engine.ingest.post_write.worker import PostWriteWorker
 
 __all__ = ["PostWriteWorker"]

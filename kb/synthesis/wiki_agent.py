@@ -28,15 +28,30 @@ from typing import Any
 
 import asyncpg
 
-from services.ingestion.handlers.base import ConnectorContext, make_default_context
-from services.ingestion.handlers.wiki import (
+from engine.ingest.handlers.base import ConnectorContext, make_default_context
+from engine.ingest.normalizer import Normalizer
+from engine.shared.constants import (
+    WIKI_AGENT_BATCH_SIZE,
+    WIKI_DOC_TYPE_PREFIX,
+    WIKI_INDEX_DOC_TYPE,
+    CompileTrigger,
+    DocClass,
+    SourceSystem,
+)
+from engine.shared.db import with_tenant
+from engine.shared.embeddings import GeminiEmbedder, get_embedder_v2
+from engine.shared.exceptions import ToolValidationError
+from engine.shared.locks import advisory_lock_key
+from engine.shared.logging import get_logger
+from engine.shared.models import NormalizationResult, WebhookEvent
+from engine.shared.storage import ObjectStore, get_store
+from kb.handlers.wiki import (
     INDEX_SLUG,
     WIKI_PAYLOAD_KEY,
     build_normalization_result,
 )
-from services.ingestion.normalizer import Normalizer
-from services.synthesis import index_renderer, persistence
-from services.synthesis.agent_tools import (
+from kb.synthesis import index_renderer, persistence
+from kb.synthesis.agent_tools import (
     TOOL_VALIDATORS,
     CreatePageArgs,
     DoneArgs,
@@ -47,23 +62,8 @@ from services.synthesis.agent_tools import (
     SkipEventsArgs,
     UpdatePageArgs,
 )
-from services.synthesis.directed_phrases import persist_directed_vectors
-from services.synthesis.wiki_links import extract_links, persist_links_for_page
-from shared.constants import (
-    WIKI_AGENT_BATCH_SIZE,
-    WIKI_DOC_TYPE_PREFIX,
-    WIKI_INDEX_DOC_TYPE,
-    CompileTrigger,
-    DocClass,
-    SourceSystem,
-)
-from shared.db import with_tenant
-from shared.embeddings import GeminiEmbedder, get_embedder_v2
-from shared.exceptions import ToolValidationError
-from shared.locks import advisory_lock_key
-from shared.logging import get_logger
-from shared.models import NormalizationResult, WebhookEvent
-from shared.storage import ObjectStore, get_store
+from kb.synthesis.directed_phrases import persist_directed_vectors
+from kb.synthesis.wiki_links import extract_links, persist_links_for_page
 
 log = get_logger(__name__)
 
@@ -686,7 +686,7 @@ class WikiAgentRuntime:
     ) -> None:
         """Reconcile directed_vectors rows for a freshly-written wiki page.
 
-        Calls services.synthesis.directed_phrases.persist_directed_vectors
+        Calls kb.synthesis.directed_phrases.persist_directed_vectors
         with the page's frontmatter pins + an LLM-generated phrase set.
         Best-effort: any failure logs and is swallowed so the page write
         path stays bulletproof. The directed retriever silently treats a

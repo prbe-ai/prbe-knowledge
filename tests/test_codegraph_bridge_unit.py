@@ -7,7 +7,7 @@ test_codegraph_bridge_live.py.
 
 from __future__ import annotations
 
-from services.ingestion.code_graph.bridge import (
+from kb.code_graph.bridge import (
     BRIDGE_PAYLOAD_SCHEMA_VERSION,
     _cap_changed_paths,
 )

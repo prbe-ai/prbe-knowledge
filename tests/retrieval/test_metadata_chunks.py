@@ -12,14 +12,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from services.ingestion.normalizer import (
+from engine.ingest.normalizer import (
     METADATA_CHUNK_INDEX,
     _metadata_piece,
     _metadata_text,
     _strip_opaque_ids,
 )
-from services.retrieval.fusion import fuse
-from shared.models import (
+from engine.retrieval.fusion import fuse
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     DocClass,

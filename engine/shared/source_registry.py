@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from shared.constants import DEFAULT_INGESTION_PRIORITY
+from engine.shared.constants import DEFAULT_INGESTION_PRIORITY
 
 # Prefix of DocType.CUSTOM_DOCUMENT ("custom.document") — the doc_type family
 # that unregistered/dynamic sources fall back to.

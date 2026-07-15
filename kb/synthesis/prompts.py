@@ -16,8 +16,8 @@ import re
 from datetime import datetime
 from typing import Any
 
-from services.synthesis.models import TriageInput
-from shared.constants import WIKI_TRIAGE_MAX_OUTPUT_TOKENS
+from engine.shared.constants import WIKI_TRIAGE_MAX_OUTPUT_TOKENS
+from kb.synthesis.models import TriageInput
 
 # ---------------------------------------------------------------------------
 # Triage — Haiku

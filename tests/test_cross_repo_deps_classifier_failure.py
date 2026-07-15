@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from services.ingestion.code_graph.cross_repo_deps import (
+from kb.code_graph.cross_repo_deps import (
     CandidateMatch,
     ClassifierUnavailable,
     classify_with_llm,
@@ -26,7 +26,7 @@ async def test_classify_returns_empty_list_when_all_coincidence(monkeypatch) -> 
         ]
 
     monkeypatch.setattr(
-        "services.ingestion.code_graph.cross_repo_deps._call_classifier_llm",
+        "kb.code_graph.cross_repo_deps._call_classifier_llm",
         fake_call_classifier_llm,
     )
 
@@ -50,7 +50,7 @@ async def test_classify_raises_when_llm_returns_none(monkeypatch) -> None:
         return None
 
     monkeypatch.setattr(
-        "services.ingestion.code_graph.cross_repo_deps._call_classifier_llm",
+        "kb.code_graph.cross_repo_deps._call_classifier_llm",
         fake_call_classifier_llm,
     )
 

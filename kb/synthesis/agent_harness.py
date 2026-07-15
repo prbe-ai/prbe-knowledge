@@ -63,7 +63,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from shared.constants import (
+from engine.shared.constants import (
     WIKI_AGENT_BATCH_SIZE,
     WIKI_AGENT_COMPACT_THRESHOLD,
     WIKI_AGENT_MODEL,
@@ -71,8 +71,8 @@ from shared.constants import (
     WIKI_AGENT_TURN_CAP,
     WIKI_AGENT_UPDATE_CAP,
 )
-from shared.exceptions import AgentCompactionError, AgentHaltError, ToolValidationError
-from shared.logging import get_logger
+from engine.shared.exceptions import AgentCompactionError, AgentHaltError, ToolValidationError
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

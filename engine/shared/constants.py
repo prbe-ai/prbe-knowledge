@@ -469,7 +469,7 @@ SONNET_MODEL = "claude-sonnet-4-6"
 # rate) at the same cost as Haiku-current. See
 # scripts/eval_inferred_edges_widebundle.py.
 #
-# Provider dispatch is by prefix in services.ingestion.inferred_edges.
+# Provider dispatch is by prefix in engine.ingest.inferred_edges.
 # extractor: "claude-*" -> anthropic SDK; "gemini-*" -> google-genai.
 INFERRED_EDGES_MODEL = "gemini-3.1-flash-lite"
 
@@ -883,7 +883,7 @@ BACKFILL_PARALLELISM = 6
 WIKI_SYNTHESIS_CLAIM_BATCH = 200
 
 # Token budget per Haiku triage call, expressed in *estimated Anthropic
-# tokens* (post-multiplier — see `services.synthesis.triage`). Rows are
+# tokens* (post-multiplier — see `kb.synthesis.triage`). Rows are
 # packed greedily until this ceiling is hit, then the batch fires. The
 # packer adds prompt + tool-schema + per-event framing overhead on top
 # of body tokens before comparing to this budget, so it represents the

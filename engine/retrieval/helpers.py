@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncpg
 
-from shared.constants import SourceSystem
-from shared.db import with_tenant
+from engine.shared.constants import SourceSystem
+from engine.shared.db import with_tenant
 
 KNOWN_SOURCES: frozenset[str] = frozenset(s.value for s in SourceSystem)
 

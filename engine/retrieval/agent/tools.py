@@ -53,17 +53,17 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
-from services.retrieval.agent.models import GathererOutput
-from services.retrieval.grounding import GroundingBundle, build_bundle
-from services.retrieval.helpers import expand_to_cluster_members
-from services.retrieval.retrievers.bm25 import bm25_search as _bm25
-from services.retrieval.retrievers.graph import graph_search as _graph
-from services.retrieval.retrievers.inferred_edges import inferred_edge_search as _inferred
-from services.retrieval.retrievers.vector import vector_search as _vector
-from services.retrieval.router import (
+from engine.retrieval.agent.models import GathererOutput
+from engine.retrieval.grounding import GroundingBundle, build_bundle
+from engine.retrieval.helpers import expand_to_cluster_members
+from engine.retrieval.retrievers.bm25 import bm25_search as _bm25
+from engine.retrieval.retrievers.graph import graph_search as _graph
+from engine.retrieval.retrievers.inferred_edges import inferred_edge_search as _inferred
+from engine.retrieval.retrievers.vector import vector_search as _vector
+from engine.retrieval.router import (
     _escape_query_for_xml,  # noqa: F401 — re-exported for any caller
 )
-from shared.constants import (
+from engine.shared.constants import (
     INFERRED_EDGE_HYDRATION_CHUNKS,
     SEARCH_AGENT_BM25_TOP_K,
     SEARCH_AGENT_CHUNK_WINDOW_DEFAULT,
@@ -76,9 +76,9 @@ from shared.constants import (
     SEARCH_AGENT_VECTOR_TOP_K,
     NodeLabel,
 )
-from shared.db import with_tenant
-from shared.logging import get_logger
-from shared.models import TemporalSpec
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
+from engine.shared.models import TemporalSpec
 
 log = get_logger(__name__)
 
@@ -211,7 +211,7 @@ async def _resolve_entities_to_anchor_docs(
     up to `total_cap` distinct doc canonical_ids ordered by recency."""
     if not entities:
         return []
-    from services.retrieval.grounding import _LABEL_TO_ENTITY_TYPE
+    from engine.retrieval.grounding import _LABEL_TO_ENTITY_TYPE
     entity_to_label = {v: k for k, v in _LABEL_TO_ENTITY_TYPE.items()}
 
     pairs: list[tuple[str, str]] = []
@@ -337,7 +337,7 @@ async def execute_search(
         # Channel-side anchor pairs for graph_search.
         graph_pairs: list[tuple[str, str]] = []
         if ents:
-            from services.retrieval.retrievers.graph import _ENTITY_TO_LABEL
+            from engine.retrieval.retrievers.graph import _ENTITY_TO_LABEL
             for e in ents:
                 et = (e.get("entity_type") or "").lower()
                 cid = e.get("canonical_id")
@@ -450,8 +450,8 @@ async def _graph_walk_one_hop(
     """1-hop bidirectional walk on graph_edges from a single anchor.
     Internal helper for execute_subgraph; same shape as the old
     execute_graph_walk."""
-    from services.retrieval.graph_explore import anchor_exists
-    from services.retrieval.main import _resolve_anchor_alias
+    from engine.retrieval.graph_explore import anchor_exists
+    from engine.retrieval.main import _resolve_anchor_alias
 
     resolved = await _resolve_anchor_alias(
         customer_id=customer_id,

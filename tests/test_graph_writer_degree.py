@@ -17,8 +17,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from services.ingestion.graph_writer import upsert_edges
-from shared.models import GraphEdgeSpec
+from engine.ingest.graph_writer import upsert_edges
+from engine.shared.models import GraphEdgeSpec
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -33,7 +33,7 @@ def _edge(
     to_cid: str = "svc-b",
     confidence: str = "EXTRACTED",
 ) -> GraphEdgeSpec:
-    from shared.models import EdgeType, NodeLabel
+    from engine.shared.models import EdgeType, NodeLabel
 
     return GraphEdgeSpec(
         edge_type=EdgeType(edge_type),
@@ -193,7 +193,7 @@ async def test_shared_node_degree_incremented_by_correct_sum() -> None:
         ("Service", "c", 40),
     )
     # Need distinct edge_types to avoid dedup collision in upsert_edges
-    from shared.models import EdgeType, NodeLabel
+    from engine.shared.models import EdgeType, NodeLabel
 
     spec_edges = [
         GraphEdgeSpec(

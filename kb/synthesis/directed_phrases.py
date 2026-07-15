@@ -23,19 +23,19 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any
 
-from services.synthesis.providers import (
-    DirectedPhrasesProvider,
-    get_directed_phrases_provider,
-)
-from shared.constants import (
+from engine.shared.constants import (
     DIRECTED_DEDUPE_COSINE_THRESHOLD,
     MAX_DIRECTED_PHRASE_CHARS,
     MAX_DIRECTED_VECTORS_PER_DOC,
     MAX_HUMAN_DIRECTED_PER_DOC,
 )
-from shared.db import with_tenant
-from shared.embeddings import GeminiEmbedder, get_embedder_v2
-from shared.logging import get_logger
+from engine.shared.db import with_tenant
+from engine.shared.embeddings import GeminiEmbedder, get_embedder_v2
+from engine.shared.logging import get_logger
+from kb.synthesis.providers import (
+    DirectedPhrasesProvider,
+    get_directed_phrases_provider,
+)
 
 log = get_logger(__name__)
 

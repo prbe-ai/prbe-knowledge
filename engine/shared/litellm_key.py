@@ -50,8 +50,8 @@ from contextvars import ContextVar
 
 import httpx
 
-from shared.config import get_settings
-from shared.logging import get_logger
+from engine.shared.config import get_settings
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

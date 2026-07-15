@@ -1,5 +1,5 @@
-from shared.constants import SourceSystem
-from shared.models import IntegrationToken
+from engine.shared.constants import SourceSystem
+from engine.shared.models import IntegrationToken
 
 
 def test_integration_token_defaults_have_no_device() -> None:

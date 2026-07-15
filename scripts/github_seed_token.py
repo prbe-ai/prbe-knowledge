@@ -30,17 +30,17 @@ import sys
 
 import httpx
 
-from shared.backend_client import fetch_github_installation_token
-from shared.config import get_settings
-from shared.constants import (
+from engine.shared.backend_client import fetch_github_installation_token
+from engine.shared.config import get_settings
+from engine.shared.constants import (
     GITHUB_INSTALLATION_SCOPE_PREFIX,
     IntegrationStatus,
     SourceSystem,
 )
-from shared.customer_mapping import record_mapping
-from shared.db import close_pool, init_pool, raw_conn
-from shared.encryption import encrypt_token
-from shared.logging import configure_logging, get_logger
+from engine.shared.customer_mapping import record_mapping
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.encryption import encrypt_token
+from engine.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
 

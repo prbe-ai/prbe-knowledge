@@ -34,14 +34,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from shared import llm as shared_llm
-from shared.config import get_settings
-from shared.constants import SYNTHESIS_MODELS
-from shared.exceptions import PrbeError
-from shared.llm import LLMError
-from shared.llm_tools import ToolCallParseError, forced_tool_call
-from shared.logging import get_logger
-from shared.models import GraphEvidence, QueryDocumentResult, QueryResult
+from engine.shared import llm as shared_llm
+from engine.shared.config import get_settings
+from engine.shared.constants import SYNTHESIS_MODELS
+from engine.shared.exceptions import PrbeError
+from engine.shared.llm import LLMError
+from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
+from engine.shared.logging import get_logger
+from engine.shared.models import GraphEvidence, QueryDocumentResult, QueryResult
 
 log = get_logger(__name__)
 
@@ -688,7 +688,7 @@ async def _call_openai(
     (`additionalProperties: false`, every property in `required`)
     is enforced upstream in `ANSWER_SCHEMA`.
     """
-    from shared.llm import acompletion
+    from engine.shared.llm import acompletion
 
     _check_provider_credentials(provider="openai", env_name="OPENAI_API_KEY")
     try:
@@ -758,7 +758,7 @@ async def _call_google(
     `additionalProperties` outright while OpenAI strict mode requires
     it, so the schema is identical to `ANSWER_SCHEMA` minus that key.
     """
-    from shared.llm import acompletion
+    from engine.shared.llm import acompletion
 
     _check_provider_credentials(provider="google", env_name="GOOGLE_API_KEY")
     # Google has no separate system slot; LiteLLM merges system into the
@@ -808,7 +808,7 @@ def _check_provider_credentials(*, provider: str, env_name: str) -> None:
     tenants run without provider keys — the gateway URL carries the
     credential — so we must accept either condition.
     """
-    from shared.llm import gateway_url
+    from engine.shared.llm import gateway_url
 
     secret = getattr(get_settings(), f"{provider}_api_key", None)
     key = secret.get_secret_value() if secret is not None else ""

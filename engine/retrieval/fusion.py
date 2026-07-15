@@ -58,13 +58,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from shared.constants import (
+from engine.shared.constants import (
     DEFAULT_RECENCY_HALF_LIFE_DAYS,
     DIRECTED_RETRIEVAL_WEIGHT,
     RRF_BREADTH_ALPHA,
     RRF_K,
 )
-from shared.source_registry import half_life_days_for, score_multiplier_for
+from engine.shared.source_registry import half_life_days_for, score_multiplier_for
 
 
 @dataclass(slots=True)

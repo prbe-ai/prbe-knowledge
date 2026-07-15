@@ -1,4 +1,4 @@
-"""Unit tests for `services.retrieval.agent.extractor`.
+"""Unit tests for `engine.retrieval.agent.extractor`.
 
 The extractor's job is to turn the raw query + grounding bundle into an
 `EntityExtraction` (entities + `search_options`). After the
@@ -17,12 +17,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.retrieval.agent.extractor import (
+from engine.retrieval.agent.extractor import (
     _coerce_search_options,
     extract_entities_with_llm,
 )
-from services.retrieval.agent.models import EntityExtraction, SearchOptions
-from services.retrieval.grounding import GroundingBundle
+from engine.retrieval.agent.models import EntityExtraction, SearchOptions
+from engine.retrieval.grounding import GroundingBundle
 
 
 def _fake_completion(content: str) -> SimpleNamespace:
@@ -101,7 +101,7 @@ async def test_extract_returns_entity_extraction_with_search_options(
     else:
         monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
     monkeypatch.setattr(
-        "services.retrieval.agent.extractor.acompletion",
+        "engine.retrieval.agent.extractor.acompletion",
         mock_acompletion,
     )
 
@@ -142,7 +142,7 @@ async def test_extract_coerces_bad_sort_before_validation(
         "search_options": {"sort": "latest"},
     })
     monkeypatch.setattr(
-        "services.retrieval.agent.extractor.acompletion",
+        "engine.retrieval.agent.extractor.acompletion",
         AsyncMock(return_value=_fake_completion(payload)),
     )
 
@@ -162,7 +162,7 @@ async def test_extract_returns_defaulted_on_json_parse_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "services.retrieval.agent.extractor.acompletion",
+        "engine.retrieval.agent.extractor.acompletion",
         AsyncMock(return_value=_fake_completion("not json at all")),
     )
 
@@ -194,7 +194,7 @@ async def test_extract_search_options_omitted_defaults_to_relevance(
         ],
     })
     monkeypatch.setattr(
-        "services.retrieval.agent.extractor.acompletion",
+        "engine.retrieval.agent.extractor.acompletion",
         AsyncMock(return_value=_fake_completion(payload)),
     )
 

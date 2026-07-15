@@ -20,11 +20,11 @@ from datetime import UTC, datetime, timedelta
 import httpx
 from jose import jwt
 
-from shared.config import get_settings
-from shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
-from shared.exceptions import GitHubAuthError
-from shared.logging import get_logger
-from shared.tokens import load_token
+from engine.shared.config import get_settings
+from engine.shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
+from engine.shared.exceptions import GitHubAuthError
+from engine.shared.logging import get_logger
+from engine.shared.tokens import load_token
 
 log = get_logger(__name__)
 

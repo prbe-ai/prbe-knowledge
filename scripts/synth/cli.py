@@ -519,8 +519,8 @@ async def _open_db_and_bucket():
     is synchronous and raises DatabaseUnavailable if not initialized. We use
     `await init_pool()` which initializes the pool from settings and returns it.
     """
-    from shared.db import init_pool  # type: ignore[import-untyped]
-    from shared.storage import ObjectStore  # type: ignore[import-untyped]
+    from engine.shared.db import init_pool  # type: ignore[import-untyped]
+    from engine.shared.storage import ObjectStore  # type: ignore[import-untyped]
 
     db = await init_pool()
     bucket = ObjectStore()

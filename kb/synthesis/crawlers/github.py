@@ -40,40 +40,40 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field, field_validator
 
-from services.synthesis.agent_harness import AgentLoop, new_agent_run_id
-from services.synthesis.agent_tools import (
+from engine.shared.constants import (
+    WIKI_BACKFILL_GITHUB_PRS_DAYS,
+    WIKI_BACKFILL_MODEL_GITHUB,
+    WIKI_BACKFILL_QUIET_STREAK,
+)
+from engine.shared.db import with_tenant
+from engine.shared.exceptions import AgentHaltError, ToolValidationError
+from engine.shared.logging import get_logger
+from kb.synthesis.agent_harness import AgentLoop, new_agent_run_id
+from kb.synthesis.agent_tools import (
     CREATE_PAGE_TOOL,
     DONE_TOOL,
     LIST_WIKI_PAGES_TOOL,
     READ_PAGE_TOOL,
     UPDATE_PAGE_TOOL,
 )
-from services.synthesis.api_clients.github import (
+from kb.synthesis.api_clients.github import (
     GitHubAPIClient,
     GitHubAPIError,
     GitHubRateLimitExhausted,
     get_shared_bucket,
 )
-from services.synthesis.crawlers.base import (
+from kb.synthesis.crawlers.base import (
     BackfillAgent,
     BackfillAgentResult,
     empty_result,
 )
-from services.synthesis.gemini_agent_client import GeminiAgentClient
-from services.synthesis.models import WikiType
-from services.synthesis.prompts import (
+from kb.synthesis.gemini_agent_client import GeminiAgentClient
+from kb.synthesis.models import WikiType
+from kb.synthesis.prompts import (
     build_github_crawler_system_prompt,
     build_github_repo_subtask_prompt,
 )
-from services.synthesis.wiki_agent import WikiAgentRuntime
-from shared.constants import (
-    WIKI_BACKFILL_GITHUB_PRS_DAYS,
-    WIKI_BACKFILL_MODEL_GITHUB,
-    WIKI_BACKFILL_QUIET_STREAK,
-)
-from shared.db import with_tenant
-from shared.exceptions import AgentHaltError, ToolValidationError
-from shared.logging import get_logger
+from kb.synthesis.wiki_agent import WikiAgentRuntime
 
 log = get_logger(__name__)
 
@@ -82,7 +82,7 @@ _REVIEW_PAGE_SIZE = 100
 _SOURCE_KIND = "github"
 
 # Free-form wiki_type schema for the crawler's tool palette. Mirrors
-# `services.synthesis.agent_tools._WIKI_TYPE_SCHEMA` — the agent picks
+# `kb.synthesis.agent_tools._WIKI_TYPE_SCHEMA` — the agent picks
 # slugs as it sees fit; URL-safety is enforced at persistence time.
 _WIKI_TYPE_SCHEMA: dict[str, Any] = {
     "type": "string",

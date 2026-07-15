@@ -29,9 +29,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp
 
-from services.mcp.config import Settings, get_settings
-from services.mcp.dependencies.jwks import JwtAuthError, verify_access_token
-from services.mcp.dependencies.revocation import assert_session_active
+from engine.mcp.config import Settings, get_settings
+from engine.mcp.dependencies.jwks import JwtAuthError, verify_access_token
+from engine.mcp.dependencies.revocation import assert_session_active
 
 current_customer: ContextVar[str] = ContextVar("current_customer")
 

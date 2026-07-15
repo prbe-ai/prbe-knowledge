@@ -41,13 +41,7 @@ from typing import Any
 
 import asyncpg
 
-from services.synthesis import persistence
-from services.synthesis.models import TriageInput, TriageVerdict
-from services.synthesis.triage import (
-    call_triage_with_split_retry,
-    pack_into_batches,
-)
-from shared.constants import (
+from engine.shared.constants import (
     WIKI_SYNTHESIS_CLAIM_BATCH,
     WIKI_SYNTHESIS_CUSTOMER_CONCURRENCY,
     WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
@@ -55,8 +49,14 @@ from shared.constants import (
     WIKI_TRIAGE_SCORE_THRESHOLD,
     WIKI_TRIAGED_CHANNEL,
 )
-from shared.db import raw_conn
-from shared.logging import get_logger
+from engine.shared.db import raw_conn
+from engine.shared.logging import get_logger
+from kb.synthesis import persistence
+from kb.synthesis.models import TriageInput, TriageVerdict
+from kb.synthesis.triage import (
+    call_triage_with_split_retry,
+    pack_into_batches,
+)
 
 log = get_logger(__name__)
 
@@ -345,7 +345,7 @@ class TriageWorker:
         _call_triage_batches). We log per batch; the reason string here
         is the single tag the dashboard shows.
         """
-        from shared.constants import WIKI_TRIAGE_MODEL
+        from engine.shared.constants import WIKI_TRIAGE_MODEL
 
         model = (WIKI_TRIAGE_MODEL or "").lower()
         if model.startswith("gemini"):

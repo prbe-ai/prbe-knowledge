@@ -62,18 +62,18 @@ import re
 from datetime import datetime
 from typing import Any
 
-from services.synthesis.models import TriageInput, TriageOutput, TriageVerdict
-from services.synthesis.providers import (
-    TriageParseError,
-    get_triage_provider,
-)
-from shared.constants import (
+from engine.shared.constants import (
     WIKI_TRIAGE_MAX_EVENTS_PER_BATCH,
     WIKI_TRIAGE_TOKEN_BUDGET,
 )
-from shared.llm import LLMError
-from shared.llm_tools import is_context_overflow
-from shared.logging import get_logger
+from engine.shared.llm import LLMError
+from engine.shared.llm_tools import is_context_overflow
+from engine.shared.logging import get_logger
+from kb.synthesis.models import TriageInput, TriageOutput, TriageVerdict
+from kb.synthesis.providers import (
+    TriageParseError,
+    get_triage_provider,
+)
 
 __all__ = [
     "ANTHROPIC_TOKEN_MULTIPLIER",

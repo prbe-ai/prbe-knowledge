@@ -24,19 +24,19 @@ These tests pin the fix:
 
 from __future__ import annotations
 
-from services.synthesis.models import TriageInput
-from services.synthesis.triage import (
+from engine.shared.constants import (
+    WIKI_TRIAGE_MAX_EVENTS_PER_BATCH,
+    WIKI_TRIAGE_MAX_OUTPUT_TOKENS,
+    WIKI_TRIAGE_VERDICT_TOKENS,
+)
+from kb.synthesis.models import TriageInput
+from kb.synthesis.triage import (
     ANTHROPIC_TOKEN_MULTIPLIER,
     EVENT_FRAMING_TOKENS,
     OVERSIZED_EVENT_TOKENS,
     PROMPT_OVERHEAD_TOKENS,
     estimate_event_cost,
     pack_into_batches,
-)
-from shared.constants import (
-    WIKI_TRIAGE_MAX_EVENTS_PER_BATCH,
-    WIKI_TRIAGE_MAX_OUTPUT_TOKENS,
-    WIKI_TRIAGE_VERDICT_TOKENS,
 )
 
 ANTHROPIC_HARD_LIMIT = 200_000

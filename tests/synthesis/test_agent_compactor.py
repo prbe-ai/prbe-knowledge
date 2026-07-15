@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from services.synthesis.agent_compactor import call_summarizer, extract_state_for_summary
-from shared.exceptions import AgentCompactionError
+from engine.shared.exceptions import AgentCompactionError
+from kb.synthesis.agent_compactor import call_summarizer, extract_state_for_summary
 
 
 def _runtime_state(**overrides) -> dict:
@@ -104,14 +104,14 @@ async def test_call_summarizer_routes_through_shared_llm(monkeypatch) -> None:
         captured["kwargs"] = kwargs
         return _stub_acompletion_response("conversation summary here")
 
-    import services.synthesis.agent_compactor as compactor_mod
-    from shared import llm as shared_llm
+    import kb.synthesis.agent_compactor as compactor_mod
+    from engine.shared import llm as shared_llm
 
     monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
-    # The compactor imports `from shared.config import get_settings`
+    # The compactor imports `from engine.shared.config import get_settings`
     # inside the function — patch the SecretStr roundtrip the easiest
     # way (via the existing settings instance).
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
@@ -140,8 +140,8 @@ async def test_call_summarizer_uses_gateway_when_no_google_key(monkeypatch) -> N
     async def fake_acompletion(*, model, messages, **kwargs):
         return _stub_acompletion_response("gateway summary text")
 
-    from shared import llm as shared_llm
-    from shared.config import get_settings
+    from engine.shared import llm as shared_llm
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
     monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
@@ -159,7 +159,7 @@ async def test_call_summarizer_raises_when_neither_key_nor_gateway(monkeypatch) 
     raises AgentCompactionError (it has no way to reach a model)."""
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
-    from shared.config import get_settings
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 
@@ -178,8 +178,8 @@ async def test_call_summarizer_wraps_llm_error_as_compaction_error(
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
 
-    from shared import llm as shared_llm
-    from shared.config import get_settings
+    from engine.shared import llm as shared_llm
+    from engine.shared.config import get_settings
 
     get_settings.cache_clear()
 

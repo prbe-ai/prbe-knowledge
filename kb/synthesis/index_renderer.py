@@ -29,9 +29,9 @@ from typing import Any
 
 import asyncpg
 
-from shared.constants import WIKI_AGENT_MODEL
-from shared.db import with_tenant
-from shared.logging import get_logger
+from engine.shared.constants import WIKI_AGENT_MODEL
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -315,8 +315,8 @@ async def render_index_via_llm(
             return _fallback_flat_list(pages)
         text = (getattr(resp, "text", None) or "").strip()
     else:
-        from shared import llm as shared_llm
-        from shared.config import get_settings
+        from engine.shared import llm as shared_llm
+        from engine.shared.config import get_settings
 
         # Preserve the "no key + no gateway → deterministic fallback"
         # contract: the index page must always render.
@@ -379,9 +379,9 @@ async def render_index_via_llm(
     # To revive: uncomment the _build_mermaid_block + splice insertion
     # below, and re-enable cross-repo edge extraction (see CROSS-REPO
     # DEPS DISABLED markers in codegraph.py and nightly_trigger.py).
-    from services.synthesis.diagram_renderer import splice_mermaid_block
+    from kb.synthesis.diagram_renderer import splice_mermaid_block
     text = splice_mermaid_block(text, "")
-    # from services.synthesis.diagram_renderer import (
+    # from kb.synthesis.diagram_renderer import (
     #     _build_mermaid_block,
     #     splice_mermaid_block,
     # )

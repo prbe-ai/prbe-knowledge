@@ -35,10 +35,10 @@ import asyncio
 import sys
 from collections import Counter
 
-from services.ingestion.auto_merge import AutoMergeAnalyzer
-from shared.config import get_settings
-from shared.db import close_pool, init_pool, with_tenant
-from shared.logging import configure_logging, get_logger
+from engine.ingest.auto_merge import AutoMergeAnalyzer
+from engine.shared.config import get_settings
+from engine.shared.db import close_pool, init_pool, with_tenant
+from engine.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
 

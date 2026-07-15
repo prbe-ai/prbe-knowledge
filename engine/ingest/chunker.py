@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import tiktoken
 
-from shared.constants import CHUNKER_VERSION, EMBEDDING_V2_MAX_INPUT_TOKENS
+from engine.shared.constants import CHUNKER_VERSION, EMBEDDING_V2_MAX_INPUT_TOKENS
 
 # ChunkPiece moved to shared.models so cross-module contracts
 # (NormalizationResult.documents_with_chunks) can reference it without
 # the shared→services layering violation. Re-exported here for
 # backwards-compatible imports.
-from shared.models import ChunkPiece
+from engine.shared.models import ChunkPiece
 
 DEFAULT_CHUNK_TOKENS = 512
 DEFAULT_CHUNK_OVERLAP = 64

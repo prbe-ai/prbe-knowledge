@@ -22,12 +22,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.synthesis.directed_phrases import (
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.embeddings import reset_embedder
+from kb.synthesis.directed_phrases import (
     parse_directed_frontmatter,
     persist_directed_vectors,
 )
-from shared.db import raw_conn, with_tenant
-from shared.embeddings import reset_embedder
 
 _NOW = datetime(2026, 5, 8, tzinfo=UTC)
 
@@ -334,13 +334,13 @@ async def test_persist_human_pin_preserved_when_embed_fails(live_db) -> None:
 
     # Run 2: same frontmatter, but the embedder claims partial failure
     # for index 0 (the human pin). Pre-fix this DELETED the row.
-    from services.synthesis import directed_phrases as mod
+    from kb.synthesis import directed_phrases as mod
 
     class _BrokenEmbedder:
         async def embed_many(self, phrases: list[str]):
             # Return an EmbedResult-shaped object: nothing embedded,
             # everything failed — simulating an OpenAI 5xx mid-batch.
-            from shared.embeddings import EmbedResult
+            from engine.shared.embeddings import EmbedResult
 
             return EmbedResult(
                 embedded=[],

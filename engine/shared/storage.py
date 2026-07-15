@@ -14,8 +14,8 @@ import boto3
 from botocore.client import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
 
-from shared.config import Settings, get_settings
-from shared.exceptions import StorageNotFound, StorageUnavailable
+from engine.shared.config import Settings, get_settings
+from engine.shared.exceptions import StorageNotFound, StorageUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ async def _load_bucket(customer_id: str, settings: Settings) -> str:
     correct place once the DB is back. db import is lazy to avoid a
     module-load cycle (shared.db imports shared.config which can be
     imported before storage by tests)."""
-    from shared.db import raw_conn  # local import: avoid module-load cycle
+    from engine.shared.db import raw_conn  # local import: avoid module-load cycle
 
     del settings  # no longer consulted; kept for signature compat
     async with raw_conn() as conn:

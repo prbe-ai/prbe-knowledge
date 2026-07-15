@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.synthesis.wiki_links import (
+from kb.synthesis.wiki_links import (
     ExtractedLink,
     extract_links,
     extract_links_from_frontmatter,

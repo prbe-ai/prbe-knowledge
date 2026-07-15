@@ -13,10 +13,10 @@ import secrets
 
 from asyncpg.exceptions import UniqueViolationError
 
-from shared.db import raw_conn
-from shared.exceptions import PrbeError
-from shared.logging import get_logger
-from shared.storage import get_store
+from engine.shared.db import raw_conn
+from engine.shared.exceptions import PrbeError
+from engine.shared.logging import get_logger
+from engine.shared.storage import get_store
 
 log = get_logger(__name__)
 

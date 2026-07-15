@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from services.retrieval.surprise import surprise_score
+from engine.retrieval.surprise import surprise_score
 
 
 def _score(
@@ -452,13 +452,13 @@ def test_cap_safety_net() -> None:
     )
     assert s <= 8.0
 
-    from services.retrieval.surprise import _CAP
+    from engine.retrieval.surprise import _CAP
 
     assert _CAP == 8.0
 
 
 def test_cap_is_8() -> None:
     """The exported _CAP constant equals 8.0."""
-    from services.retrieval.surprise import _CAP
+    from engine.retrieval.surprise import _CAP
 
     assert _CAP == 8.0

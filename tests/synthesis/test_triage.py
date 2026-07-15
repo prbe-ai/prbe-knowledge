@@ -17,8 +17,8 @@ from unittest.mock import AsyncMock
 import orjson
 import pytest
 
-from services.synthesis.models import TriageInput, TriageOutput
-from services.synthesis.triage import (
+from kb.synthesis.models import TriageInput, TriageOutput
+from kb.synthesis.triage import (
     TriageParseError,
     call_triage,
     pack_into_batches,
@@ -134,7 +134,7 @@ async def test_call_triage_round_trip(monkeypatch) -> None:
         }
     }
     fake = AsyncMock(return_value=_tool_response(payload))
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     # `client` is unused post-Phase-0b; pass any sentinel.
     out = await call_triage(object(), events, now=datetime(2026, 5, 2, tzinfo=UTC))
     assert isinstance(out, TriageOutput)
@@ -150,7 +150,7 @@ async def test_call_triage_round_trip(monkeypatch) -> None:
 async def test_call_triage_empty_input_short_circuits(monkeypatch) -> None:
     # No call should be made; verify by pre-failing the mock.
     fake = AsyncMock(side_effect=AssertionError("must not call"))
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     out = await call_triage(object(), [], now=datetime(2026, 5, 2, tzinfo=UTC))
     assert out.verdicts == {}
 
@@ -159,7 +159,7 @@ async def test_call_triage_empty_input_short_circuits(monkeypatch) -> None:
 async def test_call_triage_raises_on_missing_tool_block(monkeypatch) -> None:
     events = [_ev(1, 10)]
     fake = AsyncMock(return_value=_no_tool_call_response())
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     with pytest.raises(TriageParseError):
         await call_triage(object(), events, now=datetime(2026, 5, 2, tzinfo=UTC))
 
@@ -176,6 +176,6 @@ async def test_call_triage_raises_on_validation_failure(monkeypatch) -> None:
         }
     }
     fake = AsyncMock(return_value=_tool_response(bad))
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     with pytest.raises(TriageParseError):
         await call_triage(object(), events, now=datetime(2026, 5, 2, tzinfo=UTC))

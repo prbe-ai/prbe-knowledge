@@ -23,18 +23,18 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from services.ingestion.connectedness import is_source_connected
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.registry import build_connector
-from shared.config import get_settings
-from shared.constants import BackfillStatus, QueueStatus, SourceSystem
-from shared.db import get_pool, raw_conn
-from shared.encryption import decrypt_token
-from shared.exceptions import NotSupportedByConnector, PermanentSourceError
-from shared.logging import get_logger
-from shared.metrics import counter
-from shared.models import IntegrationToken
-from shared.storage import ObjectStore, get_store
+from engine.ingest.connectedness import is_source_connected
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.config import get_settings
+from engine.shared.constants import BackfillStatus, QueueStatus, SourceSystem
+from engine.shared.db import get_pool, raw_conn
+from engine.shared.encryption import decrypt_token
+from engine.shared.exceptions import NotSupportedByConnector, PermanentSourceError
+from engine.shared.logging import get_logger
+from engine.shared.metrics import counter
+from engine.shared.models import IntegrationToken
+from engine.shared.storage import ObjectStore, get_store
 
 log = get_logger(__name__)
 

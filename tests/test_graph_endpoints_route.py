@@ -24,11 +24,11 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from shared.config import Settings, get_settings
-from shared.constants import EdgeType, NodeLabel
-from shared.db import close_pool, init_pool, raw_conn
-from shared.embeddings import reset_embedder
-from shared.storage import reset_store
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import EdgeType, NodeLabel
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.storage import reset_store
 
 INTERNAL_KEY = "test-internal-knowledge-key"
 
@@ -129,7 +129,7 @@ async def _post(
     teardown would fail with "pool is closed" without a re-init afterward.
     Mirrors the close_pool/init_pool dance in tests/test_query_auth.py.
     """
-    from services.retrieval.main import app as retrieval_app
+    from engine.retrieval.main import app as retrieval_app
 
     await close_pool()
     transport = ASGITransport(app=retrieval_app)
@@ -145,7 +145,7 @@ async def _post(
         # live_db.acquire() call sees a closed pool and the failure
         # surfaces in the *next* test (which makes the actual cause
         # invisible).
-        from shared.config import get_settings as _get_settings
+        from engine.shared.config import get_settings as _get_settings
         await init_pool(_get_settings())
 
 

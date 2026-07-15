@@ -38,7 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from shared.constants import (
+from engine.shared.constants import (
     GRAPH_EXPLORE_EDGE_CAP,
     GRAPH_EXPLORE_HOP1_CAP,
     GRAPH_EXPLORE_HOP2_CAP,
@@ -48,7 +48,7 @@ from shared.constants import (
     EdgeType,
     NodeLabel,
 )
-from shared.db import with_tenant
+from engine.shared.db import with_tenant
 
 # Confidence -> priority (lower = more meaningful). Drives edge-cap
 # truncation: when total edges exceed GRAPH_EXPLORE_EDGE_CAP, the highest-

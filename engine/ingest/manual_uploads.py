@@ -16,7 +16,7 @@ from pathlib import PurePath
 from defusedxml import ElementTree as SafeElementTree
 from defusedxml.common import DefusedXmlException
 
-from shared.constants import DocType
+from engine.shared.constants import DocType
 
 MAX_MANUAL_UPLOAD_FILES = 10
 MAX_MANUAL_UPLOAD_BYTES = 10 * 1024 * 1024

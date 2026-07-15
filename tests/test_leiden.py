@@ -147,7 +147,7 @@ async def test_leiden_3_cluster_100_node_graph() -> None:
 @pytest.mark.asyncio
 async def test_leiden_skips_tenant_with_few_edges() -> None:
     """Tenant with < 100 edges is skipped without any UPDATE."""
-    from services.community.leiden import run_leiden_for_tenant
+    from engine.community.leiden import run_leiden_for_tenant
 
     # Build 50 edges (below threshold)
     edges = [(i, i + 1) for i in range(0, 50)]
@@ -175,7 +175,7 @@ async def test_leiden_skips_tenant_with_few_edges() -> None:
 @pytest.mark.asyncio
 async def test_leiden_skips_empty_graph() -> None:
     """A tenant with 0 edges is treated as too_few_edges and skipped."""
-    from services.community.leiden import run_leiden_for_tenant
+    from engine.community.leiden import run_leiden_for_tenant
 
     conn = _make_conn([])
     stats = await run_leiden_for_tenant(conn, "cust-empty")
@@ -192,7 +192,7 @@ async def test_leiden_skips_empty_graph() -> None:
 @pytest.mark.asyncio
 async def test_leiden_acquires_advisory_lock() -> None:
     """pg_advisory_xact_lock is called before any graph operations."""
-    from services.community.leiden import run_leiden_for_tenant
+    from engine.community.leiden import run_leiden_for_tenant
 
     # Just enough edges to NOT skip (100 edges)
     edges = [(i, i + 1) for i in range(0, 100)]
@@ -224,7 +224,7 @@ async def test_leiden_does_not_toggle_rls() -> None:
 
     Regression guard so the toggle dance does not reappear.
     """
-    from services.community.leiden import run_leiden_for_tenant
+    from engine.community.leiden import run_leiden_for_tenant
 
     edges = [(i, i + 1) for i in range(0, 100)]
     conn = _make_conn(edges)
@@ -253,7 +253,7 @@ async def test_leiden_does_not_toggle_rls() -> None:
 @pytest.mark.asyncio
 async def test_leiden_update_contains_correct_node_ids() -> None:
     """The UPDATE is called with the correct set of node_ids."""
-    from services.community.leiden import run_leiden_for_tenant
+    from engine.community.leiden import run_leiden_for_tenant
 
     # Build a small but valid graph (>= 100 edges)
     edges = [(i, i % 20) for i in range(1, 101)]  # 100 edges, nodes 0-100

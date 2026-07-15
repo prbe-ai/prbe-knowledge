@@ -5,16 +5,16 @@ import json
 import httpx
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.slack_lifecycle import handle_slack_lifecycle_event
-from shared.config import Settings, get_settings
-from shared.constants import BackfillStatus, SourceSystem
-from shared.customer_mapping import record_mapping
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.models import IntegrationToken
-from shared.storage import reset_store
-from shared.tokens import save_token
+from engine.ingest.handlers.base import ConnectorContext
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import BackfillStatus, SourceSystem
+from engine.shared.customer_mapping import record_mapping
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.models import IntegrationToken
+from engine.shared.storage import reset_store
+from engine.shared.tokens import save_token
+from kb.slack_lifecycle import handle_slack_lifecycle_event
 
 
 @pytest.fixture(autouse=True)

@@ -24,7 +24,7 @@ from typing import Any
 
 import httpx
 
-from shared.logging import get_logger
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

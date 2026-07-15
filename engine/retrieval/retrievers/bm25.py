@@ -29,10 +29,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from services.retrieval.temporal import build_predicate
-from shared.constants import TOP_K_BM25
-from shared.db import with_tenant
-from shared.models import TemporalSpec, normalize_author_id
+from engine.retrieval.temporal import build_predicate
+from engine.shared.constants import TOP_K_BM25
+from engine.shared.db import with_tenant
+from engine.shared.models import TemporalSpec, normalize_author_id
 
 # Pull alphanumeric/underscore runs as tokens. Hyphens split — Postgres'
 # `english` parser already produces the individual hex parts of a UUID

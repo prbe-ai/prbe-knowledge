@@ -4,8 +4,8 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from services.mcp.dependencies import auth_context
-from services.mcp.dependencies.jwks import JwtAuthError
+from engine.mcp.dependencies import auth_context
+from engine.mcp.dependencies.jwks import JwtAuthError
 
 
 class _OauthSettings:

@@ -28,13 +28,13 @@ from __future__ import annotations
 
 import asyncio
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.registry import build_connector
-from shared.constants import IntegrationStatus, SourceSystem
-from shared.db import close_pool, get_pool, init_pool
-from shared.logging import configure_logging, get_logger
-from shared.metrics import counter
-from shared.tokens import load_token, mark_token_auth_failed
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.constants import IntegrationStatus, SourceSystem
+from engine.shared.db import close_pool, get_pool, init_pool
+from engine.shared.logging import configure_logging, get_logger
+from engine.shared.metrics import counter
+from engine.shared.tokens import load_token, mark_token_auth_failed
 
 log = get_logger(__name__)
 

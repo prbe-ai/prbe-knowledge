@@ -30,11 +30,11 @@ from dataclasses import dataclass
 
 import httpx
 
-from services.ingestion.code_graph.bridge import enqueue_initial_backfill
-from shared.backend_client import fetch_github_installation_token
-from shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
-from shared.db import raw_conn
-from shared.logging import get_logger
+from engine.shared.backend_client import fetch_github_installation_token
+from engine.shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
+from engine.shared.db import raw_conn
+from engine.shared.logging import get_logger
+from kb.code_graph.bridge import enqueue_initial_backfill
 
 log = get_logger(__name__)
 

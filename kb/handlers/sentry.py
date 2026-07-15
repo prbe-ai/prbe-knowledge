@@ -34,10 +34,10 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.handlers.base import Connector
-from services.ingestion.handlers.registry import register_connector
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.ingest.handlers.base import Connector
+from engine.ingest.handlers.registry import register_connector
+from engine.shared.constants import (
     DocClass,
     DocType,
     EdgeType,
@@ -47,15 +47,15 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.db import raw_conn
-from shared.exceptions import (
+from engine.shared.db import raw_conn
+from engine.shared.exceptions import (
     InvalidWebhookPayload,
     MissingSecret,
     PermanentSourceError,
     TransientSourceError,
 )
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
@@ -847,7 +847,7 @@ class SentryConnector(Connector):
         Multi-org installations only backfill the first org; the others will
         fill in as webhooks arrive.
         """
-        from shared.models import WebhookEvent
+        from engine.shared.models import WebhookEvent
 
         auth_headers = {"Authorization": f"Bearer {token.access_token}"}
 

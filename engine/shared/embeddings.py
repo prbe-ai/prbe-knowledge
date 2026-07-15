@@ -25,18 +25,18 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from shared.config import Settings, get_settings
-from shared.constants import (
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import (
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
 )
-from shared.exceptions import (
+from engine.shared.exceptions import (
     EmbeddingBatchRejected,
     EmbeddingContextLengthExceeded,
     EmbeddingProviderUnavailable,
     EmbeddingRateLimited,
 )
-from shared.logging import get_logger
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -416,7 +416,7 @@ class GeminiEmbedder(_BaseEmbedder):
     ) -> list[list[float]]:
         # Lazy import: keeps the module-load cost down for callers that
         # never touch the gateway path (eval scripts, etc).
-        from shared import llm as shared_llm
+        from engine.shared import llm as shared_llm
 
         # Pass the bare id. The proxy's model_list aliases
         # `gemini-embedding-*` (and `gemini-*`) to the Gemini provider, and

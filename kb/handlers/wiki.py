@@ -38,11 +38,10 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.handlers.base import Connector
-from services.ingestion.handlers.registry import register_connector
-from services.ingestion.wiki_links import WikiPageLink, parse_page_links
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.ingest.handlers.base import Connector
+from engine.ingest.handlers.registry import register_connector
+from engine.shared.constants import (
     WIKI_DOC_TYPE_PREFIX,
     CompileTrigger,
     DocClass,
@@ -53,9 +52,9 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.exceptions import InvalidWebhookPayload
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
@@ -66,6 +65,7 @@ from shared.models import (
     WebhookEvent,
     WebhookParseResult,
 )
+from kb.wiki_links import WikiPageLink, parse_page_links
 
 log = get_logger(__name__)
 

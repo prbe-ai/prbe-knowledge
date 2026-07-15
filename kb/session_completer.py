@@ -21,11 +21,11 @@ from __future__ import annotations
 
 import orjson
 
-from shared.constants import SourceSystem
-from shared.db import get_pool
-from shared.logging import get_logger
-from shared.source_registry import ingestion_priority_for
-from shared.storage import get_store
+from engine.shared.constants import SourceSystem
+from engine.shared.db import get_pool
+from engine.shared.logging import get_logger
+from engine.shared.source_registry import ingestion_priority_for
+from engine.shared.storage import get_store
 
 log = get_logger(__name__)
 
@@ -71,7 +71,7 @@ async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
     # marker — the worker will process it once and emit complete=True
     # with an empty event list (no unit docs, no harm).
     #
-    # Intentionally NOT gated by services.ingestion.connectedness:
+    # Intentionally NOT gated by engine.ingest.connectedness:
     # finalize markers only fire for CLAUDE_CODE / CODEX, which don't
     # have integration_tokens rows (agent sessions, no OAuth lifecycle).
     upsert_sql = """

@@ -13,8 +13,8 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent
 
-from services.mcp.clients.knowledge import KnowledgeError, get_client
-from services.mcp.consts import (
+from engine.mcp.clients.knowledge import KnowledgeError, get_client
+from engine.mcp.consts import (
     ALLOWED_HOSTS,
     ALLOWED_ORIGINS,
     MCP_INSTRUCTIONS,
@@ -22,8 +22,8 @@ from services.mcp.consts import (
     PROBE_PLAN_PROMPT_TEMPLATE,
     PROBE_PROMPT_TEMPLATE,
 )
-from services.mcp.dependencies.auth_context import get_current_customer
-from services.mcp.services.response_budget import (
+from engine.mcp.dependencies.auth_context import get_current_customer
+from engine.mcp.services.response_budget import (
     fit_response_to_budget,
     serialize_tool_response,
 )

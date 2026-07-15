@@ -28,15 +28,15 @@ import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
 
-from services.ingestion.backfill_runner import re_enqueue_for_polling
-from services.ingestion.handlers.base import PollConfig
-from services.ingestion.handlers.registry import (
+from engine.ingest.handlers.base import PollConfig
+from engine.ingest.handlers.registry import (
     get_connector_class,
     list_registered,
 )
-from shared.constants import IntegrationStatus, SourceSystem
-from shared.db import get_pool, raw_conn
-from shared.logging import get_logger
+from engine.shared.constants import IntegrationStatus, SourceSystem
+from engine.shared.db import get_pool, raw_conn
+from engine.shared.logging import get_logger
+from kb.backfill_runner import re_enqueue_for_polling
 
 log = get_logger(__name__)
 

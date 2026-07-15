@@ -17,12 +17,12 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from services.retrieval.auth import authenticate_query
-from services.retrieval.grounding import GroundingBundle
-from services.retrieval.pipeline import ResolvedIntent, RouterPhaseResult
-from services.retrieval.router import Intent, RouterEntity, RouterOutput
-from services.retrieval.synthesis import StreamDelta, StreamFinal, SynthesisError
-from shared.models import (
+from engine.retrieval.auth import authenticate_query
+from engine.retrieval.grounding import GroundingBundle
+from engine.retrieval.pipeline import ResolvedIntent, RouterPhaseResult
+from engine.retrieval.router import Intent, RouterEntity, RouterOutput
+from engine.retrieval.synthesis import StreamDelta, StreamFinal, SynthesisError
+from engine.shared.models import (
     QueryChunk,
     QueryDocumentResult,
     QueryRequest,
@@ -125,7 +125,7 @@ def _query_response() -> QueryResponse:
 
 async def _post(body: dict[str, Any]) -> httpx.Response:
     """POST to /query/stream with auth dependency overridden to a fixed customer."""
-    from services.retrieval.main import app
+    from engine.retrieval.main import app
 
     app.dependency_overrides[authenticate_query] = lambda: "cust-test"
     try:
@@ -143,11 +143,11 @@ async def test_query_stream_emits_full_event_sequence(monkeypatch) -> None:
     are forwarded one-for-one from synthesize_stream.
     """
     monkeypatch.setattr(
-        "services.retrieval.main.run_router_phase",
+        "engine.retrieval.main.run_router_phase",
         lambda req, customer_id, request=None: _async_return(_phase_result()),
     )
     monkeypatch.setattr(
-        "services.retrieval.main.run_search_phase",
+        "engine.retrieval.main.run_search_phase",
         lambda req, customer_id, phase, request=None: _async_return(_query_response()),
     )
 
@@ -163,7 +163,7 @@ async def test_query_stream_emits_full_event_sequence(monkeypatch) -> None:
             model=model,
         )
 
-    monkeypatch.setattr("services.retrieval.main.synthesize_stream", fake_stream)
+    monkeypatch.setattr("engine.retrieval.main.synthesize_stream", fake_stream)
 
     resp = await _post({"query": "what shipped?", "top_k": 5})
     assert resp.status_code == 200
@@ -223,11 +223,11 @@ async def test_query_stream_emits_error_event_on_synthesis_failure(monkeypatch) 
     synthesizing) still reach the client.
     """
     monkeypatch.setattr(
-        "services.retrieval.main.run_router_phase",
+        "engine.retrieval.main.run_router_phase",
         lambda req, customer_id, request=None: _async_return(_phase_result()),
     )
     monkeypatch.setattr(
-        "services.retrieval.main.run_search_phase",
+        "engine.retrieval.main.run_search_phase",
         lambda req, customer_id, phase, request=None: _async_return(_query_response()),
     )
 
@@ -237,7 +237,7 @@ async def test_query_stream_emits_error_event_on_synthesis_failure(monkeypatch) 
         raise SynthesisError("ANTHROPIC_API_KEY not configured")
         yield  # pragma: no cover — keeps the function an async generator
 
-    monkeypatch.setattr("services.retrieval.main.synthesize_stream", boom_stream)
+    monkeypatch.setattr("engine.retrieval.main.synthesize_stream", boom_stream)
 
     resp = await _post({"query": "what shipped?", "top_k": 5})
     assert resp.status_code == 200  # SSE always 200; status lives in the data channel
@@ -320,11 +320,11 @@ async def test_stream_emits_per_intent_entities(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(
-        "services.retrieval.main.run_router_phase",
+        "engine.retrieval.main.run_router_phase",
         lambda req, customer_id, request=None: _async_return(multi_phase),
     )
     monkeypatch.setattr(
-        "services.retrieval.main.run_search_phase",
+        "engine.retrieval.main.run_search_phase",
         lambda req, customer_id, phase, request=None: _async_return(_query_response()),
     )
 
@@ -336,7 +336,7 @@ async def test_stream_emits_per_intent_entities(monkeypatch) -> None:
             model=model,
         )
 
-    monkeypatch.setattr("services.retrieval.main.synthesize_stream", fake_stream)
+    monkeypatch.setattr("engine.retrieval.main.synthesize_stream", fake_stream)
 
     resp = await _post({"query": "auth refactor shipped to prod?", "top_k": 5})
     assert resp.status_code == 200

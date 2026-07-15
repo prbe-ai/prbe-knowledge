@@ -11,8 +11,8 @@ GitHub, Sentry) and the SQL retriever ANYs them.
 
 from __future__ import annotations
 
-from shared.constants import DocType, SourceSystem
-from shared.source_registry import doc_type_prefix_for
+from engine.shared.constants import DocType, SourceSystem
+from engine.shared.source_registry import doc_type_prefix_for
 
 # Token → unqualified bucket. The dotted DocType values that match.
 # Keys MUST match shared/services/retrieval/router.py::DOC_TYPE_TOKENS.

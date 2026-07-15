@@ -11,11 +11,11 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.retrievers.sql import sql_list
-from shared.config import Settings, get_settings
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.storage import reset_store
+from engine.retrieval.retrievers.sql import sql_list
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.storage import reset_store
 
 pytestmark = pytest.mark.asyncio
 

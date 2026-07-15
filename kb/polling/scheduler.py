@@ -31,18 +31,18 @@ import logging
 from collections.abc import Callable, Coroutine
 from typing import Any
 
-from services.ingestion.polling.base import (
+from engine.shared.constants import SourceSystem
+from kb.polling.base import (
     PollResult,
     get_poller,
     registered_sources,
 )
-from services.ingestion.polling.cursors import (
+from kb.polling.cursors import (
     CursorRow,
     advance_cursor,
     list_due_cursors,
     stamp_error,
 )
-from shared.constants import SourceSystem
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # emitted". The scheduler passes both ``customer_id`` and ``source`` so
 # the sink can dispatch into the right ingestion-queue row (the queue's
 # uniqueness key includes ``source_system``). The production sink lives
-# at :class:`services.ingestion.polling.sink.PollDocumentSink`; tests
+# at :class:`kb.polling.sink.PollDocumentSink`; tests
 # inject a recorder.
 DocumentSink = Callable[
     [str, SourceSystem, list[dict[str, Any]]], Coroutine[Any, Any, None]
@@ -64,7 +64,7 @@ async def _default_sink(
     """No-op sink used when no production sink is wired (early-stage
     tests, environments where INGESTION_MODE!=poll, or anywhere a real
     queue is undesirable). The real sink is
-    :class:`services.ingestion.polling.sink.PollDocumentSink`."""
+    :class:`kb.polling.sink.PollDocumentSink`."""
     if documents:
         logger.info(
             "polling.sink default no-op: customer_id=%s source=%s documents=%d",

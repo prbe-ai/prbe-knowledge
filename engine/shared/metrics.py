@@ -18,7 +18,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from shared.logging import get_logger
+from engine.shared.logging import get_logger
 
 log = get_logger("metrics")
 

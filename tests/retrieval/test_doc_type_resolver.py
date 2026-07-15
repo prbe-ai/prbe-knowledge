@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import pytest
 
-from services.retrieval.doc_type_resolver import resolve_doc_type_token
-from shared.constants import SourceSystem
+from engine.retrieval.doc_type_resolver import resolve_doc_type_token
+from engine.shared.constants import SourceSystem
 
 
 @pytest.mark.parametrize(

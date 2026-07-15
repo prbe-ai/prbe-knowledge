@@ -6,8 +6,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from services.retrieval.fusion import fuse
-from shared.constants import RRF_BREADTH_ALPHA
+from engine.retrieval.fusion import fuse
+from engine.shared.constants import RRF_BREADTH_ALPHA
 
 _NOW = datetime(2026, 5, 1, tzinfo=UTC)
 

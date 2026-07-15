@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import json
 
-from shared.db import raw_conn
-from shared.logging import get_logger
+from engine.shared.db import raw_conn
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

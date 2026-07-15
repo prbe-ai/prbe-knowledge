@@ -46,17 +46,17 @@ from typing import Any, ClassVar
 
 import httpx
 
-from shared.config import Settings, get_settings
-from shared.constants import DEFAULT_INGESTION_PRIORITY, BackfillStatus, SourceSystem
-from shared.exceptions import NotSupportedByConnector
-from shared.models import (
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import DEFAULT_INGESTION_PRIORITY, BackfillStatus, SourceSystem
+from engine.shared.exceptions import NotSupportedByConnector
+from engine.shared.models import (
     ExternalWorkspaceRef,
     IntegrationToken,
     NormalizationResult,
     WebhookEvent,
     WebhookParseResult,
 )
-from shared.source_registry import DEFAULT_DOC_TYPE_PREFIX, DEFAULT_SCORE_MULTIPLIER
+from engine.shared.source_registry import DEFAULT_DOC_TYPE_PREFIX, DEFAULT_SCORE_MULTIPLIER
 
 
 @dataclass(frozen=True, slots=True)

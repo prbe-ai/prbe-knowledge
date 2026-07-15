@@ -41,8 +41,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from services.ingestion.handlers.wiki import is_valid_wiki_type
-from shared.logging import get_logger
+from engine.shared.logging import get_logger
+from kb.handlers.wiki import is_valid_wiki_type
 
 log = get_logger(__name__)
 

@@ -1,12 +1,12 @@
 """Tests for PagerDuty + incident.io SourceSystem and DocType constants."""
 
-import services.ingestion.handlers  # noqa: F401  (registers source profiles)
-from shared.constants import (
+import kb.handlers  # noqa: F401  (registers source profiles)
+from engine.shared.constants import (
     SOURCE_DISPLAY_NAMES,
     DocType,
     SourceSystem,
 )
-from shared.source_registry import get_source_profile
+from engine.shared.source_registry import get_source_profile
 
 
 def test_pagerduty_source_system_value() -> None:

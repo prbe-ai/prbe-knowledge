@@ -18,7 +18,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from services.retrieval.router import (
+from engine.retrieval.router import (
     RouterEntity,
     RouterOutput,
     _build_bundle_with_token_fallback,

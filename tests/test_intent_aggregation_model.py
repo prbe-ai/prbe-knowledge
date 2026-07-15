@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from shared.models import IntentAggregation, MatchProvenance, QueryResponse
+from engine.shared.models import IntentAggregation, MatchProvenance, QueryResponse
 
 
 def test_match_provenance_intent_idx_defaults_to_zero():

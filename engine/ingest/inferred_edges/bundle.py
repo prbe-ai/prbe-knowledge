@@ -20,14 +20,14 @@ from dataclasses import dataclass, field
 
 import asyncpg
 
-from shared.constants import (
+from engine.shared.constants import (
     INFERRED_EDGES_BUNDLE_MAX_1HOP,
     INFERRED_EDGES_BUNDLE_MAX_TIME_WINDOW,
     INFERRED_EDGES_BUNDLE_MAX_VECTOR_SIMILAR,
     INFERRED_EDGES_BUNDLE_TOKEN_BUDGET,
 )
-from shared.db import with_tenant
-from shared.logging import get_logger
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

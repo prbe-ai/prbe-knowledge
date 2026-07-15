@@ -16,11 +16,11 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, get_args
 
-from services.retrieval.agent.models import GathererOutput
-from shared.constants import SourceSystem
-from shared.db import with_tenant
-from shared.logging import get_logger
-from shared.models import (
+from engine.retrieval.agent.models import GathererOutput
+from engine.shared.constants import SourceSystem
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     GraphEvidence,
     MatchProvenance,
     QueryChunk,

@@ -29,16 +29,8 @@ from typing import TYPE_CHECKING
 
 import asyncpg
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.code_graph.chunking import split_symbol_body
-from services.ingestion.code_graph.extractors import get_extractor_for_file
-from services.ingestion.code_graph.qualifier import promote_single_match
-from services.ingestion.code_graph.secrets import (
-    SKIPPED_LANGUAGE_SENTINEL,
-    looks_like_secret_dump,
-)
-from services.ingestion.code_graph.types import ExtractResult, Symbol
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.shared.constants import (
     MAX_SYMBOL_CHUNK_TOKENS,
     CodeSymbolKind,
     DocClass,
@@ -50,9 +42,9 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.db import with_tenant
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     METADATA_CHUNK_INDEX,
     ACLPrincipal,
     ACLSnapshot,
@@ -66,9 +58,17 @@ from shared.models import (
     make_code_symbol,
     make_document,
 )
+from kb.code_graph.chunking import split_symbol_body
+from kb.code_graph.extractors import get_extractor_for_file
+from kb.code_graph.qualifier import promote_single_match
+from kb.code_graph.secrets import (
+    SKIPPED_LANGUAGE_SENTINEL,
+    looks_like_secret_dump,
+)
+from kb.code_graph.types import ExtractResult, Symbol
 
 if TYPE_CHECKING:
-    from services.ingestion.code_graph.clone import FileEntry  # noqa: F401
+    from kb.code_graph.clone import FileEntry  # noqa: F401
 
 log = get_logger(__name__)
 

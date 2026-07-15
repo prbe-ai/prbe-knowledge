@@ -26,17 +26,17 @@ import orjson
 import pytest
 import pytest_asyncio
 
-from services.synthesis.backfill_app import (
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import WIKI_BACKFILL_CANCEL_CHANNEL
+from engine.shared.db import raw_conn
+from kb.synthesis.backfill_app import (
     BackfillWorker,
     _backfill_run_lock_key,
 )
-from services.synthesis.crawlers.base import (
+from kb.synthesis.crawlers.base import (
     BackfillAgent,
     BackfillAgentResult,
 )
-from shared.config import Settings, get_settings
-from shared.constants import WIKI_BACKFILL_CANCEL_CHANNEL
-from shared.db import raw_conn
 
 CUSTOMER = "bootstrap-app-test-cust"
 
@@ -574,7 +574,7 @@ def test_lock_keys_distinct_per_salt_and_parts() -> None:
     (backfill-trigger, backfill-run, page) yield different lock keys
     for the same customer/source so trigger lock + worker lock + page
     lock can't accidentally serialize on the same value."""
-    from shared.locks import advisory_lock_key
+    from engine.shared.locks import advisory_lock_key
 
     a = advisory_lock_key("backfill-trigger", "c1")
     b = advisory_lock_key("backfill-run", "c1", "github")

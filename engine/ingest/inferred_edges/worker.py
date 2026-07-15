@@ -36,14 +36,14 @@ from datetime import UTC, datetime
 
 import asyncpg
 
-from services.ingestion.graph_writer import upsert_edges, upsert_nodes
-from services.ingestion.inferred_edges.bundle import build_bundle
-from services.ingestion.inferred_edges.extractor import InferredEdge, extract_edges
-from services.ingestion.inferred_edges.prompts.v1 import PROMPT_VERSION
-from shared.constants import NodeLabel
-from shared.db import get_pool, with_tenant
-from shared.logging import get_logger
-from shared.metrics import counter, gauge
+from engine.ingest.graph_writer import upsert_edges, upsert_nodes
+from engine.ingest.inferred_edges.bundle import build_bundle
+from engine.ingest.inferred_edges.extractor import InferredEdge, extract_edges
+from engine.ingest.inferred_edges.prompts.v1 import PROMPT_VERSION
+from engine.shared.constants import NodeLabel
+from engine.shared.db import get_pool, with_tenant
+from engine.shared.logging import get_logger
+from engine.shared.metrics import counter, gauge
 
 log = get_logger(__name__)
 
@@ -202,7 +202,7 @@ async def _upsert_inferred_edges(
     We need to resolve endpoints to node_ids. The extractor already validated
     that each endpoint exists in graph_nodes for this customer.
     """
-    from shared.models import GraphEdgeSpec, GraphNodeSpec
+    from engine.shared.models import GraphEdgeSpec, GraphNodeSpec
 
     # Build minimal node specs for endpoint resolution only.
     # (Nodes already exist; upsert_nodes is idempotent.)
@@ -237,7 +237,7 @@ async def _upsert_inferred_edges(
     edge_specs: list[GraphEdgeSpec] = []
     for edge in edges:
         try:
-            from shared.constants import EdgeType as ET
+            from engine.shared.constants import EdgeType as ET
             edge_type_enum = ET(edge.edge_type)
             from_lbl = NodeLabel(edge.from_label)
             to_lbl = NodeLabel(edge.to_label)
@@ -318,7 +318,7 @@ def _build_health_app():
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
-    from shared.db import health_check
+    from engine.shared.db import health_check
 
     app = FastAPI(
         title="prbe-knowledge inferred-edges worker health",
@@ -343,9 +343,9 @@ async def run_worker_forever() -> None:
     """Entry point for the inferred-edges worker process."""
     import uvicorn
 
-    from shared.config import get_settings
-    from shared.db import init_pool
-    from shared.logging import configure_logging
+    from engine.shared.config import get_settings
+    from engine.shared.db import init_pool
+    from engine.shared.logging import configure_logging
 
     settings = get_settings()
     configure_logging(settings.log_level)
@@ -363,7 +363,7 @@ async def run_worker_forever() -> None:
     # verdicts fire merges directly or land in entity_merge_suggestions for
     # dashboard review; defaults to OFF so deploys don't auto-execute until
     # a human flips the gate.
-    from services.ingestion.post_write import PostWriteWorker
+    from engine.ingest.post_write import PostWriteWorker
 
     post_write_enabled = os.environ.get("POST_WRITE_ENABLED", "true").lower() == "true"
     post_write_execute = os.environ.get("POST_WRITE_EXECUTE", "false").lower() == "true"

@@ -1,7 +1,7 @@
 """Nightly trigger — refreshes cross-repo edges + wakes the wiki-worker.
 
 Scheduled by .github/workflows/knowledge-cron.yml (cron `0 2 * * *` UTC),
-which fires `flyctl machine run --command "python -m services.synthesis.nightly_trigger"`
+which fires `flyctl machine run --command "python -m kb.synthesis.nightly_trigger"`
 against the prbe-knowledge-cron Fly app. The script does two things in order:
 
   A. Refresh cross-repo dependency edges. Re-enqueue ``initial_backfill``
@@ -40,12 +40,12 @@ from datetime import UTC, datetime
 
 import asyncpg
 
-from services.ingestion.code_graph.bridge import enqueue_initial_backfill
-from services.synthesis.diagram_renderer import regenerate_wiki_diagram
-from shared.config import get_settings
-from shared.constants import WIKI_PENDING_CHANNEL, SourceSystem
-from shared.db import apply_connection_setup
-from shared.logging import configure_logging, get_logger
+from engine.shared.config import get_settings
+from engine.shared.constants import WIKI_PENDING_CHANNEL, SourceSystem
+from engine.shared.db import apply_connection_setup
+from engine.shared.logging import configure_logging, get_logger
+from kb.code_graph.bridge import enqueue_initial_backfill
+from kb.synthesis.diagram_renderer import regenerate_wiki_diagram
 
 log = get_logger(__name__)
 

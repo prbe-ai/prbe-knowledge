@@ -18,11 +18,10 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.registry import build_connector
-from services.ingestion.handlers.sentry import SentryConnector
-from shared.config import Settings
-from shared.constants import (
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.handlers.registry import build_connector
+from engine.shared.config import Settings
+from engine.shared.constants import (
     DocType,
     EdgeType,
     NodeLabel,
@@ -30,12 +29,13 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import (
+from engine.shared.exceptions import (
     InvalidWebhookPayload,
     PermanentSourceError,
     TransientSourceError,
 )
-from shared.models import IntegrationToken, WebhookEvent
+from engine.shared.models import IntegrationToken, WebhookEvent
+from kb.handlers.sentry import SentryConnector
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "sentry"
 
@@ -358,7 +358,7 @@ async def test_backfill_starts_from_connected_org_mapping() -> None:
     )
 
     with patch(
-        "services.ingestion.handlers.sentry._connected_sentry_org_slug",
+        "kb.handlers.sentry._connected_sentry_org_slug",
         new_callable=AsyncMock,
         return_value="acme",
     ):

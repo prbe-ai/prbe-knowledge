@@ -22,10 +22,10 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.handlers.base import Connector
-from services.ingestion.handlers.registry import register_connector
-from shared.constants import (
+from engine.ingest.chunker import count_tokens
+from engine.ingest.handlers.base import Connector
+from engine.ingest.handlers.registry import register_connector
+from engine.shared.constants import (
     DocClass,
     DocType,
     DocumentKind,
@@ -37,13 +37,13 @@ from shared.constants import (
     RefType,
     SourceSystem,
 )
-from shared.exceptions import (
+from engine.shared.exceptions import (
     InvalidWebhookPayload,
     PermanentSourceError,
     TransientSourceError,
 )
-from shared.logging import get_logger
-from shared.models import (
+from engine.shared.logging import get_logger
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
@@ -650,7 +650,7 @@ class LinearConnector(Connector):
     def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
         cid = self.settings.linear_client_id
         if not cid:
-            from shared.exceptions import MissingSecret
+            from engine.shared.exceptions import MissingSecret
 
             raise MissingSecret("LINEAR_CLIENT_ID not configured")
         scopes = ",".join(["read", "write", "issues:create"])
@@ -678,7 +678,7 @@ class LinearConnector(Connector):
         cid = self.settings.linear_client_id
         secret = self.settings.linear_client_secret
         if not cid or secret is None:
-            from shared.exceptions import MissingSecret
+            from engine.shared.exceptions import MissingSecret
 
             raise MissingSecret("LINEAR_CLIENT_ID / LINEAR_CLIENT_SECRET not configured")
 
@@ -758,7 +758,7 @@ class LinearConnector(Connector):
         cid = self.settings.linear_client_id
         secret = self.settings.linear_client_secret
         if not cid or secret is None:
-            from shared.exceptions import MissingSecret
+            from engine.shared.exceptions import MissingSecret
 
             raise MissingSecret(
                 "LINEAR_CLIENT_ID / LINEAR_CLIENT_SECRET not configured"
@@ -842,8 +842,8 @@ class LinearConnector(Connector):
 
     async def identify_workspaces(self, token: IntegrationToken):  # type: ignore[override]
         """GraphQL `viewer { organization { id name urlKey } }` to get org info."""
-        from shared.logging import get_logger
-        from shared.models import ExternalWorkspaceRef
+        from engine.shared.logging import get_logger
+        from engine.shared.models import ExternalWorkspaceRef
 
         lg = get_logger(__name__)
         query = "{ viewer { organization { id name urlKey } } }"
@@ -899,7 +899,7 @@ class LinearConnector(Connector):
         Phase 0 limitation: we only backfill issues (and their nested
         comments per-issue). Projects, cycles, docs, etc. are ignored.
         """
-        from shared.models import WebhookEvent
+        from engine.shared.models import WebhookEvent
 
         page_cursor = cursor
         # Get organizationId once to populate webhook-shaped top-level field.

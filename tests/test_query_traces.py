@@ -27,7 +27,7 @@ from typing import Any
 
 import pytest
 
-from services.retrieval.usage import (
+from engine.retrieval.usage import (
     EVENT_TYPE_GET_SOURCE,
     EVENT_TYPE_QUERY,
     EVENT_TYPE_RETRIEVE,
@@ -35,9 +35,9 @@ from services.retrieval.usage import (
     QueryTrace,
     write_query_trace,
 )
-from shared.constants import SourceSystem
-from shared.db import raw_conn, with_tenant
-from shared.models import (
+from engine.shared.constants import SourceSystem
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.models import (
     AnswerResponse,
     QueryChunk,
     QueryDocumentResult,
@@ -200,7 +200,7 @@ async def test_write_query_trace_swallows_db_errors(
     def fake_with_tenant(_customer_id: str) -> _BoomCtx:
         return _BoomCtx()
 
-    monkeypatch.setattr("services.retrieval.usage.with_tenant", fake_with_tenant)
+    monkeypatch.setattr("engine.retrieval.usage.with_tenant", fake_with_tenant)
 
     # Must NOT raise.
     await write_query_trace(
@@ -238,7 +238,7 @@ async def test_write_query_trace_swallows_cancelled_error(
             return None
 
     monkeypatch.setattr(
-        "services.retrieval.usage.with_tenant",
+        "engine.retrieval.usage.with_tenant",
         lambda _cid: _CancellingCtx(),
     )
 

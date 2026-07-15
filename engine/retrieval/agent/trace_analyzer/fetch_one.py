@@ -7,7 +7,7 @@ plumbing those creds into the GH Actions runner (more secret surface,
 more rotation), sub-agents invoke this module via:
 
     kubectl exec deploy/managed-retrieval -- python -m \
-      services.retrieval.agent.trace_analyzer.fetch_one \
+      engine.retrieval.agent.trace_analyzer.fetch_one \
       --bucket prbe-acme \
       --key search-traces/2026-05-17/q-1779062199597.json.gz
 
@@ -29,8 +29,8 @@ import gzip
 import json
 import sys
 
-from shared.exceptions import StorageNotFound, StorageUnavailable
-from shared.storage import get_store
+from engine.shared.exceptions import StorageNotFound, StorageUnavailable
+from engine.shared.storage import get_store
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:

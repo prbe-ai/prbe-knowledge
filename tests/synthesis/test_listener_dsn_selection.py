@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.config import Settings
+from engine.shared.config import Settings
 
 
 @pytest.fixture(autouse=True)

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from shared.constants import CodeSymbolKind, EdgeType
+from engine.shared.constants import CodeSymbolKind, EdgeType
 
 
 @dataclass(slots=True)

@@ -32,13 +32,13 @@ from typing import Any
 import httpx
 import pytest
 
-from services.ingestion.polling import linear as linear_poller_mod
-from services.ingestion.polling.base import PollResult
-from services.ingestion.polling.linear import (
+from engine.shared.constants import SourceSystem
+from kb.polling import linear as linear_poller_mod
+from kb.polling.base import PollResult
+from kb.polling.linear import (
     RESOURCE_ID_WILDCARD,
     LinearPoller,
 )
-from shared.constants import SourceSystem
 
 _CUSTOMER = "test-linear-cust"
 _API_KEY = "lin_api_test_abc123"
@@ -146,7 +146,7 @@ def _ok_body(
 def test_linear_poller_registers_itself() -> None:
     """Importing the module should have registered ``LinearPoller`` against
     ``SourceSystem.LINEAR`` (the ``register_poller`` call at module scope)."""
-    from services.ingestion.polling.base import get_poller
+    from kb.polling.base import get_poller
 
     # Re-import to make sure registration ran for this process.
     assert get_poller(SourceSystem.LINEAR) is LinearPoller

@@ -14,13 +14,13 @@ from typing import Any
 
 import pytest
 
-from services.retrieval.agent.trace_analyzer import (
+from engine.retrieval.agent.trace_analyzer import (
     __main__ as cli,
 )
-from services.retrieval.agent.trace_analyzer import (
+from engine.retrieval.agent.trace_analyzer import (
     loader,
 )
-from services.retrieval.agent.trace_analyzer.digest import summarize_trace
+from engine.retrieval.agent.trace_analyzer.digest import summarize_trace
 
 # ============================================================
 # loader: regression-guard the SQL shape (no DB needed)
@@ -258,11 +258,11 @@ def _stub_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     via its startup hook, but the standalone CLI has no lifespan)."""
     from unittest.mock import AsyncMock as _AsyncMock
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_analyzer.__main__.init_pool",
+        "engine.retrieval.agent.trace_analyzer.__main__.init_pool",
         _AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_analyzer.__main__.close_pool",
+        "engine.retrieval.agent.trace_analyzer.__main__.close_pool",
         _AsyncMock(return_value=None),
     )
 
@@ -279,7 +279,7 @@ def test_cli_accepts_valid_date_no_traces(
         return
 
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_analyzer.__main__.iter_trace_blobs",
+        "engine.retrieval.agent.trace_analyzer.__main__.iter_trace_blobs",
         _empty_iter,
     )
     out_path = tmp_path / "digests.jsonl"
@@ -302,7 +302,7 @@ def test_cli_writes_jsonl_lines_for_blobs(
             yield b
 
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_analyzer.__main__.iter_trace_blobs",
+        "engine.retrieval.agent.trace_analyzer.__main__.iter_trace_blobs",
         _iter,
     )
     out_path = tmp_path / "digests.jsonl"
@@ -336,7 +336,7 @@ def test_fetch_one_happy_path(
     """
     import gzip as _gz
 
-    from services.retrieval.agent.trace_analyzer import fetch_one
+    from engine.retrieval.agent.trace_analyzer import fetch_one
 
     blob = {"trace_id": "t-1", "schema_version": 1, "status": "ok"}
     body = _gz.compress(json.dumps(blob).encode("utf-8"))
@@ -361,8 +361,8 @@ def test_fetch_one_missing_blob_exits_nonzero(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """StorageNotFound → exit code 2, error on stderr."""
-    from services.retrieval.agent.trace_analyzer import fetch_one
-    from shared.exceptions import StorageNotFound
+    from engine.retrieval.agent.trace_analyzer import fetch_one
+    from engine.shared.exceptions import StorageNotFound
 
     class _Store:
         async def get(self, bucket: str, key: str) -> bytes:
@@ -380,8 +380,8 @@ def test_fetch_one_storage_unavailable_distinct_exit_code(
 ) -> None:
     """StorageUnavailable → exit code 3 (distinct from 2 so sub-agents
     can tell 'blob is gone forever' vs 'try later')."""
-    from services.retrieval.agent.trace_analyzer import fetch_one
-    from shared.exceptions import StorageUnavailable
+    from engine.retrieval.agent.trace_analyzer import fetch_one
+    from engine.shared.exceptions import StorageUnavailable
 
     class _Store:
         async def get(self, bucket: str, key: str) -> bytes:
@@ -404,10 +404,10 @@ def test_cli_closes_pool_on_exception(
     init_mock = _AsyncMock(return_value=None)
     close_mock = _AsyncMock(return_value=None)
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_analyzer.__main__.init_pool", init_mock
+        "engine.retrieval.agent.trace_analyzer.__main__.init_pool", init_mock
     )
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_analyzer.__main__.close_pool", close_mock
+        "engine.retrieval.agent.trace_analyzer.__main__.close_pool", close_mock
     )
 
     async def _boom(*_args: Any, **_kwargs: Any) -> Any:
@@ -415,7 +415,7 @@ def test_cli_closes_pool_on_exception(
         yield {}  # makes it a generator
 
     monkeypatch.setattr(
-        "services.retrieval.agent.trace_analyzer.__main__.iter_trace_blobs",
+        "engine.retrieval.agent.trace_analyzer.__main__.iter_trace_blobs",
         _boom,
     )
     out_path = tmp_path / "digests.jsonl"
@@ -440,7 +440,7 @@ class _StoreSpy:
 
     async def bucket_for(self, customer_id: str) -> str:
         if customer_id not in self._buckets:
-            from shared.exceptions import StorageUnavailable
+            from engine.shared.exceptions import StorageUnavailable
             raise StorageUnavailable(f"no bucket for {customer_id}")
         return self._buckets[customer_id]
 
@@ -448,7 +448,7 @@ class _StoreSpy:
         self.get_calls.append((bucket, key))
         body = self._blobs.get((bucket, key))
         if body is None:
-            from shared.exceptions import StorageNotFound
+            from engine.shared.exceptions import StorageNotFound
             raise StorageNotFound(f"{bucket}/{key}")
         return body
 

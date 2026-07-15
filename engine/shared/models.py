@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from shared.constants import (
+from engine.shared.constants import (
     AttachmentKind,
     CodeSymbolKind,
     CompileTrigger,
@@ -41,7 +41,7 @@ class ChunkPiece:
     contracts — like `NormalizationResult.documents_with_chunks` —
     can reference it without dragging chunker's tiktoken dependency
     or violating the shared/services layering. Re-exported from
-    `services.ingestion.chunker` for backwards-compatible imports.
+    `engine.ingest.chunker` for backwards-compatible imports.
     """
 
     chunk_index: int
@@ -672,7 +672,7 @@ class RetrieveResponse(BaseModel):
     # Search-agent (gatherer) self-reported notes. Optional; absent on
     # router/list-only paths and on pre-gatherer responses. Schema is the
     # `GathererNotes` Pydantic shape from
-    # `services.retrieval.agent.models`; dumped here as a dict so this
+    # `engine.retrieval.agent.models`; dumped here as a dict so this
     # module doesn't need to import the gatherer model (which would close
     # a layering loop on startup-time imports). Consumers that don't
     # know about this field (older MCP clients) ignore it under

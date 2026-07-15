@@ -18,10 +18,10 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from shared.config import Settings, get_settings
-from shared.db import close_pool, init_pool, raw_conn
-from shared.embeddings import reset_embedder
-from shared.storage import reset_store
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.storage import reset_store
 
 
 @pytest.fixture(autouse=True)
@@ -126,7 +126,7 @@ async def _get_source(
     *,
     query: str = "",
 ) -> httpx.Response:
-    from services.retrieval.main import app as retrieval_app
+    from engine.retrieval.main import app as retrieval_app
 
     await close_pool()
     transport = ASGITransport(app=retrieval_app)
@@ -146,7 +146,7 @@ async def _get_source_view(
     *,
     query: str = "",
 ) -> httpx.Response:
-    from services.retrieval.main import app as retrieval_app
+    from engine.retrieval.main import app as retrieval_app
 
     await close_pool()
     transport = ASGITransport(app=retrieval_app)

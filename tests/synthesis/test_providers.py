@@ -17,8 +17,8 @@ from unittest.mock import AsyncMock
 import orjson
 import pytest
 
-from services.synthesis.models import TriageInput
-from services.synthesis.providers import (
+from kb.synthesis.models import TriageInput
+from kb.synthesis.providers import (
     GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS,
     TriageParseError,
     _AnthropicTriage,
@@ -101,7 +101,7 @@ def test_gemini_temperature_uses_provider_default_for_gemini3() -> None:
 @pytest.mark.asyncio
 async def test_gemini_call_json_sets_temperature_and_timeout(monkeypatch) -> None:
     fake = AsyncMock(return_value=_gemini_json_response({"verdicts": {}}))
-    monkeypatch.setattr("shared.llm.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm.acompletion", fake)
 
     out = await _gemini_call_json(
         model="gemini-3.5-flash",
@@ -123,9 +123,9 @@ async def test_gemini_call_json_times_out_stalled_completion(monkeypatch) -> Non
     async def _stalled(*args, **kwargs):
         await asyncio.sleep(60)
 
-    monkeypatch.setattr("shared.llm.acompletion", _stalled)
+    monkeypatch.setattr("engine.shared.llm.acompletion", _stalled)
     monkeypatch.setattr(
-        "services.synthesis.providers.GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS",
+        "kb.synthesis.providers.GEMINI_STRUCTURED_OUTPUT_TIMEOUT_SECONDS",
         0.01,
     )
 
@@ -154,7 +154,7 @@ async def test_anthropic_triage_raises_on_validation_error(monkeypatch) -> None:
             {"verdicts": {"1": {"important": True}}},
         )
     )
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     provider = get_triage_provider()
     with pytest.raises(TriageParseError):
         await provider.triage([_ev(1)], now=datetime.now(UTC))

@@ -38,10 +38,10 @@ from typing import Any
 
 import orjson
 
-from shared.constants import IntegrationStatus, SourceSystem
-from shared.db import get_pool
-from shared.encryption import decrypt_token, encrypt_token
-from shared.models import IntegrationToken
+from engine.shared.constants import IntegrationStatus, SourceSystem
+from engine.shared.db import get_pool
+from engine.shared.encryption import decrypt_token, encrypt_token
+from engine.shared.models import IntegrationToken
 
 
 async def save_token(token: IntegrationToken) -> None:

@@ -7,8 +7,8 @@ def module_qname_from_path(file_path: str, language: str) -> str:
     """Derive a module-style qualified name from a repo-relative file path.
 
     Examples (Python):
-        services/ingestion/normalizer.py  -> services.ingestion.normalizer
-        services/ingestion/__init__.py    -> services.ingestion
+        services/ingestion/normalizer.py  -> engine.ingest.normalizer
+        services/ingestion/__init__.py    -> engine.ingest
 
     Examples (TypeScript / JavaScript):
         src/lib/auth.ts                   -> src.lib.auth

@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from shared.constants import DEDUP_COSINE_THRESHOLD
+from engine.shared.constants import DEDUP_COSINE_THRESHOLD
 
 
 def cosine(a: list[float], b: list[float]) -> float:

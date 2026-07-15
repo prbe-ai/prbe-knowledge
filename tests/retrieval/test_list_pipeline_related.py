@@ -13,15 +13,15 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from services.retrieval.list_pipeline import run_list
-from services.retrieval.retrievers.bm25 import BM25Hit
-from services.retrieval.router import Intent
-from shared.config import Settings, get_settings
-from shared.constants import EdgeType, NodeLabel
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.models import QueryRequest, TemporalSpec
-from shared.storage import reset_store
+from engine.retrieval.list_pipeline import run_list
+from engine.retrieval.retrievers.bm25 import BM25Hit
+from engine.retrieval.router import Intent
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import EdgeType, NodeLabel
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.models import QueryRequest, TemporalSpec
+from engine.shared.storage import reset_store
 
 pytestmark = pytest.mark.asyncio
 
@@ -174,7 +174,7 @@ async def test_list_response_populates_related_entities(live_db) -> None:
     req = QueryRequest(query="x", top_k=5, top_k_related=10)
 
     with patch(
-        "services.retrieval.list_pipeline.sql_list",
+        "engine.retrieval.list_pipeline.sql_list",
         new=AsyncMock(return_value=[_bm25_hit("doc:1")]),
     ):
         resp = await run_list(
@@ -208,10 +208,10 @@ async def test_count_aggregation_skips_walk(live_db) -> None:
     req = QueryRequest(query="x", top_k=5, top_k_related=10)
 
     with patch(
-        "services.retrieval.list_pipeline.sql_count",
+        "engine.retrieval.list_pipeline.sql_count",
         new=AsyncMock(return_value=42),
     ), patch(
-        "services.retrieval.list_pipeline.walk_result_doc_neighbors",
+        "engine.retrieval.list_pipeline.walk_result_doc_neighbors",
         new=AsyncMock(return_value=[]),
     ) as m_walk:
         resp = await run_list(
@@ -250,10 +250,10 @@ async def test_group_by_aggregation_skips_walk(live_db) -> None:
     req = QueryRequest(query="x", top_k=5, top_k_related=10)
 
     with patch(
-        "services.retrieval.list_pipeline.sql_group_by",
+        "engine.retrieval.list_pipeline.sql_group_by",
         new=AsyncMock(return_value=[{"source_system": "github", "count": 7}]),
     ), patch(
-        "services.retrieval.list_pipeline.walk_result_doc_neighbors",
+        "engine.retrieval.list_pipeline.walk_result_doc_neighbors",
         new=AsyncMock(return_value=[]),
     ) as m_walk:
         resp = await run_list(
@@ -287,10 +287,10 @@ async def test_list_top_k_related_zero_skips_walk(live_db) -> None:
     req = QueryRequest(query="x", top_k=5, top_k_related=0)
 
     with patch(
-        "services.retrieval.list_pipeline.sql_list",
+        "engine.retrieval.list_pipeline.sql_list",
         new=AsyncMock(return_value=[_bm25_hit("doc:1")]),
     ), patch(
-        "services.retrieval.list_pipeline.walk_result_doc_neighbors",
+        "engine.retrieval.list_pipeline.walk_result_doc_neighbors",
         new=AsyncMock(return_value=[]),
     ) as m_walk:
         resp = await run_list(

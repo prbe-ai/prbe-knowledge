@@ -18,8 +18,8 @@ import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from services.retrieval.fusion import fuse
-from shared.constants import DEFAULT_RECENCY_HALF_LIFE_DAYS, SourceSystem
+from engine.retrieval.fusion import fuse
+from engine.shared.constants import DEFAULT_RECENCY_HALF_LIFE_DAYS, SourceSystem
 
 _NOW = datetime(2026, 4, 28, tzinfo=UTC)
 

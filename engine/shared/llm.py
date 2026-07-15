@@ -219,7 +219,7 @@ def _maybe_inject_gateway(kwargs: dict[str, Any]) -> dict[str, Any]:
         # second (self-host / no-tenant-context). Lazy-import the helper so a
         # circular import (litellm_key imports config; config might one
         # day import llm) is impossible.
-        from shared.litellm_key import current_tenant_virtual_key
+        from engine.shared.litellm_key import current_tenant_virtual_key
 
         key = current_tenant_virtual_key() or gateway_key()
         if key:

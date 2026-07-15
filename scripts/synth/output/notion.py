@@ -31,12 +31,11 @@ from datetime import datetime
 
 import orjson
 
-from scripts.synth.output.base import SynthDoc
-
 # blocks_to_markdown is the same renderer the prod handler uses post-fetch,
 # so synth's inlined body_markdown matches what real Notion ingestion would
 # have produced for the same block tree.
-from services.ingestion.handlers.notion import blocks_to_markdown
+from kb.handlers.notion import blocks_to_markdown
+from scripts.synth.output.base import SynthDoc
 
 _SYNTH_WORKSPACE_ID = "ws-synth"
 _SYNTH_WORKSPACE_NAME = "Synth"

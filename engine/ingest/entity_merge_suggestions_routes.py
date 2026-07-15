@@ -35,12 +35,12 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
-from services.ingestion.entity_clusters_routes import (
+from engine.ingest.entity_clusters_routes import (
     MergeRequest,
     merge_cluster,
 )
-from shared.config import get_settings
-from shared.db import with_tenant
+from engine.shared.config import get_settings
+from engine.shared.db import with_tenant
 
 log = logging.getLogger(__name__)
 router = APIRouter(

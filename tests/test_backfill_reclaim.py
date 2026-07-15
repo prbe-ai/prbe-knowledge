@@ -23,8 +23,11 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from services.ingestion import backfill_runner
-from services.ingestion.backfill_runner import (
+from engine.ingest.worker import ReclaimLoop
+from engine.shared.constants import BackfillStatus, SourceSystem
+from engine.shared.db import raw_conn
+from kb import backfill_runner
+from kb.backfill_runner import (
     BackfillReclaimedError,
     _heartbeat_loop,
     _load_resume_state,
@@ -35,9 +38,6 @@ from services.ingestion.backfill_runner import (
     drain_pending_release_tasks,
     enqueue_slack_channel_backfill,
 )
-from services.ingestion.worker import ReclaimLoop
-from shared.constants import BackfillStatus, SourceSystem
-from shared.db import raw_conn
 
 
 async def _insert_customer(customer_id: str) -> None:

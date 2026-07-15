@@ -27,13 +27,13 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from services.ingestion.polling.notion import (
+from engine.shared.constants import SourceSystem
+from engine.shared.models import IntegrationToken
+from kb.polling.notion import (
     NotionPoller,
     _format_cursor,
     _parse_cursor,
 )
-from shared.constants import SourceSystem
-from shared.models import IntegrationToken
 
 _CUSTOMER = "cust_notion_test"
 _WORKSPACE = "ws_test_42"
@@ -106,7 +106,7 @@ def _patch_client(transport: httpx.MockTransport) -> Any:
         return _FakeAsyncClient(transport)
 
     return patch(
-        "services.ingestion.polling.notion.httpx.AsyncClient",
+        "kb.polling.notion.httpx.AsyncClient",
         side_effect=_factory,
     )
 
@@ -116,7 +116,7 @@ def _patch_load_token(token: IntegrationToken | None) -> Any:
         return token
 
     return patch(
-        "services.ingestion.polling.notion.load_token",
+        "kb.polling.notion.load_token",
         side_effect=_loader,
     )
 
@@ -535,7 +535,7 @@ def test_parse_cursor_naive_iso_gets_utc() -> None:
 
 
 def test_notion_poller_registers_on_import() -> None:
-    from services.ingestion.polling.base import get_poller
+    from kb.polling.base import get_poller
 
     cls = get_poller(SourceSystem.NOTION)
     assert cls is NotionPoller

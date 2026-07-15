@@ -57,10 +57,10 @@ from typing import Any, ClassVar
 
 import httpx
 
-from services.ingestion.polling.base import BasePoller, PollResult, register_poller
-from shared.constants import SourceSystem
-from shared.logging import get_logger
-from shared.tokens import load_token
+from engine.shared.constants import SourceSystem
+from engine.shared.logging import get_logger
+from engine.shared.tokens import load_token
+from kb.polling.base import BasePoller, PollResult, register_poller
 
 log = get_logger(__name__)
 

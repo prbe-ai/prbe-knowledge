@@ -19,8 +19,8 @@ import contextlib
 
 import asyncpg
 
-from shared.db import apply_connection_setup
-from shared.logging import get_logger
+from engine.shared.db import apply_connection_setup
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

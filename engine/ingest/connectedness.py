@@ -9,8 +9,8 @@ disconnected — exactly the acme/github incident on 2026-05-15.
 
 from __future__ import annotations
 
-from shared.constants import IntegrationStatus, SourceSystem
-from shared.db import raw_conn
+from engine.shared.constants import IntegrationStatus, SourceSystem
+from engine.shared.db import raw_conn
 
 # Sources whose lifecycle is keyed on an `integration_tokens` row. For these,
 # disconnect = token row gone (or status flipped from 'active'), and enqueue

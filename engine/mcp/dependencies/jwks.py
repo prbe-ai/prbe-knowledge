@@ -23,7 +23,7 @@ import httpx
 import jwt as pyjwt
 from jwt import PyJWK
 
-from services.mcp.config import get_settings
+from engine.mcp.config import get_settings
 
 
 class JwtAuthError(Exception):

@@ -1,4 +1,4 @@
-from services.ingestion.chunker import chunk_text, count_tokens
+from engine.ingest.chunker import chunk_text, count_tokens
 
 
 def test_empty_returns_empty() -> None:

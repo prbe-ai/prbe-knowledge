@@ -45,13 +45,13 @@ from typing import Any
 
 import httpx
 
-from services.ingestion.polling.base import (
+from engine.shared.constants import SourceSystem
+from engine.shared.tokens import load_token
+from kb.polling.base import (
     BasePoller,
     PollResult,
     register_poller,
 )
-from shared.constants import SourceSystem
-from shared.tokens import load_token
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +373,7 @@ def _build_webhook_payload(
     }
 
 
-# Self-register on import so ``services.ingestion.polling.notion`` only
+# Self-register on import so ``kb.polling.notion`` only
 # needs to be referenced in the scheduler's startup imports for the row
 # dispatch to wire up.
 register_poller(SourceSystem.NOTION, NotionPoller)

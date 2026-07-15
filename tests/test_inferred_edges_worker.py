@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from services.ingestion.inferred_edges.worker import (
+from engine.ingest.inferred_edges.worker import (
     _MAX_ATTEMPTS,
     InferredEdgesWorker,
 )
@@ -76,7 +76,7 @@ async def test_claim_one_returns_none_on_empty_queue() -> None:
     worker = InferredEdgesWorker(concurrency=1)
     mock_pool = _make_mock_pool(fetchrow_return=None)
 
-    with patch("services.ingestion.inferred_edges.worker.get_pool", return_value=mock_pool):
+    with patch("engine.ingest.inferred_edges.worker.get_pool", return_value=mock_pool):
         result = await worker._claim_one()
 
     assert result is None
@@ -89,7 +89,7 @@ async def test_claim_one_marks_processing() -> None:
     row = _make_row()
     mock_pool = _make_mock_pool(fetchrow_return=row)
 
-    with patch("services.ingestion.inferred_edges.worker.get_pool", return_value=mock_pool):
+    with patch("engine.ingest.inferred_edges.worker.get_pool", return_value=mock_pool):
         result = await worker._claim_one()
 
     assert result is row
@@ -118,17 +118,17 @@ async def test_process_success_marks_done() -> None:
     mock_bundle.anchor_doc_id = "doc-anchor"
 
     # Mock extraction result with no edges
-    from services.ingestion.inferred_edges.extractor import ExtractionResult
+    from engine.ingest.inferred_edges.extractor import ExtractionResult
     mock_extraction = ExtractionResult(bundle_failed=False, cost_usd=0.005)
 
     mock_conn = AsyncMock()
     mock_conn.execute = AsyncMock()
 
     with (
-        patch("services.ingestion.inferred_edges.worker.with_tenant") as mock_tenant,
-        patch("services.ingestion.inferred_edges.worker.build_bundle", return_value=mock_bundle),
-        patch("services.ingestion.inferred_edges.worker.extract_edges", return_value=mock_extraction),
-        patch("services.ingestion.inferred_edges.worker._mark_done") as mock_mark_done,
+        patch("engine.ingest.inferred_edges.worker.with_tenant") as mock_tenant,
+        patch("engine.ingest.inferred_edges.worker.build_bundle", return_value=mock_bundle),
+        patch("engine.ingest.inferred_edges.worker.extract_edges", return_value=mock_extraction),
+        patch("engine.ingest.inferred_edges.worker._mark_done") as mock_mark_done,
     ):
         mock_tenant.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
         mock_tenant.return_value.__aexit__ = AsyncMock(return_value=None)
@@ -145,10 +145,10 @@ async def test_process_failure_marks_error() -> None:
     row = _make_row()
 
     with (
-        patch("services.ingestion.inferred_edges.worker.with_tenant") as mock_tenant,
-        patch("services.ingestion.inferred_edges.worker.build_bundle", side_effect=RuntimeError("DB is down")),
-        patch("services.ingestion.inferred_edges.worker._mark_done") as mock_mark_done,
-        patch("services.ingestion.inferred_edges.worker._mark_error") as mock_mark_error,
+        patch("engine.ingest.inferred_edges.worker.with_tenant") as mock_tenant,
+        patch("engine.ingest.inferred_edges.worker.build_bundle", side_effect=RuntimeError("DB is down")),
+        patch("engine.ingest.inferred_edges.worker._mark_done") as mock_mark_done,
+        patch("engine.ingest.inferred_edges.worker._mark_error") as mock_mark_error,
     ):
         mock_tenant.return_value.__aenter__ = AsyncMock(return_value=AsyncMock())
         mock_tenant.return_value.__aexit__ = AsyncMock(return_value=None)
@@ -177,7 +177,7 @@ async def test_process_bundle_failed_marks_error_not_done() -> None:
     mock_bundle.customer_id = "cust-worker-test"
     mock_bundle.anchor_doc_id = "doc-anchor"
 
-    from services.ingestion.inferred_edges.extractor import ExtractionResult
+    from engine.ingest.inferred_edges.extractor import ExtractionResult
     mock_extraction = ExtractionResult(
         bundle_failed=True,
         bundle_fail_reason="unknown_endpoint_ratio=3/4",
@@ -186,11 +186,11 @@ async def test_process_bundle_failed_marks_error_not_done() -> None:
     mock_conn = AsyncMock()
 
     with (
-        patch("services.ingestion.inferred_edges.worker.with_tenant") as mock_tenant,
-        patch("services.ingestion.inferred_edges.worker.build_bundle", return_value=mock_bundle),
-        patch("services.ingestion.inferred_edges.worker.extract_edges", return_value=mock_extraction),
-        patch("services.ingestion.inferred_edges.worker._mark_done") as mock_mark_done,
-        patch("services.ingestion.inferred_edges.worker._mark_error") as mock_mark_error,
+        patch("engine.ingest.inferred_edges.worker.with_tenant") as mock_tenant,
+        patch("engine.ingest.inferred_edges.worker.build_bundle", return_value=mock_bundle),
+        patch("engine.ingest.inferred_edges.worker.extract_edges", return_value=mock_extraction),
+        patch("engine.ingest.inferred_edges.worker._mark_done") as mock_mark_done,
+        patch("engine.ingest.inferred_edges.worker._mark_error") as mock_mark_error,
     ):
         mock_tenant.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
         mock_tenant.return_value.__aexit__ = AsyncMock(return_value=None)
@@ -254,8 +254,8 @@ async def test_upsert_inferred_edges_passes_why_in_properties() -> None:
     """
     from datetime import UTC, datetime
 
-    from services.ingestion.inferred_edges.extractor import InferredEdge
-    from services.ingestion.inferred_edges.worker import _upsert_inferred_edges
+    from engine.ingest.inferred_edges.extractor import InferredEdge
+    from engine.ingest.inferred_edges.worker import _upsert_inferred_edges
 
     edge = InferredEdge(
         from_label="Document",
@@ -281,11 +281,11 @@ async def test_upsert_inferred_edges_passes_why_in_properties() -> None:
 
     with (
         patch(
-            "services.ingestion.inferred_edges.worker.upsert_nodes",
+            "engine.ingest.inferred_edges.worker.upsert_nodes",
             side_effect=fake_upsert_nodes,
         ),
         patch(
-            "services.ingestion.inferred_edges.worker.upsert_edges",
+            "engine.ingest.inferred_edges.worker.upsert_edges",
             side_effect=fake_upsert_edges,
         ),
     ):
@@ -304,8 +304,8 @@ async def test_upsert_inferred_edges_omits_empty_why() -> None:
     """
     from datetime import UTC, datetime
 
-    from services.ingestion.inferred_edges.extractor import InferredEdge
-    from services.ingestion.inferred_edges.worker import _upsert_inferred_edges
+    from engine.ingest.inferred_edges.extractor import InferredEdge
+    from engine.ingest.inferred_edges.worker import _upsert_inferred_edges
 
     edge = InferredEdge(
         from_label="Document",
@@ -330,11 +330,11 @@ async def test_upsert_inferred_edges_omits_empty_why() -> None:
 
     with (
         patch(
-            "services.ingestion.inferred_edges.worker.upsert_nodes",
+            "engine.ingest.inferred_edges.worker.upsert_nodes",
             side_effect=fake_upsert_nodes,
         ),
         patch(
-            "services.ingestion.inferred_edges.worker.upsert_edges",
+            "engine.ingest.inferred_edges.worker.upsert_edges",
             side_effect=fake_upsert_edges,
         ),
     ):

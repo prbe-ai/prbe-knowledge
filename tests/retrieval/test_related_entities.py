@@ -25,17 +25,17 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from services.retrieval.retrievers.related_entities import (
+from engine.retrieval.retrievers.related_entities import (
     _RANK_TO_CONFIDENCE,
     _confidence_case_sql,
     build_exclude_node_keys,
     walk_result_doc_neighbors,
 )
-from shared.config import Settings, get_settings
-from shared.constants import EdgeType, NodeLabel
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.storage import reset_store
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import EdgeType, NodeLabel
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.storage import reset_store
 
 pytestmark = pytest.mark.asyncio
 
@@ -207,7 +207,7 @@ def test_rank_to_confidence_inverse_complete() -> None:
 
 
 class _FakeRouterEntity:
-    """Stand-in for `services.retrieval.router.RouterEntity` -- tests don't
+    """Stand-in for `engine.retrieval.router.RouterEntity` -- tests don't
     need the dataclass machinery, just the duck-typed attrs.
     """
     def __init__(

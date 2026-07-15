@@ -12,7 +12,7 @@ from typing import Literal
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from shared.constants import (
+from engine.shared.constants import (
     DB_INIT_RETRY_ATTEMPTS,
     DB_INIT_RETRY_BACKOFF_CAP_SECONDS,
     DB_INIT_RETRY_BASE_SECONDS,
@@ -345,4 +345,5 @@ def get_settings() -> Settings:
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    # engine/shared/config.py -> engine/shared -> engine -> repo root
+    return Path(__file__).resolve().parent.parent.parent

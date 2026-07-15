@@ -8,13 +8,13 @@ property-key conflict filtering, and prompt construction shape.
 
 from __future__ import annotations
 
-from services.ingestion.auto_merge.analyzer import (
+from engine.ingest.auto_merge.analyzer import (
     Candidate,
     _build_prompt,
     _is_path_canonical,
     _properties_conflict,
 )
-from services.ingestion.auto_merge.models import AutoMergeVerdict
+from engine.ingest.auto_merge.models import AutoMergeVerdict
 
 # --------------------------------------------------------------------------- #
 # _is_path_canonical
@@ -29,7 +29,7 @@ def test_path_canonical_rejects_pr_canonical_ids() -> None:
 def test_path_canonical_rejects_code_symbol_ids() -> None:
     assert _is_path_canonical(
         "Function",
-        "prbe-ai/prbe-knowledge:services.ingestion.graph_writer.upsert_nodes",
+        "prbe-ai/prbe-knowledge:engine.ingest.graph_writer.upsert_nodes",
     )
     assert _is_path_canonical(
         "Method", "prbe-ai/prbe-knowledge:app.services.foo.MyClass.__init__"

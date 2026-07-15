@@ -10,9 +10,9 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
-from services.ingestion.main import app
-from shared.config import Settings, get_settings
-from shared.db import close_pool, init_pool, raw_conn
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn
+from kb.ingestion_app import app
 
 CUSTOMER = "dev-test-cust"
 EMPLOYEE = "emp-1"

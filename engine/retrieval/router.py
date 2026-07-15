@@ -27,12 +27,12 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any
 
-from services.retrieval.grounding import (
+from engine.retrieval.grounding import (
     GroundingBundle,
     _extract_tokens,
     build_bundle,
 )
-from shared.logging import get_logger
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

@@ -1,4 +1,4 @@
-"""Tests for services.ingestion.code_graph.chunking.split_symbol_body.
+"""Tests for kb.code_graph.chunking.split_symbol_body.
 
 Covers:
   - Small symbol -> 1 chunk, primary header preserved (existing behavior)
@@ -10,12 +10,12 @@ Covers:
     emits a chunk above MAX_SYMBOL_CHUNK_TOKENS
 """
 
-from services.ingestion.chunker import count_tokens
-from services.ingestion.code_graph.chunking import (
+from engine.ingest.chunker import count_tokens
+from engine.shared.constants import MAX_SYMBOL_CHUNK_TOKENS
+from kb.code_graph.chunking import (
     _split_into_blocks,
     split_symbol_body,
 )
-from shared.constants import MAX_SYMBOL_CHUNK_TOKENS
 
 PRIMARY = (
     "# prbe-ai/prbe-knowledge · services/foo.py · "

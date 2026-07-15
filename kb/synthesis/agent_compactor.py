@@ -19,9 +19,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from shared.constants import WIKI_AGENT_COMPACTOR_MODEL
-from shared.exceptions import AgentCompactionError
-from shared.logging import get_logger
+from engine.shared.constants import WIKI_AGENT_COMPACTOR_MODEL
+from engine.shared.exceptions import AgentCompactionError
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -141,8 +141,8 @@ async def call_summarizer(
         # LLM_GATEWAY_URL for gateway-routed tenants. The wrapper
         # auto-injects api_base (and, post-chunk-A, api_key) when the
         # gateway env var is set; otherwise litellm uses GOOGLE_API_KEY.
-        from shared import llm as shared_llm
-        from shared.config import get_settings
+        from engine.shared import llm as shared_llm
+        from engine.shared.config import get_settings
 
         # Gate on either a configured gateway URL or a direct provider
         # key — without one of these, the compactor cannot reach a model.

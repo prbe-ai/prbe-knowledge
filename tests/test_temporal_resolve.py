@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from services.retrieval.temporal import resolve_temporal
-from shared.models import TemporalMode
+from engine.retrieval.temporal import resolve_temporal
+from engine.shared.models import TemporalMode
 
 _NOW = datetime(2026, 4, 24, 12, 0, 0, tzinfo=UTC)
 

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from shared.config import get_settings
-from shared.exceptions import ConfigError, MissingSecret
+from engine.shared.config import get_settings
+from engine.shared.exceptions import ConfigError, MissingSecret
 
 
 def _fernet() -> Fernet:

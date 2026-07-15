@@ -16,11 +16,11 @@ from __future__ import annotations
 
 import re
 
-from services.retrieval.helpers import resolve_aliases
-from services.retrieval.retrievers.graph import _CONFIDENCE_RANK, _ENTITY_TO_LABEL
-from shared.constants import NodeLabel
-from shared.db import with_tenant
-from shared.models import RelatedEntity
+from engine.retrieval.helpers import resolve_aliases
+from engine.retrieval.retrievers.graph import _CONFIDENCE_RANK, _ENTITY_TO_LABEL
+from engine.shared.constants import NodeLabel
+from engine.shared.db import with_tenant
+from engine.shared.models import RelatedEntity
 
 # Strip everything up to and including the last '/' to convert
 # 'prbe-ai/prbe-backend' -> 'prbe-backend'. Shared by

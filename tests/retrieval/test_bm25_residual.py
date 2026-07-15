@@ -6,7 +6,7 @@ way through 10k unrelated chunks on a UUID-by-id query.
 
 from __future__ import annotations
 
-from services.retrieval.retrievers.bm25 import residualize_for_bm25
+from engine.retrieval.retrievers.bm25 import residualize_for_bm25
 
 
 def test_no_identifiers_returns_query_unchanged() -> None:

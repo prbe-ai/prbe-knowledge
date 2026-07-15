@@ -20,9 +20,9 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from shared.config import get_settings
-from shared.exceptions import SourceAPIError
-from shared.logging import get_logger
+from engine.shared.config import get_settings
+from engine.shared.exceptions import SourceAPIError
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

@@ -12,12 +12,12 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from shared.config import Settings, get_settings
-from shared.constants import SourceSystem
-from shared.db import close_pool, init_pool, raw_conn
-from shared.embeddings import reset_embedder
-from shared.encryption import encrypt_token
-from shared.storage import reset_store
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import SourceSystem
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.encryption import encrypt_token
+from engine.shared.storage import reset_store
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "slack" / "message_simple.json"
 CUSTOMER = "cust-idempotent"
@@ -70,13 +70,13 @@ async def test_replay_produces_one_doc(live_db, settings: Settings) -> None:
             encrypt_token("xoxb-test"),
         )
 
-    from shared.storage import get_store
+    from engine.shared.storage import get_store
 
     store = get_store()
     await store.ensure_bucket(await store.bucket_for(CUSTOMER))
 
     body = json.dumps(json.loads(FIXTURE.read_text())).encode()
-    from services.ingestion.main import app as ingestion_app
+    from kb.ingestion_app import app as ingestion_app
 
     await close_pool()
     transport = ASGITransport(app=ingestion_app)
@@ -97,8 +97,8 @@ async def test_replay_produces_one_doc(live_db, settings: Settings) -> None:
 
     # Now drive the single queue row through the normalizer 10 times — doc
     # version stays at 1 because content_hash matches.
-    from services.ingestion.handlers.base import make_default_context
-    from services.ingestion.normalizer import Normalizer
+    from engine.ingest.handlers.base import make_default_context
+    from engine.ingest.normalizer import Normalizer
 
     ctx = make_default_context()
     try:

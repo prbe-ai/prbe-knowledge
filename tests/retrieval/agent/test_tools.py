@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from services.retrieval.agent.tools import (
+from engine.retrieval.agent.tools import (
     NEED_DEEPER_TOOL_NAME,
     TERMINAL_TOOL_NAME,
     TOOL_REGISTRY,
@@ -99,7 +99,7 @@ def test_tool_definitions_shape_is_openai_compatible() -> None:
 def test_emit_gatherer_output_schema_is_gatherer_output_pydantic() -> None:
     """The terminal's parameters MUST be the GathererOutput JSON
     Schema. If we drift, the model can't terminate correctly."""
-    from services.retrieval.agent.models import GathererOutput
+    from engine.retrieval.agent.models import GathererOutput
     defs = tool_definitions()
     terminal = next(d for d in defs if d["function"]["name"] == TERMINAL_TOOL_NAME)
     schema = terminal["function"]["parameters"]
@@ -214,11 +214,11 @@ async def test_search_empty_queries_short_circuits() -> None:
 async def test_search_caps_at_five_subqueries() -> None:
     """Cap mirrors MAX_INTENTS+headroom. Extras dropped silently."""
     with patch(
-        "services.retrieval.agent.tools._vector", new=AsyncMock(return_value=[])
+        "engine.retrieval.agent.tools._vector", new=AsyncMock(return_value=[])
     ), patch(
-        "services.retrieval.agent.tools._bm25", new=AsyncMock(return_value=[])
+        "engine.retrieval.agent.tools._bm25", new=AsyncMock(return_value=[])
     ), patch(
-        "services.retrieval.agent.tools.build_bundle",
+        "engine.retrieval.agent.tools.build_bundle",
         new=AsyncMock(
             return_value=type("B", (), {
                 "candidates": [], "bare_id_matches": [],
@@ -243,15 +243,15 @@ async def test_search_threads_sort_and_author_ids_to_every_channel() -> None:
     grp = AsyncMock(return_value=[])
     inf = AsyncMock(return_value=[])
     with patch(
-        "services.retrieval.agent.tools._vector", new=vec
+        "engine.retrieval.agent.tools._vector", new=vec
     ), patch(
-        "services.retrieval.agent.tools._bm25", new=bm
+        "engine.retrieval.agent.tools._bm25", new=bm
     ), patch(
-        "services.retrieval.agent.tools._graph", new=grp
+        "engine.retrieval.agent.tools._graph", new=grp
     ), patch(
-        "services.retrieval.agent.tools._inferred", new=inf
+        "engine.retrieval.agent.tools._inferred", new=inf
     ), patch(
-        "services.retrieval.agent.tools._resolve_entities_to_anchor_docs",
+        "engine.retrieval.agent.tools._resolve_entities_to_anchor_docs",
         new=AsyncMock(return_value=["doc:1"]),  # non-empty so inferred fires
     ):
         await execute_search(
@@ -276,15 +276,15 @@ async def test_search_defaults_preserve_today_behavior() -> None:
     Regression guard for non-deterministic queries."""
     vec = AsyncMock(return_value=[])
     with patch(
-        "services.retrieval.agent.tools._vector", new=vec
+        "engine.retrieval.agent.tools._vector", new=vec
     ), patch(
-        "services.retrieval.agent.tools._bm25", new=AsyncMock(return_value=[])
+        "engine.retrieval.agent.tools._bm25", new=AsyncMock(return_value=[])
     ), patch(
-        "services.retrieval.agent.tools._graph", new=AsyncMock(return_value=[])
+        "engine.retrieval.agent.tools._graph", new=AsyncMock(return_value=[])
     ), patch(
-        "services.retrieval.agent.tools._inferred", new=AsyncMock(return_value=[])
+        "engine.retrieval.agent.tools._inferred", new=AsyncMock(return_value=[])
     ), patch(
-        "services.retrieval.agent.tools._resolve_entities_to_anchor_docs",
+        "engine.retrieval.agent.tools._resolve_entities_to_anchor_docs",
         new=AsyncMock(return_value=[]),
     ):
         await execute_search(
@@ -302,7 +302,7 @@ def test_search_tool_schema_exposes_author_ids_and_sort_by() -> None:
     """The agent's `search` tool description must surface both new knobs
     so the model can use them on follow-up `search` calls (e.g. to
     refine after recognizing the harness picked a bad anchor)."""
-    from services.retrieval.agent.tools import tool_definitions
+    from engine.retrieval.agent.tools import tool_definitions
 
     defs = {d["function"]["name"]: d for d in tool_definitions()}
     search_params = defs["search"]["function"]["parameters"]["properties"]
@@ -317,10 +317,10 @@ def test_search_tool_schema_exposes_author_ids_and_sort_by() -> None:
 async def test_subgraph_empty_anchor_returns_not_existed() -> None:
     """Empty anchor canonical_id can't be resolved → empty result, no crash."""
     with patch(
-        "services.retrieval.main._resolve_anchor_alias",
+        "engine.retrieval.main._resolve_anchor_alias",
         new=AsyncMock(return_value=""),
     ), patch(
-        "services.retrieval.graph_explore.anchor_exists",
+        "engine.retrieval.graph_explore.anchor_exists",
         new=AsyncMock(return_value=False),
     ):
         out = await execute_subgraph("cust-1", anchor_canonical_id="")
@@ -345,7 +345,7 @@ async def test_fetch_doc_minimal_call_returns_chunks_only() -> None:
             pass
 
     with patch(
-        "services.retrieval.agent.tools.with_tenant",
+        "engine.retrieval.agent.tools.with_tenant",
         new=lambda customer_id: MockCtxMgr(),
     ):
         out = await execute_fetch_doc("cust-1", doc_id="doc:nonexistent")

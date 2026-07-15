@@ -23,7 +23,7 @@ import asyncio
 from datetime import UTC, datetime
 from typing import Any
 
-from shared.logging import get_logger
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

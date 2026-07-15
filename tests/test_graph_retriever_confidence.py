@@ -8,7 +8,7 @@ on per-doc results -- see PR feat/polymorphic-search-results).
 
 from __future__ import annotations
 
-from services.retrieval.retrievers.graph import (
+from engine.retrieval.retrievers.graph import (
     CODE_GRAPH_LABELS,
     passes_confidence_filter,
 )

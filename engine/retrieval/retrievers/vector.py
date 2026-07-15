@@ -6,11 +6,11 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from services.retrieval.temporal import build_predicate
-from shared.constants import TOP_K_VECTOR
-from shared.db import with_tenant
-from shared.embeddings import get_embedder_v2
-from shared.models import TemporalSpec, normalize_author_id
+from engine.retrieval.temporal import build_predicate
+from engine.shared.constants import TOP_K_VECTOR
+from engine.shared.db import with_tenant
+from engine.shared.embeddings import get_embedder_v2
+from engine.shared.models import TemporalSpec, normalize_author_id
 
 
 @dataclass(slots=True)

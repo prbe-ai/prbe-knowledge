@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
-from services.retrieval.agent.loop import (
+from engine.retrieval.agent.loop import (
     LoopState,
     _affinity_key,
     _build_prefanout_doc_meta,
@@ -37,17 +37,17 @@ from services.retrieval.agent.loop import (
     _seed_for_query,
     run_gatherer,
 )
-from services.retrieval.agent.models import (
+from engine.retrieval.agent.models import (
     EntityExtraction,
     ExtractedEntity,
     GathererOutput,
     SearchOptions,
 )
-from services.retrieval.agent.tools import TERMINAL_TOOL_NAME
-from services.retrieval.grounding import GroundingBundle
-from shared.llm import LLMError
-from shared.llm_tools import is_context_overflow
-from shared.models import QueryRequest
+from engine.retrieval.agent.tools import TERMINAL_TOOL_NAME
+from engine.retrieval.grounding import GroundingBundle
+from engine.shared.llm import LLMError
+from engine.shared.llm_tools import is_context_overflow
+from engine.shared.models import QueryRequest
 
 # ============================================================
 # Fixtures: fake LiteLLM response builder
@@ -144,7 +144,7 @@ def _force_llm_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     """Most tests run as if LLM is configured. Tests that want the
     short-circuit override this fixture."""
     monkeypatch.setattr(
-        "services.retrieval.agent.loop._no_llm_configured", lambda: False
+        "engine.retrieval.agent.loop._no_llm_configured", lambda: False
     )
 
 
@@ -159,15 +159,15 @@ def _stub_grounding_extraction_prefanout(monkeypatch: pytest.MonkeyPatch) -> Non
     empty `sub_queries`.
     """
     monkeypatch.setattr(
-        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
         AsyncMock(return_value=GroundingBundle()),
     )
     monkeypatch.setattr(
-        "services.retrieval.agent.loop.extract_entities_with_llm",
+        "engine.retrieval.agent.loop.extract_entities_with_llm",
         AsyncMock(return_value=EntityExtraction()),
     )
     monkeypatch.setattr(
-        "services.retrieval.agent.loop.execute_search",
+        "engine.retrieval.agent.loop.execute_search",
         AsyncMock(return_value={"sub_queries": [{
             "query": "stub",
             "grounded_entities": [],
@@ -603,7 +603,7 @@ def test_format_inferred_chains_respects_cap_with_truncation_note() -> None:
     "showing top N of M" footer so the agent knows the remainder is
     reachable via subgraph / fetch_doc — chain shape stays scannable
     even on hub-heavy queries."""
-    from services.retrieval.agent.loop import _PREFANOUT_INFERRED_CHAINS_CAP
+    from engine.retrieval.agent.loop import _PREFANOUT_INFERRED_CHAINS_CAP
 
     over = _PREFANOUT_INFERRED_CHAINS_CAP + 5
     hits = [
@@ -747,7 +747,7 @@ def test_build_user_message_includes_inferred_chains_when_present() -> None:
     """When inferred-edge hits exist the `<inferred_chains>` section
     renders AFTER `<channel_results>` with the regrouped view + the
     instruction text. This is the structural cue for why-chain queries."""
-    from services.retrieval.grounding import GroundingBundle
+    from engine.retrieval.grounding import GroundingBundle
 
     inf_hit = {
         "doc_id": "linear:org:issue:abc",
@@ -777,7 +777,7 @@ def test_build_user_message_omits_inferred_chains_when_no_inferred_hits() -> Non
     `<inferred_chains>` by name (it tells the agent where inferred-edge
     data lives WHEN present), so a bare substring search isn't enough;
     we check the actual section opener appears on a fresh line."""
-    from services.retrieval.grounding import GroundingBundle
+    from engine.retrieval.grounding import GroundingBundle
 
     prefanout = {"sub_queries": [{
         "query": "q",
@@ -796,7 +796,7 @@ def test_build_user_message_includes_search_options_when_nondefault() -> None:
     `<channel_results>`. The block tells the agent the channel ordering is
     authoritative — without it the agent will re-rank by intuition and
     scatter the result set."""
-    from services.retrieval.grounding import GroundingBundle
+    from engine.retrieval.grounding import GroundingBundle
 
     out = _build_user_message(
         "what did mahit do last?",
@@ -821,7 +821,7 @@ def test_build_user_message_omits_sort_when_only_author_filter_applied() -> None
     prompt-cache prefix stability for every person-anchored query that
     wasn't asking for recency, blowing up the cache miss rate. The block
     must show ONLY `author_ids=[...]` in that case."""
-    from services.retrieval.grounding import GroundingBundle
+    from engine.retrieval.grounding import GroundingBundle
 
     out = _build_user_message(
         "what does mahit work on",
@@ -841,7 +841,7 @@ def test_build_user_message_omits_search_options_for_default_query() -> None:
     """sort=relevance + no author filter → the tag is suppressed. This
     keeps the prompt-cache prefix bit-identical to pre-PR for the 90%
     case (non-deterministic queries), so cache hit rates don't drop."""
-    from services.retrieval.grounding import GroundingBundle
+    from engine.retrieval.grounding import GroundingBundle
 
     out = _build_user_message(
         "how does auth work",
@@ -858,7 +858,7 @@ def test_build_user_message_omits_inferred_chains_when_no_prefanout() -> None:
     channel_results nor inferred_chains render. Same opener-only check
     as the no-inferred-hits sibling: the prose intro doesn't render
     either since channel_results itself is skipped."""
-    from services.retrieval.grounding import GroundingBundle
+    from engine.retrieval.grounding import GroundingBundle
 
     out = _build_user_message("q", GroundingBundle(), None)
     assert "<channel_results>" not in out
@@ -884,11 +884,11 @@ async def test_extracted_search_options_flow_into_execute_search(
     req = QueryRequest(query="what did mahit do last?", customer_id="cust-1", top_k=5)
 
     monkeypatch.setattr(
-        "services.retrieval.agent.loop._build_bundle_with_token_fallback",
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
         AsyncMock(return_value=GroundingBundle()),
     )
     monkeypatch.setattr(
-        "services.retrieval.agent.loop.extract_entities_with_llm",
+        "engine.retrieval.agent.loop.extract_entities_with_llm",
         AsyncMock(return_value=EntityExtraction(
             entities=[
                 ExtractedEntity(
@@ -902,7 +902,7 @@ async def test_extracted_search_options_flow_into_execute_search(
         )),
     )
     monkeypatch.setattr(
-        "services.retrieval.agent.loop._resolve_person_author_ids",
+        "engine.retrieval.agent.loop._resolve_person_author_ids",
         AsyncMock(return_value=["mahit@prbe.ai", "mahitoburrito"]),
     )
     captured = AsyncMock(return_value={"sub_queries": [{
@@ -914,12 +914,12 @@ async def test_extracted_search_options_flow_into_execute_search(
         "bm25": [], "graph": [], "inferred_edge": [],
     }]})
     monkeypatch.setattr(
-        "services.retrieval.agent.loop.execute_search",
+        "engine.retrieval.agent.loop.execute_search",
         captured,
     )
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(return_value=_mk_resp(
             tool_calls=[_terminal_call(_final_emission_args(chunks=1, confidence="high"))],
         )),
@@ -948,7 +948,7 @@ async def test_terminal_on_turn_1_is_happy_path(
         monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(return_value=_mk_resp(
             tool_calls=[_terminal_call(_final_emission_args(chunks=2, confidence="high"))],
             cached_tokens=80,
@@ -993,12 +993,12 @@ async def test_run_gatherer_forwards_top_k_related_to_adapter(
     sentinel = object()
     mock_adapter = AsyncMock(return_value=sentinel)
     monkeypatch.setattr(
-        "services.retrieval.agent.loop.to_query_response",
+        "engine.retrieval.agent.loop.to_query_response",
         mock_adapter,
     )
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(return_value=_mk_resp(
             tool_calls=[_terminal_call(_final_emission_args())],
         )),
@@ -1028,10 +1028,10 @@ async def test_exploration_then_terminal(
     turn_2 = _mk_resp(tool_calls=[_terminal_call(_final_emission_args(chunks=3))])
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(side_effect=[turn_1, turn_2]),
     ), patch(
-        "services.retrieval.agent.loop.dispatch_tool_call",
+        "engine.retrieval.agent.loop.dispatch_tool_call",
         new=AsyncMock(return_value={"sub_queries": []}),
     ) as mock_dispatch:
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
@@ -1054,7 +1054,7 @@ async def test_no_tool_calls_returns_schema_violation(
     bad_turn = _mk_resp(content="I wasn't able to find anything.", tool_calls=[])
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(return_value=bad_turn),
     ):
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
@@ -1084,7 +1084,7 @@ async def test_wrong_shape_terminal_args_recovers_via_recall_floor(
     bad_terminal = _terminal_call({"completely": "wrong shape"})
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(return_value=_mk_resp(tool_calls=[bad_terminal])),
     ):
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
@@ -1112,7 +1112,7 @@ async def test_bad_confidence_literal_clamps_to_medium(
     bad_args = _final_emission_args(chunks=3)
     bad_args["gatherer_notes"]["confidence"] = "definitely_unknown_label"
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(return_value=_mk_resp(
             tool_calls=[_terminal_call(bad_args)],
         )),
@@ -1137,7 +1137,7 @@ async def test_explicit_null_confidence_clamps_to_medium(
     args = _final_emission_args(chunks=1)
     args["gatherer_notes"]["confidence"] = None
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(return_value=_mk_resp(
             tool_calls=[_terminal_call(args)],
         )),
@@ -1161,7 +1161,7 @@ async def test_non_string_matched_via_member_does_not_crash(
     args = _final_emission_args(chunks=1)
     args["chunks"][0]["matched_via"] = ["vector", {"broken": "shape"}, 123]
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(return_value=_mk_resp(
             tool_calls=[_terminal_call(args)],
         )),
@@ -1188,7 +1188,7 @@ async def test_bad_matched_via_values_are_filtered(
     args["chunks"][0]["matched_via"] = ["vector", "telepathy"]
     args["chunks"][1]["matched_via"] = ["fabricated_only"]
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(return_value=_mk_resp(
             tool_calls=[_terminal_call(args)],
         )),
@@ -1205,11 +1205,11 @@ async def test_llm_error_raises_503(
     fake_request: SimpleNamespace,
 ) -> None:
     """Fatal provider error → HTTPException(503). No fallback by design."""
-    from shared.llm import LLMError
+    from engine.shared.llm import LLMError
     req = QueryRequest(query="boom", customer_id="cust-1", top_k=5)
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(side_effect=LLMError("fireworks down")),
     ), pytest.raises(HTTPException) as exc_info:
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
@@ -1226,11 +1226,11 @@ async def test_no_llm_configured_short_circuits_to_empty(
     instead of 503 — mirrors PR #282's _call_haiku graceful no-op."""
     req = QueryRequest(query="anything", customer_id="cust-1", top_k=5)
     monkeypatch.setattr(
-        "services.retrieval.agent.loop._no_llm_configured", lambda: True
+        "engine.retrieval.agent.loop._no_llm_configured", lambda: True
     )
     boom = AsyncMock(side_effect=AssertionError("acompletion should NOT be called"))
 
-    with patch("services.retrieval.agent.loop.acompletion", new=boom):
+    with patch("engine.retrieval.agent.loop.acompletion", new=boom):
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
     assert resp.total_candidates == 0
@@ -1252,12 +1252,12 @@ async def test_zero_recall_short_circuits_to_empty(
     burn the wall-clock oscillating search/fetch_doc."""
     req = QueryRequest(query="zxyq-no-matches", customer_id="cust-1", top_k=5)
     monkeypatch.setattr(
-        "services.retrieval.agent.loop.execute_search",
+        "engine.retrieval.agent.loop.execute_search",
         AsyncMock(return_value={"sub_queries": []}),
     )
     boom = AsyncMock(side_effect=AssertionError("acompletion should NOT be called"))
 
-    with patch("services.retrieval.agent.loop.acompletion", new=boom):
+    with patch("engine.retrieval.agent.loop.acompletion", new=boom):
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
     assert resp.total_candidates == 0
@@ -1280,11 +1280,11 @@ async def test_zero_recall_short_circuits_even_with_extracted_entities(
     death loop whenever extraction surfaced any entity at all."""
     req = QueryRequest(query="blue yeti microphones", customer_id="cust-1", top_k=5)
     monkeypatch.setattr(
-        "services.retrieval.agent.loop.execute_search",
+        "engine.retrieval.agent.loop.execute_search",
         AsyncMock(return_value={"sub_queries": []}),
     )
     monkeypatch.setattr(
-        "services.retrieval.agent.loop.extract_entities_with_llm",
+        "engine.retrieval.agent.loop.extract_entities_with_llm",
         AsyncMock(return_value=EntityExtraction(entities=[
             ExtractedEntity(
                 entity_type="service",
@@ -1296,7 +1296,7 @@ async def test_zero_recall_short_circuits_even_with_extracted_entities(
     )
     boom = AsyncMock(side_effect=AssertionError("acompletion should NOT be called"))
 
-    with patch("services.retrieval.agent.loop.acompletion", new=boom):
+    with patch("engine.retrieval.agent.loop.acompletion", new=boom):
         resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
     assert resp.total_candidates == 0
@@ -1317,10 +1317,10 @@ async def test_per_stage_latency_recorded_on_state(
     turn_2 = _mk_resp(tool_calls=[_terminal_call()])
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(side_effect=[turn_1, turn_2]),
     ), patch(
-        "services.retrieval.agent.loop.dispatch_tool_call",
+        "engine.retrieval.agent.loop.dispatch_tool_call",
         new=AsyncMock(return_value={"sub_queries": []}),
     ):
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
@@ -1352,10 +1352,10 @@ async def test_reasoning_content_captured_per_turn(
     )
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(side_effect=[turn_1, turn_2]),
     ), patch(
-        "services.retrieval.agent.loop.dispatch_tool_call",
+        "engine.retrieval.agent.loop.dispatch_tool_call",
         new=AsyncMock(return_value={"sub_queries": []}),
     ):
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
@@ -1381,10 +1381,10 @@ async def test_reasoning_per_turn_starts_empty_and_grows(
     turn_1 = _mk_resp(tool_calls=[_terminal_call()], reasoning_content=None)
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(side_effect=[turn_1]),
     ), patch(
-        "services.retrieval.agent.loop.dispatch_tool_call",
+        "engine.retrieval.agent.loop.dispatch_tool_call",
         new=AsyncMock(return_value={"sub_queries": []}),
     ):
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
@@ -1434,10 +1434,10 @@ async def test_seed_sent_and_system_fingerprint_captured_per_turn(
 
     fake_acompletion = AsyncMock(side_effect=[turn_1, turn_2])
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=fake_acompletion,
     ), patch(
-        "services.retrieval.agent.loop.dispatch_tool_call",
+        "engine.retrieval.agent.loop.dispatch_tool_call",
         new=AsyncMock(return_value={"sub_queries": []}),
     ):
         await run_gatherer(req, customer_id="cust-7", request=fake_request)
@@ -1477,13 +1477,13 @@ async def test_per_turn_telemetry_cardinality_preserved_when_usage_missing(
     )
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(side_effect=[turn_1, turn_2]),
     ), patch(
-        "services.retrieval.agent.loop.dispatch_tool_call",
+        "engine.retrieval.agent.loop.dispatch_tool_call",
         new=AsyncMock(return_value={"sub_queries": []}),
     ), patch(
-        "services.retrieval.agent.loop._extract_cache_hit_rate",
+        "engine.retrieval.agent.loop._extract_cache_hit_rate",
         side_effect=[0.8, None],  # turn 2's usage was unparseable
     ):
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
@@ -1513,10 +1513,10 @@ async def test_system_fingerprint_none_when_provider_omits(
     turn_1 = _mk_resp(tool_calls=[_terminal_call()], system_fingerprint=None)
 
     with patch(
-        "services.retrieval.agent.loop.acompletion",
+        "engine.retrieval.agent.loop.acompletion",
         new=AsyncMock(side_effect=[turn_1]),
     ), patch(
-        "services.retrieval.agent.loop.dispatch_tool_call",
+        "engine.retrieval.agent.loop.dispatch_tool_call",
         new=AsyncMock(return_value={"sub_queries": []}),
     ):
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
@@ -1558,7 +1558,7 @@ def test_prefanout_budget_trims_when_over_budget() -> None:
     prefanout = {"sub_queries": [{
         "query": "q", "vector": hits, "bm25": [], "graph": [], "inferred_edge": [],
     }]}
-    with patch("services.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 2000):
+    with patch("engine.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 2000):
         out = _render_prefanout_budgeted(prefanout)
     assert "trimmed to fit context" in out
     present = sum(1 for i in range(30) if f"github:doc:{i}" in out)
@@ -1578,7 +1578,7 @@ def test_prefanout_budget_no_source_masking() -> None:
     prefanout = {"sub_queries": [{
         "query": "q", "vector": github, "bm25": [slack], "graph": [], "inferred_edge": [],
     }]}
-    with patch("services.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 2500):
+    with patch("engine.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 2500):
         out = _render_prefanout_budgeted(prefanout)
     assert "trimmed to fit context" in out  # budget did bite (github tail dropped)
     present_github = sum(1 for i in range(20) if f"github:doc:{i}" in out)
@@ -1594,7 +1594,7 @@ def test_prefanout_budget_deterministic_for_cache() -> None:
     prefanout = {"sub_queries": [{
         "query": "q", "vector": hits, "bm25": [], "graph": [], "inferred_edge": [],
     }]}
-    with patch("services.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 1500):
+    with patch("engine.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 1500):
         a = _render_prefanout_budgeted(prefanout)
         b = _render_prefanout_budgeted(prefanout)
     assert a == b
@@ -1631,7 +1631,7 @@ def test_enforce_context_budget_stubs_oldest_tool_results() -> None:
             {"role": "tool", "tool_call_id": "call_2", "content": big},
         ],
     )
-    with patch("services.retrieval.agent.loop.SEARCH_AGENT_MAX_CONTEXT_TOKENS", 10_000):
+    with patch("engine.retrieval.agent.loop.SEARCH_AGENT_MAX_CONTEXT_TOKENS", 10_000):
         _enforce_context_budget(state)
     # System / user / assistant untouched; tool_call_id linkage intact.
     assert state.messages[0]["content"][0]["text"] == "sys"

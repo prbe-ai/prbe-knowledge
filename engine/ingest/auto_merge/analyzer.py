@@ -20,15 +20,15 @@ from typing import Any
 import asyncpg
 from pydantic import ValidationError
 
-from services.ingestion.auto_merge.models import AutoMergeVerdict
-from services.ingestion.entity_clusters_routes import (
+from engine.ingest.auto_merge.models import AutoMergeVerdict
+from engine.ingest.entity_clusters_routes import (
     MergeRequest,
     MergeResponse,
     merge_cluster,
 )
-from shared.constants import SEARCH_AGENT_INFERENCE_MODEL
-from shared.llm import LLMError, acompletion
-from shared.logging import get_logger
+from engine.shared.constants import SEARCH_AGENT_INFERENCE_MODEL
+from engine.shared.llm import LLMError, acompletion
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 

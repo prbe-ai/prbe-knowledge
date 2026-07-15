@@ -26,10 +26,10 @@ from typing import Any, ClassVar
 
 import orjson
 
-from services.ingestion.handlers.base import Connector
-from services.ingestion.handlers.registry import register_connector
-from shared import claude_code_extraction as _ext
-from shared.constants import (
+from engine.ingest.handlers.base import Connector
+from engine.ingest.handlers.registry import register_connector
+from engine.shared import claude_code_extraction as _ext
+from engine.shared.constants import (
     DocClass,
     DocType,
     EdgeType,
@@ -38,8 +38,8 @@ from shared.constants import (
     PrincipalType,
     SourceSystem,
 )
-from shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
-from shared.models import (
+from engine.shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
@@ -52,7 +52,7 @@ from shared.models import (
     WebhookEvent,
     WebhookParseResult,
 )
-from shared.storage import get_store
+from engine.shared.storage import get_store
 
 # Cap on simultaneous R2 GETs per fetch_supplementary call. With WORKER
 # concurrency=4 and a long session of ~100 batches, unbounded asyncio.gather

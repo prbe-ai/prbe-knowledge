@@ -28,10 +28,10 @@ from datetime import UTC, datetime
 import httpx
 import pytest
 
-import services.ingestion.polling.github as gh_poller
-from services.ingestion.polling.github import GitHubPoller
-from shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
-from shared.models import IntegrationToken
+import kb.polling.github as gh_poller
+from engine.shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX, SourceSystem
+from engine.shared.models import IntegrationToken
+from kb.polling.github import GitHubPoller
 
 _CUST = "test-cust-poll"
 _RESOURCE = "acme/api"
@@ -440,6 +440,6 @@ async def test_malformed_resource_id_returns_error_without_http(
 
 def test_module_import_registers_poller():
     """Just importing the module wires GitHubPoller into the registry."""
-    from services.ingestion.polling.base import get_poller
+    from kb.polling.base import get_poller
 
     assert get_poller(SourceSystem.GITHUB) is GitHubPoller

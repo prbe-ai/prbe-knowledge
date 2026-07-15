@@ -12,12 +12,12 @@ from uuid import uuid4
 
 import httpx
 
-from services.mcp.clients._responses import (
+from engine.mcp.clients._responses import (
     compact_query,
     compact_search,
     compact_source_view,
 )
-from services.mcp.config import Settings, get_settings
+from engine.mcp.config import Settings, get_settings
 
 CALLER_KIND = "mcp"
 

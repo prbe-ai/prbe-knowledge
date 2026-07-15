@@ -39,20 +39,20 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval import graph_explore
-from services.retrieval.graph_explore import (
+from engine.retrieval import graph_explore
+from engine.retrieval.graph_explore import (
     ExploreFilters,
     _truncate_why,
     anchor_exists,
     anchor_graph_query,
     default_graph_query,
 )
-from shared.constants import (
+from engine.shared.constants import (
     GRAPH_EXPLORE_WHY_MAX_CHARS,
     EdgeType,
     NodeLabel,
 )
-from shared.db import raw_conn
+from engine.shared.db import raw_conn
 
 pytestmark = pytest.mark.asyncio
 

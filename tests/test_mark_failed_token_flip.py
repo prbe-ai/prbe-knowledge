@@ -25,24 +25,24 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.ingestion.backfill_runner import (
+from engine.ingest.connectedness import is_source_connected
+from engine.ingest.handlers.base import Connector, ConnectorContext
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import BackfillStatus, SourceSystem
+from engine.shared.db import raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.encryption import encrypt_token
+from engine.shared.exceptions import (
+    PermanentSourceError,
+    TransientSourceError,
+)
+from engine.shared.models import IntegrationToken, WebhookEvent
+from engine.shared.storage import reset_store
+from kb.backfill_runner import (
     _mark_failed,
     enqueue_backfill,
     run_backfill,
 )
-from services.ingestion.connectedness import is_source_connected
-from services.ingestion.handlers.base import Connector, ConnectorContext
-from shared.config import Settings, get_settings
-from shared.constants import BackfillStatus, SourceSystem
-from shared.db import raw_conn
-from shared.embeddings import reset_embedder
-from shared.encryption import encrypt_token
-from shared.exceptions import (
-    PermanentSourceError,
-    TransientSourceError,
-)
-from shared.models import IntegrationToken, WebhookEvent
-from shared.storage import reset_store
 
 # ---------------------------------------------------------------------------
 # fixtures / helpers
@@ -405,7 +405,7 @@ async def test_run_backfill_aborts_when_token_deleted(live_db, monkeypatch) -> N
     intentionally DROPPED so a disconnected source never gets new rows. So
     queue_count = floor(disconnect_at / batch_size) * batch_size.
     """
-    from shared.config import get_settings as _get_settings
+    from engine.shared.config import get_settings as _get_settings
 
     await _seed_customer()
     await _seed_token(status="active")
@@ -424,7 +424,7 @@ async def test_run_backfill_aborts_when_token_deleted(live_db, monkeypatch) -> N
     )
 
     monkeypatch.setattr(
-        "services.ingestion.backfill_runner.build_connector", lambda src, ctx: fake
+        "kb.backfill_runner.build_connector", lambda src, ctx: fake
     )
 
     enqueued = await run_backfill(_ctx(), CUSTOMER_ID, SOURCE)
@@ -454,7 +454,7 @@ async def test_run_backfill_continues_when_token_active(live_db, monkeypatch) ->
     fake = _FakeConnector(_ctx(), total=total)
 
     monkeypatch.setattr(
-        "services.ingestion.backfill_runner.build_connector", lambda src, ctx: fake
+        "kb.backfill_runner.build_connector", lambda src, ctx: fake
     )
 
     enqueued = await run_backfill(_ctx(), CUSTOMER_ID, SOURCE)
@@ -570,7 +570,7 @@ async def test_runner_checkpoint_event_persists_cursor_without_enqueue(
         checkpoint_cursor=checkpoint_cursor,
     )
     monkeypatch.setattr(
-        "services.ingestion.backfill_runner.build_connector", lambda src, ctx: fake
+        "kb.backfill_runner.build_connector", lambda src, ctx: fake
     )
 
     enqueued = await run_backfill(_ctx(), CUSTOMER_ID, SOURCE)

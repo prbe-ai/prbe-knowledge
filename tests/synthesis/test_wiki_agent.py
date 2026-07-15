@@ -12,9 +12,9 @@ from typing import Any
 
 import pytest
 
-from services.synthesis import wiki_agent as wa_module
-from services.synthesis.wiki_agent import WikiAgentRuntime
-from shared.exceptions import ToolValidationError
+from engine.shared.exceptions import ToolValidationError
+from kb.synthesis import wiki_agent as wa_module
+from kb.synthesis.wiki_agent import WikiAgentRuntime
 
 
 @pytest.fixture
@@ -48,19 +48,19 @@ def runtime(monkeypatch) -> WikiAgentRuntime:
         return list(page_db.values())  # close-enough stub
 
     monkeypatch.setattr(
-        "services.synthesis.persistence.fetch_existing_page",
+        "kb.synthesis.persistence.fetch_existing_page",
         stub_fetch_existing_page,
     )
     monkeypatch.setattr(
-        "services.synthesis.persistence.get_event_body_for_agent",
+        "kb.synthesis.persistence.get_event_body_for_agent",
         stub_get_event_body,
     )
     monkeypatch.setattr(
-        "services.synthesis.persistence.fetch_triaged_manifest",
+        "kb.synthesis.persistence.fetch_triaged_manifest",
         stub_fetch_triaged_manifest,
     )
     monkeypatch.setattr(
-        "services.synthesis.persistence.fetch_wiki_index",
+        "kb.synthesis.persistence.fetch_wiki_index",
         stub_fetch_wiki_index,
     )
 
@@ -416,7 +416,7 @@ def test_estimate_tokens_consistent_with_gemini_count() -> None:
     Pure unit assertion against the harness, not the runtime — verify a
     known string maps to the expected ballpark.
     """
-    from services.synthesis.agent_harness import AgentLoop
+    from kb.synthesis.agent_harness import AgentLoop
 
     # Skip dataclass init: build the loop manually so we don't need a
     # full LLM stub here.

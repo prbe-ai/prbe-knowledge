@@ -33,11 +33,11 @@ import sys
 
 import asyncpg
 
-from services.ingestion.normalizer import _pg_vector
-from shared.config import get_settings
-from shared.db import close_pool, init_pool
-from shared.embeddings import DocItem, get_embedder_v2
-from shared.logging import configure_logging, get_logger
+from engine.ingest.normalizer import _pg_vector
+from engine.shared.config import get_settings
+from engine.shared.db import close_pool, init_pool
+from engine.shared.embeddings import DocItem, get_embedder_v2
+from engine.shared.logging import configure_logging, get_logger
 
 log = get_logger(__name__)
 
@@ -155,7 +155,7 @@ async def run(customer: str | None, dry_run: bool, max_batches: int | None) -> N
                 break
             # Use raw connection for cross-tenant SELECT (no RLS scope needed on
             # graph_nodes for this script — script runs as the table owner).
-            from shared.db import raw_conn
+            from engine.shared.db import raw_conn
 
             async with raw_conn() as conn:
                 rows = await _fetch_batch(conn, customer, BATCH_SIZE)

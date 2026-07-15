@@ -28,22 +28,22 @@ import httpx
 import orjson
 import pytest
 
-from services.ingestion.handlers.base import ConnectorContext
-from services.ingestion.handlers.claude_code import (  # noqa: F401 — registers
+from engine.ingest.handlers.base import ConnectorContext
+from engine.ingest.normalizer import Normalizer
+from engine.shared import claude_code_extraction as _ext
+from engine.shared import db as db_module
+from engine.shared.claude_code_extraction import UnitBundle
+from engine.shared.config import Settings
+from engine.shared.constants import EMBEDDING_V2_DIM, SourceSystem
+from engine.shared.customer_mapping import record_mapping
+from engine.shared.embeddings import EmbeddedChunk, EmbedResult
+from engine.shared.encryption import encrypt_token
+from engine.shared.models import IntegrationToken
+from engine.shared.tokens import save_device_token
+from kb.handlers.claude_code import (  # noqa: F401 — registers
     ClaudeCodeConnector,
 )
-from services.ingestion.handlers.slack import SlackConnector  # noqa: F401 — registers
-from services.ingestion.normalizer import Normalizer
-from shared import claude_code_extraction as _ext
-from shared import db as db_module
-from shared.claude_code_extraction import UnitBundle
-from shared.config import Settings
-from shared.constants import EMBEDDING_V2_DIM, SourceSystem
-from shared.customer_mapping import record_mapping
-from shared.embeddings import EmbeddedChunk, EmbedResult
-from shared.encryption import encrypt_token
-from shared.models import IntegrationToken
-from shared.tokens import save_device_token
+from kb.handlers.slack import SlackConnector  # noqa: F401 — registers
 
 # ---- minimal in-memory stubs ------------------------------------------------
 
@@ -153,7 +153,7 @@ async def _seed_integration_token(customer_id: str, source: SourceSystem) -> Non
 
 @pytest.mark.asyncio
 async def test_three_batches_coalesce_to_one_row(live_db) -> None:
-    from services.ingestion.main import _enqueue, _payload_key
+    from kb.ingestion_app import _enqueue, _payload_key
 
     customer = "coalesce-cust-1"
     session = "sess-coalesce-1"
@@ -195,8 +195,8 @@ async def test_three_batches_coalesce_to_one_row(live_db) -> None:
 
 @pytest.mark.asyncio
 async def test_github_claims_before_cc_at_same_pending_state(live_db) -> None:
-    from services.ingestion.main import _enqueue
-    from services.ingestion.worker import Worker
+    from engine.ingest.worker import Worker
+    from kb.ingestion_app import _enqueue
 
     customer = "priority-cust-1"
     await _seed_customer(customer)
@@ -238,7 +238,7 @@ async def test_github_claims_before_cc_at_same_pending_state(live_db) -> None:
 
 @pytest.mark.asyncio
 async def test_done_session_resurrects_on_new_batch(live_db) -> None:
-    from services.ingestion.main import _enqueue
+    from kb.ingestion_app import _enqueue
 
     customer = "resurrect-cust-1"
     session = "sess-resurrect"
@@ -342,7 +342,7 @@ async def test_full_session_body_has_events_from_all_batches(live_db, monkeypatc
     # claude_code.fetch_supplementary calls `get_store()` directly (not the
     # injected normalizer store), so monkeypatch the global lookup so the
     # connector's R2 reads land on our stub.
-    from services.ingestion.handlers import claude_code as _cc_mod
+    from kb.handlers import claude_code as _cc_mod
     monkeypatch.setattr(_cc_mod, "get_store", lambda: store)
 
     settings = Settings(environment="local")
@@ -395,7 +395,7 @@ async def test_full_session_body_has_events_from_all_batches(live_db, monkeypatc
 
 @pytest.mark.asyncio
 async def test_slack_still_uses_one_row_per_event(live_db) -> None:
-    from services.ingestion.main import _enqueue
+    from kb.ingestion_app import _enqueue
 
     customer = "slack-cust-1"
     await _seed_customer(customer)
@@ -444,7 +444,7 @@ def test_compose_storage_id_suffixes_batch_seq_per_agent_source(
     had this protection; CODEX was originally missing it and lost data
     silently on multi-batch sessions until this fix.
     """
-    from services.ingestion.main import _compose_storage_id, _payload_key
+    from kb.ingestion_app import _compose_storage_id, _payload_key
 
     customer = f"kc-{source.value}-cust"
     session = f"{source.value}-sess-keys-unique"
@@ -473,7 +473,7 @@ def test_compose_storage_id_passes_through_for_non_agent_sources() -> None:
     event — source_event_id is already unique per delivery, so the
     storage_id should be the bare event id without a suffix.
     """
-    from services.ingestion.main import _compose_storage_id
+    from kb.ingestion_app import _compose_storage_id
 
     for source in (
         SourceSystem.SLACK,
@@ -496,7 +496,7 @@ def test_compose_storage_id_handles_missing_batch_seq() -> None:
     batch_seq — composition should fall back to bare session_id rather
     than emit `<session>:None` or crash.
     """
-    from services.ingestion.main import _compose_storage_id
+    from kb.ingestion_app import _compose_storage_id
 
     # parse_hint missing batch_seq
     assert _compose_storage_id(

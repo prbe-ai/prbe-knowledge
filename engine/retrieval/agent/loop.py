@@ -37,9 +37,9 @@ from fastapi import HTTPException
 if TYPE_CHECKING:
     from starlette.requests import Request
 
-from services.retrieval.agent.adapter import to_query_response
-from services.retrieval.agent.extractor import extract_entities_with_llm
-from services.retrieval.agent.models import (
+from engine.retrieval.agent.adapter import to_query_response
+from engine.retrieval.agent.extractor import extract_entities_with_llm
+from engine.retrieval.agent.models import (
     ConfidenceLabel,
     DroppedCandidate,
     GatheredChunk,
@@ -49,24 +49,24 @@ from services.retrieval.agent.models import (
     MatchedViaChannel,
     SearchOptions,
 )
-from services.retrieval.agent.prompt import build_system_prompt
-from services.retrieval.agent.tools import (
+from engine.retrieval.agent.prompt import build_system_prompt
+from engine.retrieval.agent.tools import (
     NEED_DEEPER_TOOL_NAME,
     TERMINAL_TOOL_NAME,
     dispatch_tool_call,
     execute_search,
     tool_definitions,
 )
-from services.retrieval.grounding import GroundingBundle
-from services.retrieval.helpers import expand_to_author_id_set
-from services.retrieval.router import (
+from engine.retrieval.grounding import GroundingBundle
+from engine.retrieval.helpers import expand_to_author_id_set
+from engine.retrieval.router import (
     Intent,
     RouterEntity,
     _build_bundle_with_token_fallback,
     _escape_query_for_xml,
     _reconcile_entities_with_bundle,
 )
-from shared.constants import (
+from engine.shared.constants import (
     SEARCH_AGENT_EXTENSION_GRANT,
     SEARCH_AGENT_HARD_CAP,
     SEARCH_AGENT_INFERENCE_MODEL,
@@ -80,11 +80,11 @@ from shared.constants import (
     SEARCH_AGENT_TURN_TIMEOUT_SECONDS,
     SourceSystem,
 )
-from shared.db import with_tenant
-from shared.llm import LLMError, acompletion, gateway_url
-from shared.llm_tools import is_context_overflow
-from shared.logging import get_logger
-from shared.models import QueryRequest, RetrieveResponse
+from engine.shared.db import with_tenant
+from engine.shared.llm import LLMError, acompletion, gateway_url
+from engine.shared.llm_tools import is_context_overflow
+from engine.shared.logging import get_logger
+from engine.shared.models import QueryRequest, RetrieveResponse
 
 log = get_logger(__name__)
 
@@ -679,8 +679,8 @@ def _no_llm_configured() -> bool:
     """True when no LLM provider is reachable. Mirrors PR #282's
     `_call_haiku` graceful no-op for test env / bootstrap / self-host
     without keys."""
-    from shared.config import get_settings
-    from shared.llm import gateway_url
+    from engine.shared.config import get_settings
+    from engine.shared.llm import gateway_url
 
     if gateway_url():
         return False

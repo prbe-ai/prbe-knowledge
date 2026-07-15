@@ -22,18 +22,18 @@ from unittest.mock import AsyncMock, patch
 import orjson
 import pytest
 
-from services.synthesis.providers import (
+from engine.shared.constants import (
+    HAIKU_MODEL,
+    MAX_DIRECTED_PHRASE_CHARS,
+    MAX_DIRECTED_VECTORS_PER_DOC,
+)
+from kb.synthesis.providers import (
     DirectedPhrasesParseError,
     _AnthropicDirectedPhrases,
     _coerce_phrases,
     _GeminiDirectedPhrases,
     _thinking_budget_for,
     get_directed_phrases_provider,
-)
-from shared.constants import (
-    HAIKU_MODEL,
-    MAX_DIRECTED_PHRASE_CHARS,
-    MAX_DIRECTED_VECTORS_PER_DOC,
 )
 
 # ---- _coerce_phrases (rule-based, no LLM) --------------------------------
@@ -117,7 +117,7 @@ async def test_anthropic_directed_happy_path(monkeypatch) -> None:
             {"phrases": ["alpha", "beta", "gamma"]},
         )
     )
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
     out = await provider.generate(page_title="t", page_body="b")
     assert out == ["alpha", "beta", "gamma"]
@@ -126,7 +126,7 @@ async def test_anthropic_directed_happy_path(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_anthropic_directed_no_tool_use_block_raises(monkeypatch) -> None:
     fake = AsyncMock(return_value=_litellm_no_tool_call_response())
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
     with pytest.raises(DirectedPhrasesParseError, match=r"no .* tool_use block"):
         await provider.generate(page_title="t", page_body="b")
@@ -146,7 +146,7 @@ async def test_anthropic_directed_input_not_a_dict_raises(monkeypatch) -> None:
     choice = SimpleNamespace(message=message, finish_reason="tool_calls")
     response = SimpleNamespace(choices=[choice], usage=None)
     fake = AsyncMock(return_value=response)
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
     with pytest.raises(DirectedPhrasesParseError):
         await provider.generate(page_title="t", page_body="b")
@@ -161,7 +161,7 @@ async def test_anthropic_directed_phrases_not_a_list_raises(monkeypatch) -> None
             {"phrases": "not a list"},
         )
     )
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
     with pytest.raises(DirectedPhrasesParseError, match="not a list"):
         await provider.generate(page_title="t", page_body="b")
@@ -177,7 +177,7 @@ async def test_gemini_directed_happy_path() -> None:
     the returned dict.
     """
     with patch(
-        "services.synthesis.providers._gemini_call_json",
+        "kb.synthesis.providers._gemini_call_json",
         new=AsyncMock(return_value={"phrases": ["alpha", "beta"]}),
     ) as mock_call:
         provider = _GeminiDirectedPhrases(model="gemini-3-flash-preview")
@@ -197,7 +197,7 @@ async def test_gemini_directed_underlying_failure_wraps_as_parse_error() -> None
     from the directed_phrases.persist orchestrator.
     """
     with patch(
-        "services.synthesis.providers._gemini_call_json",
+        "kb.synthesis.providers._gemini_call_json",
         new=AsyncMock(side_effect=RuntimeError("gemini 5xx")),
     ):
         provider = _GeminiDirectedPhrases(model="gemini-3-flash-preview")
@@ -296,7 +296,7 @@ async def test_gemini_directed_missing_phrases_key_raises_not_silent_empty(
     """
     # Simulate Gemini returning a different key (prompt/schema drift).
     with patch(
-        "services.synthesis.providers._gemini_call_json",
+        "kb.synthesis.providers._gemini_call_json",
         new=AsyncMock(return_value={"trigger_phrases": ["a", "b"]}),
     ):
         provider = _GeminiDirectedPhrases(model="gemini-3-flash-preview")
@@ -318,7 +318,7 @@ async def test_anthropic_directed_missing_phrases_key_raises_not_silent_empty(
             {"some_other_key": ["a"]},  # missing 'phrases'
         )
     )
-    monkeypatch.setattr("shared.llm_tools.acompletion", fake)
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
     provider = _AnthropicDirectedPhrases(model=HAIKU_MODEL)
     with pytest.raises(DirectedPhrasesParseError, match=r"missing 'phrases' key"):
         await provider.generate(page_title="t", page_body="b")

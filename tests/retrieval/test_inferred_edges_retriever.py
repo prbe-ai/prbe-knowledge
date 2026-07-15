@@ -26,13 +26,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.retrievers.inferred_edges import (
+from engine.retrieval.retrievers.inferred_edges import (
     INFERRED_EDGES_EXTRACTOR_ID,
     inferred_edge_search,
 )
-from shared.config import Settings, get_settings
-from shared.constants import EdgeType, NodeLabel
-from shared.db import raw_conn
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import EdgeType, NodeLabel
+from engine.shared.db import raw_conn
 
 pytestmark = pytest.mark.asyncio
 

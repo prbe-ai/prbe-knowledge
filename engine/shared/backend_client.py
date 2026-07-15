@@ -10,9 +10,9 @@ from datetime import datetime
 
 import httpx
 
-from shared.config import get_settings
-from shared.exceptions import GitHubAuthError
-from shared.logging import get_logger
+from engine.shared.config import get_settings
+from engine.shared.exceptions import GitHubAuthError
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 
@@ -45,7 +45,7 @@ async def fetch_github_installation_token(
         # token locally from the self-hoster's own GitHub App creds, preserving
         # the (token, expires_at) contract so call sites are unchanged.
         if settings.github_app_id and settings.github_app_private_key.get_secret_value():
-            from shared.github_app import mint_installation_token
+            from engine.shared.github_app import mint_installation_token
 
             return await mint_installation_token(http, customer_id=customer_id)
         raise GitHubAuthError(

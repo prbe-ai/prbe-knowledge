@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import httpx
 
-from services.mcp.config import Settings
-from services.mcp.dependencies.jwks import AccessClaims, JwtAuthError
+from engine.mcp.config import Settings
+from engine.mcp.dependencies.jwks import AccessClaims, JwtAuthError
 
 
 async def assert_session_active(claims: AccessClaims, settings: Settings) -> None:

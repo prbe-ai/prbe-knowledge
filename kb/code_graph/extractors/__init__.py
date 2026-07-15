@@ -17,14 +17,14 @@ and not production-ready as of 2026-05. Follow-up with a vendored grammar.
 
 from __future__ import annotations
 
-from services.ingestion.code_graph.extractors import (
+from kb.code_graph.extractors import (
     go,  # noqa: F401
     java,  # noqa: F401
     javascript,  # noqa: F401
     python,  # noqa: F401
     typescript,  # noqa: F401
 )
-from services.ingestion.code_graph.extractors.registry import (
+from kb.code_graph.extractors.registry import (
     get_extractor_for_file,
     registered_extractors,
 )

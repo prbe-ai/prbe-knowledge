@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from shared.constants import SourceSystem
-from shared.db import raw_conn, with_tenant
+from engine.shared.constants import SourceSystem
+from engine.shared.db import raw_conn, with_tenant
 
 
 @dataclass

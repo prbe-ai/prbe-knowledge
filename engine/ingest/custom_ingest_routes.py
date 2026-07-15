@@ -17,10 +17,9 @@ from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from services.system_settings import get_ingestion_killswitch
-from shared.config import get_settings
-from shared.constants import SourceSystem
-from shared.custom_ingest import (
+from engine.shared.config import get_settings
+from engine.shared.constants import SourceSystem
+from engine.shared.custom_ingest import (
     CustomIngestDocument,
     CustomIngestEnvelope,
     document_content_hash,
@@ -28,11 +27,12 @@ from shared.custom_ingest import (
     json_size,
     source_event_id,
 )
-from shared.db import get_pool, raw_conn
-from shared.exceptions import PrbeError
-from shared.logging import bind_trace, get_logger
-from shared.source_registry import ingestion_priority_for
-from shared.storage import get_store
+from engine.shared.db import get_pool, raw_conn
+from engine.shared.exceptions import PrbeError
+from engine.shared.logging import bind_trace, get_logger
+from engine.shared.source_registry import ingestion_priority_for
+from engine.shared.storage import get_store
+from engine.system_settings import get_ingestion_killswitch
 
 router = APIRouter()
 log = get_logger(__name__)
@@ -285,7 +285,7 @@ async def _enqueue_custom_document(
     payload_s3_key: str,
 ) -> bool:
     priority = ingestion_priority_for(SourceSystem.CUSTOM_INGEST.value)
-    # Intentionally NOT gated by services.ingestion.connectedness:
+    # Intentionally NOT gated by engine.ingest.connectedness:
     # CUSTOM_INGEST uses BYO signed tokens (custom_ingest_tokens table,
     # validated upstream at the API boundary), not integration_tokens.
     async with get_pool().acquire() as conn:

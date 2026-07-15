@@ -18,10 +18,10 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
-from services.ingestion.code_graph import reindex as reindex_module
-from services.ingestion.main import app
-from shared.config import Settings, get_settings
-from shared.db import close_pool, init_pool, raw_conn
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn
+from kb.code_graph import reindex as reindex_module
+from kb.ingestion_app import app
 
 CUSTOMER = "cust-reindex-test"
 INSTALLATION_ID = "12345"

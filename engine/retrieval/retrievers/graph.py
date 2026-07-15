@@ -11,12 +11,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
-from services.retrieval.surprise import surprise_score
-from services.retrieval.temporal import build_predicate
-from shared.constants import ROUTER_ENTITY_TO_LABEL, TOP_K_GRAPH
-from shared.db import with_tenant
-from shared.logging import get_logger
-from shared.models import TemporalSpec, normalize_author_id
+from engine.retrieval.surprise import surprise_score
+from engine.retrieval.temporal import build_predicate
+from engine.shared.constants import ROUTER_ENTITY_TO_LABEL, TOP_K_GRAPH
+from engine.shared.db import with_tenant
+from engine.shared.logging import get_logger
+from engine.shared.models import TemporalSpec, normalize_author_id
 
 log = get_logger(__name__)
 

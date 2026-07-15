@@ -1,5 +1,5 @@
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.handlers.claude_code import ClaudeCodeConnector
+from engine.ingest.handlers.base import make_default_context
+from kb.handlers.claude_code import ClaudeCodeConnector
 
 
 def _make() -> ClaudeCodeConnector:

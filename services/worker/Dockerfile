@@ -12,7 +12,8 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY pyproject.toml ./
-COPY shared/ ./shared/
+COPY engine/ ./engine/
+COPY kb/ ./kb/
 COPY services/ ./services/
 COPY db/ ./db/
 # scripts/ ships into the worker image so operators can run one-shot

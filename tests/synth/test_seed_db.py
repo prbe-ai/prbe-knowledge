@@ -11,13 +11,13 @@ from pathlib import Path
 
 import pytest
 
-from scripts.synth.seed import MissingCanonicalError, seed_tenant
-from shared.db import get_pool, raw_conn
+from engine.shared.db import get_pool, raw_conn
 
 # ObjectStore is constructed directly — there is no build_object_store factory
 # in shared/storage.py. The CLI (scripts/synth/cli.py::_open_db_and_bucket)
 # uses ObjectStore() with no arguments, pulling config from settings.
-from shared.storage import ObjectStore
+from engine.shared.storage import ObjectStore
+from scripts.synth.seed import MissingCanonicalError, seed_tenant
 
 CANONICAL_MINI = Path(__file__).parent.parent / "fixtures" / "canonical-mini"
 

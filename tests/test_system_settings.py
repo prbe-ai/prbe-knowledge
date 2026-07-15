@@ -18,7 +18,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _reset_cache():
     """Each test starts with a cold cache."""
-    from services.system_settings import store
+    from engine.system_settings import store
 
     store.invalidate_cache()
     yield
@@ -64,7 +64,7 @@ def _make_pool(rows: list[dict | None] | Exception):
 
 @pytest.mark.asyncio
 async def test_returns_enabled_when_row_says_enabled() -> None:
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool([{"value": json.dumps({"enabled": True, "reason": None})}])
     with mock.patch.object(store, "get_pool", return_value=pool):
@@ -75,7 +75,7 @@ async def test_returns_enabled_when_row_says_enabled() -> None:
 
 @pytest.mark.asyncio
 async def test_returns_disabled_with_reason() -> None:
-    from services.system_settings import store
+    from engine.system_settings import store
 
     payload = {"enabled": False, "reason": "maintenance window 20:00-21:00 UTC"}
     pool = _make_pool([{"value": json.dumps(payload)}])
@@ -89,7 +89,7 @@ async def test_returns_disabled_with_reason() -> None:
 async def test_accepts_dict_value_not_just_str() -> None:
     """asyncpg with a JSONB codec returns dict; without one returns str.
     The store must handle both."""
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool([{"value": {"enabled": False, "reason": "x"}}])
     with mock.patch.object(store, "get_pool", return_value=pool):
@@ -103,7 +103,7 @@ async def test_missing_row_fails_open() -> None:
     """A missing row (e.g. mid-deploy before seed) defaults to enabled.
     Better to keep ingesting than halt every customer over a half-deployed
     state."""
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool([None])
     with mock.patch.object(store, "get_pool", return_value=pool):
@@ -115,7 +115,7 @@ async def test_missing_row_fails_open() -> None:
 @pytest.mark.asyncio
 async def test_db_exception_fails_open() -> None:
     """DB unreachable: log + return enabled rather than halting ingestion."""
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool(RuntimeError("connection refused"))
     with mock.patch.object(store, "get_pool", return_value=pool):
@@ -125,7 +125,7 @@ async def test_db_exception_fails_open() -> None:
 
 @pytest.mark.asyncio
 async def test_garbage_json_fails_open() -> None:
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool([{"value": "not valid json {"}])
     with mock.patch.object(store, "get_pool", return_value=pool):
@@ -135,7 +135,7 @@ async def test_garbage_json_fails_open() -> None:
 
 @pytest.mark.asyncio
 async def test_unexpected_value_type_fails_open() -> None:
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool([{"value": 42}])
     with mock.patch.object(store, "get_pool", return_value=pool):
@@ -147,7 +147,7 @@ async def test_unexpected_value_type_fails_open() -> None:
 async def test_cache_hit_within_ttl_skips_db() -> None:
     """Hot path: webhook handler calls this on every POST. The DB must
     only be hit once per 30s window."""
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool([{"value": json.dumps({"enabled": True, "reason": None})}])
     with mock.patch.object(store, "get_pool", return_value=pool):
@@ -163,7 +163,7 @@ async def test_cache_hit_within_ttl_skips_db() -> None:
 async def test_force_refresh_bypasses_cache() -> None:
     """The /api/internal/ingestion-status endpoint uses force_refresh=True
     so admin polling never sees stale cache."""
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool(
         [
@@ -182,7 +182,7 @@ async def test_force_refresh_bypasses_cache() -> None:
 @pytest.mark.asyncio
 async def test_cache_expires_after_ttl() -> None:
     """After TTL elapses, the next call refetches."""
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool(
         [
@@ -205,7 +205,7 @@ async def test_cache_expires_after_ttl() -> None:
 async def test_concurrent_callers_single_flight() -> None:
     """Thundering herd: 50 simultaneous webhook handlers all call this on
     a cold cache. The DB must only be hit once."""
-    from services.system_settings import store
+    from engine.system_settings import store
 
     pool = _make_pool([{"value": json.dumps({"enabled": True, "reason": None})}])
     with mock.patch.object(store, "get_pool", return_value=pool):

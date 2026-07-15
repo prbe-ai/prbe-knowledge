@@ -17,25 +17,25 @@ from datetime import UTC, datetime
 import pytest
 import pytest_asyncio
 
-from services.ingestion.handlers.base import make_default_context
-from services.ingestion.normalizer import Normalizer
-from services.synthesis.synthesis_worker import SynthesisWorker
-from shared.config import Settings, get_settings
-from shared.constants import (
+from engine.ingest.handlers.base import make_default_context
+from engine.ingest.normalizer import Normalizer
+from engine.shared.config import Settings, get_settings
+from engine.shared.constants import (
     DocClass,
     DocType,
     Permission,
     PrincipalType,
     SourceSystem,
 )
-from shared.db import raw_conn
-from shared.models import (
+from engine.shared.db import raw_conn
+from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
     ACLSnapshotRow,
     Document,
     NormalizationResult,
 )
+from kb.synthesis.synthesis_worker import SynthesisWorker
 
 CUSTOMER = "wiki-syn-v4-cust"
 
@@ -196,7 +196,7 @@ async def test_advisory_lock_contended_no_op_exit(reset_db: None) -> None:
     sibling_conn = None
     sibling_txn = None
     try:
-        from shared.db import raw_conn as raw_conn_factory
+        from engine.shared.db import raw_conn as raw_conn_factory
 
         cm = raw_conn_factory()
         sibling_conn = await cm.__aenter__()
@@ -238,7 +238,7 @@ async def test_agent_halt_dlqs_all_synthesizing_rows(
 
     # Lower the stall threshold so the test halts quickly without
     # producing 200 turns of stall.
-    import services.synthesis.agent_harness as h
+    import kb.synthesis.agent_harness as h
 
     monkeypatch.setattr(h, "WIKI_AGENT_STALL_TURNS", 1)
 

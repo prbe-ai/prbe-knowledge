@@ -17,11 +17,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 
-from shared.config import get_settings
-from shared.constants import SourceSystem
-from shared.db import close_pool, init_pool
-from shared.logging import configure_logging, get_logger
-from shared.provisioning import (
+from engine.shared.config import get_settings
+from engine.shared.constants import SourceSystem
+from engine.shared.db import close_pool, init_pool
+from engine.shared.logging import configure_logging, get_logger
+from engine.shared.provisioning import (
     CustomerAlreadyExists,
     create_customer,
     ensure_bucket_for,
@@ -49,8 +49,8 @@ async def bootstrap(
     bucket = await ensure_bucket_for(customer_id)
 
     # Best-effort OAuth install URLs — connectors without registered OAuth skip.
-    from services.ingestion.handlers.base import make_default_context
-    from services.ingestion.handlers.registry import build_connector, list_registered
+    from engine.ingest.handlers.base import make_default_context
+    from engine.ingest.handlers.registry import build_connector, list_registered
 
     ctx = make_default_context()
     urls: dict[str, str] = {}

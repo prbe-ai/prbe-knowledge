@@ -22,23 +22,23 @@ from typing import ClassVar
 import pytest
 import pytest_asyncio
 
-import services.ingestion.polling.base as polling_base
-from services.ingestion.polling.base import (
+import kb.polling.base as polling_base
+from engine.shared.constants import SourceSystem
+from engine.shared.db import raw_conn, with_tenant
+from kb.polling.base import (
     BasePoller,
     PollResult,
     get_poller,
     register_poller,
     registered_sources,
 )
-from services.ingestion.polling.cursors import (
+from kb.polling.cursors import (
     advance_cursor,
     list_due_cursors,
     load_cursor,
     stamp_error,
 )
-from services.ingestion.polling.scheduler import PollScheduler
-from shared.constants import SourceSystem
-from shared.db import raw_conn, with_tenant
+from kb.polling.scheduler import PollScheduler
 
 _TENANT = "test-polling-tenant"
 

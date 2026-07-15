@@ -17,9 +17,9 @@ from typing import Any
 
 import pytest
 
-from services.synthesis.fanout import REGISTRY, BackfillFanout
-from services.synthesis.fanout.github import GitHubBackfillFanout
-from shared.constants import BACKFILL_MAX_TARGETS_PER_SOURCE
+from engine.shared.constants import BACKFILL_MAX_TARGETS_PER_SOURCE
+from kb.synthesis.fanout import REGISTRY, BackfillFanout
+from kb.synthesis.fanout.github import GitHubBackfillFanout
 
 
 def test_registry_has_github() -> None:
@@ -69,7 +69,7 @@ async def test_github_fanout_filters_archived_and_disabled(monkeypatch) -> None:
             for r in repos:
                 yield r
 
-    monkeypatch.setattr("services.synthesis.fanout.github.GitHubAPIClient", _FakeClient)
+    monkeypatch.setattr("kb.synthesis.fanout.github.GitHubAPIClient", _FakeClient)
 
     fanout = GitHubBackfillFanout()
     targets = await fanout.discover_targets(
@@ -105,7 +105,7 @@ async def test_github_fanout_caps_at_max(monkeypatch) -> None:
             for r in repos:
                 yield r
 
-    monkeypatch.setattr("services.synthesis.fanout.github.GitHubAPIClient", _FakeClient)
+    monkeypatch.setattr("kb.synthesis.fanout.github.GitHubAPIClient", _FakeClient)
 
     targets = await GitHubBackfillFanout().discover_targets(
         customer_id="c",
@@ -125,7 +125,7 @@ async def test_github_fanout_swallows_api_error(monkeypatch) -> None:
             raise RuntimeError("boom")
             yield  # pragma: no cover — make this an async generator
 
-    monkeypatch.setattr("services.synthesis.fanout.github.GitHubAPIClient", _FakeClient)
+    monkeypatch.setattr("kb.synthesis.fanout.github.GitHubAPIClient", _FakeClient)
 
     targets = await GitHubBackfillFanout().discover_targets(
         customer_id="c",
@@ -152,7 +152,7 @@ async def test_github_fanout_skips_repos_missing_full_name(monkeypatch) -> None:
             for r in repos:
                 yield r
 
-    monkeypatch.setattr("services.synthesis.fanout.github.GitHubAPIClient", _FakeClient)
+    monkeypatch.setattr("kb.synthesis.fanout.github.GitHubAPIClient", _FakeClient)
 
     targets = await GitHubBackfillFanout().discover_targets(
         customer_id="c",

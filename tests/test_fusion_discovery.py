@@ -26,8 +26,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from services.retrieval.fusion import DISCOVERY_GRAPH_MULTIPLIER_CAP, fuse
-from shared.constants import RRF_K
+from engine.retrieval.fusion import DISCOVERY_GRAPH_MULTIPLIER_CAP, fuse
+from engine.shared.constants import RRF_K
 
 _NOW = datetime(2026, 5, 8, tzinfo=UTC)
 _RRF_RANK1 = 1.0 / (RRF_K + 1)  # ~0.01639

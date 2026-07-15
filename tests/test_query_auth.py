@@ -18,10 +18,10 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from shared.config import Settings, get_settings
-from shared.db import close_pool, init_pool, raw_conn
-from shared.embeddings import reset_embedder
-from shared.storage import reset_store
+from engine.shared.config import Settings, get_settings
+from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.embeddings import reset_embedder
+from engine.shared.storage import reset_store
 
 # Test internal-knowledge key. Set via monkeypatch so each test gets a clean
 # settings instance (the autouse fixture clears the lru_cache).
@@ -63,7 +63,7 @@ async def _post_query(
     headers: dict[str, str] | None = None,
     body: dict | None = None,
 ) -> httpx.Response:
-    from services.retrieval.main import app as retrieval_app
+    from engine.retrieval.main import app as retrieval_app
 
     await close_pool()
     transport = ASGITransport(app=retrieval_app)

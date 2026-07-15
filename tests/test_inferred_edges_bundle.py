@@ -15,10 +15,10 @@ from datetime import UTC, datetime
 import pytest
 import pytest_asyncio
 
-from services.ingestion.inferred_edges.bundle import (
+from engine.ingest.inferred_edges.bundle import (
     build_bundle,
 )
-from shared.db import with_tenant
+from engine.shared.db import with_tenant
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -101,7 +101,7 @@ TENANT_B = "cust-bundle-test-tenant-b"
 @pytest_asyncio.fixture
 async def db_with_tenants(live_db):
     """Insert two tenants with overlapping content. Yield (TENANT_A, TENANT_B)."""
-    from shared.db import raw_conn
+    from engine.shared.db import raw_conn
 
     async with raw_conn() as conn:
         await _insert_customer(conn, TENANT_A)
@@ -132,7 +132,7 @@ async def db_with_tenants(live_db):
 @pytest.mark.asyncio
 async def test_bundle_anchor_only(live_db) -> None:
     """An anchor doc with no neighbors produces a bundle with just the anchor."""
-    from shared.db import raw_conn
+    from engine.shared.db import raw_conn
 
     async with raw_conn() as conn:
         await _insert_customer(conn, "cust-anchor-only")
@@ -152,7 +152,7 @@ async def test_bundle_anchor_only(live_db) -> None:
 @pytest.mark.asyncio
 async def test_bundle_missing_anchor_returns_empty(live_db) -> None:
     """If the anchor doc doesn't exist, return an empty bundle (don't crash)."""
-    from shared.db import raw_conn
+    from engine.shared.db import raw_conn
 
     async with raw_conn() as conn:
         await _insert_customer(conn, "cust-missing-anchor")
@@ -167,7 +167,7 @@ async def test_bundle_missing_anchor_returns_empty(live_db) -> None:
 @pytest.mark.asyncio
 async def test_bundle_token_budget_enforced(live_db) -> None:
     """Bundle content is trimmed to fit within the token budget."""
-    from shared.db import raw_conn
+    from engine.shared.db import raw_conn
 
     customer_id = "cust-token-budget"
     async with raw_conn() as conn:
@@ -246,7 +246,7 @@ async def test_bundle_tenant_b_does_not_see_tenant_a(db_with_tenants) -> None:
 @pytest.mark.asyncio
 async def test_bundle_customer_id_on_bundle_object(live_db) -> None:
     """bundle.customer_id always equals the requested customer_id."""
-    from shared.db import raw_conn
+    from engine.shared.db import raw_conn
 
     async with raw_conn() as conn:
         await _insert_customer(conn, "cust-id-check")

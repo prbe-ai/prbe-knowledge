@@ -13,12 +13,12 @@ from __future__ import annotations
 import hashlib
 from typing import TYPE_CHECKING
 
-from shared.encryption import encrypt_token
-from shared.logging import get_logger
+from engine.shared.encryption import encrypt_token
+from engine.shared.logging import get_logger
 
 if TYPE_CHECKING:
+    from engine.shared.storage import ObjectStore
     from scripts.synth.profile import Profile
-    from shared.storage import ObjectStore
 
 
 log = get_logger(__name__)
