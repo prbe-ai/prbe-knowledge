@@ -92,6 +92,28 @@ CREATE INDEX idx_customer_source_mapping_customer
     ON customer_source_mapping (customer_id, source_system);
 
 -- ---------------------------------------------------------------------------
+-- system_settings: global (non-tenant) operational config, keyed by name.
+-- Introduced by alembic 0025; folded into schema.sql here so a fresh DB (built
+-- from this file + stamped to head) carries it. The `ingestion_killswitch` row
+-- is read on every webhook/ingest; a missing table makes the reader fail OPEN
+-- (ingestion enabled), so the drift was silent until a truly-fresh deploy.
+-- ---------------------------------------------------------------------------
+CREATE TABLE system_settings (
+    key         TEXT PRIMARY KEY,
+    value       JSONB NOT NULL,
+    description TEXT,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by  TEXT
+);
+INSERT INTO system_settings (key, value, description)
+VALUES (
+    'ingestion_killswitch',
+    '{"enabled": true, "reason": null}'::jsonb,
+    'Master switch for all plugin ingestion. Set value->>enabled to false to halt webhooks globally.'
+)
+ON CONFLICT (key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
 -- documents: canonical normalized form, one row per version.
 -- Temporal columns:
 --   valid_from         — when this version became the live version
