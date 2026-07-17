@@ -13,13 +13,17 @@ Usage:
 
 What it does:
     1. Verifies the customer exists.
-    2. Upserts a `customer_source_mapping` row so prbe-backend can resolve
+    2. Upserts a `customer_source_mapping` row so the mint path can resolve
        the installation_id from this customer when it mints a token.
-    3. Verifies BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY are configured.
+    3. Verifies a token mint path is configured: either hosted
+       (BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY, prbe-backend mints) or
+       standalone (GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY, local minting via
+       engine.shared.github_app).
     4. Upserts an `integration_tokens` row with scope=`installation:<id>`.
-    5. Dry-run fetches an installation token via prbe-backend's
-       /internal/github/installation_token endpoint to confirm the
-       end-to-end mint path is live.
+    5. Dry-run fetches an installation token through
+       `fetch_github_installation_token` (which selects the same hosted vs
+       standalone branch the connectors use) to confirm the end-to-end mint
+       path is live.
 """
 
 from __future__ import annotations
@@ -30,7 +34,7 @@ import sys
 
 import httpx
 
-from engine.shared.backend_client import fetch_github_installation_token
+from engine.shared.backend_client import fetch_github_installation_token, github_mint_path
 from engine.shared.config import get_settings
 from engine.shared.constants import (
     GITHUB_INSTALLATION_SCOPE_PREFIX,
@@ -67,21 +71,27 @@ async def seed(customer_id: str, installation_id: str) -> None:
             )
             raise SystemExit(1)
 
-        if not settings.backend_base_url or not settings.internal_backend_api_key.get_secret_value():
+        path = github_mint_path(settings)
+        if path is None:
             sys.stderr.write(
-                "error: BACKEND_BASE_URL and INTERNAL_BACKEND_API_KEY must be set in .env\n"
+                "error: no GitHub token mint path configured — set either\n"
+                "       BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY (hosted; prbe-backend mints)\n"
+                "       or GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY (standalone; local minting)\n"
             )
             raise SystemExit(1)
 
         scope = f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}"
         # access_token_encrypted is NOT NULL in the schema. The actual value
-        # is never read — `_resolve_installation_bearer` fetches via backend
-        # whenever scope starts with `installation:` — so we store an opaque
-        # encrypted placeholder that makes the intent obvious in a DB dump.
+        # is never read — `_resolve_installation_bearer` fetches through the
+        # configured mint path whenever scope starts with `installation:` — so
+        # we store an opaque encrypted placeholder that makes the intent
+        # obvious in a DB dump.
         placeholder = encrypt_token("installation-minted-on-demand")
 
-        # Record the mapping + token row FIRST so backend can resolve customer
-        # → installation when we dry-run-fetch the token below.
+        # Record the mapping + token row FIRST so the mint path can resolve
+        # customer -> installation when we dry-run-fetch the token below
+        # (hosted resolves via prbe-backend; standalone reads the
+        # integration_tokens.scope written here).
         await record_mapping(
             customer_id=customer_id,
             source_system=SourceSystem.GITHUB,
@@ -127,6 +137,7 @@ async def seed(customer_id: str, installation_id: str) -> None:
     print(f"GitHub installation seeded for customer {customer_id}")
     print(f"  installation_id: {installation_id}")
     print(f"  scope:           {scope}")
+    print(f"  mint path:       {path}")
     print(f"  expires_at:      {expires_at.isoformat()} (first mint, refreshes on demand)")
     print("=" * 72)
 

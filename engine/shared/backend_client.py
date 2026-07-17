@@ -10,11 +10,33 @@ from datetime import datetime
 
 import httpx
 
-from engine.shared.config import get_settings
+from engine.shared.config import Settings, get_settings
 from engine.shared.exceptions import GitHubAuthError
 from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
+
+
+def github_mint_path(settings: Settings) -> str | None:
+    """Which installation-token mint path the current config selects.
+
+    ``"hosted"`` (prbe-backend mints; both backend settings present),
+    ``"standalone"`` (local minting from the self-hoster's own App creds),
+    or ``None``. Single source of truth for the branch below and for
+    operator tooling (``scripts.github_seed_token``) — keep them from
+    drifting.
+    """
+    base = (settings.backend_base_url or "").rstrip("/")
+    api_key = (
+        settings.internal_backend_api_key.get_secret_value()
+        if settings.internal_backend_api_key
+        else ""
+    )
+    if base and api_key:
+        return "hosted"
+    if settings.github_app_id and settings.github_app_private_key.get_secret_value():
+        return "standalone"
+    return None
 
 
 async def fetch_github_installation_token(
@@ -34,17 +56,12 @@ async def fetch_github_installation_token(
     their except clauses.
     """
     settings = get_settings()
-    base = (settings.backend_base_url or "").rstrip("/")
-    api_key = (
-        settings.internal_backend_api_key.get_secret_value()
-        if settings.internal_backend_api_key
-        else ""
-    )
-    if not base or not api_key:
+    path = github_mint_path(settings)
+    if path != "hosted":
         # Standalone (community) mode: no control plane. Mint the installation
         # token locally from the self-hoster's own GitHub App creds, preserving
         # the (token, expires_at) contract so call sites are unchanged.
-        if settings.github_app_id and settings.github_app_private_key.get_secret_value():
+        if path == "standalone":
             from engine.shared.github_app import mint_installation_token
 
             return await mint_installation_token(http, customer_id=customer_id)
@@ -53,6 +70,8 @@ async def fetch_github_installation_token(
             "(hosted) or GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY (standalone)"
         )
 
+    base = (settings.backend_base_url or "").rstrip("/")
+    api_key = settings.internal_backend_api_key.get_secret_value()
     url = f"{base}/internal/github/installation_token"
     try:
         resp = await http.post(
