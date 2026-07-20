@@ -17,6 +17,7 @@ from typing import Any
 import orjson
 
 from engine.shared.config import get_settings
+from engine.shared.llm import gateway_url
 from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
 
 
@@ -153,14 +154,19 @@ async def extract_units_from_session(
         + orjson.dumps(user_payload).decode("utf-8")
     )
 
-    # Model id prefixed with `anthropic/` so LiteLLM unambiguously routes
-    # to Anthropic. `settings.claude_code_extraction_model` defaults to
-    # `claude-sonnet-4-6`; if it's already provider-prefixed we leave it
-    # alone (supports a future override that picks a non-Anthropic
-    # extractor without breaking this call site).
-    model = _ensure_provider_prefix(
-        settings.claude_code_extraction_model, default_provider="anthropic"
-    )
+    # Gateway model ids are proxy-owned aliases and must pass through verbatim.
+    # Force the OpenAI wire shape so LiteLLM calls the proxy's /chat/completions
+    # endpoint instead of deriving a provider-native path from the model name.
+    # Direct calls retain the legacy Anthropic prefix and native transport.
+    gateway_enabled = gateway_url() is not None
+    if gateway_enabled:
+        model = settings.claude_code_extraction_model
+        transport_kwargs: dict[str, Any] = {"custom_llm_provider": "openai"}
+    else:
+        model = _ensure_provider_prefix(
+            settings.claude_code_extraction_model, default_provider="anthropic"
+        )
+        transport_kwargs = {}
 
     try:
         args, _resp = await forced_tool_call(
@@ -173,6 +179,7 @@ async def extract_units_from_session(
             tool_description=_TOOL_DESCRIPTION,
             tool_schema=_TOOL_PARAMETERS,
             max_tokens=8000,
+            **transport_kwargs,
         )
     except ToolCallParseError:
         # Model declined to call the tool — return an empty bundle, the

@@ -101,6 +101,48 @@ async def test_extract_units_dispatches_via_litellm_and_parses_tool_call(
 
 
 @pytest.mark.asyncio
+async def test_extract_units_gateway_preserves_alias_and_uses_openai_wire(
+    monkeypatch,
+) -> None:
+    """Gateway aliases stay bare while LiteLLM speaks the proxy's OpenAI wire."""
+    empty_payload = {"qa": [], "code_change": [], "decision": [], "file_ref": []}
+    fake = AsyncMock(return_value=_litellm_tool_response("emit_units", empty_payload))
+    monkeypatch.setenv("LLM_GATEWAY_URL", "https://litellm.example/v1")
+    monkeypatch.setattr(
+        "engine.shared.claude_code_extraction.get_settings",
+        lambda: SimpleNamespace(claude_code_extraction_model="gemini-3.5-flash"),
+    )
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
+
+    await extract_units_from_session(session_id="gateway", events=[])
+
+    kwargs = fake.await_args.kwargs
+    assert kwargs["model"] == "gemini-3.5-flash"
+    assert kwargs["custom_llm_provider"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_extract_units_direct_prefixes_anthropic_without_wire_override(
+    monkeypatch,
+) -> None:
+    """Direct calls keep the legacy Anthropic routing contract."""
+    empty_payload = {"qa": [], "code_change": [], "decision": [], "file_ref": []}
+    fake = AsyncMock(return_value=_litellm_tool_response("emit_units", empty_payload))
+    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
+    monkeypatch.setattr(
+        "engine.shared.claude_code_extraction.get_settings",
+        lambda: SimpleNamespace(claude_code_extraction_model="claude-sonnet-4-6"),
+    )
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
+
+    await extract_units_from_session(session_id="direct", events=[])
+
+    kwargs = fake.await_args.kwargs
+    assert kwargs["model"] == "anthropic/claude-sonnet-4-6"
+    assert "custom_llm_provider" not in kwargs
+
+
+@pytest.mark.asyncio
 async def test_extract_units_truncates_oversized_event_list(monkeypatch) -> None:
     """Defensive guard: events lists larger than _MAX_EVENTS are truncated to
     the most recent slice before being sent to the LLM. Prevents context
