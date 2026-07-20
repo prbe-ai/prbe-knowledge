@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Install the Probe MCP server in Claude Code, Codex, and/or Cursor, and add
-# agent-instruction snippets so coding agents proactively reach for it.
+# Install the Probe Knowledge MCP server in Claude Code, Codex, and/or Cursor,
+# and add agent-instruction snippets so coding agents proactively reach for it.
 #
 # Usage:
 #   curl -fsSL https://mcp.knowledge.prbe.ai/install | bash
@@ -9,9 +9,24 @@
 
 set -euo pipefail
 
-MCP_NAME="Probe"
+MCP_NAME="probe-knowledge"
 MCP_URL="https://mcp.knowledge.prbe.ai/mcp"
-PROBE_HEADING="## Probe MCP server (team operational memory)"
+PROBE_HEADING="## Probe Knowledge MCP server (team operational memory)"
+
+# Names this server shipped under before, in every client. The rename is not a
+# rename to any client: `claude mcp get probe-knowledge` finds nothing on a box
+# that has `Probe`, so without an explicit sweep the installer would add a
+# second entry pointing at the same URL and the user would load both tool sets.
+#
+# Note the server name is part of the tool name (`mcp__<server>__<tool>`), so it
+# is restricted to [A-Za-z0-9_-] — "Probe Knowledge" with a space is rejected by
+# `claude mcp add`.
+LEGACY_MCP_NAMES="Probe probe"
+
+# Section headings this snippet shipped under before. The section guard keys on
+# the heading, so a changed heading reads as "no section present" and appends a
+# duplicate. These are migrated in place instead.
+LEGACY_PROBE_HEADINGS="## Probe MCP server (team operational memory)"
 
 # Use ANSI colors only when stdout is a real TTY; piping to a log file
 # or another command shouldn't leak `\033[0;32m` sequences into the
@@ -140,7 +155,34 @@ alwaysApply: true
 $AGENT_GUIDANCE_SNIPPET
 EOF
 
-green "Probe MCP installer"
+# Drop an entry this server shipped under previously, in whichever client, but
+# only when it still points at our URL — a same-named entry aimed somewhere else
+# belongs to someone else and is left alone.
+#
+# Renaming orphans the client's stored OAuth token: Claude Code keys those as
+# `<serverName>|<urlHash>` in the macOS keychain, so the new name starts with an
+# empty credential and the user re-auths once via /mcp. That is the cost of not
+# leaving two live entries behind, and it is why this warns rather than doing it
+# silently.
+_sweep_legacy_mcp() {
+    local client="$1" legacy found=""
+    for legacy in $LEGACY_MCP_NAMES; do
+        [ "$legacy" = "$MCP_NAME" ] && continue
+        case "$client" in
+            claude) found="$(claude mcp get "$legacy" 2>/dev/null || true)" ;;
+            codex)  found="$(codex  mcp get "$legacy" 2>/dev/null || true)" ;;
+        esac
+        printf "%s" "$found" | grep -qF "$MCP_URL" || continue
+        dim "→ Removing legacy '$legacy' entry (renamed to '$MCP_NAME')…"
+        case "$client" in
+            claude) claude mcp remove "$legacy" >/dev/null 2>&1 || true ;;
+            codex)  codex  mcp remove "$legacy" >/dev/null 2>&1 || true ;;
+        esac
+        yellow "! $client: removed legacy '$legacy' — re-authenticate '$MCP_NAME' once (/mcp)"
+    done
+}
+
+green "Probe Knowledge MCP installer"
 dim "  Server: $MCP_URL"
 dim "  Local alias: $MCP_NAME"
 echo ""
@@ -149,6 +191,7 @@ echo ""
 # 1. Claude Code
 # ---------------------------------------------------------------------------
 if command -v claude >/dev/null 2>&1; then
+    _sweep_legacy_mcp claude
     claude_probe="$(claude mcp get "$MCP_NAME" 2>/dev/null || true)"
     # Register Probe with "alwaysLoad": true so its tools load into context
     # at session start instead of sitting behind MCP tool search (deferred).
@@ -193,6 +236,7 @@ fi
 # 2. Codex — global config via `codex mcp add`
 # ---------------------------------------------------------------------------
 if command -v codex >/dev/null 2>&1; then
+    _sweep_legacy_mcp codex
     codex_probe="$(codex mcp get "$MCP_NAME" 2>/dev/null || true)"
     if printf "%s" "$codex_probe" | grep -qF "$MCP_URL"; then
         yellow "✓ Codex: '$MCP_NAME' already points at $MCP_URL (skipping)"
@@ -225,8 +269,70 @@ fi
 # ---------------------------------------------------------------------------
 GLOBAL_CODEX_AGENTS="$HOME/.codex/AGENTS.md"
 
+_file_has_legacy_section() {
+    local target="$1" line
+    [ -f "$target" ] || return 1
+    # Iterated as lines, not words: a heading contains spaces, so `for x in
+    # $LEGACY_PROBE_HEADINGS` would split it into fragments that match nothing.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if grep -qF "$line" "$target" 2>/dev/null; then
+            return 0
+        fi
+    done <<EOF
+$LEGACY_PROBE_HEADINGS
+EOF
+    return 1
+}
+
+# Rewrite a section that shipped under an older heading or older server name.
+# Editing in place matters twice over: the guard keys on the heading, so a
+# stale one reads as "no section here" and appends a second copy — and that
+# leftover copy keeps instructing the agent to call a tool name that no longer
+# resolves after the rename.
+_migrate_file_section() {
+    local target="$1"
+    [ -f "$target" ] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$target" "$PROBE_HEADING" "$MCP_NAME" \
+        "$LEGACY_PROBE_HEADINGS" "$LEGACY_MCP_NAMES" <<'PY' 2>/dev/null
+import pathlib, re, sys
+
+target, heading, name, legacy_headings, legacy_names = sys.argv[1:6]
+path = pathlib.Path(target)
+text = original = path.read_text()
+
+for old in (h for h in legacy_headings.split("\n") if h.strip()):
+    text = text.replace(old, heading)
+
+for old in (n for n in legacy_names.split() if n and n != name):
+    esc = re.escape(old)
+    # `Probe` as a marked-up identifier, and Probe.<tool> call sites. Bare
+    # prose mentions of Probe are the product name and are left alone.
+    text = re.sub(rf"`{esc}`", f"`{name}`", text)
+    text = re.sub(rf"(?<![\w.-]){esc}\.(\w+)", rf"{name}.\1", text)
+
+if text == original:
+    raise SystemExit(1)
+path.write_text(text)
+PY
+}
+
 _file_has_section() {
-    [ -f "$1" ] && grep -qF "$PROBE_HEADING" "$1" 2>/dev/null
+    [ -f "$1" ] || return 1
+    if grep -qF "$PROBE_HEADING" "$1" 2>/dev/null; then
+        return 0
+    fi
+    if _file_has_legacy_section "$1"; then
+        if _migrate_file_section "$1"; then
+            green "✓ Migrated legacy Probe section in $1 → '$MCP_NAME'"
+        else
+            yellow "! $1 has a legacy Probe section that needs a manual update to '$MCP_NAME'"
+        fi
+        # Either way the section exists — never append a second one.
+        return 0
+    fi
+    return 1
 }
 
 _append_text() {
