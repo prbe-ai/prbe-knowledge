@@ -159,6 +159,72 @@ def test_pre_chunked_path_skips_chunk_text(monkeypatch) -> None:
     assert sentinel == [], "chunk_text was called — pre-chunked path is broken"
 
 
+def test_pre_chunked_path_escapes_nul_before_hash_embedding_and_persist(
+    monkeypatch,
+) -> None:
+    """Literal NULs are valid bytes in a git blob but PostgreSQL rejects
+    them in ``text``. The shared planning seam must escape the byte before
+    hashing and embedding, and the safe piece must be what Phase B receives.
+    """
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    import httpx
+
+    import engine.ingest.normalizer as norm_mod
+    from engine.ingest.chunker import count_tokens
+    from engine.ingest.handlers.base import ConnectorContext
+    from engine.shared.embeddings import EmbeddedChunk, EmbedResult
+
+    class _StubConn:
+        async def fetch(self, *args, **kwargs):
+            return []
+
+    @asynccontextmanager
+    async def _fake_with_tenant(_customer_id):
+        yield _StubConn()
+
+    monkeypatch.setattr(norm_mod, "with_tenant", _fake_with_tenant)
+
+    embedded_contents: list[str] = []
+
+    class _CapturingEmbedder:
+        async def embed_documents(self, items):
+            embedded_contents.extend(item.content for item in items)
+            return EmbedResult(
+                embedded=[
+                    EmbeddedChunk(chunk_index=index, embedding=[0.1])
+                    for index in range(len(items))
+                ],
+                failed=[],
+            )
+
+    async def run():
+        async with httpx.AsyncClient() as http:
+            ctx = ConnectorContext(settings=get_settings(), http=http)
+            normalizer = norm_mod.Normalizer(ctx, embedder=_CapturingEmbedder())
+            return await normalizer._plan_chunks(
+                "c1",
+                _make_doc(),
+                pre_chunked=[
+                    ChunkPiece(
+                        chunk_index=0,
+                        content="return `${workspace}\x00${query}`;",
+                        token_count=1,
+                    )
+                ],
+            )
+
+    plan = asyncio.run(run())
+
+    assert embedded_contents == ["return `${workspace}\\0${query}`;"]
+    assert len(plan.added_pieces) == 1
+    safe_piece = plan.added_pieces[0][0]
+    assert "\x00" not in safe_piece.content
+    assert safe_piece.content == embedded_contents[0]
+    assert safe_piece.token_count == count_tokens(safe_piece.content)
+
+
 def test_pre_chunked_doc_with_body_raises_in_persist() -> None:
     """body + pre_chunked is ambiguous; the normalizer must reject it
     upfront instead of silently picking one path.
