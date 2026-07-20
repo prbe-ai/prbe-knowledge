@@ -6,6 +6,18 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- `POST /api/github/connect` (X-Internal-Knowledge-Key gated): seeds a GitHub
+  App installation (customer_source_mapping + `installation:<id>` token row,
+  validated by a dry-run mint) and enqueues its historical backfill, which the
+  deployed BackfillWorker drains. This is the invokable equivalent of the
+  `scripts.github_seed_token` + `scripts.backfill` runbook, so a downstream
+  consumer (research-os) can backfill a repo the moment a team claims the
+  installation instead of running the manual runbook. The seed logic is
+  extracted to `kb.github_seed.seed_github_installation`, shared by the
+  endpoint and the CLI.
+
 ### Fixed
 
 - Retrieval queries now return citable pre-fan-out evidence with low

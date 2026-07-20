@@ -44,6 +44,11 @@ from kb.code_graph.reindex import (
     ReindexResult,
     reindex_customer,
 )
+from kb.github_seed import (
+    CustomerNotFoundError,
+    GitHubMintNotConfigured,
+    seed_github_installation,
+)
 
 log = get_logger(__name__)
 
@@ -254,6 +259,82 @@ async def oauth_exchange(
         customer_id=body.customer_id,
         source=source,
         workspaces=workspaces,
+        backfill_queued=backfill_queued,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GitHub connect: seed an App installation + enqueue its historical backfill.
+#
+# GitHub is the one connector whose credential is an App installation, not an
+# OAuth code, so it can't ride /oauth/{source}/exchange. This endpoint is the
+# invokable equivalent: research-os calls it after a team claims an
+# installation, so the repo backfills immediately instead of via the manual
+# `scripts.github_seed_token` + `scripts.backfill` runbook. The deployed
+# BackfillWorker drains the enqueued row.
+# ---------------------------------------------------------------------------
+class GitHubConnectRequest(BaseModel):
+    customer_id: str
+    installation_id: str
+
+
+class GitHubConnectResponse(BaseModel):
+    customer_id: str
+    installation_id: str
+    backfill_queued: bool = False
+
+
+@router.post(
+    "/github/connect",
+    response_model=GitHubConnectResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def github_connect(body: GitHubConnectRequest) -> GitHubConnectResponse:
+    try:
+        await seed_github_installation(body.customer_id, body.installation_id)
+    except CustomerNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except GitHubMintNotConfigured as exc:
+        # 503, not 500: the request is well-formed; the deployment is missing
+        # its GitHub App mint credentials. Retriable once they're wired.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except PrbeError as exc:
+        # The dry-run token fetch failed -- the mint path is configured but
+        # broken (bad key, GitHub down). Upstream failure, not a client error.
+        log.error(
+            "github_connect.seed_failed",
+            customer=body.customer_id,
+            installation=body.installation_id,
+            error=str(exc),
+        )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # Seeding succeeded, so the connection is usable even if enqueue hiccups;
+    # don't fail the connect on a backfill-enqueue error (a later re-connect,
+    # or the reconciler, recovers it). Mirrors oauth_exchange.
+    backfill_queued = False
+    try:
+        await enqueue_backfill(
+            customer_id=body.customer_id, source=SourceSystem.GITHUB
+        )
+        backfill_queued = True
+    except Exception as exc:
+        log.warning(
+            "github_connect.backfill_enqueue_failed",
+            customer=body.customer_id,
+            installation=body.installation_id,
+            error=str(exc),
+        )
+
+    log.info(
+        "github_connect.ok",
+        customer=body.customer_id,
+        installation=body.installation_id,
+        backfill_queued=backfill_queued,
+    )
+    return GitHubConnectResponse(
+        customer_id=body.customer_id,
+        installation_id=body.installation_id,
         backfill_queued=backfill_queued,
     )
 

@@ -11,7 +11,7 @@ Usage:
         --customer prbe-internal \\
         --installation-id 87654321
 
-What it does:
+What it does (via `kb.github_seed.seed_github_installation`):
     1. Verifies the customer exists.
     2. Upserts a `customer_source_mapping` row so the mint path can resolve
        the installation_id from this customer when it mints a token.
@@ -24,6 +24,10 @@ What it does:
        `fetch_github_installation_token` (which selects the same hosted vs
        standalone branch the connectors use) to confirm the end-to-end mint
        path is live.
+
+The same core also backs `POST /api/github/connect` (kb.admin_routes), which
+the research-os connect flow calls so a claimed installation backfills
+immediately instead of via this manual runbook.
 """
 
 from __future__ import annotations
@@ -32,30 +36,16 @@ import argparse
 import asyncio
 import sys
 
-import httpx
-
-from engine.shared.backend_client import fetch_github_installation_token, github_mint_path
+from engine.shared.backend_client import github_mint_path
 from engine.shared.config import get_settings
-from engine.shared.constants import (
-    GITHUB_INSTALLATION_SCOPE_PREFIX,
-    IntegrationStatus,
-    SourceSystem,
+from engine.shared.constants import GITHUB_INSTALLATION_SCOPE_PREFIX
+from engine.shared.db import close_pool, init_pool
+from engine.shared.logging import configure_logging
+from kb.github_seed import (
+    CustomerNotFoundError,
+    GitHubMintNotConfigured,
+    seed_github_installation,
 )
-from engine.shared.customer_mapping import record_mapping
-from engine.shared.db import close_pool, init_pool, raw_conn
-from engine.shared.encryption import encrypt_token
-from engine.shared.logging import configure_logging, get_logger
-
-log = get_logger(__name__)
-
-
-async def _customer_exists(customer_id: str) -> bool:
-    async with raw_conn() as conn:
-        row = await conn.fetchrow(
-            "SELECT 1 FROM customers WHERE customer_id = $1",
-            customer_id,
-        )
-    return row is not None
 
 
 async def seed(customer_id: str, installation_id: str) -> None:
@@ -64,75 +54,22 @@ async def seed(customer_id: str, installation_id: str) -> None:
     await init_pool(settings)
 
     try:
-        if not await _customer_exists(customer_id):
+        try:
+            expires_at = await seed_github_installation(customer_id, installation_id)
+        except CustomerNotFoundError:
             sys.stderr.write(
                 f"error: customer {customer_id!r} not found — run "
                 "`scripts.bootstrap_customer --id <id> --display-name <name>` first\n"
             )
-            raise SystemExit(1)
-
-        path = github_mint_path(settings)
-        if path is None:
-            sys.stderr.write(
-                "error: no GitHub token mint path configured — set either\n"
-                "       BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY (hosted; prbe-backend mints)\n"
-                "       or GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY (standalone; local minting)\n"
-            )
-            raise SystemExit(1)
-
-        scope = f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}"
-        # access_token_encrypted is NOT NULL in the schema. The actual value
-        # is never read — `_resolve_installation_bearer` fetches through the
-        # configured mint path whenever scope starts with `installation:` — so
-        # we store an opaque encrypted placeholder that makes the intent
-        # obvious in a DB dump.
-        placeholder = encrypt_token("installation-minted-on-demand")
-
-        # Record the mapping + token row FIRST so the mint path can resolve
-        # customer -> installation when we dry-run-fetch the token below
-        # (hosted resolves via prbe-backend; standalone reads the
-        # integration_tokens.scope written here).
-        await record_mapping(
-            customer_id=customer_id,
-            source_system=SourceSystem.GITHUB,
-            external_id=installation_id,
-            external_name=None,
-            metadata={"installation_id": installation_id},
-        )
-
-        async with raw_conn() as conn:
-            await conn.execute(
-                """
-                INSERT INTO integration_tokens
-                    (customer_id, source_system, access_token_encrypted,
-                     refresh_token_encrypted, expires_at, scope, status)
-                VALUES ($1, 'github', $2, NULL, NULL, $3, $4)
-                ON CONFLICT (customer_id, source_system) WHERE device_id IS NULL DO UPDATE SET
-                    scope      = EXCLUDED.scope,
-                    status     = 'active',
-                    updated_at = NOW()
-                """,
-                customer_id,
-                placeholder,
-                scope,
-                IntegrationStatus.ACTIVE.value,
-            )
-
-        async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as http:
-            _token, expires_at = await fetch_github_installation_token(
-                http,
-                customer_id=customer_id,
-            )
-
-        log.info(
-            "github_seed_token.dry_run_ok",
-            customer=customer_id,
-            installation=installation_id,
-            expires_at=expires_at.isoformat(),
-        )
+            raise SystemExit(1) from None
+        except GitHubMintNotConfigured as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            raise SystemExit(1) from None
     finally:
         await close_pool()
 
+    scope = f"{GITHUB_INSTALLATION_SCOPE_PREFIX}{installation_id}"
+    path = github_mint_path(settings)
     print("=" * 72)
     print(f"GitHub installation seeded for customer {customer_id}")
     print(f"  installation_id: {installation_id}")
