@@ -20,6 +20,10 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- Claude Code session extraction now sends gateway-configured model aliases
+  over the proxy's OpenAI-compatible transport while preserving direct
+  Anthropic routing, preventing gateway URLs from becoming
+  `/v1/v1/messages` and leaving finalized sessions in the ingestion DLQ.
 - Retrieval queries now return citable pre-fan-out evidence with low
   confidence when the gateway exhausts its providers on a transient timeout,
   rate limit, or server error. Permanent provider failures and responses
