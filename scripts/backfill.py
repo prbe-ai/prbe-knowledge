@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-from datetime import UTC, datetime
 
 # Composition root: engine/ never imports kb/ itself, so operator entry
 # points must load the connector pack explicitly or the handler registry
@@ -107,11 +106,15 @@ async def backfill(customer_id: str, source_value: str) -> None:
             return
 
         async for event in events:
+            # Mirror kb/backfill_runner.py's envelope: connectors synthesize
+            # per-event headers (github's parse REQUIRES X-GitHub-Event) and
+            # a real received_at; dropping them DLQs every event at re-parse.
             envelope = {
-                "_headers": {},
+                "_headers": event.headers,
                 "payload": event.raw_payload,
-                "received_at": datetime.now(UTC).isoformat(),
+                "received_at": event.received_at.isoformat(),
                 "trace_id": f"backfill-{count}",
+                "_backfill": True,
             }
             key = f"raw/{source.value}/{customer_id}/backfill/{event.source_event_id}.json"
             await store.put(bucket, key, json.dumps(envelope).encode())
