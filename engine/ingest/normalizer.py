@@ -31,7 +31,13 @@ from typing import Any
 import asyncpg
 import orjson
 
-from engine.ingest.chunker import DEFAULT_CHUNK_OVERLAP, ChunkPiece, _enc, chunk_text
+from engine.ingest.chunker import (
+    DEFAULT_CHUNK_OVERLAP,
+    ChunkPiece,
+    _enc,
+    chunk_text,
+    count_tokens,
+)
 from engine.ingest.graph_writer import upsert_edges, upsert_nodes
 from engine.ingest.handlers.base import Connector, ConnectorContext
 from engine.ingest.handlers.registry import build_connector
@@ -549,6 +555,26 @@ class Normalizer:
         else:
             new_pieces = chunk_text(_stringify_body(doc))
             metadata_piece = _metadata_piece(doc)
+
+        # PostgreSQL text values cannot contain U+0000. Source code can:
+        # JavaScript/TypeScript template strings occasionally use a literal
+        # NUL as an internal delimiter, and code-graph preserves the source
+        # snippet verbatim. Normalize every connector's chunk content at this
+        # shared boundary so hashing, embedding, and persistence all see the
+        # same PostgreSQL-safe representation.
+        nul_piece_count = sum("\x00" in piece.content for piece in new_pieces)
+        if metadata_piece is not None and "\x00" in metadata_piece.content:
+            nul_piece_count += 1
+        if nul_piece_count:
+            log.warning(
+                "normalizer.chunk_nul_escaped",
+                customer=customer_id,
+                doc_id=doc.doc_id,
+                chunks=nul_piece_count,
+            )
+            new_pieces = [_postgres_safe_chunk_piece(piece) for piece in new_pieces]
+            if metadata_piece is not None:
+                metadata_piece = _postgres_safe_chunk_piece(metadata_piece)
 
         new_hashes: list[str] = [_chunk_hash(p.content) for p in new_pieces]
         new_by_hash: dict[str, ChunkPiece] = {
@@ -1409,6 +1435,24 @@ def _pg_vector(vec: list[float]) -> str:
 def _chunk_hash(content: str) -> str:
     """Stable content-hash used as the identity of a chunk within a doc."""
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _postgres_safe_chunk_piece(piece: ChunkPiece) -> ChunkPiece:
+    """Escape literal NULs before a chunk reaches PostgreSQL.
+
+    PostgreSQL rejects U+0000 in ``text`` values. A visible ``\\0`` escape
+    preserves the delimiter's position for search/debugging without merging
+    the surrounding tokens. Recomputing the token count keeps the ChunkPiece
+    contract accurate after the one-character-to-two-character rewrite.
+    """
+    if "\x00" not in piece.content:
+        return piece
+    content = piece.content.replace("\x00", "\\0")
+    return ChunkPiece(
+        chunk_index=piece.chunk_index,
+        content=content,
+        token_count=count_tokens(content),
+    )
 
 
 # METADATA_CHUNK_INDEX moved to shared.models so cross-module callers
