@@ -40,6 +40,7 @@ import uuid
 import asyncpg
 
 from engine.ingest.auto_merge import AutoMergeAnalyzer
+from engine.ingest.graph_writer import drain_pending_edges, reap_expired_pending_edges
 from engine.ingest.normalizer import _pg_vector
 from engine.shared.db import raw_conn, with_tenant
 from engine.shared.embeddings import get_embedder_v2
@@ -152,6 +153,7 @@ class PostWriteWorker:
         try:
             async with with_tenant(customer_id) as conn:
                 await self._ensure_embedding(conn, node_id)
+                await self._drain_pending_edges(conn, customer_id, node_id)
                 result = await self._analyzer.analyze(conn, customer_id, node_id)
 
             counter(
@@ -180,6 +182,36 @@ class PostWriteWorker:
                 error=str(exc),
             )
             await self._record_failure(customer_id, node_id, attempts, repr(exc))
+
+    async def _drain_pending_edges(
+        self, conn: asyncpg.Connection, customer_id: str, node_id: int
+    ) -> None:
+        """Materialise edges that were parked waiting on this node.
+
+        A node has just been written; any pending_edges row keyed on this
+        node's (label, canonical_id) can now resolve. Best-effort: a drain
+        failure must not fail the node's post-write processing, since the
+        reaper and the next touch of this node both retry.
+        """
+        row = await conn.fetchrow(
+            "SELECT label, canonical_id FROM graph_nodes WHERE node_id = $1",
+            node_id,
+        )
+        if row is None:
+            return
+        try:
+            await drain_pending_edges(
+                conn, customer_id, row["label"], row["canonical_id"]
+            )
+            # Opportunistic TTL sweep for this tenant -- no separate cron.
+            await reap_expired_pending_edges(conn, customer_id)
+        except Exception as exc:
+            log.warning(
+                "post_write_worker.drain_pending_edges_failed",
+                customer=customer_id,
+                node_id=node_id,
+                error=str(exc),
+            )
 
     async def _ensure_embedding(
         self, conn: asyncpg.Connection, node_id: int

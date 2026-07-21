@@ -1438,6 +1438,45 @@ CREATE INDEX idx_node_post_write_queue_pending
     WHERE locked_until IS NULL;
 
 -- ---------------------------------------------------------------------------
+-- pending_edges: deferred-edge queue (migration 0095).
+--
+-- upsert_edges resolves endpoints only against the node set in the same batch.
+-- An edge whose endpoint is not yet ingested (a run before its experiment; the
+-- research-os outbox delivers out of order) would otherwise be silently
+-- dropped. Instead it parks here keyed by the MISSING endpoint's
+-- (label, canonical_id); the post-write worker drains matching rows when that
+-- node lands, and a TTL reaper sweeps rows whose counterpart never arrives.
+-- Queue depth is the completeness signal the silent drop never gave.
+-- ---------------------------------------------------------------------------
+CREATE TABLE pending_edges (
+    id                   BIGSERIAL PRIMARY KEY,
+    customer_id          TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    missing_label        TEXT NOT NULL,
+    missing_canonical_id TEXT NOT NULL,
+    edge_type            TEXT NOT NULL,
+    from_label           TEXT NOT NULL,
+    from_canonical_id    TEXT NOT NULL,
+    to_label             TEXT NOT NULL,
+    to_canonical_id      TEXT NOT NULL,
+    source_system        TEXT NOT NULL,
+    properties           JSONB NOT NULL DEFAULT '{}'::JSONB,
+    valid_from           TIMESTAMPTZ NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    locked_until         TIMESTAMPTZ NULL
+);
+CREATE INDEX idx_pending_edges_missing
+    ON pending_edges (customer_id, missing_label, missing_canonical_id)
+    WHERE locked_until IS NULL;
+CREATE INDEX idx_pending_edges_created
+    ON pending_edges (created_at)
+    WHERE locked_until IS NULL;
+ALTER TABLE pending_edges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE pending_edges FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON pending_edges
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
 -- entity_merge_suggestions: medium/low-confidence verdicts from
 -- AutoMergeAnalyzer surfaced in the dashboard /graph cluster admin UI
 -- (migration 0082). High-confidence verdicts go straight to the
