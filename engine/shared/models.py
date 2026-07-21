@@ -374,15 +374,16 @@ class QueryRequest(BaseModel):
     discovery: bool = Field(
         default=False,
         description=(
-            "When true, weight graph-retriever hits by their surprise score "
-            "in fusion's RRF math (multiplier capped at 2.0). Surfaces "
-            "cross-source / cross-community / inferred-edge neighbors that "
-            "default focus mode buries beneath dominant vector/BM25 hits. "
-            "Use for conceptual queries ('how should we approach X', "
-            "'anything else I should know about Y') where the agent wants "
-            "less-obvious connections. Skip for direct lookups (PR#, ticket, "
-            "error message) where the canonical answer is wanted. "
-            "When false (default), graph hits contribute flat 1/(k+rank) RRF."
+            "When true, widen the graph channel's retrieval budget so more of "
+            "its surprise-ranked tail reaches the gatherer. graph_search "
+            "orders hits by a per-edge surprise score that rewards "
+            "cross-source and cross-community edges and demotes hub-to-hub "
+            "ones, so a wider budget admits less-obvious connections while "
+            "low-surprise edges stay at the back. Vector and BM25 budgets are "
+            "unchanged. Use for conceptual queries ('how should we approach "
+            "X', 'anything else I should know about Y'); skip for direct "
+            "lookups (PR#, ticket, error message) where the canonical answer "
+            "is wanted."
         ),
     )
 
@@ -970,6 +971,44 @@ def make_person(
         label=NodeLabel.PERSON,
         canonical_id=canonical_id,
         properties=properties or {},
+    )
+
+
+def make_named_entity(
+    label: NodeLabel,
+    canonical_id: str,
+    name: str,
+    properties: dict[str, Any] | None = None,
+) -> "GraphNodeSpec":
+    """Build an entity node that MUST be resolvable by name.
+
+    ``name`` is required and non-empty, and that is the whole point of this
+    factory. Grounding resolves a query token to a node by fuzzy-matching
+    ``coalesce(properties->>'name', canonical_id)``; when canonical_ids are
+    opaque (a UUID, say) a node that ships without a name silently degrades
+    to fuzzy-matching against that UUID, which no human query will ever hit.
+    The node exists, ingest reports success, and the entity is simply
+    unfindable. Raising here makes that state unrepresentable rather than
+    merely discouraged.
+
+    Use for domain entities whose identity is a name — the label-per-entity
+    kind, not the Document/CodeSymbol families that carry a ``kind``
+    discriminator (use make_document / make_code_symbol for those).
+
+    Raises:
+        ValueError: if ``name`` is empty or whitespace-only.
+    """
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError(
+            f"make_named_entity requires a non-empty name "
+            f"(label={label.value}, canonical_id={canonical_id!r}); "
+            "a nameless entity node cannot be resolved by grounding"
+        )
+    return GraphNodeSpec(
+        label=label,
+        canonical_id=canonical_id,
+        properties={**(properties or {}), "name": cleaned},
     )
 
 

@@ -12,9 +12,11 @@ dashboard consumers — no breaking changes downstream.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
+
+from engine.shared.constants import ROUTER_ENTITY_TO_LABEL
 
 # Subset of channels we surface in matched_via. Mirrors the tool-name set
 # the agent uses, plus the two derived-from-walker labels.
@@ -207,6 +209,7 @@ EntityType = Literal[
     "service",
     "ticket",
     "pr",
+    "issue",
     "feature",
     "decision",
     "error_group",
@@ -215,6 +218,28 @@ EntityType = Literal[
     "session",
     "commit_sha",
 ]
+
+# This Literal must stay a static annotation: it is serialised via
+# model_json_schema() into the extractor's constrained-decoding response_format
+# (engine/retrieval/agent/extractor.py), so it cannot be generated at runtime.
+# It is therefore ASSERTED against the registry instead.
+#
+# The invariant is containment, not equality. The registry is deliberately
+# wider: code-symbol types (function / class / method / module / symbol) are
+# addressable in graph_nodes but are produced by tree-sitter at ingest, not
+# emitted by this extractor. What must never happen is the reverse -- a value
+# the LLM can emit that nothing can address, which is exactly how `commit_sha`
+# ended up being silently discarded by the `if label and cid` guard in
+# tools.py for every query that produced one.
+_REGISTRY_ENTITY_TYPES = frozenset(ROUTER_ENTITY_TO_LABEL)
+_LITERAL_ENTITY_TYPES = frozenset(get_args(EntityType))
+_UNADDRESSABLE = _LITERAL_ENTITY_TYPES - _REGISTRY_ENTITY_TYPES
+if _UNADDRESSABLE:
+    raise RuntimeError(
+        "EntityType Literal contains values with no ENTITY_TYPE_REGISTRY entry "
+        f"in engine/shared/constants.py: {sorted(_UNADDRESSABLE)}. "
+        "The extractor would emit these and the graph channel would drop them."
+    )
 
 
 class ExtractedEntity(BaseModel):

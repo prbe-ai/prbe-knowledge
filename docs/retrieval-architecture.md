@@ -13,7 +13,7 @@ A query is answered in five stages:
 2. **Extract** the entities and intent (one LLM call).
 3. **Fan out** across complementary retrievers in parallel (vector + keyword +
    graph), each scoped to the tenant.
-4. **Fuse** the candidate lists into one ranking (Reciprocal Rank Fusion).
+4. **Fuse** the candidate lists into one pre-fan-out ranking (RRF + per-source weighting).
 5. Optionally let a small **agent** widen/deepen the gather, then **synthesize**
    a cited answer.
 
@@ -48,7 +48,7 @@ flowchart TB
         IE["inferred edges<br/>doc–doc walk"]:::ret
     end
 
-    F["4 · RRF fusion + recency decay + dedup"]:::svc
+    F["4 · RRF + source weight + recency decay"]:::svc
     AG["5a · Agentic gatherer (optional)<br/>search · subgraph · fetch_doc"]:::llm
     SY["5b · Synthesis (/query only)<br/>cited answer"]:::llm
     OUT["ranked results / answer + citations"]:::svc
@@ -93,7 +93,7 @@ on error the pipeline falls back to grounding-only retrieval.
 
 One `search` call fans out across complementary retrievers **in parallel**, each
 running inside the tenant's RLS scope. They return a common hit shape
-(`chunk_id`, `doc_id`, score, timestamps) so fusion can compare them.
+(`chunk_id`, `doc_id`, score, timestamps) so the pre-fan-out ranking can compare them.
 
 | Retriever | Queries | What it's good at |
 |---|---|---|
@@ -112,31 +112,45 @@ filters, and the `recency` vs `relevance` sort.
 > reliably combine two single-column edge indexes with a bitmap-OR, so
 > `from_node = X OR to_node = X` is split into two indexed scans and unioned.
 
-## Stage 4 — Fusion
+## Stage 4 — Pre-fan-out fusion
 
-Candidate lists are merged with **Reciprocal Rank Fusion**
-([`fusion.py`](../services/retrieval/fusion.py)):
+The agentic cutover removed the standalone fusion stage: there is no separate
+`fuse()` step between the retrievers and the answer. What survives is the
+**pre-fan-out ranking** the harness builds before entering the gatherer loop,
+in [`agent/loop.py`](../engine/retrieval/agent/loop.py) (`_fuse_prefanout_docs`).
+
+Every `(sub_query, channel)` ranked list is reciprocal-rank-fused into one
+doc-deduped ranking:
 
 ```
-score(chunk) = Σ_retrievers  1 / (RRF_K + rank_in_retriever)
+score(doc) = Σ_lists  1 / (RRF_K + rank_in_list)
 ```
 
 RRF is rank-based, so retrievers with incompatible score scales (cosine distance
-vs `ts_rank_cd` vs graph surprise) combine without normalization. On top of the
-base score:
+vs `ts_rank_cd` vs graph surprise) combine without normalization. A doc that
+surfaces high across several sub-queries or channels outranks one that appears
+once, deep in a single list.
 
-- **Doc-grouped scoring** — content chunks compete for the global top-k; extra
-  matching chunks in the same doc add a breadth bonus, so a doc that matches in
-  several places outranks a one-line fluke.
-- **Recency decay** — an exponential half-life applied per source at the doc
-  level (a fresh doc can still be demoted by a low source multiplier).
-- **Dedup** — near-identical chunks (cosine > the dedup threshold) collapse to
-  the higher-ranked one ([`dedup.py`](../services/retrieval/dedup.py)).
+The fused score is then scaled per doc by `_source_weight`:
 
-All of the knobs — `RRF_K`, the breadth alpha, dedup threshold, per-source
-half-lives and score multipliers, per-retriever top-k — live in one place,
-[`shared/constants.py`](../shared/constants.py). That's the file to read (and
-tune) if you want to change ranking behavior.
+- **Per-source multiplier** — values below 1.0 demote a source at equal
+  relevance (agent transcripts sit at 0.5, code-graph chunks at 0.3), so
+  high-volume machine output does not bury authored artifacts.
+- **Recency decay** — exponential, with a per-source half-life (7d for agent
+  transcripts, 30d for code-graph, 120d baseline).
+
+Multiplier applies **before** decay, deliberately: otherwise a brand-new
+transcript sits at age 0, decays by nothing, and escapes its demotion entirely.
+Both values come from the source registry
+([`shared/source_registry.py`](../engine/shared/source_registry.py)), which each
+connector populates by declaring `score_multiplier` / `half_life_days`.
+
+`discovery` does not amplify scores here. It widens the graph channel's
+retrieval budget upstream (Stage 3), so more of that channel's surprise-ranked
+tail reaches the gatherer; vector and BM25 budgets are untouched.
+
+The remaining knobs — `RRF_K`, per-retriever top-k, the discovery budget — live
+in [`shared/constants.py`](../engine/shared/constants.py).
 
 ## Stage 5 — Agentic gather + synthesis
 
@@ -208,7 +222,7 @@ source fetch — see the [README MCP section](../README.md#mcp-server).
 |---|---|
 | Change ranking / weighting | [`shared/constants.py`](../shared/constants.py) (`RRF_K`, half-lives, source multipliers, top-k) |
 | Add or swap a retriever | [`services/retrieval/retrievers/`](../services/retrieval/retrievers/) + register it in [`pipeline.py`](../services/retrieval/pipeline.py) |
-| Change how fusion combines signals | [`fusion.py`](../services/retrieval/fusion.py) |
+| Change how signals are combined | `_fuse_prefanout_docs` / `_source_weight` in [`agent/loop.py`](../engine/retrieval/agent/loop.py) |
 | Change the embedding model/dims | embedding config in `shared/constants.py` (must match the `chunks.embedding_v2` column dimension) |
 | Change the gatherer's tools or budget | [`agent/tools.py`](../services/retrieval/agent/tools.py), [`agent/loop.py`](../services/retrieval/agent/loop.py) |
 | Change the answer format / citations | [`synthesis.py`](../services/retrieval/synthesis.py) |

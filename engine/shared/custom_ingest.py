@@ -10,6 +10,8 @@ from typing import Any
 import orjson
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from engine.shared.constants import EdgeType, NodeLabel
+
 # Colon allowed (after the first char) so consumers can namespace dynamic
 # source keys, e.g. research-os pushes workspace files under
 # `workspace:<uuid>`. The key is treated as opaque everywhere it flows
@@ -30,6 +32,96 @@ class CustomIngestAuthor(BaseModel):
     id: str | None = Field(default=None, min_length=1, max_length=256)
     name: str | None = Field(default=None, min_length=1, max_length=256)
     email: str | None = Field(default=None, min_length=1, max_length=320)
+
+
+class CustomIngestNode(BaseModel):
+    """An entity node a client asserts alongside a document.
+
+    Lets a client project its own domain graph (experiment -> run ->
+    artifact, say) instead of the flat Document + Person + AUTHORED shape
+    custom-ingest emitted before. The node is an ANCHOR: the graph
+    retriever's neighbour join is `AND n.label = 'Document'`, so an entity
+    node is traversed FROM, never returned as a hit. Reaching a document
+    means asserting an edge to it.
+
+    `name` is required. Grounding resolves query tokens by fuzzy-matching
+    `coalesce(properties->>'name', canonical_id)`, so a nameless node with an
+    opaque canonical_id (a UUID) is silently unfindable -- it exists, ingest
+    succeeds, and no query ever reaches it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=64)
+    canonical_id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=512)
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("label")
+    @classmethod
+    def _validate_label(cls, value: str) -> str:
+        label = value.strip()
+        try:
+            NodeLabel(label)
+        except ValueError:
+            allowed = ", ".join(sorted(nl.value for nl in NodeLabel))
+            raise ValueError(
+                f"unknown node label {label!r}; expected one of: {allowed}"
+            ) from None
+        return label
+
+    @field_validator("name")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("node name is required and cannot be blank")
+        return name
+
+
+class CustomIngestEdge(BaseModel):
+    """An edge a client asserts between two nodes in the same document push.
+
+    Edges are BIDIRECTIONAL in retrieval -- the graph walk matches on
+    `(from_node_id = anchor OR to_node_id = anchor)` and takes whichever end
+    is opposite -- so assert each relationship ONCE. Emitting both directions
+    just doubles the write cost and the degree of both endpoints.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    edge_type: str = Field(min_length=1, max_length=64)
+    from_label: str = Field(min_length=1, max_length=64)
+    from_canonical_id: str = Field(min_length=1, max_length=256)
+    to_label: str = Field(min_length=1, max_length=64)
+    to_canonical_id: str = Field(min_length=1, max_length=256)
+    properties: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("edge_type")
+    @classmethod
+    def _validate_edge_type(cls, value: str) -> str:
+        edge_type = value.strip()
+        try:
+            EdgeType(edge_type)
+        except ValueError:
+            allowed = ", ".join(sorted(et.value for et in EdgeType))
+            raise ValueError(
+                f"unknown edge type {edge_type!r}; expected one of: {allowed}"
+            ) from None
+        return edge_type
+
+    @field_validator("from_label", "to_label")
+    @classmethod
+    def _validate_endpoint_label(cls, value: str) -> str:
+        label = value.strip()
+        try:
+            NodeLabel(label)
+        except ValueError:
+            allowed = ", ".join(sorted(nl.value for nl in NodeLabel))
+            raise ValueError(
+                f"unknown node label {label!r}; expected one of: {allowed}"
+            ) from None
+        return label
 
 
 class CustomIngestDocument(BaseModel):
@@ -53,6 +145,13 @@ class CustomIngestDocument(BaseModel):
     # Accepted for backward compatibility with the original v1 payload shape,
     # but intentionally ignored until document-level permissions are built.
     acl: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+
+    # Client-asserted graph payload. Optional and empty by default, so every
+    # existing caller is byte-identical. Caps bound a single document's write
+    # amplification -- each node is an upsert and each edge a row, all landing
+    # on shared hot rows (a project node is touched by every run beneath it).
+    nodes: list[CustomIngestNode] = Field(default_factory=list, max_length=64)
+    edges: list[CustomIngestEdge] = Field(default_factory=list, max_length=128)
 
     @field_validator("id", "type", "title", "url", mode="before")
     @classmethod

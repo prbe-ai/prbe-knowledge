@@ -10,7 +10,11 @@ from datetime import datetime
 import asyncpg
 import orjson
 
+from engine.shared.constants import EdgeType, NodeLabel
+from engine.shared.logging import get_logger
 from engine.shared.models import GraphEdgeSpec, GraphNodeSpec
+
+log = get_logger(__name__)
 
 
 async def _fetch_aliases(
@@ -372,6 +376,94 @@ async def upsert_edges(
         )
 
     return len(deduped)
+
+
+async def delete_edges_from_node(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    *,
+    from_label: NodeLabel,
+    from_canonical_id: str,
+    edge_type: EdgeType,
+    keep_to_node_ids: list[int] | None = None,
+) -> int:
+    """Delete edges of one type leaving one node, decrementing degree.
+
+    The graph is otherwise append-only: nothing in the ingest path has ever
+    removed an edge, and `GraphEdgeSpec.valid_to` is inert end-to-end (written
+    by upsert_edges, set by no connector, and read by NO retriever -- so
+    closing an edge would not hide it). Without a delete path, a relationship
+    that MOVES leaves the old edge live forever: reparent a run to a different
+    experiment and it surfaces under both, permanently, with nothing marking
+    which is current.
+
+    `keep_to_node_ids` spares endpoints that are still current, so a caller
+    can re-assert its full edge set and have only the departed ones removed
+    in a single statement -- no delete-then-reinsert window.
+
+    Degree is decremented in the SAME statement via a data-modifying CTE.
+    Doing it in two statements is what silently drained degree in
+    kb/code_graph/cross_repo_deps.py: its DELETE decremented, its re-INSERT
+    never incremented, so repo-node degree ratcheted toward the
+    GREATEST(..., 0) floor on every refresh.
+
+    Returns the number of edges deleted.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT node_id FROM graph_nodes
+        WHERE customer_id = $1 AND label = $2 AND canonical_id = $3
+        """,
+        customer_id,
+        from_label.value,
+        from_canonical_id,
+    )
+    if row is None:
+        return 0
+    from_node_id = int(row["node_id"])
+
+    deleted = await conn.fetch(
+        """
+        WITH deleted AS (
+            DELETE FROM graph_edges
+            WHERE customer_id = $1
+              AND edge_type = $2
+              AND from_node_id = $3
+              AND NOT (to_node_id = ANY($4::bigint[]))
+            RETURNING from_node_id, to_node_id
+        ),
+        endpoint_decs AS (
+            SELECT node_id, COUNT(*) AS dec FROM (
+                SELECT from_node_id AS node_id FROM deleted
+                UNION ALL
+                SELECT to_node_id FROM deleted
+            ) e
+            GROUP BY node_id
+        ),
+        bumped AS (
+            UPDATE graph_nodes gn
+            SET degree = GREATEST(gn.degree - ed.dec, 0)
+            FROM endpoint_decs ed
+            WHERE gn.customer_id = $1 AND gn.node_id = ed.node_id
+            RETURNING 1
+        )
+        SELECT count(*) AS n FROM deleted
+        """,
+        customer_id,
+        edge_type.value,
+        from_node_id,
+        keep_to_node_ids or [],
+    )
+    removed = int(deleted[0]["n"]) if deleted else 0
+    if removed:
+        log.info(
+            "graph_writer.edges_deleted",
+            customer=customer_id,
+            edge_type=edge_type.value,
+            from_canonical_id=from_canonical_id,
+            removed=removed,
+        )
+    return removed
 
 
 _CONFIDENCE_RANK: dict[str, int] = {"AMBIGUOUS": 0, "INFERRED": 1, "EXTRACTED": 2}

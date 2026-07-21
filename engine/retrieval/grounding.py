@@ -7,10 +7,14 @@ candidate list flows in the user message.
 
 The four channels:
   1. _fuzzy_match_entities       -- pg_trgm + FTS on graph_nodes.properties->>'name'
-                                    for labels in _LABEL_TO_ENTITY_TYPE (Person, PR,
-                                    Ticket, Feature, etc.). EXCLUDES Document nodes.
+                                    for GROUNDING_ENTITY_LABELS (Person, Service,
+                                    Feature, Decision, ErrorGroup). EXCLUDES Document
+                                    (matched by channel 4 instead) and CodeSymbol
+                                    (see the cost note in shared/constants.py).
   2. _lookup_bare_id_matches     -- regex-extracted exact IDs ("PR #340", "PRB-18",
-                                    7-char commit shas) looked up in graph_nodes.
+                                    7-char commit shas) looked up in graph_nodes by
+                                    (label, properties['kind']) -- NOT by a bare
+                                    label, which has matched nothing since 0091.
   3. _connected_sources          -- lists which sources this customer has wired up.
                                     Metadata only — informs fanout scoping.
   4. _fuzzy_match_document_titles -- pg_trgm + FTS on documents.title (NEW). Concept
@@ -37,6 +41,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Final
 
+from engine.shared.constants import (
+    GROUNDING_ENTITY_LABELS,
+    entity_type_for_node,
+    node_addressing_for_entity_type,
+)
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
 
@@ -138,20 +147,14 @@ def _detect_bare_ids(query: str) -> list[tuple[str, str]]:
 
 # ---- Label mapping ------------------------------------------------------
 
-_LABEL_TO_ENTITY_TYPE: dict[str, str] = {
-    "Person": "person",
-    "Repo": "repo",
-    "Service": "service",
-    "Ticket": "ticket",
-    "PR": "pr",
-    "Feature": "feature",
-    "Decision": "decision",
-    "ErrorGroup": "error_group",
-    "File": "file_path",
-    "Channel": "channel",
-    "Session": "session",
-    "Commit": "commit_sha",
-}
+# NOTE: the former private `_LABEL_TO_ENTITY_TYPE` map lived here. It keyed on
+# the PRE-migration-0091 labels (Repo / Ticket / PR / File / Channel / Session /
+# Commit), 7 of which stopped existing when 0091 collapsed them into Document
+# and 0052 folded File in -- so they matched zero rows and this channel had
+# silently shrunk to Person / Service / Feature / Decision / ErrorGroup.
+# The vocabulary now derives from ENTITY_TYPE_REGISTRY in engine/shared/
+# constants.py, which discriminates on (label, properties['kind']) and is the
+# single source shared with ROUTER_ENTITY_TO_LABEL and the EntityType Literal.
 
 
 # ---- SQL helpers --------------------------------------------------------
@@ -171,12 +174,13 @@ async def _fuzzy_match_entities(
         return []
 
     trgm_probe = " ".join(tokens)
-    labels = list(_LABEL_TO_ENTITY_TYPE.keys())
+    labels = list(GROUNDING_ENTITY_LABELS)
 
     sql = """
     WITH ranked AS (
         SELECT
             label, canonical_id,
+            properties->>'kind' AS kind,
             coalesce(properties->>'name', canonical_id) AS display_name,
             properties->>'last_seen_at' AS last_seen_at_raw,
             GREATEST(
@@ -208,7 +212,7 @@ async def _fuzzy_match_entities(
                  @@ plainto_tsquery('english', $3)
           )
     )
-    SELECT label, canonical_id, display_name, last_seen_at_raw, rel
+    SELECT label, canonical_id, kind, display_name, last_seen_at_raw, rel
     FROM ranked
     WHERE rn <= $5
     ORDER BY rel DESC, last_seen_at_raw DESC NULLS LAST
@@ -222,7 +226,7 @@ async def _fuzzy_match_entities(
 
     out: list[GroundingCandidate] = []
     for r in rows:
-        entity_type = _LABEL_TO_ENTITY_TYPE.get(r["label"])
+        entity_type = entity_type_for_node(r["label"], r["kind"])
         if not entity_type:
             continue
         last_seen = None
@@ -248,30 +252,41 @@ async def _lookup_bare_id_matches(
     if not bare_ids:
         return []
 
-    kind_to_label = {"ticket": "Ticket", "pr": "PR", "commit_sha": "Commit"}
-    by_label: dict[str, list[str]] = {}
-    for kind, val in bare_ids:
-        label = kind_to_label.get(kind)
-        if label:
-            by_label.setdefault(label, []).append(val)
+    # Address (label, properties['kind']), NOT a bare label. Migration 0091
+    # collapsed PR / Issue / Ticket / Channel / Repo into label='Document' and
+    # moved the distinction into properties['kind']; the previous
+    # {"ticket": "Ticket", "pr": "PR", "commit_sha": "Commit"} map therefore
+    # matched ZERO rows, silently breaking every bare-id lookup ("PR #340",
+    # "PRB-18", commit shas) since that migration landed.
+    by_addressing: dict[tuple[str, str | None, str], list[str]] = {}
+    for entity_type, val in bare_ids:
+        addressing = node_addressing_for_entity_type(entity_type)
+        if addressing is None:
+            continue
+        node_label, node_kind = addressing
+        by_addressing.setdefault(
+            (node_label.value, node_kind, entity_type), []
+        ).append(val)
 
-    if not by_label:
+    if not by_addressing:
         return []
 
     out: list[GroundingCandidate] = []
     async with with_tenant(customer_id) as conn:
-        for label, ids in by_label.items():
+        for (label_value, node_kind, entity_type), ids in by_addressing.items():
             rows = await conn.fetch(
                 """
                 SELECT canonical_id,
                        coalesce(properties->>'name', canonical_id) AS display_name,
                        properties->>'last_seen_at' AS last_seen_at_raw
                 FROM graph_nodes
-                WHERE customer_id = $1 AND label = $2 AND canonical_id = ANY($3::text[])
+                WHERE customer_id = $1
+                  AND label = $2
+                  AND canonical_id = ANY($3::text[])
+                  AND ($4::text IS NULL OR properties->>'kind' = $4)
                 """,
-                customer_id, label, ids,
+                customer_id, label_value, ids, node_kind,
             )
-            entity_type = _LABEL_TO_ENTITY_TYPE.get(label, "")
             for r in rows:
                 last_seen = None
                 if r["last_seen_at_raw"]:
@@ -291,7 +306,7 @@ async def _lookup_bare_id_matches(
 
 # source_system → grounding entity_type for doc-title matches. The downstream
 # extractor / fanout already understands ticket / pr / channel / commit_sha
-# from the existing _LABEL_TO_ENTITY_TYPE surface; notion/wiki/other get a
+# from the ENTITY_TYPE_REGISTRY surface; notion/wiki/other get a
 # generic `page` / `document` so the field carries provenance without
 # requiring downstream code changes. `entity_type` is informational on
 # GroundingCandidate (the strong signal is canonical_id) — this map only

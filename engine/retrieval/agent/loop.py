@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import random
 import time
 from dataclasses import dataclass, field
@@ -67,6 +68,7 @@ from engine.retrieval.router import (
     _reconcile_entities_with_bundle,
 )
 from engine.shared.constants import (
+    DEFAULT_RECENCY_HALF_LIFE_DAYS,
     SEARCH_AGENT_EXTENSION_GRANT,
     SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
     SEARCH_AGENT_HARD_CAP,
@@ -85,6 +87,7 @@ from engine.shared.llm import LLMError, acompletion, gateway_url
 from engine.shared.llm_tools import is_context_overflow, is_transient_provider_error
 from engine.shared.logging import get_logger
 from engine.shared.models import QueryRequest, RetrieveResponse
+from engine.shared.source_registry import half_life_days_for, score_multiplier_for
 
 log = get_logger(__name__)
 
@@ -176,6 +179,11 @@ class LoopState:
     # keeps the dispatch arguments byte-identical to pre-filter behavior.
     request_source_keys: list[str] | None = None
     request_doc_types: list[str] | None = None
+
+    # QueryRequest.discovery. Widens the graph channel's budget on every
+    # in-loop `search` dispatch (not exposed on the tool schema — the agent
+    # reformulates queries, it does not choose the retrieval posture).
+    request_discovery: bool = False
 
 
 # ============================================================
@@ -991,6 +999,8 @@ async def _execute_tool_call(
             arguments["source_keys"] = state.request_source_keys
         if state.request_doc_types:
             arguments["doc_types"] = state.request_doc_types
+    if name == "search" and state.request_discovery:
+        arguments["discovery"] = True
 
     t_tool = time.perf_counter()
     result = await dispatch_tool_call(
@@ -1103,6 +1113,53 @@ _RECALL_FLOOR_DOCS = 10
 # top hit of any list contributes 1/(_RRF_K + 1).
 _RRF_K = 60
 
+# ln(2), for the exponential recency half-life below.
+_LN2 = math.log(2)
+
+
+def _source_weight(hit: dict[str, Any], ref_now: datetime) -> float:
+    """Per-source score multiplier + recency decay for one hit.
+
+    Ported from the deleted fusion._apply_source_decay. These two signals
+    were the ONLY consumers of source_registry's `score_multiplier` and
+    `half_life_days`, so when the agentic cutover removed fusion.py from the
+    pipeline they stopped being applied at all -- silently. That regression
+    is why high-volume agent transcripts (claude_code / codex, both weighted
+    0.5) stopped being demoted below authored artifacts like PR descriptions
+    and Linear tickets.
+
+    Multiplier BEFORE decay, deliberately: otherwise a brand-new transcript
+    sits at age 0, contributes no decay, and bypasses its demotion entirely.
+
+    A hit missing source_system or updated_at contributes weight 1.0 rather
+    than being dropped -- an unattributed hit should rank neutrally, not
+    vanish.
+    """
+    source_system = hit.get("source_system")
+    if not isinstance(source_system, str) or not source_system:
+        return 1.0
+
+    weight = score_multiplier_for(source_system)
+
+    updated_at = hit.get("updated_at")
+    if isinstance(updated_at, str) and updated_at:
+        try:
+            parsed = datetime.fromisoformat(updated_at)
+        except ValueError:
+            return weight
+    elif isinstance(updated_at, datetime):
+        parsed = updated_at
+    else:
+        return weight
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    half_life = half_life_days_for(source_system, DEFAULT_RECENCY_HALF_LIFE_DAYS)
+    age_days = (ref_now - parsed).total_seconds() / 86400.0
+    if age_days >= 0 and half_life > 0:
+        weight *= math.exp(-_LN2 * age_days / half_life)
+    return weight
+
 
 def _fuse_prefanout_docs(prefanout: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Reciprocal-rank-fuse every (sub_query, channel) ranked list in the
@@ -1115,10 +1172,15 @@ def _fuse_prefanout_docs(prefanout: dict[str, Any] | None) -> list[dict[str, Any
     first (highest-ranked) channel hit seen for that doc, carrying the
     content + doc-level meta the backfill synthesizes a chunk from. Docs
     with no usable content are skipped (e.g. inferred-edge-only hits).
+
+    Each doc's fused score is scaled by `_source_weight` (per-source
+    multiplier + recency decay), restoring the two ranking signals that the
+    agentic cutover dropped along with fusion.py.
     """
     scores: dict[str, float] = {}
     best_hit: dict[str, dict[str, Any]] = {}
     best_channel: dict[str, str] = {}
+    ref_now = datetime.now(UTC)
     for sq in (prefanout or {}).get("sub_queries") or []:
         if not isinstance(sq, dict):
             continue
@@ -1134,6 +1196,8 @@ def _fuse_prefanout_docs(prefanout: dict[str, Any] | None) -> list[dict[str, Any
                 if doc_id not in best_hit:
                     best_hit[doc_id] = hit
                     best_channel[doc_id] = channel
+    for doc_id in scores:
+        scores[doc_id] *= _source_weight(best_hit[doc_id], ref_now)
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [
         {"doc_id": d, "hit": best_hit[d], "channel": best_channel[d]}
@@ -1641,6 +1705,7 @@ async def run_gatherer(
     # unfiltered requests byte-identical to pre-scope behavior.
     request_source_keys = req.source_keys or None
     request_doc_types = req.doc_types or None
+    request_discovery = bool(req.discovery)
     effective_doc_types = request_doc_types or search_options.doc_types or None
 
     log.info(
@@ -1687,6 +1752,7 @@ async def run_gatherer(
         sort_by=search_options.sort,
         doc_types=effective_doc_types,
         source_keys=request_source_keys,
+        discovery=request_discovery,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
@@ -1729,6 +1795,7 @@ async def run_gatherer(
         pre_fanout_author_ids=list(author_ids),
         request_source_keys=request_source_keys,
         request_doc_types=request_doc_types,
+        request_discovery=request_discovery,
         messages=[
             {
                 "role": "system",
