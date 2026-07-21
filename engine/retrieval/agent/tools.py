@@ -65,6 +65,7 @@ from engine.retrieval.router import (
 )
 from engine.shared.constants import (
     INFERRED_EDGE_HYDRATION_CHUNKS,
+    ROUTER_ENTITY_TO_LABEL,
     SEARCH_AGENT_BM25_TOP_K,
     SEARCH_AGENT_CHUNK_WINDOW_DEFAULT,
     SEARCH_AGENT_CHUNK_WINDOW_MAX,
@@ -243,16 +244,19 @@ async def _resolve_entities_to_anchor_docs(
     up to `total_cap` distinct doc canonical_ids ordered by recency."""
     if not entities:
         return []
-    from engine.retrieval.grounding import _LABEL_TO_ENTITY_TYPE
-    entity_to_label = {v: k for k, v in _LABEL_TO_ENTITY_TYPE.items()}
-
+    # Previously inverted grounding's private label map, which keyed on
+    # pre-0091 labels -- so "pr" resolved to a bare label 'PR' that no longer
+    # exists and this anchor resolver matched nothing for pr / ticket / repo /
+    # channel. ROUTER_ENTITY_TO_LABEL is the post-0091 mapping and is the same
+    # source the graph channel uses a few lines below, so the two stop
+    # disagreeing within one call chain.
     pairs: list[tuple[str, str]] = []
     for e in entities:
         et = (e.get("entity_type") or "").lower()
         cid = e.get("canonical_id")
-        label = entity_to_label.get(et)
-        if label and cid:
-            pairs.append((label, cid))
+        node_label = ROUTER_ENTITY_TO_LABEL.get(et)
+        if node_label and cid:
+            pairs.append((node_label.value, cid))
     if not pairs:
         return []
 

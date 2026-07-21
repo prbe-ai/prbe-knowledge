@@ -1,6 +1,7 @@
 """Phase 0 canonical enums. Every string used as a type/label/edge/status lives here."""
 
 import os
+from dataclasses import dataclass
 from enum import StrEnum
 
 
@@ -239,40 +240,157 @@ class DocumentKind(StrEnum):
 # to add them, but the graph retriever now logs + falls back gracefully
 # (see services/retrieval/retrievers/graph.py).
 # ---------------------------------------------------------------------------
-ROUTER_ENTITY_TO_LABEL: dict[str, NodeLabel] = {
-    # Router-emitted typed entities (kept in sync with the router prompt's
-    # entity_type enum at services/retrieval/router.py).
-    #
-    # After migration 0091's label collapse, multiple router entity_types
-    # share a target NodeLabel — e.g. "pr", "issue", "ticket", "channel",
-    # "repo", "file_path", "session" all map to DOCUMENT. The router prompt
-    # still emits the fine-grained entity_type; this dict is the single
-    # mapping into the (now coarser) graph_nodes.label vocabulary.
-    "service":     NodeLabel.SERVICE,
-    "person":      NodeLabel.PERSON,
-    "feature":     NodeLabel.FEATURE,
-    "decision":    NodeLabel.DECISION,
-    "error_group": NodeLabel.ERROR_GROUP,
+@dataclass(frozen=True)
+class EntityTypeSpec:
+    """One router/LLM-facing entity_type and how it addresses graph_nodes.
 
-    # All addressable-source-document entities collapse to DOCUMENT post-0091.
-    "repo":        NodeLabel.DOCUMENT,
-    "ticket":      NodeLabel.DOCUMENT,
-    "pr":          NodeLabel.DOCUMENT,
-    "issue":       NodeLabel.DOCUMENT,
-    "channel":     NodeLabel.DOCUMENT,
-    "file_path":   NodeLabel.DOCUMENT,
-    "session":     NodeLabel.DOCUMENT,
+    Post-0091 the label vocabulary is coarser than the router's, so a label
+    alone no longer identifies an entity type: ``pr``, ``issue``, ``ticket``,
+    ``channel`` and ``repo`` all live at ``label='Document'`` and are told
+    apart by ``properties['kind']``. A flat ``label -> entity_type`` dict
+    cannot invert that collapse, which is why grounding's private copy went
+    stale (it still keyed on the pre-0091 labels and matched zero rows).
+
+    ``kind is None`` means the label carries no sub-type discriminator, or
+    the entity type addresses plain untyped documents.
+    """
+
+    entity_type: str
+    label: NodeLabel
+    kind: str | None = None
+
+
+# The single source of truth for the entity vocabulary. Everything that needs
+# to know "what entity types exist" or "how does one address graph_nodes"
+# derives from this tuple:
+#
+#   ROUTER_ENTITY_TO_LABEL      forward:  entity_type -> label
+#   entity_type_for_node()      reverse:  (label, kind) -> entity_type
+#   GROUNDING_ENTITY_LABELS     which labels grounding's fuzzy channel scans
+#   engine/retrieval/agent/models.py  EntityType Literal (asserted in sync)
+#
+# Adding a type is a one-line change here. Previously it meant editing three
+# hand-maintained maps that had already drifted twice.
+ENTITY_TYPE_REGISTRY: tuple[EntityTypeSpec, ...] = (
+    # Entity-bearing labels: a node here IS the thing, not a document about it.
+    EntityTypeSpec("person", NodeLabel.PERSON),
+    EntityTypeSpec("service", NodeLabel.SERVICE),
+    EntityTypeSpec("feature", NodeLabel.FEATURE),
+    EntityTypeSpec("decision", NodeLabel.DECISION),
+    EntityTypeSpec("error_group", NodeLabel.ERROR_GROUP),
+
+    # Collapsed into DOCUMENT by 0091; discriminated by properties['kind'].
+    EntityTypeSpec("pr", NodeLabel.DOCUMENT, DocumentKind.PR),
+    EntityTypeSpec("issue", NodeLabel.DOCUMENT, DocumentKind.ISSUE),
+    EntityTypeSpec("ticket", NodeLabel.DOCUMENT, DocumentKind.TICKET),
+    EntityTypeSpec("channel", NodeLabel.DOCUMENT, DocumentKind.CHANNEL),
+    EntityTypeSpec("repo", NodeLabel.DOCUMENT, DocumentKind.REPO),
+
+    # Document-addressing types with no kind discriminator. `commit_sha` has
+    # no Commit node anywhere (DocumentKind has no COMMIT and no handler emits
+    # one) -- it is mapped rather than omitted so that a router-extracted commit
+    # resolves to an empty typed lookup instead of being silently dropped by
+    # the `if label and cid` guard in engine/retrieval/agent/tools.py.
+    EntityTypeSpec("file_path", NodeLabel.DOCUMENT),
+    EntityTypeSpec("session", NodeLabel.DOCUMENT),
+    EntityTypeSpec("commit_sha", NodeLabel.DOCUMENT),
+    EntityTypeSpec("document", NodeLabel.DOCUMENT),
 
     # Code-graph entities (extracted by tree-sitter at ingest, not by the
     # router LLM, but the router can still emit these from queries that
     # mention qualified symbol names like `Normalizer.process_queue_row`).
     # All collapse to CODE_SYMBOL post-0091.
-    "function":    NodeLabel.CODE_SYMBOL,
-    "method":      NodeLabel.CODE_SYMBOL,
-    "class":       NodeLabel.CODE_SYMBOL,
-    "module":      NodeLabel.CODE_SYMBOL,
-    "symbol":      NodeLabel.CODE_SYMBOL,
+    EntityTypeSpec("function", NodeLabel.CODE_SYMBOL, CodeSymbolKind.FUNCTION),
+    EntityTypeSpec("method", NodeLabel.CODE_SYMBOL, CodeSymbolKind.METHOD),
+    EntityTypeSpec("class", NodeLabel.CODE_SYMBOL, CodeSymbolKind.CLASS),
+    EntityTypeSpec("module", NodeLabel.CODE_SYMBOL, CodeSymbolKind.MODULE),
+    EntityTypeSpec("symbol", NodeLabel.CODE_SYMBOL, CodeSymbolKind.SYMBOL),
+)
+
+
+# Reverse resolution for a node whose properties['kind'] is unset. A label
+# alone is ambiguous across the kind-less types above (file_path / session /
+# commit_sha / document all sit at Document with no kind), so the generic
+# member of each label wins.
+_DEFAULT_ENTITY_TYPE_FOR_LABEL: dict[NodeLabel, str] = {
+    NodeLabel.PERSON: "person",
+    NodeLabel.SERVICE: "service",
+    NodeLabel.FEATURE: "feature",
+    NodeLabel.DECISION: "decision",
+    NodeLabel.ERROR_GROUP: "error_group",
+    NodeLabel.DOCUMENT: "document",
+    NodeLabel.CODE_SYMBOL: "symbol",
 }
+
+
+ROUTER_ENTITY_TO_LABEL: dict[str, NodeLabel] = {
+    spec.entity_type: spec.label for spec in ENTITY_TYPE_REGISTRY
+}
+
+
+# (label, kind) -> entity_type, for specs that carry a kind discriminator.
+_NODE_TO_ENTITY_TYPE: dict[tuple[str, str], str] = {
+    (spec.label.value, spec.kind): spec.entity_type
+    for spec in ENTITY_TYPE_REGISTRY
+    if spec.kind is not None
+}
+
+
+# Labels grounding's fuzzy-entity channel scans.
+#
+# DOCUMENT is deliberately excluded (long-standing behaviour): it is the
+# largest label, and document titles are matched by grounding's separate
+# doc-title channel rather than by entity resolution.
+#
+# CODE_SYMBOL is excluded on cost, not principle. grounding's predicate is
+#     coalesce(properties->>'name','') % $2
+# while the trigram index is
+#     idx_graph_nodes_name_trgm ON (LOWER(properties->>'name') gin_trgm_ops)
+# The expressions do not match, so that GIN index cannot serve this query --
+# it degrades to a scan of every row for each scanned label. That is fine for
+# the small entity labels below, but CodeSymbol is ~100k rows/tenant at
+# probe-founders scale. Align the predicate with the index before adding it.
+_GROUNDING_EXCLUDED_LABELS: frozenset[NodeLabel] = frozenset({
+    NodeLabel.DOCUMENT,
+    NodeLabel.CODE_SYMBOL,
+})
+
+GROUNDING_ENTITY_LABELS: tuple[str, ...] = tuple(
+    sorted({
+        spec.label.value
+        for spec in ENTITY_TYPE_REGISTRY
+        if spec.label not in _GROUNDING_EXCLUDED_LABELS
+    })
+)
+
+
+def entity_type_for_node(label: str, kind: str | None = None) -> str | None:
+    """Reverse a graph_nodes row into the router entity_type that names it.
+
+    Returns None for a label outside the registry (e.g. Runbook, Agent),
+    which callers treat as "not an addressable entity".
+    """
+    if kind:
+        typed = _NODE_TO_ENTITY_TYPE.get((label, kind))
+        if typed is not None:
+            return typed
+    try:
+        return _DEFAULT_ENTITY_TYPE_FOR_LABEL.get(NodeLabel(label))
+    except ValueError:
+        return None
+
+
+def node_addressing_for_entity_type(entity_type: str) -> tuple[NodeLabel, str | None] | None:
+    """Forward: entity_type -> (label, kind) for an exact graph_nodes lookup.
+
+    Used by grounding's bare-id channel, which must match `PR #340` against
+    (label='Document', kind='PR') -- matching on a bare `label='PR'` has
+    found nothing since migration 0091.
+    """
+    for spec in ENTITY_TYPE_REGISTRY:
+        if spec.entity_type == entity_type:
+            return spec.label, spec.kind
+    return None
 
 
 class EdgeType(StrEnum):
