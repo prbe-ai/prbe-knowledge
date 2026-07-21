@@ -848,6 +848,29 @@ SEARCH_AGENT_MIN_OUTPUT = 5
 SEARCH_AGENT_VECTOR_TOP_K = 30
 SEARCH_AGENT_BM25_TOP_K = 30
 SEARCH_AGENT_GRAPH_TOP_K = 10
+
+# Graph-channel budget when QueryRequest.discovery is set. Discovery asks the
+# engine to favour structurally surprising connections, and the graph channel
+# is the only one that carries that signal: graph_search computes a per-edge
+# surprise score (engine/retrieval/surprise.py) and returns its hits already
+# sorted by it (retrievers/graph.py). Widening this budget therefore admits
+# more of the surprise-ranked tail into the gatherer's evidence pool without
+# touching vector or BM25.
+#
+# This replaces the pre-cutover implementation, which multiplied graph hits'
+# reciprocal-rank contribution inside fusion.py. That module was deleted with
+# the agentic cutover (see retrieval/pipeline.py) and `discovery` had been
+# silently inert ever since -- accepted on the wire, plumbed onto QueryRequest,
+# read by nothing.
+#
+# The invariants the old fusion tests encoded are preserved:
+#   * off by default                    -- discovery defaults to False
+#   * graph channel ONLY                -- vector/bm25 budgets are untouched
+#   * bounded                           -- _clamp_top_k caps at _HARD_TOP_K_CAP
+#   * two-sided, not just amplifying    -- hits are surprise-ORDERED, so
+#     low-surprise edges (hub<->hub, score < 1.0) sort to the tail and fall
+#     outside the budget rather than being promoted
+SEARCH_AGENT_GRAPH_TOP_K_DISCOVERY = 30
 SEARCH_AGENT_INFERRED_EDGE_TOP_K = 10
 SEARCH_AGENT_GRAPH_WALK_TOP_K = 20
 SEARCH_AGENT_EXPAND_NEIGHBORS_TOP_K = 10

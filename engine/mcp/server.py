@@ -197,15 +197,16 @@ async def search_knowledge(
             demoted in favor of specific ones. Pick the highest-`score`
             one and feed its `canonical_id` into the next call's
             `query` to BFS the knowledge graph.
-        discovery: Default False (focus mode — vector + BM25 only).
-            Set True for **discovery mode**: graph hits' contribution
-            to fusion is amplified by their surprise score (capped 2x),
-            and edges between two hub nodes are demoted via a log-decay
-            anti-bonus. The combined effect: entity-anchored canonical
-            docs (the actual PR, ticket, design rationale, runbook)
-            rise above two common kinds of noise — recent transcripts
-            that semantically mention the topic, and wiki/index summary
-            docs that connect to everything.
+        discovery: Default False (focus mode). Set True for **discovery
+            mode**: the graph channel gets a wider retrieval budget, so
+            more of its surprise-ranked tail reaches the answer. Graph
+            hits are ordered by a per-edge surprise score that rewards
+            cross-source and cross-community edges and demotes edges
+            between two hub nodes, so widening the budget surfaces
+            entity-anchored canonical docs (the actual PR, ticket,
+            design rationale, runbook) rather than the hub-to-hub
+            wiki/index docs that connect to everything. Vector and BM25
+            are unaffected.
 
             Default to True for most queries against this corpus.
             Empirically (post-anti-bonus, 6 paired acme
@@ -325,13 +326,13 @@ async def query_knowledge(
             vague/exploratory questions: if the entity extractor
             misfires or the canonical form isn't in the docs, the
             answer comes back empty.
-        discovery: Default False (focus mode). Set True to amplify
-            graph hits' contribution to fusion (capped 2x via surprise
-            score, with hub-to-hub edges demoted via log-decay) so the
-            LLM sees entity-anchored canonical docs (the actual PR,
-            commit, design doc, ticket, runbook) instead of recent
-            transcripts that semantically mention the topic or wiki
-            summary docs that connect to everything. Default to True
+        discovery: Default False (focus mode). Set True to widen the
+            graph channel's retrieval budget so more of its
+            surprise-ranked tail reaches the LLM — surfacing
+            entity-anchored canonical docs (the actual PR, commit,
+            design doc, ticket, runbook) rather than the hub-to-hub
+            wiki/index docs that connect to everything. Vector and BM25
+            budgets are unchanged. Default to True
             for most questions against this corpus. Use for conceptual
             questions ("how should we approach X", "what's blocking
             Y") and any case where focus mode is returning transcript-

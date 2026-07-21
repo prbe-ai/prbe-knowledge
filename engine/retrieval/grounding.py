@@ -263,15 +263,17 @@ async def _lookup_bare_id_matches(
         addressing = node_addressing_for_entity_type(entity_type)
         if addressing is None:
             continue
-        label, node_kind = addressing
-        by_addressing.setdefault((label.value, node_kind, entity_type), []).append(val)
+        node_label, node_kind = addressing
+        by_addressing.setdefault(
+            (node_label.value, node_kind, entity_type), []
+        ).append(val)
 
     if not by_addressing:
         return []
 
     out: list[GroundingCandidate] = []
     async with with_tenant(customer_id) as conn:
-        for (label, node_kind, entity_type), ids in by_addressing.items():
+        for (label_value, node_kind, entity_type), ids in by_addressing.items():
             rows = await conn.fetch(
                 """
                 SELECT canonical_id,
@@ -283,7 +285,7 @@ async def _lookup_bare_id_matches(
                   AND canonical_id = ANY($3::text[])
                   AND ($4::text IS NULL OR properties->>'kind' = $4)
                 """,
-                customer_id, label, ids, node_kind,
+                customer_id, label_value, ids, node_kind,
             )
             for r in rows:
                 last_seen = None

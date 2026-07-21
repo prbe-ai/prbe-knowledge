@@ -71,6 +71,7 @@ from engine.shared.constants import (
     SEARCH_AGENT_CHUNK_WINDOW_MAX,
     SEARCH_AGENT_FETCH_CHUNKS_MAX,
     SEARCH_AGENT_GRAPH_TOP_K,
+    SEARCH_AGENT_GRAPH_TOP_K_DISCOVERY,
     SEARCH_AGENT_GRAPH_WALK_TOP_K,
     SEARCH_AGENT_INFERRED_EDGE_TOP_K,
     SEARCH_AGENT_PER_HIT_PROPERTIES_CAP,
@@ -314,9 +315,16 @@ async def execute_search(
     sort_by: Literal["relevance", "recency"] = "relevance",
     doc_types: list[str] | None = None,
     source_keys: list[str] | None = None,
+    discovery: bool = False,
 ) -> dict[str, Any]:
     """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
     inferred_edge) in parallel — same shape the harness runs on turn 0.
+
+    `discovery` widens the GRAPH channel's budget only (see
+    SEARCH_AGENT_GRAPH_TOP_K_DISCOVERY). Graph hits arrive sorted by their
+    per-edge surprise score, so a wider budget admits more of the
+    structurally-surprising tail while low-surprise hub-to-hub edges stay at
+    the back and fall outside it. Vector and BM25 budgets are unchanged.
 
     If `entity_ids` is omitted and the agent provides multiple queries,
     each query gets its own grounding run; entity-anchored channels
@@ -360,7 +368,10 @@ async def execute_search(
         return {"sub_queries": []}
     top_k_v = _clamp_top_k(top_k, SEARCH_AGENT_VECTOR_TOP_K)
     top_k_b = _clamp_top_k(top_k, SEARCH_AGENT_BM25_TOP_K)
-    top_k_g = _clamp_top_k(top_k, SEARCH_AGENT_GRAPH_TOP_K)
+    top_k_g = _clamp_top_k(
+        top_k,
+        SEARCH_AGENT_GRAPH_TOP_K_DISCOVERY if discovery else SEARCH_AGENT_GRAPH_TOP_K,
+    )
     top_k_i = _clamp_top_k(top_k, SEARCH_AGENT_INFERRED_EDGE_TOP_K)
 
     async def _per_query(q: str) -> dict[str, Any]:
@@ -378,15 +389,24 @@ async def execute_search(
             grounded_summary = _bundle_to_compact(bundle)
 
         # Channel-side anchor pairs for graph_search.
+        #
+        # graph_search's contract is (ENTITY_TYPE, canonical_id) -- it does its
+        # own entity_type -> NodeLabel resolution. This previously passed the
+        # resolved NodeLabel VALUE instead ("Document", "CodeSymbol", ...),
+        # which graph_search then lower-cased and looked up as an entity_type.
+        # "document" / "codesymbol" / "errorgroup" are not entity types, so the
+        # most common entity class round-tripped into graph_search's untyped
+        # fallback branch and fired its drift warning on nearly every
+        # entity-bearing query. Pass the entity_type through; keep the
+        # membership check so genuinely unaddressable types are still dropped
+        # here rather than reaching the SQL.
         graph_pairs: list[tuple[str, str]] = []
         if ents:
-            from engine.retrieval.retrievers.graph import _ENTITY_TO_LABEL
             for e in ents:
                 et = (e.get("entity_type") or "").lower()
                 cid = e.get("canonical_id")
-                label = _ENTITY_TO_LABEL.get(et)
-                if label and cid:
-                    graph_pairs.append((label, cid))
+                if cid and et in ROUTER_ENTITY_TO_LABEL:
+                    graph_pairs.append((et, cid))
 
         async def _vec_call() -> list[dict[str, Any]]:
             try:

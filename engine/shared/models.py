@@ -374,15 +374,16 @@ class QueryRequest(BaseModel):
     discovery: bool = Field(
         default=False,
         description=(
-            "When true, weight graph-retriever hits by their surprise score "
-            "in fusion's RRF math (multiplier capped at 2.0). Surfaces "
-            "cross-source / cross-community / inferred-edge neighbors that "
-            "default focus mode buries beneath dominant vector/BM25 hits. "
-            "Use for conceptual queries ('how should we approach X', "
-            "'anything else I should know about Y') where the agent wants "
-            "less-obvious connections. Skip for direct lookups (PR#, ticket, "
-            "error message) where the canonical answer is wanted. "
-            "When false (default), graph hits contribute flat 1/(k+rank) RRF."
+            "When true, widen the graph channel's retrieval budget so more of "
+            "its surprise-ranked tail reaches the gatherer. graph_search "
+            "orders hits by a per-edge surprise score that rewards "
+            "cross-source and cross-community edges and demotes hub-to-hub "
+            "ones, so a wider budget admits less-obvious connections while "
+            "low-surprise edges stay at the back. Vector and BM25 budgets are "
+            "unchanged. Use for conceptual queries ('how should we approach "
+            "X', 'anything else I should know about Y'); skip for direct "
+            "lookups (PR#, ticket, error message) where the canonical answer "
+            "is wanted."
         ),
     )
 
