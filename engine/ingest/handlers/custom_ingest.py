@@ -28,10 +28,11 @@ from engine.shared.models import (
     ACLSnapshotRow,
     Document,
     GraphEdgeSpec,
-    GraphNodeSpec,
     NormalizationResult,
     WebhookEvent,
     WebhookParseResult,
+    make_document,
+    make_person,
 )
 
 
@@ -187,9 +188,19 @@ class CustomIngestConnector(Connector):
         if is_delete:
             return NormalizationResult(documents=[doc], acl_snapshots=acl_rows)
 
+        # Emit via the shared factories rather than constructing GraphNodeSpec
+        # directly. NodeLabel's docstring asks for this so the label-to-kind
+        # relationship is enforced in one place; this handler was the last
+        # in-tree exception.
+        #
+        # Note the Document node's canonical_id MUST remain the doc_id: the
+        # graph retriever joins `documents d ON d.doc_id = gn.canonical_id`
+        # (engine/retrieval/retrievers/graph.py), so any other scheme makes
+        # the node structurally unable to return a result. No `kind` — a
+        # custom-ingest document is a plain source document, not one of the
+        # five sub-types migration 0091 collapsed into Document.
         graph_nodes = [
-            GraphNodeSpec(
-                label=NodeLabel.DOCUMENT,
+            make_document(
                 canonical_id=doc_id,
                 properties={
                     "title": title,
@@ -203,8 +214,7 @@ class CustomIngestConnector(Connector):
         if author_id:
             author_node_id = f"person:{author_id}"
             graph_nodes.append(
-                GraphNodeSpec(
-                    label=NodeLabel.PERSON,
+                make_person(
                     canonical_id=author_node_id,
                     properties={
                         "name": author.name if author else None,

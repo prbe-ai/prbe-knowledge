@@ -974,6 +974,44 @@ def make_person(
     )
 
 
+def make_named_entity(
+    label: NodeLabel,
+    canonical_id: str,
+    name: str,
+    properties: dict[str, Any] | None = None,
+) -> "GraphNodeSpec":
+    """Build an entity node that MUST be resolvable by name.
+
+    ``name`` is required and non-empty, and that is the whole point of this
+    factory. Grounding resolves a query token to a node by fuzzy-matching
+    ``coalesce(properties->>'name', canonical_id)``; when canonical_ids are
+    opaque (a UUID, say) a node that ships without a name silently degrades
+    to fuzzy-matching against that UUID, which no human query will ever hit.
+    The node exists, ingest reports success, and the entity is simply
+    unfindable. Raising here makes that state unrepresentable rather than
+    merely discouraged.
+
+    Use for domain entities whose identity is a name — the label-per-entity
+    kind, not the Document/CodeSymbol families that carry a ``kind``
+    discriminator (use make_document / make_code_symbol for those).
+
+    Raises:
+        ValueError: if ``name`` is empty or whitespace-only.
+    """
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError(
+            f"make_named_entity requires a non-empty name "
+            f"(label={label.value}, canonical_id={canonical_id!r}); "
+            "a nameless entity node cannot be resolved by grounding"
+        )
+    return GraphNodeSpec(
+        label=label,
+        canonical_id=canonical_id,
+        properties={**(properties or {}), "name": cleaned},
+    )
+
+
 def make_feature(
     canonical_id: str,
     properties: dict[str, Any] | None = None,
