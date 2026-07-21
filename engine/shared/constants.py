@@ -188,6 +188,28 @@ class NodeLabel(StrEnum):
     FIX_ARTIFACT = "FixArtifact"
     VERIFICATION_RESULT = "VerificationResult"
 
+    # ---- Research domain ----
+    # Generic experiment-tracking vocabulary, not specific to any one
+    # tracker: a Project groups Experiments, an Experiment has Runs, a Run
+    # produces Artifacts, an Asset is a reusable input/output pinned across
+    # runs. Any custom-ingest client modelling that shape can address these.
+    #
+    # These are deliberately NOT collapsed into DOCUMENT the way migration
+    # 0091 collapsed PR/Issue/Ticket/Channel/Repo. That collapse applied to
+    # things that were really *documents from a source*; 0091's own docstring
+    # keeps distinct-semantics domain labels (Service, Decision, Runbook,
+    # Agent, Workflow) separate. A Run is a domain object, not a document
+    # about one -- it sits on the same side of that line.
+    #
+    # Each is paired with its own Document node at ingest and reached through
+    # it: the graph retriever's neighbour join is `AND n.label = 'Document'`,
+    # so an entity node is an ANCHOR to traverse from, never a returned hit.
+    PROJECT = "Project"
+    EXPERIMENT = "Experiment"
+    RUN = "Run"
+    ARTIFACT = "Artifact"
+    ASSET = "Asset"
+
 
 class CodeSymbolKind(StrEnum):
     """Sub-type of a CODE_SYMBOL node, stored in ``properties['kind']``.
@@ -296,6 +318,14 @@ ENTITY_TYPE_REGISTRY: tuple[EntityTypeSpec, ...] = (
     EntityTypeSpec("commit_sha", NodeLabel.DOCUMENT),
     EntityTypeSpec("document", NodeLabel.DOCUMENT),
 
+    # Research-domain entities. Each keeps its own label (see NodeLabel) and
+    # carries no kind discriminator, so reverse resolution is label-only.
+    EntityTypeSpec("project", NodeLabel.PROJECT),
+    EntityTypeSpec("experiment", NodeLabel.EXPERIMENT),
+    EntityTypeSpec("run", NodeLabel.RUN),
+    EntityTypeSpec("artifact", NodeLabel.ARTIFACT),
+    EntityTypeSpec("asset", NodeLabel.ASSET),
+
     # Code-graph entities (extracted by tree-sitter at ingest, not by the
     # router LLM, but the router can still emit these from queries that
     # mention qualified symbol names like `Normalizer.process_queue_row`).
@@ -320,6 +350,11 @@ _DEFAULT_ENTITY_TYPE_FOR_LABEL: dict[NodeLabel, str] = {
     NodeLabel.ERROR_GROUP: "error_group",
     NodeLabel.DOCUMENT: "document",
     NodeLabel.CODE_SYMBOL: "symbol",
+    NodeLabel.PROJECT: "project",
+    NodeLabel.EXPERIMENT: "experiment",
+    NodeLabel.RUN: "run",
+    NodeLabel.ARTIFACT: "artifact",
+    NodeLabel.ASSET: "asset",
 }
 
 

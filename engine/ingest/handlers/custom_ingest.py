@@ -32,6 +32,7 @@ from engine.shared.models import (
     WebhookEvent,
     WebhookParseResult,
     make_document,
+    make_named_entity,
     make_person,
 )
 
@@ -235,6 +236,64 @@ class CustomIngestConnector(Connector):
                 )
             )
 
+        # ---- Client-asserted graph payload ------------------------------
+        #
+        # Entity nodes are anchors: the graph retriever's neighbour join is
+        # `AND n.label = 'Document'`, so an entity is traversed FROM and never
+        # returned. Every asserted node therefore gets a TOUCHES edge to THIS
+        # document automatically -- without it the node is reachable by name
+        # but resolves to nothing, which is the failure mode this whole
+        # payload exists to avoid.
+        for node in document.nodes:
+            node_label = NodeLabel(node.label)
+            graph_nodes.append(
+                make_named_entity(
+                    label=node_label,
+                    canonical_id=node.canonical_id,
+                    name=node.name,
+                    properties={
+                        **node.properties,
+                        "source_system": SourceSystem.CUSTOM_INGEST.value,
+                        "source_key": source_key,
+                    },
+                )
+            )
+            graph_edges.append(
+                GraphEdgeSpec(
+                    edge_type=EdgeType.TOUCHES,
+                    from_label=node_label,
+                    from_canonical_id=node.canonical_id,
+                    to_label=NodeLabel.DOCUMENT,
+                    to_canonical_id=doc_id,
+                    properties={"source_key": source_key},
+                    valid_from=updated_at,
+                )
+            )
+
+        # Client edges. A client cannot know the engine's doc_id (it composes
+        # customer_id + encoded source_key + the client's own id), so a
+        # Document endpoint is addressed by the CLIENT's document id and
+        # rewritten here. That keeps the doc_id scheme an engine
+        # implementation detail rather than leaking it into every caller.
+        for edge in document.edges:
+            graph_edges.append(
+                GraphEdgeSpec(
+                    edge_type=EdgeType(edge.edge_type),
+                    from_label=NodeLabel(edge.from_label),
+                    from_canonical_id=_resolve_endpoint(
+                        event.customer_id, source_key,
+                        edge.from_label, edge.from_canonical_id,
+                    ),
+                    to_label=NodeLabel(edge.to_label),
+                    to_canonical_id=_resolve_endpoint(
+                        event.customer_id, source_key,
+                        edge.to_label, edge.to_canonical_id,
+                    ),
+                    properties={**edge.properties, "source_key": source_key},
+                    valid_from=updated_at,
+                )
+            )
+
         return NormalizationResult(
             documents=[doc],
             graph_nodes=graph_nodes,
@@ -276,3 +335,22 @@ def _parse_iso(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+def _resolve_endpoint(
+    customer_id: str,
+    source_key: str,
+    label: str,
+    canonical_id: str,
+) -> str:
+    """Map a client-asserted edge endpoint to its engine canonical_id.
+
+    Document endpoints are addressed by the CLIENT's document id and
+    rewritten to the engine doc_id here; every other label passes through
+    untouched. Clients cannot compose a doc_id themselves (it folds in
+    customer_id and a percent-encoded source_key), and requiring them to
+    would leak that scheme into every caller and break the moment it changes.
+    """
+    if label == NodeLabel.DOCUMENT.value:
+        return custom_ingest_doc_id(customer_id, source_key, canonical_id)
+    return canonical_id
