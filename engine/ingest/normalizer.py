@@ -260,12 +260,13 @@ class Normalizer:
 
         # ---- Phase B: ONE short write transaction. No external I/O between
         # BEGIN and COMMIT, so every lock held here is millisecond-scale.
+        # Doc_ids this batch is trying to write. Used below to tell a node
+        # that MIRRORS one of these documents (canonical_id == doc_id) from an
+        # independent entity node, so only the former is gated on the document
+        # actually persisting.
+        all_doc_ids = {doc.doc_id for (doc, _, _) in all_docs}
+
         async with with_tenant(customer_id) as conn:
-            # Nodes first, then edges — edges look up node_ids.
-            node_ids = await upsert_nodes(
-                conn, customer_id, result.graph_nodes, source_system.value
-            )
-            await upsert_edges(conn, customer_id, result.graph_edges, node_ids, source_system.value)
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
             await _upsert_code_repo_state(conn, customer_id, result.code_repo_state_updates)
 
@@ -312,6 +313,92 @@ class Normalizer:
                         error_class=type(exc).__name__,
                     )
                 await conn.execute(f"RELEASE SAVEPOINT {sp}")
+
+            # ---- Graph writes, AFTER the documents they describe ---------
+            #
+            # Ordering is load-bearing. These used to run BEFORE the loop and
+            # therefore OUTSIDE every savepoint, so `ROLLBACK TO SAVEPOINT`
+            # could not undo them: a quarantined doc still committed its
+            # nodes, edges, provenance rows and post-write-queue entries,
+            # pointing at a document that was never written. The transaction
+            # then committed anyway. Stale-skip hit the same path, and that
+            # one is not even an error -- it is the ordinary outcome when a
+            # newer version of a doc wins the ordering check, so orphans
+            # accumulated during normal operation, not just on failures.
+            #
+            # Filtering to `persisted_doc_ids` keeps the graph in step with
+            # what is actually retrievable. Orphan entity nodes are worse
+            # than useless: they still resolve by name in grounding, so a
+            # query anchors on a real node, traverses, finds no document and
+            # returns nothing -- indistinguishable from the entity not
+            # existing. Their edges also inflate degree, which skews the
+            # surprise scores discovery rides on.
+            persisted_doc_ids = set(doc_ids)
+
+            # Step 1: drop any edge whose document endpoint was skipped this
+            # round. An entity->document edge is meaningless once that
+            # document isn't in the index.
+            graph_edges = [
+                e for e in result.graph_edges
+                if (e.from_canonical_id not in all_doc_ids
+                    or e.from_canonical_id in persisted_doc_ids)
+                and (e.to_canonical_id not in all_doc_ids
+                     or e.to_canonical_id in persisted_doc_ids)
+            ]
+
+            # Step 2: drop nodes that no longer have a home.
+            #   - a node MIRRORING a document (canonical_id == doc_id) goes
+            #     only if that document persisted;
+            #   - an ENTITY node that HAD edges but lost every one of them to
+            #     step 1 is a freshly-created orphan: its only reason to exist
+            #     this batch was to anchor those edges, and now it would
+            #     resolve by name in grounding, traverse to nothing, and
+            #     inflate degree. Drop it.
+            #   - an entity node that never carried an edge is left untouched
+            #     (some connectors assert standalone Person nodes); this
+            #     change only removes orphans it would otherwise CREATE, never
+            #     pre-existing edgeless nodes.
+            surviving_endpoints = {
+                cid
+                for e in graph_edges
+                for cid in (e.from_canonical_id, e.to_canonical_id)
+            }
+            nodes_with_original_edges = {
+                cid
+                for e in result.graph_edges
+                for cid in (e.from_canonical_id, e.to_canonical_id)
+            }
+
+            # A doc-mirror node is kept iff its document persisted; an entity
+            # node is dropped only if it lost every edge it arrived with.
+            newly_orphaned = nodes_with_original_edges - surviving_endpoints
+            graph_nodes = [
+                n for n in result.graph_nodes
+                if (
+                    n.canonical_id in persisted_doc_ids
+                    if n.canonical_id in all_doc_ids
+                    else n.canonical_id not in newly_orphaned
+                )
+            ]
+            dropped_nodes = len(result.graph_nodes) - len(graph_nodes)
+            dropped_edges = len(result.graph_edges) - len(graph_edges)
+            if dropped_nodes or dropped_edges:
+                log.info(
+                    "normalizer.graph_filtered_to_persisted_docs",
+                    customer=customer_id,
+                    dropped_nodes=dropped_nodes,
+                    dropped_edges=dropped_edges,
+                    quarantined=len(quarantined),
+                    stale_skipped=len(stale_skipped),
+                )
+
+            # Nodes first, then edges — edges look up node_ids.
+            node_ids = await upsert_nodes(
+                conn, customer_id, graph_nodes, source_system.value
+            )
+            await upsert_edges(
+                conn, customer_id, graph_edges, node_ids, source_system.value
+            )
 
         # ---- Wiki-synthesis enqueue (no NOTIFY) -------------------------
         # After Phase B's commit, append one row per persisted doc into
