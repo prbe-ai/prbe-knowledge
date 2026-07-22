@@ -934,6 +934,21 @@ async def persist_cross_repo_edges(
             customer_id,
             source_node_id,
         )
+        # Resolve targets, then insert in ONE statement. Two bugs made this
+        # a landmine for whoever revives cross-repo deps (disabled since
+        # 2026-05-08):
+        #   1. The per-edge `ON CONFLICT (customer_id, edge_type, from_node_id,
+        #      to_node_id)` named a constraint migration 0076 DROPPED in favour
+        #      of the 6-column `graph_edges_unique_lane` expression index. That
+        #      raised 42P10 on the first edge. Now matches the live index.
+        #   2. The DELETE above decrements degree for removed edges, but the
+        #      re-insert never re-incremented it, so repo-node degree drained
+        #      toward the GREATEST(..., 0) floor on every refresh. Now bumps
+        #      degree for genuine inserts (xmax = 0), same pattern as
+        #      engine/ingest/graph_writer.upsert_edges -- which is the path this
+        #      whole function should route through if it is ever un-disabled.
+        target_node_ids: list[int] = []
+        properties_json: list[str] = []
         for edge in edges:
             target_node_id = await _get_or_create_repo_node(
                 conn, customer_id, edge.target_repo
@@ -942,20 +957,54 @@ async def persist_cross_repo_edges(
                 # Self-reference (variants matched the source repo's
                 # own name in its own files). Drop silently.
                 continue
-            await conn.execute(
+            target_node_ids.append(target_node_id)
+            properties_json.append(
+                orjson.dumps({"evidence": edge.evidence}).decode()
+            )
+
+        if target_node_ids:
+            inserted = await conn.fetch(
                 """
-                    INSERT INTO graph_edges
-                        (customer_id, edge_type, from_node_id, to_node_id,
-                         properties, source_system, confidence)
-                    VALUES ($1, 'DEPENDS_ON', $2, $3, $4, 'code_graph', 'EXTRACTED')
-                    ON CONFLICT (customer_id, edge_type, from_node_id, to_node_id)
-                    DO UPDATE SET properties = EXCLUDED.properties
-                    """,
+                INSERT INTO graph_edges
+                    (customer_id, edge_type, from_node_id, to_node_id,
+                     properties, source_system, confidence)
+                SELECT $1, 'DEPENDS_ON', $2, t.to_node_id, t.properties::jsonb,
+                       'code_graph', 'EXTRACTED'
+                FROM unnest($3::bigint[], $4::text[]) AS t(to_node_id, properties)
+                ON CONFLICT (
+                    customer_id, edge_type, from_node_id, to_node_id,
+                    COALESCE(aliased_from_canonical_id, ''),
+                    COALESCE(aliased_to_canonical_id, '')
+                )
+                DO UPDATE SET properties = EXCLUDED.properties
+                RETURNING to_node_id, (xmax = 0) AS inserted
+                """,
                 customer_id,
                 source_node_id,
-                target_node_id,
-                orjson.dumps({"evidence": edge.evidence}).decode(),
+                target_node_ids,
+                properties_json,
             )
+            degree_bump: dict[int, int] = {}
+            for row in inserted:
+                if row["inserted"]:
+                    degree_bump[source_node_id] = degree_bump.get(source_node_id, 0) + 1
+                    degree_bump[row["to_node_id"]] = (
+                        degree_bump.get(row["to_node_id"], 0) + 1
+                    )
+            if degree_bump:
+                node_ids = list(degree_bump.keys())
+                deltas = [degree_bump[n] for n in node_ids]
+                await conn.execute(
+                    """
+                    UPDATE graph_nodes gn
+                    SET degree = gn.degree + t.delta
+                    FROM unnest($1::bigint[], $2::int[]) AS t(node_id, delta)
+                    WHERE gn.customer_id = $3 AND gn.node_id = t.node_id
+                    """,
+                    node_ids,
+                    deltas,
+                    customer_id,
+                )
 
 
 async def _get_or_create_repo_node(
