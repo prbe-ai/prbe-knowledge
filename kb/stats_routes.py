@@ -1,13 +1,13 @@
 """Per-source ingestion statistics — internal API.
 
     GET /api/stats/ingestion
+    GET /api/stats/ingestion/{source}/devices
 
 Gated by X-Internal-Knowledge-Key; the tenant comes from the X-Prbe-Customer
 header the gateway sets — never from the client. Returns per-source live
 document/chunk counts, queue depth, and last-ingested timestamps, plus the
-backfill_state rows and index-wide totals. Generic aggregates only — no
-source-specific logic; consumers (a dashboard ingestion/health page) render
-them however they like.
+backfill_state rows and index-wide totals. The device route is limited to
+device-paired sources and keeps queue counts on their parent source row.
 
 "Live" follows the bitemporal model: document versions and chunks with
 valid_to IS NULL, documents additionally not soft-deleted.
@@ -15,12 +15,19 @@ valid_to IS NULL, documents additionally not soft-deleted.
 
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 
+from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
 from kb.admin_routes import verify_internal_knowledge_key
 
 router = APIRouter(prefix="/api/stats", tags=["stats"])
+
+_DEVICE_PAIRED_SOURCES = frozenset(
+    {SourceSystem.CLAUDE_CODE.value, SourceSystem.CODEX.value}
+)
 
 
 def _require_customer(
@@ -129,5 +136,89 @@ async def ingestion_stats(customer_id: str = Depends(_require_customer)) -> dict
                 ),
             }
             for r in backfill_rows
+        ],
+    }
+
+
+@router.get(
+    "/ingestion/{source}/devices",
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def ingestion_device_stats(
+    source: str,
+    customer_id: str = Depends(_require_customer),
+) -> dict[str, Any]:
+    if source not in _DEVICE_PAIRED_SOURCES:
+        raise HTTPException(
+            status_code=404,
+            detail=f"source does not support per-device stats: {source}",
+        )
+
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            WITH live_docs AS (
+                SELECT DISTINCT ON (d.customer_id, d.doc_id)
+                       d.customer_id,
+                       d.doc_id,
+                       d.version,
+                       d.parent_doc_id,
+                       d.metadata,
+                       d.ingested_at
+                FROM documents d
+                WHERE d.customer_id = $1
+                  AND d.source_system = $2
+                  AND d.valid_to IS NULL
+                  AND d.deleted_at IS NULL
+                ORDER BY d.customer_id, d.doc_id, d.version DESC
+            ),
+            attributed_docs AS (
+                SELECT d.customer_id,
+                       d.doc_id,
+                       d.ingested_at,
+                       COALESCE(
+                           NULLIF(BTRIM(d.metadata->>'device_id'), ''),
+                           NULLIF(BTRIM(parent.metadata->>'device_id'), '')
+                       ) AS device_id
+                FROM live_docs d
+                LEFT JOIN live_docs parent
+                  ON parent.doc_id = COALESCE(
+                      NULLIF(BTRIM(d.parent_doc_id), ''),
+                      NULLIF(BTRIM(d.metadata->>'parent_doc_id'), '')
+                  )
+            )
+            SELECT d.device_id,
+                   COUNT(DISTINCT d.doc_id) AS docs,
+                   COUNT(c.chunk_id)        AS chunks,
+                   MAX(d.ingested_at)       AS last_ingested_at
+            FROM attributed_docs d
+            LEFT JOIN chunks c
+              ON c.customer_id = d.customer_id
+             AND c.doc_id      = d.doc_id
+             AND c.valid_to   IS NULL
+            WHERE d.device_id IS NOT NULL
+            GROUP BY d.device_id
+            ORDER BY last_ingested_at DESC, device_id
+            LIMIT 10
+            """,
+            customer_id,
+            source,
+        )
+
+    return {
+        "customer_id": customer_id,
+        "source": source,
+        "devices": [
+            {
+                "device_id": row["device_id"],
+                "docs": row["docs"],
+                "chunks": row["chunks"],
+                "last_ingested_at": (
+                    row["last_ingested_at"].isoformat()
+                    if row["last_ingested_at"]
+                    else None
+                ),
+            }
+            for row in rows
         ],
     }

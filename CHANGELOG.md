@@ -8,6 +8,9 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- Internal ingestion stats can now break Claude Code and Codex totals down by
+  device, including historical derived documents linked through their parent
+  session, so downstream dashboards can show trustworthy per-laptop counts.
 - `POST /api/github/connect` (X-Internal-Knowledge-Key gated): seeds a GitHub
   App installation (customer_source_mapping + `installation:<id>` token row,
   validated by a dry-run mint) and enqueues its historical backfill, which the
