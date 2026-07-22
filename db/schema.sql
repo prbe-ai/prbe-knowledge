@@ -1377,6 +1377,163 @@ CREATE INDEX mcp_oauth_refresh_tokens_session_active
     WHERE revoked_at IS NULL;
 
 -- ---------------------------------------------------------------------------
+-- kg_classes: debugging knowledge graph — class table (Phase 1 foundation).
+--
+-- One row per class per tenant. `frontmatter` is JSONB end-to-end (signature,
+-- related, context_sources, evidence — all structured fields). `body` is the
+-- opaque markdown playbook prose with [[wiki-links]]. `signature_embedding`
+-- is a pgvector column populated by the embed pass after write (nullable
+-- until first embed). See docs/superpowers/specs/2026-04-29-debugging-
+-- knowledge-graph-design.md §5.1.
+--
+-- Indexes (GIN on frontmatter->'related', ivfflat on signature_embedding),
+-- updated_at trigger, and RLS policy are added in subsequent migrations
+-- (Phase 1 Tasks 4 and 5).
+-- ---------------------------------------------------------------------------
+CREATE TABLE kg_classes (
+    customer_id          TEXT         NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    class_id             TEXT         NOT NULL,
+    frontmatter          JSONB        NOT NULL,
+    body                 TEXT         NOT NULL DEFAULT '',
+    signature_embedding  vector(1536),
+    created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (customer_id, class_id)
+);
+
+-- GIN index on frontmatter->'related' for compute-on-read edge queries
+-- (1-hop expand: spec §6 step 5). jsonb_path_ops is the right opclass
+-- because we only need containment (@>) on the related array.
+CREATE INDEX kg_classes_related_gin
+    ON kg_classes USING GIN ((frontmatter->'related') jsonb_path_ops);
+
+-- ivfflat index on signature_embedding for the classifier's cosine
+-- similarity step (spec §6 step 2). lists=100 is the practical floor
+-- for ivfflat; revisit if classes-per-tenant exceeds ~10K.
+CREATE INDEX kg_classes_embedding_ivfflat
+    ON kg_classes USING ivfflat (signature_embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- Generic kg_* updated_at trigger function. No pre-existing
+-- set_updated_at() helper in this schema; kg-prefixed to avoid future
+-- collisions if a generic helper lands later.
+CREATE OR REPLACE FUNCTION kg_set_updated_at()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER kg_classes_updated
+    BEFORE UPDATE ON kg_classes
+    FOR EACH ROW EXECUTE FUNCTION kg_set_updated_at();
+
+-- ---------------------------------------------------------------------------
+-- kg_evidence: debugging knowledge graph — episodic learning trail.
+--
+-- One row per refinement observation tied to a specific ticket. Distinct from
+-- the `frontmatter.evidence` aggregate summary on kg_classes: this table is
+-- the per-ticket trail the maintenance agent reads on each run to decide what
+-- to adjust on a class. A single ticket can produce multiple refinements over
+-- time, so observed_at is part of the primary key. See docs/superpowers/
+-- specs/2026-04-29-debugging-knowledge-graph-design.md §5.1, §7.
+--
+-- Composite FK to kg_classes(customer_id, class_id) ON DELETE CASCADE so
+-- deleting a class drops its evidence trail. RLS policy is added in a
+-- subsequent migration (Phase 1 Task 5).
+-- ---------------------------------------------------------------------------
+CREATE TABLE kg_evidence (
+    customer_id  TEXT         NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    class_id     TEXT         NOT NULL,
+    ticket_id    TEXT         NOT NULL,
+    refinement   TEXT         NOT NULL,
+    observed_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (customer_id, class_id, ticket_id, observed_at),
+    FOREIGN KEY (customer_id, class_id)
+        REFERENCES kg_classes(customer_id, class_id)
+        ON DELETE CASCADE
+);
+
+-- ---------------------------------------------------------------------------
+-- kg_candidates: debugging-agent observation queue with two-layer dedup.
+--
+-- The debugging agent writes a row here whenever something is off (incident
+-- matched poorly, traversal went outside the playbook, agent disagreed with
+-- ordering, etc.). The maintenance agent (Phase 2) drains the queue. See
+-- docs/superpowers/specs/2026-04-29-debugging-knowledge-graph-design.md
+-- §5.1, §7.3.
+--
+-- Two-layer dedup:
+--   * payload_hash = sha256 over STRUCTURED fields only (type,
+--     top_class_match.id, score_bucket, agent_action,
+--     incident_signature_keys) — never prose `notes`. Hashing prose would
+--     defeat dedup the moment the LLM rephrases the same observation.
+--   * payload_hash is INTENTIONALLY NOT UNIQUE. Two genuinely-different
+--     observations can hash identically (e.g., two 401s with different root
+--     causes); the hash is a clustering key for layer-1 lookup, not a
+--     definitive dedup key.
+--   * notes_embedding (vector(1536)) is the layer-2 confirmation signal:
+--     on hash collision the agent compares notes embeddings and only
+--     increments repeat_count when cosine > 0.85.
+--   * repeat_count counts CONFIRMED duplicates only.
+--
+-- candidate_id uses gen_random_uuid() (pgcrypto; already used by
+-- oauth_tokens, ingestion_events). Status check constraint enforces the
+-- pending|accepted|rejected|merged state machine.
+--
+-- ivfflat index on notes_embedding and RLS policy land in subsequent
+-- migrations (Phase 1 Task 5 for RLS; the ivfflat index lives below).
+-- ---------------------------------------------------------------------------
+CREATE TABLE kg_candidates (
+    customer_id      TEXT         NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    candidate_id     UUID         NOT NULL DEFAULT gen_random_uuid(),
+    payload_hash     TEXT         NOT NULL,
+    payload          JSONB        NOT NULL,
+    notes_embedding  vector(1536),
+    repeat_count     INTEGER      NOT NULL DEFAULT 1,
+    status           TEXT         NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'accepted', 'rejected', 'merged')),
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    resolved_at      TIMESTAMPTZ,
+    PRIMARY KEY (customer_id, candidate_id)
+);
+
+CREATE INDEX kg_candidates_dedup
+    ON kg_candidates (customer_id, payload_hash, status, created_at);
+
+-- ivfflat index on notes_embedding for layer-2 dedup confirmation
+-- (spec §7.3): on hash collision, compare notes embeddings against
+-- pending candidates and increment repeat_count only when cosine > 0.85.
+CREATE INDEX kg_candidates_notes_embedding_ivfflat
+    ON kg_candidates USING ivfflat (notes_embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- ---------------------------------------------------------------------------
+-- kg_* RLS: tenant isolation on kg_classes, kg_evidence, kg_candidates.
+-- Same pattern as graph_nodes / graph_edges / usage_events: USING-only
+-- policy filtered on the `app.current_customer_id` GUC that
+-- shared/db.with_tenant() sets per transaction. FORCE applies the policy
+-- to the table owner too. No bypass role — services that need
+-- cross-tenant access just don't enter with_tenant() and therefore see
+-- zero rows on these tables (by design). See spec §5.1 / §12.3.
+-- ---------------------------------------------------------------------------
+ALTER TABLE kg_classes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kg_classes FORCE ROW LEVEL SECURITY;
+ALTER TABLE kg_evidence ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kg_evidence FORCE ROW LEVEL SECURITY;
+ALTER TABLE kg_candidates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE kg_candidates FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY kg_classes_tenant_isolation ON kg_classes
+    USING (customer_id = current_setting('app.current_customer_id', true));
+
+CREATE POLICY kg_evidence_tenant_isolation ON kg_evidence
+    USING (customer_id = current_setting('app.current_customer_id', true));
+
+CREATE POLICY kg_candidates_tenant_isolation ON kg_candidates
+    USING (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
 -- Late-bound FKs: targets defined later in this file than their source tables.
 -- ---------------------------------------------------------------------------
 ALTER TABLE documents
