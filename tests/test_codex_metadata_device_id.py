@@ -21,3 +21,15 @@ def test_codex_connector_inherits_build_session_doc() -> None:
         "CodexConnector overrode _build_session_doc — confirm device_id is "
         "still written into metadata, then update this test."
     )
+
+
+def test_codex_connector_inherits_build_unit_doc() -> None:
+    # Derived Codex artifacts need the same denormalized device_id stamp and
+    # historical parent fallback contract as Claude Code artifacts.
+    assert (
+        CodexConnector._build_unit_doc  # type: ignore[attr-defined]
+        is ClaudeCodeConnector._build_unit_doc  # type: ignore[attr-defined]
+    ), (
+        "CodexConnector overrode _build_unit_doc — confirm device_id is still "
+        "copied from the parent session, then update this test."
+    )

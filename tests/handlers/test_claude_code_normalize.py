@@ -110,6 +110,7 @@ async def test_normalize_complete_emits_session_plus_units(monkeypatch) -> None:
                       DocType.CLAUDE_CODE_DECISION, DocType.CLAUDE_CODE_FILE_REF):
         for d in by_type[unit_type]:
             assert d.parent_doc_id == session_doc_id
+            assert d.metadata["device_id"] == "dev-1"
             assert d.author_id == "emp-1"
 
 

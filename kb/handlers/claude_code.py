@@ -718,6 +718,13 @@ class ClaudeCodeConnector(Connector):
         # Identity keys land on metadata only when present — same
         # "omit when absent" convention as the session doc above.
         md = dict(metadata)
+        device_id = _nonempty_str(parent.metadata.get("device_id"))
+        if device_id:
+            # Keep derived artifacts directly attributable for new ingests.
+            # Historical unit docs only have parent_doc_id, so readers must
+            # retain parent fallback rather than relying on this denormalized
+            # field being universally present.
+            md["device_id"] = device_id
         if employee_name:
             md["employee_name"] = employee_name
         if employee_email:
