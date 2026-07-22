@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from engine.retrieval.synthesis import (
@@ -12,14 +14,17 @@ from engine.retrieval.synthesis import (
     SynthesisError,
     _build_streaming_system_prompt,
     _build_system_prompt,
+    _call_google,
     _extract_citations,
     _fallback_parse_text,
     _format_user_prompt,
+    _google_synthesis_thinking_config,
     _strip_keys_recursive,
     normalize_citations_in_answer,
     synthesize,
     synthesize_stream,
 )
+from engine.shared.constants import SYNTHESIS_MODEL_ALIASES, SYNTHESIS_MODELS
 
 _NOW_ISO = "2026-04-24T00:00:00+00:00"
 
@@ -387,6 +392,26 @@ def test_extract_citations_finds_all_in_multi_chunk() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_synthesis_model_registry_advertises_only_current_gemini_ids() -> None:
+    google_models = {
+        model for model, provider in SYNTHESIS_MODELS.items() if provider == "google"
+    }
+    assert google_models == {
+        "google/gemini-3.6-flash",
+        "google/gemini-3.5-flash-lite",
+    }
+    assert SYNTHESIS_MODEL_ALIASES == {
+        "google/gemini-3-flash-preview": "google/gemini-3.6-flash",
+        "google/gemini-3.1-flash-lite": "google/gemini-3.5-flash-lite",
+    }
+    assert set(SYNTHESIS_MODEL_ALIASES).isdisjoint(SYNTHESIS_MODELS)
+
+
+def test_google_synthesis_model_requires_explicit_thinking_config() -> None:
+    with pytest.raises(SynthesisError, match="missing thinking configuration"):
+        _google_synthesis_thinking_config("gemini-future-model")
+
+
 @pytest.mark.asyncio
 async def test_synthesize_short_circuits_on_empty_chunks() -> None:
     result = await synthesize(
@@ -401,7 +426,48 @@ async def test_synthesize_short_circuits_on_empty_chunks() -> None:
 async def test_synthesize_rejects_unknown_model() -> None:
     with pytest.raises(SynthesisError) as exc_info:
         await synthesize("q", [_chunk(1)], model="bogus/model-name")
-    assert "unsupported synthesis model" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert "unsupported synthesis model" in message
+    assert "google/gemini-3.6-flash" in message
+    assert "google/gemini-3.5-flash-lite" in message
+    assert "gemini-3-flash-preview" not in message
+    assert "gemini-3.1-flash-lite" not in message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("submitted_model", "canonical_model"),
+    [
+        ("google/gemini-3.6-flash", "google/gemini-3.6-flash"),
+        ("google/gemini-3-flash-preview", "google/gemini-3.6-flash"),
+        ("google/gemini-3.5-flash-lite", "google/gemini-3.5-flash-lite"),
+        ("google/gemini-3.1-flash-lite", "google/gemini-3.5-flash-lite"),
+    ],
+)
+async def test_synthesize_canonicalizes_current_and_legacy_gemini_models(
+    monkeypatch,
+    submitted_model: str,
+    canonical_model: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_call(provider_name, *, system, user, model, max_tokens):
+        captured.update(provider=provider_name, model=model)
+        return {
+            "answer": "answer [chunk:1]",
+            "citations_used": [1],
+            "insufficient_context": False,
+        }
+
+    monkeypatch.setattr("engine.retrieval.synthesis._dispatch", fake_call)
+
+    result = await synthesize("q", [_chunk(1)], model=submitted_model)
+
+    assert captured == {
+        "provider": "google",
+        "model": canonical_model.split("/", 1)[1],
+    }
+    assert result.model == canonical_model
 
 
 @pytest.mark.asyncio
@@ -500,6 +566,60 @@ async def test_synthesize_normalizes_bare_citations(monkeypatch) -> None:
     assert "[chunk:1]" in result.answer
     assert "[chunk:2]" in result.answer
     assert "chunk:1." not in result.answer  # bare form was rewritten
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "thinking_level"),
+    [
+        ("gemini-3.6-flash", "medium"),
+        ("gemini-3.5-flash-lite", "minimal"),
+    ],
+)
+async def test_google_nonstreaming_omits_deprecated_sampling_parameters(
+    monkeypatch,
+    model: str,
+    thinking_level: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def fake_acompletion(**kwargs: object):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"answer":"ok [chunk:1]","citations_used":[1],'
+                            '"insufficient_context":false}'
+                        )
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(
+        "engine.retrieval.synthesis._check_provider_credentials",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr("engine.shared.llm.acompletion", fake_acompletion)
+
+    parsed = await _call_google("system", "user", model, 200)
+
+    assert parsed["answer"] == "ok [chunk:1]"
+    assert captured["model"] == f"gemini/{model}"
+    assert captured["thinking_config"] == {"thinkingLevel": thinking_level}
+    assert "reasoning_effort" not in captured
+    assert "thinkingBudget" not in captured["thinking_config"]
+    deprecated_sampling_parameters = {
+        "temperature",
+        "top_p",
+        "top_k",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+    }
+    assert deprecated_sampling_parameters.isdisjoint(captured)
 
 
 # ---------------------------------------------------------------------------
@@ -672,13 +792,19 @@ async def test_synthesize_stream_yields_deltas_then_final_anthropic(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "thinking_level"),
+    [
+        ("google/gemini-3.6-flash", "medium"),
+        ("google/gemini-3.5-flash-lite", "minimal"),
+    ],
+)
 async def test_synthesize_stream_yields_deltas_then_final_google(
     monkeypatch,
+    model: str,
+    thinking_level: str,
 ) -> None:
-    """Google streaming path goes through the same LiteLLM call, with the
-    Gemini-specific `reasoning_effort="none"` knob (the chunk-D replacement
-    for the legacy `thinking_config: {thinking_budget: 0}`).
-    """
+    """Google streaming uses each model's supported thinking level."""
     fake = _AcompletionRecorder(
         texts=["Gemini ", "answered [chunk:1]."]
     )
@@ -690,7 +816,7 @@ async def test_synthesize_stream_yields_deltas_then_final_google(
     async for evt in synthesize_stream(
         "q?",
         chunks,
-        model="google/gemini-3-flash-preview",
+        model=model,
         max_tokens=150,
     ):
         events.append(evt)
@@ -705,13 +831,60 @@ async def test_synthesize_stream_yields_deltas_then_final_google(
     # only prefix LiteLLM routes via AI Studio API-key auth. `google/`
     # and bare ids both go to Vertex AI (full GCP creds required), so
     # the translation in synthesize_stream is load-bearing.
-    assert call["model"] == "gemini/gemini-3-flash-preview"
+    assert call["model"] == f"gemini/{model.split('/', 1)[1]}"
     assert call["stream"] is True
     assert call["max_tokens"] == 150
-    # reasoning_effort="none" is the LiteLLM-canonical replacement for
-    # `thinking_config: {thinking_budget: 0}`. On Gemini 3+ it maps to
-    # `thinking_level="minimal"` (true budget=0 is unavailable on 3.x).
-    assert call["reasoning_effort"] == "none"
+    assert call["thinking_config"] == {"thinkingLevel": thinking_level}
+    assert "reasoning_effort" not in call
+    assert "thinkingBudget" not in call["thinking_config"]
+    deprecated_sampling_parameters = {
+        "temperature",
+        "top_p",
+        "top_k",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+    }
+    assert deprecated_sampling_parameters.isdisjoint(call)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("submitted_model", "canonical_model", "thinking_level"),
+    [
+        (
+            "google/gemini-3-flash-preview",
+            "google/gemini-3.6-flash",
+            "medium",
+        ),
+        (
+            "google/gemini-3.1-flash-lite",
+            "google/gemini-3.5-flash-lite",
+            "minimal",
+        ),
+    ],
+)
+async def test_synthesize_stream_canonicalizes_legacy_gemini_models(
+    monkeypatch,
+    submitted_model: str,
+    canonical_model: str,
+    thinking_level: str,
+) -> None:
+    fake = _AcompletionRecorder(texts=["answer [chunk:1]"])
+    monkeypatch.setattr("engine.retrieval.synthesis.shared_llm.acompletion", fake)
+
+    events = []
+    async for event in synthesize_stream(
+        "q",
+        [_chunk(1)],
+        model=submitted_model,
+    ):
+        events.append(event)
+
+    assert fake.calls[0]["model"] == f"gemini/{canonical_model.split('/', 1)[1]}"
+    assert fake.calls[0]["thinking_config"] == {"thinkingLevel": thinking_level}
+    final = next(event for event in events if isinstance(event, StreamFinal))
+    assert final.model == canonical_model
 
 
 @pytest.mark.asyncio

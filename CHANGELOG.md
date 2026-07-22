@@ -21,6 +21,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   extracted to `kb.github_seed.seed_github_installation`, shared by the
   endpoint and the CLI.
 
+### Changed
+
+- Query synthesis now advertises Gemini 3.6 Flash and Gemini 3.5 Flash Lite,
+  keeps the previous picker IDs as compatibility aliases, and uses each new
+  model's supported thinking level without retired sampling controls.
+
 ### Fixed
 
 - Claude Code session extraction now sends gateway-configured model aliases

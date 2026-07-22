@@ -236,8 +236,9 @@ async def query(
     over the resulting chunks to produce a cited answer.
 
     Pick the model via `model: "<provider>/<model>"`. Defaults to
-    anthropic/claude-sonnet-4-6. Allowed models live in
-    shared.constants.SYNTHESIS_MODELS — Sonnet and Haiku only.
+    anthropic/claude-sonnet-4-6. Active picker models live in
+    engine.shared.constants.SYNTHESIS_MODELS; retired picker ids are accepted
+    only through the query-synthesis compatibility map.
     """
     # Stash for UsageLoggingMiddleware (see /retrieve for shape).
     request.state.customer_id = customer_id
