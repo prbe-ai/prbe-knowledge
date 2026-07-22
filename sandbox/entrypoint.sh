@@ -35,6 +35,14 @@ until pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB" -h localhost >/dev/null 2
   sleep 0.5
 done
 
+# Provision a minimal neon_auth stand-in: prod/CI get this schema from Neon Auth, but the bare
+# pgvector image lacks it and db/schema.sql FKs customers.organization_id -> neon_auth.organization(id).
+# The eval corpus never sets organization_id (stays NULL), so an empty stub satisfies the FK.
+# Sandbox-only — sandbox/ ships in no prod image, and the prod bootstrap (scripts/migrate.py) keeps
+# its own copy of this shim, so nothing here touches a prod code path.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -c \
+  "CREATE SCHEMA IF NOT EXISTS neon_auth; CREATE TABLE IF NOT EXISTS neon_auth.organization (id uuid PRIMARY KEY); CREATE TABLE IF NOT EXISTS neon_auth.\"user\" (id uuid PRIMARY KEY, organization_id uuid REFERENCES neon_auth.organization(id), email text, name text);"
+
 # Fresh DB on first boot, so a one-shot apply is safe. `prbe` is a superuser here, so
 # the RLS policies in schema.sql are bypassed and retrieval's explicit
 # `WHERE customer_id = $1` does the tenant scoping.
