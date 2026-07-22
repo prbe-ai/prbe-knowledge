@@ -240,11 +240,26 @@ async def upsert_edges(
     # wins. Same rule on ON CONFLICT — an existing EXTRACTED row stays
     # EXTRACTED even if a later AMBIGUOUS write touches it.
     # Order: EXTRACTED > INFERRED > AMBIGUOUS.
+    # Endpoints missing from THIS batch's node_ids might still exist from an
+    # earlier batch. Resolve those from the DB in one query rather than
+    # dropping the edge -- a run whose experiment was ingested last week must
+    # still connect. Only endpoints absent everywhere get parked.
+    node_ids = await _resolve_missing_endpoints(conn, customer_id, edges, node_ids)
+
+    deferred: list[tuple[GraphEdgeSpec, str, str]] = []
     deduped: dict[tuple[str, int, int, str, str], dict] = {}
     for edge in edges:
         from_id = node_ids.get((edge.from_label.value, edge.from_canonical_id))
         to_id = node_ids.get((edge.to_label.value, edge.to_canonical_id))
         if from_id is None or to_id is None:
+            # Park keyed on the (first) unresolved endpoint. The post-write
+            # worker replays this edge when that node is written. Previously a
+            # silent `continue` -- the drop is now a durable, countable row.
+            if from_id is None:
+                miss_label, miss_cid = edge.from_label.value, edge.from_canonical_id
+            else:
+                miss_label, miss_cid = edge.to_label.value, edge.to_canonical_id
+            deferred.append((edge, miss_label, miss_cid))
             continue
         aliased_from = edge.aliased_from_canonical_id or ""
         aliased_to = edge.aliased_to_canonical_id or ""
@@ -272,6 +287,11 @@ async def upsert_edges(
             )
 
     if not deduped:
+        # Nothing resolvable to write, but there may still be edges to park
+        # (a batch of purely forward-referencing edges resolves to zero
+        # deduped + N deferred). Park before returning, or they vanish.
+        if deferred:
+            await _park_pending_edges(conn, customer_id, source_system, deferred)
         return 0
 
     sorted_keys = sorted(deduped.keys())
@@ -375,7 +395,232 @@ async def upsert_edges(
             customer_id,
         )
 
+    if deferred:
+        await _park_pending_edges(conn, customer_id, source_system, deferred)
+
     return len(deduped)
+
+
+async def _resolve_missing_endpoints(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    edges: list[GraphEdgeSpec],
+    node_ids: dict[tuple[str, str], int],
+) -> dict[tuple[str, str], int]:
+    """Look up endpoints absent from `node_ids` against graph_nodes.
+
+    Returns node_ids augmented with any (label, canonical_id) that already
+    exists in the DB from an earlier batch. Endpoints absent everywhere stay
+    absent, and their edges get parked by the caller. One bulk query.
+    """
+    wanted: set[tuple[str, str]] = set()
+    for edge in edges:
+        for key in (
+            (edge.from_label.value, edge.from_canonical_id),
+            (edge.to_label.value, edge.to_canonical_id),
+        ):
+            if key not in node_ids:
+                wanted.add(key)
+    if not wanted:
+        return node_ids
+
+    labels = [k[0] for k in wanted]
+    cids = [k[1] for k in wanted]
+    rows = await conn.fetch(
+        """
+        SELECT label, canonical_id, node_id
+        FROM graph_nodes
+        WHERE customer_id = $1
+          AND (label, canonical_id) IN (
+                SELECT * FROM UNNEST($2::text[], $3::text[])
+              )
+        """,
+        customer_id,
+        labels,
+        cids,
+    )
+    if not rows:
+        return node_ids
+    resolved = dict(node_ids)
+    for r in rows:
+        resolved[(r["label"], r["canonical_id"])] = r["node_id"]
+    return resolved
+
+
+async def _park_pending_edges(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    source_system: str,
+    deferred: list[tuple[GraphEdgeSpec, str, str]],
+) -> None:
+    """Park edges whose endpoint isn't ingested yet, keyed on the missing one.
+
+    The post-write worker (drain_pending_edges) replays them when the node
+    lands. Bulk INSERT; one row per deferred edge.
+    """
+    await conn.executemany(
+        """
+        INSERT INTO pending_edges (
+            customer_id, missing_label, missing_canonical_id,
+            edge_type, from_label, from_canonical_id,
+            to_label, to_canonical_id, source_system, properties, valid_from
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
+        """,
+        [
+            (
+                customer_id,
+                miss_label,
+                miss_cid,
+                edge.edge_type.value,
+                edge.from_label.value,
+                edge.from_canonical_id,
+                edge.to_label.value,
+                edge.to_canonical_id,
+                source_system,
+                orjson.dumps(edge.properties).decode("utf-8"),
+                edge.valid_from,
+            )
+            for edge, miss_label, miss_cid in deferred
+        ],
+    )
+    log.info(
+        "graph_writer.edges_parked",
+        customer=customer_id,
+        count=len(deferred),
+    )
+
+
+# A parked edge whose counterpart never arrives would otherwise live forever.
+# 14 days is generously past any real out-of-order or backfill window (the
+# outbox drains in minutes; a full-corpus re-push in hours), so anything older
+# is a genuine dangling reference -- an endpoint that was deleted, or a client
+# bug -- not an in-flight edge.
+_PENDING_EDGE_TTL_DAYS = 14
+
+
+async def reap_expired_pending_edges(
+    conn: asyncpg.Connection,
+    customer_id: str,
+) -> int:
+    """Delete pending edges older than the TTL for this tenant.
+
+    Runs opportunistically from the drain path -- no separate cron. A tenant
+    with no ingestion parks nothing, so there is nothing to reap there;
+    wherever edges ARE parking, the drain fires and sweeps the stale tail.
+    Returns rows reaped.
+    """
+    reaped = await conn.fetchval(
+        """
+        WITH deleted AS (
+            DELETE FROM pending_edges
+            WHERE customer_id = $1
+              AND created_at < NOW() - make_interval(days => $2)
+            RETURNING id
+        )
+        SELECT count(*) FROM deleted
+        """,
+        customer_id,
+        _PENDING_EDGE_TTL_DAYS,
+    )
+    if reaped:
+        log.warning(
+            "graph_writer.pending_edges_reaped",
+            customer=customer_id,
+            reaped=reaped,
+            ttl_days=_PENDING_EDGE_TTL_DAYS,
+        )
+    return int(reaped or 0)
+
+
+async def drain_pending_edges(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    label: str,
+    canonical_id: str,
+) -> int:
+    """Materialise pending edges that were waiting on this node.
+
+    Called from the post-write worker after a node is written. Claims the
+    rows keyed on (label, canonical_id) with a lease, rebuilds GraphEdgeSpecs,
+    and runs them back through upsert_edges -- which resolves both endpoints
+    (now present) and, for anything STILL unresolved, re-parks on the OTHER
+    endpoint. Returns edges materialised.
+
+    Runs inside the caller's with_tenant scope. Idempotent under the lease:
+    a concurrent drain of the same node skips leased rows.
+    """
+    claimed = await conn.fetch(
+        """
+        UPDATE pending_edges
+        SET locked_until = NOW() + INTERVAL '30 seconds'
+        WHERE id IN (
+            SELECT id FROM pending_edges
+            WHERE customer_id = $1
+              AND missing_label = $2
+              AND missing_canonical_id = $3
+              AND locked_until IS NULL
+            ORDER BY id
+            FOR UPDATE SKIP LOCKED
+            LIMIT 500
+        )
+        RETURNING id, edge_type, from_label, from_canonical_id,
+                  to_label, to_canonical_id, source_system, properties, valid_from
+        """,
+        customer_id,
+        label,
+        canonical_id,
+    )
+    if not claimed:
+        return 0
+
+    from engine.shared.constants import EdgeType as _ET
+    from engine.shared.constants import NodeLabel as _NL
+
+    specs: list[GraphEdgeSpec] = []
+    ids: list[int] = []
+    by_source: dict[str, list[GraphEdgeSpec]] = {}
+    for r in claimed:
+        ids.append(r["id"])
+        props = r["properties"]
+        if isinstance(props, str):
+            props = orjson.loads(props)
+        spec = GraphEdgeSpec(
+            edge_type=_ET(r["edge_type"]),
+            from_label=_NL(r["from_label"]),
+            from_canonical_id=r["from_canonical_id"],
+            to_label=_NL(r["to_label"]),
+            to_canonical_id=r["to_canonical_id"],
+            properties=props or {},
+            valid_from=r["valid_from"],
+        )
+        by_source.setdefault(r["source_system"], []).append(spec)
+        specs.append(spec)
+
+    # Resolve every endpoint these edges name against the live graph, then
+    # replay. Anything still unresolved re-parks on its other endpoint via the
+    # normal upsert_edges path -- so a chain (artifact needs run needs
+    # experiment) settles one hop per node arrival.
+    node_ids = await _resolve_missing_endpoints(conn, customer_id, specs, {})
+    total = 0
+    for src, src_specs in by_source.items():
+        total += await upsert_edges(conn, customer_id, src_specs, node_ids, src)
+
+    # These rows are consumed: upsert_edges either wrote them or re-parked the
+    # still-unresolvable ones as NEW rows keyed on the other endpoint. Delete
+    # the originals so they don't drain twice.
+    await conn.execute(
+        "DELETE FROM pending_edges WHERE id = ANY($1::bigint[])",
+        ids,
+    )
+    log.info(
+        "graph_writer.pending_edges_drained",
+        customer=customer_id,
+        anchor=canonical_id,
+        materialised=total,
+        claimed=len(ids),
+    )
+    return total
 
 
 async def delete_edges_from_node(
