@@ -316,6 +316,8 @@ async def execute_search(
     doc_types: list[str] | None = None,
     source_keys: list[str] | None = None,
     discovery: bool = False,
+    source_keys_include_keyless: bool = False,
+    per_source_top_k: int | None = None,
 ) -> dict[str, Any]:
     """Fan out 1+ queries through the 4 channels (vector + bm25 + graph +
     inferred_edge) in parallel — same shape the harness runs on turn 0.
@@ -417,6 +419,8 @@ async def execute_search(
                     sort_by=sort_by,
                     doc_types=doc_types,
                     source_keys=source_keys,
+                    source_keys_include_keyless=source_keys_include_keyless,
+                    per_source_top_k=per_source_top_k,
                 )
                 return [_hit_to_chunk_dict(h, "vector") for h in hits]
             except Exception as exc:
@@ -432,6 +436,8 @@ async def execute_search(
                     sort_by=sort_by,
                     doc_types=doc_types,
                     source_keys=source_keys,
+                    source_keys_include_keyless=source_keys_include_keyless,
+                    per_source_top_k=per_source_top_k,
                 )
                 return [_hit_to_chunk_dict(h, "bm25") for h in hits]
             except Exception as exc:
@@ -449,6 +455,7 @@ async def execute_search(
                     sort_by=sort_by,
                     doc_types=doc_types,
                     source_keys=source_keys,
+                    source_keys_include_keyless=source_keys_include_keyless,
                 )
                 return [
                     {
@@ -480,6 +487,7 @@ async def execute_search(
                     sort_by=sort_by,
                     doc_types=doc_types,
                     source_keys=source_keys,
+                    source_keys_include_keyless=source_keys_include_keyless,
                 )
                 return [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:

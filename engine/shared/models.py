@@ -386,6 +386,35 @@ class QueryRequest(BaseModel):
             "is wanted."
         ),
     )
+    source_keys_include_keyless: bool = Field(
+        default=False,
+        description=(
+            "Changes how `source_keys` filters. Default (false) is a HARD "
+            "filter: a doc must carry one of the listed keys, so connector-"
+            "ingested docs with NO source_key (github, transcripts) drop out. "
+            "When true, the filter also ADMITS keyless docs -- i.e. 'match one "
+            "of these keys OR have no key at all'. This lets a single request "
+            "mix keyed corpora (custom-ingest) with keyless connector corpora "
+            "instead of a client fanning out one request per corpus. No effect "
+            "when `source_keys` is unset. Pair with `per_source_top_k` to keep "
+            "one loud source from burying another in the shared budget."
+        ),
+    )
+    per_source_top_k: int | None = Field(
+        default=None,
+        gt=0,
+        description=(
+            "When set, the recall channels (vector + BM25) fetch this many hits "
+            "PER source_system and union them, instead of one global top_k "
+            "across all sources. Guarantees every source a slot in a "
+            "mixed-source request -- the recall guarantee a client otherwise "
+            "gets by fanning out one request per source (PR#78). The graph and "
+            "inferred-edge channels are unaffected (graph hits are "
+            "surprise-ranked in-process, and are single-source in the common "
+            "anchored case). No effect when unset (single global top_k, "
+            "current behaviour)."
+        ),
+    )
 
 
 def normalize_author_id(value: str | None) -> str | None:

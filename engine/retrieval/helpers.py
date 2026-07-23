@@ -288,3 +288,34 @@ async def expand_to_author_id_set(
         customer_id, person_canonical_ids,
     )
     return [r["v"] for r in rows]
+
+
+def source_key_predicate(
+    params: list,
+    source_keys: list[str] | None,
+    *,
+    alias: str,
+    include_keyless: bool = False,
+) -> str:
+    """Build the `AND ...source_key...` predicate shared by every retriever.
+
+    Appends the source_keys array to `params` (in place) and returns the SQL
+    fragment. Returns '' when `source_keys` is falsy.
+
+    Default is a HARD filter: `metadata->>'source_key' = ANY($n)`, so a doc with
+    no source_key (connector-ingested: github, transcripts) is excluded. That
+    is the long-standing behaviour and stays byte-identical.
+
+    When `include_keyless` is True the predicate also admits keyless docs:
+    `(metadata->>'source_key' = ANY($n) OR metadata->>'source_key' IS NULL)`.
+    That lets ONE request mix keyed custom-ingest corpora with keyless connector
+    corpora instead of a client fanning out one request per corpus.
+    """
+    if not source_keys:
+        return ""
+    params.append(source_keys)
+    idx = len(params)
+    keyed = f"{alias}.metadata->>'source_key' = ANY(${idx}::text[])"
+    if include_keyless:
+        return f"AND ({keyed} OR {alias}.metadata->>'source_key' IS NULL)"
+    return f"AND {keyed}"
