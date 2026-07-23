@@ -646,14 +646,22 @@ INFERRED_EDGES_BUNDLE_MAX_1HOP = 50
 INFERRED_EDGES_BUNDLE_MAX_VECTOR_SIMILAR = 20
 INFERRED_EDGES_BUNDLE_MAX_TIME_WINDOW = 30
 
-# Models supported by the /query synthesis layer. Keys are the
-# "<provider>/<model>" identifier callers pass; values are provider names
-# the synthesis dispatcher uses to pick a client.
+# Models advertised by the /query synthesis layer. Keys are the active
+# "<provider>/<model>" identifiers callers (and the dashboard picker) use;
+# values are provider names the synthesis dispatcher uses to pick a client.
 SYNTHESIS_MODELS: dict[str, str] = {
     "anthropic/claude-haiku-4-5-20251001": "anthropic",
     "anthropic/claude-sonnet-4-6": "anthropic",
-    "google/gemini-3-flash-preview": "google",
-    "google/gemini-3.1-flash-lite": "google",
+    "google/gemini-3.6-flash": "google",
+    "google/gemini-3.5-flash-lite": "google",
+}
+
+# Submitted model ids from the previous picker remain accepted during the
+# rollout, but intentionally live outside SYNTHESIS_MODELS so they are not
+# advertised as active choices or included in validation error messages.
+SYNTHESIS_MODEL_ALIASES: dict[str, str] = {
+    "google/gemini-3-flash-preview": "google/gemini-3.6-flash",
+    "google/gemini-3.1-flash-lite": "google/gemini-3.5-flash-lite",
 }
 DEFAULT_SYNTHESIS_MODEL = "anthropic/claude-sonnet-4-6"
 

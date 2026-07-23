@@ -72,6 +72,39 @@ async def test_acompletion_passes_through_tools_and_tool_choice() -> None:
     assert kwargs["tool_choice"] is tool_choice
 
 
+@pytest.mark.parametrize(
+    "model",
+    ["gemini-3.6-flash", "gemini-3.5-flash-lite"],
+)
+def test_latest_gemini_models_do_not_reinsert_temperature(model: str) -> None:
+    """Pin the provider mapping where LiteLLM adds a default temperature."""
+    mapped = llm.litellm.get_optional_params(
+        model=model,
+        custom_llm_provider="gemini",
+        max_tokens=600,
+        drop_params=True,
+    )
+
+    assert mapped["max_output_tokens"] == 600
+    assert "temperature" not in mapped
+
+
+def test_gemini_sampling_shim_is_idempotent_and_model_scoped() -> None:
+    """Installing twice must not wrap again or alter older Gemini models."""
+    mapper = llm.litellm.GoogleAIStudioGeminiConfig.map_openai_params
+
+    llm._install_gemini_sampling_compatibility_shim()
+
+    assert llm.litellm.GoogleAIStudioGeminiConfig.map_openai_params is mapper
+    legacy_mapped = llm.litellm.get_optional_params(
+        model="gemini-3-flash-preview",
+        custom_llm_provider="gemini",
+        max_tokens=600,
+        drop_params=True,
+    )
+    assert legacy_mapped["temperature"] == 1.0
+
+
 # ---------------------------------------------------------------------------
 # aembedding
 # ---------------------------------------------------------------------------

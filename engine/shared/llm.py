@@ -99,6 +99,53 @@ from typing import Any
 import litellm
 from litellm.exceptions import OpenAIError as _LiteLLMBaseError
 
+# Gemini 3.6 Flash and 3.5 Flash-Lite retire the legacy sampling controls.
+# LiteLLM 1.83.14 (and 1.93.0, checked 2026-07-22) still injects
+# ``temperature=1.0`` for every Gemini 3+ request after caller kwargs have
+# been processed. Patch the provider mapper at the integration boundary so
+# the native request actually omits that field rather than merely omitting it
+# at our call site. The wrapper is deliberately limited to the two model ids
+# with the new contract; older Gemini workloads in this process keep
+# LiteLLM's existing behavior. Other retired controls are not LiteLLM
+# defaults and remain omitted by the synthesis call sites.
+_GEMINI_NO_SAMPLING_MODELS = frozenset(
+    {"gemini-3.6-flash", "gemini-3.5-flash-lite"}
+)
+
+
+def _install_gemini_sampling_compatibility_shim() -> None:
+    """Stop LiteLLM from re-adding its retired Gemini temperature default."""
+    config_class = litellm.GoogleAIStudioGeminiConfig
+    current_mapper = config_class.map_openai_params
+    if getattr(current_mapper, "_probe_sampling_compatibility_shim", False):
+        return
+
+    def _map_openai_params_without_retired_sampling(
+        self: Any,
+        non_default_params: dict[str, Any],
+        optional_params: dict[str, Any],
+        model: str,
+        drop_params: bool,
+    ) -> dict[str, Any]:
+        mapped = current_mapper(
+            self,
+            non_default_params=non_default_params,
+            optional_params=optional_params,
+            model=model,
+            drop_params=drop_params,
+        )
+        if model in _GEMINI_NO_SAMPLING_MODELS:
+            mapped.pop("temperature", None)
+        return mapped
+
+    _map_openai_params_without_retired_sampling._probe_sampling_compatibility_shim = (  # type: ignore[attr-defined]
+        True
+    )
+    config_class.map_openai_params = _map_openai_params_without_retired_sampling  # type: ignore[method-assign]
+
+
+_install_gemini_sampling_compatibility_shim()
+
 __all__ = [
     "LLMError",
     "acompletion",

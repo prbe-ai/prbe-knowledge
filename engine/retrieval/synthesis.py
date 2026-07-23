@@ -11,10 +11,9 @@ shape is enforced at the API level, not by asking the model nicely:
     OpenAI    — response_format = json_schema strict mode
     Google    — config.response_schema
 
-Phase-0b: the non-streaming paths route through `shared.llm.acompletion`
-so tenants without provider keys can use them via the central LiteLLM
-gateway. The streaming path (`synthesize_stream`) still
-uses the provider SDKs directly — chunk D handles that migration.
+Phase-0b: both the non-streaming and streaming paths route through
+`shared.llm.acompletion` so tenants without provider keys can use them via
+the central LiteLLM gateway.
 
 This avoids the "did the model wrap in JSON or return prose?" guessing
 game that the old prompt-only approach hit on every provider.
@@ -36,7 +35,7 @@ from typing import Any
 
 from engine.shared import llm as shared_llm
 from engine.shared.config import get_settings
-from engine.shared.constants import SYNTHESIS_MODELS
+from engine.shared.constants import SYNTHESIS_MODEL_ALIASES, SYNTHESIS_MODELS
 from engine.shared.exceptions import PrbeError
 from engine.shared.llm import LLMError
 from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
@@ -46,6 +45,14 @@ from engine.shared.models import GraphEvidence, QueryDocumentResult, QueryResult
 log = get_logger(__name__)
 
 SYNTHESIS_TIMEOUT_SECONDS = 30.0
+
+# Gemini 3.5+ no longer accepts token-based ``thinking_budget`` controls.
+# Keep the level explicit per advertised query-synthesis model so a future
+# model addition cannot silently inherit an incompatible provider default.
+_GOOGLE_SYNTHESIS_THINKING_LEVELS: dict[str, str] = {
+    "gemini-3.6-flash": "medium",
+    "gemini-3.5-flash-lite": "minimal",
+}
 
 
 class SynthesisError(PrbeError):
@@ -291,6 +298,36 @@ def flatten_documents_for_synthesis(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_synthesis_model(model: str) -> tuple[str, str]:
+    """Return the active model id and provider for a submitted model id.
+
+    Compatibility aliases are accepted at the request boundary but resolve
+    before dispatch, so deprecated ids are never sent upstream or advertised
+    in the active-model validation error.
+    """
+    canonical_model = SYNTHESIS_MODEL_ALIASES.get(model, model)
+    provider_name = SYNTHESIS_MODELS.get(canonical_model)
+    if provider_name is None:
+        raise SynthesisError(
+            f"unsupported synthesis model: {model}. Allowed: {sorted(SYNTHESIS_MODELS)}"
+        )
+    return canonical_model, provider_name
+
+
+def _google_synthesis_thinking_config(model: str) -> dict[str, str]:
+    """Return the supported thinking config for an active Gemini model."""
+    try:
+        thinking_level = _GOOGLE_SYNTHESIS_THINKING_LEVELS[model]
+    except KeyError as exc:
+        raise SynthesisError(
+            f"missing thinking configuration for Google synthesis model: {model}"
+        ) from exc
+    # LiteLLM camel-cases only the outer ``thinking_config`` key before
+    # sending the native Gemini REST payload. Keep the nested provider field
+    # in its wire-format spelling as well.
+    return {"thinkingLevel": thinking_level}
+
+
 async def synthesize(
     query: str,
     chunks: list[SynthesisChunk],
@@ -304,6 +341,8 @@ async def synthesize(
     Model output that doesn't match the schema falls back to plain-text
     handling so the user always gets *something* renderable.
     """
+    model, provider_name = _resolve_synthesis_model(model)
+
     if not chunks:
         return SynthesisResult(
             answer="No chunks were retrieved for this query, so there's nothing to summarize.",
@@ -313,11 +352,6 @@ async def synthesize(
             raw_provider_response="",
         )
 
-    if model not in SYNTHESIS_MODELS:
-        raise SynthesisError(
-            f"unsupported synthesis model: {model}. Allowed: {sorted(SYNTHESIS_MODELS)}"
-        )
-    provider_name = SYNTHESIS_MODELS[model]
     model_id = model.split("/", 1)[1]
 
     user_prompt = _format_user_prompt(query, chunks)
@@ -343,7 +377,7 @@ async def synthesize(
 
 
 # ---------------------------------------------------------------------------
-# Streaming synthesis (Anthropic only) — used by /query/stream
+# Streaming synthesis (Anthropic + Google) — used by /query/stream
 # ---------------------------------------------------------------------------
 
 
@@ -390,6 +424,8 @@ async def synthesize_stream(
     by extending SYNTHESIS_MODELS without further code change. The
     non-streaming `synthesize` path covers all three providers.
     """
+    model, provider_name = _resolve_synthesis_model(model)
+
     if not chunks:
         yield StreamFinal(
             answer="No chunks were retrieved for this query, so there's nothing to summarize.",
@@ -399,11 +435,6 @@ async def synthesize_stream(
         )
         return
 
-    if model not in SYNTHESIS_MODELS:
-        raise SynthesisError(
-            f"unsupported synthesis model: {model}. Allowed: {sorted(SYNTHESIS_MODELS)}"
-        )
-    provider_name = SYNTHESIS_MODELS[model]
     if provider_name not in ("anthropic", "google"):
         raise SynthesisError(
             f"streaming synthesis only supports Anthropic and Google models today (got {provider_name})"
@@ -435,24 +466,13 @@ async def synthesize_stream(
         "timeout": SYNTHESIS_TIMEOUT_SECONDS,
     }
     if provider_name == "google":
-        # Gemini 3 Flash thinks by default. Thinking tokens are billed
-        # against `max_output_tokens` and produce no visible output;
-        # for retrieval-grounded synthesis the answer must come from the
-        # chunks, so extended reasoning is pure latency + wasted budget.
-        # The legacy call used `thinking_config: {thinking_budget: 0}`.
-        # LiteLLM normalizes this to `reasoning_effort="none"`; for
-        # Gemini 2.x that maps to budget=0, but for **Gemini 3+** it
-        # maps to `thinking_level="minimal"` because Google removed the
-        # ability to fully disable thinking on the 3.x line. "Minimal"
-        # is the closest available approximation — managed-tenant
-        # streaming may incur a small thinking-token overhead the old
-        # direct-SDK path did not, but correctness (cited prose grounded
-        # in the chunks) is unchanged. The optimization was about
-        # latency, not correctness.
-        # TODO(phase-0b-thinking-config): revisit when LiteLLM exposes
-        # a passthrough for Gemini 3's `thinking_level` budget knob, or
-        # when Google re-enables true budget=0 on 3.x.
-        completion_kwargs["reasoning_effort"] = "none"
+        # Gemini 3.5+ rejects the deprecated token-based thinking budget.
+        # Use the provider-native level so LiteLLM does not have to infer a
+        # level from the model id (and the streaming/non-streaming paths stay
+        # byte-for-byte consistent at the call boundary).
+        completion_kwargs["thinking_config"] = _google_synthesis_thinking_config(
+            model_id
+        )
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -777,10 +797,9 @@ async def _call_google(
             # to google-genai's GenerateContentConfig.
             response_schema=google_schema,
             response_mime_type="application/json",
-            # Disable Gemini 3 thinking so the full token budget is
-            # available for structured JSON output (see streaming
-            # branch for full rationale).
-            thinking_config={"thinking_budget": 0},
+            # Gemini 3.5+ accepts named thinking levels, not the deprecated
+            # token-based thinking budget. Keep this aligned with streaming.
+            thinking_config=_google_synthesis_thinking_config(model),
             timeout=SYNTHESIS_TIMEOUT_SECONDS,
         )
     except LLMError as exc:
