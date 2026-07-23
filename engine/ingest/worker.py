@@ -274,29 +274,41 @@ class Worker:
                         customer_id, source, payload_keys
                     )
                     normalized.append((row, result))
-                except (DuplicateEventIgnored, UnsupportedEventType) as exc:
+                except DuplicateEventIgnored as exc:
                     log.info("worker.skipped", queue_id=queue_id, reason=str(exc))
                     await self._mark_skipped(
                         queue_id, customer_id, source, event_id, payload_key,
                         str(exc), captured_version,
                     )
+                except UnsupportedEventType as exc:
+                    log.info("worker.unsupported", queue_id=queue_id, reason=str(exc))
+                    await self._mark_skipped(
+                        queue_id, customer_id, source, event_id, payload_key,
+                        str(exc), captured_version,
+                    )
                 except PrbeError as exc:
-                    await self._on_error(
-                        queue_id, attempts, str(exc),
+                    await self._fail_batch_row(
+                        queue_id, attempts, str(exc), source, customer_id, event_id,
                         transient=getattr(exc, "transient", False),
                         captured_version=captured_version,
                     )
                 except Exception as exc:  # pragma: no cover — last-resort
                     log.exception("worker.batch_normalize_unhandled", queue_id=queue_id)
-                    await self._on_error(
-                        queue_id, attempts, repr(exc),
+                    await self._fail_batch_row(
+                        queue_id, attempts, repr(exc), source, customer_id, event_id,
                         transient=True, captured_version=captured_version,
                     )
 
             if not normalized:
                 return
 
-            # ONE coalesced Phase B for every survivor.
+            # ONE coalesced Phase B for every survivor. A *non-transient* poison
+            # doc is isolated per-item inside persist_batch (savepoint) and does
+            # not reach here. A *transient* persist error re-raises out of the
+            # single shared transaction, so it rolls back EVERY item -- failure
+            # is batch-scoped, not item-scoped (documented in persist_batch and
+            # tracked as a pre-flip hardening item: retry the offender alone so
+            # healthy siblings aren't penalized).
             try:
                 outcomes = await self._normalizer.persist_batch(
                     customer_id,
@@ -306,36 +318,74 @@ class Worker:
             except PrbeError as exc:
                 transient = getattr(exc, "transient", False)
                 for row, _ in normalized:
-                    await self._on_error(
+                    await self._fail_batch_row(
                         row["queue_id"], row["attempts"] + 1, str(exc),
+                        source, customer_id, row["source_event_id"],
                         transient=transient, captured_version=row["version"],
                     )
                 return
             except Exception as exc:  # pragma: no cover
                 log.exception("worker.batch_persist_unhandled", customer=customer_id)
                 for row, _ in normalized:
-                    await self._on_error(
+                    await self._fail_batch_row(
                         row["queue_id"], row["attempts"] + 1, repr(exc),
+                        source, customer_id, row["source_event_id"],
                         transient=True, captured_version=row["version"],
                     )
                 return
 
             for (row, _result), outcome in zip(normalized, outcomes, strict=True):
-                if source == SourceSystem.MANUAL_UPLOAD:
-                    await self._cleanup_manual_upload_original(
-                        customer_id, row["source_event_id"]
+                # Finalization runs AFTER the batch already committed. A transient
+                # DB blip here must not crash the drain loop -- the single-row
+                # path absorbs the same event via its `except Exception`. The
+                # committed docs are idempotent, so leaving the row PROCESSING
+                # for reclaim simply re-marks it done on the next pass.
+                try:
+                    if source == SourceSystem.MANUAL_UPLOAD:
+                        await self._cleanup_manual_upload_original(
+                            customer_id, row["source_event_id"]
+                        )
+                    await self._mark_done(
+                        row["queue_id"], customer_id, source, row["source_event_id"],
+                        self._row_payload_keys(row)[0] if self._row_payload_keys(row) else "",
+                        outcome, row["version"],
                     )
-                await self._mark_done(
-                    row["queue_id"], customer_id, source, row["source_event_id"],
-                    self._row_payload_keys(row)[0] if self._row_payload_keys(row) else "",
-                    outcome, row["version"],
-                )
+                except Exception:
+                    log.exception(
+                        "worker.batch_finalize_failed", queue_id=row["queue_id"],
+                    )
         finally:
             for hb in heartbeats:
                 hb.cancel()
             for hb in heartbeats:
                 with contextlib.suppress(asyncio.CancelledError):
                     await hb
+
+    async def _fail_batch_row(
+        self,
+        queue_id: int,
+        attempts: int,
+        error: str,
+        source: SourceSystem,
+        customer_id: str,
+        event_id: str,
+        *,
+        transient: bool,
+        captured_version: int,
+    ) -> None:
+        """Dead-letter one row from a batch, mirroring `_process`'s error tail:
+        record the error/attempt via `_on_error` and, if it DLQ'd a manual
+        upload, surface that upload as `failed_ingest` (otherwise it would sit
+        forever in its prior 'processing' state in the dashboard)."""
+        dead = await self._on_error(
+            queue_id, attempts, error,
+            transient=transient, captured_version=captured_version,
+        )
+        if dead and source == SourceSystem.MANUAL_UPLOAD:
+            with contextlib.suppress(Exception):
+                await self._mark_manual_upload_failed_ingest(
+                    customer_id, event_id, error
+                )
 
     async def _process(self, row: asyncpg.Record) -> None:
         queue_id = row["queue_id"]

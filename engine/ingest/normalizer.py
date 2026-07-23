@@ -522,12 +522,22 @@ class Normalizer:
         of N -- the drain-ceiling relief in TODOS.md:149-151.
 
         Every item keeps its OWN document set, per-doc savepoint isolation
-        (a poison doc in one item does not roll back another -- group-split-on-
-        failure), ordering check, per-item outcome, and post-commit wiki /
-        inferred-edge enqueues. Writes are idempotent (upsert by doc_id +
-        content_hash), so if a caller's per-row commit bookkeeping later
-        re-claims an item, re-processing is a no-op -- same safety as the
-        single-row path.
+        (a NON-TRANSIENT poison doc in one item is quarantined via savepoint and
+        does not roll back another -- group-split-on-failure), ordering check,
+        per-item outcome, and post-commit wiki / inferred-edge enqueues. Writes
+        are idempotent (upsert by doc_id + content_hash), so if a caller's
+        per-row commit bookkeeping later re-claims an item, re-processing is a
+        no-op -- same safety as the single-row path.
+
+        SCOPE OF FAILURE: savepoint isolation covers non-transient quarantines.
+        A *transient* PrbeError (statement timeout, connection drop, upsert-race
+        exhaustion) re-raises out of THIS single shared transaction and rolls
+        back EVERY item in the batch -- failure is batch-scoped, not item-scoped.
+        The caller (`Worker._process_batch`) then bumps `attempts` on all
+        siblings and they are re-claimed together. This is acceptable because the
+        flag is off by default and re-claim self-heals; the pre-flip hardening
+        item is to retry a transient offender in its own single-row transaction
+        so healthy siblings aren't penalized.
 
         The single-row path (`_persist`) is deliberately left untouched; this
         method is reached only when the coalescing flag claims a batch.
