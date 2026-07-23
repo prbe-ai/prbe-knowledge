@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from engine.retrieval.helpers import source_key_predicate
 from engine.retrieval.temporal import build_predicate
 from engine.shared.constants import TOP_K_BM25
 from engine.shared.db import with_tenant
@@ -140,6 +141,8 @@ async def bm25_search(
     author_ids: list[str] | None = None,
     sort_by: Literal["relevance", "recency"] = "relevance",
     source_keys: list[str] | None = None,
+    source_keys_include_keyless: bool = False,
+    per_source_top_k: int | None = None,
 ) -> list[BM25Hit]:
     """`include_drafts` defaults to False — retrieval hides ``visibility='draft'``
     rows (see migration 0082 + Plan A Component 6). Reviewer surfaces pass
@@ -179,12 +182,10 @@ async def bm25_search(
             params.append(author_ids)
             author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
 
-        source_key_filter = ""
-        if source_keys:
-            params.append(source_keys)
-            source_key_filter = (
-                f"AND d.metadata->>'source_key' = ANY(${len(params)}::text[])"
-            )
+        source_key_filter = source_key_predicate(
+            params, source_keys, alias="d",
+            include_keyless=source_keys_include_keyless,
+        )
 
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
@@ -204,8 +205,7 @@ async def bm25_search(
             else "score DESC, c.chunk_id"
         )
 
-        rows = await conn.fetch(
-            f"""
+        inner_sql = f"""
             SELECT c.chunk_id,
                    c.doc_id,
                    d.version AS doc_version,
@@ -233,11 +233,35 @@ async def bm25_search(
               {visibility_filter}
               {author_filter}
               {source_key_filter}
-            ORDER BY {order_by_sql}
+        """
+        if per_source_top_k is not None:
+            # Per-source top-K slotting (PR#78 recall guarantee, server-side).
+            # Window orders by SELECTED columns, not the raw ts_rank expr.
+            partition_order = (
+                "updated_at DESC, chunk_id"
+                if sort_by == "recency"
+                else "score DESC, chunk_id"
+            )
+            params.append(per_source_top_k)
+            ps_idx = len(params)
+            sql = f"""
+            SELECT chunk_id, doc_id, doc_version, source_system, source_url,
+                   title, author_id, content, kind, created_at, updated_at, score
+            FROM (
+                SELECT sub.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY sub.source_system ORDER BY {partition_order}
+                       ) AS _ps_rn
+                FROM ({inner_sql}) sub
+            ) ranked
+            WHERE _ps_rn <= ${ps_idx}
+            ORDER BY {partition_order}
             LIMIT $3
-            """,
-            *params,
-        )
+            """
+        else:
+            sql = f"{inner_sql}\n            ORDER BY {order_by_sql}\n            LIMIT $3"
+
+        rows = await conn.fetch(sql, *params)
 
     return [
         BM25Hit(

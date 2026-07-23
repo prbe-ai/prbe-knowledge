@@ -184,6 +184,8 @@ class LoopState:
     # in-loop `search` dispatch (not exposed on the tool schema — the agent
     # reformulates queries, it does not choose the retrieval posture).
     request_discovery: bool = False
+    request_source_keys_include_keyless: bool = False
+    request_per_source_top_k: int | None = None
 
 
 # ============================================================
@@ -1001,6 +1003,11 @@ async def _execute_tool_call(
             arguments["doc_types"] = state.request_doc_types
     if name == "search" and state.request_discovery:
         arguments["discovery"] = True
+    if name == "search":
+        if state.request_source_keys_include_keyless:
+            arguments["source_keys_include_keyless"] = True
+        if state.request_per_source_top_k is not None:
+            arguments["per_source_top_k"] = state.request_per_source_top_k
 
     t_tool = time.perf_counter()
     result = await dispatch_tool_call(
@@ -1706,6 +1713,8 @@ async def run_gatherer(
     request_source_keys = req.source_keys or None
     request_doc_types = req.doc_types or None
     request_discovery = bool(req.discovery)
+    request_source_keys_include_keyless = bool(req.source_keys_include_keyless)
+    request_per_source_top_k = req.per_source_top_k
     effective_doc_types = request_doc_types or search_options.doc_types or None
 
     log.info(
@@ -1753,6 +1762,8 @@ async def run_gatherer(
         doc_types=effective_doc_types,
         source_keys=request_source_keys,
         discovery=request_discovery,
+        source_keys_include_keyless=request_source_keys_include_keyless,
+        per_source_top_k=request_per_source_top_k,
     )
     timing["prefanout_ms"] = (time.perf_counter() - t_prefanout) * 1000
 
@@ -1796,6 +1807,8 @@ async def run_gatherer(
         request_source_keys=request_source_keys,
         request_doc_types=request_doc_types,
         request_discovery=request_discovery,
+        request_source_keys_include_keyless=request_source_keys_include_keyless,
+        request_per_source_top_k=request_per_source_top_k,
         messages=[
             {
                 "role": "system",
