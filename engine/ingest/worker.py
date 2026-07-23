@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from datetime import UTC, datetime
+from typing import Any
 
 import asyncpg
 
@@ -43,12 +45,23 @@ class Worker:
         max_attempts: int = 5,
         concurrency: int = 1,
         per_customer_max_inflight: int = 10,
+        claim_coalesce_max: int | None = None,
     ) -> None:
         self._ctx = ctx
         self._normalizer = Normalizer(ctx)
         self._max_attempts = max_attempts
         self._concurrency = max(1, concurrency)
         self._per_customer_max_inflight = max(1, per_customer_max_inflight)
+        # Claim-time coalescing (T11): when > 1, a claim grabs up to this many
+        # PENDING rows for the SAME (customer, source_system) and processes
+        # their graph writes through ONE upsert per Phase B, collapsing repeated
+        # hot-node touches into one lock acquisition instead of N. Default 1 =
+        # the proven single-row path, untouched. Env override so it can be
+        # dialled up per deployment without a code change once a real drain
+        # incident justifies it (see TODOS.md hot-node write strategy).
+        if claim_coalesce_max is None:
+            claim_coalesce_max = int(os.getenv("INGEST_CLAIM_COALESCE_MAX", "1"))
+        self._claim_coalesce_max = max(1, claim_coalesce_max)
         self._shutdown = asyncio.Event()
 
     async def run(self, poll_interval: float = 1.0) -> None:
@@ -83,6 +96,16 @@ class Worker:
 
     async def _claim_loop(self, poll_interval: float) -> None:
         while not self._shutdown.is_set():
+            if self._claim_coalesce_max > 1:
+                rows = await self._claim_batch()
+                if not rows:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            self._shutdown.wait(), timeout=poll_interval
+                        )
+                    continue
+                await self._process_batch(rows)
+                continue
             claimed = await self._claim_one()
             if claimed is None:
                 with contextlib.suppress(TimeoutError):
@@ -158,6 +181,161 @@ class Worker:
                 row["queue_id"],
             )
             return row
+
+    async def _claim_batch(self) -> list[asyncpg.Record]:
+        """Claim up to `claim_coalesce_max` PENDING rows for ONE
+        (customer, source_system), atomically marking them PROCESSING.
+
+        Picks the same first-in-line (customer, source) `_claim_one` would,
+        then grabs its sibling rows so their graph writes coalesce. Same
+        per-customer inflight cap and `FOR UPDATE SKIP LOCKED` no-double-claim
+        guarantee. Same (customer, source) so persist_batch's provenance /
+        enqueue logic stays single-source. Returns [] when nothing is
+        claimable."""
+        async with get_pool().acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                """
+                    WITH inflight AS (
+                        SELECT customer_id, COUNT(*) AS cnt
+                        FROM ingestion_queue
+                        WHERE status = $2
+                        GROUP BY customer_id
+                    ),
+                    pick AS (
+                        SELECT q.customer_id, q.source_system
+                        FROM ingestion_queue q
+                        LEFT JOIN inflight i ON i.customer_id = q.customer_id
+                        WHERE q.status = $1
+                          AND COALESCE(i.cnt, 0) < $3
+                        ORDER BY q.priority DESC, q.enqueued_at
+                        LIMIT 1
+                    )
+                    SELECT q.queue_id, q.customer_id, q.source_system,
+                           q.source_event_id, q.payload_s3_key, q.payload_s3_keys,
+                           q.version, q.attempts
+                    FROM ingestion_queue q
+                    JOIN pick p
+                      ON p.customer_id = q.customer_id
+                     AND p.source_system = q.source_system
+                    WHERE q.status = $1
+                    ORDER BY q.priority DESC, q.enqueued_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $4
+                    """,
+                QueueStatus.PENDING.value,
+                QueueStatus.PROCESSING.value,
+                self._per_customer_max_inflight,
+                self._claim_coalesce_max,
+            )
+            if not rows:
+                return []
+            await conn.execute(
+                """
+                    UPDATE ingestion_queue
+                    SET status = $1, started_at = NOW(), heartbeat_at = NOW(),
+                        attempts = attempts + 1
+                    WHERE queue_id = ANY($2::bigint[])
+                    """,
+                QueueStatus.PROCESSING.value,
+                [r["queue_id"] for r in rows],
+            )
+            return list(rows)
+
+    @staticmethod
+    def _row_payload_keys(row: asyncpg.Record) -> list[str]:
+        keys: list[str] = list(row["payload_s3_keys"] or [])
+        if not keys and row["payload_s3_key"]:
+            keys = [row["payload_s3_key"]]
+        return keys
+
+    async def _process_batch(self, rows: list[asyncpg.Record]) -> None:
+        """Normalize each claimed row, persist them in ONE coalesced Phase B,
+        and mark each row with its own version-CAS -- so this stays as safe as
+        the single-row path (idempotent writes make a CAS-failed re-claim a
+        no-op) while collapsing shared hot-node upserts.
+
+        Per-row normalize errors are handled exactly like `_process`
+        (skip / dead-letter) and simply exclude that row from the batch."""
+        customer_id = rows[0]["customer_id"]
+        source = SourceSystem(rows[0]["source_system"])
+        heartbeats = [asyncio.create_task(self._heartbeat(r["queue_id"])) for r in rows]
+        # (row, result) survivors that normalized cleanly.
+        normalized: list[tuple[asyncpg.Record, Any]] = []
+        try:
+            for row in rows:
+                queue_id = row["queue_id"]
+                event_id = row["source_event_id"]
+                payload_keys = self._row_payload_keys(row)
+                payload_key = payload_keys[0] if payload_keys else ""
+                captured_version = row["version"]
+                attempts = row["attempts"] + 1
+                try:
+                    result = await self._normalizer._normalize_only(
+                        customer_id, source, payload_keys
+                    )
+                    normalized.append((row, result))
+                except (DuplicateEventIgnored, UnsupportedEventType) as exc:
+                    log.info("worker.skipped", queue_id=queue_id, reason=str(exc))
+                    await self._mark_skipped(
+                        queue_id, customer_id, source, event_id, payload_key,
+                        str(exc), captured_version,
+                    )
+                except PrbeError as exc:
+                    await self._on_error(
+                        queue_id, attempts, str(exc),
+                        transient=getattr(exc, "transient", False),
+                        captured_version=captured_version,
+                    )
+                except Exception as exc:  # pragma: no cover — last-resort
+                    log.exception("worker.batch_normalize_unhandled", queue_id=queue_id)
+                    await self._on_error(
+                        queue_id, attempts, repr(exc),
+                        transient=True, captured_version=captured_version,
+                    )
+
+            if not normalized:
+                return
+
+            # ONE coalesced Phase B for every survivor.
+            try:
+                outcomes = await self._normalizer.persist_batch(
+                    customer_id,
+                    source,
+                    [(result, row["queue_id"]) for (row, result) in normalized],
+                )
+            except PrbeError as exc:
+                transient = getattr(exc, "transient", False)
+                for row, _ in normalized:
+                    await self._on_error(
+                        row["queue_id"], row["attempts"] + 1, str(exc),
+                        transient=transient, captured_version=row["version"],
+                    )
+                return
+            except Exception as exc:  # pragma: no cover
+                log.exception("worker.batch_persist_unhandled", customer=customer_id)
+                for row, _ in normalized:
+                    await self._on_error(
+                        row["queue_id"], row["attempts"] + 1, repr(exc),
+                        transient=True, captured_version=row["version"],
+                    )
+                return
+
+            for (row, _result), outcome in zip(normalized, outcomes, strict=True):
+                if source == SourceSystem.MANUAL_UPLOAD:
+                    await self._cleanup_manual_upload_original(
+                        customer_id, row["source_event_id"]
+                    )
+                await self._mark_done(
+                    row["queue_id"], customer_id, source, row["source_event_id"],
+                    self._row_payload_keys(row)[0] if self._row_payload_keys(row) else "",
+                    outcome, row["version"],
+                )
+        finally:
+            for hb in heartbeats:
+                hb.cancel()
+            for hb in heartbeats:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await hb
 
     async def _process(self, row: asyncpg.Record) -> None:
         queue_id = row["queue_id"]

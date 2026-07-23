@@ -139,6 +139,22 @@ class Normalizer:
             payload_count=len(payload_s3_keys),
         )
 
+        result = await self._normalize_only(
+            customer_id, source_system, payload_s3_keys
+        )
+        return await self._persist(customer_id, source_system, result, queue_id=queue_id)
+
+    async def _normalize_only(
+        self,
+        customer_id: str,
+        source_system: SourceSystem,
+        payload_s3_keys: list[str],
+    ) -> NormalizationResult:
+        """Read + parse + fetch + normalize a queue row's payload into a
+        NormalizationResult, WITHOUT persisting. Shared by the single-row
+        `process_queue_row` and the coalesced batch path so the parse/normalize
+        logic lives in one place. Raises the same UnsupportedEventType /
+        DuplicateEventIgnored / NormalizationError the single path did."""
         if not payload_s3_keys:
             raise UnsupportedEventType(
                 "queue row has no payload_s3_keys",
@@ -181,8 +197,7 @@ class Normalizer:
             if result.skipped_reason:
                 raise DuplicateEventIgnored(result.skipped_reason)
             raise NormalizationError("connector produced no documents and no reason")
-
-        return await self._persist(customer_id, source_system, result, queue_id=queue_id)
+        return result
 
     # ---- persistence --------------------------------------------------------
 
@@ -488,6 +503,233 @@ class Normalizer:
             removed_chunk_count=total_removed,
             quarantined_doc_ids=quarantined,
         )
+
+    async def persist_batch(
+        self,
+        customer_id: str,
+        source_system: SourceSystem,
+        items: list[tuple[NormalizationResult, int | None]],
+    ) -> list[NormalizeOutcome]:
+        """Persist N results for ONE (customer, source_system) in a single
+        Phase B transaction, coalescing their graph writes.
+
+        This is the claim-time-coalescing path (T11): when the worker claims
+        several pending queue rows for the same customer+source, their graph
+        node/edge upserts run through ONE `upsert_nodes` / `upsert_edges` call
+        instead of N separate transactions. `upsert_nodes` already dedupes by
+        (label, canonical_id) within a call, so repeated touches of a hot node
+        (a shared repo/team/channel) collapse into one lock acquisition instead
+        of N -- the drain-ceiling relief in TODOS.md:149-151.
+
+        Every item keeps its OWN document set, per-doc savepoint isolation
+        (a poison doc in one item does not roll back another -- group-split-on-
+        failure), ordering check, per-item outcome, and post-commit wiki /
+        inferred-edge enqueues. Writes are idempotent (upsert by doc_id +
+        content_hash), so if a caller's per-row commit bookkeeping later
+        re-claims an item, re-processing is a no-op -- same safety as the
+        single-row path.
+
+        The single-row path (`_persist`) is deliberately left untouched; this
+        method is reached only when the coalescing flag claims a batch.
+        Returns one NormalizeOutcome per item, in input order.
+        """
+        if not items:
+            return []
+        if len(items) == 1:
+            # Degenerate batch -> exact single-row behaviour, same code path.
+            return [await self._persist(customer_id, source_system, items[0][0], items[0][1])]
+
+        # ---- Per-item flattened docs + storage guard (mirrors _persist) ----
+        per_item_docs: list[
+            list[tuple[Document, list[ChunkPiece] | None, ChunkPiece | None]]
+        ] = []
+        for result, _ in items:
+            docs: list[tuple[Document, list[ChunkPiece] | None, ChunkPiece | None]] = [
+                (doc, None, None) for doc in result.documents
+            ]
+            for prechunked in result.documents_with_chunks:
+                docs.append(
+                    (prechunked.document, prechunked.chunks, prechunked.metadata_chunk)
+                )
+            for doc, pre_chunked, _ in docs:
+                if "body" in doc.metadata:
+                    raise NormalizationError(
+                        f"connector {source_system.value} set metadata['body'] on "
+                        f"doc {doc.doc_id}"
+                    )
+                if pre_chunked is not None and doc.body is not None:
+                    raise NormalizationError(
+                        f"connector {source_system.value} provided both body and "
+                        f"pre-chunked pieces for doc {doc.doc_id}"
+                    )
+            per_item_docs.append(docs)
+
+        # ---- Phase A: chunk plans per item, NO write txn held --------------
+        per_item_plans: list[list[_ChunkPlan]] = []
+        for docs in per_item_docs:
+            plans: list[_ChunkPlan] = []
+            for doc, pre_chunked, pre_chunked_metadata in docs:
+                plans.append(
+                    await self._plan_chunks(
+                        customer_id, doc, pre_chunked, pre_chunked_metadata
+                    )
+                )
+            per_item_plans.append(plans)
+
+        # Union of every doc_id this batch tries to write -- used to tell a
+        # doc-mirror node from an independent entity node in the graph filter.
+        all_doc_ids: set[str] = {
+            doc.doc_id for docs in per_item_docs for (doc, _, _) in docs
+        }
+
+        # Per-item accumulators (index-aligned with `items`).
+        per_item_doc_ids: list[list[str]] = [[] for _ in items]
+        per_item_quarantined: list[list[str]] = [[] for _ in items]
+        per_item_chunks: list[dict[str, int]] = [
+            {"live": 0, "added": 0, "reused": 0, "removed": 0, "failed": 0}
+            for _ in items
+        ]
+
+        # ---- Phase B: ONE transaction for the whole batch ------------------
+        async with with_tenant(customer_id) as conn:
+            sp_counter = 0
+            for item_idx, (result, queue_id) in enumerate(items):
+                await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
+                await _upsert_code_repo_state(
+                    conn, customer_id, result.code_repo_state_updates
+                )
+                for (doc, _, _), plan in zip(
+                    per_item_docs[item_idx], per_item_plans[item_idx], strict=True
+                ):
+                    sp = f"doc_{sp_counter}"
+                    sp_counter += 1
+                    await conn.execute(f"SAVEPOINT {sp}")
+                    try:
+                        if not await _admit_ordered_write(
+                            conn,
+                            customer_id=customer_id,
+                            source_system=source_system,
+                            doc=doc,
+                            queue_id=queue_id,
+                        ):
+                            await conn.execute(f"RELEASE SAVEPOINT {sp}")
+                            continue
+                        persisted = await _upsert_document(conn, doc)
+                        if persisted:
+                            per_item_doc_ids[item_idx].append(doc.doc_id)
+                            sync = await _apply_chunk_plan(conn, doc, plan)
+                            c = per_item_chunks[item_idx]
+                            c["live"] += sync.live
+                            c["added"] += sync.added
+                            c["reused"] += sync.reused
+                            c["removed"] += sync.removed
+                            c["failed"] += sync.failed
+                    except PrbeError as exc:
+                        if getattr(exc, "transient", False):
+                            raise
+                        await conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                        per_item_quarantined[item_idx].append(doc.doc_id)
+                        log.warning(
+                            "normalizer.doc_quarantined",
+                            customer=customer_id,
+                            doc_id=doc.doc_id,
+                            error=str(exc),
+                            error_class=type(exc).__name__,
+                        )
+                    await conn.execute(f"RELEASE SAVEPOINT {sp}")
+
+            # ---- Coalesced graph write for the WHOLE batch --------------
+            # Same T7 two-pass filter as _persist, but over the UNION of every
+            # item's persisted docs and the concatenation of every item's
+            # graph payload. This is where the coalescing happens: one
+            # upsert_nodes / upsert_edges for the batch, so shared hot nodes
+            # are upserted once instead of once per item.
+            persisted_doc_ids: set[str] = {
+                d for ids in per_item_doc_ids for d in ids
+            }
+            all_edges = [e for result, _ in items for e in result.graph_edges]
+            all_nodes = [n for result, _ in items for n in result.graph_nodes]
+            graph_edges = [
+                e for e in all_edges
+                if (e.from_canonical_id not in all_doc_ids
+                    or e.from_canonical_id in persisted_doc_ids)
+                and (e.to_canonical_id not in all_doc_ids
+                     or e.to_canonical_id in persisted_doc_ids)
+            ]
+            surviving_endpoints = {
+                cid for e in graph_edges
+                for cid in (e.from_canonical_id, e.to_canonical_id)
+            }
+            nodes_with_original_edges = {
+                cid for e in all_edges
+                for cid in (e.from_canonical_id, e.to_canonical_id)
+            }
+            newly_orphaned = nodes_with_original_edges - surviving_endpoints
+            graph_nodes = [
+                n for n in all_nodes
+                if (
+                    n.canonical_id in persisted_doc_ids
+                    if n.canonical_id in all_doc_ids
+                    else n.canonical_id not in newly_orphaned
+                )
+            ]
+            node_ids = await upsert_nodes(
+                conn, customer_id, graph_nodes, source_system.value
+            )
+            await upsert_edges(
+                conn, customer_id, graph_edges, node_ids, source_system.value
+            )
+
+        # ---- Post-commit per-item enqueues (best-effort, mirrors _persist) -
+        outcomes: list[NormalizeOutcome] = []
+        for item_idx, (result, _queue_id) in enumerate(items):
+            doc_ids = per_item_doc_ids[item_idx]
+            if (
+                source_system != SourceSystem.WIKI
+                and source_system != SourceSystem.CODE_GRAPH
+                and doc_ids
+                and await is_wiki_generation_enabled(customer_id)
+            ):
+                try:
+                    persisted_docs = [
+                        doc for doc in result.documents if doc.doc_id in set(doc_ids)
+                    ]
+                    await self._enqueue_wiki_synthesis(customer_id, persisted_docs)
+                except Exception as exc:
+                    log.warning(
+                        "wiki.synthesis.enqueue_failed",
+                        customer=customer_id, doc_count=len(doc_ids),
+                        error=str(exc), error_class=type(exc).__name__,
+                    )
+            if source_system != SourceSystem.WIKI and doc_ids:
+                try:
+                    await self._enqueue_inferred_edges(customer_id, doc_ids)
+                except Exception as exc:
+                    log.warning(
+                        "inferred_edges.enqueue_failed",
+                        customer=customer_id, doc_count=len(doc_ids),
+                        error=str(exc), error_class=type(exc).__name__,
+                    )
+            c = per_item_chunks[item_idx]
+            outcomes.append(
+                NormalizeOutcome(
+                    doc_ids=doc_ids,
+                    chunk_count=c["live"],
+                    failed_chunk_count=c["failed"],
+                    added_chunk_count=c["added"],
+                    reused_chunk_count=c["reused"],
+                    removed_chunk_count=c["removed"],
+                    quarantined_doc_ids=per_item_quarantined[item_idx],
+                )
+            )
+        log.info(
+            "normalizer.batch_done",
+            customer=customer_id,
+            source=source_system.value,
+            items=len(items),
+            docs=sum(len(x) for x in per_item_doc_ids),
+        )
+        return outcomes
 
     async def persist_single_document(
         self,
