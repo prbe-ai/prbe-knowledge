@@ -94,9 +94,11 @@ class NormalizeOutcome:
 # per append fired one full ~300K-token bundle extraction each time, so a
 # single long session ran dozens-to-hundreds of redundant LLM calls on a doc
 # that wasn't done growing (and whose cross-source edges aren't stable until
-# it is). session_completer writes a finalize.marker that flips
-# metadata["session_complete"] on the final re-persist -- gate these two
-# sources to that finalization pass. Every other source enqueues each doc.
+# it is). The session's completion pass -- a natural final turn, or the
+# finalize.marker session_completer writes for idle sessions -- normalizes
+# with session_complete=True on the session doc and extracts the high-signal
+# unit docs (qa / decision / code_change / file_ref). We detect that pass at
+# the session level and enqueue then; every other source enqueues each doc.
 _AGENT_SESSION_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX)
 
 
@@ -107,20 +109,23 @@ def _inferred_edge_doc_ids(
 ) -> list[str]:
     """Filter ``doc_ids`` down to those eligible for inferred-edges enqueue.
 
-    For agent-session sources only session-complete transcripts qualify (see
-    ``_AGENT_SESSION_SOURCES``); every other source passes through unchanged.
-    ``documents`` is the in-memory persisted set, which carries the
-    ``session_complete`` metadata the DB row does not surface here.
+    Non-agent sources pass through unchanged. For agent-session sources (see
+    ``_AGENT_SESSION_SOURCES``) the decision is made at the SESSION level, not
+    per doc: only the session doc ever carries ``session_complete`` -- the unit
+    docs (qa / decision / code_change / file_ref), which are the high-signal
+    cross-source anchors, never do, and on the idle-finalize path the session
+    doc is a content no-op that isn't even in ``doc_ids``. So a per-doc filter
+    would enqueue nothing. Instead: if ANY doc in this normalize result is
+    session_complete, the session has finalized -- enqueue every persisted doc
+    from this pass. During a live session no doc is complete, so nothing
+    enqueues, keeping the per-append flood out.
     """
     if source_system not in _AGENT_SESSION_SOURCES:
         return doc_ids
-    wanted = set(doc_ids)
-    complete = {
-        doc.doc_id
-        for doc in documents
-        if doc.doc_id in wanted and doc.metadata.get("session_complete")
-    }
-    return [doc_id for doc_id in doc_ids if doc_id in complete]
+    session_complete = any(
+        doc.metadata.get("session_complete") for doc in documents
+    )
+    return doc_ids if session_complete else []
 
 
 class Normalizer:

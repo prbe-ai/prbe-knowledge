@@ -54,7 +54,9 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     # Fail fast rather than wedge behind an active drain; a collision is
     # retriable. The queue table is small so the held window is sub-second.
-    op.execute("SET lock_timeout = '10s'")
+    # SET LOCAL: scope the timeout to this migration, not the whole alembic
+    # transaction (which runs all pending migrations together).
+    op.execute("SET LOCAL lock_timeout = '10s'")
     op.execute(
         "LOCK TABLE inferred_edges_queue IN SHARE ROW EXCLUSIVE MODE"
     )
