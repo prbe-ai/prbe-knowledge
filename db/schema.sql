@@ -1276,6 +1276,17 @@ CREATE INDEX idx_inferred_edges_queue_pending
     ON inferred_edges_queue (enqueued_at)
     WHERE processing_started_at IS NULL AND done_at IS NULL;
 
+-- Dedup guard: at most one OUTSTANDING (not-yet-done) row per
+-- (customer, anchor_doc, extractor). Makes the enqueue-time
+-- `ON CONFLICT DO NOTHING` actually bite, so re-delivers and bursty
+-- re-persists (agent-session batch appends, repo re-scans) cannot flood the
+-- queue with duplicate pending work. Partial `WHERE done_at IS NULL` so a
+-- genuine re-extraction after completion (prompt-version bump, real content
+-- change) still enqueues a fresh row. See migration 0096.
+CREATE UNIQUE INDEX idx_inferred_edges_queue_outstanding
+    ON inferred_edges_queue (customer_id, anchor_doc_id, extractor_id)
+    WHERE done_at IS NULL;
+
 -- inferred_edges_queue is an internal queue table drained CROSS-tenant by
 -- the inferred-edges side-worker (services/ingestion/inferred_edges/
 -- worker.py:_claim_one). Under FORCE RLS that drain SELECT silently
