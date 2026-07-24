@@ -32,6 +32,32 @@ Order inside phase 2 is not arbitrary. `chunks`, `directed_vectors` and
 `failed_chunks` carry NO foreign key to `documents` (deliberate — see
 schema.sql), so they must be deleted through a doc_id sub-select BEFORE the
 documents they point at disappear, or they are orphaned permanently.
+
+What `verified=True` does and does not mean
+-------------------------------------------
+It means: a full postcondition pass, run under the same tenant fence as the
+deletes, found zero rows for this cascade and zero raw objects in R2.
+
+It does NOT mean the source can never reappear, and callers should not read it
+that way. Known limits, all inherent to the schema rather than to this code:
+
+* **Not a quiescence barrier.** The gate closes first, so nothing NEW can be
+  enqueued, but a worker that claimed a queue row before the gate shut can
+  still commit a document after the final verification pass. The re-sweep loop
+  catches anything that lands while the purge is running; a straggler slower
+  than the loop needs another purge. Re-running is cheap and idempotent.
+* **Shared graph nodes keep merged properties.** Node writes merge properties
+  into one row and only provenance is per-source, so a node another source
+  still asserts survives with values this source contributed. Removing those
+  would need per-source property provenance.
+* **Edges carry a single `source_system`.** The edge upsert key excludes it and
+  first writer wins, so an edge asserted by two sources is tagged with one of
+  them. Deleting by tag is the best signal the schema offers; it can drop an
+  edge a surviving source also asserted, or keep one this source contributed
+  to under another source's tag.
+* **Wiki artifacts synthesized from this source survive.** They are written as
+  `source_system='wiki'`, so they are outside the cascade by construction and
+  outside the verification count too.
 """
 
 from __future__ import annotations
@@ -143,7 +169,12 @@ _CASCADE_STEPS: tuple[_Step, ...] = (
     # -- per-source state ----------------------------------------------
     _by_source("acl_snapshots"),
     _by_source("ingestion_events"),
-    _by_source("wiki_links", column="link_source"),
+    # wiki_raw_data.source / wiki_timeline_entries.source hold the source
+    # system ('github' — kb/synthesis/crawlers/github.py:82), so these are
+    # genuinely source-scoped. wiki_links is NOT: its `link_source` column is
+    # the link KIND ('markdown'/'frontmatter'/'manual', enforced by
+    # ck_wiki_links_source), so matching it against a source system would
+    # delete nothing while still reporting clean.
     _by_source("wiki_timeline_entries", column="source"),
     _by_source("wiki_raw_data", column="source"),
     _by_customer("code_repo_state", only_for=(SourceSystem.GITHUB,)),
@@ -154,16 +185,24 @@ _CASCADE_STEPS: tuple[_Step, ...] = (
 # cascaded sources go regardless; edges between surviving nodes stay.
 _GRAPH_PROVENANCE_SQL = (
     "DELETE FROM graph_node_provenance "
-    "WHERE customer_id = $1 AND source_system = ANY($2::text[])"
+    "WHERE customer_id = $1 AND source_system = ANY($2::text[]) "
+    "RETURNING node_id"
 )
 _GRAPH_EDGES_SQL = (
     "DELETE FROM graph_edges "
     "WHERE customer_id = $1 AND source_system = ANY($2::text[])"
 )
 # Deleting a node cascades its remaining provenance + edges by FK.
+#
+# Restricted to the nodes THIS purge just de-provenanced ($3). A blanket
+# "every provenance-less node" sweep would also delete nodes that legitimately
+# never had provenance — cross_repo_deps.py:1024 inserts repo Document nodes
+# straight into graph_nodes with no provenance row — so purging one source
+# would silently take another source's nodes with it.
 _GRAPH_ORPHAN_NODES_SQL = """
     DELETE FROM graph_nodes n
     WHERE n.customer_id = $1
+      AND n.node_id = ANY($2::bigint[])
       AND NOT EXISTS (
           SELECT 1 FROM graph_node_provenance p
           WHERE p.node_id = n.node_id AND p.customer_id = n.customer_id
@@ -177,12 +216,16 @@ _GRAPH_EDGES_COUNT = (
     "SELECT COUNT(*) FROM graph_edges "
     "WHERE customer_id = $1 AND source_system = ANY($2::text[])"
 )
+# Residue check for the graph: any node still carrying provenance from a
+# cascaded source. (Nodes with no provenance at all are NOT residue — they may
+# predate provenance tracking or come from a writer that never records it.)
 _GRAPH_ORPHAN_COUNT = """
     SELECT COUNT(*) FROM graph_nodes n
     WHERE n.customer_id = $1
-      AND NOT EXISTS (
+      AND EXISTS (
           SELECT 1 FROM graph_node_provenance p
           WHERE p.node_id = n.node_id AND p.customer_id = n.customer_id
+            AND p.source_system = ANY($2::text[])
       )
 """
 # node_post_write_queue references graph_nodes by id but has NO foreign key to
@@ -253,12 +296,22 @@ async def _run_cascade(
                 status = await conn.execute(step.sql, customer_id)
             deleted[step.table] = _rows_from_status(status)
 
-        status = await conn.execute(_GRAPH_PROVENANCE_SQL, customer_id, cascade)
-        deleted["graph_node_provenance"] = _rows_from_status(status)
+        # RETURNING gives the exact node set this purge de-provenanced, which
+        # is what bounds the orphan sweep below.
+        touched = await conn.fetch(_GRAPH_PROVENANCE_SQL, customer_id, cascade)
+        deleted["graph_node_provenance"] = len(touched)
+        node_ids = [r["node_id"] for r in touched]
+
         status = await conn.execute(_GRAPH_EDGES_SQL, customer_id, cascade)
         deleted["graph_edges"] = _rows_from_status(status)
-        status = await conn.execute(_GRAPH_ORPHAN_NODES_SQL, customer_id)
-        deleted["graph_nodes"] = _rows_from_status(status)
+
+        if node_ids:
+            status = await conn.execute(
+                _GRAPH_ORPHAN_NODES_SQL, customer_id, node_ids
+            )
+            deleted["graph_nodes"] = _rows_from_status(status)
+        else:
+            deleted["graph_nodes"] = 0
         status = await conn.execute(_GRAPH_QUEUE_ORPHANS_SQL, customer_id)
         deleted["node_post_write_queue"] = _rows_from_status(status)
     return deleted
@@ -329,7 +382,7 @@ async def _count_residue(
             n = await conn.fetchval(sql, customer_id, cascade)
             if n:
                 residue[name] = int(n)
-        n = await conn.fetchval(_GRAPH_ORPHAN_COUNT, customer_id)
+        n = await conn.fetchval(_GRAPH_ORPHAN_COUNT, customer_id, cascade)
         if n:
             residue["graph_nodes"] = int(n)
         n = await conn.fetchval(_GRAPH_QUEUE_ORPHANS_COUNT, customer_id)

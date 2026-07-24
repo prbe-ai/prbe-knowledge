@@ -19,6 +19,8 @@ existing backfill surface (POST to start, GET /backfill/status to follow).
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 from typing import Any
 
 import structlog
@@ -91,6 +93,25 @@ def _resolve_source(raw: str) -> SourceSystem:
     return source
 
 
+def _decode_result(raw: Any) -> dict[str, Any]:
+    """JSONB comes back as a string.
+
+    The pool's connection setup pins search_path and nothing else — no jsonb
+    codec is registered — so asyncpg hands back the raw JSON text. Treating it
+    as a dict crashes the status endpoint on exactly the requests that matter
+    (a purge that finished).
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
 async def _run_and_record(
     customer_id: str, source: SourceSystem, purge_id: str
 ) -> None:
@@ -98,6 +119,22 @@ async def _run_and_record(
     try:
         result = await purge_source(customer_id, source, purge_id)
         await finish_purge_run(customer_id, purge_id, result)
+    except asyncio.CancelledError:
+        # Shutdown mid-purge. CancelledError is BaseException, so without this
+        # the run would stay 'running' forever and a caller polling status
+        # could wait on a purge nothing is executing. Mark it failed —
+        # re-triggering is safe because the cascade is idempotent.
+        log.warning(
+            "purge.cancelled",
+            customer=customer_id,
+            source=source.value,
+            purge_id=purge_id,
+        )
+        with contextlib.suppress(Exception):
+            await finish_purge_run(
+                customer_id, purge_id, None, error="cancelled (worker shutdown)"
+            )
+        raise
     except Exception as exc:
         log.exception(
             "purge.failed",
@@ -164,7 +201,7 @@ async def purge_status(
             status_code=400, detail="provide purge_id or source"
         )
 
-    result = row.get("result") or {}
+    result = _decode_result(row.get("result"))
     return {
         "purge_id": str(row["purge_id"]),
         "source": row["source_system"],
