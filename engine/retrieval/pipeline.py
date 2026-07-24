@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
@@ -50,6 +49,7 @@ from engine.shared.models import (
     TemporalMode,
     TemporalSpec,
 )
+from engine.shared.telemetry import new_trace_id
 
 log = get_logger(__name__)
 
@@ -127,7 +127,7 @@ async def run_router_phase(
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="empty query")
 
-    trace_id = req.trace_id or f"q-{int(datetime.now().timestamp() * 1000)}"
+    trace_id = req.trace_id or new_trace_id()
     timing: dict[str, float] = {}
 
     t_grounding = time.perf_counter()

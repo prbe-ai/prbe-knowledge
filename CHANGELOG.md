@@ -29,6 +29,18 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- Entity extraction no longer silently returns nothing on reasoning models.
+  `max_tokens` bounds reasoning *and* visible content together, so the old
+  600-token cap was consumed by the reasoning trace and truncated the JSON
+  mid-object; the caller swallowed the parse error and searched with zero
+  entity anchors while still reporting `state:"ok"`. Raised to 2000 and made
+  it env-overridable, since the right value follows the model.
+- Extraction failure logs now carry `finish_reason` and `content_len`, which
+  distinguish "the model emitted bad JSON" from "we cut the model off".
+- Retrieval trace ids no longer collide. They were a bare millisecond
+  timestamp, so the several concurrent `/retrieve` calls a single search fans
+  out into shared one id — making interleaved log lines unattributable and
+  letting their R2 trace blobs overwrite each other at the same key.
 - Claude Code session extraction now sends gateway-configured model aliases
   over the proxy's OpenAI-compatible transport while preserving direct
   Anthropic routing, preventing gateway URLs from becoming
