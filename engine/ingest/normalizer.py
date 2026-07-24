@@ -89,6 +89,45 @@ class NormalizeOutcome:
     quarantined_doc_ids: list[str] = field(default_factory=list)
 
 
+# Agent-session sources (Claude Code / Codex) re-persist the SAME transcript
+# doc on every batch append during a live session. Enqueuing inferred-edges
+# per append fired one full ~300K-token bundle extraction each time, so a
+# single long session ran dozens-to-hundreds of redundant LLM calls on a doc
+# that wasn't done growing (and whose cross-source edges aren't stable until
+# it is). The session's completion pass -- a natural final turn, or the
+# finalize.marker session_completer writes for idle sessions -- normalizes
+# with session_complete=True on the session doc and extracts the high-signal
+# unit docs (qa / decision / code_change / file_ref). We detect that pass at
+# the session level and enqueue then; every other source enqueues each doc.
+_AGENT_SESSION_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX)
+
+
+def _inferred_edge_doc_ids(
+    source_system: SourceSystem,
+    doc_ids: list[str],
+    documents: list[Any],
+) -> list[str]:
+    """Filter ``doc_ids`` down to those eligible for inferred-edges enqueue.
+
+    Non-agent sources pass through unchanged. For agent-session sources (see
+    ``_AGENT_SESSION_SOURCES``) the decision is made at the SESSION level, not
+    per doc: only the session doc ever carries ``session_complete`` -- the unit
+    docs (qa / decision / code_change / file_ref), which are the high-signal
+    cross-source anchors, never do, and on the idle-finalize path the session
+    doc is a content no-op that isn't even in ``doc_ids``. So a per-doc filter
+    would enqueue nothing. Instead: if ANY doc in this normalize result is
+    session_complete, the session has finalized -- enqueue every persisted doc
+    from this pass. During a live session no doc is complete, so nothing
+    enqueues, keeping the per-append flood out.
+    """
+    if source_system not in _AGENT_SESSION_SOURCES:
+        return doc_ids
+    session_complete = any(
+        doc.metadata.get("session_complete") for doc in documents
+    )
+    return doc_ids if session_complete else []
+
+
 class Normalizer:
     def __init__(
         self,
@@ -468,19 +507,24 @@ class Normalizer:
         # INFERRED/AMBIGUOUS edges. Insert failure MUST NOT block main
         # ingestion -- wrap in try/except, log on failure, continue.
         #
-        # Skip wiki source (no cross-source inference on compiled pages)
-        # and skip if no docs were persisted this cycle.
+        # Skip wiki source (no cross-source inference on compiled pages) and
+        # skip if no docs were persisted this cycle. Agent-session transcripts
+        # are gated to their finalization pass (see _inferred_edge_doc_ids).
         if source_system != SourceSystem.WIKI and doc_ids:
-            try:
-                await self._enqueue_inferred_edges(customer_id, doc_ids)
-            except Exception as exc:
-                log.warning(
-                    "inferred_edges.enqueue_failed",
-                    customer=customer_id,
-                    doc_count=len(doc_ids),
-                    error=str(exc),
-                    error_class=type(exc).__name__,
-                )
+            edge_doc_ids = _inferred_edge_doc_ids(
+                source_system, doc_ids, result.documents
+            )
+            if edge_doc_ids:
+                try:
+                    await self._enqueue_inferred_edges(customer_id, edge_doc_ids)
+                except Exception as exc:
+                    log.warning(
+                        "inferred_edges.enqueue_failed",
+                        customer=customer_id,
+                        doc_count=len(edge_doc_ids),
+                        error=str(exc),
+                        error_class=type(exc).__name__,
+                    )
 
         log.info(
             "normalizer.done",
@@ -712,14 +756,18 @@ class Normalizer:
                         error=str(exc), error_class=type(exc).__name__,
                     )
             if source_system != SourceSystem.WIKI and doc_ids:
-                try:
-                    await self._enqueue_inferred_edges(customer_id, doc_ids)
-                except Exception as exc:
-                    log.warning(
-                        "inferred_edges.enqueue_failed",
-                        customer=customer_id, doc_count=len(doc_ids),
-                        error=str(exc), error_class=type(exc).__name__,
-                    )
+                edge_doc_ids = _inferred_edge_doc_ids(
+                    source_system, doc_ids, result.documents
+                )
+                if edge_doc_ids:
+                    try:
+                        await self._enqueue_inferred_edges(customer_id, edge_doc_ids)
+                    except Exception as exc:
+                        log.warning(
+                            "inferred_edges.enqueue_failed",
+                            customer=customer_id, doc_count=len(edge_doc_ids),
+                            error=str(exc), error_class=type(exc).__name__,
+                        )
             c = per_item_chunks[item_idx]
             outcomes.append(
                 NormalizeOutcome(
@@ -833,10 +881,11 @@ class Normalizer:
 
         Uses ON CONFLICT DO NOTHING so re-delivers of the same doc are
         deduplicated at the (customer_id, anchor_doc_id, extractor_id) level.
-        The queue has no UNIQUE constraint on those three columns by default
-        (the design intentionally allows re-extraction on prompt version bumps)
-        -- idempotence here is soft: we just avoid flooding the queue with
-        identical rows from the same ingest run.
+        The partial unique index idx_inferred_edges_queue_outstanding
+        (WHERE done_at IS NULL, migration 0096) is what the ON CONFLICT
+        arbitrates on: at most one OUTSTANDING row per key, so a re-persist
+        can't flood the queue, while a genuine re-extraction after the prior
+        row completes (prompt-version bump, real content change) still enqueues.
 
         CRITICAL: any exception from this method is caught by the caller
         (_persist) which logs it and continues. This must never block ingestion.
