@@ -194,7 +194,7 @@ _GRAPH_EDGES_SQL = (
 )
 # Deleting a node cascades its remaining provenance + edges by FK.
 #
-# Restricted to the nodes THIS purge just de-provenanced ($3). A blanket
+# Restricted to the nodes THIS purge just de-provenanced ($2). A blanket
 # "every provenance-less node" sweep would also delete nodes that legitimately
 # never had provenance — cross_repo_deps.py:1024 inserts repo Document nodes
 # straight into graph_nodes with no provenance row — so purging one source
