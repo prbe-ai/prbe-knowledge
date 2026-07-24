@@ -75,6 +75,7 @@ from kb.admin_routes import router as admin_router
 from kb.backfill_routes import router as backfill_router
 from kb.feature_nodes_routes import router as feature_nodes_router
 from kb.internal_devices import router as devices_router
+from kb.purge_routes import router as purge_router
 from kb.slack_lifecycle import handle_slack_lifecycle_event
 from kb.stats_routes import router as stats_router
 from kb.wiki_routes import router as wiki_router
@@ -110,6 +111,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="prbe-knowledge ingestion", lifespan=lifespan)
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 app.include_router(backfill_router)
+app.include_router(purge_router)
 app.include_router(stats_router)
 app.include_router(admin_router)
 app.include_router(entity_clusters_router)

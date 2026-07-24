@@ -252,6 +252,66 @@ class ObjectStore:
 
         return await asyncio.to_thread(_list)
 
+    async def delete_prefix(self, bucket: str, prefix: str) -> tuple[int, int]:
+        """Delete every object under `prefix`. Returns (deleted, errors).
+
+        Unlike `delete_bucket_recursive` this keeps the bucket and only
+        removes one prefix, so a per-source disconnect can sweep its own
+        raw payloads without touching other sources sharing the tenant
+        bucket. Per-key failures are counted rather than raised: the
+        caller decides whether a partial sweep blocks the operation.
+        A missing bucket is "already gone" (0, 0).
+        """
+        def _delete() -> tuple[int, int]:
+            deleted = 0
+            errors = 0
+            paginator = self._client.get_paginator("list_objects_v2")
+            try:
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    contents = page.get("Contents") or []
+                    if not contents:
+                        continue
+                    # delete_objects caps at 1000 keys/request; list_objects_v2
+                    # pages at 1000, so one page maps to one delete call.
+                    response = self._client.delete_objects(
+                        Bucket=bucket,
+                        Delete={"Objects": [{"Key": c["Key"]} for c in contents]},
+                    )
+                    deleted += len(response.get("Deleted") or [])
+                    errors += len(response.get("Errors") or [])
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"NoSuchBucket", "404", "NotFound"}:
+                    return deleted, errors
+                raise StorageUnavailable(f"delete_prefix failed: {exc}") from exc
+            except BotoCoreError as exc:
+                raise StorageUnavailable(f"delete_prefix failed: {exc}") from exc
+            return deleted, errors
+
+        return await asyncio.to_thread(_delete)
+
+    async def count_prefix(self, bucket: str, prefix: str) -> int:
+        """Number of objects remaining under `prefix`. Postcondition check.
+
+        A missing bucket counts as zero — nothing left to sweep.
+        """
+        def _count() -> int:
+            total = 0
+            paginator = self._client.get_paginator("list_objects_v2")
+            try:
+                for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                    total += len(page.get("Contents") or [])
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code in {"NoSuchBucket", "404", "NotFound"}:
+                    return 0
+                raise StorageUnavailable(f"count_prefix failed: {exc}") from exc
+            except BotoCoreError as exc:
+                raise StorageUnavailable(f"count_prefix failed: {exc}") from exc
+            return total
+
+        return await asyncio.to_thread(_count)
+
 
 _store: ObjectStore | None = None
 
