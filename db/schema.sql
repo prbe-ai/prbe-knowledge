@@ -1522,3 +1522,36 @@ CREATE POLICY entity_merge_suggestions_tenant_isolation
     ON entity_merge_suggestions
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
+-- purge_runs: durable outcome of a per-source disconnect purge.
+--
+-- The caller (research-os / prbe-backend) removes its own record of the
+-- integration ONLY after a purge reports verified=true, so it needs an
+-- outcome that survives a lost HTTP response, a pod restart mid-purge, or a
+-- client timeout. Without this table a caller that dropped its connection has
+-- no way to learn whether the delete finished, and re-running blind is the
+-- only recovery.
+--
+-- Rows cascade with the customer: a purge is per-source, and a whole-tenant
+-- delete removes everything the history could still describe.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS purge_runs (
+    purge_id       UUID PRIMARY KEY,
+    customer_id    TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    source_system  TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'running'
+                   CHECK (status IN ('running','done','failed')),
+    result         JSONB,
+    error          TEXT,
+    started_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_purge_runs_customer_source
+    ON purge_runs (customer_id, source_system, started_at DESC);
+
+ALTER TABLE purge_runs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE purge_runs FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON purge_runs
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
