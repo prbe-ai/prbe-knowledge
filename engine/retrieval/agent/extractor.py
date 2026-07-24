@@ -32,6 +32,7 @@ from engine.retrieval.agent.models import (
 from engine.retrieval.grounding import GroundingBundle
 from engine.retrieval.router import _escape_query_for_xml
 from engine.shared.constants import (
+    SEARCH_AGENT_EXTRACTOR_MAX_TOKENS,
     SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS,
     SEARCH_AGENT_INFERENCE_MODEL,
 )
@@ -362,7 +363,9 @@ async def extract_entities_with_llm(
             # Greedy decoding — same query must produce the same extracted
             # entities run-to-run. See loop.py _run_turn for the same fix.
             "temperature": 0,
-            "max_tokens": 600,
+            # Bounds reasoning + content TOGETHER on a reasoning model --
+            # see SEARCH_AGENT_EXTRACTOR_MAX_TOKENS for why 600 truncated.
+            "max_tokens": SEARCH_AGENT_EXTRACTOR_MAX_TOKENS,
             "timeout": SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS,
         }
         if gateway_url():
@@ -393,11 +396,18 @@ async def extract_entities_with_llm(
         return EntityExtraction()
     msg = getattr(choices[0], "message", None)
     content = getattr(msg, "content", None) if msg is not None else None
+    # `finish_reason="length"` is the difference between "the model emitted
+    # bad JSON" and "we cut the model off mid-JSON", and only the second is
+    # our bug. Without it on the failure logs below, a blown max_tokens is
+    # indistinguishable from provider drift -- which is how the 600-token
+    # cap stayed invisible while returning empty extractions.
+    finish_reason = getattr(choices[0], "finish_reason", None)
     if not content:
         log.warning(
             "agent.entity_extract_empty_content",
             customer_id=customer_id,
             elapsed_ms=round(elapsed_ms, 1),
+            finish_reason=finish_reason,
         )
         return EntityExtraction()
 
@@ -413,6 +423,8 @@ async def extract_entities_with_llm(
             customer_id=customer_id,
             elapsed_ms=round(elapsed_ms, 1),
             error=str(exc),
+            finish_reason=finish_reason,
+            content_len=len(content),
             preview=content[:200],
         )
         return EntityExtraction()

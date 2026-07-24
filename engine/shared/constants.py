@@ -974,6 +974,34 @@ SEARCH_AGENT_CACHE_HIT_RATE_FLOOR = 0.7
 # retains the original 30s bound; failure falls back to grounding-only anchors.
 SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS = 30.0
 
+# Token cap on one entity-extraction completion. This is NOT a JSON-size
+# budget: SEARCH_AGENT_INFERENCE_MODEL is a reasoning model, and on the
+# OpenAI wire shape `max_tokens` bounds reasoning + visible content
+# TOGETHER (reasoning lands in `usage.completion_tokens`, not beside it).
+# Extraction reasons ~440-560 tokens before emitting a single character,
+# so the old 600 left ~45 tokens for the JSON body -- the extractor
+# returned `finish_reason="length"` with the object cut mid-string inside
+# `sub_queries`, json.loads raised, and the caller silently got an empty
+# EntityExtraction() while the response still read state:"ok".
+#
+# Measured against cerebras/gpt-oss-120b on the probe tenant with a fully
+# populated 22-candidate grounding bundle: reasoning 555 + content 52 =
+# 607 completion tokens. The old cap missed by SEVEN tokens, which is why
+# it reproduced 100% of the time on that query rather than intermittently.
+# 2000 leaves ~3x headroom for a longer bundle without letting a runaway
+# reasoning trace burn the extractor's 30s budget.
+#
+# Env-overridable because the right value is a property of the MODEL, and
+# SEARCH_AGENT_INFERENCE_MODEL is itself env-overridable: point the extractor
+# at a heavier reasoner and this cap has to move with it. Retune via
+# `kubectl set env DEPLOY SEARCH_AGENT_EXTRACTOR_MAX_TOKENS=4000` without a
+# deploy -- the failure mode it guards against is silent (empty extraction,
+# response still state:"ok"), so waiting on a release to correct it is the
+# expensive option.
+SEARCH_AGENT_EXTRACTOR_MAX_TOKENS = int(
+    os.getenv("SEARCH_AGENT_EXTRACTOR_MAX_TOKENS", "2000")
+)
+
 # Client-side cap on one gatherer model turn. The managed LiteLLM gateway owns
 # the Cerebras -> Fireworks provider chain, so this must leave enough time for
 # both routes to run before the retrieval client gives up. It remains nested

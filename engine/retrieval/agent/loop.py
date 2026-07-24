@@ -88,6 +88,7 @@ from engine.shared.llm_tools import is_context_overflow, is_transient_provider_e
 from engine.shared.logging import get_logger
 from engine.shared.models import QueryRequest, RetrieveResponse
 from engine.shared.source_registry import half_life_days_for, score_multiplier_for
+from engine.shared.telemetry import new_trace_id
 
 log = get_logger(__name__)
 
@@ -1629,7 +1630,7 @@ async def run_gatherer(
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="empty query")
 
-    trace_id = req.trace_id or f"q-{int(datetime.now().timestamp() * 1000)}"
+    trace_id = req.trace_id or new_trace_id()
     timing: dict[str, float] = {}
 
     # Step 1 — SEQUENTIAL grounding → LLM extraction (bundle as context).
