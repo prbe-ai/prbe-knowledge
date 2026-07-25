@@ -25,8 +25,11 @@ from datetime import UTC, datetime
 from typing import Any
 from typing import get_args as _get_args
 
+from pydantic import ValidationError
+
 from engine.retrieval.agent.models import (
     EntityExtraction,
+    ExtractedEntity,
     SortMode,
 )
 from engine.retrieval.grounding import GroundingBundle
@@ -313,6 +316,44 @@ def _coerce_sub_queries(raw: object) -> list[str]:
     return out
 
 
+def _coerce_entities(raw: object) -> tuple[object, list[str]]:
+    """Validate entities ONE AT A TIME, keeping the ones that pass.
+
+    Same rationale as `_coerce_sub_queries` above, applied to the field that
+    rationale was protecting. That helper exists so a malformed sub_query
+    cannot tank the entities; nothing protected the entities from each other,
+    so a single bad member discarded every good one alongside it -- which is
+    not a degraded extraction, it is an empty one, and the caller cannot tell
+    the difference from "found nothing".
+
+    Deliberately NOT a special case for `entity_type`. Any field can sink an
+    entity (a confidence of 1.5, a missing canonical_id, a non-dict member),
+    and special-casing one field would leave the same silent-total-loss bug
+    live for the others. Validating the member is the general fix.
+
+    Returns `(kept, dropped)` where `dropped` holds one short human-readable
+    reason per discarded member. A non-list `raw` passes through untouched for
+    EntityExtraction's own validation to reject coherently.
+    """
+    if not isinstance(raw, list):
+        return raw, []
+    kept: list[object] = []
+    dropped: list[str] = []
+    for item in raw:
+        try:
+            ExtractedEntity.model_validate(item)
+        except ValidationError as exc:
+            bad_type = (
+                item.get("entity_type") if isinstance(item, dict) else None
+            )
+            first = exc.errors()[0] if exc.errors() else {}
+            field = ".".join(str(p) for p in first.get("loc", ())) or "?"
+            dropped.append(f"entity_type={bad_type!r} field={field}")
+            continue
+        kept.append(item)
+    return kept, dropped
+
+
 async def extract_entities_with_llm(
     customer_id: str,
     query: str,
@@ -432,6 +473,20 @@ async def extract_entities_with_llm(
         raw["search_options"] = _coerce_search_options(raw.get("search_options"))
     if isinstance(raw, dict) and "sub_queries" in raw:
         raw["sub_queries"] = _coerce_sub_queries(raw.get("sub_queries"))
+    if isinstance(raw, dict) and "entities" in raw:
+        raw["entities"], _dropped_entities = _coerce_entities(raw.get("entities"))
+        if _dropped_entities:
+            # Logged, not swallowed. A rising count here is the signal that
+            # the emittable vocabulary has drifted from what the model wants
+            # to say -- the same drift that caused the outage this helper
+            # exists to survive. Silence is what made that one expensive.
+            log.warning(
+                "agent.entity_extract_entities_dropped",
+                customer_id=customer_id,
+                dropped_count=len(_dropped_entities),
+                kept_count=len(raw["entities"]),
+                dropped=_dropped_entities[:5],
+            )
     try:
         parsed = EntityExtraction.model_validate(raw)
     except Exception as exc:

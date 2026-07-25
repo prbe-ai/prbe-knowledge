@@ -275,11 +275,21 @@ class EntityTypeSpec:
 
     ``kind is None`` means the label carries no sub-type discriminator, or
     the entity type addresses plain untyped documents.
+
+    ``llm_extractable`` says whether the entity extractor's constrained
+    decoding may emit this type. It DEFAULTS TO TRUE deliberately: the
+    failure this flag exists to prevent is a type being addressable in the
+    graph while the extractor is forbidden from naming it, which is silent
+    (the entity validates away and the search runs with no anchors) and cost
+    us production searches on the research corpus for an unknown period.
+    Opting a type OUT is a visible, deliberate act at the callsite; opting a
+    new type IN happens for free, which is the direction that fails safely.
     """
 
     entity_type: str
     label: NodeLabel
     kind: str | None = None
+    llm_extractable: bool = True
 
 
 # The single source of truth for the entity vocabulary. Everything that needs
@@ -316,7 +326,11 @@ ENTITY_TYPE_REGISTRY: tuple[EntityTypeSpec, ...] = (
     EntityTypeSpec("file_path", NodeLabel.DOCUMENT),
     EntityTypeSpec("session", NodeLabel.DOCUMENT),
     EntityTypeSpec("commit_sha", NodeLabel.DOCUMENT),
-    EntityTypeSpec("document", NodeLabel.DOCUMENT),
+    # Not extractable: `document` is the generic Document fallback used by
+    # reverse resolution, not an anchor a query names. An extractor that
+    # emitted it would ground to "every document", which is no narrowing at
+    # all -- worse than emitting nothing.
+    EntityTypeSpec("document", NodeLabel.DOCUMENT, llm_extractable=False),
 
     # Research-domain entities. Each keeps its own label (see NodeLabel) and
     # carries no kind discriminator, so reverse resolution is label-only.
@@ -326,15 +340,59 @@ ENTITY_TYPE_REGISTRY: tuple[EntityTypeSpec, ...] = (
     EntityTypeSpec("artifact", NodeLabel.ARTIFACT),
     EntityTypeSpec("asset", NodeLabel.ASSET),
 
-    # Code-graph entities (extracted by tree-sitter at ingest, not by the
-    # router LLM, but the router can still emit these from queries that
-    # mention qualified symbol names like `Normalizer.process_queue_row`).
-    # All collapse to CODE_SYMBOL post-0091.
-    EntityTypeSpec("function", NodeLabel.CODE_SYMBOL, CodeSymbolKind.FUNCTION),
-    EntityTypeSpec("method", NodeLabel.CODE_SYMBOL, CodeSymbolKind.METHOD),
-    EntityTypeSpec("class", NodeLabel.CODE_SYMBOL, CodeSymbolKind.CLASS),
-    EntityTypeSpec("module", NodeLabel.CODE_SYMBOL, CodeSymbolKind.MODULE),
-    EntityTypeSpec("symbol", NodeLabel.CODE_SYMBOL, CodeSymbolKind.SYMBOL),
+    # Code-graph entities (extracted by tree-sitter at ingest). All collapse
+    # to CODE_SYMBOL post-0091.
+    #
+    # Not extractable, preserving the pre-centralisation Literal exactly.
+    # Note these were never in that Literal, so the extractor has never been
+    # able to emit them -- flipping any of these to True is a real behaviour
+    # change and needs its own evaluation, not a drive-by. Two things gate it:
+    # CODE_SYMBOL is excluded from grounding on cost (see
+    # _GROUNDING_EXCLUDED_LABELS below), so an emitted symbol would have no
+    # grounded candidate to reconcile against; and the prose above this tuple
+    # historically claimed "the router can still emit these", which contradicts
+    # the extractor's own Literal. Resolve that contradiction before enabling.
+    EntityTypeSpec(
+        "function", NodeLabel.CODE_SYMBOL, CodeSymbolKind.FUNCTION,
+        llm_extractable=False,
+    ),
+    EntityTypeSpec(
+        "method", NodeLabel.CODE_SYMBOL, CodeSymbolKind.METHOD,
+        llm_extractable=False,
+    ),
+    EntityTypeSpec(
+        "class", NodeLabel.CODE_SYMBOL, CodeSymbolKind.CLASS,
+        llm_extractable=False,
+    ),
+    EntityTypeSpec(
+        "module", NodeLabel.CODE_SYMBOL, CodeSymbolKind.MODULE,
+        llm_extractable=False,
+    ),
+    EntityTypeSpec(
+        "symbol", NodeLabel.CODE_SYMBOL, CodeSymbolKind.SYMBOL,
+        llm_extractable=False,
+    ),
+)
+
+
+# The extractor's emittable vocabulary, DERIVED so it cannot drift from the
+# registry. This tuple is what `EntityType` in
+# engine/retrieval/agent/models.py builds its Literal from, which in turn is
+# serialised into the extractor's constrained-decoding response_format.
+#
+# It replaces a second, hand-maintained copy of this list. That copy went
+# stale exactly the way a duplicated list does: the research-domain types
+# (experiment / project / run / artifact / asset) were added to the registry
+# and to grounding, but nobody added them here, so grounding surfaced
+# Experiment candidates, the model correctly emitted entity_type="experiment",
+# and Pydantic rejected the whole extraction. Searches returned zero entity
+# anchors while still reporting state:"ok". There is now one list.
+LLM_EXTRACTABLE_ENTITY_TYPES: tuple[str, ...] = tuple(
+    sorted({
+        spec.entity_type
+        for spec in ENTITY_TYPE_REGISTRY
+        if spec.llm_extractable
+    })
 )
 
 
@@ -393,6 +451,33 @@ _GROUNDING_EXCLUDED_LABELS: frozenset[NodeLabel] = frozenset({
 GROUNDING_ENTITY_LABELS: tuple[str, ...] = tuple(
     sorted({
         spec.label.value
+        for spec in ENTITY_TYPE_REGISTRY
+        if spec.label not in _GROUNDING_EXCLUDED_LABELS
+    })
+)
+
+
+# The entity types grounding's fuzzy channel can actually put in front of the
+# extractor, as types rather than labels.
+#
+# Every one of these MUST be llm_extractable, and models.py enforces it at
+# import. The reasoning is end-to-end: grounding hands the model a candidate
+# of this type, the prompt invites the model to name it, so a model doing its
+# job emits it -- and if it is not emittable, Pydantic rejects the extraction.
+# That is not a degraded result, it is a zero result, and it is silent. This
+# is the precise shape of the research-corpus outage: Experiment and Project
+# candidates were grounded and offered for weeks while the extractor was
+# forbidden from naming them.
+#
+# Note this is deliberately NOT "resolvable via entity_type_for_node". Types
+# like file_path / session / commit_sha sit at Document with no kind, so the
+# label-only default resolves them to `document` and they are unresolvable by
+# that route -- yet they are legitimately emittable, reaching the graph through
+# bare-ID detection instead. Grounding-addressability is the invariant that
+# matches the failure; resolvability is not.
+GROUNDING_ADDRESSABLE_ENTITY_TYPES: tuple[str, ...] = tuple(
+    sorted({
+        spec.entity_type
         for spec in ENTITY_TYPE_REGISTRY
         if spec.label not in _GROUNDING_EXCLUDED_LABELS
     })
