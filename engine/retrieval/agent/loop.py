@@ -857,10 +857,22 @@ async def _run_turn(state: LoopState) -> Any:
         # gotcha memory for why this is per-call rather than global.
         "custom_llm_provider": "openai",
         "extra_headers": {"x-session-affinity": _affinity_key(state.customer_id, state.query)},
-        # LiteLLM's SDK treats this as a client transport deadline (the OpenAI
-        # client sends x-stainless-read-timeout); it is not the proxy request
-        # body's provider timeout. Per-deployment limits remain gateway-owned
-        # and can therefore trigger Cerebras -> Fireworks.
+        # This deadline is what actually ends a stalled turn -- NOT the
+        # gateway's per-deployment deadline.
+        #
+        # A previous comment here asserted the opposite: that the SDK sends
+        # this only as a client transport deadline
+        # (`x-stainless-read-timeout`), leaving per-deployment limits
+        # gateway-owned and free to trigger Cerebras -> Fireworks. Production
+        # contradicts it. Stalled turns end at exactly this value
+        # (`litellm.Timeout ... timeout value=60.0, time taken=60.01`,
+        # repeatedly) carrying `x-litellm-attempted-fallbacks: 0`, never at the
+        # 12s Cerebras deployment deadline. A call cannot run past 12s if a 12s
+        # deadline is being enforced.
+        #
+        # The practical consequence: this number bounds a provider stall, so it
+        # must stay small enough to fit the caller's budget and large enough to
+        # let a failover hop land. See SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS.
         "timeout": SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
     }
     if gateway_url():
