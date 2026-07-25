@@ -2215,11 +2215,44 @@ async def _drive_loop(state: LoopState) -> GathererOutput | None:
                 turns=state.turn_count,
                 reason=reason,
             )
-            state.messages.append({
+            # The assistant turn is echoed WITH its tool_calls, so the chat
+            # contract now obliges us to answer every one of those
+            # tool_call_ids with a `tool` message before the next request.
+            # This path deliberately does NOT execute them -- that is the
+            # whole point of force-terminating -- so answer each with an
+            # explicit skip instead of leaving it unanswered.
+            #
+            # Leaving them unanswered is a hard 400 from strict providers:
+            #   CerebrasException - An assistant message with 'tool_calls'
+            #   must be followed by tool messages responding to each
+            #   'tool_call_id'
+            # which surfaces as agent.fatal_provider_error -> 503. With
+            # SEARCH_AGENT_SOFT_TURN_CAP=1 this branch is reached on the
+            # SECOND turn of any query the model doesn't finish in one, so
+            # this was not an edge case -- it turned every multi-turn query
+            # into a hard failure.
+            echoed = _serialize_tool_calls(tool_calls)
+            assistant_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": content or "",
-                "tool_calls": _serialize_tool_calls(tool_calls),
-            })
+            }
+            if echoed:
+                assistant_msg["tool_calls"] = echoed
+            state.messages.append(assistant_msg)
+            for tc in tool_calls:
+                state.messages.append({
+                    "role": "tool",
+                    "tool_call_id": getattr(tc, "id", "?"),
+                    "content": json.dumps({
+                        "skipped": True,
+                        "reason": reason,
+                        "detail": (
+                            "Exploration budget reached; this tool was not "
+                            "run. Emit the final output from the evidence "
+                            "you already have."
+                        ),
+                    }),
+                })
             state.messages.append({
                 "role": "user",
                 "content": (
