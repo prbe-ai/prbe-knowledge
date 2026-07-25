@@ -21,9 +21,17 @@ from engine.retrieval.agent.extractor import (
     _coerce_search_options,
     extract_entities_with_llm,
 )
-from engine.retrieval.agent.models import EntityExtraction, SearchOptions
+from engine.retrieval.agent.models import (
+    EntityExtraction,
+    SearchOptions,
+    assert_grounded_types_are_emittable,
+)
 from engine.retrieval.grounding import GroundingBundle
-from engine.shared.constants import SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS
+from engine.shared.constants import (
+    GROUNDING_ADDRESSABLE_ENTITY_TYPES,
+    LLM_EXTRACTABLE_ENTITY_TYPES,
+    SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS,
+)
 
 
 def _fake_completion(content: str) -> SimpleNamespace:
@@ -208,3 +216,79 @@ async def test_extract_search_options_omitted_defaults_to_relevance(
 
     assert result.search_options.sort == "relevance"
     assert len(result.entities) == 1
+
+
+def test_grounded_entity_type_must_be_emittable() -> None:
+    """The guard that would have caught the research-corpus outage.
+
+    Grounding surfaced Experiment/Project candidates while the extractor's
+    vocabulary omitted them, so the model named them, validation rejected the
+    whole emission, and every search silently ran with zero entity anchors.
+    Exercises the production callable, not a paraphrase of it — a guard that
+    only runs on the day it matters is a guard nobody has verified.
+    """
+    # Real registry-derived tuples must already satisfy the invariant.
+    assert_grounded_types_are_emittable(
+        GROUNDING_ADDRESSABLE_ENTITY_TYPES, LLM_EXTRACTABLE_ENTITY_TYPES
+    )
+
+    # Drift in the direction that broke: grounded, but not emittable.
+    with pytest.raises(RuntimeError, match="experiment"):
+        assert_grounded_types_are_emittable(
+            ["person", "experiment"], ["person"]
+        )
+
+    # The opposite direction is legitimate and must NOT raise: file_path,
+    # session and commit_sha are emittable but never grounded (they reach the
+    # graph via bare-ID detection).
+    assert_grounded_types_are_emittable(["person"], ["person", "commit_sha"])
+
+
+@pytest.mark.asyncio
+async def test_extract_keeps_research_entities_and_drops_only_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION: `experiment` / `project` used to fail validation and take
+    every valid entity down with them, returning an empty extraction while the
+    response still read state:"ok".
+
+    Also pins that rejection is per-entity and not entity_type-specific: the
+    bad `confidence` member is dropped on its own, without discarding the rest.
+    """
+    payload = json.dumps({
+        "entities": [
+            {
+                "entity_type": "experiment",
+                "canonical_id": "abag-leg3",
+                "display_name": "AbAg Leg 3",
+                "confidence": 0.9,
+            },
+            {
+                "entity_type": "project",
+                "canonical_id": "anthrogen",
+                "display_name": "Anthrogen",
+                "confidence": 0.8,
+            },
+            {
+                "entity_type": "person",
+                "canonical_id": "bad-confidence",
+                "display_name": "Nope",
+                "confidence": 1.5,
+            },
+        ],
+        "search_options": {"sort": "relevance"},
+    })
+    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
+    monkeypatch.setattr(
+        "engine.retrieval.agent.extractor.acompletion",
+        AsyncMock(return_value=_fake_completion(payload)),
+    )
+
+    result = await extract_entities_with_llm(
+        customer_id="cust-1",
+        query="anthrogen abag protenix",
+        bundle=GroundingBundle(),
+    )
+
+    kept = {e.canonical_id: e.entity_type for e in result.entities}
+    assert kept == {"abag-leg3": "experiment", "anthrogen": "project"}

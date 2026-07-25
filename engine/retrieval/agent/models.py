@@ -12,11 +12,15 @@ dashboard consumers — no breaking changes downstream.
 
 from __future__ import annotations
 
-from typing import Literal, get_args
+from collections.abc import Sequence
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from engine.shared.constants import ROUTER_ENTITY_TO_LABEL
+from engine.shared.constants import (
+    GROUNDING_ADDRESSABLE_ENTITY_TYPES,
+    LLM_EXTRACTABLE_ENTITY_TYPES,
+)
 
 # Subset of channels we surface in matched_via. Mirrors the tool-name set
 # the agent uses, plus the two derived-from-walker labels.
@@ -203,43 +207,58 @@ class GathererOutput(BaseModel):
 # as the agent loop, parallel with grounding) reads the query and proposes
 # entities. Results merge with grounding before pre-fan-out.
 
-EntityType = Literal[
-    "person",
-    "repo",
-    "service",
-    "ticket",
-    "pr",
-    "issue",
-    "feature",
-    "decision",
-    "error_group",
-    "file_path",
-    "channel",
-    "session",
-    "commit_sha",
-]
-
-# This Literal must stay a static annotation: it is serialised via
-# model_json_schema() into the extractor's constrained-decoding response_format
-# (engine/retrieval/agent/extractor.py), so it cannot be generated at runtime.
-# It is therefore ASSERTED against the registry instead.
+# DERIVED from ENTITY_TYPE_REGISTRY -- do not hand-edit this list, and do not
+# reintroduce a literal one. Add the type to the registry in
+# engine/shared/constants.py and it appears here automatically.
 #
-# The invariant is containment, not equality. The registry is deliberately
-# wider: code-symbol types (function / class / method / module / symbol) are
-# addressable in graph_nodes but are produced by tree-sitter at ingest, not
-# emitted by this extractor. What must never happen is the reverse -- a value
-# the LLM can emit that nothing can address, which is exactly how `commit_sha`
-# ended up being silently discarded by the `if label and cid` guard in
-# tools.py for every query that produced one.
-_REGISTRY_ENTITY_TYPES = frozenset(ROUTER_ENTITY_TO_LABEL)
-_LITERAL_ENTITY_TYPES = frozenset(get_args(EntityType))
-_UNADDRESSABLE = _LITERAL_ENTITY_TYPES - _REGISTRY_ENTITY_TYPES
-if _UNADDRESSABLE:
-    raise RuntimeError(
-        "EntityType Literal contains values with no ENTITY_TYPE_REGISTRY entry "
-        f"in engine/shared/constants.py: {sorted(_UNADDRESSABLE)}. "
-        "The extractor would emit these and the graph channel would drop them."
-    )
+# A previous revision spelled these values out and kept them in sync with the
+# registry by assertion. The assertion only checked one direction (nothing
+# emittable may be unaddressable), so the reverse drifted unnoticed: the
+# research-domain types were addressable and grounded, but absent here, and
+# every extraction naming one failed validation and returned EMPTY. Deriving
+# removes the second list rather than watching it, so the two cannot disagree.
+#
+# Building the Literal at runtime is fine despite an earlier comment here
+# claiming otherwise: `Literal[<tuple of str>]` is a well-formed annotation,
+# and Pydantic serialises it into an `enum` in model_json_schema() exactly as
+# it does a spelled-out Literal -- which is what the extractor's
+# constrained-decoding response_format needs. The cost is that static type
+# checkers see an opaque alias instead of the concrete members; the runtime
+# contract, which is what the response_format is built from, is unchanged.
+EntityType = Literal[LLM_EXTRACTABLE_ENTITY_TYPES]  # type: ignore[valid-type]
+
+# Derivation guarantees emittable ⊆ registry, so the old one-directional
+# containment check is structurally impossible to violate and is gone.
+#
+# This guard covers the direction derivation does NOT cover, and the one that
+# actually broke: a type grounding can surface must be a type the extractor
+# may name. Grounding offering a candidate the model is forbidden to name
+# fails silently -- the model names it anyway, validation rejects it, and the
+# search runs with no anchors while reporting success.
+# A function, not inline module code, so a test can exercise the SAME logic
+# the import runs rather than a paraphrase of it. A guard that only ever
+# executes on the one day it matters is a guard nobody has verified.
+def assert_grounded_types_are_emittable(
+    grounded: Sequence[str], emittable: Sequence[str]
+) -> None:
+    """Raise if grounding can surface an entity type the extractor cannot emit.
+
+    Called at import against the real registry-derived tuples.
+    """
+    unsayable = sorted(set(grounded) - set(emittable))
+    if unsayable:
+        raise RuntimeError(
+            "These entity types are surfaced by grounding but marked "
+            f"llm_extractable=False: {unsayable}. The extractor would be "
+            "offered them as candidates, emit them, and every extraction "
+            "naming one would validate away to nothing. Fix the registry "
+            "entry in engine/shared/constants.py."
+        )
+
+
+assert_grounded_types_are_emittable(
+    GROUNDING_ADDRESSABLE_ENTITY_TYPES, LLM_EXTRACTABLE_ENTITY_TYPES
+)
 
 
 class ExtractedEntity(BaseModel):
