@@ -1087,11 +1087,38 @@ SEARCH_AGENT_EXTRACTOR_MAX_TOKENS = int(
     os.getenv("SEARCH_AGENT_EXTRACTOR_MAX_TOKENS", "2000")
 )
 
-# Client-side cap on one gatherer model turn. The managed LiteLLM gateway owns
-# the Cerebras -> Fireworks provider chain, so this must leave enough time for
-# both routes to run before the retrieval client gives up. It remains nested
-# inside SEARCH_AGENT_LOOP_TIMEOUT_SECONDS, which bounds the complete loop.
-SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 60.0
+# Client-side cap on one gatherer model turn. Nested inside
+# SEARCH_AGENT_LOOP_TIMEOUT_SECONDS, which bounds the complete loop via
+# asyncio.wait_for and is the hard backstop.
+#
+# 20s, not 60s. The old value was chosen to "leave enough time for both routes
+# to run", on the belief that the gateway's per-deployment deadlines would cut
+# a stalled provider first and trigger Cerebras -> Fireworks. MEASURED, that
+# does not happen: a stalled turn runs to exactly this deadline (repeated
+# `litellm.Timeout ... timeout value=60.0, time taken=60.01` with
+# `x-litellm-attempted-fallbacks: 0`), never to the 12s Cerebras deployment
+# deadline. Whatever the mechanism, the observable is that THIS number, not
+# the gateway's, is what ends a stalled turn -- so it has to be a number we
+# would actually accept waiting.
+#
+# The stall is reproducible and specific: large context COMBINED WITH
+# tool-calling. A 300KB prompt alone returns in ~1.5s; the same prompt with
+# `tools` + tool_choice="required" was measured at 61.6s. Neither ingredient
+# alone does it, which is why isolated probes look healthy and only real
+# gatherer turns hang.
+#
+# Why 20 and not lower: the Cerebras deployment deadline is 12s, and a
+# Fireworks hop answers in ~1-4s. 20s is the smallest value that still leaves
+# room for 12s + a failover hop to complete, so it bounds the damage WITHOUT
+# foreclosing the recovery path if the gateway does cut at 12s. Below ~16s the
+# failover could never land and the fallback config would be dead weight.
+#
+# Why not higher: research-os gives /v1/search 30s total
+# (ENGINE_TIMEOUT_SECONDS), and grounding+extraction+prefanout already spend
+# ~16s of it under load. A 60s turn cannot fit inside that budget under any
+# arrangement, so a stalled turn was guaranteed to blow the caller's deadline
+# and return nothing.
+SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 20.0
 
 # Overall agent loop cap. Prevents pathological queries from monopolising
 # a worker. p99 should land far below this; timeout degrades to the citable
