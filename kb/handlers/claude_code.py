@@ -37,6 +37,7 @@ from engine.shared.constants import (
     Permission,
     PrincipalType,
     SourceSystem,
+    agent_session_canonical_id,
 )
 from engine.shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
 from engine.shared.models import (
@@ -51,6 +52,7 @@ from engine.shared.models import (
     NormalizationResult,
     WebhookEvent,
     WebhookParseResult,
+    make_named_entity,
 )
 from engine.shared.storage import get_store
 
@@ -352,6 +354,20 @@ class ClaudeCodeConnector(Connector):
         if employee_hostname:
             person_props["hostname"] = employee_hostname
 
+        # The AgentSession entity is the JOIN POINT with research-os, which
+        # emits a node with the SAME canonical_id beside each run that came out
+        # of this session. Neither side can reference the other's Document
+        # (custom-ingest rewrites every Document endpoint into the caller's own
+        # namespace), so they meet on this entity instead and the engine's
+        # pending-edge machinery tolerates either side landing first.
+        #
+        # Named from the session document's title rather than the bare uuid:
+        # grounding resolves a query token by fuzzy-matching properties['name'],
+        # so "Richard's Claude Code session" only lands if the name carries the
+        # person, and a uuid-named node is unfindable by any human query.
+        agent_session_node_id = agent_session_canonical_id(
+            self._agent_label, session_id
+        )
         graph_nodes: list[GraphNodeSpec] = [
             GraphNodeSpec(
                 label=NodeLabel.PERSON,
@@ -363,6 +379,12 @@ class ClaudeCodeConnector(Connector):
                 canonical_id=session_doc.doc_id,
                 properties={"doc_type": DocType.CLAUDE_CODE_SESSION.value},
             ),
+            make_named_entity(
+                NodeLabel.AGENT_SESSION,
+                agent_session_node_id,
+                session_doc.title,
+                properties={"agent": self._agent_label, "session_id": session_id},
+            ),
         ]
         graph_edges: list[GraphEdgeSpec] = [
             GraphEdgeSpec(
@@ -372,7 +394,19 @@ class ClaudeCodeConnector(Connector):
                 to_label=NodeLabel.DOCUMENT,
                 to_canonical_id=session_doc.doc_id,
                 properties={"session_id": session_id},
-            )
+            ),
+            # Entity -> its own document, the same shape every research-domain
+            # entity uses. The graph retriever's neighbour join is
+            # `AND n.label = 'Document'`, so this is what makes the transcript
+            # reachable in ONE hop from a grounded session anchor.
+            GraphEdgeSpec(
+                edge_type=EdgeType.TOUCHES,
+                from_label=NodeLabel.AGENT_SESSION,
+                from_canonical_id=agent_session_node_id,
+                to_label=NodeLabel.DOCUMENT,
+                to_canonical_id=session_doc.doc_id,
+                properties={"session_id": session_id},
+            ),
         ]
         acl = self._acl(employee_id)
         acl_rows: list[ACLSnapshotRow] = [

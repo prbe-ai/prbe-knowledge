@@ -210,6 +210,24 @@ class NodeLabel(StrEnum):
     ARTIFACT = "Artifact"
     ASSET = "Asset"
 
+    # ---- Coding-agent sessions ----
+    # A coding-agent conversation (Claude Code today; Codex has a handler but
+    # no capture plugin yet). It is the JOIN between two independent ingest
+    # pipelines: the transcript connector emits it beside the session
+    # document, and research-os emits it beside the run document, so a session
+    # and the runs it produced become one-hop neighbours through it.
+    #
+    # It has to be an entity rather than a reference to the session Document:
+    # custom-ingest rewrites EVERY Document-labelled edge endpoint through
+    # custom_ingest_doc_id() (see engine/ingest/handlers/custom_ingest.py),
+    # which is the namespace-confinement control that stops one system
+    # attaching edges to another tenant's or another connector's documents.
+    # That rewrite is unconditional, so a same-tenant cross-connector
+    # reference is mangled just like a hostile one, accepted with a 200, and
+    # parked in pending_edges until the reaper drops it. Non-Document labels
+    # pass through untouched.
+    AGENT_SESSION = "AgentSession"
+
 
 class CodeSymbolKind(StrEnum):
     """Sub-type of a CODE_SYMBOL node, stored in ``properties['kind']``.
@@ -340,6 +358,14 @@ ENTITY_TYPE_REGISTRY: tuple[EntityTypeSpec, ...] = (
     EntityTypeSpec("artifact", NodeLabel.ARTIFACT),
     EntityTypeSpec("asset", NodeLabel.ASSET),
 
+    # Coding-agent session. Deliberately EXTRACTABLE: the graph retriever
+    # returns early when the router surfaced no entities, so a non-extractable
+    # entity is never an anchor and the node is dead weight. Nodes are named
+    # like the session document's title ("Claude Code session 122b91da
+    # (Richard Wei)"), not the bare uuid, so grounding's fuzzy name match can
+    # resolve "Richard's Claude Code session" to it.
+    EntityTypeSpec("agent_session", NodeLabel.AGENT_SESSION),
+
     # Code-graph entities (extracted by tree-sitter at ingest). All collapse
     # to CODE_SYMBOL post-0091.
     #
@@ -447,6 +473,25 @@ _GROUNDING_EXCLUDED_LABELS: frozenset[NodeLabel] = frozenset({
     NodeLabel.DOCUMENT,
     NodeLabel.CODE_SYMBOL,
 })
+
+def agent_session_canonical_id(agent: str, session_id: str) -> str:
+    """canonical_id for an AGENT_SESSION node.
+
+    CROSS-REPO CONTRACT. research-os composes this exact string independently
+    (it cannot import this package) so that its run-side node and this
+    connector's transcript-side node MERGE into one graph node. Both sides
+    hold the same two inputs: the agent label and the agent's session id.
+
+        agent_session:{agent}:{session_id}
+
+    Changing the shape silently un-merges the two sides: each keeps writing a
+    node, no error is raised, and the edges simply stop meeting. There is no
+    validation that can catch it from inside one repo, which is why the
+    post-deploy check asserts the join THROUGH the retrieval API rather than
+    against graph_nodes.
+    """
+    return f"agent_session:{agent}:{session_id}"
+
 
 GROUNDING_ENTITY_LABELS: tuple[str, ...] = tuple(
     sorted({
