@@ -356,11 +356,14 @@ class ClaudeCodeConnector(Connector):
             person_props["hostname"] = employee_hostname
 
         # The AgentSession entity is the JOIN POINT with research-os, which
-        # emits a node with the SAME canonical_id beside each run that came out
-        # of this session. Neither side can reference the other's Document
+        # asserts an EDGE to this same canonical_id beside each run that came
+        # out of this session. Neither side can reference the other's Document
         # (custom-ingest rewrites every Document endpoint into the caller's own
-        # namespace), so they meet on this entity instead and the engine's
-        # pending-edge machinery tolerates either side landing first.
+        # namespace), so they meet on this entity instead. THIS side owns the
+        # node, and therefore its name: naming needs the person, which a run
+        # row does not carry, and two writers would flip the name -- and so
+        # flip whether grounding can find it -- by ingest order. The run-side
+        # edge parks in pending_edges until this node lands.
         #
         # NOT the session document's title. That is what the first version
         # used, and it grounded to nothing: the title carries an email address
