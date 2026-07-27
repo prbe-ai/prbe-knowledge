@@ -38,6 +38,7 @@ from engine.shared.constants import (
     PrincipalType,
     SourceSystem,
     agent_session_canonical_id,
+    agent_session_display_name,
 )
 from engine.shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
 from engine.shared.models import (
@@ -355,16 +356,21 @@ class ClaudeCodeConnector(Connector):
             person_props["hostname"] = employee_hostname
 
         # The AgentSession entity is the JOIN POINT with research-os, which
-        # emits a node with the SAME canonical_id beside each run that came out
-        # of this session. Neither side can reference the other's Document
+        # asserts an EDGE to this same canonical_id beside each run that came
+        # out of this session. Neither side can reference the other's Document
         # (custom-ingest rewrites every Document endpoint into the caller's own
-        # namespace), so they meet on this entity instead and the engine's
-        # pending-edge machinery tolerates either side landing first.
+        # namespace), so they meet on this entity instead. THIS side owns the
+        # node, and therefore its name: naming needs the person, which a run
+        # row does not carry, and two writers would flip the name -- and so
+        # flip whether grounding can find it -- by ingest order. The run-side
+        # edge parks in pending_edges until this node lands.
         #
-        # Named from the session document's title rather than the bare uuid:
-        # grounding resolves a query token by fuzzy-matching properties['name'],
-        # so "Richard's Claude Code session" only lands if the name carries the
-        # person, and a uuid-named node is unfindable by any human query.
+        # NOT the session document's title. That is what the first version
+        # used, and it grounded to nothing: the title carries an email address
+        # whose trigrams pushed pg_trgm similarity under the threshold, and it
+        # truncates the id to 8 characters so a query naming the real session
+        # id could not match. agent_session_display_name is short and carries
+        # the FULL id; see its docstring.
         agent_session_node_id = agent_session_canonical_id(
             self._agent_label, session_id
         )
@@ -382,7 +388,9 @@ class ClaudeCodeConnector(Connector):
             make_named_entity(
                 NodeLabel.AGENT_SESSION,
                 agent_session_node_id,
-                session_doc.title,
+                agent_session_display_name(
+                    self._agent_label, session_id, employee_name
+                ),
                 properties={"agent": self._agent_label, "session_id": session_id},
             ),
         ]

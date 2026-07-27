@@ -360,10 +360,10 @@ ENTITY_TYPE_REGISTRY: tuple[EntityTypeSpec, ...] = (
 
     # Coding-agent session. Deliberately EXTRACTABLE: the graph retriever
     # returns early when the router surfaced no entities, so a non-extractable
-    # entity is never an anchor and the node is dead weight. Nodes are named
-    # like the session document's title ("Claude Code session 122b91da
-    # (Richard Wei)"), not the bare uuid, so grounding's fuzzy name match can
-    # resolve "Richard's Claude Code session" to it.
+    # entity is never an anchor and the node is dead weight. Kind-less, so it
+    # also supplies its own reverse mapping in _DEFAULT_ENTITY_TYPE_FOR_LABEL.
+    # Node naming lives in agent_session_display_name -- NOT the session
+    # document's title, which grounds to nothing for an id query.
     EntityTypeSpec("agent_session", NodeLabel.AGENT_SESSION),
 
     # Code-graph entities (extracted by tree-sitter at ingest). All collapse
@@ -424,22 +424,34 @@ LLM_EXTRACTABLE_ENTITY_TYPES: tuple[str, ...] = tuple(
 
 # Reverse resolution for a node whose properties['kind'] is unset. A label
 # alone is ambiguous across the kind-less types above (file_path / session /
-# commit_sha / document all sit at Document with no kind), so the generic
-# member of each label wins.
-_DEFAULT_ENTITY_TYPE_FOR_LABEL: dict[NodeLabel, str] = {
-    NodeLabel.PERSON: "person",
-    NodeLabel.SERVICE: "service",
-    NodeLabel.FEATURE: "feature",
-    NodeLabel.DECISION: "decision",
-    NodeLabel.ERROR_GROUP: "error_group",
+# commit_sha / document all sit at Document with no kind), so a generic member
+# is declared per ambiguous label and everything else is DERIVED.
+#
+# This map used to be spelled out by hand and it drifted exactly the way the
+# registry comment above says a hand-maintained list drifts: AgentSession was
+# added to the registry, to ROUTER_ENTITY_TO_LABEL, to GROUNDING_ENTITY_LABELS
+# and to the extractor's Literal -- and omitted here. Grounding's fuzzy SQL
+# matched those nodes and then dropped every one of them, because its only
+# consumer does `if not entity_type: continue`. The node was addressable,
+# extractable, grounded by SQL, and unreachable in practice.
+#
+# Only genuinely ambiguous labels need a hand-picked winner; a label owned by a
+# single kind-less spec resolves to that spec.
+_AMBIGUOUS_LABEL_WINNER: dict[NodeLabel, str] = {
     NodeLabel.DOCUMENT: "document",
     NodeLabel.CODE_SYMBOL: "symbol",
-    NodeLabel.PROJECT: "project",
-    NodeLabel.EXPERIMENT: "experiment",
-    NodeLabel.RUN: "run",
-    NodeLabel.ARTIFACT: "artifact",
-    NodeLabel.ASSET: "asset",
 }
+
+_DEFAULT_ENTITY_TYPE_FOR_LABEL: dict[NodeLabel, str] = {
+    **{
+        spec.label: spec.entity_type
+        for spec in ENTITY_TYPE_REGISTRY
+        if spec.kind is None
+    },
+    **_AMBIGUOUS_LABEL_WINNER,
+}
+
+
 
 
 ROUTER_ENTITY_TO_LABEL: dict[str, NodeLabel] = {
@@ -478,9 +490,10 @@ def agent_session_canonical_id(agent: str, session_id: str) -> str:
     """canonical_id for an AGENT_SESSION node.
 
     CROSS-REPO CONTRACT. research-os composes this exact string independently
-    (it cannot import this package) so that its run-side node and this
-    connector's transcript-side node MERGE into one graph node. Both sides
-    hold the same two inputs: the agent label and the agent's session id.
+    (it cannot import this package) and asserts an EDGE to it; this connector
+    asserts the NODE. One writer owns the node's groundable name, and the
+    run-side edge parks in pending_edges until the node lands. Both sides hold
+    the same two inputs: the agent label and the agent's session id.
 
         agent_session:{agent}:{session_id}
 
@@ -493,6 +506,41 @@ def agent_session_canonical_id(agent: str, session_id: str) -> str:
     return f"agent_session:{agent}:{session_id}"
 
 
+def agent_session_display_name(
+    agent: str, session_id: str, person: str | None = None
+) -> str:
+    """properties['name'] for an AGENT_SESSION node.
+
+    The ENGINE owns this name. research-os asserts only the edge, so there is
+    exactly one writer and the node's name cannot flip-flop between two sides
+    that know different things about the session.
+
+    Grounding decides whether this node is reachable at all, matching
+    ``properties->>'name'`` through pg_trgm similarity (diluted by every
+    character NOT in the query) and a tsvector word match. Measured against a
+    live index, per query style:
+
+        name shape                       full uuid   "<person> ... session"
+        session document's title          0.118 no    0.625 yes
+        "<agent> session <full id>"       0.673 yes   0.269 no
+        "<person> <agent> session <id>"   0.552 yes   0.448 yes   <- this
+
+    The first version reused the session document's title and grounded to
+    NOTHING for an id query: the email address in that title contributed enough
+    non-matching trigrams to drop similarity under the 0.3 threshold, and the id
+    was truncated to 8 characters so naming the real session could not match.
+    The node existed, ingest reported success, and the entity was unreachable --
+    the failure make_named_entity's docstring warns about, reached by a
+    different route.
+
+    So: the FULL id (an id query is the precise one), the person when known
+    (the human phrasing), the agent with underscores spaced out so it
+    tokenises, and NO email.
+    """
+    spaced = agent.replace("_", " ")
+    if person:
+        return f"{person} {spaced} session {session_id}"
+    return f"{spaced} session {session_id}"
 GROUNDING_ENTITY_LABELS: tuple[str, ...] = tuple(
     sorted({
         spec.label.value
@@ -500,6 +548,22 @@ GROUNDING_ENTITY_LABELS: tuple[str, ...] = tuple(
         if spec.label not in _GROUNDING_EXCLUDED_LABELS
     })
 )
+
+
+# Every label grounding is allowed to SCAN must reverse to an entity type, or
+# grounding silently discards the rows it just matched. Asserted at import so a
+# new registry entry cannot reintroduce the AgentSession failure.
+_UNREVERSIBLE = [
+    label for label in GROUNDING_ENTITY_LABELS
+    if NodeLabel(label) not in _DEFAULT_ENTITY_TYPE_FOR_LABEL
+]
+if _UNREVERSIBLE:  # pragma: no cover - import-time guard
+    raise RuntimeError(
+        "grounding would scan and then discard these labels because they have "
+        f"no reverse entity_type: {_UNREVERSIBLE}. Add them to "
+        "ENTITY_TYPE_REGISTRY as a kind-less spec, or to "
+        "_AMBIGUOUS_LABEL_WINNER."
+    )
 
 
 # The entity types grounding's fuzzy channel can actually put in front of the
