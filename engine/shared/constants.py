@@ -493,6 +493,43 @@ def agent_session_canonical_id(agent: str, session_id: str) -> str:
     return f"agent_session:{agent}:{session_id}"
 
 
+def agent_session_display_name(
+    agent: str, session_id: str, person: str | None = None
+) -> str:
+    """properties['name'] for an AGENT_SESSION node.
+
+    The ENGINE owns this name. research-os asserts only the edge, so there is
+    exactly one writer and the node's name cannot flip-flop between two sides
+    that know different things about the session.
+
+    Grounding decides whether this node is reachable at all, matching
+    ``properties->>'name'`` through pg_trgm similarity (diluted by every
+    character NOT in the query) and a tsvector word match. Measured against a
+    live index, per query style:
+
+        name shape                       full uuid   "<person> ... session"
+        session document's title          0.118 no    0.625 yes
+        "<agent> session <full id>"       0.673 yes   0.269 no
+        "<person> <agent> session <id>"   0.552 yes   0.448 yes   <- this
+
+    The first version reused the session document's title and grounded to
+    NOTHING for an id query: the email address in that title contributed enough
+    non-matching trigrams to drop similarity under the 0.3 threshold, and the id
+    was truncated to 8 characters so naming the real session could not match.
+    The node existed, ingest reported success, and the entity was unreachable --
+    the failure make_named_entity's docstring warns about, reached by a
+    different route.
+
+    So: the FULL id (an id query is the precise one), the person when known
+    (the human phrasing), the agent with underscores spaced out so it
+    tokenises, and NO email.
+    """
+    spaced = agent.replace("_", " ")
+    if person:
+        return f"{person} {spaced} session {session_id}"
+    return f"{spaced} session {session_id}"
+
+
 GROUNDING_ENTITY_LABELS: tuple[str, ...] = tuple(
     sorted({
         spec.label.value
