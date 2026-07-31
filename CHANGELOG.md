@@ -8,6 +8,22 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- Per-turn `finish_reason` and `usage.completion_tokens` are recorded on the
+  gatherer loop state, logged on `agent.turn_complete`, carried in the trace
+  blob (schema v2), and summarised in the trace digest as
+  `completion_tokens_max` / `was_truncated`. The gatherer emits each chunk's
+  content verbatim, so emit size scales with results and cannot be inferred
+  from a synthetic probe — this is the measurement needed before capping
+  `max_tokens`. `finish_reason` is also the truncation alarm whose absence
+  from the extractor's failure logs once kept a blown token cap invisible.
+- `LLM_TPM_BUDGET` / `LLM_TPM_MAX_WAIT_SECONDS`: an optional per-process
+  token-rate limiter in `engine/shared/llm.py`, covering every provider call
+  (`import litellm` appears in exactly one engine file). Limits tokens rather
+  than requests, because the quota is denominated in tokens and this engine's
+  requests differ by ~50x. **Disabled by default** (`0`), and it **fails
+  open** — if budget is not available within the max wait it proceeds and
+  lets the provider decide, because blocking longer than the caller's own
+  deadline turns a fast 429 into a slow timeout that returns nothing.
 - Internal ingestion stats can now break Claude Code and Codex totals down by
   device, including historical derived documents linked through their parent
   session, so downstream dashboards can show trustworthy per-laptop counts.
@@ -23,6 +39,22 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- The turn-1 pre-fan-out dump is rendered as compact JSON instead of
+  `indent=2`. Indentation is input tokens carrying no information, re-sent on
+  every turn, and it was un-budgeted: the budget counts `content` only, so
+  whitespace rode on top of the cap rather than inside it.
+- `SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET` lowered 40,000 → 18,000 and made
+  env-overridable. This is the highest-leverage knob on provider quota
+  because the turn-1 dump is charged on every turn, while a completion is
+  charged once. Cerebras enforces 250,000 tokens-per-minute at the
+  **organization** level — shared by every deployment of this engine — and
+  reserves `input + max_completion_tokens` before running a request, which
+  admitted only ~2-3 concurrent searches before `429 token_quota_exceeded`.
+  This is a payload cap, not a recall cap: `SEARCH_AGENT_VECTOR_TOP_K` and
+  `_BM25_TOP_K` are deliberately unchanged, so the candidate pool and the
+  recall ceiling are untouched and only the post-fusion payload shrinks.
+  Measured in production, ~280 candidates were rendered to return 10-16
+  results.
 - Query synthesis now advertises Gemini 3.6 Flash and Gemini 3.5 Flash Lite,
   keeps the previous picker IDs as compatibility aliases, and uses each new
   model's supported thinking level without retired sampling controls.

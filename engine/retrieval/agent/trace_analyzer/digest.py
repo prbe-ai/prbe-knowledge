@@ -62,6 +62,10 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
     fingerprints_per_turn: list[str | None] = list(
         blob.get("system_fingerprints_per_turn") or []
     )
+    finish_reasons: list[str | None] = list(blob.get("finish_reasons_per_turn") or [])
+    completion_tokens: list[int | None] = list(
+        blob.get("completion_tokens_per_turn") or []
+    )
 
     missed = sorted(_REQUIRED_TURN_1_CHANNELS - set(turn_1_tools))
 
@@ -125,6 +129,19 @@ def summarize_trace(blob: dict[str, Any]) -> dict[str, Any]:
         "system_fingerprint_changed_mid_query": (
             len({f for f in fingerprints_per_turn if f}) > 1
         ),
+        # Emit size + truncation. `completion_tokens_max` is the number a
+        # `max_tokens` cap has to clear: the gatherer emits each chunk's
+        # content verbatim, so the emit scales with results and cannot be
+        # inferred from a synthetic probe. Cluster the population p99 here
+        # before setting a cap. `was_truncated` is the alarm — with no cap
+        # configured it should be identically false, so any True means the
+        # provider truncated us on its own ceiling.
+        "completion_tokens_per_turn": completion_tokens,
+        "completion_tokens_max": (
+            max([t for t in completion_tokens if t is not None], default=None)
+        ),
+        "finish_reasons_per_turn": finish_reasons,
+        "was_truncated": any(r == "length" for r in finish_reasons),
         # Per-turn LLM latency — slow turns surface model-side issues
         "turn_latencies_ms": turn_latencies,
         "failed_turn_latencies_ms": failed_turn_latencies,

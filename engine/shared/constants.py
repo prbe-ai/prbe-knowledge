@@ -1132,13 +1132,43 @@ SEARCH_AGENT_FETCH_CHUNKS_MAX = 10
 #     was previously an uncapped json.dumps of every hit with full content.
 #     Docs are kept in fused-RRF order until the budget fills (Top-N, no
 #     per-source floor — the recall eval guards against source masking; add
-#     a floor only if it regresses). ~80 chunks fit at the 512-tok chunk size.
+#     a floor only if it regresses). ~35 chunks fit at the 512-tok chunk
+#     size (was ~80 while this budget was 40_000).
+#
+#     NOTE this guard is no longer only about the 131,072 context window.
+#     It is now also the primary control on PROVIDER QUOTA — see the budget's
+#     own comment below. The context window bounds one request; the quota
+#     bounds how many can run at once, and the turn-1 dump is charged again
+#     on every turn.
 #  2. MAX_CONTEXT_TOKENS is the running backstop enforced before every LLM
 #     turn: if accumulated messages exceed it, the oldest tool results are
 #     truncated in place (message pairing preserved) until the payload fits.
 #     Set well under 131,072 because the cl100k count we estimate with
 #     diverges from gpt-oss's true tokenizer — headroom absorbs the drift.
-SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET = 40_000
+# Lowered 40_000 -> 18_000, and made env-overridable.
+#
+# This is the highest-leverage knob on provider quota, because the turn-1
+# dump is re-sent on EVERY turn: input is charged per turn, output once.
+# Cerebras enforces a 250,000 tokens-per-minute ceiling at the ORGANIZATION
+# level, shared by every deployment of this engine, and it reserves
+# `input + max_completion_tokens` BEFORE running a request. At a 33k-54k
+# prompt that admitted only ~2-3 concurrent searches before
+# 429 token_quota_exceeded, which is what made concurrent search fail while
+# a single search served fine.
+#
+# 18_000 is a payload cap, NOT a recall cap. The candidate pool is set by
+# SEARCH_AGENT_VECTOR_TOP_K / _BM25_TOP_K above and is deliberately left
+# alone: cutting those would lower the recall CEILING before fusion, while
+# this trims what gets SENT after fusion, keeping the highest-RRF docs. The
+# funnel has room -- measured in production, ~280 candidates are rendered to
+# return 10-16 results.
+#
+# Env-overridable because it is the first dial to reach for if recall
+# regresses: `kubectl set env DEPLOY SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET=40000`
+# restores the old behaviour without a release.
+SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET = int(
+    os.getenv("SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", "18000")
+)
 SEARCH_AGENT_MAX_CONTEXT_TOKENS = 115_000
 
 # fetch_chunk_window: neighbors returned on each side of a matched chunk.
@@ -1242,6 +1272,36 @@ SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 90.0
 SEARCH_AGENT_TRACE_SAMPLE_RATE = float(
     os.getenv("SEARCH_AGENT_TRACE_SAMPLE_RATE", "1.0")
 )
+
+# ---- Provider token-rate limiting (shared.llm) -------------------------------
+# Per-PROCESS ceiling on tokens sent to the provider per minute, enforced in
+# shared.llm around every litellm call. See _acquire_token_budget there.
+#
+# 0 = DISABLED, and that is the default on purpose. A self-host install with
+# its own provider account has no shared quota to protect, and enabling this
+# without a measured budget throttles for no reason.
+#
+# Set it where a quota IS shared. Cerebras enforces 250,000 TPM at the
+# ORGANIZATION level, and both the research and managed data planes draw on
+# that one budget with separate API keys under the same org. There is no
+# shared store between them (separate Postgres, no Redis), so the budget is
+# SPLIT STATICALLY rather than coordinated: give each process its share and
+# keep the sum under the org limit. With N processes across both clusters,
+# start near (org_limit / N) and lower it if 429s persist.
+#
+# This is a burst smoother, not an accountant. The cost estimate is chars/4
+# plus max_tokens, so it tracks the provider's own pre-admission reservation
+# without trying to match it exactly.
+LLM_TPM_BUDGET = int(os.getenv("LLM_TPM_BUDGET", "0"))
+
+# How long a call may wait for budget before proceeding anyway.
+#
+# The limiter FAILS OPEN. Waiting longer than the caller's own deadline turns
+# a fast 429 (which degrades to pre-fan-out evidence) into a slow timeout
+# (which returns nothing) -- strictly worse for the user. The gatherer's turn
+# deadline is SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS (20s) and research-os
+# abandons /v1/search at 30s, so this stays well inside both.
+LLM_TPM_MAX_WAIT_SECONDS = float(os.getenv("LLM_TPM_MAX_WAIT_SECONDS", "5.0"))
 
 # Prefix used in `integration_tokens.scope` to signal the row represents a
 # GitHub App installation rather than an OAuth access_token. The installation

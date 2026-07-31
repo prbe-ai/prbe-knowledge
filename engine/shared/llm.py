@@ -77,6 +77,7 @@ dev / self-host-with-own-keys path. A
 
 from __future__ import annotations
 
+import json as _json
 import os
 from typing import Any
 
@@ -97,7 +98,13 @@ from typing import Any
 # from a provider call, plus a generic `Exception` fallback for
 # library-internal errors that don't subclass it.
 import litellm
+from aiolimiter import AsyncLimiter
 from litellm.exceptions import OpenAIError as _LiteLLMBaseError
+
+from engine.shared.constants import (
+    LLM_TPM_BUDGET,
+    LLM_TPM_MAX_WAIT_SECONDS,
+)
 
 # Gemini 3.6 Flash and 3.5 Flash-Lite retire the legacy sampling controls.
 # LiteLLM 1.83.14 (and 1.93.0, checked 2026-07-22) still injects
@@ -180,6 +187,102 @@ def gateway_key() -> str | None:
     gateway URL is ignored (there's nothing to send it to)."""
     val = os.environ.get(_GATEWAY_KEY_ENV)
     return val if val else None
+
+
+# ---------------------------------------------------------------------------
+# Provider token-rate limiter
+# ---------------------------------------------------------------------------
+# Cerebras enforces a tokens-per-minute ceiling at the ORGANIZATION level, and
+# it reserves `input + max_completion_tokens` BEFORE running a request. Every
+# deployment of this engine draws on that one budget, so a burst of concurrent
+# searches earns 429 token_quota_exceeded even when average usage sits far
+# below the limit. This smooths the burst.
+#
+# Why here: `import litellm` appears in exactly one file in the engine (this
+# one), so wrapping the two call sites below covers 100% of provider traffic
+# without every caller having to remember a decorator.
+#
+# Why TOKENS and not requests: the quota is denominated in tokens, and this
+# engine's requests differ by ~50x (a 33k-token gatherer turn vs a ~1k
+# extractor call). A request-rate limit would either throttle the small calls
+# pointlessly or let the big ones through unchecked.
+#
+# Per-loop registry: aiolimiter caches the running loop on first use and warns
+# about undefined behaviour if reused across loops. Same idiom as
+# `kb/handlers/slack.py::_get_history_limiter` — production has one loop per
+# worker process, but pytest spins one per test.
+_TPM_LIMITERS: dict[int, AsyncLimiter] = {}
+
+
+def _get_tpm_limiter() -> AsyncLimiter | None:
+    """Per-event-loop token limiter, or None when disabled.
+
+    Disabled (budget <= 0) is the default: a self-host install with its own
+    provider account has no shared quota to protect, and switching this on
+    without a measured budget would throttle for no reason.
+    """
+    if LLM_TPM_BUDGET <= 0:
+        return None
+    import asyncio as _asyncio
+
+    loop = _asyncio.get_running_loop()
+    limiter = _TPM_LIMITERS.get(id(loop))
+    if limiter is None:
+        # max_rate tokens per 60s, replenished continuously.
+        limiter = AsyncLimiter(float(LLM_TPM_BUDGET), 60.0)
+        _TPM_LIMITERS[id(loop)] = limiter
+    return limiter
+
+
+def _estimate_request_tokens(messages: list[dict[str, Any]], kwargs: dict[str, Any]) -> int:
+    """Approximate what the provider will RESERVE for this request.
+
+    Deliberately crude (chars/4, the same estimator the gatherer's context
+    budget uses) because precision buys nothing here: the limiter smooths
+    bursts, and a systematic 20% error just shifts the effective budget by
+    20%, which the operator absorbs when setting LLM_TPM_BUDGET.
+
+    Includes `max_tokens` when present because the provider reserves the
+    completion allowance up front — that reservation is the whole reason
+    concurrent searches trip the quota.
+    """
+    try:
+        body = _json.dumps(messages, default=str)
+    except (TypeError, ValueError):
+        body = str(messages)
+    tokens = len(body) // 4
+    max_tokens = kwargs.get("max_tokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        tokens += max_tokens
+    return max(tokens, 1)
+
+
+async def _acquire_token_budget(messages: list[dict[str, Any]], kwargs: dict[str, Any]) -> None:
+    """Wait for provider token budget, but never for long.
+
+    FAILS OPEN on purpose. If the budget cannot be acquired within
+    LLM_TPM_MAX_WAIT_SECONDS we proceed and let the provider decide.
+    Blocking longer would convert a fast 429 into a slow caller timeout --
+    the gatherer's own turn deadline is 20s and research-os abandons
+    /v1/search at 30s, so a limiter that queues past those windows makes the
+    user experience worse while looking like it is helping.
+    """
+    limiter = _get_tpm_limiter()
+    if limiter is None:
+        return
+    cost = _estimate_request_tokens(messages, kwargs)
+    # A single request larger than the whole per-minute budget can never be
+    # satisfied; acquiring would deadlock until the wait expires. Let it
+    # through and let the provider reject it if it must.
+    if cost >= LLM_TPM_BUDGET:
+        return
+    import asyncio as _asyncio
+
+    try:
+        await _asyncio.wait_for(limiter.acquire(cost), timeout=LLM_TPM_MAX_WAIT_SECONDS)
+    except TimeoutError:
+        # asyncio.TimeoutError is an alias of the builtin on 3.11+.
+        return
 
 
 class LLMError(Exception):
@@ -332,6 +435,7 @@ async def acompletion(
     let LiteLLM pick from the model prefix.
     """
     kwargs = _maybe_inject_gateway(kwargs)
+    await _acquire_token_budget(messages, kwargs)
     try:
         return await litellm.acompletion(model=model, messages=messages, **kwargs)
     except _LiteLLMBaseError as exc:
