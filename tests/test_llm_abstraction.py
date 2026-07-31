@@ -378,3 +378,99 @@ def test_llmerror_default_attrs() -> None:
 # Importing this in case future call-site tests want to swap in a stub
 # `litellm.acompletion`. Marking `Any` here keeps mypy happy.
 _unused: Any = None
+
+
+# ---------------------------------------------------------------------------
+# Provider token-rate limiter
+# ---------------------------------------------------------------------------
+# Cerebras enforces a tokens-per-minute ceiling at the ORGANIZATION level and
+# reserves `input + max_completion_tokens` before running a request, so a
+# burst of concurrent searches 429s even when average usage is far below the
+# limit. The limiter smooths that burst; these tests pin the two properties
+# that make it safe to ship enabled-by-config.
+
+
+def _reset_limiters() -> None:
+    llm._TPM_LIMITERS.clear()
+
+
+def test_limiter_disabled_by_default_is_a_no_op() -> None:
+    """Budget 0 means no limiter object is ever created.
+
+    Default-off matters: a self-host install with its own provider account
+    has no shared quota to protect, and throttling it would be a pure
+    regression.
+    """
+    _reset_limiters()
+    with patch.object(llm, "LLM_TPM_BUDGET", 0):
+        assert llm._get_tpm_limiter() is None
+
+
+def test_estimate_includes_the_reserved_completion_allowance() -> None:
+    """The estimate counts max_tokens, not just the prompt.
+
+    The provider reserves the completion allowance UP FRONT — that
+    reservation is the entire reason concurrent searches trip the quota, so
+    a limiter that ignored it would model the wrong resource.
+    """
+    messages = [{"role": "user", "content": "x" * 4000}]
+    without = llm._estimate_request_tokens(messages, {})
+    with_cap = llm._estimate_request_tokens(messages, {"max_tokens": 5000})
+    assert with_cap - without == 5000
+
+
+@pytest.mark.asyncio
+async def test_limiter_fails_open_rather_than_outlasting_the_caller() -> None:
+    """Budget exhausted → proceed anyway, bounded by max wait.
+
+    THIS IS THE SAFETY PROPERTY. Blocking longer than the caller's own
+    deadline converts a fast 429 (which degrades to pre-fan-out evidence)
+    into a slow timeout (which returns nothing) — strictly worse for the
+    user. The gatherer's turn deadline is 20s and research-os abandons
+    /v1/search at 30s, so the limiter must never become the long pole.
+    """
+    import time
+
+    _reset_limiters()
+    messages = [{"role": "user", "content": "x" * 400}]
+    with patch.object(llm, "LLM_TPM_BUDGET", 1000), patch.object(
+        llm, "LLM_TPM_MAX_WAIT_SECONDS", 0.05
+    ):
+        # Drain the bucket, then a second acquire cannot be satisfied within
+        # the wait window. It must still return, not raise and not hang.
+        await llm._acquire_token_budget(messages, {"max_tokens": 800})
+        started = time.monotonic()
+        await llm._acquire_token_budget(messages, {"max_tokens": 800})
+        waited = time.monotonic() - started
+    # Bounded by the max wait: it genuinely blocked (so the test is not
+    # trivially passing on an un-drained bucket) but gave up promptly rather
+    # than queueing for the ~54s the bucket would actually need to refill.
+    assert waited >= 0.04, "budget was not exhausted; test proved nothing"
+    assert waited < 1.0, f"limiter outlasted its max wait ({waited:.2f}s)"
+
+
+@pytest.mark.asyncio
+async def test_request_larger_than_the_whole_budget_is_let_through() -> None:
+    """A single request bigger than the per-minute budget can never be
+    satisfied; acquiring would just burn the max wait before proceeding
+    anyway. Skip straight through and let the provider decide."""
+    _reset_limiters()
+    messages = [{"role": "user", "content": "x" * 40000}]
+    with patch.object(llm, "LLM_TPM_BUDGET", 100), patch.object(
+        llm, "LLM_TPM_MAX_WAIT_SECONDS", 30.0
+    ):
+        # Would block for 30s if the oversize guard were missing.
+        await llm._acquire_token_budget(messages, {})
+
+
+@pytest.mark.asyncio
+async def test_acompletion_still_calls_provider_when_limiter_enabled() -> None:
+    """The limiter sits in front of the call without changing its contract."""
+    _reset_limiters()
+    fake = AsyncMock(return_value="ok")
+    with patch.object(llm, "LLM_TPM_BUDGET", 1_000_000), patch(
+        "litellm.acompletion", new=fake
+    ):
+        out = await acompletion(model="m", messages=[{"role": "user", "content": "hi"}])
+    assert out == "ok"
+    assert fake.await_count == 1

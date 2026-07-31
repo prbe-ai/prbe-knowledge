@@ -64,6 +64,9 @@ def _mk_resp(
     cached_tokens: int = 0,
     reasoning_content: str | None = None,
     system_fingerprint: str | None = None,
+    finish_reason: str | None = None,
+    completion_tokens: int = 50,
+    usage: bool = True,
 ) -> SimpleNamespace:
     """Build a SimpleNamespace mimicking a LiteLLM chat-completion response.
 
@@ -91,11 +94,15 @@ def _mk_resp(
         reasoning_content=reasoning_content,
     )
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=msg)],
-        usage=SimpleNamespace(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=50,
-            prompt_tokens_details={"cached_tokens": cached_tokens},
+        choices=[SimpleNamespace(message=msg, finish_reason=finish_reason)],
+        usage=(
+            SimpleNamespace(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                prompt_tokens_details={"cached_tokens": cached_tokens},
+            )
+            if usage
+            else None
         ),
         system_fingerprint=system_fingerprint,
     )
@@ -1575,6 +1582,76 @@ async def test_per_stage_latency_recorded_on_state(
 
 
 @pytest.mark.asyncio
+async def test_finish_reason_and_completion_tokens_captured_per_turn(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Per-turn `finish_reason` + `usage.completion_tokens` land on state.
+
+    These size a future `max_tokens` cap. The gatherer emits each chunk's
+    content VERBATIM, so the emit scales with results and cannot be inferred
+    from a synthetic probe — the distribution has to come from production.
+
+    `finish_reason` is also the truncation alarm. Its ABSENCE from the
+    extractor's failure logs is what kept a blown 600-token cap invisible
+    (see SEARCH_AGENT_EXTRACTOR_MAX_TOKENS), so it is captured here BEFORE
+    any cap exists.
+    """
+    req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
+    turn_1 = _mk_resp(
+        tool_calls=[{"id": "s1", "name": "search", "arguments": {"queries": ["q1"]}}],
+        finish_reason="tool_calls",
+        completion_tokens=1234,
+    )
+    turn_2 = _mk_resp(tool_calls=[_terminal_call()], finish_reason="stop",
+                      completion_tokens=9876)
+
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(side_effect=[turn_1, turn_2]),
+    ), patch(
+        "engine.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state is not None
+    assert loop_state.finish_reasons_per_turn == ["tool_calls", "stop"]
+    assert loop_state.completion_tokens_per_turn == [1234, 9876]
+    # Cardinality contract: one entry per turn, aligned with the other
+    # per-turn arrays so the analyzer can join by index.
+    assert len(loop_state.completion_tokens_per_turn) == loop_state.turn_count
+    assert len(loop_state.finish_reasons_per_turn) == loop_state.turn_count
+
+
+@pytest.mark.asyncio
+async def test_completion_tokens_none_when_provider_reports_no_usage(
+    fake_request: SimpleNamespace,
+) -> None:
+    """No `usage` object → None, not 0.
+
+    usage_tokens() defaults every field to 0 so arithmetic callers need no
+    None-guards. Recording that 0 here would silently drag down the p99 we
+    size the cap from, so missing data must stay distinguishable from a
+    genuine zero-token emit.
+    """
+    req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
+    turn = _mk_resp(tool_calls=[_terminal_call()], usage=False)
+
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=turn),
+    ), patch(
+        "engine.retrieval.agent.loop.dispatch_tool_call",
+        new=AsyncMock(return_value={"sub_queries": []}),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state.completion_tokens_per_turn == [None]
+
+
+@pytest.mark.asyncio
 async def test_reasoning_content_captured_per_turn(
     fake_request: SimpleNamespace,
 ) -> None:
@@ -1854,6 +1931,30 @@ def test_prefanout_budget_small_input_unchanged() -> None:
     out = _render_prefanout_budgeted(prefanout)
     assert "trimmed to fit context" not in out
     assert "github:owner/repo:pr:42" in out
+
+
+def test_prefanout_render_spends_no_tokens_on_whitespace() -> None:
+    """The rendered dump is compact JSON, not pretty-printed.
+
+    Indentation is input tokens that carry no information, and the turn-1
+    dump is re-sent on EVERY turn against a per-minute provider quota. It was
+    also un-budgeted spend: the budget above counts `content` only, so
+    whitespace rode on top of the cap rather than inside it.
+    """
+    hits = [_big_hit(f"github:doc:{i}", content_reps=2) for i in range(3)]
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": hits, "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+    out = _render_prefanout_budgeted(prefanout)
+    # Compact separators: no ", " and no ": " outside the content strings.
+    assert '\n  "' not in out, "pre-fan-out is pretty-printed again"
+    assert out.startswith("{\"") or out.startswith("{'"), out[:40]
+    # Still valid JSON and still carrying every doc.
+    reparsed = json.loads(out)
+    rendered_ids = {
+        h["doc_id"] for h in reparsed["sub_queries"][0]["vector"]
+    }
+    assert rendered_ids == {f"github:doc:{i}" for i in range(3)}
 
 
 def test_enforce_context_budget_stubs_oldest_tool_results() -> None:

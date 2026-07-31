@@ -84,7 +84,11 @@ from engine.shared.constants import (
 )
 from engine.shared.db import with_tenant
 from engine.shared.llm import LLMError, acompletion, gateway_url
-from engine.shared.llm_tools import is_context_overflow, is_transient_provider_error
+from engine.shared.llm_tools import (
+    is_context_overflow,
+    is_transient_provider_error,
+    usage_tokens,
+)
 from engine.shared.logging import get_logger
 from engine.shared.models import QueryRequest, RetrieveResponse
 from engine.shared.source_registry import half_life_days_for, score_multiplier_for
@@ -153,6 +157,24 @@ class LoopState:
     # only round-trips role/content/tool_calls), so without this list
     # the agent's "why did it pick this tool" trail is lost.
     reasoning_per_turn: list[str | None] = field(default_factory=list)
+    # Per-turn `finish_reason` and `usage.completion_tokens`. Same
+    # cardinality contract as the lists above: one entry per acompletion
+    # call, None when the provider omitted the field.
+    #
+    # These exist to size a `max_tokens` cap on this call. Cerebras
+    # reserves `input + max_completion_tokens` BEFORE running a request,
+    # so an absent cap books the model maximum (40k) against a
+    # tokens-per-minute quota we share org-wide -- but the gatherer emits
+    # each chunk's content VERBATIM, so the right cap is a property of
+    # real emit sizes, not a guess. `_extract_cache_hit_rate` already
+    # reads `usage` for prompt_tokens and throws completion_tokens away.
+    #
+    # finish_reason is the field whose ABSENCE from the extractor's
+    # failure logs kept a blown 600-token cap invisible (see
+    # SEARCH_AGENT_EXTRACTOR_MAX_TOKENS). Capturing it here before any cap
+    # exists means a truncation is diagnosable from turn one.
+    finish_reasons_per_turn: list[str | None] = field(default_factory=list)
+    completion_tokens_per_turn: list[int | None] = field(default_factory=list)
     # Deterministic 32-bit `seed` sent to the provider on every turn of
     # this query. Same value for all turns so the tool trajectory stays
     # stable; derived from sha256(customer_id, query). Recorded so the
@@ -293,7 +315,12 @@ def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
 
     if len(kept_docs) >= total_trim_docs:
         # Every content doc fits — original behaviour, no filtering overhead.
-        return json.dumps(prefanout, default=str, indent=2)
+        # NO indent: pretty-printing spends input tokens on whitespace that
+        # carries no information, and input is charged on EVERY turn (the
+        # budget above only counts `content`, so indentation was un-budgeted
+        # spend on top of the cap). Compact separators for the same reason.
+        # One-time prefix-cache reset when this ships; deterministic after.
+        return json.dumps(prefanout, default=str, separators=(",", ":"))
 
     # Trim vector + bm25 to kept docs. Keep every metadata-only hit (no content
     # body -> ~free, and dropping it would narrow PR#328's "show every hit"
@@ -325,7 +352,7 @@ def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
         f"across all sources; {dropped} lower-ranked docs omitted. Call `search` "
         f"with a reformulated query if you need something not shown.)"
     )
-    return json.dumps(filtered, default=str, indent=2) + note
+    return json.dumps(filtered, default=str, separators=(",", ":")) + note
 
 
 # Total chain-line cap. Each line ~100-300 chars; capping ~30 keeps the
@@ -921,6 +948,20 @@ async def _run_turn(state: LoopState) -> Any:
     # here" instead of only the chosen arguments.
     reasoning = getattr(msg, "reasoning_content", None) if msg is not None else None
     state.reasoning_per_turn.append(reasoning if reasoning else None)
+    # Truncation signal + real emit size. See the LoopState fields for why
+    # these are recorded before any max_tokens cap exists.
+    finish_reason = getattr(choices[0], "finish_reason", None) if choices else None
+    state.finish_reasons_per_turn.append(finish_reason if finish_reason else None)
+    # usage_tokens() defaults every field to 0 so arithmetic callers need no
+    # None-guards, but 0 and "provider reported no usage" must stay
+    # distinguishable here or the p99 we size the cap from is silently
+    # dragged down by missing data. Gate on the usage object itself.
+    completion_tokens = (
+        usage_tokens(resp)["completion_tokens"]
+        if getattr(resp, "usage", None) is not None
+        else None
+    )
+    state.completion_tokens_per_turn.append(completion_tokens)
     log.info(
         "agent.turn_complete",
         customer_id=state.customer_id,
@@ -932,6 +973,8 @@ async def _run_turn(state: LoopState) -> Any:
         reasoning_len=len(reasoning) if reasoning else 0,
         cache_hit_rate=round(rate, 3) if rate is not None else None,
         system_fingerprint=fingerprint,
+        finish_reason=finish_reason,
+        completion_tokens=completion_tokens,
     )
     return resp
 
