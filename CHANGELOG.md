@@ -6,6 +6,21 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- `per_source_top_k` no longer loses a whole corpus to the final `LIMIT`. The
+  window function gave each `source_system` its own slot budget and the query
+  then applied `ORDER BY score DESC LIMIT top_k`, handing every slot back to
+  whichever source scores highest in the absolute — undoing the guarantee one
+  line after computing it. Measured on the research cluster with
+  `per_source_top_k=20, top_k=30`: the response contained
+  `{github: 4, claude_code: 20, code_graph: 6}` and **no `custom_ingest` at
+  all**, which first appeared at rank 61. Scores are not comparable across
+  sources — a terse structured projection never out-scores a chatty transcript
+  on a natural-language query — so the final ordering now leads with the
+  per-source rank, interleaving sources instead of letting one sweep the limit.
+  Callers that do not pass `per_source_top_k` keep a straight score ranking.
+
 ### Added
 
 - BM25 matches document TITLES, not only chunk content (migration 0099). The

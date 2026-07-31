@@ -285,7 +285,10 @@ async def bm25_search(
                 FROM ({inner_sql}) sub
             ) ranked
             WHERE _ps_rn <= ${ps_idx}
-            ORDER BY {partition_order}
+            -- Interleave sources; see the same ORDER BY in vector.py. Ordering
+            -- by score would undo the PARTITION one line above and let the
+            -- highest-scoring source take every slot under the LIMIT.
+            ORDER BY _ps_rn, {partition_order}
             LIMIT $3
             """
         else:
