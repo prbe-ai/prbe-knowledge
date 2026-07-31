@@ -12,6 +12,29 @@ tokenization; the materialized column reduces that to score math + heap
 reads. For Phase 1 we can still swap this to pg_bm25 or a real BM25 lib
 if ranking quality matters enough.
 
+Titles are searchable too (migration 0099), and they could not be before.
+`chunks.content_tsv` is a GENERATED column, and a generation expression may
+only reference its own row, so it can never reach `documents.title` -- the two
+are in different tables. Nothing in the query read the title, so a file named
+`model.ckpt` or a PR titled "Fix the retry loop" was findable by keyword ONLY
+if those words also appeared in the body. Vector search did see titles (chunks
+embed as `title: {title} | text: {content}`), but an exact filename is exactly
+the query where semantic similarity is weakest and lexical matching should win.
+
+Two things follow from adding `documents.title_tsv` to the WHERE:
+
+  * RANKING. Scores are the SUM of the content rank and the title rank.
+    `title_tsv` is setweight'd 'A' while `content_tsv` is unweighted ('D'), so
+    under ts_rank_cd's default weights a title hit is worth 1.0 against a body
+    hit's 0.1. A document matching in both outranks one matching in either.
+
+  * WHICH CHUNK REPRESENTS A TITLE-ONLY HIT. A title match belongs to the
+    DOCUMENT, not to any one chunk, so matching on it alone would surface every
+    chunk of that document -- all with identical scores, and a long document
+    would bury everything else. Title-only matches are therefore restricted to
+    `chunk_index = 0`: one representative chunk per document. Chunks that match
+    on their own content are unaffected and still surface individually.
+
 Query parsing: we OR the user's tokens via `to_tsquery` (built from a
 simple word-split) instead of relying on `plainto_tsquery`'s implicit
 AND. AND-strictness silently zero-matches realistic queries: "agent
@@ -217,15 +240,22 @@ async def bm25_search(
                    c.kind,
                    d.created_at,
                    d.updated_at,
-                   ts_rank_cd(c.content_tsv,
-                              to_tsquery('english', $2)) AS score
+                   ts_rank_cd(c.content_tsv, to_tsquery('english', $2))
+                     + ts_rank_cd(d.title_tsv, to_tsquery('english', $2))
+                     AS score
             FROM chunks c
             JOIN documents d
               ON c.doc_id = d.doc_id
              AND d.customer_id = c.customer_id
              AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
             WHERE c.customer_id = $1
-              AND c.content_tsv @@ to_tsquery('english', $2)
+              AND (
+                    c.content_tsv @@ to_tsquery('english', $2)
+                    OR (
+                         d.title_tsv @@ to_tsquery('english', $2)
+                         AND c.chunk_index = 0
+                       )
+                  )
               {pred.chunk_sql}
               {pred.doc_sql}
               {source_filter}
@@ -255,7 +285,10 @@ async def bm25_search(
                 FROM ({inner_sql}) sub
             ) ranked
             WHERE _ps_rn <= ${ps_idx}
-            ORDER BY {partition_order}
+            -- Interleave sources; see the same ORDER BY in vector.py. Ordering
+            -- by score would undo the PARTITION one line above and let the
+            -- highest-scoring source take every slot under the LIMIT.
+            ORDER BY _ps_rn, {partition_order}
             LIMIT $3
             """
         else:

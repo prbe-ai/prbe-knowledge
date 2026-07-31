@@ -211,7 +211,17 @@ async def vector_search(
                 FROM ({inner_sql}) sub
             ) ranked
             WHERE _ps_rn <= ${ps_idx}
-            ORDER BY {partition_order}
+            -- Interleave sources: each source's rank-1 before any source's
+            -- rank-2. Ordering by score here instead would re-impose exactly
+            -- the cross-source competition the PARTITION just prevented, and
+            -- the LIMIT below would hand every slot to whichever source scores
+            -- highest in the absolute -- which is what happened: on a
+            -- keyed+keyless request, `custom_ingest` first appeared at rank 61
+            -- and a LIMIT of 30 cut it entirely, so the caller saw a corpus
+            -- vanish. Cosine scores are NOT comparable across sources (terse
+            -- structured projections always lose to chatty transcripts), so
+            -- rank, not score, is the only fair cross-source currency.
+            ORDER BY _ps_rn, {partition_order}
             LIMIT $3
             """
         else:

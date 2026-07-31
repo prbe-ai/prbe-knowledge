@@ -6,7 +6,42 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- `per_source_top_k` no longer loses a whole corpus to the final `LIMIT`. The
+  window function gave each `source_system` its own slot budget and the query
+  then applied `ORDER BY score DESC LIMIT top_k`, handing every slot back to
+  whichever source scores highest in the absolute — undoing the guarantee one
+  line after computing it. Measured on the research cluster with
+  `per_source_top_k=20, top_k=30`: the response contained
+  `{github: 4, claude_code: 20, code_graph: 6}` and **no `custom_ingest` at
+  all**, which first appeared at rank 61. Scores are not comparable across
+  sources — a terse structured projection never out-scores a chatty transcript
+  on a natural-language query — so the final ordering now leads with the
+  per-source rank, interleaving sources instead of letting one sweep the limit.
+  Callers that do not pass `per_source_top_k` keep a straight score ranking.
+
 ### Added
+
+- BM25 matches document TITLES, not only chunk content (migration 0099). The
+  title was unreachable by keyword search: `chunks.content_tsv` is a GENERATED
+  column, and a generation expression may only reference its own row, so it can
+  never reach `documents.title` — the two are in different tables. A file named
+  `model.ckpt`, or a PR titled "Fix the retry loop", was findable by keyword
+  only if those words also appeared in the body. Titles are now indexed in a
+  `documents.title_tsv` generated column, weighted `A` against unweighted
+  content so a title hit outranks a body hit under `ts_rank_cd`.
+
+  The title is indexed twice over — verbatim, and with path punctuation
+  flattened to spaces. Postgres' `english` parser emits `model.ckpt` as a
+  single `file` lexeme while the retriever splits queries on alphanumeric runs,
+  so a verbatim-only index would have missed exactly the case this exists for.
+
+  Title-only matches return one representative chunk (`chunk_index = 0`). A
+  title belongs to the document rather than any chunk, so matching without that
+  restriction would return every chunk of the document at an identical score
+  and a long document would bury everything else. Chunks matching on their own
+  content are unaffected.
 
 - Per-turn `finish_reason` and `usage.completion_tokens` are recorded on the
   gatherer loop state, logged on `agent.turn_complete`, carried in the trace
