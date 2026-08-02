@@ -1928,7 +1928,7 @@ async def run_gatherer(
             request.state.cache_hit_rate = None
             request.state.intents_count = 1
             request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
-            request.state.failure_recovered = True
+            request.state.failure_recovered = is_degraded(status)
         _stash_for_trace_persist(
             request,
             customer_id=customer_id,
@@ -1949,6 +1949,7 @@ async def run_gatherer(
             top_k_related=req.top_k_related,
             source_keys=request_source_keys,
             doc_types=request_doc_types,
+            status=status,
         )
 
     if _no_llm_configured():
@@ -1969,7 +1970,7 @@ async def run_gatherer(
             request.state.cache_hit_rate = None
             request.state.intents_count = 1
             request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
-            request.state.failure_recovered = True
+            request.state.failure_recovered = is_degraded(status)
         _stash_for_trace_persist(
             request,
             customer_id=customer_id,
@@ -1990,6 +1991,7 @@ async def run_gatherer(
             top_k_related=req.top_k_related,
             source_keys=request_source_keys,
             doc_types=request_doc_types,
+            status=status,
         )
 
     gathered: GathererOutput | None = None

@@ -96,11 +96,18 @@ _NON_DEGRADED_STATUSES: frozenset[str] = frozenset(
 def is_degraded(status: GathererStatus | str | None) -> bool:
     """True when `status` means the caller is holding lower-quality output.
 
-    Single source of truth for two consumers that must never disagree:
+    Single source of truth across every path that returns a 200: both
     `query_traces.failure_recovered` (telemetry) and the `degraded` field on
-    RetrieveResponse (caller-visible). Before this existed, the telemetry
-    side open-coded `status != "ok"`, which counted an honestly-empty
-    zero-recall query as a recovered failure and inflated the metric.
+    RetrieveResponse (caller-visible) derive from this, so the two can never
+    disagree about the same request. Before this existed the telemetry side
+    open-coded `status != "ok"` at one site and hardcoded `True` at two
+    others, so an honestly-empty zero-recall query was recorded as a
+    recovered failure and inflated the metric.
+
+    ONE deliberate exception: the `fatal_provider_error` path raises 503 and
+    writes `failure_recovered = False` directly. That is correct — nothing
+    was recovered and no response body exists to carry a flag — so it does
+    not route through here.
 
     `None` means the gatherer never ran (list-only / router paths) — not a
     degradation.

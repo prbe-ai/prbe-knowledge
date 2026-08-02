@@ -743,6 +743,27 @@ class RetrieveResponse(BaseModel):
     # None whenever `degraded` is False.
     degraded: bool = False
     degraded_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _clear_reason_when_healthy(self) -> "RetrieveResponse":
+        """`degraded_reason` is meaningless unless `degraded` is True.
+
+        The adapter already enforces this by construction, but adapter
+        discipline is not a wire contract — mocks, alternate constructors,
+        and future endpoints can all build this model directly. Normalizing
+        here makes `degraded=False, degraded_reason="context_overflow"`
+        unrepresentable on the wire, so a caller can branch on one field
+        without cross-checking the other.
+
+        Deliberately normalizes instead of raising: an inconsistent pair is
+        a bug worth erasing, not worth converting into a 500 on a response
+        path whose entire purpose is to stay up during a degradation.
+        (`degraded=True` with no reason stays legal — "degraded, cause
+        unknown" is a real state.)
+        """
+        if not self.degraded and self.degraded_reason is not None:
+            self.degraded_reason = None
+        return self
     # The doc the query is most about — the explicit "root" anchor of
     # the result set. Surfaced so downstream consumers (esp. the
     # dashboard's chain-of-reasoning graph viz) can deterministically

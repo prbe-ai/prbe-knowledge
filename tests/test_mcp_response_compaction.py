@@ -1,14 +1,15 @@
 """The MCP response-compaction layer must not strip caller-critical signals.
 
 `compact_search` runs on every `search_knowledge` response and drops a
-deny-list of diagnostic fields before the caller sees the payload. Two
+deny-list of diagnostic fields before the caller sees the payload. Three
 top-level fields are deliberately exempt because an agent needs them to
 decide whether to trust or re-run:
 
   * `confidence_breakdown` — pre-existing router signal.
   * `degraded`            — added with the degradation-visibility work.
+  * `degraded_reason`     — says WHICH action to take (retry vs narrow).
 
-The failure mode this guards is silent and total: if either name lands in
+The failure mode this guards is silent and total: if any of those names lands in
 `_TOP_LEVEL_DROP`, the field vanishes from every response and a degraded
 search becomes byte-identical to a healthy one again. There is no error, no
 log, and no other test that would notice — which is the exact bug the
