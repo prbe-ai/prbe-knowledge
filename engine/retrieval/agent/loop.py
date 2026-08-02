@@ -49,6 +49,7 @@ from engine.retrieval.agent.models import (
     GathererStatus,
     MatchedViaChannel,
     SearchOptions,
+    is_degraded,
 )
 from engine.retrieval.agent.prompt import build_system_prompt
 from engine.retrieval.agent.tools import (
@@ -2152,7 +2153,7 @@ async def run_gatherer(
         )
         request.state.intents_count = 1
         request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
-        request.state.failure_recovered = status != "ok"
+        request.state.failure_recovered = is_degraded(status)
 
     _stash_for_trace_persist(
         request,
@@ -2175,6 +2176,7 @@ async def run_gatherer(
         top_k_related=req.top_k_related,
         source_keys=request_source_keys,
         doc_types=request_doc_types,
+        status=status,
     )
 
 

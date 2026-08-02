@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, get_args
 
-from engine.retrieval.agent.models import GathererOutput
+from engine.retrieval.agent.models import GathererOutput, GathererStatus, is_degraded
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
@@ -415,6 +415,7 @@ async def to_query_response(
     top_k_related: int = 10,
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
+    status: GathererStatus | None = None,
 ) -> RetrieveResponse:
     """Wrap a GathererOutput in the existing RetrieveResponse shape.
 
@@ -452,6 +453,12 @@ async def to_query_response(
     unverifiable chunks are dropped BEFORE the response is assembled -- see
     _enforce_scope_on_chunks. This is the final gate behind the per-channel
     SQL filters and the tool-dispatch injection.
+
+    `status` (optional): the harness's terminal GathererStatus. Projected onto
+    the response as `degraded` / `degraded_reason` so a caller can tell a
+    fallback answer from a full one WITHOUT reaching into
+    `gatherer_notes.dropped[].reason`, which nothing reads. None (the default,
+    used by tests and any non-gatherer caller) reports not-degraded.
     """
     if (source_keys or doc_types) and customer_id:
         await _enforce_scope_on_chunks(
@@ -669,6 +676,10 @@ async def to_query_response(
         related_entities=related_entities or None,
         gatherer_notes=gathered.gatherer_notes.model_dump(),
         query_root_doc_id=query_root_doc_id,
+        degraded=is_degraded(status),
+        # Only carry the reason when it IS a degradation — a reason string on
+        # a healthy response invites callers to branch on it.
+        degraded_reason=status if is_degraded(status) else None,
     )
 
 

@@ -724,6 +724,25 @@ class RetrieveResponse(BaseModel):
     # know about this field (older MCP clients) ignore it under
     # Pydantic's default extra='ignore' semantics.
     gatherer_notes: dict[str, object] | None = None
+    # Did the caller get lower-quality output than a healthy run produces?
+    #
+    # The gatherer degrades to a 200 rather than a 503 by design (see
+    # prbe-knowledge #411): a provider outage or a context overflow returns
+    # the pre-fan-out pool at low confidence instead of failing the request.
+    # That is the right availability trade, but it made an outage
+    # indistinguishable from a healthy answer at the call site — the only
+    # signal was a reason string buried in `gatherer_notes.dropped[]`, which
+    # no consumer reads. These two fields are that signal, hoisted to the top
+    # level for the same reason `confidence_breakdown` lives there: a caller
+    # needs it to decide whether to trust or re-run.
+    #
+    # False on every non-gatherer path (list-only, router-only) and on an
+    # honestly-empty zero-recall result. `degraded_reason` is the terminal
+    # GathererStatus, typed as plain `str` so this module keeps its no-import
+    # boundary with the gatherer package (see `gatherer_notes` above); it is
+    # None whenever `degraded` is False.
+    degraded: bool = False
+    degraded_reason: str | None = None
     # The doc the query is most about — the explicit "root" anchor of
     # the result set. Surfaced so downstream consumers (esp. the
     # dashboard's chain-of-reasoning graph viz) can deterministically

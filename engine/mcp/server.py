@@ -131,6 +131,18 @@ async def search_knowledge(
     `related_entities=null` with `related_entities_error` set means the
     walk failed — documents are still trustworthy.
 
+    CHECK `degraded` FIRST. Top-level boolean. `true` means the search
+    agent hit a provider outage or a context overflow and this response is
+    the raw pre-fan-out pool WITHOUT the agent's curation — it is not the
+    answer a healthy run would have given, even though it looks like one
+    and arrived as a normal 200. `degraded_reason` carries the terminal
+    status (e.g. `provider_error_prefanout_fallback`, `context_overflow`,
+    `loop_timeout`). Re-run the search once before trusting or citing a
+    degraded result set; the failure is usually transient. Do NOT report
+    "the team has no context on X" off a degraded response — you cannot
+    distinguish that from the agent never having run. `false` on healthy
+    runs and on honestly-empty results.
+
     `gatherer_notes` — self-reported metadata from the search agent
     (gatherer). When present, surface `gatherer_notes.confidence`
     ("high" / "medium" / "low") to decide how much to trust the result
