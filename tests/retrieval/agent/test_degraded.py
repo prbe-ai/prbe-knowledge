@@ -53,7 +53,7 @@ def test_every_status_is_classified() -> None:
     Without this, a new status silently inherits "degraded" from the
     exclusion list and nobody revisits whether that was right.
     """
-    assert _HEALTHY | _DEGRADED == set(get_args(GathererStatus))
+    assert set(get_args(GathererStatus)) == (_HEALTHY | _DEGRADED)
     assert not (_HEALTHY & _DEGRADED)
 
 
