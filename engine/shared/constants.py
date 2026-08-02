@@ -1230,15 +1230,12 @@ SEARCH_AGENT_EXTRACTOR_MAX_TOKENS = int(
 # SEARCH_AGENT_LOOP_TIMEOUT_SECONDS, which bounds the complete loop via
 # asyncio.wait_for and is the hard backstop.
 #
-# 20s, not 60s. The old value was chosen to "leave enough time for both routes
-# to run", on the belief that the gateway's per-deployment deadlines would cut
-# a stalled provider first and trigger Cerebras -> Fireworks. MEASURED, that
-# does not happen: a stalled turn runs to exactly this deadline (repeated
-# `litellm.Timeout ... timeout value=60.0, time taken=60.01` with
-# `x-litellm-attempted-fallbacks: 0`), never to the 12s Cerebras deployment
-# deadline. Whatever the mechanism, the observable is that THIS number, not
-# the gateway's, is what ends a stalled turn -- so it has to be a number we
-# would actually accept waiting.
+# This number, not the gateway's, is what ends a stalled turn. MEASURED: a
+# stalled turn runs to exactly this deadline (repeated `litellm.Timeout ...
+# time taken=<deadline>.01` with `x-litellm-attempted-fallbacks: 0`), never to
+# the 12s Cerebras deployment deadline, so the Cerebras -> Fireworks failover
+# the old 60s value was sized for does not actually fire. Treat this purely as
+# "how long are we willing to wait", not as failover headroom.
 #
 # The stall is reproducible and specific: large context COMBINED WITH
 # tool-calling. A 300KB prompt alone returns in ~1.5s; the same prompt with
@@ -1246,18 +1243,30 @@ SEARCH_AGENT_EXTRACTOR_MAX_TOKENS = int(
 # alone does it, which is why isolated probes look healthy and only real
 # gatherer turns hang.
 #
-# Why 20 and not lower: the Cerebras deployment deadline is 12s, and a
-# Fireworks hop answers in ~1-4s. 20s is the smallest value that still leaves
-# room for 12s + a failover hop to complete, so it bounds the damage WITHOUT
-# foreclosing the recovery path if the gateway does cut at 12s. Below ~16s the
-# failover could never land and the fallback config would be dead weight.
+# 70s, raised from 20s (2026-08-02). Production logs showed 3 of 12 gatherer
+# runs degrading, and BOTH provider failures were this deadline firing --
+# `status_code=408, timeout value=20.0, time taken=20.01` -- not 429s, not the
+# gateway. At 20s every one of those 61.6s stalls was cut and returned the
+# uncurated pre-fan-out pool instead of an answer.
 #
-# Why not higher: research-os gives /v1/search 30s total
-# (ENGINE_TIMEOUT_SECONDS), and grounding+extraction+prefanout already spend
-# ~16s of it under load. A 60s turn cannot fit inside that budget under any
-# arrangement, so a stalled turn was guaranteed to blow the caller's deadline
-# and return nothing.
-SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 20.0
+# Why 70 specifically: it clears the measured 61.6s stall, and it stays
+# strictly under SEARCH_AGENT_LOOP_TIMEOUT_SECONDS (90s) with ~20s left for a
+# follow-up turn. Multi-turn runs are common (turns=2 and turns=3 both appear
+# in normal traffic), so a per-turn budget equal to the loop cap would let a
+# single turn consume the whole loop and silently make the agent single-turn.
+#
+# What this does NOT fix, and the caller asymmetry:
+#   * MCP callers (search_knowledge) wait `knowledge_timeout_s = 180s`, so a
+#     70s turn fits comfortably and they now get a curated answer where they
+#     previously got the raw pool.
+#   * research-os gives /v1/search 30s total (ENGINE_TIMEOUT_SECONDS, defined
+#     in that repo). A turn over ~14s never fits there regardless of what this
+#     is set to, so that path is unchanged -- 20s did not help it either.
+#   * The root cause is upstream: pre-fan-out pulls ~300 chunks (median
+#     19.5s, max 27.5s BEFORE the model runs), which is what builds the 300KB
+#     prompt that triggers the stall. This value buys better answers today;
+#     capping pre-fan-out is the actual fix and would help every caller.
+SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 70.0
 
 # Overall agent loop cap. Prevents pathological queries from monopolising
 # a worker. p99 should land far below this; timeout degrades to the citable
@@ -1299,8 +1308,9 @@ LLM_TPM_BUDGET = int(os.getenv("LLM_TPM_BUDGET", "0"))
 # The limiter FAILS OPEN. Waiting longer than the caller's own deadline turns
 # a fast 429 (which degrades to pre-fan-out evidence) into a slow timeout
 # (which returns nothing) -- strictly worse for the user. The gatherer's turn
-# deadline is SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS (20s) and research-os
-# abandons /v1/search at 30s, so this stays well inside both.
+# deadline is SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS (70s), but the binding
+# constraint is research-os abandoning /v1/search at 30s, so this stays well
+# inside the tighter of the two.
 LLM_TPM_MAX_WAIT_SECONDS = float(os.getenv("LLM_TPM_MAX_WAIT_SECONDS", "5.0"))
 
 # Prefix used in `integration_tokens.scope` to signal the row represents a

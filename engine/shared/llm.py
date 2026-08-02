@@ -263,9 +263,9 @@ async def _acquire_token_budget(messages: list[dict[str, Any]], kwargs: dict[str
     FAILS OPEN on purpose. If the budget cannot be acquired within
     LLM_TPM_MAX_WAIT_SECONDS we proceed and let the provider decide.
     Blocking longer would convert a fast 429 into a slow caller timeout --
-    the gatherer's own turn deadline is 20s and research-os abandons
-    /v1/search at 30s, so a limiter that queues past those windows makes the
-    user experience worse while looking like it is helping.
+    the gatherer's own turn deadline is 70s and research-os abandons
+    /v1/search at 30s, so a limiter that queues past the tighter of those
+    windows makes the user experience worse while looking like it is helping.
     """
     limiter = _get_tpm_limiter()
     if limiter is None:
