@@ -724,6 +724,46 @@ class RetrieveResponse(BaseModel):
     # know about this field (older MCP clients) ignore it under
     # Pydantic's default extra='ignore' semantics.
     gatherer_notes: dict[str, object] | None = None
+    # Did the caller get lower-quality output than a healthy run produces?
+    #
+    # The gatherer degrades to a 200 rather than a 503 by design (see
+    # prbe-knowledge #411): a provider outage or a context overflow returns
+    # the pre-fan-out pool at low confidence instead of failing the request.
+    # That is the right availability trade, but it made an outage
+    # indistinguishable from a healthy answer at the call site — the only
+    # signal was a reason string buried in `gatherer_notes.dropped[]`, which
+    # no consumer reads. These two fields are that signal, hoisted to the top
+    # level for the same reason `confidence_breakdown` lives there: a caller
+    # needs it to decide whether to trust or re-run.
+    #
+    # False on every non-gatherer path (list-only, router-only) and on an
+    # honestly-empty zero-recall result. `degraded_reason` is the terminal
+    # GathererStatus, typed as plain `str` so this module keeps its no-import
+    # boundary with the gatherer package (see `gatherer_notes` above); it is
+    # None whenever `degraded` is False.
+    degraded: bool = False
+    degraded_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _clear_reason_when_healthy(self) -> "RetrieveResponse":
+        """`degraded_reason` is meaningless unless `degraded` is True.
+
+        The adapter already enforces this by construction, but adapter
+        discipline is not a wire contract — mocks, alternate constructors,
+        and future endpoints can all build this model directly. Normalizing
+        here makes `degraded=False, degraded_reason="context_overflow"`
+        unrepresentable on the wire, so a caller can branch on one field
+        without cross-checking the other.
+
+        Deliberately normalizes instead of raising: an inconsistent pair is
+        a bug worth erasing, not worth converting into a 500 on a response
+        path whose entire purpose is to stay up during a degradation.
+        (`degraded=True` with no reason stays legal — "degraded, cause
+        unknown" is a real state.)
+        """
+        if not self.degraded and self.degraded_reason is not None:
+            self.degraded_reason = None
+        return self
     # The doc the query is most about — the explicit "root" anchor of
     # the result set. Surfaced so downstream consumers (esp. the
     # dashboard's chain-of-reasoning graph viz) can deterministically

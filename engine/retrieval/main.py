@@ -394,6 +394,12 @@ async def query_stream(
                         else None
                     ),
                     "related_entities_error": rresp.related_entities_error,
+                    # Same reason related_entities_error is here: the client
+                    # cannot otherwise distinguish "broken" from "empty".
+                    # `degraded` is the stronger form of that signal, so a
+                    # frame that carries one must carry the other.
+                    "degraded": rresp.degraded,
+                    "degraded_reason": rresp.degraded_reason,
                 },
             )
 
@@ -423,6 +429,12 @@ async def query_stream(
                     "citations": final.citations,
                     "insufficient_context": final.insufficient_context,
                     "model": final.model,
+                    # Mirrored from the `results` frame so a consumer that
+                    # only parses `done` (reconnects, late joins) still sees
+                    # it. An `insufficient_context` refusal on a degraded run
+                    # must NOT be reported as "no context exists".
+                    "degraded": rresp.degraded,
+                    "degraded_reason": rresp.degraded_reason,
                     "timing_ms": timing,
                     "trace_id": phase.trace_id,
                 },

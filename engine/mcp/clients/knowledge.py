@@ -22,6 +22,28 @@ from engine.mcp.config import Settings, get_settings
 CALLER_KIND = "mcp"
 
 
+def _default_degraded(payload: dict[str, Any]) -> None:
+    """Fill in `degraded` when talking to a retrieval server that predates it.
+
+    This MCP server and the retrieval server deploy independently (the MCP
+    Helm chart ships out-of-band, and self-hosters upgrade the two images
+    separately), so there is a real window where a NEW MCP proxies to an OLD
+    retrieval deployment that never emits the field. The tool docstrings tell
+    agents to check `degraded` first, and an absent key is not `False` — it is
+    "unknown", which every caller would misread as healthy anyway.
+
+    Normalizing here makes the absent case explicit and matches the guard this
+    client already carries for the opposite skew direction (see `discovery`,
+    only forwarded when set so older servers aren't sent unknown keys).
+
+    Fails open by design: during skew a genuinely degraded response still
+    reads as healthy. That is not a fix for the window, it just removes the
+    absent-vs-false ambiguity. The window closes when both images are current.
+    """
+    payload.setdefault("degraded", False)
+    payload.setdefault("degraded_reason", None)
+
+
 class KnowledgeError(Exception):
     def __init__(self, status: int, body: str, *, trace_id: str | None = None) -> None:
         super().__init__(f"prbe-knowledge http {status}: {body[:200]}")
@@ -139,6 +161,7 @@ class KnowledgeClient:
             headers=self._headers(customer_id),
         )
         payload = self._decode_payload(resp, path="/retrieve", trace_id=trace_id)
+        _default_degraded(payload)
         return payload if verbose else compact_search(payload)
 
     async def query(
@@ -171,6 +194,7 @@ class KnowledgeClient:
             headers=self._headers(customer_id),
         )
         payload = self._decode_payload(resp, path="/query", trace_id=trace_id)
+        _default_degraded(payload)
         return payload if verbose else compact_query(payload)
 
     async def get_source(

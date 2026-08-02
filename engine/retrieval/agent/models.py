@@ -74,6 +74,48 @@ GathererStatus = Literal[
     "context_overflow",
 ]
 
+# Statuses that are NOT a degradation. Everything else is.
+#
+# Deliberately an exclusion list, not an inclusion list: an eleventh
+# GathererStatus added without touching this set defaults to "degraded",
+# which is the safe direction — a new failure mode reports itself rather
+# than hiding until someone remembers to register it.
+#
+# `zero_recall_short_circuit` is the interesting exclusion. The loop never
+# ran because grounding found no entities AND all four pre-fan-out channels
+# returned nothing. That is an honest empty answer, not a degraded one, and
+# reporting it as degraded would train callers to ignore the flag.
+_NON_DEGRADED_STATUSES: frozenset[str] = frozenset(
+    {
+        "ok",
+        "zero_recall_short_circuit",
+    }
+)
+
+
+def is_degraded(status: GathererStatus | str | None) -> bool:
+    """True when `status` means the caller is holding lower-quality output.
+
+    Single source of truth across every path that returns a 200: both
+    `query_traces.failure_recovered` (telemetry) and the `degraded` field on
+    RetrieveResponse (caller-visible) derive from this, so the two can never
+    disagree about the same request. Before this existed the telemetry side
+    open-coded `status != "ok"` at one site and hardcoded `True` at two
+    others, so an honestly-empty zero-recall query was recorded as a
+    recovered failure and inflated the metric.
+
+    ONE deliberate exception: the `fatal_provider_error` path raises 503 and
+    writes `failure_recovered = False` directly. That is correct — nothing
+    was recovered and no response body exists to carry a flag — so it does
+    not route through here.
+
+    `None` means the gatherer never ran (list-only / router paths) — not a
+    degradation.
+    """
+    if status is None:
+        return False
+    return status not in _NON_DEGRADED_STATUSES
+
 
 class GatheredEntity(BaseModel):
     """A graph node the agent chose to surface alongside the chunks.

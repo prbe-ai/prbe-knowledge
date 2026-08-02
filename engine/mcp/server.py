@@ -131,6 +131,31 @@ async def search_knowledge(
     `related_entities=null` with `related_entities_error` set means the
     walk failed — documents are still trustworthy.
 
+    CHECK `degraded` FIRST. Top-level boolean. `true` means the search
+    agent could not complete normally and this response is the raw
+    pre-fan-out pool WITHOUT the agent's curation — it is not the answer a
+    healthy run would have given, even though it looks like one and
+    arrived as a normal 200.
+
+    Do NOT report "the team has no context on X" off a degraded response.
+    You cannot distinguish that from the agent never having run.
+
+    `degraded_reason` says what to do next, and the right action differs:
+      * `provider_error_prefanout_fallback`, `loop_timeout` — transient.
+        Re-run ONCE. If it degrades again, report the degradation rather
+        than retrying further; repeated retries during a provider outage
+        add load to the thing that is already failing.
+      * `context_overflow`, `tool_budget_exceeded` — deterministic. The
+        identical request will fail identically, so re-running is pure
+        waste. NARROW instead: lower `top_k`, tighten the keyword bag.
+      * `no_llm_configured` — deployment-level. Do not retry. Surface it.
+      * `schema_violation`, `passthrough_harness_fallback` — the agent
+        returned something unusable. Re-run ONCE, then treat as transient
+        if it repeats.
+      * anything else — treat as transient, re-run once, do not loop.
+
+    `false` on healthy runs and on honestly-empty results.
+
     `gatherer_notes` — self-reported metadata from the search agent
     (gatherer). When present, surface `gatherer_notes.confidence`
     ("high" / "medium" / "low") to decide how much to trust the result
@@ -305,6 +330,20 @@ async def query_knowledge(
     top-level `related_entities` + `query_root_doc_id` + `gatherer_notes`.
     When `insufficient_context=true`, surface that refusal to the user
     instead of paraphrasing it.
+
+    CHECK `degraded` FIRST — same top-level flag and same semantics as
+    `search_knowledge` (see that tool's docstring for the per-reason
+    action table). It matters MORE here: this tool runs an LLM over the
+    evidence, so a degraded, uncurated pool comes back as fluent, confident
+    prose with citations. The synthesis hides the degradation that raw
+    results would have made obvious.
+
+    The two flags interact, and the combination is a trap. When
+    `degraded=true` AND `insufficient_context=true`, do NOT surface the
+    refusal as "the team has no context on this" — a degraded run means the
+    agent never curated, so a refusal is indistinguishable from it never
+    having looked. Act on `degraded_reason` first; only treat
+    `insufficient_context` as a real answer when `degraded` is false.
 
     Args:
         question: Natural-language question, ideally how the user phrased it.

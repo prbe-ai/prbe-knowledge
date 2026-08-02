@@ -16,7 +16,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, get_args
 
-from engine.retrieval.agent.models import GathererOutput
+from engine.retrieval.agent.models import GathererOutput, GathererStatus, is_degraded
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
@@ -413,6 +413,7 @@ async def to_query_response(
     prefanout: dict[str, Any] | None = None,
     customer_id: str | None = None,
     top_k_related: int = 10,
+    status: GathererStatus | None,
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
 ) -> RetrieveResponse:
@@ -452,6 +453,19 @@ async def to_query_response(
     unverifiable chunks are dropped BEFORE the response is assembled -- see
     _enforce_scope_on_chunks. This is the final gate behind the per-channel
     SQL filters and the tool-dispatch injection.
+
+    `status` (REQUIRED, may be None): the harness's terminal GathererStatus.
+    Projected onto the response as `degraded` / `degraded_reason` so a caller
+    can tell a fallback answer from a full one WITHOUT reaching into
+    `gatherer_notes.dropped[].reason`, which nothing reads.
+
+    Required with no default ON PURPOSE. It was optional in the first cut of
+    this change, and two of the three gatherer call sites promptly forgot it —
+    which silently reported `degraded=False` on genuinely degraded responses,
+    the exact failure this parameter exists to surface. An omission has to be
+    a TypeError, not a fail-open default. Pass `None` explicitly when the
+    caller genuinely has no gatherer outcome (non-gatherer paths, unit tests);
+    that reports not-degraded, which is correct for those callers.
     """
     if (source_keys or doc_types) and customer_id:
         await _enforce_scope_on_chunks(
@@ -669,6 +683,10 @@ async def to_query_response(
         related_entities=related_entities or None,
         gatherer_notes=gathered.gatherer_notes.model_dump(),
         query_root_doc_id=query_root_doc_id,
+        degraded=is_degraded(status),
+        # Only carry the reason when it IS a degradation — a reason string on
+        # a healthy response invites callers to branch on it.
+        degraded_reason=status if is_degraded(status) else None,
     )
 
 

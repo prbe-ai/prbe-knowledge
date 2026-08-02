@@ -139,6 +139,7 @@ async def test_chunks_carry_graph_evidence_from_prefanout() -> None:
         }],
     }]}
     resp = await to_query_response(
+        status=None,
         query="why was pr72 built",
         gathered=gathered,
         trace_id="t-1",
@@ -176,6 +177,7 @@ async def test_confidence_breakdown_aggregates_across_chunks() -> None:
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=prefanout,
     )
     assert resp.confidence_breakdown == {"EXTRACTED": 0, "INFERRED": 2, "AMBIGUOUS": 0}
@@ -191,6 +193,7 @@ async def test_no_prefanout_leaves_graph_evidence_empty() -> None:
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     docs = [r for r in resp.results if r.canonical_id == "d1"]
@@ -217,6 +220,7 @@ async def test_related_entities_populated_from_gathered_entities() -> None:
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     assert resp.related_entities is not None
@@ -236,6 +240,7 @@ async def test_top_k_related_zero_disables_gatherer_projection() -> None:
     )
 
     resp = await to_query_response(
+        status=None,
         query="q",
         gathered=gathered,
         trace_id="t",
@@ -257,6 +262,7 @@ async def test_top_k_related_caps_gatherer_projection() -> None:
     )
 
     resp = await to_query_response(
+        status=None,
         query="q",
         gathered=gathered,
         trace_id="t",
@@ -279,6 +285,7 @@ async def test_related_entities_label_falls_back_to_canonical_prefix() -> None:
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     assert resp.related_entities[0].label == "Feature"
@@ -323,6 +330,7 @@ async def test_enrichment_merges_db_edges_with_prefanout(monkeypatch) -> None:
     )
 
     resp = await to_query_response(
+        status=None,
         query="what is multi-granola",
         gathered=gathered,
         trace_id="t",
@@ -359,6 +367,7 @@ async def test_enrichment_skipped_when_no_customer_id(monkeypatch) -> None:
         gatherer_notes=GathererNotes(),
     )
     await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={},
         prefanout=None, customer_id=None,
     )
@@ -391,6 +400,7 @@ async def test_enrichment_fires_on_single_doc_result(monkeypatch) -> None:
         entities=[], chunks=[_ge("only-doc")], gatherer_notes=GathererNotes(),
     )
     await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={},
         prefanout=None, customer_id="cust-test",
     )
@@ -432,6 +442,7 @@ async def test_enrichment_carries_via_entity_title_through_to_response(monkeypat
     )
 
     resp = await to_query_response(
+        status=None,
         query="multi-granola",
         gathered=gathered,
         trace_id="t",
@@ -487,6 +498,7 @@ async def test_enrichment_carries_neighbor_metadata_through_to_response(monkeypa
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="multi-granola timeline",
         gathered=gathered,
         trace_id="t",
@@ -535,6 +547,7 @@ async def test_enrichment_dedupes_against_prefanout_evidence(monkeypatch) -> Non
         fake_enrich,
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={},
         prefanout=prefanout, customer_id="cust-test",
     )
@@ -558,6 +571,7 @@ async def test_query_root_doc_id_picks_top_ranked_document() -> None:
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="why was pr328 created",
         gathered=gathered,
         trace_id="t",
@@ -580,6 +594,7 @@ async def test_query_root_doc_id_falls_back_to_top_entity() -> None:
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="pr 328", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     assert resp.query_root_doc_id == "pr-328"
@@ -592,6 +607,7 @@ async def test_query_root_doc_id_none_for_empty_result() -> None:
         entities=[], chunks=[], gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     assert resp.query_root_doc_id is None
@@ -606,6 +622,7 @@ async def test_related_entities_none_when_agent_emitted_no_entities() -> None:
         entities=[], chunks=[_ge("d1")], gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={}, prefanout=None,
     )
     assert resp.related_entities is None
@@ -654,6 +671,7 @@ async def test_display_name_enriched_from_graph_nodes_lookup(monkeypatch) -> Non
     )
 
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={},
         prefanout=None, customer_id="cust-1",
     )
@@ -702,6 +720,7 @@ async def test_display_name_enrichment_prefers_db_over_emitted_properties(
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={},
         prefanout=None, customer_id="cust-1",
     )
@@ -735,6 +754,7 @@ async def test_display_name_enrichment_skipped_when_no_customer_id(monkeypatch) 
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={},
         prefanout=None, customer_id=None,
     )
@@ -762,6 +782,7 @@ async def test_display_name_enrichment_handles_db_failure_gracefully(monkeypatch
         gatherer_notes=GathererNotes(),
     )
     resp = await to_query_response(
+        status=None,
         query="q", gathered=gathered, trace_id="t", timing_ms={},
         prefanout=None, customer_id="cust-1",
     )

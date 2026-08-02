@@ -1348,6 +1348,11 @@ async def test_transient_http_error_degrades_to_citable_prefanout(
     assert getattr(fake_request.state, "full_failure", False) is False
     assert fake_request.state.search_agent_status == "provider_error_prefanout_fallback"
     assert fake_request.state.search_agent_gathered.chunks[0].doc_id == "stub:0"
+    # End-to-end: the caller must be able to see this was a fallback. Results
+    # look normal (1 candidate, real content) — `degraded` is the only thing
+    # distinguishing it from a healthy run.
+    assert resp.degraded is True
+    assert resp.degraded_reason == "provider_error_prefanout_fallback"
 
 
 @pytest.mark.asyncio
