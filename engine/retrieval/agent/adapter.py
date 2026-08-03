@@ -337,8 +337,11 @@ def _chunk_to_query_chunk(
     return QueryChunk(
         chunk_id=chunk.chunk_id,
         content=chunk.content,
-        score=1.0 - (0.01 * rank),  # decay so consumers' sort is stable; agent's
-                                    # actual ranking signal is matched_via / why_relevant
+        # ORDINAL, not similarity: a decay so consumers' sort is stable. The
+        # agent's actual ranking signal is matched_via / why_relevant. The
+        # response says so machine-readably via `score_semantics`; do not
+        # threshold or scale this. See QueryResultBase.score.
+        score=1.0 - (0.01 * rank),
         rank_in_doc=rank + 1,
         retriever_scores={},
         graph_evidence=graph_evidence,
@@ -411,6 +414,7 @@ async def to_query_response(
     trace_id: str,
     timing_ms: dict[str, float],
     prefanout: dict[str, Any] | None = None,
+    fused_scores: dict[str, float] | None = None,
     customer_id: str | None = None,
     top_k_related: int = 10,
     status: GathererStatus | None,
@@ -442,6 +446,14 @@ async def to_query_response(
     missed them because none was the grounded anchor, but the graph
     *does* have edges between them. None preserves the pre-enrichment
     behaviour for tests / harness-passthrough.
+
+    `fused_scores` (optional): doc_id -> fused RRF magnitude, from
+    `loop.fused_prefanout_scores`. Surfaced per doc as
+    `retriever_scores["rrf_fused"]` — the only number this path produces that
+    a consumer can legitimately threshold or compare, since `score` is an
+    ordinal restatement of `rank` (see QueryResultBase.score). Passed in
+    rather than recomputed here because the fusion lives in loop.py, which
+    imports this module.
 
     `top_k_related` controls only the optional crawl-candidate projection.
     Zero disables it; positive values cap it without removing gathered entity
@@ -561,6 +573,9 @@ async def to_query_response(
         results.append(
             QueryDocumentResult(
                 canonical_id=doc_id,
+                # ORDINAL (see QueryResultBase.score). The magnitude-carrying
+                # number for this doc, when one exists, is in
+                # retriever_scores below.
                 score=1.0 - (0.01 * (rank_counter - 1)),
                 rank=rank_counter,
                 matched_via=provenance,
@@ -582,7 +597,15 @@ async def to_query_response(
                     for i, c in enumerate(chunks)
                 ],
                 chunk_count=len(chunks),
-                retriever_scores={},
+                # The one real magnitude on this path. Omitted, not zeroed,
+                # when the doc never entered the fused pool — the agent can
+                # reach a doc by traversal, and 0.0 would read as "fused, and
+                # scored worst" rather than "never fused".
+                retriever_scores=(
+                    {"rrf_fused": fused_scores[doc_id]}
+                    if fused_scores and doc_id in fused_scores
+                    else {}
+                ),
             )
         )
 
@@ -666,6 +689,10 @@ async def to_query_response(
     return RetrieveResponse(
         query=query,
         results=results,
+        # Explicit, not defaulted: this path is precisely the one that made
+        # the field necessary, so it states its own contract rather than
+        # inheriting a default that a later edit could quietly flip.
+        score_semantics="ordinal_rank",
         total_candidates=len(results),
         router_hit_cache=False,
         timing_ms=timing_ms,
