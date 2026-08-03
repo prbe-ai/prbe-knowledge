@@ -46,5 +46,25 @@ env-overridable.
 - [ ] loop.py: send `max_tokens` on every gatherer turn
 - [ ] loop.py: count `tool_definitions()` in the context budget
 - [ ] loop.py: surface `finish_reason == "length"` as a degraded status
-- [ ] Tests
-- [ ] Full non-integration suite; compare failure set to origin/main
+- [x] Tests (7 new; the tool-schema one proven to fail pre-fix, pass post-fix)
+- [x] `tests/retrieval/agent/` — 206 passed, covers every changed file
+- [x] ruff clean; invariant asserted numerically (105_072 + 16_000 + 10_000 = 131_072)
+- [x] main-vs-branch comparison, same selection, back to back on a quiet box:
+
+      origin/main   10 failed, 342 passed
+      this branch   10 failed, 345 passed
+
+      IDENTICAL failure set — the same four files on both sides
+      (`test_cli_plan3_flags`, `test_directed_phrases`,
+      `test_graph_retriever_confidence`, `test_mark_failed_token_flip`), all
+      asyncpg/infra-bound and unrelated to this change. The +3 is exactly the
+      new tests that match this `-k` selection.
+
+      Worth recording: an earlier run of the SAME branch code read 32 failed /
+      322 passed, purely because three other sessions were hammering
+      `tests/integration` against a down Postgres. Never compare failure sets
+      across differently-loaded runs.
+
+- [ ] Full non-integration suite on a quiet machine before landing (the run
+      above is the `-k` selection, not the whole suite; `tests/retrieval/agent/`
+      is separately green at 206 passed).
