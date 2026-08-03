@@ -1232,14 +1232,20 @@ def _fuse_prefanout_docs(prefanout: dict[str, Any] | None) -> list[dict[str, Any
     A doc that surfaces high across multiple sub-queries / channels scores
     higher than one that appears once deep in a single list — exactly the
     breadth signal the single-turn gatherer can't weigh by hand. Returns
-    `[{doc_id, hit, channel}]` ordered by fused score DESC; `hit` is the
-    first (highest-ranked) channel hit seen for that doc, carrying the
+    `[{doc_id, hit, channel, score}]` ordered by fused score DESC; `hit` is
+    the first (highest-ranked) channel hit seen for that doc, carrying the
     content + doc-level meta the backfill synthesizes a chunk from. Docs
     with no usable content are skipped (e.g. inferred-edge-only hits).
 
     Each doc's fused score is scaled by `_source_weight` (per-source
     multiplier + recency decay), restoring the two ranking signals that the
     agentic cutover dropped along with fusion.py.
+
+    `score` is carried out rather than discarded because this is the only
+    number in the gatherer path with real magnitude -- the adapter surfaces
+    it as `retriever_scores["rrf_fused"]` so consumers have something they
+    can legitimately compare, instead of the ordinal rank-decay that
+    `QueryResultBase.score` has always been.
     """
     scores: dict[str, float] = {}
     best_hit: dict[str, dict[str, Any]] = {}
@@ -1264,9 +1270,26 @@ def _fuse_prefanout_docs(prefanout: dict[str, Any] | None) -> list[dict[str, Any
         scores[doc_id] *= _source_weight(best_hit[doc_id], ref_now)
     ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
     return [
-        {"doc_id": d, "hit": best_hit[d], "channel": best_channel[d]}
-        for d, _ in ranked
+        {"doc_id": d, "hit": best_hit[d], "channel": best_channel[d], "score": s}
+        for d, s in ranked
     ]
+
+
+def fused_prefanout_scores(prefanout: dict[str, Any] | None) -> dict[str, float]:
+    """doc_id -> fused RRF score for every doc in the pre-fan-out pool.
+
+    The adapter's window onto the one real magnitude this path computes. Kept
+    here, next to the fusion it reads, so the RRF constant and the source
+    weighting cannot drift from a second copy -- and exported as a function
+    rather than importing `_fuse_prefanout_docs` into the adapter, which would
+    close an import cycle (loop imports the adapter).
+
+    A doc absent from the returned map was never fused (agent traversal,
+    fetch_doc, inferred-edge-only hits with no citable body). That is "no
+    score", not "score zero", and the adapter omits the key rather than
+    writing a 0.0 that reads as "scored, and badly".
+    """
+    return {entry["doc_id"]: entry["score"] for entry in _fuse_prefanout_docs(prefanout)}
 
 
 def _has_citable_prefanout_evidence(prefanout: dict[str, Any] | None) -> bool:
@@ -1945,6 +1968,7 @@ async def run_gatherer(
             trace_id=trace_id,
             timing_ms=timing,
             prefanout=state.prefanout,
+            fused_scores=fused_prefanout_scores(state.prefanout),
             customer_id=customer_id,
             top_k_related=req.top_k_related,
             source_keys=request_source_keys,
@@ -1987,6 +2011,7 @@ async def run_gatherer(
             trace_id=trace_id,
             timing_ms=timing,
             prefanout=state.prefanout,
+            fused_scores=fused_prefanout_scores(state.prefanout),
             customer_id=customer_id,
             top_k_related=req.top_k_related,
             source_keys=request_source_keys,
@@ -2174,6 +2199,7 @@ async def run_gatherer(
         trace_id=trace_id,
         timing_ms=timing,
         prefanout=state.prefanout,
+        fused_scores=fused_prefanout_scores(state.prefanout),
         customer_id=customer_id,
         top_k_related=req.top_k_related,
         source_keys=request_source_keys,

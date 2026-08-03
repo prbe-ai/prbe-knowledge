@@ -789,3 +789,87 @@ async def test_display_name_enrichment_handles_db_failure_gracefully(monkeypatch
     # No DB hit — fall back to the gatherer-emitted label rather than
     # raw canonical_id.
     assert resp.related_entities[0].display_name == "brand-new-channel"
+
+
+# ============================================================
+# score semantics — `score` is ordinal, `retriever_scores` is not
+# ============================================================
+
+async def test_response_declares_score_as_ordinal() -> None:
+    """`score_semantics` is on the wire, not folklore.
+
+    The gatherer's `score` is `1.0 - 0.01*rank` — a restatement of position.
+    Consumers could not tell, and research-os both thresholded it (no
+    relevance floor, so a terminal log ranked #1 on unrelated queries) and
+    MULTIPLIED it by a 0.6 source demotion. Both operations are silent
+    no-ops-shaped-like-signal on an ordinal, so the response has to say
+    which kind of number it is carrying."""
+    gathered = GathererOutput(
+        entities=[], chunks=[_ge("github:pr:1")], gatherer_notes=GathererNotes()
+    )
+    resp = await to_query_response(
+        status=None, query="q", gathered=gathered, trace_id="t", timing_ms={}
+    )
+    assert resp.score_semantics == "ordinal_rank"
+
+
+async def test_fused_score_surfaces_as_retriever_score() -> None:
+    """A doc that WAS in the fused pool carries its real RRF magnitude.
+
+    This is the number a consumer may legitimately compare or threshold —
+    unlike `score`, whose 1.0/0.99/0.98 ladder is pure position."""
+    gathered = GathererOutput(
+        entities=[],
+        chunks=[_ge("github:pr:1"), _ge("github:pr:2")],
+        gatherer_notes=GathererNotes(),
+    )
+    resp = await to_query_response(
+        status=None,
+        query="q",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        fused_scores={"github:pr:1": 0.0328, "github:pr:2": 0.0161},
+    )
+    by_id = {r.canonical_id: r for r in resp.results}
+    assert by_id["github:pr:1"].retriever_scores == {"rrf_fused": 0.0328}
+    assert by_id["github:pr:2"].retriever_scores == {"rrf_fused": 0.0161}
+    # The ordinal score says nothing about the 2x gap between them.
+    assert by_id["github:pr:1"].score == 1.0
+    assert by_id["github:pr:2"].score == 0.99
+
+
+async def test_unfused_doc_omits_the_key_rather_than_scoring_zero() -> None:
+    """A doc the agent reached by traversal was never fused.
+
+    Writing 0.0 would read as "fused, and scored worst" — the opposite of the
+    truth, and exactly the kind of confident-wrong number this change exists
+    to stop emitting. Absent means unknown."""
+    gathered = GathererOutput(
+        entities=[],
+        chunks=[_ge("github:pr:1"), _ge("linear:org:issue:traversed")],
+        gatherer_notes=GathererNotes(),
+    )
+    resp = await to_query_response(
+        status=None,
+        query="q",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        fused_scores={"github:pr:1": 0.0328},
+    )
+    by_id = {r.canonical_id: r for r in resp.results}
+    assert by_id["github:pr:1"].retriever_scores == {"rrf_fused": 0.0328}
+    assert by_id["linear:org:issue:traversed"].retriever_scores == {}
+
+
+async def test_no_fused_scores_leaves_retriever_scores_empty() -> None:
+    """Harness-passthrough / no-LLM paths pass no fused map; nothing is
+    synthesized in their place."""
+    gathered = GathererOutput(
+        entities=[], chunks=[_ge("github:pr:1")], gatherer_notes=GathererNotes()
+    )
+    resp = await to_query_response(
+        status=None, query="q", gathered=gathered, trace_id="t", timing_ms={}
+    )
+    assert resp.results[0].retriever_scores == {}

@@ -2063,3 +2063,54 @@ def test_transient_provider_error_cause_cycle_terminates() -> None:
     wrapped.__cause__ = first
 
     assert is_transient_provider_error(wrapped) is False
+
+
+# ============================================================
+# fused_prefanout_scores — the one real magnitude on this path
+# ============================================================
+
+def test_fused_scores_reward_breadth_across_sub_queries() -> None:
+    """A doc surfacing in two sub-queries outscores one appearing once.
+
+    That breadth signal is what makes the fused score worth exposing: it is
+    the only number in the gatherer path with real magnitude, since `score`
+    on the response is a rank restatement."""
+    from engine.retrieval.agent.loop import fused_prefanout_scores
+
+    prefanout = {"sub_queries": [
+        {"query": "a", "vector": [
+            {"doc_id": "d:broad", "content": "x"},
+            {"doc_id": "d:narrow", "content": "y"},
+        ], "bm25": [], "graph": [], "inferred_edge": []},
+        {"query": "b", "vector": [
+            {"doc_id": "d:broad", "content": "x"},
+        ], "bm25": [], "graph": [], "inferred_edge": []},
+    ]}
+    scores = fused_prefanout_scores(prefanout)
+    assert scores["d:broad"] > scores["d:narrow"]
+
+
+def test_fused_scores_skip_docs_with_no_citable_body() -> None:
+    """Contentless hits are not fused, so they get no score at all — the
+    adapter then omits the key rather than emitting a 0.0 that would read
+    as a genuine low relevance."""
+    from engine.retrieval.agent.loop import fused_prefanout_scores
+
+    prefanout = {"sub_queries": [{
+        "query": "a",
+        "vector": [{"doc_id": "d:real", "content": "x"}],
+        "bm25": [], "graph": [],
+        "inferred_edge": [{"doc_id": "d:bodyless", "content": ""}],
+    }]}
+    scores = fused_prefanout_scores(prefanout)
+    assert "d:real" in scores
+    assert "d:bodyless" not in scores
+
+
+def test_fused_scores_empty_for_absent_prefanout() -> None:
+    """No prefanout (harness passthrough, no-LLM short circuit) fuses
+    nothing — and must not raise."""
+    from engine.retrieval.agent.loop import fused_prefanout_scores
+
+    assert fused_prefanout_scores(None) == {}
+    assert fused_prefanout_scores({}) == {}

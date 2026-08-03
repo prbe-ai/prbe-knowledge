@@ -329,6 +329,11 @@ async def run_list(
     return RetrieveResponse(
         query=req.query,
         results=results,
+        # The SQL retriever scores 1.0/(1+i) off its own result order
+        # (retrievers/sql.py) — ordinal, same as the gatherer path, for a
+        # different reason. `retriever_scores["sql"]` carries the same
+        # ordinal, so there is no magnitude to be had here either.
+        score_semantics="ordinal_rank",
         total_candidates=total_candidates,
         router_hit_cache=False,
         confidence_breakdown={"EXTRACTED": 0, "INFERRED": 0, "AMBIGUOUS": 0},

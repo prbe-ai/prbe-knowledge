@@ -594,6 +594,20 @@ class QueryResultBase(BaseModel):
     """
 
     canonical_id: str
+    # NOT a similarity. Read `RetrieveResponse.score_semantics` before doing
+    # anything numeric with this: on every live path today it is ORDINAL --
+    # a restatement of `rank` as a descending float (the gatherer emits
+    # 1.0 - 0.01*rank, the SQL retriever 1.0/(1+rank)). It exists so a
+    # consumer sorting on it gets a stable order, and for nothing else.
+    #
+    # Consequences, both observed in the wild:
+    #   * Thresholding it is meaningless. Every returned doc scores high by
+    #     construction, so "score > 0.9" is "position < 10", not "relevant".
+    #     There is no relevance floor to be had from this number.
+    #   * MULTIPLYING it is worse than meaningless. A 0.6 source demotion on
+    #     an ordinal moves a doc ~40 rank positions regardless of how well it
+    #     matched. research-os's search does exactly this today.
+    # For a number with real magnitude, read `retriever_scores` instead.
     score: float
     rank: int  # 1-indexed final rank in RetrieveResponse.results
     matched_via: list[MatchProvenance] = Field(default_factory=list)
@@ -624,6 +638,16 @@ class QueryDocumentResult(QueryResultBase):
     updated_at: datetime | None = None
     chunks: list[QueryChunk] = Field(default_factory=list)
     chunk_count: int = 0
+    # Per-channel scores that carry real MAGNITUDE, unlike `score`. Keys are
+    # channel names; `rrf_fused` is the reciprocal-rank fusion of every
+    # pre-fan-out channel this doc appeared in, scaled by its source weight
+    # and recency decay -- so a doc surfacing high across several sub-queries
+    # outscores one that appeared once, deep, in a single list.
+    #
+    # EMPTY IS MEANINGFUL, and it is not "score zero": on the gatherer path
+    # a doc the agent reached by traversal (fetch_doc, inferred-edge follow-up)
+    # was never in the fused pool and genuinely has no fused score. Treat an
+    # absent key as unknown, never as irrelevant.
     retriever_scores: dict[str, float] = Field(default_factory=dict)
 
 
@@ -686,6 +710,24 @@ class RetrieveResponse(BaseModel):
     # Polymorphic per-node results -- Document or Entity, discriminated on
     # `node_type`. Documents carry their body chunks nested under `chunks`.
     results: list[QueryResult] = Field(default_factory=list)
+    # What `QueryResultBase.score` MEANS on this response. Machine-readable
+    # because the answer has been "ordinal" on every path for as long as the
+    # gatherer has existed, and no consumer could tell -- research-os both
+    # thresholds and multiplies it, and a rank-decay score silently passes
+    # both operations while meaning nothing.
+    #
+    #   "ordinal_rank" -> `score` restates `rank`. Sort on it; never compare
+    #                     it across responses, threshold it, or scale it.
+    #                     Real magnitudes, where they exist, are in
+    #                     `QueryDocumentResult.retriever_scores`.
+    #   "similarity"   -> `score` is a genuine per-doc relevance magnitude.
+    #                     No path emits this today; the value exists so one
+    #                     can start to WITHOUT every consumer having to guess
+    #                     which kind of number it just received.
+    #
+    # Defaults to the conservative answer: a caller that forgets to set it is
+    # told not to trust the magnitude, which is the safe direction to be wrong.
+    score_semantics: Literal["ordinal_rank", "similarity"] = "ordinal_rank"
     total_candidates: int
     router_hit_cache: bool
     aggregations: list[IntentAggregation] = Field(default_factory=list)
