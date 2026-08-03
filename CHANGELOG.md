@@ -8,6 +8,11 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- Full-source reads now remove standard 64-token chunker overlap while
+  provenance-gating pre-chunked `code_graph` rows so their boundaries remain
+  intact. Reconstruction also repairs Unicode replacement characters created
+  when a token window bisects UTF-8, keeps source-view line spans aligned with
+  the reconstructed body, and runs off the async request loop.
 - `per_source_top_k` no longer loses a whole corpus to the final `LIMIT`. The
   window function gave each `source_system` its own slot budget and the query
   then applied `ORDER BY score DESC LIMIT top_k`, handing every slot back to

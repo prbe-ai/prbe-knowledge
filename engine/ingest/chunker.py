@@ -11,8 +11,10 @@ boundaries) is Phase 1+.
 
 from __future__ import annotations
 
-import tiktoken
-
+from engine.shared.chunk_reconstruction import (
+    DEFAULT_CHUNK_OVERLAP,
+    chunk_encoding,
+)
 from engine.shared.constants import CHUNKER_VERSION, EMBEDDING_V2_MAX_INPUT_TOKENS
 
 # ChunkPiece moved to shared.models so cross-module contracts
@@ -21,23 +23,14 @@ from engine.shared.constants import CHUNKER_VERSION, EMBEDDING_V2_MAX_INPUT_TOKE
 # backwards-compatible imports.
 from engine.shared.models import ChunkPiece
 
+_enc = chunk_encoding
+
 DEFAULT_CHUNK_TOKENS = 512
-DEFAULT_CHUNK_OVERLAP = 64
 # Conservative input ceiling: OpenAI text-embedding-3-large allows 8191,
 # but during the Gemini migration both providers must accept the same
 # chunks. Take the smaller bound to prevent silent overflow at the
 # Gemini-side embed call.
 MAX_INPUT_TOKENS = min(8191, EMBEDDING_V2_MAX_INPUT_TOKENS)
-
-
-_encoding: tiktoken.Encoding | None = None
-
-
-def _enc() -> tiktoken.Encoding:
-    global _encoding
-    if _encoding is None:
-        _encoding = tiktoken.get_encoding("cl100k_base")
-    return _encoding
 
 
 def chunk_text(

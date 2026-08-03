@@ -27,6 +27,7 @@ glue only.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import AsyncIterator
@@ -63,6 +64,12 @@ from engine.retrieval.synthesis import (
     synthesize_stream,
 )
 from engine.retrieval.usage import usage_router
+from engine.shared.chunk_reconstruction import (
+    DEFAULT_CHUNK_OVERLAP,
+    ChunkLineSpan,
+    reconstruct_chunk_text,
+    reconstruct_chunk_text_with_spans,
+)
 from engine.shared.community import ensure_default_customer
 from engine.shared.config import get_settings
 from engine.shared.constants import (
@@ -810,17 +817,22 @@ def _mcp_full_source_too_large() -> HTTPException:
     )
 
 
-def _chunk_line_offsets(chunk_rows: list[object]) -> dict[int, tuple[int, int]]:
-    offsets: dict[int, tuple[int, int]] = {}
-    current_line = 1
-    for row in chunk_rows:
-        line_count = len(str(row["content"]).splitlines()) or 1  # type: ignore[index]
-        chunk_index = int(row["chunk_index"])  # type: ignore[index]
-        offsets[chunk_index] = (current_line, current_line + line_count - 1)
-        # Full source reassembly joins chunks with "\n\n", which creates one
-        # blank separator line between adjacent chunk bodies.
-        current_line += line_count + 1
-    return offsets
+def _chunk_line_offsets(
+    chunk_rows: list[object],
+    chunk_spans: list[ChunkLineSpan],
+) -> dict[int, tuple[int, int]]:
+    if len(chunk_rows) != len(chunk_spans):
+        raise ValueError("chunk rows and reconstructed spans must have equal length")
+    return {
+        int(row["chunk_index"]): (span.line_start, span.line_end)  # type: ignore[index]
+        for row, span in zip(chunk_rows, chunk_spans, strict=True)
+    }
+
+
+def _expected_source_overlap_tokens(doc: object) -> int | None:
+    """Return the chunker signature for sources known to use token windows."""
+    source_system = SourceSystem(doc["source_system"])  # type: ignore[index]
+    return None if source_system is SourceSystem.CODE_GRAPH else DEFAULT_CHUNK_OVERLAP
 
 
 def _parse_cursor(cursor: str | None) -> int | None:
@@ -999,8 +1011,8 @@ def _source_search_view(
     limit_lines: int,
     max_bytes: int,
     max_matches: int,
+    chunk_offsets: dict[int, tuple[int, int]],
 ) -> SourceViewResponse:
-    offsets = _chunk_line_offsets(chunk_rows)
     ranked = _rank_source_chunks(chunk_rows, query)
     sections: list[SourceViewSection] = []
     parts: list[str] = []
@@ -1016,7 +1028,7 @@ def _source_search_view(
         take = min(len(chunk_lines), remaining_lines)
         if take <= 0:
             continue
-        chunk_start, _ = offsets[chunk_index]
+        chunk_start, _ = chunk_offsets[chunk_index]
         sections.append(
             SourceViewSection(
                 chunk_index=chunk_index,
@@ -1176,7 +1188,15 @@ async def get_source_view(
             _SOURCE_VIEW_MCP_FULL_MAX_BYTES if is_mcp_full else None
         ),
     )
-    full_content = "\n\n".join(str(c["content"]) for c in chunk_rows)  # type: ignore[index]
+    chunk_contents = [
+        str(chunk["content"]) for chunk in chunk_rows  # type: ignore[index]
+    ]
+    full_content, chunk_spans = await asyncio.to_thread(
+        reconstruct_chunk_text_with_spans,
+        chunk_contents,
+        expected_overlap_tokens=_expected_source_overlap_tokens(doc),
+    )
+    chunk_offsets = _chunk_line_offsets(chunk_rows, chunk_spans)
     full_lines = full_content.splitlines()
     total_lines = len(full_lines)
     sections: list[SourceViewSection] = []
@@ -1192,6 +1212,7 @@ async def get_source_view(
             limit_lines=limit_lines,
             max_bytes=max_bytes,
             max_matches=max_matches,
+            chunk_offsets=chunk_offsets,
         )
     elif mode == "grep":
         if pattern is None:
@@ -1247,8 +1268,7 @@ async def get_source_view(
         )
         if chunk is None:
             raise HTTPException(status_code=404, detail=f"chunk not found: {chunk_index}")
-        offsets = _chunk_line_offsets(chunk_rows)
-        chunk_start, _ = offsets[chunk_index]
+        chunk_start, _ = chunk_offsets[chunk_index]
         chunk_lines = str(chunk["content"]).splitlines()  # type: ignore[index]
         content, local_start, local_end, next_cursor, truncated = _bounded_lines(
             chunk_lines,
@@ -1396,7 +1416,11 @@ async def get_source(
             doc["version"],
         )
 
-    full_content = "\n\n".join(c["content"] for c in chunk_rows)
+    full_content = await asyncio.to_thread(
+        reconstruct_chunk_text,
+        [str(row["content"]) for row in chunk_rows],
+        expected_overlap_tokens=_expected_source_overlap_tokens(doc),
+    )
     metadata = doc["metadata"] if isinstance(doc["metadata"], dict) else {}
     entities = doc["entities"] if isinstance(doc["entities"], list) else []
     if isinstance(doc["metadata"], str):
