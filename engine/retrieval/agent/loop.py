@@ -30,6 +30,7 @@ import random
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import lru_cache
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, get_args
 
@@ -77,6 +78,7 @@ from engine.shared.constants import (
     SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
     SEARCH_AGENT_MAX_CONTEXT_TOKENS,
     SEARCH_AGENT_MAX_EXTENSIONS,
+    SEARCH_AGENT_MAX_OUTPUT_TOKENS,
     SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET,
     SEARCH_AGENT_SOFT_TURN_CAP,
     SEARCH_AGENT_TOOL_BUDGET,
@@ -797,6 +799,16 @@ def _message_tokens(m: dict[str, Any]) -> int:
     return total
 
 
+@lru_cache(maxsize=1)
+def _tool_definitions_tokens() -> int:
+    """Token cost of the tool schemas, which ride on EVERY turn.
+
+    Cached: `tool_definitions()` is static for the process, and re-encoding it
+    once per turn would pay a tokenizer pass for a number that cannot change.
+    """
+    return _count_tokens(json.dumps(tool_definitions(), default=str))
+
+
 # Stub that replaces an evicted tool result. Keeps the `tool` message (and
 # its tool_call_id linkage) so the assistant<->tool pairing the OpenAI
 # contract requires stays intact — only the bulky content is dropped.
@@ -820,7 +832,12 @@ def _enforce_context_budget(state: LoopState) -> None:
     # One tokenizer pass over the history; reuse the per-message counts in the
     # eviction loop so tool bodies aren't encoded twice.
     per_msg = [_message_tokens(m) for m in state.messages]
-    total = sum(per_msg)
+    # The tool SCHEMAS are part of the input on every turn but live in
+    # call_kwargs, not in `messages`, so counting messages alone understated the
+    # payload by a fixed amount on every single call. Cheap and cached, so
+    # charge it rather than leaving it to the safety margin.
+    fixed_overhead = _tool_definitions_tokens()
+    total = sum(per_msg) + fixed_overhead
     if total <= SEARCH_AGENT_MAX_CONTEXT_TOKENS:
         return
     stub_cost = _count_tokens(_EVICTED_TOOL_CONTENT)
@@ -902,6 +919,16 @@ async def _run_turn(state: LoopState) -> Any:
         # must stay small enough to fit the caller's budget and large enough to
         # let a failover hop land. See SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS.
         "timeout": SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
+        # Bound the completion. Providers admit on `input + max_completion_tokens`,
+        # so omitting this books the model maximum (~40k) on top of an input the
+        # budget above had already trimmed -- which is how a request whose input
+        # fit 115k still came back `prompt is too long: 143250 ... maximum
+        # context length of 131071`. It is also charged against Cerebras's
+        # org-wide TPM ceiling before the request runs, so the booking is quota
+        # spent on output that never arrives. See SEARCH_AGENT_MAX_OUTPUT_TOKENS
+        # for the measured sizing; _enforce_context_budget reserves exactly this
+        # many tokens, so the two cannot drift apart.
+        "max_tokens": SEARCH_AGENT_MAX_OUTPUT_TOKENS,
     }
     if gateway_url():
         # The managed proxy owns provider retries and failover. If it exhausts
@@ -2006,6 +2033,19 @@ async def run_gatherer(
         else:
             if state.tool_calls_count >= SEARCH_AGENT_HARD_CAP and not gathered.chunks and not gathered.entities:
                 status = "tool_budget_exceeded"
+            elif "length" in state.finish_reasons_per_turn:
+                # Only from "ok". A run that already knows a more specific way
+                # it degraded keeps that status -- truncation is the least
+                # informative of the two, and overwriting would hide the cause.
+                status = "output_truncated"
+                log.warning(
+                    "agent.output_truncated",
+                    customer_id=customer_id,
+                    trace_id=trace_id,
+                    max_output_tokens=SEARCH_AGENT_MAX_OUTPUT_TOKENS,
+                    completion_tokens_per_turn=state.completion_tokens_per_turn,
+                    finish_reasons_per_turn=state.finish_reasons_per_turn,
+                )
     except TimeoutError:
         log.warning(
             "agent.loop_timeout",

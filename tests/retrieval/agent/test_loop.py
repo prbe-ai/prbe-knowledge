@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -32,11 +32,14 @@ from engine.retrieval.agent.loop import (
     _empty_passthrough,
     _enforce_context_budget,
     _extract_cache_hit_rate,
+    _message_tokens,
     _format_inferred_chains,
     _has_citable_prefanout_evidence,
     _parse_terminal_args,
     _render_prefanout_budgeted,
+    _run_turn,
     _seed_for_query,
+    _tool_definitions_tokens,
     run_gatherer,
 )
 from engine.retrieval.agent.models import (
@@ -47,7 +50,14 @@ from engine.retrieval.agent.models import (
 )
 from engine.retrieval.agent.tools import TERMINAL_TOOL_NAME
 from engine.retrieval.grounding import GroundingBundle
-from engine.shared.constants import SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS
+from engine.shared.constants import (
+    SEARCH_AGENT_CONTEXT_SAFETY_MARGIN,
+    SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
+    SEARCH_AGENT_MAX_CONTEXT_TOKENS,
+    SEARCH_AGENT_MAX_OUTPUT_TOKENS,
+    SEARCH_AGENT_MODEL_CONTEXT_WINDOW,
+    SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET,
+)
 from engine.shared.llm import LLMError
 from engine.shared.llm_tools import is_context_overflow, is_transient_provider_error
 from engine.shared.models import QueryRequest
@@ -1994,6 +2004,105 @@ def test_enforce_context_budget_stubs_oldest_tool_results() -> None:
         _count_tokens(m["content"]) for m in state.messages if isinstance(m.get("content"), str)
     )
     assert total < 50_000  # materially smaller than the ~100K we started with
+
+
+def test_context_budget_reserves_the_completion_within_the_window() -> None:
+    """input cap + max output + margin must fit the model's context window.
+
+    This is the invariant whose absence caused the 2026-08-03 overflow: the
+    input cap was a hardcoded 115_000 that silently assumed a zero-token
+    completion, while the provider admits on `input + max_completion_tokens`.
+    A request whose input had already been trimmed to fit still came back
+    `prompt is too long: 143250 tokens exceeds maximum context length of
+    131071`. Deriving the cap makes the sum true by construction; this test
+    fails if anyone re-hardcodes either half.
+    """
+    assert (
+        SEARCH_AGENT_MAX_CONTEXT_TOKENS
+        + SEARCH_AGENT_MAX_OUTPUT_TOKENS
+        + SEARCH_AGENT_CONTEXT_SAFETY_MARGIN
+    ) <= SEARCH_AGENT_MODEL_CONTEXT_WINDOW
+    # And the input cap must still leave room to be useful, not collapse to
+    # something that evicts the prefanout on every query.
+    assert SEARCH_AGENT_MAX_CONTEXT_TOKENS > SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET * 2
+
+
+def test_enforce_context_budget_charges_the_tool_schemas() -> None:
+    """Tool definitions ride on every turn but live in call_kwargs, not in
+    `messages` — counting messages alone understated the payload on every
+    single call. The budget must include them."""
+    schema_tokens = _tool_definitions_tokens()
+    assert schema_tokens > 100, "tool schemas should cost something substantial"
+
+    def _fresh() -> LoopState:
+        return LoopState(
+            customer_id="c", trace_id="t", query="q",
+            messages=[
+                {"role": "user", "content": "the query evidence"},
+                {"role": "assistant", "content": "",
+                 "tool_calls": [{"id": "call_1", "type": "function",
+                                 "function": {"name": "fetch_doc", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "y " * 2_000},
+            ],
+        )
+
+    msg_tokens = sum(_message_tokens(m) for m in _fresh().messages)
+    # Budget sits ABOVE the message history but BELOW history + schemas. So the
+    # schemas alone decide whether we are over budget: count them and this
+    # evicts, ignore them and it returns early. That gap is the whole test.
+    budget = msg_tokens + (schema_tokens // 2)
+    assert msg_tokens < budget < msg_tokens + schema_tokens
+
+    state = _fresh()
+    with patch("engine.retrieval.agent.loop.SEARCH_AGENT_MAX_CONTEXT_TOKENS", budget):
+        _enforce_context_budget(state)
+    assert '"truncated": true' in state.messages[2]["content"], (
+        "tool schemas were not charged against the budget"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_turn_sends_max_tokens() -> None:
+    """The completion cap must reach the provider. Omitting it is what let the
+    provider book the model maximum on top of a trimmed input."""
+    captured: dict[str, Any] = {}
+
+    async def _fake_acompletion(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(tool_calls=[], content="", reasoning_content=None),
+                finish_reason="tool_calls",
+            )],
+            usage=None,
+            system_fingerprint=None,
+        )
+
+    state = LoopState(
+        customer_id="c", trace_id="t", query="q",
+        messages=[{"role": "user", "content": "q"}],
+    )
+    with patch("engine.retrieval.agent.loop.acompletion", _fake_acompletion):
+        await _run_turn(state)
+
+    assert captured["max_tokens"] == SEARCH_AGENT_MAX_OUTPUT_TOKENS
+    # The cap the loop sends and the room the budget reserves must be the same
+    # number, or the two drift and the window is over-subscribed again.
+    assert (
+        captured["max_tokens"] + SEARCH_AGENT_MAX_CONTEXT_TOKENS
+        <= SEARCH_AGENT_MODEL_CONTEXT_WINDOW
+    )
+
+
+def test_output_truncated_is_a_degraded_status() -> None:
+    """`output_truncated` must count as degraded. Capping the completion is what
+    keeps the request inside the window, but an under-sized cap truncates the
+    emit — and a truncated answer that reports itself healthy is the exact
+    silent failure the extractor's 600-token cap produced."""
+    from engine.retrieval.agent.models import _NON_DEGRADED_STATUSES, GathererStatus
+
+    assert "output_truncated" in get_args(GathererStatus)
+    assert "output_truncated" not in _NON_DEGRADED_STATUSES
 
 
 def test_is_context_overflow_classifies_overflow_vs_outage() -> None:
