@@ -32,15 +32,17 @@ import asyncpg
 import orjson
 
 from engine.ingest.chunker import (
-    DEFAULT_CHUNK_OVERLAP,
     ChunkPiece,
-    _enc,
     chunk_text,
     count_tokens,
 )
 from engine.ingest.graph_writer import upsert_edges, upsert_nodes
 from engine.ingest.handlers.base import Connector, ConnectorContext
 from engine.ingest.handlers.registry import build_connector
+from engine.shared.chunk_reconstruction import (
+    reconstruct_chunk_text,
+    strip_chunk_overlap_tokens,
+)
 from engine.shared.constants import (
     CHUNKER_VERSION,
     EMBEDDING_V2_DIM,
@@ -75,6 +77,10 @@ from engine.shared.models import (
 from engine.shared.storage import ObjectStore, get_store
 
 log = get_logger(__name__)
+
+# Backwards-compatible private name retained for existing callers/tests while
+# the implementation lives at the shared ingestion/retrieval layer boundary.
+_skip_chunk_overlap_tokens = strip_chunk_overlap_tokens
 
 
 @dataclass(slots=True)
@@ -1969,38 +1975,6 @@ def ensure_tenant_bound(customer_id: str) -> None:
         raise TenantIsolationError("customer_id required for normalize")
 
 
-def _skip_chunk_overlap_tokens(prev: str, curr: str) -> str:
-    """Return ``curr`` with its leading token-overlap with ``prev`` stripped.
-
-    The chunker creates 512-token windows with ``DEFAULT_CHUNK_OVERLAP``
-    (64) tokens of overlap, so adjacent chunks share their last/first
-    N tokens in cl100k_base encoding. Reassembling via raw concatenation
-    leaves that token region duplicated in the body. Character-level
-    dedup is unreliable because the chunker slices at token boundaries
-    and the decoded text on either side of a seam can be asymmetric
-    (e.g. one side ends ``…|one-way|`` and the other starts
-    ``be_cc_tap_plugin…`` mid-word).
-
-    This re-encodes both sides via the chunker's tiktoken encoding,
-    finds the longest token-level overlap up to ``DEFAULT_CHUNK_OVERLAP``,
-    and returns ``curr`` with that prefix removed. Returns ``curr``
-    unchanged when no token-level overlap is found (e.g. the chunks
-    were not produced by the standard chunker, or the body has been
-    manually edited mid-chunk).
-
-    Cost: two ``tiktoken.encode`` calls and one ``decode`` per adjacent
-    chunk pair. Few ms per chunk; negligible vs the network round-trip.
-    """
-    enc = _enc()
-    prev_tokens = enc.encode(prev, disallowed_special=())
-    curr_tokens = enc.encode(curr, disallowed_special=())
-    upper = min(len(prev_tokens), len(curr_tokens), DEFAULT_CHUNK_OVERLAP)
-    for n in range(upper, 0, -1):
-        if prev_tokens[-n:] == curr_tokens[:n]:
-            return enc.decode(curr_tokens[n:])
-    return curr
-
-
 async def fetch_live_body_from_chunks(
     conn: asyncpg.Connection,
     customer_id: str,
@@ -2033,12 +2007,10 @@ async def fetch_live_body_from_chunks(
         customer_id,
         doc_id,
     )
-    if not rows:
-        return ""
-    parts: list[str] = [rows[0]["content"]]
-    for row in rows[1:]:
-        parts.append(_skip_chunk_overlap_tokens(parts[-1], row["content"]))
-    return "".join(parts)
+    return reconstruct_chunk_text(
+        (row["content"] for row in rows),
+        non_overlap_separator="",
+    )
 
 
 async def fetch_body_from_chunks_for_version(
@@ -2075,9 +2047,7 @@ async def fetch_body_from_chunks_for_version(
         doc_id,
         version,
     )
-    if not rows:
-        return ""
-    parts: list[str] = [rows[0]["content"]]
-    for row in rows[1:]:
-        parts.append(_skip_chunk_overlap_tokens(parts[-1], row["content"]))
-    return "".join(parts)
+    return reconstruct_chunk_text(
+        (row["content"] for row in rows),
+        non_overlap_separator="",
+    )

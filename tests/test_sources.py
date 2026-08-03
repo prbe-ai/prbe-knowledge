@@ -18,6 +18,8 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
+from engine.ingest.chunker import DEFAULT_CHUNK_OVERLAP, _enc, chunk_text
+from engine.shared.chunk_reconstruction import chunk_encoding
 from engine.shared.config import Settings, get_settings
 from engine.shared.db import close_pool, init_pool, raw_conn
 from engine.shared.embeddings import reset_embedder
@@ -60,6 +62,7 @@ async def _seed_doc_with_chunks(
     version: int = 1,
     title: str | None = "Test Doc",
     recorded_body_size_bytes: int | None = None,
+    source_system: str = "slack",
 ) -> None:
     """Insert a single-version document and N ordered chunks."""
     now = datetime.now(UTC)
@@ -80,16 +83,17 @@ async def _seed_doc_with_chunks(
                 acl
             ) VALUES (
                 $1, $2, $3,
-                'slack', 'msg-1', 'https://example.slack.com/archives/C/p1',
+                $4, 'msg-1', 'https://example.slack.com/archives/C/p1',
                 'raw_source', 'slack_message', 'text/plain',
-                'hash', $4, $5, 0,
-                $6, $6, $6, $6,
+                'hash', $5, $6, 0,
+                $7, $7, $7, $7,
                 '{}'::jsonb
             )
             """,
             doc_id,
             version,
             customer_id,
+            source_system,
             title,
             body_size,
             now,
@@ -192,6 +196,71 @@ async def test_sources_returns_full_reassembled_content(live_db, settings) -> No
     assert body["source_system"] == "slack"
     assert "created_at" in body
     assert "updated_at" in body
+
+
+@pytest.mark.asyncio
+async def test_sources_removes_real_chunker_overlap(live_db, settings) -> None:
+    api_key = await _seed_customer("cust-src-overlap")
+    original = "\n".join(
+        f"😀 café 漢字 row {index}: " + ("x" * ((index % 17) + 1))
+        for index in range(1000)
+    )
+    pieces = chunk_text(original)
+    assert len(pieces) >= 2
+    await _seed_doc_with_chunks(
+        "cust-src-overlap",
+        "slack:T1:C1:overlap",
+        chunks=[piece.content for piece in pieces],
+    )
+
+    resp = await _get_source(
+        "slack:T1:C1:overlap",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    await init_pool(settings)
+
+    assert resp.status_code == 200, resp.text
+    enc = chunk_encoding()
+    expected = enc.decode(enc.encode(original, disallowed_special=()))
+    assert resp.json()["content"] == expected
+
+
+@pytest.mark.asyncio
+async def test_code_graph_exact_64_token_boundary_is_preserved(live_db, settings) -> None:
+    api_key = await _seed_customer("cust-code-graph")
+    enc = chunk_encoding()
+    tokens = enc.encode(
+        " ".join(f"code_token_{index}" for index in range(400)),
+        disallowed_special=(),
+    )
+    previous = enc.decode(tokens[:160])
+    current = enc.decode(tokens[96:260])
+    assert enc.encode(previous, disallowed_special=())[-64:] == enc.encode(
+        current,
+        disallowed_special=(),
+    )[:64]
+    expected = f"{previous}\n\n{current}"
+    doc_id = "code_graph:owner/repo:path/to/file.py"
+    await _seed_doc_with_chunks(
+        "cust-code-graph",
+        doc_id,
+        chunks=[previous, current],
+        source_system="code_graph",
+    )
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    source_resp = await _get_source(doc_id, headers=headers)
+    assert source_resp.status_code == 200, source_resp.text
+    assert source_resp.json()["content"] == expected
+
+    view_resp = await _get_source_view(
+        doc_id,
+        headers=headers,
+        query="?mode=full",
+    )
+    await init_pool(settings)
+    assert view_resp.status_code == 200, view_resp.text
+    assert view_resp.json()["content"] == expected
 
 
 @pytest.mark.asyncio
@@ -388,6 +457,79 @@ async def test_source_view_full_mode_returns_whole_doc(live_db, settings) -> Non
     assert body["truncated"] is False
     assert body["next_cursor"] is None
     assert body["max_bytes"] == 12_000
+
+
+@pytest.mark.asyncio
+async def test_source_view_full_removes_real_chunker_overlap(live_db, settings) -> None:
+    api_key = await _seed_customer("cust-view-overlap")
+    original = "\n".join(
+        f"line {index:03d}: node_{index:03d} --> node_{index + 1:03d}"
+        for index in range(250)
+    )
+    pieces = chunk_text(original)
+    assert len(pieces) >= 2
+    await _seed_doc_with_chunks(
+        "cust-view-overlap",
+        "slack:T1:C1:view-overlap",
+        chunks=[piece.content for piece in pieces],
+    )
+
+    resp = await _get_source_view(
+        "slack:T1:C1:view-overlap",
+        headers={"Authorization": f"Bearer {api_key}"},
+        query="?mode=full",
+    )
+    await init_pool(settings)
+
+    assert resp.status_code == 200, resp.text
+    enc = chunk_encoding()
+    expected = enc.decode(enc.encode(original, disallowed_special=()))
+    assert resp.json()["content"] == expected
+
+    # Compatibility aliases remain available from the historical chunker
+    # module even though their implementation now lives in engine.shared.
+    assert DEFAULT_CHUNK_OVERLAP == 64
+    assert _enc() is enc
+
+    second_chunk = pieces[1].content
+    second_start = expected.index(second_chunk)
+    expected_line_start = expected[:second_start].count("\n") + 1
+    expected_line_end = expected_line_start + len(second_chunk.splitlines()) - 1
+
+    chunk_resp = await _get_source_view(
+        "slack:T1:C1:view-overlap",
+        headers={"Authorization": f"Bearer {api_key}"},
+        query="?mode=chunk&chunk_index=1&limit_lines=100",
+    )
+    assert chunk_resp.status_code == 200, chunk_resp.text
+    chunk_body = chunk_resp.json()
+    assert chunk_body["content"] == "\n".join(second_chunk.splitlines())
+    assert chunk_body["sections"] == [
+        {
+            "chunk_index": 1,
+            "line_start": expected_line_start,
+            "line_end": expected_line_end,
+            "score": None,
+        }
+    ]
+
+    first_words = set(pieces[0].content.split())
+    search_term = next(
+        word
+        for word in second_chunk.split()
+        if word.startswith("node_") and word not in first_words
+    )
+    search_resp = await _get_source_view(
+        "slack:T1:C1:view-overlap",
+        headers={"Authorization": f"Bearer {api_key}"},
+        query=f"?mode=search&query={search_term}&limit_lines=100",
+    )
+    await init_pool(settings)
+    assert search_resp.status_code == 200, search_resp.text
+    first_section = search_resp.json()["sections"][0]
+    assert first_section["chunk_index"] == 1
+    assert first_section["line_start"] == expected_line_start
+    assert first_section["line_end"] == expected_line_end
 
 
 @pytest.mark.asyncio
