@@ -1233,6 +1233,29 @@ SEARCH_AGENT_MAX_CONTEXT_TOKENS = (
     - SEARCH_AGENT_CONTEXT_SAFETY_MARGIN
 )
 
+# FAIL FAST on a config that cannot work. All three terms above are env-
+# overridable so an operator can retune without a release, which also means a
+# typo is a realistic path: `SEARCH_AGENT_MAX_OUTPUT_TOKENS=200000` yields a
+# budget of -78928. Nothing downstream would raise -- `_enforce_context_budget`
+# would just evict every tool result on every turn and send anyway, so retrieval
+# quality collapses silently and looks like a model regression. A pod that
+# refuses to start naming the three knobs is far cheaper to diagnose.
+#
+# The floor is the prefanout budget: below that the turn-1 evidence dump alone
+# cannot fit, so the agent has nothing to reason over and the config is a
+# mistake however it was reached.
+if SEARCH_AGENT_MAX_CONTEXT_TOKENS < SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET:
+    raise ValueError(
+        "search-agent token budget is unusable: "
+        f"window({SEARCH_AGENT_MODEL_CONTEXT_WINDOW}) "
+        f"- output({SEARCH_AGENT_MAX_OUTPUT_TOKENS}) "
+        f"- margin({SEARCH_AGENT_CONTEXT_SAFETY_MARGIN}) "
+        f"= {SEARCH_AGENT_MAX_CONTEXT_TOKENS}, which is below the prefanout "
+        f"budget ({SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET}). Lower "
+        "SEARCH_AGENT_MAX_OUTPUT_TOKENS or SEARCH_AGENT_CONTEXT_SAFETY_MARGIN, "
+        "or raise SEARCH_AGENT_MODEL_CONTEXT_WINDOW to match the model."
+    )
+
 # fetch_chunk_window: neighbors returned on each side of a matched chunk.
 # The matched chunk is already surfaced by the pre-fan-out, so this pulls
 # just enough adjacent context to repair fixed-window chunk fragmentation

@@ -15,6 +15,7 @@ no live DB. Covers:
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 from typing import Any, get_args
 from unittest.mock import AsyncMock, patch
@@ -32,9 +33,9 @@ from engine.retrieval.agent.loop import (
     _empty_passthrough,
     _enforce_context_budget,
     _extract_cache_hit_rate,
-    _message_tokens,
     _format_inferred_chains,
     _has_citable_prefanout_evidence,
+    _message_tokens,
     _parse_terminal_args,
     _render_prefanout_budgeted,
     _run_turn,
@@ -2025,6 +2026,30 @@ def test_context_budget_reserves_the_completion_within_the_window() -> None:
     # And the input cap must still leave room to be useful, not collapse to
     # something that evicts the prefanout on every query.
     assert SEARCH_AGENT_MAX_CONTEXT_TOKENS > SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET * 2
+
+
+def test_an_unusable_token_budget_fails_fast_at_import() -> None:
+    """A typo in any of the three env knobs must refuse to boot, not degrade.
+
+    `SEARCH_AGENT_MAX_OUTPUT_TOKENS=200000` derives a budget of -78928. Nothing
+    downstream raises on that: `_enforce_context_budget` evicts every tool result
+    on every turn and sends anyway, so retrieval quality collapses silently and
+    reads as a model regression. Fail fast naming the knobs instead.
+    """
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-c", "import engine.shared.constants"],
+        env={**os.environ, "SEARCH_AGENT_MAX_OUTPUT_TOKENS": "200000"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode != 0, "an unusable budget booted anyway"
+    # Names all three knobs, so the operator does not have to guess which one.
+    assert "token budget is unusable" in proc.stderr
+    assert "SEARCH_AGENT_MAX_OUTPUT_TOKENS" in proc.stderr
 
 
 def test_enforce_context_budget_charges_the_tool_schemas() -> None:
