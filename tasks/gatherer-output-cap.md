@@ -65,6 +65,13 @@ env-overridable.
       `tests/integration` against a down Postgres. Never compare failure sets
       across differently-loaded runs.
 
-- [ ] Full non-integration suite on a quiet machine before landing (the run
-      above is the `-k` selection, not the whole suite; `tests/retrieval/agent/`
-      is separately green at 206 passed).
+- [x] FULL non-integration suite, both sides, quiet machine:
+
+      origin/main   55 failed, 2617 passed, 22 skipped  (8:53)
+      this branch   55 failed, 2621 passed, 22 skipped  (10:04)
+
+      Failure sets diffed by test id: ZERO only-on-branch, ZERO only-on-
+      baseline. Identical 55. The +4 passed are exactly the four tests added
+      here. No failure touches loop.py / models.py / constants.py; the 55 are
+      Postgres/MinIO-bound (test_related_entities 11, test_backfill 4,
+      test_seed_db 4, slack/storage/graph-writer handlers).
