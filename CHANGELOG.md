@@ -6,6 +6,29 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Changed
+
+- The gatherer now cuts a stalled Cerebras turn at **5s** (was 70s) and
+  finishes the run on Fireworks, sticky for every remaining turn. Cerebras
+  latency is bimodal — measured over 105 production turns, 87.6% land at
+  mean 971ms (p90 1.6s, max 3.9s) and 12.4% stall at 59.5-63.8s with nothing
+  in between — so a 5s deadline separates the two modes cleanly without
+  truncating healthy traffic. Waiting the stall out was the old strategy; at a
+  mean 2.23 turns/retrieval a 12.4% per-turn stall compounds to ~30% of
+  retrievals degrading, and research-os abandons /v1/search at 30s, so a 60s
+  "success" was already an empty result set for that caller. The gateway's own
+  Cerebras -> Fireworks route fallback provably never fires (stalled turns
+  carry `x-litellm-attempted-fallbacks: 0`), so the loop owns the hop:
+  `agent.provider_failover` records it. Set
+  `SEARCH_AGENT_FALLBACK_INFERENCE_MODEL=""` to disable failover on
+  single-provider installs.
+- `SEARCH_AGENT_LOOP_TIMEOUT_SECONDS` is now **60s** (was 90s) and bounds the
+  WHOLE gatherer stage, not just the loop: grounding + extraction +
+  pre-fan-out (~4s) are subtracted from it rather than added to it, so the
+  number is a ceiling a caller can size its own HTTP timeout against. On
+  expiry the stage still returns the deterministic pre-fan-out evidence via
+  `_backfill_recall_floor` — a real result set, not an error.
+
 ### Fixed
 
 - `sources` is now an applied filter on `/retrieve` and `/query`. It was

@@ -1385,9 +1385,17 @@ async def test_fatal_error_after_exploration_stashes_query_trace_summary(
         cached_tokens=75,
     )
 
+    # Turn 2 fails on BOTH providers. A single failure is no longer fatal --
+    # the loop fails over to SEARCH_AGENT_FALLBACK_INFERENCE_MODEL and retries
+    # the turn once. "Fatal" now means the fallback died too, which is the
+    # condition this test is about.
     with patch(
         "engine.retrieval.agent.loop.acompletion",
-        new=AsyncMock(side_effect=[turn_1, LLMError("unknown provider failure")]),
+        new=AsyncMock(side_effect=[
+            turn_1,
+            LLMError("unknown provider failure"),
+            LLMError("unknown provider failure"),
+        ]),
     ), patch(
         "engine.retrieval.agent.loop.dispatch_tool_call",
         new=AsyncMock(return_value={"sub_queries": []}),
@@ -1405,9 +1413,10 @@ async def test_fatal_error_after_exploration_stashes_query_trace_summary(
     assert fake_request.state.failure_recovered is False
     assert fake_request.state.search_agent_status == "fatal_provider_error"
     assert fake_request.state.search_agent_gathered is None
+    # Two failed attempts for one failed turn: the primary and the failover.
     assert len(
         fake_request.state.search_agent_loop_state.failed_turn_latencies_ms
-    ) == 1
+    ) == 2
     state = fake_request.state.search_agent_loop_state
     timing = fake_request.state.search_agent_timing
     assert timing["agent_failed_llm_ms"] == pytest.approx(
@@ -1475,9 +1484,11 @@ async def test_transient_error_after_exploration_preserves_loop_ledger_and_laten
         provider="fireworks_ai",
     )
 
+    # Both providers fail on turn 2 (see the fatal-error test): one failure
+    # alone now just moves the run onto the fallback.
     with patch(
         "engine.retrieval.agent.loop.acompletion",
-        new=AsyncMock(side_effect=[turn_1, provider_error]),
+        new=AsyncMock(side_effect=[turn_1, provider_error, provider_error]),
     ), patch(
         "engine.retrieval.agent.loop.dispatch_tool_call",
         new=AsyncMock(return_value={"sub_queries": []}),
@@ -1491,7 +1502,8 @@ async def test_transient_error_after_exploration_preserves_loop_ledger_and_laten
     assert state.turn_count == 1
     assert state.tools_fired == ["search"]
     assert len(state.turn_latencies_ms) == 1
-    assert len(state.failed_turn_latencies_ms) == 1
+    # Primary attempt + failover attempt, both failed.
+    assert len(state.failed_turn_latencies_ms) == 2
     timing = fake_request.state.search_agent_timing
     assert timing["agent_failed_llm_ms"] == pytest.approx(
         sum(state.failed_turn_latencies_ms)
