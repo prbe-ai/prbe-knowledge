@@ -1328,35 +1328,73 @@ SEARCH_AGENT_EXTRACTOR_MAX_TOKENS = int(
 # alone does it, which is why isolated probes look healthy and only real
 # gatherer turns hang.
 #
-# 70s, raised from 20s (2026-08-02). Production logs showed 3 of 12 gatherer
-# runs degrading, and BOTH provider failures were this deadline firing --
-# `status_code=408, timeout value=20.0, time taken=20.01` -- not 429s, not the
-# gateway. At 20s every one of those 61.6s stalls was cut and returned the
-# uncurated pre-fan-out pool instead of an answer.
+# 5s, CUT FROM 70s (2026-08-04), and the strategy changed with it: this is no
+# longer "how long are we willing to wait for Cerebras to unstick", it is "how
+# long before we give up on Cerebras and finish the run on Fireworks".
 #
-# Why 70 specifically: it clears the measured 61.6s stall, and it stays
-# strictly under SEARCH_AGENT_LOOP_TIMEOUT_SECONDS (90s) with ~20s left for a
-# follow-up turn. Multi-turn runs are common (turns=2 and turns=3 both appear
-# in normal traffic), so a per-turn budget equal to the loop cap would let a
-# single turn consume the whole loop and silently make the agent single-turn.
+# Waiting was the wrong trade. Measured over 105 production turns:
 #
-# What this does NOT fix, and the caller asymmetry:
-#   * MCP callers (search_knowledge) wait `knowledge_timeout_s = 180s`, so a
-#     70s turn fits comfortably and they now get a curated answer where they
-#     previously got the raw pool.
-#   * research-os gives /v1/search 30s total (ENGINE_TIMEOUT_SECONDS, defined
-#     in that repo). A turn over ~14s never fits there regardless of what this
-#     is set to, so that path is unchanged -- 20s did not help it either.
-#   * The root cause is upstream: pre-fan-out pulls ~300 chunks (median
-#     19.5s, max 27.5s BEFORE the model runs), which is what builds the 300KB
-#     prompt that triggers the stall. This value buys better answers today;
-#     capping pre-fan-out is the actual fix and would help every caller.
-SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 70.0
+#     healthy turns (n=92, 87.6%)   mean 971ms   p50 812ms   p90 1.6s   max 3.9s
+#     stalled turns (n=13, 12.4%)   59.5s - 63.8s, NOTHING in between
+#
+# The distribution is bimodal with a 55-second empty gap, so a deadline
+# anywhere in 4s..59s separates the two modes perfectly. 5s sits above the
+# healthy max (3.9s) with headroom and cuts every stall. It cannot truncate
+# healthy traffic: a turn slower than 5s has never been observed to then
+# succeed quickly -- it goes to ~60s.
+#
+# Why waiting out the stall did not work. The 70s value assumed the stalled
+# turn eventually returns something useful, and it does (finish_reason
+# tool_calls at ~60s). But turns are per-RETRIEVAL dice rolls: at a mean 2.23
+# turns/retrieval, a 12.4% per-turn stall rate compounds to ~30% of retrievals
+# degrading. And research-os hangs up at 30s (ENGINE_TIMEOUT_SECONDS), so for
+# that caller a 60s success is indistinguishable from a failure -- it had
+# already returned an empty result set.
+#
+# The failover this enables is OURS, not the gateway's. The proxy's
+# Cerebras -> Fireworks route fallback provably never fires: stalled turns end
+# at exactly this client deadline carrying `x-litellm-attempted-fallbacks: 0`,
+# never at the gateway's own 12s deployment deadline (see the block above).
+# So the loop owns it: on the first stall it flips to
+# SEARCH_AGENT_FALLBACK_INFERENCE_MODEL and STAYS there for the rest of the
+# run -- see `_run_turn`. Retrying Cerebras every turn would re-pay this 5s on
+# each one.
+#
+# Caller budgets this now fits inside:
+#   * research-os /v1/search: 30s total. Worst case is now ~4s deterministic
+#     + one 5s cut + Fireworks turns, which fits. It did not before.
+#   * MCP search_knowledge: 180s. Unaffected; it just stops spending 60s of
+#     that on a stalled provider.
+SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 5.0
 
-# Overall agent loop cap. Prevents pathological queries from monopolising
-# a worker. p99 should land far below this; timeout degrades to the citable
-# pre-fan-out evidence already retrieved by the harness.
-SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 90.0
+# Per-turn deadline once the run has failed over. Fireworks is the same
+# gpt-oss-120b with the same tool-calling contract and does not exhibit the
+# large-context + tool-calling stall, so this is a normal generous deadline,
+# not a stall cut. Mirrors the gateway's own Fireworks route timeout (12s).
+SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS = 12.0
+
+# Where a stalled run finishes. Must be a model id the gateway's modelList
+# resolves -- `accounts/fireworks/*` expands to the upstream
+# `fireworks_ai/accounts/fireworks/...` route. Empty string disables failover
+# entirely (self-hosted installs with no second provider), in which case a
+# stalled turn just raises as it did before.
+SEARCH_AGENT_FALLBACK_INFERENCE_MODEL = os.getenv(
+    "SEARCH_AGENT_FALLBACK_INFERENCE_MODEL",
+    "accounts/fireworks/models/gpt-oss-120b",
+)
+
+# Overall agent loop cap, and a HARD ceiling on the whole gatherer stage:
+# `run_gatherer` converts this into a deadline measured from its own entry, so
+# grounding + extraction + pre-fan-out (~4s) come OUT of this budget rather
+# than being added to it. Whatever happens, the stage returns within this many
+# seconds; timeout degrades to the citable pre-fan-out evidence the harness
+# already retrieved (`_backfill_recall_floor` off `state.prefanout`), which is
+# a real result set, not an error.
+#
+# 60s, cut from 90s (2026-08-04). With a 5s primary cut and a 12s fallback
+# deadline, a 3-turn run lands ~40s worst case, so 60s is the backstop for
+# pathological cases rather than a routine ceiling.
+SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 60.0
 
 # Fraction of gatherer runs whose full per-turn transcript gets persisted
 # to R2 alongside the query_traces summary row. 1.0 = persist every run.

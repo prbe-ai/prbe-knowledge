@@ -72,6 +72,8 @@ from engine.retrieval.router import (
 from engine.shared.constants import (
     DEFAULT_RECENCY_HALF_LIFE_DAYS,
     SEARCH_AGENT_EXTENSION_GRANT,
+    SEARCH_AGENT_FALLBACK_INFERENCE_MODEL,
+    SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS,
     SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
     SEARCH_AGENT_HARD_CAP,
     SEARCH_AGENT_INFERENCE_MODEL,
@@ -192,6 +194,15 @@ class LoopState:
     # smoking gun, but no fingerprint was captured). None when the
     # provider omits it for that turn.
     system_fingerprints_per_turn: list[str | None] = field(default_factory=list)
+    # Which provider this run is talking to, and whether it has already been
+    # forced off the primary. STICKY by design: once Cerebras has stalled and
+    # cost the run a 5s cut, every remaining turn goes straight to the
+    # fallback. Retrying the primary per-turn would re-pay that cut on each
+    # one, and at a mean 2.23 turns/retrieval the stall is a per-turn dice
+    # roll -- re-entering it is how a 12.4% per-turn failure rate became ~30%
+    # of retrievals degrading. Reset per run, never shared between requests.
+    llm_model: str = field(default_factory=lambda: SEARCH_AGENT_INFERENCE_MODEL)
+    llm_failed_over: bool = False
     # Resolved search_options from the LLM extractor — sort directive +
     # downstream filter args the harness applied to the pre-fan-out. Kept
     # on state so the trace blob captures intent without re-running the
@@ -218,6 +229,26 @@ class LoopState:
     request_discovery: bool = False
     request_source_keys_include_keyless: bool = False
     request_per_source_top_k: int | None = None
+
+
+# Floor for the remaining-loop budget. Setup (grounding + extraction +
+# pre-fan-out) should never consume the whole stage deadline, but if it ever
+# does, run at least one turn's worth rather than handing wait_for a
+# non-positive timeout that cancels the loop before it starts a single turn.
+_MIN_LOOP_BUDGET_SECONDS = 5.0
+
+
+def _remaining_loop_budget(stage_started_at: float) -> float:
+    """Seconds the agent loop may still run, given the whole-stage deadline.
+
+    SEARCH_AGENT_LOOP_TIMEOUT_SECONDS is a ceiling on the ENTIRE gatherer
+    stage, so the setup already spent (grounding + extraction + pre-fan-out)
+    comes out of it. Passing the raw constant to `wait_for` would instead make
+    the real ceiling `setup + cap`, which is what a caller sizing its own HTTP
+    timeout against this number would get wrong.
+    """
+    spent = time.perf_counter() - stage_started_at
+    return max(_MIN_LOOP_BUDGET_SECONDS, SEARCH_AGENT_LOOP_TIMEOUT_SECONDS - spent)
 
 
 # ============================================================
@@ -938,7 +969,7 @@ async def _run_turn(state: LoopState) -> Any:
     # case; this catches deep multi-doc paging).
     _enforce_context_budget(state)
     call_kwargs: dict[str, Any] = {
-        "model": SEARCH_AGENT_INFERENCE_MODEL,
+        "model": state.llm_model,
         "messages": state.messages,
         "tools": tool_definitions(),
         # Greedy decoding. Without this, Fireworks defaults to
@@ -984,7 +1015,16 @@ async def _run_turn(state: LoopState) -> Any:
         # The practical consequence: this number bounds a provider stall, so it
         # must stay small enough to fit the caller's budget and large enough to
         # let a failover hop land. See SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS.
-        "timeout": SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
+        #
+        # Post-failover turns get the fallback's own (longer) deadline: the 5s
+        # value is a Cerebras stall cut, not a statement about how fast any
+        # provider should be, and applying it to Fireworks would cut healthy
+        # traffic on a provider that does not exhibit the stall.
+        "timeout": (
+            SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS
+            if state.llm_failed_over
+            else SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS
+        ),
         # Bound the completion. Providers admit on `input + max_completion_tokens`,
         # so omitting this books the model maximum (~40k) on top of an input the
         # budget above had already trimmed -- which is how a request whose input
@@ -1014,9 +1054,50 @@ async def _run_turn(state: LoopState) -> Any:
             trace_id=state.trace_id,
             turn=state.turn_count,
             elapsed_ms=round(elapsed_ms, 1),
+            model=call_kwargs["model"],
             error=str(exc),
         )
-        raise
+        # First failure on the primary: finish this run on the fallback
+        # provider instead of surfacing a degraded result. The gateway's own
+        # route fallback does not fire (`x-litellm-attempted-fallbacks: 0` on
+        # every stalled turn), so the loop owns the hop.
+        #
+        # ONE retry, and only off the primary. A fallback failure re-raises:
+        # both providers being down is a real outage, and replaying this
+        # high-token turn a third time only spends the loop deadline that the
+        # pre-fan-out degrade path needs.
+        if state.llm_failed_over or not SEARCH_AGENT_FALLBACK_INFERENCE_MODEL:
+            raise
+        state.llm_failed_over = True
+        state.llm_model = SEARCH_AGENT_FALLBACK_INFERENCE_MODEL
+        log.warning(
+            "agent.provider_failover",
+            customer_id=state.customer_id,
+            trace_id=state.trace_id,
+            turn=state.turn_count,
+            from_model=call_kwargs["model"],
+            to_model=state.llm_model,
+            after_ms=round(elapsed_ms, 1),
+            reason=str(exc)[:200],
+        )
+        call_kwargs["model"] = state.llm_model
+        call_kwargs["timeout"] = SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS
+        t_turn = time.perf_counter()
+        try:
+            resp = await acompletion(**call_kwargs)
+        except LLMError as fallback_exc:
+            elapsed_ms = (time.perf_counter() - t_turn) * 1000
+            state.failed_turn_latencies_ms.append(elapsed_ms)
+            log.warning(
+                "agent.turn_llm_error",
+                customer_id=state.customer_id,
+                trace_id=state.trace_id,
+                turn=state.turn_count,
+                elapsed_ms=round(elapsed_ms, 1),
+                model=call_kwargs["model"],
+                error=str(fallback_exc),
+            )
+            raise
 
     elapsed_ms = (time.perf_counter() - t_turn) * 1000
     state.turn_count += 1
@@ -1811,6 +1892,12 @@ async def run_gatherer(
 
     trace_id = req.trace_id or new_trace_id()
     timing: dict[str, float] = {}
+    # Deadline for the WHOLE gatherer stage, not just the loop. Grounding,
+    # extraction and pre-fan-out (~4s together) are spent before the loop
+    # starts, so budgeting them separately would let the stage run to
+    # loop_cap + setup. Anchored here so SEARCH_AGENT_LOOP_TIMEOUT_SECONDS is
+    # a ceiling a caller can actually rely on.
+    t_stage_start = time.perf_counter()
 
     # Step 1 — SEQUENTIAL grounding → LLM extraction (bundle as context).
     t_grounding = time.perf_counter()
@@ -2127,10 +2214,16 @@ async def run_gatherer(
         )
 
     gathered: GathererOutput | None = None
+    # What is LEFT of the stage budget after setup. Floored at a small positive
+    # value rather than 0: a non-positive wait_for would cancel the loop before
+    # it ran a single turn, and an already-blown budget should still degrade
+    # through the normal loop_timeout path (which backfills from the
+    # pre-fan-out) rather than take a different branch.
+    loop_budget = _remaining_loop_budget(t_stage_start)
     try:
         gathered = await asyncio.wait_for(
             _drive_loop(state),
-            timeout=SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
+            timeout=loop_budget,
         )
         if gathered is None:
             status = "schema_violation"
