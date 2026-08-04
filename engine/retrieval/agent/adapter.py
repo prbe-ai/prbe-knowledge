@@ -357,6 +357,8 @@ async def _enforce_scope_on_chunks(
     source_keys: list[str] | None,
     doc_types: list[str] | None,
     trace_id: str,
+    source_keys_include_keyless: bool = False,
+    sources: list[str] | None = None,
 ) -> None:
     """Hard scope gate at the response choke point. Mutates gathered.chunks.
 
@@ -378,7 +380,8 @@ async def _enforce_scope_on_chunks(
         async with with_tenant(customer_id) as conn:
             rows = await conn.fetch(
                 """
-                SELECT doc_id, doc_type, metadata->>'source_key' AS source_key
+                SELECT doc_id, doc_type, source_system,
+                       metadata->>'source_key' AS source_key
                 FROM documents
                 WHERE customer_id = $1 AND doc_id = ANY($2::text[])
                   AND valid_to IS NULL
@@ -387,9 +390,18 @@ async def _enforce_scope_on_chunks(
                 doc_ids,
             )
         for r in rows:
-            if source_keys and r["source_key"] not in source_keys:
+            if source_keys and not (
+                r["source_key"] in source_keys
+                # Keyless tolerance must match what the channels admitted
+                # (helpers.source_key_predicate). Without this the gate
+                # dropped every connector doc the request had explicitly
+                # opted into, emptying the response.
+                or (source_keys_include_keyless and r["source_key"] is None)
+            ):
                 continue
             if doc_types and r["doc_type"] not in doc_types:
+                continue
+            if sources and r["source_system"] not in sources:
                 continue
             allowed.add(r["doc_id"])
     kept = [c for c in gathered.chunks if c.doc_id and c.doc_id in allowed]
@@ -402,6 +414,8 @@ async def _enforce_scope_on_chunks(
             dropped=dropped,
             kept=len(kept),
             source_keys=source_keys,
+            source_keys_include_keyless=source_keys_include_keyless,
+            sources=sources,
             doc_types=doc_types,
         )
     gathered.chunks = kept
@@ -420,6 +434,8 @@ async def to_query_response(
     status: GathererStatus | None,
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
+    source_keys_include_keyless: bool = False,
+    sources: list[str] | None = None,
 ) -> RetrieveResponse:
     """Wrap a GathererOutput in the existing RetrieveResponse shape.
 
@@ -479,13 +495,15 @@ async def to_query_response(
     caller genuinely has no gatherer outcome (non-gatherer paths, unit tests);
     that reports not-degraded, which is correct for those callers.
     """
-    if (source_keys or doc_types) and customer_id:
+    if (source_keys or doc_types or sources) and customer_id:
         await _enforce_scope_on_chunks(
             customer_id,
             gathered,
             source_keys=source_keys,
             doc_types=doc_types,
             trace_id=trace_id,
+            source_keys_include_keyless=source_keys_include_keyless,
+            sources=sources,
         )
 
     doc_evidence = _build_doc_to_graph_evidence(prefanout)
@@ -695,6 +713,12 @@ async def to_query_response(
         score_semantics="ordinal_rank",
         total_candidates=len(results),
         router_hit_cache=False,
+        # Only `sources` is echoed. `doc_types` here is the CALLER's
+        # request_doc_types, but the filter actually applied downstream is
+        # `effective_doc_types` (request_doc_types or the extractor's
+        # inference), so echoing this value would report None while a
+        # filter was in force — the same lie the echo exists to prevent.
+        applied_sources=sources,
         timing_ms=timing_ms,
         trace_id=trace_id,
         confidence_breakdown=confidence_breakdown,

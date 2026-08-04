@@ -109,6 +109,7 @@ async def graph_search(
     sort_by: Literal["relevance", "recency"] = "relevance",
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    sources: list[str] | None = None,
 ) -> list[GraphHit]:
     """Return chunks from documents within 1 hop of any matching entity node.
 
@@ -192,6 +193,11 @@ async def graph_search(
         if author_ids:
             params.append(author_ids)
             author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
+
+        source_filter = ""
+        if sources:
+            params.append(sources)
+            source_filter = f"AND d.source_system = ANY(${len(params)}::text[])"
 
         source_key_filter = source_key_predicate(
             params, source_keys, alias="d",
@@ -341,6 +347,7 @@ async def graph_search(
               {doc_type_filter}
               {visibility_filter}
               {author_filter}
+              {source_filter}
               {source_key_filter}
             GROUP BY c.chunk_id, c.doc_id, c.chunk_index, d.version,
                      d.source_system, d.source_url, d.title, d.author_id,

@@ -741,6 +741,12 @@ class RetrieveResponse(BaseModel):
     applied_entity_filter: dict[str, object] | None = None
     applied_mode: str | None = None
     applied_doc_types: list[str] | None = None
+    # Echo of the request's `sources` scope, mirroring applied_doc_types.
+    # This exists because `sources` was silently dropped on the gatherer
+    # path for months and nothing in the response could show it: a caller
+    # could not distinguish "filtered, nothing matched" from "never
+    # filtered at all". If you add a request-level filter, echo it here.
+    applied_sources: list[str] | None = None
     applied_min_confidence: str | None = None
     extracted_entities: list[dict[str, object]] = Field(default_factory=list)
     aggregation: dict[str, object] | None = None

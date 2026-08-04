@@ -8,6 +8,26 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- `sources` is now an applied filter on `/retrieve` and `/query`. It was
+  accepted and enum-validated on `QueryRequest` but never threaded into the
+  gatherer path — `execute_search` had no `sources` parameter at all, so the
+  only consumer was `list_pipeline`, which is dead for `/retrieve` post-
+  cutover. Live proof: `sources=["claude_code"]` returned 10 github docs and
+  zero transcripts. The loop now carries `request_sources` into the pre-fan-out
+  and injects it into every in-loop `search` dispatch (same contract as
+  `source_keys` / `doc_types`: the agent reformulates queries but cannot widen
+  the caller's scope), all four channels filter on `d.source_system` before the
+  LIMIT, and the adapter's scope gate re-verifies it. Responses now echo
+  `applied_sources` so a dropped filter is visible instead of silent.
+- Keyless tolerance now reaches the scope GATES, not just the channels.
+  `source_keys_include_keyless` admitted connector docs (github, claude_code)
+  into the retrieval channels while `_doc_scope_sql` and the adapter's
+  `_enforce_scope_on_chunks` kept applying the hard filter, so the agent
+  retrieved github hits it was then refused permission to read
+  (`agent.fetch_doc_scope_refused`) and every one was dropped at the response
+  choke point (`dropped=10, kept=0`). A mixed keyed+keyless request therefore
+  returned an empty result set with a non-zero candidate count, and the loop
+  reported `degraded=true, degraded_reason="schema_violation"`.
 - Full-source reads now remove standard 64-token chunker overlap while
   provenance-gating pre-chunked `code_graph` rows so their boundaries remain
   intact. Reconstruction also repairs Unicode replacement characters created

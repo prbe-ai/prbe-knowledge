@@ -25,6 +25,7 @@ _TOP_LEVEL_DROP = frozenset(
         "applied_entity_filter",
         "applied_mode",
         "applied_doc_types",
+        "applied_sources",
         "aggregation",
         "router_hit_cache",
     }

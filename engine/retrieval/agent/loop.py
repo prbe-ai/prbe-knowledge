@@ -205,6 +205,12 @@ class LoopState:
     # keeps the dispatch arguments byte-identical to pre-filter behavior.
     request_source_keys: list[str] | None = None
     request_doc_types: list[str] | None = None
+    # QueryRequest.sources. Same contract as the two above: the tool schema
+    # does not expose it, so the loop injects it on every dispatch. It was
+    # accepted and validated but never threaded into this path, which made
+    # `sources` a silent no-op on /retrieve and left corpus-scoped callers
+    # (research-os transcripts, github) post-filtering a diluted pool.
+    request_sources: list[str] | None = None
 
     # QueryRequest.discovery. Widens the graph channel's budget on every
     # in-loop `search` dispatch (not exposed on the tool schema — the agent
@@ -1145,11 +1151,18 @@ async def _execute_tool_call(
             arguments["source_keys"] = state.request_source_keys
         if state.request_doc_types:
             arguments["doc_types"] = state.request_doc_types
+        # Keyless tolerance travels WITH source_keys to every scope-gated
+        # tool, not just `search`. When it did not, the content tools
+        # refused the very connector docs `search` had just returned
+        # (agent.fetch_doc_scope_refused on github docs the caller asked
+        # for), so the loop could see them but never read or emit them.
+        if state.request_source_keys_include_keyless:
+            arguments["source_keys_include_keyless"] = True
     if name == "search" and state.request_discovery:
         arguments["discovery"] = True
     if name == "search":
-        if state.request_source_keys_include_keyless:
-            arguments["source_keys_include_keyless"] = True
+        if state.request_sources:
+            arguments["sources"] = state.request_sources
         if state.request_per_source_top_k is not None:
             arguments["per_source_top_k"] = state.request_per_source_top_k
 
@@ -1879,6 +1892,7 @@ async def run_gatherer(
     # unfiltered requests byte-identical to pre-scope behavior.
     request_source_keys = req.source_keys or None
     request_doc_types = req.doc_types or None
+    request_sources = [s.value for s in req.sources] if req.sources else None
     request_discovery = bool(req.discovery)
     request_source_keys_include_keyless = bool(req.source_keys_include_keyless)
     request_per_source_top_k = req.per_source_top_k
@@ -1928,6 +1942,7 @@ async def run_gatherer(
         sort_by=search_options.sort,
         doc_types=effective_doc_types,
         source_keys=request_source_keys,
+        sources=request_sources,
         discovery=request_discovery,
         source_keys_include_keyless=request_source_keys_include_keyless,
         per_source_top_k=request_per_source_top_k,
@@ -1973,6 +1988,7 @@ async def run_gatherer(
         pre_fanout_author_ids=list(author_ids),
         request_source_keys=request_source_keys,
         request_doc_types=request_doc_types,
+        request_sources=request_sources,
         request_discovery=request_discovery,
         request_source_keys_include_keyless=request_source_keys_include_keyless,
         request_per_source_top_k=request_per_source_top_k,
@@ -2060,6 +2076,8 @@ async def run_gatherer(
             top_k_related=req.top_k_related,
             source_keys=request_source_keys,
             doc_types=request_doc_types,
+            source_keys_include_keyless=request_source_keys_include_keyless,
+            sources=request_sources,
             status=status,
         )
 
@@ -2103,6 +2121,8 @@ async def run_gatherer(
             top_k_related=req.top_k_related,
             source_keys=request_source_keys,
             doc_types=request_doc_types,
+            source_keys_include_keyless=request_source_keys_include_keyless,
+            sources=request_sources,
             status=status,
         )
 
@@ -2304,6 +2324,8 @@ async def run_gatherer(
         top_k_related=req.top_k_related,
         source_keys=request_source_keys,
         doc_types=request_doc_types,
+        source_keys_include_keyless=request_source_keys_include_keyless,
+        sources=request_sources,
         status=status,
     )
 
