@@ -86,6 +86,7 @@ async def inferred_edge_search(
     doc_types: list[str] | None = None,
     source_keys: list[str] | None = None,
     source_keys_include_keyless: bool = False,
+    sources: list[str] | None = None,
 ) -> list[InferredEdgeHit]:
     """Walk INFERRED Doc-Doc edges from `top_doc_ids` and return up to
     `top_k` linked documents.
@@ -133,6 +134,11 @@ async def inferred_edge_search(
     if doc_types:
         params.append(doc_types)
         doc_type_filter_sql = f"AND d.doc_type = ANY(${len(params)}::text[])"
+
+    source_filter_sql = ""
+    if sources:
+        params.append(sources)
+        source_filter_sql = f"AND d.source_system = ANY(${len(params)}::text[])"
 
     source_key_filter_sql = source_key_predicate(
         params, source_keys, alias="d",
@@ -254,6 +260,7 @@ async def inferred_edge_search(
         WHERE nd.doc_id <> ALL($2::text[])  -- exclude top_doc_ids themselves
           {author_filter_sql}
           {doc_type_filter_sql}
+          {source_filter_sql}
           {source_key_filter_sql}
         ORDER BY {order_by_sql}
         LIMIT $3

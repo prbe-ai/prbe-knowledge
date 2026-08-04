@@ -154,17 +154,31 @@ def _doc_scope_sql(
     alias: str,
     source_keys: list[str] | None,
     doc_types: list[str] | None,
+    source_keys_include_keyless: bool = False,
 ) -> str:
     """Append scope params and return AND-predicates against a documents alias.
 
     Same predicates the retrieval channels apply (request-level
     QueryRequest.source_keys / .doc_types hard scope). Mutates `params`
     in place; returns '' when no scope is set.
+
+    `source_keys_include_keyless` mirrors `helpers.source_key_predicate`: it
+    admits keyless docs (connector-ingested — github, claude_code) alongside
+    the keyed ones. It MUST track that helper. When the channels admitted a
+    keyless doc and this gate did not, the agent retrieved github hits it was
+    then forbidden to read or emit, and the caller got an empty result set
+    with a non-zero candidate count.
     """
     parts: list[str] = []
     if source_keys:
         params.append(source_keys)
-        parts.append(f"AND {alias}.metadata->>'source_key' = ANY(${len(params)}::text[])")
+        keyed = f"{alias}.metadata->>'source_key' = ANY(${len(params)}::text[])"
+        if source_keys_include_keyless:
+            parts.append(
+                f"AND ({keyed} OR {alias}.metadata->>'source_key' IS NULL)"
+            )
+        else:
+            parts.append(f"AND {keyed}")
     if doc_types:
         params.append(doc_types)
         parts.append(f"AND {alias}.doc_type = ANY(${len(params)}::text[])")
@@ -315,6 +329,7 @@ async def execute_search(
     sort_by: Literal["relevance", "recency"] = "relevance",
     doc_types: list[str] | None = None,
     source_keys: list[str] | None = None,
+    sources: list[str] | None = None,
     discovery: bool = False,
     source_keys_include_keyless: bool = False,
     per_source_top_k: int | None = None,
@@ -419,6 +434,7 @@ async def execute_search(
                     sort_by=sort_by,
                     doc_types=doc_types,
                     source_keys=source_keys,
+                    sources=sources,
                     source_keys_include_keyless=source_keys_include_keyless,
                     per_source_top_k=per_source_top_k,
                 )
@@ -436,6 +452,7 @@ async def execute_search(
                     sort_by=sort_by,
                     doc_types=doc_types,
                     source_keys=source_keys,
+                    sources=sources,
                     source_keys_include_keyless=source_keys_include_keyless,
                     per_source_top_k=per_source_top_k,
                 )
@@ -455,6 +472,7 @@ async def execute_search(
                     sort_by=sort_by,
                     doc_types=doc_types,
                     source_keys=source_keys,
+                    sources=sources,
                     source_keys_include_keyless=source_keys_include_keyless,
                 )
                 return [
@@ -487,6 +505,7 @@ async def execute_search(
                     sort_by=sort_by,
                     doc_types=doc_types,
                     source_keys=source_keys,
+                    sources=sources,
                     source_keys_include_keyless=source_keys_include_keyless,
                 )
                 return [_inferred_hit_to_dict(h) for h in hits]
@@ -627,6 +646,7 @@ async def execute_subgraph(
     top_k_per_hop: int | None = None,
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
+    source_keys_include_keyless: bool = False,
 ) -> dict[str, Any]:
     """Multi-hop BFS from an anchor node in ONE tool call.
 
@@ -720,6 +740,7 @@ async def execute_subgraph(
                     dampening=1.0,
                     source_keys=source_keys,
                     doc_types=doc_types,
+                    source_keys_include_keyless=source_keys_include_keyless,
                 )
                 inferred_edges = [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:
@@ -775,6 +796,7 @@ async def execute_fetch_doc(
     with_evidence: bool | None = None,
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
+    source_keys_include_keyless: bool = False,
 ) -> dict[str, Any]:
     """Paginate a doc's chunks plus optional inferred-edge context in ONE call.
 
@@ -824,7 +846,8 @@ async def execute_fetch_doc(
         if source_keys or doc_types:
             scope_params: list[Any] = [customer_id, doc_id]
             scope_preds = _doc_scope_sql(
-                scope_params, alias="d", source_keys=source_keys, doc_types=doc_types
+                scope_params, alias="d", source_keys=source_keys, doc_types=doc_types,
+                source_keys_include_keyless=source_keys_include_keyless,
             )
             visible = await conn.fetchval(
                 f"""
@@ -876,6 +899,7 @@ async def execute_fetch_doc(
                     dampening=1.0,
                     source_keys=source_keys,
                     doc_types=doc_types,
+                    source_keys_include_keyless=source_keys_include_keyless,
                 )
                 inferred_edges = [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:
@@ -921,7 +945,8 @@ async def execute_fetch_doc(
                 ev_scope = ""
                 if source_keys or doc_types:
                     preds = _doc_scope_sql(
-                        ev_params, alias="d", source_keys=source_keys, doc_types=doc_types
+                        ev_params, alias="d", source_keys=source_keys, doc_types=doc_types,
+                        source_keys_include_keyless=source_keys_include_keyless,
                     )
                     ev_scope = f"""
                       AND EXISTS (
@@ -972,6 +997,7 @@ async def execute_fetch_chunk_window(
     after: int | None = None,
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
+    source_keys_include_keyless: bool = False,
 ) -> dict[str, Any]:
     """Return a matched chunk plus its immediate neighbours in the same doc.
 
@@ -1003,7 +1029,8 @@ async def execute_fetch_chunk_window(
     scope_sql = ""
     if source_keys or doc_types:
         preds = _doc_scope_sql(
-            params, alias="d", source_keys=source_keys, doc_types=doc_types
+            params, alias="d", source_keys=source_keys, doc_types=doc_types,
+            source_keys_include_keyless=source_keys_include_keyless,
         )
         scope_sql = f"""
               AND EXISTS (
