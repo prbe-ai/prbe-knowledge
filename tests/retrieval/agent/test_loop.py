@@ -555,6 +555,98 @@ def test_prefanout_full_dump_preserves_inferred_edge_why() -> None:
     assert long_why.strip() in out
 
 
+def _fat_metadata_hit(i: int) -> dict:
+    """A hit shaped like production: modest text, heavy metadata. The old cost
+    model charged ONLY `content`, so everything below it was free."""
+    return {
+        "doc_id": f"github:acme/repo:pr:{i}",
+        "chunk_id": f"github:acme/repo:pr:{i}:c0",
+        "content": "short body text " * 20,
+        "title": f"A reasonably long pull request title number {i}",
+        "source_url": f"https://github.com/acme/repo/pull/{i}",
+        "source_system": "github",
+        "score": 0.87,
+        "rank": i,
+        "matched_via": ["bm25", "vector"],
+        "created_at": "2026-08-01T00:00:00Z",
+        "updated_at": "2026-08-02T00:00:00Z",
+        "author_id": "u-123456",
+        "graph_evidence": [
+            {"edge_type": "touches", "confidence": "EXTRACTED",
+             "via_entity": "repo:acme/repo", "reason": "x" * 80}
+        ],
+        "properties": {"labels": ["a", "b", "c"], "state": "merged", "extra": "y" * 200},
+    }
+
+
+def test_rendered_prefanout_actually_fits_the_budget() -> None:
+    """The budget must bound what is SENT, not one field of it.
+
+    This charged `_count_tokens(hit["content"])` and then emitted
+    `json.dumps(prefanout)`, so doc_id / title / source_url / scores /
+    graph_evidence / matched_via / timestamps / properties all rode along
+    uncounted. On this fixture the old model rendered 1.95x its own budget;
+    in production a turn-0 request reached 136,314 tokens against Cerebras's
+    131,000 ceiling with nothing accumulated yet.
+    """
+    hits = [_fat_metadata_hit(i) for i in range(60)]
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": list(hits), "bm25": list(hits),
+        "graph": [], "inferred_edge": [],
+    }]}
+    budget = 18_000
+
+    with patch(
+        "engine.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", budget
+    ):
+        out = _render_prefanout_budgeted(prefanout)
+
+    rendered = _count_tokens(out)
+    # 5% slack covers the trim note appended after selection.
+    assert rendered <= budget * 1.05, (
+        f"rendered {rendered} tokens against a {budget} budget "
+        f"({rendered / budget:.2f}x) — the budget is not measuring what it sends"
+    )
+
+
+def test_an_oversized_first_doc_cannot_walk_past_the_budget() -> None:
+    """The always-keep-first exemption was the last unbounded path: one doc
+    bigger than the whole budget was emitted intact. Ranking is by fused RRF,
+    so stopping is honest — the note says what was omitted."""
+    huge = _fat_metadata_hit(0)
+    huge["content"] = "enormous " * 40_000
+    prefanout = {"sub_queries": [{
+        "query": "q", "vector": [huge], "bm25": [], "graph": [], "inferred_edge": [],
+    }]}
+
+    with patch("engine.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 5_000):
+        out = _render_prefanout_budgeted(prefanout)
+
+    assert _count_tokens(out) <= 5_000 * 1.05
+    assert "trimmed to fit context" in out
+
+
+def test_metadata_only_and_graph_hits_survive_the_tighter_budget() -> None:
+    """Costing the whole record must not cost RECALL: metadata-only hits carry
+    no body (PR#328's "show every hit" guarantee) and graph/inferred hits carry
+    the why-chains. Both belong to the baseline, not the selection."""
+    meta_only = {"doc_id": "github:acme/repo:pr:999", "title": "metadata only",
+                 "source_system": "github", "score": 0.4}
+    graph_hit = {"doc_id": "github:acme/repo:pr:7", "channel": "graph",
+                 "edge_type": "references_pr", "why": "linked in the thread"}
+    prefanout = {"sub_queries": [{
+        "query": "q",
+        "vector": [_fat_metadata_hit(i) for i in range(40)] + [meta_only],
+        "bm25": [], "graph": [graph_hit], "inferred_edge": [],
+    }]}
+
+    with patch("engine.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", 3_000):
+        out = _render_prefanout_budgeted(prefanout)
+
+    assert "pr:999" in out, "a metadata-only hit was dropped"
+    assert "references_pr" in out, "a graph why-chain was dropped"
+
+
 def test_prefanout_full_dump_handles_empty_prefanout() -> None:
     """Edge case: pre-fan-out returned nothing on any channel."""
     assert _render_prefanout_budgeted({"sub_queries": []}) == "(no pre-fan-out hits)"

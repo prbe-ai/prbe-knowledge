@@ -246,6 +246,48 @@ def _count_tokens(text: str) -> int:
     return len(_TOKEN_ENCODING.encode(text))
 
 
+def _dump_prefanout(payload: Any) -> str:
+    """THE serializer for the pre-fan-out, used for both costing and output.
+
+    One function on purpose: if the budget measured with different settings than
+    the renderer emitted, the cap would be wrong by exactly that difference, and
+    silently. NO indent -- pretty-printing spends input tokens on whitespace
+    that carries no information, and this payload is re-sent on EVERY turn.
+    """
+    return json.dumps(payload, default=str, separators=(",", ":"))
+
+
+def _is_trimmable_hit(hit: Any) -> bool:
+    """A vector/bm25 hit carrying a content body — the only kind selection drops.
+
+    Metadata-only hits stay whichever way the budget falls (PR#328's "show every
+    hit" guarantee), so they belong to the baseline, not to the selection.
+    """
+    if not isinstance(hit, dict):
+        return False
+    content = hit.get("content")
+    return bool(hit.get("doc_id")) and isinstance(content, str) and bool(content.strip())
+
+
+def _without_trimmable(prefanout: dict[str, Any]) -> dict[str, Any]:
+    """The payload with every trimmable hit removed — i.e. the floor that ships
+    regardless of selection. Rendering THIS is how the baseline gets measured
+    including the envelope, rather than estimated by summing content."""
+    stripped_sqs: list[dict[str, Any]] = []
+    for sq in prefanout.get("sub_queries") or []:
+        if not isinstance(sq, dict):
+            continue
+        new_sq = dict(sq)
+        for channel in ("vector", "bm25"):
+            hits = sq.get(channel)
+            if isinstance(hits, list):
+                new_sq[channel] = [h for h in hits if not _is_trimmable_hit(h)]
+        stripped_sqs.append(new_sq)
+    stripped = dict(prefanout)
+    stripped["sub_queries"] = stripped_sqs
+    return stripped
+
+
 def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
     """Render the pre-fan-out for the LLM, capped at a token budget.
 
@@ -280,8 +322,19 @@ def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
     # selection is scoped to vector/bm25 only — ranking across all four
     # channels would let high-fused graph docs consume the budget and starve
     # the vector/bm25 content the filter then wipes.
+    # Cost is the hit's RENDERED SIZE, not its `content` field.
+    #
+    # This budget used to charge `_count_tokens(hit["content"])` and then emit
+    # `json.dumps(prefanout)` -- every hit's doc_id, title, source_url, scores,
+    # graph_evidence, matched_via, timestamps and properties rode along
+    # UNCOUNTED. At the ~280 candidates a query renders, that metadata outweighs
+    # the text it decorates, so an "18,000 token" budget shipped six figures.
+    # Measured 2026-08-04 on sha-902ebe2af173: a turn-0 request reached 136,314
+    # tokens against Cerebras's 131,000 ceiling with NOTHING accumulated yet, and
+    # `_enforce_context_budget` could not help because it only stubs tool-role
+    # messages and turn 0 has none. Correct arithmetic on a wrong measurement is
+    # still wrong, so measure what is actually sent.
     trim_occurrences: dict[str, int] = {}
-    baseline_tokens = 0
     for sq in sub_queries:
         if not isinstance(sq, dict):
             continue
@@ -293,10 +346,14 @@ def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
                 doc_id = hit.get("doc_id")
                 if doc_id and isinstance(content, str) and content.strip():
                     trim_occurrences[doc_id] = trim_occurrences.get(doc_id, 0) + 1
-        for channel in ("graph", "inferred_edge"):
-            for hit in sq.get(channel) or []:
-                if isinstance(hit, dict):
-                    baseline_tokens += _count_tokens(hit.get("content") or "")
+
+    # The baseline is measured, not summed: render the payload with every
+    # TRIMMABLE hit removed and count that. What remains is exactly what ships
+    # no matter what we select -- graph + inferred_edge hits, metadata-only
+    # hits, and the envelope around them (sub_query keys, top-level fields,
+    # every brace and comma). Summing per-hit content the way this used to
+    # missed all three.
+    baseline_tokens = _count_tokens(_dump_prefanout(_without_trimmable(prefanout)))
 
     total_trim_docs = len(trim_occurrences)
     # Rank content docs by fused RRF (deterministic) and keep them, cheapest-
@@ -310,30 +367,33 @@ def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
         occ = trim_occurrences.get(doc_id, 0)
         if occ == 0:
             continue  # graph/inferred-only doc — already in the baseline
-        cost = _count_tokens(entry["hit"].get("content") or "") * occ
-        if kept_docs and budget_used + cost > SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET:
+        # Whole rendered record, times how many channels will render it.
+        cost = _count_tokens(_dump_prefanout(entry["hit"])) * occ
+        if budget_used + cost > SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET:
+            # No always-keep-first exemption. It existed so a query could never
+            # render zero content docs, but it let ONE oversized doc walk past
+            # the cap intact -- the budget's last unbounded path. Ranking is by
+            # fused RRF, so this doc is the best remaining one and everything
+            # after it is worse: stopping here is the honest end of the budget,
+            # and the trim note below tells the agent what was omitted and how
+            # to reach it. A baseline that alone exceeds the budget yields zero
+            # content docs, which is a real (loud) answer rather than a silent
+            # overflow.
             break
         kept_docs.add(doc_id)
         budget_used += cost
 
     if len(kept_docs) >= total_trim_docs:
         # Every content doc fits — original behaviour, no filtering overhead.
-        # NO indent: pretty-printing spends input tokens on whitespace that
-        # carries no information, and input is charged on EVERY turn (the
-        # budget above only counts `content`, so indentation was un-budgeted
-        # spend on top of the cap). Compact separators for the same reason.
-        # One-time prefix-cache reset when this ships; deterministic after.
-        return json.dumps(prefanout, default=str, separators=(",", ":"))
+        # Same serializer the budget costed with, so the two cannot drift.
+        return _dump_prefanout(prefanout)
 
     # Trim vector + bm25 to kept docs. Keep every metadata-only hit (no content
     # body -> ~free, and dropping it would narrow PR#328's "show every hit"
     # guarantee) and every graph/inferred hit (why-chains).
     def _keep(h: Any) -> bool:
-        if not isinstance(h, dict):
-            return True
-        content = h.get("content")
-        if not (isinstance(content, str) and content.strip()):
-            return True  # metadata-only, ~free
+        if not _is_trimmable_hit(h):
+            return True  # metadata-only / malformed — part of the baseline
         return h.get("doc_id") in kept_docs
 
     filtered_sqs: list[dict[str, Any]] = []
@@ -355,7 +415,7 @@ def _render_prefanout_budgeted(prefanout: dict[str, Any]) -> str:
         f"across all sources; {dropped} lower-ranked docs omitted. Call `search` "
         f"with a reformulated query if you need something not shown.)"
     )
-    return json.dumps(filtered, default=str, separators=(",", ":")) + note
+    return _dump_prefanout(filtered) + note
 
 
 # Total chain-line cap. Each line ~100-300 chars; capping ~30 keeps the
