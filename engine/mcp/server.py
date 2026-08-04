@@ -145,9 +145,12 @@ async def search_knowledge(
         Re-run ONCE. If it degrades again, report the degradation rather
         than retrying further; repeated retries during a provider outage
         add load to the thing that is already failing.
-      * `context_overflow`, `tool_budget_exceeded` — deterministic. The
-        identical request will fail identically, so re-running is pure
-        waste. NARROW instead: lower `top_k`, tighten the keyword bag.
+      * `context_overflow`, `tool_budget_exceeded`, `output_truncated` —
+        deterministic. The identical request will fail identically, so
+        re-running is pure waste. NARROW instead: lower `top_k`, tighten
+        the keyword bag. (`output_truncated` is deterministic because the
+        gatherer runs at temperature=0 with a query-derived seed, so the
+        same input reproduces the same over-long emit.)
       * `no_llm_configured` — deployment-level. Do not retry. Surface it.
       * `schema_violation`, `passthrough_harness_fallback` — the agent
         returned something unusable. Re-run ONCE, then treat as transient

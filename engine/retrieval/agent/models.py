@@ -72,6 +72,19 @@ GathererStatus = Literal[
     # passthrough over the pre-fan-out pool instead of raising 503. See
     # loop.run_gatherer's LLMError handler + is_context_window_error.
     "context_overflow",
+    # A turn stopped on `finish_reason="length"` -- it ran into
+    # SEARCH_AGENT_MAX_OUTPUT_TOKENS instead of finishing its own emit. The
+    # answer that comes back is whatever the model had written when the cap
+    # cut it off, so it is structurally partial even when the JSON repair in
+    # `_coerce_lenient` salvages a parseable object.
+    #
+    # This status exists BECAUSE we now send a max_tokens cap. Capping the
+    # completion is what keeps `input + reservation` inside the context window,
+    # but an under-sized cap fails the same silent way the extractor's 600-token
+    # cap did: a truncated body that still reads as a healthy 200. Reporting it
+    # makes the cap's sizing self-correcting -- see SEARCH_AGENT_MAX_OUTPUT_TOKENS
+    # for the retune knob.
+    "output_truncated",
 ]
 
 # Statuses that are NOT a degradation. Everything else is.

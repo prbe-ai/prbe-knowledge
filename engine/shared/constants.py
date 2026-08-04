@@ -1169,7 +1169,92 @@ SEARCH_AGENT_FETCH_CHUNKS_MAX = 10
 SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET = int(
     os.getenv("SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET", "18000")
 )
-SEARCH_AGENT_MAX_CONTEXT_TOKENS = 115_000
+
+# The model's hard context window. Providers admit a request on
+# `input + max_completion_tokens`, NOT on input alone, so this is the number
+# both halves below have to share.
+SEARCH_AGENT_MODEL_CONTEXT_WINDOW = int(
+    os.getenv("SEARCH_AGENT_MODEL_CONTEXT_WINDOW", "131072")
+)
+
+# Cap on one gatherer completion. Sending NO cap is what broke this: the
+# provider then books the MODEL MAXIMUM (~40k) as the reservation, and that
+# booking is charged twice over --
+#
+#   * against the context window. On 2026-08-03 a request whose input the
+#     115_000 backstop had already bounded was still rejected by Fireworks
+#     with `prompt is too long: 143250 tokens exceeds maximum context length
+#     of 131071`. The backstop bounded the INPUT; the reservation rode on top
+#     and cleared the ceiling. Nothing in the loop had ever measured the sum.
+#   * against provider quota. Cerebras reserves `input + max_completion_tokens`
+#     BEFORE running a request, against a 250,000 TPM ceiling shared org-wide
+#     (see SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET's comment). An uncapped 40k
+#     booking per request is quota burned on output that never arrives, and it
+#     is the half of the 429s that raising the quota is NOT needed to fix.
+#
+# MEASURED, not guessed -- which is what `completion_tokens_per_turn` and
+# `finish_reasons_per_turn` on LoopState were added to make possible. Live
+# retrieval pods, 3h window: min 145, p50 1,635, p90/max 4,698 completion
+# tokens. 16_000 is ~3.4x the observed max, the same headroom multiple
+# SEARCH_AGENT_EXTRACTOR_MAX_TOKENS settled on after a too-tight cap there
+# silently truncated JSON mid-string.
+#
+# Remember this bounds reasoning + visible content TOGETHER on the OpenAI wire
+# shape (gpt-oss reasoning lands inside `usage.completion_tokens`), so it is
+# not a JSON-size budget. A turn that hits it returns
+# `finish_reason="length"`, which `_run_turn` now reports as a degradation
+# rather than letting a half-emitted answer read as a healthy one.
+#
+# Env-overridable: the right value is a property of the MODEL, and
+# SEARCH_AGENT_INFERENCE_MODEL is itself env-overridable. The sample above is
+# small (n=10, light traffic), so retune with
+# `kubectl set env DEPLOY SEARCH_AGENT_MAX_OUTPUT_TOKENS=24000` if
+# `finish_reason="length"` starts appearing in agent.turn_complete.
+SEARCH_AGENT_MAX_OUTPUT_TOKENS = int(
+    os.getenv("SEARCH_AGENT_MAX_OUTPUT_TOKENS", "16000")
+)
+
+# Slack between our token estimate and the provider's real count. We measure
+# with cl100k while gpt-oss tokenizes differently, and `_enforce_context_budget`
+# counts `messages` only -- the tool schemas ride along on every turn too. This
+# absorbs both. Raise it before raising the window if 400s reappear.
+SEARCH_AGENT_CONTEXT_SAFETY_MARGIN = int(
+    os.getenv("SEARCH_AGENT_CONTEXT_SAFETY_MARGIN", "10000")
+)
+
+# DERIVED, never hardcoded. The old flat 115_000 encoded an input budget that
+# silently assumed a zero-token completion; whenever the reservation or the
+# window moved, the invariant broke with no compiler or test to notice. Stating
+# it as subtraction makes "input + output + slack fits the window" true by
+# construction -- change any term and the others still add up.
+SEARCH_AGENT_MAX_CONTEXT_TOKENS = (
+    SEARCH_AGENT_MODEL_CONTEXT_WINDOW
+    - SEARCH_AGENT_MAX_OUTPUT_TOKENS
+    - SEARCH_AGENT_CONTEXT_SAFETY_MARGIN
+)
+
+# FAIL FAST on a config that cannot work. All three terms above are env-
+# overridable so an operator can retune without a release, which also means a
+# typo is a realistic path: `SEARCH_AGENT_MAX_OUTPUT_TOKENS=200000` yields a
+# budget of -78928. Nothing downstream would raise -- `_enforce_context_budget`
+# would just evict every tool result on every turn and send anyway, so retrieval
+# quality collapses silently and looks like a model regression. A pod that
+# refuses to start naming the three knobs is far cheaper to diagnose.
+#
+# The floor is the prefanout budget: below that the turn-1 evidence dump alone
+# cannot fit, so the agent has nothing to reason over and the config is a
+# mistake however it was reached.
+if SEARCH_AGENT_MAX_CONTEXT_TOKENS < SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET:
+    raise ValueError(
+        "search-agent token budget is unusable: "
+        f"window({SEARCH_AGENT_MODEL_CONTEXT_WINDOW}) "
+        f"- output({SEARCH_AGENT_MAX_OUTPUT_TOKENS}) "
+        f"- margin({SEARCH_AGENT_CONTEXT_SAFETY_MARGIN}) "
+        f"= {SEARCH_AGENT_MAX_CONTEXT_TOKENS}, which is below the prefanout "
+        f"budget ({SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET}). Lower "
+        "SEARCH_AGENT_MAX_OUTPUT_TOKENS or SEARCH_AGENT_CONTEXT_SAFETY_MARGIN, "
+        "or raise SEARCH_AGENT_MODEL_CONTEXT_WINDOW to match the model."
+    )
 
 # fetch_chunk_window: neighbors returned on each side of a matched chunk.
 # The matched chunk is already surfaced by the pre-fan-out, so this pulls
