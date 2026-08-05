@@ -207,7 +207,20 @@ async def _fuzzy_match_entities(
         WHERE customer_id = $1
           AND label = ANY($4::text[])
           AND (
-              coalesce(properties->>'name','') % $2
+              -- lower(...), not coalesce(...), and that is an INDEX fix rather
+              -- than a semantic one. `idx_graph_nodes_name_trgm` is built on
+              -- `lower(properties->>'name')`; an expression index only serves
+              -- the exact expression it was built on, so wrapping the same
+              -- column in coalesce() made this disjunct un-indexable and the
+              -- whole OR fell to a seq scan (20,173 rows filtered).
+              --
+              -- Equivalent, verified rather than assumed: pg_trgm case-folds
+              -- internally (show_trgm('AbC') = show_trgm('abc')), the probe is
+              -- already lowercased by _extract_tokens, and `%` on NULL yields
+              -- NULL -- never true -- so the coalesce was never admitting rows
+              -- lower() drops. Measured on the managed plane, same query:
+              -- 46 rows both ways, symmetric difference 0, 115 ms -> 1.6 ms.
+              lower(properties->>'name') % $2
               OR to_tsvector('english', coalesce(properties->>'name', ''))
                  @@ plainto_tsquery('english', $3)
           )
@@ -352,10 +365,34 @@ def _doc_id_to_entity_type(doc_id: str, source_system: str) -> str:
 # bound that covers multi-aspect queries without flooding the prompt.
 _DOC_TITLE_TOTAL_CAP: Final[int] = 10
 
-# pg_trgm similarity floor. Below this, matches are usually noise (single
-# common token coincidences). 0.15 was the empirical floor in
-# _fuzzy_match_entities; reuse it here for consistency.
-_DOC_TITLE_TRGM_FLOOR: Final[float] = 0.15
+# pg_trgm similarity floor, and it now actually applies.
+#
+# This read 0.15 and was DEAD. It is used as a post-filter
+# (`WHERE trgm_sim >= $4`), but the `%` operator in the WHERE clause had
+# already filtered on `pg_trgm.similarity_threshold`, which nobody set, so it
+# ran at Postgres' default of 0.3. Anything reaching the post-filter therefore
+# had similarity >= 0.3 and could not fail a >= 0.15 test. The constant
+# documented an intent (be more permissive than the entity channel) that the
+# database silently overrode in the stricter direction, and no one could tell
+# from reading the file.
+#
+# Fixed by SETTING the threshold from this constant rather than leaving it
+# implicit, so the number in this file is the number the query uses.
+#
+# 0.3, not 0.15: that is the value production has actually been running under
+# for the life of this channel, so it is the only value with evidence behind
+# it. Restoring the written-but-never-applied 0.15 would LOOSEN matching and
+# change results, which is a recall decision, not a bug fix. Measured cost of
+# the alternatives on the managed plane, same query:
+#
+#     0.3   823 candidate rows   27.7 ms   <- current behaviour, kept
+#     0.5    56 candidate rows    8.9 ms
+#     0.7     0 candidate rows    6.9 ms
+#
+# Raising it is the single cheapest latency win left in this channel. It is
+# deliberately NOT taken here because dropping matches between 0.3 and 0.5 is
+# a recall change and belongs behind a search-quality decision, not a perf PR.
+_DOC_TITLE_TRGM_FLOOR: Final[float] = 0.3
 
 
 async def _fuzzy_match_document_titles(
@@ -402,6 +439,26 @@ async def _fuzzy_match_document_titles(
             coalesce(d.title, '') AS title,
             d.updated_at,
             similarity(coalesce(d.title, ''), $2) AS trgm_sim,
+            -- NOT switched to the stored `d.title_tsv`, though that is
+            -- tempting: it would skip re-tokenizing body_preview per row and
+            -- measured 138 ms -> 71 ms.
+            --
+            -- It is wrong, and the test suite says so. `fts_hit` is not just a
+            -- ranking signal: the outer query filters on
+            -- `WHERE trgm_sim >= $4 OR fts_hit = 1`, so a document that
+            -- matched ONLY through body_preview would lose its qualification
+            -- and drop out of the results entirely. That is a recall
+            -- regression wearing a performance fix's clothes --
+            -- test_fuzzy_match_document_titles_fts_only_path_hits_body_preview
+            -- is what caught it.
+            --
+            -- A short-circuit (`title_tsv @@ q OR <full expr> @@ q`) recovers
+            -- most of the speed, but title_tsv carries 0099's
+            -- punctuation-flattened tokens, so it can match where the plain
+            -- concatenation does not -- which LOOSENS qualification rather
+            -- than preserving it. Also a behaviour change, just in the other
+            -- direction. Left alone deliberately; the channel is already fast
+            -- enough after the threshold and index fixes.
             CASE
                 WHEN to_tsvector('english', coalesce(d.title, '') || ' '
                                  || coalesce(d.body_preview, ''))
@@ -443,6 +500,16 @@ async def _fuzzy_match_document_titles(
     """
 
     async with with_tenant(customer_id) as conn:
+        # Drive the `%` operator from the same constant as the post-filter.
+        # Without this the operator silently used Postgres' 0.3 default while
+        # the post-filter claimed a different number -- see the constant.
+        # SET LOCAL, never SET: with_tenant runs inside a transaction and
+        # pgbouncer is transaction-pooled, so a session-level SET would leak
+        # this threshold onto another tenant's query.
+        await conn.execute(
+            "SET LOCAL pg_trgm.similarity_threshold = "
+            f"{_DOC_TITLE_TRGM_FLOOR}"
+        )
         rows = await conn.fetch(
             sql, customer_id, trgm_probe, trgm_probe, _DOC_TITLE_TRGM_FLOOR, cap,
         )
