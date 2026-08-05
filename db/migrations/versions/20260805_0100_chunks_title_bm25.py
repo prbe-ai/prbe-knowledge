@@ -85,56 +85,107 @@ _BATCH = 5000
 
 
 def upgrade() -> None:
-    # Catalog-only in PG11+ (no DEFAULT), so no table rewrite.
-    op.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS title text")
+    # NOT NULL DEFAULT '' in the SAME statement, and that is load-bearing.
+    #
+    # The obvious form -- bare ADD COLUMN, backfill, then SET NOT NULL -- has a
+    # race that took production to find. ADD COLUMN is catalog-only, so a row
+    # inserted by ingestion WHILE this long transaction runs is physically
+    # missing the attribute; once this commits it reads as NULL, and the
+    # `UPDATE ... WHERE title IS NULL` that was supposed to catch it already
+    # ran. `SET NOT NULL` then fails:
+    #
+    #     NotNullViolation: column "title" of relation "chunks"
+    #     contains null values
+    #
+    # Observed exactly that on the research plane, which had live ingestion
+    # during the backfill. Managed survived the same migration purely on
+    # timing, which is the worst kind of pass.
+    #
+    # A constant DEFAULT is still catalog-only in PG11+ (attmissingval, no
+    # rewrite), and it applies to rows that lack the attribute -- including
+    # ones inserted concurrently. So the constraint holds from the first
+    # instant the column exists and there is no window to lose.
+    op.execute(
+        "ALTER TABLE chunks ADD COLUMN IF NOT EXISTS title text NOT NULL DEFAULT ''"
+    )
 
-    # Batched backfill. DISTINCT ON picks the newest title in the chunk's
-    # version range -- see the dedupe note in the docstring.
+    # Batched backfill, walked by the PRIMARY KEY cursor (customer_id,
+    # chunk_id) rather than by `WHERE title IS NULL`.
+    #
+    # Two reasons, both learned the hard way on the first production run:
+    #
+    #   * A `WHERE title <needs work>` predicate has no index, so EVERY batch
+    #     re-scanned the whole 4.4 GB table -- 42 batches, 42 scans, ~15
+    #     minutes for work that is seconds of actual writing.
+    #   * Exiting on ROW_COUNT = 0 is wrong once the column defaults to ''.
+    #     A batch whose documents genuinely have no title updates nothing, and
+    #     the loop would stop there with the rest of the table unprocessed.
+    #     Exiting on an EMPTY BATCH is the correct termination condition.
+    #
+    # `(customer_id, chunk_id) > (cursor)` matches chunks_pkey exactly, so each
+    # batch is an index range scan on both data planes -- including research,
+    # which does not have the single-column chunk_id index (0101 adds it, and
+    # runs after this).
     op.execute(
         f"""
         DO $$
         DECLARE
-            n integer;
+            last_cust text := '';
+            last_id   text := '';
+            b_cust    text;
+            b_id      text;
         BEGIN
             LOOP
                 WITH batch AS (
-                    SELECT c.chunk_id
+                    SELECT c.customer_id, c.chunk_id, c.doc_id,
+                           c.first_seen_version, c.last_seen_version
                     FROM chunks c
-                    WHERE c.title IS NULL
+                    WHERE (c.customer_id, c.chunk_id) > (last_cust, last_id)
+                    ORDER BY c.customer_id, c.chunk_id
                     LIMIT {_BATCH}
                 ),
                 resolved AS (
-                    SELECT DISTINCT ON (c.chunk_id)
-                           c.chunk_id,
+                    SELECT DISTINCT ON (b.customer_id, b.chunk_id)
+                           b.customer_id, b.chunk_id,
                            coalesce(d.title, '') AS title
-                    FROM chunks c
-                    JOIN batch b ON b.chunk_id = c.chunk_id
+                    FROM batch b
                     LEFT JOIN documents d
-                      ON d.doc_id = c.doc_id
-                     AND d.customer_id = c.customer_id
-                     AND d.version BETWEEN c.first_seen_version
-                                       AND c.last_seen_version
-                    ORDER BY c.chunk_id, d.version DESC
+                      ON d.doc_id = b.doc_id
+                     AND d.customer_id = b.customer_id
+                     AND d.version BETWEEN b.first_seen_version
+                                       AND b.last_seen_version
+                    ORDER BY b.customer_id, b.chunk_id, d.version DESC
+                ),
+                upd AS (
+                    UPDATE chunks c
+                    SET title = r.title
+                    FROM resolved r
+                    WHERE c.customer_id = r.customer_id
+                      AND c.chunk_id = r.chunk_id
+                      AND c.title IS DISTINCT FROM r.title
+                    RETURNING 1
                 )
-                UPDATE chunks c
-                SET title = r.title
-                FROM resolved r
-                WHERE c.chunk_id = r.chunk_id;
+                -- The LAST row in sort order, not max() of each column
+                -- independently: with rows (custA,'z') and (custB,'a'),
+                -- independent maxima give the cursor (custB,'z') and silently
+                -- skip everything between (custB,'a') and (custB,'z').
+                SELECT b.customer_id, b.chunk_id
+                INTO b_cust, b_id
+                FROM batch b
+                ORDER BY b.customer_id DESC, b.chunk_id DESC
+                LIMIT 1;
 
-                GET DIAGNOSTICS n = ROW_COUNT;
-                EXIT WHEN n = 0;
+                EXIT WHEN b_id IS NULL;
+                last_cust := b_cust;
+                last_id   := b_id;
             END LOOP;
         END
         $$;
         """
     )
 
-    # Backstop: a chunk with no title is a bug, and '' is the honest value for
-    # "document has no title". NOT NULL makes the trigger below the only way a
-    # chunk can be created, rather than one of two ways.
-    op.execute("ALTER TABLE chunks ALTER COLUMN title SET DEFAULT ''")
-    op.execute("UPDATE chunks SET title = '' WHERE title IS NULL")
-    op.execute("ALTER TABLE chunks ALTER COLUMN title SET NOT NULL")
+    # No SET NOT NULL step: the column was created NOT NULL above. Removing it
+    # is the fix, not an omission -- see the race note at the ADD COLUMN.
 
     # --- consistency enforcement -------------------------------------------
     # Path 1: an in-place retitle. normalizer.py:1327 updates documents.title
