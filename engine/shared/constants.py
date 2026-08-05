@@ -1367,11 +1367,38 @@ SEARCH_AGENT_EXTRACTOR_MAX_TOKENS = int(
 #     that on a stalled provider.
 SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 5.0
 
-# Per-turn deadline once the run has failed over. Fireworks is the same
-# gpt-oss-120b with the same tool-calling contract and does not exhibit the
-# large-context + tool-calling stall, so this is a normal generous deadline,
-# not a stall cut. Mirrors the gateway's own Fireworks route timeout (12s).
-SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS = 12.0
+# Per-turn deadline once the run has failed over.
+#
+# This was 12.0, on two claims that production contradicts.
+#
+# 1. "Mirrors the gateway's own Fireworks route timeout (12s)." It does not.
+#    The deployed proxy config gives `accounts/fireworks/*` a timeout of 40 and
+#    `cerebras/*` a timeout of 12 -- 12 is the CEREBRAS deployment deadline, so
+#    the mirror was taken off the wrong route and held the fallback to a
+#    deadline 28s tighter than the gateway itself allows.
+# 2. "Fireworks ... does not exhibit the large-context + tool-calling stall."
+#    It does. The stall is driven by the ~300-chunk pre-fan-out prompt with
+#    tool_choice=required, not by the provider, so the hop lands on a model
+#    that stalls the same way.
+#
+# The 5s primary cut is safe because Cerebras is bimodal -- healthy maxes at
+# 3.9s, stalls start at 59.5s, and nothing lives in the 55s gap. Fireworks has
+# no such gap, so the same reasoning does NOT transfer. Measured over 16h on
+# the managed data plane (111 failovers): successful fallback turns ran a
+# smooth continuum from 451ms to 11904ms, and 72 of 76 failures landed within
+# 100ms of exactly 12000ms. That is a clipped distribution -- the deadline was
+# truncating turns that were going to succeed, which is the exact failure the
+# old comment claimed to be avoiding by not reusing the 5s value.
+#
+# 30, not the gateway's 40: SEARCH_AGENT_LOOP_TIMEOUT_SECONDS caps the whole
+# stage at 60s with setup subtracted, and measured setup (grounding +
+# extraction + pre-fan-out) is p50 32s, leaving ~28s for all turns at the
+# median. 40 is unreachable there, so it would be a number that never binds.
+# This is a CEILING, not a guarantee: the stage deadline usually fires first
+# and degrades through the normal loop_timeout path. It is still strictly
+# better than 12, which cut the turn while ~16s of stage budget sat unused.
+# Capping the pre-fan-out is what would make this deadline fully reachable.
+SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS = 30.0
 
 # Where a stalled run finishes. Must be a model id the gateway's modelList
 # resolves -- `accounts/fireworks/*` expands to the upstream

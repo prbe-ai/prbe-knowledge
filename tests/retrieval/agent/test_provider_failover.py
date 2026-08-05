@@ -76,13 +76,38 @@ def test_primary_deadline_separates_the_two_latency_modes() -> None:
     assert 3.9 < SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS < 59.5
 
 
-def test_stage_cap_leaves_room_for_a_multi_turn_run() -> None:
-    """A 3-turn run worst case is 5s cut + 3 fallback turns; the stage cap
-    must exceed that or the backstop becomes the routine path."""
-    worst_turns = (
-        SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS + 3 * SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS
+def test_stage_cap_leaves_room_for_the_failover_to_land() -> None:
+    """The load-bearing invariant: a primary cut plus ONE fallback turn must
+    fit the stage cap, or the failover could never complete a turn and the
+    fallback config would be dead weight."""
+    worst_single = (
+        SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS + SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS
     )
-    assert worst_turns < SEARCH_AGENT_LOOP_TIMEOUT_SECONDS
+    assert worst_single < SEARCH_AGENT_LOOP_TIMEOUT_SECONDS
+
+
+def test_multi_turn_worst_case_now_leans_on_the_stage_cap() -> None:
+    """This assertion is a tripwire, not an endorsement.
+
+    At the old 12s fallback deadline a 3-turn worst case (5 + 36 = 41s) fit
+    inside the 60s stage cap, so the cap was a true backstop. At 30s only ONE
+    fallback turn fits (5 + 30 = 35s); two do not (65s). Multi-turn runs are
+    normal traffic (mean 2.23 turns/retrieval), so the cap is now the routine
+    terminator for them -- they degrade through loop_timeout, which backfills
+    from the deterministic pre-fan-out rather than failing.
+
+    That is a deliberate trade: bounding the per-turn deadline was worth more
+    than preserving multi-turn headroom, because the 12s deadline was
+    truncating turns that would have succeeded (72 of 76 failures landed
+    within 100ms of exactly 12000ms). It stops being a trade and starts being
+    a bug once the pre-fan-out is capped and the stage cap has real slack --
+    at that point raise the cap or lower this, and delete this test.
+    """
+    fallback_turns_that_fit = int(
+        (SEARCH_AGENT_LOOP_TIMEOUT_SECONDS - SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS)
+        // SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS
+    )
+    assert fallback_turns_that_fit == 1
 
 
 # ============================================================
