@@ -161,3 +161,40 @@ async def seeded_customer_many_repos(live_db) -> SeededCustomer:
             customer_id,
         )
     return SeededCustomer(customer_id=customer_id)
+
+
+@pytest_asyncio.fixture
+async def pg_search_db(live_db):
+    """`live_db`, but skipped when the database has no pg_search.
+
+    Phase 2 moved BM25 onto pg_search's `@@@` operator. Production runs
+    `ghcr.io/prbe-ai/prbe-postgres` (pg_search 0.23.4 + AGE + pgvector); the
+    default local compose Postgres is `pgvector/pgvector:pg16`, which has
+    neither pg_search nor AGE.
+
+    Skipping LOUDLY rather than falling back to the old ranker: a fallback
+    would make these tests pass on a database that cannot execute the code
+    path they exist to cover, which is worse than not running them. A skip
+    line in the output is a visible gap; a green fallback is an invisible one.
+
+    To run these, point the suite at a prod-parity Postgres:
+        docker run -d --name prbe-parity-pg \\
+          -e POSTGRES_USER=probe -e POSTGRES_PASSWORD=probe \\
+          -e POSTGRES_DB=probe -p 5459:5432 \\
+          ghcr.io/prbe-ai/prbe-postgres:<sha>
+    (that image's init scripts hardcode the `probe` role and database).
+    """
+    import pytest
+
+    from engine.shared.db import raw_conn
+
+    async with raw_conn() as conn:
+        has_it = await conn.fetchval(
+            "SELECT count(*) FROM pg_extension WHERE extname = 'pg_search'"
+        )
+    if not has_it:
+        pytest.skip(
+            "pg_search not installed on the test database -- BM25 retrieval "
+            "cannot be exercised. See pg_search_db in tests/retrieval/conftest.py."
+        )
+    yield None

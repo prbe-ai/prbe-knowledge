@@ -1504,7 +1504,7 @@ async def _insert_chunk(
             chunker_version,
             first_seen_version, last_seen_version, kind,
             embedding_v2, embedding_v2_model, embedding_v2_dim,
-            visibility
+            visibility, title
         )
         VALUES (
             $1, $2, $3,
@@ -1512,15 +1512,22 @@ async def _insert_chunk(
             $8,
             $9, $9, $10,
             $11::halfvec, $12, $13,
-            $14
+            $14, $15
         )
+        -- `title` is carried on the upsert branch too, and that is not
+        -- redundant with the documents-title trigger from 0100. On a
+        -- retitle+reingest the trigger fires while this chunk's range still
+        -- ends at the PREVIOUS version, so it matches nothing; the row then
+        -- has its last_seen_version extended here and would keep the stale
+        -- title forever. Setting it on both branches closes that window.
         ON CONFLICT (doc_id, content_hash) DO UPDATE
             SET last_seen_version = EXCLUDED.last_seen_version,
                 valid_to = NULL,
                 embedding_v2 = EXCLUDED.embedding_v2,
                 embedding_v2_model = EXCLUDED.embedding_v2_model,
                 embedding_v2_dim = EXCLUDED.embedding_v2_dim,
-                visibility = EXCLUDED.visibility
+                visibility = EXCLUDED.visibility,
+                title = EXCLUDED.title
         """,
         chunk_id,
         doc.doc_id,
@@ -1536,6 +1543,7 @@ async def _insert_chunk(
         EMBEDDING_V2_MODEL,
         EMBEDDING_V2_DIM,
         doc.visibility.value,
+        doc.title or "",
     )
 
 
@@ -1596,7 +1604,7 @@ async def _insert_chunks_batch(
             chunker_version,
             first_seen_version, last_seen_version, kind,
             embedding_v2, embedding_v2_model, embedding_v2_dim,
-            visibility
+            visibility, title
         )
         SELECT
             chunk_id, $2, $3,
@@ -1604,19 +1612,22 @@ async def _insert_chunks_batch(
             $9,
             $10, $10, kind,
             embedding_v2::halfvec, $12, $13,
-            $14
+            $14, $15
         FROM unnest(
             $1::text[], $4::int[], $5::text[], $6::text[], $7::int[],
             $8::text[], $11::text[]
         ) AS t(chunk_id, chunk_index, content, content_hash, token_count,
                embedding_v2, kind)
+        -- See the single-chunk path: `title` on the upsert branch closes the
+        -- retitle+reingest window the documents trigger cannot see.
         ON CONFLICT (doc_id, content_hash) DO UPDATE
             SET last_seen_version = EXCLUDED.last_seen_version,
                 valid_to = NULL,
                 embedding_v2 = EXCLUDED.embedding_v2,
                 embedding_v2_model = EXCLUDED.embedding_v2_model,
                 embedding_v2_dim = EXCLUDED.embedding_v2_dim,
-                visibility = EXCLUDED.visibility
+                visibility = EXCLUDED.visibility,
+                title = EXCLUDED.title
         """,
         chunk_ids,
         doc.doc_id,
@@ -1632,6 +1643,7 @@ async def _insert_chunks_batch(
         EMBEDDING_V2_MODEL,
         EMBEDDING_V2_DIM,
         doc.visibility.value,
+        doc.title or "",
     )
 
 
