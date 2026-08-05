@@ -96,7 +96,7 @@ async def _seed_corpus(customer_id: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_content_tsv_column_equals_english_to_tsvector(live_db) -> None:
+async def test_content_tsv_column_equals_english_to_tsvector(pg_search_db) -> None:
     """The actual drift detector: every row's stored `content_tsv` must
     equal `to_tsvector('english', content)` byte-for-byte. If a future
     migration ever swaps the GENERATED expression (different config, added
@@ -129,7 +129,7 @@ async def test_content_tsv_column_equals_english_to_tsvector(live_db) -> None:
 
 @pytest.mark.asyncio
 async def test_bm25_search_returns_only_chunks_with_matching_lexemes(
-    live_db,
+    pg_search_db,
 ) -> None:
     """Containment + spot check: chunks containing query terms surface,
     chunks without any matching lexeme do not, and the densest match is
@@ -170,7 +170,7 @@ async def test_bm25_search_returns_only_chunks_with_matching_lexemes(
 
 @pytest.mark.asyncio
 async def test_bm25_search_excludes_chunks_with_no_matching_lexeme(
-    live_db,
+    pg_search_db,
 ) -> None:
     """The @@ predicate must filter at the index, not just deprioritize.
     A query whose every token is absent from a chunk's content_tsv must

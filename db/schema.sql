@@ -372,7 +372,15 @@ BEGIN
                 chunk_id, content, title, customer_id, doc_id, kind,
                 chunk_index, first_seen_version, last_seen_version, visibility
             )
-            WITH (key_field=chunk_id)
+            WITH (
+                key_field=chunk_id,
+                -- source_code, not the default: the default splits on `/` but
+                -- NOT on `.`, so `checkpoints/model.ckpt` indexes as
+                -- {checkpoints, model.ckpt} and a search for `model` or `ckpt`
+                -- finds nothing. Same case migration 0099 handles on the
+                -- tsvector side by storing a punctuation-flattened copy.
+                text_fields='{"title": {"tokenizer": {"type": "source_code"}}}'
+            )
         $ix$;
     END IF;
 END

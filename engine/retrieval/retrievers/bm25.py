@@ -111,11 +111,85 @@ def _build_or_tsquery_string(query_text: str) -> str:
     """Build a `to_tsquery` input that ORs every >=2-char token in the
     user's query. Returns "" when the query has no usable tokens — caller
     skips the SQL pass.
+
+    Still used, but no longer for RANKING. pg_search ranks now; this only
+    answers "did this chunk's own content match?" so the title-only cap
+    below can tell a chunk that earned its slot from one that rode in on
+    its document's title. Evaluated on the bounded pool (~1200 rows), never
+    on the table, so it costs a stored-column check and no index probe.
     """
     tokens = [t for t in _TOKEN_RE.findall(query_text) if len(t) >= 2]
     if not tokens:
         return ""
     return " | ".join(tokens)
+
+
+def _build_pg_search_query(tokens: list[str]) -> str:
+    """Space-joined tokens for pg_search's `@@@ 'text'` form.
+
+    pg_search parses this into its own OR-of-terms and scores with BM25, so
+    unlike `to_tsquery` it does NOT need explicit `|` operators and does not
+    reject punctuation. Tokens are already stripped to [A-Za-z0-9_] runs by
+    `_TOKEN_RE`, which also removes the quote characters that would otherwise
+    let a query escape into pg_search's query-string syntax.
+    """
+    return " ".join(tokens)
+
+
+# How many chunks ONE document may contribute on the strength of its TITLE
+# alone. Chunks whose own content matched are never capped.
+#
+# 1 reproduces the pre-Phase-2 rule exactly. `bm25.py` used to express this
+# structurally as `AND c.chunk_index = 0` -- "a title match contributes the
+# document's first chunk" -- which is a cap of one that also picked the chunk
+# arbitrarily rather than by relevance. Making it a number means the value is
+# visible and tunable instead of implied by a predicate, and BM25 now picks
+# WHICH chunk by score.
+#
+# Raise deliberately and behind a search-quality eval: the failure mode the old
+# rule was guarding is one long document filling the result set, and that risk
+# grows linearly with this number.
+BM25_TITLE_ONLY_PER_DOC = 1
+
+# The per-document cap is a window function, and a window over the full match
+# set defeats pg_search's TopK execution -- measured on production, 204,637
+# chunks:
+#
+#     no cap                        TopKScanExecState   216 ms
+#     cap over the full match set   NormalScanExecState 533 ms   (53,646 rows sorted)
+#     cap over an over-fetched pool TopKScanExecState   227 ms
+#
+# So the cap runs INSIDE a bounded pool. This multiplier sizes that pool. A
+# top-1200 pool held 253 distinct documents on this corpus, against the 40 that
+# a cap of 1 needs to fill 120 slots, so the margin is ~6x. If a caller ever
+# reports short result sets on a corpus dominated by one document, this is the
+# knob.
+_BM25_POOL_MULTIPLIER = 10
+
+# Weight on a title match relative to a content match.
+#
+# The old ranker got a ~10x title advantage for free: migration 0099 stores
+# `documents.title_tsv` with setweight('A') while `chunks.content_tsv` is
+# unweighted ('D'), and ts_rank_cd's default weights are {D:0.1, A:1.0}. BM25
+# has no equivalent, so the intent has to be restated as a number.
+#
+# 10.0 reproduces the OLD ratio exactly. That is the point: ts_rank_cd's default
+# weights are {D: 0.1, A: 1.0}, so the previous ranker gave a title match
+# precisely 10x a body match, and this is a performance change, not a decision
+# to re-rank titles.
+#
+# This was 2.5 on the reasoning that BM25 term scores already scale with rarity
+# so a large multiplier double-boosts. Measured, that reasoning was wrong in the
+# direction that matters: at 2.5 a title-only hit on `checkpoints/model.ckpt`
+# scored 3.44 against 4.37 for a document merely MENTIONING the file in its body
+# -- the exact inversion `test_title_match_outranks_a_body_only_match` exists to
+# prevent. Worse, the winner flipped with corpus statistics: the same comparison
+# on a differently-populated index put title ahead at 2.5. A value that depends
+# on the corpus is not a guarantee.
+#
+# 10.0 restores a ratio that does not depend on which documents happen to be
+# indexed, and it is the ratio this system already shipped for months.
+_BM25_TITLE_BOOST = 10.0
 
 
 # Identifier-frame descriptor words. These accompany a stable identifier
@@ -213,9 +287,14 @@ async def bm25_search(
     or_query = _build_or_tsquery_string(query_text)
     if not or_query:
         return []
+    pg_query = _build_pg_search_query(
+        [t for t in _TOKEN_RE.findall(query_text) if len(t) >= 2]
+    )
 
     async with with_tenant(customer_id) as conn:
-        params: list = [customer_id, or_query, top_k]
+        # $2 is the pg_search query (ranking); $4 is the tsquery form, used
+        # ONLY to decide whether a chunk's own content matched.
+        params: list = [customer_id, pg_query, top_k, or_query]
         source_filter = ""
         if sources:
             params.append(sources)
@@ -241,52 +320,100 @@ async def bm25_search(
         )
         params.extend(pred.params)
 
-        # Hide drafts unless the reviewer surface explicitly opts in.
-        visibility_filter = (
-            ""
-            if include_drafts
-            else "AND c.visibility = 'approved' AND d.visibility = 'approved'"
-        )
+        # Drafts are hidden on BOTH sides, but the two halves are applied at
+        # different depths now: the chunk half inside the pg_search pool (so a
+        # draft never consumes a pool slot) and the document half at the join.
+        # Both are inlined at their callsites below.
 
+        # Column references are unqualified here: this orders the OUTER select,
+        # whose columns come from the pool/join projection, not from `c`/`d`.
         order_by_sql = (
-            "d.updated_at DESC, c.chunk_id"
+            "updated_at DESC, chunk_id"
             if sort_by == "recency"
-            else "score DESC, c.chunk_id"
+            else "score DESC, chunk_id"
         )
 
-        inner_sql = f"""
+        # ---- 1. ANN-equivalent for keywords: a bounded, index-ranked pool ----
+        # Single table. `title` lives on the chunk (migration 0100), so the
+        # cross-table OR that made this un-indexable is now unwriteable: there
+        # is no second table in this scan to OR against.
+        #
+        # `title` is boosted rather than restricted to chunk_index=0. A title
+        # match is evidence the DOCUMENT is relevant, so it should raise that
+        # document's chunks in the ranking; picking chunk 0 was expressing a
+        # ranking idea as a join predicate. The cap below keeps the guarantee
+        # the old predicate was really providing.
+        params.append(top_k * _BM25_POOL_MULTIPLIER)
+        pool_idx = len(params)
+        pool_sql = f"""
             SELECT c.chunk_id,
                    c.doc_id,
+                   c.content,
+                   c.kind,
+                   c.chunk_index,
+                   c.first_seen_version,
+                   c.last_seen_version,
+                   paradedb.score(c.chunk_id) AS score,
+                   (c.content_tsv @@ to_tsquery('english', $4)) AS content_hit
+            FROM chunks c
+            WHERE c.customer_id = $1
+              AND c.chunk_id @@@ paradedb.boolean(should => ARRAY[
+                    paradedb.boost({_BM25_TITLE_BOOST}, paradedb.match('title', $2)),
+                    paradedb.match('content', $2)
+                  ])
+              {"" if include_drafts else "AND c.visibility = 'approved'"}
+              {pred.chunk_sql}
+            ORDER BY paradedb.score(c.chunk_id) DESC
+            LIMIT ${pool_idx}
+        """
+
+        # ---- 2. cap title-only contributions, INSIDE the pool ----
+        # `content_hit` is the whole point: a chunk that matched on its own
+        # content earned its slot and is never capped, however many its
+        # document contributes. Only free riders are limited.
+        params.append(BM25_TITLE_ONLY_PER_DOC)
+        cap_idx = len(params)
+        capped_sql = f"""
+            SELECT * FROM (
+                SELECT p.*,
+                       CASE WHEN p.content_hit THEN 0
+                            ELSE ROW_NUMBER() OVER (
+                                PARTITION BY p.doc_id, p.content_hit
+                                ORDER BY p.score DESC, p.chunk_id
+                            )
+                       END AS _title_rn
+                FROM ({pool_sql}) p
+            ) q
+            WHERE q.content_hit OR q._title_rn <= ${cap_idx}
+        """
+
+        # ---- 3. join documents for the doc-level filters and projection ----
+        # Doc-level predicates stay a join because they filter on columns that
+        # belong to the document, not the chunk. They run against the capped
+        # pool (hundreds of rows), not the table.
+        inner_sql = f"""
+            SELECT k.chunk_id,
+                   k.doc_id,
                    d.version AS doc_version,
                    d.source_system,
                    d.source_url,
                    d.title,
                    d.author_id,
-                   c.content,
-                   c.kind,
+                   k.content,
+                   k.kind,
                    d.created_at,
                    d.updated_at,
-                   ts_rank_cd(c.content_tsv, to_tsquery('english', $2))
-                     + ts_rank_cd(d.title_tsv, to_tsquery('english', $2))
-                     AS score
-            FROM chunks c
+                   k.score
+            FROM ({capped_sql}) k
             JOIN documents d
-              ON c.doc_id = d.doc_id
-             AND d.customer_id = c.customer_id
-             AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
-            WHERE c.customer_id = $1
-              AND (
-                    c.content_tsv @@ to_tsquery('english', $2)
-                    OR (
-                         d.title_tsv @@ to_tsquery('english', $2)
-                         AND c.chunk_index = 0
-                       )
-                  )
-              {pred.chunk_sql}
+              ON k.doc_id = d.doc_id
+             AND d.customer_id = $1
+             AND d.version BETWEEN k.first_seen_version AND k.last_seen_version
+            WHERE TRUE
               {pred.doc_sql}
               {source_filter}
               {doc_type_filter}
-              {visibility_filter}
+              {"" if include_drafts else "AND d.visibility = 'approved'"}
               {author_filter}
               {source_key_filter}
         """
