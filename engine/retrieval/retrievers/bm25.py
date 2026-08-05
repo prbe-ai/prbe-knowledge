@@ -1,7 +1,33 @@
 """BM25-ish retriever via Postgres `ts_rank_cd`.
 
-Postgres doesn't have true BM25 out of the box — `ts_rank_cd` (cover-density
-ranking) is a reasonable stand-in and runs on the `idx_chunks_content_tsv`
+STALE PREMISE — READ THIS FIRST. The next paragraph's opening claim is no
+longer true of this database, and the retriever has not caught up:
+
+    pg_search 0.23.4 IS installed, and `idx_chunks_bm25` (174 MB, ParadeDB,
+    key_field=chunk_id) already exists over chunks. `pg_stat_user_indexes`
+    reports scans = 0. It has never been used, because this module ranks with
+    `ts_rank_cd` instead.
+
+Measured against that index on the managed data plane, same corpus:
+
+    ts_rank_cd, cross-table OR (current)   30,000 ms (statement timeout)
+    ts_rank_cd, OR rewritten as UNION       2,997 ms
+    pg_search `@@@`, TopKScanExecState        263 ms, 77 heap fetches
+
+The gap is structural, not tuning. `ts_rank_cd` must find every matching row
+(the OR-ed tsquery matches 99,670 of 204,637 chunks, 48.7% of the corpus),
+score each, sort them all, and keep 120. A real BM25 index keeps ranking
+inside the index and returns top-K directly.
+
+Migrating is Phase 2 of the retrieval-latency work and is deliberately NOT
+bundled with the Phase 1 fixes: it needs a title denormalization, a 206k-row
+backfill, and a search-quality evaluation, because BM25 ranking is genuinely
+different from cover-density ranking. Do not "just switch the operator".
+
+Everything below describes the CURRENT implementation and remains accurate.
+
+Postgres' built-in text search has no true BM25 — `ts_rank_cd` (cover-density
+ranking) is the stand-in used here, and runs on the `idx_chunks_content_tsv`
 GIN index over the stored `chunks.content_tsv` column (migration 0062).
 The column is `GENERATED ALWAYS AS (to_tsvector('english', content)) STORED`,
 so the bitmap-heap recheck and `ts_rank_cd` both read the precomputed

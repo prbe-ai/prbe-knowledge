@@ -151,6 +151,13 @@ async def search_knowledge(
         the keyword bag. (`output_truncated` is deterministic because the
         gatherer runs at temperature=0 with a query-derived seed, so the
         same input reproduces the same over-long emit.)
+      * `channel_degraded` — one of the four retrieval channels failed and
+        contributed nothing, so the answer came from a strictly smaller
+        candidate pool. The results you got are REAL, just incomplete.
+        Transient (usually a database statement timeout). Re-run ONCE. If it
+        repeats, say the search was partial rather than reporting the gap as
+        an absence — this is the one reason where "I found nothing about X"
+        is most likely to be wrong.
       * `no_llm_configured` — deployment-level. Do not retry. Surface it.
       * `schema_violation`, `passthrough_harness_fallback` — the agent
         returned something unusable. Re-run ONCE, then treat as transient

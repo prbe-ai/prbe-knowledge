@@ -16,7 +16,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, get_args
 
-from engine.retrieval.agent.models import GathererOutput, GathererStatus, is_degraded
+from engine.retrieval.agent.models import (
+    GathererOutput,
+    GathererStatus,
+    is_degraded,
+    merge_channel_loss,
+)
+from engine.retrieval.channel_health import lost_channels
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
@@ -704,6 +710,11 @@ async def to_query_response(
     if query_root_doc_id is None and gathered.entities:
         query_root_doc_id = gathered.entities[0].canonical_id
 
+    # A channel can die without the loop noticing (its handler returns []).
+    # Fold that in here, at the one place the caller-visible flag is built, so
+    # `degraded` and `degraded_reason` cannot disagree about the same request.
+    effective_status = merge_channel_loss(status, lost_channels())
+
     return RetrieveResponse(
         query=query,
         results=results,
@@ -734,10 +745,10 @@ async def to_query_response(
         related_entities=related_entities or None,
         gatherer_notes=gathered.gatherer_notes.model_dump(),
         query_root_doc_id=query_root_doc_id,
-        degraded=is_degraded(status),
+        degraded=is_degraded(effective_status),
         # Only carry the reason when it IS a degradation — a reason string on
         # a healthy response invites callers to branch on it.
-        degraded_reason=status if is_degraded(status) else None,
+        degraded_reason=effective_status if is_degraded(effective_status) else None,
     )
 
 
