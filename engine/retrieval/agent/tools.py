@@ -54,6 +54,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
 from engine.retrieval.agent.models import GathererOutput
+from engine.retrieval.channel_health import record_channel_loss
 from engine.retrieval.grounding import GroundingBundle, build_bundle
 from engine.retrieval.helpers import expand_to_cluster_members
 from engine.retrieval.retrievers.bm25 import bm25_search as _bm25
@@ -441,6 +442,10 @@ async def execute_search(
                 return [_hit_to_chunk_dict(h, "vector") for h in hits]
             except Exception as exc:
                 log.warning("agent.search_vector_failed", error=str(exc), query=q[:50])
+                # Returning [] here is indistinguishable from "found
+                # nothing" downstream. Record the loss so the response
+                # reports degraded instead of a clean success.
+                record_channel_loss("vector")
                 return []
 
         async def _bm25_call() -> list[dict[str, Any]]:
@@ -459,6 +464,10 @@ async def execute_search(
                 return [_hit_to_chunk_dict(h, "bm25") for h in hits]
             except Exception as exc:
                 log.warning("agent.search_bm25_failed", error=str(exc), query=q[:50])
+                # Returning [] here is indistinguishable from "found
+                # nothing" downstream. Record the loss so the response
+                # reports degraded instead of a clean success.
+                record_channel_loss("bm25")
                 return []
 
         async def _graph_call() -> list[dict[str, Any]]:
@@ -487,6 +496,10 @@ async def execute_search(
                 ]
             except Exception as exc:
                 log.warning("agent.search_graph_failed", error=str(exc), query=q[:50])
+                # Returning [] here is indistinguishable from "found
+                # nothing" downstream. Record the loss so the response
+                # reports degraded instead of a clean success.
+                record_channel_loss("graph")
                 return []
 
         async def _inferred_call() -> list[dict[str, Any]]:
@@ -511,6 +524,10 @@ async def execute_search(
                 return [_inferred_hit_to_dict(h) for h in hits]
             except Exception as exc:
                 log.warning("agent.search_inferred_failed", error=str(exc), query=q[:50])
+                # Returning [] here is indistinguishable from "found
+                # nothing" downstream. Record the loss so the response
+                # reports degraded instead of a clean success.
+                record_channel_loss("inferred_edge")
                 return []
 
         v, b, g, i = await asyncio.gather(

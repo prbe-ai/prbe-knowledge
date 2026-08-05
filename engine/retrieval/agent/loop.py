@@ -51,6 +51,7 @@ from engine.retrieval.agent.models import (
     MatchedViaChannel,
     SearchOptions,
     is_degraded,
+    merge_channel_loss,
 )
 from engine.retrieval.agent.prompt import build_system_prompt
 from engine.retrieval.agent.tools import (
@@ -60,6 +61,7 @@ from engine.retrieval.agent.tools import (
     execute_search,
     tool_definitions,
 )
+from engine.retrieval.channel_health import begin_request, lost_channels
 from engine.retrieval.grounding import GroundingBundle
 from engine.retrieval.helpers import expand_to_author_id_set
 from engine.retrieval.router import (
@@ -1890,6 +1892,11 @@ async def run_gatherer(
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="empty query")
 
+    # Fresh channel-loss accumulator for this retrieval. Must happen before any
+    # channel runs (pre-fan-out is the first) and before any early return, or a
+    # loss recorded under the previous request's set would be attributed here.
+    begin_request()
+
     trace_id = req.trace_id or new_trace_id()
     timing: dict[str, float] = {}
     # Deadline for the WHOLE gatherer stage, not just the loop. Grounding,
@@ -2133,6 +2140,14 @@ async def run_gatherer(
         gathered = _empty_passthrough("zero_recall_short_circuit", state)
         timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
         if request is not None:
+            # Fold channel loss in HERE, not at the response boundary: `is_degraded`
+            # is contractually the single source behind BOTH
+            # query_traces.failure_recovered and the caller-visible `degraded` flag.
+            # Merging only downstream would make a channel-degraded request report
+            # degraded=True to the caller and failure_recovered=False in telemetry --
+            # the exact disagreement models.is_degraded exists to prevent, and it would
+            # hide channel loss from the very metric meant to measure it.
+            status = merge_channel_loss(status, lost_channels())
             request.state.gatherer_status = status
             request.state.tool_calls_count = 0
             request.state.need_deeper_extensions = 0
@@ -2178,6 +2193,14 @@ async def run_gatherer(
         gathered = _empty_passthrough("no_llm_configured", state)
         timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
         if request is not None:
+            # Fold channel loss in HERE, not at the response boundary: `is_degraded`
+            # is contractually the single source behind BOTH
+            # query_traces.failure_recovered and the caller-visible `degraded` flag.
+            # Merging only downstream would make a channel-degraded request report
+            # degraded=True to the caller and failure_recovered=False in telemetry --
+            # the exact disagreement models.is_degraded exists to prevent, and it would
+            # hide channel loss from the very metric meant to measure it.
+            status = merge_channel_loss(status, lost_channels())
             request.state.gatherer_status = status
             request.state.tool_calls_count = 0
             request.state.need_deeper_extensions = 0
@@ -2382,6 +2405,14 @@ async def run_gatherer(
 
     # Telemetry to request.state for the query_traces middleware.
     if request is not None:
+        # Fold channel loss in HERE, not at the response boundary: `is_degraded`
+        # is contractually the single source behind BOTH
+        # query_traces.failure_recovered and the caller-visible `degraded` flag.
+        # Merging only downstream would make a channel-degraded request report
+        # degraded=True to the caller and failure_recovered=False in telemetry --
+        # the exact disagreement models.is_degraded exists to prevent, and it would
+        # hide channel loss from the very metric meant to measure it.
+        status = merge_channel_loss(status, lost_channels())
         request.state.gatherer_status = status
         request.state.tool_calls_count = state.tool_calls_count
         request.state.need_deeper_extensions = state.extensions_used

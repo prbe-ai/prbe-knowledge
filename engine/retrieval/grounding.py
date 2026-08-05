@@ -414,7 +414,22 @@ async def _fuzzy_match_document_titles(
           AND d.title IS NOT NULL
           AND d.title <> ''
           AND (
-              coalesce(d.title, '') % $2
+              -- BARE `d.title`, not `coalesce(d.title, '')`. Migration 0089
+              -- built `idx_documents_title_trgm` on `(title gin_trgm_ops)
+              -- WHERE valid_to IS NULL`, and an expression index only serves
+              -- the EXACT expression it was built on. Wrapping title in
+              -- coalesce() here made this disjunct un-indexable, and an OR is
+              -- only as indexable as its worst branch, so the whole predicate
+              -- fell to a seq scan with similarity() computed per row.
+              --
+              -- Measured on the managed data plane, same query:
+              --     coalesce(title,'') % $2 -> Parallel Seq Scan   742 ms
+              --     title % $2              -> BitmapOr both idxs   77 ms
+              --
+              -- The coalesce was never doing anything: the two guards directly
+              -- above already exclude NULL and empty titles, and `valid_to IS
+              -- NULL` above matches the index's own partial predicate.
+              d.title % $2
               OR to_tsvector('english', coalesce(d.title, '') || ' '
                              || coalesce(d.body_preview, ''))
                  @@ plainto_tsquery('english', $3)

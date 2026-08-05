@@ -48,6 +48,12 @@ _DEGRADED = {
     # SEARCH_AGENT_MAX_OUTPUT_TOKENS, so the caller holds a structurally
     # partial answer even when JSON repair salvages a parseable object.
     "output_truncated",
+    # Degraded, deliberately: one of the four channels failed and returned
+    # zero rows, so the answer was synthesized from a strictly smaller
+    # candidate pool than the query asked for. The loop itself may have
+    # finished perfectly -- that is the whole point, since a channel dies
+    # several frames below it and its handler returns [].
+    "channel_degraded",
 }
 
 
@@ -229,3 +235,53 @@ def test_every_loop_call_site_forwards_status() -> None:
         f"to_query_response at line(s) {missing} omit status= — those responses "
         "will report degraded=False no matter how the gatherer actually ended."
     )
+
+
+def test_merge_channel_loss_upgrades_only_honest_successes() -> None:
+    """Channel loss must not overwrite a more specific terminal status.
+
+    `loop_timeout` tells the caller more than `channel_degraded` does, and a
+    request can genuinely hit both (a 30s channel timeout is a good way to run
+    the loop out of budget). Precedence is one-directional on purpose.
+    """
+    from engine.retrieval.agent.models import merge_channel_loss
+
+    lost = frozenset({"bm25"})
+    assert merge_channel_loss("ok", lost) == "channel_degraded"
+    assert merge_channel_loss("zero_recall_short_circuit", lost) == "channel_degraded"
+    # Already-degraded statuses keep precedence.
+    assert merge_channel_loss("loop_timeout", lost) == "loop_timeout"
+    assert merge_channel_loss("provider_error_prefanout_fallback", lost) == (
+        "provider_error_prefanout_fallback"
+    )
+    # No loss, no change. None means the gatherer never ran.
+    assert merge_channel_loss("ok", frozenset()) == "ok"
+    assert merge_channel_loss(None, lost) is None
+
+
+def test_merge_channel_loss_is_idempotent() -> None:
+    """It runs at the loop terminal AND defensively in the adapter.
+
+    Applying it twice must be a no-op, or the second application would need to
+    know whether the first already ran.
+    """
+    from engine.retrieval.agent.models import merge_channel_loss
+
+    lost = frozenset({"vector"})
+    once = merge_channel_loss("ok", lost)
+    assert merge_channel_loss(once, lost) == once
+
+
+def test_zero_recall_is_not_honest_when_a_channel_died() -> None:
+    """The carve-out has a carve-out.
+
+    `zero_recall_short_circuit` means "all four channels returned nothing", and
+    that is an honest empty answer ONLY if all four actually ran. If one died on
+    the way, the emptiness is an artifact and reporting it as honest is exactly
+    the lie this whole mechanism exists to stop.
+    """
+    from engine.retrieval.agent.models import merge_channel_loss
+
+    assert is_degraded("zero_recall_short_circuit") is False
+    upgraded = merge_channel_loss("zero_recall_short_circuit", frozenset({"graph"}))
+    assert is_degraded(upgraded) is True

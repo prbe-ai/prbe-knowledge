@@ -85,6 +85,22 @@ GathererStatus = Literal[
     # makes the cap's sizing self-correcting -- see SEARCH_AGENT_MAX_OUTPUT_TOKENS
     # for the retune knob.
     "output_truncated",
+    # One or more of the four retrieval channels failed and contributed zero
+    # rows, but the gatherer loop itself completed normally. The answer is
+    # built from a strictly smaller candidate pool than the query asked for.
+    #
+    # This status exists because the loop's own outcome cannot express it. A
+    # channel dies several frames below the loop, inside `search()`, and its
+    # handler returns [] -- so a retrieval whose BM25 channel timed out at 30s
+    # still finished "ok" from the loop's point of view. Measured over one 16h
+    # window: 102 retrievals lost a channel and 24 of them reported ok with
+    # degraded=False. That silence is what let the #444 BM25 regression run for
+    # three days.
+    #
+    # Only ever set when the loop status would otherwise be "ok". A terminal
+    # status (loop_timeout, provider_error_prefanout_fallback, ...) is the more
+    # informative failure and keeps precedence -- see `merge_channel_loss`.
+    "channel_degraded",
 ]
 
 # Statuses that are NOT a degradation. Everything else is.
@@ -128,6 +144,33 @@ def is_degraded(status: GathererStatus | str | None) -> bool:
     if status is None:
         return False
     return status not in _NON_DEGRADED_STATUSES
+
+
+def merge_channel_loss(
+    status: GathererStatus | str | None,
+    lost: frozenset[str],
+) -> GathererStatus | str | None:
+    """Fold channel losses into a gatherer status.
+
+    Precedence is deliberate and one-directional: an already-degraded status
+    WINS. `loop_timeout` tells the caller more than `channel_degraded` does,
+    and a request can hit both (a 30s BM25 timeout is a good way to run the
+    loop out of budget). Overwriting the terminal status with the channel one
+    would trade a specific diagnosis for a vaguer one.
+
+    So this only ever upgrades the honest-success statuses. `None` stays None:
+    the gatherer never ran, so it has no channels to have lost.
+
+    Note `zero_recall_short_circuit` IS upgraded despite being non-degraded.
+    "Every channel returned zero hits" is only an honest empty answer if the
+    channels actually ran; if one of them died on the way, the emptiness is an
+    artifact and reporting it as honest is exactly the lie this exists to stop.
+    """
+    if status is None or not lost:
+        return status
+    if is_degraded(status):
+        return status
+    return "channel_degraded"
 
 
 class GatheredEntity(BaseModel):

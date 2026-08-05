@@ -87,12 +87,21 @@ async def vector_search(
     UNDER-RETURN (fewer than top_k in-scope hits exist among the scanned
     candidates even though more exist in the table). We mitigate by
     enabling pgvector's iterative scan (`hnsw.iterative_scan =
-    relaxed_order`, pgvector >= 0.8) for source_keys queries so the scan
-    keeps widening until enough in-scope rows are found; on older
-    pgvector builds the SET fails softly (savepoint rollback) and the
-    pre-mitigation under-return behavior remains. relaxed_order may
-    return near-ties slightly out of distance order -- acceptable for a
-    fused retrieval channel.
+    relaxed_order`, pgvector >= 0.8) so the scan keeps widening until
+    enough in-scope rows are found; on older pgvector builds the SET
+    fails softly (savepoint rollback) and the pre-mitigation under-return
+    behavior remains. relaxed_order may return near-ties slightly out of
+    distance order -- acceptable for a fused retrieval channel.
+
+    That mitigation covers EVERY filter on the ANN path, not just
+    source_keys: the visibility predicate is unconditional, so pgvector is
+    always post-filtering something.
+
+    Result ordering is deterministic. The ANN pool is ordered by distance
+    ALONE (the only shape HNSW can serve), then the outer query applies the
+    `chunk_id` tiebreak over that bounded pool. Putting the tiebreak in the
+    ANN ORDER BY is what turned this into a 3,355 ms seq scan; see the
+    comment at the ordering callsite.
     """
     embedder = get_embedder_v2()
     query_vec = await embedder.embed_query(query_text)
@@ -101,11 +110,19 @@ async def vector_search(
     spec = temporal or TemporalSpec()
 
     async with with_tenant(customer_id) as conn:
-        if source_keys:
-            # Selective post-filter mitigation (see docstring). with_tenant
-            # runs inside a transaction, so SET LOCAL scopes to this query
-            # and the savepoint makes the missing-GUC case (pgvector < 0.8)
-            # a soft no-op instead of poisoning the transaction.
+        # Selective post-filter mitigation (see docstring). This used to be
+        # gated on `source_keys`, which under-scoped it: pgvector applies
+        # EVERY filter after the ANN scan, and the visibility filter below is
+        # unconditional (include_drafts defaults False). So the under-return
+        # this guards against applies to essentially every ANN query, not just
+        # keyed ones -- a doc_type or author filter under-returns exactly the
+        # same way. Gate on the ANN path itself instead.
+        #
+        # with_tenant runs inside a transaction, so SET LOCAL scopes to this
+        # query and cannot leak across a pgbouncer-pooled connection. The
+        # savepoint makes the missing-GUC case (pgvector < 0.8) a soft no-op
+        # instead of poisoning the transaction.
+        if sort_by != "recency":
             await conn.execute("SAVEPOINT iterscan")
             try:
                 await conn.execute("SET LOCAL hnsw.iterative_scan = 'relaxed_order'")
@@ -148,14 +165,28 @@ async def vector_search(
             else "AND c.visibility = 'approved' AND d.visibility = 'approved'"
         )
 
-        # Default: ANN distance ordering (HNSW-indexed, fast). recency: re-order
-        # by updated_at DESC across the narrowed pool (slower than the HNSW path
-        # but bounded — author/doc_type/temporal filters typically prune by
-        # orders of magnitude before this row count matters).
-        order_by_sql = (
-            "d.updated_at DESC, c.chunk_id"
+        # ANN ordering MUST be `ORDER BY <distance>` and nothing else, or the
+        # HNSW index cannot serve it. This previously read
+        # `c.embedding_v2 <=> $2::halfvec, c.chunk_id`; the `chunk_id`
+        # tiebreaker forced exact distances for every candidate row and the
+        # planner fell back to a Parallel Seq Scan + Sort. Measured on the
+        # managed plane against 203,454 rows:
+        #
+        #     ORDER BY dist, chunk_id  ->  Parallel Seq Scan + Sort   3,355 ms
+        #     ORDER BY dist            ->  Index Scan (hnsw)             12.7 ms
+        #
+        # This is the documented pgvector behaviour (pgvector#760), not a
+        # planner quirk. Determinism is NOT dropped -- it moves to the outer
+        # query below, which tiebreaks a bounded pool instead of the table.
+        #
+        # recency is unchanged: it cannot use the ANN index by construction,
+        # so it keeps its combined ordering and pays a sort over the narrowed
+        # pool (author/doc_type/temporal filters prune before it matters).
+        ann_order_sql = "c.embedding_v2 <=> $2::halfvec"
+        outer_order_sql = (
+            "updated_at DESC, chunk_id"
             if sort_by == "recency"
-            else "c.embedding_v2 <=> $2::halfvec, c.chunk_id"
+            else "score DESC, chunk_id"
         )
 
         inner_sql = f"""
@@ -186,6 +217,34 @@ async def vector_search(
               {author_filter}
               {source_key_filter}
         """
+        # ANN candidate pool. The index returns its best N by distance; every
+        # later step (per-source windowing, deterministic tiebreak) runs over
+        # that bounded pool rather than the table.
+        #
+        # Deliberately NOT applied when per_source_top_k is set. That window
+        # partitions by source_system precisely so a quiet corpus cannot be
+        # buried by a loud one, and it can only do that if it sees the full
+        # matching set: `custom_ingest`'s first hit once landed at global rank
+        # 61, and a LIMIT of 30 cut it entirely (see the note at the window).
+        # Truncating to an ANN pool first would reinstate that bug, and any
+        # over-fetch multiplier big enough to be safe is a guess about corpus
+        # size, not a guarantee. A silent recall regression is exactly the
+        # failure this whole change exists to remove, so the per-source path
+        # keeps its full scan and its guarantee.
+        #
+        # The default path -- which is what production traffic actually uses,
+        # since per_source_top_k comes from the request and defaults to None --
+        # gets the index scan. Making the per-source path fast too needs a real
+        # per-source ANN strategy (one ANN query per source), tracked separately.
+        if sort_by == "recency" or per_source_top_k is not None:
+            candidate_sql = inner_sql
+        else:
+            params.append(top_k)
+            candidate_sql = (
+                f"{inner_sql}\n            ORDER BY {ann_order_sql}"
+                f"\n            LIMIT ${len(params)}"
+            )
+
         if per_source_top_k is not None:
             # Give each source_system its own top-K slot instead of one global
             # budget, so a loud source can't bury a quiet one in a mixed-source
@@ -208,7 +267,7 @@ async def vector_search(
                        ROW_NUMBER() OVER (
                            PARTITION BY sub.source_system ORDER BY {partition_order}
                        ) AS _ps_rn
-                FROM ({inner_sql}) sub
+                FROM ({candidate_sql}) sub
             ) ranked
             WHERE _ps_rn <= ${ps_idx}
             -- Interleave sources: each source's rank-1 before any source's
@@ -225,7 +284,15 @@ async def vector_search(
             LIMIT $3
             """
         else:
-            sql = f"{inner_sql}\n            ORDER BY {order_by_sql}\n            LIMIT $3"
+            # Deterministic tiebreak lives HERE, outside the ANN pool, so it
+            # sorts at most `pool_size` rows instead of defeating the index.
+            sql = f"""
+            SELECT chunk_id, doc_id, doc_version, source_system, source_url,
+                   title, author_id, content, kind, created_at, updated_at, score
+            FROM ({candidate_sql}) pool
+            ORDER BY {outer_order_sql}
+            LIMIT $3
+            """
 
         rows = await conn.fetch(sql, *params)
 
