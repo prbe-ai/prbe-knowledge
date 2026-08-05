@@ -139,6 +139,25 @@ CREATE TABLE documents (
     content_hash         TEXT NOT NULL,
     title                TEXT,
     body_preview         TEXT,
+
+    -- Materialized, weighted tsvector over the title (migration 0099).
+    -- setweight 'A' against chunks.content_tsv's unweighted 'D' is what gave
+    -- the old ts_rank_cd ranker its ~10x title advantage for free.
+    -- Indexed TWICE over: verbatim, and with path/filename punctuation
+    -- flattened to spaces, because Postgres' `english` parser emits
+    -- `model.ckpt` as ONE `file` lexeme while query tokenizers split on
+    -- alphanumeric runs -- a verbatim-only index misses exactly the filename
+    -- case this exists for.
+    title_tsv            tsvector GENERATED ALWAYS AS (
+                             setweight(
+                                 to_tsvector(
+                                     'english',
+                                     coalesce(title, '') || ' ' ||
+                                     translate(coalesce(title, ''), './\-_:', '      ')
+                                 ),
+                                 'A'
+                             )
+                         ) STORED,
     body_size_bytes      INT  NOT NULL DEFAULT 0,
     body_token_count     INT  NOT NULL DEFAULT 0,
     author_id            TEXT,
@@ -200,6 +219,19 @@ CREATE INDEX idx_documents_metadata ON documents USING GIN (metadata jsonb_path_
 -- customer_id. See migration 0055.
 CREATE INDEX idx_documents_source_id_trgm ON documents USING GIN (source_id gin_trgm_ops);
 CREATE INDEX idx_documents_doc_id_trgm ON documents USING GIN (doc_id gin_trgm_ops);
+
+-- Trigram index on the document TITLE (migration 0089). grounding.py's
+-- doc_title subtask ORs a trgm predicate against an FTS one, and an OR is only
+-- as indexable as its worst branch -- without this the whole predicate falls to
+-- a scan. This index is the reason schema.sql drift matters: it was added by a
+-- migration, never backported here, and every database born fresh afterwards
+-- silently lacked it while reporting alembic head (measured: 677 ms on the
+-- plane missing it vs 77 ms on the plane that had it).
+CREATE INDEX idx_documents_title_trgm ON documents USING GIN (title gin_trgm_ops)
+    WHERE valid_to IS NULL;
+
+-- GIN over the weighted title tsvector (migration 0099).
+CREATE INDEX idx_documents_title_tsv ON documents USING GIN (title_tsv);
 -- Partial index keeps the doc-type listing path from scanning draft rows
 -- once visibility='draft' wiki artifacts start appearing. See migration 0082.
 CREATE INDEX IF NOT EXISTS documents_visibility_approved_idx
@@ -267,6 +299,15 @@ CREATE TABLE chunks (
     -- bm25.py for the perf rationale.
     content_tsv          tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
 
+    -- Denormalized copy of the owning document's title (migration 0100).
+    -- NOT a convenience: BM25 matches titles, and a cross-table
+    -- `chunks.content OR documents.title` predicate cannot be served by any
+    -- single index -- it seq-scanned 4.4 GB and timed out at 30s in
+    -- production. With the title on the chunk the whole query is single-table
+    -- and pg_search answers it from one index (measured 191 ms).
+    -- Kept in sync by two triggers below, not by application code.
+    title                TEXT NOT NULL DEFAULT '',
+
     -- migration 0082 (post-approval wiki-artifact draft gating). Tracks
     -- the visibility of the chunk's owning document version so retrieval
     -- can default-filter draft chunks without joining documents.
@@ -306,6 +347,82 @@ CREATE INDEX idx_chunks_fts_content    ON chunks USING GIN (to_tsvector('english
 CREATE INDEX idx_chunks_content_tsv    ON chunks USING GIN (content_tsv);
 -- One metadata chunk per doc; partial index serves backfill idempotency check.
 CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kind = 'metadata';
+
+-- Single-column uniqueness on chunk_id (migration 0101). chunk_id is already
+-- unique in practice (`{doc_id}:{prefix}{content_hash[:16]}`); this enforces
+-- it. Was also a pg_search key_field requirement before 0.23.4 relaxed it.
+CREATE UNIQUE INDEX chunks_chunk_id_unique ON chunks (chunk_id);
+
+-- pg_search BM25 index (migration 0100). Guarded because the extension ships
+-- in `prbe-postgres` but NOT in the `pgvector/pgvector` image used for local
+-- dev, and schema.sql has to bootstrap both. Without the guard every fresh
+-- local database fails here; with it, local gets a working schema minus BM25
+-- and the retrieval tests skip loudly (see tests/retrieval/conftest.py).
+--
+-- pg_search permits exactly ONE `USING bm25` index per relation, so this is
+-- the only one -- adding a second raises
+-- "a relation may only have one `USING bm25` index".
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_search') THEN
+        CREATE EXTENSION IF NOT EXISTS pg_search;
+        EXECUTE $ix$
+            CREATE INDEX IF NOT EXISTS idx_chunks_bm25_v2
+            ON chunks USING bm25 (
+                chunk_id, content, title, customer_id, doc_id, kind,
+                chunk_index, first_seen_version, last_seen_version, visibility
+            )
+            WITH (key_field=chunk_id)
+        $ix$;
+    END IF;
+END
+$$;
+
+-- Title sync (migration 0100). The obligation a denormalized column takes on.
+-- Enforced in the database because the application is not the only writer:
+-- backfill scripts, migrations and manual SQL all insert chunks.
+CREATE OR REPLACE FUNCTION chunks_sync_title_from_document()
+RETURNS trigger AS $fn$
+BEGIN
+    UPDATE chunks c
+    SET title = coalesce(NEW.title, '')
+    WHERE c.customer_id = NEW.customer_id
+      AND c.doc_id = NEW.doc_id
+      AND NEW.version BETWEEN c.first_seen_version AND c.last_seen_version
+      AND c.title IS DISTINCT FROM coalesce(NEW.title, '');
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION chunks_fill_title_on_insert()
+RETURNS trigger AS $fn$
+BEGIN
+    IF NEW.title IS NULL OR NEW.title = '' THEN
+        SELECT coalesce(d.title, '') INTO NEW.title
+        FROM documents d
+        WHERE d.doc_id = NEW.doc_id
+          AND d.customer_id = NEW.customer_id
+          AND d.version BETWEEN NEW.first_seen_version AND NEW.last_seen_version
+        ORDER BY d.version DESC
+        LIMIT 1;
+        NEW.title := coalesce(NEW.title, '');
+    END IF;
+    RETURN NEW;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_chunks_sync_title ON documents;
+CREATE TRIGGER trg_chunks_sync_title
+    AFTER UPDATE OF title ON documents
+    FOR EACH ROW
+    WHEN (OLD.title IS DISTINCT FROM NEW.title)
+    EXECUTE FUNCTION chunks_sync_title_from_document();
+
+DROP TRIGGER IF EXISTS trg_chunks_fill_title ON chunks;
+CREATE TRIGGER trg_chunks_fill_title
+    BEFORE INSERT ON chunks
+    FOR EACH ROW
+    EXECUTE FUNCTION chunks_fill_title_on_insert();
 -- Partial index keeps retrieval's per-doc chunk fetch index-only once
 -- visibility='draft' rows start appearing (post-approval wiki artifacts).
 -- See migration 0082.
