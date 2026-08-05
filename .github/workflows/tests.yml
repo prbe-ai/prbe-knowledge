@@ -25,5 +25,13 @@ jobs:
       - name: Lint
         run: .venv/bin/ruff check .
 
+      # Retrieval indexes that exist, are paid for, and are silently bypassed
+      # because the query no longer matches their expression. Four separate
+      # production incidents, none of which failed a test -- Postgres answers
+      # correctly, just by scanning. Runs here rather than as a pytest test
+      # because this workflow does not run pytest.
+      - name: Index contracts
+        run: .venv/bin/python scripts/check_index_contracts.py
+
       - name: Type-check
         run: .venv/bin/mypy engine kb services || true   # strict mypy soft-gated in Phase 0
