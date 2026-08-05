@@ -9,10 +9,17 @@ keyword ONLY if those words also appeared in the body.
 Three invariants here:
 
 1. A title-only match surfaces the document at all (the regression).
-2. It surfaces exactly ONE chunk -- the `chunk_index = 0` representative.
-   A title belongs to the document, not to any chunk, so matching on it without
-   that restriction would return every chunk of the document at an identical
-   score and a long document would bury everything else.
+2. It surfaces exactly ONE chunk per document. A title belongs to the
+   document, not to any chunk, so matching on it without that restriction
+   would return every chunk of the document and a long document would bury
+   everything else.
+
+   Phase 2 kept the guarantee and changed the mechanism. The rule used to be
+   `AND c.chunk_index = 0` -- a cap of one that also picked the chunk
+   arbitrarily. It is now `BM25_TITLE_ONLY_PER_DOC` (default 1) applied to
+   chunks that did NOT match on their own content, so the count is a visible
+   tunable number and BM25 chooses which chunk by relevance. Chunks that
+   matched on content are never capped; invariant 3's test covers that.
 3. Filename tokenization actually aligns. Postgres' `english` parser emits
    `model.ckpt` as ONE `file` lexeme while the retriever splits queries on
    alphanumeric runs, so a verbatim-only index would have missed exactly the
@@ -113,7 +120,7 @@ async def _seed(customer_id: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_title_only_match_surfaces_the_document(live_db) -> None:
+async def test_title_only_match_surfaces_the_document(pg_search_db) -> None:
     """The regression: a filename in the TITLE is findable even though no
     chunk body contains it."""
     cust = "cust-bm25-title-title-surfaces"
@@ -129,7 +136,7 @@ async def test_title_only_match_surfaces_the_document(live_db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_title_only_match_returns_one_representative_chunk(live_db) -> None:
+async def test_title_only_match_returns_one_representative_chunk(pg_search_db) -> None:
     """A title belongs to the DOCUMENT. Matching on it must not return every
     chunk of that document at an identical score."""
     cust = "cust-bm25-title-one-chunk"
@@ -143,14 +150,25 @@ async def test_title_only_match_returns_one_representative_chunk(live_db) -> Non
         f"expected one representative chunk, got {len(title_hits)} -- a long "
         "document would bury every other result"
     )
-    assert title_hits[0].chunk_id == f'{_doc(cust, "doc-title-hit")}-c0'
+    # The COUNT is still 1 and still for the same reason. What changed in
+    # Phase 2 is WHICH chunk: the old rule hardcoded `chunk_index = 0`, so a
+    # title match returned whichever chunk happened to be first. BM25 picks the
+    # best-scoring one instead, and the cap (BM25_TITLE_ONLY_PER_DOC) enforces
+    # the count. Asserting `-c0` here would now be asserting the arbitrariness,
+    # not the guarantee -- so assert the guarantee.
+    assert title_hits[0].doc_id == _doc(cust, "doc-title-hit")
+    assert title_hits[0].score > 0
 
 
 @pytest.mark.asyncio
-async def test_title_match_outranks_a_body_only_match(live_db) -> None:
-    """title_tsv is setweight'd 'A' and content_tsv is unweighted ('D'), so a
-    title hit is worth ~10x a body hit under ts_rank_cd's default weights.
-    Someone typing a filename wants the file, not a doc that mentions it."""
+async def test_title_match_outranks_a_body_only_match(pg_search_db) -> None:
+    """Someone typing a filename wants the file, not a doc that mentions it.
+
+    The ~10x used to come for free from Postgres' own weighting: 0099 stores
+    title_tsv setweight'd 'A' against an unweighted ('D') content_tsv, and
+    ts_rank_cd's defaults are {D:0.1, A:1.0}. BM25 has no weight classes, so
+    the intent is restated explicitly as `_BM25_TITLE_BOOST`. This test pins
+    the OUTCOME, which is why it survives the ranker swap unchanged."""
     cust = "cust-bm25-title-outranks"
     await _seed(cust)
 
@@ -164,9 +182,10 @@ async def test_title_match_outranks_a_body_only_match(live_db) -> None:
 
 
 @pytest.mark.asyncio
-async def test_body_only_matches_still_return_every_matching_chunk(live_db) -> None:
-    """The chunk_index restriction applies ONLY to title-only matches. A chunk
-    that matches on its own content is unaffected."""
+async def test_body_only_matches_still_return_every_matching_chunk(pg_search_db) -> None:
+    """The per-document cap applies ONLY to title-only matches. A chunk that
+    matches on its own content earned its slot and is never capped, however
+    many its document contributes."""
     cust = "cust-bm25-title-body-chunks"
     await _seed(cust)
 
