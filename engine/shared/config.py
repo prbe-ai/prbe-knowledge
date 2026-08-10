@@ -9,7 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from engine.shared.constants import (
@@ -31,6 +31,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        populate_by_name=True,
     )
 
     environment: Environment = "local"
@@ -103,11 +104,32 @@ class Settings(BaseSettings):
     backfill_heartbeat_interval_seconds: int = 30
     backfill_stale_heartbeat_seconds: int = 180
 
-    # --- Object storage (R2 in prod, MinIO locally) -------------------------
-    r2_endpoint_url: str = "http://localhost:9000"
-    r2_access_key_id: str = "minioadmin"
-    r2_secret_access_key: SecretStr = SecretStr("minioadmin")
-    r2_region: str = "auto"
+    # --- Object storage (S3-API: Cloudflare R2 or AWS S3; MinIO locally) -----
+    # One boto3 "s3" client. R2 and AWS S3 speak the same API — the differences are
+    # endpoint, region, and credentials. Canonical env is OBJECT_STORE_*; the legacy
+    # R2_* names remain aliases (OBJECT_STORE_* wins when both are set) so this reads
+    # the SAME shared research-os secret as the control plane. Static creds are
+    # OPTIONAL: an AWS-S3 deploy may omit them and use ambient IAM credentials (IRSA
+    # web-identity / instance profile). Empty endpoint -> botocore's default resolver.
+    r2_endpoint_url: str = Field(
+        "http://localhost:9000",
+        validation_alias=AliasChoices("OBJECT_STORE_ENDPOINT", "R2_ENDPOINT_URL"),
+    )
+    r2_access_key_id: str = Field(
+        "", validation_alias=AliasChoices("OBJECT_STORE_ACCESS_KEY", "R2_ACCESS_KEY_ID")
+    )
+    r2_secret_access_key: SecretStr | None = Field(
+        None, validation_alias=AliasChoices("OBJECT_STORE_SECRET", "R2_SECRET_ACCESS_KEY")
+    )
+    r2_session_token: SecretStr | None = Field(
+        None,
+        validation_alias=AliasChoices(
+            "OBJECT_STORE_SESSION_TOKEN", "AWS_SESSION_TOKEN", "R2_SESSION_TOKEN"
+        ),
+    )
+    r2_region: str = Field(
+        "auto", validation_alias=AliasChoices("OBJECT_STORE_REGION", "R2_REGION")
+    )
     r2_bucket_prefix: str = "prbe-knowledge"
 
     # --- External model providers -------------------------------------------
@@ -319,10 +341,14 @@ def validate_boot_secrets(settings: Settings) -> None:
             if settings.internal_knowledge_api_key is not None
             else ""
         ),
-        "R2_ACCESS_KEY_ID": settings.r2_access_key_id,
-        "R2_SECRET_ACCESS_KEY": settings.r2_secret_access_key.get_secret_value(),
         "GOOGLE_API_KEY": settings.google_api_key.get_secret_value(),
     }
+    # Static object-store creds are OPTIONAL: an AWS-S3 deploy may use ambient IAM
+    # credentials (IRSA / instance profile) and set no static secret. Validate the
+    # static creds only when a secret is actually provided.
+    if settings.r2_secret_access_key is not None:
+        checked["R2_ACCESS_KEY_ID"] = settings.r2_access_key_id
+        checked["R2_SECRET_ACCESS_KEY"] = settings.r2_secret_access_key.get_secret_value()
     offending = sorted(
         name
         for name, value in checked.items()

@@ -1,4 +1,5 @@
-"""R2 (S3-compatible) client wrapper. Works against R2 in prod, MinIO locally.
+"""Object-store client wrapper over one boto3 "s3" client (Cloudflare R2 or AWS S3;
+MinIO locally). R2 and S3 are the same API — endpoint, region, and credentials differ.
 
 boto3 is sync; we run calls in a thread executor to stay out of the asyncio path.
 """
@@ -76,17 +77,28 @@ class ObjectLocation:
 
 
 def _make_client(settings: Settings) -> Any:
-    return boto3.client(
-        "s3",
-        endpoint_url=settings.r2_endpoint_url,
-        aws_access_key_id=settings.r2_access_key_id,
-        aws_secret_access_key=settings.r2_secret_access_key.get_secret_value(),
-        region_name=settings.r2_region,
-        config=BotoConfig(
+    kwargs: dict[str, Any] = {
+        # Empty endpoint -> None so botocore resolves the AWS regional endpoint.
+        "endpoint_url": settings.r2_endpoint_url or None,
+        # R2 is region-less ("auto"); AWS S3 binds the region into the SigV4 signature,
+        # so a real region is required there (MinIO ignores it).
+        "region_name": settings.r2_region,
+        "config": BotoConfig(
             signature_version="s3v4",
             retries={"max_attempts": 3, "mode": "standard"},
         ),
-    )
+    }
+    # Static creds when supplied (R2 always; S3 optionally). When absent, pass NOTHING
+    # so boto3 uses the ambient chain (IRSA web-identity, instance profile, env).
+    # Passing empty strings would BREAK that resolution.
+    secret = settings.r2_secret_access_key
+    if settings.r2_access_key_id and secret is not None:
+        kwargs["aws_access_key_id"] = settings.r2_access_key_id
+        kwargs["aws_secret_access_key"] = secret.get_secret_value()
+        token = settings.r2_session_token
+        if token is not None:
+            kwargs["aws_session_token"] = token.get_secret_value()
+    return boto3.client("s3", **kwargs)
 
 
 class ObjectStore:
