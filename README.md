@@ -207,6 +207,13 @@ ships in-repo at `services/mcp/` (vendored from the former standalone
 Mode auto-resolves from the env (static when only `MCP_API_TOKEN` is set, oauth
 when a JWKS URL is set); set `MCP_AUTH_MODE` to force one.
 
+The MCP and installer guidance uses a decision gate: agents search only when a
+concrete question about team history could change the answer or approach, such
+as prior rationale, incidents, ownership, constraints, or parallel work. Routine
+implementation, review, status, and shipping steps do not trigger a lookup.
+Re-running the hosted `/install` script refreshes this shared guidance for
+Codex, Claude Code, and Cursor while preserving unrelated instructions.
+
 ## Contributing & community
 
 - [Contributing](CONTRIBUTING.md) — dev setup, gates, PR norms.
