@@ -90,14 +90,22 @@ async def test_triage_sends_openai_structured_output_in_gateway_mode(monkeypatch
 
     seen: dict[str, object] = {}
 
+    class _Captured(Exception):
+        """Named so the assertion below cannot pass on an unrelated failure.
+
+        `pytest.raises(Exception)` would swallow a TypeError from a changed
+        signature and still let the response_format assertions run against a
+        half-populated dict.
+        """
+
     async def fake_acompletion(**kwargs):
         seen.update(kwargs)
-        raise RuntimeError("stop after capture")
+        raise _Captured
 
     monkeypatch.setattr("engine.shared.llm.acompletion", fake_acompletion)
     monkeypatch.setattr("engine.shared.llm.gateway_url", lambda: GATEWAY)
 
-    with pytest.raises(Exception):
+    with pytest.raises(_Captured):
         await prov._gemini_call_json(
             model="gemini-3.5-flash",
             system="sys",
@@ -106,6 +114,12 @@ async def test_triage_sends_openai_structured_output_in_gateway_mode(monkeypatch
             max_tokens=8000,
         )
 
-    assert seen.get("response_format") == {"type": "json_object"}
+    # json_schema, NOT json_object. Both unfence the JSON, but json_object
+    # constrains only "some JSON" and Gemini answers with a top-level ARRAY,
+    # which the parser rejects as "not a JSON object: list". The schema has to
+    # ride along for the shape contract to match the native path.
+    rf = seen.get("response_format")
+    assert rf is not None and rf["type"] == "json_schema", rf
+    assert rf["json_schema"]["schema"] == {"type": "object", "properties": {}}
     assert "response_mime_type" not in seen, "native mime type is dropped by the proxy"
     assert "response_schema" not in seen

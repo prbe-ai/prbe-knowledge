@@ -420,18 +420,30 @@ async def _gemini_call_json(
         # finds nothing. That is the silent half of the 2026-08-11 incident:
         # the loud transport error was fixed first, and this replaced it.
         #
-        # `response_format={"type": "json_object"}` is the OpenAI equivalent and
-        # produces raw JSON through the same route (verified against the live
-        # proxy). The SCHEMA is not forwarded -- json_object constrains shape,
-        # not fields -- so the prompt's own schema description carries that,
-        # exactly as it does for the Anthropic triage path.
+        # `json_schema` (NOT `json_object`). Both return raw, unfenced JSON, so
+        # both fix the fencing -- but json_object constrains only "some JSON",
+        # and Gemini then answers with a top-level ARRAY of verdicts while the
+        # parser requires the object the schema describes:
+        #
+        #     json_object -> '[{"queue_id": 1, "score": 2.0}, ...]'
+        #                    -> "gemini response was not a JSON object: list"
+        #     json_schema -> '{"verdicts":[{"queue_id":1,"score":0.1}, ...]}'
+        #
+        # Both verified against the live proxy. json_schema carries `sanitized`
+        # -- the same schema the native path sends -- so the shape contract is
+        # identical on both routes rather than reconstructed from prose.
         #
         # thinking_config is dropped too, and that one is genuinely fine here:
         # at the triage output budget (WIKI_TRIAGE_MAX_OUTPUT_TOKENS = 8000)
         # Gemini 3 spends ~650 tokens reasoning and still completes the verdict
         # list. It only bites at toy budgets, which is what made it look like
         # the cause for longer than it should have.
-        extra_kwargs: dict[str, Any] = {"response_format": {"type": "json_object"}}
+        extra_kwargs: dict[str, Any] = {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "triage_verdicts", "schema": sanitized},
+            }
+        }
     else:
         extra_kwargs = {
             "response_schema": sanitized,
