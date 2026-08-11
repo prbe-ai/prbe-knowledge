@@ -90,14 +90,22 @@ async def test_triage_sends_openai_structured_output_in_gateway_mode(monkeypatch
 
     seen: dict[str, object] = {}
 
+    class _Captured(Exception):
+        """Named so the assertion below cannot pass on an unrelated failure.
+
+        `pytest.raises(Exception)` would swallow a TypeError from a changed
+        signature and still let the response_format assertions run against a
+        half-populated dict.
+        """
+
     async def fake_acompletion(**kwargs):
         seen.update(kwargs)
-        raise RuntimeError("stop after capture")
+        raise _Captured
 
     monkeypatch.setattr("engine.shared.llm.acompletion", fake_acompletion)
     monkeypatch.setattr("engine.shared.llm.gateway_url", lambda: GATEWAY)
 
-    with pytest.raises(Exception):
+    with pytest.raises(_Captured):
         await prov._gemini_call_json(
             model="gemini-3.5-flash",
             system="sys",
