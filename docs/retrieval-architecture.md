@@ -211,7 +211,7 @@ return the tenant-scoped view. (`/health` is unauthenticated.)
 | `GET /sources/{doc_id}` | Reassembled full source content for a document |
 | `GET /health` | Liveness + DB ping |
 
-The MCP server (`services/mcp/`) is a thin proxy over `/query`, `/retrieve`, and
+The MCP server (`engine/mcp/`) is a thin proxy over `/query`, `/retrieve`, and
 source fetch — see the [README MCP section](../README.md#mcp-server).
 
 ---

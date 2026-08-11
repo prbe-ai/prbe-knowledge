@@ -46,92 +46,21 @@ ALLOWED_ORIGINS = [
 # describing the data ("here's what's in here") doesn't make agents reach
 # for it. Telling them when to call it, with examples, does.
 MCP_INSTRUCTIONS = """\
-Probe Knowledge is the user's team operational memory — Slack threads,
-GitHub PRs, Linear tickets, Notion docs, and Sentry incidents synced from
-their workplace tools. The team has probably discussed your current task
-before; surfacing that history is your job.
+Probe searches team operational history in Slack, GitHub, Linear, Notion, and
+Sentry. Use search_knowledge only when a concrete history question could change
+the answer or approach: prior rationale, incidents, ownership, constraints, or
+similar/parallel work.
 
-This is not a one-time startup check. At every new user request, task
-shift, debugging phase, design decision, or implementation plan, re-evaluate
-whether Probe has relevant team context. A search from earlier in the
-session only covers that earlier question.
+Do not call Probe for repo facts, routine implementation/review, status, or
+shipping. A new request, plan, phase change, compaction, or elapsed time is not a
+trigger. Reuse a relevant lookup for the same decision.
 
-CALL search_knowledge PROACTIVELY when:
-- The user asks you to make a design decision, refactor, or implement a
-  non-trivial feature. The team likely has prior context on it.
-- You're touching code in a system or area you haven't seen before.
-- The user asks "how do we…", "why did we…", "what about…", "who's
-  working on…", or references a past event ("that incident", "the bug
-  last sprint", "the design doc Y mentioned").
-- Before you commit to an approach or write a substantial amount of new
-  code.
-- New information changes the direction of the work after an earlier
-  Probe lookup.
-- Conversation context was just compacted or summarized — prior Probe
-  results are no longer in your direct context, so re-search anything
-  you'd otherwise rely on from earlier.
+Query with an entity/keyword bag and top_k=5. Use get_source, retry, or follow
+related_entities only when needed to resolve the decision. Surface useful
+findings, then continue from repo evidence. Use query_knowledge only for a direct
+question needing a synthesized, cited answer. Probe is not source-code search.
 
-Pass a bag of entities/keywords as the query — ticket IDs, repos, services,
-files, symbols, error strings, feature flags. NOT a question or sentence;
-prose dilutes BM25, vector, and entity extraction. Good: "PRB-17 Linear
-enrichment per-source toggle workspace_prefs JSONB". Bad: "Why is PRB-17
-still broken?". Surface what you find to the user before proceeding —
-don't silently fold it into your output.
-
-Do NOT skip Probe on these triggers — a missed lookup is the default
-failure mode. If you find yourself proposing a plan, design, refactor,
-or "here's how I'd approach this" response without having called
-search_knowledge for the current goal, stop and search first.
-
-Default retrieval loop:
-1. Start with search_knowledge top_k=5.
-2. If a result looks relevant, call get_source for bounded context before
-   relying on it.
-3. If recall looks low, retry once with top_k=15, a narrower source, or
-   strict_entity_filtering=true for named entities.
-4. If `related_entities` surfaces a high-`score` node adjacent to your
-   results that wasn't in your original query, drop its `canonical_id`
-   into the next search_knowledge call's query to BFS the knowledge graph.
-   The IDF-adjusted score demotes generic high-degree nodes (busy
-   channels, prolific people). Set top_k_related=0 to skip the enrichment.
-5. If results are empty or noisy, say so and continue with repo context.
-
-Long-session checkpoint: if the conversation has moved to a new subsystem,
-ticket, PR, design choice, incident, or implementation phase since the last
-Probe call, call Probe again before proceeding. By default in a long
-session, treat any Probe lookup older than ~5-10 turns as stale and
-re-search before relying on it — the cost of a redundant lookup is small;
-a stale assumption is large.
-
-Planning gate:
-- Before you output an implementation plan, architecture plan, refactor plan,
-  <proposed_plan>, or plan-mode response for product code, call
-  search_knowledge unless you have a Probe lookup from this turn or the last
-  few turns covering the same goal and subsystem.
-- Use the results to constrain the plan. Include a short "Probe context" note
-  in the plan: cite the relevant sources, or say no relevant Probe context was
-  found.
-- Do not treat a startup/session-opening Probe lookup as sufficient for a later
-  plan if the user goal, subsystem, or approach has changed.
-
-NOT for source-code search. Read the repo directly for that.
-
-Tool guide:
-- search_knowledge (default) — doc-grouped evidence (each Document in `results[]`
-  entry carries doc-level metadata and a nested `chunks[]` array of
-  matching spans) for you to quote and reason over. Pass `source` to
-  scope when the user names a system ("check Linear", "find the Slack
-  thread").
-- query_knowledge — the user asked a direct question and wants a
-  synthesized answer with citations. Don't pre-summarize the answer.
-- get_source — a document or chunk looks relevant; fetch bounded
-  context from the same source by doc_id. Defaults to a preview. Use `mode="search"`
-  with `query`, `mode="grep"` with `pattern`, `mode="range"` with
-  `start_line`/`cursor`, `mode="chunk"` with `chunk_index`, or
-  `mode="tail"`. `mode="full"` returns the whole document only when it
-  fits the MCP response budget; oversized documents return a 413 and
-  should be read with a bounded mode. Use it only when you genuinely need
-  broad context or the user asks.
+If Probe informs a plan, cite the useful sources; otherwise omit a Probe note.
 """
 
 

@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Install the Probe Knowledge MCP server in Claude Code, Codex, and/or Cursor,
-# and add agent-instruction snippets so coding agents proactively reach for it.
+# and add guidance so coding agents use it when team context matters.
 #
 # Usage:
 #   curl -fsSL https://mcp.knowledge.prbe.ai/install | bash
 #
-# Idempotent: re-running skips current entries and updates stale URLs.
+# Idempotent: re-running preserves configuration and refreshes managed guidance.
 
 set -euo pipefail
 
 MCP_NAME="probe-knowledge"
 MCP_URL="https://mcp.knowledge.prbe.ai/mcp"
 PROBE_HEADING="## Probe Knowledge MCP server (team operational memory)"
+PROBE_BEGIN="<!-- probe-knowledge:begin (managed by Probe installer) -->"
+PROBE_END="<!-- probe-knowledge:end -->"
 
 # Names this server shipped under before, in every client. The rename is not a
 # rename to any client: `claude mcp get probe-knowledge` finds nothing on a box
@@ -68,86 +70,31 @@ prompt_yn() {
 }
 
 read -r -d '' AGENT_GUIDANCE_SNIPPET <<EOF || true
+$PROBE_BEGIN
 $PROBE_HEADING
 
-You have access to this team's operational memory via the \`$MCP_NAME\` MCP
-server: Slack threads, GitHub PRs, Linear tickets, Notion docs, and Sentry
-incidents.
+\`$MCP_NAME\` searches team operational history in Slack, GitHub, Linear,
+Notion, and Sentry. Use \`$MCP_NAME.search_knowledge\` only when a concrete
+history question could change the answer or approach: prior rationale,
+incidents, ownership, constraints, or similar/parallel work.
 
-This is not a one-time startup check. At every new user request, task shift,
-debugging phase, design decision, or implementation plan, re-evaluate whether
-Probe has relevant team context. A search from earlier in the session only
-covers that earlier question.
+Do not call Probe for repo facts, routine implementation/review, status, or
+shipping. A new request, plan, phase change, compaction, or elapsed time is not a
+trigger. Reuse a relevant lookup for the same decision.
 
-ALWAYS call \`$MCP_NAME.search_knowledge\` when:
+Query with an entity/keyword bag and \`top_k=5\`. Use
+\`$MCP_NAME.get_source\`, retry, or follow \`related_entities\` only when needed
+to resolve the decision. Surface useful findings, then continue from repo
+evidence. Use \`$MCP_NAME.query_knowledge\` only for a direct question needing a
+synthesized, cited answer. Probe is not source-code search.
 
-- Making architectural or design decisions
-- Touching code in an unfamiliar system or area
-- The user asks "how do we…", "why did we…", "what about…", "who's
-  working on…"
-- Before each non-trivial implementation phase or before committing to a new
-  approach
-- The user references a past event ("that incident", "the bug last
-  sprint", "the design doc Y mentioned")
-- New information changes the direction of the work after an earlier Probe
-  lookup
-- Conversation context was just compacted or summarized — prior Probe results
-  are no longer in your direct context, so re-search anything you'd
-  otherwise rely on from earlier
-
-Pass a bag of entities/keywords as the query — ticket IDs, repos, services,
-files, symbols, error strings, feature flags. NOT a question or sentence;
-prose dilutes BM25, vector, and entity extraction. Good: "PRB-17 Linear
-enrichment per-source toggle workspace_prefs JSONB". Bad: "Why is PRB-17
-still broken?". Surface what you find to the user before proceeding —
-don't silently fold it into your output.
-
-Do NOT skip Probe on these triggers — a missed lookup is the default
-failure mode. If you find yourself proposing a plan, design, refactor,
-or "here's how I'd approach this" response without having called
-\`$MCP_NAME.search_knowledge\` for the current goal, stop and search first.
-
-Default retrieval loop:
-1. Call \`$MCP_NAME.search_knowledge\` with \`top_k=5\`.
-2. If a result looks relevant, call \`$MCP_NAME.get_source\` for bounded
-   context before relying on it.
-3. If recall looks low, retry once with \`top_k=15\` or a narrower
-   \`source\` filter.
-4. If \`related_entities\` surfaces a high-\`score\` node adjacent to your
-   results that wasn't in your original query, drop its \`canonical_id\`
-   into the next \`$MCP_NAME.search_knowledge\` call's query to BFS the
-   knowledge graph. Set \`top_k_related=0\` to skip the enrichment on
-   token-sensitive flows.
-5. If results are empty or noisy, say so and continue with repo context.
-
-Long-session checkpoint: if the conversation has moved to a new subsystem,
-ticket, PR, design choice, incident, or implementation phase since the last
-Probe call, call Probe again before proceeding. By default in a long session,
-treat any Probe lookup older than ~5-10 turns as stale and re-search before
-relying on it — the cost of a redundant lookup is small; a stale assumption
-is large.
-
-Planning gate:
-- Before you output an implementation plan, architecture plan, refactor plan,
-  <proposed_plan>, or plan-mode response for product code, call
-  \`$MCP_NAME.search_knowledge\` unless you have a Probe lookup from this turn
-  or the last few turns covering the same goal and subsystem.
-- Use the results to constrain the plan. Include a short "Probe context" note
-  in the plan: cite the relevant sources, or say no relevant Probe context was
-  found.
-- Do not treat a startup/session-opening Probe lookup as sufficient for a later
-  plan if the user goal, subsystem, or approach has changed.
-
-Use \`$MCP_NAME.query_knowledge\` only when the user asks a direct question
-and wants a synthesized answer with citations. For your own reasoning,
-prefer \`search_knowledge\` plus \`get_source\`.
-
-This is NOT a source-code search. For code, read the repo directly.
+If Probe informs a plan, cite the useful sources; otherwise omit a Probe note.
+$PROBE_END
 EOF
 
 read -r -d '' CURSOR_RULE_SNIPPET <<EOF || true
 ---
-description: Use Probe team operational memory before architecture, design, debugging, and non-trivial coding decisions.
+description: Use Probe only for concrete team-history questions that can change the current decision.
 globs: "**/*"
 alwaysApply: true
 ---
@@ -269,69 +216,17 @@ fi
 # ---------------------------------------------------------------------------
 GLOBAL_CODEX_AGENTS="$HOME/.codex/AGENTS.md"
 
-_file_has_legacy_section() {
+_file_has_section() {
     local target="$1" line
     [ -f "$target" ] || return 1
-    # Iterated as lines, not words: a heading contains spaces, so `for x in
-    # $LEGACY_PROBE_HEADINGS` would split it into fragments that match nothing.
+    grep -qF "$PROBE_BEGIN" "$target" 2>/dev/null && return 0
+    grep -qF "$PROBE_HEADING" "$target" 2>/dev/null && return 0
     while IFS= read -r line; do
         [ -n "$line" ] || continue
-        if grep -qF "$line" "$target" 2>/dev/null; then
-            return 0
-        fi
+        grep -qF "$line" "$target" 2>/dev/null && return 0
     done <<EOF
 $LEGACY_PROBE_HEADINGS
 EOF
-    return 1
-}
-
-# Rewrite a section that shipped under an older heading or older server name.
-# Editing in place matters twice over: the guard keys on the heading, so a
-# stale one reads as "no section here" and appends a second copy — and that
-# leftover copy keeps instructing the agent to call a tool name that no longer
-# resolves after the rename.
-_migrate_file_section() {
-    local target="$1"
-    [ -f "$target" ] || return 1
-    command -v python3 >/dev/null 2>&1 || return 1
-    python3 - "$target" "$PROBE_HEADING" "$MCP_NAME" \
-        "$LEGACY_PROBE_HEADINGS" "$LEGACY_MCP_NAMES" <<'PY' 2>/dev/null
-import pathlib, re, sys
-
-target, heading, name, legacy_headings, legacy_names = sys.argv[1:6]
-path = pathlib.Path(target)
-text = original = path.read_text()
-
-for old in (h for h in legacy_headings.split("\n") if h.strip()):
-    text = text.replace(old, heading)
-
-for old in (n for n in legacy_names.split() if n and n != name):
-    esc = re.escape(old)
-    # `Probe` as a marked-up identifier, and Probe.<tool> call sites. Bare
-    # prose mentions of Probe are the product name and are left alone.
-    text = re.sub(rf"`{esc}`", f"`{name}`", text)
-    text = re.sub(rf"(?<![\w.-]){esc}\.(\w+)", rf"{name}.\1", text)
-
-if text == original:
-    raise SystemExit(1)
-path.write_text(text)
-PY
-}
-
-_file_has_section() {
-    [ -f "$1" ] || return 1
-    if grep -qF "$PROBE_HEADING" "$1" 2>/dev/null; then
-        return 0
-    fi
-    if _file_has_legacy_section "$1"; then
-        if _migrate_file_section "$1"; then
-            green "✓ Migrated legacy Probe section in $1 → '$MCP_NAME'"
-        else
-            yellow "! $1 has a legacy Probe section that needs a manual update to '$MCP_NAME'"
-        fi
-        # Either way the section exists — never append a second one.
-        return 0
-    fi
     return 1
 }
 
@@ -345,11 +240,83 @@ _append_text() {
     fi
 }
 
+# Refresh installer-managed guidance in place. Older installs predate the
+# begin/end markers, so migrate their heading-delimited section too.
+_upsert_probe_section() {
+    local target="$1" text="$2" tmp replacement
+    if ! _file_has_section "$target"; then
+        _append_text "$target" "$text"
+        return 0
+    fi
+
+    tmp=$(mktemp) || return 1
+    replacement=$(mktemp) || { rm -f "$tmp"; return 1; }
+    printf "%s\n" "$text" > "$replacement"
+
+    if awk \
+        -v begin="$PROBE_BEGIN" \
+        -v end="$PROBE_END" \
+        -v heading="$PROBE_HEADING" \
+        -v legacy_headings="$LEGACY_PROBE_HEADINGS" \
+        -v replacement="$replacement" '
+        BEGIN { split(legacy_headings, old_headings, "\n") }
+        function is_probe_heading(line,    i) {
+            if (line == heading) return 1
+            for (i in old_headings) if (line == old_headings[i]) return 1
+            return 0
+        }
+        function emit(    line) {
+            while ((getline line < replacement) > 0) print line
+            close(replacement)
+            inserted = 1
+        }
+        $0 == begin {
+            if (!inserted) emit()
+            managed = 1
+            next
+        }
+        managed {
+            if ($0 == end) managed = 0
+            next
+        }
+        is_probe_heading($0) {
+            if (!inserted) emit()
+            legacy = 1
+            next
+        }
+        legacy && $0 == "This is NOT a source-code search. For code, read the repo directly." {
+            legacy = 0
+            next
+        }
+        legacy && $0 ~ /^#{1,6}[[:space:]]/ {
+            legacy = 0
+            print
+            next
+        }
+        !legacy { print }
+        END {
+            if (!inserted) {
+                if (NR > 0) print ""
+                emit()
+            }
+        }
+    ' "$target" > "$tmp"
+    then
+        mv "$tmp" "$target"
+        rm -f "$replacement"
+        return 0
+    fi
+
+    rm -f "$tmp" "$replacement"
+    return 1
+}
+
 if command -v codex >/dev/null 2>&1; then
     if _file_has_section "$GLOBAL_CODEX_AGENTS"; then
-        yellow "✓ Codex AGENTS.md: Probe section already in ~/.codex/AGENTS.md (skipping)"
+        _upsert_probe_section "$GLOBAL_CODEX_AGENTS" "$AGENT_GUIDANCE_SNIPPET"
+        green "✓ Codex AGENTS.md: refreshed Probe guidance in ~/.codex/AGENTS.md"
     elif prompt_yn "Add Probe guidance to ~/.codex/AGENTS.md so Codex reaches for it?"; then
-        _append_text "$GLOBAL_CODEX_AGENTS" "$AGENT_GUIDANCE_SNIPPET"
+        _upsert_probe_section "$GLOBAL_CODEX_AGENTS" "$AGENT_GUIDANCE_SNIPPET"
         green "✓ Codex AGENTS.md: added Probe guidance to ~/.codex/AGENTS.md"
     else
         dim "· Codex AGENTS.md: skipped (you said no)"
@@ -453,9 +420,10 @@ LOCAL_CURSOR_RULE=".cursor/rules/probe-knowledge.mdc"
 
 if [ -d "$CURSOR_DIR" ]; then
     if _file_has_section "$LOCAL_CURSOR_RULE"; then
-        yellow "✓ Cursor rule: Probe section already in $(pwd)/$LOCAL_CURSOR_RULE (skipping)"
+        _upsert_probe_section "$LOCAL_CURSOR_RULE" "$AGENT_GUIDANCE_SNIPPET"
+        green "✓ Cursor rule: refreshed Probe guidance in $(pwd)/$LOCAL_CURSOR_RULE"
     elif prompt_yn "Add a project Cursor rule at $LOCAL_CURSOR_RULE so Cursor reaches for Probe?"; then
-        _append_text "$LOCAL_CURSOR_RULE" "$CURSOR_RULE_SNIPPET"
+        _upsert_probe_section "$LOCAL_CURSOR_RULE" "$CURSOR_RULE_SNIPPET"
         green "✓ Cursor rule: added Probe guidance to $(pwd)/$LOCAL_CURSOR_RULE"
     else
         dim "· Cursor rule: skipped (you said no)"
@@ -471,14 +439,16 @@ GLOBAL_CLAUDE_MD="$HOME/.claude/CLAUDE.md"
 LOCAL_CLAUDE_MD="CLAUDE.md"
 
 if _file_has_section "$GLOBAL_CLAUDE_MD"; then
-    yellow "✓ CLAUDE.md: Probe section already in global ~/.claude/CLAUDE.md (skipping)"
+    _upsert_probe_section "$GLOBAL_CLAUDE_MD" "$AGENT_GUIDANCE_SNIPPET"
+    green "✓ CLAUDE.md: refreshed Probe guidance in global ~/.claude/CLAUDE.md"
 elif _file_has_section "$LOCAL_CLAUDE_MD"; then
-    yellow "✓ CLAUDE.md: Probe section already in $(pwd)/CLAUDE.md (skipping)"
+    _upsert_probe_section "$LOCAL_CLAUDE_MD" "$AGENT_GUIDANCE_SNIPPET"
+    green "✓ CLAUDE.md: refreshed Probe guidance in $(pwd)/CLAUDE.md"
 elif prompt_yn "Add a Probe section to your global ~/.claude/CLAUDE.md so EVERY project's agent reaches for it?"; then
-    _append_text "$GLOBAL_CLAUDE_MD" "$AGENT_GUIDANCE_SNIPPET"
+    _upsert_probe_section "$GLOBAL_CLAUDE_MD" "$AGENT_GUIDANCE_SNIPPET"
     green "✓ CLAUDE.md: added Probe section to ~/.claude/CLAUDE.md (applies globally)"
 elif prompt_yn "Add it just to this project's CLAUDE.md instead?"; then
-    _append_text "$LOCAL_CLAUDE_MD" "$AGENT_GUIDANCE_SNIPPET"
+    _upsert_probe_section "$LOCAL_CLAUDE_MD" "$AGENT_GUIDANCE_SNIPPET"
     green "✓ CLAUDE.md: added Probe section to $(pwd)/CLAUDE.md"
 else
     dim "· CLAUDE.md: skipped (you said no to both)"

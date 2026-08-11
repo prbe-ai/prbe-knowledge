@@ -89,14 +89,15 @@ async def search_knowledge(
     discovery: bool = False,
     verbose: bool = False,
 ) -> CallToolResult:
-    """Call BEFORE making design decisions, debugging unfamiliar systems,
-    producing an implementation/architecture/refactor plan, or answering
-    "how do we / why did we / what about" questions.
+    """Search team operational history when a concrete history question could
+    change the answer or approach.
 
     Searches the user's team operational memory — Slack threads, GitHub PRs,
-    Linear tickets, Notion docs, Sentry incidents. The team has probably
-    discussed your current task before; this surfaces that history as
-    full-fidelity evidence you can quote, cite, or reason over directly.
+    Linear tickets, Notion docs, Sentry incidents. Use it for prior rationale,
+    incidents, ownership, constraints, or similar/parallel work—not repo facts,
+    routine implementation/review, status, or shipping. Requests, plans, phase
+    changes, compaction, and elapsed time are not triggers. Reuse relevant
+    results for the same decision.
 
     Pass a bag of entities/keywords as the query — ticket IDs, repo or
     service names, file/symbol names, error strings, feature flags. NOT a
@@ -105,7 +106,8 @@ async def search_knowledge(
       Good: "PRB-17 Linear enrichment per-source toggle workspace_prefs JSONB"
       Bad:  "Why is PRB-17 still considered broken?"
 
-    Surface what you find to the user before proceeding.
+    Surface useful findings. Use `get_source`, retry, or follow related entities
+    only when needed to resolve the decision.
 
     NOT source-code search. For code, read the repo directly.
 
@@ -123,10 +125,8 @@ async def search_knowledge(
     treat the result set as weaker.
 
     The response also includes `related_entities` — non-Document graph
-    nodes attached to the returned docs. When you want to crawl laterally
-    (BFS the knowledge graph), pick one with the highest `score`
-    (IDF-adjusted, demotes generic high-degree entities) and drop its
-    `canonical_id` into the next `search_knowledge` query bag. Set
+    nodes attached to the returned docs. Follow one with another search only
+    when the adjacent context is relevant to the current decision. Set
     `top_k_related=0` to skip this enrichment for token-sensitive flows.
     `related_entities=null` with `related_entities_error` set means the
     walk failed — documents are still trustworthy.
@@ -206,9 +206,8 @@ async def search_knowledge(
         top_k: How many documents to return. Default 5, max 50. Each
             document may contain multiple matching chunks, so the total
             chunk count is typically higher than `top_k`. This is your
-            recall dial — if the result you're looking for isn't in the
-            top 5, raise it (e.g. 15 or 50) and search again before
-            concluding the team hasn't discussed something.
+            recall dial. Raise it only when missing expected context would
+            block or materially change the current decision.
         source: Optional filter — "slack", "github", "linear", "notion",
             "sentry". Omit to search across all connected sources.
         strict_entity_filtering: Default False — broad recall, pure
@@ -229,9 +228,8 @@ async def search_knowledge(
             are non-Document graph nodes attached to the result-set
             docs, ranked by IDF-adjusted `score` so generic high-
             degree entities (e.g. busy channels, prolific people) are
-            demoted in favor of specific ones. Pick the highest-`score`
-            one and feed its `canonical_id` into the next call's
-            `query` to BFS the knowledge graph.
+            demoted in favor of specific ones. Follow one with another
+            search only when its context is relevant to the decision.
         discovery: Default False (focus mode). Set True for **discovery
             mode**: the graph channel gets a wider retrieval budget, so
             more of its surprise-ranked tail reaches the answer. Graph
@@ -325,9 +323,8 @@ async def query_knowledge(
     on top of it; surface the answer (and let the user click through the
     citations).
 
-    For your own reasoning or before-you-design context-gathering, prefer
-    `search_knowledge` — it gives you the same evidence without an LLM
-    in the middle.
+    For agent reasoning about team history, prefer `search_knowledge`; it
+    exposes the evidence without an LLM in the middle.
 
     Response shape: `answer` (string), `citations` (list referencing the
     underlying documents), `insufficient_context` (bool — true when the
