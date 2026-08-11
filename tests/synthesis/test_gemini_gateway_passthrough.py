@@ -14,6 +14,8 @@ production on 2026-08-11 (13,147 queue rows dead-lettered by the first).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from kb.synthesis.providers import _gemini_litellm_model
@@ -123,3 +125,129 @@ async def test_triage_sends_openai_structured_output_in_gateway_mode(monkeypatch
     assert rf["json_schema"]["schema"] == {"type": "object", "properties": {}}
     assert "response_mime_type" not in seen, "native mime type is dropped by the proxy"
     assert "response_schema" not in seen
+
+
+def test_map_schema_becomes_an_array_for_the_openai_wire() -> None:
+    """Triage's schema is a MAP keyed by queue_id; json_schema cannot express it.
+
+    `additionalProperties` carries no generation semantics in OpenAI's
+    json_schema, so the model emits `{}` -- which VALIDATES while containing
+    nothing, and every batch reports "no verdict" with no error anywhere.
+    Observed as `RAW RESULT: {"verdicts": {}}` in production.
+    """
+    from kb.synthesis.providers import _map_schema_to_array
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "verdicts": {
+                "type": "object",
+                "description": "Map keyed by queue_id",
+                "additionalProperties": {
+                    "type": "object",
+                    "properties": {"score": {"type": "number"}},
+                    "required": ["score"],
+                },
+            }
+        },
+    }
+
+    wire, converted = _map_schema_to_array(schema)
+
+    assert converted == ["verdicts"]
+    assert wire["properties"]["verdicts"]["type"] == "array"
+    item = wire["properties"]["verdicts"]["items"]
+    assert item["properties"]["_key"] == {"type": "string"}
+    assert set(item["required"]) == {"_key", "score"}
+    # The map's own description must survive -- it is what tells the model to
+    # emit one entry per input event.
+    assert wire["properties"]["verdicts"]["description"] == "Map keyed by queue_id"
+
+
+def test_array_response_is_rekeyed_back_into_the_map() -> None:
+    """The caller must see the SAME shape on both routes."""
+    from kb.synthesis.providers import _array_to_map
+
+    payload = {
+        "verdicts": [
+            {"_key": "1", "score": 8, "important": True},
+            {"_key": "2", "score": 2, "important": False},
+        ]
+    }
+
+    assert _array_to_map(payload, ["verdicts"]) == {
+        "verdicts": {
+            "1": {"score": 8, "important": True},
+            "2": {"score": 2, "important": False},
+        }
+    }
+
+
+def test_rekeying_is_a_no_op_on_the_native_route() -> None:
+    """Direct-provider mode converts nothing, so nothing may be rewritten."""
+    from kb.synthesis.providers import _array_to_map
+
+    native = {"verdicts": {"1": {"score": 8}}}
+    assert _array_to_map(native, []) == native
+
+
+@pytest.mark.asyncio
+async def test_gemini_call_json_converts_the_map_and_rekeys_the_response(
+    monkeypatch,
+) -> None:
+    """The WIRING, end to end, not the two helpers in isolation.
+
+    Written after both helper tests above passed against a build where
+    `_map_schema_to_array` was never called AND where `_array_to_map` was never
+    applied -- i.e. against the exact production bug, twice. A pure-function
+    test cannot fail when its caller stops calling it, so this asserts what goes
+    onto the wire and what comes back out.
+    """
+    import kb.synthesis.providers as prov
+
+    sent: dict[str, object] = {}
+
+    # SimpleNamespace rather than nested classes: a class attribute holding a
+    # mutable list is shared across instantiations (RUF012) and this stub is
+    # built fresh per call anyway.
+    _resp = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"verdicts":[{"_key":"7","score":9,"important":true}]}'
+                )
+            )
+        ]
+    )
+
+    async def fake_acompletion(**kwargs):
+        sent.update(kwargs)
+        return _resp
+
+    monkeypatch.setattr("engine.shared.llm.acompletion", fake_acompletion)
+    monkeypatch.setattr("engine.shared.llm.gateway_url", lambda: GATEWAY)
+
+    result = await prov._gemini_call_json(
+        model="gemini-3.5-flash",
+        system="sys",
+        user="score",
+        schema={
+            "type": "object",
+            "properties": {
+                "verdicts": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "object",
+                        "properties": {"score": {"type": "number"}},
+                    },
+                }
+            },
+        },
+        max_tokens=8000,
+    )
+
+    wire = sent["response_format"]["json_schema"]["schema"]
+    assert wire["properties"]["verdicts"]["type"] == "array", "map must go out as an array"
+    assert result == {"verdicts": {"7": {"score": 9, "important": True}}}, (
+        "response must come back re-keyed as the map the parser expects"
+    )
