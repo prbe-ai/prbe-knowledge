@@ -106,6 +106,12 @@ async def test_triage_sends_openai_structured_output_in_gateway_mode(monkeypatch
             max_tokens=8000,
         )
 
-    assert seen.get("response_format") == {"type": "json_object"}
+    # json_schema, NOT json_object. Both unfence the JSON, but json_object
+    # constrains only "some JSON" and Gemini answers with a top-level ARRAY,
+    # which the parser rejects as "not a JSON object: list". The schema has to
+    # ride along for the shape contract to match the native path.
+    rf = seen.get("response_format")
+    assert rf is not None and rf["type"] == "json_schema", rf
+    assert rf["json_schema"]["schema"] == {"type": "object", "properties": {}}
     assert "response_mime_type" not in seen, "native mime type is dropped by the proxy"
     assert "response_schema" not in seen
