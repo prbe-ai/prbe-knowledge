@@ -14,6 +14,8 @@ production on 2026-08-11 (13,147 queue rows dead-lettered by the first).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from kb.synthesis.providers import _gemini_litellm_model
@@ -205,18 +207,22 @@ async def test_gemini_call_json_converts_the_map_and_rekeys_the_response(
 
     sent: dict[str, object] = {}
 
-    class _Msg:
-        content = '{"verdicts":[{"_key":"7","score":9,"important":true}]}'
-
-    class _Choice:
-        message = _Msg()
-
-    class _Resp:
-        choices = [_Choice()]
+    # SimpleNamespace rather than nested classes: a class attribute holding a
+    # mutable list is shared across instantiations (RUF012) and this stub is
+    # built fresh per call anyway.
+    _resp = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content='{"verdicts":[{"_key":"7","score":9,"important":true}]}'
+                )
+            )
+        ]
+    )
 
     async def fake_acompletion(**kwargs):
         sent.update(kwargs)
-        return _Resp()
+        return _resp
 
     monkeypatch.setattr("engine.shared.llm.acompletion", fake_acompletion)
     monkeypatch.setattr("engine.shared.llm.gateway_url", lambda: GATEWAY)
