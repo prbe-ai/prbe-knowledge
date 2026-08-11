@@ -355,6 +355,67 @@ def _gemini_temperature_for(model: str) -> float:
     return 0.0
 
 
+def _map_schema_to_array(schema: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Rewrite `additionalProperties` MAPS as arrays, for OpenAI json_schema.
+
+    Gemini's native `response_schema` accepts a dynamic map -- an object whose
+    keys are data (here: queue_id) and whose values follow one sub-schema. The
+    triage contract is exactly that shape. OpenAI's `json_schema` has no way to
+    express it: `additionalProperties` carries no generation semantics there, so
+    the model emits `{}` -- which VALIDATES against the schema while containing
+    nothing, and the caller reports "no verdict" with no error anywhere.
+
+    Observed 2026-08-11: `RAW RESULT: {"verdicts": {}}` on every batch, after the
+    fenced-JSON and prefix bugs above were already fixed.
+
+    So for the gateway route each map becomes an ARRAY of objects carrying the
+    key as a field, which json_schema CAN constrain, and `_array_to_map` puts it
+    back before the caller ever sees it. Returns the rewritten schema plus the
+    names of the properties that were converted, so the inverse is exact rather
+    than guessed from the payload's shape.
+    """
+    converted: list[str] = []
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return schema, converted
+
+    rewritten = {**schema, "properties": dict(props)}
+    for name, sub in props.items():
+        if not isinstance(sub, dict) or sub.get("type") != "object":
+            continue
+        value_schema = sub.get("additionalProperties")
+        if not isinstance(value_schema, dict):
+            continue
+        item = {**value_schema}
+        item_props = {"_key": {"type": "string"}, **(item.get("properties") or {})}
+        item["type"] = "object"
+        item["properties"] = item_props
+        item["required"] = sorted({*(item.get("required") or []), "_key"})
+        rewritten["properties"][name] = {
+            "type": "array",
+            "description": sub.get("description", ""),
+            "items": item,
+        }
+        converted.append(name)
+    return rewritten, converted
+
+
+def _array_to_map(payload: dict[str, Any], converted: list[str]) -> dict[str, Any]:
+    """Inverse of `_map_schema_to_array`, applied to the model's response."""
+    if not converted:
+        return payload
+    out = dict(payload)
+    for name in converted:
+        rows = out.get(name)
+        if not isinstance(rows, list):
+            continue
+        out[name] = {
+            str(row.pop("_key")): row
+            for row in (dict(r) for r in rows if isinstance(r, dict) and "_key" in r)
+        }
+    return out
+
+
 async def _gemini_call_json(
     *,
     model: str,
@@ -438,13 +499,23 @@ async def _gemini_call_json(
         # Gemini 3 spends ~650 tokens reasoning and still completes the verdict
         # list. It only bites at toy budgets, which is what made it look like
         # the cause for longer than it should have.
+        # From the RAW schema, NOT `sanitized`. The sanitizer strips
+        # `additionalProperties` (Gemini's native response_schema rejects it),
+        # which is exactly the marker that says "this is a map" -- so converting
+        # after sanitization finds nothing to convert and leaves
+        # `verdicts: {type: object}` with no properties, which generates `{}`.
+        # That is the production symptom this whole branch exists to fix, and
+        # sanitizing first reintroduces it silently.
+        wire_schema, converted_maps = _map_schema_to_array(schema)
+        wire_schema = _strip_keys_recursive(wire_schema, _GEMINI_REJECTED_SCHEMA_KEYS)
         extra_kwargs: dict[str, Any] = {
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "triage_verdicts", "schema": sanitized},
+                "json_schema": {"name": "triage_verdicts", "schema": wire_schema},
             }
         }
     else:
+        converted_maps = []
         extra_kwargs = {
             "response_schema": sanitized,
             "response_mime_type": "application/json",
@@ -490,7 +561,9 @@ async def _gemini_call_json(
         raise RuntimeError(
             f"gemini response was not a JSON object: {type(parsed).__name__}"
         )
-    return parsed
+    # Undo the gateway-only map->array rewrite so the caller sees the SAME shape
+    # on both routes and no parser downstream has to know which one was used.
+    return _array_to_map(parsed, converted_maps)
 
 
 def _flatten_anthropic_kwargs(
