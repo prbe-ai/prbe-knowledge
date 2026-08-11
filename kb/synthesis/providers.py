@@ -405,13 +405,39 @@ async def _gemini_call_json(
     # the provider so `response_schema` and `thinking_config` land in
     # Gemini's GenerateContentConfig unchanged. `response_mime_type`
     # is the JSON-output hint Gemini wants when a schema is supplied.
-    extra_kwargs: dict[str, Any] = {
-        "response_schema": sanitized,
-        "response_mime_type": "application/json",
-        "thinking_config": {"thinking_budget": _thinking_budget_for(model)},
-    }
+    from engine.shared.llm import acompletion, gateway_url
 
-    from engine.shared.llm import acompletion
+    if gateway_url():
+        # GATEWAY MODE: OpenAI-shaped structured output, because the proxy's
+        # /chat/completions route DROPS the Gemini-native trio below. Nothing
+        # errors when it does -- the request succeeds and the model, no longer
+        # told to emit `application/json`, returns MARKDOWN-FENCED JSON:
+        #
+        #     '```json\n{"verdict": "1/10"}\n```'
+        #
+        # The verdict parser sees no JSON at the top level, reports "no
+        # verdict", and the split-retry recurses to single events and still
+        # finds nothing. That is the silent half of the 2026-08-11 incident:
+        # the loud transport error was fixed first, and this replaced it.
+        #
+        # `response_format={"type": "json_object"}` is the OpenAI equivalent and
+        # produces raw JSON through the same route (verified against the live
+        # proxy). The SCHEMA is not forwarded -- json_object constrains shape,
+        # not fields -- so the prompt's own schema description carries that,
+        # exactly as it does for the Anthropic triage path.
+        #
+        # thinking_config is dropped too, and that one is genuinely fine here:
+        # at the triage output budget (WIKI_TRIAGE_MAX_OUTPUT_TOKENS = 8000)
+        # Gemini 3 spends ~650 tokens reasoning and still completes the verdict
+        # list. It only bites at toy budgets, which is what made it look like
+        # the cause for longer than it should have.
+        extra_kwargs: dict[str, Any] = {"response_format": {"type": "json_object"}}
+    else:
+        extra_kwargs = {
+            "response_schema": sanitized,
+            "response_mime_type": "application/json",
+            "thinking_config": {"thinking_budget": _thinking_budget_for(model)},
+        }
 
     try:
         resp = await asyncio.wait_for(
