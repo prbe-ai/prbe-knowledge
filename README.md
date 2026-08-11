@@ -193,7 +193,7 @@ prbe-knowledge/
 ### MCP server
 
 The agent tool surface (`search_knowledge`, `query_knowledge`, `get_source`)
-ships in-repo at `services/mcp/` (vendored from the former standalone
+ships in-repo at `engine/mcp/` (vendored from the former standalone
 `prbe-knowledge-mcp`). It proxies to the retrieval service over HTTP
 (`KNOWLEDGE_QUERY_URL`) and has two auth modes via `MCP_AUTH_MODE`:
 
