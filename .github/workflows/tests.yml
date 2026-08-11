@@ -1,4 +1,4 @@
-name: lint+typecheck
+name: tests
 
 on:
   pull_request:
@@ -35,3 +35,92 @@ jobs:
 
       - name: Type-check
         run: .venv/bin/mypy engine kb services || true   # strict mypy soft-gated in Phase 0
+
+  # Runs the pytest suite against a real Postgres + MinIO (the S3-API store the
+  # tests talk to as R2). This repo is low-churn and had NO pytest gate for a
+  # while, so a change like the S3 backend support (#460) shipped with its unit
+  # tests green locally but never exercised in CI. This restores that gate.
+  pytest:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: prbe
+          POSTGRES_PASSWORD: prbe
+          POSTGRES_DB: prbe_knowledge
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U prbe -d prbe_knowledge"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL_SYNC: postgresql+psycopg://prbe:prbe@localhost:5432/prbe_knowledge
+      DATABASE_URL: postgresql://prbe:prbe@localhost:5432/prbe_knowledge
+      PGPASSWORD: prbe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start MinIO (S3-API store the tests use as R2)
+        run: |
+          docker run -d --name minio \
+            -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          for i in {1..30}; do
+            curl -sf http://localhost:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          echo "MinIO did not become healthy"; docker logs minio; exit 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -e ".[dev]"
+
+      # Fresh DB: apply db/schema.sql (canonical-latest) directly and stamp alembic
+      # head, rather than `alembic upgrade head` -- migrations 0007+ duplicate state
+      # schema.sql already creates, so the upgrade chain throws on an empty DB.
+      # neon_auth is provisioned for real in prod (Neon); the shim stands in here.
+      - name: Provision neon_auth shim
+        run: |
+          psql -h localhost -p 5432 -U prbe -d prbe_knowledge -v ON_ERROR_STOP=1 <<'SQL'
+            CREATE SCHEMA IF NOT EXISTS neon_auth;
+            CREATE TABLE IF NOT EXISTS neon_auth.organization (id UUID PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS neon_auth."user" (
+              id UUID PRIMARY KEY,
+              organization_id UUID REFERENCES neon_auth.organization(id),
+              email TEXT,
+              name TEXT
+            );
+          SQL
+
+      - name: Apply schema and stamp alembic
+        run: |
+          psql -h localhost -p 5432 -U prbe -d prbe_knowledge -v ON_ERROR_STOP=1 -f db/schema.sql
+          .venv/bin/alembic stamp head
+
+      # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale. The
+      # full suite has ~42 pre-existing failures unrelated to storage: tests that need
+      # the ParadeDB/BM25 extension or a live Gemini key, plus stale expectations left
+      # by a code-graph label refactor (Function/Class/Module -> CodeSymbol, Repo ->
+      # Document). De-drifting that is its own effort; gating on it now would just paint
+      # every PR red. This gate covers the object-store backend + blob/upload paths -- the
+      # area #460 touched -- and can widen as the rest of the suite is repaired.
+      - name: Tests (storage suite)
+        run: >-
+          .venv/bin/pytest -q
+          tests/test_object_store_s3.py
+          tests/test_storage_list_keys.py
+          tests/test_persist_trace_blob_r2.py
+          tests/test_query_traces_trace_blob_migration.py
+          tests/handlers/test_manual_upload.py
