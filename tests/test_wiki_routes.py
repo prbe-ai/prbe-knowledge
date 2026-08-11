@@ -756,3 +756,217 @@ async def test_bootstrap_status_ignores_old_runs_outside_burst(
     body = resp.json()
     assert body["sources_attempted"] == ["github"]
     assert body["pages_created"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Compare-and-swap on PUT + the per-page lock the synthesis agent takes
+# ---------------------------------------------------------------------------
+#
+# The wiki has two writers -- the nightly synthesis agent and whoever runs
+# `probe wiki write` -- and before this route took a version precondition,
+# the second one to arrive silently won. These tests pin the contract that
+# replaces that: equal version wins, stale gets 409 CARRYING THE BODY, and
+# a write with no precondition still works so the dashboard BFF (which has
+# never sent one) keeps functioning.
+
+
+async def _put(
+    client: httpx.AsyncClient, slug: str, body: str, **extra: object
+) -> httpx.Response:
+    return await client.put(
+        f"/api/wiki/pages/runbook/{slug}",
+        json={"title": "CAS fixture", "body": body, **extra},
+        headers=_hdr(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_put_without_expected_version_still_writes(
+    client: httpx.AsyncClient,
+) -> None:
+    """BACKWARDS COMPATIBILITY, and the reason the engine's precondition is
+    optional while research-os's is mandatory.
+
+    The dashboard reaches this route through the prbe-backend BFF and has
+    never sent a version. A mandatory precondition here would 428 every
+    dashboard save on the day it shipped. research-os requires the version
+    at ITS boundary instead, where every caller is new.
+    """
+    first = await _put(client, "no-precondition", "one")
+    assert first.status_code == 200, first.text
+    second = await _put(client, "no-precondition", "two")
+    assert second.status_code == 200, second.text
+    assert second.json()["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_put_with_matching_expected_version_wins(
+    client: httpx.AsyncClient,
+) -> None:
+    """The writer that read the current version writes."""
+    created = await _put(client, "matching", "one", expected_version=0)
+    assert created.status_code == 200, created.text
+    assert created.json()["version"] == 1
+
+    updated = await _put(client, "matching", "two", expected_version=1)
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_put_with_stale_expected_version_409_carries_current_body(
+    client: httpx.AsyncClient,
+) -> None:
+    """THE CONTRACT WORTH PORTING. A loser is told what it lost to.
+
+    The body in the 409 is the whole point: the other writer is usually the
+    nightly agent, which the caller cannot see coming and cannot wait out.
+    Handing back only a version number means every loser must re-read, and
+    the re-read races the same way.
+    """
+    await _put(client, "stale", "original", expected_version=0)
+    await _put(client, "stale", "moved on by someone else", expected_version=1)
+
+    lost = await _put(client, "stale", "my edit", expected_version=1)
+    assert lost.status_code == 409, lost.text
+    detail = lost.json()["detail"]
+    assert detail["expected_version"] == 1
+    assert detail["current_version"] == 2
+    assert detail["current_body"] == "moved on by someone else"
+
+    # AND NOTHING WAS WRITTEN. A 409 that still persisted would be worse
+    # than no check at all -- it would report a conflict while performing
+    # the clobber the check exists to prevent.
+    page = await client.get("/api/wiki/pages/runbook/stale", headers=_hdr())
+    assert page.json()["body"] == "moved on by someone else"
+    assert page.json()["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_put_expecting_absent_page_conflicts_when_it_exists(
+    client: httpx.AsyncClient,
+) -> None:
+    """`expected_version=0` means "create it, and only if nobody beat me".
+
+    Without this branch, two agents told to create the same page would both
+    succeed and the second would silently replace the first's work.
+    """
+    await _put(client, "already-there", "first writer", expected_version=0)
+    second = await _put(client, "already-there", "second writer", expected_version=0)
+    assert second.status_code == 409, second.text
+    assert second.json()["detail"]["current_body"] == "first writer"
+
+
+# ---------------------------------------------------------------------------
+# The two writers, together
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_synthesis_agent_does_not_clobber_a_page_written_through_the_route(
+    client: httpx.AsyncClient,
+) -> None:
+    """THE DEFINITION-OF-DONE TEST: a page an agent wrote survives the
+    nightly synthesis run.
+
+    Not an argument about locks -- the actual agent persist path, run
+    against a page this route created, asserting the bytes afterwards.
+
+    The guard being exercised is `_persist_update`'s manual-entry skip:
+    everything written through this route is `doc_class=manual_entry` (the
+    route's validator permits nothing else), and the agent refuses to
+    overwrite that class. `test_http_put_takes_the_page_lock` covers the
+    other half -- that the skip is decided ATOMICALLY rather than in a
+    window a concurrent PUT can slip through.
+    """
+    from kb.synthesis.wiki_agent import WikiAgentRuntime, _StagedUpdate
+
+    human_text = "Written by a person through `probe wiki write`. Do not overwrite."
+    created = await _put(client, "human-owned", human_text, expected_version=0)
+    assert created.status_code == 200, created.text
+
+    runtime = WikiAgentRuntime(
+        CUSTOMER,
+        agent_run_id="test-agent-run",
+        run_id=1,
+        run_kind="synthesis",
+    )
+    await runtime._persist_update(
+        _StagedUpdate(
+            wiki_type="runbook",
+            slug="human-owned",
+            body_markdown="THE AGENT REWROTE THIS PAGE FROM SCRATCH.",
+            summary="nightly synthesis pass",
+            commit_message="synthesis",
+        )
+    )
+
+    page = await client.get("/api/wiki/pages/runbook/human-owned", headers=_hdr())
+    assert page.status_code == 200, page.text
+    assert page.json()["body"] == human_text
+    assert page.json()["version"] == 1, "a skipped write must not bump the version"
+
+
+@pytest.mark.asyncio
+async def test_http_put_takes_the_page_lock(client: httpx.AsyncClient) -> None:
+    """The route participates in the agent's per-page advisory lock.
+
+    WHY THIS MATTERS BEYOND TIDINESS. The agent's manual-entry skip is a
+    read-then-write: it re-reads the page, sees `doc_class=compiled_wiki`,
+    and only then overwrites. Before this route took the lock, a PUT could
+    land inside that window -- turning the page into a human-authored one
+    the agent was already committed to destroying. The skip was real; it
+    just was not atomic.
+
+    Asserted by holding the agent's key and showing the route BLOCKS on it.
+    A route that ignored the lock would answer immediately, so the timeout
+    is the assertion.
+    """
+    import asyncio
+
+    from engine.shared.db import with_tenant
+    from engine.shared.locks import advisory_lock_key
+
+    # THE KEY IS BUILT HERE, NOT IMPORTED FROM THE ROUTE. Calling the
+    # route's own `page_lock_key` would make this test agree with the route
+    # by construction: change the route's namespace to "httproute" and the
+    # test would hold the SAME wrong key, block correctly, and pass while
+    # the route no longer shares a lock with the agent at all. (Verified --
+    # that mutation survived an earlier version of this test.)
+    #
+    # So the expression below is a deliberate literal copy of the one in
+    # `WikiAgentRuntime._persist_update`. It is the AGENT's key, and the
+    # test's claim is that the route blocks on it.
+    key = advisory_lock_key("page", CUSTOMER, "runbook:contended")
+    released = asyncio.Event()
+
+    async def hold_the_lock() -> None:
+        async with with_tenant(CUSTOMER) as conn:
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", key)
+            await released.wait()
+
+    holder = asyncio.create_task(hold_the_lock())
+    put: asyncio.Task[httpx.Response] | None = None
+    try:
+        await asyncio.sleep(0.3)  # let the holder acquire
+
+        put = asyncio.create_task(_put(client, "contended", "blocked?", expected_version=0))
+        await asyncio.sleep(0.6)
+        blocked = not put.done()
+    finally:
+        # RELEASE IN `finally`, ALWAYS. The holder sits in an open
+        # transaction on a real connection; leaking it when the assertion
+        # below fails would leave the fixture's TRUNCATE waiting on that
+        # transaction forever. A test whose FAILURE mode is a hung suite
+        # gets skipped rather than fixed -- and this is exactly the test a
+        # mutation run is expected to fail.
+        released.set()
+        await holder
+
+    assert blocked, (
+        "the PUT completed while the agent's page lock was held -- the route "
+        "is not participating in the lock, so the agent's manual-entry skip "
+        "is decided in a window this write can slip through"
+    )
+    resp = await asyncio.wait_for(put, timeout=60)
+    assert resp.status_code == 200, resp.text

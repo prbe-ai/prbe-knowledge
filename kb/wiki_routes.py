@@ -107,6 +107,22 @@ class WikiUpsertBody(BaseModel):
     updated_at: datetime | None = None
     commit_message: str | None = Field(default=None, max_length=240)
     summary: str | None = Field(default=None, max_length=240)
+    expected_version: int | None = Field(default=None, ge=0)
+    """Compare-and-swap precondition: write only if the page is still here.
+
+    OPTIONAL, and that is a deliberate asymmetry with research-os's
+    `PUT /v1/wiki`, which answers 428 when a write carries no version.
+
+    This route already has a consumer -- the dashboard through the
+    prbe-backend BFF -- that has never sent a version. Making the
+    precondition mandatory HERE would 428 the dashboard's every save on
+    the day this ships. So the engine offers CAS and research-os REQUIRES
+    it: the 428 lives at the boundary the CLI and agents actually talk to,
+    where every caller is new and can be held to the contract.
+
+    `0` means "I expect this page not to exist yet" and is how a create
+    asserts it is not silently overwriting a page someone else just made.
+    """
 
     @field_validator("doc_class")
     @classmethod
@@ -329,6 +345,77 @@ async def _read_doc_version(customer_id: str, doc_id: str) -> int | None:
     return row["version"] if row else None
 
 
+def page_lock_key(customer_id: str, wiki_type: str, slug: str) -> int:
+    """The per-page advisory lock key. THE SAME KEY THE AGENT TAKES.
+
+    `WikiAgentRuntime._persist_update` / `_persist_create` lock on
+    `advisory_lock_key("page", customer_id, f"{wiki_type}:{slug}")` around
+    their read-then-write, so that two writers integrate rather than
+    clobber. This route did not participate, and that was the hole: the
+    agent re-reads a page, sees `doc_class=compiled_wiki`, decides it is
+    safe to overwrite -- and a PUT lands in that window and turns it into a
+    human-authored `manual_entry` the agent then destroys. The
+    manual-entry skip is a real guard; without a shared lock it just is not
+    atomic.
+
+    Spelled as a named helper rather than inlined so the two call sites
+    cannot drift apart silently -- a lock is only a lock while every writer
+    computes the same key.
+    """
+    return advisory_lock_key("page", customer_id, f"{wiki_type}:{slug}")
+
+
+async def _read_live_page_for_cas(
+    conn: asyncpg.Connection, customer_id: str, doc_id: str
+) -> tuple[int, str] | None:
+    """`(version, body)` of the live page, or None when there is none.
+
+    Both halves are read under the caller's held lock. The BODY is not
+    incidental: a losing writer gets it back in the 409 so it can merge
+    without a second round trip against a page that may have moved again
+    by the time it re-reads. That is the property research-os's
+    `PUT /v1/wiki` established and the one worth carrying over.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT version, deleted_at FROM documents
+        WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+        """,
+        customer_id,
+        doc_id,
+    )
+    if row is None or row["deleted_at"] is not None:
+        return None
+    body = await fetch_live_body_from_chunks(conn, customer_id, doc_id)
+    return row["version"], body
+
+
+def _wiki_precondition_failed(
+    *, expected: int | None, current: int, current_body: str
+) -> HTTPException:
+    """409, CARRYING THE BODY the caller lost to.
+
+    Deliberately not `409 {"detail": "conflict"}`. The other writer here is
+    usually the nightly synthesis agent, which the caller cannot see coming
+    and cannot wait out; handing back only a version number means every
+    loser must re-read, and a re-read races the same way. The body makes a
+    merge possible on the spot.
+    """
+    return HTTPException(
+        status_code=409,
+        detail={
+            "message": (
+                f"the page moved to version {current} since you read "
+                f"version {expected}. Merge into `current_body` and write "
+                "again with `current_version`."
+            ),
+            "expected_version": expected,
+            "current_version": current,
+            "current_body": current_body,
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -375,7 +462,37 @@ async def upsert_wiki_page(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     normalizer = Normalizer(ctx=request.app.state.ctx, store=request.app.state.store)
-    outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
+    doc_id = f"wiki:{wiki_type}:{slug}"
+
+    # THE LOCK SPANS THE CHECK AND THE WRITE, and it is the same lock the
+    # synthesis agent takes (see `page_lock_key`). `Normalizer._persist`
+    # opens its own tenant transaction, so this connection's only job is to
+    # hold the advisory lock across that call -- exactly the arrangement
+    # `WikiAgentRuntime._persist_update` uses and for the same reason.
+    # Blocking, not `try_`: the second writer should integrate with the
+    # first's committed content, not fail because it arrived second.
+    #
+    # No explicit `.transaction()` here -- `with_tenant` already opens one
+    # (it binds the tenant GUC tx-locally), and `pg_advisory_xact_lock`
+    # holds to the end of THAT transaction. Adding a nested block would
+    # only open a savepoint and read as though the lock's lifetime were
+    # scoped to it.
+    async with with_tenant(customer_id) as lock_conn:
+        await lock_conn.execute(
+            "SELECT pg_advisory_xact_lock($1)", page_lock_key(customer_id, wiki_type, slug)
+        )
+        live = await _read_live_page_for_cas(lock_conn, customer_id, doc_id)
+        if body.expected_version is not None:
+            # Absent page reads as version 0, so "create if still absent"
+            # is `expected_version=0` and needs no separate branch.
+            current_version = live[0] if live else 0
+            if body.expected_version != current_version:
+                raise _wiki_precondition_failed(
+                    expected=body.expected_version,
+                    current=current_version,
+                    current_body=live[1] if live else "",
+                )
+        outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
 
     if not outcome.doc_ids:
         raise HTTPException(status_code=500, detail="wiki normalize produced no documents")
