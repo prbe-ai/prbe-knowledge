@@ -92,6 +92,7 @@ def _install_fake_genai(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     can inspect the recorded calls.
     """
     recorder: SimpleNamespace = SimpleNamespace(
+        last_client_kwargs={},
         generate_calls=[],
         cache_calls=[],
         cache_response=SimpleNamespace(name="cachedContents/fake-1"),
@@ -122,7 +123,15 @@ def _install_fake_genai(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     fake_client = SimpleNamespace(aio=fake_aio)
 
     fake_genai_module = ModuleType("google.genai")
-    fake_genai_module.Client = lambda **kwargs: fake_client  # type: ignore[attr-defined]
+    def _client_factory(**kwargs: Any) -> Any:
+        # Record how the client was CONSTRUCTED, not just what it was asked to
+        # do: gateway mode has to point google-genai at the proxy's /gemini
+        # passthrough, and aiming it at the OpenAI root instead 404s every
+        # native call while every other assertion in this file still passes.
+        recorder.last_client_kwargs = kwargs
+        return fake_client
+
+    fake_genai_module.Client = _client_factory  # type: ignore[attr-defined]
 
     fake_types_module = ModuleType("google.genai.types")
     fake_types_module.FunctionDeclaration = _FakeFunctionDeclaration  # type: ignore[attr-defined]
@@ -669,32 +678,41 @@ async def test_client_is_loop_compatible(
 
 
 @pytest.mark.asyncio
-async def test_gateway_mode_blocks_client_construction(
+async def test_gateway_mode_uses_the_gemini_passthrough(
     fake_genai: SimpleNamespace,
     patched_settings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """In LLM_GATEWAY_URL (gateway-routed) mode the
-    GeminiAgentClient must refuse to make a real call. LiteLLM doesn't
-    expose Gemini CachedContent or thought_signature round-tripping, so
-    routing this call site through the proxy is not viable today —
-    surface the carve-out loudly rather than emit a confusing
-    "GOOGLE_API_KEY not configured" that suggests a fixable config gap.
+    """Gateway mode ROUTES through the proxy's Gemini passthrough; it used to refuse.
 
-    Construction stays cheap; the gate fires on first `_ensure_client`
-    (i.e. when create_cache / generate_with_cache is actually invoked).
+    This test previously asserted the opposite -- that the client raises in
+    gateway-routed mode because "LiteLLM doesn't expose Gemini CachedContent or
+    thought_signature round-tripping". That was true of LiteLLM's
+    `/chat/completions` normalization and never true of its `/gemini/*`
+    PASSTHROUGH, which forwards Gemini-native requests untouched.
+
+    Verified against a live proxy on 2026-08-11: `caches.create` on
+    gemini-3.1-pro-preview returned a real cache handle, and generate_content on
+    the same model returned 200. Both objections in the old carve-out are gone.
+
+    The base_url assertion is the load-bearing half: the gateway env points at
+    the OpenAI-compatible root (`.../v1`), and aiming google-genai there instead
+    of `/gemini` 404s every native call.
     """
     monkeypatch.setenv("LLM_GATEWAY_URL", "https://litellm.example/v1")
+    monkeypatch.setenv("LLM_GATEWAY_KEY", "sk-gateway")
 
     from kb.synthesis.gemini_agent_client import GeminiAgentClient
 
-    client = GeminiAgentClient()  # construction itself is fine
-    with pytest.raises(RuntimeError) as exc_info:
-        await client.create_cache(
-            system_instruction="sys",
-            tools=[_tool("done")],
-            seed_contents=[],
-        )
-    msg = str(exc_info.value)
-    assert "LLM_GATEWAY_URL" in msg
-    assert "CachedContent" in msg or "carve-out" in msg.lower()
+    client = GeminiAgentClient()
+    await client.create_cache(
+        system_instruction="sys",
+        tools=[_tool("done")],
+        seed_contents=[],
+    )
+
+    assert fake_genai.last_client_kwargs["api_key"] == "sk-gateway"
+    assert (
+        fake_genai.last_client_kwargs["http_options"]["base_url"]
+        == "https://litellm.example/gemini"
+    )

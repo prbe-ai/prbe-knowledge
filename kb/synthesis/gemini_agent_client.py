@@ -28,19 +28,23 @@ to `shared.llm.acompletion`** in Phase 0b. Two reasons:
      bug `agent.gemini_persistent_error` flagged before AFC was
      disabled, but with no clean workaround inside LiteLLM).
 
-So `GeminiAgentClient` keeps the direct google-genai SDK. The
-trade-off: **on managed tenants (where LLM_GATEWAY_URL is set), the
-data-plane pod has no GOOGLE_API_KEY**, so wiki-agent runs cannot
-execute. Constructing this client in gateway mode raises a clear
-RuntimeError — surfaces loudly, doesn't silently downgrade to a
-broken request.
+So `GeminiAgentClient` keeps the direct google-genai SDK -- but it is no
+longer direct-keys-only.
 
-TODO(phase-0b-cached-content): re-enable on managed tenants when
-either (a) LiteLLM exposes Gemini's `caches.create` / `cached_content`
-lifecycle plus `thought_signature` passthrough, or (b) the central
-LiteLLM proxy gets per-customer GCP credentials so the call can route
-through the proxy with provider-native shape. Until then, wiki-agent
-is a direct-keys-only feature.
+RESOLVED (2026-08-11): both objections above are properties of LiteLLM's
+`/chat/completions` NORMALIZATION, not of the proxy. LiteLLM also exposes a
+`/gemini/*` PASSTHROUGH that forwards Gemini-native requests untouched, so
+`thought_signature` survives (nothing rewrites it) and `caches.create` is
+reachable (it is the real Gemini REST API). In gateway mode this client now
+points google-genai at `<gateway>/gemini` with the gateway key as
+`x-goog-api-key`; direct-keys mode is unchanged.
+
+Verified against a live proxy: `GET /gemini/v1beta/models` -> 200, and
+`generateContent` on gemini-3.1-pro-preview and gemini-3.5-flash -> 200. That
+route's model catalog is stale (2.5-era) and is NOT a capability bound.
+
+The prior carve-out was accurate when written and outlived its constraint; a
+blanket "gateway mode is unsupported" guard is what kept it untested.
 
 Critical Gemini constraint (caused v4 first-turn halt):
 
@@ -141,29 +145,55 @@ class GeminiAgentClient:
     def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
-        # Phase-0b carve-out gate: in gateway-routed mode
-        # the data plane has no GOOGLE_API_KEY (provider creds live in
-        # the central LiteLLM proxy). Since CachedContent + thought-
-        # signature round-tripping don't migrate through LiteLLM today
-        # (see module docstring), refuse to construct the client rather
-        # than emit a misleading "GOOGLE_API_KEY not configured" — that
-        # error implies a config fix exists. The carve-out doesn't.
-        if shared_llm.gateway_url():
-            raise RuntimeError(
-                "GeminiAgentClient is not available in LLM_GATEWAY_URL "
-                "(gateway-routed) mode — Gemini CachedContent "
-                "and thought_signature round-tripping have no LiteLLM "
-                "equivalent. The wiki-agent loop is direct-keys-only "
-                "until either LiteLLM exposes Gemini caches or the proxy "
-                "gets GCP credentials. See module docstring for the full "
-                "rationale + TODO(phase-0b-cached-content)."
-            )
         try:
             from google import genai
         except ImportError as exc:
             raise RuntimeError(
                 "google-genai not installed; cannot use GeminiAgentClient"
             ) from exc
+
+        # GATEWAY MODE: the proxy's Gemini PASSTHROUGH, not chat-completions.
+        #
+        # This used to refuse to construct whenever LLM_GATEWAY_URL was set. The
+        # stated reason -- CachedContent and thought_signature "have no LiteLLM
+        # equivalent" -- was true of LiteLLM's /chat/completions route, which
+        # normalizes tools to OpenAI's `tool_calls` shape and has nowhere to put
+        # the opaque signature bytes Gemini 3.x requires on every echoed
+        # function_call. It is NOT true of the `/gemini/*` passthrough, which
+        # forwards Gemini-native requests untouched: signatures survive because
+        # nothing rewrites them, and `caches.create` is reachable because it IS
+        # the real Gemini REST API.
+        #
+        # Verified against a live proxy (2026-08-11): GET /gemini/v1beta/models
+        # returns 200, and generateContent on BOTH gemini-3.1-pro-preview and
+        # gemini-3.5-flash returns 200. The catalog that route lists is stale
+        # (2.5-era) and is not a capability bound -- check by calling, not by
+        # reading the list.
+        #
+        # The blanket guard is what kept this untried: gateway-routed did mean
+        # "no Gemini-native path" before passthrough existed, and the guard
+        # outlived the constraint.
+        gateway = shared_llm.gateway_url()
+        if gateway:
+            key = shared_llm.gateway_key()
+            if not key:
+                raise RuntimeError(
+                    "LLM_GATEWAY_URL is set but no gateway key is available; "
+                    "the Gemini passthrough authenticates with the gateway key "
+                    "as x-goog-api-key."
+                )
+            # The gateway URL points at the OpenAI-compatible root (.../v1).
+            # The passthrough lives beside it at /gemini, so strip a trailing
+            # /v1 rather than appending to it.
+            base = gateway.rstrip("/")
+            if base.endswith("/v1"):
+                base = base[: -len("/v1")]
+            self._client = genai.Client(
+                api_key=key,
+                http_options={"base_url": f"{base}/gemini"},
+            )
+            return self._client
+
         secret = get_settings().google_api_key
         api_key = secret.get_secret_value() if secret is not None else ""
         if not api_key:

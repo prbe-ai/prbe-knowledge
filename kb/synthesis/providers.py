@@ -199,12 +199,35 @@ def _anthropic_litellm_model(model: str) -> str:
 
 
 def _gemini_litellm_model(model: str) -> str:
-    """Return a LiteLLM-prefixed Gemini model id. Per the Google
-    convention LiteLLM uses ``gemini/<id>`` (NOT ``google/<id>``); see
-    shared/llm.py docstring for the routing rules.
+    """Return a LiteLLM model id for a Gemini call, gateway-aware.
+
+    DIRECT-PROVIDER MODE: ``gemini/<id>``. Per the Google convention LiteLLM
+    uses ``gemini/`` (NOT ``google/``); see shared/llm.py for the routing rules.
+
+    GATEWAY MODE: ``openai/<id>``. The ``gemini/`` prefix makes LiteLLM select
+    Google's NATIVE transport and then point it at our ``api_base`` -- a
+    Google-shaped request sent to an OpenAI-compatible proxy. It never gets
+    that far in practice: the native client looks for Application Default
+    Credentials first and dies inside the pod, so the failure reads as
+    ``DefaultCredentialsError`` or ``GeminiException - Method Not Allowed``
+    rather than anything mentioning the prefix.
+
+    Observed in production 2026-08-11 on a gateway-routed tenant: every wiki
+    triage batch failed this way, and because one batch failure dead-letters
+    the whole customer, 13,147 queue rows went to DLQ in a single run.
+
+    NOTE the asymmetry with `GeminiAgentClient`: that client needs Gemini's
+    NATIVE request shape (CachedContent, thought_signature) and therefore uses
+    the proxy's `/gemini/*` passthrough. This path sends plain structured-output
+    completions, which normalize to OpenAI shape cleanly, so it takes the
+    ordinary chat-completions route.
     """
     if "/" in model:
         return model
+    from engine.shared.llm import gateway_url
+
+    if gateway_url():
+        return f"openai/{model}"
     return f"gemini/{model}"
 
 
