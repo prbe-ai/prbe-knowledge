@@ -377,6 +377,47 @@ def _maybe_inject_gateway(kwargs: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+def _gateway_model(model: str, kwargs: dict[str, Any]) -> str:
+    """Route a BARE model id through the gateway as an OpenAI-compatible call.
+
+    LiteLLM picks its transport from the model id's provider prefix. A bare id
+    like ``gemini-3.5-flash`` is inferred as the GOOGLE provider, so LiteLLM uses
+    Gemini's NATIVE transport -- and then applies our ``api_base`` to it. The
+    result is a Google-shaped request sent to an OpenAI-compatible proxy, which
+    answers ``404``/``405`` or, worse, never gets that far: the native client
+    looks for Application Default Credentials first and dies with
+    ``DefaultCredentialsError`` before a single byte reaches the gateway.
+
+    Both were observed in production on 2026-08-11: every wiki triage call
+    failed with ``GeminiException - {"detail":"Method Not Allowed"}`` and one
+    batch failure dead-lettered 13,147 queue rows for the tenant. The proof is
+    two calls through the same gateway:
+
+        gemini-3.5-flash         -> DefaultCredentialsError (never left the pod)
+        openai/gemini-3.5-flash  -> "ok"
+
+    WHY THIS IS CENTRAL AND NOT A CONSTANT RENAME. The bare ids are CORRECT for
+    the deployment that owns them: upstream runs with direct provider keys and no
+    gateway, where ``gemini-3.5-flash`` is exactly right and an ``openai/`` prefix
+    would be wrong. The bug is not the id, it is the combination of a bare id and
+    a proxy. So the normalization belongs where the proxy is known -- here -- and
+    fixes every call site at once, including ones added later that would
+    otherwise have to remember.
+
+    Left alone:
+      * any id already carrying a ``/`` (``cerebras/gpt-oss-120b``,
+        ``accounts/fireworks/...``) -- the caller has chosen a transport;
+      * any call passing an explicit ``custom_llm_provider`` -- same reason,
+        stated louder;
+      * every call when no gateway is in play, which is the direct-provider path.
+    """
+    if not kwargs.get("api_base"):
+        return model
+    if "/" in model or kwargs.get("custom_llm_provider"):
+        return model
+    return f"openai/{model}"
+
+
 async def acompletion(
     model: str,
     messages: list[dict[str, Any]],
@@ -435,6 +476,7 @@ async def acompletion(
     let LiteLLM pick from the model prefix.
     """
     kwargs = _maybe_inject_gateway(kwargs)
+    model = _gateway_model(model, kwargs)
     await _acquire_token_budget(messages, kwargs)
     try:
         return await litellm.acompletion(model=model, messages=messages, **kwargs)
