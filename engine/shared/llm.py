@@ -377,6 +377,96 @@ def _maybe_inject_gateway(kwargs: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
+# LiteLLM provider that speaks the OpenAI wire shape against a LiteLLM
+# PROXY, forwarding unknown params instead of validating them locally.
+_LITELLM_PROXY_PROVIDER = "litellm_proxy"
+
+# Provider prefixes that are LiteLLM *SDK routing hints* and NOT part of the
+# model's name on the proxy.
+#
+# The distinction cannot be guessed from the string, which is why this is a
+# list rather than a rule. The proxy's `model_list` registers Gemini under its
+# BARE id (`gemini-*`), so `gemini/gemini-3.5-flash` reaches it as an unknown
+# model and comes back 400. Cerebras and Fireworks are registered WITH their
+# prefix (`cerebras/*`, `accounts/fireworks/*`), so for them the prefix IS the
+# name and stripping it would break them. Verified against the live gateway's
+# `GET /v1/models`.
+_SDK_ONLY_PROVIDER_PREFIXES = ("gemini/",)
+
+
+def _gateway_model(model: str, kwargs: dict[str, Any]) -> str:
+    """Normalize a model id for a call routed through OUR LiteLLM proxy.
+
+    LiteLLM picks its transport from the model id's provider prefix, and our
+    proxy speaks OpenAI-compatible HTTP. Two id shapes therefore break against
+    it, and both were live on 2026-08-11:
+
+      * A BARE id (`gemini-3.5-flash`) is inferred as the GOOGLE provider, so
+        LiteLLM uses Gemini's NATIVE transport and points it at our `api_base`.
+        Often it never gets that far -- the native client looks for Application
+        Default Credentials first and dies with `DefaultCredentialsError`
+        inside the pod.
+      * An SDK-PREFIXED id (`gemini/gemini-3.5-flash`) builds the Gemini-native
+        URL `/v1beta/models/<m>:generateContent` and POSTs it at a proxy that
+        serves no such path, which answers 405 `{"detail":"Method Not
+        Allowed"}`.
+
+    The second shape is the one the wiki synthesis stack actually sends:
+    `kb/synthesis/providers.py::_gemini_call_json` calls
+    `acompletion(model=_gemini_litellm_model(model))`, and that helper prepends
+    `gemini/`. Every triage batch died on it, and one batch failure
+    dead-lettered 13,147 queue rows for the tenant. Verified against the live
+    gateway:
+
+        gemini-3.5-flash                -> DefaultCredentialsError
+        gemini/gemini-3.5-flash         -> 405 Method Not Allowed
+        openai/gemini-3.5-flash         -> "ok"
+        litellm_proxy/gemini-3.5-flash  -> "ok"
+
+    WHY THIS IS CENTRAL AND NOT A CONSTANT RENAME. The bare ids are CORRECT for
+    the deployment that owns them: upstream runs with direct provider keys and no
+    gateway, where `gemini-3.5-flash` is exactly right and an `openai/` prefix
+    would be wrong. The bug is not the id, it is the combination of an id and a
+    proxy. So the normalization belongs where the proxy is known -- here -- and
+    fixes every call site at once, including ones added later that would
+    otherwise have to remember.
+
+    WHY THE PREFIXED PATH SETS `litellm_proxy` AND THE BARE PATH SETS `openai`.
+    Both speak the same wire shape, but the strict `openai` provider VALIDATES
+    params locally and rejects `reasoning_effort` with `UnsupportedParamsError`
+    -- and the Gemini synthesis callers pass exactly that. `litellm_proxy`
+    forwards unknown params to the proxy instead. The bare-id path keeps
+    `openai/` because that is what shipped and what its callers were checked
+    against; it carries the same latent exposure, and a bare-id caller that
+    starts passing `reasoning_effort` will find it. Worth unifying on
+    `litellm_proxy` in a change that can be tested against those callers, not
+    silently here.
+
+    Returns the model to send. When it also needs a `custom_llm_provider`, that
+    is set on `kwargs` in place -- one function so the two normalizations cannot
+    drift into disagreeing about which ids they own.
+
+    Left alone:
+      * any id already carrying a `/` that is NOT an SDK-only prefix
+        (`cerebras/gpt-oss-120b`, `accounts/fireworks/...`) -- the caller has
+        chosen a transport, and for those the prefix is the proxy's own name;
+      * any call passing an explicit `custom_llm_provider` -- same reason,
+        stated louder;
+      * every call when no gateway is in play, which is the direct-provider path.
+    """
+    if not kwargs.get("api_base"):
+        return model
+    if kwargs.get("custom_llm_provider"):
+        return model
+    for prefix in _SDK_ONLY_PROVIDER_PREFIXES:
+        if model.startswith(prefix):
+            kwargs["custom_llm_provider"] = _LITELLM_PROXY_PROVIDER
+            return model[len(prefix) :]
+    if "/" in model:
+        return model
+    return f"openai/{model}"
+
+
 async def acompletion(
     model: str,
     messages: list[dict[str, Any]],
@@ -433,8 +523,16 @@ async def acompletion(
     ``services/retrieval/agent/loop.py`` for the gatherer's reasoning).
     Callers that need the provider-native wire shape pass nothing and
     let LiteLLM pick from the model prefix.
+
+    ONE EXCEPTION, and it is a routing bug fix rather than a policy:
+    ``_gateway_model`` normalizes ids that cannot work against our own proxy
+    -- a bare id (inferred as a native provider) and a ``gemini/``-prefixed one
+    (which builds a Gemini-native URL the proxy answers 405 to). It applies
+    only when a gateway is in play and the caller expressed no provider of its
+    own. See that function for the whole argument.
     """
     kwargs = _maybe_inject_gateway(kwargs)
+    model = _gateway_model(model, kwargs)
     await _acquire_token_budget(messages, kwargs)
     try:
         return await litellm.acompletion(model=model, messages=messages, **kwargs)

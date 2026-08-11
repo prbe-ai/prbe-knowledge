@@ -199,12 +199,35 @@ def _anthropic_litellm_model(model: str) -> str:
 
 
 def _gemini_litellm_model(model: str) -> str:
-    """Return a LiteLLM-prefixed Gemini model id. Per the Google
-    convention LiteLLM uses ``gemini/<id>`` (NOT ``google/<id>``); see
-    shared/llm.py docstring for the routing rules.
+    """Return a LiteLLM model id for a Gemini call, gateway-aware.
+
+    DIRECT-PROVIDER MODE: ``gemini/<id>``. Per the Google convention LiteLLM
+    uses ``gemini/`` (NOT ``google/``); see shared/llm.py for the routing rules.
+
+    GATEWAY MODE: ``openai/<id>``. The ``gemini/`` prefix makes LiteLLM select
+    Google's NATIVE transport and then point it at our ``api_base`` -- a
+    Google-shaped request sent to an OpenAI-compatible proxy. It never gets
+    that far in practice: the native client looks for Application Default
+    Credentials first and dies inside the pod, so the failure reads as
+    ``DefaultCredentialsError`` or ``GeminiException - Method Not Allowed``
+    rather than anything mentioning the prefix.
+
+    Observed in production 2026-08-11 on a gateway-routed tenant: every wiki
+    triage batch failed this way, and because one batch failure dead-letters
+    the whole customer, 13,147 queue rows went to DLQ in a single run.
+
+    NOTE the asymmetry with `GeminiAgentClient`: that client needs Gemini's
+    NATIVE request shape (CachedContent, thought_signature) and therefore uses
+    the proxy's `/gemini/*` passthrough. This path sends plain structured-output
+    completions, which normalize to OpenAI shape cleanly, so it takes the
+    ordinary chat-completions route.
     """
     if "/" in model:
         return model
+    from engine.shared.llm import gateway_url
+
+    if gateway_url():
+        return f"openai/{model}"
     return f"gemini/{model}"
 
 
@@ -332,6 +355,67 @@ def _gemini_temperature_for(model: str) -> float:
     return 0.0
 
 
+def _map_schema_to_array(schema: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Rewrite `additionalProperties` MAPS as arrays, for OpenAI json_schema.
+
+    Gemini's native `response_schema` accepts a dynamic map -- an object whose
+    keys are data (here: queue_id) and whose values follow one sub-schema. The
+    triage contract is exactly that shape. OpenAI's `json_schema` has no way to
+    express it: `additionalProperties` carries no generation semantics there, so
+    the model emits `{}` -- which VALIDATES against the schema while containing
+    nothing, and the caller reports "no verdict" with no error anywhere.
+
+    Observed 2026-08-11: `RAW RESULT: {"verdicts": {}}` on every batch, after the
+    fenced-JSON and prefix bugs above were already fixed.
+
+    So for the gateway route each map becomes an ARRAY of objects carrying the
+    key as a field, which json_schema CAN constrain, and `_array_to_map` puts it
+    back before the caller ever sees it. Returns the rewritten schema plus the
+    names of the properties that were converted, so the inverse is exact rather
+    than guessed from the payload's shape.
+    """
+    converted: list[str] = []
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return schema, converted
+
+    rewritten = {**schema, "properties": dict(props)}
+    for name, sub in props.items():
+        if not isinstance(sub, dict) or sub.get("type") != "object":
+            continue
+        value_schema = sub.get("additionalProperties")
+        if not isinstance(value_schema, dict):
+            continue
+        item = {**value_schema}
+        item_props = {"_key": {"type": "string"}, **(item.get("properties") or {})}
+        item["type"] = "object"
+        item["properties"] = item_props
+        item["required"] = sorted({*(item.get("required") or []), "_key"})
+        rewritten["properties"][name] = {
+            "type": "array",
+            "description": sub.get("description", ""),
+            "items": item,
+        }
+        converted.append(name)
+    return rewritten, converted
+
+
+def _array_to_map(payload: dict[str, Any], converted: list[str]) -> dict[str, Any]:
+    """Inverse of `_map_schema_to_array`, applied to the model's response."""
+    if not converted:
+        return payload
+    out = dict(payload)
+    for name in converted:
+        rows = out.get(name)
+        if not isinstance(rows, list):
+            continue
+        out[name] = {
+            str(row.pop("_key")): row
+            for row in (dict(r) for r in rows if isinstance(r, dict) and "_key" in r)
+        }
+    return out
+
+
 async def _gemini_call_json(
     *,
     model: str,
@@ -382,13 +466,61 @@ async def _gemini_call_json(
     # the provider so `response_schema` and `thinking_config` land in
     # Gemini's GenerateContentConfig unchanged. `response_mime_type`
     # is the JSON-output hint Gemini wants when a schema is supplied.
-    extra_kwargs: dict[str, Any] = {
-        "response_schema": sanitized,
-        "response_mime_type": "application/json",
-        "thinking_config": {"thinking_budget": _thinking_budget_for(model)},
-    }
+    from engine.shared.llm import acompletion, gateway_url
 
-    from engine.shared.llm import acompletion
+    if gateway_url():
+        # GATEWAY MODE: OpenAI-shaped structured output, because the proxy's
+        # /chat/completions route DROPS the Gemini-native trio below. Nothing
+        # errors when it does -- the request succeeds and the model, no longer
+        # told to emit `application/json`, returns MARKDOWN-FENCED JSON:
+        #
+        #     '```json\n{"verdict": "1/10"}\n```'
+        #
+        # The verdict parser sees no JSON at the top level, reports "no
+        # verdict", and the split-retry recurses to single events and still
+        # finds nothing. That is the silent half of the 2026-08-11 incident:
+        # the loud transport error was fixed first, and this replaced it.
+        #
+        # `json_schema` (NOT `json_object`). Both return raw, unfenced JSON, so
+        # both fix the fencing -- but json_object constrains only "some JSON",
+        # and Gemini then answers with a top-level ARRAY of verdicts while the
+        # parser requires the object the schema describes:
+        #
+        #     json_object -> '[{"queue_id": 1, "score": 2.0}, ...]'
+        #                    -> "gemini response was not a JSON object: list"
+        #     json_schema -> '{"verdicts":[{"queue_id":1,"score":0.1}, ...]}'
+        #
+        # Both verified against the live proxy. json_schema carries `sanitized`
+        # -- the same schema the native path sends -- so the shape contract is
+        # identical on both routes rather than reconstructed from prose.
+        #
+        # thinking_config is dropped too, and that one is genuinely fine here:
+        # at the triage output budget (WIKI_TRIAGE_MAX_OUTPUT_TOKENS = 8000)
+        # Gemini 3 spends ~650 tokens reasoning and still completes the verdict
+        # list. It only bites at toy budgets, which is what made it look like
+        # the cause for longer than it should have.
+        # From the RAW schema, NOT `sanitized`. The sanitizer strips
+        # `additionalProperties` (Gemini's native response_schema rejects it),
+        # which is exactly the marker that says "this is a map" -- so converting
+        # after sanitization finds nothing to convert and leaves
+        # `verdicts: {type: object}` with no properties, which generates `{}`.
+        # That is the production symptom this whole branch exists to fix, and
+        # sanitizing first reintroduces it silently.
+        wire_schema, converted_maps = _map_schema_to_array(schema)
+        wire_schema = _strip_keys_recursive(wire_schema, _GEMINI_REJECTED_SCHEMA_KEYS)
+        extra_kwargs: dict[str, Any] = {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "triage_verdicts", "schema": wire_schema},
+            }
+        }
+    else:
+        converted_maps = []
+        extra_kwargs = {
+            "response_schema": sanitized,
+            "response_mime_type": "application/json",
+            "thinking_config": {"thinking_budget": _thinking_budget_for(model)},
+        }
 
     try:
         resp = await asyncio.wait_for(
@@ -429,7 +561,9 @@ async def _gemini_call_json(
         raise RuntimeError(
             f"gemini response was not a JSON object: {type(parsed).__name__}"
         )
-    return parsed
+    # Undo the gateway-only map->array rewrite so the caller sees the SAME shape
+    # on both routes and no parser downstream has to know which one was used.
+    return _array_to_map(parsed, converted_maps)
 
 
 def _flatten_anthropic_kwargs(

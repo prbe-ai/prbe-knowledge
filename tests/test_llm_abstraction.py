@@ -234,6 +234,129 @@ async def test_caller_custom_llm_provider_wins_over_gateway_default(
 
 
 @pytest.mark.asyncio
+async def test_gateway_completion_strips_gemini_prefix_and_routes_via_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 405 that kept the team wiki empty.
+
+    `gemini/<m>` makes the LiteLLM SDK build the Gemini-NATIVE URL
+    `/v1beta/models/<m>:generateContent` and POST it at our proxy, which
+    serves no such path and answers FastAPI 405
+    `{"detail":"Method Not Allowed"}`. Every wiki triage batch died on
+    exactly that, 13,147 rows deep into the DLQ.
+
+    Two assertions, and BOTH are load-bearing:
+
+      * the prefix is STRIPPED. The proxy's `model_list` registers Gemini
+        under the bare `gemini-*`, so `gemini/gemini-3.5-flash` reaches it
+        as an unknown model and comes back 400 -- a different failure, not
+        a fix. Verified against the live gateway.
+      * the provider is `litellm_proxy`, NOT `openai`. Both speak the
+        OpenAI wire shape, but `openai` validates params locally and
+        rejects the `reasoning_effort` the Gemini synthesis callers pass
+        (`UnsupportedParamsError`); `litellm_proxy` forwards it.
+    """
+    monkeypatch.setenv("LLM_GATEWAY_URL", "https://customer-proxy.example.com")
+    fake = AsyncMock(return_value="resp")
+    with patch.object(llm.litellm, "acompletion", fake):
+        await acompletion(
+            "gemini/gemini-3.5-flash",
+            [{"role": "user", "content": "x"}],
+        )
+    kwargs = fake.await_args.kwargs
+    assert kwargs["model"] == "gemini-3.5-flash"
+    assert kwargs["custom_llm_provider"] == "litellm_proxy"
+
+
+@pytest.mark.asyncio
+async def test_gateway_completion_preserves_proxy_registered_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`cerebras/` is NOT an SDK routing hint -- it is the model's name on
+    the proxy (`model_list` carries `cerebras/*`, verified against the live
+    gateway's `GET /v1/models`). Stripping it would turn a working call
+    into an unknown-model 400.
+
+    This is the test that stops the fix from being generalised into
+    "strip every prefix", which reads tidier and is wrong.
+    """
+    monkeypatch.setenv("LLM_GATEWAY_URL", "https://customer-proxy.example.com")
+    fake = AsyncMock(return_value="resp")
+    with patch.object(llm.litellm, "acompletion", fake):
+        await acompletion(
+            "cerebras/gpt-oss-120b",
+            [{"role": "user", "content": "x"}],
+        )
+    kwargs = fake.await_args.kwargs
+    assert kwargs["model"] == "cerebras/gpt-oss-120b"
+    assert "custom_llm_provider" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_no_gateway_completion_keeps_gemini_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct-provider mode: `gemini/` is exactly right and the SDK's
+    native routing is what we want. Rewriting here would break the dev and
+    bring-your-own-key paths, where there is no proxy to route through."""
+    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
+    fake = AsyncMock(return_value="resp")
+    with patch.object(llm.litellm, "acompletion", fake):
+        await acompletion(
+            "gemini/gemini-3.5-flash",
+            [{"role": "user", "content": "x"}],
+        )
+    kwargs = fake.await_args.kwargs
+    assert kwargs["model"] == "gemini/gemini-3.5-flash"
+    assert "custom_llm_provider" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_caller_named_provider_keeps_its_model_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that named a provider has chosen its own wire shape, and the
+    normalization must not second-guess it -- rewriting the model underneath a
+    declared provider would silently retarget the call."""
+    # THE GATEWAY IS SET. Without it the normalization returns on its first
+    # guard ("no proxy in play") and this test passes without ever reaching the
+    # branch it claims to cover -- verified: deleting the caller-provider guard
+    # left an earlier version of this test green.
+    monkeypatch.setenv("LLM_GATEWAY_URL", "https://customer-proxy.example.com")
+    fake = AsyncMock(return_value="resp")
+    with patch.object(llm.litellm, "acompletion", fake):
+        await acompletion(
+            "gemini/gemini-3.5-flash",
+            [{"role": "user", "content": "x"}],
+            custom_llm_provider="gemini",
+        )
+    kwargs = fake.await_args.kwargs
+    assert kwargs["model"] == "gemini/gemini-3.5-flash"
+    assert kwargs["custom_llm_provider"] == "gemini"
+
+
+@pytest.mark.asyncio
+async def test_caller_custom_llm_provider_wins_for_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that named a provider has already decided its wire shape;
+    the rewrite is a default, not an override. The retrieval gatherer
+    passes `custom_llm_provider="openai"` deliberately and must keep the
+    model string it asked for."""
+    monkeypatch.setenv("LLM_GATEWAY_URL", "https://customer-proxy.example.com")
+    fake = AsyncMock(return_value="resp")
+    with patch.object(llm.litellm, "acompletion", fake):
+        await acompletion(
+            "gemini/gemini-3.5-flash",
+            [{"role": "user", "content": "x"}],
+            custom_llm_provider="openai",
+        )
+    kwargs = fake.await_args.kwargs
+    assert kwargs["model"] == "gemini/gemini-3.5-flash"
+    assert kwargs["custom_llm_provider"] == "openai"
+
+
+@pytest.mark.asyncio
 async def test_no_gateway_url_means_no_api_base(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
