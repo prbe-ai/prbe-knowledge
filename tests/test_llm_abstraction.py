@@ -318,7 +318,11 @@ async def test_caller_named_provider_keeps_its_model_untouched(
     """A caller that named a provider has chosen its own wire shape, and the
     normalization must not second-guess it -- rewriting the model underneath a
     declared provider would silently retarget the call."""
-    monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
+    # THE GATEWAY IS SET. Without it the normalization returns on its first
+    # guard ("no proxy in play") and this test passes without ever reaching the
+    # branch it claims to cover -- verified: deleting the caller-provider guard
+    # left an earlier version of this test green.
+    monkeypatch.setenv("LLM_GATEWAY_URL", "https://customer-proxy.example.com")
     fake = AsyncMock(return_value="resp")
     with patch.object(llm.litellm, "acompletion", fake):
         await acompletion(

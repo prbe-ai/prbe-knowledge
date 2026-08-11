@@ -531,7 +531,6 @@ async def acompletion(
     only when a gateway is in play and the caller expressed no provider of its
     own. See that function for the whole argument.
     """
-    caller_set_api_base = "api_base" in kwargs
     kwargs = _maybe_inject_gateway(kwargs)
     model = _gateway_model(model, kwargs)
     await _acquire_token_budget(messages, kwargs)
