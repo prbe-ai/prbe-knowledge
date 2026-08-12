@@ -23,6 +23,19 @@ Public PUT/PATCH/DELETE accept `doc_class=manual_entry` ONLY (validated by
 `_reject_non_manual_doc_class` on `WikiUpsertBody.doc_class`). Anything else
 is rejected with 422.
 
+`doc_class` is PROVENANCE and nothing else: it records who wrote a given
+version, which is what lets page history tell a person's revision from the
+nightly agent's. It is NOT the switch that decides whether the agent may
+rewrite a page -- that is `pipeline_updates`, a separate per-page setting in
+`wiki_page_settings` (migration 0103), read here and written by
+`PUT /pages/{wiki_type}/{slug}/settings`.
+
+The two were one field until 0103, and conflating them made a hand edit an
+irreversible freeze: stamping `manual_entry` on a typo fix stopped the page
+from ever updating again, with no path back short of SQL. If you are tempted
+to reach for `doc_class` to answer "will this page be regenerated?", reach for
+`pipeline_updates` instead.
+
 `doc_class=compiled_wiki` writes are produced by the synthesis cron in
 `services/synthesis/wiki_cron.py` (Phase 2). The cron does NOT call this
 HTTP route; it builds a synthetic `WebhookEvent` and calls
@@ -74,6 +87,7 @@ from kb.handlers.wiki import (
     build_normalization_result,
     is_valid_wiki_type,
 )
+from kb.synthesis import persistence
 from kb.synthesis.crawlers import REGISTRY as BACKFILL_CRAWLER_REGISTRY
 from kb.wiki_links import parse_page_links
 
@@ -124,6 +138,21 @@ class WikiUpsertBody(BaseModel):
     asserts it is not silently overwriting a page someone else just made.
     """
 
+    pipeline_updates: bool | None = Field(default=None)
+    """Optionally flip the page's pipeline-updates setting as part of this write.
+
+    `None` -- the default, and what every existing caller sends -- LEAVES THE
+    SETTING ALONE. That matters more than it looks: the setting lives in
+    `wiki_page_settings`, not on the document row, precisely so that a writer
+    who does not know about it cannot reset it. Defaulting to `True` here
+    would hand that footgun straight back, since a dashboard save would then
+    silently un-freeze a page somebody deliberately froze.
+
+    Most callers should leave this alone and use
+    `PUT /pages/{wiki_type}/{slug}/settings` instead, which changes the
+    setting WITHOUT writing a new document version.
+    """
+
     @field_validator("doc_class")
     @classmethod
     def _reject_non_manual_doc_class(cls, value: str) -> str:
@@ -133,6 +162,14 @@ class WikiUpsertBody(BaseModel):
         produced by `services/synthesis/wiki_cron.py` calling
         `build_normalization_result` directly, in-process. The HTTP route
         is the human-authoring surface and stays narrowly scoped.
+
+        THIS IS NOT THE PIPELINE-UPDATES SWITCH ANY MORE (migration 0103).
+        It used to be, by accident: stamping a hand edit `manual_entry` made
+        the nightly agent skip the page forever. Now `doc_class` records only
+        who wrote a version — which is a true and useful thing for the history
+        list to show — and whether the agent may rewrite the page is the
+        separate, reversible `pipeline_updates` setting. So this validator
+        stays: a write through the human-authoring route IS a human write.
         """
         if value != DocClass.MANUAL_ENTRY.value:
             raise ValueError(
@@ -140,6 +177,18 @@ class WikiUpsertBody(BaseModel):
                 "use 'manual_entry' for human uploads"
             )
         return value
+
+
+class WikiPageSettingsBody(BaseModel):
+    pipeline_updates: bool
+    author_id: str | None = Field(default=None, max_length=128)
+
+
+class WikiPageSettingsResponse(BaseModel):
+    doc_id: str
+    wiki_type: str
+    slug: str
+    pipeline_updates: bool
 
 
 class WikiRevertBody(BaseModel):
@@ -204,6 +253,11 @@ class WikiPageResponse(BaseModel):
     body: str
     frontmatter: dict[str, Any]
     doc_class: str
+    #: Whether the nightly synthesis agent may rewrite this page. True unless
+    #: somebody explicitly froze it. NOT derivable from `doc_class`: a page can
+    #: be hand-written (`manual_entry`) and still receive pipeline updates,
+    #: which is the default and the whole point of migration 0103.
+    pipeline_updates: bool
     author_id: str | None
     version: int
     created_at: datetime
@@ -215,13 +269,23 @@ class WikiListItem(BaseModel):
     wiki_type: str
     slug: str
     title: str | None
+    #: The page's one-line blurb. Carried here because this list IS the wiki's
+    #: directory now: the front page used to enumerate every page with its
+    #: summary, and once it stopped doing that a title-only list was the entire
+    #: remaining description of the corpus.
+    summary: str | None
     updated_at: datetime
     version: int
 
 
 class WikiListResponse(BaseModel):
     items: list[WikiListItem]
+    #: How many rows this response carries.
     count: int
+    #: How many pages EXIST. Separate from `count` because they differ exactly
+    #: when the caller hit `limit`, and a directory that silently stops at 100
+    #: of 150 pages reads as a complete wiki that is missing a third of itself.
+    total: int
 
 
 class WikiDeleteResponse(BaseModel):
@@ -385,11 +449,15 @@ def page_lock_key(customer_id: str, wiki_type: str, slug: str) -> int:
     `advisory_lock_key("page", customer_id, f"{wiki_type}:{slug}")` around
     their read-then-write, so that two writers integrate rather than
     clobber. This route did not participate, and that was the hole: the
-    agent re-reads a page, sees `doc_class=compiled_wiki`, decides it is
-    safe to overwrite -- and a PUT lands in that window and turns it into a
-    human-authored `manual_entry` the agent then destroys. The
-    manual-entry skip is a real guard; without a shared lock it just is not
-    atomic.
+    agent re-reads a page, decides it is allowed to write, and a PUT lands
+    inside that window -- so the agent's write is computed against a body
+    that is already gone by the time it commits.
+
+    What the agent re-reads has changed (it is `pipeline_updates` now, not
+    `doc_class` -- migration 0103), and the lock matters MORE than it did,
+    not less: the setting can be flipped between the agent staging an update
+    and committing it, so "may I write this page?" and "write it" have to be
+    one atomic step or a freeze can land a moment too late to take effect.
 
     Spelled as a named helper rather than inlined so the two call sites
     cannot drift apart silently -- a lock is only a lock while every writer
@@ -525,6 +593,26 @@ async def upsert_wiki_page(
                     current=current_version,
                     current_body=live[1] if live else "",
                 )
+        # BEFORE the body write, not after. `set_page_pipeline_updates` and
+        # `_persist` each open their own transaction, so one commits first
+        # whatever the order -- and this is the order whose retry converges.
+        # Setting-then-body: a failed body write leaves an idempotent upsert
+        # applied and nothing else, and the retry writes the body once.
+        # Body-then-setting: a failed setting write leaves a committed new
+        # VERSION behind, and the retry mints a second one.
+        #
+        # Inside the lock either way, so a write that also flips the setting
+        # cannot interleave with the agent's read-then-write on the same page.
+        # Only when explicitly asked -- see `WikiUpsertBody.pipeline_updates`
+        # for why the default has to be "leave it alone".
+        if body.pipeline_updates is not None:
+            await persistence.set_page_pipeline_updates(
+                customer_id,
+                wiki_type,
+                slug,
+                pipeline_updates=body.pipeline_updates,
+                updated_by=body.author_id,
+            )
         outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
 
     if not outcome.doc_ids:
@@ -556,6 +644,88 @@ async def upsert_wiki_page(
             WikiLinkOut(raw=link.raw, kind=link.kind, target=link.target) for link in parsed_links
         ],
         dangling_links=dangling,
+    )
+
+
+@router.put(
+    "/pages/{wiki_type}/{slug}/settings",
+    response_model=WikiPageSettingsResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def set_wiki_page_settings(
+    wiki_type: str,
+    slug: str,
+    body: WikiPageSettingsBody,
+    customer_id: str = Depends(_require_customer),
+) -> WikiPageSettingsResponse:
+    """Turn nightly pipeline updates for ONE page on or off.
+
+    WRITES NO DOCUMENT VERSION, deliberately. Freezing a page changes nothing
+    about what the page says, so it must not appear in the page's history as a
+    revision -- a history where half the entries changed no prose is a history
+    nobody reads. `wiki_page_settings` carries its own `updated_at` /
+    `updated_by` for the audit question this leaves open.
+
+    No `expected_version` precondition either, and that is not an oversight:
+    the setting is not derived from the body, so there is no lost update to
+    protect against. Two people racing to freeze the same page both get what
+    they asked for.
+
+    404s on a page that does not exist. The setting would be harmless to store
+    early -- an absent page reads as unfrozen either way -- but silently
+    accepting a typo'd slug is how somebody ends up certain they froze a page
+    that kept updating.
+    """
+    wiki_type = _validate_wiki_type(wiki_type)
+    slug = _validate_slug(slug)
+    doc_id = f"wiki:{wiki_type}:{slug}"
+
+    # THE SAME LOCK THE AGENT TAKES, and it is the whole reason a freeze
+    # takes effect. `WikiAgentRuntime._persist_update` holds this key across
+    # its read-then-write: it reads `pipeline_updates`, decides, and only then
+    # rewrites the body -- a window that spans chunking and embedding, so
+    # seconds, not microseconds. Without the lock a freeze can return 200
+    # INSIDE that window and the page is rewritten anyway, which is a freeze
+    # the user was told succeeded and did not.
+    #
+    # The existence check moves inside for the same reason: outside it, a
+    # delete landing between the check and the write leaves a settings row
+    # for a page that no longer exists, and a later page reusing the slug
+    # inherits a freeze nobody asked for.
+    async with with_tenant(customer_id) as lock_conn:
+        await lock_conn.execute(
+            "SELECT pg_advisory_xact_lock($1)", page_lock_key(customer_id, wiki_type, slug)
+        )
+        row = await lock_conn.fetchrow(
+            """
+            SELECT deleted_at FROM documents
+            WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+            """,
+            customer_id,
+            doc_id,
+        )
+        if row is None or row["deleted_at"] is not None:
+            raise HTTPException(status_code=404, detail="wiki page not found")
+
+        await persistence.set_page_pipeline_updates(
+            customer_id,
+            wiki_type,
+            slug,
+            pipeline_updates=body.pipeline_updates,
+            updated_by=body.author_id,
+        )
+    log.info(
+        "wiki.pipeline_updates_set",
+        customer=customer_id,
+        doc_id=doc_id,
+        pipeline_updates=body.pipeline_updates,
+        author_id=body.author_id,
+    )
+    return WikiPageSettingsResponse(
+        doc_id=doc_id,
+        wiki_type=wiki_type,
+        slug=slug,
+        pipeline_updates=body.pipeline_updates,
     )
 
 
@@ -591,6 +761,9 @@ async def get_wiki_page(
         # tenant GUC.
         body = await fetch_live_body_from_chunks(conn, customer_id, doc_id)
 
+    pipeline_updates = await persistence.fetch_page_pipeline_updates(
+        customer_id, wiki_type, slug
+    )
     metadata = _coerce_metadata(row["metadata"])
     return WikiPageResponse(
         doc_id=row["doc_id"],
@@ -601,6 +774,7 @@ async def get_wiki_page(
         body=body,
         frontmatter=metadata.get("frontmatter", {}),
         doc_class=metadata.get("doc_class", DocClass.MANUAL_ENTRY.value),
+        pipeline_updates=pipeline_updates,
         author_id=row["author_id"],
         version=row["version"],
         created_at=row["created_at"],
@@ -647,6 +821,25 @@ async def delete_wiki_page(
     normalizer = Normalizer(ctx=request.app.state.ctx, store=request.app.state.store)
     outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
     doc_id = result.documents[0].doc_id
+    # Drop the setting with the page. `wiki_page_settings` has no FK to
+    # `documents` (its PK includes `version`, so there is nothing to point at),
+    # so without this the row outlives the page -- and a page later recreated
+    # under the same slug would come back silently frozen by a decision made
+    # about a different page. The setting is about a page; no page, no setting.
+    try:
+        await persistence.clear_page_pipeline_updates(customer_id, wiki_type, slug)
+    except Exception as exc:
+        # The page is already deleted and committed. Reporting 500 here would
+        # be a lie the caller acts on -- they retry a delete that succeeded.
+        # The orphan row is invisible until someone recreates the slug, and
+        # this log is how that gets traced when they do.
+        log.warning(
+            "wiki.settings_cleanup_failed",
+            customer=customer_id,
+            doc_id=doc_id,
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
     log.info("wiki.deleted", customer=customer_id, doc_id=doc_id)
     return WikiDeleteResponse(doc_id=doc_id, deleted=bool(outcome.doc_ids))
 
@@ -670,7 +863,8 @@ async def list_wiki_pages(
         if doc_type_filter:
             rows = await conn.fetch(
                 """
-                SELECT doc_id, source_id, title, version, updated_at, metadata
+                SELECT doc_id, source_id, title, body_preview, version,
+                       updated_at, metadata
                 FROM documents
                 WHERE customer_id = $1
                   AND source_system = $2
@@ -685,10 +879,24 @@ async def list_wiki_pages(
                 doc_type_filter,
                 limit,
             )
+            total = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM documents
+                WHERE customer_id = $1
+                  AND source_system = $2
+                  AND doc_type = $3
+                  AND valid_to IS NULL
+                  AND deleted_at IS NULL
+                """,
+                customer_id,
+                SourceSystem.WIKI.value,
+                doc_type_filter,
+            )
         else:
             rows = await conn.fetch(
                 """
-                SELECT doc_id, source_id, title, version, updated_at, metadata
+                SELECT doc_id, source_id, title, body_preview, version,
+                       updated_at, metadata
                 FROM documents
                 WHERE customer_id = $1
                   AND source_system = $2
@@ -700,6 +908,22 @@ async def list_wiki_pages(
                 customer_id,
                 SourceSystem.WIKI.value,
                 limit,
+            )
+            # Counted with the index EXCLUDED, matching what the loop below
+            # drops in Python. A total that counted a page the response can
+            # never contain would report the list as permanently one short.
+            total = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM documents
+                WHERE customer_id = $1
+                  AND source_system = $2
+                  AND doc_type <> $3
+                  AND valid_to IS NULL
+                  AND deleted_at IS NULL
+                """,
+                customer_id,
+                SourceSystem.WIKI.value,
+                WIKI_INDEX_DOC_TYPE,
             )
 
     items: list[WikiListItem] = []
@@ -718,16 +942,22 @@ async def list_wiki_pages(
         # general list of user-authored pages.
         if wiki_type_value == "index":
             continue
+        summary = metadata.get("summary") or row["body_preview"] or ""
+        if isinstance(summary, str) and summary.strip():
+            summary = summary.strip().splitlines()[0]
+        else:
+            summary = ""
         items.append(
             WikiListItem(
                 wiki_type=wiki_type_value or "unknown",
                 slug=slug_value or row["source_id"],
                 title=row["title"],
+                summary=summary or None,
                 updated_at=row["updated_at"],
                 version=row["version"],
             )
         )
-    return WikiListResponse(items=items, count=len(items))
+    return WikiListResponse(items=items, count=len(items), total=total)
 
 
 # ---------------------------------------------------------------------------

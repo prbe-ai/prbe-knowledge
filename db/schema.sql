@@ -1254,6 +1254,43 @@ CREATE INDEX ix_wiki_links_from
 CREATE INDEX ix_wiki_links_to
     ON wiki_links (customer_id, dst_wiki_type, dst_slug);
 
+-- Per-PAGE settings, deliberately NOT on `documents` (migration 0103).
+--
+-- `documents` is a version chain: PK (customer_id, doc_id, version), one new
+-- row per write, and `Normalizer._persist` builds that row wholly from the
+-- incoming payload. A flag stored there is a fact about ONE VERSION, so every
+-- writer (dashboard BFF, `probe wiki write`, research-os PUT, the synthesis
+-- agent) would have to remember to copy it forward or silently reset it -- and
+-- `revert` rebuilds its event from the metadata of the version being reverted
+-- TO, which would time-travel the setting along with the prose.
+--
+-- A setting is also not a revision: toggling it changes no content, so it must
+-- not mint a version. Hence its own row, keyed on page identity rather than on
+-- (doc_id, version), carrying its own audit columns.
+--
+-- ABSENT ROW MEANS PIPELINE UPDATES ARE ON. The default lives in the reader
+-- (`fetch_page_pipeline_updates`), not in a backfill, so a page nobody has
+-- ever configured is one nobody has to migrate.
+CREATE TABLE wiki_page_settings (
+    customer_id      TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    wiki_type        TEXT NOT NULL,
+    slug             TEXT NOT NULL,
+    -- False freezes the page: the nightly synthesis agent reads it as context
+    -- but will not rewrite it. True is the default and needs no row.
+    pipeline_updates BOOLEAN NOT NULL DEFAULT TRUE,
+    -- Who last flipped it and when. The page's own version history cannot
+    -- answer this, because flipping it writes no version.
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by       TEXT,
+    PRIMARY KEY (customer_id, wiki_type, slug)
+);
+
+ALTER TABLE wiki_page_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wiki_page_settings FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON wiki_page_settings
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
 CREATE TABLE wiki_timeline_entries (
     id              BIGSERIAL PRIMARY KEY,
     customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,

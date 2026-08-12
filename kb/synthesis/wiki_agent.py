@@ -29,7 +29,7 @@ from typing import Any
 import asyncpg
 
 from engine.ingest.handlers.base import ConnectorContext, make_default_context
-from engine.ingest.normalizer import Normalizer
+from engine.ingest.normalizer import Normalizer, fetch_live_body_from_chunks
 from engine.shared.constants import (
     WIKI_AGENT_BATCH_SIZE,
     WIKI_DOC_TYPE_PREFIX,
@@ -282,6 +282,9 @@ class WikiAgentRuntime:
             "version": None,
             "is_staged": False,
             "stage_kind": None,
+            # False means a person has frozen this page: read it for context,
+            # but an update_page against it will be dropped at persist time.
+            "pipeline_updates": existing.get("pipeline_updates", True),
         }
 
     async def _tool_get_event_body(self, args: GetEventBodyArgs) -> dict[str, Any]:
@@ -519,10 +522,9 @@ class WikiAgentRuntime:
         lock_key = advisory_lock_key("page", self.customer_id, page_slug)
         async with with_tenant(self.customer_id) as lock_conn:
             await lock_conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
-            # Re-fetch the existing page so MANUAL_ENTRY pages are skipped
-            # (we don't want the agent to clobber a human-authored page).
-            # The fetch happens AFTER the lock so it sees the latest
-            # committed state.
+            # Re-fetch the existing page AFTER the lock so we see the latest
+            # committed state, and so the pipeline_updates check below cannot
+            # race a toggle that landed while this run was thinking.
             existing = await persistence.fetch_existing_page(
                 self.customer_id, update.wiki_type, update.slug
             )
@@ -534,9 +536,18 @@ class WikiAgentRuntime:
                     slug=update.slug,
                 )
                 return
-            if existing.get("doc_class") == DocClass.MANUAL_ENTRY.value:
+            # THE ONLY THING THAT STOPS A REWRITE IS THE EXPLICIT SETTING.
+            #
+            # This used to read `doc_class == MANUAL_ENTRY`, which meant a
+            # person fixing a typo froze the page forever with no way back
+            # short of SQL. A hand edit is evidence about what the page should
+            # say, not an instruction to stop maintaining it -- the agent has
+            # already read that text through `read_page` and the prompt binds
+            # it to treat it as authoritative. So editing no longer freezes;
+            # only asking to freeze freezes.
+            if existing.get("pipeline_updates") is False:
                 log.info(
-                    "agent.skipped_manual_entry",
+                    "agent.skipped_pipeline_updates_off",
                     customer=self.customer_id,
                     wiki_type=update.wiki_type,
                     slug=update.slug,
@@ -882,7 +893,7 @@ async def regenerate_wiki_index(
         # writebacks (Component 5) and must not appear in the auto-index.
         rows = await conn.fetch(
             """
-            SELECT title, body_preview, source_id, version, updated_at,
+            SELECT doc_id, title, body_preview, source_id, version, updated_at,
                    metadata
             FROM documents
             WHERE customer_id = $1
@@ -899,9 +910,40 @@ async def regenerate_wiki_index(
             f"{WIKI_DOC_TYPE_PREFIX}%",
             WIKI_INDEX_DOC_TYPE,
         )
-    body = await index_renderer.render_index_via_llm(
-        rows, customer_id=customer_id
-    )
+        # THE BODIES, not just the previews. The front page is a synthesis of
+        # what these pages SAY, and the renderer used to get titles and
+        # one-line summaries only -- so it could re-list the corpus and
+        # nothing more. Read on the same connection the rows came from, so
+        # RLS on `chunks` sees the tenant GUC.
+        rows = [
+            {
+                **dict(row),
+                # Sliced AT FETCH, not after: the renderer only reads
+                # _PER_PAGE_BODY_CHARS of each page, and materialising every
+                # full body first would hold the whole wiki in memory to throw
+                # most of it away. One char over the cap so the renderer can
+                # still tell a trimmed page from an exactly-sized one.
+                "body": (
+                    await fetch_live_body_from_chunks(conn, customer_id, row["doc_id"])
+                    or ""
+                )[: index_renderer.PER_PAGE_BODY_CHARS + 1],
+            }
+            for row in rows
+        ]
+
+    body = await index_renderer.render_index_via_llm(rows, customer_id=customer_id)
+    if body is None:
+        # The renderer could not write an overview this run. Leave the
+        # published one alone: it is stale by one drain, which is strictly
+        # better than replacing a real overview with a placeholder, and far
+        # better than the page list the old fallback substituted.
+        log.warning(
+            "agent.index_regen_skipped_no_body",
+            customer=customer_id,
+            agent_run_id=run_id,
+            page_count=len(rows),
+        )
+        return
     received_at = datetime.now(UTC)
     run_id_suffix = f" #{run_id}" if run_id is not None else ""
     raw_payload: dict[str, Any] = {
