@@ -458,10 +458,29 @@ async def test_tool_done_marks_applied_and_skipped_correctly(
 
 
 @pytest.mark.asyncio
-async def test_tool_done_regenerates_wiki_index(reset_db: None) -> None:
-    qid = await _seed_synthesizing("github:commit:idx-1", "body")
-    run_id = await _open_run()
-    rt = _make_runtime(run_id)
+async def _stub_index_llm(monkeypatch, body: str) -> None:
+    """Make the index renderer produce `body`, through its real code path.
+
+    Patched at `shared.llm.acompletion` rather than at `render_index_via_llm`
+    so the row fetch, the body-loading and the prompt assembly all still run --
+    a stub one layer higher would leave the thing this test is about untested.
+    """
+    from types import SimpleNamespace
+
+    from engine.shared import llm as shared_llm
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    get_settings.cache_clear()
+
+    async def fake_acompletion(**_kwargs):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=body))]
+        )
+
+    monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
+
+
+async def _seed_indexed_page(rt, qid: int) -> None:
     await rt.dispatch_tool(
         "create_page",
         {
@@ -474,16 +493,81 @@ async def test_tool_done_regenerates_wiki_index(reset_db: None) -> None:
             "applied_queue_ids": [qid],
         },
     )
-    await rt.dispatch_tool("done", {})
 
-    async with raw_conn() as conn:
-        index_row = await conn.fetchrow(
-            "SELECT title FROM documents "
+
+async def _live_index_body() -> str | None:
+    from engine.ingest.normalizer import fetch_live_body_from_chunks
+    from engine.shared.db import with_tenant
+
+    async with with_tenant(CUSTOMER) as conn:
+        row = await conn.fetchrow(
+            "SELECT doc_id FROM documents "
             "WHERE customer_id = $1 AND doc_id = 'wiki:index:contents' "
             "AND valid_to IS NULL",
             CUSTOMER,
         )
-    assert index_row is not None
+        if row is None:
+            return None
+        return await fetch_live_body_from_chunks(conn, CUSTOMER, row["doc_id"])
+
+
+async def test_tool_done_regenerates_wiki_index(reset_db: None, monkeypatch) -> None:
+    await _stub_index_llm(monkeypatch, "# Probe\n\nAn overview of the work.\n")
+    qid = await _seed_synthesizing("github:commit:idx-1", "body")
+    run_id = await _open_run()
+    rt = _make_runtime(run_id)
+    await _seed_indexed_page(rt, qid)
+    await rt.dispatch_tool("done", {})
+
+    assert "An overview of the work." in (await _live_index_body() or "")
+
+
+async def test_a_failed_index_render_leaves_the_published_page_alone(
+    reset_db: None, monkeypatch
+) -> None:
+    """THE REASON THE FALLBACK WAS REMOVED.
+
+    The renderer used to substitute a flat list of every page when the LLM was
+    unavailable. Under the overview design that substitute IS the directory the
+    front page stopped being, so one Gemini hiccup would silently undo the
+    change. Declining to write keeps the last good overview instead.
+    """
+    await _stub_index_llm(monkeypatch, "# Probe\n\nThe good overview.\n")
+    qid = await _seed_synthesizing("github:commit:idx-1", "body")
+    run_id = await _open_run()
+    rt = _make_runtime(run_id)
+    await _seed_indexed_page(rt, qid)
+    await rt.dispatch_tool("done", {})
+    assert "The good overview." in (await _live_index_body() or "")
+
+    # Next drain, LLM down.
+    from engine.shared import llm as shared_llm
+
+    async def failing(**_kwargs):
+        raise shared_llm.LLMError("upstream timeout", status_code=504, provider="google")
+
+    monkeypatch.setattr(shared_llm, "acompletion", failing)
+
+    qid2 = await _seed_synthesizing("github:commit:idx-2", "body")
+    run_id2 = await _open_run()
+    rt2 = _make_runtime(run_id2)
+    await rt2.dispatch_tool(
+        "create_page",
+        {
+            "wiki_type": "decision",
+            "slug": "second",
+            "title": "Second Page",
+            "body_markdown": "b2",
+            "summary": "second summary",
+            "commit_message": "m",
+            "applied_queue_ids": [qid2],
+        },
+    )
+    await rt2.dispatch_tool("done", {})
+
+    body = await _live_index_body() or ""
+    assert "The good overview." in body, "the last good overview survives"
+    assert "[[Second Page]]" not in body, "and is NOT replaced by a page list"
 
 
 # ---------------------------------------------------------------------------

@@ -15,24 +15,35 @@ from unittest.mock import AsyncMock
 import pytest
 
 from kb.synthesis.index_renderer import (
-    _fallback_flat_list,
+    _format_pages_for_prompt,
     _PageRow,
     render_index_via_llm,
 )
 
 
-def _row(source_id: str, title: str, summary: str = "", body_preview: str = "") -> dict:
+def _row(
+    source_id: str,
+    title: str,
+    summary: str = "",
+    body_preview: str = "",
+    body: str | None = None,
+) -> dict:
     """Build a fake asyncpg.Record-like dict the renderer accepts.
 
     The renderer indexes rows by key (`row["title"]`, `row["metadata"]`,
-    etc.); plain dicts work in tests.
+    etc.); plain dicts work in tests. `body` is omitted entirely when not
+    given, which is how an older caller's rows arrive -- the renderer must
+    tolerate the key being absent rather than empty.
     """
-    return {
+    row = {
         "source_id": source_id,
         "title": title,
         "metadata": {"summary": summary} if summary else {},
         "body_preview": body_preview,
     }
+    if body is not None:
+        row["body"] = body
+    return row
 
 
 def _stub_acompletion_response(text: str):
@@ -50,9 +61,14 @@ async def test_render_index_falls_back_when_no_pages() -> None:
 
 
 @pytest.mark.asyncio
-async def test_render_index_falls_back_without_key_or_gateway(monkeypatch) -> None:
-    """No GOOGLE_API_KEY and no LLM_GATEWAY_URL → deterministic flat
-    list (the index page must always render)."""
+async def test_render_index_declines_without_key_or_gateway(monkeypatch) -> None:
+    """No GOOGLE_API_KEY and no LLM_GATEWAY_URL → None, meaning "leave the
+    published page alone".
+
+    This used to return a flat alphabetical list of every page. Under the
+    overview design that substitute IS the directory the front page stopped
+    being, so a single unavailable LLM would silently undo the change.
+    """
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
     from engine.shared.config import get_settings
@@ -60,10 +76,7 @@ async def test_render_index_falls_back_without_key_or_gateway(monkeypatch) -> No
     get_settings.cache_clear()
 
     rows = [_row("decision:abc", "Title A", summary="Summary A")]
-    out = await render_index_via_llm(rows, client=None)
-    assert "Title A" in out
-    # Fallback is alphabetical bullets, not an LLM-shaped paragraph.
-    assert out.startswith("# Wiki")
+    assert await render_index_via_llm(rows, client=None) is None
 
 
 @pytest.mark.asyncio
@@ -99,7 +112,7 @@ async def test_render_index_via_shared_llm_happy_path(monkeypatch) -> None:
     assert captured["model"] == f"gemini/{WIKI_AGENT_MODEL}"
     assert [m["role"] for m in captured["messages"]] == ["system", "user"]
     assert "engineering wiki" in captured["messages"][0]["content"].lower()
-    assert captured["kwargs"].get("max_tokens") == 16384
+    assert captured["kwargs"].get("max_tokens") == 4096
     assert "Title A" in out
     # The renderer trims the leading `# Wiki` heading; verify it didn't
     # touch the company H1.
@@ -130,9 +143,9 @@ async def test_render_index_uses_gateway_without_google_key(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_render_index_falls_back_on_llm_error(monkeypatch) -> None:
-    """An LLMError from the wrapper should NOT crash the index render;
-    the function falls back to the flat list."""
+async def test_render_index_declines_on_llm_error(monkeypatch) -> None:
+    """An LLMError must not crash the render -- and must not substitute a
+    page list either. `None` tells the caller to keep the published page."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
     from engine.shared.config import get_settings
@@ -147,15 +160,12 @@ async def test_render_index_falls_back_on_llm_error(monkeypatch) -> None:
     monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
 
     rows = [_row("decision:abc", "Title A", summary="Summary A")]
-    out = await render_index_via_llm(rows, client=None)
-    # Fallback path → markdown bullets with the page title.
-    assert "Title A" in out
-    assert out.startswith("# Wiki")
+    assert await render_index_via_llm(rows, client=None) is None
 
 
 @pytest.mark.asyncio
-async def test_render_index_falls_back_on_empty_response(monkeypatch) -> None:
-    """Empty LLM content → flat-list fallback."""
+async def test_render_index_declines_on_empty_response(monkeypatch) -> None:
+    """Empty LLM content is a failed render, not an empty overview."""
     monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
     from engine.shared.config import get_settings
@@ -170,9 +180,7 @@ async def test_render_index_falls_back_on_empty_response(monkeypatch) -> None:
     monkeypatch.setattr(shared_llm, "acompletion", fake_acompletion)
 
     rows = [_row("decision:abc", "Title A", summary="Summary A")]
-    out = await render_index_via_llm(rows, client=None)
-    assert "Title A" in out
-    assert out.startswith("# Wiki")
+    assert await render_index_via_llm(rows, client=None) is None
 
 
 @pytest.mark.asyncio
@@ -191,14 +199,66 @@ async def test_render_index_legacy_client_path_still_works() -> None:
     assert "# Probe" in out
 
 
-def test_fallback_flat_list_renders_pages_alphabetically() -> None:
-    """Sanity: the deterministic fallback emits the title list in
-    alphabetical order."""
+def test_the_prompt_carries_page_text_not_just_titles() -> None:
+    """THE POINT OF THE CHANGE. The renderer used to send titles and one-line
+    summaries only, so the model writing the overview had never read a page it
+    was describing -- it could re-group the list it was handed and nothing
+    more. The bodies are what make an overview possible."""
     pages = [
-        _PageRow(wiki_type="decision", slug="b", title="Bravo", summary="b summary"),
-        _PageRow(wiki_type="decision", slug="a", title="Alpha", summary="a summary"),
+        _PageRow(
+            wiki_type="decision",
+            slug="a",
+            title="Alpha",
+            summary="a summary",
+            body="We chose pgvector because the alternative needed a second datastore.",
+        ),
     ]
-    out = _fallback_flat_list(pages)
-    a_pos = out.index("Alpha")
-    b_pos = out.index("Bravo")
-    assert a_pos < b_pos
+    corpus, missing_body = _format_pages_for_prompt(pages)
+
+    assert "needed a second datastore" in corpus
+    assert missing_body == 0
+
+
+def test_pages_with_no_body_are_counted_not_hidden() -> None:
+    """A front page that quietly stopped seeing half the wiki would read as
+    the wiki having gotten less interesting. The count is what makes that
+    visible in the logs instead."""
+    pages = [
+        _PageRow(wiki_type="decision", slug="a", title="Alpha", summary="s", body=""),
+        _PageRow(wiki_type="decision", slug="b", title="Bravo", summary="s", body="text"),
+    ]
+    _, missing_body = _format_pages_for_prompt(pages)
+    assert missing_body == 1
+
+
+def test_a_long_body_is_trimmed_and_marked() -> None:
+    """Trimming is signposted in the prompt so the model knows it is reading
+    an excerpt, rather than treating a sentence cut mid-clause as the page's
+    final word."""
+    from kb.synthesis.index_renderer import _PER_PAGE_BODY_CHARS
+
+    pages = [
+        _PageRow(
+            wiki_type="decision",
+            slug="a",
+            title="Alpha",
+            summary="s",
+            body="x" * (_PER_PAGE_BODY_CHARS + 500),
+        ),
+    ]
+    corpus, _ = _format_pages_for_prompt(pages)
+    assert "[...truncated]" in corpus
+    # Measured on the body LINE, not by counting "x" across the whole corpus:
+    # the `text: |` label contains one, which is exactly the kind of off-by-one
+    # that makes a cap look wrong when it is right.
+    body_line = next(line for line in corpus.splitlines() if line.strip().startswith("x"))
+    assert len(body_line.strip()) == _PER_PAGE_BODY_CHARS
+
+
+def test_a_row_with_no_body_key_is_tolerated() -> None:
+    """Older callers send rows without the key at all. That must read as "no
+    body", not raise -- the index regen is the last step of every drain."""
+    from kb.synthesis.index_renderer import _rows_to_pages
+
+    pages = _rows_to_pages([_row("decision:abc", "Title A", summary="Summary A")])
+    assert pages[0].body == ""

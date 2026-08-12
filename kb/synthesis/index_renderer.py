@@ -1,24 +1,29 @@
-"""LLM-driven wiki index renderer.
+"""LLM-driven wiki index renderer: the front page is an OVERVIEW, not an index.
 
-Replaces the old deterministic ``render_index_markdown`` function (which
-grouped pages by ``wiki_type`` under fixed section headers) with a
-Gemini-Pro call that:
+What this used to produce, and why it changed. The prompt asked for "a
+thoughtful overview, NOT a table of contents" and then instructed the model to
+list every page with its summary. With 37 pages that arithmetic only has one
+outcome: four sentences of prose on top of a 37-line directory. Worse, the
+model was handed page titles and one-line summaries ONLY -- it had never read a
+single page it was describing -- so re-grouping the list it was given was the
+most it could physically do.
 
-  1. Writes a short intro paragraph describing what the company is about,
-     synthesized from the page titles + summaries it sees.
-  2. Emits a ``mermaid`` ``graph TD`` block showing repo<->repo /
-     repo<->service relationships and how each repo contributes to the
-     overall product.
-  3. Organizes the page list however makes sense for THIS corpus —
-     no hardcoded "## Service Cards / ## Decisions" sections.
+Both halves are fixed here:
 
-The motivation is that wiki taxonomies are wildly different per
-company; a fixed grouping by ``wiki_type`` was both noisy (one page
-per section) and uninformative (the user wanted to see structure, not
-a bucket label).
+  1. The renderer reads page BODIES (``_PER_PAGE_BODY_CHARS`` of each), so the
+     overview can make concrete claims about the work.
+  2. The prompt forbids enumerating pages. Discovery lives where directories
+     belong -- the dashboard's page browser, ``probe wiki list``, and the MCP's
+     ``view="pages"`` -- and the front page spends itself on meaning instead.
 
-Falls back to a flat alphabetical list when the LLM call fails or the
-``GOOGLE_API_KEY`` is unset, so the index page always renders.
+The architecture diagram (item 2 of the old docstring) has been disabled since
+2026-05-08; see the splice block at the end of ``render_index_via_llm``.
+
+FAILURE IS A NO-OP, NOT A SUBSTITUTE. When the LLM is unavailable the renderer
+returns ``None`` and the caller leaves the existing page alone. The old code
+substituted a flat alphabetical page list, which under this design would mean
+one Gemini hiccup silently reverts the front page to the directory this change
+exists to remove.
 """
 
 from __future__ import annotations
@@ -42,6 +47,26 @@ class _PageRow:
     slug: str
     title: str
     summary: str
+    #: The page's actual prose, trimmed to `_PER_PAGE_BODY_CHARS`. Empty when
+    #: the caller did not fetch bodies (older callers, and the tests that
+    #: predate them).
+    body: str = ""
+
+
+# How much of each page the renderer reads. The front page is a synthesis of
+# what the wiki KNOWS, and a model given only titles and one-line summaries
+# cannot write one -- it can only re-list what it was handed, which is how the
+# old front page ended up as a directory with a paragraph on top.
+#
+# 4k chars is roughly the first half of a substantial page: enough to carry the
+# claims and the shape, cheap enough that a 100-page wiki still fits in one
+# request with room to spare.
+_PER_PAGE_BODY_CHARS = 4000
+
+# Ceiling across ALL pages, so a wiki that grows to hundreds of pages degrades
+# by dropping the tail rather than by failing the request. Pages arrive
+# newest-updated first, so the tail is the stalest material.
+_TOTAL_BODY_CHARS = 250_000
 
 
 @dataclass(frozen=True)
@@ -54,40 +79,42 @@ class _RepoEdge:
 
 
 _INDEX_SYSTEM_PROMPT = (
-    "You are writing the front page of an engineering wiki. The wiki "
-    "covers one company; you have the full list of pages it contains "
-    "(title + 1-line summary + type). Produce a Markdown body that "
-    "feels like a thoughtful overview, NOT a table of contents.\n\n"
-    "Required structure:\n\n"
-    "  1. **`# {Company}` H1 + intro** (~3-5 sentences). Infer the "
-    "company / product name from the corpus (typical signals: a repo "
-    "named `<name>-something`, a project page, recurring mentions). "
-    "Use that as the H1 — never the literal word `Wiki`, since the "
-    "dashboard already shows the page title above your body. The "
-    "intro: what is this company about, what's the main product, "
-    "what's getting built? Do NOT list pages here.\n\n"
-    "  2. **Pages** — list every page with a wiki link. Organize them "
-    "however makes sense for THIS corpus (group by product line, by "
-    "team, by service, by type — your call). **Lead with the most "
-    "load-bearing pages first**: typically the company's repos / "
-    "services come first (those are what the company actually builds), "
-    "then runbooks, then people / customers / projects / events. Use "
-    "`[[Title]]` syntax so the dashboard rewrites them into routed "
-    "links. Include the 1-line summary after each link. **Never emit "
-    "a bullet with no content** (`- ` on its own line) — every bullet "
-    "must have a page link AND a summary or be omitted.\n\n"
-    "**Do NOT emit a ```mermaid``` block.** The architecture diagram "
-    "is generated deterministically by the system from verified "
-    "code-graph edges and spliced into your output between the intro "
-    "and the Pages section. Anything you write inside a fenced "
-    "mermaid block will be replaced — and risks producing a "
-    "malformed diagram if the syntax doesn't parse. Just write the "
-    "intro, then go straight to the Pages section.\n\n"
-    "Tone: direct, builder-to-builder. No corporate language. Don't "
-    "narrate ('Below you will find...'). Just write the page.\n\n"
-    "Output ONLY the Markdown body — no `# Wiki` heading at the top, "
-    "no ```markdown fences around the whole thing, no ```mermaid "
-    "block (the system handles the diagram)."
+    "You are writing the front page of an engineering wiki. You have the "
+    "wiki's pages, each with its type, title, one-line summary, and the "
+    "opening of its actual text. Write a HIGH-LEVEL OVERVIEW of what this "
+    "company is and what it is working on.\n\n"
+    "**DO NOT LIST THE PAGES.** This is the instruction most likely to be "
+    "ignored, so read it twice. No 'Pages' section, no directory, no "
+    "grouped bullet list of every page with its summary after it. A reader "
+    "who wants the full list has a page browser and a `wiki list` command; "
+    "the front page is the one surface that can tell them what it all MEANS, "
+    "and spending it on an index they can get elsewhere wastes it.\n\n"
+    "What to write:\n\n"
+    "  1. **`# {Company}` H1.** Infer the company / product name from the "
+    "corpus (typical signals: a repo named `<name>-something`, a project "
+    "page, recurring mentions). Never the literal word `Wiki` — the "
+    "dashboard already shows the page title above your body.\n\n"
+    "  2. **The overview itself, in prose** — a handful of short sections "
+    "with `##` headings, chosen to fit THIS company. Aim for something a "
+    "new engineer could read in two minutes and come away knowing what is "
+    "being built, how the main pieces fit together, what the team has "
+    "learned, and what is actively moving. Draw on the page BODIES you have "
+    "been given, not just their titles: specifics are the whole point. "
+    "Concrete claims, named systems, real decisions and their reasons.\n\n"
+    "Linking: mention a page with `[[Title]]` where it genuinely helps a "
+    "reader go deeper on something you just said. That is a handful of "
+    "links inside prose, not a bullet per page. A paragraph that is mostly "
+    "links has become the directory this page must not be.\n\n"
+    "Do NOT write a section that merely names the categories of pages that "
+    "exist ('the wiki also covers several runbooks and people'). Say "
+    "something true about the work or leave it out.\n\n"
+    "**Do NOT emit a ```mermaid``` block.** Diagram rendering is disabled "
+    "and anything inside a fenced mermaid block is stripped before the page "
+    "is stored.\n\n"
+    "Tone: direct, builder-to-builder. No corporate language. Don't narrate "
+    "('Below you will find...'). Just write the page.\n\n"
+    "Output ONLY the Markdown body — no ```markdown fences around the whole "
+    "thing."
 )
 
 
@@ -115,40 +142,61 @@ def _rows_to_pages(rows: list[asyncpg.Record]) -> list[_PageRow]:
             summary = summary.strip().splitlines()[0] if summary.strip() else ""
         else:
             summary = ""
+        try:
+            body = row["body"]
+        except (KeyError, IndexError):
+            body = ""
         pages.append(
-            _PageRow(wiki_type=str(wiki_type), slug=str(slug), title=str(title), summary=summary)
+            _PageRow(
+                wiki_type=str(wiki_type),
+                slug=str(slug),
+                title=str(title),
+                summary=summary,
+                body=str(body or ""),
+            )
         )
     return pages
 
 
-def _fallback_flat_list(pages: list[_PageRow]) -> str:
-    """Plain alphabetical list rendered when the LLM path is unavailable.
+def _format_pages_for_prompt(pages: list[_PageRow]) -> tuple[str, int]:
+    """Render the corpus the LLM reads. Returns `(text, pages_without_body)`.
 
-    No hardcoded section headers — matches the new no-grouping intent.
+    Carries each page's TEXT, not just its title and summary. The old version
+    sent metadata only, which meant the model writing the front page had never
+    read a single page it was describing -- so the best it could do was
+    reorganise the list it was handed. An overview needs the prose.
+
+    Trimming is reported, never silent: the caller logs how many pages arrived
+    with no body and how much text was dropped, because a front page that
+    quietly stopped seeing half the wiki would read as the wiki having gotten
+    less interesting.
     """
-    if not pages:
-        return "# Wiki\n\nNo pages yet.\n"
-    sorted_pages = sorted(pages, key=lambda p: p.title.lower())
-    parts = ["# Wiki", ""]
-    for page in sorted_pages:
-        line = f"- [[{page.title}]]"
-        if page.summary:
-            line += f" — {page.summary}"
-        parts.append(line)
-    return "\n".join(parts).rstrip() + "\n"
-
-
-def _format_pages_for_prompt(pages: list[_PageRow]) -> str:
-    """Compact YAML-ish render the LLM consumes as user content."""
     lines: list[str] = []
+    spent = 0
+    missing_body = 0
     for page in pages:
+        body = page.body.strip()
+        if not body:
+            missing_body += 1
+        excerpt = body[:_PER_PAGE_BODY_CHARS]
+        if spent + len(excerpt) > _TOTAL_BODY_CHARS:
+            excerpt = excerpt[: max(0, _TOTAL_BODY_CHARS - spent)]
+        spent += len(excerpt)
+        truncated = len(body) > len(excerpt)
         lines.append(
             f"- type: {page.wiki_type}\n"
             f"  slug: {page.slug}\n"
             f"  title: {page.title}\n"
-            f"  summary: {page.summary or '(none)'}"
+            f"  summary: {page.summary or '(none)'}\n"
+            f"  text: |\n"
+            + (
+                "\n".join(f"    {line}" for line in excerpt.splitlines())
+                if excerpt
+                else "    (no text)"
+            )
+            + ("\n    [...truncated]" if truncated else "")
         )
-    return "\n".join(lines)
+    return "\n".join(lines), missing_body
 
 
 async def fetch_verified_repo_edges(customer_id: str) -> list[_RepoEdge]:
@@ -242,19 +290,17 @@ async def render_index_via_llm(
     customer_id: str | None = None,
     client: Any | None = None,
     model: str = WIKI_AGENT_MODEL,
-) -> str:
+) -> str | None:
     """Produce the wiki index body via Gemini Pro.
 
-    Returns the markdown body verbatim. Falls back to ``_fallback_flat_list``
-    when the LLM call fails or ``GOOGLE_API_KEY`` is unset — the index
-    page must always render.
+    Returns the markdown body, or ``None`` when no overview could be written
+    (LLM unavailable, errored, or empty). ``None`` means LEAVE THE PAGE ALONE:
+    the caller keeps whatever overview is already published rather than
+    replacing it, because there is no useful thing to substitute. A page list
+    would be exactly the directory this page stopped being.
 
-    When ``customer_id`` is supplied the function fetches the verified
-    cross-repo edges for that customer (extracted by the code-graph
-    pipeline) and passes them to the LLM as facts. The prompt then
-    requires the architecture diagram to use ONLY these edges. Without
-    a customer_id (older callers / tests) the LLM falls back to the
-    looser "infer from page summaries" path.
+    ``customer_id`` is accepted for the disabled architecture-diagram path and
+    is otherwise unused; see the splice block at the end.
     """
     pages = _rows_to_pages(rows)
     if not pages:
@@ -275,10 +321,17 @@ async def render_index_via_llm(
     #         )
     # edges_block = _format_edges_for_prompt(edges)
 
-    user_prompt = (
-        f"Wiki page corpus ({len(pages)} pages):\n\n"
-        f"{_format_pages_for_prompt(pages)}"
-    )
+    corpus, missing_body = _format_pages_for_prompt(pages)
+    if missing_body:
+        # Not fatal -- the model still has titles and summaries for those
+        # pages -- but it is the difference between an overview and a
+        # re-listing, so it is said out loud rather than absorbed.
+        log.info(
+            "index_renderer.pages_without_body",
+            page_count=len(pages),
+            missing_body=missing_body,
+        )
+    user_prompt = f"Wiki page corpus ({len(pages)} pages):\n\n{corpus}"
 
     # Phase-0b chunk B: the production call routes through
     # shared.llm.acompletion so the call honors LLM_GATEWAY_URL for
@@ -288,8 +341,8 @@ async def render_index_via_llm(
     # is preserved for tests that inject a stub mimicking the google-
     # genai surface (`client.aio.models.generate_content`) — when
     # supplied we drive that legacy path verbatim so existing fixtures
-    # keep working. The deterministic-fallback codepath (no gateway AND
-    # no key → flat alphabetical list) is preserved verbatim.
+    # keep working. The no-gateway-and-no-key codepath now declines to
+    # write rather than substituting a page list.
     if client is not None:
         try:
             resp = await client.aio.models.generate_content(
@@ -297,12 +350,12 @@ async def render_index_via_llm(
                 contents=user_prompt,
                 config={
                     "system_instruction": _INDEX_SYSTEM_PROMPT,
-                    # 16k accommodates a 50-page index with summaries
-                    # comfortably. Bumped from 4096 after a acme
-                    # run truncated mid-block — page list never landed in
-                    # the body, leaving only the intro + a half-written
-                    # Mermaid attempt.
-                    "max_output_tokens": 16384,
+                    # 4k fits a two-minute-read overview with room to
+                    # spare. It was 16384 to accommodate a 50-page list
+                    # with summaries; the page list is gone, and a tighter
+                    # ceiling is also a cheap brake on the model drifting
+                    # back into enumerating pages.
+                    "max_output_tokens": 4096,
                 },
             )
         except Exception as exc:
@@ -312,7 +365,7 @@ async def render_index_via_llm(
                 error_class=type(exc).__name__,
                 page_count=len(pages),
             )
-            return _fallback_flat_list(pages)
+            return None
         text = (getattr(resp, "text", None) or "").strip()
     else:
         from engine.shared import llm as shared_llm
@@ -325,7 +378,7 @@ async def render_index_via_llm(
             or get_settings().google_api_key.get_secret_value()
         ):
             log.warning("index_renderer.no_google_api_key_falling_back")
-            return _fallback_flat_list(pages)
+            return None
 
         try:
             resp = await shared_llm.acompletion(
@@ -334,12 +387,12 @@ async def render_index_via_llm(
                     {"role": "system", "content": _INDEX_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-                # 16k accommodates a 50-page index with summaries
-                # comfortably. Bumped from 4096 after a acme
-                # run truncated mid-block — page list never landed in
-                # the body, leaving only the intro + a half-written
-                # Mermaid attempt.
-                max_tokens=16384,
+                # 4k fits a two-minute-read overview with room to spare.
+                # It was 16384 to accommodate a 50-page list with
+                # summaries; the page list is gone, and a tighter ceiling
+                # is also a cheap brake on the model drifting back into
+                # enumerating pages.
+                max_tokens=4096,
             )
         except shared_llm.LLMError as exc:
             log.warning(
@@ -350,7 +403,7 @@ async def render_index_via_llm(
                 provider=exc.provider,
                 page_count=len(pages),
             )
-            return _fallback_flat_list(pages)
+            return None
 
         try:
             text = (resp.choices[0].message.content or "").strip()
@@ -360,11 +413,11 @@ async def render_index_via_llm(
                 error=str(exc),
                 page_count=len(pages),
             )
-            return _fallback_flat_list(pages)
+            return None
 
     if not text:
         log.warning("index_renderer.empty_response_falling_back", page_count=len(pages))
-        return _fallback_flat_list(pages)
+        return None
 
     text = _strip_leading_wiki_heading(text)
     text = _strip_empty_bullets(text)

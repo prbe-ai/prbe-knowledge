@@ -269,13 +269,23 @@ class WikiListItem(BaseModel):
     wiki_type: str
     slug: str
     title: str | None
+    #: The page's one-line blurb. Carried here because this list IS the wiki's
+    #: directory now: the front page used to enumerate every page with its
+    #: summary, and once it stopped doing that a title-only list was the entire
+    #: remaining description of the corpus.
+    summary: str | None
     updated_at: datetime
     version: int
 
 
 class WikiListResponse(BaseModel):
     items: list[WikiListItem]
+    #: How many rows this response carries.
     count: int
+    #: How many pages EXIST. Separate from `count` because they differ exactly
+    #: when the caller hit `limit`, and a directory that silently stops at 100
+    #: of 150 pages reads as a complete wiki that is missing a third of itself.
+    total: int
 
 
 class WikiDeleteResponse(BaseModel):
@@ -817,7 +827,8 @@ async def list_wiki_pages(
         if doc_type_filter:
             rows = await conn.fetch(
                 """
-                SELECT doc_id, source_id, title, version, updated_at, metadata
+                SELECT doc_id, source_id, title, body_preview, version,
+                       updated_at, metadata
                 FROM documents
                 WHERE customer_id = $1
                   AND source_system = $2
@@ -832,10 +843,24 @@ async def list_wiki_pages(
                 doc_type_filter,
                 limit,
             )
+            total = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM documents
+                WHERE customer_id = $1
+                  AND source_system = $2
+                  AND doc_type = $3
+                  AND valid_to IS NULL
+                  AND deleted_at IS NULL
+                """,
+                customer_id,
+                SourceSystem.WIKI.value,
+                doc_type_filter,
+            )
         else:
             rows = await conn.fetch(
                 """
-                SELECT doc_id, source_id, title, version, updated_at, metadata
+                SELECT doc_id, source_id, title, body_preview, version,
+                       updated_at, metadata
                 FROM documents
                 WHERE customer_id = $1
                   AND source_system = $2
@@ -847,6 +872,22 @@ async def list_wiki_pages(
                 customer_id,
                 SourceSystem.WIKI.value,
                 limit,
+            )
+            # Counted with the index EXCLUDED, matching what the loop below
+            # drops in Python. A total that counted a page the response can
+            # never contain would report the list as permanently one short.
+            total = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM documents
+                WHERE customer_id = $1
+                  AND source_system = $2
+                  AND doc_type <> $3
+                  AND valid_to IS NULL
+                  AND deleted_at IS NULL
+                """,
+                customer_id,
+                SourceSystem.WIKI.value,
+                WIKI_INDEX_DOC_TYPE,
             )
 
     items: list[WikiListItem] = []
@@ -865,16 +906,22 @@ async def list_wiki_pages(
         # general list of user-authored pages.
         if wiki_type_value == "index":
             continue
+        summary = metadata.get("summary") or row["body_preview"] or ""
+        if isinstance(summary, str) and summary.strip():
+            summary = summary.strip().splitlines()[0]
+        else:
+            summary = ""
         items.append(
             WikiListItem(
                 wiki_type=wiki_type_value or "unknown",
                 slug=slug_value or row["source_id"],
                 title=row["title"],
+                summary=summary or None,
                 updated_at=row["updated_at"],
                 version=row["version"],
             )
         )
-    return WikiListResponse(items=items, count=len(items))
+    return WikiListResponse(items=items, count=len(items), total=total)
 
 
 # ---------------------------------------------------------------------------

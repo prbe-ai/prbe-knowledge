@@ -29,7 +29,7 @@ from typing import Any
 import asyncpg
 
 from engine.ingest.handlers.base import ConnectorContext, make_default_context
-from engine.ingest.normalizer import Normalizer
+from engine.ingest.normalizer import Normalizer, fetch_live_body_from_chunks
 from engine.shared.constants import (
     WIKI_AGENT_BATCH_SIZE,
     WIKI_DOC_TYPE_PREFIX,
@@ -893,7 +893,7 @@ async def regenerate_wiki_index(
         # writebacks (Component 5) and must not appear in the auto-index.
         rows = await conn.fetch(
             """
-            SELECT title, body_preview, source_id, version, updated_at,
+            SELECT doc_id, title, body_preview, source_id, version, updated_at,
                    metadata
             FROM documents
             WHERE customer_id = $1
@@ -910,9 +910,35 @@ async def regenerate_wiki_index(
             f"{WIKI_DOC_TYPE_PREFIX}%",
             WIKI_INDEX_DOC_TYPE,
         )
-    body = await index_renderer.render_index_via_llm(
-        rows, customer_id=customer_id
-    )
+        # THE BODIES, not just the previews. The front page is a synthesis of
+        # what these pages SAY, and the renderer used to get titles and
+        # one-line summaries only -- so it could re-list the corpus and
+        # nothing more. Read on the same connection the rows came from, so
+        # RLS on `chunks` sees the tenant GUC.
+        rows = [
+            {
+                **dict(row),
+                "body": await fetch_live_body_from_chunks(
+                    conn, customer_id, row["doc_id"]
+                )
+                or "",
+            }
+            for row in rows
+        ]
+
+    body = await index_renderer.render_index_via_llm(rows, customer_id=customer_id)
+    if body is None:
+        # The renderer could not write an overview this run. Leave the
+        # published one alone: it is stale by one drain, which is strictly
+        # better than replacing a real overview with a placeholder, and far
+        # better than the page list the old fallback substituted.
+        log.warning(
+            "agent.index_regen_skipped_no_body",
+            customer=customer_id,
+            agent_run_id=run_id,
+            page_count=len(rows),
+        )
+        return
     received_at = datetime.now(UTC)
     run_id_suffix = f" #{run_id}" if run_id is not None else ""
     raw_payload: dict[str, Any] = {
