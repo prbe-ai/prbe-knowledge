@@ -69,7 +69,12 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0103_wiki_page_settings"
-down_revision = "0102_bm25_title_tokenizer"
+# The REVISION STRING of 0102, not its filename. That file is
+# `20260805_0102_bm25_title_tokenizer.py` but declares
+# `revision = "0102_bm25_title_tok"` -- abbreviated to fit alembic_version's
+# 32-char column. Pointing at the filename builds no revision map at all, and
+# `alembic upgrade head` fails before running anything.
+down_revision = "0102_bm25_title_tok"
 branch_labels = None
 depends_on = None
 
