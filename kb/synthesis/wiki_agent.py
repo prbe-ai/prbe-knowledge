@@ -282,6 +282,9 @@ class WikiAgentRuntime:
             "version": None,
             "is_staged": False,
             "stage_kind": None,
+            # False means a person has frozen this page: read it for context,
+            # but an update_page against it will be dropped at persist time.
+            "pipeline_updates": existing.get("pipeline_updates", True),
         }
 
     async def _tool_get_event_body(self, args: GetEventBodyArgs) -> dict[str, Any]:
@@ -519,10 +522,9 @@ class WikiAgentRuntime:
         lock_key = advisory_lock_key("page", self.customer_id, page_slug)
         async with with_tenant(self.customer_id) as lock_conn:
             await lock_conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
-            # Re-fetch the existing page so MANUAL_ENTRY pages are skipped
-            # (we don't want the agent to clobber a human-authored page).
-            # The fetch happens AFTER the lock so it sees the latest
-            # committed state.
+            # Re-fetch the existing page AFTER the lock so we see the latest
+            # committed state, and so the pipeline_updates check below cannot
+            # race a toggle that landed while this run was thinking.
             existing = await persistence.fetch_existing_page(
                 self.customer_id, update.wiki_type, update.slug
             )
@@ -534,9 +536,18 @@ class WikiAgentRuntime:
                     slug=update.slug,
                 )
                 return
-            if existing.get("doc_class") == DocClass.MANUAL_ENTRY.value:
+            # THE ONLY THING THAT STOPS A REWRITE IS THE EXPLICIT SETTING.
+            #
+            # This used to read `doc_class == MANUAL_ENTRY`, which meant a
+            # person fixing a typo froze the page forever with no way back
+            # short of SQL. A hand edit is evidence about what the page should
+            # say, not an instruction to stop maintaining it -- the agent has
+            # already read that text through `read_page` and the prompt binds
+            # it to treat it as authoritative. So editing no longer freezes;
+            # only asking to freeze freezes.
+            if existing.get("pipeline_updates") is False:
                 log.info(
-                    "agent.skipped_manual_entry",
+                    "agent.skipped_pipeline_updates_off",
                     customer=self.customer_id,
                     wiki_type=update.wiki_type,
                     slug=update.slug,

@@ -958,28 +958,15 @@ async def test_put_expecting_absent_page_conflicts_when_it_exists(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_synthesis_agent_does_not_clobber_a_page_written_through_the_route(
-    client: httpx.AsyncClient,
-) -> None:
-    """THE DEFINITION-OF-DONE TEST: a page an agent wrote survives the
-    nightly synthesis run.
+async def _run_agent_update(slug: str, body_markdown: str) -> None:
+    """Run the REAL agent persist path against one page.
 
-    Not an argument about locks -- the actual agent persist path, run
-    against a page this route created, asserting the bytes afterwards.
-
-    The guard being exercised is `_persist_update`'s manual-entry skip:
-    everything written through this route is `doc_class=manual_entry` (the
-    route's validator permits nothing else), and the agent refuses to
-    overwrite that class. `test_http_put_takes_the_page_lock` covers the
-    other half -- that the skip is decided ATOMICALLY rather than in a
-    window a concurrent PUT can slip through.
+    Not a stand-in for the agent: `_persist_update` is the function the
+    nightly run calls, and it is the one that decides whether a page may be
+    rewritten. Tests that mocked it would pass against a skip that no longer
+    exists.
     """
     from kb.synthesis.wiki_agent import WikiAgentRuntime, _StagedUpdate
-
-    human_text = "Written by a person through `probe wiki write`. Do not overwrite."
-    created = await _put(client, "human-owned", human_text, expected_version=0)
-    assert created.status_code == 200, created.text
 
     runtime = WikiAgentRuntime(
         CUSTOMER,
@@ -990,17 +977,226 @@ async def test_synthesis_agent_does_not_clobber_a_page_written_through_the_route
     await runtime._persist_update(
         _StagedUpdate(
             wiki_type="runbook",
-            slug="human-owned",
-            body_markdown="THE AGENT REWROTE THIS PAGE FROM SCRATCH.",
+            slug=slug,
+            body_markdown=body_markdown,
             summary="nightly synthesis pass",
             commit_message="synthesis",
         )
     )
 
+
+@pytest.mark.asyncio
+async def test_hand_editing_a_page_does_not_stop_the_pipeline(
+    client: httpx.AsyncClient,
+) -> None:
+    """THE DEFINITION-OF-DONE TEST, and it asserts the OPPOSITE of what it
+    used to.
+
+    Editing a page by hand used to freeze it forever: the route stamps every
+    public write `doc_class=manual_entry`, and `_persist_update` skipped that
+    class outright. No API, CLI or UI path could undo it. Nobody chose that --
+    they fixed a typo and the page quietly stopped updating.
+
+    So the guarantee now runs the other way: a hand-written page STILL
+    receives nightly updates, because a human edit is evidence about what the
+    page should say, not an instruction to abandon it. Freezing is a separate,
+    explicit, reversible thing -- see the tests below.
+    """
+    human_text = "Written by a person through `probe wiki write`."
+    created = await _put(client, "human-owned", human_text, expected_version=0)
+    assert created.status_code == 200, created.text
+    assert (
+        created.json()["version"] == 1
+    ), "precondition: the hand write is the live version"
+
+    await _run_agent_update("human-owned", "THE AGENT UPDATED THIS PAGE.")
+
     page = await client.get("/api/wiki/pages/runbook/human-owned", headers=_hdr())
     assert page.status_code == 200, page.text
-    assert page.json()["body"] == human_text
+    assert page.json()["body"] == "THE AGENT UPDATED THIS PAGE."
+    assert page.json()["version"] == 2, "the agent's write is a new version"
+    # The default is ON and a hand edit does not change it. Asserted
+    # explicitly: if a future writer starts stamping the setting on every PUT,
+    # the body assertion above would still pass while the trapdoor came back.
+    assert page.json()["pipeline_updates"] is True
+
+
+@pytest.mark.asyncio
+async def test_settings_default_is_on_for_a_page_nobody_configured(
+    client: httpx.AsyncClient,
+) -> None:
+    """THE MIGRATION DECISION, asserted as behaviour.
+
+    Migration 0103 inserts no rows: an absent `wiki_page_settings` row reads
+    as pipeline_updates=TRUE. That is what returns every page frozen by the
+    old trapdoor to receiving updates, without a backfill UPDATE that could
+    get its WHERE clause wrong.
+
+    So the default has to live in the reader, and it has to be ON.
+    """
+    from kb.synthesis import persistence
+
+    await _put(client, "never-configured", "body", expected_version=0)
+
+    page = await client.get("/api/wiki/pages/runbook/never-configured", headers=_hdr())
+    assert page.json()["pipeline_updates"] is True
+
+    # Asserted at the persistence layer too, because that is the function the
+    # nightly agent consults -- a route that hardcoded True in its response
+    # would satisfy the check above while the agent still skipped the page.
+    assert (
+        await persistence.fetch_page_pipeline_updates(CUSTOMER, "runbook", "never-configured")
+        is True
+    )
+    # And for a page that does not exist at all: not frozen, because there is
+    # nothing there to freeze.
+    assert (
+        await persistence.fetch_page_pipeline_updates(CUSTOMER, "runbook", "no-such-page")
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_freezing_a_page_stops_the_pipeline(client: httpx.AsyncClient) -> None:
+    """The explicit setting is what stops a rewrite -- and only it."""
+    frozen_text = "Frozen on purpose. The nightly run must leave this alone."
+    await _put(client, "frozen", frozen_text, expected_version=0)
+
+    resp = await client.put(
+        "/api/wiki/pages/runbook/frozen/settings",
+        json={"pipeline_updates": False, "author_id": "richard"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["pipeline_updates"] is False
+
+    await _run_agent_update("frozen", "THE AGENT REWROTE THIS PAGE FROM SCRATCH.")
+
+    page = await client.get("/api/wiki/pages/runbook/frozen", headers=_hdr())
+    assert page.json()["body"] == frozen_text
     assert page.json()["version"] == 1, "a skipped write must not bump the version"
+    assert page.json()["pipeline_updates"] is False
+
+
+@pytest.mark.asyncio
+async def test_freezing_is_reversible(client: httpx.AsyncClient) -> None:
+    """THE POINT OF THE WHOLE CHANGE: a frozen page can be un-frozen, through
+    the same API that froze it.
+
+    The old freeze had no path back at any layer -- not the route, not the
+    CLI, not the dashboard. Only hand-written SQL. A test that only proved
+    freezing works would have passed against that design too.
+    """
+    await _put(client, "thawed", "original", expected_version=0)
+
+    for state in (False, True):
+        resp = await client.put(
+            "/api/wiki/pages/runbook/thawed/settings",
+            json={"pipeline_updates": state},
+            headers=_hdr(),
+        )
+        assert resp.status_code == 200, resp.text
+
+    await _run_agent_update("thawed", "THE AGENT UPDATED THIS PAGE AGAIN.")
+
+    page = await client.get("/api/wiki/pages/runbook/thawed", headers=_hdr())
+    assert page.json()["body"] == "THE AGENT UPDATED THIS PAGE AGAIN."
+    assert page.json()["pipeline_updates"] is True
+
+
+@pytest.mark.asyncio
+async def test_toggling_the_setting_writes_no_version(
+    client: httpx.AsyncClient,
+) -> None:
+    """Freezing changes no prose, so it must not appear in page history.
+
+    This is why the setting lives in `wiki_page_settings` instead of on the
+    `documents` row: a version-carried flag could only be changed by writing a
+    version, and a history where half the entries changed nothing is a history
+    nobody reads.
+    """
+    await _put(client, "quiet-toggle", "body text", expected_version=0)
+    before = await client.get("/api/wiki/pages/runbook/quiet-toggle", headers=_hdr())
+
+    await client.put(
+        "/api/wiki/pages/runbook/quiet-toggle/settings",
+        json={"pipeline_updates": False},
+        headers=_hdr(),
+    )
+
+    after = await client.get("/api/wiki/pages/runbook/quiet-toggle", headers=_hdr())
+    assert after.json()["version"] == before.json()["version"]
+    assert after.json()["body"] == before.json()["body"]
+    assert after.json()["pipeline_updates"] is False
+
+
+@pytest.mark.asyncio
+async def test_settings_on_a_missing_page_is_404(client: httpx.AsyncClient) -> None:
+    """A typo'd slug must not silently succeed.
+
+    Storing the setting for a page that does not exist would be harmless to
+    the data and awful for the user: they would be told they froze a page,
+    and the page they meant would keep updating.
+    """
+    resp = await client.put(
+        "/api/wiki/pages/runbook/no-such-page/settings",
+        json={"pipeline_updates": False},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_page_forgets_its_setting(
+    client: httpx.AsyncClient,
+) -> None:
+    """A recreated slug must not inherit a freeze decided about a page that no
+    longer exists.
+
+    `wiki_page_settings` has no FK to `documents` -- its PK includes `version`,
+    so there is nothing to cascade from -- which means the row outlives the
+    page unless the delete path clears it.
+    """
+    await _put(client, "recycled", "first life", expected_version=0)
+    await client.put(
+        "/api/wiki/pages/runbook/recycled/settings",
+        json={"pipeline_updates": False},
+        headers=_hdr(),
+    )
+    await client.delete("/api/wiki/pages/runbook/recycled", headers=_hdr())
+
+    await _put(client, "recycled", "second life")
+    page = await client.get("/api/wiki/pages/runbook/recycled", headers=_hdr())
+    assert page.json()["pipeline_updates"] is True
+
+    await _run_agent_update("recycled", "THE AGENT UPDATED THE RECREATED PAGE.")
+    page = await client.get("/api/wiki/pages/runbook/recycled", headers=_hdr())
+    assert page.json()["body"] == "THE AGENT UPDATED THE RECREATED PAGE."
+
+
+@pytest.mark.asyncio
+async def test_a_write_that_omits_the_setting_leaves_it_alone(
+    client: httpx.AsyncClient,
+) -> None:
+    """A caller who has never heard of the setting cannot reset it.
+
+    Every existing writer -- the dashboard BFF, `probe wiki write`, the
+    research-os proxy -- sends a body with no `pipeline_updates` field. If the
+    schema defaulted that to True, saving a typo fix on a frozen page would
+    silently un-freeze it: the same class of bug as the trapdoor, pointing the
+    other way.
+    """
+    await _put(client, "stays-frozen", "original", expected_version=0)
+    await client.put(
+        "/api/wiki/pages/runbook/stays-frozen/settings",
+        json={"pipeline_updates": False},
+        headers=_hdr(),
+    )
+
+    await _put(client, "stays-frozen", "edited by someone unaware of the setting")
+
+    page = await client.get("/api/wiki/pages/runbook/stays-frozen", headers=_hdr())
+    assert page.json()["pipeline_updates"] is False
 
 
 @pytest.mark.asyncio

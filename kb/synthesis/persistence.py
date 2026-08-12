@@ -689,10 +689,15 @@ async def fetch_existing_page(
 ) -> dict[str, Any] | None:
     """Return the live wiki page for `(wiki_type, slug)`, or None.
 
-    The returned `doc_class` is what the synthesis worker checks before
-    deciding whether the cron is allowed to rewrite the body.
-    MANUAL_ENTRY pages are read-only; only COMPILED_WIKI / AGENT_ARTIFACT
-    pages are open for regeneration.
+    `doc_class` is PROVENANCE -- who wrote this version. It is deliberately
+    NOT what decides whether the agent may rewrite the page; that is
+    `pipeline_updates`, which is a per-page setting and comes from
+    `wiki_page_settings` (migration 0103). The two were the same field until
+    then, which made a hand edit a permanent, unreversible freeze.
+
+    `pipeline_updates` is TRUE when no settings row exists. The default lives
+    HERE rather than in a backfill, so a page nobody configured is a page
+    nobody had to migrate.
     """
     from engine.ingest.normalizer import fetch_live_body_from_chunks
 
@@ -700,15 +705,22 @@ async def fetch_existing_page(
     async with with_tenant(customer_id) as conn:
         row = await conn.fetchrow(
             """
-            SELECT title, doc_class, metadata
-            FROM documents
-            WHERE customer_id = $1
-              AND doc_id = $2
-              AND valid_to IS NULL
-              AND deleted_at IS NULL
+            SELECT d.title, d.doc_class, d.metadata,
+                   COALESCE(s.pipeline_updates, TRUE) AS pipeline_updates
+            FROM documents d
+            LEFT JOIN wiki_page_settings s
+                   ON s.customer_id = d.customer_id
+                  AND s.wiki_type = $3
+                  AND s.slug = $4
+            WHERE d.customer_id = $1
+              AND d.doc_id = $2
+              AND d.valid_to IS NULL
+              AND d.deleted_at IS NULL
             """,
             customer_id,
             doc_id,
+            wiki_type,
+            slug,
         )
         if row is None:
             return None
@@ -723,10 +735,70 @@ async def fetch_existing_page(
     return {
         "title": row["title"],
         "doc_class": row["doc_class"],
+        "pipeline_updates": row["pipeline_updates"],
         "body": body or None,
         "frontmatter": metadata.get("frontmatter") or {},
         "summary": metadata.get("summary"),
     }
+
+
+async def fetch_page_pipeline_updates(
+    customer_id: str,
+    wiki_type: str,
+    slug: str,
+) -> bool:
+    """Whether the nightly agent may rewrite this page. TRUE when unset.
+
+    Standalone because the HTTP read path wants the setting without paying for
+    the page body, and because a page that does not exist yet still has an
+    answer: a page nobody has created is not frozen.
+    """
+    async with with_tenant(customer_id) as conn:
+        value = await conn.fetchval(
+            """
+            SELECT pipeline_updates FROM wiki_page_settings
+            WHERE customer_id = $1 AND wiki_type = $2 AND slug = $3
+            """,
+            customer_id,
+            wiki_type,
+            slug,
+        )
+    return True if value is None else bool(value)
+
+
+async def set_page_pipeline_updates(
+    customer_id: str,
+    wiki_type: str,
+    slug: str,
+    *,
+    pipeline_updates: bool,
+    updated_by: str | None = None,
+) -> None:
+    """Flip the setting. Writes NO document version -- see migration 0103.
+
+    Upsert rather than insert-if-absent: turning updates back ON stores an
+    explicit TRUE. That reads the same as an absent row, and storing it anyway
+    is what makes `updated_at` / `updated_by` answer "who un-froze this page,
+    and when" -- a question the page's own history cannot answer, because
+    flipping the setting mints no revision.
+    """
+    async with with_tenant(customer_id) as conn:
+        await conn.execute(
+            """
+            INSERT INTO wiki_page_settings
+                (customer_id, wiki_type, slug, pipeline_updates, updated_at, updated_by)
+            VALUES ($1, $2, $3, $4, NOW(), $5)
+            ON CONFLICT (customer_id, wiki_type, slug) DO UPDATE
+               SET pipeline_updates = EXCLUDED.pipeline_updates,
+                   updated_at = NOW(),
+                   updated_by = EXCLUDED.updated_by
+            """,
+            customer_id,
+            wiki_type,
+            slug,
+            pipeline_updates,
+            updated_by,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +842,7 @@ async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:
             f"{WIKI_DOC_TYPE_PREFIX}%",
             WIKI_INDEX_DOC_TYPE,
         )
+    frozen = await fetch_frozen_pages(customer_id)
     out: list[dict[str, Any]] = []
     for row in rows:
         meta = row["metadata"] or {}
@@ -789,9 +862,58 @@ async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:
                 "summary": meta.get("summary"),
                 "last_updated": row["updated_at"],
                 "version": row["version"],
+                # Marked in the index so the agent can pass over a frozen page
+                # while CHOOSING targets, instead of researching and drafting
+                # one whose write `_persist_update` would then drop on the
+                # floor. The persist-time check stays authoritative -- this is
+                # a cost optimisation, not the guard.
+                "pipeline_updates": (wiki_type, slug) not in frozen,
             }
         )
     return out
+
+
+async def clear_page_pipeline_updates(
+    customer_id: str,
+    wiki_type: str,
+    slug: str,
+) -> None:
+    """Forget the page's setting entirely, returning it to the default.
+
+    Called when the page is deleted. Distinct from setting it back to TRUE:
+    this leaves no row, so a page recreated under the same slug later starts
+    from the default rather than inheriting an `updated_by` from whoever
+    configured a page that no longer exists.
+    """
+    async with with_tenant(customer_id) as conn:
+        await conn.execute(
+            """
+            DELETE FROM wiki_page_settings
+            WHERE customer_id = $1 AND wiki_type = $2 AND slug = $3
+            """,
+            customer_id,
+            wiki_type,
+            slug,
+        )
+
+
+async def fetch_frozen_pages(customer_id: str) -> set[tuple[str, str]]:
+    """`(wiki_type, slug)` of every page with pipeline updates turned OFF.
+
+    Only explicitly-configured pages have a row at all, and only a fraction of
+    those are frozen, so this is a small read even on a large wiki -- which is
+    why the agent's index marks frozen pages from a set rather than joining
+    `wiki_page_settings` on a string-concatenated source_id.
+    """
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT wiki_type, slug FROM wiki_page_settings
+            WHERE customer_id = $1 AND pipeline_updates = FALSE
+            """,
+            customer_id,
+        )
+    return {(r["wiki_type"], r["slug"]) for r in rows}
 
 
 async def fetch_triaged_manifest(

@@ -74,6 +74,7 @@ from kb.handlers.wiki import (
     build_normalization_result,
     is_valid_wiki_type,
 )
+from kb.synthesis import persistence
 from kb.synthesis.crawlers import REGISTRY as BACKFILL_CRAWLER_REGISTRY
 from kb.wiki_links import parse_page_links
 
@@ -124,6 +125,21 @@ class WikiUpsertBody(BaseModel):
     asserts it is not silently overwriting a page someone else just made.
     """
 
+    pipeline_updates: bool | None = Field(default=None)
+    """Optionally flip the page's pipeline-updates setting as part of this write.
+
+    `None` -- the default, and what every existing caller sends -- LEAVES THE
+    SETTING ALONE. That matters more than it looks: the setting lives in
+    `wiki_page_settings`, not on the document row, precisely so that a writer
+    who does not know about it cannot reset it. Defaulting to `True` here
+    would hand that footgun straight back, since a dashboard save would then
+    silently un-freeze a page somebody deliberately froze.
+
+    Most callers should leave this alone and use
+    `PUT /pages/{wiki_type}/{slug}/settings` instead, which changes the
+    setting WITHOUT writing a new document version.
+    """
+
     @field_validator("doc_class")
     @classmethod
     def _reject_non_manual_doc_class(cls, value: str) -> str:
@@ -133,6 +149,14 @@ class WikiUpsertBody(BaseModel):
         produced by `services/synthesis/wiki_cron.py` calling
         `build_normalization_result` directly, in-process. The HTTP route
         is the human-authoring surface and stays narrowly scoped.
+
+        THIS IS NOT THE PIPELINE-UPDATES SWITCH ANY MORE (migration 0103).
+        It used to be, by accident: stamping a hand edit `manual_entry` made
+        the nightly agent skip the page forever. Now `doc_class` records only
+        who wrote a version — which is a true and useful thing for the history
+        list to show — and whether the agent may rewrite the page is the
+        separate, reversible `pipeline_updates` setting. So this validator
+        stays: a write through the human-authoring route IS a human write.
         """
         if value != DocClass.MANUAL_ENTRY.value:
             raise ValueError(
@@ -140,6 +164,18 @@ class WikiUpsertBody(BaseModel):
                 "use 'manual_entry' for human uploads"
             )
         return value
+
+
+class WikiPageSettingsBody(BaseModel):
+    pipeline_updates: bool
+    author_id: str | None = Field(default=None, max_length=128)
+
+
+class WikiPageSettingsResponse(BaseModel):
+    doc_id: str
+    wiki_type: str
+    slug: str
+    pipeline_updates: bool
 
 
 class WikiRevertBody(BaseModel):
@@ -204,6 +240,11 @@ class WikiPageResponse(BaseModel):
     body: str
     frontmatter: dict[str, Any]
     doc_class: str
+    #: Whether the nightly synthesis agent may rewrite this page. True unless
+    #: somebody explicitly froze it. NOT derivable from `doc_class`: a page can
+    #: be hand-written (`manual_entry`) and still receive pipeline updates,
+    #: which is the default and the whole point of migration 0103.
+    pipeline_updates: bool
     author_id: str | None
     version: int
     created_at: datetime
@@ -526,6 +567,18 @@ async def upsert_wiki_page(
                     current_body=live[1] if live else "",
                 )
         outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
+        # Inside the lock, so a write that also flips the setting cannot
+        # interleave with the agent's read-then-write on the same page. Only
+        # when explicitly asked -- see `WikiUpsertBody.pipeline_updates` for
+        # why the default has to be "leave it alone" rather than "turn it on".
+        if body.pipeline_updates is not None:
+            await persistence.set_page_pipeline_updates(
+                customer_id,
+                wiki_type,
+                slug,
+                pipeline_updates=body.pipeline_updates,
+                updated_by=body.author_id,
+            )
 
     if not outcome.doc_ids:
         raise HTTPException(status_code=500, detail="wiki normalize produced no documents")
@@ -556,6 +609,73 @@ async def upsert_wiki_page(
             WikiLinkOut(raw=link.raw, kind=link.kind, target=link.target) for link in parsed_links
         ],
         dangling_links=dangling,
+    )
+
+
+@router.put(
+    "/pages/{wiki_type}/{slug}/settings",
+    response_model=WikiPageSettingsResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def set_wiki_page_settings(
+    wiki_type: str,
+    slug: str,
+    body: WikiPageSettingsBody,
+    customer_id: str = Depends(_require_customer),
+) -> WikiPageSettingsResponse:
+    """Turn nightly pipeline updates for ONE page on or off.
+
+    WRITES NO DOCUMENT VERSION, deliberately. Freezing a page changes nothing
+    about what the page says, so it must not appear in the page's history as a
+    revision -- a history where half the entries changed no prose is a history
+    nobody reads. `wiki_page_settings` carries its own `updated_at` /
+    `updated_by` for the audit question this leaves open.
+
+    No `expected_version` precondition either, and that is not an oversight:
+    the setting is not derived from the body, so there is no lost update to
+    protect against. Two people racing to freeze the same page both get what
+    they asked for.
+
+    404s on a page that does not exist. The setting would be harmless to store
+    early -- an absent page reads as unfrozen either way -- but silently
+    accepting a typo'd slug is how somebody ends up certain they froze a page
+    that kept updating.
+    """
+    wiki_type = _validate_wiki_type(wiki_type)
+    slug = _validate_slug(slug)
+    doc_id = f"wiki:{wiki_type}:{slug}"
+
+    async with with_tenant(customer_id) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT deleted_at FROM documents
+            WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+            """,
+            customer_id,
+            doc_id,
+        )
+    if row is None or row["deleted_at"] is not None:
+        raise HTTPException(status_code=404, detail="wiki page not found")
+
+    await persistence.set_page_pipeline_updates(
+        customer_id,
+        wiki_type,
+        slug,
+        pipeline_updates=body.pipeline_updates,
+        updated_by=body.author_id,
+    )
+    log.info(
+        "wiki.pipeline_updates_set",
+        customer=customer_id,
+        doc_id=doc_id,
+        pipeline_updates=body.pipeline_updates,
+        author_id=body.author_id,
+    )
+    return WikiPageSettingsResponse(
+        doc_id=doc_id,
+        wiki_type=wiki_type,
+        slug=slug,
+        pipeline_updates=body.pipeline_updates,
     )
 
 
@@ -591,6 +711,9 @@ async def get_wiki_page(
         # tenant GUC.
         body = await fetch_live_body_from_chunks(conn, customer_id, doc_id)
 
+    pipeline_updates = await persistence.fetch_page_pipeline_updates(
+        customer_id, wiki_type, slug
+    )
     metadata = _coerce_metadata(row["metadata"])
     return WikiPageResponse(
         doc_id=row["doc_id"],
@@ -601,6 +724,7 @@ async def get_wiki_page(
         body=body,
         frontmatter=metadata.get("frontmatter", {}),
         doc_class=metadata.get("doc_class", DocClass.MANUAL_ENTRY.value),
+        pipeline_updates=pipeline_updates,
         author_id=row["author_id"],
         version=row["version"],
         created_at=row["created_at"],
@@ -647,6 +771,12 @@ async def delete_wiki_page(
     normalizer = Normalizer(ctx=request.app.state.ctx, store=request.app.state.store)
     outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
     doc_id = result.documents[0].doc_id
+    # Drop the setting with the page. `wiki_page_settings` has no FK to
+    # `documents` (its PK includes `version`, so there is nothing to point at),
+    # so without this the row outlives the page -- and a page later recreated
+    # under the same slug would come back silently frozen by a decision made
+    # about a different page. The setting is about a page; no page, no setting.
+    await persistence.clear_page_pipeline_updates(customer_id, wiki_type, slug)
     log.info("wiki.deleted", customer=customer_id, doc_id=doc_id)
     return WikiDeleteResponse(doc_id=doc_id, deleted=bool(outcome.doc_ids))
 
