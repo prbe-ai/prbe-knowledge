@@ -354,6 +354,102 @@ async def test_put_rejects_index_wiki_type(client: httpx.AsyncClient) -> None:
     assert resp.status_code == 400
 
 
+@pytest.mark.asyncio
+async def test_revert_rejects_index_wiki_type(client: httpx.AsyncClient) -> None:
+    """Same reservation, on the other write. Worth its own test because the
+    read below deliberately lifts it: the two must not drift into each other.
+
+    A COMPLETE body (`reason` is required too): an incomplete one is a 422
+    from FastAPI before the route ever runs, which would pass a "not 200"
+    check while proving nothing about the reservation.
+    """
+    resp = await client.post(
+        "/api/wiki/pages/index/contents/revert",
+        json={"to_version": 1, "reason": "trying to rewrite the generated index"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "reserved" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_history_is_readable_for_the_index_page(
+    client: httpx.AsyncClient,
+) -> None:
+    """The index page's history is READABLE even though writing it is not.
+
+    THIS SHIPPED BROKEN. The reservation was applied by one validator shared
+    between the writes and this read, so `GET /pages/index/contents/history`
+    answered 400 for every tenant — and with it research-os's
+    `GET /v1/wiki/versions` and the MCP's `wiki_versions()`, both of which ask
+    for exactly this page because it is the document `GET /v1/wiki` returns.
+
+    The row is written through the app's own PUT and then RE-IDENTIFIED as the
+    index page, rather than hand-inserted: `documents` has a dozen NOT NULL
+    columns the writer fills, and a hand-rolled INSERT that keeps up with them
+    is a second copy of the writer that rots.
+
+    Asserts a REAL history, not just "not 400": a route that validated the type
+    and then read the wrong doc_id would still pass a status check.
+    """
+    await client.put(
+        "/api/wiki/pages/runbook/soon-to-be-index",
+        json={"title": "Contents", "body": "A generated table of contents."},
+        headers=_hdr(),
+    )
+    doc_id = "wiki:index:contents"
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            UPDATE documents
+               SET doc_id = $2, source_id = 'index:contents', doc_type = 'wiki.index'
+             WHERE customer_id = $1 AND doc_id = $3
+            """,
+            CUSTOMER,
+            doc_id,
+            "wiki:runbook:soon-to-be-index",
+        )
+
+    resp = await client.get("/api/wiki/pages/index/contents/history", headers=_hdr())
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["doc_id"] == doc_id
+    assert [entry["version"] for entry in body["entries"]] == [1]
+    assert body["entries"][0]["is_live"] is True
+
+
+@pytest.mark.asyncio
+async def test_history_of_an_absent_index_page_is_404_not_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """A tenant whose synthesis has never run must get ABSENCE, not rejection.
+
+    The two are different bugs with different fixes, and 400 was the one this
+    route gave for every tenant regardless: "your wiki_type is invalid" sends a
+    caller looking at their request when the answer is "there is nothing here
+    yet". research-os maps this 404 to an empty history; it maps a 400 to a
+    502, so the distinction reaches users.
+    """
+    resp = await client.get("/api/wiki/pages/index/contents/history", headers=_hdr())
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_history_still_rejects_a_malformed_wiki_type(
+    client: httpx.AsyncClient,
+) -> None:
+    """Lifting the `index` reservation must not lift the SHAPE check with it.
+
+    The shape check is what keeps a stray path segment from becoming a
+    permanent garbage doc_id lookup; only the reservation is read-specific.
+    """
+    resp = await client.get(
+        "/api/wiki/pages/NOT-A-TYPE/contents/history", headers=_hdr()
+    )
+    assert resp.status_code == 400
+
+
 # ---------------------------------------------------------------------------
 # Bootstrap trigger
 # ---------------------------------------------------------------------------

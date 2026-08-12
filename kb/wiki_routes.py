@@ -264,6 +264,39 @@ def _validate_wiki_type(wiki_type: str) -> str:
     return wiki_type
 
 
+def _validate_readable_wiki_type(wiki_type: str) -> str:
+    """Validate the path wiki_type for READ-ONLY routes.
+
+    Same URL-safe shape as `_validate_wiki_type`, WITHOUT the `index`
+    reservation. That reservation exists to stop a human WRITING the
+    auto-generated overview page -- a write there would be silently discarded
+    by the next synthesis tick. Reading it is not that: the index is a
+    persisted `documents` row with a real version chain like any other page,
+    and refusing to show its history means the only document
+    `GET /api/wiki/index` will serve is the one document nobody can audit.
+
+    research-os's compatibility route `GET /v1/wiki/versions` is the caller
+    that made this concrete. It answers with the history of whatever
+    `GET /v1/wiki` returned -- the index page -- so that a caller reading a
+    body and then its history is always describing ONE document. Against the
+    reservation, that route returned 400 for every tenant, and so did the
+    MCP's `wiki_versions()`.
+
+    ONE caller, deliberately: `get_wiki_page_history`. The single-page GET
+    keeps the reservation even though it is also a read, because the index
+    already has a dedicated route (`GET /api/wiki/index`) whose response
+    carries the page entries and the never-generated fallback. A second way to
+    read the same document is a second thing to keep in sync, and the way it
+    drifts is by serving a body without the entries beside it.
+    """
+    if not is_valid_wiki_type(wiki_type):
+        raise HTTPException(
+            status_code=400,
+            detail="wiki_type must match ^[a-z][a-z0-9_]{0,31}$",
+        )
+    return wiki_type
+
+
 def _validate_slug(slug: str) -> str:
     if not _SLUG_RE.match(slug):
         raise HTTPException(
@@ -718,7 +751,9 @@ async def get_wiki_page_history(
     historical versions. Each entry surfaces the commit metadata stamped at
     write time so consumers can render an audit trail.
     """
-    wiki_type = _validate_wiki_type(wiki_type)
+    # The READ-ONLY validator: `index` is reserved against WRITES, and its
+    # history is the one thing a reader cannot get any other way.
+    wiki_type = _validate_readable_wiki_type(wiki_type)
     slug = _validate_slug(slug)
     doc_id = f"wiki:{wiki_type}:{slug}"
 
