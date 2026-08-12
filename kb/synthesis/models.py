@@ -16,21 +16,92 @@ agent-facing shape, not a router output.
 from __future__ import annotations
 
 from datetime import datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+
 # ---------------------------------------------------------------------------
-# WikiType — the page-kind discriminator.
+# WikiType — the page-kind discriminator. A CLOSED set.
 #
-# Free-form string. The wiki agent picks page-type slugs as it sees fit
-# (typically `repo`, `runbook`, `person`, but the LLM is free to invent
-# new ones for a given customer's corpus). Validation is purely a
-# URL-safety regex enforced at the ingestion route boundary
-# (services/ingestion/handlers/wiki.is_valid_wiki_type) — the model
-# layer treats it as opaque text.
+# It used to be `WikiType = str`, free-form, with the agent told it "may
+# invent new types if the corpus calls for it". Two things went wrong with
+# that, and only one of them is obvious.
+#
+# The obvious one: a wiki whose page kinds are invented per drain has no
+# stable shape to navigate. `repo` and `repository` and `codebase` are three
+# sections of the same wiki, and no reader or renderer can tell.
+#
+# The one that actually bit: the type is a PATH SEGMENT
+# (`/api/wiki/pages/{wiki_type}/{slug}`) and a doc_id component
+# (`wiki:{wiki_type}:{slug}`), so an invented type is a permanent identity.
+# Nothing renames it afterwards -- there is no rename route -- so a typo the
+# agent made once at 04:00 is a page kind forever.
+#
+# THE MEMBERS ARE THE PRODUCT DECISION, not a sample. `index` is included
+# because it is a real stored page (the generated overview), and excluding it
+# would mean the one type the system writes itself is not in the type it
+# writes with. It stays reserved against human WRITES separately -- see
+# `_validate_wiki_type` in kb/wiki_routes.py.
+#
+# Verified against production before closing: every wiki page in every tenant
+# used one of `repo`, `project`, `runbook`, `person`, `index` (37 pages,
+# 2026-08-12). Nothing is orphaned by this list. Adding a member later is a
+# one-line change here that reaches the tool schema, the ingestion gate and
+# the agent prompt at once -- which is the point of having one constant.
 # ---------------------------------------------------------------------------
-WikiType = str
+class WikiType(StrEnum):
+    #: The auto-generated overview. Written only by the synthesis cron.
+    INDEX = "index"
+    #: A codebase.
+    REPO = "repo"
+    #: A stream of work with a goal and an end.
+    PROJECT = "project"
+    #: How to do a recurring operational thing.
+    RUNBOOK = "runbook"
+    #: A teammate: what they own, what they are working on.
+    PERSON = "person"
+    #: A research experiment -- hypothesis, setup, what it showed.
+    EXPERIMENT = "experiment"
+    #: A corpus: where it came from, its shape, its known problems.
+    DATASET = "dataset"
+    #: A trained or hosted model and what is known about its behaviour.
+    MODEL = "model"
+    #: A decision that was made, why, and what it ruled out.
+    DECISION = "decision"
+
+
+#: The types the AGENT may write. `index` is excluded: it is generated from
+#: the other pages at the end of a drain, and an agent writing it directly
+#: would be overwritten by that step within the same run.
+AGENT_WIKI_TYPES: tuple[str, ...] = tuple(
+    t.value for t in WikiType if t is not WikiType.INDEX
+)
+
+
+class AgentWikiType(StrEnum):
+    """`WikiType` minus `index` — the type the agent's TOOL ARGS validate on.
+
+    Separate from `WikiType` because the tool SCHEMA and the tool VALIDATOR
+    have to agree, and they did not: the schema advertised `AGENT_WIKI_TYPES`
+    (no `index`) while the Pydantic args used `WikiType` (with it). A model
+    that emitted `index` would have passed validation against the one rule the
+    schema said it could not break, and the write would then be silently
+    overwritten by the index regeneration at the end of the same drain.
+
+    Derived from the same members rather than restated, so adding a kind is
+    still one edit in one place.
+    """
+
+    REPO = WikiType.REPO.value
+    PROJECT = WikiType.PROJECT.value
+    RUNBOOK = WikiType.RUNBOOK.value
+    PERSON = WikiType.PERSON.value
+    EXPERIMENT = WikiType.EXPERIMENT.value
+    DATASET = WikiType.DATASET.value
+    MODEL = WikiType.MODEL.value
+    DECISION = WikiType.DECISION.value
 
 
 # ---------------------------------------------------------------------------

@@ -155,3 +155,81 @@ def test_create_args_still_rejects_blank_slug() -> None:
             summary="s",
             commit_message="m",
         )
+
+
+# ---------------------------------------------------------------------------
+# wiki_type is a CLOSED set
+# ---------------------------------------------------------------------------
+
+
+def test_the_tool_schema_declares_the_types_as_an_enum_not_prose() -> None:
+    """The model must be CONSTRAINED to the set, not merely told about it.
+
+    A description listing the allowed kinds is a suggestion the model may
+    ignore on any given turn, and `wiki_type` is a permanent identity: it is a
+    path segment (`/api/wiki/pages/{wiki_type}/{slug}`) and a doc_id component
+    (`wiki:{type}:{slug}`), and there is no rename route. One ignored
+    suggestion at 04:00 is a page kind forever.
+    """
+    from kb.synthesis.agent_tools import _WIKI_TYPE_SCHEMA
+    from kb.synthesis.models import AGENT_WIKI_TYPES
+
+    assert _WIKI_TYPE_SCHEMA.get("enum") == list(AGENT_WIKI_TYPES)
+
+
+def test_the_agent_cannot_write_the_generated_index_page() -> None:
+    """`index` is a real member but is NOT offered to the agent.
+
+    The index is regenerated from the other pages at the end of every drain,
+    so an agent writing it directly would have its work overwritten inside the
+    same run -- a write that succeeds and then silently disappears.
+    """
+    from kb.synthesis.models import AGENT_WIKI_TYPES, WikiType
+
+    assert WikiType.INDEX.value not in AGENT_WIKI_TYPES
+    assert set(AGENT_WIKI_TYPES) == {t.value for t in WikiType} - {"index"}
+
+
+def test_the_gate_the_prompt_and_the_schema_cannot_drift() -> None:
+    """One constant reaches all three, and this is what pins that.
+
+    They are three different surfaces -- the ingestion gate that persists a
+    page, the tool schema the model is constrained by, and the prose it reads
+    -- and the failure when they disagree is silent: the agent emits a type
+    the gate then refuses, so the drain loses that page every night with
+    nothing but a log line.
+    """
+    from kb.handlers.wiki import is_valid_wiki_type
+    from kb.synthesis.agent_tools import _WIKI_TYPE_SCHEMA
+    from kb.synthesis.models import AGENT_WIKI_TYPES
+    from kb.synthesis.prompts import _AGENT_WIKI_TYPES_SENTENCE
+
+    for wiki_type in _WIKI_TYPE_SCHEMA["enum"]:
+        assert is_valid_wiki_type(wiki_type), f"schema offers {wiki_type}, gate refuses it"
+        assert f"`{wiki_type}`" in _AGENT_WIKI_TYPES_SENTENCE
+    # ...and the prose names nothing the schema does not offer.
+    import re
+
+    assert re.findall(r"`([a-z_]+)`", _AGENT_WIKI_TYPES_SENTENCE) == list(AGENT_WIKI_TYPES)
+
+
+def test_an_invented_type_is_refused_by_the_gate() -> None:
+    """The behaviour that changed. `company` was in the old prompt's
+    suggestions and is not a member; the gate must now refuse it rather than
+    mint a permanent page kind."""
+    from kb.handlers.wiki import is_valid_wiki_type
+
+    for invented in ("company", "customer", "event", "repository", "codebase"):
+        assert not is_valid_wiki_type(invented), invented
+
+
+def test_the_shape_check_survives_the_membership_check() -> None:
+    """Membership must not REPLACE the URL-safety regex.
+
+    A member added later with a slash or a space in it would pass membership
+    and still break every route that carries it as a path segment.
+    """
+    from kb.handlers.wiki import is_valid_wiki_type
+
+    for malformed in ("Repo", "re po", "repo/slug", "1repo", "", None, 7):
+        assert not is_valid_wiki_type(malformed), malformed

@@ -42,7 +42,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from engine.shared.logging import get_logger
-from kb.handlers.wiki import is_valid_wiki_type
+from kb.handlers.wiki import is_wiki_type_shaped
 
 log = get_logger(__name__)
 
@@ -106,12 +106,16 @@ def _build_context(body: str, start: int, end: int) -> str:
 def _validate_type(dst_wiki_type: str, *, where: str, slug: str) -> bool:
     """Return True iff ``dst_wiki_type`` matches the URL-safe wiki_type shape.
 
-    Wiki page kinds are free-form (the LLM picks them); the only
-    constraint is the same regex the ingestion route enforces, so a
-    `[[<script>:foo]]` injection attempt doesn't slip through. We never
+    SHAPE ONLY, deliberately -- not the closed page-kind set. A link points
+    at a graph ENTITY, and `_LINK_NODE_MAP` resolves kinds like `service` and
+    `ticket` to graph nodes that have no wiki page of their own. Gating this
+    on page-kind membership would silently drop those edges, and the drop
+    would be indistinguishable from the agent not writing the links.
+
+    The regex is what stops a `[[<script>:foo]]` injection attempt. We never
     raise — the page is more important than the link graph.
     """
-    if is_valid_wiki_type(dst_wiki_type):
+    if is_wiki_type_shaped(dst_wiki_type):
         return True
     log.warning(
         "wiki_links.invalid_type",

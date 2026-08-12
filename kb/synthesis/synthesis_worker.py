@@ -177,6 +177,11 @@ class SynthesisWorker:
 
             pages_updated = pages_created = 0
             halt_reason: str | None = None
+            # Initialised BEFORE the try: both except arms below fall through
+            # to the close-run block, which reads it. Assigning it only inside
+            # the try makes every halted drain die on an unbound name instead
+            # of recording why it halted.
+            metrics = None
             try:
                 metrics = await self._run_agent(
                     customer_id=customer_id,
@@ -218,14 +223,45 @@ class SynthesisWorker:
                     dlq_count=dlq_count,
                 )
 
-            status = "failed" if halt_reason else "complete"
+            # A drain that finished but REFUSED writes is `partial`, not
+            # `complete`. The refusals are almost always a `wiki_type` outside
+            # the closed set: the model is told, may move on, and the page it
+            # meant to write simply never exists. Reporting that as `complete`
+            # is the failure mode this whole lane keeps producing -- a green
+            # signal over work that did not happen -- and the only trace was an
+            # INFO log line. `partial` is already in the status CHECK and is
+            # already what the status endpoint surfaces.
+            #
+            # halt_reason still wins: a halted drain is failed, not partial.
+            rejected = getattr(metrics, "rejected_tool_calls", 0) if metrics else 0
+            if halt_reason:
+                status, error = "failed", halt_reason
+            elif rejected:
+                bad = sorted(getattr(metrics, "rejected_wiki_types", set()))
+                status = "partial"
+                # Names WHAT was refused, not just how often: a wiki_type that
+                # keeps recurring here is the enum missing a member, and that
+                # is a product decision someone has to make from this string.
+                error = f"{rejected} tool call(s) refused" + (
+                    f"; rejected wiki_type(s): {', '.join(bad)}" if bad else ""
+                )
+                log.warning(
+                    "synthesis_worker.run_partial_rejected_writes",
+                    customer=customer_id,
+                    run_id=run_id,
+                    rejected=rejected,
+                    wiki_types=bad,
+                )
+            else:
+                status, error = "complete", None
+
             await self._close_run(
                 run_id,
                 customer_id=customer_id,
                 status=status,
                 pages_updated=pages_updated,
                 pages_created=pages_created,
-                error=halt_reason,
+                error=error,
             )
 
     async def _run_agent(

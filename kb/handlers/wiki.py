@@ -65,6 +65,7 @@ from engine.shared.models import (
     WebhookEvent,
     WebhookParseResult,
 )
+from kb.synthesis.models import WikiType
 from kb.wiki_links import WikiPageLink, parse_page_links
 
 log = get_logger(__name__)
@@ -75,11 +76,44 @@ WIKI_PAYLOAD_KEY = "wiki_page"
 # wiki_type slugs are free-form (the LLM picks them) but must conform to
 # this shape so they're URL-safe and don't allow path/SQL/HTML weirdness.
 # Lowercase letters/digits/underscore, 1-32 chars, must start with a letter.
+# Kept alongside the membership check below rather than replaced by it: the
+# shape is what makes a type safe as a URL path segment, and a future member
+# added to the enum with a slash or a space in it would pass membership and
+# still break every route that carries it.
 _WIKI_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+
+#: The CLOSED set, from the one place that defines it. Imported rather than
+#: restated: this gate and the agent's tool schema disagreeing is exactly the
+#: failure a shared constant exists to prevent -- the agent would emit a type
+#: the gate then rejects, and the drain would lose that page every night with
+#: nothing but a log line to show for it.
+_VALID_WIKI_TYPES = frozenset(t.value for t in WikiType)
+
+
+def is_wiki_type_shaped(wiki_type: object) -> bool:
+    """URL-safe SHAPE only. Says nothing about whether a page may have it.
+
+    Two callers need exactly this and not membership:
+
+      * the `[[type:slug]]` link parser (kb/synthesis/wiki_links.py). A wiki
+        LINK points at a graph entity, which is not always a wiki page --
+        `_LINK_NODE_MAP` above resolves `service` and `ticket` to graph nodes
+        that have no page of their own. Gating links on page-kind membership
+        would silently drop those edges from the link graph, and the drop
+        would look like the agent simply not writing links.
+      * anything that only needs to know a string is safe as a path segment.
+    """
+    return isinstance(wiki_type, str) and bool(_WIKI_TYPE_RE.match(wiki_type))
 
 
 def is_valid_wiki_type(wiki_type: object) -> bool:
-    return isinstance(wiki_type, str) and bool(_WIKI_TYPE_RE.match(wiki_type))
+    """A kind a PAGE may actually have: correctly shaped AND in the closed set.
+
+    Shape is kept alongside membership rather than replaced by it -- a member
+    added to the enum later with a slash or a space in it would pass
+    membership and still break every route that carries it as a path segment.
+    """
+    return is_wiki_type_shaped(wiki_type) and wiki_type in _VALID_WIKI_TYPES
 
 # Singleton slug for the auto-generated index page. The cron always writes
 # `wiki:index:contents`; GET /api/wiki/index resolves to that doc_id.

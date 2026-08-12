@@ -34,7 +34,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from kb.synthesis.models import WikiType
+from kb.synthesis.models import AGENT_WIKI_TYPES, AgentWikiType, WikiType
 
 # Slug normalization: collapse `/`, whitespace, and dots into `-`, drop any
 # remaining chars outside `[a-z0-9_-]`, collapse hyphen runs, trim leading/
@@ -100,17 +100,21 @@ def _strip_title_prefix(summary: str, *, title: str | None = None) -> str:
 # Tool schemas (Gemini function-call format)
 # ---------------------------------------------------------------------------
 
-# wiki_type is free-form — the agent picks slugs as it sees fit. The
-# schema description below names common ones as guidance but the field
-# itself accepts any string. URL-safety regex is enforced when the page
-# is persisted, not at the tool boundary.
+# wiki_type is a CLOSED set (kb/synthesis/models.WikiType), declared to the
+# model as a schema `enum` rather than as prose in a description. The
+# difference is enforcement: a description is a suggestion the model may
+# ignore on any given turn, and the type is a permanent path segment and
+# doc_id component, so one ignored suggestion is a page kind forever.
+#
+# `index` is excluded — see AGENT_WIKI_TYPES. It is generated from the other
+# pages at the end of a drain, so an agent writing it would be overwritten
+# within the same run.
 _WIKI_TYPE_SCHEMA: dict[str, Any] = {
     "type": "string",
+    "enum": list(AGENT_WIKI_TYPES),
     "description": (
-        "The page-kind discriminator. You typically pick from `repo`, "
-        "`runbook`, `person`, `company`, `customer`, `project`, `event`, "
-        "but you may invent new types if the corpus calls for it. Keep "
-        "the slug lowercase, alphanumeric + underscore, <= 32 chars."
+        "The page-kind discriminator. Pick the closest fit from the "
+        "allowed values; there is no option to invent a new one."
     ),
 }
 
@@ -325,6 +329,8 @@ class ListWikiPagesArgs(BaseModel):
 
 
 class ReadPageArgs(BaseModel):
+    # READS may name the index: the agent is shown the overview and may want
+    # to look at it. Only the WRITES are restricted.
     wiki_type: WikiType
     slug: str = Field(min_length=1, max_length=64)
 
@@ -335,7 +341,7 @@ class GetEventBodyArgs(BaseModel):
 
 
 class UpdatePageArgs(BaseModel):
-    wiki_type: WikiType
+    wiki_type: AgentWikiType
     slug: str = Field(min_length=1, max_length=64)
     body_markdown: str
     summary: str = Field(min_length=1, max_length=240)
@@ -354,7 +360,7 @@ class UpdatePageArgs(BaseModel):
 
 
 class CreatePageArgs(BaseModel):
-    wiki_type: WikiType
+    wiki_type: AgentWikiType
     slug: str = Field(min_length=1, max_length=64)
     title: str = Field(min_length=1, max_length=200)
     body_markdown: str

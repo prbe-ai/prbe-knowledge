@@ -151,6 +151,19 @@ class AgentMetrics:
     consequential_turns: int = 0
     last_consequential_turn: int = 0
     halt_reason: str | None = None
+    #: Tool calls the runtime refused because their arguments did not
+    #: validate -- overwhelmingly a `wiki_type` outside the closed set.
+    #:
+    #: COUNTED, not just logged, because the model is told about each one and
+    #: may simply move on: the drain then finishes, reports `complete`, and
+    #: the page the agent meant to write does not exist. That is a silent
+    #: partial success, and the only trace of it was an INFO line nobody
+    #: reads. The worker turns a non-zero count into run status `partial`.
+    rejected_tool_calls: int = 0
+    #: The distinct wiki_types the model tried to use and could not, so the
+    #: run's `error` names WHAT was refused rather than only how often. A
+    #: recurring value here is the signal that the enum is missing a member.
+    rejected_wiki_types: set[str] = field(default_factory=set)
 
     @property
     def cache_hit_rate(self) -> float | None:
@@ -367,6 +380,10 @@ class AgentLoop:
                 # Pydantic validation failure on tool input. Tell the
                 # model so it can re-decide on the next turn.
                 result = {"error": "tool_validation_error", "detail": str(exc)}
+                self.metrics.rejected_tool_calls += 1
+                bad_type = args.get("wiki_type") if isinstance(args, dict) else None
+                if isinstance(bad_type, str) and bad_type:
+                    self.metrics.rejected_wiki_types.add(bad_type[:64])
                 log.info(
                     "agent.tool_validation_error",
                     customer=self.runtime.customer_id,

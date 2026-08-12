@@ -180,3 +180,37 @@ def test_combined_keeps_markdown_and_frontmatter_separate() -> None:
     sources = {link.link_source for link in links}
     assert sources == {"markdown", "frontmatter"}
     assert len(links) == 2
+
+
+def test_a_link_may_name_a_kind_no_PAGE_can_have() -> None:
+    """Links are gated on SHAPE, pages on membership, and the split matters.
+
+    `wiki_type` became a closed set so page kinds stop being invented one
+    drain at a time. The link parser shares that validator's module, and
+    tightening BOTH would have silently dropped edges: `_LINK_NODE_MAP`
+    resolves `service` and `ticket` to graph nodes that have no wiki page of
+    their own, so those links point at entities, not pages.
+
+    The drop would have been invisible -- a refused link is logged and
+    skipped, never raised, and the page still writes -- so nothing downstream
+    could tell it from the agent not writing links at all. Caught only because
+    an unrelated route test that used `feature` went red.
+    """
+    links = extract_links_from_markdown(
+        "Page [[person:alice]], escalate to [[service:gateway]], "
+        "file [[ticket:prb-17]]."
+    )
+    kinds = {link.dst_wiki_type for link in links}
+
+    assert "service" in kinds, "a link to a graph entity with no page was dropped"
+    assert "ticket" in kinds
+    assert "person" in kinds
+
+
+def test_a_link_type_that_is_not_url_safe_is_still_refused() -> None:
+    """Loosening links back to shape-only must not loosen them to anything.
+
+    The regex is what stops `[[<script>:foo]]` becoming a path segment; only
+    page-kind membership is link-inapplicable.
+    """
+    assert extract_links_from_markdown("[[<script>:foo]]") == []
