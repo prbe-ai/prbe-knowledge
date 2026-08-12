@@ -125,15 +125,15 @@ async def test_put_twice_bumps_version_and_diffs_chunks(
 async def test_delete_then_get_404(client: httpx.AsyncClient) -> None:
     headers = _hdr()
     await client.put(
-        "/api/wiki/pages/feature/auth",
+        "/api/wiki/pages/runbook/auth",
         json={"title": "Auth", "body": "OAuth across all sources."},
         headers=headers,
     )
-    deleted = await client.delete("/api/wiki/pages/feature/auth", headers=headers)
+    deleted = await client.delete("/api/wiki/pages/runbook/auth", headers=headers)
     assert deleted.status_code == 200, deleted.text
     assert deleted.json()["deleted"] is True
 
-    missing = await client.get("/api/wiki/pages/feature/auth", headers=headers)
+    missing = await client.get("/api/wiki/pages/runbook/auth", headers=headers)
     assert missing.status_code == 404
 
 
@@ -1312,3 +1312,27 @@ async def test_http_put_takes_the_page_lock(client: httpx.AsyncClient) -> None:
     )
     resp = await asyncio.wait_for(put, timeout=60)
     assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
+async def test_a_page_kind_outside_the_closed_set_is_refused(
+    client: httpx.AsyncClient,
+) -> None:
+    """`wiki_type` is a closed set, and the page routes are where that bites.
+
+    It used to be free-form, with the agent explicitly told it "may invent new
+    types if the corpus calls for it". The type is a path segment and a doc_id
+    component with no rename route, so an invented one is a permanent page
+    kind -- `repo` / `repository` / `codebase` become three sections of the
+    same wiki that nothing can merge.
+
+    `feature` is the value this test used to use, which is why it is the one
+    checked here: it reads as plausible, and that is exactly the kind of value
+    that used to slip through.
+    """
+    resp = await client.put(
+        "/api/wiki/pages/feature/auth",
+        json={"title": "Auth", "body": "OAuth across all sources."},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 400, resp.text

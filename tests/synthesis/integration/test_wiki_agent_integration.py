@@ -595,7 +595,7 @@ async def test_commit_writes_wiki_links_for_created_page(reset_db: None) -> None
     await rt.dispatch_tool(
         "create_page",
         {
-            "wiki_type": "service_card",
+            "wiki_type": "runbook",
             "slug": "auth",
             "title": "Auth",
             "body_markdown": "Owner is [[person:maison|works_at|Maison]].",
@@ -614,11 +614,15 @@ async def test_commit_writes_wiki_links_for_created_page(reset_db: None) -> None
             "WHERE customer_id = $1 AND src_wiki_type = $2 AND src_slug = $3 "
             "ORDER BY link_source, dst_slug",
             CUSTOMER,
-            "service_card",
+            "runbook",
             "auth",
         )
     tuples = {(r["dst_wiki_type"], r["dst_slug"], r["link_type"], r["link_source"]) for r in rows}
     assert tuples == {
+        # `service_card` is NOT a page kind, and the row is here anyway --
+        # links are gated on SHAPE, pages on membership. A frontmatter
+        # reference to an entity with no page of its own still belongs in
+        # the link graph.
         ("service_card", "auth", "owns", "frontmatter"),
         ("person", "maison", "works_at", "markdown"),
     }
@@ -637,7 +641,7 @@ async def test_commit_update_preserves_frontmatter_links(reset_db: None) -> None
     await rt.dispatch_tool(
         "create_page",
         {
-            "wiki_type": "service_card",
+            "wiki_type": "runbook",
             "slug": "billing",
             "title": "Billing",
             "body_markdown": "Initial body.",
@@ -656,7 +660,7 @@ async def test_commit_update_preserves_frontmatter_links(reset_db: None) -> None
             "WHERE customer_id = $1 AND src_wiki_type = $2 AND src_slug = $3 "
             "AND link_source = 'frontmatter'",
             CUSTOMER,
-            "service_card",
+            "runbook",
             "billing",
         )
     assert before == 1
@@ -670,7 +674,7 @@ async def test_commit_update_preserves_frontmatter_links(reset_db: None) -> None
     await rt2.dispatch_tool(
         "update_page",
         {
-            "wiki_type": "service_card",
+            "wiki_type": "runbook",
             "slug": "billing",
             "body_markdown": "Updated body without any markdown links.",
             "summary": "s",
@@ -686,7 +690,7 @@ async def test_commit_update_preserves_frontmatter_links(reset_db: None) -> None
             "WHERE customer_id = $1 AND src_wiki_type = $2 AND src_slug = $3 "
             "AND link_source = 'frontmatter'",
             CUSTOMER,
-            "service_card",
+            "runbook",
             "billing",
         )
     assert after == 1, "frontmatter link must survive a body-only update"

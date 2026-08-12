@@ -202,7 +202,7 @@ async def test_tool_update_page_applied_queue_ids_accumulate_across_stages(
         await runtime.dispatch_tool(
             "update_page",
             {
-                "wiki_type": "feature",
+                "wiki_type": "runbook",
                 "slug": "f",
                 "body_markdown": "b",
                 "summary": "s",
@@ -210,7 +210,7 @@ async def test_tool_update_page_applied_queue_ids_accumulate_across_stages(
                 "applied_queue_ids": ids,
             },
         )
-    staged = runtime._pending_updates[("feature", "f")]
+    staged = runtime._pending_updates[("runbook", "f")]
     assert staged.applied_queue_ids == [1, 2, 3, 4]
 
 

@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Any
 
 from engine.shared.constants import WIKI_TRIAGE_MAX_OUTPUT_TOKENS
-from kb.synthesis.models import TriageInput
+from kb.synthesis.models import AGENT_WIKI_TYPES, TriageInput
 
 # ---------------------------------------------------------------------------
 # Triage — Haiku
@@ -308,6 +308,13 @@ def directed_tool_name() -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Rendered from the ONE constant, so the prose the model reads and the enum
+#: the tool schema enforces cannot drift. Prose that lists a kind the schema
+#: rejects is worse than no prose: the model follows it and every write is
+#: refused.
+_AGENT_WIKI_TYPES_SENTENCE = ", ".join(f"`{t}`" for t in AGENT_WIKI_TYPES)
+
+
 def _wiki_agent_system(now: datetime) -> str:
     """The wiki-keeper persona the agent loop runs as.
 
@@ -318,7 +325,11 @@ def _wiki_agent_system(now: datetime) -> str:
     """
     return (
         "You are the keeper of an engineering team's wiki — a small, "
-        "slow-moving knowledge base of repos, runbooks, and people. "
+        "slow-moving knowledge base. Every page has one of a FIXED set of "
+        f"kinds: {_AGENT_WIKI_TYPES_SENTENCE}. There is no option to invent "
+        "a new kind; pick the closest fit. The kind is part of the page's "
+        "permanent address, so a page filed under the wrong one cannot be "
+        "moved later. "
         f"Today's date is {now.date().isoformat()}.\n\n"
         "Each drain you see all of yesterday's triaged events at once, "
         "ordered by source_ts ASC (the time the event happened, not "

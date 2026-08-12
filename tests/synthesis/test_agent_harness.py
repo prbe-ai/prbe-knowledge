@@ -492,6 +492,72 @@ async def test_dispatch_tool_validation_error_continues_loop() -> None:
     assert metrics.turns == 2
 
 
+@pytest.mark.asyncio
+async def test_a_refused_write_is_counted_and_its_wiki_type_recorded() -> None:
+    """The loop continuing is not the whole story -- the refusal must be VISIBLE.
+
+    The model is told about the rejection and is free to move on. When it
+    does, the drain finishes, reports `complete`, and the page it meant to
+    write does not exist: a silent partial success whose only trace was an
+    INFO log line. The worker turns these counts into run status `partial`,
+    and the recorded wiki_type is what tells someone the closed enum is
+    missing a member rather than the model being confused.
+    """
+
+    async def bad_args(rt, n, a):
+        raise ToolValidationError("wiki_type: 'company' is not a valid WikiType")
+
+    async def done_h(rt, n, a):
+        rt.is_done = True
+        return {"committed": True}
+
+    runtime = StubRuntime(tool_handlers={"update_page": bad_args, "done": done_h})
+    llm = StubLLM(
+        [
+            {
+                "tool_calls": [
+                    {"name": "update_page", "args": {"wiki_type": "company", "slug": "acme"}}
+                ],
+                "usage_metadata": {},
+            },
+            {
+                "tool_calls": [
+                    {"name": "update_page", "args": {"wiki_type": "company", "slug": "beta"}}
+                ],
+                "usage_metadata": {},
+            },
+            _done_call(),
+        ]
+    )
+    loop = _make_loop(runtime, llm)
+    metrics = await loop.run()
+
+    assert metrics.rejected_tool_calls == 2
+    # A SET, so two refusals of the same kind read as one missing member
+    # rather than as two different problems.
+    assert metrics.rejected_wiki_types == {"company"}
+
+
+@pytest.mark.asyncio
+async def test_a_clean_drain_records_no_refusals() -> None:
+    """The other half: a run with nothing refused must stay at zero.
+
+    Without this, a counter that incremented on every tool call would still
+    satisfy the test above, and every healthy drain would report `partial`.
+    """
+
+    async def done_h(rt, n, a):
+        rt.is_done = True
+        return {"committed": True}
+
+    runtime = StubRuntime(tool_handlers={"done": done_h})
+    loop = _make_loop(runtime, StubLLM([_done_call()]))
+    metrics = await loop.run()
+
+    assert metrics.rejected_tool_calls == 0
+    assert metrics.rejected_wiki_types == set()
+
+
 # ---------------------------------------------------------------------------
 # call_llm behaviors (cached content + retries + persistent error)
 # ---------------------------------------------------------------------------
