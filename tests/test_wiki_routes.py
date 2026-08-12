@@ -1338,3 +1338,141 @@ async def test_a_page_kind_outside_the_closed_set_is_refused(
         headers=_hdr(),
     )
     assert resp.status_code == 400, resp.text
+
+
+# ---------------------------------------------------------------------------
+# Tenant-level generation setting
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generation_is_off_until_someone_turns_it_on(
+    client: httpx.AsyncClient,
+) -> None:
+    """A tenant that has never touched the setting reads as OFF.
+
+    Matching every consumer: the queue drains and the nightly trigger compare
+    `preferences->>'wiki_generation_enabled'` to the string `'true'`, so an
+    absent key is off. A route that reported `null` or errored on the common
+    case would make "is the wiki on" unanswerable for exactly the tenants that
+    have never used it.
+    """
+    resp = await client.get("/api/wiki/settings", headers=_hdr())
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"customer_id": CUSTOMER, "generation_enabled": False}
+
+
+@pytest.mark.asyncio
+async def test_generation_can_be_turned_on_and_back_off(
+    client: httpx.AsyncClient,
+) -> None:
+    """Both directions, and the stored value is what the PIPELINE reads.
+
+    Asserted against the raw `preferences->>` text, not just the response: the
+    route could return `true` while writing a JSON boolean, a nested object, or
+    the wrong key, and every one of those reads back correctly through its own
+    response while the nightly trigger sees nothing.
+    """
+    on = await client.put(
+        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
+    )
+    assert on.status_code == 200, on.text
+    assert on.json()["generation_enabled"] is True
+
+    async with raw_conn() as conn:
+        stored = await conn.fetchval(
+            "SELECT preferences->>'wiki_generation_enabled' FROM customers "
+            "WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    assert stored == "true", "the pipeline compares this to the STRING 'true'"
+
+    off = await client.put(
+        "/api/wiki/settings", json={"generation_enabled": False}, headers=_hdr()
+    )
+    assert off.status_code == 200, off.text
+    assert off.json()["generation_enabled"] is False
+    assert (await client.get("/api/wiki/settings", headers=_hdr())).json()[
+        "generation_enabled"
+    ] is False
+
+
+@pytest.mark.asyncio
+async def test_turning_generation_on_preserves_other_preferences(
+    client: httpx.AsyncClient,
+) -> None:
+    """The write must not clobber the rest of the JSONB column.
+
+    `preferences` is shared. A naive `SET preferences = '{"wiki...": "true"}'`
+    reads back perfectly through this route while silently discarding every
+    other setting the tenant had -- which is the kind of loss nobody attributes
+    to the wiki weeks later.
+    """
+    async with raw_conn() as conn:
+        await conn.execute(
+            "UPDATE customers SET preferences = '{\"keep_me\": \"yes\"}'::jsonb "
+            "WHERE customer_id = $1",
+            CUSTOMER,
+        )
+
+    await client.put(
+        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
+    )
+
+    async with raw_conn() as conn:
+        kept = await conn.fetchval(
+            "SELECT preferences->>'keep_me' FROM customers WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    assert kept == "yes"
+
+
+@pytest.mark.asyncio
+async def test_turning_generation_on_works_from_the_default_preferences(
+    client: httpx.AsyncClient,
+) -> None:
+    """The actual common case: `preferences` at its `'{}'` default.
+
+    A tenant that has never set anything has an EMPTY OBJECT, not NULL --
+    `customers.preferences` is NOT NULL DEFAULT '{}'. That is why the write
+    passes `create_missing`: `jsonb_set` without it leaves an absent key
+    absent, reports success, and the operator then waits for a nightly run that
+    will never include them.
+    """
+    async with raw_conn() as conn:
+        await conn.execute(
+            "UPDATE customers SET preferences = '{}'::jsonb WHERE customer_id = $1",
+            CUSTOMER,
+        )
+
+    resp = await client.put(
+        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["generation_enabled"] is True
+    async with raw_conn() as conn:
+        stored = await conn.fetchval(
+            "SELECT preferences->>'wiki_generation_enabled' FROM customers "
+            "WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    assert stored == "true"
+
+
+@pytest.mark.asyncio
+async def test_the_settings_routes_require_the_internal_key(
+    client: httpx.AsyncClient,
+) -> None:
+    """Same trust boundary as every other route here: the key, then the tenant
+    header. Without this a read of one team's setting is a header away."""
+    for call in (
+        client.get("/api/wiki/settings", headers={"X-Prbe-Customer": CUSTOMER}),
+        client.put(
+            "/api/wiki/settings",
+            json={"generation_enabled": True},
+            headers={"X-Prbe-Customer": CUSTOMER},
+        ),
+    ):
+        assert (await call).status_code == 401
