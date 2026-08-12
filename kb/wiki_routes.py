@@ -191,6 +191,15 @@ class WikiPageSettingsResponse(BaseModel):
     pipeline_updates: bool
 
 
+class WikiGenerationSettingsBody(BaseModel):
+    generation_enabled: bool
+
+
+class WikiGenerationSettingsResponse(BaseModel):
+    customer_id: str
+    generation_enabled: bool
+
+
 class WikiRevertBody(BaseModel):
     to_version: int = Field(ge=1)
     reason: str = Field(min_length=1, max_length=240)
@@ -1127,6 +1136,97 @@ async def revert_wiki_page(
             WikiLinkOut(raw=link.raw, kind=link.kind, target=link.target) for link in parsed_links
         ],
         dangling_links=dangling,
+    )
+
+
+@router.get(
+    "/settings",
+    response_model=WikiGenerationSettingsResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def get_wiki_generation_settings(
+    customer_id: str = Depends(_require_customer),
+) -> WikiGenerationSettingsResponse:
+    """Whether the nightly pipeline runs for this tenant at all.
+
+    The flag has only ever been settable by hand-written SQL, which made "is
+    the wiki on for this team" a question only someone with database access
+    could answer -- and the answer decides whether an empty wiki means "nothing
+    to say yet" or "nobody turned it on".
+
+    ABSENT READS AS FALSE, matching every consumer: the queue drains and the
+    nightly trigger both compare `preferences->>'wiki_generation_enabled'` to
+    the string `'true'`, so a missing key, a null, or any other value is off.
+    Reproducing that comparison here rather than casting to boolean keeps this
+    route from disagreeing with the pipeline about a tenant whose preferences
+    hold something unexpected.
+    """
+    async with with_tenant(customer_id) as conn:
+        raw = await conn.fetchval(
+            "SELECT preferences->>'wiki_generation_enabled' FROM customers "
+            "WHERE customer_id = $1",
+            customer_id,
+        )
+    return WikiGenerationSettingsResponse(
+        customer_id=customer_id, generation_enabled=raw == "true"
+    )
+
+
+@router.put(
+    "/settings",
+    response_model=WikiGenerationSettingsResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def set_wiki_generation_settings(
+    body: WikiGenerationSettingsBody,
+    customer_id: str = Depends(_require_customer),
+) -> WikiGenerationSettingsResponse:
+    """Turn the nightly pipeline on or off for this tenant.
+
+    WRITES THE STRING `'true'` / `'false'`. A JSON boolean would be
+    indistinguishable to every reader today -- `->>` renders it as the same
+    text -- so this is a choice about the FUTURE reader, the one who uses `->`
+    and a cast and then disagrees with the pipeline about the same row. One
+    representation, matched to the comparison its only consumers make.
+    Turning it OFF does not stop the pipeline mid-drain and does not delete
+    anything already written; it stops the next one from starting, and the
+    queue guards re-check the flag so rows enqueued before the flip do not
+    drain afterwards.
+
+    `create_missing` is the load-bearing argument. A tenant that has never
+    touched a setting has `preferences` at its `'{}'` default (the column is
+    NOT NULL), so the key is ABSENT -- and `jsonb_set` without `create_missing`
+    leaves an absent key absent, returns the row, and reports success. The
+    operator then waits for a nightly run that will never include them. The
+    COALESCE beside it is belt-and-braces against the column's NOT NULL being
+    relaxed later, where `jsonb_set(NULL, ...)` would fail the same way
+    silently.
+    """
+    async with with_tenant(customer_id) as conn:
+        updated = await conn.fetchval(
+            """
+            UPDATE customers
+               SET preferences = jsonb_set(
+                       COALESCE(preferences, '{}'::jsonb),
+                       '{wiki_generation_enabled}',
+                       to_jsonb($2::text),
+                       true
+                   )
+             WHERE customer_id = $1
+         RETURNING preferences->>'wiki_generation_enabled'
+            """,
+            customer_id,
+            "true" if body.generation_enabled else "false",
+        )
+    if updated is None:
+        raise HTTPException(status_code=404, detail="unknown customer")
+    log.info(
+        "wiki.generation_setting_changed",
+        customer=customer_id,
+        generation_enabled=updated == "true",
+    )
+    return WikiGenerationSettingsResponse(
+        customer_id=customer_id, generation_enabled=updated == "true"
     )
 
 
