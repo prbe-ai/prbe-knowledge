@@ -1326,12 +1326,14 @@ async def test_a_page_kind_outside_the_closed_set_is_refused(
     kind -- `repo` / `repository` / `codebase` become three sections of the
     same wiki that nothing can merge.
 
-    `feature` is the value this test used to use, which is why it is the one
-    checked here: it reads as plausible, and that is exactly the kind of value
-    that used to slip through.
+    `company` is checked because it reads as plausible -- it was named in the
+    old prompt's list of suggestions -- and that is exactly the kind of value
+    that used to slip through. It is deliberately NOT `feature`, which this
+    test used until `feature` became a real page kind; a test pinned to a value
+    that later gets added stops testing anything the day it is added.
     """
     resp = await client.put(
-        "/api/wiki/pages/feature/auth",
+        "/api/wiki/pages/company/acme",
         json={"title": "Auth", "body": "OAuth across all sources."},
         headers=_hdr(),
     )

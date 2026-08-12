@@ -50,6 +50,13 @@ from pydantic import BaseModel, Field, field_validator
 # 2026-08-12). Nothing is orphaned by this list. Adding a member later is a
 # one-line change here that reaches the tool schema, the ingestion gate and
 # the agent prompt at once -- which is the point of having one constant.
+#
+# `service` and `feature` were added the same day, and the two-step is worth
+# reading as one decision rather than an oversight: the first list was drawn
+# from what the wiki HAD, and these are things an engineering wiki should be
+# able to hold that it simply had no page of yet. Both already existed in the
+# graph's node vocabulary (`_LINK_NODE_MAP` resolves `[[service: X]]`), so
+# until now a page could link to a service it could never be.
 # ---------------------------------------------------------------------------
 class WikiType(StrEnum):
     #: The auto-generated overview. Written only by the synthesis cron.
@@ -70,6 +77,17 @@ class WikiType(StrEnum):
     MODEL = "model"
     #: A decision that was made, why, and what it ruled out.
     DECISION = "decision"
+    #: A running system: what it does, what it depends on, how it fails.
+    #: Distinct from `repo` -- a service is deployed and can be paged about,
+    #: a repo is source. One repo can ship several services and a service can
+    #: be assembled from several repos, so folding them would lose which of
+    #: the two an on-call page is actually about.
+    SERVICE = "service"
+    #: A product capability: what it does for a user, its constraints, the
+    #: decisions behind it. Distinct from `project` -- a project ends and a
+    #: feature keeps being true afterwards, which is exactly the knowledge a
+    #: wiki is for.
+    FEATURE = "feature"
 
 
 #: The types the AGENT may write. `index` is excluded: it is generated from
@@ -80,28 +98,25 @@ AGENT_WIKI_TYPES: tuple[str, ...] = tuple(
 )
 
 
-class AgentWikiType(StrEnum):
-    """`WikiType` minus `index` — the type the agent's TOOL ARGS validate on.
-
-    Separate from `WikiType` because the tool SCHEMA and the tool VALIDATOR
-    have to agree, and they did not: the schema advertised `AGENT_WIKI_TYPES`
-    (no `index`) while the Pydantic args used `WikiType` (with it). A model
-    that emitted `index` would have passed validation against the one rule the
-    schema said it could not break, and the write would then be silently
-    overwritten by the index regeneration at the end of the same drain.
-
-    Derived from the same members rather than restated, so adding a kind is
-    still one edit in one place.
-    """
-
-    REPO = WikiType.REPO.value
-    PROJECT = WikiType.PROJECT.value
-    RUNBOOK = WikiType.RUNBOOK.value
-    PERSON = WikiType.PERSON.value
-    EXPERIMENT = WikiType.EXPERIMENT.value
-    DATASET = WikiType.DATASET.value
-    MODEL = WikiType.MODEL.value
-    DECISION = WikiType.DECISION.value
+#: `WikiType` minus `index` — what the agent's TOOL ARGS validate on.
+#:
+#: DERIVED, never restated. It was a hand-written class listing its members
+#: literally, and adding `service` and `feature` to `WikiType` silently did not
+#: reach it: the tool schema offered two kinds the validator then refused, so
+#: every attempt to use them would have been rejected as an invalid argument
+#: with no hint why. That is the drift a shared constant exists to prevent,
+#: reintroduced by the constant's own sibling. Built functionally so the two
+#: cannot disagree again.
+#:
+#: Separate from `WikiType` at all because the tool SCHEMA and the tool
+#: VALIDATOR have to agree about `index`: the schema advertises the
+#: agent-facing set, and a model emitting `index` must not pass validation
+#: against the one rule the schema said it could not break -- the write would
+#: be overwritten by the index regeneration at the end of the same drain.
+AgentWikiType = StrEnum(
+    "AgentWikiType",
+    {t.name: t.value for t in WikiType if t is not WikiType.INDEX},
+)
 
 
 # ---------------------------------------------------------------------------

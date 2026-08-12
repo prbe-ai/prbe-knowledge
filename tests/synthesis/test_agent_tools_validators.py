@@ -190,6 +190,38 @@ def test_the_agent_cannot_write_the_generated_index_page() -> None:
     assert set(AGENT_WIKI_TYPES) == {t.value for t in WikiType} - {"index"}
 
 
+def test_the_agent_enum_is_derived_from_WikiType_not_restated() -> None:
+    """`AgentWikiType` must track `WikiType`, and this is why it is generated.
+
+    It was a hand-written class listing its members literally. Adding
+    `service` and `feature` to `WikiType` reached the tool schema, the
+    ingestion gate and the prompt -- and silently did not reach this. The
+    schema then offered two kinds the validator refused, so every attempt to
+    use them came back as an invalid argument with no hint why.
+
+    Asserted as EQUALITY against the derivation, not membership: a check that
+    every `AgentWikiType` is a `WikiType` passes for a set missing half its
+    members, which is precisely the failure that shipped.
+    """
+    from kb.synthesis.models import AgentWikiType, WikiType
+
+    assert [t.value for t in AgentWikiType] == [
+        t.value for t in WikiType if t is not WikiType.INDEX
+    ]
+
+
+def test_a_service_and_a_feature_are_page_kinds() -> None:
+    """Both are things an engineering wiki should hold, and both were already
+    in the graph's link vocabulary (`[[service: X]]` resolves to a node), so
+    until they were added a page could link to a service it could never be."""
+    from kb.handlers.wiki import is_valid_wiki_type
+    from kb.synthesis.agent_tools import _WIKI_TYPE_SCHEMA
+
+    for wiki_type in ("service", "feature"):
+        assert is_valid_wiki_type(wiki_type)
+        assert wiki_type in _WIKI_TYPE_SCHEMA["enum"]
+
+
 def test_the_gate_the_prompt_and_the_schema_cannot_drift() -> None:
     """One constant reaches all three, and this is what pins that.
 
