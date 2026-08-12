@@ -23,6 +23,19 @@ Public PUT/PATCH/DELETE accept `doc_class=manual_entry` ONLY (validated by
 `_reject_non_manual_doc_class` on `WikiUpsertBody.doc_class`). Anything else
 is rejected with 422.
 
+`doc_class` is PROVENANCE and nothing else: it records who wrote a given
+version, which is what lets page history tell a person's revision from the
+nightly agent's. It is NOT the switch that decides whether the agent may
+rewrite a page -- that is `pipeline_updates`, a separate per-page setting in
+`wiki_page_settings` (migration 0103), read here and written by
+`PUT /pages/{wiki_type}/{slug}/settings`.
+
+The two were one field until 0103, and conflating them made a hand edit an
+irreversible freeze: stamping `manual_entry` on a typo fix stopped the page
+from ever updating again, with no path back short of SQL. If you are tempted
+to reach for `doc_class` to answer "will this page be regenerated?", reach for
+`pipeline_updates` instead.
+
 `doc_class=compiled_wiki` writes are produced by the synthesis cron in
 `services/synthesis/wiki_cron.py` (Phase 2). The cron does NOT call this
 HTTP route; it builds a synthetic `WebhookEvent` and calls
@@ -426,11 +439,15 @@ def page_lock_key(customer_id: str, wiki_type: str, slug: str) -> int:
     `advisory_lock_key("page", customer_id, f"{wiki_type}:{slug}")` around
     their read-then-write, so that two writers integrate rather than
     clobber. This route did not participate, and that was the hole: the
-    agent re-reads a page, sees `doc_class=compiled_wiki`, decides it is
-    safe to overwrite -- and a PUT lands in that window and turns it into a
-    human-authored `manual_entry` the agent then destroys. The
-    manual-entry skip is a real guard; without a shared lock it just is not
-    atomic.
+    agent re-reads a page, decides it is allowed to write, and a PUT lands
+    inside that window -- so the agent's write is computed against a body
+    that is already gone by the time it commits.
+
+    What the agent re-reads has changed (it is `pipeline_updates` now, not
+    `doc_class` -- migration 0103), and the lock matters MORE than it did,
+    not less: the setting can be flipped between the agent staging an update
+    and committing it, so "may I write this page?" and "write it" have to be
+    one atomic step or a freeze can land a moment too late to take effect.
 
     Spelled as a named helper rather than inlined so the two call sites
     cannot drift apart silently -- a lock is only a lock while every writer
