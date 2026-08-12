@@ -273,7 +273,7 @@ def test_a_page_the_total_budget_zeroes_is_counted_separately() -> None:
     corpus grows -- which reads to a person as the wiki getting less
     interesting, not as a cap being hit.
     """
-    from kb.synthesis.index_renderer import PER_PAGE_BODY_CHARS, _TOTAL_BODY_CHARS
+    from kb.synthesis.index_renderer import _TOTAL_BODY_CHARS, PER_PAGE_BODY_CHARS
 
     # Enough full-size pages to exhaust the budget, plus two: the first of
     # those gets a partial slice (still text, still marked truncated) and the
