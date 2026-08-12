@@ -109,14 +109,22 @@ jobs:
           psql -h localhost -p 5432 -U prbe -d prbe_knowledge -v ON_ERROR_STOP=1 -f db/schema.sql
           .venv/bin/alembic stamp head
 
-      # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale. The
+      # Scoped to the STORAGE suite (Postgres + MinIO) PLUS the wiki routes, not
+      # `tests/` wholesale. The
       # full suite has ~42 pre-existing failures unrelated to storage: tests that need
       # the ParadeDB/BM25 extension or a live Gemini key, plus stale expectations left
       # by a code-graph label refactor (Function/Class/Module -> CodeSymbol, Repo ->
       # Document). De-drifting that is its own effort; gating on it now would just paint
       # every PR red. This gate covers the object-store backend + blob/upload paths -- the
       # area #460 touched -- and can widen as the rest of the suite is repaired.
-      - name: Tests (storage suite)
+      #
+      # `test_wiki_routes.py` was added because the wiki page API is the engine's
+      # only externally-reachable write surface AND it was shipping bugs this
+      # gate could not see: `GET /pages/index/contents/history` answered 400 for
+      # every tenant (breaking research-os's `/v1/wiki/versions` and the MCP's
+      # `wiki_versions()`) and nothing in CI ran the file that would have caught
+      # it. It is green as of this commit; keep it that way.
+      - name: Tests (storage + wiki-routes suites)
         run: >-
           .venv/bin/pytest -q
           tests/test_object_store_s3.py
@@ -124,3 +132,4 @@ jobs:
           tests/test_persist_trace_blob_r2.py
           tests/test_query_traces_trace_blob_migration.py
           tests/handlers/test_manual_upload.py
+          tests/test_wiki_routes.py
