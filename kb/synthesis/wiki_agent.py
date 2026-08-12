@@ -918,10 +918,15 @@ async def regenerate_wiki_index(
         rows = [
             {
                 **dict(row),
-                "body": await fetch_live_body_from_chunks(
-                    conn, customer_id, row["doc_id"]
-                )
-                or "",
+                # Sliced AT FETCH, not after: the renderer only reads
+                # _PER_PAGE_BODY_CHARS of each page, and materialising every
+                # full body first would hold the whole wiki in memory to throw
+                # most of it away. One char over the cap so the renderer can
+                # still tell a trimmed page from an exactly-sized one.
+                "body": (
+                    await fetch_live_body_from_chunks(conn, customer_id, row["doc_id"])
+                    or ""
+                )[: index_renderer.PER_PAGE_BODY_CHARS + 1],
             }
             for row in rows
         ]

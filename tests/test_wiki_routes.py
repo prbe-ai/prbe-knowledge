@@ -1131,6 +1131,56 @@ async def test_toggling_the_setting_writes_no_version(
 
 
 @pytest.mark.asyncio
+async def test_the_settings_route_takes_the_agents_page_lock(
+    client: httpx.AsyncClient,
+) -> None:
+    """A FREEZE THAT RETURNS 200 MUST ACTUALLY BEAT THE AGENT.
+
+    `_persist_update` holds the page lock across read-then-write: it reads
+    `pipeline_updates`, decides, and only then rewrites the body -- a window
+    that spans chunking and embedding, so seconds. A settings route outside
+    that lock can return 200 inside the window and the page is rewritten
+    anyway: a freeze the user was told succeeded, and did not.
+
+    Asserted by holding the AGENT's key and showing the route BLOCKS on it. A
+    route that ignored the lock would answer immediately, so the timeout is
+    the assertion.
+
+    The key is built here rather than imported from the route, for the reason
+    `test_http_put_takes_the_page_lock` gives: importing `page_lock_key` would
+    make the test agree with the route by construction, and a route that
+    changed its namespace would still pass.
+    """
+    import asyncio
+
+    from engine.shared.db import with_tenant
+    from engine.shared.locks import advisory_lock_key
+
+    await _put(client, "lock-me", "body", expected_version=0)
+    agents_key = advisory_lock_key("page", CUSTOMER, "runbook:lock-me")
+
+    async with with_tenant(CUSTOMER) as holder:
+        await holder.execute("SELECT pg_advisory_xact_lock($1)", agents_key)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                client.put(
+                    "/api/wiki/pages/runbook/lock-me/settings",
+                    json={"pipeline_updates": False},
+                    headers=_hdr(),
+                ),
+                timeout=1.5,
+            )
+
+    # Released: the same call now completes.
+    resp = await client.put(
+        "/api/wiki/pages/runbook/lock-me/settings",
+        json={"pipeline_updates": False},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
 async def test_settings_on_a_missing_page_is_404(client: httpx.AsyncClient) -> None:
     """A typo'd slug must not silently succeed.
 

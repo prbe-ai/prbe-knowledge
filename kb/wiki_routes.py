@@ -593,11 +593,18 @@ async def upsert_wiki_page(
                     current=current_version,
                     current_body=live[1] if live else "",
                 )
-        outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
-        # Inside the lock, so a write that also flips the setting cannot
-        # interleave with the agent's read-then-write on the same page. Only
-        # when explicitly asked -- see `WikiUpsertBody.pipeline_updates` for
-        # why the default has to be "leave it alone" rather than "turn it on".
+        # BEFORE the body write, not after. `set_page_pipeline_updates` and
+        # `_persist` each open their own transaction, so one commits first
+        # whatever the order -- and this is the order whose retry converges.
+        # Setting-then-body: a failed body write leaves an idempotent upsert
+        # applied and nothing else, and the retry writes the body once.
+        # Body-then-setting: a failed setting write leaves a committed new
+        # VERSION behind, and the retry mints a second one.
+        #
+        # Inside the lock either way, so a write that also flips the setting
+        # cannot interleave with the agent's read-then-write on the same page.
+        # Only when explicitly asked -- see `WikiUpsertBody.pipeline_updates`
+        # for why the default has to be "leave it alone".
         if body.pipeline_updates is not None:
             await persistence.set_page_pipeline_updates(
                 customer_id,
@@ -606,6 +613,7 @@ async def upsert_wiki_page(
                 pipeline_updates=body.pipeline_updates,
                 updated_by=body.author_id,
             )
+        outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
 
     if not outcome.doc_ids:
         raise HTTPException(status_code=500, detail="wiki normalize produced no documents")
@@ -672,8 +680,23 @@ async def set_wiki_page_settings(
     slug = _validate_slug(slug)
     doc_id = f"wiki:{wiki_type}:{slug}"
 
-    async with with_tenant(customer_id) as conn:
-        row = await conn.fetchrow(
+    # THE SAME LOCK THE AGENT TAKES, and it is the whole reason a freeze
+    # takes effect. `WikiAgentRuntime._persist_update` holds this key across
+    # its read-then-write: it reads `pipeline_updates`, decides, and only then
+    # rewrites the body -- a window that spans chunking and embedding, so
+    # seconds, not microseconds. Without the lock a freeze can return 200
+    # INSIDE that window and the page is rewritten anyway, which is a freeze
+    # the user was told succeeded and did not.
+    #
+    # The existence check moves inside for the same reason: outside it, a
+    # delete landing between the check and the write leaves a settings row
+    # for a page that no longer exists, and a later page reusing the slug
+    # inherits a freeze nobody asked for.
+    async with with_tenant(customer_id) as lock_conn:
+        await lock_conn.execute(
+            "SELECT pg_advisory_xact_lock($1)", page_lock_key(customer_id, wiki_type, slug)
+        )
+        row = await lock_conn.fetchrow(
             """
             SELECT deleted_at FROM documents
             WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
@@ -681,16 +704,16 @@ async def set_wiki_page_settings(
             customer_id,
             doc_id,
         )
-    if row is None or row["deleted_at"] is not None:
-        raise HTTPException(status_code=404, detail="wiki page not found")
+        if row is None or row["deleted_at"] is not None:
+            raise HTTPException(status_code=404, detail="wiki page not found")
 
-    await persistence.set_page_pipeline_updates(
-        customer_id,
-        wiki_type,
-        slug,
-        pipeline_updates=body.pipeline_updates,
-        updated_by=body.author_id,
-    )
+        await persistence.set_page_pipeline_updates(
+            customer_id,
+            wiki_type,
+            slug,
+            pipeline_updates=body.pipeline_updates,
+            updated_by=body.author_id,
+        )
     log.info(
         "wiki.pipeline_updates_set",
         customer=customer_id,
@@ -803,7 +826,20 @@ async def delete_wiki_page(
     # so without this the row outlives the page -- and a page later recreated
     # under the same slug would come back silently frozen by a decision made
     # about a different page. The setting is about a page; no page, no setting.
-    await persistence.clear_page_pipeline_updates(customer_id, wiki_type, slug)
+    try:
+        await persistence.clear_page_pipeline_updates(customer_id, wiki_type, slug)
+    except Exception as exc:
+        # The page is already deleted and committed. Reporting 500 here would
+        # be a lie the caller acts on -- they retry a delete that succeeded.
+        # The orphan row is invisible until someone recreates the slug, and
+        # this log is how that gets traced when they do.
+        log.warning(
+            "wiki.settings_cleanup_failed",
+            customer=customer_id,
+            doc_id=doc_id,
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
     log.info("wiki.deleted", customer=customer_id, doc_id=doc_id)
     return WikiDeleteResponse(doc_id=doc_id, deleted=bool(outcome.doc_ids))
 

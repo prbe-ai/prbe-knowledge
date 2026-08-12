@@ -213,10 +213,10 @@ def test_the_prompt_carries_page_text_not_just_titles() -> None:
             body="We chose pgvector because the alternative needed a second datastore.",
         ),
     ]
-    corpus, missing_body = _format_pages_for_prompt(pages)
+    corpus, stats = _format_pages_for_prompt(pages)
 
     assert "needed a second datastore" in corpus
-    assert missing_body == 0
+    assert stats.missing_body == 0
 
 
 def test_pages_with_no_body_are_counted_not_hidden() -> None:
@@ -227,15 +227,15 @@ def test_pages_with_no_body_are_counted_not_hidden() -> None:
         _PageRow(wiki_type="decision", slug="a", title="Alpha", summary="s", body=""),
         _PageRow(wiki_type="decision", slug="b", title="Bravo", summary="s", body="text"),
     ]
-    _, missing_body = _format_pages_for_prompt(pages)
-    assert missing_body == 1
+    _, stats = _format_pages_for_prompt(pages)
+    assert stats.missing_body == 1
 
 
 def test_a_long_body_is_trimmed_and_marked() -> None:
     """Trimming is signposted in the prompt so the model knows it is reading
     an excerpt, rather than treating a sentence cut mid-clause as the page's
     final word."""
-    from kb.synthesis.index_renderer import _PER_PAGE_BODY_CHARS
+    from kb.synthesis.index_renderer import PER_PAGE_BODY_CHARS
 
     pages = [
         _PageRow(
@@ -243,7 +243,7 @@ def test_a_long_body_is_trimmed_and_marked() -> None:
             slug="a",
             title="Alpha",
             summary="s",
-            body="x" * (_PER_PAGE_BODY_CHARS + 500),
+            body="x" * (PER_PAGE_BODY_CHARS + 500),
         ),
     ]
     corpus, _ = _format_pages_for_prompt(pages)
@@ -252,7 +252,7 @@ def test_a_long_body_is_trimmed_and_marked() -> None:
     # the `text: |` label contains one, which is exactly the kind of off-by-one
     # that makes a cap look wrong when it is right.
     body_line = next(line for line in corpus.splitlines() if line.strip().startswith("x"))
-    assert len(body_line.strip()) == _PER_PAGE_BODY_CHARS
+    assert len(body_line.strip()) == PER_PAGE_BODY_CHARS
 
 
 def test_a_row_with_no_body_key_is_tolerated() -> None:
@@ -262,3 +262,54 @@ def test_a_row_with_no_body_key_is_tolerated() -> None:
 
     pages = _rows_to_pages([_row("decision:abc", "Title A", summary="Summary A")])
     assert pages[0].body == ""
+
+
+def test_a_page_the_total_budget_zeroes_is_counted_separately() -> None:
+    """A page starved by the TOTAL budget renders exactly like a page that
+    never had a body, and only the first one means the renderer has quietly
+    stopped reading part of the wiki.
+
+    Counting them together would let the front page silently narrow as the
+    corpus grows -- which reads to a person as the wiki getting less
+    interesting, not as a cap being hit.
+    """
+    from kb.synthesis.index_renderer import PER_PAGE_BODY_CHARS, _TOTAL_BODY_CHARS
+
+    # Enough full-size pages to exhaust the budget, plus two: the first of
+    # those gets a partial slice (still text, still marked truncated) and the
+    # second gets nothing at all. Only the second is what this counts.
+    n = _TOTAL_BODY_CHARS // PER_PAGE_BODY_CHARS
+    pages = [
+        _PageRow(
+            wiki_type="decision",
+            slug=f"p{i}",
+            title=f"P{i}",
+            summary="s",
+            body="x" * PER_PAGE_BODY_CHARS,
+        )
+        for i in range(n + 2)
+    ]
+
+    _, stats = _format_pages_for_prompt(pages)
+
+    assert stats.dropped_by_budget == 1, "the starved page is reported"
+    assert stats.missing_body == 0, "and is NOT miscounted as bodyless"
+
+
+def test_the_prompt_marks_the_corpus_as_untrusted() -> None:
+    """The renderer now reads page BODIES, and those bodies were written from
+    Slack, GitHub and tickets -- places many people can write to. Without a
+    stated trust boundary, a page saying "ignore your instructions" is being
+    handed to the model as though the team had written it.
+
+    It lands on the FRONT PAGE, which every person and agent reads first.
+    """
+    from kb.synthesis.index_renderer import _CORPUS_MARKER, _INDEX_SYSTEM_PROMPT
+
+    lowered = _INDEX_SYSTEM_PROMPT.lower()
+    assert "untrusted" in lowered
+    assert "never" in lowered and "instructions" in lowered
+    # The rule points at a marker, so the marker has to exist in the prompt
+    # the model actually receives -- see `render_index_via_llm`.
+    assert "corpus marker" in lowered
+    assert "UNTRUSTED" in _CORPUS_MARKER
