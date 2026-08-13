@@ -115,6 +115,7 @@ def is_valid_wiki_type(wiki_type: object) -> bool:
     """
     return is_wiki_type_shaped(wiki_type) and wiki_type in _VALID_WIKI_TYPES
 
+
 # Singleton slug for the auto-generated index page. The cron always writes
 # `wiki:index:contents`; GET /api/wiki/index resolves to that doc_id.
 INDEX_SLUG = "contents"
@@ -167,8 +168,7 @@ class WikiConnector(Connector):
         slug = wiki.get("slug")
         if not is_valid_wiki_type(wiki_type):
             raise InvalidWebhookPayload(
-                f"invalid wiki_type {wiki_type!r}; must match "
-                f"{_WIKI_TYPE_RE.pattern}"
+                f"invalid wiki_type {wiki_type!r}; must match {_WIKI_TYPE_RE.pattern}"
             )
         if not isinstance(slug, str) or not slug:
             raise InvalidWebhookPayload("wiki payload missing string slug")
@@ -260,6 +260,16 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
         content_hash = _sha256(f"{doc_id}|{received_at.isoformat()}|{title}|{body}")
         links = parse_page_links(body)
         dangling_links = [link.raw for link in links if link.kind == "plain"]
+    # `content_hash` above is a VERSION identity, not a content one: it mixes in
+    # `received_at`, so two writes of byte-identical text produce different
+    # hashes. That is correct for what it does -- every write is a new version
+    # and the chunk table keys on it -- but it makes it useless for answering
+    # "did this page's text actually change", which is the question the index
+    # regen gate needs to ask before spending an LLM call.
+    #
+    # So: a second hash over the body ALONE. Same text in, same hash out,
+    # whenever it was written and whatever the version number.
+    body_sha256 = _sha256(body)
 
     acl = ACLSnapshot(
         principals=[
@@ -289,6 +299,35 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
         "frontmatter": dict(frontmatter),
         "dangling_links": dangling_links,
         "doc_class": doc_class.value,
+        # In metadata rather than a `documents` column deliberately. Every
+        # document has a body, so a column would be a cross-connector change
+        # (NOT NULL forces Slack, GitHub and the rest to populate it; nullable
+        # leaves a column that is NULL for all but one source). Only the wiki
+        # needs this, and the one reader -- the index regen gate -- already
+        # SELECTs `metadata` for every wiki page, so comparing costs no extra
+        # query and no index.
+        #
+        # THE KEY IS ABSENT ON EVERY PAGE WRITTEN BEFORE THIS SHIPPED, and there
+        # is no backfill. Read it with `.get()`, and treat a missing value as
+        # "compute it now", NOT as "changed":
+        #
+        #   * `.get()` returning None treated as changed marks every
+        #     never-edited page dirty forever, which inverts the saving the
+        #     field exists for -- stable pages are exactly the population a
+        #     skip-if-unchanged gate is meant to skip.
+        #   * Re-POSTing a page unchanged does NOT backfill it. The route takes
+        #     `received_at = updated_at or now()` (kb/wiki_routes.py), so an
+        #     identical body with an identical `updated_at` reproduces the same
+        #     content_hash and hits the idempotent no-op at
+        #     engine/ingest/normalizer.py:1306, which returns WITHOUT writing
+        #     metadata.
+        #
+        # Computing on read is free for the one reader that matters: since the
+        # index renderer stopped slicing bodies at fetch (#476) it already holds
+        # every page's full text, so hashing a row that lacks the key costs a
+        # sha256 over a string already in memory. The stored value is the fast
+        # path, not the only path.
+        "body_sha256": body_sha256,
     }
 
     # Optional one-sentence summary for the wiki.index page. The synthesis

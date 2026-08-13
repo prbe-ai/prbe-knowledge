@@ -124,6 +124,14 @@ jobs:
       # every tenant (breaking research-os's `/v1/wiki/versions` and the MCP's
       # `wiki_versions()`) and nothing in CI ran the file that would have caught
       # it. It is green as of this commit; keep it that way.
+      # `test_wiki.py` and `test_index_renderer.py` were added for the same
+      # reason `test_wiki_routes.py` was: work shipped with tests that this gate
+      # never executed. PR #476 changed how much of the wiki the front page
+      # reads and its `pytest` check went green without running a single one of
+      # the tests it added. `test_wiki.py` also had a permanently-red test
+      # (contradictory `in` / `not in` assertions left over from migration
+      # 0091's label rename) that sat undetected precisely because nothing ran
+      # it. Both files are green as of this commit; keep them that way.
       - name: Tests (storage + wiki-routes suites)
         run: >-
           .venv/bin/pytest -q
@@ -133,3 +141,5 @@ jobs:
           tests/test_query_traces_trace_blob_migration.py
           tests/handlers/test_manual_upload.py
           tests/test_wiki_routes.py
+          tests/handlers/test_wiki.py
+          tests/synthesis/test_index_renderer.py

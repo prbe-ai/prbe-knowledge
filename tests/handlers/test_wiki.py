@@ -33,6 +33,7 @@ from engine.shared.models import WebhookEvent
 from kb.handlers.wiki import (  # noqa: F401 — registers the connector
     WIKI_PAYLOAD_KEY,
     WikiConnector,
+    _sha256,
     build_normalization_result,
 )
 from kb.wiki_links import parse_page_links, slugify
@@ -45,12 +46,17 @@ def _make_ctx() -> ConnectorContext:
     )
 
 
-def _make_event(payload: dict, *, customer_id: str = "cust-1") -> WebhookEvent:
+def _make_event(
+    payload: dict,
+    *,
+    customer_id: str = "cust-1",
+    received_at: datetime | None = None,
+) -> WebhookEvent:
     return WebhookEvent(
         customer_id=customer_id,
         source_system=SourceSystem.WIKI,
         source_event_id="evt-x",
-        received_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
+        received_at=received_at or datetime(2026, 5, 1, 12, 0, tzinfo=UTC),
         payload_s3_key="",
         payload_s3_keys=[],
         raw_payload={WIKI_PAYLOAD_KEY: payload},
@@ -252,12 +258,20 @@ def test_build_normalization_result_runbook_with_typed_links() -> None:
     assert principal.permission == Permission.READ
 
     # Graph: DOCUMENT node + one node per typed link, deduped on (label, id).
-    # `[[Person: X]]` resolves to WIKI_PERSON, not PERSON — wiki bodies carry
-    # only a rendered name, not a canonical platform id.
+    # `[[Person: X]]` resolves to PERSON. It used to emit WIKI_PERSON, to keep
+    # wiki-side references away from canonical platform ids; migration 0091
+    # collapsed the label vocabulary to 4 and moved that isolation to
+    # canonical_id shape (a rendered name vs. a platform id) instead. See
+    # `_LINK_NODE_MAP` in kb/handlers/wiki.py.
+    #
+    # This block carried both `in labels` and `not in labels` for the same
+    # tuple, so it could not pass under any behaviour. The negative was the
+    # leftover half of the 0091 rename: the positive got updated to PERSON, the
+    # negative kept asserting the pre-0091 absence. Removed, not "fixed" -- the
+    # assertion it was making is now the same claim as the line above it.
     labels = {(n.label, n.canonical_id) for n in result.graph_nodes}
     assert (NodeLabel.DOCUMENT, doc.doc_id) in labels
     assert (NodeLabel.PERSON, "mahit") in labels
-    assert (NodeLabel.PERSON, "mahit") not in labels
     assert (NodeLabel.SERVICE, "prbe-knowledge") in labels
     assert (NodeLabel.DOCUMENT, "prbe-knowledge") in labels
 
@@ -378,9 +392,89 @@ def test_build_dedupes_repeated_typed_links() -> None:
     )
     result = build_normalization_result(event)
     # One DOCUMENT + one WikiPerson node (deduped), three MENTIONS edges.
-    wiki_person_nodes = [
-        n for n in result.graph_nodes if n.label == NodeLabel.PERSON
-    ]
+    wiki_person_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.PERSON]
     assert len(wiki_person_nodes) == 1
     person_edges = [e for e in result.graph_edges if e.edge_type == EdgeType.MENTIONS]
     assert len(person_edges) == 3
+
+
+# ---------------------------------------------------------------------------
+# body_sha256 — content identity, as opposed to version identity
+# ---------------------------------------------------------------------------
+
+
+def _page_payload(body: str, *, title: str = "Research OS") -> dict:
+    return {
+        "wiki_type": "repo",
+        "slug": "research-os",
+        "title": title,
+        "body": body,
+        "frontmatter": {},
+        "updated_at": "2026-05-01T12:00:00Z",
+    }
+
+
+def test_body_sha256_is_stable_when_the_same_text_is_written_twice() -> None:
+    """THE REASON THIS FIELD EXISTS. `content_hash` mixes in `received_at`, so
+    two writes of byte-identical text produce different hashes -- correct for a
+    version identity, useless for answering "did the text actually change".
+
+    The index regen gate asks exactly that question before spending an LLM call,
+    so it needs a hash that holds still when the text does.
+    """
+    body = "# Research OS\n\nThe monorepo.\n"
+    first = build_normalization_result(
+        _make_event(_page_payload(body), received_at=datetime(2026, 5, 1, 12, 0, tzinfo=UTC))
+    ).documents[0]
+    second = build_normalization_result(
+        _make_event(_page_payload(body), received_at=datetime(2026, 6, 2, 9, 30, tzinfo=UTC))
+    ).documents[0]
+
+    assert first.metadata["body_sha256"] == second.metadata["body_sha256"]
+    assert first.content_hash != second.content_hash, (
+        "content_hash must still move per write -- chunk identity keys on it"
+    )
+
+
+def test_body_sha256_moves_when_the_body_moves() -> None:
+    """The other half. A hash that never changes is as useless as one that
+    always does."""
+    a = build_normalization_result(_make_event(_page_payload("one"))).documents[0]
+    b = build_normalization_result(_make_event(_page_payload("two"))).documents[0]
+
+    assert a.metadata["body_sha256"] != b.metadata["body_sha256"]
+
+
+def test_body_sha256_does_not_cover_the_title() -> None:
+    """Deliberate and worth knowing before it bites: this hashes the BODY, so a
+    title-only edit does not move it.
+
+    The index prompt carries titles, so a consumer that gates an index re-render
+    on `body_sha256` alone would keep a stale title until the body next changes.
+    Whatever builds that gate must compare title (and summary) alongside this --
+    the field is a content identity for the body, not a render-input identity.
+    """
+    a = build_normalization_result(_make_event(_page_payload("same", title="Old"))).documents[0]
+    b = build_normalization_result(_make_event(_page_payload("same", title="New"))).documents[0]
+
+    assert a.metadata["body_sha256"] == b.metadata["body_sha256"]
+    assert a.title != b.title
+
+
+def test_body_sha256_is_present_on_a_delete() -> None:
+    """A delete writes an empty body, so the field is the hash of "" rather than
+    absent. A consumer comparing hashes must not have to special-case a missing
+    key on the one document kind where the body is guaranteed empty.
+
+    Do NOT read this as "deletions are covered". A tombstone never reaches the
+    index corpus at all -- `regenerate_wiki_index` filters
+    `deleted_at IS NULL AND valid_to IS NULL`, so a deleted page just vanishes
+    from the row set and no surviving page's hash moves. Same for a page that
+    was added. So per-page hash equality alone misses the two most common
+    reasons the front page goes stale; a gate must compare the SET of page ids
+    as well as each page's hash, alongside the title/summary caveat above.
+    """
+    event = _make_event({"wiki_type": "repo", "slug": "research-os", "is_delete": True})
+    doc = build_normalization_result(event).documents[0]
+
+    assert doc.metadata["body_sha256"] == _sha256("")
