@@ -10,8 +10,9 @@ most it could physically do.
 
 Both halves are fixed here:
 
-  1. The renderer reads page BODIES (``PER_PAGE_BODY_CHARS`` of each), so the
-     overview can make concrete claims about the work.
+  1. The renderer reads page BODIES IN FULL, so the overview can make concrete
+     claims about the work. (Originally it read a 4,000-char prefix of each. See
+     ``_TOTAL_BODY_CHARS`` for why that came out.)
   2. The prompt forbids enumerating pages. Discovery lives where directories
      belong -- the dashboard's page browser, ``probe wiki list``, and the MCP's
      ``view="pages"`` -- and the front page spends itself on meaning instead.
@@ -47,34 +48,62 @@ class _PageRow:
     slug: str
     title: str
     summary: str
-    #: The page's actual prose, trimmed to `PER_PAGE_BODY_CHARS`. Empty when
-    #: the caller did not fetch bodies (older callers, and the tests that
-    #: predate them).
+    #: The page's actual prose, in full. Empty when the caller did not fetch
+    #: bodies (older callers, and the tests that predate them). Trimming, if any,
+    #: happens in `_format_pages_for_prompt` against the corpus budget -- not at
+    #: fetch, where it used to happen and where it was invisible to this module.
     body: str = ""
 
-
-# How much of each page the renderer reads. The front page is a synthesis of
-# what the wiki KNOWS, and a model given only titles and one-line summaries
-# cannot write one -- it can only re-list what it was handed, which is how the
-# old front page ended up as a directory with a paragraph on top.
-#
-# 4k chars is roughly the first half of a substantial page: enough to carry the
-# claims and the shape, cheap enough that a 100-page wiki still fits in one
-# request with room to spare.
-PER_PAGE_BODY_CHARS = 4000
 
 # Ceiling across ALL pages, so a wiki that grows to hundreds of pages degrades
 # by dropping the tail rather than by failing the request. Pages arrive
 # newest-updated first, so the tail is the stalest material.
+#
+# THIS IS THE ONLY REAL BUDGET. There used to be a second one, PER_PAGE_BODY_CHARS
+# = 4000, applied to every page before this one was consulted. It was calibrated
+# for pages of 4-8k chars and nothing enforced that size, so it silently decided
+# how much of the wiki the front page could see. Measured on this team's wiki on
+# 2026-08-13: 41 pages totalling 140,824 chars, of which the per-page cut passed
+# 76,544 -- 46% of the corpus discarded while the corpus itself was 35% of the
+# budget below. It protected nothing and cost more than half of the two most
+# active repos' pages. Read the pages; this ceiling is what bounds the request.
 _TOTAL_BODY_CHARS = 250_000
+
+# A STARVATION GUARD, not a budget. Pages arrive newest-updated first and spend
+# the total budget in order, so one runaway page could consume it and zero every
+# page behind it -- the tail-drop above turns into a tail-wipe. No page may take
+# more than a fifth of the corpus.
+#
+# At 50,000 chars this does not fire on anything that exists (the largest page
+# today is 37,540). It is here so that the failure mode, if a page ever does run
+# away, is one truncated page rather than a front page written from one page.
+# When a body cap lands in the write path this becomes doubly redundant, which
+# is the intent: the guard should never be the thing doing the work.
+PAGE_STARVATION_CEILING = _TOTAL_BODY_CHARS // 5
 
 
 @dataclass(frozen=True)
 class _CorpusStats:
-    """What the prompt did NOT get, so the caller can say so out loud."""
+    """What the prompt did NOT get, so the caller can say so out loud.
+
+    `corpus_chars` and `budget_chars` are what the prompt DID get. They are here
+    because the per-page cut this module used to apply was invisible: nothing
+    logged how much of the wiki reached the model, so a renderer reading half the
+    corpus looked exactly like one reading all of it. Logged every render, not
+    only on trouble, so the budget is watched before it binds rather than after.
+    """
 
     missing_body: int
     dropped_by_budget: int
+    truncated_by_budget: int
+    truncated_by_ceiling: int
+    #: What the prompt actually carried. Clipped to `budget_chars` by construction.
+    corpus_chars: int
+    #: What the wiki actually holds, before any cut. UNCLIPPED, so it is the only
+    #: field that can exceed `budget_chars` and therefore the only one that can
+    #: show an overrun rather than saturating at it.
+    raw_corpus_chars: int
+    budget_chars: int
 
 
 # Names the boundary the system prompt's untrusted-content rule points at.
@@ -93,9 +122,9 @@ class _RepoEdge:
 
 _INDEX_SYSTEM_PROMPT = (
     "You are writing the front page of an engineering wiki. You have the "
-    "wiki's pages, each with its type, title, one-line summary, and the "
-    "opening of its actual text. Write a HIGH-LEVEL OVERVIEW of what this "
-    "company is and what it is working on.\n\n"
+    "wiki's pages, each with its type, title, one-line summary, and its full "
+    "text. A page marked `[...truncated]` is the rare exception. Write a "
+    "HIGH-LEVEL OVERVIEW of what this company is and what it is working on.\n\n"
     "**DO NOT LIST THE PAGES.** This is the instruction most likely to be "
     "ignored, so read it twice. No 'Pages' section, no directory, no "
     "grouped bullet list of every page with its summary after it. A reader "
@@ -190,28 +219,56 @@ def _format_pages_for_prompt(pages: list[_PageRow]) -> tuple[str, _CorpusStats]:
     read a single page it was describing -- so the best it could do was
     reorganise the list it was handed. An overview needs the prose.
 
-    Trimming is reported, never silent -- BOTH kinds. A page can reach the
-    renderer with no body, and a page can have its body zeroed by the total
-    budget; on the page they look the same, and only the second one means the
-    renderer has quietly stopped reading part of the wiki. A front page that
-    did that would read as the wiki having gotten less interesting.
+    Pages are read IN FULL. The only limits are the corpus budget and the
+    starvation guard, and both are reported rather than applied silently.
+
+    Trimming is reported, never silent -- ALL THREE kinds. A page can reach the
+    renderer with no body, a page can have its body zeroed by the total budget,
+    and a runaway page can be cut by the starvation ceiling; on the page the
+    first two look identical, and only the second means the renderer has quietly
+    stopped reading part of the wiki. A front page that did that would read as
+    the wiki having gotten less interesting.
     """
     lines: list[str] = []
     spent = 0
+    raw_total = 0
     missing_body = 0
     dropped_by_budget = 0
+    truncated_by_budget = 0
+    truncated_by_ceiling = 0
     for page in pages:
         body = page.body.strip()
+        excerpt = body
         if not body:
             missing_body += 1
-        excerpt = body[:PER_PAGE_BODY_CHARS]
-        if spent + len(excerpt) > _TOTAL_BODY_CHARS:
-            excerpt = excerpt[: max(0, _TOTAL_BODY_CHARS - spent)]
-            # A page whose text the TOTAL budget zeroed out reads identically
-            # to a page that never had any. Counted separately so the log can
-            # tell "the wiki got quiet" from "the renderer stopped reading it".
-            if body and not excerpt:
-                dropped_by_budget += 1
+        else:
+            # Counted BEFORE any cut, and this is the only number that can show
+            # an overrun. `spent` is clipped to the budget by construction, so a
+            # wiki at 260k chars and one at 2.6M would log an identical
+            # corpus_chars=250000. The whole point of this log is to see the
+            # budget coming; a metric that saturates at the ceiling cannot.
+            raw_total += len(body)
+            # Exactly ONE outcome per page. Ceiling-then-budget used to increment
+            # both counters for a single page, so the log reported one problem
+            # twice, while the page that straddles the budget boundary and gets a
+            # partial slice incremented neither and vanished. The docstring
+            # promises every kind of trimming is reported; that only holds if the
+            # branches are exclusive and the partial cut has a counter of its own.
+            cut_by_ceiling = len(excerpt) > PAGE_STARVATION_CEILING
+            if cut_by_ceiling:
+                excerpt = excerpt[:PAGE_STARVATION_CEILING]
+            room = max(0, _TOTAL_BODY_CHARS - spent)
+            if len(excerpt) > room:
+                excerpt = excerpt[:room]
+                if excerpt:
+                    truncated_by_budget += 1
+                else:
+                    # A page the TOTAL budget zeroed reads identically to one
+                    # that never had a body. Counted apart so the log can tell
+                    # "the wiki got quiet" from "the renderer stopped reading it".
+                    dropped_by_budget += 1
+            elif cut_by_ceiling:
+                truncated_by_ceiling += 1
         spent += len(excerpt)
         truncated = len(body) > len(excerpt)
         lines.append(
@@ -228,7 +285,13 @@ def _format_pages_for_prompt(pages: list[_PageRow]) -> tuple[str, _CorpusStats]:
             + ("\n    [...truncated]" if truncated else "")
         )
     return "\n".join(lines), _CorpusStats(
-        missing_body=missing_body, dropped_by_budget=dropped_by_budget
+        missing_body=missing_body,
+        dropped_by_budget=dropped_by_budget,
+        truncated_by_budget=truncated_by_budget,
+        truncated_by_ceiling=truncated_by_ceiling,
+        corpus_chars=spent,
+        raw_corpus_chars=raw_total,
+        budget_chars=_TOTAL_BODY_CHARS,
     )
 
 
@@ -355,7 +418,27 @@ async def render_index_via_llm(
     # edges_block = _format_edges_for_prompt(edges)
 
     corpus, stats = _format_pages_for_prompt(pages)
-    if stats.missing_body or stats.dropped_by_budget:
+    # EVERY render, not only the troubled ones. How much of the wiki reaches the
+    # model is the number that decided this module's behaviour for months without
+    # anyone being able to see it; watching the corpus approach the budget is how
+    # the next size decision gets made on evidence instead of on a guess.
+    log.info(
+        "index_renderer.corpus",
+        page_count=len(pages),
+        corpus_chars=stats.corpus_chars,
+        # `budget_pct` is computed from the RAW total, not the emitted one, so it
+        # goes past 100 instead of pinning there. Reading it off `corpus_chars`
+        # would make the metric blind in exactly the regime it exists for.
+        raw_corpus_chars=stats.raw_corpus_chars,
+        budget_chars=stats.budget_chars,
+        budget_pct=round(100 * stats.raw_corpus_chars / stats.budget_chars, 1),
+    )
+    if (
+        stats.missing_body
+        or stats.dropped_by_budget
+        or stats.truncated_by_budget
+        or stats.truncated_by_ceiling
+    ):
         # Not fatal -- the model still has titles and summaries for those
         # pages -- but it is the difference between an overview and a
         # re-listing, so it is said out loud rather than absorbed.
@@ -364,11 +447,10 @@ async def render_index_via_llm(
             page_count=len(pages),
             missing_body=stats.missing_body,
             dropped_by_budget=stats.dropped_by_budget,
+            truncated_by_budget=stats.truncated_by_budget,
+            truncated_by_ceiling=stats.truncated_by_ceiling,
         )
-    user_prompt = (
-        f"Wiki page corpus ({len(pages)} pages).\n"
-        f"{_CORPUS_MARKER}\n\n{corpus}"
-    )
+    user_prompt = f"Wiki page corpus ({len(pages)} pages).\n{_CORPUS_MARKER}\n\n{corpus}"
 
     # Phase-0b chunk B: the production call routes through
     # shared.llm.acompletion so the call honors LLM_GATEWAY_URL for
@@ -410,10 +492,7 @@ async def render_index_via_llm(
 
         # Preserve the "no key + no gateway → deterministic fallback"
         # contract: the index page must always render.
-        if not (
-            shared_llm.gateway_url()
-            or get_settings().google_api_key.get_secret_value()
-        ):
+        if not (shared_llm.gateway_url() or get_settings().google_api_key.get_secret_value()):
             log.warning("index_renderer.no_google_api_key_falling_back")
             return None
 
@@ -470,6 +549,7 @@ async def render_index_via_llm(
     # below, and re-enable cross-repo edge extraction (see CROSS-REPO
     # DEPS DISABLED markers in codegraph.py and nightly_trigger.py).
     from kb.synthesis.diagram_renderer import splice_mermaid_block
+
     text = splice_mermaid_block(text, "")
     # from kb.synthesis.diagram_renderer import (
     #     _build_mermaid_block,
@@ -491,9 +571,7 @@ _LEADING_WIKI_HEADING_RE = re.compile(r"^\s*#\s+Wiki\s*\n+", re.IGNORECASE)
 # the same with a `[[]]` skeleton the model sometimes emits when it
 # loses track. Stripping these is preferable to rendering a phantom
 # bullet in the UI.
-_EMPTY_BULLET_RE = re.compile(
-    r"^[ \t]*[-*+][ \t]*(?:\[\[\s*\]\])?[ \t]*$\n?", re.MULTILINE
-)
+_EMPTY_BULLET_RE = re.compile(r"^[ \t]*[-*+][ \t]*(?:\[\[\s*\]\])?[ \t]*$\n?", re.MULTILINE)
 
 
 def _strip_leading_wiki_heading(text: str) -> str:
