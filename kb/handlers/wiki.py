@@ -115,6 +115,7 @@ def is_valid_wiki_type(wiki_type: object) -> bool:
     """
     return is_wiki_type_shaped(wiki_type) and wiki_type in _VALID_WIKI_TYPES
 
+
 # Singleton slug for the auto-generated index page. The cron always writes
 # `wiki:index:contents`; GET /api/wiki/index resolves to that doc_id.
 INDEX_SLUG = "contents"
@@ -167,8 +168,7 @@ class WikiConnector(Connector):
         slug = wiki.get("slug")
         if not is_valid_wiki_type(wiki_type):
             raise InvalidWebhookPayload(
-                f"invalid wiki_type {wiki_type!r}; must match "
-                f"{_WIKI_TYPE_RE.pattern}"
+                f"invalid wiki_type {wiki_type!r}; must match {_WIKI_TYPE_RE.pattern}"
             )
         if not isinstance(slug, str) or not slug:
             raise InvalidWebhookPayload("wiki payload missing string slug")
@@ -260,6 +260,16 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
         content_hash = _sha256(f"{doc_id}|{received_at.isoformat()}|{title}|{body}")
         links = parse_page_links(body)
         dangling_links = [link.raw for link in links if link.kind == "plain"]
+    # `content_hash` above is a VERSION identity, not a content one: it mixes in
+    # `received_at`, so two writes of byte-identical text produce different
+    # hashes. That is correct for what it does -- every write is a new version
+    # and the chunk table keys on it -- but it makes it useless for answering
+    # "did this page's text actually change", which is the question the index
+    # regen gate needs to ask before spending an LLM call.
+    #
+    # So: a second hash over the body ALONE. Same text in, same hash out,
+    # whenever it was written and whatever the version number.
+    body_sha256 = _sha256(body)
 
     acl = ACLSnapshot(
         principals=[
@@ -289,6 +299,14 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
         "frontmatter": dict(frontmatter),
         "dangling_links": dangling_links,
         "doc_class": doc_class.value,
+        # In metadata rather than a `documents` column deliberately. Every
+        # document has a body, so a column would be a cross-connector change
+        # (NOT NULL forces Slack, GitHub and the rest to populate it; nullable
+        # leaves a column that is NULL for all but one source). Only the wiki
+        # needs this, and the one reader -- the index regen gate -- already
+        # SELECTs `metadata` for every wiki page, so comparing costs no extra
+        # query and no index.
+        "body_sha256": body_sha256,
     }
 
     # Optional one-sentence summary for the wiki.index page. The synthesis
