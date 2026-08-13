@@ -114,6 +114,31 @@ def test_pack_minimum_per_event_charge() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _patch_llm(monkeypatch, *, returns=None, raises=None):
+    """Mock the ONE network boundary triage actually crosses, and return the mock
+    so the test can assert it was used.
+
+    THE TARGET MOVED AND NOTHING NOTICED. These tests patched
+    `engine.shared.llm_tools.acompletion`, which `call_triage` stopped calling
+    two refactors ago: the default model became Gemini
+    (`WIKI_TRIAGE_MODEL = "gemini-3.5-flash"`) and the path now runs
+    `call_triage -> provider.triage -> _gemini_call_json`. `monkeypatch.setattr`
+    on a name nothing calls succeeds silently, so the tests began making real
+    network calls and failing on a missing API key.
+
+    Worse, two of them kept PASSING. `_GeminiTriage.triage` wraps any exception
+    as `TriageParseError`, so `pytest.raises(TriageParseError)` was satisfied by
+    the missing key itself -- green tests asserting nothing about parsing, which
+    is the failure mode where a broken thing certifies itself.
+
+    Hence `assert fake.called` at every call site: when this seam moves again,
+    the test fails loudly instead of quietly going live.
+    """
+    fake = AsyncMock(side_effect=raises) if raises else AsyncMock(return_value=returns)
+    monkeypatch.setattr("kb.synthesis.providers._gemini_call_json", fake)
+    return fake
+
+
 @pytest.mark.asyncio
 async def test_call_triage_round_trip(monkeypatch) -> None:
     events = [_ev(1, 100), _ev(2, 100)]
@@ -133,10 +158,10 @@ async def test_call_triage_round_trip(monkeypatch) -> None:
             },
         }
     }
-    fake = AsyncMock(return_value=_tool_response(payload))
-    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
+    fake = _patch_llm(monkeypatch, returns=payload)
     # `client` is unused post-Phase-0b; pass any sentinel.
     out = await call_triage(object(), events, now=datetime(2026, 5, 2, tzinfo=UTC))
+    assert fake.called, "the LLM boundary must be mocked, not called for real"
     assert isinstance(out, TriageOutput)
     assert out.verdicts["1"].important is True
     assert out.verdicts["1"].score == pytest.approx(7.5)
@@ -158,10 +183,13 @@ async def test_call_triage_empty_input_short_circuits(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_call_triage_raises_on_missing_tool_block(monkeypatch) -> None:
     events = [_ev(1, 10)]
-    fake = AsyncMock(return_value=_no_tool_call_response())
-    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
+    # The provider wraps ANY call failure as TriageParseError, so this has to
+    # come from the boundary raising -- not from the test environment happening
+    # to lack a key, which is what it was actually asserting before.
+    fake = _patch_llm(monkeypatch, raises=RuntimeError("no tool block in response"))
     with pytest.raises(TriageParseError):
         await call_triage(object(), events, now=datetime(2026, 5, 2, tzinfo=UTC))
+    assert fake.called, "the LLM boundary must be mocked, not called for real"
 
 
 @pytest.mark.asyncio
@@ -175,7 +203,7 @@ async def test_call_triage_raises_on_validation_failure(monkeypatch) -> None:
             }
         }
     }
-    fake = AsyncMock(return_value=_tool_response(bad))
-    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
+    fake = _patch_llm(monkeypatch, returns=bad)
     with pytest.raises(TriageParseError):
         await call_triage(object(), events, now=datetime(2026, 5, 2, tzinfo=UTC))
+    assert fake.called, "the LLM boundary must be mocked, not called for real"

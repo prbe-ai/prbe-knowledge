@@ -1265,7 +1265,16 @@ async def test_normalize_stamps_channel_display_name_from_hydrated() -> None:
 
     result = await slack.normalize(event, {"channel_name": "engineering"})
 
-    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.DOCUMENT]
+    # Selected by canonical_id, not by label. Migration 0091 collapsed the label
+    # vocabulary to 4 (Document | Person | Feature | CodeSymbol), so CHANNEL
+    # became DOCUMENT -- and so did the MESSAGE. Filtering on the label alone
+    # started matching both and this assertion became `2 == 1`. The channel is
+    # the node keyed by the channel id; the message is keyed by its ts.
+    channel_nodes = [
+        n
+        for n in result.graph_nodes
+        if n.label == NodeLabel.DOCUMENT and n.canonical_id == "C456"
+    ]
     assert len(channel_nodes) == 1
     props = channel_nodes[0].properties
     # `name` is the retrieval-readable one; `display_name` has the `#` prefix.
@@ -1299,7 +1308,16 @@ async def test_normalize_no_channel_display_name_when_unresolved() -> None:
 
     result = await slack.normalize(event, {})  # no channel_name
 
-    channel_nodes = [n for n in result.graph_nodes if n.label == NodeLabel.DOCUMENT]
+    # Selected by canonical_id, not by label. Migration 0091 collapsed the label
+    # vocabulary to 4 (Document | Person | Feature | CodeSymbol), so CHANNEL
+    # became DOCUMENT -- and so did the MESSAGE. Filtering on the label alone
+    # started matching both and this assertion became `2 == 1`. The channel is
+    # the node keyed by the channel id; the message is keyed by its ts.
+    channel_nodes = [
+        n
+        for n in result.graph_nodes
+        if n.label == NodeLabel.DOCUMENT and n.canonical_id == "C456"
+    ]
     assert len(channel_nodes) == 1
     props = channel_nodes[0].properties
     assert "display_name" not in props
