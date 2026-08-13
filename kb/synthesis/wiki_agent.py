@@ -345,8 +345,7 @@ class WikiAgentRuntime:
             )
             if page is None:
                 raise ToolValidationError(
-                    f"no wiki page {args.wiki_type}/{args.slug}; "
-                    "use create_page for a new one"
+                    f"no wiki page {args.wiki_type}/{args.slug}; use create_page for a new one"
                 )
             base = page.get("body") or ""
             merged_qids = sorted(set(args.applied_queue_ids))
@@ -955,15 +954,19 @@ async def regenerate_wiki_index(
         rows = [
             {
                 **dict(row),
-                # Sliced AT FETCH, not after: the renderer only reads
-                # _PER_PAGE_BODY_CHARS of each page, and materialising every
-                # full body first would hold the whole wiki in memory to throw
-                # most of it away. One char over the cap so the renderer can
-                # still tell a trimmed page from an exactly-sized one.
-                "body": (
-                    await fetch_live_body_from_chunks(conn, customer_id, row["doc_id"])
-                    or ""
-                )[: index_renderer.PER_PAGE_BODY_CHARS + 1],
+                # NOT sliced here. This used to cut every body to
+                # PER_PAGE_BODY_CHARS + 1 at fetch, to avoid materialising the
+                # whole wiki in memory -- a sound instinct aimed at the wrong
+                # number. The cut discarded 46% of this team's corpus while the
+                # corpus was 35% of the renderer's actual budget, and because it
+                # happened HERE the renderer could not see it, report it, or
+                # weigh it against the budget it does own.
+                #
+                # Sizing: the whole wiki is ~141k chars against a 250k ceiling.
+                # Holding it briefly is a fraction of what the prompt built from
+                # it already costs. If that stops being true, the fix is a
+                # streaming assembly in the renderer, not a blind prefix here.
+                "body": (await fetch_live_body_from_chunks(conn, customer_id, row["doc_id"]) or ""),
             }
             for row in rows
         ]
@@ -994,9 +997,7 @@ async def regenerate_wiki_index(
             "is_delete": False,
             "updated_at": received_at.isoformat(),
             "summary": f"Wiki overview ({len(rows)} pages).",
-            "commit_message": (
-                f"Regenerate index ({len(rows)} pages){run_id_suffix}"
-            ),
+            "commit_message": (f"Regenerate index ({len(rows)} pages){run_id_suffix}"),
             "commit_author": commit_author,
             "commit_run_id": run_id,
             "author_id": commit_author,

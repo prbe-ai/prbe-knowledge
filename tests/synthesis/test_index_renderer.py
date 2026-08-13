@@ -231,28 +231,67 @@ def test_pages_with_no_body_are_counted_not_hidden() -> None:
     assert stats.missing_body == 1
 
 
-def test_a_long_body_is_trimmed_and_marked() -> None:
-    """Trimming is signposted in the prompt so the model knows it is reading
-    an excerpt, rather than treating a sentence cut mid-clause as the page's
-    final word."""
-    from kb.synthesis.index_renderer import PER_PAGE_BODY_CHARS
+def test_a_page_that_fits_is_read_in_full() -> None:
+    """The whole point of the change that removed PER_PAGE_BODY_CHARS: a page
+    under the budget reaches the model entire, not as a prefix.
+
+    This is the regression guard. The old per-page cut was calibrated for pages
+    of 4-8k chars, nothing enforced that size, and on this team's wiki it was
+    discarding 46% of the corpus while the corpus was 35% of the real budget.
+    """
+    body = "x" * 30_000
+    pages = [
+        _PageRow(wiki_type="repo", slug="a", title="Alpha", summary="s", body=body),
+    ]
+    corpus, stats = _format_pages_for_prompt(pages)
+
+    assert "[...truncated]" not in corpus, "a page inside the budget is not cut"
+    assert stats.truncated_by_ceiling == 0
+    assert stats.corpus_chars == len(body)
+    body_line = next(line for line in corpus.splitlines() if line.strip().startswith("x"))
+    assert len(body_line.strip()) == len(body)
+
+
+def test_a_runaway_page_is_cut_by_the_starvation_ceiling_and_marked() -> None:
+    """The guard that replaced the per-page cap. It exists so one enormous page
+    cannot spend the whole corpus budget and zero every page behind it -- pages
+    arrive newest-first, so a tail-drop would become a tail-wipe.
+
+    Trimming stays signposted, so the model knows it is reading an excerpt
+    rather than treating a clause cut mid-sentence as the page's final word.
+    """
+    from kb.synthesis.index_renderer import PAGE_STARVATION_CEILING
 
     pages = [
         _PageRow(
-            wiki_type="decision",
+            wiki_type="repo",
             slug="a",
             title="Alpha",
             summary="s",
-            body="x" * (PER_PAGE_BODY_CHARS + 500),
+            body="x" * (PAGE_STARVATION_CEILING + 500),
         ),
     ]
-    corpus, _ = _format_pages_for_prompt(pages)
+    corpus, stats = _format_pages_for_prompt(pages)
+
     assert "[...truncated]" in corpus
+    assert stats.truncated_by_ceiling == 1, "the cut is reported, never silent"
     # Measured on the body LINE, not by counting "x" across the whole corpus:
     # the `text: |` label contains one, which is exactly the kind of off-by-one
     # that makes a cap look wrong when it is right.
     body_line = next(line for line in corpus.splitlines() if line.strip().startswith("x"))
-    assert len(body_line.strip()) == PER_PAGE_BODY_CHARS
+    assert len(body_line.strip()) == PAGE_STARVATION_CEILING
+
+
+def test_the_starvation_ceiling_does_not_fire_on_any_real_page() -> None:
+    """The guard is sized to be inert. The largest page on this team's wiki when
+    it was written was 37,540 chars; if a future change ever lowers the ceiling
+    under that, this fails rather than quietly starting to truncate production
+    pages -- which is the exact failure the guard replaced.
+    """
+    from kb.synthesis.index_renderer import PAGE_STARVATION_CEILING
+
+    largest_page_seen_in_production = 37_540
+    assert largest_page_seen_in_production < PAGE_STARVATION_CEILING
 
 
 def test_a_row_with_no_body_key_is_tolerated() -> None:
@@ -273,19 +312,24 @@ def test_a_page_the_total_budget_zeroes_is_counted_separately() -> None:
     corpus grows -- which reads to a person as the wiki getting less
     interesting, not as a cap being hit.
     """
-    from kb.synthesis.index_renderer import _TOTAL_BODY_CHARS, PER_PAGE_BODY_CHARS
+    from kb.synthesis.index_renderer import _TOTAL_BODY_CHARS
 
-    # Enough full-size pages to exhaust the budget, plus two: the first of
-    # those gets a partial slice (still text, still marked truncated) and the
-    # second gets nothing at all. Only the second is what this counts.
-    n = _TOTAL_BODY_CHARS // PER_PAGE_BODY_CHARS
+    # Enough pages to exhaust the budget, plus two: the first of those gets a
+    # partial slice (still text, still marked truncated) and the second gets
+    # nothing at all. Only the second is what this counts.
+    #
+    # Page size is a local constant now rather than the per-page cap, which no
+    # longer exists. It only has to divide the budget evenly and stay under the
+    # starvation ceiling, so the arithmetic below lands exactly on the boundary.
+    page_chars = 4000
+    n = _TOTAL_BODY_CHARS // page_chars
     pages = [
         _PageRow(
             wiki_type="decision",
             slug=f"p{i}",
             title=f"P{i}",
             summary="s",
-            body="x" * PER_PAGE_BODY_CHARS,
+            body="x" * page_chars,
         )
         for i in range(n + 2)
     ]
