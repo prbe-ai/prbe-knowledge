@@ -40,7 +40,7 @@ from engine.shared.constants import (
 )
 from engine.shared.db import with_tenant
 from engine.shared.embeddings import GeminiEmbedder, get_embedder_v2
-from engine.shared.exceptions import ToolValidationError
+from engine.shared.exceptions import AgentHaltError, ToolValidationError
 from engine.shared.locks import advisory_lock_key
 from engine.shared.logging import get_logger
 from engine.shared.models import NormalizationResult, WebhookEvent
@@ -50,7 +50,7 @@ from kb.handlers.wiki import (
     WIKI_PAYLOAD_KEY,
     build_normalization_result,
 )
-from kb.synthesis import index_renderer, persistence
+from kb.synthesis import index_renderer, persistence, staged_graph
 from kb.synthesis.agent_tools import (
     TOOL_VALIDATORS,
     CreatePageArgs,
@@ -93,6 +93,13 @@ class _StagedCreate:
     frontmatter: dict[str, Any]
     commit_message: str
     applied_queue_ids: list[int] = field(default_factory=list)
+    #: True once `update_page` has folded edits into `body_markdown`. A second
+    #: `create_page` for the same slug would overwrite the body wholesale while
+    #: still unioning the queue ids, so the folded events would be marked done
+    #: with their content never landing. Reachable after a compaction, where
+    #: `state_snapshot_for_summary` shows the model only the slug and the ids --
+    #: not that a body it no longer has in context was edited.
+    has_folded_edits: bool = False
 
 
 class WikiAgentRuntime:
@@ -339,6 +346,20 @@ class WikiAgentRuntime:
             existing = self._pending_updates[key]
             base = existing.body_markdown
             merged_qids = sorted(set(existing.applied_queue_ids) | set(args.applied_queue_ids))
+        elif key in self._pending_creates:
+            # A page CREATED earlier in this same drain. Without this branch the
+            # lookup fell through to the database, found nothing (the create has
+            # not been published yet), and told the agent "no such page; use
+            # create_page" -- about a page it had just created. The agent's only
+            # ways out were to re-create it, losing the edit, or to give up.
+            #
+            # Edits land on the staged create's body and stay in
+            # `_pending_creates`: the page is still new, so it must publish as a
+            # create. Promoting it to `_pending_updates` here would stage the
+            # same page in both maps, which the preflight then refuses.
+            staged_create = self._pending_creates[key]
+            base = staged_create.body_markdown
+            merged_qids = sorted(set(staged_create.applied_queue_ids) | set(args.applied_queue_ids))
         else:
             page = await persistence.fetch_existing_page(
                 self.customer_id, args.wiki_type, args.slug
@@ -359,14 +380,32 @@ class WikiAgentRuntime:
             # The model's mistake, and it can fix it: say which edit and why.
             raise ToolValidationError(str(exc)) from exc
 
-        self._pending_updates[key] = _StagedUpdate(
-            wiki_type=args.wiki_type,
-            slug=args.slug,
-            body_markdown=body,
-            summary=args.summary,
-            commit_message=args.commit_message,
-            applied_queue_ids=merged_qids,
-        )
+        if key in self._pending_creates:
+            # Edits to a page created THIS drain fold back into the create. It
+            # has never been published, so it is still a create; staging it in
+            # `_pending_updates` as well would put the same page in both maps
+            # and the preflight would (correctly) refuse the batch.
+            staged_create = self._pending_creates[key]
+            self._pending_creates[key] = _StagedCreate(
+                wiki_type=staged_create.wiki_type,
+                slug=staged_create.slug,
+                title=staged_create.title,
+                body_markdown=body,
+                summary=args.summary,
+                frontmatter=dict(staged_create.frontmatter),
+                commit_message=args.commit_message,
+                applied_queue_ids=merged_qids,
+                has_folded_edits=True,
+            )
+        else:
+            self._pending_updates[key] = _StagedUpdate(
+                wiki_type=args.wiki_type,
+                slug=args.slug,
+                body_markdown=body,
+                summary=args.summary,
+                commit_message=args.commit_message,
+                applied_queue_ids=merged_qids,
+            )
         # Track the union for excluded_queue_ids on the next next_events.
         # Skip wins over apply per spec, so don't add ids that are
         # already in skipped.
@@ -403,6 +442,22 @@ class WikiAgentRuntime:
 
         if key in self._pending_creates:
             existing_c = self._pending_creates[key]
+            if existing_c.has_folded_edits:
+                # Re-creating over edits would drop them silently AND union the
+                # queue ids, so the folded events commit as done with their
+                # content nowhere. Refuse and say what to do instead: the page
+                # is already staged, so the model wants update_page.
+                return {
+                    "error": "staged_create_has_edits",
+                    "wiki_type": args.wiki_type,
+                    "slug": args.slug,
+                    "hint": (
+                        f"{args.wiki_type}/{args.slug} is already staged this drain and has "
+                        "edits applied to it. create_page would replace the body and lose "
+                        "them. Use update_page, or read_page first if you need the current "
+                        "staged text."
+                    ),
+                }
             merged_qids = sorted(set(existing_c.applied_queue_ids) | set(args.applied_queue_ids))
         else:
             merged_qids = sorted(set(args.applied_queue_ids))
@@ -475,6 +530,66 @@ class WikiAgentRuntime:
     # Commit / discard
     # -----------------------------------------------------------------------
 
+    def _staged_pages(self) -> list[staged_graph.StagedPage]:
+        """The whole staged set, creates and updates together, in one view.
+
+        The thing that did not exist before: every rule that spans pages needed
+        this and there was nowhere to get it, so the rules went into modules
+        that could only see one page (or could only run after the write).
+        """
+        return [
+            staged_graph.StagedPage(
+                wiki_type=c.wiki_type, slug=c.slug, body=c.body_markdown, is_new=True
+            )
+            for c in self._pending_creates.values()
+        ] + [
+            staged_graph.StagedPage(
+                wiki_type=u.wiki_type, slug=u.slug, body=u.body_markdown, is_new=False
+            )
+            for u in self._pending_updates.values()
+        ]
+
+    async def _persist_staged_batch(self) -> None:
+        """Preflight the whole staged set, then publish it in order.
+
+        Shared with `BackfillWikiRuntime`, which overrides `commit()` to skip
+        the queue and index steps. Before this existed the subclass carried its
+        own copy of the persist loop, so it validated nothing and published in
+        the old order -- on the path that creates the MOST new pages. Any rule
+        added to `validate_batch` would have been silently unenforced there.
+
+        A refusal RAISES. It must not return normally: `_tool_done` sets
+        `is_done` and reports `committed: True` off the back of this call, the
+        harness reads `is_done` as a clean finish, and the worker then closes
+        the run `complete` with `error=None`. The queue rows would be DLQ'd
+        underneath all of that. `synthesis_worker` says exactly why that is not
+        allowed, a few lines below where it catches this: "a green signal over
+        work that did not happen". AgentHaltError is the channel that already
+        routes to DLQ-with-reason and a failed run status, so the refusal uses
+        it rather than inventing a quieter one.
+        """
+        staged = self._staged_pages()
+        violations = staged_graph.validate_batch(staged)
+        if violations:
+            log.warning(
+                "agent.preflight_refused",
+                customer=self.customer_id,
+                agent_run_id=self.agent_run_id,
+                violations=[{"rule": v.rule, "ref": v.ref, "detail": v.detail} for v in violations],
+            )
+            # The rules go in the reason so the DLQ row says WHY, not just
+            # "preflight". The worker does the DLQ and the discard; doing
+            # either here as well would double-count the rows.
+            raise AgentHaltError(
+                f"agent.preflight_refused: {', '.join(sorted({v.rule for v in violations}))}"
+            )
+
+        for page in staged_graph.publish_order(staged):
+            if page.is_new:
+                await self._persist_create(self._pending_creates[page.key])
+            else:
+                await self._persist_update(self._pending_updates[page.key])
+
     async def commit(self) -> None:
         """Atomic commit of all staged updates + creates.
 
@@ -483,17 +598,31 @@ class WikiAgentRuntime:
         Mark queue rows 'done' (applied) or 'synthesis_skipped' (skipped).
         Regenerate the wiki.index page from the live set.
 
+        PREFLIGHT RUNS BEFORE THE FIRST WRITE. Rules that span more than one
+        page have nowhere else to live: `apply_edits` sees a single body and the
+        create path bypasses it entirely, while link persistence happens after
+        the page is already published. See `staged_graph`. A batch that violates
+        one is refused whole -- nothing is written, the events are DLQ'd with
+        the rule that refused them, and the agent sees why on its next drain.
+
+        PUBLISH ORDER IS CREATES FIRST. A page created and linked from a page
+        updated in the same batch has to exist by the time the linking page
+        persists its links. The previous order (updates, then creates) had this
+        backwards.
+
         This isn't a true single-DB-transaction (Normalizer does its own
         Phase A/B split for embedding cost), but the queue mark-done
         runs after every page persist succeeds, so a partial failure
         in any page rolls back the whole drain (the tool_exception
         surfaces back to the agent, which can decide to skip the
         offending events and retry).
+
+        The honest limit: preflight makes VALIDATION all-or-nothing, not
+        persistence. A batch that passes and then fails on its third page leaves
+        the first two published, because each document persists in its own
+        transaction and there is no batch transaction to enroll them in.
         """
-        for update in self._pending_updates.values():
-            await self._persist_update(update)
-        for create in self._pending_creates.values():
-            await self._persist_create(create)
+        await self._persist_staged_batch()
 
         applied_qids = sorted(self._applied_queue_ids - self._skipped_queue_ids)
         skipped_qids = sorted(self._skipped_queue_ids)

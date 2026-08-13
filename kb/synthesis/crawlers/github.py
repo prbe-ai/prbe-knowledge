@@ -440,11 +440,15 @@ class BackfillWikiRuntime(WikiAgentRuntime):
         queue mark-done / mark-skipped / regenerate-index steps. Backfill
         regenerates the index at the end of run() instead — the per-source
         crawler doesn't own the customer-wide index lifecycle.
+
+        The persist loop is the PARENT'S, not a copy. This method used to
+        reimplement it inline, so when the parent grew a staged-set preflight
+        and a publish order this path silently kept neither -- on the path that
+        creates the most brand-new pages, which is exactly what those exist
+        for. Only the queue/index steps are skipped here; validation is not
+        optional.
         """
-        for update in self._pending_updates.values():
-            await self._persist_update(update)
-        for create in self._pending_creates.values():
-            await self._persist_create(create)
+        await self._persist_staged_batch()
 
 
 # ---------------------------------------------------------------------------

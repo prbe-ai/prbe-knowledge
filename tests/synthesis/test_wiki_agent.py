@@ -110,13 +110,16 @@ async def test_tool_get_event_body_page_2_returns_next_chunk(
     runtime: WikiAgentRuntime,
 ) -> None:
     big_body = "a" * 6000 + "b" * 6000
-    runtime._test_event_bodies[42] = (big_body, {  # type: ignore[attr-defined]
-        "doc_id": "d:1",
-        "version": 1,
-        "title": "t",
-        "source_system": "github",
-        "source_ts": datetime(2026, 5, 4, tzinfo=UTC),
-    })
+    runtime._test_event_bodies[42] = (
+        big_body,
+        {  # type: ignore[attr-defined]
+            "doc_id": "d:1",
+            "version": 1,
+            "title": "t",
+            "source_system": "github",
+            "source_ts": datetime(2026, 5, 4, tzinfo=UTC),
+        },
+    )
     out = await runtime.dispatch_tool("get_event_body", {"queue_id": 42, "page": 2})
     assert out["page"] == 2
     assert out["total_pages"] == 2
@@ -127,13 +130,16 @@ async def test_tool_get_event_body_page_2_returns_next_chunk(
 async def test_tool_get_event_body_out_of_range_page_errors(
     runtime: WikiAgentRuntime,
 ) -> None:
-    runtime._test_event_bodies[5] = ("hello", {  # type: ignore[attr-defined]
-        "doc_id": "d:1",
-        "version": 1,
-        "title": "t",
-        "source_system": "github",
-        "source_ts": datetime(2026, 5, 4, tzinfo=UTC),
-    })
+    runtime._test_event_bodies[5] = (
+        "hello",
+        {  # type: ignore[attr-defined]
+            "doc_id": "d:1",
+            "version": 1,
+            "title": "t",
+            "source_system": "github",
+            "source_ts": datetime(2026, 5, 4, tzinfo=UTC),
+        },
+    )
     out = await runtime.dispatch_tool("get_event_body", {"queue_id": 5, "page": 9})
     assert out["error"] == "page_out_of_range"
 
@@ -223,6 +229,8 @@ async def test_tool_update_page_re_staged_edits_on_top_of_the_staged_body(
     assert staged.body_markdown == "body v2"
     assert staged.summary == "s2"
     # applied_queue_ids unioned (1 + 2)
+
+
 @pytest.mark.asyncio
 async def test_tool_update_page_applied_queue_ids_accumulate_across_stages(
     runtime: WikiAgentRuntime,
@@ -306,9 +314,7 @@ async def test_tool_create_page_slug_exists_on_disk_errors(
 async def test_tool_skip_events_marks_correctly(
     runtime: WikiAgentRuntime,
 ) -> None:
-    out = await runtime.dispatch_tool(
-        "skip_events", {"queue_ids": [10, 11, 12], "reason": "noise"}
-    )
+    out = await runtime.dispatch_tool("skip_events", {"queue_ids": [10, 11, 12], "reason": "noise"})
     assert out["status"] == "marked"
     assert out["skipped_count"] == 3
     assert runtime._skipped_queue_ids == {10, 11, 12}
@@ -333,9 +339,7 @@ async def test_tool_skip_events_skip_wins_over_apply(
     )
     # Then skip 7 + 9. Skip wins; 7 should leave the staged update's
     # applied_queue_ids and join skipped_queue_ids.
-    await runtime.dispatch_tool(
-        "skip_events", {"queue_ids": [7, 9], "reason": "second thought"}
-    )
+    await runtime.dispatch_tool("skip_events", {"queue_ids": [7, 9], "reason": "second thought"})
     staged = runtime._pending_updates[("decision", "x")]
     assert 7 not in staged.applied_queue_ids
     assert 8 in staged.applied_queue_ids
@@ -458,9 +462,7 @@ def test_estimate_tokens_consistent_with_gemini_count() -> None:
     # Skip dataclass init: build the loop manually so we don't need a
     # full LLM stub here.
     loop = AgentLoop.__new__(AgentLoop)
-    loop._conversation = [
-        {"role": "user", "parts": [{"text": "x" * 350}]}
-    ]
+    loop._conversation = [{"role": "user", "parts": [{"text": "x" * 350}]}]
     est = loop._estimate_tokens()
     # 350 chars at 1/3.5 = 100 tokens.
     assert 90 <= est <= 110
@@ -487,3 +489,192 @@ async def test_dispatch_unknown_tool_raises_tool_validation_error(
 def test_default_batch_size_export() -> None:
     """Public re-export so tests / tools can read the same constant."""
     assert wa_module.default_batch_size() > 0
+
+
+# ---------------------------------------------------------------------------
+# create-then-edit within one drain
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_page_can_edit_a_page_created_in_the_same_drain(
+    runtime: WikiAgentRuntime,
+) -> None:
+    """`update_page` consulted `_pending_updates`, then fell through to the DB.
+    It never looked at `_pending_creates`.
+
+    So an agent that created a page and then edited it in the same drain was
+    told "no wiki page decision/fresh; use create_page for a new one" -- about a
+    page it had just created. Its only ways out were to re-create the page,
+    losing the edit, or to give up on it. The staged set has to be one view.
+    """
+    await runtime.dispatch_tool(
+        "create_page",
+        {
+            "wiki_type": "decision",
+            "slug": "fresh",
+            "title": "T",
+            "body_markdown": "alpha beta",
+            "summary": "s",
+            "commit_message": "m",
+            "applied_queue_ids": [1],
+        },
+    )
+
+    out = await runtime.dispatch_tool(
+        "update_page",
+        {
+            "wiki_type": "decision",
+            "slug": "fresh",
+            "edits": [{"op": "replace", "find": "beta", "text": "gamma"}],
+            "summary": "s2",
+            "commit_message": "m2",
+            "applied_queue_ids": [2],
+        },
+    )
+
+    assert out["status"] == "staged"
+    staged = runtime._pending_creates[("decision", "fresh")]
+    assert staged.body_markdown == "alpha gamma"
+    # STILL a create. It has never been published, so publishing it as an update
+    # would target a row that does not exist -- and staging it in both maps is
+    # what the preflight refuses.
+    assert ("decision", "fresh") not in runtime._pending_updates
+    assert staged.applied_queue_ids == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_a_page_created_then_edited_stays_a_single_staged_page(
+    runtime: WikiAgentRuntime,
+) -> None:
+    """The preflight's own invariant, checked end to end: the fold-back above
+    must leave exactly one staged entry for the page, or the batch it produces
+    would be refused as a duplicate."""
+    from kb.synthesis.staged_graph import validate_batch
+
+    await runtime.dispatch_tool(
+        "create_page",
+        {
+            "wiki_type": "decision",
+            "slug": "fresh",
+            "title": "T",
+            "body_markdown": "alpha",
+            "summary": "s",
+            "commit_message": "m",
+            "applied_queue_ids": [],
+        },
+    )
+    await runtime.dispatch_tool(
+        "update_page",
+        {
+            "wiki_type": "decision",
+            "slug": "fresh",
+            "edits": [{"op": "replace", "find": "alpha", "text": "omega"}],
+            "summary": "s",
+            "commit_message": "m",
+            "applied_queue_ids": [],
+        },
+    )
+
+    staged = runtime._staged_pages()
+    assert len(staged) == 1
+    assert validate_batch(staged) == []
+
+
+@pytest.mark.asyncio
+async def test_recreating_a_page_that_has_folded_edits_is_refused(
+    runtime: WikiAgentRuntime,
+) -> None:
+    """create -> update (folds an edit) -> create again.
+
+    The second create merged `applied_queue_ids` but replaced `body_markdown`
+    wholesale, so the folded event committed as done with its content nowhere.
+    Reachable after a compaction: `state_snapshot_for_summary` shows the model
+    the slug and the ids, not that a body it no longer holds was edited.
+    """
+    await runtime.dispatch_tool(
+        "create_page",
+        {
+            "wiki_type": "decision",
+            "slug": "x",
+            "title": "T",
+            "body_markdown": "original",
+            "summary": "s",
+            "commit_message": "m",
+            "applied_queue_ids": [],
+        },
+    )
+    await runtime.dispatch_tool(
+        "update_page",
+        {
+            "wiki_type": "decision",
+            "slug": "x",
+            "edits": [{"op": "replace", "find": "original", "text": "edited"}],
+            "summary": "s",
+            "commit_message": "m",
+            "applied_queue_ids": [7],
+        },
+    )
+
+    out = await runtime.dispatch_tool(
+        "create_page",
+        {
+            "wiki_type": "decision",
+            "slug": "x",
+            "title": "T",
+            "body_markdown": "original",
+            "summary": "s",
+            "commit_message": "m",
+            "applied_queue_ids": [],
+        },
+    )
+
+    assert out["error"] == "staged_create_has_edits"
+    assert runtime._pending_creates[("decision", "x")].body_markdown == "edited"
+    assert 7 in runtime._applied_queue_ids
+
+
+@pytest.mark.asyncio
+async def test_a_refused_batch_halts_rather_than_reporting_a_clean_commit(
+    runtime: WikiAgentRuntime,
+) -> None:
+    """THE FAILURE THIS GUARDS. `commit()` returning normally on a refusal made
+    `_tool_done` set `is_done` and report `committed: True`; the harness read
+    that as a clean finish and the worker closed the run `complete, error=None`
+    -- while the claimed queue rows went to DLQ underneath it.
+
+    `synthesis_worker` names that outcome a few lines below where it catches
+    this: "a green signal over work that did not happen". So a refusal must
+    raise, and AgentHaltError is the channel that already routes to
+    DLQ-with-reason and a failed run.
+
+    Staged by hand: after the create/update fold, no tool sequence can produce a
+    duplicate, which is why the refusal branch needs driving directly.
+    """
+    from engine.shared.exceptions import AgentHaltError
+    from kb.synthesis.wiki_agent import _StagedCreate, _StagedUpdate
+
+    key = ("decision", "dup")
+    runtime._pending_creates[key] = _StagedCreate(
+        wiki_type="decision",
+        slug="dup",
+        title="T",
+        body_markdown="a",
+        summary="s",
+        frontmatter={},
+        commit_message="m",
+    )
+    runtime._pending_updates[key] = _StagedUpdate(
+        wiki_type="decision",
+        slug="dup",
+        body_markdown="b",
+        summary="s",
+        commit_message="m",
+    )
+
+    with pytest.raises(AgentHaltError) as caught:
+        await runtime.dispatch_tool("done", {})
+
+    assert "preflight_refused" in str(caught.value)
+    assert "duplicate_staged_page" in str(caught.value)
+    assert runtime.is_done is False, "a refused drain is not a finished one"

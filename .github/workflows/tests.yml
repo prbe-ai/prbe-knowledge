@@ -143,3 +143,5 @@ jobs:
           tests/test_wiki_routes.py
           tests/handlers/test_wiki.py
           tests/synthesis/test_index_renderer.py
+          tests/synthesis/test_staged_graph.py
+          tests/synthesis/test_wiki_agent.py
