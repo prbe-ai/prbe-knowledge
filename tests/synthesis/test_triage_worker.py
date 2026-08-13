@@ -652,3 +652,68 @@ async def test_mark_orphans_rejected_empty_list_is_noop() -> None:
         [],
         reason=TRIAGE_DOC_SUPERSEDED_OR_DELETED_REASON,
     )
+
+
+# ---------------------------------------------------------------------------
+# The drain is NOTIFY-driven, not polled
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_worker_does_not_drain_on_a_timer() -> None:
+    """No periodic wake. The wiki drains when something NOTIFIES it.
+
+    THIS SHIPPED AS A 30-MINUTE POLL described as "a safety net if a notify is
+    missed during a connection drop". It was not a safety net -- it was the
+    scheduler. Only the nightly cron and the manual trigger route ever notify
+    these channels (ingestion does not), so the timer was never catching a
+    missed notify; it was finding rows ingestion left pending and draining them
+    every half hour. 32 synthesis runs in a day against zero nightly ones,
+    rewriting 16 pages 72 times, each drain a multi-turn Gemini Pro loop.
+
+    Asserted as "waits FOREVER when nothing notifies", because a regression
+    here does not fail -- it costs money quietly and rewrites pages nobody
+    asked it to.
+    """
+    worker = TriageWorker(asyncio.Event())
+    assert worker._periodic is None
+
+    with pytest.raises(asyncio.TimeoutError):
+        # If a timer existed, `_wait` would return once it elapsed. With none,
+        # it blocks until NOTIFY or shutdown -- so a bounded wait must time out.
+        await asyncio.wait_for(worker._wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_a_notify_still_wakes_the_worker_immediately() -> None:
+    """The other half: removing the timer must not remove the wake.
+
+    Without this, setting the interval to None would "pass" the test above by
+    breaking the drain entirely -- the worker would simply never run again, and
+    the wiki would stop updating with no error anywhere.
+    """
+    wake = asyncio.Event()
+    worker = TriageWorker(wake)
+    wake.set()
+
+    woken_by_notify = await asyncio.wait_for(worker._wait(), timeout=1)
+
+    assert woken_by_notify is True
+    # ...and the event is cleared, so the next wait blocks again rather than
+    # spinning the loop on a latched event.
+    assert not wake.is_set()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_still_releases_the_wait() -> None:
+    """A worker blocked forever on NOTIFY must still stop on SIGTERM.
+
+    With a timer, a missed shutdown signal only delayed the exit by one
+    interval; with none, it would hang the pod until Kubernetes killed it.
+    """
+    worker = TriageWorker(asyncio.Event())
+    worker.shutdown()
+
+    woken_by_notify = await asyncio.wait_for(worker._wait(), timeout=1)
+
+    assert woken_by_notify is False

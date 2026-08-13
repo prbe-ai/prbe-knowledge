@@ -66,7 +66,7 @@ class SynthesisWorker:
         store: ObjectStore | None = None,
         embedder: GeminiEmbedder | None = None,
         llm_client: object | None = None,
-        periodic_wake_seconds: float = WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
+        periodic_wake_seconds: float | None = WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
         global_concurrency: int = WIKI_AGENT_GLOBAL_CONCURRENCY,
     ) -> None:
         self._wake = wake_event
