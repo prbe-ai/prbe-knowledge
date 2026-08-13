@@ -282,11 +282,72 @@ def test_a_runaway_page_is_cut_by_the_starvation_ceiling_and_marked() -> None:
     assert len(body_line.strip()) == PAGE_STARVATION_CEILING
 
 
-def test_the_starvation_ceiling_does_not_fire_on_any_real_page() -> None:
-    """The guard is sized to be inert. The largest page on this team's wiki when
-    it was written was 37,540 chars; if a future change ever lowers the ceiling
-    under that, this fails rather than quietly starting to truncate production
-    pages -- which is the exact failure the guard replaced.
+def test_an_over_budget_corpus_is_visible_in_the_stats() -> None:
+    """`corpus_chars` is clipped to the budget by construction, so on its own it
+    saturates: a wiki at 260k chars and one at 2.6M both report 250,000. This is
+    the log's whole job -- seeing the budget coming -- so the raw total is carried
+    separately and is the number the percentage is computed from.
+    """
+    from kb.synthesis.index_renderer import _TOTAL_BODY_CHARS
+
+    page_chars = 30_000
+    n = (_TOTAL_BODY_CHARS // page_chars) + 4  # comfortably over
+    pages = [
+        _PageRow(wiki_type="repo", slug=f"p{i}", title=f"P{i}", summary="s", body="x" * page_chars)
+        for i in range(n)
+    ]
+
+    _, stats = _format_pages_for_prompt(pages)
+
+    assert stats.corpus_chars == _TOTAL_BODY_CHARS, "emitted text is clipped"
+    assert stats.raw_corpus_chars == n * page_chars, "the real size is not"
+    assert stats.raw_corpus_chars > stats.budget_chars, "and so an overrun is visible"
+
+
+def test_each_page_is_counted_under_exactly_one_outcome() -> None:
+    """A page cut by the ceiling AND then zeroed by the budget used to increment
+    both counters, reporting one page as two problems; a page given a partial
+    slice at the budget boundary incremented neither and vanished from the log
+    entirely. The docstring promises every kind of trimming is reported, which
+    only holds if the branches are exclusive and the partial cut has its own
+    counter.
+    """
+    from kb.synthesis.index_renderer import _TOTAL_BODY_CHARS, PAGE_STARVATION_CEILING
+
+    # Big enough that the ceiling fires on every page and the budget runs out
+    # partway through, so all four outcomes appear in one corpus.
+    body = "x" * (PAGE_STARVATION_CEILING + 1_000)
+    n = (_TOTAL_BODY_CHARS // PAGE_STARVATION_CEILING) + 3
+    pages = [
+        _PageRow(wiki_type="repo", slug=f"p{i}", title=f"P{i}", summary="s", body=body)
+        for i in range(n)
+    ]
+    pages.append(_PageRow(wiki_type="repo", slug="empty", title="E", summary="s", body=""))
+
+    _, stats = _format_pages_for_prompt(pages)
+
+    accounted = (
+        stats.truncated_by_ceiling
+        + stats.truncated_by_budget
+        + stats.dropped_by_budget
+        + stats.missing_body
+    )
+    assert accounted <= len(pages), "no page is counted twice"
+    assert stats.missing_body == 1
+    assert stats.dropped_by_budget >= 1, "pages past the budget are reported"
+    assert stats.truncated_by_ceiling >= 1, "pages the ceiling cut are reported"
+
+
+def test_the_starvation_ceiling_is_not_lowered_under_known_page_sizes() -> None:
+    """A ratchet on the CONSTANT, and only that. It compares two literals, so it
+    cannot notice a real page growing past the ceiling -- if `research_os` reaches
+    60k it gets cut and this still passes. That case is covered by the
+    `truncated_by_ceiling` counter at runtime, not here.
+
+    What it does catch: someone tuning the ceiling down to a number that would
+    start truncating pages this team already has. That was the previous failure
+    mode exactly -- a per-page cap of 4,000 chosen for pages of 4-8k, left in
+    place while pages grew to 37,540 -- so it is worth a guard even a cheap one.
     """
     from kb.synthesis.index_renderer import PAGE_STARVATION_CEILING
 
@@ -319,9 +380,13 @@ def test_a_page_the_total_budget_zeroes_is_counted_separately() -> None:
     # nothing at all. Only the second is what this counts.
     #
     # Page size is a local constant now rather than the per-page cap, which no
-    # longer exists. It only has to divide the budget evenly and stay under the
-    # starvation ceiling, so the arithmetic below lands exactly on the boundary.
+    # longer exists. It must NOT divide the budget evenly: this test needs one
+    # page to straddle the boundary (partial slice) and the NEXT one to be
+    # zeroed, and an even divisor zeroes two pages instead, making
+    # dropped_by_budget 2. 250,000 // 4,000 = 62 pages = 248,000 chars, so page
+    # 63 takes the last 2,000 and page 64 is the single starved page below.
     page_chars = 4000
+    assert _TOTAL_BODY_CHARS % page_chars != 0, "an even divisor breaks the setup"
     n = _TOTAL_BODY_CHARS // page_chars
     pages = [
         _PageRow(

@@ -95,8 +95,14 @@ class _CorpusStats:
 
     missing_body: int
     dropped_by_budget: int
+    truncated_by_budget: int
     truncated_by_ceiling: int
+    #: What the prompt actually carried. Clipped to `budget_chars` by construction.
     corpus_chars: int
+    #: What the wiki actually holds, before any cut. UNCLIPPED, so it is the only
+    #: field that can exceed `budget_chars` and therefore the only one that can
+    #: show an overrun rather than saturating at it.
+    raw_corpus_chars: int
     budget_chars: int
 
 
@@ -225,24 +231,44 @@ def _format_pages_for_prompt(pages: list[_PageRow]) -> tuple[str, _CorpusStats]:
     """
     lines: list[str] = []
     spent = 0
+    raw_total = 0
     missing_body = 0
     dropped_by_budget = 0
+    truncated_by_budget = 0
     truncated_by_ceiling = 0
     for page in pages:
         body = page.body.strip()
+        excerpt = body
         if not body:
             missing_body += 1
-        excerpt = body
-        if len(excerpt) > PAGE_STARVATION_CEILING:
-            excerpt = excerpt[:PAGE_STARVATION_CEILING]
-            truncated_by_ceiling += 1
-        if spent + len(excerpt) > _TOTAL_BODY_CHARS:
-            excerpt = excerpt[: max(0, _TOTAL_BODY_CHARS - spent)]
-            # A page whose text the TOTAL budget zeroed out reads identically
-            # to a page that never had any. Counted separately so the log can
-            # tell "the wiki got quiet" from "the renderer stopped reading it".
-            if body and not excerpt:
-                dropped_by_budget += 1
+        else:
+            # Counted BEFORE any cut, and this is the only number that can show
+            # an overrun. `spent` is clipped to the budget by construction, so a
+            # wiki at 260k chars and one at 2.6M would log an identical
+            # corpus_chars=250000. The whole point of this log is to see the
+            # budget coming; a metric that saturates at the ceiling cannot.
+            raw_total += len(body)
+            # Exactly ONE outcome per page. Ceiling-then-budget used to increment
+            # both counters for a single page, so the log reported one problem
+            # twice, while the page that straddles the budget boundary and gets a
+            # partial slice incremented neither and vanished. The docstring
+            # promises every kind of trimming is reported; that only holds if the
+            # branches are exclusive and the partial cut has a counter of its own.
+            cut_by_ceiling = len(excerpt) > PAGE_STARVATION_CEILING
+            if cut_by_ceiling:
+                excerpt = excerpt[:PAGE_STARVATION_CEILING]
+            room = max(0, _TOTAL_BODY_CHARS - spent)
+            if len(excerpt) > room:
+                excerpt = excerpt[:room]
+                if excerpt:
+                    truncated_by_budget += 1
+                else:
+                    # A page the TOTAL budget zeroed reads identically to one
+                    # that never had a body. Counted apart so the log can tell
+                    # "the wiki got quiet" from "the renderer stopped reading it".
+                    dropped_by_budget += 1
+            elif cut_by_ceiling:
+                truncated_by_ceiling += 1
         spent += len(excerpt)
         truncated = len(body) > len(excerpt)
         lines.append(
@@ -261,8 +287,10 @@ def _format_pages_for_prompt(pages: list[_PageRow]) -> tuple[str, _CorpusStats]:
     return "\n".join(lines), _CorpusStats(
         missing_body=missing_body,
         dropped_by_budget=dropped_by_budget,
+        truncated_by_budget=truncated_by_budget,
         truncated_by_ceiling=truncated_by_ceiling,
         corpus_chars=spent,
+        raw_corpus_chars=raw_total,
         budget_chars=_TOTAL_BODY_CHARS,
     )
 
@@ -398,10 +426,19 @@ async def render_index_via_llm(
         "index_renderer.corpus",
         page_count=len(pages),
         corpus_chars=stats.corpus_chars,
+        # `budget_pct` is computed from the RAW total, not the emitted one, so it
+        # goes past 100 instead of pinning there. Reading it off `corpus_chars`
+        # would make the metric blind in exactly the regime it exists for.
+        raw_corpus_chars=stats.raw_corpus_chars,
         budget_chars=stats.budget_chars,
-        budget_pct=round(100 * stats.corpus_chars / stats.budget_chars, 1),
+        budget_pct=round(100 * stats.raw_corpus_chars / stats.budget_chars, 1),
     )
-    if stats.missing_body or stats.dropped_by_budget or stats.truncated_by_ceiling:
+    if (
+        stats.missing_body
+        or stats.dropped_by_budget
+        or stats.truncated_by_budget
+        or stats.truncated_by_ceiling
+    ):
         # Not fatal -- the model still has titles and summaries for those
         # pages -- but it is the difference between an overview and a
         # re-listing, so it is said out loud rather than absorbed.
@@ -410,6 +447,7 @@ async def render_index_via_llm(
             page_count=len(pages),
             missing_body=stats.missing_body,
             dropped_by_budget=stats.dropped_by_budget,
+            truncated_by_budget=stats.truncated_by_budget,
             truncated_by_ceiling=stats.truncated_by_ceiling,
         )
     user_prompt = f"Wiki page corpus ({len(pages)} pages).\n{_CORPUS_MARKER}\n\n{corpus}"
