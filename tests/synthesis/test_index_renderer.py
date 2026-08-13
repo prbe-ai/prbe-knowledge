@@ -422,3 +422,32 @@ def test_the_prompt_marks_the_corpus_as_untrusted() -> None:
     # the model actually receives -- see `render_index_via_llm`.
     assert "corpus marker" in lowered
     assert "UNTRUSTED" in _CORPUS_MARKER
+
+
+def test_the_prompt_demands_resolvable_links() -> None:
+    """The front page is the one page every agent is told to read first, so a
+    link it cannot follow is the most expensive kind to write.
+
+    The prompt used to ask for `[[Title]]`. That form is unresolvable: `[[research-os]]`
+    does not map to the page `repo/research_os` (hyphen vs underscore), and
+    `[[Wiki Synthesis Pipeline (prbe-knowledge)]]` -> `feature/prbe_knowledge-wiki_synthesis`
+    is not guessable at all. It is also recorded as a DANGLING reference by the
+    link parser, so it connects nothing in the graph either.
+    """
+    from kb.synthesis.index_renderer import _INDEX_SYSTEM_PROMPT
+
+    assert "[[type:slug|Title]]" in _INDEX_SYSTEM_PROMPT
+    assert "never bare `[[Title]]`" in _INDEX_SYSTEM_PROMPT
+
+
+def test_the_corpus_gives_the_model_the_type_and_slug_it_must_link_with() -> None:
+    """Asking for `type:slug` only works if both are in front of the model. They
+    are, on every page — this pins that they stay there."""
+    pages = [
+        _PageRow(wiki_type="repo", slug="research_os", title="research-os", summary="s", body="b")
+    ]
+
+    corpus, _ = _format_pages_for_prompt(pages)
+
+    assert "type: repo" in corpus
+    assert "slug: research_os" in corpus
