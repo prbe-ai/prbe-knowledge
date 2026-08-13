@@ -755,3 +755,51 @@ def test_the_index_signature_prefers_the_stored_body_hash() -> None:
     ]
 
     assert _index_signature(stored) == _index_signature(same_digest_other_body)
+
+
+def test_a_prompt_change_moves_the_index_signature() -> None:
+    """THE GATE'S OWN ESCAPE HATCH, and it was missing.
+
+    The first version hashed the pages alone. A prompt change moves no page, so
+    the signature did not move, so the gate skipped the render forever and the
+    change never reached the front page. That actually shipped: a fix asking
+    the model for resolvable `[[type:slug]]` links could not take effect, and
+    the only symptom was a front page staying subtly wrong while every run
+    reported a clean skip.
+
+    Hashing the prompt TEXT rather than a version constant is deliberate -- a
+    constant is a second thing to remember, and forgetting it fails silently in
+    exactly this way.
+    """
+    import kb.synthesis.wiki_agent as wa
+    from kb.synthesis.wiki_agent import _index_signature
+
+    rows = [{"doc_id": "a", "title": "A", "body": "x", "metadata": {}}]
+    before = _index_signature(rows)
+
+    original = wa._INDEX_SYSTEM_PROMPT
+    try:
+        wa._INDEX_SYSTEM_PROMPT = original + "\n\nAn added instruction."
+        assert _index_signature(rows) != before, "a prompt edit must force a re-render"
+    finally:
+        wa._INDEX_SYSTEM_PROMPT = original
+
+    assert _index_signature(rows) == before, "and restoring it must restore the signature"
+
+
+def test_a_model_change_moves_the_index_signature() -> None:
+    """Same reasoning one step out: a different model writes a different page
+    from identical input, so the cached render is no longer what this config
+    would produce."""
+    import kb.synthesis.wiki_agent as wa
+    from kb.synthesis.wiki_agent import _index_signature
+
+    rows = [{"doc_id": "a", "title": "A", "body": "x", "metadata": {}}]
+    before = _index_signature(rows)
+
+    original = wa.WIKI_AGENT_MODEL
+    try:
+        wa.WIKI_AGENT_MODEL = original + "-turbo"
+        assert _index_signature(rows) != before
+    finally:
+        wa.WIKI_AGENT_MODEL = original

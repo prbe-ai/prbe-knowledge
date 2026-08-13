@@ -32,6 +32,7 @@ from engine.ingest.handlers.base import ConnectorContext, make_default_context
 from engine.ingest.normalizer import Normalizer, fetch_live_body_from_chunks
 from engine.shared.constants import (
     WIKI_AGENT_BATCH_SIZE,
+    WIKI_AGENT_MODEL,
     WIKI_DOC_TYPE_PREFIX,
     WIKI_INDEX_DOC_TYPE,
     CompileTrigger,
@@ -63,6 +64,7 @@ from kb.synthesis.agent_tools import (
     UpdatePageArgs,
 )
 from kb.synthesis.directed_phrases import persist_directed_vectors
+from kb.synthesis.index_renderer import _INDEX_SYSTEM_PROMPT
 from kb.synthesis.page_edits import EditError, PageEdit, apply_edits
 from kb.synthesis.wiki_links import extract_links, persist_links_for_page
 
@@ -1091,15 +1093,31 @@ def default_batch_size() -> int:
 
 
 def _index_signature(rows: list[dict[str, Any]]) -> str:
-    """A stable fingerprint of everything the index render reads.
+    """A stable fingerprint of everything that decides what the index says.
 
     Sorted so dict/row ordering cannot change it, and covering title and
     summary alongside the body hash because the prompt carries all three -- a
     renamed page must re-render even though its body never moved.
+
+    THE PROMPT AND THE MODEL ARE PART OF THE INPUT. The first version of this
+    hashed the pages alone, which quietly broke the gate's own escape hatch: a
+    prompt change moved no page, so the signature did not move, so the gate
+    skipped the render forever and the change never reached the front page.
+    That shipped -- the fix asking the model for resolvable `[[type:slug]]`
+    links could not take effect, and the only symptom was a front page that
+    stayed subtly wrong with every run reporting a clean skip.
+
+    Hashing the prompt TEXT rather than a hand-maintained version constant is
+    deliberate: a constant is a second thing to remember, and the failure mode
+    of forgetting it is exactly the silent one above. Edit the prompt and the
+    next render happens, with no ceremony.
     """
     import hashlib
 
-    parts = []
+    parts = [
+        f"__prompt__|{hashlib.sha256(_INDEX_SYSTEM_PROMPT.encode('utf-8')).hexdigest()}",
+        f"__model__|{WIKI_AGENT_MODEL}",
+    ]
     for row in sorted(rows, key=lambda r: str(r.get("doc_id"))):
         meta = row.get("metadata") or {}
         if not isinstance(meta, dict):
