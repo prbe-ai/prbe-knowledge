@@ -84,7 +84,7 @@ class TestCreatePageArgsValidators:
             wiki_type="repo",
             slug=slug,
             title=title,
-            body_markdown="# body",
+            body_markdown="b",
             summary=summary,
             commit_message="msg",
         )
@@ -127,7 +127,7 @@ class TestUpdatePageArgsValidators:
         args = UpdatePageArgs(
             wiki_type="repo",
             slug="prbe-backend",
-            body_markdown="# body",
+            edits=[{"op": "replace", "find": "a", "text": "b"}],
             summary="Repo: prbe-backend: Updated blurb.",
             commit_message="msg",
         )
@@ -138,7 +138,7 @@ class TestUpdatePageArgsValidators:
         args = UpdatePageArgs(
             wiki_type="repo",
             slug="prbe-ai/kb",
-            body_markdown="# body",
+            edits=[{"op": "replace", "find": "a", "text": "b"}],
             summary="Edits.",
             commit_message="msg",
         )

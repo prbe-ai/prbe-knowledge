@@ -30,7 +30,7 @@ Tools (BOOKKEEPING):
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -192,8 +192,20 @@ GET_EVENT_BODY_TOOL: dict[str, Any] = {
 UPDATE_PAGE_TOOL: dict[str, Any] = {
     "name": "update_page",
     "description": (
-        "Stage an update to an existing wiki page. Last-write-wins per "
-        "slug; applied_queue_ids accumulate (union) across re-stages. "
+        "Stage SURGICAL EDITS to an existing wiki page. You do not send the "
+        "page body -- you send anchored changes to it, and everything you do "
+        "not mention is left exactly as it is.\n"
+        "Each edit's `find` must be copied VERBATIM from the current body "
+        "(call read_page first) and must match EXACTLY ONCE. If it matches "
+        "nothing the edit is refused; if it matches twice, extend it with "
+        "surrounding text until it is unique. Edits apply in order, and an "
+        "edit may anchor on text an earlier one inserted. If ANY edit fails, "
+        "none of them are applied and the page is untouched.\n"
+        "  replace       — swap `find` for `text`\n"
+        "  append_after  — insert `text` immediately after `find`\n"
+        "  delete        — remove `find` (send no `text`)\n"
+        "Re-staging the same slug applies the new edits on top of the "
+        "already-staged body; applied_queue_ids accumulate (union). "
         "Committed atomically at done()."
     ),
     "parameters": {
@@ -201,7 +213,38 @@ UPDATE_PAGE_TOOL: dict[str, Any] = {
         "properties": {
             "wiki_type": _WIKI_TYPE_SCHEMA,
             "slug": {"type": "string"},
-            "body_markdown": {"type": "string"},
+            "edits": {
+                "type": "array",
+                "minItems": 1,
+                "description": (
+                    "The changes to make, applied in order. Keep each anchor "
+                    "as short as it can be while still unique."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "op": {
+                            "type": "string",
+                            "enum": ["replace", "append_after", "delete"],
+                        },
+                        "find": {
+                            "type": "string",
+                            "description": (
+                                "Text copied verbatim from the current body. "
+                                "Must appear exactly once."
+                            ),
+                        },
+                        "text": {
+                            "type": "string",
+                            "description": (
+                                "The new text. Required by replace and "
+                                "append_after; omit it for delete."
+                            ),
+                        },
+                    },
+                    "required": ["op", "find"],
+                },
+            },
             "summary": {
                 "type": "string",
                 "description": (
@@ -223,7 +266,7 @@ UPDATE_PAGE_TOOL: dict[str, Any] = {
         "required": [
             "wiki_type",
             "slug",
-            "body_markdown",
+            "edits",
             "summary",
             "commit_message",
             "applied_queue_ids",
@@ -340,10 +383,25 @@ class GetEventBodyArgs(BaseModel):
     page: int = Field(default=1, ge=1)
 
 
+class PageEditArgs(BaseModel):
+    """One anchored edit. See kb/synthesis/page_edits for why the agent sends
+    these instead of a whole page body."""
+
+    op: Literal["replace", "append_after", "delete"]
+    #: Text copied VERBATIM from the current body. Must match exactly once.
+    find: str = Field(min_length=1)
+    #: The new text. Required by replace and append_after, refused by delete.
+    text: str | None = None
+
+
 class UpdatePageArgs(BaseModel):
     wiki_type: AgentWikiType
     slug: str = Field(min_length=1, max_length=64)
-    body_markdown: str
+    #: SURGICAL EDITS, not a new body. A model asked to reproduce the text it is
+    #: not changing drifts on some of it every pass, and the page feeds its own
+    #: output back in, so the drift compounds invisibly -- measured at 8-13% of
+    #: retired sentences dropped outright before this changed.
+    edits: list[PageEditArgs] = Field(min_length=1)
     summary: str = Field(min_length=1, max_length=240)
     commit_message: str = Field(min_length=1, max_length=240)
     applied_queue_ids: list[int] = Field(default_factory=list)

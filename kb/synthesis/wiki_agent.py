@@ -63,6 +63,7 @@ from kb.synthesis.agent_tools import (
     UpdatePageArgs,
 )
 from kb.synthesis.directed_phrases import persist_directed_vectors
+from kb.synthesis.page_edits import EditError, PageEdit, apply_edits
 from kb.synthesis.wiki_links import extract_links, persist_links_for_page
 
 log = get_logger(__name__)
@@ -320,18 +321,49 @@ class WikiAgentRuntime:
         }
 
     async def _tool_update_page(self, args: UpdatePageArgs) -> dict[str, Any]:
+        """Apply anchored edits to a page. The agent never sends a whole body.
+
+        THE BASE IS WHAT THE AGENT LAST SAW. A page already staged this drain
+        edits on top of the staged text, not the live row -- otherwise a second
+        edit to the same page would silently discard the first. An unstaged page
+        edits the live body.
+
+        Applying HERE rather than at persist time is what lets a failed anchor
+        reach the model: `apply_edits` raises, the harness turns that into a
+        tool_validation_error result, and the model gets to re-anchor on the
+        next turn. Deferring it to the commit would surface the same failure
+        after the conversation had ended, where nothing can act on it.
+        """
         key = (args.wiki_type, args.slug)
-        # Last-write-wins on body / summary / commit_message; union-merge
-        # applied_queue_ids so a re-stage doesn't drop earlier events.
         if key in self._pending_updates:
             existing = self._pending_updates[key]
+            base = existing.body_markdown
             merged_qids = sorted(set(existing.applied_queue_ids) | set(args.applied_queue_ids))
         else:
+            page = await persistence.fetch_existing_page(
+                self.customer_id, args.wiki_type, args.slug
+            )
+            if page is None:
+                raise ToolValidationError(
+                    f"no wiki page {args.wiki_type}/{args.slug}; "
+                    "use create_page for a new one"
+                )
+            base = page.get("body") or ""
             merged_qids = sorted(set(args.applied_queue_ids))
+
+        try:
+            body = apply_edits(
+                base,
+                [PageEdit(op=e.op, find=e.find, text=e.text) for e in args.edits],
+            )
+        except EditError as exc:
+            # The model's mistake, and it can fix it: say which edit and why.
+            raise ToolValidationError(str(exc)) from exc
+
         self._pending_updates[key] = _StagedUpdate(
             wiki_type=args.wiki_type,
             slug=args.slug,
-            body_markdown=args.body_markdown,
+            body_markdown=body,
             summary=args.summary,
             commit_message=args.commit_message,
             applied_queue_ids=merged_qids,
@@ -345,6 +377,11 @@ class WikiAgentRuntime:
         return {
             "status": "staged",
             "slug": args.slug,
+            "edits_applied": len(args.edits),
+            # The model asked for a change, not a rewrite. Reporting the size
+            # delta lets it notice an anchor that matched more than it meant.
+            "chars_before": len(base),
+            "chars_after": len(body),
             "pages_pending": self.pending_update_count,
             "events_applied_total": len(self._applied_queue_ids),
         }

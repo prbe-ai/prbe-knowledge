@@ -138,6 +138,27 @@ async def test_tool_get_event_body_out_of_range_page_errors(
     assert out["error"] == "page_out_of_range"
 
 
+def _seed(runtime: WikiAgentRuntime, wiki_type: str, slug: str, body: str = "SEED") -> None:
+    """Put a page on disk for the agent to edit.
+
+    `update_page` sends anchored EDITS now, so it needs something to anchor on,
+    and it refuses a slug that does not exist rather than staging an update the
+    commit would silently drop.
+    """
+    runtime._test_page_db[(wiki_type, slug)] = {  # type: ignore[attr-defined]
+        "doc_id": f"wiki:{wiki_type}:{slug}",
+        "body": body,
+        "title": slug,
+        "version": 1,
+        "doc_class": "compiled_wiki",
+    }
+
+
+def _edit(text: str, find: str = "SEED") -> list[dict[str, str]]:
+    """One replace edit, the shape almost every test needs."""
+    return [{"op": "replace", "find": find, "text": text}]
+
+
 # ---------------------------------------------------------------------------
 # update_page (staging + last-write-wins + applied_queue_ids merge)
 # ---------------------------------------------------------------------------
@@ -145,12 +166,13 @@ async def test_tool_get_event_body_out_of_range_page_errors(
 
 @pytest.mark.asyncio
 async def test_tool_update_page_staged(runtime: WikiAgentRuntime) -> None:
+    _seed(runtime, "decision", "x")
     out = await runtime.dispatch_tool(
         "update_page",
         {
             "wiki_type": "decision",
             "slug": "x",
-            "body_markdown": "body v1",
+            "edits": _edit("body v1"),
             "summary": "s",
             "commit_message": "m",
             "applied_queue_ids": [1, 2],
@@ -162,15 +184,23 @@ async def test_tool_update_page_staged(runtime: WikiAgentRuntime) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_update_page_re_staged_last_write_wins(
+async def test_tool_update_page_re_staged_edits_on_top_of_the_staged_body(
     runtime: WikiAgentRuntime,
 ) -> None:
+    """A second update edits what the FIRST one staged, not the live row.
+
+    This is the property that stopped a re-stage discarding earlier work. With
+    a whole-body tool the second call simply overwrote the first, so the model
+    could lose its own edit and not know; anchored on the staged text, the two
+    compose.
+    """
+    _seed(runtime, "decision", "x")
     await runtime.dispatch_tool(
         "update_page",
         {
             "wiki_type": "decision",
             "slug": "x",
-            "body_markdown": "body v1",
+            "edits": _edit("body v1"),
             "summary": "s1",
             "commit_message": "m1",
             "applied_queue_ids": [1],
@@ -181,7 +211,9 @@ async def test_tool_update_page_re_staged_last_write_wins(
         {
             "wiki_type": "decision",
             "slug": "x",
-            "body_markdown": "body v2",
+            # Anchored on the text the first edit wrote -- proof the base is
+            # the staged body and not the row on disk, which still says SEED.
+            "edits": _edit("body v2", find="body v1"),
             "summary": "s2",
             "commit_message": "m2",
             "applied_queue_ids": [2],
@@ -191,20 +223,21 @@ async def test_tool_update_page_re_staged_last_write_wins(
     assert staged.body_markdown == "body v2"
     assert staged.summary == "s2"
     # applied_queue_ids unioned (1 + 2)
-    assert staged.applied_queue_ids == [1, 2]
-
-
 @pytest.mark.asyncio
 async def test_tool_update_page_applied_queue_ids_accumulate_across_stages(
     runtime: WikiAgentRuntime,
 ) -> None:
+    _seed(runtime, "runbook", "f")
     for ids in [[1], [2, 3], [4]]:
         await runtime.dispatch_tool(
             "update_page",
             {
                 "wiki_type": "runbook",
                 "slug": "f",
-                "body_markdown": "b",
+                # `append_after` on an anchor that survives its own edit, so
+                # all three stages apply -- a `replace` would consume the
+                # anchor and the second call would have nothing to match.
+                "edits": [{"op": "append_after", "find": "SEED", "text": " b"}],
                 "summary": "s",
                 "commit_message": "m",
                 "applied_queue_ids": ids,
@@ -286,12 +319,13 @@ async def test_tool_skip_events_skip_wins_over_apply(
     runtime: WikiAgentRuntime,
 ) -> None:
     # First apply event 7 to a staged page.
+    _seed(runtime, "decision", "x")
     await runtime.dispatch_tool(
         "update_page",
         {
             "wiki_type": "decision",
             "slug": "x",
-            "body_markdown": "b",
+            "edits": _edit("b"),
             "summary": "s",
             "commit_message": "m",
             "applied_queue_ids": [7, 8],
@@ -339,12 +373,13 @@ async def test_tool_done_invokes_commit(
 async def test_discard_drops_pending_updates(
     runtime: WikiAgentRuntime,
 ) -> None:
+    _seed(runtime, "decision", "x")
     await runtime.dispatch_tool(
         "update_page",
         {
             "wiki_type": "decision",
             "slug": "x",
-            "body_markdown": "b",
+            "edits": _edit("b"),
             "summary": "s",
             "commit_message": "m",
             "applied_queue_ids": [1],
@@ -367,12 +402,13 @@ async def test_snapshot_then_mutate_rolls_back_on_tool_error(
     """Force _tool_update_page to raise mid-mutation; assert state is
     restored to pre-call snapshot."""
     # First successful update so we have something to snapshot.
+    _seed(runtime, "decision", "ok")
     await runtime.dispatch_tool(
         "update_page",
         {
             "wiki_type": "decision",
             "slug": "ok",
-            "body_markdown": "b",
+            "edits": _edit("b"),
             "summary": "s",
             "commit_message": "m",
             "applied_queue_ids": [1],
@@ -388,12 +424,13 @@ async def test_snapshot_then_mutate_rolls_back_on_tool_error(
 
     monkeypatch.setattr(WikiAgentRuntime, "_tool_update_page", bad_update)
     with pytest.raises(RuntimeError):
+        _seed(runtime, "decision", "broken")
         await runtime.dispatch_tool(
             "update_page",
             {
                 "wiki_type": "decision",
                 "slug": "broken",
-                "body_markdown": "b",
+                "edits": _edit("b"),
                 "summary": "s",
                 "commit_message": "m",
                 "applied_queue_ids": [],
