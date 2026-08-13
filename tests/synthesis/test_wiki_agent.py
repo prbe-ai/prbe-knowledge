@@ -59,9 +59,19 @@ def runtime(monkeypatch) -> WikiAgentRuntime:
         "kb.synthesis.persistence.fetch_triaged_manifest",
         stub_fetch_triaged_manifest,
     )
+    async def stub_fetch_subpage_parents(customer_id):
+        # No live subpage edges by default. Tests that need a live parent (to
+        # exercise a cycle or a depth breach reaching through pages this drain
+        # did not touch) override this.
+        return {}
+
     monkeypatch.setattr(
         "kb.synthesis.persistence.fetch_wiki_index",
         stub_fetch_wiki_index,
+    )
+    monkeypatch.setattr(
+        "kb.synthesis.persistence.fetch_subpage_parents",
+        stub_fetch_subpage_parents,
     )
 
     # Build the runtime without importing the Normalizer / store / etc.

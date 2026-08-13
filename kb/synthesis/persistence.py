@@ -806,6 +806,36 @@ async def set_page_pipeline_updates(
 # ---------------------------------------------------------------------------
 
 
+async def fetch_subpage_parents(customer_id: str) -> dict[tuple[str, str], tuple[str, str]]:
+    """Live `subpage` edges as child -> parent, for the staged-set preflight.
+
+    The preflight has to judge a batch against the tree that will EXIST, not
+    the fragment of it the batch happens to contain. Without this, a drain that
+    reparents one page could close a cycle through two pages it never touched
+    and nothing would notice.
+
+    Child -> parent rather than the other direction because every rule that
+    reads it walks upward: at most one parent per child makes the ascent a path
+    instead of a search. A child with two live parents is already a violated
+    invariant; `MIN(src_wiki_type)` picks one deterministically so the walk
+    terminates, and the multi-parent rule reports it from the staged side.
+    """
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT dst_wiki_type, dst_slug,
+                   MIN(src_wiki_type) AS src_wiki_type,
+                   MIN(src_slug)      AS src_slug
+            FROM wiki_links
+            WHERE customer_id = $1 AND link_type = $2
+            GROUP BY dst_wiki_type, dst_slug
+            """,
+            customer_id,
+            "subpage",
+        )
+    return {(r["dst_wiki_type"], r["dst_slug"]): (r["src_wiki_type"], r["src_slug"]) for r in rows}
+
+
 async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:
     """Return live COMPILED_WIKI / MANUAL_ENTRY pages for the agent's index.
 

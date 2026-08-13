@@ -380,6 +380,23 @@ class WikiAgentRuntime:
             # The model's mistake, and it can fix it: say which edit and why.
             raise ToolValidationError(str(exc)) from exc
 
+        over = staged_graph.page_over_cap(
+            staged_graph.StagedPage(
+                wiki_type=args.wiki_type, slug=args.slug, body=body, is_new=False
+            )
+        )
+        if over is not None:
+            # HERE, not only at preflight, for the reason this method already
+            # gives about anchors: a refusal at commit time reaches the model
+            # after the conversation has ended, where nothing can act on it.
+            # Told now, it can split the page and carry on in the same drain.
+            return {
+                "error": "page_over_cap",
+                "wiki_type": args.wiki_type,
+                "slug": args.slug,
+                "hint": over.detail,
+            }
+
         if key in self._pending_creates:
             # Edits to a page created THIS drain fold back into the create. It
             # has never been published, so it is still a create; staging it in
@@ -439,6 +456,22 @@ class WikiAgentRuntime:
                     "slug": args.slug,
                     "hint": "call update_page to modify; create_page rejects existing slugs",
                 }
+
+        over = staged_graph.page_over_cap(
+            staged_graph.StagedPage(
+                wiki_type=args.wiki_type, slug=args.slug, body=args.body_markdown, is_new=True
+            )
+        )
+        if over is not None:
+            # The create path never touches `apply_edits`, so without this the
+            # cap would only be enforced at preflight -- which is to say, on a
+            # brand-new page, too late for the model to do anything about.
+            return {
+                "error": "page_over_cap",
+                "wiki_type": args.wiki_type,
+                "slug": args.slug,
+                "hint": over.detail,
+            }
 
         if key in self._pending_creates:
             existing_c = self._pending_creates[key]
@@ -569,7 +602,13 @@ class WikiAgentRuntime:
         it rather than inventing a quieter one.
         """
         staged = self._staged_pages()
-        violations = staged_graph.validate_batch(staged)
+        # Read the live subpage edges so depth and cycles are checked against
+        # the tree that will exist rather than the slice of it in this batch.
+        # One query per drain, at the point where a wrong answer is expensive.
+        violations = staged_graph.validate_batch(
+            staged,
+            live_parents=await persistence.fetch_subpage_parents(self.customer_id),
+        )
         if violations:
             log.warning(
                 "agent.preflight_refused",
