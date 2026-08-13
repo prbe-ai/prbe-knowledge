@@ -81,6 +81,11 @@ class _StagedUpdate:
     summary: str
     commit_message: str
     applied_queue_ids: list[int] = field(default_factory=list)
+    #: UTF-8 size of the body this edit replaced. Threaded to the preflight so
+    #: it grandfathers a shrinking edit on the same rule the tool used -- a tool
+    #: that accepts what preflight refuses halts the drain after the
+    #: conversation has ended, where nothing can act on it.
+    prev_size_bytes: int | None = None
 
 
 @dataclass(slots=True)
@@ -382,7 +387,15 @@ class WikiAgentRuntime:
 
         over = staged_graph.page_over_cap(
             staged_graph.StagedPage(
-                wiki_type=args.wiki_type, slug=args.slug, body=body, is_new=False
+                wiki_type=args.wiki_type,
+                slug=args.slug,
+                body=body,
+                is_new=False,
+                # What the edit is replacing, so `page_over_cap` can grandfather
+                # a shrinking edit to an already-over-cap page. Passing it here
+                # rather than deciding here keeps the tool and the preflight on
+                # one rule.
+                prev_size_bytes=len(base.encode("utf-8")),
             )
         )
         if over is not None:
@@ -422,6 +435,7 @@ class WikiAgentRuntime:
                 summary=args.summary,
                 commit_message=args.commit_message,
                 applied_queue_ids=merged_qids,
+                prev_size_bytes=len(base.encode("utf-8")),
             )
         # Track the union for excluded_queue_ids on the next next_events.
         # Skip wins over apply per spec, so don't add ids that are
@@ -577,7 +591,11 @@ class WikiAgentRuntime:
             for c in self._pending_creates.values()
         ] + [
             staged_graph.StagedPage(
-                wiki_type=u.wiki_type, slug=u.slug, body=u.body_markdown, is_new=False
+                wiki_type=u.wiki_type,
+                slug=u.slug,
+                body=u.body_markdown,
+                is_new=False,
+                prev_size_bytes=u.prev_size_bytes,
             )
             for u in self._pending_updates.values()
         ]
@@ -605,9 +623,19 @@ class WikiAgentRuntime:
         # Read the live subpage edges so depth and cycles are checked against
         # the tree that will exist rather than the slice of it in this batch.
         # One query per drain, at the point where a wrong answer is expensive.
+        # Live pages as well as live edges. Existence has to be answered by the
+        # PAGE set: `live_parents` only holds pages that have a parent, so using
+        # it as the existence check falsely orphaned every published top-level
+        # page -- including the ordinary case of adopting one as a subpage.
+        index = await self.wiki_index()
         violations = staged_graph.validate_batch(
             staged,
             live_parents=await persistence.fetch_subpage_parents(self.customer_id),
+            live_pages=[
+                (row["wiki_type"], row["slug"])
+                for row in index
+                if row.get("wiki_type") and row.get("slug")
+            ],
         )
         if violations:
             log.warning(

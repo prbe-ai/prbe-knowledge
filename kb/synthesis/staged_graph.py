@@ -81,6 +81,12 @@ MAX_DEPTH = 2
 
 #: The front page is generated whole from every other page and has no business
 #: being split. It is the one page the cap must not apply to.
+#:
+#: Unreachable from the agent path in practice: `index` is excluded from
+#: `AgentWikiType`, and the front page is regenerated outside the staged batch
+#: entirely. Kept because `page_over_cap` is a public helper anything may call
+#: on any page, and the day something does call it on the index page, silently
+#: refusing the one page that is SUPPOSED to be long would be a bad surprise.
 CAP_EXEMPT_TYPES = frozenset({"index"})
 
 
@@ -97,6 +103,10 @@ class StagedPage:
     slug: str
     body: str
     is_new: bool
+    #: Size of the body this page is REPLACING, in UTF-8 bytes. None for a
+    #: create. Carried so the cap can grandfather an edit that shrinks an
+    #: already-over-cap page -- see `page_over_cap`.
+    prev_size_bytes: int | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -116,11 +126,15 @@ class StagedPage:
         Order matters for the fan-out message: naming the seventh child is more
         useful than saying "too many".
         """
-        return [
-            (link.dst_wiki_type, link.dst_slug)
-            for link in extract_links_from_markdown(self.body)
-            if link.link_type == SUBPAGE
-        ]
+        seen: dict[tuple[str, str], None] = {}
+        for link in extract_links_from_markdown(self.body):
+            if link.link_type == SUBPAGE:
+                # DEDUPED. `extract_links_from_markdown` does not (only
+                # `extract_links` does), so a page that lists its children in a
+                # table of contents and again inline counted each one twice and
+                # tripped fan-out at four real children.
+                seen.setdefault((link.dst_wiki_type, link.dst_slug))
+        return list(seen)
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +161,26 @@ def page_over_cap(page: StagedPage) -> Violation | None:
     lets a failed anchor reach the model"). Checked at the tool, the model is
     told while it can still split the page. This copy is the backstop for
     everything that does not route through a tool.
+
+    GRANDFATHERS A SHRINKING EDIT. An edit that makes an already-over-cap page
+    strictly smaller passes even though the result is still over. Without it
+    the cap freezes legacy pages rather than fixing them: three pages are over
+    it the day this ships and no single edit takes any of them under, so every
+    edit would be refused until one call did the whole split. Faced with a wall
+    of refusals the model skips those events -- leaving the drain green while
+    the page silently stops updating, which is the failure shape this lane
+    keeps producing.
+
+    Strictly smaller, not merely not-larger: equal size would allow indefinite
+    rewriting at the current size, which is the freeze again with extra steps.
+
+    The rule lives HERE rather than in the tool so the tool and the preflight
+    cannot disagree about which edits are allowed -- a tool that accepts what
+    preflight then refuses halts the drain after the conversation has ended.
     """
     if page.wiki_type in CAP_EXEMPT_TYPES or page.size_bytes <= PAGE_CAP_BYTES:
+        return None
+    if page.prev_size_bytes is not None and page.size_bytes < page.prev_size_bytes:
         return None
     return Violation(
         rule="page_over_cap",
@@ -167,6 +199,7 @@ def validate_batch(
     pages: Iterable[StagedPage],
     *,
     live_parents: Mapping[tuple[str, str], tuple[str, str]] | None = None,
+    live_pages: Iterable[tuple[str, str]] | None = None,
 ) -> list[Violation]:
     """Every rule that needs to see the whole staged set. Pure, no I/O.
 
@@ -213,27 +246,32 @@ def validate_batch(
         if over is not None:
             violations.append(over)
 
-    violations.extend(_graph_violations(seen, live_parents or {}))
+    violations.extend(_graph_violations(seen, live_parents or {}, frozenset(live_pages or ())))
     return violations
 
 
 def _graph_violations(
     staged: Mapping[tuple[str, str], StagedPage],
     live_parents: Mapping[tuple[str, str], tuple[str, str]],
+    live_pages: frozenset[tuple[str, str]],
 ) -> list[Violation]:
     """Ownership, fan-out, depth, cycles, orphans, and the split floor."""
     violations: list[Violation] = []
 
-    # parent -> children, and the inverse. Built from the staged bodies, then
-    # overlaid on the live graph so a batch is judged against the tree that will
-    # exist, not the fragment it contains.
-    parents: dict[tuple[str, str], list[tuple[str, str]]] = dict(
-        {child: [parent] for child, parent in live_parents.items()}
-    )
-    children: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    # A RE-STAGED PAGE REPLACES ITS EDGES ENTIRELY. The body is the edge set,
+    # so an edge the new body does not carry no longer exists -- dropping live
+    # edges whose SOURCE is in this batch is what makes that true. Without it,
+    # reparenting inside one drain was a hard error: re-stage the old parent
+    # without the link, stage the new one with it, and the child had two
+    # claimants (or, swapping the direction, a cycle). Both refused the batch
+    # and DLQ'd the drain, for the operation `fetch_subpage_parents` exists to
+    # support.
+    parents: dict[tuple[str, str], list[tuple[str, str]]] = {
+        child: [parent] for child, parent in live_parents.items() if parent not in staged
+    }
+
     for key, page in staged.items():
         targets = page.subpage_targets()
-        children[key] = targets
         if len(targets) > MAX_CHILDREN:
             violations.append(
                 Violation(
@@ -249,11 +287,6 @@ def _graph_violations(
                 )
             )
         for target in targets:
-            # A page re-staged this drain replaces its live parent claim rather
-            # than adding to it: the body IS the edge set, so an edge the new
-            # body does not carry no longer exists.
-            if target in live_parents and live_parents[target] == key:
-                continue
             parents.setdefault(target, [])
             if key not in parents[target]:
                 parents[target].append(key)
@@ -273,7 +306,15 @@ def _graph_violations(
                     ),
                 )
             )
-        if child not in staged and child not in live_parents:
+        # EXISTENCE IS THE LIVE PAGE SET, not the parent map. `live_parents`
+        # only holds pages that HAVE a parent, so using it here falsely
+        # orphaned every published top-level page -- including the common case
+        # of adopting an existing page as a subpage, and including any page
+        # whose link rows were lost (link persistence swallows its errors, and
+        # a wiki wipe deletes links while keeping manual entries). That last
+        # one wedged permanently: the batch halts, never publishes, so the
+        # links are never rewritten.
+        if child not in staged and child not in live_pages:
             violations.append(
                 Violation(
                     rule="orphan_subpage_target",
@@ -288,7 +329,7 @@ def _graph_violations(
                 )
             )
 
-    violations.extend(_depth_and_cycle_violations(staged, parents))
+    violations.extend(_depth_and_cycle_violations(staged, parents, live_pages))
     violations.extend(_split_floor_violations(staged, parents))
     return violations
 
@@ -296,6 +337,7 @@ def _graph_violations(
 def _depth_and_cycle_violations(
     staged: Mapping[tuple[str, str], StagedPage],
     parents: Mapping[tuple[str, str], list[tuple[str, str]]],
+    live_pages: frozenset[tuple[str, str]],
 ) -> list[Violation]:
     """Walk each staged page upward. A cycle is a repeat; depth is the count.
 
@@ -306,7 +348,17 @@ def _depth_and_cycle_violations(
     following those edges would loop forever.
     """
     violations: list[Violation] = []
-    for key, page in sorted(staged.items()):
+    # Every page with a parent, not only the staged ones. Inserting a NEW level
+    # above an existing subtree pushes untouched descendants past the limit, and
+    # walking only what the batch touched would miss it -- the batch's own pages
+    # are all still shallow. `parents` already holds live edges, so the extra
+    # walks are free.
+    walkable = {**{k: staged[k].ref for k in staged}}
+    for child in parents:
+        walkable.setdefault(child, f"{child[0]}/{child[1]}")
+    for key, ref in sorted(walkable.items()):
+        if key not in staged and key not in live_pages:
+            continue  # an orphan target; the orphan rule reports it
         seen: list[tuple[str, str]] = [key]
         cursor = key
         while True:
@@ -318,7 +370,7 @@ def _depth_and_cycle_violations(
                 violations.append(
                     Violation(
                         rule="subpage_cycle",
-                        ref=page.ref,
+                        ref=ref,
                         detail=(
                             "subpage links form a cycle: "
                             + " -> ".join(f"{t}/{s}" for t, s in [*seen, cursor])
@@ -333,9 +385,9 @@ def _depth_and_cycle_violations(
                 violations.append(
                     Violation(
                         rule="subpage_depth_exceeded",
-                        ref=page.ref,
+                        ref=ref,
                         detail=(
-                            f"{page.ref} sits {len(seen) - 1} levels deep, past {MAX_DEPTH} "
+                            f"{ref} sits {len(seen) - 1} levels deep, past {MAX_DEPTH} "
                             "(" + " -> ".join(f"{t}/{s}" for t, s in reversed(seen)) + "). "
                             "Both discovery surfaces are flat, so depth past this exists only "
                             "in the graph and no reader ever sees it. A topic this nested "
@@ -358,6 +410,11 @@ def _split_floor_violations(
     deliberately does NOT apply to pages generally -- `person/shi_dong` is 143
     bytes and correct -- nor to a new page created on its own, which is a new
     subject rather than a fragment of an old one.
+
+    BOTH SIDES, not just the child. The prompt tells the agent both sides must
+    clear the floor and only the child was checked, so a parent that split
+    everything out and kept a stub passed -- the fragmentation the floor exists
+    to stop, arriving from the other direction.
     """
     violations: list[Violation] = []
     for key, page in sorted(staged.items()):
@@ -378,6 +435,31 @@ def _split_floor_violations(
                     "makes splitting the cheapest way to comply, so without a floor pages "
                     "fragment into pieces too small to be worth opening. Keep this section in "
                     "its parent, or move enough with it to stand on its own."
+                ),
+            )
+        )
+
+    for key, page in sorted(staged.items()):
+        # NEW children only. A parent merely linking children it already had is
+        # not a split, and firing there would refuse any batch that touches a
+        # small parent -- including a reparent, which stages no new page at all.
+        kids = [
+            c
+            for c, cl in parents.items()
+            if cl and cl[0] == key and c in staged and staged[c].is_new
+        ]
+        if not kids or page.size_bytes >= SPLIT_FLOOR_BYTES:
+            continue
+        violations.append(
+            Violation(
+                rule="split_below_floor",
+                ref=page.ref,
+                detail=(
+                    f"{page.ref} split {len(kids)} page(s) out and kept only "
+                    f"{page.size_bytes} bytes, under the {SPLIT_FLOOR_BYTES}-byte floor. A "
+                    "parent is the map AND enough context to orient someone who lands on it; "
+                    "a stub of links is a table of contents, which the page browser already "
+                    "provides. Keep more with the parent, or split fewer sections out."
                 ),
             )
         )

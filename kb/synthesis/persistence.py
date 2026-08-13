@@ -817,18 +817,34 @@ async def fetch_subpage_parents(customer_id: str) -> dict[tuple[str, str], tuple
     Child -> parent rather than the other direction because every rule that
     reads it walks upward: at most one parent per child makes the ascent a path
     instead of a search. A child with two live parents is already a violated
-    invariant; `MIN(src_wiki_type)` picks one deterministically so the walk
+    invariant; `DISTINCT ON` picks one deterministically so the walk
     terminates, and the multi-parent rule reports it from the staged side.
+
+    `DISTINCT ON` and not `MIN()` per column: `MIN(src_wiki_type)` and
+    `MIN(src_slug)` are independent aggregates, so two live parents `repo/aaa`
+    and `feature/zzz` would compose `feature/aaa` -- a page that does not
+    exist. That fabricated key then drove the depth walk and the orphan check.
+
+    JOINed against live documents because page deletion is a SOFT delete on
+    `documents` and does not remove link rows. Without the join a deleted
+    parent keeps claiming its child forever, and a drain that legitimately
+    reparents that child hits a multi-parent violation naming a page nobody
+    can open.
     """
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(
             """
-            SELECT dst_wiki_type, dst_slug,
-                   MIN(src_wiki_type) AS src_wiki_type,
-                   MIN(src_slug)      AS src_slug
-            FROM wiki_links
-            WHERE customer_id = $1 AND link_type = $2
-            GROUP BY dst_wiki_type, dst_slug
+            SELECT DISTINCT ON (l.dst_wiki_type, l.dst_slug)
+                   l.dst_wiki_type, l.dst_slug, l.src_wiki_type, l.src_slug
+            FROM wiki_links l
+            JOIN documents d
+              ON d.customer_id = l.customer_id
+             AND d.source_id   = l.src_wiki_type || ':' || l.src_slug
+             AND d.source_system = 'wiki'
+             AND d.valid_to IS NULL
+             AND d.deleted_at IS NULL
+            WHERE l.customer_id = $1 AND l.link_type = $2
+            ORDER BY l.dst_wiki_type, l.dst_slug, l.src_wiki_type, l.src_slug
             """,
             customer_id,
             "subpage",
