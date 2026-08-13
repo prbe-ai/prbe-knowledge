@@ -116,9 +116,9 @@ class _RepoEdge:
 
 _INDEX_SYSTEM_PROMPT = (
     "You are writing the front page of an engineering wiki. You have the "
-    "wiki's pages, each with its type, title, one-line summary, and the "
-    "opening of its actual text. Write a HIGH-LEVEL OVERVIEW of what this "
-    "company is and what it is working on.\n\n"
+    "wiki's pages, each with its type, title, one-line summary, and its full "
+    "text. A page marked `[...truncated]` is the rare exception. Write a "
+    "HIGH-LEVEL OVERVIEW of what this company is and what it is working on.\n\n"
     "**DO NOT LIST THE PAGES.** This is the instruction most likely to be "
     "ignored, so read it twice. No 'Pages' section, no directory, no "
     "grouped bullet list of every page with its summary after it. A reader "
