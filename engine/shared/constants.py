@@ -1599,9 +1599,32 @@ WIKI_TRIAGE_SCORE_THRESHOLD = 7.0
 # Per-row attempt cap before a queue row is parked in 'failed'.
 WIKI_SYNTHESIS_MAX_ATTEMPTS = 3
 
-# Defensive periodic wake interval. The cron also wakes on every NOTIFY; this
-# is a safety net if a notify is missed during a connection drop.
-WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS = 1800  # 30 min
+# NO PERIODIC WAKE. The wiki drains on NOTIFY only.
+#
+# This was 1800 (30 min), described as "a safety net if a notify is missed
+# during a connection drop". It was not a safety net -- it was the scheduler,
+# and it silently replaced the design. Only TWO things ever notify the wiki
+# channels: the nightly cron (kb/synthesis/nightly_trigger) and the manual
+# "generate now" route. Ingestion does not. So the timer was never catching a
+# missed notify from a busy pipeline; it was finding rows ingestion had left
+# pending and draining them on its own schedule.
+#
+# The cost of that, measured on 2026-08-12 before this changed: 32 synthesis
+# runs and 25 timer-driven triage runs in 24 hours, against ZERO nightly ones,
+# rewriting 16 pages 72 times. Every drain is a multi-turn Gemini Pro agent
+# loop, and the wiki is explicitly slow-moving knowledge -- see
+# WIKI_TRIAGE_SCORE_THRESHOLD above, raised to 7.0 for exactly that reason. It
+# also made `updated_at` meaningless as "when did this knowledge change" and
+# left the page histories full of rewrites of unchanged material.
+#
+# WHAT THE RISK ACTUALLY IS, stated so it can be re-decided: if a NOTIFY is
+# genuinely lost -- a connection drop at the moment the 02:00 cron fires --
+# that tenant waits until the next night. Two senders, one of them a cron at a
+# fixed time whose failure is visible in its own run history, is a small enough
+# surface that a 30-minute poll is the wrong shape of insurance. Set this to a
+# number of seconds if that judgement turns out to be wrong; the workers still
+# read it.
+WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS: float | None = None
 
 # Provider knob for the triage stage. v4 uses the wiki agent (Gemini
 # Pro) for synthesis, so the synthesis + verifier provider knobs are

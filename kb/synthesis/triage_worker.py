@@ -95,7 +95,7 @@ class TriageWorker:
         wake_event: asyncio.Event,
         *,
         anthropic_client: Any | None = None,
-        periodic_wake_seconds: float = WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
+        periodic_wake_seconds: float | None = WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS,
         notify_channel: str = WIKI_TRIAGED_CHANNEL,
         customer_concurrency: int = WIKI_SYNTHESIS_CUSTOMER_CONCURRENCY,
         batch_concurrency: int = WIKI_TRIAGE_BATCH_CONCURRENCY,
@@ -127,7 +127,14 @@ class TriageWorker:
         self._shutdown.set()
 
     async def _wait(self) -> bool:
-        """Return True if the tick was woken by NOTIFY, False on periodic timer."""
+        """Block until NOTIFY, shutdown, or the periodic timer if one is set.
+
+        Returns True when a NOTIFY woke it, which is what makes a run `wake`
+        rather than `scheduled`. `self._periodic` is None by default --
+        `asyncio.wait(timeout=None)` blocks indefinitely -- so every run is a
+        `wake` now and `scheduled` marks a timer tick, which only exists if
+        someone sets an interval back.
+        """
         shutdown_task = asyncio.create_task(self._shutdown.wait())
         wake_task = asyncio.create_task(self._wake.wait())
         try:
