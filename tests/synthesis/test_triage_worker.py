@@ -160,21 +160,36 @@ def _make_triage_client(triage_payload: dict) -> SimpleNamespace:
 
 
 @pytest.fixture(autouse=True)
-def _patch_acompletion(monkeypatch) -> None:
-    """Route every ``shared.llm_tools.acompletion`` call to the
-    LiteLLM-shaped response that wraps the current ``_TRIAGE_PAYLOAD``.
-    Reset the payload to the empty default between tests so a stale
-    payload from a prior test can't leak in.
+def _patch_triage_llm(monkeypatch) -> list[dict]:
+    """Route the triage LLM boundary to the current ``_TRIAGE_PAYLOAD``.
+
+    Reset the payload to the empty default between tests so a stale one cannot
+    leak in. Yields the recorded call list so a test can assert the boundary
+    was actually crossed -- the previous version of this fixture patched a name
+    nothing called, which succeeds silently and let these tests go live.
     """
     global _TRIAGE_PAYLOAD
     _TRIAGE_PAYLOAD = {"verdicts": {}}
 
-    async def _fake(**kwargs):
-        return _tool_use_response("record_triage", _TRIAGE_PAYLOAD)
+    # Patched at the boundary the code ACTUALLY crosses. This used to target
+    # `engine.shared.llm_tools.acompletion`, which the triage path stopped
+    # calling when the default model became Gemini
+    # (`call_triage -> provider.triage -> _gemini_call_json`).
+    # `monkeypatch.setattr` on an unused name succeeds silently, so these tests
+    # were making real network calls and failing on a missing API key.
+    #
+    # `_gemini_call_json` returns the parsed payload dict, so the fake returns
+    # the payload directly rather than a LiteLLM-shaped response envelope.
+    calls: list[dict] = []
 
-    monkeypatch.setattr("engine.shared.llm_tools.acompletion", _fake)
+    async def _fake(**kwargs):
+        calls.append(kwargs)
+        return _TRIAGE_PAYLOAD
+
+    monkeypatch.setattr("kb.synthesis.providers._gemini_call_json", _fake)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
+    return calls
 
 
 async def _read_queue_ids(customer_id: str) -> list[int]:
