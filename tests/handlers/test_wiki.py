@@ -464,7 +464,16 @@ def test_body_sha256_does_not_cover_the_title() -> None:
 def test_body_sha256_is_present_on_a_delete() -> None:
     """A delete writes an empty body, so the field is the hash of "" rather than
     absent. A consumer comparing hashes must not have to special-case a missing
-    key on the one document kind where the body is guaranteed empty."""
+    key on the one document kind where the body is guaranteed empty.
+
+    Do NOT read this as "deletions are covered". A tombstone never reaches the
+    index corpus at all -- `regenerate_wiki_index` filters
+    `deleted_at IS NULL AND valid_to IS NULL`, so a deleted page just vanishes
+    from the row set and no surviving page's hash moves. Same for a page that
+    was added. So per-page hash equality alone misses the two most common
+    reasons the front page goes stale; a gate must compare the SET of page ids
+    as well as each page's hash, alongside the title/summary caveat above.
+    """
     event = _make_event({"wiki_type": "repo", "slug": "research-os", "is_delete": True})
     doc = build_normalization_result(event).documents[0]
 

@@ -306,6 +306,27 @@ def build_normalization_result(event: WebhookEvent) -> NormalizationResult:
         # needs this, and the one reader -- the index regen gate -- already
         # SELECTs `metadata` for every wiki page, so comparing costs no extra
         # query and no index.
+        #
+        # THE KEY IS ABSENT ON EVERY PAGE WRITTEN BEFORE THIS SHIPPED, and there
+        # is no backfill. Read it with `.get()`, and treat a missing value as
+        # "compute it now", NOT as "changed":
+        #
+        #   * `.get()` returning None treated as changed marks every
+        #     never-edited page dirty forever, which inverts the saving the
+        #     field exists for -- stable pages are exactly the population a
+        #     skip-if-unchanged gate is meant to skip.
+        #   * Re-POSTing a page unchanged does NOT backfill it. The route takes
+        #     `received_at = updated_at or now()` (kb/wiki_routes.py), so an
+        #     identical body with an identical `updated_at` reproduces the same
+        #     content_hash and hits the idempotent no-op at
+        #     engine/ingest/normalizer.py:1306, which returns WITHOUT writing
+        #     metadata.
+        #
+        # Computing on read is free for the one reader that matters: since the
+        # index renderer stopped slicing bodies at fetch (#476) it already holds
+        # every page's full text, so hashing a row that lacks the key costs a
+        # sha256 over a string already in memory. The stored value is the fast
+        # path, not the only path.
         "body_sha256": body_sha256,
     }
 
