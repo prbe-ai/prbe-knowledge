@@ -32,7 +32,7 @@ from typing import Any
 import asyncpg
 
 from engine.ingest.normalizer import fetch_body_from_chunks_for_version
-from engine.shared.constants import WIKI_SYNTHESIS_MAX_ATTEMPTS
+from engine.shared.constants import WIKI_INDEX_DOC_TYPE, WIKI_SYNTHESIS_MAX_ATTEMPTS
 from engine.shared.db import raw_conn, with_tenant
 from engine.shared.logging import get_logger
 from kb.synthesis.models import TriageInput, TriageVerdict
@@ -804,6 +804,94 @@ async def set_page_pipeline_updates(
 # ---------------------------------------------------------------------------
 # Wiki agent helpers (v4)
 # ---------------------------------------------------------------------------
+
+
+async def fetch_index_signature(customer_id: str) -> str | None:
+    """The signature the LIVE index page was rendered from, or None.
+
+    Stored in the index page's own frontmatter rather than a side table: it
+    describes that specific rendered page, so keeping it anywhere else invites
+    the two drifting apart -- and a stale signature would skip a render that
+    was needed, which is the failure this gate must not have.
+
+    None means "never rendered, or rendered before this shipped". Both must
+    render: no signature is not evidence that nothing changed.
+    """
+    async with with_tenant(customer_id) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT metadata
+            FROM documents
+            WHERE customer_id = $1
+              AND source_system = 'wiki'
+              AND doc_type = $2
+              AND valid_to IS NULL
+              AND deleted_at IS NULL
+            LIMIT 1
+            """,
+            customer_id,
+            WIKI_INDEX_DOC_TYPE,
+        )
+    if row is None:
+        return None
+    meta = row["metadata"] or {}
+    if isinstance(meta, (str, bytes, bytearray)):
+        import orjson
+
+        meta = orjson.loads(meta)
+    if not isinstance(meta, dict):
+        return None
+    frontmatter = meta.get("frontmatter") or {}
+    if not isinstance(frontmatter, dict):
+        return None
+    value = frontmatter.get("index_signature")
+    return value if isinstance(value, str) else None
+
+
+async def fetch_subpage_parents(customer_id: str) -> dict[tuple[str, str], tuple[str, str]]:
+    """Live `subpage` edges as child -> parent, for the staged-set preflight.
+
+    The preflight has to judge a batch against the tree that will EXIST, not
+    the fragment of it the batch happens to contain. Without this, a drain that
+    reparents one page could close a cycle through two pages it never touched
+    and nothing would notice.
+
+    Child -> parent rather than the other direction because every rule that
+    reads it walks upward: at most one parent per child makes the ascent a path
+    instead of a search. A child with two live parents is already a violated
+    invariant; `DISTINCT ON` picks one deterministically so the walk
+    terminates, and the multi-parent rule reports it from the staged side.
+
+    `DISTINCT ON` and not `MIN()` per column: `MIN(src_wiki_type)` and
+    `MIN(src_slug)` are independent aggregates, so two live parents `repo/aaa`
+    and `feature/zzz` would compose `feature/aaa` -- a page that does not
+    exist. That fabricated key then drove the depth walk and the orphan check.
+
+    JOINed against live documents because page deletion is a SOFT delete on
+    `documents` and does not remove link rows. Without the join a deleted
+    parent keeps claiming its child forever, and a drain that legitimately
+    reparents that child hits a multi-parent violation naming a page nobody
+    can open.
+    """
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (l.dst_wiki_type, l.dst_slug)
+                   l.dst_wiki_type, l.dst_slug, l.src_wiki_type, l.src_slug
+            FROM wiki_links l
+            JOIN documents d
+              ON d.customer_id = l.customer_id
+             AND d.source_id   = l.src_wiki_type || ':' || l.src_slug
+             AND d.source_system = 'wiki'
+             AND d.valid_to IS NULL
+             AND d.deleted_at IS NULL
+            WHERE l.customer_id = $1 AND l.link_type = $2
+            ORDER BY l.dst_wiki_type, l.dst_slug, l.src_wiki_type, l.src_slug
+            """,
+            customer_id,
+            "subpage",
+        )
+    return {(r["dst_wiki_type"], r["dst_slug"]): (r["src_wiki_type"], r["src_slug"]) for r in rows}
 
 
 async def fetch_wiki_index(customer_id: str) -> list[dict[str, Any]]:

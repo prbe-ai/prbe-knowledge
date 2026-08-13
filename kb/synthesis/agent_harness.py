@@ -100,9 +100,7 @@ class _RuntimeProtocol(Protocol):
     is_done: bool
     pending_update_count: int
 
-    async def dispatch_tool(
-        self, name: str, args: dict[str, Any]
-    ) -> dict[str, Any]: ...
+    async def dispatch_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]: ...
 
     def state_snapshot_for_summary(self) -> dict[str, Any]: ...
 
@@ -323,12 +321,8 @@ class AgentLoop:
         usage = resp.get("usage_metadata") or {}
         self.metrics.gemini_call_count += 1
         self.metrics.total_input_tokens += int(usage.get("prompt_token_count") or 0)
-        self.metrics.total_cached_tokens += int(
-            usage.get("cached_content_token_count") or 0
-        )
-        self.metrics.total_output_tokens += int(
-            usage.get("candidates_token_count") or 0
-        )
+        self.metrics.total_cached_tokens += int(usage.get("cached_content_token_count") or 0)
+        self.metrics.total_output_tokens += int(usage.get("candidates_token_count") or 0)
 
     # -----------------------------------------------------------------------
     # Tool dispatch
@@ -345,9 +339,7 @@ class AgentLoop:
             # next turn sees its commentary, then short-circuit.
             text = resp.get("text") or ""
             if text:
-                self._conversation.append(
-                    {"role": "model", "parts": [{"text": text}]}
-                )
+                self._conversation.append({"role": "model", "parts": [{"text": text}]})
             return False
 
         # Append the model turn (with tool_call parts) to conversation
@@ -363,9 +355,7 @@ class AgentLoop:
         self._conversation.append(
             {
                 "role": "model",
-                "parts": [
-                    _model_part_with_signature(tc) for tc in tool_calls
-                ],
+                "parts": [_model_part_with_signature(tc) for tc in tool_calls],
             }
         )
 
@@ -404,7 +394,23 @@ class AgentLoop:
                     error_class=type(exc).__name__,
                 )
             results.append({"name": name, "result": result})
-            if name in {"update_page", "create_page", "skip_events", "done"}:
+            # A REFUSED write is not progress. This keyed on the tool NAME
+            # alone, so a tool that came back `{"error": ...}` still reset the
+            # stall counter -- and the stall detector is the only thing bounding
+            # a model that keeps retrying the same rejected call.
+            #
+            # Latent until the page cap landed: `update_page` had almost no way
+            # to return an error, so the distinction never mattered. With a cap
+            # it can refuse the same page every turn, and each refusal looked
+            # like work. The loop would run to the turn cap instead of halting
+            # at the stall threshold, burning a full drain's budget on a call
+            # that cannot succeed.
+            #
+            # `slug_exists` and `staged_create_has_edits` were always in this
+            # category too; they were just rarer.
+            if name in {"update_page", "create_page", "skip_events", "done"} and not (
+                isinstance(result, dict) and result.get("error")
+            ):
                 consequential = True
 
         self._conversation.append(
@@ -448,9 +454,7 @@ class AgentLoop:
         except AgentCompactionError as exc:
             self._halt("agent.compaction_failed", error=str(exc))
         except Exception as exc:
-            self._halt(
-                "agent.compaction_failed", error=f"{type(exc).__name__}: {exc}"
-            )
+            self._halt("agent.compaction_failed", error=f"{type(exc).__name__}: {exc}")
         # Replace the conversation with the summary; runtime state is
         # preserved across the boundary because the summarizer reads it
         # from runtime.state_snapshot_for_summary() and writes it back
@@ -461,9 +465,7 @@ class AgentLoop:
                 "parts": [
                     {
                         "text": (
-                            "[compacted history at "
-                            f"{datetime.now(UTC).isoformat()}]\n\n"
-                            f"{summary}\n"
+                            f"[compacted history at {datetime.now(UTC).isoformat()}]\n\n{summary}\n"
                         )
                     }
                 ],
@@ -472,7 +474,10 @@ class AgentLoop:
         self.metrics.compaction_count += 1
 
     def _stalled(self) -> bool:
-        if self.metrics.last_consequential_turn == 0 and self.metrics.turns < WIKI_AGENT_STALL_TURNS:
+        if (
+            self.metrics.last_consequential_turn == 0
+            and self.metrics.turns < WIKI_AGENT_STALL_TURNS
+        ):
             # Pre-first-consequential grace window.
             return False
         gap = self.metrics.turns - self.metrics.last_consequential_turn
@@ -518,9 +523,7 @@ class AgentLoop:
                     char_count += len(str(fc.get("args") or "")) + len(fc.get("name", ""))
                 if "function_response" in part:
                     fr = part["function_response"]
-                    char_count += len(str(fr.get("response") or "")) + len(
-                        fr.get("name", "")
-                    )
+                    char_count += len(str(fr.get("response") or "")) + len(fr.get("name", ""))
         return int(char_count * _TOKENS_PER_CHAR)
 
 

@@ -7,6 +7,7 @@ live DB.
 
 from __future__ import annotations
 
+import inspect
 from datetime import UTC, datetime
 from typing import Any
 
@@ -59,9 +60,20 @@ def runtime(monkeypatch) -> WikiAgentRuntime:
         "kb.synthesis.persistence.fetch_triaged_manifest",
         stub_fetch_triaged_manifest,
     )
+
+    async def stub_fetch_subpage_parents(customer_id):
+        # No live subpage edges by default. Tests that need a live parent (to
+        # exercise a cycle or a depth breach reaching through pages this drain
+        # did not touch) override this.
+        return {}
+
     monkeypatch.setattr(
         "kb.synthesis.persistence.fetch_wiki_index",
         stub_fetch_wiki_index,
+    )
+    monkeypatch.setattr(
+        "kb.synthesis.persistence.fetch_subpage_parents",
+        stub_fetch_subpage_parents,
     )
 
     # Build the runtime without importing the Normalizer / store / etc.
@@ -678,3 +690,68 @@ async def test_a_refused_batch_halts_rather_than_reporting_a_clean_commit(
     assert "preflight_refused" in str(caught.value)
     assert "duplicate_staged_page" in str(caught.value)
     assert runtime.is_done is False, "a refused drain is not a finished one"
+
+
+# ---------------------------------------------------------------------------
+# T3 — a refused write is not progress
+# ---------------------------------------------------------------------------
+
+
+def test_a_refused_tool_result_does_not_count_as_consequential() -> None:
+    """The stall detector is the only thing bounding a model that keeps
+    retrying the same rejected call, and it was keyed on the tool NAME alone --
+    so a tool returning `{"error": ...}` still reset the counter.
+
+    Latent until the page cap: `update_page` had almost no way to fail, so the
+    distinction never mattered. With a cap it can refuse the same page every
+    turn, each refusal looking like work, and the loop runs to the turn cap
+    instead of halting at the stall threshold.
+    """
+    from kb.synthesis.agent_harness import AgentLoop
+
+    src = inspect.getsource(AgentLoop._dispatch)
+    assert 'result.get("error")' in src, "refusals must be excluded from consequential"
+    # The names still gate it -- read_page returning fine is not progress either.
+    assert '"update_page", "create_page", "skip_events", "done"' in src
+
+
+def test_the_index_signature_covers_titles_and_the_page_set() -> None:
+    """A hash-only-over-bodies gate would skip exactly the two most common
+    reasons the front page goes stale: a page added or deleted (no surviving
+    page's body moves) and a page renamed (the prompt carries titles)."""
+    from kb.synthesis.wiki_agent import _index_signature
+
+    base = [{"doc_id": "a", "title": "A", "body": "x", "metadata": {"summary": "s"}}]
+    renamed = [{"doc_id": "a", "title": "RENAMED", "body": "x", "metadata": {"summary": "s"}}]
+    added = [*base, {"doc_id": "b", "title": "B", "body": "y", "metadata": {}}]
+
+    assert _index_signature(base) != _index_signature(renamed), "a rename must re-render"
+    assert _index_signature(base) != _index_signature(added), "an added page must re-render"
+    assert _index_signature(base) == _index_signature(list(base)), "stable for equal input"
+
+
+def test_the_index_signature_is_order_independent() -> None:
+    """Row order is whatever the query returned. If it moved the signature, the
+    gate would never fire and the whole thing would be decoration."""
+    from kb.synthesis.wiki_agent import _index_signature
+
+    rows = [
+        {"doc_id": "a", "title": "A", "body": "x", "metadata": {}},
+        {"doc_id": "b", "title": "B", "body": "y", "metadata": {}},
+    ]
+
+    assert _index_signature(rows) == _index_signature(list(reversed(rows)))
+
+
+def test_the_index_signature_prefers_the_stored_body_hash() -> None:
+    """`body_sha256` when present, hashed body otherwise. Pages written before
+    that field shipped have no digest, and treating "missing" as "changed"
+    would mark every stable page dirty forever -- inverting the saving."""
+    from kb.synthesis.wiki_agent import _index_signature
+
+    stored = [{"doc_id": "a", "title": "A", "body": "IGNORED", "metadata": {"body_sha256": "d"}}]
+    same_digest_other_body = [
+        {"doc_id": "a", "title": "A", "body": "DIFFERENT", "metadata": {"body_sha256": "d"}}
+    ]
+
+    assert _index_signature(stored) == _index_signature(same_digest_other_body)
