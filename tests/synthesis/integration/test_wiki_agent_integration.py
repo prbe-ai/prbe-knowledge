@@ -149,6 +149,48 @@ async def _open_run() -> int:
     return int(row["run_id"])
 
 
+
+async def _seed_page_on_disk(wiki_type: str, slug: str, body: str = "SEED") -> None:
+    """Put a page in the DB so `update_page` has something to anchor on.
+
+    `update_page` sends anchored EDITS now, and refuses a slug that is not
+    there rather than staging an update the commit would silently drop -- so a
+    test that updates must create first. Goes through the Normalizer, the same
+    path a real manual write takes, rather than hand-rolled SQL that would
+    drift from the columns the reader expects.
+    """
+    from engine.shared.models import WebhookEvent
+    from kb.handlers.wiki import build_normalization_result
+
+    received_at = datetime.now(UTC)
+    event = WebhookEvent(
+        customer_id=CUSTOMER,
+        source_system=SourceSystem.WIKI,
+        source_event_id=f"{wiki_type}:{slug}:seed",
+        received_at=received_at,
+        payload_s3_key="",
+        payload_s3_keys=[],
+        raw_payload={
+            "wiki_page": {
+                "wiki_type": wiki_type,
+                "slug": slug,
+                "title": slug,
+                "body": body,
+                "frontmatter": {},
+                "doc_class": DocClass.MANUAL_ENTRY.value,
+                "is_delete": False,
+                "updated_at": received_at.isoformat(),
+                "summary": "seeded",
+            }
+        },
+        headers={},
+    )
+    normalizer = Normalizer(make_default_context())
+    await normalizer._persist(
+        CUSTOMER, SourceSystem.WIKI, build_normalization_result(event)
+    )
+
+
 def _make_runtime(run_id: int) -> WikiAgentRuntime:
     return WikiAgentRuntime(
         CUSTOMER,
@@ -195,12 +237,13 @@ async def test_tool_next_events_excludes_applied_and_skipped(reset_db: None) -> 
     rt = _make_runtime(run_id)
 
     # Stage an update that applies one event.
+    await _seed_page_on_disk("decision", "x")
     await rt.dispatch_tool(
         "update_page",
         {
             "wiki_type": "decision",
             "slug": "x",
-            "body_markdown": "b",
+            "edits": [{"op": "replace", "find": "SEED", "text": "b"}],
             "summary": "s",
             "commit_message": "m",
             "applied_queue_ids": [qids[0]],
@@ -297,12 +340,13 @@ async def test_tool_read_page_on_disk_returns_db_row(reset_db: None) -> None:
 async def test_tool_read_page_staged_for_update_returns_staged(reset_db: None) -> None:
     run_id = await _open_run()
     rt = _make_runtime(run_id)
+    await _seed_page_on_disk("decision", "stagedu")
     await rt.dispatch_tool(
         "update_page",
         {
             "wiki_type": "decision",
             "slug": "stagedu",
-            "body_markdown": "STAGED BODY",
+            "edits": [{"op": "replace", "find": "SEED", "text": "STAGED BODY"}],
             "summary": "s",
             "commit_message": "m",
             "applied_queue_ids": [],
@@ -375,12 +419,13 @@ async def test_tool_done_atomic_commit_one_version_per_slug(
     qid = await _seed_synthesizing("github:commit:q1", "We chose pgvector inside Neon.")
     run_id = await _open_run()
     rt = _make_runtime(run_id)
+    await _seed_page_on_disk("decision", "adopt-pg")
     await rt.dispatch_tool(
         "update_page",
         {
             "wiki_type": "decision",
             "slug": "adopt-pg",
-            "body_markdown": "We chose pgvector inside Neon for embeddings.",
+            "edits": [{"op": "replace", "find": "SEED", "text": "We chose pgvector inside Neon for embeddings."}],
             "summary": "Embeddings store choice.",
             "commit_message": "Initial decision",
             "applied_queue_ids": [qid],
@@ -671,12 +716,15 @@ async def test_commit_update_preserves_frontmatter_links(reset_db: None) -> None
     qid_update = await _seed_synthesizing("github:commit:fm-update", "next")
     run_id2 = await _open_run()
     rt2 = _make_runtime(run_id2)
+    # NOT re-seeded: the page was created above WITH the frontmatter link this
+    # test is about, and seeding over it would delete the thing under test.
+    # The anchor is therefore the body that create wrote.
     await rt2.dispatch_tool(
         "update_page",
         {
             "wiki_type": "runbook",
             "slug": "billing",
-            "body_markdown": "Updated body without any markdown links.",
+            "edits": [{"op": "replace", "find": "Initial body.", "text": "Updated body without any markdown links."}],
             "summary": "s",
             "commit_message": "update",
             "applied_queue_ids": [qid_update],
@@ -706,12 +754,13 @@ async def test_discard_dlqs_triaged_rows_with_reason(reset_db: None) -> None:
     qid = await _seed_synthesizing("github:commit:dlq", "body")
     run_id = await _open_run()
     rt = _make_runtime(run_id)
+    await _seed_page_on_disk("decision", "x")
     await rt.dispatch_tool(
         "update_page",
         {
             "wiki_type": "decision",
             "slug": "x",
-            "body_markdown": "b",
+            "edits": [{"op": "replace", "find": "SEED", "text": "b"}],
             "summary": "s",
             "commit_message": "m",
             "applied_queue_ids": [qid],
