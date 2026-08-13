@@ -579,3 +579,102 @@ async def test_a_page_created_then_edited_stays_a_single_staged_page(
     staged = runtime._staged_pages()
     assert len(staged) == 1
     assert validate_batch(staged) == []
+
+
+@pytest.mark.asyncio
+async def test_recreating_a_page_that_has_folded_edits_is_refused(
+    runtime: WikiAgentRuntime,
+) -> None:
+    """create -> update (folds an edit) -> create again.
+
+    The second create merged `applied_queue_ids` but replaced `body_markdown`
+    wholesale, so the folded event committed as done with its content nowhere.
+    Reachable after a compaction: `state_snapshot_for_summary` shows the model
+    the slug and the ids, not that a body it no longer holds was edited.
+    """
+    await runtime.dispatch_tool(
+        "create_page",
+        {
+            "wiki_type": "decision",
+            "slug": "x",
+            "title": "T",
+            "body_markdown": "original",
+            "summary": "s",
+            "commit_message": "m",
+            "applied_queue_ids": [],
+        },
+    )
+    await runtime.dispatch_tool(
+        "update_page",
+        {
+            "wiki_type": "decision",
+            "slug": "x",
+            "edits": [{"op": "replace", "find": "original", "text": "edited"}],
+            "summary": "s",
+            "commit_message": "m",
+            "applied_queue_ids": [7],
+        },
+    )
+
+    out = await runtime.dispatch_tool(
+        "create_page",
+        {
+            "wiki_type": "decision",
+            "slug": "x",
+            "title": "T",
+            "body_markdown": "original",
+            "summary": "s",
+            "commit_message": "m",
+            "applied_queue_ids": [],
+        },
+    )
+
+    assert out["error"] == "staged_create_has_edits"
+    assert runtime._pending_creates[("decision", "x")].body_markdown == "edited"
+    assert 7 in runtime._applied_queue_ids
+
+
+@pytest.mark.asyncio
+async def test_a_refused_batch_halts_rather_than_reporting_a_clean_commit(
+    runtime: WikiAgentRuntime,
+) -> None:
+    """THE FAILURE THIS GUARDS. `commit()` returning normally on a refusal made
+    `_tool_done` set `is_done` and report `committed: True`; the harness read
+    that as a clean finish and the worker closed the run `complete, error=None`
+    -- while the claimed queue rows went to DLQ underneath it.
+
+    `synthesis_worker` names that outcome a few lines below where it catches
+    this: "a green signal over work that did not happen". So a refusal must
+    raise, and AgentHaltError is the channel that already routes to
+    DLQ-with-reason and a failed run.
+
+    Staged by hand: after the create/update fold, no tool sequence can produce a
+    duplicate, which is why the refusal branch needs driving directly.
+    """
+    from engine.shared.exceptions import AgentHaltError
+    from kb.synthesis.wiki_agent import _StagedCreate, _StagedUpdate
+
+    key = ("decision", "dup")
+    runtime._pending_creates[key] = _StagedCreate(
+        wiki_type="decision",
+        slug="dup",
+        title="T",
+        body_markdown="a",
+        summary="s",
+        frontmatter={},
+        commit_message="m",
+    )
+    runtime._pending_updates[key] = _StagedUpdate(
+        wiki_type="decision",
+        slug="dup",
+        body_markdown="b",
+        summary="s",
+        commit_message="m",
+    )
+
+    with pytest.raises(AgentHaltError) as caught:
+        await runtime.dispatch_tool("done", {})
+
+    assert "preflight_refused" in str(caught.value)
+    assert "duplicate_staged_page" in str(caught.value)
+    assert runtime.is_done is False, "a refused drain is not a finished one"

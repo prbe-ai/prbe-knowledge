@@ -24,11 +24,20 @@ and there is no batch transaction to enroll them in. Closing that needs a
 reconciliation pass; the preflight only guarantees that a batch which was going
 to be refused is refused before any of it lands.
 
-PUBLISH ORDER IS PART OF THE CONTRACT. Creates go first. A page that is created
-and linked from a page updated in the same batch must exist by the time the
-linking page persists its links, or the edge resolves against nothing. The old
-order (updates, then creates) got this backwards, which was invisible only
-because nothing yet depends on the link graph being complete at publish time.
+PUBLISH ORDER IS DETERMINISTIC: creates first, then updates, stable within each
+group. The reason is replay, not referential integrity. A batch that fails
+halfway has published a prefix of itself, and diagnosing which pages landed
+means being able to reproduce the same prefix -- dict insertion order across two
+maps is not that.
+
+It is NOT ordered so links resolve. `persist_links_for_page` writes
+`dst_wiki_type`/`dst_slug` as plain text and `wiki_links` has no foreign key on
+the destination, so an edge to a page that does not exist yet persists exactly
+like one to a page that does. An earlier version of this docstring claimed
+otherwise; it was wrong, and creates are unordered among themselves anyway, so a
+create->create link inside one batch would break the claim even if the FK
+existed. Ordering here buys reproducibility. If referential integrity is ever
+wanted, it has to come from a constraint or a preflight rule, not from sequence.
 """
 
 from __future__ import annotations
@@ -113,9 +122,10 @@ def validate_batch(pages: Iterable[StagedPage]) -> list[Violation]:
 def publish_order(pages: Iterable[StagedPage]) -> list[StagedPage]:
     """Creates first, then updates; stable within each group.
 
-    See the module docstring. Stability matters for reproducing a partial
-    publish: a batch that failed halfway should fail at the same page when
-    replayed, or diagnosing it means guessing which pages made it.
+    See the module docstring for why this is about replay and not about links
+    resolving. A batch that failed halfway must fail at the same page when
+    replayed, or diagnosing a partial publish means guessing which pages made
+    it.
     """
     staged = list(pages)
     return [p for p in staged if p.is_new] + [p for p in staged if not p.is_new]

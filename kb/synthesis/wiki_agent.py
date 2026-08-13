@@ -40,7 +40,7 @@ from engine.shared.constants import (
 )
 from engine.shared.db import with_tenant
 from engine.shared.embeddings import GeminiEmbedder, get_embedder_v2
-from engine.shared.exceptions import ToolValidationError
+from engine.shared.exceptions import AgentHaltError, ToolValidationError
 from engine.shared.locks import advisory_lock_key
 from engine.shared.logging import get_logger
 from engine.shared.models import NormalizationResult, WebhookEvent
@@ -93,6 +93,13 @@ class _StagedCreate:
     frontmatter: dict[str, Any]
     commit_message: str
     applied_queue_ids: list[int] = field(default_factory=list)
+    #: True once `update_page` has folded edits into `body_markdown`. A second
+    #: `create_page` for the same slug would overwrite the body wholesale while
+    #: still unioning the queue ids, so the folded events would be marked done
+    #: with their content never landing. Reachable after a compaction, where
+    #: `state_snapshot_for_summary` shows the model only the slug and the ids --
+    #: not that a body it no longer has in context was edited.
+    has_folded_edits: bool = False
 
 
 class WikiAgentRuntime:
@@ -388,6 +395,7 @@ class WikiAgentRuntime:
                 frontmatter=dict(staged_create.frontmatter),
                 commit_message=args.commit_message,
                 applied_queue_ids=merged_qids,
+                has_folded_edits=True,
             )
         else:
             self._pending_updates[key] = _StagedUpdate(
@@ -434,6 +442,22 @@ class WikiAgentRuntime:
 
         if key in self._pending_creates:
             existing_c = self._pending_creates[key]
+            if existing_c.has_folded_edits:
+                # Re-creating over edits would drop them silently AND union the
+                # queue ids, so the folded events commit as done with their
+                # content nowhere. Refuse and say what to do instead: the page
+                # is already staged, so the model wants update_page.
+                return {
+                    "error": "staged_create_has_edits",
+                    "wiki_type": args.wiki_type,
+                    "slug": args.slug,
+                    "hint": (
+                        f"{args.wiki_type}/{args.slug} is already staged this drain and has "
+                        "edits applied to it. create_page would replace the body and lose "
+                        "them. Use update_page, or read_page first if you need the current "
+                        "staged text."
+                    ),
+                }
             merged_qids = sorted(set(existing_c.applied_queue_ids) | set(args.applied_queue_ids))
         else:
             merged_qids = sorted(set(args.applied_queue_ids))
@@ -525,6 +549,47 @@ class WikiAgentRuntime:
             for u in self._pending_updates.values()
         ]
 
+    async def _persist_staged_batch(self) -> None:
+        """Preflight the whole staged set, then publish it in order.
+
+        Shared with `BackfillWikiRuntime`, which overrides `commit()` to skip
+        the queue and index steps. Before this existed the subclass carried its
+        own copy of the persist loop, so it validated nothing and published in
+        the old order -- on the path that creates the MOST new pages. Any rule
+        added to `validate_batch` would have been silently unenforced there.
+
+        A refusal RAISES. It must not return normally: `_tool_done` sets
+        `is_done` and reports `committed: True` off the back of this call, the
+        harness reads `is_done` as a clean finish, and the worker then closes
+        the run `complete` with `error=None`. The queue rows would be DLQ'd
+        underneath all of that. `synthesis_worker` says exactly why that is not
+        allowed, a few lines below where it catches this: "a green signal over
+        work that did not happen". AgentHaltError is the channel that already
+        routes to DLQ-with-reason and a failed run status, so the refusal uses
+        it rather than inventing a quieter one.
+        """
+        staged = self._staged_pages()
+        violations = staged_graph.validate_batch(staged)
+        if violations:
+            log.warning(
+                "agent.preflight_refused",
+                customer=self.customer_id,
+                agent_run_id=self.agent_run_id,
+                violations=[{"rule": v.rule, "ref": v.ref, "detail": v.detail} for v in violations],
+            )
+            # The rules go in the reason so the DLQ row says WHY, not just
+            # "preflight". The worker does the DLQ and the discard; doing
+            # either here as well would double-count the rows.
+            raise AgentHaltError(
+                f"agent.preflight_refused: {', '.join(sorted({v.rule for v in violations}))}"
+            )
+
+        for page in staged_graph.publish_order(staged):
+            if page.is_new:
+                await self._persist_create(self._pending_creates[page.key])
+            else:
+                await self._persist_update(self._pending_updates[page.key])
+
     async def commit(self) -> None:
         """Atomic commit of all staged updates + creates.
 
@@ -557,39 +622,7 @@ class WikiAgentRuntime:
         the first two published, because each document persists in its own
         transaction and there is no batch transaction to enroll them in.
         """
-        staged = self._staged_pages()
-        violations = staged_graph.validate_batch(staged)
-        if violations:
-            log.warning(
-                "agent.preflight_refused",
-                customer=self.customer_id,
-                agent_run_id=self.agent_run_id,
-                violations=[{"rule": v.rule, "ref": v.ref, "detail": v.detail} for v in violations],
-            )
-            # `discard()` is the IN-MEMORY half only -- it drops the staged
-            # pages and deliberately leaves the queue rows alone, because the
-            # worker normally DLQs them separately with a categorized halt
-            # reason. Nothing else runs on this path, so the DLQ call has to be
-            # here: without it the 'synthesizing' rows sit in flight until the
-            # reclaim loop times them out (600s, up to 3 attempts), turning a
-            # refusal that is already fully decided into a half-hour of retries
-            # that cannot succeed -- the batch is refused for its shape, and
-            # replaying it reproduces the same shape.
-            #
-            # The rules that refused it go in the reason, so the DLQ row says
-            # WHY rather than just "preflight".
-            await self.discard()
-            await persistence.dlq_agent_synthesizing_rows(
-                self.customer_id,
-                reason=f"preflight: {', '.join(sorted({v.rule for v in violations}))}",
-            )
-            return
-
-        for page in staged_graph.publish_order(staged):
-            if page.is_new:
-                await self._persist_create(self._pending_creates[page.key])
-            else:
-                await self._persist_update(self._pending_updates[page.key])
+        await self._persist_staged_batch()
 
         applied_qids = sorted(self._applied_queue_ids - self._skipped_queue_ids)
         skipped_qids = sorted(self._skipped_queue_ids)
