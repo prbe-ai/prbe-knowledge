@@ -32,7 +32,7 @@ from typing import Any
 import asyncpg
 
 from engine.ingest.normalizer import fetch_body_from_chunks_for_version
-from engine.shared.constants import WIKI_SYNTHESIS_MAX_ATTEMPTS
+from engine.shared.constants import WIKI_INDEX_DOC_TYPE, WIKI_SYNTHESIS_MAX_ATTEMPTS
 from engine.shared.db import raw_conn, with_tenant
 from engine.shared.logging import get_logger
 from kb.synthesis.models import TriageInput, TriageVerdict
@@ -804,6 +804,48 @@ async def set_page_pipeline_updates(
 # ---------------------------------------------------------------------------
 # Wiki agent helpers (v4)
 # ---------------------------------------------------------------------------
+
+
+async def fetch_index_signature(customer_id: str) -> str | None:
+    """The signature the LIVE index page was rendered from, or None.
+
+    Stored in the index page's own frontmatter rather than a side table: it
+    describes that specific rendered page, so keeping it anywhere else invites
+    the two drifting apart -- and a stale signature would skip a render that
+    was needed, which is the failure this gate must not have.
+
+    None means "never rendered, or rendered before this shipped". Both must
+    render: no signature is not evidence that nothing changed.
+    """
+    async with with_tenant(customer_id) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT metadata
+            FROM documents
+            WHERE customer_id = $1
+              AND source_system = 'wiki'
+              AND doc_type = $2
+              AND valid_to IS NULL
+              AND deleted_at IS NULL
+            LIMIT 1
+            """,
+            customer_id,
+            WIKI_INDEX_DOC_TYPE,
+        )
+    if row is None:
+        return None
+    meta = row["metadata"] or {}
+    if isinstance(meta, (str, bytes, bytearray)):
+        import orjson
+
+        meta = orjson.loads(meta)
+    if not isinstance(meta, dict):
+        return None
+    frontmatter = meta.get("frontmatter") or {}
+    if not isinstance(frontmatter, dict):
+        return None
+    value = frontmatter.get("index_signature")
+    return value if isinstance(value, str) else None
 
 
 async def fetch_subpage_parents(customer_id: str) -> dict[tuple[str, str], tuple[str, str]]:

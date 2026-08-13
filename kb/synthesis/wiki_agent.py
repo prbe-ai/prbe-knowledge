@@ -1090,12 +1090,37 @@ def default_batch_size() -> int:
     return WIKI_AGENT_BATCH_SIZE
 
 
+def _index_signature(rows: list[dict[str, Any]]) -> str:
+    """A stable fingerprint of everything the index render reads.
+
+    Sorted so dict/row ordering cannot change it, and covering title and
+    summary alongside the body hash because the prompt carries all three -- a
+    renamed page must re-render even though its body never moved.
+    """
+    import hashlib
+
+    parts = []
+    for row in sorted(rows, key=lambda r: str(r.get("doc_id"))):
+        meta = row.get("metadata") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        digest = (
+            meta.get("body_sha256")
+            or hashlib.sha256((row.get("body") or "").encode("utf-8")).hexdigest()
+        )
+        parts.append(
+            f"{row.get('doc_id')}|{digest}|{row.get('title') or ''}|{meta.get('summary') or ''}"
+        )
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
 async def regenerate_wiki_index(
     *,
     customer_id: str,
     run_id: int | None = None,
     commit_author: str = "system:wiki-index-regen",
     normalizer: Normalizer | None = None,
+    force: bool = False,
 ) -> None:
     """Regenerate the wiki index page for a customer.
 
@@ -1167,50 +1192,109 @@ async def regenerate_wiki_index(
             for row in rows
         ]
 
-    body = await index_renderer.render_index_via_llm(rows, customer_id=customer_id)
-    if body is None:
-        # The renderer could not write an overview this run. Leave the
-        # published one alone: it is stale by one drain, which is strictly
-        # better than replacing a real overview with a placeholder, and far
-        # better than the page list the old fallback substituted.
-        log.warning(
-            "agent.index_regen_skipped_no_body",
-            customer=customer_id,
-            agent_run_id=run_id,
-            page_count=len(rows),
-        )
-        return
-    received_at = datetime.now(UTC)
-    run_id_suffix = f" #{run_id}" if run_id is not None else ""
-    raw_payload: dict[str, Any] = {
-        WIKI_PAYLOAD_KEY: {
-            "wiki_type": "index",
-            "slug": INDEX_SLUG,
-            "title": "Wiki",
-            "body": body,
-            "frontmatter": {"page_count": len(rows)},
-            "doc_class": DocClass.AGENT_ARTIFACT.value,
-            "is_delete": False,
-            "updated_at": received_at.isoformat(),
-            "summary": f"Wiki overview ({len(rows)} pages).",
-            "commit_message": (f"Regenerate index ({len(rows)} pages){run_id_suffix}"),
-            "commit_author": commit_author,
-            "commit_run_id": run_id,
-            "author_id": commit_author,
+    # THE GATE, and it lives HERE rather than at the call sites because there
+    # are three of them (commit(), the GitHub crawler, the cross-repo refresh)
+    # and gating at each would fix two and leave the third -- the crawler being
+    # the easiest to forget.
+    #
+    # The index is a function of the pages it reads. If none of their content
+    # moved since the last render, re-rendering spends a Gemini call to produce
+    # a near-identical page and bumps the version chain for nothing; that chain
+    # is where someone looks to answer "when did the overview actually change",
+    # and it is already at v115.
+    #
+    # Keyed on `body_sha256` -- the content hash, NOT `content_hash`, which
+    # mixes in `received_at` and therefore moves on every write whether or not
+    # the text did. Pages with no digest yet (written before that field
+    # shipped) hash their body here: the renderer already holds every body in
+    # full, so it costs a sha256 over a string already in memory.
+    #
+    # The page SET is part of the signature, not just the hashes: a page added
+    # or deleted changes the index without changing any surviving page's
+    # content, and a hash-only gate would skip exactly those.
+    # SINGLE-FLIGHT per customer. Two regenerators running at once both read
+    # the same signature, both decide to render, and both spend a Gemini call
+    # to write the same page -- and the second write bumps the version chain
+    # again for content the first already produced.
+    #
+    # `pg_try_advisory_xact_lock`, not the blocking form: a regen that is
+    # already in flight will produce the page this caller wanted, so waiting
+    # for it only to render again is worse than standing down. The lock is held
+    # for the transaction, so it releases even if this task dies.
+    #
+    # Reachable today: the nightly trigger, the GitHub crawler and a drain's
+    # commit() can all reach `regenerate_wiki_index` for one customer, and the
+    # crawler runs alongside the daily drain.
+    lock_key = advisory_lock_key("wiki-index-regen", customer_id)
+    async with with_tenant(customer_id) as lock_conn:
+        got_lock = await lock_conn.fetchval("SELECT pg_try_advisory_xact_lock($1)", lock_key)
+        if not got_lock:
+            log.info(
+                "agent.index_regen_skipped_locked",
+                customer=customer_id,
+                agent_run_id=run_id,
+            )
+            return
+
+        signature = _index_signature(rows)
+        previous = await persistence.fetch_index_signature(customer_id)
+        if not force and previous is not None and previous == signature:
+            log.info(
+                "agent.index_regen_skipped_unchanged",
+                customer=customer_id,
+                agent_run_id=run_id,
+                page_count=len(rows),
+            )
+            return
+
+        body = await index_renderer.render_index_via_llm(rows, customer_id=customer_id)
+        if body is None:
+            # The renderer could not write an overview this run. Leave the
+            # published one alone: it is stale by one drain, which is strictly
+            # better than replacing a real overview with a placeholder, and far
+            # better than the page list the old fallback substituted.
+            log.warning(
+                "agent.index_regen_skipped_no_body",
+                customer=customer_id,
+                agent_run_id=run_id,
+                page_count=len(rows),
+            )
+            return
+        received_at = datetime.now(UTC)
+        run_id_suffix = f" #{run_id}" if run_id is not None else ""
+        raw_payload: dict[str, Any] = {
+            WIKI_PAYLOAD_KEY: {
+                "wiki_type": "index",
+                "slug": INDEX_SLUG,
+                "title": "Wiki",
+                "body": body,
+                "frontmatter": {"page_count": len(rows), "index_signature": signature},
+                "doc_class": DocClass.AGENT_ARTIFACT.value,
+                "is_delete": False,
+                "updated_at": received_at.isoformat(),
+                "summary": f"Wiki overview ({len(rows)} pages).",
+                "commit_message": (f"Regenerate index ({len(rows)} pages){run_id_suffix}"),
+                "commit_author": commit_author,
+                "commit_run_id": run_id,
+                "author_id": commit_author,
+            }
         }
-    }
-    event = WebhookEvent(
-        customer_id=customer_id,
-        source_system=SourceSystem.WIKI,
-        source_event_id=f"index:{INDEX_SLUG}:edit:{received_at.isoformat()}",
-        received_at=received_at,
-        payload_s3_key="",
-        payload_s3_keys=[],
-        raw_payload=raw_payload,
-        headers={},
-    )
-    norm: NormalizationResult = build_normalization_result(event)
-    await normalizer._persist(customer_id, SourceSystem.WIKI, norm)
+        event = WebhookEvent(
+            customer_id=customer_id,
+            source_system=SourceSystem.WIKI,
+            source_event_id=f"index:{INDEX_SLUG}:edit:{received_at.isoformat()}",
+            received_at=received_at,
+            payload_s3_key="",
+            payload_s3_keys=[],
+            raw_payload=raw_payload,
+            headers={},
+        )
+        norm: NormalizationResult = build_normalization_result(event)
+        await normalizer._persist(customer_id, SourceSystem.WIKI, norm)
+
+        # Persisted INSIDE the lock. Releasing after the render would let a
+        # second regenerator read the pre-write signature, conclude nothing
+        # changed was false, and render the same page again.
 
 
 __all__ = [
