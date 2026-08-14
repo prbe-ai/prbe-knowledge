@@ -19,7 +19,9 @@
 #     customer_id:      slug (probe-founders)
 #
 # Required secrets — mirror of the nightly workflow:
-#   ANTHROPIC_API_KEY, GH_PAT, DIGITALOCEAN_ACCESS_TOKEN,
+#   ANTHROPIC_API_KEY, GH_PAT,
+#   KUBE_API_SERVER, KUBE_CA_CERT, KUBE_SA_TOKEN (these three replaced
+#     DIGITALOCEAN_ACCESS_TOKEN — see ci/README.md),
 #   PROBE_MCP_INTERNAL_KEY, PROBE_MCP_CUSTOMER_ID,
 #   RESEND_API_KEY, RESEND_FROM_ADDRESS,
 #   SENDBLUE_API_KEY_ID, SENDBLUE_API_SECRET,
@@ -67,11 +69,69 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Was `doctl kubernetes cluster kubeconfig save probe-managed`, which
+      # minted a throwaway DigitalOcean personal access token on every run.
+      # See agent-optimization-nightly.yml (same block) and ci/README.md for
+      # the full rationale and the 2026-08-12 outage that motivated it.
+      #
+      # Identity: ServiceAccount `ci/knowledge-nightly`, namespace-admin in
+      # `managed` only. Manifest: ci/rbac/probe-managed.yaml.
       - name: Configure kubectl for managed-shared cluster
-        uses: digitalocean/action-doctl@v2
-        with:
-          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-      - run: doctl kubernetes cluster kubeconfig save probe-managed
+        env:
+          KUBE_API_SERVER: ${{ secrets.KUBE_API_SERVER }}
+          KUBE_CA_CERT: ${{ secrets.KUBE_CA_CERT }}
+          KUBE_SA_TOKEN: ${{ secrets.KUBE_SA_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${KUBE_API_SERVER}" ] || missing="${missing} KUBE_API_SERVER"
+          [ -n "${KUBE_CA_CERT}" ]    || missing="${missing} KUBE_CA_CERT"
+          [ -n "${KUBE_SA_TOKEN}" ]   || missing="${missing} KUBE_SA_TOKEN"
+          if [ -n "${missing}" ]; then
+            echo "::error title=Cluster credentials not configured::Missing repo secret(s):${missing}. Regenerate them from the ci/knowledge-nightly ServiceAccount — see ci/README.md."
+            exit 1
+          fi
+          install -m 600 /dev/null "${RUNNER_TEMP}/kubeconfig"
+          cat > "${RUNNER_TEMP}/kubeconfig" <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+            - name: probe-managed
+              cluster:
+                server: ${KUBE_API_SERVER}
+                certificate-authority-data: ${KUBE_CA_CERT}
+          contexts:
+            - name: probe-managed
+              context:
+                cluster: probe-managed
+                user: knowledge-nightly
+                namespace: managed
+          current-context: probe-managed
+          users:
+            - name: knowledge-nightly
+              user:
+                token: ${KUBE_SA_TOKEN}
+          EOF
+          echo "KUBECONFIG=${RUNNER_TEMP}/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Check the cluster credential is still valid
+        run: |
+          set -uo pipefail
+          if ! whoami_out="$(kubectl auth whoami 2>&1)"; then
+            case "${whoami_out}" in
+              *Unauthorized*|*401*)
+                echo "::error title=Cluster token rejected::The ci/knowledge-nightly ServiceAccount token is invalid or was revoked. Re-issue it: kubectl --context do-sfo3-probe-managed -n ci get secret knowledge-nightly-token -o jsonpath='{.data.token}' | base64 -d | gh secret set KUBE_SA_TOKEN --repo prbe-ai/prbe-knowledge  (see ci/README.md)."
+                ;;
+              *Forbidden*|*403*)
+                echo "::error title=Cluster token under-privileged::The ServiceAccount authenticated but is missing RBAC. Re-apply ci/rbac/probe-managed.yaml. Detail: ${whoami_out}"
+                ;;
+              *)
+                echo "::error title=Cluster unreachable::This looks like the API server, not the token. Check the probe-managed cluster before touching credentials. Detail: ${whoami_out}"
+                ;;
+            esac
+            exit 1
+          fi
+          echo "Acting as: $(kubectl auth whoami -o jsonpath='{.status.userInfo.username}' 2>/dev/null || echo 'unknown')"
 
       - name: Stage payload + needs-human note
         run: |
