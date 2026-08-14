@@ -29,7 +29,11 @@
 # Required secrets:
 #   ANTHROPIC_API_KEY           — Claude Code
 #   GH_PAT                      — push branches + open PRs
-#   DIGITALOCEAN_ACCESS_TOKEN   — kubectl access to probe-managed cluster
+#   KUBE_API_SERVER             — probe-managed API server URL
+#   KUBE_CA_CERT                — probe-managed CA cert, base64
+#   KUBE_SA_TOKEN               — ci/knowledge-nightly ServiceAccount token
+#                                 (replaces DIGITALOCEAN_ACCESS_TOKEN; see
+#                                 ci/README.md for why and how to rotate)
 #   PROBE_MCP_INTERNAL_KEY      — mcp.prbe.ai internal-key auth (matches
 #                                 managed-data-plane.env INTERNAL_BACKEND_API_KEY)
 #   PROBE_MCP_CUSTOMER_ID       — slug for probe-founders customer
@@ -88,11 +92,82 @@ jobs:
           # Subagents create worktrees off origin/main — need full history.
           fetch-depth: 0
 
+      # Was `doctl kubernetes cluster kubeconfig save probe-managed`, which
+      # MINTED A FRESH DigitalOcean personal access token every nightly run
+      # (`doks:probe-managed`, 7-day expiry, never deleted). Across six
+      # workflows in three repos that left 200+ live credentials on the DO
+      # account, and that noise is what hid the 2026-08-12 outage: the real
+      # DIGITALOCEAN_ACCESS_TOKEN expired, the managed fleet stopped receiving
+      # engine builds for 26 hours, and nobody could spot one dead token among
+      # twenty pages of machine-generated ones.
+      #
+      # This repo's own DIGITALOCEAN_ACCESS_TOKEN was minted 2026-05-18 and
+      # expires 2026-08-16 — the same failure was already scheduled here. It is
+      # removed rather than renewed. doctl was used for nothing else.
+      #
+      # Identity: ServiceAccount `ci/knowledge-nightly` on probe-managed, with
+      # namespace-admin in `managed` ONLY — narrower than the fleet-rollout SA,
+      # and a separate identity so revoking these nightlies cannot affect fleet
+      # rollouts. Manifest: ci/rbac/probe-managed.yaml.
       - name: Configure kubectl for managed-shared cluster
-        uses: digitalocean/action-doctl@v2
-        with:
-          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-      - run: doctl kubernetes cluster kubeconfig save probe-managed
+        env:
+          KUBE_API_SERVER: ${{ secrets.KUBE_API_SERVER }}
+          KUBE_CA_CERT: ${{ secrets.KUBE_CA_CERT }}
+          KUBE_SA_TOKEN: ${{ secrets.KUBE_SA_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${KUBE_API_SERVER}" ] || missing="${missing} KUBE_API_SERVER"
+          [ -n "${KUBE_CA_CERT}" ]    || missing="${missing} KUBE_CA_CERT"
+          [ -n "${KUBE_SA_TOKEN}" ]   || missing="${missing} KUBE_SA_TOKEN"
+          if [ -n "${missing}" ]; then
+            echo "::error title=Cluster credentials not configured::Missing repo secret(s):${missing}. Regenerate them from the ci/knowledge-nightly ServiceAccount — see ci/README.md."
+            exit 1
+          fi
+          install -m 600 /dev/null "${RUNNER_TEMP}/kubeconfig"
+          cat > "${RUNNER_TEMP}/kubeconfig" <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+            - name: probe-managed
+              cluster:
+                server: ${KUBE_API_SERVER}
+                certificate-authority-data: ${KUBE_CA_CERT}
+          contexts:
+            - name: probe-managed
+              context:
+                cluster: probe-managed
+                user: knowledge-nightly
+                namespace: managed
+          current-context: probe-managed
+          users:
+            - name: knowledge-nightly
+              user:
+                token: ${KUBE_SA_TOKEN}
+          EOF
+          echo "KUBECONFIG=${RUNNER_TEMP}/kubeconfig" >> "$GITHUB_ENV"
+
+      # Name which failure this is before anything downstream trips over it: a
+      # dead credential and an unreachable cluster look identical from a failed
+      # kubectl and need completely different fixes.
+      - name: Check the cluster credential is still valid
+        run: |
+          set -uo pipefail
+          if ! whoami_out="$(kubectl auth whoami 2>&1)"; then
+            case "${whoami_out}" in
+              *Unauthorized*|*401*)
+                echo "::error title=Cluster token rejected::The ci/knowledge-nightly ServiceAccount token is invalid or was revoked. Re-issue it: kubectl --context do-sfo3-probe-managed -n ci get secret knowledge-nightly-token -o jsonpath='{.data.token}' | base64 -d | gh secret set KUBE_SA_TOKEN --repo prbe-ai/prbe-knowledge  (see ci/README.md)."
+                ;;
+              *Forbidden*|*403*)
+                echo "::error title=Cluster token under-privileged::The ServiceAccount authenticated but is missing RBAC. Re-apply ci/rbac/probe-managed.yaml. Detail: ${whoami_out}"
+                ;;
+              *)
+                echo "::error title=Cluster unreachable::This looks like the API server, not the token. Check the probe-managed cluster before touching credentials. Detail: ${whoami_out}"
+                ;;
+            esac
+            exit 1
+          fi
+          echo "Acting as: $(kubectl auth whoami -o jsonpath='{.status.userInfo.username}' 2>/dev/null || echo 'unknown')"
 
       - name: Resolve target date + current knowledge image tag
         id: ctx

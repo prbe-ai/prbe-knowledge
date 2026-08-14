@@ -1,0 +1,70 @@
+# CI cluster access for prbe-ai/prbe-knowledge ::
+#   .github/workflows/agent-optimization-nightly.yml
+#   .github/workflows/nightly-improvement-resume.yml
+#
+# Replaces `doctl kubernetes cluster kubeconfig save probe-managed`, which
+# minted a throwaway DigitalOcean personal access token on every nightly run.
+# See prbe-ai/prbe-data-plane-image ci/README.md for the full rationale and the
+# 2026-08-12 outage that motivated it.
+#
+# This repo's own DIGITALOCEAN_ACCESS_TOKEN was minted 2026-05-18 and expires
+# 2026-08-16 -- the identical outage was already scheduled for these two
+# workflows. This removes the credential rather than renewing it.
+#
+# SCOPE: namespace-admin in `managed` ONLY -- strictly narrower than the
+# fleet-rollout ServiceAccount, which also needs control-plane and
+# prbe-image-prepull. A separate identity per consumer so that revoking the
+# nightlies does not touch the fleet rollout, and so cluster audit logs
+# attribute actions to the workflow that took them.
+#
+# Namespace-admin rather than a hand-enumerated verb list: these workflows
+# render and `kubectl apply` a Job from k8s/jobs/nightly-trace-digest.yaml,
+# then wait/log/delete it. A Role pinned to today's fields breaks the next
+# time that manifest gains one.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ci
+  labels:
+    app.kubernetes.io/managed-by: manual
+    probe.prbe.ai/purpose: ci-automation
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: knowledge-nightly
+  namespace: ci
+  annotations:
+    probe.prbe.ai/consumer: "prbe-ai/prbe-knowledge nightly workflows"
+    probe.prbe.ai/rotation: "Manual. Delete the Secret below, re-apply, re-run `gh secret set KUBE_SA_TOKEN`."
+---
+# Non-expiring token, for the same reason as the fleet-rollout SA: a
+# `kubectl create token --duration` refresh needs a credential to mint the
+# next one, which reintroduces the bootstrap dependency this removes.
+# Cluster is v1.35.1, so tokens are not auto-created -- this Secret is what
+# makes one exist.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: knowledge-nightly-token
+  namespace: ci
+  annotations:
+    kubernetes.io/service-account.name: knowledge-nightly
+type: kubernetes.io/service-account-token
+---
+# Read managed-retrieval's image tag; apply/wait/log/delete the trace-digest
+# Job (k8s/jobs/nightly-trace-digest.yaml pins `namespace: managed`).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: knowledge-nightly-admin
+  namespace: managed
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: admin
+subjects:
+  - kind: ServiceAccount
+    name: knowledge-nightly
+    namespace: ci
