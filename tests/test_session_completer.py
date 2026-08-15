@@ -239,3 +239,35 @@ async def test_finalize_event_processes_through_normalizer(
     assert "claude_code.session" in types, (
         f"expected claude_code.session doc, found: {types}"
     )
+
+
+class TestCronIdleWindowPrecedence:
+    """`--idle-minutes` is the whole point of the nightly sweep.
+
+    The nightly job passes 360 because finalizing is effectively one-way: the
+    marker key is sticky, so a session that resumes afterwards re-runs the
+    extraction LLM on every later batch. If the flag were silently ignored and
+    the 5-minute settings default won, the sweep would finalize sessions people
+    are still using — which is exactly the failure this tests against.
+    """
+
+    def test_explicit_flag_wins_over_settings_default(self) -> None:
+        from scripts.cron_session_completer import _parse_args, resolve_idle_minutes
+
+        args = _parse_args(["--idle-minutes", "360"])
+        assert resolve_idle_minutes(args.idle_minutes) == 360
+
+    def test_omitted_flag_falls_back_to_settings(self) -> None:
+        from engine.shared.config import get_settings
+        from scripts.cron_session_completer import _parse_args, resolve_idle_minutes
+
+        args = _parse_args([])
+        assert args.idle_minutes is None
+        assert resolve_idle_minutes(None) == get_settings().claude_code_session_idle_minutes
+
+    def test_nonpositive_window_is_rejected(self) -> None:
+        """A 0 would finalize every live session on the next sweep."""
+        from scripts.cron_session_completer import _parse_args
+
+        with pytest.raises(SystemExit):
+            _parse_args(["--idle-minutes", "0"])

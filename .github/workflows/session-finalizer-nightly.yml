@@ -1,0 +1,178 @@
+# Nightly agent-session finalizer sweep.
+#
+# WHAT IT FIXES
+# -------------
+# Claude Code / Codex transcripts stream in continuously, but the extracted
+# knowledge units — qa, code_change (with its `intent`), decision (with
+# options considered + rationale), file_ref — are produced ONLY on the
+# `session_complete=True` branch of kb/handlers/claude_code.py. A session
+# nothing ever finalizes is captured, indexed as a live transcript, and never
+# mined for intent.
+#
+# The tap now sends an explicit finalize on SessionEnd, which covers clean
+# endings. This sweep covers the endings that send nothing at all: a
+# hard-killed terminal, a laptop that slept and never woke, a crashed daemon,
+# a machine that dropped off the network before its last drain.
+#
+# WHY ITS OWN WORKFLOW
+# --------------------
+# knowledge-cron.yml still launches its jobs with `flyctl machine run` against
+# the prbe-knowledge-cron Fly app, but fly.cron.toml was deleted in the
+# self-host cleanup (#392) and prod now runs on the probe-managed K8s cluster.
+# Rather than add a third job to a workflow whose launch mechanism no longer
+# matches the deployment, this uses the live pattern —
+# kubectl + k8s/jobs/*.yaml, same as agent-optimization-nightly.yml.
+#
+# Required secrets (same ci/knowledge-nightly ServiceAccount as the other
+# nightlies; see ci/README.md):
+#   KUBE_API_SERVER — probe-managed API server URL
+#   KUBE_CA_CERT    — probe-managed CA cert, base64
+#   KUBE_SA_TOKEN   — ci/knowledge-nightly ServiceAccount token
+name: session-finalizer-nightly
+
+on:
+  schedule:
+    # 04:00 UTC — after wiki (02:00) and leiden (03:00) so the three nightlies
+    # never contend for the same DB.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      idle_minutes:
+        description: >-
+          Finalize sessions idle this many minutes. Default 360 (6h).
+          Lower it only deliberately: finalizing is effectively one-way, and a
+          session that resumes afterwards re-runs the extraction LLM on every
+          later batch.
+        required: false
+        default: "360"
+        type: string
+
+concurrency:
+  # Two sweeps at once would race on the same UPSERT. The finder query makes
+  # that harmless rather than corrupting, but there is no reason to pay for it.
+  group: session-finalizer-nightly
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl for managed-shared cluster
+        env:
+          KUBE_API_SERVER: ${{ secrets.KUBE_API_SERVER }}
+          KUBE_CA_CERT: ${{ secrets.KUBE_CA_CERT }}
+          KUBE_SA_TOKEN: ${{ secrets.KUBE_SA_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${KUBE_API_SERVER}" ] || missing="${missing} KUBE_API_SERVER"
+          [ -n "${KUBE_CA_CERT}" ]    || missing="${missing} KUBE_CA_CERT"
+          [ -n "${KUBE_SA_TOKEN}" ]   || missing="${missing} KUBE_SA_TOKEN"
+          if [ -n "${missing}" ]; then
+            echo "::error title=Cluster credentials not configured::Missing repo secret(s):${missing}. Regenerate them from the ci/knowledge-nightly ServiceAccount — see ci/README.md."
+            exit 1
+          fi
+          install -m 600 /dev/null "${RUNNER_TEMP}/kubeconfig"
+          cat > "${RUNNER_TEMP}/kubeconfig" <<EOF
+          apiVersion: v1
+          kind: Config
+          clusters:
+            - name: probe-managed
+              cluster:
+                server: ${KUBE_API_SERVER}
+                certificate-authority-data: ${KUBE_CA_CERT}
+          contexts:
+            - name: probe-managed
+              context:
+                cluster: probe-managed
+                user: knowledge-nightly
+                namespace: managed
+          current-context: probe-managed
+          users:
+            - name: knowledge-nightly
+              user:
+                token: ${KUBE_SA_TOKEN}
+          EOF
+          echo "KUBECONFIG=${RUNNER_TEMP}/kubeconfig" >> "$GITHUB_ENV"
+
+      # Name which failure this is before anything downstream trips over it: a
+      # dead credential and an unreachable cluster look identical from a failed
+      # kubectl and need completely different fixes.
+      - name: Check the cluster credential is still valid
+        run: |
+          set -uo pipefail
+          if ! whoami_out="$(kubectl auth whoami 2>&1)"; then
+            case "${whoami_out}" in
+              *Unauthorized*|*401*)
+                echo "::error title=Cluster token rejected::The ci/knowledge-nightly ServiceAccount token is invalid or was revoked. Re-issue it (see ci/README.md)."
+                ;;
+              *Forbidden*|*403*)
+                echo "::error title=Cluster token under-privileged::The ServiceAccount authenticated but is missing RBAC. Re-apply ci/rbac/probe-managed.yaml. Detail: ${whoami_out}"
+                ;;
+              *)
+                echo "::error title=Cluster unreachable::This looks like the API server, not the token. Check the probe-managed cluster before touching credentials. Detail: ${whoami_out}"
+                ;;
+            esac
+            exit 1
+          fi
+          echo "Acting as: $(kubectl auth whoami -o jsonpath='{.status.userInfo.username}' 2>/dev/null || echo 'unknown')"
+
+      - name: Resolve image tag + job name
+        id: ctx
+        run: |
+          set -euo pipefail
+          # Pin to whatever the live retrieval tier is running, so the sweep
+          # never executes code the deployed engine has not shipped.
+          IMAGE_TAG=$(kubectl -n managed get deploy managed-retrieval \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' \
+            | sed 's|.*:||')
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          echo "job_suffix=$(date +%s | tail -c 6)" >> "$GITHUB_OUTPUT"
+          IDLE="${{ inputs.idle_minutes }}"
+          echo "idle_minutes=${IDLE:-360}" >> "$GITHUB_OUTPUT"
+
+      - name: Render + launch finalizer sweep Job
+        id: launch
+        run: |
+          set -euo pipefail
+          JOB_NAME="session-finalizer-sweep-${{ steps.ctx.outputs.date }}-${{ steps.ctx.outputs.job_suffix }}"
+          echo "job_name=$JOB_NAME" >> "$GITHUB_OUTPUT"
+
+          sed \
+            -e "s|DATE_PLACEHOLDER|${{ steps.ctx.outputs.date }}|g" \
+            -e "s|JOB_SUFFIX_PLACEHOLDER|${{ steps.ctx.outputs.job_suffix }}|g" \
+            -e "s|IMAGE_TAG_PLACEHOLDER|${{ steps.ctx.outputs.image_tag }}|g" \
+            -e "s|IDLE_MINUTES_PLACEHOLDER|${{ steps.ctx.outputs.idle_minutes }}|g" \
+            k8s/jobs/session-finalizer-sweep.yaml > /tmp/job.yaml
+
+          echo "--- rendered Job (head) ---"
+          head -12 /tmp/job.yaml
+          kubectl apply -f /tmp/job.yaml
+
+      - name: Wait for sweep + report how many sessions were finalized
+        run: |
+          set -euo pipefail
+          kubectl -n managed wait \
+            --for=condition=complete \
+            --timeout=15m \
+            "job/${{ steps.launch.outputs.job_name }}"
+          POD=$(kubectl -n managed get pods \
+            -l "job-name=${{ steps.launch.outputs.job_name }}" \
+            -o jsonpath='{.items[0].metadata.name}')
+          OUT=$(kubectl -n managed logs "$POD")
+          echo "$OUT"
+          # The script's last line is `enqueued N finalize events (...)`. Zero
+          # is a normal night once the tap's own finalize is doing its job —
+          # surface it as a notice so a permanently-zero sweep is visible
+          # rather than looking like success.
+          echo "::notice title=Session finalizer sweep::${OUT##*$'\n'}"
+
+      - name: Clean up the Job
+        if: always()
+        run: |
+          kubectl -n managed delete job "${{ steps.launch.outputs.job_name }}" \
+            --ignore-not-found=true

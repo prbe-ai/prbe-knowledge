@@ -1,0 +1,115 @@
+# In-cluster agent-session finalizer sweep.
+#
+# WHY THIS JOB EXISTS
+# -------------------
+# Claude Code and Codex transcripts are captured continuously, but the
+# extracted knowledge units (qa / code_change / decision / file_ref) are
+# produced ONLY on the `session_complete=True` path in
+# kb/handlers/claude_code.py. Until something marks a session complete, the
+# transcript is indexed and the intent behind it is never mined.
+#
+# The tap sends an explicit finalize when a session ends cleanly. This sweep
+# is the backstop for the endings that send nothing: a hard-killed terminal,
+# a laptop that slept and never woke, a crashed daemon, a machine that lost
+# the network before its last drain. Without it those sessions stay open
+# forever.
+#
+# Why a Job driven by the workflow rather than a CronJob in the Helm chart:
+# same reasoning as nightly-trace-digest.yaml — the chart is `helm upgrade`
+# territory, and this manifest is owned by the workflow that launches it
+# (.github/workflows/session-finalizer-nightly.yml) with the same
+# envsubst + kubectl create + wait + logs pattern.
+#
+# IDLE WINDOW: the workflow passes --idle-minutes 360, deliberately far above
+# the 5-minute default. Finalizing is effectively one-way — the marker key is
+# sticky, so a session that resumes afterwards re-runs the extraction LLM on
+# every later batch — so the sweep must only ever catch sessions that are
+# genuinely over, never one a researcher paused between meetings.
+#
+# Idempotent: sessions whose live queue row already carries a finalize.marker
+# are filtered out by the finder query in kb/session_completer.py, so a
+# re-fire (or an overlapping manual run) costs nothing.
+#
+# RLS: enqueue_idle_session_finalizers writes to ingestion_queue across
+# tenants using the app role's DSN, matching the trace-digest job's prior art.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: session-finalizer-sweep-DATE_PLACEHOLDER-JOB_SUFFIX_PLACEHOLDER
+  namespace: managed
+  labels:
+    app.kubernetes.io/name: prbe-data-plane
+    app.kubernetes.io/instance: prbe-data-plane
+    app.kubernetes.io/part-of: prbe-data-plane
+    probe.prbe.ai/role: worker
+    probe.prbe.ai/mode: managed-shared
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 2
+  # The sweep is a handful of queries plus one small R2 put per finalized
+  # session. Ten minutes is generous; if it ever runs longer than this,
+  # something is wrong with the DB rather than with the workload.
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prbe-data-plane
+        app.kubernetes.io/instance: prbe-data-plane
+        probe.prbe.ai/role: worker
+    spec:
+      restartPolicy: Never
+      # GHCR is private — same pull-secret the app tier uses. Without this the
+      # pod hits ImagePullBackOff and the workflow's `kubectl wait` burns its
+      # whole timeout instead of failing fast.
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: session-finalizer
+          # IMAGE_TAG_PLACEHOLDER is substituted by the workflow with the tag
+          # the managed-retrieval deployment is currently running, so the
+          # sweep always executes the same code as the live tier.
+          image: ghcr.io/prbe-ai/prbe-data-plane-knowledge:IMAGE_TAG_PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          # `uv` is NOT in the runtime image — it ships a baked venv at
+          # /opt/probe-venv already on PATH, and /opt/upstreams/prbe-knowledge
+          # is on sys.path, so plain `python -m scripts.…` resolves from any cwd.
+          command:
+            - python
+            - -m
+            - scripts.cron_session_completer
+            - --idle-minutes
+            - "IDLE_MINUTES_PLACEHOLDER"
+          env:
+            # App role's DSN (not the migrator superuser), so RLS is enforced.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: managed-data-plane-secrets
+                  key: DATABASE_URL
+            - name: NEON_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: managed-data-plane-secrets
+                  key: DATABASE_URL
+            - name: PROBE_DEPLOYMENT_MODE
+              value: managed-shared
+          envFrom:
+            # R2 credentials — the sweep PUTs a finalize.marker object per
+            # session before UPSERTing the queue row, so storage config is
+            # load-bearing here, not incidental.
+            - secretRef:
+                name: managed-data-plane-secrets
+            - configMapRef:
+                name: managed-data-plane-config
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: false
