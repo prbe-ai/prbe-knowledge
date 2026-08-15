@@ -321,6 +321,51 @@ def _line_bounds(events: list[dict[str, Any]]) -> tuple[int | None, int | None]:
     return (min(nums), max(nums)) if nums else (None, None)
 
 
+def _fold_empty_code_changes(bundle: UnitBundle) -> UnitBundle:
+    """A code_change with no before and no after is a file_ref wearing a hat.
+
+    The tap deliberately does not ship diffs — it sends the file path and a
+    measured [+added/-removed] count — and the prompt tells the model to leave
+    `before`/`after` EMPTY rather than reconstruct code it was not shown. It
+    obeys: measured on a real backfill, 78 of 93 code_change units came back
+    with both sides empty. What remains is a file path plus an intent string,
+    which is exactly what a file_ref already is, and 47 of those 78 named a
+    file that ALREADY had a file_ref in the same segment.
+
+    So fold rather than duplicate. Merging into the existing file_ref removed
+    51 of 139 file-oriented units on that session — a 37% cut — while losing
+    nothing: the intent is appended to the context it belongs with, so the
+    reader gets "this file was consulted, AND here is what changed in it" as
+    one statement instead of two documents that each tell half of it.
+
+    A code_change that DID quote the transcript is untouched; those are the
+    ones carrying something a file_ref cannot say.
+    """
+    kept: list[CodeChange] = []
+    for change in bundle.code_change:
+        if change.before.strip() or change.after.strip():
+            kept.append(change)
+            continue
+        _absorb_into_file_refs(bundle.file_ref, change)
+    bundle.code_change = kept
+    return bundle
+
+
+def _absorb_into_file_refs(refs: list[FileRef], change: CodeChange) -> None:
+    """Attach a describe-only change to the file_ref for its file, or make one."""
+    path = (change.file or "").strip()
+    intent = (change.intent or "").strip()
+    if not path:
+        return  # nothing to attach it to, and nothing to say without a file
+    note = f"Changed: {intent}" if intent else ""
+    for ref in refs:
+        if path in ref.files:
+            if note and note not in ref.context:
+                ref.context = f"{ref.context} {note}".strip()
+            return
+    refs.append(FileRef(files=[path], context=note or "Changed."))
+
+
 def _stamp(bundle: UnitBundle, ref: SegmentRef) -> UnitBundle:
     """Give every unit its own ref, carrying its position within this segment.
 
@@ -465,11 +510,13 @@ async def _extract_one(
         # `tool_use` block came back.
         return UnitBundle()
 
-    return UnitBundle(
-        qa=[QA(**x) for x in args.get("qa", [])],
-        code_change=[CodeChange(**x) for x in args.get("code_change", [])],
-        decision=[Decision(**x) for x in args.get("decision", [])],
-        file_ref=[FileRef(**x) for x in args.get("file_ref", [])],
+    return _fold_empty_code_changes(
+        UnitBundle(
+            qa=[QA(**x) for x in args.get("qa", [])],
+            code_change=[CodeChange(**x) for x in args.get("code_change", [])],
+            decision=[Decision(**x) for x in args.get("decision", [])],
+            file_ref=[FileRef(**x) for x in args.get("file_ref", [])],
+        )
     )
 
 

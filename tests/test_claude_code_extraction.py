@@ -316,3 +316,69 @@ async def test_units_carry_their_place_in_the_session(monkeypatch) -> None:
     assert refs[1].start_line_no == 11
     # Every unit type is stamped, not just qa.
     assert all(d.segment is not None for d in bundle.decision)
+
+
+@pytest.mark.asyncio
+async def test_describe_only_code_changes_fold_into_file_refs(monkeypatch) -> None:
+    """The tap does not ship diffs, and the prompt forbids inventing them, so
+    most code_change units come back with both sides empty — 78 of 93 on a real
+    backfill. What is left is a file path plus an intent string, which is what a
+    file_ref already is, and 47 of those 78 named a file that ALREADY had one."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        return _litellm_tool_response("emit_units", {
+            "qa": [],
+            "code_change": [
+                # describe-only, and its file already has a file_ref
+                {"file": "app/store.py", "before": "", "after": "",
+                 "intent": "add cardinality guard"},
+                # describe-only, no existing file_ref
+                {"file": "app/routes.py", "before": "", "after": "",
+                 "intent": "map the new error to 422"},
+                # quotes the transcript — must survive untouched
+                {"file": "app/models.py", "before": "x: int", "after": "x: str",
+                 "intent": "widen the field"},
+            ],
+            "decision": [],
+            "file_ref": [
+                {"files": ["app/store.py"], "context": "Core metric write path."},
+            ],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("go", 0)]
+    )
+
+    # Only the transcript-quoting change stays a code_change.
+    assert [c.file for c in bundle.code_change] == ["app/models.py"]
+
+    by_file = {tuple(f.files): f.context for f in bundle.file_ref}
+    # Merged into the existing ref rather than adding a second document.
+    assert by_file[("app/store.py",)] == (
+        "Core metric write path. Changed: add cardinality guard"
+    )
+    # The one with no existing ref becomes its own.
+    assert by_file[("app/routes.py",)] == "Changed: map the new error to 422"
+    # Net: 4 units in, 3 out, and nothing said was lost.
+    assert len(bundle.code_change) + len(bundle.file_ref) == 3
+
+
+def test_fold_is_idempotent_and_survives_a_missing_path() -> None:
+    """A change with no file has nothing to attach to and no file_ref to be."""
+    from engine.shared.claude_code_extraction import (
+        CodeChange,
+        FileRef,
+        UnitBundle,
+        _fold_empty_code_changes,
+    )
+
+    bundle = UnitBundle(
+        code_change=[CodeChange(file="", before="", after="", intent="mystery")],
+        file_ref=[FileRef(files=["a.py"], context="ctx")],
+    )
+    once = _fold_empty_code_changes(bundle)
+    twice = _fold_empty_code_changes(once)
+    assert twice.code_change == []
+    assert [f.context for f in twice.file_ref] == ["ctx"]
