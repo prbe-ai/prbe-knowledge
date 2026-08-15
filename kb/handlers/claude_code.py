@@ -972,9 +972,24 @@ def _render_user(raw: dict[str, Any]) -> str:
     msg = raw.get("message")
     if not isinstance(msg, dict):
         return ""
+
+    # A compaction summary is NOT something the user said. When a session runs
+    # out of context, Claude Code writes its own 18-25 KB summary of everything
+    # so far and injects it as a `user` message flagged isCompactSummary. One
+    # measured session carried four of them, 83 KB in total.
+    #
+    # Rendering that as "USER:" tells the index the researcher personally wrote
+    # a structured account of their own intent, which is exactly the text an
+    # extractor reaches for when filling qa.prompt — so the model's summary of
+    # the human comes back out attributed to the human. Label it instead of
+    # dropping it: it is the single densest statement of intent in a long
+    # session, and for the early parts of a session that fall outside the
+    # extractor's 2,000-event window it is the ONLY surviving record.
+    speaker = "COMPACTION SUMMARY" if raw.get("isCompactSummary") else "USER"
+
     content = msg.get("content")
     if isinstance(content, str) and content:
-        return f"USER: {content}"
+        return f"{speaker}: {content}"
     if not isinstance(content, list):
         return ""
 
@@ -986,7 +1001,7 @@ def _render_user(raw: dict[str, Any]) -> str:
         if bt == "text":
             text = b.get("text") or ""
             if text:
-                parts.append(f"USER: {text}")
+                parts.append(f"{speaker}: {text}")
         elif bt == "tool_result":
             # SUCCESSFUL results are not rendered at all. Measured over a real
             # session, `TOOL_RESULT (toolu_x): ok` accounted for 1,660 lines and

@@ -443,3 +443,31 @@ def test_ansi_escape_codes_are_stripped_from_the_body() -> None:
         }),
     ]
     assert _events_to_text(events) == "USER: ├ passed"
+
+
+def test_compaction_summary_is_not_attributed_to_the_user() -> None:
+    """When a session runs out of context, Claude Code writes an 18-25 KB
+    summary of everything so far and injects it as a `user` message. One
+    measured session carried four, 83 KB in total. Rendering them as USER told
+    the index the researcher personally authored a structured account of their
+    own intent — which is exactly the text an extractor reaches for when
+    filling qa.prompt."""
+    raw = {
+        "type": "user",
+        "isCompactSummary": True,
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "This session is being continued from…"}
+            ],
+        },
+    }
+    assert _render_event(raw) == "COMPACTION SUMMARY: This session is being continued from…"
+
+
+def test_ordinary_user_messages_are_unaffected() -> None:
+    raw = {
+        "type": "user",
+        "message": {"role": "user", "content": [{"type": "text", "text": "fix it"}]},
+    }
+    assert _render_event(raw) == "USER: fix it"
