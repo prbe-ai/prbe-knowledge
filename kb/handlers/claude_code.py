@@ -548,6 +548,7 @@ class ClaudeCodeConnector(Connector):
                         "chosen": dec.chosen,
                         "rationale": dec.rationale,
                         "serves": dec.serves,
+                        "decided_by": dec.decided_by,
                         **self._segment_metadata(dec),
                     },
                     body=_decision_body(dec),
@@ -950,6 +951,8 @@ def _decision_body(decision: Any) -> str:
     ]
     if decision.serves:
         lines.append(f"SERVES: {decision.serves}")
+    if decision.decided_by:
+        lines.append(f"DECIDED BY: {decision.decided_by.replace('_', ' ')}")
     ref = getattr(decision, "segment", None)
     if ref is not None and ref.objective:
         lines.append(f"GOAL: {ref.objective}")

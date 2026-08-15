@@ -104,6 +104,17 @@ class Decision:
     #: choosing at all". Asking "why did we decide this?" needs both, and the
     #: second was the half that did not exist.
     serves: str = ""
+    #: WHO made the call. Currently not just absent but actively lost: audited
+    #: over 72 real decisions, only 8 rationales credited the user at all, and
+    #: in one session 0 of 12 did while tracing the transcript showed roughly
+    #: five were the user's call outright ("using the server as the source and
+    #: keeping the local locks as a fast-path" came back as though the agent had
+    #: reasoned its way there).
+    #:
+    #: This is the field that makes per-person norms possible: a decision the
+    #: agent took alone says nothing about how a researcher works, and one they
+    #: overrode says a great deal.
+    decided_by: str = ""  # see _DECIDED_BY
     segment: SegmentRef | None = None
 
 
@@ -231,9 +242,28 @@ _TOOL_PARAMETERS: dict[str, Any] = {
                             "for. Empty if the decision is incidental to it."
                         ),
                     },
+                    "decided_by": {
+                        "type": "string",
+                        "enum": [
+                            "user_directed",
+                            "user_confirmed",
+                            "agent_proposed_user_approved",
+                            "agent_unilateral",
+                            "agent_overrode_user",
+                        ],
+                        "description": (
+                            "Who actually made the call. Attribute to the USER "
+                            "whenever a user turn states the choice, even if the "
+                            "reasoning around it is the assistant's. "
+                            "agent_unilateral is a real answer, not a fallback. "
+                            "Use agent_overrode_user only when a user turn asked "
+                            "for something else and it was not done."
+                        ),
+                    },
                 },
                 "required": [
-                    "question", "options_considered", "chosen", "rationale", "serves",
+                    "question", "options_considered", "chosen", "rationale",
+                    "serves", "decided_by",
                 ],
             },
         },
@@ -323,6 +353,15 @@ _SYSTEM_TEMPLATE = (
 )
 
 _AGENT_LABELS = {"claude_code": "Claude Code", "codex": "Codex"}
+
+#: Authorship of a decision. Ordered from most to least human involvement.
+_DECIDED_BY = (
+    "user_directed",              # the user stated the choice
+    "user_confirmed",             # the user endorsed a choice already on the table
+    "agent_proposed_user_approved",
+    "agent_unilateral",           # a real answer, not a missing one
+    "agent_overrode_user",        # rare, and the highest-signal value here
+)
 
 
 log = get_logger(__name__)

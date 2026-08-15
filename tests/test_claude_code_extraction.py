@@ -453,3 +453,37 @@ async def test_concurrent_segments_do_not_swap_goals(monkeypatch) -> None:
     assert seen["n"] == 2
     for unit in bundle.qa:
         assert unit.segment.objective == f"objective for the {unit.prompt} part"
+
+
+@pytest.mark.asyncio
+async def test_decisions_record_who_actually_decided(monkeypatch) -> None:
+    """Authorship was not merely absent, it was actively lost: over 72 real
+    decisions only 8 rationales credited the user, and in one session 0 of 12
+    did while the transcript showed roughly five were the user's call outright.
+
+    It is the field that makes per-person norms possible — a decision the agent
+    took alone says nothing about how a researcher works, and one they overrode
+    says a great deal.
+    """
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        return _litellm_tool_response("emit_units", {
+            "goal": {"objective": "make liveness honest", "motivation": ""},
+            "qa": [], "code_change": [], "file_ref": [],
+            "decision": [{
+                "question": "server, local locks, or both?",
+                "options_considered": ["server", "local locks", "both"],
+                "chosen": "both",
+                "rationale": "local locks cannot see a remote run",
+                "serves": "liveness is correct on every machine",
+                "decided_by": "user_directed",
+            }],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("go", 0)]
+    )
+    assert bundle.decision[0].decided_by == "user_directed"
+    assert bundle.decision[0].decided_by in ext_mod._DECIDED_BY

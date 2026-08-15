@@ -87,6 +87,43 @@ def _render_event(raw: dict[str, Any]) -> str:
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
+#: Machine-generated envelopes that arrive on the USER channel. They are not
+#: speech — the harness injects them — but they render as `USER:` and are then
+#: read as the researcher's own words by everything downstream, including the
+#: extractor filling qa.prompt and any attempt to mine per-person habits.
+#:
+#: Measured over twelve real sessions (774 user turns carrying text): 23.6%
+#: contained a task-notification, 6.2% slash-command plumbing, 5.2% the
+#: local-command caveat, 4.8% an entire injected skill body.
+_HARNESS_BLOCKS = [
+    re.compile(r"<task-notification>.*?</task-notification>", re.S),
+    re.compile(r"<system-reminder>.*?</system-reminder>", re.S),
+    re.compile(r"<local-command-caveat>.*?</local-command-caveat>", re.S),
+    re.compile(r"<local-command-(?:stdout|stderr)>.*?</local-command-(?:stdout|stderr)>", re.S),
+    re.compile(r"</?command-(?:name|message|args)>", re.S),
+    re.compile(r"<codex_internal_context>.*?</codex_internal_context>", re.S),
+]
+
+#: A whole injected document rather than an envelope around one: when a skill
+#: fires, its body arrives as a user turn. There is no user text to preserve, so
+#: the turn goes rather than being trimmed.
+_INJECTED_DOCUMENT = re.compile(r"^\s*Base directory for this skill:", re.M)
+
+
+def _strip_harness(text: str) -> str:
+    """User text with the harness's own injections removed.
+
+    Trimmed rather than dropped whole, because a turn routinely carries a real
+    request AND an appended reminder; discarding the turn would lose the half
+    that matters.
+    """
+    if _INJECTED_DOCUMENT.search(text):
+        return ""
+    for pattern in _HARNESS_BLOCKS:
+        text = pattern.sub(" ", text)
+    return text.strip()
+
+
 def _render_tool_use(block: dict[str, Any]) -> str:
     """One line for a tool call: name, what it acted on, what it changed.
 
@@ -139,7 +176,8 @@ def _render_user(raw: dict[str, Any]) -> str:
 
     content = msg.get("content")
     if isinstance(content, str) and content:
-        return f"{speaker}: {content}"
+        cleaned = _strip_harness(content)
+        return f"{speaker}: {cleaned}" if cleaned else ""
     if not isinstance(content, list):
         return ""
 
@@ -149,7 +187,7 @@ def _render_user(raw: dict[str, Any]) -> str:
             continue
         bt = b.get("type")
         if bt == "text":
-            text = b.get("text") or ""
+            text = _strip_harness(b.get("text") or "")
             if text:
                 parts.append(f"{speaker}: {text}")
         elif bt == "tool_result":
