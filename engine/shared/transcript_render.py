@@ -43,15 +43,50 @@ def _events_to_text(events: list[dict[str, Any]]) -> str:
     rather than dumped as JSON — JSON noise in the embedded text was the
     original problem this rewrite solves.
     """
+    return render_indexed(events)[0]
+
+
+def render_indexed(
+    events: list[dict[str, Any]],
+) -> tuple[str, list[tuple[int, int, int]]]:
+    """The same prose, plus a map from text offset back to transcript line.
+
+    Exists so a quote can be traced to the event it came from. That is what
+    turns an evidence string into a VERIFIED one — a quote that matches nothing
+    was not in the transcript — and the matched span yields the unit's anchor
+    line, which is the only way to order two units inside one segment.
+
+    Returns (text, spans) where each span is (start, end, line_no) over the
+    returned text. ANSI is stripped per-block so offsets stay valid; stripping
+    it afterwards would shift every span left of the escape.
+    """
     blocks: list[str] = []
+    spans: list[tuple[int, int, int]] = []
+    cursor = 0
     for ev in events:
         raw = ev.get("raw") if isinstance(ev, dict) else None
         if not isinstance(raw, dict):
             continue
-        rendered = _render_event(raw)
-        if rendered:
-            blocks.append(rendered)
-    return _ANSI_RE.sub("", "\n\n".join(blocks))
+        rendered = _ANSI_RE.sub("", _render_event(raw))
+        if not rendered:
+            continue
+        if blocks:
+            cursor += 2  # the "\n\n" join between blocks
+        line_no = ev.get("line_no") if isinstance(ev, dict) else None
+        spans.append(
+            (cursor, cursor + len(rendered), line_no if isinstance(line_no, int) else -1)
+        )
+        cursor += len(rendered)
+        blocks.append(rendered)
+    return "\n\n".join(blocks), spans
+
+
+def line_for_offset(spans: list[tuple[int, int, int]], offset: int) -> int | None:
+    """The transcript line whose rendered text contains `offset`."""
+    for start, end, line_no in spans:
+        if start <= offset < end:
+            return line_no if line_no >= 0 else None
+    return None
 
 
 def _render_event(raw: dict[str, Any]) -> str:

@@ -19,7 +19,11 @@ from engine.shared.config import get_settings
 from engine.shared.llm import gateway_url
 from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
 from engine.shared.logging import get_logger
-from engine.shared.transcript_render import _events_to_text
+from engine.shared.transcript_render import (
+    _events_to_text,
+    line_for_offset,
+    render_indexed,
+)
 
 
 @dataclass(slots=True)
@@ -67,6 +71,15 @@ class QA:
     prompt: str
     outcome: str
     tags: list[str] = field(default_factory=list)
+    #: A short VERBATIM quote from the transcript that supports this unit.
+    #: Checked server-side: a quote that matches nothing was not in the
+    #: transcript, which is the one fabrication signal available without a
+    #: human. `evidence_verified` and `anchor_line_no` are set from that check,
+    #: never by the model.
+    evidence: str = ""
+    evidence_verified: bool = False
+    anchor_line_no: int | None = None
+    confidence: str = ""  # see _CONFIDENCE
     segment: SegmentRef | None = None
 
 
@@ -81,15 +94,23 @@ class CodeChange:
     nobody searches one that way either.
 
     `before`/`after` are gone. The tap deliberately ships no diffs, and 78 of
-    those 93 came back with both sides empty; the rare case where the
-    transcript really did contain the text is served by `evidence`.
+    those 93 came back with both sides empty; the rare case where the transcript
+    really did contain the text is served by the shared `evidence` quote.
     """
 
     summary: str                          # the change, one line
     kind: str = ""                        # feature | fix | refactor | test | docs | config | infra
     files: list[str] = field(default_factory=list)
     rationale: str = ""
-    evidence: str = ""                    # literal snippet, only when the transcript had one
+    #: A short VERBATIM quote from the transcript that supports this unit.
+    #: Checked server-side: a quote that matches nothing was not in the
+    #: transcript, which is the one fabrication signal available without a
+    #: human. `evidence_verified` and `anchor_line_no` are set from that check,
+    #: never by the model.
+    evidence: str = ""
+    evidence_verified: bool = False
+    anchor_line_no: int | None = None
+    confidence: str = ""  # see _CONFIDENCE
     segment: SegmentRef | None = None
 
 
@@ -115,6 +136,15 @@ class Decision:
     #: agent took alone says nothing about how a researcher works, and one they
     #: overrode says a great deal.
     decided_by: str = ""  # see _DECIDED_BY
+    #: A short VERBATIM quote from the transcript that supports this unit.
+    #: Checked server-side: a quote that matches nothing was not in the
+    #: transcript, which is the one fabrication signal available without a
+    #: human. `evidence_verified` and `anchor_line_no` are set from that check,
+    #: never by the model.
+    evidence: str = ""
+    evidence_verified: bool = False
+    anchor_line_no: int | None = None
+    confidence: str = ""  # see _CONFIDENCE
     segment: SegmentRef | None = None
 
 
@@ -122,6 +152,15 @@ class Decision:
 class FileRef:
     files: list[str]
     context: str
+    #: A short VERBATIM quote from the transcript that supports this unit.
+    #: Checked server-side: a quote that matches nothing was not in the
+    #: transcript, which is the one fabrication signal available without a
+    #: human. `evidence_verified` and `anchor_line_no` are set from that check,
+    #: never by the model.
+    evidence: str = ""
+    evidence_verified: bool = False
+    anchor_line_no: int | None = None
+    confidence: str = ""  # see _CONFIDENCE
     segment: SegmentRef | None = None
 
 
@@ -183,8 +222,32 @@ _TOOL_PARAMETERS: dict[str, Any] = {
                     "prompt": {"type": "string"},
                     "outcome": {"type": "string"},
                     "tags": {"type": "array", "items": {"type": "string"}},
+                    "evidence": {
+                        "type": "string",
+                        "description": (
+                            "A SHORT VERBATIM quote from the transcript above "
+                            "that supports this unit — copied exactly, not "
+                            "paraphrased, one or two lines. It is checked "
+                            "against the transcript, so an approximate quote, "
+                            "a tidied one, or two spans joined by an ellipsis "
+                            "all fail the check."
+                        ),
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                        "description": (
+                            "high: the transcript states this outright. "
+                            "medium: strongly implied but assembled from "
+                            "several turns. low: a reasonable reading that "
+                            "someone could disagree with. Prefer emitting a "
+                            "low-confidence unit with honest evidence over "
+                            "omitting it, and never raise confidence to make a "
+                            "unit look better."
+                        ),
+                    },
                 },
-                "required": ["prompt", "outcome"],
+                "required": ["prompt", "outcome", "evidence", "confidence"],
             },
         },
         "code_change": {
@@ -214,12 +277,28 @@ _TOOL_PARAMETERS: dict[str, Any] = {
                     "evidence": {
                         "type": "string",
                         "description": (
-                            "A literal snippet quoted from the transcript, when it "
-                            "contained one. Empty otherwise — never reconstructed."
+                            "A SHORT VERBATIM quote from the transcript above "
+                            "that supports this unit — copied exactly, not "
+                            "paraphrased, one or two lines. It is checked "
+                            "against the transcript, so an approximate quote "
+                            "fails the check."
+                        ),
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                        "description": (
+                            "high: the transcript states this outright. "
+                            "medium: strongly implied but assembled from "
+                            "several turns. low: a reasonable reading that "
+                            "someone could disagree with. Prefer emitting a "
+                            "low-confidence unit with honest evidence over "
+                            "omitting it, and never raise confidence to make a "
+                            "unit look better."
                         ),
                     },
                 },
-                "required": ["summary", "kind", "files", "rationale"],
+                "required": ["summary", "kind", "files", "rationale", "evidence", "confidence"],
             },
         },
         "decision": {
@@ -260,10 +339,33 @@ _TOOL_PARAMETERS: dict[str, Any] = {
                             "for something else and it was not done."
                         ),
                     },
+                    "evidence": {
+                        "type": "string",
+                        "description": (
+                            "A SHORT VERBATIM quote from the transcript above "
+                            "that supports this unit — copied exactly, not "
+                            "paraphrased, one or two lines. It is checked "
+                            "against the transcript, so an approximate quote "
+                            "fails the check."
+                        ),
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                        "description": (
+                            "high: the transcript states this outright. "
+                            "medium: strongly implied but assembled from "
+                            "several turns. low: a reasonable reading that "
+                            "someone could disagree with. Prefer emitting a "
+                            "low-confidence unit with honest evidence over "
+                            "omitting it, and never raise confidence to make a "
+                            "unit look better."
+                        ),
+                    },
                 },
                 "required": [
                     "question", "options_considered", "chosen", "rationale",
-                    "serves", "decided_by",
+                    "serves", "decided_by", "evidence", "confidence",
                 ],
             },
         },
@@ -274,8 +376,31 @@ _TOOL_PARAMETERS: dict[str, Any] = {
                 "properties": {
                     "files": {"type": "array", "items": {"type": "string"}},
                     "context": {"type": "string"},
+                    "evidence": {
+                        "type": "string",
+                        "description": (
+                            "A SHORT VERBATIM quote from the transcript above "
+                            "that supports this unit — copied exactly, not "
+                            "paraphrased, one or two lines. It is checked "
+                            "against the transcript, so an approximate quote "
+                            "fails the check."
+                        ),
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                        "description": (
+                            "high: the transcript states this outright. "
+                            "medium: strongly implied but assembled from "
+                            "several turns. low: a reasonable reading that "
+                            "someone could disagree with. Prefer emitting a "
+                            "low-confidence unit with honest evidence over "
+                            "omitting it, and never raise confidence to make a "
+                            "unit look better."
+                        ),
+                    },
                 },
-                "required": ["files", "context"],
+                "required": ["files", "context", "evidence", "confidence"],
             },
         },
     },
@@ -334,6 +459,13 @@ _SYSTEM_TEMPLATE = (
     "same session, written when it ran out of context — not something the user "
     "said. Read them for intent, and never quote one as a user prompt.\n"
     "\n"
+    "EVERY unit needs `evidence`: one CONTIGUOUS verbatim span copied from the "
+    "transcript, and a `confidence`. Do not stitch two places together with an "
+    "ellipsis and do not tidy the wording — the quote is checked against the "
+    "transcript, and a stitched or tidied one fails and caps the unit at low "
+    "confidence. If no single span supports the unit, quote the closest one and "
+    "say low.\n"
+    "\n"
     "`goal` first: say what this stretch of work was actually FOR, in one "
     "sentence. Not a paraphrase of the opening message — the objective as it "
     "turned out, including if the work changed direction. Then, on each "
@@ -351,6 +483,12 @@ _SYSTEM_TEMPLATE = (
     "not contain the text, leave evidence EMPTY — never reconstruct code you "
     "were not shown. The summary and rationale carry the meaning."
 )
+
+#: Ordinal, not a float. A model asked for 0.87 produces fake precision; asked
+#: to pick one of three it has to commit. The machine-checked signal is
+#: `evidence_verified`, which is what actually distinguishes a grounded unit
+#: from a fluent one.
+_CONFIDENCE = ("high", "medium", "low")
 
 _AGENT_LABELS = {"claude_code": "Claude Code", "codex": "Codex"}
 
@@ -469,6 +607,92 @@ def _line_bounds(events: list[dict[str, Any]]) -> tuple[int | None, int | None]:
     return (min(nums), max(nums)) if nums else (None, None)
 
 
+def _ground_units(bundle: UnitBundle, transcript: str, spans) -> UnitBundle:
+    """Check every unit's quote against the transcript it was drawn from.
+
+    This is the only fabrication signal available without a human reading the
+    session. A model asked for a quote and answering with one that appears
+    nowhere has told us something about the unit that the unit's own prose
+    never would.
+
+    Two things fall out of a match, and neither is taken from the model:
+    `evidence_verified`, and `anchor_line_no` — the transcript line the quote
+    sits on. That anchor is what lets two units inside one segment be ordered
+    against each other; segment bounds alone put ~33 units in an identical
+    1000-event window.
+
+    Confidence is DOWNGRADED on a failed match, never upgraded on a passing
+    one. Matching a quote proves the words were said, not that the unit read
+    them correctly.
+    """
+    normalised = _collapse(transcript)
+    for unit in (*bundle.qa, *bundle.code_change, *bundle.decision, *bundle.file_ref):
+        quote = (unit.evidence or "").strip()
+        if unit.confidence not in _CONFIDENCE:
+            unit.confidence = "low"
+        if not quote:
+            unit.confidence = "low"
+            continue
+        offset = _locate(normalised, quote)
+        if offset < 0:
+            unit.evidence_verified = False
+            # An unverifiable quote caps the unit at low no matter what the
+            # model claimed for it.
+            unit.confidence = "low"
+            continue
+        unit.evidence_verified = True
+        unit.anchor_line_no = line_for_offset(spans, _expand(normalised, offset))
+    return bundle
+
+
+#: How much of a quote has to match. A whole-string match is the ideal and is
+#: tried first, but models reproduce the OPENING of a passage faithfully and
+#: drift later — measured on a real session, every failing quote matched its
+#: first several words and diverged after. Failing those outright made the
+#: check measure verbosity rather than fabrication.
+#:
+#: 60 contiguous characters is still a real check: a unit invented out of
+#: nothing does not accidentally reproduce sixty characters of a transcript it
+#: never saw.
+_QUOTE_MATCH_PREFIX = 60
+
+
+def _locate(normalised: str, quote: str) -> int:
+    """Offset of `quote` in the transcript, or -1.
+
+    Whole quote first, then its leading _QUOTE_MATCH_PREFIX characters.
+    """
+    collapsed = _collapse(quote)
+    offset = normalised.find(collapsed)
+    if offset >= 0:
+        return offset
+    if len(collapsed) <= _QUOTE_MATCH_PREFIX:
+        return -1
+    return normalised.find(collapsed[:_QUOTE_MATCH_PREFIX])
+
+
+def _collapse(text: str) -> str:
+    """Whitespace-insensitive form for quote matching.
+
+    A model reproduces the words reliably and the line breaks less so; failing
+    a quote over a wrapped newline would make the check measure formatting
+    rather than fabrication. Character positions are preserved 1:1 so an offset
+    in the collapsed text still maps back to the original.
+    """
+    return "".join(" " if c.isspace() else c for c in text)
+
+
+def _expand(_normalised: str, offset: int) -> int:
+    """_collapse preserves length, so offsets need no translation."""
+    return offset
+
+
+#: Fields the SERVER sets and the model may never supply. `evidence_verified`
+#: is the whole point of the check — a model that could assert it would be
+#: grading its own homework — and the other two are derived, not reported.
+_SERVER_OWNED = frozenset({"segment", "evidence_verified", "anchor_line_no"})
+
+
 def _only(raw: dict[str, Any], cls: type) -> dict[str, Any]:
     """Keep just the fields `cls` declares.
 
@@ -476,7 +700,7 @@ def _only(raw: dict[str, Any], cls: type) -> dict[str, Any]:
     occasionally answers with an older shape. Dropping the extras costs one
     field; letting them through raises TypeError and costs the segment.
     """
-    allowed = {f.name for f in fields(cls)} - {"segment"}
+    allowed = {f.name for f in fields(cls)} - _SERVER_OWNED
     return {k: v for k, v in raw.items() if k in allowed}
 
 
@@ -576,7 +800,7 @@ async def _extract_one(
 
     if drop_summaries:
         events = [e for e in events if not _is_compact_summary(e)]
-    transcript = _events_to_text(events)
+    transcript, spans = render_indexed(events)
     if not transcript.strip():
         return UnitBundle()
 
@@ -630,14 +854,14 @@ async def _extract_one(
     # Unknown keys are dropped rather than raising: a model that answers with a
     # field the schema no longer has must not cost the whole segment its units.
     goal = args.get("goal") if isinstance(args.get("goal"), dict) else {}
-    return UnitBundle(
+    return _ground_units(UnitBundle(
         objective=str(goal.get("objective") or "").strip(),
         motivation=str(goal.get("motivation") or "").strip(),
         qa=[QA(**_only(x, QA)) for x in args.get("qa", [])],
         code_change=[CodeChange(**_only(x, CodeChange)) for x in args.get("code_change", [])],
         decision=[Decision(**_only(x, Decision)) for x in args.get("decision", [])],
         file_ref=[FileRef(**_only(x, FileRef)) for x in args.get("file_ref", [])],
-    )
+    ), transcript, spans)
 
 
 def _ensure_provider_prefix(model: str, *, default_provider: str) -> str:

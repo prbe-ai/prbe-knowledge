@@ -811,10 +811,20 @@ class ClaudeCodeConnector(Connector):
         break the AGENT chose when it ran out of context, `size` is a cut we
         made to fit a call and means nothing about the work.
         """
+        md: dict[str, Any] = {}
+        # Grounding first: it applies whether or not the unit has segment
+        # provenance, and it is the field a reader should weigh before the prose.
+        if getattr(unit, "confidence", ""):
+            md["confidence"] = unit.confidence
+        if getattr(unit, "evidence", ""):
+            md["evidence"] = unit.evidence
+            md["evidence_verified"] = bool(unit.evidence_verified)
+        if getattr(unit, "anchor_line_no", None) is not None:
+            md["anchor_line_no"] = unit.anchor_line_no
         ref = getattr(unit, "segment", None)
         if ref is None:
-            return {}
-        md: dict[str, Any] = {
+            return md
+        md |= {
             "segment_index": ref.index,
             "segment_count": ref.total,
             "segment_boundary": ref.boundary,

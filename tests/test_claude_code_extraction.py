@@ -487,3 +487,125 @@ async def test_decisions_record_who_actually_decided(monkeypatch) -> None:
     )
     assert bundle.decision[0].decided_by == "user_directed"
     assert bundle.decision[0].decided_by in ext_mod._DECIDED_BY
+
+
+@pytest.mark.asyncio
+async def test_a_quote_that_is_not_in_the_transcript_is_caught(monkeypatch) -> None:
+    """The only fabrication signal available without a human reading the
+    session. A model asked for a quote and answering with one that appears
+    nowhere has told us something its own prose never would.
+
+    Confidence is DOWNGRADED on a failed match and never raised on a passing
+    one — matching a quote proves the words were said, not that the unit read
+    them correctly.
+    """
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        return _litellm_tool_response("emit_units", {
+            "goal": {"objective": "o", "motivation": ""},
+            "code_change": [], "decision": [], "file_ref": [],
+            "qa": [
+                {"prompt": "real", "outcome": "o", "confidence": "high",
+                 "evidence": "pin the tokenizer"},
+                {"prompt": "invented", "outcome": "o", "confidence": "high",
+                 "evidence": "we agreed to rewrite the scheduler"},
+            ],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("we should pin the tokenizer version", 4)]
+    )
+
+    grounded = {q.prompt: q for q in bundle.qa}
+    assert grounded["real"].evidence_verified is True
+    assert grounded["real"].confidence == "high"
+    assert grounded["real"].anchor_line_no == 4, "the quote locates its own line"
+
+    assert grounded["invented"].evidence_verified is False
+    assert grounded["invented"].confidence == "low", "claimed high, capped at low"
+
+
+@pytest.mark.asyncio
+async def test_quote_matching_ignores_line_wrapping(monkeypatch) -> None:
+    """A model reproduces the words reliably and the newlines less so. Failing
+    a quote over a wrapped line would measure formatting, not fabrication."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        return _litellm_tool_response("emit_units", {
+            "goal": {"objective": "o", "motivation": ""},
+            "code_change": [], "decision": [], "file_ref": [],
+            "qa": [{"prompt": "p", "outcome": "o", "confidence": "medium",
+                    "evidence": "pin the tokenizer version"}],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("we should pin the\ntokenizer version", 9)]
+    )
+    assert bundle.qa[0].evidence_verified is True
+    assert bundle.qa[0].confidence == "medium", "a match never raises confidence"
+
+
+@pytest.mark.asyncio
+async def test_the_model_cannot_mark_its_own_evidence_verified(monkeypatch) -> None:
+    """evidence_verified is the whole point of the check; a model that could
+    assert it would be grading its own homework."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        return _litellm_tool_response("emit_units", {
+            "goal": {"objective": "o", "motivation": ""},
+            "code_change": [], "decision": [], "file_ref": [],
+            "qa": [{"prompt": "p", "outcome": "o", "confidence": "high",
+                    "evidence": "nowhere in the transcript",
+                    "evidence_verified": True, "anchor_line_no": 999}],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("something else entirely", 0)]
+    )
+    assert bundle.qa[0].evidence_verified is False
+    assert bundle.qa[0].anchor_line_no is None
+
+
+@pytest.mark.asyncio
+async def test_a_long_quote_that_drifts_late_still_verifies(monkeypatch) -> None:
+    """Models reproduce the opening of a passage faithfully and drift later.
+    Measured on a real session, every failing quote matched its first several
+    words and diverged after — failing those outright made the check measure
+    verbosity rather than fabrication."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    real = ("Qwen3-8B is the minimal-diff switch because its chat template is "
+            "byte-for-byte the same mechanic as the model we started from")
+
+    async def fake_acompletion(**kwargs):
+        return _litellm_tool_response("emit_units", {
+            "goal": {"objective": "o", "motivation": ""},
+            "code_change": [], "decision": [], "file_ref": [],
+            "qa": [{"prompt": "p", "outcome": "o", "confidence": "high",
+                    # faithful opening, drifted tail
+                    "evidence": real[:70] + " and everything else carried over"}],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user(real, 3)]
+    )
+    assert bundle.qa[0].evidence_verified is True
+    assert bundle.qa[0].anchor_line_no == 3
+
+
+def test_a_short_invented_quote_cannot_ride_the_prefix_rule() -> None:
+    """The fallback must not become a way in. Sixty contiguous characters of a
+    transcript are not reproduced by accident."""
+    from engine.shared.claude_code_extraction import _collapse, _locate
+
+    transcript = _collapse("we should pin the tokenizer version before training")
+    assert _locate(transcript, "we should pin the tokenizer") >= 0
+    assert _locate(transcript, "we decided to rewrite the entire training scheduler "
+                               "from scratch this afternoon") < 0
