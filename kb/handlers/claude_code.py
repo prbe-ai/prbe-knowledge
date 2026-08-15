@@ -260,6 +260,7 @@ class ClaudeCodeConnector(Connector):
         fetched: list[tuple[str, bytes]] = await asyncio.gather(*(_fetch(k) for k in keys))
 
         finalize_marker_seen = False
+        client_finalize_seen = False
         for key, body in fetched:
             if key.endswith("/finalize.marker"):
                 finalize_marker_seen = True
@@ -271,6 +272,20 @@ class ClaudeCodeConnector(Connector):
             payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else {}
             if not isinstance(payload, dict):
                 continue
+            # An explicit client finalize (the tap's SessionEnd hook, via the
+            # gateway's SessionFinalizeRequest route) lands here as an ordinary
+            # coalesced payload carrying `finalize: true` and NO events. It is
+            # NOT the cron's marker: the cron writes a dedicated
+            # `.../finalize.marker` R2 object, while this one is keyed like any
+            # other batch (`raw/<source>/<cust>/<date>/<session_id>.json`,
+            # since a finalize parse_hint carries no batch_seq to suffix with).
+            #
+            # Without this branch the gateway route was a no-op with a 202: it
+            # authenticated, forwarded and stored the payload, and nothing ever
+            # marked the session complete — so the unit extraction that only
+            # runs on completion never fired for a cleanly-ended session.
+            if payload.get("finalize") is True:
+                client_finalize_seen = True
             _remember_payload_identity(payload)
             for obj in payload.get("events") or []:
                 if isinstance(obj, dict):
@@ -278,13 +293,23 @@ class ClaudeCodeConnector(Connector):
 
         merged_events.sort(key=lambda e: (e.get("line_no") is None, e.get("line_no") or 0))
 
-        # Session-complete detection: live SessionEnd, cron-injected
-        # finalize.marker, or legacy `:finalize` source_event_id from
-        # in-flight pre-migration rows.
+        # Session-complete detection, four ways in:
+        #   1. a live `session_end` event in the merged stream
+        #   2. an explicit client finalize payload (the tap's SessionEnd hook)
+        #   3. the cron sweep's injected finalize.marker
+        #   4. a legacy `:finalize` source_event_id on a pre-0026 in-flight row
+        #
+        # (2) and (3) are deliberately separate signals rather than one. They
+        # come from different actors with different failure modes — the client
+        # says "this session ended cleanly", the sweep says "nobody ever said
+        # anything and it has been quiet for hours" — and collapsing them would
+        # make it impossible to tell a working finish hook from a silent one.
         complete = any(
             (e.get("raw") or {}).get("type") == "session_end"
             for e in merged_events
         )
+        if client_finalize_seen:
+            complete = True
         if finalize_marker_seen:
             complete = True
         if event.source_event_id.endswith(":finalize"):
