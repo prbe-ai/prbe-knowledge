@@ -12,7 +12,7 @@ gateway.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from engine.shared.config import get_settings
@@ -44,6 +44,11 @@ class SegmentRef:
     boundary: str       # session_start | compaction | size
     start_line_no: int | None = None
     end_line_no: int | None = None
+    # Position of this unit among units of the SAME kind in the SAME segment.
+    # Deliberately segment-local: a document id built from a session-wide
+    # counter shifts every id after any segment that returns a different number
+    # of units, so one changed segment silently repoints every later document.
+    position: int = 0
 
 
 @dataclass(slots=True)
@@ -317,8 +322,15 @@ def _line_bounds(events: list[dict[str, Any]]) -> tuple[int | None, int | None]:
 
 
 def _stamp(bundle: UnitBundle, ref: SegmentRef) -> UnitBundle:
-    for unit in (*bundle.qa, *bundle.code_change, *bundle.decision, *bundle.file_ref):
-        unit.segment = ref
+    """Give every unit its own ref, carrying its position within this segment.
+
+    Each kind is enumerated separately: `position` only has to be unique among
+    units of the same kind in the same segment, because the document id already
+    carries both the kind and the segment.
+    """
+    for units in (bundle.qa, bundle.code_change, bundle.decision, bundle.file_ref):
+        for position, unit in enumerate(units):
+            unit.segment = replace(ref, position=position)
     return bundle
 
 

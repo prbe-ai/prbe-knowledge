@@ -493,6 +493,7 @@ class ClaudeCodeConnector(Connector):
                     doc_type=DocType.CLAUDE_CODE_QA,
                     unit_kind="qa",
                     idx=idx,
+                    unit=qa,
                     metadata={
                         "prompt": qa.prompt,
                         "outcome": qa.outcome,
@@ -515,6 +516,7 @@ class ClaudeCodeConnector(Connector):
                     doc_type=DocType.CLAUDE_CODE_CODE_CHANGE,
                     unit_kind="code_change",
                     idx=idx,
+                    unit=cc,
                     metadata={
                         "file": cc.file,
                         "before": cc.before,
@@ -538,6 +540,7 @@ class ClaudeCodeConnector(Connector):
                     doc_type=DocType.CLAUDE_CODE_DECISION,
                     unit_kind="decision",
                     idx=idx,
+                    unit=dec,
                     metadata={
                         "question": dec.question,
                         "options_considered": list(dec.options_considered),
@@ -564,6 +567,7 @@ class ClaudeCodeConnector(Connector):
                     doc_type=DocType.CLAUDE_CODE_FILE_REF,
                     unit_kind="file_ref",
                     idx=idx,
+                    unit=fr,
                     metadata={
                         "files": list(fr.files),
                         "context": fr.context,
@@ -773,6 +777,27 @@ class ClaudeCodeConnector(Connector):
         )
 
     @staticmethod
+    def _unit_suffix(unit: Any, idx: int) -> str:
+        """The part of a unit's document id that identifies WHICH unit.
+
+        Segment-scoped (`s2:0`) rather than a session-wide counter, because a
+        session is extracted in parts and any part can return a different
+        number of units on a re-run. With one counter across the whole session,
+        a segment that yields three decisions instead of four shifts every id
+        after it: the surviving documents silently come to describe different
+        content, and the tail of the old numbering is orphaned. Scoping the
+        counter to its segment confines both effects to the segment that
+        actually changed.
+
+        Falls back to the flat counter when a unit has no segment, so anything
+        constructing units without one keeps its old ids.
+        """
+        ref = getattr(unit, "segment", None)
+        if ref is None:
+            return str(idx)
+        return f"s{ref.index}:{ref.position}"
+
+    @staticmethod
     def _segment_metadata(unit: Any) -> dict[str, Any]:
         """Where in its session this unit came from.
 
@@ -812,11 +837,12 @@ class ClaudeCodeConnector(Connector):
         doc_type: DocType,
         unit_kind: str,
         idx: int,
+        unit: Any,
         metadata: dict[str, Any],
         body: str,
         now: datetime,
     ) -> Document:
-        source_id = f"{parent.source_id}:{unit_kind}:{idx}"
+        source_id = f"{parent.source_id}:{unit_kind}:{self._unit_suffix(unit, idx)}"
         doc_id = f"{self._doc_id_prefix}:{event.customer_id}:{source_id}"
         body_bytes = body.encode("utf-8")
         content_hash = hashlib.sha256(body_bytes).hexdigest()
