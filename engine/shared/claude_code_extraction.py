@@ -42,6 +42,17 @@ class SegmentRef:
     index: int          # 1-based position within the session
     total: int          # how many parts the session was split into
     boundary: str       # session_start | compaction | size
+    #: What this stretch of work was FOR. Lives here because it is a property of
+    #: the segment, not of any one unit, and every unit is already stamped with
+    #: its segment — so one extracted sentence gives every unit its context
+    #: instead of asking the model to repeat itself per unit.
+    #:
+    #: Without it a decision is a well-argued local tradeoff orphaned from the
+    #: work it served: you can tell WHAT was decided and why that option won,
+    #: but not why the work was happening at all. Audited over 72 real
+    #: decisions, that was the one thing missing from every single one.
+    objective: str = ""
+    motivation: str = ""  # why the objective mattered, when the transcript says
     start_line_no: int | None = None
     end_line_no: int | None = None
     # Position of this unit among units of the SAME kind in the SAME segment.
@@ -88,6 +99,11 @@ class Decision:
     options_considered: list[str]
     chosen: str
     rationale: str
+    #: How this choice advances the segment's objective. `rationale` answers
+    #: "why this option over the others"; `serves` answers "why we were
+    #: choosing at all". Asking "why did we decide this?" needs both, and the
+    #: second was the half that did not exist.
+    serves: str = ""
     segment: SegmentRef | None = None
 
 
@@ -100,6 +116,12 @@ class FileRef:
 
 @dataclass(slots=True)
 class UnitBundle:
+    #: The goal for this bundle's segment. Carried here rather than in module
+    #: state because segments extract CONCURRENTLY — a shared slot would hand
+    #: one segment's objective to another's units, which is worse than having
+    #: none at all.
+    objective: str = ""
+    motivation: str = ""
     qa: list[QA] = field(default_factory=list)
     code_change: list[CodeChange] = field(default_factory=list)
     decision: list[Decision] = field(default_factory=list)
@@ -116,6 +138,32 @@ _TOOL_DESCRIPTION = (
 _TOOL_PARAMETERS: dict[str, Any] = {
     "type": "object",
     "properties": {
+        "goal": {
+            "type": "object",
+            "description": (
+                "What this stretch of the session was trying to achieve. One "
+                "goal for the whole transcript below, not one per unit."
+            ),
+            "properties": {
+                "objective": {
+                    "type": "string",
+                    "description": (
+                        "The objective in one sentence, as it actually turned "
+                        "out — not a restatement of the opening request. If the "
+                        "work changed direction, say what it became."
+                    ),
+                },
+                "motivation": {
+                    "type": "string",
+                    "description": (
+                        "Why the objective mattered — what it unblocks, what "
+                        "breaks without it. Only if the transcript says. Empty "
+                        "otherwise; do not invent a business reason."
+                    ),
+                },
+            },
+            "required": ["objective"],
+        },
         "qa": {
             "type": "array",
             "items": {
@@ -171,9 +219,22 @@ _TOOL_PARAMETERS: dict[str, Any] = {
                     "question": {"type": "string"},
                     "options_considered": {"type": "array", "items": {"type": "string"}},
                     "chosen": {"type": "string"},
-                    "rationale": {"type": "string"},
+                    "rationale": {
+                        "type": "string",
+                        "description": "Why this option beat the others.",
+                    },
+                    "serves": {
+                        "type": "string",
+                        "description": (
+                            "How this choice advances the goal above — the link "
+                            "between the local tradeoff and what the work was "
+                            "for. Empty if the decision is incidental to it."
+                        ),
+                    },
                 },
-                "required": ["question", "options_considered", "chosen", "rationale"],
+                "required": [
+                    "question", "options_considered", "chosen", "rationale", "serves",
+                ],
             },
         },
         "file_ref": {
@@ -188,7 +249,7 @@ _TOOL_PARAMETERS: dict[str, Any] = {
             },
         },
     },
-    "required": ["qa", "code_change", "decision", "file_ref"],
+    "required": ["goal", "qa", "code_change", "decision", "file_ref"],
 }
 
 
@@ -242,6 +303,13 @@ _SYSTEM_TEMPLATE = (
     "COMPACTION SUMMARY lines are Claude's own summary of earlier turns in this "
     "same session, written when it ran out of context — not something the user "
     "said. Read them for intent, and never quote one as a user prompt.\n"
+    "\n"
+    "`goal` first: say what this stretch of work was actually FOR, in one "
+    "sentence. Not a paraphrase of the opening message — the objective as it "
+    "turned out, including if the work changed direction. Then, on each "
+    "decision, `serves` says how that particular choice advances it. Together "
+    "they answer both halves of \"why did we decide this\": the technical "
+    "reason, and what it was in service of.\n"
     "\n"
     "code_change is one LOGICAL CHANGE, not one file. A feature or a fix that "
     "touched six files is ONE code_change listing six files — never six. Group "
@@ -427,7 +495,10 @@ async def extract_units_from_session(
                 part=(ref.index, ref.total),
                 drop_summaries=drop_summaries,
             )
-        return _stamp(result, ref)
+        return _stamp(
+            result,
+            replace(ref, objective=result.objective, motivation=result.motivation),
+        )
 
     results = await asyncio.gather(
         *(_run(i, evs, why) for i, (evs, why) in enumerate(segments)),
@@ -519,7 +590,10 @@ async def _extract_one(
 
     # Unknown keys are dropped rather than raising: a model that answers with a
     # field the schema no longer has must not cost the whole segment its units.
+    goal = args.get("goal") if isinstance(args.get("goal"), dict) else {}
     return UnitBundle(
+        objective=str(goal.get("objective") or "").strip(),
+        motivation=str(goal.get("motivation") or "").strip(),
         qa=[QA(**_only(x, QA)) for x in args.get("qa", [])],
         code_change=[CodeChange(**_only(x, CodeChange)) for x in args.get("code_change", [])],
         decision=[Decision(**_only(x, Decision)) for x in args.get("decision", [])],

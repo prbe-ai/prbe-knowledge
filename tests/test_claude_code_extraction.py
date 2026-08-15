@@ -379,3 +379,77 @@ async def test_a_stale_unit_shape_does_not_cost_the_segment(monkeypatch) -> None
         session_id="s", events=[_user("go", 0)]
     )
     assert [c.summary for c in bundle.code_change] == ["Widen the field"]
+
+
+@pytest.mark.asyncio
+async def test_units_carry_the_goal_their_segment_served(monkeypatch) -> None:
+    """Audited over 72 real decisions, every one read as a well-argued LOCAL
+    tradeoff orphaned from the work it served: you could tell what was decided
+    and why that option won, never why the work was happening.
+
+    The goal is extracted once per segment and stamped onto every unit, so one
+    sentence gives all of them their context instead of the model repeating
+    itself per unit.
+    """
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        return _litellm_tool_response("emit_units", {
+            "goal": {
+                "objective": "Capture Harbor sandbox end-state without touching the task image",
+                "motivation": "Without it a failed trial leaves no evidence of what the agent did",
+            },
+            "qa": [{"prompt": "q", "outcome": "o"}],
+            "code_change": [], "file_ref": [],
+            "decision": [{
+                "question": "exec into the container or observe from the host?",
+                "options_considered": ["exec", "docker diff from host"],
+                "chosen": "exec, hardened to be ephemeral",
+                "rationale": "host observation needs the Docker socket, which Harbor's "
+                             "remote providers do not expose",
+                "serves": "Makes the capture work on every provider, which the objective "
+                          "requires since Nebius runs remote sandboxes",
+            }],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("go", 0)]
+    )
+
+    decision = bundle.decision[0]
+    # Both halves of "why did we decide this".
+    assert "Docker socket" in decision.rationale        # why this option won
+    assert "every provider" in decision.serves          # why we were choosing
+    assert decision.segment.objective.startswith("Capture Harbor sandbox")
+    assert decision.segment.motivation
+
+    # Every unit type inherits it, not just decisions.
+    assert bundle.qa[0].segment.objective == decision.segment.objective
+
+
+@pytest.mark.asyncio
+async def test_concurrent_segments_do_not_swap_goals(monkeypatch) -> None:
+    """Segments extract concurrently. Holding the goal in module state would
+    hand one segment's objective to another's units — worse than having none,
+    because it reads as true."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    seen = {"n": 0}
+
+    async def fake_acompletion(**kwargs):
+        seen["n"] += 1
+        which = "first" if "first" in kwargs["messages"][-1]["content"] else "second"
+        return _litellm_tool_response("emit_units", {
+            "goal": {"objective": f"objective for the {which} part", "motivation": ""},
+            "qa": [{"prompt": which, "outcome": "o"}],
+            "code_change": [], "decision": [], "file_ref": [],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    events = [_user("first", 0), _boundary(1), _user("second", 2)]
+    bundle = await ext_mod.extract_units_from_session(session_id="s", events=events)
+
+    assert seen["n"] == 2
+    for unit in bundle.qa:
+        assert unit.segment.objective == f"objective for the {unit.prompt} part"

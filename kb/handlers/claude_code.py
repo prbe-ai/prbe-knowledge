@@ -547,12 +547,10 @@ class ClaudeCodeConnector(Connector):
                         "options_considered": list(dec.options_considered),
                         "chosen": dec.chosen,
                         "rationale": dec.rationale,
+                        "serves": dec.serves,
                         **self._segment_metadata(dec),
                     },
-                    body=(
-                        f"Q: {dec.question}\nOPTIONS: {', '.join(dec.options_considered)}\n"
-                        f"CHOSE: {dec.chosen}\nRATIONALE: {dec.rationale}"
-                    ),
+                    body=_decision_body(dec),
                     now=now,
                 )
             )
@@ -820,6 +818,10 @@ class ClaudeCodeConnector(Connector):
             "segment_count": ref.total,
             "segment_boundary": ref.boundary,
         }
+        if ref.objective:
+            md["objective"] = ref.objective
+        if ref.motivation:
+            md["motivation"] = ref.motivation
         if ref.start_line_no is not None:
             md["segment_start_line_no"] = ref.start_line_no
         if ref.end_line_no is not None:
@@ -926,6 +928,34 @@ class ClaudeCodeConnector(Connector):
         extra_params: dict[str, str] | None = None,
     ) -> IntegrationToken:
         raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
+
+
+def _decision_body(decision: Any) -> str:
+    """The indexed text for one decision — both halves of "why".
+
+    RATIONALE says why this option beat the others. SERVES and GOAL say why the
+    choice was being made at all. Audited over 72 real decisions, the second
+    half was missing from every one: each read as a well-argued local tradeoff
+    orphaned from the work it served.
+
+    They go in the BODY, not only in metadata, because metadata is queryable and
+    the body is retrievable — a search for the goal should surface the decisions
+    taken in pursuit of it.
+    """
+    lines = [
+        f"Q: {decision.question}",
+        f"OPTIONS: {', '.join(decision.options_considered)}",
+        f"CHOSE: {decision.chosen}",
+        f"RATIONALE: {decision.rationale}",
+    ]
+    if decision.serves:
+        lines.append(f"SERVES: {decision.serves}")
+    ref = getattr(decision, "segment", None)
+    if ref is not None and ref.objective:
+        lines.append(f"GOAL: {ref.objective}")
+        if ref.motivation:
+            lines.append(f"WHY THAT GOAL: {ref.motivation}")
+    return "\n".join(lines)
 
 
 def _change_body(change: Any) -> str:
