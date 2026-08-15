@@ -55,12 +55,12 @@ concurrency:
 
 jobs:
   sweep:
-    # Kill switch, matching agent-optimization-nightly.yml. The sweep's real
-    # cost lands asynchronously on the worker fleet — the workflow reports
-    # success as soon as the enqueue finishes — so a bad run cannot be aborted
-    # after the fact. Turning the var off is the only lever, and it has to exist
-    # BEFORE the first run rather than after.
-    if: vars.SESSION_FINALIZER_ENABLED != 'false'
+    # OPT-IN, not opt-out. Merging this file is what schedules it, and pushing
+    # to main auto-deploys — so a default-on sweep would run against the entire
+    # never-swept backlog the same night it lands, buying a full extraction per
+    # session, before anyone had a chance to size it. The var has to be set
+    # deliberately, ideally after a `--dry-run` says how big the backlog is.
+    if: vars.SESSION_FINALIZER_ENABLED == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

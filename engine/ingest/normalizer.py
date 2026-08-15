@@ -246,6 +246,52 @@ class Normalizer:
 
     # ---- persistence --------------------------------------------------------
 
+    async def _consume_payload_keys(self, queue_id: int, keys: list[str]) -> None:
+        """Drop keys the connector has acted on from the queue row.
+
+        `payload_s3_keys` is append-only, which is right for batches — every one
+        is part of the transcript and every claim needs all of them. It is wrong
+        for a signal. An agent session's finalize key stays in the array
+        forever, so a session that RESUMES (same session id, new batches) is
+        seen as complete on every subsequent claim and re-runs the entire
+        multi-segment extraction each time. Measured at ~4.6 model calls and
+        ~219k input tokens per pass, that is a live cost loop bounded only by
+        how fast the batches arrive.
+
+        Consuming the key returns the session to being live. Something has to
+        finalize it again -- the tap's next SessionEnd, or the nightly sweep --
+        before it is re-mined, which is exactly what "finalize" should mean.
+
+        The R2 objects are left alone; only the row's reference to them goes.
+        Best-effort: failing to consume costs a redundant extraction later, so
+        it must never cost the documents this pass just wrote.
+        """
+        try:
+            async with get_pool().acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE ingestion_queue
+                       SET payload_s3_keys = (
+                             SELECT COALESCE(array_agg(k), ARRAY[]::text[])
+                               FROM unnest(payload_s3_keys) AS k
+                              WHERE NOT (k = ANY($2::text[]))
+                           )
+                     WHERE queue_id = $1
+                    """,
+                    queue_id,
+                    keys,
+                )
+        except Exception as exc:
+            log.warning(
+                "normalizer.consume_payload_keys_failed",
+                queue_id=queue_id,
+                error=str(exc),
+            )
+            return
+        log.info(
+            "normalizer.consumed_payload_keys", queue_id=queue_id, count=len(keys)
+        )
+
     async def _retire_orphaned_children(
         self,
         customer_id: str,
@@ -576,6 +622,9 @@ class Normalizer:
         # Skip wiki source (no cross-source inference on compiled pages) and
         # skip if no docs were persisted this cycle. Agent-session transcripts
         # are gated to their finalization pass (see _inferred_edge_doc_ids).
+        if result.consume_payload_keys and queue_id is not None:
+            await self._consume_payload_keys(queue_id, result.consume_payload_keys)
+
         if result.retire_children_of:
             # DECLARED, not written. `doc_ids` holds what this pass actually
             # persisted, and a child whose content is byte-identical to its live

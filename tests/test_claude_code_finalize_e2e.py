@@ -403,3 +403,115 @@ async def test_a_shrinking_re_extraction_retires_its_orphans(
     one = await run_with(1)
     assert len(one) == 1, f"surplus decisions still live: {one}"
     assert one < three, "the surviving decision keeps its identity"
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_session_does_not_re_extract(
+    live_db: None, settings: Settings, monkeypatch
+) -> None:
+    """`payload_s3_keys` is append-only, which is right for batches and wrong
+    for a signal. Leaving the finalize key in the array made every later batch
+    of a RESUMED session look complete again and buy another full
+    multi-segment extraction — ~4.6 model calls and ~219k input tokens a time,
+    bounded only by how fast batches arrive.
+    """
+    customer = "resume-e2e-cust"
+    session_id = f"sess-resume-{uuid.uuid4()}"
+    device_id = f"dev-resume-{uuid.uuid4()}"
+    calls = {"n": 0}
+
+    async def fake_extract(**kwargs):
+        from engine.shared import claude_code_extraction as ext
+        calls["n"] += 1
+        return ext.UnitBundle(qa=[ext.QA(prompt="p", outcome="o")])
+
+    monkeypatch.setattr(
+        "kb.handlers.claude_code._ext.extract_units_from_session", fake_extract
+    )
+
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO customers(customer_id, display_name, api_key_hash) "
+            "VALUES ($1, 'resume', 'resume-hash') ON CONFLICT DO NOTHING",
+            customer,
+        )
+    from engine.shared.storage import get_store
+
+    store = get_store()
+    await store.ensure_bucket(await store.bucket_for(customer))
+
+    await close_pool()
+    transport = ASGITransport(app=app)
+    hdr = {"X-Internal-Knowledge-Key": "test-internal-key", "X-Prbe-Customer": customer}
+    internal = {"X-Internal-Knowledge-Key": "test-internal-key"}
+
+    async def post_batch(seq: int) -> None:
+        async with (
+            httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+            app.router.lifespan_context(app),
+        ):
+            await client.post("/webhooks/claude_code", json={
+                "device_id": device_id, "session_id": session_id, "batch_seq": seq,
+                "cwd": "/tmp", "employee_id": "emp",
+                "events": [{"line_no": seq, "raw": {"type": "user", "message":
+                            {"content": f"turn {seq}"}}}],
+            }, headers=hdr)
+
+    async def post_finalize() -> None:
+        async with (
+            httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+            app.router.lifespan_context(app),
+        ):
+            await client.post("/webhooks/claude_code", json={
+                "finalize": True, "session_id": session_id,
+                "device_id": device_id, "employee_id": "emp",
+            }, headers=hdr)
+
+    async def drain() -> None:
+        from engine.ingest.handlers.base import make_default_context
+        from engine.ingest.normalizer import Normalizer
+
+        async with raw_conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT queue_id, payload_s3_keys FROM ingestion_queue "
+                "WHERE customer_id = $1 AND source_event_id = $2",
+                customer, session_id,
+            )
+        ctx = make_default_context()
+        try:
+            await Normalizer(ctx).process_queue_row(
+                queue_id=row["queue_id"], customer_id=customer,
+                source_system=SourceSystem.CLAUDE_CODE,
+                source_event_id=session_id,
+                payload_s3_keys=list(row["payload_s3_keys"]),
+            )
+        finally:
+            await ctx.http.aclose()
+
+    # register the device
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        app.router.lifespan_context(app),
+    ):
+        await client.post("/api/devices/register", json={
+            "customer_id": customer, "employee_id": "emp", "device_id": device_id,
+            "token_hash": hashlib.sha256(b"x").hexdigest(),
+            "os": "macos", "hostname": "h",
+        }, headers=internal)
+
+    await post_batch(0)
+    await post_finalize()
+    await init_pool(settings)
+    await drain()
+    assert calls["n"] == 1, "the finalize should mine the session once"
+
+    # The session RESUMES: same id, a new batch. It must not be mined again
+    # just because a finalize key from last time is still lying around.
+    await close_pool()
+    await post_batch(1)
+    await init_pool(settings)
+    await drain()
+    assert calls["n"] == 1, (
+        f"a resumed session re-extracted ({calls['n']} passes) — the finalize "
+        "key was replayed"
+    )

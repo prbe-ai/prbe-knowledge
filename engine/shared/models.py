@@ -1259,6 +1259,16 @@ class NormalizationResult(BaseModel):
     # Empty for every connector that does not re-derive children, which is all
     # of them today except claude_code/codex.
     retire_children_of: list[str] = Field(default_factory=list)
+    # Payload keys the connector has now ACTED on and that must not be replayed.
+    # Removed from the queue row's payload_s3_keys after a successful commit.
+    #
+    # Exists because completion is an EVENT, and payload_s3_keys is append-only.
+    # A coding-agent session's finalize key otherwise stays in the array
+    # forever, so every later batch of a resumed session re-reads it, sees the
+    # session as complete again, and buys another full multi-segment
+    # re-extraction of the entire transcript. Consuming the key makes the
+    # session go back to being live until something finalizes it again.
+    consume_payload_keys: list[str] = Field(default_factory=list)
     # Non-fatal reason this event produced no documents (e.g. "slack edit of deleted msg").
     skipped_reason: str | None = None
 

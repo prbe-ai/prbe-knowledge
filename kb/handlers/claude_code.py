@@ -272,9 +272,13 @@ class ClaudeCodeConnector(Connector):
 
         finalize_marker_seen = False
         client_finalize_seen = False
+        # The keys that carry the completion signal, so the normalizer can drop
+        # them once we have acted on it. See `consume_payload_keys`.
+        finalize_keys: list[str] = []
         for key, body in fetched:
             if key.endswith("/finalize.marker"):
                 finalize_marker_seen = True
+                finalize_keys.append(key)
             try:
                 envelope = orjson.loads(body)
             except orjson.JSONDecodeError:
@@ -297,6 +301,7 @@ class ClaudeCodeConnector(Connector):
             # runs on completion never fired for a cleanly-ended session.
             if payload.get("finalize") is True:
                 client_finalize_seen = True
+                finalize_keys.append(key)
             _remember_payload_identity(payload)
             for obj in payload.get("events") or []:
                 if isinstance(obj, dict):
@@ -330,6 +335,7 @@ class ClaudeCodeConnector(Connector):
             "session_id": session_id,
             "events": merged_events,
             "session_complete": complete,
+            "finalize_keys": finalize_keys,
             "cwd": event.raw_payload.get("cwd"),
             **session_identity,
         }
@@ -647,6 +653,18 @@ class ClaudeCodeConnector(Connector):
             retire_children_of=(
                 [session_doc.doc_id]
                 if bundle.authoritative and len(documents) > 1
+                else []
+            ),
+            # Completion is an EVENT, not a property. Having acted on it, drop
+            # the keys that carried it: payload_s3_keys is append-only, so
+            # leaving them makes every later batch of a resumed session look
+            # complete again and buy another full re-extraction of the whole
+            # transcript. Only consumed when the extraction was authoritative —
+            # a degraded pass has not really acted on the signal, and dropping
+            # it would strand the session unmined until the next sweep.
+            consume_payload_keys=(
+                list(hydrated.get("finalize_keys") or [])
+                if bundle.authoritative
                 else []
             ),
         )
