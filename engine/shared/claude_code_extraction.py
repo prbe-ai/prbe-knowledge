@@ -11,14 +11,15 @@ gateway.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any
-
-import orjson
 
 from engine.shared.config import get_settings
 from engine.shared.llm import gateway_url
 from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
+from engine.shared.logging import get_logger
+from engine.shared.transcript_render import _events_to_text
 
 
 @dataclass(slots=True)
@@ -122,10 +123,35 @@ _TOOL_PARAMETERS: dict[str, Any] = {
 }
 
 
-# Hard cap to prevent context-length-exceeded errors. Real production sessions
-# rarely exceed a few hundred events. Anything beyond this is suspicious; we
-# keep the most recent _MAX_EVENTS so the extractor still sees the conclusion.
-_MAX_EVENTS = 2000
+# SEGMENTATION, not truncation.
+#
+# This used to keep the last 2000 events and send them as raw JSON. Both halves
+# were wrong. Measured over six real sessions, that payload was 476k-929k
+# tokens against a 200k-token context — every large session would have failed
+# outright — and the tail-only window meant that in four of six compacted
+# sessions ZERO pre-compaction events reached the extractor. The conversation
+# was never lost (it is on disk, shipped, and in the indexed document); only
+# the mining missed it.
+#
+# So: render the transcript instead of dumping JSON (3.7x-9.3x smaller, and the
+# same prose the chunker already reads), then split the session and extract
+# every part.
+#
+# Compaction boundaries are the natural split. One exists precisely BECAUSE
+# that much conversation filled a context window, so the segments come
+# pre-sized by the agent itself. Sessions that never compacted still need a
+# size guard — one measured 1.1M-character session had no boundary at all — so
+# an oversized segment is sub-split on turn boundaries.
+_SEGMENT_CHAR_BUDGET = 260_000  # ~65-75k tokens of rendered transcript
+
+# Bound on cost per session. A session needing more segments than this is
+# pathological; the LAST _MAX_SEGMENTS are kept (the conclusion matters most)
+# and the drop is logged rather than silent.
+_MAX_SEGMENTS = 16
+
+# Extraction calls run concurrently, but a chatty session should not saturate
+# the gateway on its own.
+_SEGMENT_CONCURRENCY = 4
 
 # The agent name is interpolated rather than hardcoded. Every Codex session was
 # being introduced to the model as a Claude Code session, because CodexConnector
@@ -157,24 +183,169 @@ _SYSTEM_TEMPLATE = (
 _AGENT_LABELS = {"claude_code": "Claude Code", "codex": "Codex"}
 
 
+log = get_logger(__name__)
+
+
+def _is_compact_boundary(event: dict[str, Any]) -> bool:
+    raw = event.get("raw")
+    raw = raw if isinstance(raw, dict) else event
+    return raw.get("type") == "system" and raw.get("subtype") == "compact_boundary"
+
+
+def _is_compact_summary(event: dict[str, Any]) -> bool:
+    raw = event.get("raw")
+    raw = raw if isinstance(raw, dict) else event
+    return bool(raw.get("isCompactSummary"))
+
+
+def _split_on_compaction(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """One segment per stretch between compactions."""
+    segments: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for event in events:
+        if _is_compact_boundary(event) and current:
+            segments.append(current)
+            current = []
+        current.append(event)
+    if current:
+        segments.append(current)
+    return segments or [[]]
+
+
+def _split_to_budget(segment: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Sub-split a segment that is still too large to send in one call.
+
+    Splits on USER turns where possible: a request and the work it produced
+    belong in the same call, and cutting mid-exchange is how you get a
+    `decision` whose rationale sits in the next chunk.
+    """
+    if _rendered_size(segment) <= _SEGMENT_CHAR_BUDGET:
+        return [segment]
+
+    out: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    size = 0
+    for event in segment:
+        one = _rendered_size([event])
+        starts_turn = _renders_as_user_turn(event)
+        if current and size + one > _SEGMENT_CHAR_BUDGET and starts_turn:
+            out.append(current)
+            current, size = [], 0
+        elif current and size + one > _SEGMENT_CHAR_BUDGET * 1.5:
+            # No user turn arrived in time — a single enormous exchange. Cut
+            # anyway rather than send something the model will refuse.
+            out.append(current)
+            current, size = [], 0
+        current.append(event)
+        size += one
+    if current:
+        out.append(current)
+    return out
+
+
+def _renders_as_user_turn(event: dict[str, Any]) -> bool:
+    raw = event.get("raw")
+    raw = raw if isinstance(raw, dict) else event
+    return raw.get("type") == "user" and not raw.get("isCompactSummary")
+
+
+def _rendered_size(events: list[dict[str, Any]]) -> int:
+    return len(_events_to_text(events))
+
+
+def _segment_session(events: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any]]], bool]:
+    """(segments, capped) — every part of the session, oldest first."""
+    segments: list[list[dict[str, Any]]] = []
+    for chunk in _split_on_compaction(events):
+        segments.extend(_split_to_budget(chunk))
+    segments = [s for s in segments if s]
+    capped = len(segments) > _MAX_SEGMENTS
+    if capped:
+        segments = segments[-_MAX_SEGMENTS:]
+    return segments, capped
+
+
 async def extract_units_from_session(
     session_id: str,
     events: list[dict[str, Any]],
     cwd: str | None = None,
     agent: str = "claude_code",
 ) -> UnitBundle:
-    if len(events) > _MAX_EVENTS:
-        events = events[-_MAX_EVENTS:]
+    """Mine every part of the session, not just its tail."""
+    segments, capped = _segment_session(events)
+
+    # With the originals of every segment in hand, the compaction summaries are
+    # a second telling of conversation we are already reading — drop them from
+    # the model's input. When the cap DID drop early segments, they are the only
+    # remaining account of those, so they stay.
+    drop_summaries = not capped
+    if capped:
+        log.warning(
+            "claude_code_extraction.segments_capped",
+            extra={"session_id": session_id, "kept": _MAX_SEGMENTS},
+        )
+
+    bundle = UnitBundle()
+    semaphore = asyncio.Semaphore(_SEGMENT_CONCURRENCY)
+
+    async def _run(index: int, segment: list[dict[str, Any]]) -> UnitBundle:
+        async with semaphore:
+            return await _extract_one(
+                session_id=session_id,
+                events=segment,
+                cwd=cwd,
+                agent=agent,
+                part=(index + 1, len(segments)),
+                drop_summaries=drop_summaries,
+            )
+
+    results = await asyncio.gather(
+        *(_run(i, seg) for i, seg in enumerate(segments)), return_exceptions=True
+    )
+    for index, result in enumerate(results):
+        if isinstance(result, BaseException):
+            # One segment failing must not cost the whole session. A partial
+            # bundle is strictly better than none, and the loss is visible.
+            log.warning(
+                "claude_code_extraction.segment_failed",
+                extra={
+                    "session_id": session_id,
+                    "part": index + 1,
+                    "error": str(result),
+                },
+            )
+            continue
+        bundle.qa.extend(result.qa)
+        bundle.code_change.extend(result.code_change)
+        bundle.decision.extend(result.decision)
+        bundle.file_ref.extend(result.file_ref)
+    return bundle
+
+
+async def _extract_one(
+    *,
+    session_id: str,
+    events: list[dict[str, Any]],
+    cwd: str | None,
+    agent: str,
+    part: tuple[int, int],
+    drop_summaries: bool,
+) -> UnitBundle:
     settings = get_settings()
 
-    user_payload = {
-        "session_id": session_id,
-        "cwd": cwd,
-        "events": events,
-    }
+    if drop_summaries:
+        events = [e for e in events if not _is_compact_summary(e)]
+    transcript = _events_to_text(events)
+    if not transcript.strip():
+        return UnitBundle()
+
+    index, total = part
+    where = f" (part {index} of {total})" if total > 1 else ""
     user_content = (
-        "Extract structured units from this session.\n\n"
-        + orjson.dumps(user_payload).decode("utf-8")
+        f"Extract structured units from this session{where}.\n"
+        f"session_id: {session_id}\n"
+        f"cwd: {cwd or 'unknown'}\n\n"
+        f"{transcript}"
     )
 
     # Gateway model ids are proxy-owned aliases and must pass through verbatim.

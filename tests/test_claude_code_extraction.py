@@ -83,7 +83,7 @@ async def test_extract_units_dispatches_via_litellm_and_parses_tool_call(
     bundle = await extract_units_from_session(
         session_id="s1",
         events=[
-            {"line_no": 0, "raw": {"role": "user", "content": "Why is /ingest 422?"}}
+            {"line_no": 0, "raw": {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Why is /ingest 422?"}]}}}
         ],
         cwd="/tmp/p",
     )
@@ -114,7 +114,7 @@ async def test_extract_units_gateway_preserves_alias_and_uses_openai_wire(
     )
     monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
 
-    await extract_units_from_session(session_id="gateway", events=[])
+    await extract_units_from_session(session_id="gateway", events=[{"line_no": 0, "raw": {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Why is /ingest 422?"}]}}}])
 
     kwargs = fake.await_args.kwargs
     assert kwargs["model"] == "gemini-3.5-flash"
@@ -135,44 +135,123 @@ async def test_extract_units_direct_prefixes_anthropic_without_wire_override(
     )
     monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
 
-    await extract_units_from_session(session_id="direct", events=[])
+    await extract_units_from_session(session_id="direct", events=[{"line_no": 0, "raw": {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Why is /ingest 422?"}]}}}])
 
     kwargs = fake.await_args.kwargs
     assert kwargs["model"] == "anthropic/claude-sonnet-4-6"
     assert "custom_llm_provider" not in kwargs
 
 
-@pytest.mark.asyncio
-async def test_extract_units_truncates_oversized_event_list(monkeypatch) -> None:
-    """Defensive guard: events lists larger than _MAX_EVENTS are truncated to
-    the most recent slice before being sent to the LLM. Prevents context
-    overflow from blowing up the worker."""
+def _user(text: str, line_no: int = 0) -> dict:
+    return {
+        "line_no": line_no,
+        "raw": {
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        },
+    }
+
+
+def _boundary(line_no: int) -> dict:
+    return {
+        "line_no": line_no,
+        "raw": {"type": "system", "subtype": "compact_boundary",
+                "content": "Conversation compacted"},
+    }
+
+
+def _summary(line_no: int) -> dict:
+    return {
+        "line_no": line_no,
+        "raw": {
+            "type": "user",
+            "isCompactSummary": True,
+            "message": {"role": "user",
+                        "content": [{"type": "text", "text": "Summary of earlier work"}]},
+        },
+    }
+
+
+def test_session_splits_at_every_compaction_boundary() -> None:
+    """The pre-compaction conversation is never lost — it is on disk, shipped,
+    and in the indexed document. Only the extractor used to miss it, because it
+    kept the last 2000 events: in four of six measured compacted sessions that
+    meant ZERO pre-compaction events were ever mined."""
+    from engine.shared.claude_code_extraction import _segment_session
+
+    events = [_user("a", 0), _boundary(1), _summary(2), _user("b", 3),
+              _boundary(4), _summary(5), _user("c", 6)]
+    segments, capped = _segment_session(events)
+    assert len(segments) == 3
+    assert capped is False
+    # Boundaries open the following segment, so no turn is orphaned.
+    assert segments[0][0] is events[0]
+    assert segments[1][0] is events[1]
+
+
+def test_oversized_segment_is_split_on_a_user_turn() -> None:
+    """A session that never compacted still needs a size guard — one measured
+    session had a single 1.1M-character stretch and no boundary at all."""
     from engine.shared import claude_code_extraction as ext_mod
 
-    empty_payload = {"qa": [], "code_change": [], "decision": [], "file_ref": []}
-    captured: dict = {}
+    big = "x" * 40_000
+    events = [_user(big, i) for i in range(20)]
+    segments, _ = ext_mod._segment_session(events)
+    assert len(segments) > 1
+    # Every cut lands on a user turn, so a request stays with the work it caused.
+    for seg in segments[1:]:
+        assert ext_mod._renders_as_user_turn(seg[0])
+
+
+@pytest.mark.asyncio
+async def test_every_segment_is_extracted_and_merged(monkeypatch) -> None:
+    """One call per segment, and the units of all of them come back."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    seen: list[str] = []
 
     async def fake_acompletion(**kwargs):
-        captured["messages"] = kwargs["messages"]
-        return _litellm_tool_response("emit_units", empty_payload)
+        seen.append(kwargs["messages"][-1]["content"])
+        return _litellm_tool_response("emit_units", {
+            "qa": [{"prompt": f"q{len(seen)}", "outcome": "o"}],
+            "code_change": [], "decision": [], "file_ref": [],
+        })
 
     monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
 
-    huge_events = [{"line_no": i, "raw": {}} for i in range(ext_mod._MAX_EVENTS + 500)]
-    await ext_mod.extract_units_from_session(
-        session_id="big",
-        events=huge_events,
-        cwd=None,
-    )
+    events = [_user("first", 0), _boundary(1), _summary(2), _user("second", 3)]
+    bundle = await ext_mod.extract_units_from_session(session_id="s", events=events)
 
-    # The user message contains the truncated event list; check it's
-    # bounded by reading the captured kwargs.
-    user_msg_content = captured["messages"][-1]["content"]
-    assert isinstance(user_msg_content, str)
-    assert "big" in user_msg_content  # session_id present
-    # The truncation logic keeps the most recent _MAX_EVENTS, so line_no=500 is
-    # the smallest line_no that should be retained (since we created 2500
-    # events 0-2499, truncating to the last 2000 keeps indices 500-2499).
-    assert '"line_no":500' in user_msg_content or '"line_no": 500' in user_msg_content
-    # And line_no=2499 is the largest.
-    assert '"line_no":2499' in user_msg_content or '"line_no": 2499' in user_msg_content
+    assert len(seen) == 2, "one extraction call per segment"
+    assert len(bundle.qa) == 2, "units from every segment are merged"
+    # The model is sent RENDERED prose, not raw event JSON: measured 3.7x-9.3x
+    # smaller, and 476k-929k tokens of JSON against a 200k context was a
+    # guaranteed failure on any large session.
+    assert "USER: first" in seen[0]
+    assert '"line_no"' not in seen[0]
+    # With the originals of every segment in hand, the compaction summary is a
+    # second telling of what we are already reading.
+    assert "Summary of earlier work" not in seen[1]
+
+
+@pytest.mark.asyncio
+async def test_one_failing_segment_does_not_lose_the_others(monkeypatch) -> None:
+    """A partial bundle beats none, and the loss is logged rather than silent."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    calls = {"n": 0}
+
+    async def flaky(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("context_length_exceeded")
+        return _litellm_tool_response("emit_units", {
+            "qa": [{"prompt": "survived", "outcome": "o"}],
+            "code_change": [], "decision": [], "file_ref": [],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", flaky)
+
+    events = [_user("first", 0), _boundary(1), _user("second", 2)]
+    bundle = await ext_mod.extract_units_from_session(session_id="s", events=events)
+    assert [q.prompt for q in bundle.qa] == ["survived"]
