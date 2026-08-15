@@ -164,6 +164,51 @@ class FileRef:
     segment: SegmentRef | None = None
 
 
+#: The kinds of standing instruction worth recording. Deliberately five, chosen
+#: by measurement rather than imagination: 50 sessions and 871 genuine user
+#: turns were categorised by hand, and only these cleared BOTH bars — precision
+#: >=70% when identified, and recurrence across >=5 distinct sessions, which is
+#: what separates a norm from a one-off remark.
+#:
+#: Measured out and deliberately absent:
+#:   reuse_existing    — 12 candidate matches, ZERO true positives. "Don't write
+#:                       a new script, use the one we have" was the motivating
+#:                       example and it does not occur once in 871 turns.
+#:   prohibition       — 30% precision. "Shouldn't" is ordinary discussion.
+#:   method_constraint — 50% precision. Same problem.
+#:   reporting         — widest coverage of anything measured (29/50 sessions)
+#:                       and the least value: mostly "let me know if you have
+#:                       questions".
+_DIRECTIVE_KINDS = (
+    "verification",     # 95% precision, 18 sessions — "make sure it works e2e"
+    "sequencing",       # 80%, 23 sessions — "run the smoke first, then merge"
+    "approval_gate",    # 70%, 11 sessions — "show me a spec and I'll approve"
+    "scope_limit",      # 100%, 6 sessions — "don't worry about the legacy config"
+    "location_pointer",  # 83%, 6 sessions — "the training scripts are under X"
+)
+
+
+@dataclass(slots=True)
+class Directive:
+    """A standing instruction about HOW to work, stated by the researcher.
+
+    Not a decision: a decision settles one question, a directive is a norm that
+    outlives the session. That is the whole point — one instance is an anecdote,
+    and the same instruction phrased differently across five sessions is an SOP.
+    Aggregation across sessions is where the value is, not within one: the
+    measured density is a median of ONE directive per session.
+    """
+
+    instruction: str          # the norm, stated plainly
+    kind: str = ""            # see _DIRECTIVE_KINDS
+    scope: str = ""           # what it applies to; empty means the whole session
+    evidence: str = ""
+    evidence_verified: bool = False
+    anchor_line_no: int | None = None
+    confidence: str = ""
+    segment: SegmentRef | None = None
+
+
 @dataclass(slots=True)
 class UnitBundle:
     #: The goal for this bundle's segment. Carried here rather than in module
@@ -176,6 +221,7 @@ class UnitBundle:
     code_change: list[CodeChange] = field(default_factory=list)
     decision: list[Decision] = field(default_factory=list)
     file_ref: list[FileRef] = field(default_factory=list)
+    directive: list[Directive] = field(default_factory=list)
 
 
 # Tool name + JSON Schema for the forced tool call. The schema is
@@ -369,6 +415,54 @@ _TOOL_PARAMETERS: dict[str, Any] = {
                 ],
             },
         },
+        "directive": {
+            "type": "array",
+            "description": (
+                "Standing instructions the USER gave about how to work — not "
+                "one-off task requests. 'Verify e2e before calling it done' is "
+                "a directive; 'fix the import error' is not. Emit only what a "
+                "user turn actually says; an empty array is the common case, "
+                "and the measured rate is about one per session."
+            ),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": (
+                            "The norm stated plainly, in the imperative, as it "
+                            "would apply to a FUTURE session."
+                        ),
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": [
+                            "verification", "sequencing", "approval_gate",
+                            "scope_limit", "location_pointer",
+                        ],
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": (
+                            "What it applies to — a repo, a kind of change, a "
+                            "tool. Empty if it applies generally."
+                        ),
+                    },
+                    "evidence": {
+                        "type": "string",
+                        "description": (
+                            "The user's own words, quoted verbatim and "
+                            "contiguously. Checked against the transcript."
+                        ),
+                    },
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                    },
+                },
+                "required": ["instruction", "kind", "evidence", "confidence"],
+            },
+        },
         "file_ref": {
             "type": "array",
             "items": {
@@ -404,7 +498,7 @@ _TOOL_PARAMETERS: dict[str, Any] = {
             },
         },
     },
-    "required": ["goal", "qa", "code_change", "decision", "file_ref"],
+    "required": ["goal", "qa", "code_change", "decision", "file_ref", "directive"],
 }
 
 
@@ -458,6 +552,13 @@ _SYSTEM_TEMPLATE = (
     "COMPACTION SUMMARY lines are Claude's own summary of earlier turns in this "
     "same session, written when it ran out of context — not something the user "
     "said. Read them for intent, and never quote one as a user prompt.\n"
+    "\n"
+    "A `directive` is a standing instruction about HOW to work that the USER "
+    "stated — 'verify e2e before you call it done', 'show me a spec first', "
+    "'the training scripts are under Desktop/prbe', 'don't worry about the "
+    "legacy config'. It must come from a user turn, and it must be a norm that "
+    "would still apply next week rather than a task for today. Most segments "
+    "have none; an empty array is the right answer far more often than not.\n"
     "\n"
     "EVERY unit needs `evidence`: one CONTIGUOUS verbatim span copied from the "
     "transcript, and a `confidence`. Do not stitch two places together with an "
@@ -607,6 +708,14 @@ def _line_bounds(events: list[dict[str, Any]]) -> tuple[int | None, int | None]:
     return (min(nums), max(nums)) if nums else (None, None)
 
 
+def _all_units(bundle: UnitBundle) -> list[Any]:
+    """Every unit in the bundle, whatever its type."""
+    return [
+        *bundle.qa, *bundle.code_change, *bundle.decision,
+        *bundle.file_ref, *bundle.directive,
+    ]
+
+
 def _ground_units(bundle: UnitBundle, transcript: str, spans) -> UnitBundle:
     """Check every unit's quote against the transcript it was drawn from.
 
@@ -626,7 +735,7 @@ def _ground_units(bundle: UnitBundle, transcript: str, spans) -> UnitBundle:
     them correctly.
     """
     normalised = _collapse(transcript)
-    for unit in (*bundle.qa, *bundle.code_change, *bundle.decision, *bundle.file_ref):
+    for unit in _all_units(bundle):
         quote = (unit.evidence or "").strip()
         if unit.confidence not in _CONFIDENCE:
             unit.confidence = "low"
@@ -711,7 +820,8 @@ def _stamp(bundle: UnitBundle, ref: SegmentRef) -> UnitBundle:
     units of the same kind in the same segment, because the document id already
     carries both the kind and the segment.
     """
-    for units in (bundle.qa, bundle.code_change, bundle.decision, bundle.file_ref):
+    for units in (bundle.qa, bundle.code_change, bundle.decision,
+                  bundle.file_ref, bundle.directive):
         for position, unit in enumerate(units):
             unit.segment = replace(ref, position=position)
     return bundle
@@ -784,6 +894,7 @@ async def extract_units_from_session(
         bundle.code_change.extend(result.code_change)
         bundle.decision.extend(result.decision)
         bundle.file_ref.extend(result.file_ref)
+        bundle.directive.extend(result.directive)
     return bundle
 
 
@@ -861,6 +972,7 @@ async def _extract_one(
         code_change=[CodeChange(**_only(x, CodeChange)) for x in args.get("code_change", [])],
         decision=[Decision(**_only(x, Decision)) for x in args.get("decision", [])],
         file_ref=[FileRef(**_only(x, FileRef)) for x in args.get("file_ref", [])],
+        directive=[Directive(**_only(x, Directive)) for x in args.get("directive", [])],
     ), transcript, spans)
 
 

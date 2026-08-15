@@ -82,6 +82,14 @@ class DocType(StrEnum):
     CLAUDE_CODE_CODE_CHANGE = "claude_code.code_change"
     CLAUDE_CODE_DECISION = "claude_code.decision"
     CLAUDE_CODE_FILE_REF = "claude_code.file_ref"
+    #: A standing instruction the researcher gave about HOW to work — verify
+    #: before calling it done, spec first then approve, look here, don't touch
+    #: that. Separate from `decision` because it is a norm rather than a choice:
+    #: it outlives the session it was stated in, which is what makes it worth
+    #: aggregating per person. Scoped deliberately narrow — see the DirectiveKind
+    #: comment in engine/shared/claude_code_extraction.py for what was measured
+    #: out of it and why.
+    CLAUDE_CODE_DIRECTIVE = "claude_code.directive"
     MANUAL_UPLOAD_TEXT = "manual_upload.text"
     MANUAL_UPLOAD_MARKDOWN = "manual_upload.markdown"
     MANUAL_UPLOAD_DOCX = "manual_upload.docx"

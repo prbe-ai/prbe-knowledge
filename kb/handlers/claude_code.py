@@ -578,6 +578,30 @@ class ClaudeCodeConnector(Connector):
                 )
             )
 
+        for idx, directive in enumerate(bundle.directive):
+            documents.append(
+                self._build_unit_doc(
+                    event=event,
+                    parent=session_doc,
+                    employee_id=employee_id,
+                    employee_name=employee_name,
+                    employee_email=employee_email,
+                    employee_hostname=employee_hostname,
+                    doc_type=DocType.CLAUDE_CODE_DIRECTIVE,
+                    unit_kind="directive",
+                    idx=idx,
+                    unit=directive,
+                    metadata={
+                        "instruction": directive.instruction,
+                        "kind": directive.kind,
+                        "scope": directive.scope,
+                        **self._segment_metadata(directive),
+                    },
+                    body=_directive_body(directive),
+                    now=now,
+                )
+            )
+
         # Note: unit documents are linked to the session document via
         # `parent_doc_id` in Postgres rather than via direct graph edges. The
         # graph writer walks `parent_doc_id` to navigate from a session node
@@ -939,6 +963,22 @@ class ClaudeCodeConnector(Connector):
         extra_params: dict[str, str] | None = None,
     ) -> IntegrationToken:
         raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
+
+
+def _directive_body(directive: Any) -> str:
+    """The indexed text for one standing instruction.
+
+    Leads with the instruction itself so a search for how someone works finds
+    the norm rather than the session it happened to be stated in. The quote
+    follows because a norm nobody can trace back to the words that established
+    it is not usable as an SOP.
+    """
+    lines = [f"DIRECTIVE ({directive.kind}): {directive.instruction}"]
+    if directive.scope:
+        lines.append(f"APPLIES TO: {directive.scope}")
+    if directive.evidence:
+        lines.append(f"SAID: {directive.evidence}")
+    return "\n".join(lines)
 
 
 def _decision_body(decision: Any) -> str:
