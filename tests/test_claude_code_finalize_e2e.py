@@ -56,10 +56,14 @@ def stub_extractor(monkeypatch) -> dict:
 
     seen: dict = {}
 
-    async def fake_extract(*, session_id: str, events: list, cwd: str | None = None):
+    async def fake_extract(
+        *, session_id: str, events: list, cwd: str | None = None,
+        agent: str = "claude_code",
+    ):
         seen["session_id"] = session_id
         seen["events"] = events
         seen["cwd"] = cwd
+        seen["agent"] = agent
         return ext.UnitBundle(
             qa=[ext.QA(prompt="why 422?", outcome="tightened the schema", tags=["422"])],
             code_change=[
@@ -221,6 +225,10 @@ async def test_client_finalize_produces_unit_documents(
     assert len(stub_extractor["events"]) == 2, (
         f"extractor got the wrong events: {stub_extractor['events']}"
     )
+    # Provenance must reach the prompt: CodexConnector inherits this whole path,
+    # and every Codex session used to be introduced to the model as a Claude
+    # Code one.
+    assert stub_extractor["agent"] == "claude_code"
 
     async with raw_conn() as conn:
         docs = await conn.fetch(

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from typing import Any, ClassVar
@@ -467,6 +468,7 @@ class ClaudeCodeConnector(Connector):
             session_id=session_id,
             events=events,
             cwd=cwd,
+            agent=self._agent_label,
         )
 
         for idx, qa in enumerate(bundle.qa):
@@ -899,7 +901,7 @@ def _events_to_text(events: list[dict[str, Any]]) -> str:
         rendered = _render_event(raw)
         if rendered:
             blocks.append(rendered)
-    return "\n\n".join(blocks)
+    return _ANSI_RE.sub("", "\n\n".join(blocks))
 
 
 def _render_event(raw: dict[str, Any]) -> str:
@@ -926,6 +928,46 @@ def _render_event(raw: dict[str, Any]) -> str:
     return ""
 
 
+# Terminal colour codes reach the transcript whenever a user pastes coloured
+# output into a prompt, and they were being embedded verbatim: 1,200 sequences
+# and 14,194 characters in one measured session. They tokenise into noise no
+# query will ever match, and they render as mojibake anywhere the document is
+# shown. Stripped once over the assembled body rather than per-renderer, so no
+# future renderer can forget to do it.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def _render_tool_use(block: dict[str, Any]) -> str:
+    """One line for a tool call: name, what it acted on, what it changed.
+
+    The `stats` and `args` fields are the sanitizer's COMPACTION of inputs it
+    would otherwise have deleted outright — counts, never content. Rendering
+    them here is what makes them retrievable, and it is what lets the
+    extraction model read the shape of a change instead of recalling it: an
+    `Edit` used to reach the extractor as a bare file path, and
+    `code_change.before` / `after` could only ever be the model's recollection
+    of a diff nobody sent it.
+    """
+    name = block.get("name") or "tool"
+    summary = block.get("summary") or ""
+    line = f"TOOL_USE: {name} — {summary}" if summary else f"TOOL_USE: {name}"
+
+    stats = block.get("stats")
+    if isinstance(stats, dict):
+        added = stats.get("added_lines")
+        removed = stats.get("removed_lines")
+        if isinstance(added, int) or isinstance(removed, int):
+            line += f" [+{added or 0}/-{removed or 0} lines]"
+        if stats.get("replace_all"):
+            line += " [replace_all]"
+
+    args = block.get("args")
+    if isinstance(args, dict) and args:
+        rendered = " ".join(f"{k}={v}" for k, v in args.items())
+        line += f" — {rendered}" if not summary else f" ({rendered})"
+    return line
+
+
 def _render_user(raw: dict[str, Any]) -> str:
     msg = raw.get("message")
     if not isinstance(msg, dict):
@@ -946,13 +988,28 @@ def _render_user(raw: dict[str, Any]) -> str:
             if text:
                 parts.append(f"USER: {text}")
         elif bt == "tool_result":
-            # Sanitizer already stripped the heavy `content` field; only
-            # tool_use_id (+ optional is_error) reach here. Surface
-            # success/failure as a one-liner so the conversation flow stays
-            # readable.
+            # SUCCESSFUL results are not rendered at all. Measured over a real
+            # session, `TOOL_RESULT (toolu_x): ok` accounted for 1,660 lines and
+            # 79,839 characters — 4.4% of the indexed document and the single
+            # largest class of text in it that carries no information. In Codex
+            # it is worse: those lines are most of a document whose human and
+            # model content is ~3% of its lines, which is why a Codex session
+            # matches search queries on tool plumbing instead of on what it
+            # discussed. The tool_use line above already records that the call
+            # happened; a bare "ok" only restates it.
+            #
+            # FAILURES still render — a failed call is a real event in the
+            # session's story, and there are two orders of magnitude fewer of
+            # them (53 of 1,660 here).
+            if not b.get("is_error"):
+                continue
             tool_id = b.get("tool_use_id") or ""
             label = f"TOOL_RESULT ({tool_id})" if tool_id else "TOOL_RESULT"
-            parts.append(f"{label}: error" if b.get("is_error") else f"{label}: ok")
+            size = b.get("result_bytes")
+            if isinstance(size, int) and size > 0:
+                parts.append(f"{label}: error ({size} bytes)")
+            else:
+                parts.append(f"{label}: error")
     return "\n".join(parts)
 
 
@@ -980,9 +1037,7 @@ def _render_assistant(raw: dict[str, Any]) -> str:
             if text and text.strip():
                 parts.append(f"ASSISTANT (thinking): {text}")
         elif bt == "tool_use":
-            name = b.get("name") or "tool"
-            summary = b.get("summary") or ""
-            parts.append(f"TOOL_USE: {name} — {summary}" if summary else f"TOOL_USE: {name}")
+            parts.append(_render_tool_use(b))
 
     # Note non-default stop_reasons (max_tokens, refusal, …); end_turn is
     # the boring case and noting it would just clutter every assistant turn.

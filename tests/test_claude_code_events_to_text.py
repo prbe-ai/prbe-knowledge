@@ -41,8 +41,14 @@ def test_user_string_content_legacy_shape() -> None:
     assert _render_event(raw) == "USER: raw string"
 
 
-def test_user_tool_result_success_renders_as_one_line() -> None:
-    """Sanitizer drops the result body; we keep tool_use_id + ok/error."""
+def test_successful_tool_results_are_not_rendered_at_all() -> None:
+    """A bare "ok" restates the TOOL_USE line above it and nothing more.
+
+    Measured over a real session it was 1,660 lines and 79,839 characters —
+    4.4% of the indexed document and its largest information-free class. In
+    Codex it dominates a document whose human and model content is ~3% of its
+    lines, which is why Codex sessions matched search queries on tool plumbing.
+    """
     raw = {
         "type": "user",
         "message": {
@@ -52,7 +58,28 @@ def test_user_tool_result_success_renders_as_one_line() -> None:
             ],
         },
     }
-    assert _render_event(raw) == "TOOL_RESULT (toolu_x): ok"
+    assert _render_event(raw) == ""
+
+
+def test_failed_tool_results_still_render_with_size() -> None:
+    """Failures are the half worth keeping — rare, and a real event in the
+    session's story. `result_bytes` is the sanitizer's compaction of a body it
+    discarded: a count, never content."""
+    raw = {
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_x",
+                    "is_error": True,
+                    "result_bytes": 812,
+                },
+            ],
+        },
+    }
+    assert _render_event(raw) == "TOOL_RESULT (toolu_x): error (812 bytes)"
 
 
 def test_user_tool_result_error() -> None:
@@ -317,11 +344,12 @@ def test_events_to_text_realistic_mixed_session() -> None:
             },
         }, 3),
     ]
+    # The successful TOOL_RESULT contributes nothing and leaves no blank block:
+    # the flow reads grep -> answer, which is what actually happened.
     expected = (
         "USER: check the auth setup\n\n"
         "ASSISTANT (thinking): I should grep for it.\n"
         "TOOL_USE: Grep — JWT|cookie\n\n"
-        "TOOL_RESULT (t1): ok\n\n"
         "ASSISTANT: Found it in middleware.py."
     )
     assert _events_to_text(events) == expected
@@ -338,3 +366,80 @@ def test_events_to_text_handles_non_dict_envelope() -> None:
         }, 0),
     ]
     assert _events_to_text(events) == "USER: x"
+
+
+# ---------------------------------------------------------------------------
+# compaction: counts the sanitizer computed instead of content it deleted
+# ---------------------------------------------------------------------------
+
+
+def test_edit_tool_use_renders_its_measured_change() -> None:
+    """An Edit used to reach the index — and the extractor — as a bare file
+    path, because the sanitizer keeps 7.3% of an Edit's input (measured over a
+    real 1,660-call session). `code_change.before`/`after` could then only ever
+    be the model's recollection of a diff nobody sent it. The counts are facts
+    computed at capture time and cost almost nothing to carry."""
+    raw = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "Edit",
+                    "summary": "app/schemas/ingest.py",
+                    "stats": {
+                        "op": "edit",
+                        "added_lines": 12,
+                        "removed_lines": 3,
+                        "added_bytes": 400,
+                        "removed_bytes": 96,
+                    },
+                },
+            ],
+        },
+    }
+    assert _render_event(raw) == (
+        "TOOL_USE: Edit — app/schemas/ingest.py [+12/-3 lines]"
+    )
+
+
+def test_tool_use_without_summary_renders_its_scalar_args() -> None:
+    """3.1% of Claude Code calls and 257 lines of one real Codex session shipped
+    as a bare tool name: recorded as having happened, with nothing about what
+    they did. Every MCP tool is exposed to the same gap."""
+    raw = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "t1",
+                    "name": "TaskUpdate",
+                    "args": {"taskId": "3", "status": "completed"},
+                },
+            ],
+        },
+    }
+    assert _render_event(raw) == "TOOL_USE: TaskUpdate — taskId=3 status=completed"
+
+
+def test_ansi_escape_codes_are_stripped_from_the_body() -> None:
+    """Colour codes arrive whenever a user pastes terminal output into a prompt
+    — 1,200 sequences and 14,194 characters in one measured session. They
+    tokenise into noise no query matches and render as mojibake anywhere the
+    document is shown."""
+    events = [
+        _ev({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "\x1b[38;2;153;153;153m├\x1b[39m passed"}
+                ],
+            },
+        }),
+    ]
+    assert _events_to_text(events) == "USER: ├ passed"

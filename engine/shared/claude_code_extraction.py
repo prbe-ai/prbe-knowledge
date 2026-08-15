@@ -63,7 +63,7 @@ class UnitBundle:
 # `input_schema` and Google `function_declarations.parameters` per provider.
 _TOOL_NAME = "emit_units"
 _TOOL_DESCRIPTION = (
-    "Emit structured knowledge units extracted from a Claude Code session."
+    "Emit structured knowledge units extracted from a coding-agent session."
 )
 _TOOL_PARAMETERS: dict[str, Any] = {
     "type": "object",
@@ -127,18 +127,37 @@ _TOOL_PARAMETERS: dict[str, Any] = {
 # keep the most recent _MAX_EVENTS so the extractor still sees the conclusion.
 _MAX_EVENTS = 2000
 
-_SYSTEM = (
-    "You extract structured knowledge from one Claude Code session. "
+# The agent name is interpolated rather than hardcoded. Every Codex session was
+# being introduced to the model as a Claude Code session, because CodexConnector
+# inherits this extraction path wholesale — and the two transcripts do not look
+# alike once translated (Codex renders far more tool calls per unit of human
+# text), so telling the model the wrong provenance is telling it to expect the
+# wrong shape.
+_SYSTEM_TEMPLATE = (
+    "You extract structured knowledge from one {agent} session. "
     "Return only the emit_units tool call. Be conservative — emit a unit only "
     "when the session clearly demonstrates the corresponding kind of insight. "
-    "Empty arrays are valid."
+    "Empty arrays are valid.\n"
+    "\n"
+    "Reading the transcript: TOOL_USE lines carry the tool, what it acted on, "
+    "and for file edits a measured [+added/-removed lines] count. Those counts "
+    "are FACTS computed at capture time. Successful tool results are not shown "
+    "at all; a TOOL_RESULT line means that call FAILED.\n"
+    "\n"
+    "For code_change, `before` and `after` must be quoted from the transcript. "
+    "If the transcript does not contain the actual text on either side, leave "
+    "them empty and describe the change in `intent` instead — never reconstruct "
+    "code you were not shown."
 )
+
+_AGENT_LABELS = {"claude_code": "Claude Code", "codex": "Codex"}
 
 
 async def extract_units_from_session(
     session_id: str,
     events: list[dict[str, Any]],
     cwd: str | None = None,
+    agent: str = "claude_code",
 ) -> UnitBundle:
     if len(events) > _MAX_EVENTS:
         events = events[-_MAX_EVENTS:]
@@ -172,7 +191,12 @@ async def extract_units_from_session(
         args, _resp = await forced_tool_call(
             model=model,
             messages=[
-                {"role": "system", "content": _SYSTEM},
+                {
+                    "role": "system",
+                    "content": _SYSTEM_TEMPLATE.format(
+                        agent=_AGENT_LABELS.get(agent, "coding agent")
+                    ),
+                },
                 {"role": "user", "content": user_content},
             ],
             tool_name=_TOOL_NAME,
