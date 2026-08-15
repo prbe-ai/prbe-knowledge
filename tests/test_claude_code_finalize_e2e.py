@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import uuid
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -25,6 +26,7 @@ from engine.shared.config import Settings, get_settings
 from engine.shared.constants import SourceSystem
 from engine.shared.db import close_pool, init_pool, raw_conn
 from engine.shared.embeddings import reset_embedder
+from engine.shared.models import WebhookEvent
 from engine.shared.storage import reset_store
 from kb.ingestion_app import app
 
@@ -312,3 +314,92 @@ async def test_client_finalize_produces_unit_documents(
     assert decision_body and "validation is the point" in decision_body, (
         f"decision rationale never reached the index; chunks: {decision_body!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_shrinking_re_extraction_retires_its_orphans(
+    live_db: None, settings: Settings, monkeypatch
+) -> None:
+    """SCD2 handles a document that comes back CHANGED. It has nothing to say
+    about one that stops coming back — nothing arrives to trigger it, so the row
+    stays live forever.
+
+    That is exactly the shape of re-derived children. A session's units are
+    regenerated from scratch each time it is processed, and the count is not
+    stable: an extraction yielding one decision where the last yielded three
+    used to leave two behind, still searchable, still reading as current.
+    """
+    from engine.ingest.handlers.base import make_default_context
+    from engine.ingest.normalizer import Normalizer
+    from engine.shared import claude_code_extraction as ext
+    from kb.handlers.claude_code import ClaudeCodeConnector
+
+    customer = "retire-e2e-cust"
+    session_id = f"sess-retire-{uuid.uuid4()}"
+
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO customers(customer_id, display_name, api_key_hash) "
+            "VALUES ($1, 'retire', 'retire-hash') ON CONFLICT DO NOTHING",
+            customer,
+        )
+    from engine.shared.storage import get_store
+
+    store = get_store()
+    await store.ensure_bucket(await store.bucket_for(customer))
+
+    def _decision(i: int) -> ext.Decision:
+        return ext.Decision(
+            question=f"question {i}", options_considered=["a", "b"], chosen="a",
+            rationale="r", serves="s",
+            segment=ext.SegmentRef(index=1, total=1, boundary="session_start",
+                                   position=i),
+        )
+
+    async def run_with(count: int) -> set[str]:
+        async def fake_extract(**kwargs):
+            return ext.UnitBundle(decision=[_decision(i) for i in range(count)])
+
+        monkeypatch.setattr(
+            "kb.handlers.claude_code._ext.extract_units_from_session", fake_extract
+        )
+        ctx = make_default_context()
+        try:
+            connector = ClaudeCodeConnector(ctx)
+            event = WebhookEvent(
+                customer_id=customer,
+                source_system=SourceSystem.CLAUDE_CODE,
+                source_event_id=session_id,
+                received_at=datetime.now(UTC),
+                payload_s3_key="",
+                payload_s3_keys=[],
+                raw_payload={"device_id": "d", "session_id": session_id,
+                             "employee_id": "emp", "events": []},
+                headers={},
+            )
+            result = await connector.normalize(event, {
+                "session_id": session_id,
+                "events": [{"line_no": 0, "raw": {"type": "user", "message":
+                            {"content": "hi"}}}],
+                "session_complete": True,
+                "cwd": "/tmp",
+                "employee_id": "emp",
+            })
+            await Normalizer(ctx)._persist(customer, SourceSystem.CLAUDE_CODE, result)
+        finally:
+            await ctx.http.aclose()
+
+        async with raw_conn() as conn:
+            rows = await conn.fetch(
+                "SELECT doc_id FROM documents WHERE customer_id = $1 "
+                "AND doc_type = 'claude_code.decision' AND valid_to IS NULL",
+                customer,
+            )
+        return {r["doc_id"] for r in rows}
+
+    three = await run_with(3)
+    assert len(three) == 3
+
+    one = await run_with(1)
+    assert len(one) == 1, f"surplus decisions still live: {one}"
+    assert one < three, "the surviving decision keeps its identity"

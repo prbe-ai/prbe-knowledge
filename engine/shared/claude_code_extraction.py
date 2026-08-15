@@ -136,6 +136,23 @@ class Decision:
     #: agent took alone says nothing about how a researcher works, and one they
     #: overrode says a great deal.
     decided_by: str = ""  # see _DECIDED_BY
+    #: Whether the decision was acted on. 15% of decisions in a real backfill
+    #: already carried explicit deferral language unprompted ("defer with an
+    #: explicit TODO", "leave open; user can greenlight") — so the field is
+    #: recording something the transcript says, not asking the model to guess.
+    #: The deferred set IS the backlog, and separating what was DECIDED from
+    #: what was DONE is the thing no other field can express.
+    status: str = ""  # see _STATUS
+    #: What forced the question. Measured across 72 decisions: a discovered or
+    #: external constraint 31%, cost 12%, failure 11%. Constraint dominates,
+    #: which is itself worth knowing — most decisions here are reactions to the
+    #: world rather than free choices.
+    trigger: str = ""  # see _TRIGGER
+    #: Index of an EARLIER decision in the same session that this one reverses
+    #: or replaces. Filled by a merge-time pass, never by the per-segment
+    #: extraction — see _link_supersessions.
+    supersedes: int | None = None
+    superseded_by: int | None = None
     #: A short VERBATIM quote from the transcript that supports this unit.
     #: Checked server-side: a quote that matches nothing was not in the
     #: transcript, which is the one fabrication signal available without a
@@ -367,6 +384,27 @@ _TOOL_PARAMETERS: dict[str, Any] = {
                             "for. Empty if the decision is incidental to it."
                         ),
                     },
+                    "status": {
+                        "type": "string",
+                        "enum": ["implemented", "deferred", "abandoned", "blocked"],
+                        "description": (
+                            "Was it acted on in this session? implemented is "
+                            "the default. Use deferred/abandoned/blocked only "
+                            "when the transcript says so — a decision whose "
+                            "outcome is simply not visible is implemented."
+                        ),
+                    },
+                    "trigger": {
+                        "type": "string",
+                        "enum": [
+                            "user_request", "failure", "discovered_constraint",
+                            "review", "cost", "prior_decision",
+                        ],
+                        "description": (
+                            "What forced the question. prior_decision means it "
+                            "only arose because an earlier choice created it."
+                        ),
+                    },
                     "decided_by": {
                         "type": "string",
                         "enum": [
@@ -411,7 +449,8 @@ _TOOL_PARAMETERS: dict[str, Any] = {
                 },
                 "required": [
                     "question", "options_considered", "chosen", "rationale",
-                    "serves", "decided_by", "evidence", "confidence",
+                    "serves", "decided_by", "status", "trigger",
+                    "evidence", "confidence",
                 ],
             },
         },
@@ -583,6 +622,21 @@ _SYSTEM_TEMPLATE = (
     "`evidence` is for a snippet the transcript actually contained. If it does "
     "not contain the text, leave evidence EMPTY — never reconstruct code you "
     "were not shown. The summary and rationale carry the meaning."
+)
+
+#: Whether a decision was acted on. `implemented` is the meaningful default —
+#: most decisions are carried out in the same session that made them.
+_STATUS = ("implemented", "deferred", "abandoned", "blocked")
+
+#: What forced the decision. `prior_decision` is what makes a chain visible:
+#: it marks a question that only exists because an earlier choice created it.
+_TRIGGER = (
+    "user_request",
+    "failure",
+    "discovered_constraint",
+    "review",
+    "cost",
+    "prior_decision",
 )
 
 #: Ordinal, not a float. A model asked for 0.87 produces fake precision; asked
@@ -895,7 +949,122 @@ async def extract_units_from_session(
         bundle.decision.extend(result.decision)
         bundle.file_ref.extend(result.file_ref)
         bundle.directive.extend(result.directive)
+
+    # Once, over the assembled bundle — the only place a cross-segment reversal
+    # is visible at all.
+    await _link_supersessions(bundle, session_id, agent)
     return bundle
+
+
+_SUPERSEDE_TOOL = "emit_supersessions"
+_SUPERSEDE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "links": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "earlier": {"type": "integer"},
+                    "later": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["earlier", "later", "reason"],
+            },
+        }
+    },
+    "required": ["links"],
+}
+
+_SUPERSEDE_SYSTEM = (
+    "You are given the decisions from ONE session, numbered in the order they "
+    "were taken. Find only the pairs where a LATER decision reverses, replaces "
+    "or overrides an EARLIER one — the session changed its mind.\n"
+    "\n"
+    "A later decision that merely builds on an earlier one is NOT a "
+    "supersession. Neither is one that touches the same area. Only genuine "
+    "reversals. Most sessions have none; an empty list is the common answer, "
+    "and a wrong link is worse than a missing one because it rewrites the "
+    "session's history.\n"
+    "\n"
+    "`later` must be greater than `earlier`."
+)
+
+#: Above this many decisions the pairwise reasoning gets unreliable and the
+#: prompt gets long. Sessions this large are rare; the cap is logged, not silent.
+_SUPERSEDE_MAX_DECISIONS = 120
+
+
+async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -> None:
+    """Find decisions the session later reversed, across the whole bundle.
+
+    Cannot be a per-decision field. Segments extract in SEPARATE CONCURRENT
+    calls, so the model handling segment 7 has never seen segment 3 — and the
+    clearest real reversal in the corpus spans exactly that gap: one segment
+    settled on "no per-sample metric", a later one moved per-sample rewards
+    back onto the metric rail. Per-segment extraction cannot see it even in
+    principle, which is why this runs once over the assembled bundle.
+
+    One extra call per session, and only when there is more than one decision
+    to compare. Best-effort throughout: a failure here loses the links, never
+    the decisions.
+    """
+    decisions = bundle.decision
+    if len(decisions) < 2:
+        return
+    considered = decisions[:_SUPERSEDE_MAX_DECISIONS]
+    if len(decisions) > _SUPERSEDE_MAX_DECISIONS:
+        log.warning(
+            "claude_code_extraction.supersede_capped",
+            extra={"session_id": session_id, "total": len(decisions)},
+        )
+
+    listing = "\n".join(
+        f"{i}. [{d.segment.index if d.segment else '?'}] {d.question} "
+        f"-> CHOSE: {d.chosen}"
+        for i, d in enumerate(considered)
+    )
+    settings = get_settings()
+    gateway_enabled = gateway_url() is not None
+    if gateway_enabled:
+        model = settings.claude_code_extraction_model
+        transport_kwargs: dict[str, Any] = {"custom_llm_provider": "openai"}
+    else:
+        model = _ensure_provider_prefix(
+            settings.claude_code_extraction_model, default_provider="anthropic"
+        )
+        transport_kwargs = {}
+
+    try:
+        args, _resp = await forced_tool_call(
+            model=model,
+            messages=[
+                {"role": "system", "content": _SUPERSEDE_SYSTEM},
+                {"role": "user", "content": listing},
+            ],
+            tool_name=_SUPERSEDE_TOOL,
+            tool_description="Report decisions that a later decision reversed.",
+            tool_schema=_SUPERSEDE_SCHEMA,
+            max_tokens=2000,
+            **transport_kwargs,
+        )
+    except Exception as exc:
+        log.warning(
+            "claude_code_extraction.supersede_failed",
+            extra={"session_id": session_id, "error": str(exc)},
+        )
+        return
+
+    for link in args.get("links", []):
+        earlier, later = link.get("earlier"), link.get("later")
+        if not isinstance(earlier, int) or not isinstance(later, int):
+            continue
+        # Reject anything that is not a strictly forward link into the list we
+        # actually sent. A model index error must not rewrite the wrong pair.
+        if not (0 <= earlier < later < len(considered)):
+            continue
+        considered[earlier].superseded_by = later
+        considered[later].supersedes = earlier
 
 
 async def _extract_one(

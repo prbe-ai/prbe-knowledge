@@ -609,3 +609,99 @@ def test_a_short_invented_quote_cannot_ride_the_prefix_rule() -> None:
     assert _locate(transcript, "we should pin the tokenizer") >= 0
     assert _locate(transcript, "we decided to rewrite the entire training scheduler "
                                "from scratch this afternoon") < 0
+
+
+@pytest.mark.asyncio
+async def test_a_cross_segment_reversal_is_found(monkeypatch) -> None:
+    """Segments extract in separate concurrent calls, so the model handling
+    segment 7 has never seen segment 3. The clearest real reversal in the
+    corpus spans exactly that gap — per-segment extraction cannot see it even
+    in principle, which is why this runs once over the assembled bundle."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    def decision(q, chosen):
+        return {"question": q, "options_considered": ["a", "b"], "chosen": chosen,
+                "rationale": "r", "serves": "s", "decided_by": "agent_unilateral",
+                "status": "implemented", "trigger": "user_request",
+                "evidence": "go", "confidence": "high"}
+
+    async def fake_acompletion(**kwargs):
+        tool = kwargs["tool_choice"]["function"]["name"]
+        if tool == "emit_supersessions":
+            return _litellm_tool_response("emit_supersessions", {
+                "links": [{"earlier": 0, "later": 1, "reason": "reversed"}]
+            })
+        which = "first" if "first" in kwargs["messages"][-1]["content"] else "second"
+        return _litellm_tool_response("emit_units", {
+            "goal": {"objective": "o", "motivation": ""},
+            "qa": [], "code_change": [], "file_ref": [], "directive": [],
+            "decision": [decision(f"{which} question", which)],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    events = [_user("first", 0), _boundary(1), _user("second", 2)]
+    bundle = await ext_mod.extract_units_from_session(session_id="s", events=events)
+
+    assert len(bundle.decision) == 2
+    assert bundle.decision[0].superseded_by == 1
+    assert bundle.decision[1].supersedes == 0
+
+
+@pytest.mark.asyncio
+async def test_a_backwards_or_out_of_range_link_is_refused(monkeypatch) -> None:
+    """A wrong link is worse than a missing one — it rewrites the session's
+    history. Only strictly forward links into the list we actually sent."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    def decision(q):
+        return {"question": q, "options_considered": ["a", "b"], "chosen": "a",
+                "rationale": "r", "serves": "s", "decided_by": "agent_unilateral",
+                "status": "implemented", "trigger": "user_request",
+                "evidence": "go", "confidence": "high"}
+
+    async def fake_acompletion(**kwargs):
+        if kwargs["tool_choice"]["function"]["name"] == "emit_supersessions":
+            return _litellm_tool_response("emit_supersessions", {"links": [
+                {"earlier": 1, "later": 0, "reason": "backwards"},
+                {"earlier": 0, "later": 99, "reason": "out of range"},
+                {"earlier": 0, "later": 0, "reason": "itself"},
+            ]})
+        return _litellm_tool_response("emit_units", {
+            "goal": {"objective": "o", "motivation": ""},
+            "qa": [], "code_change": [], "file_ref": [], "directive": [],
+            "decision": [decision("one"), decision("two")],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("go", 0)]
+    )
+    assert all(d.supersedes is None and d.superseded_by is None
+               for d in bundle.decision)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_supersede_pass_keeps_the_decisions(monkeypatch) -> None:
+    """Best-effort: a failure loses the links, never the decisions."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        if kwargs["tool_choice"]["function"]["name"] == "emit_supersessions":
+            raise RuntimeError("gateway down")
+        return _litellm_tool_response("emit_units", {
+            "goal": {"objective": "o", "motivation": ""},
+            "qa": [], "code_change": [], "file_ref": [], "directive": [],
+            "decision": [
+                {"question": f"q{i}", "options_considered": ["a", "b"],
+                 "chosen": "a", "rationale": "r", "serves": "s",
+                 "decided_by": "agent_unilateral", "status": "implemented",
+                 "trigger": "user_request", "evidence": "go",
+                 "confidence": "high"} for i in range(2)
+            ],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("go", 0)]
+    )
+    assert len(bundle.decision) == 2

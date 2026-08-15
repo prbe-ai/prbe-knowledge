@@ -549,6 +549,12 @@ class ClaudeCodeConnector(Connector):
                         "rationale": dec.rationale,
                         "serves": dec.serves,
                         "decided_by": dec.decided_by,
+                        "status": dec.status,
+                        "trigger": dec.trigger,
+                        **({"supersedes": dec.supersedes}
+                           if dec.supersedes is not None else {}),
+                        **({"superseded_by": dec.superseded_by}
+                           if dec.superseded_by is not None else {}),
                         **self._segment_metadata(dec),
                     },
                     body=_decision_body(dec),
@@ -629,6 +635,12 @@ class ClaudeCodeConnector(Connector):
             graph_nodes=graph_nodes,
             graph_edges=graph_edges,
             acl_snapshots=acl_rows,
+            # This pass re-derived the session's units from scratch, so it owns
+            # the whole set: any child left over from a previous extraction
+            # describes a state that no longer exists. Only claimed on the
+            # COMPLETE path — an incomplete pass emits no units at all, and
+            # claiming ownership there would retire every unit the session has.
+            retire_children_of=[session_doc.doc_id],
         )
 
     # ---- helpers ----------------------------------------------------------
@@ -1003,6 +1015,18 @@ def _decision_body(decision: Any) -> str:
         lines.append(f"SERVES: {decision.serves}")
     if decision.decided_by:
         lines.append(f"DECIDED BY: {decision.decided_by.replace('_', ' ')}")
+    if decision.trigger:
+        lines.append(f"PROMPTED BY: {decision.trigger.replace('_', ' ')}")
+    # Only a non-default status is worth a line — "implemented" on every
+    # decision is noise, and the whole value is spotting the ones that are not.
+    if decision.status and decision.status != "implemented":
+        lines.append(f"STATUS: {decision.status}")
+    # A reversal is the one thing a reader most needs to see BEFORE the
+    # reasoning: this decision did not survive the session it was made in.
+    if decision.superseded_by is not None:
+        lines.append("SUPERSEDED: later reversed within this session")
+    if decision.supersedes is not None:
+        lines.append("REVERSES: an earlier decision in this session")
     ref = getattr(decision, "segment", None)
     if ref is not None and ref.objective:
         lines.append(f"GOAL: {ref.objective}")

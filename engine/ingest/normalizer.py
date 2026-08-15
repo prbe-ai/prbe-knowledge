@@ -246,6 +246,60 @@ class Normalizer:
 
     # ---- persistence --------------------------------------------------------
 
+    async def _retire_orphaned_children(
+        self,
+        customer_id: str,
+        parent_doc_ids: list[str],
+        kept: set[str],
+    ) -> None:
+        """Close live children of `parent_doc_ids` that this pass did not emit.
+
+        SCD2 handles a document that comes back CHANGED: the prior version is
+        closed and a new one opens. It has nothing to say about a document that
+        simply stops coming back, because nothing arrives to trigger it — the
+        row just stays live forever.
+
+        That is exactly the shape of re-derived children. A session's extracted
+        units are regenerated from scratch on every re-processing, and the count
+        is not stable: an extraction that yields three decisions where the last
+        yielded five leaves two behind, still searchable, still describing a
+        session state that no longer exists. Worse, they read as current.
+
+        Closing rather than deleting: the row stays for anyone reading history,
+        it just stops being live. Best-effort — losing the cleanup must never
+        cost the documents this pass just wrote.
+        """
+        try:
+            async with get_pool().acquire() as conn:
+                retired = await conn.fetch(
+                    """
+                    UPDATE documents
+                       SET valid_to = NOW()
+                     WHERE customer_id = $1
+                       AND parent_doc_id = ANY($2::text[])
+                       AND valid_to IS NULL
+                       AND NOT (doc_id = ANY($3::text[]))
+                    RETURNING doc_id
+                    """,
+                    customer_id,
+                    parent_doc_ids,
+                    list(kept),
+                )
+        except Exception as exc:
+            log.warning(
+                "normalizer.retire_children_failed",
+                customer=customer_id,
+                parents=len(parent_doc_ids),
+                error=str(exc),
+            )
+            return
+        if retired:
+            log.info(
+                "normalizer.retired_orphaned_children",
+                customer=customer_id,
+                count=len(retired),
+            )
+
     async def _persist(
         self,
         customer_id: str,
@@ -516,6 +570,18 @@ class Normalizer:
         # Skip wiki source (no cross-source inference on compiled pages) and
         # skip if no docs were persisted this cycle. Agent-session transcripts
         # are gated to their finalization pass (see _inferred_edge_doc_ids).
+        if result.retire_children_of:
+            # DECLARED, not written. `doc_ids` holds what this pass actually
+            # persisted, and a child whose content is byte-identical to its live
+            # version is skipped as unchanged — so using it here would retire
+            # every unit that did not happen to change, which is most of them.
+            await self._retire_orphaned_children(
+                customer_id,
+                result.retire_children_of,
+                {doc.doc_id for doc in result.documents}
+                | {pre.document.doc_id for pre in result.documents_with_chunks},
+            )
+
         if source_system != SourceSystem.WIKI and doc_ids:
             edge_doc_ids = _inferred_edge_doc_ids(
                 source_system, doc_ids, result.documents
