@@ -28,6 +28,14 @@ from engine.shared.embeddings import reset_embedder
 from engine.shared.storage import reset_store
 from kb.ingestion_app import app
 
+
+def _stamped(ref, bundle):
+    """Every unit carries where in the session it came from."""
+    for unit in (*bundle.qa, *bundle.code_change, *bundle.decision, *bundle.file_ref):
+        unit.segment = ref
+    return bundle
+
+
 CUSTOMER = "finalize-e2e-cust"
 EMPLOYEE = "emp-finalize-e2e"
 
@@ -64,7 +72,11 @@ def stub_extractor(monkeypatch) -> dict:
         seen["events"] = events
         seen["cwd"] = cwd
         seen["agent"] = agent
-        return ext.UnitBundle(
+        ref = ext.SegmentRef(
+            index=2, total=3, boundary="compaction",
+            start_line_no=40, end_line_no=90,
+        )
+        return _stamped(ref, ext.UnitBundle(
             qa=[ext.QA(prompt="why 422?", outcome="tightened the schema", tags=["422"])],
             code_change=[
                 ext.CodeChange(
@@ -85,7 +97,7 @@ def stub_extractor(monkeypatch) -> dict:
             file_ref=[
                 ext.FileRef(files=["app/routes/ingest.py"], context="Pydantic v2 fix")
             ],
-        )
+        ))
 
     monkeypatch.setattr(
         "kb.handlers.claude_code._ext.extract_units_from_session", fake_extract
@@ -263,6 +275,27 @@ async def test_client_finalize_produces_unit_documents(
     assert decision_md["options_considered"] == ["loosen", "tighten"]
     code_md = orjson.loads(by_type["claude_code.code_change"]["metadata"])
     assert code_md["intent"] == "tighten payload typing"
+
+    # Segment provenance reaches Postgres on EVERY unit type, so a long session's
+    # units can be put back in order and located in the transcript rather than
+    # read as a bag of free-floating facts.
+    for unit_type in (
+        "claude_code.qa",
+        "claude_code.code_change",
+        "claude_code.decision",
+        "claude_code.file_ref",
+    ):
+        md = orjson.loads(by_type[unit_type]["metadata"])
+        assert md["segment_index"] == 2, unit_type
+        assert md["segment_count"] == 3, unit_type
+        assert md["segment_boundary"] == "compaction", unit_type
+        assert md["segment_start_line_no"] == 40, unit_type
+        assert md["segment_end_line_no"] == 90, unit_type
+
+    # And the session document says how many chapter breaks it has, so a reader
+    # sees the shape before opening a single unit.
+    session_md = orjson.loads(session_doc["metadata"])
+    assert session_md["compaction_count"] == 0
 
     # The unit's full text must be chunked, not just its 200-char preview —
     # otherwise the extracted intent is stored but not retrievable.

@@ -497,6 +497,7 @@ class ClaudeCodeConnector(Connector):
                         "prompt": qa.prompt,
                         "outcome": qa.outcome,
                         "tags": list(qa.tags),
+                        **self._segment_metadata(qa),
                     },
                     body=f"Q: {qa.prompt}\n\nA: {qa.outcome}",
                     now=now,
@@ -519,6 +520,7 @@ class ClaudeCodeConnector(Connector):
                         "before": cc.before,
                         "after": cc.after,
                         "intent": cc.intent,
+                        **self._segment_metadata(cc),
                     },
                     body=f"FILE: {cc.file}\nINTENT: {cc.intent}\nBEFORE:\n{cc.before}\n\nAFTER:\n{cc.after}",
                     now=now,
@@ -541,6 +543,7 @@ class ClaudeCodeConnector(Connector):
                         "options_considered": list(dec.options_considered),
                         "chosen": dec.chosen,
                         "rationale": dec.rationale,
+                        **self._segment_metadata(dec),
                     },
                     body=(
                         f"Q: {dec.question}\nOPTIONS: {', '.join(dec.options_considered)}\n"
@@ -564,6 +567,7 @@ class ClaudeCodeConnector(Connector):
                     metadata={
                         "files": list(fr.files),
                         "context": fr.context,
+                        **self._segment_metadata(fr),
                     },
                     body=f"CONTEXT: {fr.context}\nFILES: {', '.join(fr.files)}",
                     now=now,
@@ -724,6 +728,11 @@ class ClaudeCodeConnector(Connector):
             "device_id": event.raw_payload.get("device_id"),
             "session_complete": complete,
             "event_count": len(events),
+            # How many times the agent ran out of context and summarised itself.
+            # A reader wants this BEFORE opening any unit: it says whether the
+            # session is one sitting or a long campaign, and it is the count of
+            # chapter breaks the units are indexed against.
+            "compaction_count": _count_compactions(events),
         }
         if employee_name:
             md["employee_name"] = employee_name
@@ -762,6 +771,34 @@ class ClaudeCodeConnector(Connector):
             coalesce_into_live=not complete,
             acl=self._acl(employee_id),
         )
+
+    @staticmethod
+    def _segment_metadata(unit: Any) -> dict[str, Any]:
+        """Where in its session this unit came from.
+
+        A long session is extracted in parts, so without this a unit is a
+        free-floating fact about a session that may have run for hours. With
+        it, units can be put back in order, grouped by chapter, and located in
+        the transcript — which is what makes a sequence of decisions readable
+        as a sequence rather than a bag.
+
+        `segment_boundary` is the load-bearing one: `compaction` is a chapter
+        break the AGENT chose when it ran out of context, `size` is a cut we
+        made to fit a call and means nothing about the work.
+        """
+        ref = getattr(unit, "segment", None)
+        if ref is None:
+            return {}
+        md: dict[str, Any] = {
+            "segment_index": ref.index,
+            "segment_count": ref.total,
+            "segment_boundary": ref.boundary,
+        }
+        if ref.start_line_no is not None:
+            md["segment_start_line_no"] = ref.start_line_no
+        if ref.end_line_no is not None:
+            md["segment_end_line_no"] = ref.end_line_no
+        return md
 
     def _build_unit_doc(
         self,
@@ -862,6 +899,23 @@ class ClaudeCodeConnector(Connector):
         extra_params: dict[str, str] | None = None,
     ) -> IntegrationToken:
         raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
+
+
+def _count_compactions(events: list[dict[str, Any]]) -> int:
+    """Compaction boundaries in the merged stream.
+
+    Each one is a point where the agent hit its context limit and wrote its own
+    summary of everything so far — a chapter break it chose, and the same
+    boundary the unit extractor segments on.
+    """
+    total = 0
+    for event in events:
+        raw = event.get("raw") if isinstance(event, dict) else None
+        raw = raw if isinstance(raw, dict) else event
+        if isinstance(raw, dict) and raw.get("type") == "system" and \
+                raw.get("subtype") == "compact_boundary":
+            total += 1
+    return total
 
 
 def _format_session_title(

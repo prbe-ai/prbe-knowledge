@@ -185,8 +185,8 @@ def test_session_splits_at_every_compaction_boundary() -> None:
     assert len(segments) == 3
     assert capped is False
     # Boundaries open the following segment, so no turn is orphaned.
-    assert segments[0][0] is events[0]
-    assert segments[1][0] is events[1]
+    assert segments[0][0][0] is events[0]
+    assert segments[1][0][0] is events[1]
 
 
 def test_oversized_segment_is_split_on_a_user_turn() -> None:
@@ -199,7 +199,7 @@ def test_oversized_segment_is_split_on_a_user_turn() -> None:
     segments, _ = ext_mod._segment_session(events)
     assert len(segments) > 1
     # Every cut lands on a user turn, so a request stays with the work it caused.
-    for seg in segments[1:]:
+    for seg, _why in segments[1:]:
         assert ext_mod._renders_as_user_turn(seg[0])
 
 
@@ -255,3 +255,64 @@ async def test_one_failing_segment_does_not_lose_the_others(monkeypatch) -> None
     events = [_user("first", 0), _boundary(1), _user("second", 2)]
     bundle = await ext_mod.extract_units_from_session(session_id="s", events=events)
     assert [q.prompt for q in bundle.qa] == ["survived"]
+
+
+def test_segments_record_why_each_one_began() -> None:
+    """`compaction` is a chapter break the AGENT chose when it ran out of
+    context; `size` is a cut we made to fit a call and means nothing about the
+    work. Collapsing the two would make a mechanical split look like a real
+    narrative boundary."""
+    from engine.shared.claude_code_extraction import _segment_session
+
+    events = [_user("a", 0), _boundary(1), _user("b", 2), _boundary(3), _user("c", 4)]
+    segments, _ = _segment_session(events)
+    assert [why for _, why in segments] == ["session_start", "compaction", "compaction"]
+
+
+def test_size_subsplits_do_not_masquerade_as_compactions() -> None:
+    """Only the FIRST piece of a compaction stretch inherits the real
+    boundary; the rest are size cuts through continuous work."""
+    from engine.shared.claude_code_extraction import _segment_session
+
+    big = "y" * 40_000
+    events = [_boundary(0)] + [_user(big, i + 1) for i in range(20)]
+    segments, _ = _segment_session(events)
+    reasons = [why for _, why in segments]
+    assert reasons[0] == "session_start"
+    assert reasons.count("size") >= 1
+    assert reasons.count("compaction") == 0, (
+        "one compaction must not become several"
+    )
+
+
+@pytest.mark.asyncio
+async def test_units_carry_their_place_in_the_session(monkeypatch) -> None:
+    """Without this a unit is a free-floating fact about a session that may
+    have run for hours; with it the units can be put back in order and located
+    in the transcript they came from."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        return _litellm_tool_response("emit_units", {
+            "qa": [{"prompt": "q", "outcome": "o"}],
+            "code_change": [],
+            "decision": [{"question": "a or b?", "options_considered": ["a", "b"],
+                          "chosen": "a", "rationale": "why"}],
+            "file_ref": [],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+
+    events = [_user("first", 10), _boundary(11), _user("second", 12)]
+    bundle = await ext_mod.extract_units_from_session(session_id="s", events=events)
+
+    assert len(bundle.qa) == 2
+    refs = sorted((q.segment for q in bundle.qa), key=lambda r: r.index)
+    assert [r.index for r in refs] == [1, 2]
+    assert all(r.total == 2 for r in refs)
+    assert [r.boundary for r in refs] == ["session_start", "compaction"]
+    # Line anchors locate the segment back in the transcript.
+    assert refs[0].start_line_no == 10
+    assert refs[1].start_line_no == 11
+    # Every unit type is stamped, not just qa.
+    assert all(d.segment is not None for d in bundle.decision)

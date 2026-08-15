@@ -23,10 +23,35 @@ from engine.shared.transcript_render import _events_to_text
 
 
 @dataclass(slots=True)
+class SegmentRef:
+    """Where in its session a unit came from.
+
+    A long session is extracted in parts, so without this every unit is a
+    free-floating fact about a session that may have run for hours. Carrying
+    the part number, the total, and WHY the part began lets a reader put the
+    units back in order and tell a real narrative break from a mechanical one.
+
+    `boundary` says what opened this segment:
+      session_start — the beginning of the session
+      compaction    — the agent ran out of context here, which is a genuine
+                      chapter break the agent itself chose
+      size          — no boundary was available and we split to fit; this is a
+                      cut through continuous work and means nothing semantically
+    """
+
+    index: int          # 1-based position within the session
+    total: int          # how many parts the session was split into
+    boundary: str       # session_start | compaction | size
+    start_line_no: int | None = None
+    end_line_no: int | None = None
+
+
+@dataclass(slots=True)
 class QA:
     prompt: str
     outcome: str
     tags: list[str] = field(default_factory=list)
+    segment: SegmentRef | None = None
 
 
 @dataclass(slots=True)
@@ -35,6 +60,7 @@ class CodeChange:
     before: str
     after: str
     intent: str
+    segment: SegmentRef | None = None
 
 
 @dataclass(slots=True)
@@ -43,12 +69,14 @@ class Decision:
     options_considered: list[str]
     chosen: str
     rationale: str
+    segment: SegmentRef | None = None
 
 
 @dataclass(slots=True)
 class FileRef:
     files: list[str]
     context: str
+    segment: SegmentRef | None = None
 
 
 @dataclass(slots=True)
@@ -198,18 +226,21 @@ def _is_compact_summary(event: dict[str, Any]) -> bool:
     return bool(raw.get("isCompactSummary"))
 
 
-def _split_on_compaction(events: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-    """One segment per stretch between compactions."""
-    segments: list[list[dict[str, Any]]] = []
+def _split_on_compaction(
+    events: list[dict[str, Any]],
+) -> list[tuple[list[dict[str, Any]], str]]:
+    """One segment per stretch between compactions, tagged with what opened it."""
+    segments: list[tuple[list[dict[str, Any]], str]] = []
     current: list[dict[str, Any]] = []
+    boundary = "session_start"
     for event in events:
         if _is_compact_boundary(event) and current:
-            segments.append(current)
-            current = []
+            segments.append((current, boundary))
+            current, boundary = [], "compaction"
         current.append(event)
     if current:
-        segments.append(current)
-    return segments or [[]]
+        segments.append((current, boundary))
+    return segments or [([], "session_start")]
 
 
 def _split_to_budget(segment: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -253,16 +284,42 @@ def _rendered_size(events: list[dict[str, Any]]) -> int:
     return len(_events_to_text(events))
 
 
-def _segment_session(events: list[dict[str, Any]]) -> tuple[list[list[dict[str, Any]]], bool]:
-    """(segments, capped) — every part of the session, oldest first."""
-    segments: list[list[dict[str, Any]]] = []
-    for chunk in _split_on_compaction(events):
-        segments.extend(_split_to_budget(chunk))
-    segments = [s for s in segments if s]
+def _segment_session(
+    events: list[dict[str, Any]],
+) -> tuple[list[tuple[list[dict[str, Any]], str]], bool]:
+    """(segments, capped) — every part of the session, oldest first.
+
+    Each segment is paired with the reason it began, so a downstream reader can
+    tell a chapter break the agent chose from a cut we made to fit a context
+    window. Sub-splits of one compaction stretch are `size`; only the first
+    inherits the real boundary.
+    """
+    segments: list[tuple[list[dict[str, Any]], str]] = []
+    for chunk, boundary in _split_on_compaction(events):
+        for offset, piece in enumerate(_split_to_budget(chunk)):
+            segments.append((piece, boundary if offset == 0 else "size"))
+    segments = [(evs, why) for evs, why in segments if evs]
     capped = len(segments) > _MAX_SEGMENTS
     if capped:
         segments = segments[-_MAX_SEGMENTS:]
     return segments, capped
+
+
+def _line_bounds(events: list[dict[str, Any]]) -> tuple[int | None, int | None]:
+    """First and last transcript line numbers in a segment, when present.
+
+    These are the anchors that let a unit be located back in the transcript it
+    came from — without them a unit says which PART of a session it belongs to
+    but not where.
+    """
+    nums = [e.get("line_no") for e in events if isinstance(e.get("line_no"), int)]
+    return (min(nums), max(nums)) if nums else (None, None)
+
+
+def _stamp(bundle: UnitBundle, ref: SegmentRef) -> UnitBundle:
+    for unit in (*bundle.qa, *bundle.code_change, *bundle.decision, *bundle.file_ref):
+        unit.segment = ref
+    return bundle
 
 
 async def extract_units_from_session(
@@ -288,19 +345,29 @@ async def extract_units_from_session(
     bundle = UnitBundle()
     semaphore = asyncio.Semaphore(_SEGMENT_CONCURRENCY)
 
-    async def _run(index: int, segment: list[dict[str, Any]]) -> UnitBundle:
+    async def _run(index: int, segment: list[dict[str, Any]], boundary: str) -> UnitBundle:
+        start, end = _line_bounds(segment)
+        ref = SegmentRef(
+            index=index + 1,
+            total=len(segments),
+            boundary=boundary,
+            start_line_no=start,
+            end_line_no=end,
+        )
         async with semaphore:
-            return await _extract_one(
+            result = await _extract_one(
                 session_id=session_id,
                 events=segment,
                 cwd=cwd,
                 agent=agent,
-                part=(index + 1, len(segments)),
+                part=(ref.index, ref.total),
                 drop_summaries=drop_summaries,
             )
+        return _stamp(result, ref)
 
     results = await asyncio.gather(
-        *(_run(i, seg) for i, seg in enumerate(segments)), return_exceptions=True
+        *(_run(i, evs, why) for i, (evs, why) in enumerate(segments)),
+        return_exceptions=True,
     )
     for index, result in enumerate(results):
         if isinstance(result, BaseException):
