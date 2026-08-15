@@ -56,10 +56,11 @@ async def test_extract_units_dispatches_via_litellm_and_parses_tool_call(
         ],
         "code_change": [
             {
-                "file": "app/schemas/ingest.py",
-                "before": "events: list[dict]",
-                "after": "events: list[Event]",
-                "intent": "tighten payload typing",
+                "summary": "Tighten the ingest payload typing",
+                "kind": "fix",
+                "files": ["app/schemas/ingest.py"],
+                "rationale": "validation is the point of the endpoint",
+                "evidence": "events: list[dict] -> events: list[Event]",
             },
         ],
         "decision": [
@@ -319,31 +320,26 @@ async def test_units_carry_their_place_in_the_session(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_describe_only_code_changes_fold_into_file_refs(monkeypatch) -> None:
-    """The tap does not ship diffs, and the prompt forbids inventing them, so
-    most code_change units come back with both sides empty — 78 of 93 on a real
-    backfill. What is left is a file path plus an intent string, which is what a
-    file_ref already is, and 47 of those 78 named a file that ALREADY had one."""
+async def test_a_change_spanning_files_is_one_unit(monkeypatch) -> None:
+    """One fix that touched six files is ONE change, not six.
+
+    The old file-shaped unit produced 93 documents for a single session — 32% of
+    everything it emitted — each telling a fraction of the work. Nobody
+    describes their own work that way.
+    """
     from engine.shared import claude_code_extraction as ext_mod
 
     async def fake_acompletion(**kwargs):
         return _litellm_tool_response("emit_units", {
-            "qa": [],
-            "code_change": [
-                # describe-only, and its file already has a file_ref
-                {"file": "app/store.py", "before": "", "after": "",
-                 "intent": "add cardinality guard"},
-                # describe-only, no existing file_ref
-                {"file": "app/routes.py", "before": "", "after": "",
-                 "intent": "map the new error to 422"},
-                # quotes the transcript — must survive untouched
-                {"file": "app/models.py", "before": "x: int", "after": "x: str",
-                 "intent": "widen the field"},
-            ],
-            "decision": [],
-            "file_ref": [
-                {"files": ["app/store.py"], "context": "Core metric write path."},
-            ],
+            "qa": [], "decision": [], "file_ref": [],
+            "code_change": [{
+                "summary": "Reject writes that would blow the per-run series cap",
+                "kind": "feature",
+                "files": ["app/store.py", "app/routes.py", "tests/test_store.py"],
+                "rationale": "A runaway dimension silently turned one curve into "
+                             "thousands of one-point series.",
+                "evidence": "",
+            }],
         })
 
     monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
@@ -351,34 +347,35 @@ async def test_describe_only_code_changes_fold_into_file_refs(monkeypatch) -> No
         session_id="s", events=[_user("go", 0)]
     )
 
-    # Only the transcript-quoting change stays a code_change.
-    assert [c.file for c in bundle.code_change] == ["app/models.py"]
+    assert len(bundle.code_change) == 1
+    change = bundle.code_change[0]
+    assert len(change.files) == 3
+    assert change.kind == "feature"
+    assert change.evidence == "", "no diff was shown, so none is claimed"
+    assert change.segment is not None
 
-    by_file = {tuple(f.files): f.context for f in bundle.file_ref}
-    # Merged into the existing ref rather than adding a second document.
-    assert by_file[("app/store.py",)] == (
-        "Core metric write path. Changed: add cardinality guard"
+
+@pytest.mark.asyncio
+async def test_a_stale_unit_shape_does_not_cost_the_segment(monkeypatch) -> None:
+    """The schema changes as we learn what a unit should be. A model answering
+    with an older shape must lose the extra field, not the whole segment."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        return _litellm_tool_response("emit_units", {
+            "qa": [], "decision": [], "file_ref": [],
+            "code_change": [{
+                "summary": "Widen the field",
+                "kind": "fix",
+                "files": ["app/models.py"],
+                "rationale": "ints could not hold the new ids",
+                "before": "x: int",      # gone from the schema
+                "after": "x: str",       # gone from the schema
+            }],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("go", 0)]
     )
-    # The one with no existing ref becomes its own.
-    assert by_file[("app/routes.py",)] == "Changed: map the new error to 422"
-    # Net: 4 units in, 3 out, and nothing said was lost.
-    assert len(bundle.code_change) + len(bundle.file_ref) == 3
-
-
-def test_fold_is_idempotent_and_survives_a_missing_path() -> None:
-    """A change with no file has nothing to attach to and no file_ref to be."""
-    from engine.shared.claude_code_extraction import (
-        CodeChange,
-        FileRef,
-        UnitBundle,
-        _fold_empty_code_changes,
-    )
-
-    bundle = UnitBundle(
-        code_change=[CodeChange(file="", before="", after="", intent="mystery")],
-        file_ref=[FileRef(files=["a.py"], context="ctx")],
-    )
-    once = _fold_empty_code_changes(bundle)
-    twice = _fold_empty_code_changes(once)
-    assert twice.code_change == []
-    assert [f.context for f in twice.file_ref] == ["ctx"]
+    assert [c.summary for c in bundle.code_change] == ["Widen the field"]

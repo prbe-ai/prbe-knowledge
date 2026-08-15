@@ -80,10 +80,10 @@ def stub_extractor(monkeypatch) -> dict:
             qa=[ext.QA(prompt="why 422?", outcome="tightened the schema", tags=["422"])],
             code_change=[
                 ext.CodeChange(
-                    file="app/schemas/ingest.py",
-                    before="events: list[dict]",
-                    after="events: list[Event]",
-                    intent="tighten payload typing",
+                    summary="Tighten the ingest payload typing",
+                    kind="fix",
+                    files=["app/schemas/ingest.py"],
+                    rationale="validation is the point of the endpoint",
                 )
             ],
             decision=[
@@ -274,7 +274,9 @@ async def test_client_finalize_produces_unit_documents(
     assert decision_md["chosen"] == "tighten"
     assert decision_md["options_considered"] == ["loosen", "tighten"]
     code_md = orjson.loads(by_type["claude_code.code_change"]["metadata"])
-    assert code_md["intent"] == "tighten payload typing"
+    assert code_md["summary"] == "Tighten the ingest payload typing"
+    assert code_md["kind"] == "fix"
+    assert code_md["files"] == ["app/schemas/ingest.py"]
 
     # Segment provenance reaches Postgres on EVERY unit type, so a long session's
     # units can be put back in order and located in the transcript rather than

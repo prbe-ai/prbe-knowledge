@@ -12,7 +12,7 @@ gateway.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import Any
 
 from engine.shared.config import get_settings
@@ -61,10 +61,24 @@ class QA:
 
 @dataclass(slots=True)
 class CodeChange:
-    file: str
-    before: str
-    after: str
-    intent: str
+    """One logical change, however many files it touched.
+
+    Was one unit per FILE, which is not how anybody describes their own work: a
+    single fix that spanned six files came back as six documents that each told
+    a sixth of it, and on a real backfill that shape produced 93 units for one
+    session — 32% of everything it emitted. Nobody reads a codebase that way and
+    nobody searches one that way either.
+
+    `before`/`after` are gone. The tap deliberately ships no diffs, and 78 of
+    those 93 came back with both sides empty; the rare case where the
+    transcript really did contain the text is served by `evidence`.
+    """
+
+    summary: str                          # the change, one line
+    kind: str = ""                        # feature | fix | refactor | test | docs | config | infra
+    files: list[str] = field(default_factory=list)
+    rationale: str = ""
+    evidence: str = ""                    # literal snippet, only when the transcript had one
     segment: SegmentRef | None = None
 
 
@@ -119,12 +133,34 @@ _TOOL_PARAMETERS: dict[str, Any] = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "file": {"type": "string"},
-                    "before": {"type": "string"},
-                    "after": {"type": "string"},
-                    "intent": {"type": "string"},
+                    "summary": {
+                        "type": "string",
+                        "description": (
+                            "The change as one line, at the level a person would "
+                            "describe their own work: 'Added a cardinality guard "
+                            "to the metric write path', not 'edited store.py'."
+                        ),
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["feature", "fix", "refactor", "test", "docs",
+                                 "config", "infra"],
+                    },
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Every file this one change spanned.",
+                    },
+                    "rationale": {"type": "string"},
+                    "evidence": {
+                        "type": "string",
+                        "description": (
+                            "A literal snippet quoted from the transcript, when it "
+                            "contained one. Empty otherwise — never reconstructed."
+                        ),
+                    },
                 },
-                "required": ["file", "before", "after", "intent"],
+                "required": ["summary", "kind", "files", "rationale"],
             },
         },
         "decision": {
@@ -207,10 +243,15 @@ _SYSTEM_TEMPLATE = (
     "same session, written when it ran out of context — not something the user "
     "said. Read them for intent, and never quote one as a user prompt.\n"
     "\n"
-    "For code_change, `before` and `after` must be quoted from the transcript. "
-    "If the transcript does not contain the actual text on either side, leave "
-    "them empty and describe the change in `intent` instead — never reconstruct "
-    "code you were not shown."
+    "code_change is one LOGICAL CHANGE, not one file. A feature or a fix that "
+    "touched six files is ONE code_change listing six files — never six. Group "
+    "by the unit of work a person would name in a commit or a standup, and give "
+    "each one a `kind`. If two edits served the same goal they are one change; "
+    "if one file was touched for two unrelated reasons they are two.\n"
+    "\n"
+    "`evidence` is for a snippet the transcript actually contained. If it does "
+    "not contain the text, leave evidence EMPTY — never reconstruct code you "
+    "were not shown. The summary and rationale carry the meaning."
 )
 
 _AGENT_LABELS = {"claude_code": "Claude Code", "codex": "Codex"}
@@ -321,49 +362,15 @@ def _line_bounds(events: list[dict[str, Any]]) -> tuple[int | None, int | None]:
     return (min(nums), max(nums)) if nums else (None, None)
 
 
-def _fold_empty_code_changes(bundle: UnitBundle) -> UnitBundle:
-    """A code_change with no before and no after is a file_ref wearing a hat.
+def _only(raw: dict[str, Any], cls: type) -> dict[str, Any]:
+    """Keep just the fields `cls` declares.
 
-    The tap deliberately does not ship diffs — it sends the file path and a
-    measured [+added/-removed] count — and the prompt tells the model to leave
-    `before`/`after` EMPTY rather than reconstruct code it was not shown. It
-    obeys: measured on a real backfill, 78 of 93 code_change units came back
-    with both sides empty. What remains is a file path plus an intent string,
-    which is exactly what a file_ref already is, and 47 of those 78 named a
-    file that ALREADY had a file_ref in the same segment.
-
-    So fold rather than duplicate. Merging into the existing file_ref removed
-    51 of 139 file-oriented units on that session — a 37% cut — while losing
-    nothing: the intent is appended to the context it belongs with, so the
-    reader gets "this file was consulted, AND here is what changed in it" as
-    one statement instead of two documents that each tell half of it.
-
-    A code_change that DID quote the transcript is untouched; those are the
-    ones carrying something a file_ref cannot say.
+    The extraction schema changes as we learn what a unit should be, and a model
+    occasionally answers with an older shape. Dropping the extras costs one
+    field; letting them through raises TypeError and costs the segment.
     """
-    kept: list[CodeChange] = []
-    for change in bundle.code_change:
-        if change.before.strip() or change.after.strip():
-            kept.append(change)
-            continue
-        _absorb_into_file_refs(bundle.file_ref, change)
-    bundle.code_change = kept
-    return bundle
-
-
-def _absorb_into_file_refs(refs: list[FileRef], change: CodeChange) -> None:
-    """Attach a describe-only change to the file_ref for its file, or make one."""
-    path = (change.file or "").strip()
-    intent = (change.intent or "").strip()
-    if not path:
-        return  # nothing to attach it to, and nothing to say without a file
-    note = f"Changed: {intent}" if intent else ""
-    for ref in refs:
-        if path in ref.files:
-            if note and note not in ref.context:
-                ref.context = f"{ref.context} {note}".strip()
-            return
-    refs.append(FileRef(files=[path], context=note or "Changed."))
+    allowed = {f.name for f in fields(cls)} - {"segment"}
+    return {k: v for k, v in raw.items() if k in allowed}
 
 
 def _stamp(bundle: UnitBundle, ref: SegmentRef) -> UnitBundle:
@@ -510,13 +517,13 @@ async def _extract_one(
         # `tool_use` block came back.
         return UnitBundle()
 
-    return _fold_empty_code_changes(
-        UnitBundle(
-            qa=[QA(**x) for x in args.get("qa", [])],
-            code_change=[CodeChange(**x) for x in args.get("code_change", [])],
-            decision=[Decision(**x) for x in args.get("decision", [])],
-            file_ref=[FileRef(**x) for x in args.get("file_ref", [])],
-        )
+    # Unknown keys are dropped rather than raising: a model that answers with a
+    # field the schema no longer has must not cost the whole segment its units.
+    return UnitBundle(
+        qa=[QA(**_only(x, QA)) for x in args.get("qa", [])],
+        code_change=[CodeChange(**_only(x, CodeChange)) for x in args.get("code_change", [])],
+        decision=[Decision(**_only(x, Decision)) for x in args.get("decision", [])],
+        file_ref=[FileRef(**_only(x, FileRef)) for x in args.get("file_ref", [])],
     )
 
 

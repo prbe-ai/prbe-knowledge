@@ -518,13 +518,14 @@ class ClaudeCodeConnector(Connector):
                     idx=idx,
                     unit=cc,
                     metadata={
-                        "file": cc.file,
-                        "before": cc.before,
-                        "after": cc.after,
-                        "intent": cc.intent,
+                        "summary": cc.summary,
+                        "kind": cc.kind,
+                        "files": list(cc.files),
+                        "rationale": cc.rationale,
+                        "evidence": cc.evidence,
                         **self._segment_metadata(cc),
                     },
-                    body=f"FILE: {cc.file}\nINTENT: {cc.intent}\nBEFORE:\n{cc.before}\n\nAFTER:\n{cc.after}",
+                    body=_change_body(cc),
                     now=now,
                 )
             )
@@ -925,6 +926,24 @@ class ClaudeCodeConnector(Connector):
         extra_params: dict[str, str] | None = None,
     ) -> IntegrationToken:
         raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
+
+
+def _change_body(change: Any) -> str:
+    """The indexed text for one logical change.
+
+    Leads with what was done, because that is what someone searches for. The
+    file list follows rather than heads the document: a change is named by its
+    purpose, and the files are where to go look.
+    """
+    kind = f" ({change.kind})" if change.kind else ""
+    lines = [f"CHANGE{kind}: {change.summary}"]
+    if change.rationale:
+        lines.append(f"WHY: {change.rationale}")
+    if change.files:
+        lines.append(f"FILES: {', '.join(change.files)}")
+    if change.evidence:
+        lines.append(f"EVIDENCE:\n{change.evidence}")
+    return "\n".join(lines)
 
 
 def _count_compactions(events: list[dict[str, Any]]) -> int:

@@ -72,7 +72,8 @@ async def test_normalize_complete_emits_session_plus_units(monkeypatch) -> None:
 
     bundle = ext_mod.UnitBundle(
         qa=[ext_mod.QA(prompt="Why?", outcome="Because.", tags=["x"])],
-        code_change=[ext_mod.CodeChange(file="a.py", before="x", after="y", intent="z")],
+        code_change=[ext_mod.CodeChange(summary="did a thing", kind="fix",
+                                        files=["a.py"], rationale="because")],
         decision=[ext_mod.Decision(question="?", options_considered=["a", "b"], chosen="b", rationale="r")],
         file_ref=[ext_mod.FileRef(files=["a.py"], context="ctx")],
     )
