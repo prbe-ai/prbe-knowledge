@@ -270,7 +270,13 @@ class Normalizer:
         cost the documents this pass just wrote.
         """
         try:
-            async with get_pool().acquire() as conn:
+            # with_tenant, NOT a bare pool connection. `documents` has FORCE
+            # RLS keyed on the app.current_customer_id GUC, so an unscoped
+            # connection as the app role matches ZERO rows -- the retirement
+            # would silently do nothing in production while passing every test
+            # that runs as a privileged role. Every other write in this file
+            # goes through with_tenant for the same reason.
+            async with with_tenant(customer_id) as conn:
                 retired = await conn.fetch(
                     """
                     UPDATE documents

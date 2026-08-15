@@ -229,6 +229,11 @@ CREATE INDEX idx_documents_customer_source_doctype_updated
     WHERE valid_to IS NULL;
 -- Fast "latest version" lookup per (customer_id, doc_id).
 CREATE INDEX idx_documents_live ON documents (customer_id, doc_id) WHERE valid_to IS NULL;
+-- Reaching a doc's CHILDREN. Retiring a session's superseded units filters on
+-- parent_doc_id, which idx_documents_live cannot satisfy (its leading column
+-- after customer_id is doc_id), so without this the retire scans every live
+-- document for the tenant. See migration 0105.
+CREATE INDEX idx_documents_parent_live ON documents (customer_id, parent_doc_id) WHERE valid_to IS NULL;
 CREATE INDEX idx_documents_fts_title_preview ON documents
     USING GIN (to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body_preview,'')));
 CREATE INDEX idx_documents_entities ON documents USING GIN (entities jsonb_path_ops);

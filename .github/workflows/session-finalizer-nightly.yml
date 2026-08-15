@@ -55,6 +55,12 @@ concurrency:
 
 jobs:
   sweep:
+    # Kill switch, matching agent-optimization-nightly.yml. The sweep's real
+    # cost lands asynchronously on the worker fleet — the workflow reports
+    # success as soon as the enqueue finishes — so a bad run cannot be aborted
+    # after the fact. Turning the var off is the only lever, and it has to exist
+    # BEFORE the first run rather than after.
+    if: vars.SESSION_FINALIZER_ENABLED != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -122,18 +128,43 @@ jobs:
 
       - name: Resolve image tag + job name
         id: ctx
+        env:
+          # Via env, never interpolated into the shell body. `${{ }}` expands
+          # before the shell parses the line, so a dispatch input containing
+          # `$(...)` or a newline would execute on a runner holding
+          # KUBE_SA_TOKEN, or rewrite the Job spec that runs with prod
+          # DATABASE_URL and R2 credentials.
+          IDLE_INPUT: ${{ inputs.idle_minutes }}
         run: |
           set -euo pipefail
-          # Pin to whatever the live retrieval tier is running, so the sweep
-          # never executes code the deployed engine has not shipped.
-          IMAGE_TAG=$(kubectl -n managed get deploy managed-retrieval \
-            -o jsonpath='{.spec.template.spec.containers[0].image}' \
-            | sed 's|.*:||')
+          IMAGE_REF=$(kubectl -n managed get deploy managed-retrieval \
+            -o jsonpath='{.spec.template.spec.containers[0].image}')
+          # A digest-pinned ref (`...@sha256:abc`) or an untagged one both
+          # survive `sed 's|.*:||'` as something unpullable, and the pod then
+          # sits in ImagePullBackOff until the 15m wait times out.
+          case "$IMAGE_REF" in
+            *@*) echo "::error::Deployment is digest-pinned ($IMAGE_REF); cannot derive a tag." ; exit 1 ;;
+            *:*) IMAGE_TAG="${IMAGE_REF##*:}" ;;
+            *)   echo "::error::Deployment image has no tag: $IMAGE_REF" ; exit 1 ;;
+          esac
+          if ! [[ "$IMAGE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Refusing to use malformed image tag: $IMAGE_TAG"
+            exit 1
+          fi
           echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
           echo "job_suffix=$(date +%s | tail -c 6)" >> "$GITHUB_OUTPUT"
-          IDLE="${{ inputs.idle_minutes }}"
-          echo "idle_minutes=${IDLE:-360}" >> "$GITHUB_OUTPUT"
+
+          IDLE="${IDLE_INPUT:-360}"
+          # A floor, not just a format check. The pre-existing script had no
+          # argparse at all and fell back to the 5-minute setting, so a short
+          # window here re-creates exactly the failure this whole job is
+          # calibrated to avoid: finalizing sessions people are still using.
+          if ! [[ "$IDLE" =~ ^[0-9]+$ ]] || [ "$IDLE" -lt 60 ]; then
+            echo "::error::idle_minutes must be an integer >= 60, got: $IDLE"
+            exit 1
+          fi
+          echo "idle_minutes=$IDLE" >> "$GITHUB_OUTPUT"
 
       - name: Render + launch finalizer sweep Job
         id: launch
@@ -165,6 +196,14 @@ jobs:
             -o jsonpath='{.items[0].metadata.name}')
           OUT=$(kubectl -n managed logs "$POD")
           echo "$OUT"
+          # Version-skew guard. The image is whatever the live tier is running,
+          # which may predate the --idle-minutes flag; the old script ignored
+          # argv entirely and used the 5-minute default, exiting 0 either way.
+          # The window it actually used is the only evidence, so check it.
+          if ! echo "$OUT" | grep -q "idle_minutes=${{ steps.ctx.outputs.idle_minutes }}"; then
+            echo "::error::Sweep did not report the requested window — the deployed image likely predates --idle-minutes. Refusing to call this a success."
+            exit 1
+          fi
           # The script's last line is `enqueued N finalize events (...)`. Zero
           # is a normal night once the tap's own finalize is doing its job —
           # surface it as a notice so a permanently-zero sweep is visible

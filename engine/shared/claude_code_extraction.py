@@ -196,6 +196,12 @@ class FileRef:
 #:   reporting         — widest coverage of anything measured (29/50 sessions)
 #:                       and the least value: mostly "let me know if you have
 #:                       questions".
+#: The closed set a code_change's `kind` must come from. Mirrors the enum in
+#: the tool schema; declared here so it can actually be enforced.
+_CHANGE_KINDS = (
+    "feature", "fix", "refactor", "test", "docs", "config", "infra",
+)
+
 _DIRECTIVE_KINDS = (
     "verification",     # 95% precision, 18 sessions — "make sure it works e2e"
     "sequencing",       # 80%, 23 sessions — "run the smoke first, then merge"
@@ -234,6 +240,13 @@ class UnitBundle:
     #: none at all.
     objective: str = ""
     motivation: str = ""
+    #: False when ANY segment failed, was capped away, or declined to answer.
+    #: The connector uses this to decide whether it may declare the bundle a
+    #: WHOLESALE replacement for the session's existing units. A partial
+    #: extraction that claimed authority would retire units a previous, better
+    #: extraction had produced -- turning one transient gateway timeout into
+    #: permanent data loss.
+    authoritative: bool = True
     qa: list[QA] = field(default_factory=list)
     code_change: list[CodeChange] = field(default_factory=list)
     decision: list[Decision] = field(default_factory=list)
@@ -762,6 +775,34 @@ def _line_bounds(events: list[dict[str, Any]]) -> tuple[int | None, int | None]:
     return (min(nums), max(nums)) if nums else (None, None)
 
 
+#: Fields whose value must come from a fixed vocabulary, and the vocabulary.
+#: Declaring the tuples without CHECKING them is how "user_directed" and
+#: "user directed" and "the user" all end up as distinct buckets in an
+#: aggregation whose entire purpose is grouping.
+_ENUM_FIELDS = (
+    ("status", _STATUS),
+    ("trigger", _TRIGGER),
+    ("decided_by", _DECIDED_BY),
+    ("kind", None),  # resolved per unit type below
+)
+
+
+def _floor_enums(unit: Any) -> None:
+    """Blank any closed-vocabulary field the model answered off-menu.
+
+    Empty is honest; an invented value is not, and it silently poisons every
+    downstream group-by.
+    """
+    for name, allowed in _ENUM_FIELDS:
+        value = getattr(unit, name, None)
+        if value is None:
+            continue
+        if allowed is None:
+            allowed = _DIRECTIVE_KINDS if type(unit).__name__ == "Directive" else _CHANGE_KINDS
+        if value and value not in allowed:
+            setattr(unit, name, "")
+
+
 def _all_units(bundle: UnitBundle) -> list[Any]:
     """Every unit in the bundle, whatever its type."""
     return [
@@ -790,6 +831,7 @@ def _ground_units(bundle: UnitBundle, transcript: str, spans) -> UnitBundle:
     """
     normalised = _collapse(transcript)
     for unit in _all_units(bundle):
+        _floor_enums(unit)
         quote = (unit.evidence or "").strip()
         if unit.confidence not in _CONFIDENCE:
             unit.confidence = "low"
@@ -853,7 +895,17 @@ def _expand(_normalised: str, offset: int) -> int:
 #: Fields the SERVER sets and the model may never supply. `evidence_verified`
 #: is the whole point of the check — a model that could assert it would be
 #: grading its own homework — and the other two are derived, not reported.
-_SERVER_OWNED = frozenset({"segment", "evidence_verified", "anchor_line_no"})
+_SERVER_OWNED = frozenset({
+    "segment",
+    "evidence_verified",
+    "anchor_line_no",
+    # Filled by the merge-time pass only. The schema does not offer these, but
+    # unknown keys are tolerated by design — and a model-supplied
+    # `superseded_by` makes _decision_body print "SUPERSEDED: later reversed
+    # within this session" into the indexed body as fact.
+    "supersedes",
+    "superseded_by",
+})
 
 
 def _only(raw: dict[str, Any], cls: type) -> dict[str, Any]:
@@ -901,7 +953,9 @@ async def extract_units_from_session(
             extra={"session_id": session_id, "kept": _MAX_SEGMENTS},
         )
 
-    bundle = UnitBundle()
+    # A capped session is missing whole segments, so the bundle it produces is
+    # not a complete picture and must never replace one.
+    bundle = UnitBundle(authoritative=not capped)
     semaphore = asyncio.Semaphore(_SEGMENT_CONCURRENCY)
 
     async def _run(index: int, segment: list[dict[str, Any]], boundary: str) -> UnitBundle:
@@ -943,12 +997,17 @@ async def extract_units_from_session(
                     "error": str(result),
                 },
             )
+            # The bundle is now missing this segment's units, so it is no longer
+            # a complete picture of the session and must not replace one.
+            bundle.authoritative = False
             continue
         bundle.qa.extend(result.qa)
         bundle.code_change.extend(result.code_change)
         bundle.decision.extend(result.decision)
         bundle.file_ref.extend(result.file_ref)
         bundle.directive.extend(result.directive)
+        if not result.authoritative:
+            bundle.authoritative = False
 
     # Once, over the assembled bundle — the only place a cross-segment reversal
     # is visible at all.
@@ -1048,6 +1107,7 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
             max_tokens=2000,
             **transport_kwargs,
         )
+        links = args.get("links")
     except Exception as exc:
         log.warning(
             "claude_code_extraction.supersede_failed",
@@ -1055,7 +1115,24 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
         )
         return
 
-    for link in args.get("links", []):
+    # Applied INSIDE the guard's blast radius, not after it. forced_tool_call
+    # only checks that the arguments are a dict, so a model answering
+    # `{"links": {...}}` or `{"links": ["a"]}` used to raise AttributeError out
+    # of here, out of normalize(), and into the worker — which classifies a
+    # bare Exception as transient and retries the row five times, re-running
+    # EVERY segment call each time before dead-lettering the session unmined.
+    # Links are best-effort by this function's own contract; nothing here may
+    # escalate to a queue failure.
+    if not isinstance(links, list):
+        log.warning(
+            "claude_code_extraction.supersede_malformed",
+            extra={"session_id": session_id, "type": type(links).__name__},
+        )
+        return
+
+    for link in links:
+        if not isinstance(link, dict):
+            continue
         earlier, later = link.get("earlier"), link.get("later")
         if not isinstance(earlier, int) or not isinstance(later, int):
             continue
@@ -1126,10 +1203,10 @@ async def _extract_one(
             **transport_kwargs,
         )
     except ToolCallParseError:
-        # Model declined to call the tool — return an empty bundle, the
-        # same fallback the previous direct-SDK path used when no
-        # `tool_use` block came back.
-        return UnitBundle()
+        # Model declined to call the tool. Marked NOT authoritative rather than
+        # treated as "this segment genuinely had nothing": the two are
+        # indistinguishable from here, and only one of them is safe to act on.
+        return UnitBundle(authoritative=False)
 
     # Unknown keys are dropped rather than raising: a model that answers with a
     # field the schema no longer has must not cost the whole segment its units.

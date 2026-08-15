@@ -403,12 +403,11 @@ def test_edit_tool_use_renders_its_measured_change() -> None:
     assert _render_event(raw) == (
         "TOOL_USE: Edit — app/schemas/ingest.py [+12/-3 lines]"
     )
-
-
-def test_tool_use_without_summary_renders_its_scalar_args() -> None:
-    """3.1% of Claude Code calls and 257 lines of one real Codex session shipped
-    as a bare tool name: recorded as having happened, with nothing about what
-    they did. Every MCP tool is exposed to the same gap."""
+def test_client_supplied_args_are_not_rendered() -> None:
+    """The sanitizer runs on the researcher's machine; a device token is all
+    that sits between it and this renderer. Free-form client args would land in
+    the indexed body AND in the prompt sent to the model, which is what this
+    module exists to prevent. Only validated counts are rendered."""
     raw = {
         "type": "assistant",
         "message": {
@@ -418,13 +417,33 @@ def test_tool_use_without_summary_renders_its_scalar_args() -> None:
                     "type": "tool_use",
                     "id": "t1",
                     "name": "TaskUpdate",
-                    "args": {"taskId": "3", "status": "completed"},
+                    "args": {"taskId": "3", "leaked": "sk-secret-value"},
                 },
             ],
         },
     }
-    assert _render_event(raw) == "TOOL_USE: TaskUpdate — taskId=3 status=completed"
+    assert _render_event(raw) == "TOOL_USE: TaskUpdate"
 
+
+def test_hostile_edit_counts_are_clamped_not_rendered_raw() -> None:
+    """An old, patched or compromised tap can post anything here."""
+    raw = {
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use", "id": "t1", "name": "Edit",
+                    "summary": "app/x.py",
+                    "stats": {"added_lines": "'; DROP TABLE documents; --",
+                              "removed_lines": -5, "replace_all": "yes"},
+                },
+            ],
+        },
+    }
+    # Non-int coerces to 0, negative clamps to 0, and a truthy-but-not-True
+    # replace_all does not render.
+    assert _render_event(raw) == "TOOL_USE: Edit — app/x.py [+0/-0 lines]"
 
 def test_ansi_escape_codes_are_stripped_from_the_body() -> None:
     """Colour codes arrive whenever a user pastes terminal output into a prompt

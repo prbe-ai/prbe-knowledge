@@ -635,12 +635,20 @@ class ClaudeCodeConnector(Connector):
             graph_nodes=graph_nodes,
             graph_edges=graph_edges,
             acl_snapshots=acl_rows,
-            # This pass re-derived the session's units from scratch, so it owns
-            # the whole set: any child left over from a previous extraction
-            # describes a state that no longer exists. Only claimed on the
-            # COMPLETE path — an incomplete pass emits no units at all, and
-            # claiming ownership there would retire every unit the session has.
-            retire_children_of=[session_doc.doc_id],
+            # Ownership is claimed ONLY when the extraction was complete,
+            # authoritative, AND actually produced units. An empty bundle is
+            # indistinguishable from a silently degraded one, and retiring on it
+            # would wipe a session's whole mined history on a bad night. A pass that lost a segment to a gateway timeout,
+            # or hit the segment cap, holds fewer units than the session really
+            # has — declaring that a wholesale replacement would turn one
+            # transient failure into permanent deletion of a better extraction's
+            # work. Leaving the old units live is the safe failure: at worst
+            # they are stale, and the next successful pass retires them.
+            retire_children_of=(
+                [session_doc.doc_id]
+                if bundle.authoritative and len(documents) > 1
+                else []
+            ),
         )
 
     # ---- helpers ----------------------------------------------------------
@@ -928,7 +936,7 @@ class ClaudeCodeConnector(Connector):
             customer_id=event.customer_id,
             source_system=self.source_system,
             source_id=source_id,
-            source_url=parent.source_url + f"#{unit_kind}-{idx}",
+            source_url=parent.source_url + f"#{unit_kind}-{self._unit_suffix(unit, idx)}",
             doc_class=DocClass.RAW_SOURCE,
             doc_type=doc_type,
             content_type="text/plain",

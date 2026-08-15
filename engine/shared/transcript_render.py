@@ -174,20 +174,34 @@ def _render_tool_use(block: dict[str, Any]) -> str:
     summary = block.get("summary") or ""
     line = f"TOOL_USE: {name} — {summary}" if summary else f"TOOL_USE: {name}"
 
+    # VALIDATED, not trusted. The sanitizer that produces `stats` runs on the
+    # researcher's machine, and the only thing between it and this renderer is
+    # a device token — an old tap, a patched one, or a compromised device can
+    # post whatever it likes. Rendering it verbatim would put arbitrary client
+    # strings into the indexed body AND into the prompt sent to the model,
+    # which is exactly what this module exists to prevent.
     stats = block.get("stats")
     if isinstance(stats, dict):
         added = stats.get("added_lines")
         removed = stats.get("removed_lines")
         if isinstance(added, int) or isinstance(removed, int):
-            line += f" [+{added or 0}/-{removed or 0} lines]"
-        if stats.get("replace_all"):
+            line += f" [+{_count(added)}/-{_count(removed)} lines]"
+        if stats.get("replace_all") is True:
             line += " [replace_all]"
-
-    args = block.get("args")
-    if isinstance(args, dict) and args:
-        rendered = " ".join(f"{k}={v}" for k, v in args.items())
-        line += f" — {rendered}" if not summary else f" ({rendered})"
     return line
+
+
+#: Upper bound on a rendered count. A line count cannot legitimately exceed
+#: this, and clamping keeps a hostile or corrupted value from becoming a
+#: multi-megabyte token in the index.
+_MAX_RENDERED_COUNT = 10_000_000
+
+
+def _count(value: Any) -> int:
+    """A non-negative integer, or 0. Never a string, float, or bool."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, min(value, _MAX_RENDERED_COUNT))
 
 
 def _render_user(raw: dict[str, Any]) -> str:

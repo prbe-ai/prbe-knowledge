@@ -48,9 +48,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Omit to use claude_code_session_idle_minutes from settings."
         ),
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=1000,
+        help=(
+            "Cap on sessions finalized per source per run. Every one buys a "
+            "full multi-segment extraction, so this is a cost bound. Work not "
+            "reached tonight is reached tomorrow."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Count what would be finalized and write nothing.",
+    )
     args = parser.parse_args(argv)
     if args.idle_minutes is not None and args.idle_minutes < 1:
         parser.error("--idle-minutes must be >= 1")
+    if args.limit < 1:
+        parser.error("--limit must be >= 1")
     return args
 
 
@@ -71,8 +88,14 @@ async def _main(argv: list[str] | None = None) -> None:
     await init_pool()
     try:
         idle_minutes = resolve_idle_minutes(args.idle_minutes)
-        n = await enqueue_idle_session_finalizers(idle_minutes)
-        print(f"enqueued {n} finalize events (idle_minutes={idle_minutes})")
+        n = await enqueue_idle_session_finalizers(
+            idle_minutes, limit=args.limit, dry_run=args.dry_run
+        )
+        verb = "would enqueue" if args.dry_run else "enqueued"
+        print(
+            f"{verb} {n} finalize events "
+            f"(idle_minutes={idle_minutes} limit={args.limit})"
+        )
     finally:
         from engine.shared.db import close_pool
 

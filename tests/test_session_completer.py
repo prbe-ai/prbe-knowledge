@@ -271,3 +271,29 @@ class TestCronIdleWindowPrecedence:
 
         with pytest.raises(SystemExit):
             _parse_args(["--idle-minutes", "0"])
+
+
+class TestSweepCostBounds:
+    """The sweep buys a full multi-segment extraction per session it finalizes.
+    Those properties are the difference between a safe first run and a bill."""
+
+    def test_limit_and_dry_run_are_rejected_when_nonsensical(self) -> None:
+        from scripts.cron_session_completer import _parse_args
+
+        with pytest.raises(SystemExit):
+            _parse_args(["--limit", "0"])
+
+    def test_dry_run_and_limit_reach_the_sweep(self) -> None:
+        from scripts.cron_session_completer import _parse_args
+
+        args = _parse_args(["--idle-minutes", "360", "--limit", "50", "--dry-run"])
+        assert (args.idle_minutes, args.limit, args.dry_run) == (360, 50, True)
+
+    def test_defaults_are_bounded(self) -> None:
+        """An unbounded default is how a first run against a never-swept corpus
+        becomes a surprise invoice."""
+        from scripts.cron_session_completer import _parse_args
+
+        args = _parse_args([])
+        assert args.limit == 1000
+        assert args.dry_run is False
