@@ -1281,7 +1281,26 @@ SEARCH_AGENT_CACHE_HIT_RATE_FLOOR = 0.7
 
 # Wall-clock cap on entity extraction. Extraction is optional enrichment and
 # retains the original 30s bound; failure falls back to grounding-only anchors.
-SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS = 30.0
+#
+# 6s, cut from 30s (2026-08-14). This 30 has never been the deadline that fired:
+# extraction goes through the same gateway route as the gatherer, because all
+# three Cerebras callers send SEARCH_AGENT_INFERENCE_MODEL verbatim and the
+# proxy has ONE `cerebras/*` entry, so research-os's
+# `litellm.searchAgentTimeout` -- 6s -- has been the real bound all along.
+#
+# It has to be stated here now because that proxy rung is being raised to 14s to
+# stop it cutting healthy GATHERER turns (see
+# SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS below). One rung, three callers: without
+# this line, widening it for the gatherer would silently hand extraction a 14s
+# hang budget too, and extraction runs INSIDE the stage cap during setup, where
+# 8 extra seconds come straight out of the turns. 6.0 keeps the bound it
+# actually has today, now enforced where the callers can differ.
+#
+# Measured extraction_ms is p50 ~1.0s / p90 ~1.6s, so 6s stays far above healthy
+# traffic. The auto-merge judge is the third caller and is deliberately left on
+# the proxy rung: it runs on the ingestion path, not inside a caller's search
+# budget, so a longer hang there costs throughput rather than a degraded search.
+SEARCH_AGENT_EXTRACTOR_TIMEOUT_SECONDS = 6.0
 
 # Token cap on one entity-extraction completion. This is NOT a JSON-size
 # budget: SEARCH_AGENT_INFERENCE_MODEL is a reasoning model, and on the
@@ -1365,7 +1384,38 @@ SEARCH_AGENT_EXTRACTOR_MAX_TOKENS = int(
 #     + one 5s cut + Fireworks turns, which fits. It did not before.
 #   * MCP search_knowledge: 180s. Unaffected; it just stops spending 60s of
 #     that on a stalled provider.
-SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 5.0
+#
+# 12s, RAISED FROM 5s (2026-08-14). Everything above is still the right
+# reasoning; its INPUT expired. That analysis rested on a bimodal distribution
+# with a 55-second empty gap -- healthy max 3.9s, stalls at 59.5-63.8s, nothing
+# between -- which made "a turn slower than 5s never then succeeds" true, and a
+# 5s cut free. Re-measured over 54 successful production turns:
+#
+#     healthy turns   p50 2.17s   p90 4.66s   p95 6.69s   max 10.6s
+#     stalls at ~60s: NONE observed
+#
+# The gap is gone and the healthy tail now runs past 10s, so 5s sits at roughly
+# p90 of HEALTHY traffic and cuts about one turn in ten that would have
+# returned. 12s clears the observed p100 with headroom.
+#
+# WHY THIS MATTERS MORE THAN THE 7s IT COSTS. Cutting the primary fails the run
+# over, and the failover is sticky, and the new provider has no cached prefix.
+# Measured on the same conversations: turns BEFORE a failover run p50 926ms at
+# mean cache_hit 0.56; turns AFTER it run p50 4.80s, max 10.6s, and 5 of 12
+# failovers then died on the gateway's 12s Fireworks deadline. So a cut
+# triggered by one slow turn makes every remaining turn ~5x slower, which is
+# what pushed ~11-14% of /v1/search past its 30s budget. The failover itself is
+# fine -- it rescued 7 of 12 -- it just must not fire on healthy traffic.
+#
+# NOT the 10s that was tried before and reverted: charts/research-os
+# values.yaml records a 10s/10s experiment that clipped healthy turns, and the
+# 10.6s max above is exactly why. This raises ONE rung; the Fireworks rung
+# stays where it is.
+#
+# The proxy's own cerebras/* deployment timeout must stay ABOVE this or it cuts
+# first and this value never binds -- research-os charts/research-os/values.yaml
+# `litellm.searchAgentTimeout`, moved to 14 in the same change.
+SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 12.0
 
 # Per-turn deadline once the run has failed over.
 #
@@ -1398,7 +1448,26 @@ SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS = 5.0
 # and degrades through the normal loop_timeout path. It is still strictly
 # better than 12, which cut the turn while ~16s of stage budget sat unused.
 # Capping the pre-fan-out is what would make this deadline fully reachable.
-SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS = 30.0
+#
+# 12s, cut back from 30s (2026-08-14), because 30 was never the deadline that
+# fired. This is a CLIENT deadline, and the gateway enforces its own on the
+# same call: `accounts/fireworks/*` carries `timeout: 12` in research-os
+# charts/research-os/values.yaml (`litellm.searchAgentFallbackTimeout`). Every
+# observed fallback failure in production is that one, not this:
+#
+#   litellm.Timeout: ... Fireworks_aiException ... Timeout passed=12.0,
+#   time taken=12.003 seconds        (n=9, all within 51ms of 12.000)
+#
+# So raising this to 30 bought nothing and, worse, made the ladder arithmetic
+# below reason about a number the system cannot produce -- the stage cap was
+# sized against 30s fallback turns that always ended at 12. Setting it to what
+# actually binds keeps `test_stage_cap_leaves_room_for_the_failover_to_land`
+# honest instead of accidentally true.
+#
+# If the fallback should really get 30s, raise the GATEWAY value; this one
+# follows it, never leads. And check the caller first: research-os abandons at
+# 30s total, so a 30s fallback turn cannot land there whatever this says.
+SEARCH_AGENT_FALLBACK_TIMEOUT_SECONDS = 12.0
 
 # Where a stalled run finishes. Must be a model id the gateway's modelList
 # resolves -- `accounts/fireworks/*` expands to the upstream
@@ -1421,7 +1490,25 @@ SEARCH_AGENT_FALLBACK_INFERENCE_MODEL = os.getenv(
 # 60s, cut from 90s (2026-08-04). With a 5s primary cut and a 12s fallback
 # deadline, a 3-turn run lands ~40s worst case, so 60s is the backstop for
 # pathological cases rather than a routine ceiling.
-SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 60.0
+#
+# 25s, cut from 60s (2026-08-14), because 60 was never reachable by the caller
+# that matters. research-os /v1/search abandons at ENGINE_TIMEOUT_SECONDS = 30,
+# so a stage permitted to run 60s spends up to half its budget producing an
+# answer nobody is still waiting for -- and the caller reports state:"partial"
+# while this pod is still working. A backstop above the caller's own deadline
+# is not a backstop, it is a leak.
+#
+# 25 not 30: the deadline is measured from `run_gatherer` entry, so setup
+# (grounding + extraction + pre-fan-out) comes OUT of it, not on top. Setup
+# measures p50 6.5s / p90 10.7s in production -- the "~4s" above is stale --
+# leaving ~14s of turns at p90 setup, which fits one full 12s primary cut plus
+# the degrade to pre-fan-out. The 5s of slack under 30 covers response
+# serialisation and the hop back to research-os.
+#
+# Timing out here is not an error: it degrades to `_backfill_recall_floor` off
+# `state.prefanout`, which is a real citable result set. Returning that at 25s
+# beats returning nothing at 30.
+SEARCH_AGENT_LOOP_TIMEOUT_SECONDS = 25.0
 
 # Fraction of gatherer runs whose full per-turn transcript gets persisted
 # to R2 alongside the query_traces summary row. 1.0 = persist every run.
