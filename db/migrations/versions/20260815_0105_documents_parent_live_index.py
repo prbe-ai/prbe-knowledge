@@ -16,22 +16,32 @@ Retiring a session's superseded units queries the other direction:
 
 The best existing index is `idx_documents_live (customer_id, doc_id) WHERE
 valid_to IS NULL`, whose leading column after customer_id is doc_id -- it cannot
-satisfy a parent_doc_id predicate. So this plans as a scan over every live
-document for the tenant, taking row locks as it goes, on the largest table in
-the system.
+satisfy a parent_doc_id predicate. Without this the retire scans every live
+document for the tenant, on a path that fires per finalize and in bulk nightly.
 
-That would be tolerable once. It is not: the path fires on every session
-finalize, again on every batch of a session that resumes after finalizing (the
-completion marker is sticky), and in bulk on the nightly sweep. With
-db_statement_timeout at 300s it would not fail loudly either -- it would just
-get slower and start contending with retrieval, which is the same shape as the
-2026-04-29 lock incident.
+WHY NOT CONCURRENTLY -- learned the hard way, 2026-08-16
+-------------------------------------------------------
+The first version of this migration used CREATE INDEX CONCURRENTLY, reasoning
+that `documents` is the hottest table in the system and an ACCESS EXCLUSIVE lock
+during a deploy was unacceptable. That reasoning was sound in the abstract and
+wrong here, and it took prod deploys down for two hours.
 
-PARTIAL, matching the predicate: `WHERE valid_to IS NULL` keeps the index to
-live rows only, which is the minority of a table that accumulates every prior
-version forever. CONCURRENTLY because this table is hot and an ACCESS EXCLUSIVE
-lock on it during a deploy is not acceptable -- which is also why this migration
-runs outside a transaction.
+CONCURRENTLY builds the index and then WAITS for every transaction older than
+the build to finish before marking it valid. It waits indefinitely. One
+long-lived transaction anywhere on the database is enough. That is exactly what
+happened: the index finished building at 152 kB and sat in its final wait until
+helm's 15m post-upgrade timeout killed the release -- twice -- leaving
+`indisvalid = false` behind. And because the retry used `IF NOT EXISTS`, it
+would have skipped the invalid leftover forever, so the index would never have
+existed while every deploy kept failing.
+
+The table is 22,543 rows and 93 MB. A plain build takes well under a second and
+the momentary lock is genuinely fine. The cost of CONCURRENTLY here was not a
+tradeoff, it was a self-inflicted outage in exchange for nothing.
+
+The lesson generalises: CONCURRENTLY belongs in an out-of-band ops step, never
+in a deploy hook with a timeout, and never before checking whether the table is
+actually big enough to need it.
 """
 from __future__ import annotations
 
@@ -42,19 +52,36 @@ down_revision = "0104_wiki_live_page_size"
 branch_labels = None
 depends_on = None
 
-# CREATE INDEX CONCURRENTLY cannot run inside a transaction block, and alembic
-# wraps migrations in one by default.
+
 def upgrade() -> None:
-    with op.get_context().autocommit_block():
-        op.execute(
-            """
-            CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_documents_parent_live
-                ON documents (customer_id, parent_doc_id)
-             WHERE valid_to IS NULL
-            """
-        )
+    # Clear the INVALID leftover from the CONCURRENTLY attempt before creating.
+    # An invalid index is unusable by the planner AND satisfies IF NOT EXISTS,
+    # so leaving it would silently mean this index never exists. Guarded on
+    # indisvalid so a healthy index on a re-run is left alone.
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                  FROM pg_class c
+                  JOIN pg_index i ON i.indexrelid = c.oid
+                 WHERE c.relname = 'idx_documents_parent_live'
+                   AND NOT i.indisvalid
+            ) THEN
+                DROP INDEX idx_documents_parent_live;
+            END IF;
+        END $$;
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_documents_parent_live
+            ON documents (customer_id, parent_doc_id)
+         WHERE valid_to IS NULL
+        """
+    )
 
 
 def downgrade() -> None:
-    with op.get_context().autocommit_block():
-        op.execute("DROP INDEX CONCURRENTLY IF EXISTS idx_documents_parent_live")
+    op.execute("DROP INDEX IF EXISTS idx_documents_parent_live")
