@@ -604,3 +604,50 @@ def test_unit_suffix_falls_back_without_a_segment() -> None:
     from kb.handlers.claude_code import ClaudeCodeConnector
 
     assert ClaudeCodeConnector._unit_suffix(QA(prompt="p", outcome="o"), 7) == "7"
+
+
+@pytest.mark.asyncio
+async def test_extraction_can_be_disabled_without_stopping_capture(monkeypatch) -> None:
+    """The nightly sweep is opt-in; the CLIENT finalize path is not. Once taps
+    ship a finalize on SessionEnd, every ending session mines — with no lever
+    short of the global ingestion killswitch, which would also stop capturing
+    transcripts, losing data to save money."""
+    from engine.shared.config import get_settings
+
+    called = {"n": 0}
+
+    async def fake_extract(**kwargs):
+        called["n"] += 1
+        raise AssertionError("extraction must not run when disabled")
+
+    monkeypatch.setattr(
+        "kb.handlers.claude_code._ext.extract_units_from_session", fake_extract
+    )
+    monkeypatch.setenv("CLAUDE_CODE_EXTRACTION_ENABLED", "false")
+    get_settings.cache_clear()  # type: ignore[attr-defined]
+    try:
+        connector = ClaudeCodeConnector(make_default_context())
+        result = await connector.normalize(
+            _event(session_id="s-off"),
+            {
+                "session_id": "s-off",
+                "events": [{"line_no": 0, "raw": {}}],
+                "session_complete": True,
+                "finalize_keys": ["raw/claude_code/c/2026/08/15/s-off.json"],
+                "cwd": "/tmp/p",
+            },
+        )
+    finally:
+        monkeypatch.delenv("CLAUDE_CODE_EXTRACTION_ENABLED", raising=False)
+        get_settings.cache_clear()  # type: ignore[attr-defined]
+
+    assert called["n"] == 0
+    # Capture is untouched: the session document is still written and indexed.
+    assert any(str(d.doc_type) .endswith("claude_code.session") or
+               getattr(d.doc_type, "value", d.doc_type) == "claude_code.session"
+               for d in result.documents)
+    assert len(result.documents) == 1, "no unit docs when mining is off"
+    # And the session is NOT recorded as done — re-enabling must re-mine it
+    # rather than leave a hole no later sweep would revisit.
+    assert result.consume_payload_keys == []
+    assert result.retire_children_of == []

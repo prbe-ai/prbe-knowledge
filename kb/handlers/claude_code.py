@@ -29,6 +29,7 @@ import orjson
 from engine.ingest.handlers.base import Connector
 from engine.ingest.handlers.registry import register_connector
 from engine.shared import claude_code_extraction as _ext
+from engine.shared.config import get_settings
 from engine.shared.constants import (
     DocClass,
     DocType,
@@ -41,6 +42,7 @@ from engine.shared.constants import (
     agent_session_display_name,
 )
 from engine.shared.exceptions import InvalidWebhookPayload, NotSupportedByConnector
+from engine.shared.logging import get_logger
 from engine.shared.models import (
     ACLPrincipal,
     ACLSnapshot,
@@ -73,6 +75,8 @@ from engine.shared.transcript_render import (  # noqa: F401
 # would peak at ~400 in-flight S3 GETs per machine and balloon memory. 16
 # is enough to drain a typical session in ~1.5s while keeping in-flight
 # envelopes bounded to a few MB.
+log = get_logger(__name__)
+
 _FETCH_SUPP_R2_CONCURRENCY = 16
 
 
@@ -473,6 +477,23 @@ class ClaudeCodeConnector(Connector):
         ]
 
         if not complete:
+            return NormalizationResult(
+                documents=documents,
+                graph_nodes=graph_nodes,
+                graph_edges=graph_edges,
+                acl_snapshots=acl_rows,
+            )
+
+        # Emergency stop, independent of capture. Skipping mining must not look
+        # like "this session had nothing to mine": leave the session
+        # un-finalized so re-enabling re-mines it, rather than recording a
+        # silent hole that no later sweep would ever revisit.
+        if not get_settings().claude_code_extraction_enabled:
+            log.info(
+                "claude_code.extraction_disabled",
+                customer=event.customer_id,
+                session_id=session_id,
+            )
             return NormalizationResult(
                 documents=documents,
                 graph_nodes=graph_nodes,

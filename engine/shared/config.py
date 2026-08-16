@@ -140,6 +140,18 @@ class Settings(BaseSettings):
     )
     google_api_key: SecretStr = SecretStr("")
     claude_code_extraction_model: str = Field(default="claude-sonnet-4-6")
+    #: Emergency stop for unit extraction, independent of capture.
+    #:
+    #: The nightly sweep is opt-in, but the CLIENT finalize path is not: once
+    #: taps ship a finalize on SessionEnd, every ending session runs extraction
+    #: (~4.6 model calls, ~219k input tokens) with no lever short of the global
+    #: ingestion killswitch -- which would also stop transcripts being captured
+    #: at all, losing data to save money.
+    #:
+    #: Turning this off keeps capture and indexing fully intact and skips only
+    #: the mining. Sessions are left un-finalized rather than marked done, so
+    #: turning it back on re-mines them instead of leaving a silent hole.
+    claude_code_extraction_enabled: bool = Field(default=True)
 
     # --- LLM gateway (managed-shared / self-host: route LLM + embedding
     #     calls through a central LiteLLM proxy instead of direct provider
