@@ -705,3 +705,65 @@ async def test_a_failed_supersede_pass_keeps_the_decisions(monkeypatch) -> None:
         session_id="s", events=[_user("go", 0)]
     )
     assert len(bundle.decision) == 2
+
+
+@pytest.mark.asyncio
+async def test_extraction_spend_is_counted_across_segments(monkeypatch) -> None:
+    """Extraction went from one model call per session to one per segment plus
+    a supersede pass, and both call sites discarded the response — so the spend
+    was invisible. A runaway loop should show up in telemetry, not on an
+    invoice."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    class _Usage:
+        prompt_tokens = 1000
+        completion_tokens = 100
+        total_tokens = 1100
+
+    def _with_usage(payload, tool="emit_units"):
+        resp = _litellm_tool_response(tool, payload)
+        resp.usage = _Usage()
+        return resp
+
+    def decision(q):
+        return {"question": q, "options_considered": ["a", "b"], "chosen": "a",
+                "rationale": "r", "serves": "s", "decided_by": "agent_unilateral",
+                "status": "implemented", "trigger": "user_request",
+                "evidence": "go", "confidence": "high"}
+
+    async def fake_acompletion(**kwargs):
+        if kwargs["tool_choice"]["function"]["name"] == "emit_supersessions":
+            return _with_usage({"links": []}, "emit_supersessions")
+        return _with_usage({
+            "goal": {"objective": "o", "motivation": ""},
+            "qa": [], "code_change": [], "file_ref": [], "directive": [],
+            "decision": [decision("q")],
+        })
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    events = [_user("first", 0), _boundary(1), _user("second", 2)]
+    bundle = await ext_mod.extract_units_from_session(session_id="s", events=events)
+
+    # Two segments plus the supersede pass — the pass is the easy one to forget.
+    assert bundle.llm_calls == 3
+    assert bundle.prompt_tokens == 3000
+    assert bundle.completion_tokens == 300
+
+
+@pytest.mark.asyncio
+async def test_a_declined_segment_still_counts_as_a_call(monkeypatch) -> None:
+    """A call that produced nothing was still paid for. Counting only
+    successful ones would under-report exactly the failure worth catching."""
+    from engine.shared import claude_code_extraction as ext_mod
+
+    async def fake_acompletion(**kwargs):
+        resp = _litellm_tool_response("emit_units", {})
+        resp.choices[0].message.tool_calls = []  # model declined
+        return resp
+
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake_acompletion)
+    bundle = await ext_mod.extract_units_from_session(
+        session_id="s", events=[_user("go", 0)]
+    )
+    assert bundle.llm_calls == 1
+    assert bundle.authoritative is False

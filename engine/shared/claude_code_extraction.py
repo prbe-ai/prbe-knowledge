@@ -17,7 +17,11 @@ from typing import Any
 
 from engine.shared.config import get_settings
 from engine.shared.llm import gateway_url
-from engine.shared.llm_tools import ToolCallParseError, forced_tool_call
+from engine.shared.llm_tools import (
+    ToolCallParseError,
+    forced_tool_call,
+    usage_tokens,
+)
 from engine.shared.logging import get_logger
 from engine.shared.transcript_render import (
     _events_to_text,
@@ -240,6 +244,14 @@ class UnitBundle:
     #: none at all.
     objective: str = ""
     motivation: str = ""
+    #: What this bundle cost. Extraction went from one model call per session to
+    #: one per segment plus a supersede pass, and the spend was completely
+    #: unobservable: both call sites discarded the response, so there was no
+    #: per-session count, no per-tenant total, and no way to see a runaway loop
+    #: in telemetry rather than on an invoice.
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    llm_calls: int = 0
     #: False when ANY segment failed, was capped away, or declined to answer.
     #: The connector uses this to decide whether it may declare the bundle a
     #: WHOLESALE replacement for the session's existing units. A partial
@@ -1006,12 +1018,29 @@ async def extract_units_from_session(
         bundle.decision.extend(result.decision)
         bundle.file_ref.extend(result.file_ref)
         bundle.directive.extend(result.directive)
+        bundle.prompt_tokens += result.prompt_tokens
+        bundle.completion_tokens += result.completion_tokens
+        bundle.llm_calls += result.llm_calls
         if not result.authoritative:
             bundle.authoritative = False
 
     # Once, over the assembled bundle — the only place a cross-segment reversal
     # is visible at all.
     await _link_supersessions(bundle, session_id, agent)
+
+    log.info(
+        "claude_code_extraction.spend",
+        extra={
+            "session_id": session_id,
+            "agent": agent,
+            "segments": len(segments),
+            "llm_calls": bundle.llm_calls,
+            "prompt_tokens": bundle.prompt_tokens,
+            "completion_tokens": bundle.completion_tokens,
+            "units": len(_all_units(bundle)),
+            "authoritative": bundle.authoritative,
+        },
+    )
     return bundle
 
 
@@ -1108,6 +1137,10 @@ async def _link_supersessions(bundle: UnitBundle, session_id: str, agent: str) -
             **transport_kwargs,
         )
         links = args.get("links")
+        used = usage_tokens(_resp)
+        bundle.prompt_tokens += used["prompt_tokens"]
+        bundle.completion_tokens += used["completion_tokens"]
+        bundle.llm_calls += 1
     except Exception as exc:
         log.warning(
             "claude_code_extraction.supersede_failed",
@@ -1206,12 +1239,16 @@ async def _extract_one(
         # Model declined to call the tool. Marked NOT authoritative rather than
         # treated as "this segment genuinely had nothing": the two are
         # indistinguishable from here, and only one of them is safe to act on.
-        return UnitBundle(authoritative=False)
+        return UnitBundle(authoritative=False, llm_calls=1)
 
     # Unknown keys are dropped rather than raising: a model that answers with a
     # field the schema no longer has must not cost the whole segment its units.
+    used = usage_tokens(_resp)
     goal = args.get("goal") if isinstance(args.get("goal"), dict) else {}
     return _ground_units(UnitBundle(
+        prompt_tokens=used["prompt_tokens"],
+        completion_tokens=used["completion_tokens"],
+        llm_calls=1,
         objective=str(goal.get("objective") or "").strip(),
         motivation=str(goal.get("motivation") or "").strip(),
         qa=[QA(**_only(x, QA)) for x in args.get("qa", [])],

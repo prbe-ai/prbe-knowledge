@@ -635,6 +635,19 @@ class ClaudeCodeConnector(Connector):
                 )
             )
 
+        # What this session cost to mine, on the session document itself. The
+        # log line is for fleet totals; this is for "why is THIS session
+        # expensive" — and it is the only place the number survives past log
+        # retention.
+        session_doc.metadata["extraction_llm_calls"] = bundle.llm_calls
+        session_doc.metadata["extraction_prompt_tokens"] = bundle.prompt_tokens
+        session_doc.metadata["extraction_completion_tokens"] = bundle.completion_tokens
+        if not bundle.authoritative:
+            # A degraded pass produced fewer units than the session really has.
+            # Recording it stops the gap being read later as "this session had
+            # little to say".
+            session_doc.metadata["extraction_degraded"] = True
+
         # Note: unit documents are linked to the session document via
         # `parent_doc_id` in Postgres rather than via direct graph edges. The
         # graph writer walks `parent_doc_id` to navigate from a session node
