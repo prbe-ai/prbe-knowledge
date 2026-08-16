@@ -262,3 +262,83 @@ async def test_fetch_supplementary_dedupes_overlapping_line_nos(
     assert hydrated["session_complete"] is False
 
     await store.delete_bucket_recursive(bucket)
+
+
+@pytest.mark.asyncio
+async def test_client_finalize_payload_completes_the_session(
+    stub_store: _StubStore,
+) -> None:
+    """The tap's SessionEnd finalize must mark the session complete.
+
+    It arrives as an ordinary coalesced payload carrying `finalize: true` and
+    no events, keyed like any other batch — NOT as the cron's dedicated
+    `.../finalize.marker` object. Before this was honored the gateway route
+    authenticated, forwarded and stored the payload, returned 202, and nothing
+    ever set complete — so a cleanly-ended session was never mined for units.
+    """
+    customer = "fs-finalize-cust"
+    session = "sess-finalize"
+    store = stub_store
+    bucket = await store.bucket_for(customer)
+    await store.ensure_bucket(bucket)
+
+    batch_key = f"raw/claude_code/{customer}/2026/04/29/{session}:0.json"
+    await store.put(bucket, batch_key, _envelope(
+        session_id=session,
+        batch_seq=0,
+        events=[{"line_no": 0, "raw": {"type": "user", "content": "hi"}}],
+    ))
+
+    # The gateway rebuilds a finalize body from validated fields only:
+    # finalize + session_id + device_id + server-stamped identity. No events,
+    # no batch_seq — hence the bare-session_id R2 key.
+    finalize_key = f"raw/claude_code/{customer}/2026/04/29/{session}.json"
+    await store.put(bucket, finalize_key, orjson.dumps({
+        "_headers": {},
+        "payload": {
+            "finalize": True,
+            "session_id": session,
+            "device_id": "dev-1",
+            "employee_id": "emp-1",
+        },
+        "received_at": datetime.now(UTC).isoformat(),
+        "trace_id": f"test-{session}-finalize",
+    }))
+
+    c = ClaudeCodeConnector(make_default_context())
+    hydrated = await c.fetch_supplementary(
+        _make_event(customer, session, [batch_key, finalize_key]), None
+    )
+
+    assert hydrated["session_complete"] is True
+    # The finalize payload contributes no events — the real transcript must
+    # survive it intact, or the extractor gets an empty session to mine.
+    assert len(hydrated["events"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_batches_without_any_finalize_stay_incomplete(
+    stub_store: _StubStore,
+) -> None:
+    """The negative half: ordinary traffic must NOT look finished.
+
+    Guards the branch above from degenerating into "always complete", which
+    would re-run the extraction LLM on every batch of every live session.
+    """
+    customer = "fs-open-cust"
+    session = "sess-open"
+    store = stub_store
+    bucket = await store.bucket_for(customer)
+    await store.ensure_bucket(bucket)
+
+    key = f"raw/claude_code/{customer}/2026/04/29/{session}:0.json"
+    await store.put(bucket, key, _envelope(
+        session_id=session,
+        batch_seq=0,
+        events=[{"line_no": 0, "raw": {"type": "user", "content": "still going"}}],
+    ))
+
+    c = ClaudeCodeConnector(make_default_context())
+    hydrated = await c.fetch_supplementary(_make_event(customer, session, [key]), None)
+
+    assert hydrated["session_complete"] is False

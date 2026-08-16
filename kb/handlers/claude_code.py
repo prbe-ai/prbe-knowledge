@@ -57,6 +57,17 @@ from engine.shared.models import (
 )
 from engine.shared.storage import get_store
 
+# Re-exported: the renderer moved to engine.shared so the unit extractor can
+# use it too (it needs the same prose, not raw event JSON). Import site kept
+# stable for the connector and its tests.
+from engine.shared.transcript_render import (  # noqa: F401
+    _events_to_text,
+    _render_assistant,
+    _render_event,
+    _render_tool_use,
+    _render_user,
+)
+
 # Cap on simultaneous R2 GETs per fetch_supplementary call. With WORKER
 # concurrency=4 and a long session of ~100 batches, unbounded asyncio.gather
 # would peak at ~400 in-flight S3 GETs per machine and balloon memory. 16
@@ -260,9 +271,14 @@ class ClaudeCodeConnector(Connector):
         fetched: list[tuple[str, bytes]] = await asyncio.gather(*(_fetch(k) for k in keys))
 
         finalize_marker_seen = False
+        client_finalize_seen = False
+        # The keys that carry the completion signal, so the normalizer can drop
+        # them once we have acted on it. See `consume_payload_keys`.
+        finalize_keys: list[str] = []
         for key, body in fetched:
             if key.endswith("/finalize.marker"):
                 finalize_marker_seen = True
+                finalize_keys.append(key)
             try:
                 envelope = orjson.loads(body)
             except orjson.JSONDecodeError:
@@ -271,6 +287,21 @@ class ClaudeCodeConnector(Connector):
             payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else {}
             if not isinstance(payload, dict):
                 continue
+            # An explicit client finalize (the tap's SessionEnd hook, via the
+            # gateway's SessionFinalizeRequest route) lands here as an ordinary
+            # coalesced payload carrying `finalize: true` and NO events. It is
+            # NOT the cron's marker: the cron writes a dedicated
+            # `.../finalize.marker` R2 object, while this one is keyed like any
+            # other batch (`raw/<source>/<cust>/<date>/<session_id>.json`,
+            # since a finalize parse_hint carries no batch_seq to suffix with).
+            #
+            # Without this branch the gateway route was a no-op with a 202: it
+            # authenticated, forwarded and stored the payload, and nothing ever
+            # marked the session complete — so the unit extraction that only
+            # runs on completion never fired for a cleanly-ended session.
+            if payload.get("finalize") is True:
+                client_finalize_seen = True
+                finalize_keys.append(key)
             _remember_payload_identity(payload)
             for obj in payload.get("events") or []:
                 if isinstance(obj, dict):
@@ -278,13 +309,23 @@ class ClaudeCodeConnector(Connector):
 
         merged_events.sort(key=lambda e: (e.get("line_no") is None, e.get("line_no") or 0))
 
-        # Session-complete detection: live SessionEnd, cron-injected
-        # finalize.marker, or legacy `:finalize` source_event_id from
-        # in-flight pre-migration rows.
+        # Session-complete detection, four ways in:
+        #   1. a live `session_end` event in the merged stream
+        #   2. an explicit client finalize payload (the tap's SessionEnd hook)
+        #   3. the cron sweep's injected finalize.marker
+        #   4. a legacy `:finalize` source_event_id on a pre-0026 in-flight row
+        #
+        # (2) and (3) are deliberately separate signals rather than one. They
+        # come from different actors with different failure modes — the client
+        # says "this session ended cleanly", the sweep says "nobody ever said
+        # anything and it has been quiet for hours" — and collapsing them would
+        # make it impossible to tell a working finish hook from a silent one.
         complete = any(
             (e.get("raw") or {}).get("type") == "session_end"
             for e in merged_events
         )
+        if client_finalize_seen:
+            complete = True
         if finalize_marker_seen:
             complete = True
         if event.source_event_id.endswith(":finalize"):
@@ -294,6 +335,7 @@ class ClaudeCodeConnector(Connector):
             "session_id": session_id,
             "events": merged_events,
             "session_complete": complete,
+            "finalize_keys": finalize_keys,
             "cwd": event.raw_payload.get("cwd"),
             **session_identity,
         }
@@ -442,6 +484,7 @@ class ClaudeCodeConnector(Connector):
             session_id=session_id,
             events=events,
             cwd=cwd,
+            agent=self._agent_label,
         )
 
         for idx, qa in enumerate(bundle.qa):
@@ -456,10 +499,12 @@ class ClaudeCodeConnector(Connector):
                     doc_type=DocType.CLAUDE_CODE_QA,
                     unit_kind="qa",
                     idx=idx,
+                    unit=qa,
                     metadata={
                         "prompt": qa.prompt,
                         "outcome": qa.outcome,
                         "tags": list(qa.tags),
+                        **self._segment_metadata(qa),
                     },
                     body=f"Q: {qa.prompt}\n\nA: {qa.outcome}",
                     now=now,
@@ -477,13 +522,16 @@ class ClaudeCodeConnector(Connector):
                     doc_type=DocType.CLAUDE_CODE_CODE_CHANGE,
                     unit_kind="code_change",
                     idx=idx,
+                    unit=cc,
                     metadata={
-                        "file": cc.file,
-                        "before": cc.before,
-                        "after": cc.after,
-                        "intent": cc.intent,
+                        "summary": cc.summary,
+                        "kind": cc.kind,
+                        "files": list(cc.files),
+                        "rationale": cc.rationale,
+                        "evidence": cc.evidence,
+                        **self._segment_metadata(cc),
                     },
-                    body=f"FILE: {cc.file}\nINTENT: {cc.intent}\nBEFORE:\n{cc.before}\n\nAFTER:\n{cc.after}",
+                    body=_change_body(cc),
                     now=now,
                 )
             )
@@ -499,16 +547,23 @@ class ClaudeCodeConnector(Connector):
                     doc_type=DocType.CLAUDE_CODE_DECISION,
                     unit_kind="decision",
                     idx=idx,
+                    unit=dec,
                     metadata={
                         "question": dec.question,
                         "options_considered": list(dec.options_considered),
                         "chosen": dec.chosen,
                         "rationale": dec.rationale,
+                        "serves": dec.serves,
+                        "decided_by": dec.decided_by,
+                        "status": dec.status,
+                        "trigger": dec.trigger,
+                        **({"supersedes": dec.supersedes}
+                           if dec.supersedes is not None else {}),
+                        **({"superseded_by": dec.superseded_by}
+                           if dec.superseded_by is not None else {}),
+                        **self._segment_metadata(dec),
                     },
-                    body=(
-                        f"Q: {dec.question}\nOPTIONS: {', '.join(dec.options_considered)}\n"
-                        f"CHOSE: {dec.chosen}\nRATIONALE: {dec.rationale}"
-                    ),
+                    body=_decision_body(dec),
                     now=now,
                 )
             )
@@ -524,11 +579,37 @@ class ClaudeCodeConnector(Connector):
                     doc_type=DocType.CLAUDE_CODE_FILE_REF,
                     unit_kind="file_ref",
                     idx=idx,
+                    unit=fr,
                     metadata={
                         "files": list(fr.files),
                         "context": fr.context,
+                        **self._segment_metadata(fr),
                     },
                     body=f"CONTEXT: {fr.context}\nFILES: {', '.join(fr.files)}",
+                    now=now,
+                )
+            )
+
+        for idx, directive in enumerate(bundle.directive):
+            documents.append(
+                self._build_unit_doc(
+                    event=event,
+                    parent=session_doc,
+                    employee_id=employee_id,
+                    employee_name=employee_name,
+                    employee_email=employee_email,
+                    employee_hostname=employee_hostname,
+                    doc_type=DocType.CLAUDE_CODE_DIRECTIVE,
+                    unit_kind="directive",
+                    idx=idx,
+                    unit=directive,
+                    metadata={
+                        "instruction": directive.instruction,
+                        "kind": directive.kind,
+                        "scope": directive.scope,
+                        **self._segment_metadata(directive),
+                    },
+                    body=_directive_body(directive),
                     now=now,
                 )
             )
@@ -560,6 +641,32 @@ class ClaudeCodeConnector(Connector):
             graph_nodes=graph_nodes,
             graph_edges=graph_edges,
             acl_snapshots=acl_rows,
+            # Ownership is claimed ONLY when the extraction was complete,
+            # authoritative, AND actually produced units. An empty bundle is
+            # indistinguishable from a silently degraded one, and retiring on it
+            # would wipe a session's whole mined history on a bad night. A pass that lost a segment to a gateway timeout,
+            # or hit the segment cap, holds fewer units than the session really
+            # has — declaring that a wholesale replacement would turn one
+            # transient failure into permanent deletion of a better extraction's
+            # work. Leaving the old units live is the safe failure: at worst
+            # they are stale, and the next successful pass retires them.
+            retire_children_of=(
+                [session_doc.doc_id]
+                if bundle.authoritative and len(documents) > 1
+                else []
+            ),
+            # Completion is an EVENT, not a property. Having acted on it, drop
+            # the keys that carried it: payload_s3_keys is append-only, so
+            # leaving them makes every later batch of a resumed session look
+            # complete again and buy another full re-extraction of the whole
+            # transcript. Only consumed when the extraction was authoritative —
+            # a degraded pass has not really acted on the signal, and dropping
+            # it would strand the session unmined until the next sweep.
+            consume_payload_keys=(
+                list(hydrated.get("finalize_keys") or [])
+                if bundle.authoritative
+                else []
+            ),
         )
 
     # ---- helpers ----------------------------------------------------------
@@ -687,6 +794,11 @@ class ClaudeCodeConnector(Connector):
             "device_id": event.raw_payload.get("device_id"),
             "session_complete": complete,
             "event_count": len(events),
+            # How many times the agent ran out of context and summarised itself.
+            # A reader wants this BEFORE opening any unit: it says whether the
+            # session is one sitting or a long campaign, and it is the count of
+            # chapter breaks the units are indexed against.
+            "compaction_count": _count_compactions(events),
         }
         if employee_name:
             md["employee_name"] = employee_name
@@ -726,6 +838,69 @@ class ClaudeCodeConnector(Connector):
             acl=self._acl(employee_id),
         )
 
+    @staticmethod
+    def _unit_suffix(unit: Any, idx: int) -> str:
+        """The part of a unit's document id that identifies WHICH unit.
+
+        Segment-scoped (`s2:0`) rather than a session-wide counter, because a
+        session is extracted in parts and any part can return a different
+        number of units on a re-run. With one counter across the whole session,
+        a segment that yields three decisions instead of four shifts every id
+        after it: the surviving documents silently come to describe different
+        content, and the tail of the old numbering is orphaned. Scoping the
+        counter to its segment confines both effects to the segment that
+        actually changed.
+
+        Falls back to the flat counter when a unit has no segment, so anything
+        constructing units without one keeps its old ids.
+        """
+        ref = getattr(unit, "segment", None)
+        if ref is None:
+            return str(idx)
+        return f"s{ref.index}:{ref.position}"
+
+    @staticmethod
+    def _segment_metadata(unit: Any) -> dict[str, Any]:
+        """Where in its session this unit came from.
+
+        A long session is extracted in parts, so without this a unit is a
+        free-floating fact about a session that may have run for hours. With
+        it, units can be put back in order, grouped by chapter, and located in
+        the transcript — which is what makes a sequence of decisions readable
+        as a sequence rather than a bag.
+
+        `segment_boundary` is the load-bearing one: `compaction` is a chapter
+        break the AGENT chose when it ran out of context, `size` is a cut we
+        made to fit a call and means nothing about the work.
+        """
+        md: dict[str, Any] = {}
+        # Grounding first: it applies whether or not the unit has segment
+        # provenance, and it is the field a reader should weigh before the prose.
+        if getattr(unit, "confidence", ""):
+            md["confidence"] = unit.confidence
+        if getattr(unit, "evidence", ""):
+            md["evidence"] = unit.evidence
+            md["evidence_verified"] = bool(unit.evidence_verified)
+        if getattr(unit, "anchor_line_no", None) is not None:
+            md["anchor_line_no"] = unit.anchor_line_no
+        ref = getattr(unit, "segment", None)
+        if ref is None:
+            return md
+        md |= {
+            "segment_index": ref.index,
+            "segment_count": ref.total,
+            "segment_boundary": ref.boundary,
+        }
+        if ref.objective:
+            md["objective"] = ref.objective
+        if ref.motivation:
+            md["motivation"] = ref.motivation
+        if ref.start_line_no is not None:
+            md["segment_start_line_no"] = ref.start_line_no
+        if ref.end_line_no is not None:
+            md["segment_end_line_no"] = ref.end_line_no
+        return md
+
     def _build_unit_doc(
         self,
         *,
@@ -738,11 +913,12 @@ class ClaudeCodeConnector(Connector):
         doc_type: DocType,
         unit_kind: str,
         idx: int,
+        unit: Any,
         metadata: dict[str, Any],
         body: str,
         now: datetime,
     ) -> Document:
-        source_id = f"{parent.source_id}:{unit_kind}:{idx}"
+        source_id = f"{parent.source_id}:{unit_kind}:{self._unit_suffix(unit, idx)}"
         doc_id = f"{self._doc_id_prefix}:{event.customer_id}:{source_id}"
         body_bytes = body.encode("utf-8")
         content_hash = hashlib.sha256(body_bytes).hexdigest()
@@ -778,7 +954,7 @@ class ClaudeCodeConnector(Connector):
             customer_id=event.customer_id,
             source_system=self.source_system,
             source_id=source_id,
-            source_url=parent.source_url + f"#{unit_kind}-{idx}",
+            source_url=parent.source_url + f"#{unit_kind}-{self._unit_suffix(unit, idx)}",
             doc_class=DocClass.RAW_SOURCE,
             doc_type=doc_type,
             content_type="text/plain",
@@ -811,6 +987,114 @@ class ClaudeCodeConnector(Connector):
             "claude_code backfill happens client-side via the agent-tap daemon"
         )
 
+    # These two were written as connector methods but ended up INSIDE
+    # _render_assistant, after its `return` -- unreachable since they were
+    # added. Extracting the renderer surfaced them; restored here, where they
+    # were meant to live.
+    def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
+        raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
+
+    async def exchange_oauth_code(
+        self,
+        code: str | None,
+        redirect_uri: str,
+        extra_params: dict[str, str] | None = None,
+    ) -> IntegrationToken:
+        raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
+
+
+def _directive_body(directive: Any) -> str:
+    """The indexed text for one standing instruction.
+
+    Leads with the instruction itself so a search for how someone works finds
+    the norm rather than the session it happened to be stated in. The quote
+    follows because a norm nobody can trace back to the words that established
+    it is not usable as an SOP.
+    """
+    lines = [f"DIRECTIVE ({directive.kind}): {directive.instruction}"]
+    if directive.scope:
+        lines.append(f"APPLIES TO: {directive.scope}")
+    if directive.evidence:
+        lines.append(f"SAID: {directive.evidence}")
+    return "\n".join(lines)
+
+
+def _decision_body(decision: Any) -> str:
+    """The indexed text for one decision — both halves of "why".
+
+    RATIONALE says why this option beat the others. SERVES and GOAL say why the
+    choice was being made at all. Audited over 72 real decisions, the second
+    half was missing from every one: each read as a well-argued local tradeoff
+    orphaned from the work it served.
+
+    They go in the BODY, not only in metadata, because metadata is queryable and
+    the body is retrievable — a search for the goal should surface the decisions
+    taken in pursuit of it.
+    """
+    lines = [
+        f"Q: {decision.question}",
+        f"OPTIONS: {', '.join(decision.options_considered)}",
+        f"CHOSE: {decision.chosen}",
+        f"RATIONALE: {decision.rationale}",
+    ]
+    if decision.serves:
+        lines.append(f"SERVES: {decision.serves}")
+    if decision.decided_by:
+        lines.append(f"DECIDED BY: {decision.decided_by.replace('_', ' ')}")
+    if decision.trigger:
+        lines.append(f"PROMPTED BY: {decision.trigger.replace('_', ' ')}")
+    # Only a non-default status is worth a line — "implemented" on every
+    # decision is noise, and the whole value is spotting the ones that are not.
+    if decision.status and decision.status != "implemented":
+        lines.append(f"STATUS: {decision.status}")
+    # A reversal is the one thing a reader most needs to see BEFORE the
+    # reasoning: this decision did not survive the session it was made in.
+    if decision.superseded_by is not None:
+        lines.append("SUPERSEDED: later reversed within this session")
+    if decision.supersedes is not None:
+        lines.append("REVERSES: an earlier decision in this session")
+    ref = getattr(decision, "segment", None)
+    if ref is not None and ref.objective:
+        lines.append(f"GOAL: {ref.objective}")
+        if ref.motivation:
+            lines.append(f"WHY THAT GOAL: {ref.motivation}")
+    return "\n".join(lines)
+
+
+def _change_body(change: Any) -> str:
+    """The indexed text for one logical change.
+
+    Leads with what was done, because that is what someone searches for. The
+    file list follows rather than heads the document: a change is named by its
+    purpose, and the files are where to go look.
+    """
+    kind = f" ({change.kind})" if change.kind else ""
+    lines = [f"CHANGE{kind}: {change.summary}"]
+    if change.rationale:
+        lines.append(f"WHY: {change.rationale}")
+    if change.files:
+        lines.append(f"FILES: {', '.join(change.files)}")
+    if change.evidence:
+        lines.append(f"EVIDENCE:\n{change.evidence}")
+    return "\n".join(lines)
+
+
+def _count_compactions(events: list[dict[str, Any]]) -> int:
+    """Compaction boundaries in the merged stream.
+
+    Each one is a point where the agent hit its context limit and wrote its own
+    summary of everything so far — a chapter break it chose, and the same
+    boundary the unit extractor segments on.
+    """
+    total = 0
+    for event in events:
+        raw = event.get("raw") if isinstance(event, dict) else None
+        raw = raw if isinstance(raw, dict) else event
+        if isinstance(raw, dict) and raw.get("type") == "system" and \
+                raw.get("subtype") == "compact_boundary":
+            total += 1
+    return total
+
 
 def _format_session_title(
     short_id: str,
@@ -837,145 +1121,6 @@ def _format_session_title(
     base = f"{kind} {short_id}"
     host_part = f" ({hostname})" if hostname else ""
     return f"{name_part}{email_part}{base}{host_part}"
-
-
-def _events_to_text(events: list[dict[str, Any]]) -> str:
-    """Render merged Claude Code events into a chunkable text body.
-
-    Output is human-readable prose — what the chunker + embedder consume,
-    so it has to look like the conversation. NOT JSON dumps.
-
-    Each turn becomes a block separated by blank lines:
-
-        USER: how does auth work?
-
-        ASSISTANT (thinking): the flow uses JWT in cookie X.
-        ASSISTANT: we use JWT.
-
-        TOOL_USE: Bash — git status
-        TOOL_RESULT (toolu_xxx): ok
-
-        USER: refactor it.
-
-    Ordering matches the line_no-sorted merged stream so a chunker walking
-    sequentially sees the session in transcript order.
-
-    Events the plugin sanitizer already drops (file-history-snapshot,
-    last-prompt, ai-title, permission-mode, stop_hook_summary, turn_duration)
-    don't reach here. Anything else without a renderer is silently skipped
-    rather than dumped as JSON — JSON noise in the embedded text was the
-    original problem this rewrite solves.
-    """
-    blocks: list[str] = []
-    for ev in events:
-        raw = ev.get("raw") if isinstance(ev, dict) else None
-        if not isinstance(raw, dict):
-            continue
-        rendered = _render_event(raw)
-        if rendered:
-            blocks.append(rendered)
-    return "\n\n".join(blocks)
-
-
-def _render_event(raw: dict[str, Any]) -> str:
-    ev_type = raw.get("type")
-    if ev_type == "user":
-        return _render_user(raw)
-    if ev_type == "assistant":
-        return _render_assistant(raw)
-    if ev_type == "system":
-        sub = raw.get("subtype") or ""
-        content = raw.get("content")
-        if isinstance(content, str) and content:
-            return f"SYSTEM ({sub}): {content}" if sub else f"SYSTEM: {content}"
-        # System event with no string content — note the subtype but skip
-        # dumping the rest. Keeps the conversation flow readable.
-        return f"SYSTEM ({sub})" if sub else ""
-
-    # Top-level string `content` for unknown event types — preserve
-    # forward-compat without leaking raw JSON into embeddings.
-    content = raw.get("content")
-    if isinstance(content, str) and content:
-        label = (ev_type or "EVENT").upper()
-        return f"{label}: {content}"
-    return ""
-
-
-def _render_user(raw: dict[str, Any]) -> str:
-    msg = raw.get("message")
-    if not isinstance(msg, dict):
-        return ""
-    content = msg.get("content")
-    if isinstance(content, str) and content:
-        return f"USER: {content}"
-    if not isinstance(content, list):
-        return ""
-
-    parts: list[str] = []
-    for b in content:
-        if not isinstance(b, dict):
-            continue
-        bt = b.get("type")
-        if bt == "text":
-            text = b.get("text") or ""
-            if text:
-                parts.append(f"USER: {text}")
-        elif bt == "tool_result":
-            # Sanitizer already stripped the heavy `content` field; only
-            # tool_use_id (+ optional is_error) reach here. Surface
-            # success/failure as a one-liner so the conversation flow stays
-            # readable.
-            tool_id = b.get("tool_use_id") or ""
-            label = f"TOOL_RESULT ({tool_id})" if tool_id else "TOOL_RESULT"
-            parts.append(f"{label}: error" if b.get("is_error") else f"{label}: ok")
-    return "\n".join(parts)
-
-
-def _render_assistant(raw: dict[str, Any]) -> str:
-    msg = raw.get("message")
-    if not isinstance(msg, dict):
-        return ""
-    content = msg.get("content")
-    if isinstance(content, str) and content:
-        return f"ASSISTANT: {content}"
-    if not isinstance(content, list):
-        return ""
-
-    parts: list[str] = []
-    for b in content:
-        if not isinstance(b, dict):
-            continue
-        bt = b.get("type")
-        if bt == "text":
-            text = b.get("text") or ""
-            if text:
-                parts.append(f"ASSISTANT: {text}")
-        elif bt == "thinking":
-            text = b.get("thinking") or ""
-            if text and text.strip():
-                parts.append(f"ASSISTANT (thinking): {text}")
-        elif bt == "tool_use":
-            name = b.get("name") or "tool"
-            summary = b.get("summary") or ""
-            parts.append(f"TOOL_USE: {name} — {summary}" if summary else f"TOOL_USE: {name}")
-
-    # Note non-default stop_reasons (max_tokens, refusal, …); end_turn is
-    # the boring case and noting it would just clutter every assistant turn.
-    stop_reason = msg.get("stop_reason")
-    if stop_reason and stop_reason not in ("end_turn", "tool_use") and parts:
-        parts.append(f"[stop: {stop_reason}]")
-    return "\n".join(parts)
-
-    def oauth_install_url(self, customer_id: str, redirect_uri: str) -> str:
-        raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
-
-    async def exchange_oauth_code(
-        self,
-        code: str | None,
-        redirect_uri: str,
-        extra_params: dict[str, str] | None = None,
-    ) -> IntegrationToken:
-        raise NotSupportedByConnector("claude_code uses pairing, not OAuth")
 
 
 @register_connector(SourceSystem.CODEX)

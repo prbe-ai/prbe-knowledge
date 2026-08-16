@@ -72,7 +72,8 @@ async def test_normalize_complete_emits_session_plus_units(monkeypatch) -> None:
 
     bundle = ext_mod.UnitBundle(
         qa=[ext_mod.QA(prompt="Why?", outcome="Because.", tags=["x"])],
-        code_change=[ext_mod.CodeChange(file="a.py", before="x", after="y", intent="z")],
+        code_change=[ext_mod.CodeChange(summary="did a thing", kind="fix",
+                                        files=["a.py"], rationale="because")],
         decision=[ext_mod.Decision(question="?", options_considered=["a", "b"], chosen="b", rationale="r")],
         file_ref=[ext_mod.FileRef(files=["a.py"], context="ctx")],
     )
@@ -553,3 +554,53 @@ async def test_normalize_pulls_hostname_from_merged_events_on_finalize() -> None
     result = await c.normalize(ev, hydrated)
     props = _person_props(result)
     assert props["hostname"] == _HOSTNAME
+
+
+def test_unit_ids_are_scoped_to_their_segment(monkeypatch) -> None:
+    """A segment returning fewer units must not repoint later segments' docs.
+
+    With one counter across the whole session, a segment yielding three
+    decisions instead of four shifts every id after it: surviving documents
+    silently come to describe different content, and the tail of the old
+    numbering is orphaned. Scoping the counter to its segment confines both
+    effects to the segment that actually changed.
+    """
+    from engine.shared.claude_code_extraction import QA, SegmentRef, UnitBundle
+    from kb.handlers.claude_code import ClaudeCodeConnector
+
+    def ids_for(first_segment_units: int) -> list[str]:
+        bundle = UnitBundle(
+            qa=[
+                QA(prompt=f"a{i}", outcome="o",
+                   segment=SegmentRef(index=1, total=2, boundary="session_start",
+                                      position=i))
+                for i in range(first_segment_units)
+            ]
+            + [
+                QA(prompt="b0", outcome="o",
+                   segment=SegmentRef(index=2, total=2, boundary="compaction",
+                                      position=0)),
+            ]
+        )
+        return [
+            ClaudeCodeConnector._unit_suffix(unit, idx)
+            for idx, unit in enumerate(bundle.qa)
+        ]
+
+    four = ids_for(4)
+    three = ids_for(3)
+
+    # The second segment's only unit keeps its identity across both runs, even
+    # though its position in the merged bundle moved from 4 to 3.
+    assert four[-1] == "s2:0"
+    assert three[-1] == "s2:0"
+    # And the first segment's surviving units keep theirs.
+    assert three[:3] == four[:3] == ["s1:0", "s1:1", "s1:2"]
+
+
+def test_unit_suffix_falls_back_without_a_segment() -> None:
+    """Units built without segment provenance keep their old flat ids."""
+    from engine.shared.claude_code_extraction import QA
+    from kb.handlers.claude_code import ClaudeCodeConnector
+
+    assert ClaudeCodeConnector._unit_suffix(QA(prompt="p", outcome="o"), 7) == "7"

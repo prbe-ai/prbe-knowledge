@@ -30,7 +30,22 @@ from engine.shared.storage import get_store
 log = get_logger(__name__)
 
 
-async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
+async def enqueue_idle_session_finalizers(
+    idle_minutes: int,
+    *,
+    limit: int = 1000,
+    dry_run: bool = False,
+) -> int:
+    """Mark idle, unfinalized sessions complete so the worker mines them.
+
+    `limit` is per source, and it is a COST bound rather than a correctness one:
+    every session this enqueues buys a full multi-segment extraction, so an
+    unbounded first run against a corpus that has never been swept is a bill
+    nobody sized. Anything not reached tonight is reached tomorrow.
+
+    `dry_run` counts what would be enqueued and writes nothing — the only
+    honest way to size that first run before paying for it.
+    """
     # Find sessions where the most recent activity (across both new-format
     # rows with bare session_id and any in-flight legacy `:batch_seq`/
     # `:finalize` rows) is older than the idle window. The split_part
@@ -58,8 +73,18 @@ async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
      WHERE q.queue_id IS NULL
         OR NOT EXISTS (
             SELECT 1 FROM unnest(q.payload_s3_keys) AS k
+            -- Already finalized, by EITHER route. Matching only the cron's own
+            -- marker was the bug: the tap's client finalize is keyed like any
+            -- other payload except that it carries no `:batch_seq` suffix
+            -- (a finalize parse_hint has no batch_seq to append), so a cleanly
+            -- ended session looked unfinished to this query forever. Every one
+            -- of them would be swept and fully re-extracted on each run, and
+            -- the first production run would do it to the entire historical
+            -- corpus at once.
             WHERE k LIKE '%/finalize.marker'
+               OR k LIKE '%/' || i.session_id || '.json'
         )
+     LIMIT $3
     """
 
     # UPSERT the finalize.marker into the live session row. Same shape as
@@ -102,11 +127,14 @@ async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
         seen_buckets: set[str] = set()
         for source in AGENT_SOURCES:
             priority = ingestion_priority_for(source.value)
-            rows = await conn.fetch(find_sql, source.value, idle_minutes)
+            rows = await conn.fetch(find_sql, source.value, idle_minutes, limit)
             total_candidates += len(rows)
             for r in rows:
                 customer_id = r["customer_id"]
                 session_id = r["session_id"]
+                if dry_run:
+                    enqueued += 1
+                    continue
                 bucket = await store.bucket_for(customer_id)
                 if bucket not in seen_buckets:
                     await store.ensure_bucket(bucket)
@@ -138,6 +166,11 @@ async def enqueue_idle_session_finalizers(idle_minutes: int) -> int:
             "idle_minutes": idle_minutes,
             "enqueued": enqueued,
             "candidates": total_candidates,
+            "limit": limit,
+            "dry_run": dry_run,
+            # A run that hits the cap left work behind. Silent truncation here
+            # would read as "the corpus is fully swept".
+            "capped": total_candidates >= limit,
         },
     )
     return enqueued

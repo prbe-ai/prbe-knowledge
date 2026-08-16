@@ -239,3 +239,61 @@ async def test_finalize_event_processes_through_normalizer(
     assert "claude_code.session" in types, (
         f"expected claude_code.session doc, found: {types}"
     )
+
+
+class TestCronIdleWindowPrecedence:
+    """`--idle-minutes` is the whole point of the nightly sweep.
+
+    The nightly job passes 360 because finalizing is effectively one-way: the
+    marker key is sticky, so a session that resumes afterwards re-runs the
+    extraction LLM on every later batch. If the flag were silently ignored and
+    the 5-minute settings default won, the sweep would finalize sessions people
+    are still using — which is exactly the failure this tests against.
+    """
+
+    def test_explicit_flag_wins_over_settings_default(self) -> None:
+        from scripts.cron_session_completer import _parse_args, resolve_idle_minutes
+
+        args = _parse_args(["--idle-minutes", "360"])
+        assert resolve_idle_minutes(args.idle_minutes) == 360
+
+    def test_omitted_flag_falls_back_to_settings(self) -> None:
+        from engine.shared.config import get_settings
+        from scripts.cron_session_completer import _parse_args, resolve_idle_minutes
+
+        args = _parse_args([])
+        assert args.idle_minutes is None
+        assert resolve_idle_minutes(None) == get_settings().claude_code_session_idle_minutes
+
+    def test_nonpositive_window_is_rejected(self) -> None:
+        """A 0 would finalize every live session on the next sweep."""
+        from scripts.cron_session_completer import _parse_args
+
+        with pytest.raises(SystemExit):
+            _parse_args(["--idle-minutes", "0"])
+
+
+class TestSweepCostBounds:
+    """The sweep buys a full multi-segment extraction per session it finalizes.
+    Those properties are the difference between a safe first run and a bill."""
+
+    def test_limit_and_dry_run_are_rejected_when_nonsensical(self) -> None:
+        from scripts.cron_session_completer import _parse_args
+
+        with pytest.raises(SystemExit):
+            _parse_args(["--limit", "0"])
+
+    def test_dry_run_and_limit_reach_the_sweep(self) -> None:
+        from scripts.cron_session_completer import _parse_args
+
+        args = _parse_args(["--idle-minutes", "360", "--limit", "50", "--dry-run"])
+        assert (args.idle_minutes, args.limit, args.dry_run) == (360, 50, True)
+
+    def test_defaults_are_bounded(self) -> None:
+        """An unbounded default is how a first run against a never-swept corpus
+        becomes a surprise invoice."""
+        from scripts.cron_session_completer import _parse_args
+
+        args = _parse_args([])
+        assert args.limit == 1000
+        assert args.dry_run is False

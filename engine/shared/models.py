@@ -1246,6 +1246,29 @@ class NormalizationResult(BaseModel):
     # Code-graph only: per-file cache state to upsert into `code_repo_state`.
     # Other connectors leave this empty; normalizer._persist no-ops on it.
     code_repo_state_updates: list[CodeRepoStateUpdate] = Field(default_factory=list)
+    # Parent doc_ids whose live children this result REPLACES wholesale. Any
+    # child of one of these that is not in `documents` gets closed out.
+    #
+    # Exists for re-derived children: a coding-agent session's extracted units
+    # are regenerated from scratch every time the session is re-processed, and
+    # a run that yields fewer units than the last one leaves the surplus behind
+    # as live documents describing a state that no longer exists. Nothing else
+    # retires them — SCD2 closes the PRIOR VERSION of a doc that comes back, and
+    # a doc that simply stops coming back is invisible to it.
+    #
+    # Empty for every connector that does not re-derive children, which is all
+    # of them today except claude_code/codex.
+    retire_children_of: list[str] = Field(default_factory=list)
+    # Payload keys the connector has now ACTED on and that must not be replayed.
+    # Removed from the queue row's payload_s3_keys after a successful commit.
+    #
+    # Exists because completion is an EVENT, and payload_s3_keys is append-only.
+    # A coding-agent session's finalize key otherwise stays in the array
+    # forever, so every later batch of a resumed session re-reads it, sees the
+    # session as complete again, and buys another full multi-segment
+    # re-extraction of the entire transcript. Consuming the key makes the
+    # session go back to being live until something finalizes it again.
+    consume_payload_keys: list[str] = Field(default_factory=list)
     # Non-fatal reason this event produced no documents (e.g. "slack edit of deleted msg").
     skipped_reason: str | None = None
 
