@@ -647,6 +647,46 @@ def _is_parse_overflow_error(exc: TriageParseError) -> bool:
     return any(rx.search(msg) for rx in _PARSE_OVERFLOW_REGEXES)
 
 
+#: How far down `__cause__` to look for the original provider error. Three is
+#: already one more link than the deepest real chain (TriageParseError ->
+#: RuntimeError -> LLMError); the bound exists so a pathological chain cannot
+#: turn a classification into a walk.
+_CAUSE_WALK_LIMIT = 3
+
+
+def _wrapped_llm_error(exc: BaseException) -> LLMError | None:
+    """The `LLMError` a wrapper buried in `__cause__`, if there is one.
+
+    WHY THIS IS NEEDED, and it is the whole bug. `_GeminiTriage.triage`
+    catches broadly and re-raises `TriageParseError`; one frame below,
+    `_gemini_call_json` catches `LLMError` and re-raises plain `RuntimeError`
+    "to preserve the pre-migration exception shape callers expect". Between
+    them the TYPE is destroyed while the evidence survives, so a genuine
+    input-side context-window refusal reaches `_is_overflow_shaped` wearing a
+    `TriageParseError` costume and gets classified by the OUTPUT-side regexes,
+    which know nothing about `ContextWindowExceededError`. Verdict: not
+    overflow -> re-raise -> the worker DLQs every sibling row in the batch.
+
+    That is precisely the failure #102 was written to prevent, reappearing on
+    the Gemini route because the predicate reads the exception it was handed
+    rather than the one the provider actually raised.
+
+    Only `__cause__` is walked, never `__context__`: both wrappers use an
+    explicit `raise ... from exc`, and `__context__` would additionally pick up
+    whatever unrelated exception happened to be in flight during handling.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    for _ in range(_CAUSE_WALK_LIMIT + 1):
+        if cur is None or id(cur) in seen:
+            return None
+        if isinstance(cur, LLMError):
+            return cur
+        seen.add(id(cur))
+        cur = cur.__cause__
+    return None
+
+
 def _is_overflow_shaped(exc: BaseException) -> bool:
     """Combined predicate: input-side LLMError/BadRequestError OR
     output-side parse-fail. Catches both the LiteLLM-shaped path
@@ -655,7 +695,17 @@ def _is_overflow_shaped(exc: BaseException) -> bool:
     if isinstance(exc, LLMError):
         return is_context_overflow(exc) or is_anthropic_oversize_error(exc)
     if isinstance(exc, TriageParseError):
-        return _is_parse_overflow_error(exc)
+        if _is_parse_overflow_error(exc):
+            return True
+        # The message said nothing, but a provider wrapper may have flattened
+        # an input-side refusal into this type. Ask the original exception.
+        # Still narrow: `is_context_overflow` demands status 400 AND an
+        # overflow signal, so an auth failure or a 5xx wrapped the same way
+        # stays non-overflow and still propagates.
+        wrapped = _wrapped_llm_error(exc)
+        if wrapped is not None:
+            return is_context_overflow(wrapped) or is_anthropic_oversize_error(wrapped)
+        return False
     # Legacy shape: anything else that quacks like the Anthropic SDK
     # BadRequestError (used by the existing test suite). Delegating to
     # `is_anthropic_oversize_error` handles it uniformly.

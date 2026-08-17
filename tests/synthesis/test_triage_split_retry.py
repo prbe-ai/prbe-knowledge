@@ -805,3 +805,183 @@ async def test_final_mile_guard_no_op_on_happy_path(monkeypatch) -> None:
             OVERSIZED_AT_CALL_TIME_REASON,
         )
     assert fake.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Input-side overflow on the GEMINI route (production incident 2026-08-17)
+#
+# The Gemini provider flattens the exception TYPE on the way up:
+# `_gemini_call_json` catches `LLMError` and re-raises plain `RuntimeError`
+# "to preserve the pre-migration exception shape", then `_GeminiTriage.triage`
+# catches broadly and re-raises `TriageParseError`. So a genuine input-side
+# context-window refusal arrived at `_is_overflow_shaped` wearing a
+# `TriageParseError` and was judged by the OUTPUT-side regexes, which know
+# nothing about `ContextWindowExceededError`. Not overflow -> re-raise -> the
+# worker DLQ'd every sibling row: 611 rows for one tenant in a single second,
+# which is exactly the failure #102 exists to prevent.
+# ---------------------------------------------------------------------------
+
+
+#: The message LiteLLM actually produced in production, trimmed. Kept verbatim
+#: rather than paraphrased because the classifier reads it.
+_PROD_CONTEXT_WINDOW_MESSAGE = (
+    "litellm.ContextWindowExceededError: litellm.BadRequestError: "
+    "ContextWindowExceededError: OpenAIException - "
+    "The input token count exceeds the maximum number of tokens allowed."
+)
+
+
+def _gemini_context_window_error() -> LLMError:
+    """The 400 LiteLLM raises for an over-window Gemini request."""
+    return LLMError(_PROD_CONTEXT_WINDOW_MESSAGE, status_code=400, provider="gemini")
+
+
+def _wrapped_as_triage_parse_error(inner: BaseException) -> BaseException:
+    """Re-create the provider's two-layer wrapping without calling Gemini.
+
+    Mirrors `providers._gemini_call_json` (LLMError -> RuntimeError) and
+    `providers._GeminiTriage.triage` (-> TriageParseError). If either wrapper
+    changes shape, these unit tests should be updated with it — the end-to-end
+    test below is the one that would catch the drift on its own.
+    """
+    from kb.synthesis.providers import TriageParseError
+
+    try:
+        try:
+            raise inner
+        except LLMError as exc:
+            raise RuntimeError(f"gemini call failed: {exc}") from exc
+    except RuntimeError as exc:
+        return TriageParseError(f"gemini triage call failed: {exc}")
+
+
+def test_context_window_refusal_survives_the_provider_wrapping() -> None:
+    """The regression, at the level of the predicate.
+
+    The evidence is intact in `__cause__` the whole way up; nothing consulted
+    it. `_is_parse_overflow_error` alone still says no, which is what makes the
+    cause-walk the fix rather than another regex.
+    """
+    from kb.synthesis.triage import _is_overflow_shaped, _is_parse_overflow_error
+
+    inner = _gemini_context_window_error()
+    err = _wrapped_as_triage_parse_error(inner)
+    err.__cause__ = RuntimeError(f"gemini call failed: {inner}")
+    err.__cause__.__cause__ = inner
+
+    assert _is_parse_overflow_error(err) is False, "message alone must not match"
+    assert _is_overflow_shaped(err) is True
+
+
+def test_a_wrapped_non_overflow_400_still_propagates() -> None:
+    """The cause-walk must not become a blanket 'split on any 400'.
+
+    An auth failure wrapped identically is still a hard failure: splitting it
+    would just multiply one bad credential into a recursion of bad credentials.
+    """
+    from kb.synthesis.triage import _is_overflow_shaped
+
+    inner = LLMError(
+        "authentication_error: invalid x-api-key header",
+        status_code=400,
+        provider="gemini",
+    )
+    err = _wrapped_as_triage_parse_error(inner)
+    err.__cause__ = RuntimeError(f"gemini call failed: {inner}")
+    err.__cause__.__cause__ = inner
+
+    assert _is_overflow_shaped(err) is False
+
+
+def test_a_wrapped_5xx_still_propagates() -> None:
+    """Transient upstream failures are not overflow and must not split."""
+    from kb.synthesis.triage import _is_overflow_shaped
+
+    inner = LLMError("upstream had a bad day", status_code=503, provider="gemini")
+    err = _wrapped_as_triage_parse_error(inner)
+    err.__cause__ = RuntimeError(f"gemini call failed: {inner}")
+    err.__cause__.__cause__ = inner
+
+    assert _is_overflow_shaped(err) is False
+
+
+def test_a_parse_error_with_no_wrapped_provider_error_still_propagates() -> None:
+    """An ordinary malformed-schema parse error has no LLMError underneath and
+    must keep propagating — the cause-walk adds an arm, it does not widen the
+    existing ones."""
+    from kb.synthesis.providers import TriageParseError
+    from kb.synthesis.triage import _is_overflow_shaped
+
+    assert _is_overflow_shaped(TriageParseError("unexpected tool name 'foo'")) is False
+
+
+def test_the_cause_walk_terminates_on_a_cycle() -> None:
+    """A self-referential `__cause__` must not hang the classifier."""
+    from kb.synthesis.providers import TriageParseError
+    from kb.synthesis.triage import _wrapped_llm_error
+
+    a = TriageParseError("a")
+    b = RuntimeError("b")
+    a.__cause__ = b
+    b.__cause__ = a
+
+    assert _wrapped_llm_error(a) is None
+
+
+@pytest.mark.asyncio
+async def test_gemini_context_window_error_splits_instead_of_dlq(monkeypatch) -> None:
+    """END TO END, through the real provider wrappers — the test that would
+    have caught this.
+
+    The full batch is refused for exceeding the context window; the halves fit.
+    Before the fix this raised out of the wrapper and the worker dead-lettered
+    every row in the batch.
+    """
+    monkeypatch.setattr(
+        "kb.synthesis.providers.WIKI_TRIAGE_MODEL",
+        "gemini-3.5-flash",
+    )
+    events = [_ev(i) for i in range(4)]
+    fake = _patch_shared_acompletion(
+        monkeypatch,
+        [
+            _gemini_context_window_error(),
+            _gemini_success_response(events[:2]),
+            _gemini_success_response(events[2:]),
+        ],
+    )
+
+    out = await call_triage_with_split_retry(object(), events, now=NOW)
+
+    # Every event keeps a verdict: nothing was dropped, nothing DLQ'd.
+    assert sorted(out.verdicts.keys()) == ["0", "1", "2", "3"]
+    # One refused full batch, then the two halves.
+    assert fake.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_gemini_auth_400_still_propagates_end_to_end(monkeypatch) -> None:
+    """The negative case through the same wrappers: a non-overflow 400 must
+    still surface, and must not be retried into a storm of identical failures.
+    """
+    from kb.synthesis.providers import TriageParseError
+
+    monkeypatch.setattr(
+        "kb.synthesis.providers.WIKI_TRIAGE_MODEL",
+        "gemini-3.5-flash",
+    )
+    events = [_ev(i) for i in range(4)]
+    fake = _patch_shared_acompletion(
+        monkeypatch,
+        [
+            LLMError(
+                "authentication_error: invalid x-api-key header",
+                status_code=400,
+                provider="gemini",
+            )
+        ],
+    )
+
+    with pytest.raises(TriageParseError):
+        await call_triage_with_split_retry(object(), events, now=NOW)
+    assert fake.await_count == 1
