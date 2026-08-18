@@ -36,6 +36,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   so their bodies and version history remain on disk. `[[person: X]]`
   LINKS are unaffected — a wiki link points at a graph entity, and
   several kinds it can name have never had pages of their own.
+- Migration 0108 redoes 0107's retire per customer. `documents` carries
+  FORCE ROW LEVEL SECURITY, which subjects even the table owner to the
+  tenant policy, and a migration binds no `app.current_customer_id` — so
+  0107's single unscoped UPDATE matched zero rows and reported success on
+  any deployment whose migration role lacks BYPASSRLS. It applied on
+  managed-shared (role `probe`, bypasses) and silently did nothing on
+  research-os's kb hook (role `app`, does not). Any future migration
+  writing `documents` globally needs the same per-customer loop.
 - Undo of a wiki rebuild never restores a page whose kind has since left
   `WikiType`. The time bound alone did not cover a taxonomy change, and a
   live page carrying a retired kind is unreachable by construction.
