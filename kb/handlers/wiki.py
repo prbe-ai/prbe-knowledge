@@ -135,7 +135,59 @@ _LINK_NODE_MAP: dict[str, tuple[NodeLabel, EdgeType]] = {
     "service": (NodeLabel.SERVICE, EdgeType.DESCRIBES),
     "repo": (NodeLabel.DOCUMENT, EdgeType.DESCRIBES),
     "ticket": (NodeLabel.DOCUMENT, EdgeType.DESCRIBES),
+    # The research vocabulary. `[[artifact:dockq-scorer]]` already PARSED before
+    # this entry existed -- `_MARKDOWN_LINK_RE` accepts any lowercase type -- it
+    # was simply dropped here, so a page could cite a scoring script and the
+    # graph would never know. That is the gap: a runbook naming the official
+    # method had no durable relationship to the artifact registry that owns it.
+    #
+    # DOCUMENT, not a new label. `NodeLabel` collapsed to four canonical kinds
+    # post-0091 and `repo`/`ticket` already take this route; minting labels for
+    # research entities would re-open the axis that collapse closed.
+    "artifact": (NodeLabel.DOCUMENT, EdgeType.DESCRIBES),
+    "experiment": (NodeLabel.DOCUMENT, EdgeType.DESCRIBES),
+    "run": (NodeLabel.DOCUMENT, EdgeType.DESCRIBES),
+    "project": (NodeLabel.DOCUMENT, EdgeType.DESCRIBES),
 }
+
+#: The kinds whose canonical id is NAMESPACED. See `_canonical_link_id`.
+_RESEARCH_LINK_KINDS = frozenset({"artifact", "experiment", "run", "project"})
+
+#: Namespace prefix for research canonical ids. Not a URL and not parsed by
+#: anything downstream -- its only job is to make the id unambiguous.
+_RESEARCH_ID_PREFIX = "probe"
+
+
+def _canonical_link_id(kind: str, target: str) -> str:
+    """The graph identity for one `[[kind:target]]` reference.
+
+    THE EXISTING KINDS KEEP A BARE NAME, and that is not an oversight being
+    preserved out of politeness -- changing it would rewrite the identity of
+    every `repo`, `ticket`, `person` and `service` node already in the graph,
+    orphaning every edge that points at one. Their shape is load-bearing for
+    the AutoMergeAnalyzer's wiki<->canonical fold, which matches on rendered
+    name.
+
+    THE RESEARCH KINDS ARE NAMESPACED, because they are new and can afford to
+    be right. A bare name would collide: `repo` and `ticket` both map to
+    DOCUMENT and both use the bare target, so `[[repo:probe]]` and
+    `[[ticket:probe]]` are already the SAME node today. Adding four more kinds
+    to that pile would mean `[[artifact:probe]]` silently merging into a
+    repository, and an artifact reference resolving to a repo is worse than no
+    reference at all -- the reuse check would confirm a method that does not
+    exist.
+
+    Tenant scoping is NOT this function's job and must not be added here: nodes
+    are persisted per-customer by the graph store, so two tenants naming the
+    same artifact stay separate rows. Folding a customer id into the id here
+    would make the same artifact unrecognisable across the tenant's own pages.
+    """
+    cleaned = target.strip()
+    if not cleaned:
+        return ""
+    if kind in _RESEARCH_LINK_KINDS:
+        return f"{_RESEARCH_ID_PREFIX}:{kind}:{cleaned}"
+    return cleaned
 
 
 @register_connector(SourceSystem.WIKI)
@@ -434,17 +486,24 @@ def _build_graph(
         if mapped is None:
             continue
         node_label, edge_type = mapped
-        canonical = link.target.strip()
+        canonical = _canonical_link_id(link.kind, link.target)
         if not canonical:
             continue
         key = (node_label.value, canonical)
         if key not in seen:
             seen.add(key)
+            properties: dict[str, Any] = {"source_system": SourceSystem.WIKI.value}
+            if link.kind in _RESEARCH_LINK_KINDS:
+                # The kind survives on the node, because the canonical id is the
+                # only other place it lives and reading it back out of a string
+                # is how a prefix convention rots into a parser.
+                properties["research_kind"] = link.kind
+                properties["name"] = link.target.strip()
             nodes.append(
                 GraphNodeSpec(
                     label=node_label,
                     canonical_id=canonical,
-                    properties={"source_system": SourceSystem.WIKI.value},
+                    properties=properties,
                 )
             )
         edges.append(
