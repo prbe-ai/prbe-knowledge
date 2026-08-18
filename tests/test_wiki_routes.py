@@ -1687,3 +1687,60 @@ async def test_append_after_a_delete_starts_a_new_page(client: httpx.AsyncClient
     ).json()["body"]
     assert "written after the delete" in body
     assert "secret that was deleted on purpose" not in body
+
+
+@pytest.mark.asyncio
+async def test_references_publishes_what_the_engine_parsed(
+    client: httpx.AsyncClient,
+) -> None:
+    """The engine is the only thing that understands `[[artifact:x]]`, and this
+    route is how a consumer gets those facts without writing a second parser.
+
+    A page's own wiki-to-wiki links must NOT appear here: the consumer wants
+    research references, and mixing the two would make "which projects
+    reference this one" count runbooks as projects.
+    """
+    await client.put(
+        "/api/wiki/pages/runbook/dockq-method",
+        json={
+            "title": "DockQ method",
+            "body": (
+                "Score with [[artifact: dockq-scorer]] as run in "
+                "[[experiment: fold-baselines]]. See also [[Person: mahit]]."
+            ),
+        },
+        headers=_hdr(),
+    )
+
+    resp = await client.get("/api/wiki/references", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+
+    by_kind = {(i["kind"], i["name"]) for i in items}
+    assert ("artifact", "dockq-scorer") in by_kind
+    assert ("experiment", "fold-baselines") in by_kind
+    # The person reference is not a research reference.
+    assert not any(i["kind"] == "person" for i in items)
+
+    one = next(i for i in items if i["name"] == "dockq-scorer")
+    assert one["src_wiki_type"] == "runbook"
+    assert one["src_slug"] == "dockq-method"
+    assert one["canonical_id"] == "probe:artifact:dockq-scorer"
+
+
+@pytest.mark.asyncio
+async def test_references_can_be_filtered_to_one_kind(
+    client: httpx.AsyncClient,
+) -> None:
+    await client.put(
+        "/api/wiki/pages/runbook/mixed",
+        json={
+            "title": "Mixed",
+            "body": "[[artifact: scorer]] and [[experiment: exp-one]].",
+        },
+        headers=_hdr(),
+    )
+    resp = await client.get("/api/wiki/references?kind=experiment", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    kinds = {i["kind"] for i in resp.json()["items"]}
+    assert kinds == {"experiment"}

@@ -15,7 +15,7 @@ Repo split:
 - [x] T2 — specify + test append serialization vs PUT / delete / restore
 - [x] T3 — refuse append on reserved `index` (free via `_validate_wiki_type`; needs the test)
 - [x] T7 — research kinds in `_LINK_NODE_MAP`, immutable tenant-scoped canonical ids
-- [ ] T8a — publish parsed refs (engine half of D11)
+- [x] T8a — publish parsed refs (engine half of D11)
 
 ## research-os
 

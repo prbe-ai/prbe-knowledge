@@ -236,6 +236,26 @@ class WikiAppendResponse(BaseModel):
     meet it as a refusal."""
 
 
+class WikiReferenceOut(BaseModel):
+    """One wiki page's reference to a research entity."""
+
+    src_wiki_type: str
+    src_slug: str
+    #: `artifact` | `experiment` | `run` | `project`.
+    kind: str
+    #: The entity as the page named it. NOT version-pinned: the link syntax
+    #: carries no version, and the registry stays the source of truth for
+    #: which version is official.
+    name: str
+    canonical_id: str
+
+
+class WikiReferencesResponse(BaseModel):
+    items: list[WikiReferenceOut]
+    #: Pass back as `after_id` to continue. Absent when the page is the last.
+    next_after_id: int | None = None
+
+
 class WikiPageSettingsBody(BaseModel):
     pipeline_updates: bool
     author_id: str | None = Field(default=None, max_length=128)
@@ -942,6 +962,98 @@ async def append_wiki_page(
         body_size_bytes=size,
         remaining_bytes=max(PAGE_CAP_BYTES - size, 0),
     )
+
+
+@router.get(
+    "/references",
+    response_model=WikiReferencesResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def list_wiki_references(
+    kind: str | None = Query(default=None, description="filter to one research kind"),
+    after_id: int | None = Query(default=None, ge=0),
+    limit: int = Query(default=500, ge=1, le=2000),
+    customer_id: str = Depends(_require_customer),
+) -> WikiReferencesResponse:
+    """Every reference a wiki page makes to a research entity.
+
+    THE ENGINE PARSES, THE CONSUMER STORES. `[[artifact:dockq-scorer]]` is
+    understood in exactly one place -- `kb/wiki_links.parse_page_links`, whose
+    output `_LINK_NODE_MAP` turns into graph nodes. research-os needs the same
+    facts to answer "which projects reference this one", and the two ways it
+    could have got them were both worse than this route: parsing the markdown
+    itself would put a second implementation of the link syntax in another
+    repo, to drift the first time the syntax moves; reading the graph live
+    would make a research-os page view depend on the engine being up AND on
+    edges that a wiki rebuild deletes without replay.
+
+    So the engine publishes what it parsed, the consumer keeps its own durable
+    copy, and there is still one parser.
+
+    CURSORED ON THE EDGE ID rather than a timestamp. Edges are inserted, never
+    updated in place, so the id is monotonic per tenant and a reconciler can
+    resume from the last one it stored without risking the window where two
+    edges share a `valid_from`.
+
+    LIVE EDGES ONLY (`valid_to IS NULL`). A page that dropped a reference has
+    the edge closed rather than deleted, and a consumer replaying history would
+    resurrect references the page no longer makes.
+    """
+    conditions = [
+        "e.customer_id = $1",
+        "e.valid_to IS NULL",
+        "src.label = 'Document'",
+        "src.canonical_id LIKE 'wiki:%'",
+        "dst.properties ? 'research_kind'",
+    ]
+    params: list[Any] = [customer_id]
+    if kind is not None:
+        params.append(kind)
+        conditions.append(f"dst.properties->>'research_kind' = ${len(params)}")
+    if after_id is not None:
+        params.append(after_id)
+        conditions.append(f"e.edge_id > ${len(params)}")
+    params.append(limit)
+
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT e.edge_id,
+                   src.canonical_id AS src_doc_id,
+                   dst.canonical_id AS dst_canonical_id,
+                   dst.properties->>'research_kind' AS kind,
+                   dst.properties->>'name'          AS name
+            FROM graph_edges e
+            JOIN graph_nodes src ON src.node_id = e.from_node_id
+            JOIN graph_nodes dst ON dst.node_id = e.to_node_id
+            WHERE {" AND ".join(conditions)}
+            ORDER BY e.edge_id
+            LIMIT ${len(params)}
+            """,
+            *params,
+        )
+
+    items: list[WikiReferenceOut] = []
+    for row in rows:
+        # `wiki:<type>:<slug>` -- split once from the left so a slug containing
+        # a colon cannot swallow the type.
+        parts = row["src_doc_id"].split(":", 2)
+        if len(parts) != 3:
+            continue
+        items.append(
+            WikiReferenceOut(
+                src_wiki_type=parts[1],
+                src_slug=parts[2],
+                kind=row["kind"] or "",
+                name=row["name"] or "",
+                canonical_id=row["dst_canonical_id"],
+            )
+        )
+
+    # Only when the page was FULL. Emitting a cursor on a short page would cost
+    # every consumer one extra request to be told the same thing.
+    next_after_id = int(rows[-1]["edge_id"]) if len(rows) == limit else None
+    return WikiReferencesResponse(items=items, next_after_id=next_after_id)
 
 
 @router.put(
