@@ -504,7 +504,13 @@ async def test_a_refused_write_is_counted_and_its_reason_recorded() -> None:
     """
 
     async def bad_args(rt, n, a):
-        raise ToolValidationError("wiki_type: 'company' is not a valid WikiType")
+        # Pydantic v2's REAL enum message, tag included -- not a paraphrase.
+        # See test_every_refusal_kind_is_classified for why that distinction
+        # is load-bearing here.
+        raise ToolValidationError(
+            "1 validation error for UpdatePageArgs\nwiki_type\n  Input should be "
+            "'repo', 'project', 'runbook' [type=enum, input_value='company']"
+        )
 
     async def done_h(rt, n, a):
         rt.is_done = True
@@ -824,15 +830,6 @@ async def test_agent_loop_propagates_cancelled_error() -> None:
             "(repo/research_os -> feature/x -> feature/y -> feature/z).",
             "levels_deep",
         ),
-        (
-            "summary: String should have at most 240 characters",
-            "too_long",
-        ),
-        (
-            "wiki_type: 'company' is not a valid WikiType",
-            "bad_wiki_type",
-        ),
-        ("commit_message: Field required", "missing_field"),
         ("something nobody has seen before", "unclassified"),
     ],
 )
@@ -887,3 +884,47 @@ async def test_an_anchor_miss_is_not_blamed_on_the_page_type() -> None:
     assert metrics.rejected_tool_calls == 1
     assert metrics.rejected_reasons == {"anchor_not_found"}
     assert "feature" not in metrics.rejected_reasons
+
+
+@pytest.mark.parametrize(
+    ("bad_args", "expected"),
+    [
+        ({"wiki_type": "company"}, "bad_wiki_type"),
+        ({"summary": "s" * 300}, "too_long"),
+        ({"summary": ""}, "too_short"),
+        ({"edits": []}, "empty_list"),
+        ({"edits": [{"op": "nope", "find": "a", "text": "b"}]}, "bad_value"),
+        ({"summary": None}, "missing_field"),
+    ],
+)
+def test_every_refusal_kind_is_classified(bad_args, expected) -> None:
+    """Built from REAL validation failures, never hand-written message strings.
+
+    The first version of this table guessed Pydantic's wording and guessed
+    wrong: it looked for "is not a valid WikiType" while Pydantic v2 actually
+    says "Input should be 'repo', 'project', ...". The hand-written test string
+    matched the guess, so the test passed while every real enum refusal in
+    production came back `unclassified`. Failing validation for real is the only
+    version of this test that can catch that, and it also turns a Pydantic
+    upgrade that moves a tag into a failure rather than a silent regression.
+    """
+    from pydantic import ValidationError
+
+    from kb.synthesis.agent_harness import _classify_refusal
+    from kb.synthesis.agent_tools import UpdatePageArgs
+
+    args = {
+        "wiki_type": "repo",
+        "slug": "x",
+        "edits": [{"op": "replace", "find": "a", "text": "b"}],
+        "summary": "s",
+        "commit_message": "m",
+    }
+    args.update(bad_args)
+    # `None` is how the table spells "omit this field entirely".
+    args = {k: v for k, v in args.items() if v is not None}
+
+    with pytest.raises(ValidationError) as caught:
+        UpdatePageArgs(**args)
+
+    assert _classify_refusal(str(caught.value)) == expected

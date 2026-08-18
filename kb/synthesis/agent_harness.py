@@ -139,18 +139,33 @@ class _LLMClient(Protocol):
 #: row's `error`, so someone reading a week of runs can see whether one cause
 #: dominates. Keep them short and mechanical -- they are a key, not prose.
 #:
-#: Every pattern here was taken from a refusal seen in production, not guessed:
-#: the anchor misses come from `page_edits.apply_edits`, the length caps from
-#: the `Field(max_length=...)` constraints on the tool-arg models, and the
-#: depth cap from the graph preflight.
+#: Two kinds of needle, because two kinds of error land here.
+#:
+#: The first three are PROSE, matched against messages this repo writes itself
+#: (`page_edits.apply_edits` and the graph depth preflight). Their wording is
+#: ours to keep stable, and the tests pin it.
+#:
+#: The rest match Pydantic's `[type=...]` tag rather than its sentence. The
+#: sentence is not ours and does not say what an earlier version of this table
+#: assumed: a bad `wiki_type` reads "Input should be 'repo', 'project', ..."
+#: not "is not a valid WikiType", so a prose needle for it matched NOTHING and
+#: every real enum refusal came back `unclassified`. The tag is the stable,
+#: machine-shaped half of that message. `test_every_refusal_kind_is_classified`
+#: builds each case by actually failing validation, so a Pydantic upgrade that
+#: moves a tag fails the test instead of silently degrading the diagnostic.
 _REFUSAL_PATTERNS: tuple[tuple[str, str], ...] = (
     ("anchor_not_found", "does not appear in the page"),
     ("anchor_ambiguous", "so it does not say which one you mean"),
     ("levels_deep", "levels deep, past"),
-    ("too_long", "should have at most"),
-    ("too_short", "should have at least"),
-    ("bad_wiki_type", "is not a valid wikitype"),
-    ("missing_field", "field required"),
+    ("bad_wiki_type", "[type=enum"),
+    ("bad_value", "[type=literal_error"),
+    ("too_long", "[type=string_too_long"),
+    # `[type=string_too_short]` is a short string; bare `[type=too_short]` is a
+    # short LIST (e.g. `edits=[]`). The `[type=` prefix keeps them distinct, so
+    # order between these two does not matter.
+    ("too_short", "[type=string_too_short"),
+    ("empty_list", "[type=too_short"),
+    ("missing_field", "[type=missing"),
 )
 
 #: What an unrecognised refusal is called. Deliberately not "other": if this
