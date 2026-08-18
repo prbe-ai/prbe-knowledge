@@ -133,6 +133,62 @@ class _LLMClient(Protocol):
     ) -> dict[str, Any]: ...
 
 
+#: Refusal message -> a short stable name for WHY the call was refused.
+#:
+#: Ordered, first match wins. The names are contract-ish: they land in the run
+#: row's `error`, so someone reading a week of runs can see whether one cause
+#: dominates. Keep them short and mechanical -- they are a key, not prose.
+#:
+#: Two kinds of needle, because two kinds of error land here.
+#:
+#: The first three are PROSE, matched against messages this repo writes itself
+#: (`page_edits.apply_edits` and the graph depth preflight). Their wording is
+#: ours to keep stable, and the tests pin it.
+#:
+#: The rest match Pydantic's `[type=...]` tag rather than its sentence. The
+#: sentence is not ours and does not say what an earlier version of this table
+#: assumed: a bad `wiki_type` reads "Input should be 'repo', 'project', ..."
+#: not "is not a valid WikiType", so a prose needle for it matched NOTHING and
+#: every real enum refusal came back `unclassified`. The tag is the stable,
+#: machine-shaped half of that message. `test_every_refusal_kind_is_classified`
+#: builds each case by actually failing validation, so a Pydantic upgrade that
+#: moves a tag fails the test instead of silently degrading the diagnostic.
+_REFUSAL_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("anchor_not_found", "does not appear in the page"),
+    ("anchor_ambiguous", "so it does not say which one you mean"),
+    ("levels_deep", "levels deep, past"),
+    ("bad_wiki_type", "[type=enum"),
+    ("bad_value", "[type=literal_error"),
+    ("too_long", "[type=string_too_long"),
+    # `[type=string_too_short]` is a short string; bare `[type=too_short]` is a
+    # short LIST (e.g. `edits=[]`). The `[type=` prefix keeps them distinct, so
+    # order between these two does not matter.
+    ("too_short", "[type=string_too_short"),
+    ("empty_list", "[type=too_short"),
+    ("missing_field", "[type=missing"),
+)
+
+#: What an unrecognised refusal is called. Deliberately not "other": if this
+#: starts dominating a run's `error`, the list above is out of date, and a name
+#: that says so is more useful than a bucket that hides it.
+_UNCLASSIFIED_REFUSAL = "unclassified"
+
+
+def _classify_refusal(detail: str) -> str:
+    """A short stable name for why a tool call was refused.
+
+    Matching on the message rather than the exception type because every one of
+    these arrives as the same `ToolValidationError`: `apply_edits` re-raises its
+    `EditError` as one, and Pydantic's constraint failures are one already. The
+    type says "the model got it wrong"; only the text says how.
+    """
+    lowered = detail.lower()
+    for name, needle in _REFUSAL_PATTERNS:
+        if needle in lowered:
+            return name
+    return _UNCLASSIFIED_REFUSAL
+
+
 @dataclass(slots=True)
 class AgentMetrics:
     """Per-drain audit metrics.
@@ -150,18 +206,31 @@ class AgentMetrics:
     last_consequential_turn: int = 0
     halt_reason: str | None = None
     #: Tool calls the runtime refused because their arguments did not
-    #: validate -- overwhelmingly a `wiki_type` outside the closed set.
+    #: validate.
     #:
     #: COUNTED, not just logged, because the model is told about each one and
     #: may simply move on: the drain then finishes, reports `complete`, and
     #: the page the agent meant to write does not exist. That is a silent
     #: partial success, and the only trace of it was an INFO line nobody
     #: reads. The worker turns a non-zero count into run status `partial`.
+    #:
+    #: They also cost a TURN and are never consequential, so a model that
+    #: cannot get a write accepted burns the stall window and halts the drain
+    #: -- which DLQs every row then in `synthesizing`. That is the expensive
+    #: version of this counter, and why naming the cause below matters.
     rejected_tool_calls: int = 0
-    #: The distinct wiki_types the model tried to use and could not, so the
-    #: run's `error` names WHAT was refused rather than only how often. A
-    #: recurring value here is the signal that the enum is missing a member.
-    rejected_wiki_types: set[str] = field(default_factory=set)
+    #: WHY the calls were refused: the distinct failure kinds, e.g.
+    #: `anchor_not_found`, `summary_too_long`. Used in the run's `error` so a
+    #: reader learns what to fix.
+    #:
+    #: This used to hold the distinct `wiki_type`s instead, taken from the
+    #: refused call's args -- but the args were recorded WHATEVER field had
+    #: actually failed, so a perfectly valid `feature` or `repo` was named as
+    #: the culprit for an anchor mismatch three fields away. The docstring then
+    #: told the reader a recurring value meant "the enum is missing a member",
+    #: sending them to add a member that was already there. Both types blamed
+    #: in production were valid members the whole time.
+    rejected_reasons: set[str] = field(default_factory=set)
 
     @property
     def cache_hit_rate(self) -> float | None:
@@ -371,9 +440,7 @@ class AgentLoop:
                 # model so it can re-decide on the next turn.
                 result = {"error": "tool_validation_error", "detail": str(exc)}
                 self.metrics.rejected_tool_calls += 1
-                bad_type = args.get("wiki_type") if isinstance(args, dict) else None
-                if isinstance(bad_type, str) and bad_type:
-                    self.metrics.rejected_wiki_types.add(bad_type[:64])
+                self.metrics.rejected_reasons.add(_classify_refusal(str(exc)))
                 log.info(
                     "agent.tool_validation_error",
                     customer=self.runtime.customer_id,

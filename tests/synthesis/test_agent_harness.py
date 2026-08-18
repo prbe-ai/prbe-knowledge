@@ -493,19 +493,24 @@ async def test_dispatch_tool_validation_error_continues_loop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_refused_write_is_counted_and_its_wiki_type_recorded() -> None:
+async def test_a_refused_write_is_counted_and_its_reason_recorded() -> None:
     """The loop continuing is not the whole story -- the refusal must be VISIBLE.
 
     The model is told about the rejection and is free to move on. When it
     does, the drain finishes, reports `complete`, and the page it meant to
     write does not exist: a silent partial success whose only trace was an
     INFO log line. The worker turns these counts into run status `partial`,
-    and the recorded wiki_type is what tells someone the closed enum is
-    missing a member rather than the model being confused.
+    and the recorded REASON is what tells someone what to fix.
     """
 
     async def bad_args(rt, n, a):
-        raise ToolValidationError("wiki_type: 'company' is not a valid WikiType")
+        # Pydantic v2's REAL enum message, tag included -- not a paraphrase.
+        # See test_every_refusal_kind_is_classified for why that distinction
+        # is load-bearing here.
+        raise ToolValidationError(
+            "1 validation error for UpdatePageArgs\nwiki_type\n  Input should be "
+            "'repo', 'project', 'runbook' [type=enum, input_value='company']"
+        )
 
     async def done_h(rt, n, a):
         rt.is_done = True
@@ -533,9 +538,10 @@ async def test_a_refused_write_is_counted_and_its_wiki_type_recorded() -> None:
     metrics = await loop.run()
 
     assert metrics.rejected_tool_calls == 2
-    # A SET, so two refusals of the same kind read as one missing member
-    # rather than as two different problems.
-    assert metrics.rejected_wiki_types == {"company"}
+    # A SET, so two refusals of the same kind read as one problem rather than
+    # two. And the recorded value is the CAUSE, not the wiki_type that
+    # happened to ride along on the refused call.
+    assert metrics.rejected_reasons == {"bad_wiki_type"}
 
 
 @pytest.mark.asyncio
@@ -555,7 +561,7 @@ async def test_a_clean_drain_records_no_refusals() -> None:
     metrics = await loop.run()
 
     assert metrics.rejected_tool_calls == 0
-    assert metrics.rejected_wiki_types == set()
+    assert metrics.rejected_reasons == set()
 
 
 # ---------------------------------------------------------------------------
@@ -792,3 +798,133 @@ async def test_agent_loop_propagates_cancelled_error() -> None:
         "assertion fails the harness is swallowing CancelledError before "
         "the awaitable inside the tool sees it"
     )
+
+
+# ---------------------------------------------------------------------------
+# What a refusal is BLAMED on (production incident 2026-08-17)
+#
+# `wiki_synthesis_runs.error` read "rejected wiki_type(s): feature" for runs
+# whose actual failure was a verbatim-anchor mismatch three fields away. The
+# harness recorded `args["wiki_type"]` whatever had failed, and `feature` and
+# `repo` are both valid members of WikiType -- so the diagnostic named innocent
+# page types, and its docstring told the reader a recurring one meant "the enum
+# is missing a member". It sent people to add members that already existed.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("detail", "expected"),
+    [
+        (
+            "edit 2 (replace): `find` does not appear in the page. Copy the "
+            "anchor VERBATIM from the current body, including punctuation.",
+            "anchor_not_found",
+        ),
+        (
+            "edit 1 (replace): `find` appears 3 times, so it does not say "
+            "which one you mean. Extend the anchor with surrounding text.",
+            "anchor_ambiguous",
+        ),
+        (
+            "feature/research_os-dashboard_run_views sits 3 levels deep, past 2 "
+            "(repo/research_os -> feature/x -> feature/y -> feature/z).",
+            "levels_deep",
+        ),
+        ("something nobody has seen before", "unclassified"),
+    ],
+)
+def test_a_refusal_is_classified_by_its_cause(detail, expected) -> None:
+    """Every one of these arrives as the same `ToolValidationError`.
+
+    `apply_edits` re-raises its `EditError` as one and Pydantic's constraint
+    failures already are one, so the exception TYPE cannot separate them. Only
+    the message can, which is why the classifier reads text.
+    """
+    from kb.synthesis.agent_harness import _classify_refusal
+
+    assert _classify_refusal(detail) == expected
+
+
+@pytest.mark.asyncio
+async def test_an_anchor_miss_is_not_blamed_on_the_page_type() -> None:
+    """The regression, end to end through the loop.
+
+    `feature` is a valid WikiType and had nothing to do with this failure. The
+    run's `error` must say what actually broke, so the next person reading it
+    fixes the anchor rather than the enum.
+    """
+
+    async def anchor_miss(rt, n, a):
+        raise ToolValidationError(
+            "edit 2 (replace): `find` does not appear in the page. "
+            "Copy the anchor VERBATIM from the current body."
+        )
+
+    async def done_h(rt, n, a):
+        rt.is_done = True
+        return {"committed": True}
+
+    runtime = StubRuntime(tool_handlers={"update_page": anchor_miss, "done": done_h})
+    llm = StubLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "name": "update_page",
+                        "args": {"wiki_type": "feature", "slug": "some-page"},
+                    }
+                ],
+                "usage_metadata": {},
+            },
+            _done_call(),
+        ]
+    )
+    metrics = await _make_loop(runtime, llm).run()
+
+    assert metrics.rejected_tool_calls == 1
+    assert metrics.rejected_reasons == {"anchor_not_found"}
+    assert "feature" not in metrics.rejected_reasons
+
+
+@pytest.mark.parametrize(
+    ("bad_args", "expected"),
+    [
+        ({"wiki_type": "company"}, "bad_wiki_type"),
+        ({"summary": "s" * 300}, "too_long"),
+        ({"summary": ""}, "too_short"),
+        ({"edits": []}, "empty_list"),
+        ({"edits": [{"op": "nope", "find": "a", "text": "b"}]}, "bad_value"),
+        ({"summary": None}, "missing_field"),
+    ],
+)
+def test_every_refusal_kind_is_classified(bad_args, expected) -> None:
+    """Built from REAL validation failures, never hand-written message strings.
+
+    The first version of this table guessed Pydantic's wording and guessed
+    wrong: it looked for "is not a valid WikiType" while Pydantic v2 actually
+    says "Input should be 'repo', 'project', ...". The hand-written test string
+    matched the guess, so the test passed while every real enum refusal in
+    production came back `unclassified`. Failing validation for real is the only
+    version of this test that can catch that, and it also turns a Pydantic
+    upgrade that moves a tag into a failure rather than a silent regression.
+    """
+    from pydantic import ValidationError
+
+    from kb.synthesis.agent_harness import _classify_refusal
+    from kb.synthesis.agent_tools import UpdatePageArgs
+
+    args = {
+        "wiki_type": "repo",
+        "slug": "x",
+        "edits": [{"op": "replace", "find": "a", "text": "b"}],
+        "summary": "s",
+        "commit_message": "m",
+    }
+    args.update(bad_args)
+    # `None` is how the table spells "omit this field entirely".
+    args = {k: v for k, v in args.items() if v is not None}
+
+    with pytest.raises(ValidationError) as caught:
+        UpdatePageArgs(**args)
+
+    assert _classify_refusal(str(caught.value)) == expected

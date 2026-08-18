@@ -30,7 +30,60 @@ model cannot see that it happened.
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass
+
+#: How many near-miss lines to quote back when an anchor does not match.
+#: Three is enough to cover "the model mis-copied one of a few similar
+#: headings" without turning a refusal into a page dump.
+_NEAR_MISS_COUNT = 3
+
+#: Longest near-miss line quoted back. A pathological single-line page would
+#: otherwise put the whole body in an error message.
+_NEAR_MISS_MAX_CHARS = 200
+
+#: Below this ratio the "closest" line is not close to anything and quoting it
+#: would be noise the model has to reason past.
+_NEAR_MISS_CUTOFF = 0.5
+
+
+def _near_misses(body: str, find: str) -> list[str]:
+    """Lines in `body` most similar to a `find` that matched nothing.
+
+    WHY THE ERROR CARRIES TEXT. Telling the model "copy the anchor VERBATIM"
+    without showing it what is actually there leaves it guessing from the same
+    context that produced the wrong anchor, so it guesses wrong again. Each
+    wrong guess costs a turn and is never consequential, and fifteen in a row
+    halt the drain. Quoting the nearest real lines turns the retry into a copy.
+
+    Matched per LINE rather than over the whole body: an anchor is nearly
+    always one line or a fragment of one, and line-level matching is what makes
+    the answer copyable.
+    """
+    needle = find.strip()
+    if not needle:
+        return []
+    candidates = [ln for ln in body.splitlines() if ln.strip()]
+    if not candidates:
+        return []
+    close = difflib.get_close_matches(
+        needle, candidates, n=_NEAR_MISS_COUNT, cutoff=_NEAR_MISS_CUTOFF
+    )
+    return [ln[:_NEAR_MISS_MAX_CHARS] for ln in close]
+
+
+def _not_found_message(index: int, op: str, body: str, find: str) -> str:
+    """The zero-match refusal, with the nearest real lines when there are any."""
+    base = (
+        f"edit {index} ({op}): `find` does not appear in the page. "
+        "Copy the anchor VERBATIM from the current body, including "
+        "punctuation and capitalisation."
+    )
+    hits = _near_misses(body, find)
+    if not hits:
+        return base
+    quoted = "\n".join(f"  {ln}" for ln in hits)
+    return f"{base}\nClosest lines currently in the page:\n{quoted}"
 
 
 class EditError(ValueError):
@@ -69,9 +122,7 @@ def apply_edits(body: str, edits: list[PageEdit]) -> str:
         occurrences = current.count(edit.find)
         if occurrences == 0:
             raise EditError(
-                f"edit {index} ({edit.op}): `find` does not appear in the page. "
-                "Copy the anchor VERBATIM from the current body, including "
-                "punctuation and capitalisation."
+                _not_found_message(index, edit.op, current, edit.find)
             )
         if occurrences > 1:
             raise EditError(
