@@ -171,10 +171,10 @@ def test_the_tool_schema_declares_the_types_as_an_enum_not_prose() -> None:
     (`wiki:{type}:{slug}`), and there is no rename route. One ignored
     suggestion at 04:00 is a page kind forever.
     """
-    from kb.synthesis.agent_tools import _WIKI_TYPE_SCHEMA
+    from kb.synthesis.agent_tools import WIKI_TYPE_SCHEMA
     from kb.synthesis.models import AGENT_WIKI_TYPES
 
-    assert _WIKI_TYPE_SCHEMA.get("enum") == list(AGENT_WIKI_TYPES)
+    assert WIKI_TYPE_SCHEMA.get("enum") == list(AGENT_WIKI_TYPES)
 
 
 def test_the_agent_cannot_write_the_generated_index_page() -> None:
@@ -215,11 +215,11 @@ def test_a_service_and_a_feature_are_page_kinds() -> None:
     in the graph's link vocabulary (`[[service: X]]` resolves to a node), so
     until they were added a page could link to a service it could never be."""
     from kb.handlers.wiki import is_valid_wiki_type
-    from kb.synthesis.agent_tools import _WIKI_TYPE_SCHEMA
+    from kb.synthesis.agent_tools import WIKI_TYPE_SCHEMA
 
     for wiki_type in ("service", "feature"):
         assert is_valid_wiki_type(wiki_type)
-        assert wiki_type in _WIKI_TYPE_SCHEMA["enum"]
+        assert wiki_type in WIKI_TYPE_SCHEMA["enum"]
 
 
 def test_the_gate_the_prompt_and_the_schema_cannot_drift() -> None:
@@ -232,11 +232,11 @@ def test_the_gate_the_prompt_and_the_schema_cannot_drift() -> None:
     nothing but a log line.
     """
     from kb.handlers.wiki import is_valid_wiki_type
-    from kb.synthesis.agent_tools import _WIKI_TYPE_SCHEMA
+    from kb.synthesis.agent_tools import WIKI_TYPE_SCHEMA
     from kb.synthesis.models import AGENT_WIKI_TYPES
     from kb.synthesis.prompts import _AGENT_WIKI_TYPES_SENTENCE
 
-    for wiki_type in _WIKI_TYPE_SCHEMA["enum"]:
+    for wiki_type in WIKI_TYPE_SCHEMA["enum"]:
         assert is_valid_wiki_type(wiki_type), f"schema offers {wiki_type}, gate refuses it"
         assert f"`{wiki_type}`" in _AGENT_WIKI_TYPES_SENTENCE
     # ...and the prose names nothing the schema does not offer.
@@ -253,6 +253,96 @@ def test_an_invented_type_is_refused_by_the_gate() -> None:
 
     for invented in ("company", "customer", "event", "repository", "codebase"):
         assert not is_valid_wiki_type(invented), invented
+
+
+def test_a_project_and_a_person_are_not_page_kinds() -> None:
+    """Both were members and were removed (migration 0107), and the reason is
+    the one rule a wiki lives by: a page is worth reading because it says
+    something no query can answer.
+
+    `project` restated research-os, where projects, experiments and runs are
+    live entities with current status. `person` restated the graph, where
+    authorship and ownership are edges the ingestion pipeline maintains
+    continuously. Each page was a second copy that went stale silently, and a
+    reader could not tell which of the two was current.
+
+    Pinned on the GATE and not only the schema: the gate is what makes the
+    removal real. A model that ignores the enum still cannot persist one.
+    """
+    from kb.handlers.wiki import is_valid_wiki_type
+    from kb.synthesis.agent_tools import WIKI_TYPE_SCHEMA
+
+    for removed in ("project", "person"):
+        assert not is_valid_wiki_type(removed), removed
+        assert removed not in WIKI_TYPE_SCHEMA["enum"]
+
+
+def test_a_decision_is_still_a_page_kind() -> None:
+    """The contrast that makes the removal a rule rather than a preference.
+
+    A decision -- why X was chosen over Y, what it ruled out -- exists in no
+    system of record. It is reconstructible only from a thread nobody will
+    re-read, which is exactly what synthesis is for. Dropping it alongside
+    `project` and `person` would remove the pages worth keeping and leave the
+    duplicated ones, so it is pinned separately.
+    """
+    from kb.handlers.wiki import is_valid_wiki_type
+    from kb.synthesis.agent_tools import WIKI_TYPE_SCHEMA
+
+    assert is_valid_wiki_type("decision")
+    assert "decision" in WIKI_TYPE_SCHEMA["enum"]
+
+
+def test_a_person_link_survives_the_person_page_kind() -> None:
+    """Removing the PAGE kind must not touch the LINK kind.
+
+    `owners: [person:maison]` in a repo page's frontmatter is an edge into the
+    canonical Person graph node, and `_LINK_NODE_MAP` has always resolved kinds
+    that have no page of their own (`service`, `ticket`). Gating links on
+    page-kind membership would silently drop those edges, and the drop would
+    look like the agent simply not writing links.
+    """
+    from kb.handlers.wiki import is_valid_wiki_type, is_wiki_type_shaped
+
+    assert is_wiki_type_shaped("person")
+    assert not is_valid_wiki_type("person")
+
+
+def test_the_crawler_uses_the_real_schema_not_a_copy() -> None:
+    """The backfill crawler had its own hand-written "mirror" of the wiki_type
+    schema that had drifted into a free-form string telling the model to invent
+    a kind "if the corpus calls for it" -- kinds its own args validator has
+    refused since the set was closed. Sharing the object is what stops a mirror
+    from being only as current as the last person who remembered it exists.
+    """
+    from kb.synthesis.agent_tools import WIKI_TYPE_SCHEMA
+    from kb.synthesis.crawlers import github
+
+    assert github.WIKI_TYPE_SCHEMA is WIKI_TYPE_SCHEMA
+
+
+def test_the_backfill_prompt_offers_no_kind_the_gate_refuses() -> None:
+    """The daily agent's prompt is rendered from the constant; the backfill
+    crawler's was hand-written, and listed `person`, `company`, `customer`,
+    `project` and `event` long after the gate started refusing four of them. A
+    crawler prompt is exercised only during a backfill, which is precisely why
+    nothing surfaced the drift.
+    """
+    import re
+
+    from kb.handlers.wiki import is_valid_wiki_type
+    from kb.synthesis.prompts import build_github_crawler_system_prompt
+
+    prompt = build_github_crawler_system_prompt(customer_id="cust_1")
+    # The palette is a bulleted list, one kind per `  - <kind>: ...` line.
+    # Matching the bullet leader rather than every backticked word keeps this
+    # about page kinds -- the same section names `summary`, a field.
+    palette = prompt.split("**Tool palette:**")[0]
+    kinds = re.findall(r"^ +- ([a-z_]+): ", palette, re.MULTILINE)
+
+    assert kinds, "no palette bullets found -- the prompt's shape changed"
+    for kind in kinds:
+        assert is_valid_wiki_type(kind), f"prompt offers {kind}, gate refuses it"
 
 
 def test_the_shape_check_survives_the_membership_check() -> None:

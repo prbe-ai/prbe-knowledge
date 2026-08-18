@@ -55,6 +55,7 @@ from kb.synthesis.agent_tools import (
     LIST_WIKI_PAGES_TOOL,
     READ_PAGE_TOOL,
     UPDATE_PAGE_TOOL,
+    WIKI_TYPE_SCHEMA,
 )
 from kb.synthesis.api_clients.github import (
     GitHubAPIClient,
@@ -81,18 +82,12 @@ _PAGE_SIZE = 50
 _REVIEW_PAGE_SIZE = 100
 _SOURCE_KIND = "github"
 
-# Free-form wiki_type schema for the crawler's tool palette. Mirrors
-# `kb.synthesis.agent_tools._WIKI_TYPE_SCHEMA` — the agent picks
-# slugs as it sees fit; URL-safety is enforced at persistence time.
-_WIKI_TYPE_SCHEMA: dict[str, Any] = {
-    "type": "string",
-    "description": (
-        "The page-kind discriminator. Pick from `repo`, `runbook`, "
-        "`person`, `company`, `customer`, `project`, `event` — or "
-        "invent a new one if the corpus calls for it. Lowercase, "
-        "alphanumeric + underscore, <= 32 chars."
-    ),
-}
+# The crawler writes pages through the same runtime as the daily agent, so it
+# gets the same wiki_type schema — imported, not mirrored. It used to be a
+# local free-form copy inviting the model to "invent a new one if the corpus
+# calls for it", which had been wrong since `WikiType` closed: the crawler's
+# own `_UpdatePageArgs` validates against the enum, so every invented kind was
+# refused after the model had already spent a turn writing the page.
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +286,7 @@ def _wiki_raw_save_tool() -> dict[str, Any]:
             "type": "object",
             "properties": {
                 "source_ref": {"type": "string"},
-                "wiki_type": _WIKI_TYPE_SCHEMA,
+                "wiki_type": WIKI_TYPE_SCHEMA,
                 "slug": {"type": "string"},
                 "payload": {"type": "object"},
             },
@@ -312,7 +307,7 @@ def _record_timeline_tool() -> dict[str, Any]:
         "parameters": {
             "type": "object",
             "properties": {
-                "wiki_type": _WIKI_TYPE_SCHEMA,
+                "wiki_type": WIKI_TYPE_SCHEMA,
                 "slug": {"type": "string"},
                 "entry_date": {"type": "string"},
                 "source_ref": {"type": "string"},

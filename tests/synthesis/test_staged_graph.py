@@ -45,9 +45,9 @@ def test_the_same_page_staged_twice_is_refused() -> None:
 
 def test_the_same_slug_under_different_types_is_fine() -> None:
     """`(wiki_type, slug)` is the identity, not slug alone. `repo/probe` and
-    `project/probe` are different pages and routinely coexist."""
+    `service/probe` are different pages and routinely coexist."""
     assert (
-        validate_batch([_page("probe", wiki_type="repo"), _page("probe", wiki_type="project")])
+        validate_batch([_page("probe", wiki_type="repo"), _page("probe", wiki_type="service")])
         == []
     )
 
@@ -154,10 +154,15 @@ def test_a_split_child_under_the_floor_is_refused() -> None:
 
 
 def test_the_floor_does_not_apply_to_ordinary_small_pages() -> None:
-    """`person/shi_dong` is 143 bytes and correct. The floor is about split
-    PRODUCTS, not about pages being short -- a new page created on its own is a
-    new subject, not a fragment of an old one."""
-    assert validate_batch([_page("shi_dong", wiki_type="person", is_new=True, body="hi")]) == []
+    """`decision/drop-wiki-person-pages` is 143 bytes and correct. The floor is
+    about split PRODUCTS, not about pages being short -- a new page created on
+    its own is a new subject, not a fragment of an old one."""
+    assert (
+        validate_batch(
+            [_page("drop-wiki-person-pages", wiki_type="decision", is_new=True, body="hi")]
+        )
+        == []
+    )
 
 
 def test_more_than_six_children_is_refused() -> None:

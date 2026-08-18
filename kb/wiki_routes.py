@@ -100,6 +100,7 @@ from kb.handlers.wiki import (
 )
 from kb.synthesis import persistence
 from kb.synthesis.crawlers import REGISTRY as BACKFILL_CRAWLER_REGISTRY
+from kb.synthesis.models import WikiType
 from kb.synthesis.staged_graph import PAGE_CAP_BYTES
 from kb.wiki_links import parse_page_links
 
@@ -2349,6 +2350,14 @@ async def _wipe_wiki_for_customer(conn: asyncpg.Connection, customer_id: str) ->
     )
 
 
+#: `documents.doc_type` for every kind a page may currently have — the closed
+#: set, prefixed. Built from `WikiType` rather than listed, so retiring a kind
+#: takes it out of the restore set in the same edit that takes it out of the
+#: enum; a hand-written copy here would keep un-retiring pages the taxonomy no
+#: longer has a route for.
+_RESTORABLE_DOC_TYPES: list[str] = [f"{WIKI_DOC_TYPE_PREFIX}{t.value}" for t in WikiType]
+
+
 async def _restore_retired_pages(conn: asyncpg.Connection, customer_id: str) -> int:
     """Put back pages the last rebuild retired and never re-derived.
 
@@ -2363,6 +2372,16 @@ async def _restore_retired_pages(conn: asyncpg.Connection, customer_id: str) -> 
     were meant to stay closed. The 60s slack mirrors the window
     `_do_get_wiki_backfill_status` uses to group one trigger's runs, since the
     per-source rows are inserted in a burst rather than at one instant.
+
+    AND never a page whose KIND has since been retired from `WikiType`. The
+    time bound alone does not cover that case: the anchor is the last
+    bootstrap's start, so on a tenant whose last rebuild predates a taxonomy
+    change, `valid_to >= anchor` matches the rows the change itself retired
+    (migration 0107 retired every `project` / `person` page this way). Undo
+    would put them back live — and a live page whose kind is not in the closed
+    set is unreachable by construction, 400 on read and 400 on the DELETE that
+    would clean it up. There is no timestamp that makes that page useful, so
+    the check is on the kind, not on when it was closed.
 
     Returns the number of pages restored. Zero is a normal answer: it means
     the rebuild had already re-derived everything it retired.
@@ -2389,6 +2408,7 @@ async def _restore_retired_pages(conn: asyncpg.Connection, customer_id: str) -> 
          WHERE d.customer_id = $1
            AND d.doc_class = 'compiled_wiki'
            AND d.valid_to >= $2
+           AND d.doc_type = ANY($3::text[])
            AND NOT EXISTS (
                SELECT 1 FROM documents live
                 WHERE live.customer_id = d.customer_id
@@ -2404,6 +2424,7 @@ async def _restore_retired_pages(conn: asyncpg.Connection, customer_id: str) -> 
         """,
         customer_id,
         anchor,
+        _RESTORABLE_DOC_TYPES,
     )
     return len(rows)
 

@@ -509,7 +509,7 @@ async def test_a_refused_write_is_counted_and_its_reason_recorded() -> None:
         # is load-bearing here.
         raise ToolValidationError(
             "1 validation error for UpdatePageArgs\nwiki_type\n  Input should be "
-            "'repo', 'project', 'runbook' [type=enum, input_value='company']"
+            "'repo', 'runbook', 'experiment' [type=enum, input_value='company']"
         )
 
     async def done_h(rt, n, a):
@@ -902,7 +902,7 @@ def test_every_refusal_kind_is_classified(bad_args, expected) -> None:
 
     The first version of this table guessed Pydantic's wording and guessed
     wrong: it looked for "is not a valid WikiType" while Pydantic v2 actually
-    says "Input should be 'repo', 'project', ...". The hand-written test string
+    says "Input should be 'repo', 'runbook', ...". The hand-written test string
     matched the guess, so the test passed while every real enum refusal in
     production came back `unclassified`. Failing validation for real is the only
     version of this test that can catch that, and it also turns a Pydantic

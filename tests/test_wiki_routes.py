@@ -1917,6 +1917,14 @@ async def _terminal_queue_row(doc_id: str, status: str = "done") -> None:
 
 
 async def _compiled_page(doc_id: str) -> None:
+    """Seed one live compiled page, `doc_id` shaped `wiki:{kind}:{slug}`.
+
+    `doc_type` is DERIVED from that kind rather than a fixed literal. It was
+    hardcoded to `wiki.page` -- a kind no page has ever had -- so every fixture
+    here described a row production cannot produce, and any code that reads the
+    kind back off `doc_type` was tested against a value it will never see.
+    """
+    _, wiki_type, _ = doc_id.split(":", 2)
     async with with_tenant(CUSTOMER) as conn:
         await conn.execute(
             """
@@ -1925,11 +1933,12 @@ async def _compiled_page(doc_id: str) -> None:
                  source_url, doc_class, doc_type, content_hash, created_at,
                  updated_at, valid_from, acl)
             VALUES ($1, 1, $2, 'wiki', $1, '/wiki/x', 'compiled_wiki',
-                    'wiki.page', $3, NOW(), NOW(), NOW(), '{}'::jsonb)
+                    $4, $3, NOW(), NOW(), NOW(), '{}'::jsonb)
             """,
             doc_id,
             CUSTOMER,
             f"hash-{doc_id}",
+            f"wiki.{wiki_type}",
         )
 
 
@@ -1952,7 +1961,7 @@ async def test_backfill_trigger_reseeds_the_daily_pipeline(
     await _insert_live_doc("doc:unqueued")
     await _insert_live_doc("doc:done")
     await _terminal_queue_row("doc:done", status="done")
-    await _compiled_page("wiki:page:old")
+    await _compiled_page("wiki:runbook:old")
 
     resp = await client.post("/api/wiki/backfill/trigger", json={}, headers=_hdr())
     assert resp.status_code == 202, resp.text
@@ -2023,7 +2032,7 @@ async def test_backfill_trigger_failure_after_wipe_rolls_everything_back(
     import kb.wiki_routes as wiki_routes_module
 
     await _insert_live_doc("doc:a")
-    await _compiled_page("wiki:page:keep")
+    await _compiled_page("wiki:runbook:keep")
 
     async def exploding_insert(conn, *, customer_id, sources):
         raise RuntimeError("boom after wipe")
@@ -2055,7 +2064,7 @@ async def test_backfill_preview_reports_counts_and_writes_nothing(
     await _insert_live_doc("doc:unqueued")
     await _insert_live_doc("doc:done")
     await _terminal_queue_row("doc:done", status="done")
-    await _compiled_page("wiki:page:old")
+    await _compiled_page("wiki:runbook:old")
 
     resp = await client.get("/api/wiki/backfill/preview", headers=_hdr())
     assert resp.status_code == 200, resp.text
@@ -2132,6 +2141,39 @@ async def test_undo_restores_pages_the_rebuild_never_rederived(
     assert body["undone"] is True
     assert body["restored_pages"] == 2
     assert await _live_pages() == {"wiki:runbook:alpha", "wiki:runbook:beta"}
+
+
+@pytest.mark.asyncio
+async def test_undo_never_restores_a_page_whose_kind_was_retired(
+    client: httpx.AsyncClient, _stub_bootstrap_registry: None
+) -> None:
+    """A taxonomy change is not something undo may reverse.
+
+    Migration 0107 retired every `project` / `person` page when both kinds left
+    `WikiType`. Undo's time bound does not cover that: the anchor is the LAST
+    bootstrap's start, so on a tenant whose last rebuild predates the change,
+    `valid_to >= anchor` matches exactly the rows the migration closed.
+
+    Putting one back would be worse than leaving it closed. The kind is a path
+    segment and a doc_id component validated against the closed set, so a live
+    page carrying a retired kind is unreachable by construction -- 400 on read,
+    and 400 on the DELETE that would have cleaned it up. There is no timestamp
+    that makes it useful, which is why the guard is on the kind.
+    """
+    await _compiled_page("wiki:runbook:alpha")
+    await _compiled_page("wiki:person:maison")
+    assert await _live_pages() == {"wiki:runbook:alpha", "wiki:person:maison"}
+
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger", json={"sources": ["github"]}, headers=_hdr()
+    )
+    assert resp.status_code == 202, resp.text
+    assert await _live_pages() == set()
+
+    undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
+    assert undo.status_code == 200, undo.text
+    assert undo.json()["restored_pages"] == 1
+    assert await _live_pages() == {"wiki:runbook:alpha"}
 
 
 @pytest.mark.asyncio

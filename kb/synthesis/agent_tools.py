@@ -109,7 +109,13 @@ def _strip_title_prefix(summary: str, *, title: str | None = None) -> str:
 # `index` is excluded — see AGENT_WIKI_TYPES. It is generated from the other
 # pages at the end of a drain, so an agent writing it would be overwritten
 # within the same run.
-_WIKI_TYPE_SCHEMA: dict[str, Any] = {
+#
+# PUBLIC because the backfill crawlers need the same schema, not their own copy
+# of it. `crawlers/github.py` carried a hand-written "mirror" that had drifted
+# into a free-form string telling the model to "invent a new one if the corpus
+# calls for it" — types the ingestion gate has refused since the set was closed.
+# A mirror is only ever as current as the last person who remembered it exists.
+WIKI_TYPE_SCHEMA: dict[str, Any] = {
     "type": "string",
     "enum": list(AGENT_WIKI_TYPES),
     "description": (
@@ -186,7 +192,7 @@ READ_PAGE_TOOL: dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
-            "wiki_type": _WIKI_TYPE_SCHEMA,
+            "wiki_type": WIKI_TYPE_SCHEMA,
             "slug": _capped(
                 "URL-safe identifier for the page, unique within its type.",
                 64,
@@ -235,7 +241,7 @@ UPDATE_PAGE_TOOL: dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
-            "wiki_type": _WIKI_TYPE_SCHEMA,
+            "wiki_type": WIKI_TYPE_SCHEMA,
             "slug": _capped(
                 "URL-safe identifier for the page, unique within its type.",
                 64,
@@ -314,7 +320,7 @@ CREATE_PAGE_TOOL: dict[str, Any] = {
     "parameters": {
         "type": "object",
         "properties": {
-            "wiki_type": _WIKI_TYPE_SCHEMA,
+            "wiki_type": WIKI_TYPE_SCHEMA,
             "slug": _capped(
                 "URL-safe identifier for the page, unique within its type.",
                 64,

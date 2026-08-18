@@ -47,9 +47,10 @@ from pydantic import BaseModel, Field, field_validator
 #
 # Verified against production before closing: every wiki page in every tenant
 # used one of `repo`, `project`, `runbook`, `person`, `index` (37 pages,
-# 2026-08-12). Nothing is orphaned by this list. Adding a member later is a
-# one-line change here that reaches the tool schema, the ingestion gate and
-# the agent prompt at once -- which is the point of having one constant.
+# 2026-08-12). Adding a member later is a one-line change here that reaches
+# the tool schema, the ingestion gate and the agent prompt at once -- which is
+# the point of having one constant. Removing one is the same one-line change,
+# plus a migration for the pages that already carry it.
 #
 # `service` and `feature` were added the same day, and the two-step is worth
 # reading as one decision rather than an oversight: the first list was drawn
@@ -57,18 +58,40 @@ from pydantic import BaseModel, Field, field_validator
 # able to hold that it simply had no page of yet. Both already existed in the
 # graph's node vocabulary (`_LINK_NODE_MAP` resolves `[[service: X]]`), so
 # until now a page could link to a service it could never be.
+#
+# WHY `project` AND `person` ARE GONE (2026-08-18, migration 0107)
+# ----------------------------------------------------------------
+# Both restated what the platform already holds, which is the one thing a wiki
+# must not do. A wiki page is worth reading because it says something no query
+# can answer; a page that paraphrases a system of record is worse than absent,
+# because it is a second copy that goes stale silently and a reader cannot tell
+# which of the two is current.
+#
+#   * `project` duplicated research-os. Projects, their experiments and their
+#     runs are first-class entities there with live status, metrics and
+#     lineage. A nightly prose snapshot of that is stale by construction.
+#   * `person` duplicated the graph and the roster. Who authored what, who
+#     reviews what, and who owns what are edges the ingestion pipeline already
+#     maintains from the sources themselves, continuously.
+#
+# `decision` deliberately STAYS, and the contrast is the rule: a decision --
+# why X was chosen over Y, what it ruled out -- exists in no system of record.
+# It is reconstructible only from a thread nobody will re-read, which is
+# exactly the knowledge synthesis is for.
+#
+# `[[person: X]]` LINKS are untouched. A wiki link points at a graph ENTITY,
+# and `_LINK_NODE_MAP` resolves several kinds that have no page of their own
+# (`service`, `ticket`). `owners: [person:maison]` in a repo page's frontmatter
+# is an edge into the canonical Person node -- it never needed a person page to
+# point at, and removing the page kind does not break it.
 # ---------------------------------------------------------------------------
 class WikiType(StrEnum):
     #: The auto-generated overview. Written only by the synthesis cron.
     INDEX = "index"
     #: A codebase.
     REPO = "repo"
-    #: A stream of work with a goal and an end.
-    PROJECT = "project"
     #: How to do a recurring operational thing.
     RUNBOOK = "runbook"
-    #: A teammate: what they own, what they are working on.
-    PERSON = "person"
     #: A research experiment -- hypothesis, setup, what it showed.
     EXPERIMENT = "experiment"
     #: A corpus: where it came from, its shape, its known problems.
@@ -84,9 +107,9 @@ class WikiType(StrEnum):
     #: the two an on-call page is actually about.
     SERVICE = "service"
     #: A product capability: what it does for a user, its constraints, the
-    #: decisions behind it. Distinct from `project` -- a project ends and a
-    #: feature keeps being true afterwards, which is exactly the knowledge a
-    #: wiki is for.
+    #: decisions behind it. This is where a stream of work belongs once it has
+    #: shipped -- the work itself is tracked elsewhere and ends, while what it
+    #: built keeps being true afterwards, which is the knowledge a wiki is for.
     FEATURE = "feature"
 
 
