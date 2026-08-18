@@ -58,7 +58,15 @@ from typing import Any
 
 import asyncpg
 import orjson
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+)
 from pydantic import BaseModel, Field, field_validator
 
 from engine.ingest.normalizer import (
@@ -276,6 +284,10 @@ class WikiGenerationSettingsBody(BaseModel):
 class WikiGenerationSettingsResponse(BaseModel):
     customer_id: str
     generation_enabled: bool
+    # True only on the PUT that flips off→on: a best-effort background
+    # seed of the tenant's existing docs was scheduled (BackgroundTasks
+    # dies with the process; the nightly reconcile is the guarantee).
+    catchup_started: bool = False
 
 
 class WikiRevertBody(BaseModel):
@@ -1626,6 +1638,7 @@ async def get_wiki_generation_settings(
 )
 async def set_wiki_generation_settings(
     body: WikiGenerationSettingsBody,
+    background_tasks: BackgroundTasks,
     customer_id: str = Depends(_require_customer),
 ) -> WikiGenerationSettingsResponse:
     """Turn the nightly pipeline on or off for this tenant.
@@ -1650,8 +1663,13 @@ async def set_wiki_generation_settings(
     silently.
     """
     async with with_tenant(customer_id) as conn:
-        updated = await conn.fetchval(
+        row = await conn.fetchrow(
             """
+            WITH prior AS (
+                SELECT preferences->>'wiki_generation_enabled' AS prev
+                FROM customers
+                WHERE customer_id = $1
+            )
             UPDATE customers
                SET preferences = jsonb_set(
                        COALESCE(preferences, '{}'::jsonb),
@@ -1660,21 +1678,66 @@ async def set_wiki_generation_settings(
                        true
                    )
              WHERE customer_id = $1
-         RETURNING preferences->>'wiki_generation_enabled'
+         RETURNING preferences->>'wiki_generation_enabled' AS now,
+                   (SELECT prev FROM prior) AS prev
             """,
             customer_id,
             "true" if body.generation_enabled else "false",
         )
-    if updated is None:
+    if row is None:
         raise HTTPException(status_code=404, detail="unknown customer")
+    updated = row["now"]
     log.info(
         "wiki.generation_setting_changed",
         customer=customer_id,
         generation_enabled=updated == "true",
     )
+    # off→on transition: seed the tenant's existing corpus so the wiki
+    # doesn't start from "documents ingested after today". Scheduled
+    # after the response (a huge tenant's seed must not time out this
+    # request) on a connection of its own. Best-effort by design —
+    # the nightly reconcile re-seeds anything a lost task leaves behind.
+    catchup_started = updated == "true" and row["prev"] != "true"
+    if catchup_started:
+        background_tasks.add_task(_seed_after_enable, customer_id)
     return WikiGenerationSettingsResponse(
-        customer_id=customer_id, generation_enabled=updated == "true"
+        customer_id=customer_id,
+        generation_enabled=updated == "true",
+        catchup_started=catchup_started,
     )
+
+
+async def _seed_after_enable(customer_id: str) -> None:
+    """Background half of the off→on toggle: seed + wake the drain.
+
+    Runs after the PUT's response is sent, so it must acquire its own
+    pooled connection — the request's connection is already released.
+    Failures log and stop; the nightly reconcile is the retry.
+    """
+    try:
+        async with with_tenant(customer_id) as conn:
+            eligible, inserted = await persistence.seed_missing_docs(
+                conn, customer_id
+            )
+            if inserted:
+                await conn.execute(
+                    "SELECT pg_notify($1, $2)",
+                    WIKI_PENDING_CHANNEL,
+                    customer_id,
+                )
+        log.info(
+            "wiki.settings_catchup_seeded",
+            customer=customer_id,
+            eligible=eligible,
+            inserted=inserted,
+        )
+    except Exception as exc:
+        log.warning(
+            "wiki.settings_catchup_failed",
+            customer=customer_id,
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
 
 
 @router.get(
