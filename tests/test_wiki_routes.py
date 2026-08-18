@@ -447,9 +447,7 @@ async def test_history_still_rejects_a_malformed_wiki_type(
     The shape check is what keeps a stray path segment from becoming a
     permanent garbage doc_id lookup; only the reservation is read-specific.
     """
-    resp = await client.get(
-        "/api/wiki/pages/NOT-A-TYPE/contents/history", headers=_hdr()
-    )
+    resp = await client.get("/api/wiki/pages/NOT-A-TYPE/contents/history", headers=_hdr())
     assert resp.status_code == 400
 
 
@@ -869,9 +867,7 @@ async def test_bootstrap_status_ignores_old_runs_outside_burst(
 # never sent one) keeps functioning.
 
 
-async def _put(
-    client: httpx.AsyncClient, slug: str, body: str, **extra: object
-) -> httpx.Response:
+async def _put(client: httpx.AsyncClient, slug: str, body: str, **extra: object) -> httpx.Response:
     return await client.put(
         f"/api/wiki/pages/runbook/{slug}",
         json={"title": "CAS fixture", "body": body, **extra},
@@ -1008,9 +1004,7 @@ async def test_hand_editing_a_page_does_not_stop_the_pipeline(
     human_text = "Written by a person through `probe wiki write`."
     created = await _put(client, "human-owned", human_text, expected_version=0)
     assert created.status_code == 200, created.text
-    assert (
-        created.json()["version"] == 1
-    ), "precondition: the hand write is the live version"
+    assert created.json()["version"] == 1, "precondition: the hand write is the live version"
 
     await _run_agent_update("human-owned", "THE AGENT UPDATED THIS PAGE.")
 
@@ -1054,8 +1048,7 @@ async def test_settings_default_is_on_for_a_page_nobody_configured(
     # And for a page that does not exist at all: not frozen, because there is
     # nothing there to freeze.
     assert (
-        await persistence.fetch_page_pipeline_updates(CUSTOMER, "runbook", "no-such-page")
-        is True
+        await persistence.fetch_page_pipeline_updates(CUSTOMER, "runbook", "no-such-page") is True
     )
 
 
@@ -1381,23 +1374,18 @@ async def test_generation_can_be_turned_on_and_back_off(
     the wrong key, and every one of those reads back correctly through its own
     response while the nightly trigger sees nothing.
     """
-    on = await client.put(
-        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
-    )
+    on = await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
     assert on.status_code == 200, on.text
     assert on.json()["generation_enabled"] is True
 
     async with raw_conn() as conn:
         stored = await conn.fetchval(
-            "SELECT preferences->>'wiki_generation_enabled' FROM customers "
-            "WHERE customer_id = $1",
+            "SELECT preferences->>'wiki_generation_enabled' FROM customers WHERE customer_id = $1",
             CUSTOMER,
         )
     assert stored == "true", "the pipeline compares this to the STRING 'true'"
 
-    off = await client.put(
-        "/api/wiki/settings", json={"generation_enabled": False}, headers=_hdr()
-    )
+    off = await client.put("/api/wiki/settings", json={"generation_enabled": False}, headers=_hdr())
     assert off.status_code == 200, off.text
     assert off.json()["generation_enabled"] is False
     assert (await client.get("/api/wiki/settings", headers=_hdr())).json()[
@@ -1418,14 +1406,12 @@ async def test_turning_generation_on_preserves_other_preferences(
     """
     async with raw_conn() as conn:
         await conn.execute(
-            "UPDATE customers SET preferences = '{\"keep_me\": \"yes\"}'::jsonb "
+            'UPDATE customers SET preferences = \'{"keep_me": "yes"}\'::jsonb '
             "WHERE customer_id = $1",
             CUSTOMER,
         )
 
-    await client.put(
-        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
-    )
+    await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
 
     async with raw_conn() as conn:
         kept = await conn.fetchval(
@@ -1453,16 +1439,13 @@ async def test_turning_generation_on_works_from_the_default_preferences(
             CUSTOMER,
         )
 
-    resp = await client.put(
-        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
-    )
+    resp = await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["generation_enabled"] is True
     async with raw_conn() as conn:
         stored = await conn.fetchval(
-            "SELECT preferences->>'wiki_generation_enabled' FROM customers "
-            "WHERE customer_id = $1",
+            "SELECT preferences->>'wiki_generation_enabled' FROM customers WHERE customer_id = $1",
             CUSTOMER,
         )
     assert stored == "true"
@@ -1548,9 +1531,7 @@ async def test_two_concurrent_appends_both_survive(client: httpx.AsyncClient) ->
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
 
-    body = (
-        await client.get("/api/wiki/pages/runbook/concurrent", headers=_hdr())
-    ).json()["body"]
+    body = (await client.get("/api/wiki/pages/runbook/concurrent", headers=_hdr())).json()["body"]
     assert "first agent" in body
     assert "second agent" in body
 
@@ -1568,14 +1549,10 @@ async def test_replaying_an_idempotency_key_appends_nothing(
     for.
     """
     payload = {"text": "only once", "idempotency_key": "retry-me"}
-    first = await client.post(
-        "/api/wiki/pages/runbook/idem/append", json=payload, headers=_hdr()
-    )
+    first = await client.post("/api/wiki/pages/runbook/idem/append", json=payload, headers=_hdr())
     assert first.status_code == 200, first.text
 
-    second = await client.post(
-        "/api/wiki/pages/runbook/idem/append", json=payload, headers=_hdr()
-    )
+    second = await client.post("/api/wiki/pages/runbook/idem/append", json=payload, headers=_hdr())
     assert second.status_code == 200, second.text
     assert second.json()["replayed"] is True
     assert second.json()["version"] == first.json()["version"]
@@ -1673,9 +1650,7 @@ async def test_append_after_a_delete_starts_a_new_page(client: httpx.AsyncClient
         headers=_hdr(),
     )
     assert (
-        await client.delete(
-            "/api/wiki/pages/runbook/deleted-then-appended", headers=_hdr()
-        )
+        await client.delete("/api/wiki/pages/runbook/deleted-then-appended", headers=_hdr())
     ).status_code == 200
 
     resp = await client.post(
@@ -1687,9 +1662,7 @@ async def test_append_after_a_delete_starts_a_new_page(client: httpx.AsyncClient
     assert resp.json()["created"] is True
 
     body = (
-        await client.get(
-            "/api/wiki/pages/runbook/deleted-then-appended", headers=_hdr()
-        )
+        await client.get("/api/wiki/pages/runbook/deleted-then-appended", headers=_hdr())
     ).json()["body"]
     assert "written after the delete" in body
     assert "secret that was deleted on purpose" not in body
@@ -1781,6 +1754,7 @@ async def test_reusing_a_key_with_different_text_is_a_409_not_a_silent_drop(
     assert "the original decision" in body
     assert "a DIFFERENT decision" not in body
 
+
 # Settings toggle → catchup seed (the off→on transition)
 # ---------------------------------------------------------------------------
 
@@ -1792,8 +1766,7 @@ async def _insert_live_doc(doc_id: str) -> None:
 async def _pending_docs() -> set[str]:
     async with raw_conn() as conn:
         rows = await conn.fetch(
-            "SELECT doc_id FROM wiki_synthesis_queue "
-            "WHERE customer_id = $1 AND status = 'pending'",
+            "SELECT doc_id FROM wiki_synthesis_queue WHERE customer_id = $1 AND status = 'pending'",
             CUSTOMER,
         )
     return {r["doc_id"] for r in rows}
@@ -1813,9 +1786,7 @@ async def test_turning_generation_on_seeds_the_existing_corpus(
     """
     await _insert_live_doc("doc:before-flip")
 
-    resp = await client.put(
-        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
-    )
+    resp = await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
     assert resp.status_code == 200, resp.text
     assert resp.json()["catchup_started"] is True
     assert await _pending_docs() == {"doc:before-flip"}
@@ -1866,16 +1837,13 @@ async def test_seed_failure_does_not_break_the_put(
 
     monkeypatch.setattr(persistence, "seed_missing_docs", exploding_seed)
 
-    resp = await client.put(
-        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
-    )
+    resp = await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
     assert resp.status_code == 200, resp.text
     assert resp.json()["catchup_started"] is True
 
     async with raw_conn() as conn:
         stored = await conn.fetchval(
-            "SELECT preferences->>'wiki_generation_enabled' FROM customers "
-            "WHERE customer_id = $1",
+            "SELECT preferences->>'wiki_generation_enabled' FROM customers WHERE customer_id = $1",
             CUSTOMER,
         )
     assert stored == "true"
@@ -1926,6 +1894,7 @@ async def test_reenabling_wakes_the_worker_even_with_nothing_new_to_seed(
         await listener.close()
 
     assert CUSTOMER in received
+
 
 # ---------------------------------------------------------------------------
 # Backfill trigger → queue reseed + preview (PR: rebuild recovers all sources)
@@ -1985,9 +1954,7 @@ async def test_backfill_trigger_reseeds_the_daily_pipeline(
     await _terminal_queue_row("doc:done", status="done")
     await _compiled_page("wiki:page:old")
 
-    resp = await client.post(
-        "/api/wiki/backfill/trigger", json={}, headers=_hdr()
-    )
+    resp = await client.post("/api/wiki/backfill/trigger", json={}, headers=_hdr())
     assert resp.status_code == 202, resp.text
     data = resp.json()
     assert data["eligible_documents"] == 2
@@ -1999,14 +1966,29 @@ async def test_backfill_trigger_reseeds_the_daily_pipeline(
         "doc:unqueued": "pending",
         "doc:done": "pending",
     }
-    # And the wipe still happened.
+    # And the wipe still happened -- as a RETIRE, not a delete.
+    #
+    # The distinction is the point. To every reader the wiki is just as empty:
+    # each page read path filters `valid_to IS NULL`, so a retired page is as
+    # gone as a deleted one. What survives is the version history that
+    # `GET /v1/wiki/pages/{type}/{slug}/versions` and `POST .../revert` are
+    # built on, and that `_restore_retired_pages` needs to undo a rebuild.
     async with raw_conn() as conn:
-        wiped = await conn.fetchval(
+        live = await conn.fetchval(
             "SELECT count(*) FROM documents "
-            "WHERE customer_id = $1 AND doc_class = 'compiled_wiki'",
+            "WHERE customer_id = $1 AND doc_class = 'compiled_wiki' "
+            "AND valid_to IS NULL",
             CUSTOMER,
         )
-    assert wiped == 0
+        history = await conn.fetchval(
+            "SELECT count(*) FROM documents WHERE customer_id = $1 AND doc_class = 'compiled_wiki'",
+            CUSTOMER,
+        )
+    assert live == 0, "the wiki must read as empty after a wipe"
+    assert history > 0, (
+        "retired versions must survive -- deleting them is what made a failed "
+        "rebuild unrecoverable and broke page history"
+    )
 
 
 @pytest.mark.asyncio
@@ -2046,20 +2028,15 @@ async def test_backfill_trigger_failure_after_wipe_rolls_everything_back(
     async def exploding_insert(conn, *, customer_id, sources):
         raise RuntimeError("boom after wipe")
 
-    monkeypatch.setattr(
-        wiki_routes_module, "_insert_pending_runs", exploding_insert
-    )
+    monkeypatch.setattr(wiki_routes_module, "_insert_pending_runs", exploding_insert)
 
     with pytest.raises(RuntimeError, match="boom after wipe"):
-        await client.post(
-            "/api/wiki/backfill/trigger", json={}, headers=_hdr()
-        )
+        await client.post("/api/wiki/backfill/trigger", json={}, headers=_hdr())
 
     # Nothing committed: page survives, queue still empty, no run rows.
     async with raw_conn() as conn:
         pages = await conn.fetchval(
-            "SELECT count(*) FROM documents "
-            "WHERE customer_id = $1 AND doc_class = 'compiled_wiki'",
+            "SELECT count(*) FROM documents WHERE customer_id = $1 AND doc_class = 'compiled_wiki'",
             CUSTOMER,
         )
         runs = await conn.fetchval(
@@ -2106,7 +2083,139 @@ async def test_backfill_preview_reports_counts_and_writes_nothing(
 async def test_backfill_preview_requires_internal_key(
     client: httpx.AsyncClient,
 ) -> None:
-    resp = await client.get(
-        "/api/wiki/backfill/preview", headers={"X-Prbe-Customer": CUSTOMER}
-    )
+    resp = await client.get("/api/wiki/backfill/preview", headers={"X-Prbe-Customer": CUSTOMER})
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Undo: the recovery path that retiring (rather than deleting) makes possible.
+# ---------------------------------------------------------------------------
+
+
+async def _live_pages() -> set[str]:
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            "SELECT doc_id FROM documents "
+            "WHERE customer_id = $1 AND doc_class = 'compiled_wiki' "
+            "AND valid_to IS NULL",
+            CUSTOMER,
+        )
+    return {r["doc_id"] for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_undo_restores_pages_the_rebuild_never_rederived(
+    client: httpx.AsyncClient, _stub_bootstrap_registry: None
+) -> None:
+    """The case the whole retire-instead-of-delete change exists for.
+
+    A rebuild retires every page and then re-derives them from the queue. But
+    re-derivation is not guaranteed to give back what was there: a replayed row
+    re-enters at TRIAGE, which is a scoring gate that legitimately rejects. So
+    a rebuild can genuinely end with fewer pages than it started with. When the
+    wipe deleted, those pages were gone for good and the only 'recovery' was to
+    run the rebuild again and hope.
+    """
+    await _compiled_page("wiki:runbook:alpha")
+    await _compiled_page("wiki:runbook:beta")
+    assert await _live_pages() == {"wiki:runbook:alpha", "wiki:runbook:beta"}
+
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger", json={"sources": ["github"]}, headers=_hdr()
+    )
+    assert resp.status_code == 202, resp.text
+    assert await _live_pages() == set(), "the wipe must leave the wiki reading empty"
+
+    undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
+    assert undo.status_code == 200, undo.text
+    body = undo.json()
+    assert body["undone"] is True
+    assert body["restored_pages"] == 2
+    assert await _live_pages() == {"wiki:runbook:alpha", "wiki:runbook:beta"}
+
+
+@pytest.mark.asyncio
+async def test_undo_leaves_pages_the_rebuild_already_rebuilt(
+    client: httpx.AsyncClient, _stub_bootstrap_registry: None
+) -> None:
+    """Undo must not resurrect a predecessor underneath a rebuilt page.
+
+    Two live versions of one doc would break every `valid_to IS NULL` read in
+    the engine -- which is most of them -- and the page would then render
+    whichever row the planner happened to return first.
+    """
+    await _compiled_page("wiki:runbook:alpha")
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger", json={"sources": ["github"]}, headers=_hdr()
+    )
+    assert resp.status_code == 202, resp.text
+
+    # Stand in for the rebuild re-deriving the page: a fresh live version.
+    async with with_tenant(CUSTOMER) as conn:
+        await conn.execute(
+            """
+            INSERT INTO documents
+                (doc_id, version, customer_id, source_system, source_id,
+                 source_url, doc_class, doc_type, content_hash, created_at,
+                 updated_at, valid_from, acl)
+            VALUES ($1, 2, $2, 'wiki', $1, '/wiki/x', 'compiled_wiki',
+                    'wiki.page', 'hash-rebuilt', NOW(), NOW(), NOW(), '{}'::jsonb)
+            """,
+            "wiki:runbook:alpha",
+            CUSTOMER,
+        )
+
+    undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
+    assert undo.status_code == 200, undo.text
+    assert undo.json()["restored_pages"] == 0
+
+    async with raw_conn() as conn:
+        live = await conn.fetch(
+            "SELECT version FROM documents "
+            "WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL",
+            CUSTOMER,
+            "wiki:runbook:alpha",
+        )
+    assert [r["version"] for r in live] == [2], "exactly one live version, the rebuilt one"
+
+
+@pytest.mark.asyncio
+async def test_undo_cancels_the_runs_still_in_flight(
+    client: httpx.AsyncClient, _stub_bootstrap_registry: None
+) -> None:
+    """Open runs are closed before the restore, not after.
+
+    A crawler that committed a page between the restore and the response would
+    leave the operator looking at a wiki they just asked to put back.
+    """
+    resp = await client.post(
+        "/api/wiki/bootstrap/trigger", json={"sources": ["github"]}, headers=_hdr()
+    )
+    assert resp.status_code == 202, resp.text
+    opened = resp.json()["run_ids"]
+
+    undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
+    assert undo.status_code == 200, undo.text
+    assert sorted(undo.json()["cancelled_run_ids"]) == sorted(opened)
+
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            "SELECT status, error FROM wiki_synthesis_runs "
+            "WHERE customer_id = $1 AND kind = 'bootstrap'",
+            CUSTOMER,
+        )
+    assert {r["status"] for r in rows} == {"cancelled"}
+    assert all("undone by admin" in (r["error"] or "") for r in rows)
+
+
+@pytest.mark.asyncio
+async def test_undo_with_no_rebuild_is_a_no_op_not_an_error(
+    client: httpx.AsyncClient,
+) -> None:
+    """Idempotent, so a double-click and a stale dashboard both behave."""
+    await _compiled_page("wiki:runbook:alpha")
+
+    undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
+    assert undo.status_code == 200, undo.text
+    assert undo.json()["restored_pages"] == 0
+    assert await _live_pages() == {"wiki:runbook:alpha"}

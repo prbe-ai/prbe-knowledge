@@ -1231,9 +1231,7 @@ async def get_wiki_page(
         # tenant GUC.
         body = await fetch_live_body_from_chunks(conn, customer_id, doc_id)
 
-    pipeline_updates = await persistence.fetch_page_pipeline_updates(
-        customer_id, wiki_type, slug
-    )
+    pipeline_updates = await persistence.fetch_page_pipeline_updates(customer_id, wiki_type, slug)
     metadata = _coerce_metadata(row["metadata"])
     return WikiPageResponse(
         doc_id=row["doc_id"],
@@ -1624,13 +1622,10 @@ async def get_wiki_generation_settings(
     """
     async with with_tenant(customer_id) as conn:
         raw = await conn.fetchval(
-            "SELECT preferences->>'wiki_generation_enabled' FROM customers "
-            "WHERE customer_id = $1",
+            "SELECT preferences->>'wiki_generation_enabled' FROM customers WHERE customer_id = $1",
             customer_id,
         )
-    return WikiGenerationSettingsResponse(
-        customer_id=customer_id, generation_enabled=raw == "true"
-    )
+    return WikiGenerationSettingsResponse(customer_id=customer_id, generation_enabled=raw == "true")
 
 
 @router.put(
@@ -1840,9 +1835,7 @@ async def get_wiki_index(
         # latest agent run produced (intro + Mermaid diagram + LLM-
         # organized sections).
         async with with_tenant(customer_id) as conn:
-            body_text = await fetch_live_body_from_chunks(
-                conn, customer_id, index_doc_id
-            )
+            body_text = await fetch_live_body_from_chunks(conn, customer_id, index_doc_id)
         return WikiIndexResponse(
             body=body_text,
             entries=entries,
@@ -2263,9 +2256,8 @@ async def _wipe_wiki_for_customer(conn: asyncpg.Connection, customer_id: str) ->
       - ``wiki_links``                 (no RLS — explicit WHERE)
       - ``wiki_timeline_entries``      (no RLS — explicit WHERE)
       - ``wiki_raw_data``              (no RLS — explicit WHERE)
-      - ``documents`` rows with doc_class='compiled_wiki'
-        (RLS — but the trigger route binds ``app.current_customer_id``
-        on this conn before calling).
+      - ``documents`` rows with doc_class='compiled_wiki' are RETIRED,
+        not deleted (``valid_to = NOW()``). See below.
 
     NOT wiped:
       - ``documents`` rows with doc_class='manual_entry' (human-authored).
@@ -2294,6 +2286,38 @@ async def _wipe_wiki_for_customer(conn: asyncpg.Connection, customer_id: str) ->
     or CLI --reset-terminal). Rare enough (rebuilds are rare, drains
     short) that a drain fence isn't worth its coupling — revisit if
     rebuild frequency ever changes.
+
+    RETIRE, NOT DELETE
+    ------------------
+    `documents` is bitemporal — the primary key is
+    (customer_id, doc_id, version) and "live" means `valid_to IS NULL`.
+    Superseding a page by closing out its version is what the normalizer
+    already does on every ordinary write (normalizer.py). A DELETE is the
+    one operation that discards what that model gives us.
+
+    It is not free to discard. `GET /v1/wiki/pages/{type}/{slug}/versions`
+    and `POST .../revert` are shipped features reading exactly this
+    history, so deleting compiled pages destroys page history and revert
+    for every page a rebuild touches.
+
+    Retiring is INDISTINGUISHABLE from deleting to every reader — all the
+    page read paths already filter `valid_to IS NULL`, so the wiki empties
+    exactly as before — while leaving the prior versions on disk. That is
+    what makes a rebuild recoverable: `_restore_retired_pages` puts back
+    any page the rebuild retired and never got around to re-deriving,
+    which matters because re-derivation is not guaranteed to reproduce
+    what was there. A replayed row re-enters at TRIAGE, and triage is a
+    scoring gate that legitimately rejects — so a rebuild can end with
+    fewer pages than it started with, and before this change those pages
+    were gone for good.
+
+    The three sidecars ARE still deleted: they carry no version history,
+    are pure derivations of the page body, and are rewritten by
+    `parse_page_links` on the next write of that page. A restored page
+    therefore comes back with its body and history but an empty link
+    graph until it is next written — noted rather than solved, because
+    the alternative is versioning three more tables for a case that only
+    arises on an abandoned rebuild.
     """
     await conn.execute(
         "DELETE FROM wiki_links WHERE customer_id = $1",
@@ -2309,14 +2333,140 @@ async def _wipe_wiki_for_customer(conn: asyncpg.Connection, customer_id: str) ->
     )
     # documents has RLS — the GUC bound on this conn powers the policy.
     # The explicit WHERE customer_id is defense-in-depth.
+    #
+    # `valid_to IS NULL` in the predicate keeps this idempotent: a second
+    # wipe must not re-stamp versions an earlier one already closed, or the
+    # restore boundary would sweep up history that predates this rebuild.
     await conn.execute(
         """
-        DELETE FROM documents
-        WHERE customer_id = $1
-          AND doc_class = 'compiled_wiki'
+        UPDATE documents
+           SET valid_to = NOW()
+         WHERE customer_id = $1
+           AND doc_class = 'compiled_wiki'
+           AND valid_to IS NULL
         """,
         customer_id,
     )
+
+
+async def _restore_retired_pages(conn: asyncpg.Connection, customer_id: str) -> int:
+    """Put back pages the last rebuild retired and never re-derived.
+
+    Only reachable because the wipe retires instead of deleting. Restores a
+    page only when the document has NO live version right now — a page the
+    rebuild successfully rewrote keeps the rebuild's version, and un-retiring
+    its predecessor underneath would leave two live versions of one doc and
+    break every `valid_to IS NULL` read in the engine.
+
+    Bounded by the rebuild's own start so an undo cannot resurrect pages
+    retired by something else — an ordinary edit, an earlier rebuild — that
+    were meant to stay closed. The 60s slack mirrors the window
+    `_do_get_wiki_backfill_status` uses to group one trigger's runs, since the
+    per-source rows are inserted in a burst rather than at one instant.
+
+    Returns the number of pages restored. Zero is a normal answer: it means
+    the rebuild had already re-derived everything it retired.
+    """
+    anchor = await conn.fetchval(
+        """
+        SELECT min(started_at) FROM wiki_synthesis_runs
+         WHERE customer_id = $1
+           AND kind = 'bootstrap'
+           AND started_at >= (
+               SELECT max(started_at) - INTERVAL '60 seconds'
+                 FROM wiki_synthesis_runs
+                WHERE customer_id = $1 AND kind = 'bootstrap'
+           )
+        """,
+        customer_id,
+    )
+    if anchor is None:
+        return 0
+    rows = await conn.fetch(
+        """
+        UPDATE documents d
+           SET valid_to = NULL
+         WHERE d.customer_id = $1
+           AND d.doc_class = 'compiled_wiki'
+           AND d.valid_to >= $2
+           AND NOT EXISTS (
+               SELECT 1 FROM documents live
+                WHERE live.customer_id = d.customer_id
+                  AND live.doc_id = d.doc_id
+                  AND live.valid_to IS NULL
+           )
+           AND d.version = (
+               SELECT max(d2.version) FROM documents d2
+                WHERE d2.customer_id = d.customer_id
+                  AND d2.doc_id = d.doc_id
+           )
+        RETURNING d.doc_id
+        """,
+        customer_id,
+        anchor,
+    )
+    return len(rows)
+
+
+class BackfillUndoResponse(BaseModel):
+    """What an undo answers.
+
+    `restored_pages` counts pages put back. Zero is normal and does not mean
+    failure — a rebuild that finished re-deriving everything it touched has
+    nothing to put back.
+    """
+
+    undone: bool = True
+    restored_pages: int = 0
+    cancelled_run_ids: list[int] = []
+
+
+async def _do_undo_wiki_backfill(customer_id: str) -> BackfillUndoResponse:
+    """Abandon the rebuild in flight and restore what it retired.
+
+    The way out of a rebuild that is not going to finish, or is finishing
+    worse than what it replaced. Before the wipe retired rather than deleted
+    there was nothing to offer here: the pages were gone, so the only recovery
+    was to run the rebuild again and hope.
+
+    Cancels open runs first so a crawler cannot write a page in between the
+    restore and the response, and clears the reseeded queue rows for the same
+    reason — leaving them pending would have the synthesis pipeline carry on
+    rebuilding a wiki the operator just asked to put back.
+    """
+    async with with_tenant(customer_id) as conn, conn.transaction():
+        rows = await conn.fetch(
+            """
+            UPDATE wiki_synthesis_runs
+               SET status = 'cancelled',
+                   finished_at = NOW(),
+                   error = COALESCE(error, '')
+                       || (CASE WHEN error IS NULL OR error = '' THEN '' ELSE ' | ' END)
+                       || 'undone by admin'
+             WHERE customer_id = $1
+               AND kind = 'bootstrap'
+               AND status = ANY($2::text[])
+            RETURNING run_id
+            """,
+            customer_id,
+            list(_IN_FLIGHT_STATUSES),
+        )
+        cancelled = [int(r["run_id"]) for r in rows]
+        if cancelled:
+            await conn.execute(
+                "SELECT pg_notify($1, $2)",
+                WIKI_BACKFILL_CANCEL_CHANNEL,
+                orjson.dumps({"customer_id": customer_id, "run_ids": cancelled}).decode("utf-8"),
+            )
+        restored = await _restore_retired_pages(conn, customer_id)
+
+    log.info(
+        "wiki.backfill.undone",
+        customer=customer_id,
+        restored_pages=restored,
+        cancelled_run_ids=cancelled or None,
+    )
+    return BackfillUndoResponse(undone=True, restored_pages=restored, cancelled_run_ids=cancelled)
 
 
 async def _insert_pending_runs(
@@ -2385,9 +2535,7 @@ async def _do_trigger_wiki_backfill(
         # trigger lock and the BFF's client timeout is 20s total; see
         # WIKI_REBUILD_STATEMENT_TIMEOUT_MS for why failing fast (whole
         # txn, wipe included, rolled back) beats an orphaned commit.
-        await conn.execute(
-            f"SET LOCAL statement_timeout = {WIKI_REBUILD_STATEMENT_TIMEOUT_MS}"
-        )
+        await conn.execute(f"SET LOCAL statement_timeout = {WIKI_REBUILD_STATEMENT_TIMEOUT_MS}")
 
         in_flight = await _get_in_flight_runs(conn, customer_id)
         if in_flight and not force:
@@ -2462,11 +2610,7 @@ async def _do_trigger_wiki_backfill(
         # parked — their reasons deserve a human read, and the CLI's
         # --include-dlq is the explicit redrive.
         eligible, seeded = await persistence.seed_missing_docs(conn, customer_id)
-        reset = (
-            await persistence.reset_terminal_rows(conn, customer_id)
-            if body.wipe_first
-            else 0
-        )
+        reset = await persistence.reset_terminal_rows(conn, customer_id) if body.wipe_first else 0
 
         run_ids_map = await _insert_pending_runs(
             conn,
@@ -2618,12 +2762,8 @@ async def preview_wiki_backfill(
     """Scale preview for the rebuild confirmation dialog. Counts only —
     writes nothing, opens no runs, fires no notifies."""
     async with with_tenant(customer_id) as conn, conn.transaction():
-        await conn.execute(
-            f"SET LOCAL statement_timeout = {WIKI_REBUILD_STATEMENT_TIMEOUT_MS}"
-        )
-        eligible, would_seed = await persistence.count_seedable_docs(
-            conn, customer_id
-        )
+        await conn.execute(f"SET LOCAL statement_timeout = {WIKI_REBUILD_STATEMENT_TIMEOUT_MS}")
+        eligible, would_seed = await persistence.count_seedable_docs(conn, customer_id)
         would_reset = await persistence.count_resettable_rows(conn, customer_id)
         compiled_pages = await conn.fetchval(
             """
@@ -2675,6 +2815,23 @@ async def trigger_wiki_bootstrap(
     return await _do_trigger_wiki_backfill(body, customer_id, force)
 
 
+@router.post(
+    "/backfill/undo",
+    response_model=BackfillUndoResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+    description=(
+        "Abandon the rebuild in flight and restore the pages it retired but "
+        "never re-derived. Idempotent; restores nothing when the rebuild "
+        "already finished re-deriving what it touched."
+    ),
+)
+async def undo_wiki_backfill(
+    customer_id: str = Depends(_require_customer),
+) -> BackfillUndoResponse:
+    """Undo the current rebuild."""
+    return await _do_undo_wiki_backfill(customer_id)
+
+
 @router.get(
     "/backfill/status",
     response_model=BackfillStatusResponse,
@@ -2697,5 +2854,3 @@ async def get_wiki_bootstrap_status(
 ) -> BackfillStatusResponse:
     """Legacy alias for ``GET /api/wiki/backfill/status``."""
     return await _do_get_wiki_backfill_status(customer_id)
-
-
