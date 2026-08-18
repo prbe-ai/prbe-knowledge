@@ -81,6 +81,7 @@ from engine.shared.constants import (
     WIKI_DOC_TYPE_PREFIX,
     WIKI_INDEX_DOC_TYPE,
     WIKI_PENDING_CHANNEL,
+    WIKI_REBUILD_STATEMENT_TIMEOUT_MS,
     WIKI_RECONCILE_SEED_BATCH,
     DocClass,
     SourceSystem,
@@ -2129,7 +2130,9 @@ async def reset_wiki_synthesis_dlq(
 #
 # Both /api/wiki/backfill/* and the legacy /api/wiki/bootstrap/* aliases
 # share the same handler logic via _do_trigger_wiki_backfill /
-# _do_get_wiki_backfill_status. The DB value `kind='bootstrap'` and the
+# _do_get_wiki_backfill_status. (GET /backfill/preview has NO bootstrap
+# alias by design: the aliases exist for consumers shipped against the
+# old names, and no shipped consumer predates the preview.) The DB value `kind='bootstrap'` and the
 # fly app name stay unchanged for now; only the public surface, Python
 # identifiers, and structlog events are renamed.
 # ---------------------------------------------------------------------------
@@ -2158,6 +2161,38 @@ class BackfillTriggerResponse(BaseModel):
 
     triggered: bool = True
     run_ids: list[int]
+    # Reseed counts from the same transaction: how many live eligible
+    # docs exist, how many queue rows the seed inserted, and how many
+    # terminal rows were reset for re-synthesis. The dashboard surfaces
+    # these so an admin sees the scale of what they just started.
+    eligible_documents: int = 0
+    seeded: int = 0
+    reset: int = 0
+
+
+class BackfillPreviewResponse(BaseModel):
+    """Read-only scale preview for the rebuild confirmation dialog.
+
+    Counts only — no writes, no run rows, no notifies. `would_seed` /
+    `would_reset` use the same eligibility SQL as the trigger itself, so
+    for the DEFAULT wipe_first=true rebuild the numbers the admin
+    confirms are the numbers the trigger produces (modulo docs ingested
+    between preview and click — the trigger recomputes; a
+    wipe_first=false trigger resets nothing, so its `reset` is 0
+    regardless of `would_reset`). The dialog should present these as
+    counts, not as a duration: synthesis is serial per tenant and its
+    rate varies more than 10x day to day, so any minutes-estimate would
+    be invented.
+    """
+
+    customer_id: str
+    eligible_documents: int
+    would_seed: int
+    would_reset: int
+    # LIVE compiled pages — what a reader sees today and what disappears
+    # at the wipe. (The wipe's DELETE also clears historical compiled
+    # versions; the live count is the honest number for the dialog.)
+    compiled_pages: int
 
 
 class BackfillStatusResponse(BaseModel):
@@ -2238,8 +2273,27 @@ async def _wipe_wiki_for_customer(conn: asyncpg.Connection, customer_id: str) ->
         generated wiki index — bootstrap regenerates this on first
         commit; leaving the prior version in place keeps the dashboard
         from flashing empty).
-      - ``wiki_synthesis_queue`` (untouched — daily replay handles it
-        via the bootstrap_absorbed marker; locked decision #3).
+      - ``wiki_synthesis_queue`` rows themselves (no deletes) — but the
+        trigger reseeds the queue in this same transaction right after
+        the wipe: seed_missing_docs fills gaps and reset_terminal_rows
+        flips previously-synthesized rows back to pending so the daily
+        pipeline re-derives every page from `documents`. Crawlers only
+        cover sources with registered agents (today: github); without
+        the reseed, pages derived from every other source — transcripts,
+        custom ingest — would never come back after a wipe. (This
+        supersedes the earlier "daily replay via the bootstrap_absorbed
+        marker" note: the daily loop ignores terminal rows, so 'done'
+        rows never replayed on their own.)
+
+    In-flight triage/synthesis finishing AFTER the wipe is fine: their
+    output derives from `documents`, which survives, so a post-wipe
+    write is valid regenerated content, not stale state — no fence
+    needed. One narrow residual: a row whose synthesizing→done flip
+    commits after this txn's reset statement ran ends 'done' with its
+    page wiped; that document sits out until the next reseed (rebuild
+    or CLI --reset-terminal). Rare enough (rebuilds are rare, drains
+    short) that a drain fence isn't worth its coupling — revisit if
+    rebuild frequency ever changes.
     """
     await conn.execute(
         "DELETE FROM wiki_links WHERE customer_id = $1",
@@ -2327,6 +2381,13 @@ async def _do_trigger_wiki_backfill(
     # contention with crawls already in flight.
     async with with_tenant(customer_id) as conn:
         await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
+        # Bound every statement in this txn — it holds the per-customer
+        # trigger lock and the BFF's client timeout is 20s total; see
+        # WIKI_REBUILD_STATEMENT_TIMEOUT_MS for why failing fast (whole
+        # txn, wipe included, rolled back) beats an orphaned commit.
+        await conn.execute(
+            f"SET LOCAL statement_timeout = {WIKI_REBUILD_STATEMENT_TIMEOUT_MS}"
+        )
 
         in_flight = await _get_in_flight_runs(conn, customer_id)
         if in_flight and not force:
@@ -2392,6 +2453,21 @@ async def _do_trigger_wiki_backfill(
         if body.wipe_first:
             await _wipe_wiki_for_customer(conn, customer_id)
 
+        # Reseed the daily pipeline in the SAME transaction as the wipe:
+        # the wipe and its recovery path commit or roll back together, so
+        # a failure after the deletes can never strand a blank wiki. The
+        # seed fills queue gaps for docs no crawler covers; the terminal
+        # reset (wipe path only — without a wipe the existing pages still
+        # stand) re-derives previously-synthesized content. dlq rows stay
+        # parked — their reasons deserve a human read, and the CLI's
+        # --include-dlq is the explicit redrive.
+        eligible, seeded = await persistence.seed_missing_docs(conn, customer_id)
+        reset = (
+            await persistence.reset_terminal_rows(conn, customer_id)
+            if body.wipe_first
+            else 0
+        )
+
         run_ids_map = await _insert_pending_runs(
             conn,
             customer_id=customer_id,
@@ -2404,6 +2480,14 @@ async def _do_trigger_wiki_backfill(
             "SELECT pg_notify($1, '')",
             WIKI_BACKFILL_CHANNEL,
         )
+        # And wake the daily pipeline for the reseeded rows — delivered
+        # on COMMIT, so the wiki-worker cannot observe pre-reseed state.
+        if seeded or reset:
+            await conn.execute(
+                "SELECT pg_notify($1, $2)",
+                WIKI_PENDING_CHANNEL,
+                customer_id,
+            )
 
     log.info(
         "wiki.backfill.trigger",
@@ -2414,10 +2498,16 @@ async def _do_trigger_wiki_backfill(
         force=force,
         run_ids=run_ids_map,
         cancelled_run_ids=cancelled_ids or None,
+        eligible_documents=eligible,
+        seeded=seeded,
+        reset=reset,
     )
     return BackfillTriggerResponse(
         triggered=True,
         run_ids=[run_ids_map[s] for s in sources],
+        eligible_documents=eligible,
+        seeded=seeded,
+        reset=reset,
     )
 
 
@@ -2515,6 +2605,44 @@ _FORCE_QUERY = Query(
         "fresh one. Without force, an in-flight run returns 409."
     ),
 )
+
+
+@router.get(
+    "/backfill/preview",
+    response_model=BackfillPreviewResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def preview_wiki_backfill(
+    customer_id: str = Depends(_require_customer),
+) -> BackfillPreviewResponse:
+    """Scale preview for the rebuild confirmation dialog. Counts only —
+    writes nothing, opens no runs, fires no notifies."""
+    async with with_tenant(customer_id) as conn, conn.transaction():
+        await conn.execute(
+            f"SET LOCAL statement_timeout = {WIKI_REBUILD_STATEMENT_TIMEOUT_MS}"
+        )
+        eligible, would_seed = await persistence.count_seedable_docs(
+            conn, customer_id
+        )
+        would_reset = await persistence.count_resettable_rows(conn, customer_id)
+        compiled_pages = await conn.fetchval(
+            """
+            SELECT count(*) FROM documents
+            WHERE customer_id = $1
+              AND doc_class = $2
+              AND valid_to IS NULL
+              AND deleted_at IS NULL
+            """,
+            customer_id,
+            DocClass.COMPILED_WIKI.value,
+        )
+    return BackfillPreviewResponse(
+        customer_id=customer_id,
+        eligible_documents=eligible,
+        would_seed=would_seed,
+        would_reset=would_reset,
+        compiled_pages=int(compiled_pages or 0),
+    )
 
 
 @router.post(

@@ -1926,3 +1926,187 @@ async def test_reenabling_wakes_the_worker_even_with_nothing_new_to_seed(
         await listener.close()
 
     assert CUSTOMER in received
+
+# ---------------------------------------------------------------------------
+# Backfill trigger → queue reseed + preview (PR: rebuild recovers all sources)
+# ---------------------------------------------------------------------------
+
+
+async def _terminal_queue_row(doc_id: str, status: str = "done") -> None:
+    async with raw_conn() as conn:
+        await conn.execute(
+            """
+            INSERT INTO wiki_synthesis_queue
+                (customer_id, doc_id, doc_version, source_system, doc_type,
+                 status, triage_score, attempts)
+            VALUES ($1, $2, 1, 'slack', 'slack.message', $3, 0.9, 2)
+            """,
+            CUSTOMER,
+            doc_id,
+            status,
+        )
+
+
+async def _compiled_page(doc_id: str) -> None:
+    async with with_tenant(CUSTOMER) as conn:
+        await conn.execute(
+            """
+            INSERT INTO documents
+                (doc_id, version, customer_id, source_system, source_id,
+                 source_url, doc_class, doc_type, content_hash, created_at,
+                 updated_at, valid_from, acl)
+            VALUES ($1, 1, $2, 'wiki', $1, '/wiki/x', 'compiled_wiki',
+                    'wiki.page', $3, NOW(), NOW(), NOW(), '{}'::jsonb)
+            """,
+            doc_id,
+            CUSTOMER,
+            f"hash-{doc_id}",
+        )
+
+
+async def _queue_state() -> dict[str, str]:
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            "SELECT doc_id, status FROM wiki_synthesis_queue WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    return {r["doc_id"]: r["status"] for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_backfill_trigger_reseeds_the_daily_pipeline(
+    client: httpx.AsyncClient,
+) -> None:
+    """The wipe's recovery path: crawlers only cover registered sources,
+    so the trigger must seed missing docs and reset terminal rows in the
+    same transaction — otherwise transcript-derived pages never return."""
+    await _insert_live_doc("doc:unqueued")
+    await _insert_live_doc("doc:done")
+    await _terminal_queue_row("doc:done", status="done")
+    await _compiled_page("wiki:page:old")
+
+    resp = await client.post(
+        "/api/wiki/backfill/trigger", json={}, headers=_hdr()
+    )
+    assert resp.status_code == 202, resp.text
+    data = resp.json()
+    assert data["eligible_documents"] == 2
+    assert data["seeded"] == 1
+    assert data["reset"] == 1
+    assert data["run_ids"]
+
+    assert await _queue_state() == {
+        "doc:unqueued": "pending",
+        "doc:done": "pending",
+    }
+    # And the wipe still happened.
+    async with raw_conn() as conn:
+        wiped = await conn.fetchval(
+            "SELECT count(*) FROM documents "
+            "WHERE customer_id = $1 AND doc_class = 'compiled_wiki'",
+            CUSTOMER,
+        )
+    assert wiped == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_trigger_without_wipe_seeds_but_never_resets(
+    client: httpx.AsyncClient,
+) -> None:
+    """wipe_first=false keeps existing pages, so terminal rows stay
+    terminal — re-deriving them would only rewrite pages that still
+    exist. Seeding gaps is still correct and harmless."""
+    await _insert_live_doc("doc:unqueued")
+    await _insert_live_doc("doc:done")
+    await _terminal_queue_row("doc:done", status="done")
+
+    resp = await client.post(
+        "/api/wiki/backfill/trigger",
+        json={"wipe_first": False},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["seeded"] == 1
+    assert resp.json()["reset"] == 0
+    assert (await _queue_state())["doc:done"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_backfill_trigger_failure_after_wipe_rolls_everything_back(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wipe + reseed + run-insert live in ONE transaction: a failure
+    after the deletes must leave the wiki exactly as it was, never a
+    wiped tenant with no recovery rows."""
+    import kb.wiki_routes as wiki_routes_module
+
+    await _insert_live_doc("doc:a")
+    await _compiled_page("wiki:page:keep")
+
+    async def exploding_insert(conn, *, customer_id, sources):
+        raise RuntimeError("boom after wipe")
+
+    monkeypatch.setattr(
+        wiki_routes_module, "_insert_pending_runs", exploding_insert
+    )
+
+    with pytest.raises(RuntimeError, match="boom after wipe"):
+        await client.post(
+            "/api/wiki/backfill/trigger", json={}, headers=_hdr()
+        )
+
+    # Nothing committed: page survives, queue still empty, no run rows.
+    async with raw_conn() as conn:
+        pages = await conn.fetchval(
+            "SELECT count(*) FROM documents "
+            "WHERE customer_id = $1 AND doc_class = 'compiled_wiki'",
+            CUSTOMER,
+        )
+        runs = await conn.fetchval(
+            "SELECT count(*) FROM wiki_synthesis_runs WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    assert pages == 1
+    assert runs == 0
+    assert await _queue_state() == {}
+
+
+@pytest.mark.asyncio
+async def test_backfill_preview_reports_counts_and_writes_nothing(
+    client: httpx.AsyncClient,
+) -> None:
+    await _insert_live_doc("doc:unqueued")
+    await _insert_live_doc("doc:done")
+    await _terminal_queue_row("doc:done", status="done")
+    await _compiled_page("wiki:page:old")
+
+    resp = await client.get("/api/wiki/backfill/preview", headers=_hdr())
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "customer_id": CUSTOMER,
+        "eligible_documents": 2,
+        "would_seed": 1,
+        "would_reset": 1,
+        "compiled_pages": 1,
+    }
+
+    # Preview is read-only: queue unchanged, page still there, no runs.
+    assert await _queue_state() == {"doc:done": "done"}
+    async with raw_conn() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM wiki_synthesis_runs WHERE customer_id = $1",
+                CUSTOMER,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_backfill_preview_requires_internal_key(
+    client: httpx.AsyncClient,
+) -> None:
+    resp = await client.get(
+        "/api/wiki/backfill/preview", headers={"X-Prbe-Customer": CUSTOMER}
+    )
+    assert resp.status_code == 401

@@ -580,3 +580,19 @@ Auto-compact:
 
 - **UNRESOLVED:** 0
 - **VERDICT:** ENG REVIEW DONE — plan is internally consistent and ready to implement. Recommend GitHub-crawler MVP first (per Decision #7) before layering in the other 6 sources.
+
+---
+
+## SUPERSEDED (2026-08-18): locked decision #3's daily-replay coexistence
+
+The "Coexistence with v4 daily loop" section above assumed the daily loop
+would replay queue rows the bootstrap did not absorb. It never did for
+TERMINAL rows — the drain's terminal-status filter skips 'done', so pages
+derived from sources with no crawler were permanently lost on every wipe.
+The rebuild trigger now reseeds the daily pipeline in the SAME transaction
+as the wipe (seed_missing_docs + reset_terminal_rows in
+kb/wiki_routes.py::_do_trigger_wiki_backfill); bootstrap_absorbed marking
+continues to prevent double-reading of rows a crawler did absorb. The
+public surface also moved: /api/wiki/backfill/* (bootstrap/* kept as
+aliases for trigger/status only), plus GET /api/wiki/backfill/preview and
+eligible_documents/seeded/reset on the trigger response.
