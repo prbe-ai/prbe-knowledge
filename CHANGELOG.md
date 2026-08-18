@@ -25,6 +25,25 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- **The wiki no longer has `project` or `person` pages.** Both restated
+  what the platform already holds — projects, experiments and runs are
+  live entities in research-os, and authorship, review and ownership are
+  graph edges the ingestion pipeline maintains continuously — so each
+  page was a second copy that went stale silently with no way for a
+  reader to tell which copy was current. `decision` stays: why X was
+  chosen over Y exists in no system of record. Migration 0107 retires
+  (does not delete) every page that still carries one of the two kinds,
+  so their bodies and version history remain on disk. `[[person: X]]`
+  LINKS are unaffected — a wiki link points at a graph entity, and
+  several kinds it can name have never had pages of their own.
+- Undo of a wiki rebuild never restores a page whose kind has since left
+  `WikiType`. The time bound alone did not cover a taxonomy change, and a
+  live page carrying a retired kind is unreachable by construction.
+- The GitHub backfill crawler shares the real `wiki_type` tool schema
+  instead of its own copy. The copy had drifted into a free-form string
+  inviting the model to invent a kind "if the corpus calls for it" —
+  kinds the crawler's own argument validator has refused since the set
+  was closed, so each one cost a turn and was then rejected.
 - "Rebuild wiki" reseeds the daily pipeline in the same transaction as
   the wipe: seed missing queue rows + reset terminal rows for live
   eligible docs, so pages derived from sources with no crawler
