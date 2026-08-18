@@ -24,7 +24,15 @@ import pytest_asyncio
 # any `.env` file on the filesystem in pydantic-settings' lookup order.
 _TEST_ENV = {
     "ENVIRONMENT": "local",
-    "DATABASE_URL": "postgresql://prbe:prbe@localhost:5432/prbe_knowledge",
+    # PRBE_TEST_DATABASE_URL lets concurrent checkouts on one machine run
+    # against their own database instead of racing each other's migrations
+    # in the shared compose Postgres (the container name is fixed, so two
+    # worktrees otherwise share one schema). Still pinned local-only —
+    # never a way to point tests at a real deployment.
+    "DATABASE_URL": os.environ.get(
+        "PRBE_TEST_DATABASE_URL",
+        "postgresql://prbe:prbe@localhost:5432/prbe_knowledge",
+    ),
     "R2_ENDPOINT_URL": "http://localhost:9000",
     "R2_ACCESS_KEY_ID": "minioadmin",
     "R2_SECRET_ACCESS_KEY": "minioadmin",

@@ -424,3 +424,35 @@ or emit a structlog warning at info level when the count is non-zero.
 
 **Trigger:** if related_entities ever appears suspiciously empty in production
 when the underlying docs clearly have graph relationships.
+
+---
+
+## Wiki backfill follow-ups (from the 2026-08-17 coverage-gap eng review)
+
+### Transcript backfill crawler lanes: claude_code + codex only
+**Where:** `kb/synthesis/crawlers/__init__.py` (registry), `docs/wiki-backfill-plan.md`
+
+The bootstrap crawler registry ships GitHub only. Of the "subsequent lanes"
+the plan names, only claude_code + codex transcripts are worth building for
+research-os tenants — they are the only sources implemented for that
+product's knowledge base (slack/linear/notion/granola/codebase lanes are
+dropped from this TODO until those integrations exist there). Note the
+rebuild trigger now reseeds transcript-DERIVED content from `documents`
+automatically; this lane is for richer bootstrap-grade extraction from the
+transcript source itself (entity/link mining per the GBrain-style design).
+**Fix:** one `BackfillAgent` subclass per source following
+`crawlers/github.py`, registered via `register_crawler`; per-source system
+prompt; time horizon "all-time" per locked decision #1. ~2 days each with
+the harness already in place.
+
+### Cleanup: code_graph rows sitting in wiki_synthesis_queue
+**Where:** production `kb` databases (research plane: probe tenant, 5,057 rows)
+
+The pre-fix catchup script excluded only `wiki`, so code_graph docs — which
+the Normalizer gate deliberately never enqueues — were mass-seeded into the
+queue on catchup runs. They are terminal (mostly rejected) and harmless but
+inflate every queue count an operator reads. The seed/reset paths now
+consume `WIKI_ENQUEUE_EXCLUDED_SOURCES`, so no new rows will appear.
+**Fix:** one idempotent DELETE of terminal rows whose source_system is in
+the excluded tuple, per tenant, behind a small ops script or a one-off
+psql. Verify counts before/after; do NOT touch non-terminal rows.
