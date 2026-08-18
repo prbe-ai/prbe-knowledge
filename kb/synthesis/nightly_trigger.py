@@ -17,6 +17,12 @@ against the prbe-knowledge-cron Fly app. The script does two things in order:
      changes). Cost: ~$0.005/repo, content_hash cache makes the
      symbol extraction itself a ~no-op on unchanged files.
 
+  B0. Reconcile the wiki queue. For every enabled tenant, insert queue
+     rows for live eligible documents that have none (idempotent
+     INSERT…ON CONFLICT). This is the safety net behind the Normalizer's
+     best-effort enqueue, the settings toggle's best-effort seed, and
+     flags flipped by SQL — see ``reconcile_missing_queue_rows``.
+
   B. Trigger nightly wiki synthesis. SELECT customer_ids with at least
      one pending wiki_synthesis_queue row AND
      ``preferences->>'wiki_generation_enabled' = 'true'``. Per
@@ -41,11 +47,26 @@ from datetime import UTC, datetime
 import asyncpg
 
 from engine.shared.config import get_settings
-from engine.shared.constants import WIKI_PENDING_CHANNEL, SourceSystem
-from engine.shared.db import apply_connection_setup
+from engine.shared.constants import (
+    WIKI_PENDING_CHANNEL,
+    WIKI_RECONCILE_SEED_BATCH,
+    WIKI_RECONCILE_STATEMENT_TIMEOUT_MS,
+    SourceSystem,
+)
+from engine.shared.db import (
+    apply_connection_setup,
+    close_pool,
+    init_pool,
+    raw_conn,
+    with_tenant,
+)
 from engine.shared.logging import configure_logging, get_logger
 from kb.code_graph.bridge import enqueue_initial_backfill
 from kb.synthesis.diagram_renderer import regenerate_wiki_diagram
+from kb.synthesis.persistence import (
+    list_enabled_active_customers,
+    seed_missing_docs,
+)
 
 log = get_logger(__name__)
 
@@ -61,6 +82,72 @@ _CODE_GRAPH_POLL_INTERVAL_SECONDS = 30
 # this and let the next nightly run pick up the slack. Sized at 30
 # minutes to comfortably fit even a fresh full-extraction.
 _CODE_GRAPH_DRAIN_TIMEOUT_SECONDS = 30 * 60
+
+
+async def reconcile_missing_queue_rows() -> dict[str, int]:
+    """Seed queue rows for every enabled tenant's un-queued live docs.
+
+    The reconcile is the guarantee behind every other seeding path: the
+    Normalizer's enqueue is best-effort (exceptions are swallowed), the
+    settings toggle's seed is best-effort (BackgroundTasks dies with the
+    process), and a flag flipped by SQL fires no event at all. Running
+    the idempotent seed here — for every enabled tenant, every night —
+    means no document stays invisible to the wiki longer than one
+    nightly cycle, however it arrived and whatever its timestamps say.
+    Stateless by design: no watermark, because bulk imports backdate
+    `created_at` wholesale and any timestamp cursor would skip them.
+
+    Per-tenant failures are logged and skipped — one broken tenant must
+    not starve the rest. Requires the pool (callers: `main`, tests).
+    Returns {"customers": N, "seeded": total_inserted, "failures": N}.
+    """
+    summary = {"customers": 0, "seeded": 0, "failures": 0}
+    async with raw_conn() as conn:
+        customers = await list_enabled_active_customers(conn)
+    for customer_id in customers:
+        summary["customers"] += 1
+        try:
+            # Batched: each batch is its own transaction under its own
+            # statement_timeout, so a backlog too big for one statement
+            # makes durable progress tonight instead of failing
+            # all-or-nothing every night — the guarantee has to hold for
+            # exactly the tenants with the largest backfills.
+            seeded_here = 0
+            while True:
+                async with with_tenant(customer_id) as conn, conn.transaction():
+                    await conn.execute(
+                        f"SET LOCAL statement_timeout = "
+                        f"{WIKI_RECONCILE_STATEMENT_TIMEOUT_MS}"
+                    )
+                    _eligible, inserted = await seed_missing_docs(
+                        conn,
+                        customer_id,
+                        limit=WIKI_RECONCILE_SEED_BATCH,
+                    )
+                seeded_here += inserted
+                # Loop until a batch inserts NOTHING — `< batch` would
+                # exit early when a concurrent seeder's ON CONFLICT wins
+                # counted toward the LIMIT but not toward inserted,
+                # leaving backlog for a full extra day.
+                if inserted == 0:
+                    break
+            summary["seeded"] += seeded_here
+            if seeded_here:
+                log.info(
+                    "nightly_reconcile.seeded",
+                    customer=customer_id,
+                    inserted=seeded_here,
+                )
+        except Exception as exc:
+            summary["failures"] += 1
+            log.warning(
+                "nightly_reconcile.customer_failed",
+                customer=customer_id,
+                error=str(exc),
+                error_class=type(exc).__name__,
+            )
+    log.info("nightly_reconcile.done", **summary)
+    return summary
 
 
 async def trigger_nightly_synthesis(dsn: str) -> int:
@@ -287,6 +374,26 @@ async def main() -> None:
     #         error=str(exc),
     #         error_class=type(exc).__name__,
     #     )
+
+    # Step B0: reconcile — seed queue rows for every enabled tenant's
+    # un-queued docs BEFORE the notify pass, so tonight's notify already
+    # covers documents the event-driven paths missed. NOTHING in this
+    # block may stop Step B: init_pool and close_pool sit inside the
+    # guard too, because a pool that cannot open (or close) is exactly
+    # the kind of transient failure that must not cost tenants with
+    # existing pending rows their nightly drain.
+    try:
+        await init_pool(settings)
+        try:
+            await reconcile_missing_queue_rows()
+        finally:
+            await close_pool()
+    except Exception as exc:
+        log.warning(
+            "nightly_trigger.reconcile_failed",
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
 
     # Step B: existing nightly synthesis trigger.
     notified = await trigger_nightly_synthesis(settings.database_url)

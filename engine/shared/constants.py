@@ -1769,6 +1769,32 @@ WIKI_TRIGGER_RATE_LIMIT_SECONDS = 300
 # nightly pipeline (Granola steady-poll cycles, etc.).
 WIKI_NIGHTLY_HOUR_UTC = 2
 
+# Source systems that never feed wiki synthesis. WIKI because the cron's
+# own COMPILED_WIKI writes must not feed back into its own queue;
+# CODE_GRAPH because code.symbol docs are deterministic AST extractions
+# whose body is a function signature + docstring — triage would burn LLM
+# tokens extracting Decisions/Runbooks from them and produce nothing.
+# The Normalizer enqueue gate and every queue-seeding path
+# (kb.synthesis.persistence.seed_missing_docs) consume THIS tuple; the
+# two lists drifted once (the catchup script excluded only WIKI and
+# enqueued thousands of code_graph rows) — do not re-list sources inline.
+WIKI_ENQUEUE_EXCLUDED_SOURCES: tuple[SourceSystem, ...] = (
+    SourceSystem.WIKI,
+    SourceSystem.CODE_GRAPH,
+)
+
+# Per-statement ceiling for the nightly queue-seed reconcile. The seed is
+# a batched INSERT…SELECT anti-join per enabled tenant; on a healthy index
+# a batch runs in seconds, so a two-minute cap only exists to stop a
+# pathological plan from occupying the nightly window.
+WIKI_RECONCILE_STATEMENT_TIMEOUT_MS = 120_000
+
+# Rows per reconcile seed batch. Each batch is its own statement + txn
+# under the timeout above, so a huge backlog makes durable progress
+# instead of failing all-or-nothing. 20k queue-row inserts is comfortably
+# a few seconds of work against the 4-index queue table.
+WIKI_RECONCILE_SEED_BATCH = 20_000
+
 
 # ---------------------------------------------------------------------------
 # Wiki agent loop (v4: Gemini 3.1 Pro driving the synthesis stage)
@@ -1813,10 +1839,30 @@ WIKI_AGENT_COMPACT_THRESHOLD = 0.60
 WIKI_AGENT_BATCH_SIZE = 200
 
 # Maximum number of customer drains running simultaneously per
-# wiki-synthesis fly machine. Higher than per-customer concurrency (1
+# wiki-synthesis machine. Higher than per-customer concurrency (1
 # under advisory lock) so two small customers can drain in parallel
-# while pebble holds its own machine.
-WIKI_AGENT_GLOBAL_CONCURRENCY = 2
+# while pebble holds its own machine. Env-overridable because adding
+# replicas is a no-op (per-customer advisory locks make extra pods log
+# drain_skip_concurrent) — cross-tenant fan-out on the ONE machine is
+# the only knob that raises throughput. Within-tenant drains stay
+# serial by design (rows claimed in source_ts order).
+def _env_positive_int(name: str, default: int) -> int:
+    """Parse a positive-int env override; malformed or non-positive values
+    fall back to the default instead of crashing every importing service
+    at boot (this module is imported by all of them)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 1 else default
+
+
+WIKI_AGENT_GLOBAL_CONCURRENCY = _env_positive_int(
+    "WIKI_AGENT_GLOBAL_CONCURRENCY", 2
+)
 
 # Gemini model used by the wiki agent loop. Triage stays Flash Lite;
 # only the agent uses Pro because per-cluster reasoning + cross-event

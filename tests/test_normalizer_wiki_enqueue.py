@@ -272,3 +272,28 @@ async def test_persist_skips_enqueue_when_wiki_generation_disabled(
             CUSTOMER,
         )
     assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_persist_does_not_enqueue_code_graph_docs(
+    reset_db: None, normalizer: Normalizer
+) -> None:
+    """The OTHER half of WIKI_ENQUEUE_EXCLUDED_SOURCES. code.symbol docs
+    are deterministic AST extractions synthesis can't use — and this
+    exclusion has drifted once already: the pre-refactor catchup script
+    excluded only `wiki` and mass-enqueued code_graph rows (5,057 in the
+    probe tenant). The gate must consume the shared tuple, not re-list
+    sources."""
+    doc = _doc(
+        "code_graph:acme/api:src/x.py:sym",
+        source_system=SourceSystem.CODE_GRAPH,
+        doc_type="code.symbol",
+    )
+    await normalizer._persist(CUSTOMER, SourceSystem.CODE_GRAPH, _result(doc))
+
+    async with raw_conn() as conn:
+        count = await conn.fetchval(
+            "SELECT count(*) FROM wiki_synthesis_queue WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    assert count == 0

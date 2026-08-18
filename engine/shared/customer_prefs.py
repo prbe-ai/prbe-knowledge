@@ -15,6 +15,7 @@ deploy temporarily can't read the row.
 from __future__ import annotations
 
 import json
+import re
 
 from engine.shared.db import raw_conn
 from engine.shared.logging import get_logger
@@ -22,6 +23,30 @@ from engine.shared.logging import get_logger
 log = get_logger(__name__)
 
 WIKI_GENERATION_ENABLED_KEY = "wiki_generation_enabled"
+
+
+def wiki_enabled_sql(prefs_col: str = "preferences") -> str:
+    """SQL predicate matching `is_wiki_generation_enabled` exactly.
+
+    Every SQL enumeration of "enabled tenants" (queue drain guards, the
+    nightly reconcile, the catchup CLI) must interpolate THIS fragment
+    rather than re-typing the JSONB comparison, so the SQL side can
+    never drift from the Python side. Text comparison against 'true'
+    keeps absent keys, nulls, and malformed values reading as OFF —
+    the same fail-closed posture as `_coerce_bool`, which accepts the
+    same two ON shapes this comparison does (jsonb boolean true and
+    jsonb string "true" both render as text 'true' under `->>`).
+    tests/test_customer_prefs_parity.py pins the two sides together.
+
+    `prefs_col` is a trusted identifier supplied by the caller (e.g.
+    "c.preferences"), never user input — and the assertion makes sure
+    a future caller cannot quietly change that.
+    """
+    if not re.fullmatch(r"[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?", prefs_col):
+        raise ValueError(f"prefs_col must be a plain identifier, got {prefs_col!r}")
+    return f"{prefs_col}->>'{WIKI_GENERATION_ENABLED_KEY}' = 'true'"
+
+
 # JSONB sub-key for per-repo code-graph branch overrides. Shape:
 #     {"acme/api": "develop", "acme/worker": "release"}
 # Missing repo → fall back to the push payload's `repository.default_branch`.
@@ -117,8 +142,17 @@ def _coerce_branch_override(raw: object, repo: str, fallback: str) -> str:
 
 def _coerce_bool(raw: object, key: str) -> bool:
     """Pull `key` out of a JSONB blob; return False unless the value is
-    a real bool True. asyncpg may return JSONB as dict or str depending
-    on driver setup — handle both.
+    ON. asyncpg may return JSONB as dict or str depending on driver
+    setup — handle both.
+
+    ON means jsonb boolean true OR jsonb string "true" — the SAME two
+    shapes `wiki_enabled_sql`'s `->> = 'true'` comparison matches. The
+    engine's own PUT /settings writes the STRING shape (to_jsonb of a
+    text parameter), while dashboard PATCHes and hand-written SQL write
+    the boolean, so both exist in the wild. Before this accepted the
+    string, a tenant enabled through the engine PUT was ON for every
+    SQL consumer (drains, nightly, catchup) and OFF for this gate — the
+    Normalizer silently stopped enqueueing their new documents.
     """
     if raw is None:
         return False
@@ -130,4 +164,4 @@ def _coerce_bool(raw: object, key: str) -> bool:
     if not isinstance(raw, dict):
         return False
     value = raw.get(key)
-    return value is True
+    return value is True or value == "true"

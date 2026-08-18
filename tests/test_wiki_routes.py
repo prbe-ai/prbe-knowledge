@@ -22,8 +22,10 @@ import pytest_asyncio
 from httpx import ASGITransport
 
 from engine.shared.config import Settings, get_settings
-from engine.shared.db import close_pool, init_pool, raw_conn
+from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
 from kb.ingestion_app import app
+from kb.synthesis import persistence
+from tests.wiki_fixtures import insert_document
 
 CUSTOMER = "wiki-test-cust"
 
@@ -1154,7 +1156,6 @@ async def test_the_settings_route_takes_the_agents_page_lock(
     """
     import asyncio
 
-    from engine.shared.db import with_tenant
     from engine.shared.locks import advisory_lock_key
 
     await _put(client, "lock-me", "body", expected_version=0)
@@ -1267,7 +1268,6 @@ async def test_http_put_takes_the_page_lock(client: httpx.AsyncClient) -> None:
     """
     import asyncio
 
-    from engine.shared.db import with_tenant
     from engine.shared.locks import advisory_lock_key
 
     # THE KEY IS BUILT HERE, NOT IMPORTED FROM THE ROUTE. Calling the
@@ -1361,7 +1361,13 @@ async def test_generation_is_off_until_someone_turns_it_on(
     resp = await client.get("/api/wiki/settings", headers=_hdr())
 
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"customer_id": CUSTOMER, "generation_enabled": False}
+    assert resp.json() == {
+        "customer_id": CUSTOMER,
+        "generation_enabled": False,
+        # GET never schedules a seed; the field only flips on the PUT
+        # that transitions off→on.
+        "catchup_started": False,
+    }
 
 
 @pytest.mark.asyncio
@@ -1774,3 +1780,149 @@ async def test_reusing_a_key_with_different_text_is_a_409_not_a_silent_drop(
     body = (await client.get("/api/wiki/pages/runbook/keyreuse", headers=_hdr())).json()["body"]
     assert "the original decision" in body
     assert "a DIFFERENT decision" not in body
+
+# Settings toggle → catchup seed (the off→on transition)
+# ---------------------------------------------------------------------------
+
+
+async def _insert_live_doc(doc_id: str) -> None:
+    await insert_document(CUSTOMER, doc_id)
+
+
+async def _pending_docs() -> set[str]:
+    async with raw_conn() as conn:
+        rows = await conn.fetch(
+            "SELECT doc_id FROM wiki_synthesis_queue "
+            "WHERE customer_id = $1 AND status = 'pending'",
+            CUSTOMER,
+        )
+    return {r["doc_id"] for r in rows}
+
+
+@pytest.mark.asyncio
+async def test_turning_generation_on_seeds_the_existing_corpus(
+    client: httpx.AsyncClient,
+) -> None:
+    """The off→on PUT schedules a seed of docs ingested BEFORE the flip.
+
+    This is the product half of the retroactive-seed fix: without it a
+    tenant who enables the wiki starts from "documents ingested after
+    today" and their backfilled history never becomes wiki input.
+    ASGITransport awaits Starlette's background tasks before returning,
+    so the seed has run by the time the client call resolves.
+    """
+    await _insert_live_doc("doc:before-flip")
+
+    resp = await client.put(
+        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["catchup_started"] is True
+    assert await _pending_docs() == {"doc:before-flip"}
+
+
+@pytest.mark.asyncio
+async def test_on_to_on_put_does_not_reschedule_the_seed(
+    client: httpx.AsyncClient,
+) -> None:
+    """Only the TRANSITION seeds — a repeated on-PUT is a plain flag write."""
+    first = await client.put(
+        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
+    )
+    assert first.json()["catchup_started"] is True
+
+    again = await client.put(
+        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
+    )
+    assert again.status_code == 200
+    assert again.json()["catchup_started"] is False
+
+
+@pytest.mark.asyncio
+async def test_turning_generation_off_never_seeds(
+    client: httpx.AsyncClient,
+) -> None:
+    await _insert_live_doc("doc:whatever")
+    resp = await client.put(
+        "/api/wiki/settings", json={"generation_enabled": False}, headers=_hdr()
+    )
+    assert resp.status_code == 200
+    assert resp.json()["catchup_started"] is False
+    assert await _pending_docs() == set()
+
+
+@pytest.mark.asyncio
+async def test_seed_failure_does_not_break_the_put(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The background seed is best-effort: the flag write already
+    committed and the response already says 200, so a seeding crash must
+    be logged and swallowed — the nightly reconcile is the retry."""
+
+    await _insert_live_doc("doc:would-seed")
+
+    async def exploding_seed(conn, customer_id, *, limit=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(persistence, "seed_missing_docs", exploding_seed)
+
+    resp = await client.put(
+        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["catchup_started"] is True
+
+    async with raw_conn() as conn:
+        stored = await conn.fetchval(
+            "SELECT preferences->>'wiki_generation_enabled' FROM customers "
+            "WHERE customer_id = $1",
+            CUSTOMER,
+        )
+    assert stored == "true"
+    assert await _pending_docs() == set()
+
+
+@pytest.mark.asyncio
+async def test_reenabling_wakes_the_worker_even_with_nothing_new_to_seed(
+    client: httpx.AsyncClient, settings: Settings
+) -> None:
+    """off→on with PENDING rows from before the flip-off must still fire
+    the wake: inserted == 0 there, and gating the notify on it left the
+    old rows waiting for the 30-minute periodic cycle."""
+    import asyncio
+
+    import asyncpg
+
+    from engine.shared.constants import WIKI_PENDING_CHANNEL
+
+    await _insert_live_doc("doc:old-pending")
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO wiki_synthesis_queue "
+            "(customer_id, doc_id, doc_version, source_system, doc_type, status) "
+            "VALUES ($1, 'doc:old-pending', 1, 'slack', 'slack.message', 'pending')",
+            CUSTOMER,
+        )
+
+    received: list[str] = []
+    notify_event = asyncio.Event()
+    listener = await asyncpg.connect(settings.database_url)
+    try:
+
+        def _on_notify(_conn, _pid, channel, payload) -> None:
+            received.append(payload)
+            notify_event.set()
+
+        await listener.add_listener(WIKI_PENDING_CHANNEL, _on_notify)
+
+        resp = await client.put(
+            "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["catchup_started"] is True
+
+        await asyncio.wait_for(notify_event.wait(), timeout=5)
+    finally:
+        await listener.close()
+
+    assert CUSTOMER in received

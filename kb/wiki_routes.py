@@ -58,7 +58,15 @@ from typing import Any
 
 import asyncpg
 import orjson
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+)
 from pydantic import BaseModel, Field, field_validator
 
 from engine.ingest.normalizer import (
@@ -73,6 +81,7 @@ from engine.shared.constants import (
     WIKI_DOC_TYPE_PREFIX,
     WIKI_INDEX_DOC_TYPE,
     WIKI_PENDING_CHANNEL,
+    WIKI_RECONCILE_SEED_BATCH,
     DocClass,
     SourceSystem,
 )
@@ -276,6 +285,10 @@ class WikiGenerationSettingsBody(BaseModel):
 class WikiGenerationSettingsResponse(BaseModel):
     customer_id: str
     generation_enabled: bool
+    # True only on the PUT that flips off→on: a best-effort background
+    # seed of the tenant's existing docs was scheduled (BackgroundTasks
+    # dies with the process; the nightly reconcile is the guarantee).
+    catchup_started: bool = False
 
 
 class WikiRevertBody(BaseModel):
@@ -1626,6 +1639,7 @@ async def get_wiki_generation_settings(
 )
 async def set_wiki_generation_settings(
     body: WikiGenerationSettingsBody,
+    background_tasks: BackgroundTasks,
     customer_id: str = Depends(_require_customer),
 ) -> WikiGenerationSettingsResponse:
     """Turn the nightly pipeline on or off for this tenant.
@@ -1650,6 +1664,25 @@ async def set_wiki_generation_settings(
     silently.
     """
     async with with_tenant(customer_id) as conn:
+        # Two statements, one transaction, prev read FIRST under FOR
+        # UPDATE. Not a CTE: a locking scan inside the UPDATE statement
+        # runs after the row was self-updated and SKIPS the tuple
+        # (HeapTupleSelfUpdated), so `prev` read as NULL on every call
+        # and each on→on PUT re-scheduled the seed. Here the row lock
+        # serializes concurrent PUTs at the SELECT — the second waits,
+        # then reads the committed flip, so only one off→on transition
+        # observes prev != 'true'.
+        prev = await conn.fetchrow(
+            """
+            SELECT preferences->>'wiki_generation_enabled' AS prev
+            FROM customers
+            WHERE customer_id = $1
+            FOR UPDATE
+            """,
+            customer_id,
+        )
+        if prev is None:
+            raise HTTPException(status_code=404, detail="unknown customer")
         updated = await conn.fetchval(
             """
             UPDATE customers
@@ -1665,16 +1698,72 @@ async def set_wiki_generation_settings(
             customer_id,
             "true" if body.generation_enabled else "false",
         )
-    if updated is None:
-        raise HTTPException(status_code=404, detail="unknown customer")
     log.info(
         "wiki.generation_setting_changed",
         customer=customer_id,
         generation_enabled=updated == "true",
     )
+    # off→on transition: seed the tenant's existing corpus so the wiki
+    # doesn't start from "documents ingested after today". Scheduled
+    # after the response (a huge tenant's seed must not time out this
+    # request) on a connection of its own. Best-effort by design —
+    # the nightly reconcile re-seeds anything a lost task leaves behind.
+    catchup_started = updated == "true" and prev["prev"] != "true"
+    if catchup_started:
+        background_tasks.add_task(_seed_after_enable, customer_id)
     return WikiGenerationSettingsResponse(
-        customer_id=customer_id, generation_enabled=updated == "true"
+        customer_id=customer_id,
+        generation_enabled=updated == "true",
+        catchup_started=catchup_started,
     )
+
+
+async def _seed_after_enable(customer_id: str) -> None:
+    """Background half of the off→on toggle: seed + wake the drain.
+
+    Runs after the PUT's response is sent, so it must acquire its own
+    pooled connection — the request's connection is already released.
+    Failures log and stop; the nightly reconcile is the retry.
+    """
+    try:
+        # Batched like the nightly reconcile — a single-statement seed of
+        # the largest corpora would be client-cancelled by the pool's
+        # command_timeout and roll back whole. The wake fires after the
+        # FIRST batch so the drain starts while later batches fill in.
+        # Notify even when nothing was inserted: a tenant re-enabling the
+        # wiki may have PENDING rows from before the flip-off, and
+        # without a wake those wait for the 30-min periodic cycle. The
+        # worker re-checks flag + pending, so a spurious wake is a cheap
+        # no-op.
+        seeded = 0
+        first_batch = True
+        while True:
+            async with with_tenant(customer_id) as conn:
+                _eligible, inserted = await persistence.seed_missing_docs(
+                    conn, customer_id, limit=WIKI_RECONCILE_SEED_BATCH
+                )
+                if first_batch:
+                    await conn.execute(
+                        "SELECT pg_notify($1, $2)",
+                        WIKI_PENDING_CHANNEL,
+                        customer_id,
+                    )
+            seeded += inserted
+            first_batch = False
+            if inserted == 0:
+                break
+        log.info(
+            "wiki.settings_catchup_seeded",
+            customer=customer_id,
+            inserted=seeded,
+        )
+    except Exception as exc:
+        log.warning(
+            "wiki.settings_catchup_failed",
+            customer=customer_id,
+            error=str(exc),
+            error_class=type(exc).__name__,
+        )
 
 
 @router.get(

@@ -424,3 +424,61 @@ or emit a structlog warning at info level when the count is non-zero.
 
 **Trigger:** if related_entities ever appears suspiciously empty in production
 when the underlying docs clearly have graph relationships.
+
+---
+
+## Wiki backfill follow-ups (from the 2026-08-17 coverage-gap eng review)
+
+### Transcript backfill crawler lanes: claude_code + codex only
+**Where:** `kb/synthesis/crawlers/__init__.py` (registry), `docs/wiki-backfill-plan.md`
+
+The bootstrap crawler registry ships GitHub only. Of the "subsequent lanes"
+the plan names, only claude_code + codex transcripts are worth building for
+research-os tenants — they are the only sources implemented for that
+product's knowledge base (slack/linear/notion/granola/codebase lanes are
+dropped from this TODO until those integrations exist there). Note the
+rebuild trigger now reseeds transcript-DERIVED content from `documents`
+automatically; this lane is for richer bootstrap-grade extraction from the
+transcript source itself (entity/link mining per the GBrain-style design).
+**Fix:** one `BackfillAgent` subclass per source following
+`crawlers/github.py`, registered via `register_crawler`; per-source system
+prompt; time horizon "all-time" per locked decision #1. ~2 days each with
+the harness already in place.
+
+### Cleanup: code_graph rows sitting in wiki_synthesis_queue
+**Where:** production `kb` databases (research plane: probe tenant, 5,057 rows)
+
+The pre-fix catchup script excluded only `wiki`, so code_graph docs — which
+the Normalizer gate deliberately never enqueues — were mass-seeded into the
+queue on catchup runs. They are terminal (mostly rejected) and harmless but
+inflate every queue count an operator reads. The seed/reset paths now
+consume `WIKI_ENQUEUE_EXCLUDED_SOURCES`, so no new rows will appear.
+**Fix:** one idempotent DELETE of terminal rows whose source_system is in
+the excluded tuple, per tenant, behind a small ops script or a one-off
+psql. Verify counts before/after; do NOT touch non-terminal rows.
+
+### Seeded queue rows order by created_at, not source-side timestamps
+**Where:** `kb/synthesis/persistence.py` (seed_missing_docs), `db/schema.sql` (wiki_synthesis_queue.source_ts)
+
+The Normalizer's live enqueue stamps source_ts from the in-memory source-side
+timestamp (Slack ts, Notion last_edited_time); the documents table does not
+store that surface, so every retroactive seed path (reconcile, toggle, rebuild,
+CLI) falls back to documents.created_at — the schema's documented fallback.
+Bulk imports whose created_at is honest drain fine; an import with fabricated
+created_at drains in ingest order and the wiki agent walks it out of
+chronological order.
+**Fix:** persist the extracted source_ts on documents (one nullable column +
+Normalizer write), then seed from it with created_at fallback; add a parity
+test comparing a Normalizer-enqueued row to a seeded row for the same doc.
+
+### Onboarding run rows are never closed
+**Where:** `kb/synthesis/persistence.py` (open_onboarding_run), workers
+
+kind='onboarding' status='running' rows have no closer: workers close only
+their own runs, backfill_reclaim scopes to kind='bootstrap'. The dashboard's
+"Wiki being generated, X events left" stays running forever (pre-existing in
+the CLI; now a shared API). Also inconsistent: the CLI opens one but the
+toggle/rebuild mass seeds do not.
+**Fix:** have the synthesis worker close open onboarding runs when the
+tenant's queue drains (or add them to a reclaim sweep), and decide whether
+toggle/rebuild seeds should open one for dashboard progress.

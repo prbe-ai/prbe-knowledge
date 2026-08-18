@@ -6,6 +6,47 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- **The wiki now covers documents that arrived before a tenant turned it
+  on.** The nightly trigger reconciles the synthesis queue for every
+  enabled tenant (batched, idempotent, timestamp-agnostic — backdated
+  bulk imports are covered), and flipping `wiki_generation_enabled` on
+  seeds the tenant's existing corpus immediately in the background. The
+  Normalizer's enqueue-failure swallow finally has the safety net its
+  comment always claimed.
+- `GET /api/wiki/backfill/preview`: read-only counts (pages the wipe
+  deletes, documents a rebuild re-derives) for the rebuild confirmation
+  dialog. The trigger response now carries `eligible_documents` /
+  `seeded` / `reset`, and `PUT /settings` carries `catchup_started`.
+- `WIKI_AGENT_GLOBAL_CONCURRENCY` is env-overridable (validated; the
+  only real synthesis throughput knob — replicas are a no-op under the
+  per-customer advisory locks).
+
+### Changed
+
+- "Rebuild wiki" reseeds the daily pipeline in the same transaction as
+  the wipe: seed missing queue rows + reset terminal rows for live
+  eligible docs, so pages derived from sources with no crawler
+  (transcripts, custom ingest) come back instead of being lost. dlq rows
+  stay parked unless the catchup CLI's `--include-dlq` redrives them.
+- `scripts/wiki_synthesis_catchup.py` is a thin CLI over
+  `kb.synthesis.persistence`; `--dry-run` now reports the REAL
+  would-insert/would-reset split (it previously always printed
+  `already_queued = eligible`).
+
+### Fixed
+
+- A tenant enabled through the engine's own `PUT /settings` (which
+  writes the JSONB **string** `"true"`) was ON for every SQL consumer
+  and OFF for the Python gate — the Normalizer silently stopped
+  enqueueing their new documents. Both sides now accept the same two
+  shapes, pinned by a parity test.
+- The catchup seed excluded only `wiki`, not `code_graph`, so catchup
+  runs mass-enqueued AST-extraction docs the pipeline deliberately
+  skips. All seed paths now consume `WIKI_ENQUEUE_EXCLUDED_SOURCES`.
+
+
 ### Changed
 
 - The gatherer now cuts a stalled Cerebras turn at **5s** (was 70s) and
