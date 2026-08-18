@@ -478,3 +478,48 @@ def test_body_sha256_is_present_on_a_delete() -> None:
     doc = build_normalization_result(event).documents[0]
 
     assert doc.metadata["body_sha256"] == _sha256("")
+
+
+def test_research_links_are_namespaced_so_they_cannot_collide_with_a_repo() -> None:
+    """`[[artifact:probe]]` and `[[Repo: probe]]` must be two different nodes.
+
+    Both map to DOCUMENT, and the existing kinds use the bare target as the
+    canonical id -- so a bare research id would land on exactly the node the
+    repo reference already owns. An artifact reference silently resolving to a
+    repository is worse than no reference: the reuse check would confirm a
+    method that does not exist.
+
+    The four original kinds keep their bare ids on purpose. Changing those
+    would rewrite the identity of every node already in the graph and orphan
+    every edge pointing at one, so the namespace applies only to the kinds
+    being introduced here.
+    """
+    body = (
+        "Score with [[artifact: dockq-scorer]] as run in "
+        "[[experiment: fold-baselines]], not [[Repo: dockq-scorer]]."
+    )
+    event = _make_event(
+        {
+            "wiki_type": "runbook",
+            "slug": "dockq-scoring",
+            "title": "DockQ scoring",
+            "body": body,
+            "frontmatter": {},
+            "updated_at": "2026-08-18T00:00:00Z",
+        }
+    )
+    result = build_normalization_result(event)
+
+    ids = {(n.label, n.canonical_id) for n in result.graph_nodes}
+    assert (NodeLabel.DOCUMENT, "probe:artifact:dockq-scorer") in ids
+    assert (NodeLabel.DOCUMENT, "probe:experiment:fold-baselines") in ids
+    # The repo of the same name stays its own node, unnamespaced.
+    assert (NodeLabel.DOCUMENT, "dockq-scorer") in ids
+
+    artifact_node = next(
+        n for n in result.graph_nodes if n.canonical_id == "probe:artifact:dockq-scorer"
+    )
+    # The kind and the plain name survive as properties, so a consumer never
+    # has to parse them back out of the id.
+    assert artifact_node.properties["research_kind"] == "artifact"
+    assert artifact_node.properties["name"] == "dockq-scorer"
