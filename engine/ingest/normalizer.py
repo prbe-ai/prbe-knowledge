@@ -48,6 +48,7 @@ from engine.shared.constants import (
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
     NORMALIZER_VERSION,
+    WIKI_ENQUEUE_EXCLUDED_SOURCES,
     SourceSystem,
 )
 from engine.shared.customer_prefs import is_wiki_generation_enabled
@@ -577,16 +578,13 @@ class Normalizer:
         # doc, causing continuous daytime synthesis. Removed so the wiki
         # behaves like the slow-moving knowledge base it's supposed to be.
         #
-        # Skip when the source IS the wiki (cron's own COMPILED_WIKI
-        # writes must not feed back into its own queue). Skip CODE_GRAPH
-        # too: code.symbol docs are deterministic AST extractions whose
-        # body is a function signature + docstring — wiki synthesis would
-        # burn LLM tokens trying to extract Decisions/Runbooks from them
-        # and produce nothing. Also skip when the tenant has not opted
-        # into wiki generation.
+        # Skip the sources that never feed synthesis (see the
+        # WIKI_ENQUEUE_EXCLUDED_SOURCES rationale: WIKI would feed the
+        # cron's own writes back into its queue; CODE_GRAPH docs are
+        # deterministic AST extractions synthesis can't use). Also skip
+        # when the tenant has not opted into wiki generation.
         if (
-            source_system != SourceSystem.WIKI
-            and source_system != SourceSystem.CODE_GRAPH
+            source_system not in WIKI_ENQUEUE_EXCLUDED_SOURCES
             and doc_ids
             and await is_wiki_generation_enabled(customer_id)
         ):
@@ -602,8 +600,9 @@ class Normalizer:
                 await self._enqueue_wiki_synthesis(customer_id, persisted_docs)
             except Exception as exc:
                 # Boundary swallow: ingestion already committed, queue
-                # enqueue is best-effort. The nightly trigger picks up
-                # anything we missed.
+                # enqueue is best-effort. The nightly trigger's
+                # reconcile step (reconcile_missing_queue_rows) seeds
+                # any doc this drop leaves un-queued.
                 log.warning(
                     "wiki.synthesis.enqueue_failed",
                     customer=customer_id,
@@ -866,8 +865,7 @@ class Normalizer:
         for item_idx, (result, _queue_id) in enumerate(items):
             doc_ids = per_item_doc_ids[item_idx]
             if (
-                source_system != SourceSystem.WIKI
-                and source_system != SourceSystem.CODE_GRAPH
+                source_system not in WIKI_ENQUEUE_EXCLUDED_SOURCES
                 and doc_ids
                 and await is_wiki_generation_enabled(customer_id)
             ):

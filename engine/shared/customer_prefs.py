@@ -22,6 +22,22 @@ from engine.shared.logging import get_logger
 log = get_logger(__name__)
 
 WIKI_GENERATION_ENABLED_KEY = "wiki_generation_enabled"
+
+
+def wiki_enabled_sql(prefs_col: str = "preferences") -> str:
+    """SQL predicate matching `is_wiki_generation_enabled` exactly.
+
+    Every SQL enumeration of "enabled tenants" (queue drain guards, the
+    nightly reconcile, the catchup CLI) must interpolate THIS fragment
+    rather than re-typing the JSONB comparison, so the SQL side can
+    never drift from the Python side. Text comparison against 'true'
+    keeps absent keys, nulls, and malformed values reading as OFF —
+    the same fail-closed posture as `_coerce_bool`.
+
+    `prefs_col` is a trusted identifier supplied by the caller (e.g.
+    "c.preferences"), never user input.
+    """
+    return f"{prefs_col}->>'{WIKI_GENERATION_ENABLED_KEY}' = 'true'"
 # JSONB sub-key for per-repo code-graph branch overrides. Shape:
 #     {"acme/api": "develop", "acme/worker": "release"}
 # Missing repo → fall back to the push payload's `repository.default_branch`.

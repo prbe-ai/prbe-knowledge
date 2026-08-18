@@ -6,6 +6,11 @@ fly apps but operate on the same `wiki_synthesis_queue` and
 every read and write against those tables flows through here so the
 two workers stay coherent on row-level state machine transitions:
 
+    (absent) ──[seed_missing_docs]────────────> pending   (idempotent; same rows
+                                                           the Normalizer enqueues)
+    done|rejected|failed|synthesis_skipped
+             ──[reset_terminal_rows]──────────> pending   (live eligible docs only;
+                                                           dlq only on request)
     pending  ──[claim_pending_batch]──────────> triaging  (attempts++)
     triaging ──[mark_batch_triaged_and_notify]─> triaged   (UPDATE+NOTIFY same txn)
     triaging ──[mark_rejected]────────────────> rejected  (terminal: triage threshold)
@@ -32,7 +37,12 @@ from typing import Any
 import asyncpg
 
 from engine.ingest.normalizer import fetch_body_from_chunks_for_version
-from engine.shared.constants import WIKI_INDEX_DOC_TYPE, WIKI_SYNTHESIS_MAX_ATTEMPTS
+from engine.shared.constants import (
+    WIKI_ENQUEUE_EXCLUDED_SOURCES,
+    WIKI_INDEX_DOC_TYPE,
+    WIKI_SYNTHESIS_MAX_ATTEMPTS,
+)
+from engine.shared.customer_prefs import wiki_enabled_sql
 from engine.shared.db import raw_conn, with_tenant
 from engine.shared.logging import get_logger
 from kb.synthesis.models import TriageInput, TriageVerdict
@@ -44,6 +54,8 @@ __all__ = [
     "claim_pending_batch",
     "claim_triaged_rows",
     "close_run",
+    "count_resettable_rows",
+    "count_seedable_docs",
     "dlq_agent_synthesizing_rows",
     "dlq_customer_for_triage_failure",
     "fetch_bodies",
@@ -63,9 +75,26 @@ __all__ = [
     "mark_synthesis_skipped",
     "mark_triaged",
     "mark_verifier_rejected",
+    "open_onboarding_run",
     "open_run",
     "reclaim_stuck_rows",
+    "reset_terminal_rows",
+    "seed_missing_docs",
 ]
+
+# Statuses `reset_terminal_rows` returns to 'pending' by default. In-flight
+# states (triaging, synthesizing) are excluded — resetting them mid-claim
+# would duplicate work the heartbeat-reclaim loop also retries. 'triaged'
+# is excluded because it is already past triage and drains on the next
+# NOTIFY. 'dlq' is excluded BY DEFAULT: dead-lettered rows carry a reason
+# a human should read, and resetting them wholesale re-poisons the worker
+# (attempts restart at 0). Pass include_dlq=True to redrive them anyway.
+WIKI_RESET_TERMINAL_STATUSES: tuple[str, ...] = (
+    "done",
+    "rejected",
+    "failed",
+    "synthesis_skipped",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -83,12 +112,12 @@ async def list_pending_customers(conn: asyncpg.Connection) -> list[str]:
     missing key (NULL) through ::boolean.
     """
     rows = await conn.fetch(
-        """
+        f"""
         SELECT DISTINCT q.customer_id
         FROM wiki_synthesis_queue q
         JOIN customers c ON c.customer_id = q.customer_id
         WHERE q.status = 'pending'
-          AND c.preferences->>'wiki_generation_enabled' = 'true'
+          AND {wiki_enabled_sql("c.preferences")}
         """
     )
     return [row["customer_id"] for row in rows]
@@ -102,15 +131,212 @@ async def list_triaged_customers(conn: asyncpg.Connection) -> list[str]:
     tenant who flipped off mid-pipeline doesn't get a partial drain.
     """
     rows = await conn.fetch(
-        """
+        f"""
         SELECT DISTINCT q.customer_id
         FROM wiki_synthesis_queue q
         JOIN customers c ON c.customer_id = q.customer_id
         WHERE q.status = 'triaged'
-          AND c.preferences->>'wiki_generation_enabled' = 'true'
+          AND {wiki_enabled_sql("c.preferences")}
         """
     )
     return [row["customer_id"] for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Queue seeding — the retroactive counterpart of the Normalizer enqueue
+# ---------------------------------------------------------------------------
+
+# One WHERE fragment defines "wiki-eligible document"; the seed INSERT,
+# the dry-run counter, and the reset eligibility join all interpolate it
+# so they cannot disagree about which docs feed synthesis. $1 is the
+# customer, $2 the excluded-source list; `d` is the documents alias.
+_ELIGIBLE_DOC_SQL = """
+          d.customer_id = $1
+          AND d.valid_to IS NULL
+          AND d.deleted_at IS NULL
+          AND d.source_system <> ALL($2::text[])
+"""
+
+_EXCLUDED_SOURCE_VALUES = [s.value for s in WIKI_ENQUEUE_EXCLUDED_SOURCES]
+
+
+async def seed_missing_docs(
+    conn: asyncpg.Connection, customer_id: str
+) -> tuple[int, int]:
+    """Insert queue rows for live eligible docs that aren't queued yet.
+
+    Idempotent: `ON CONFLICT (customer_id, doc_id, doc_version) DO
+    NOTHING` on the queue's unique key is the concurrency guarantee —
+    the Normalizer, the nightly reconcile, the settings toggle, the
+    rebuild trigger, and the catchup CLI can all seed simultaneously
+    without duplicating rows. Returns (eligible_total, inserted).
+    """
+    eligible = await conn.fetchval(
+        f"""
+        SELECT count(*)
+        FROM documents d
+        WHERE {_ELIGIBLE_DOC_SQL}
+        """,
+        customer_id,
+        _EXCLUDED_SOURCE_VALUES,
+    )
+    inserted = await conn.fetchval(
+        f"""
+        WITH inserted AS (
+            INSERT INTO wiki_synthesis_queue
+                (customer_id, doc_id, doc_version, source_system,
+                 doc_type, source_ts, status, enqueued_at)
+            SELECT d.customer_id, d.doc_id, d.version, d.source_system,
+                   d.doc_type, d.created_at, 'pending', NOW()
+            FROM documents d
+            WHERE {_ELIGIBLE_DOC_SQL}
+            ON CONFLICT (customer_id, doc_id, doc_version) DO NOTHING
+            RETURNING 1
+        )
+        SELECT count(*) FROM inserted
+        """,
+        customer_id,
+        _EXCLUDED_SOURCE_VALUES,
+    )
+    return int(eligible or 0), int(inserted or 0)
+
+
+async def count_seedable_docs(
+    conn: asyncpg.Connection, customer_id: str
+) -> tuple[int, int]:
+    """(eligible_total, would_insert) without writing anything.
+
+    Powers `--dry-run` and the rebuild preview. `would_insert` is a real
+    anti-join count, not `eligible - 0` — the historical dry-run bug
+    reported every doc as already queued and taught operators to skip
+    the preview.
+    """
+    row = await conn.fetchrow(
+        f"""
+        SELECT count(*) AS eligible,
+               count(*) FILTER (
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM wiki_synthesis_queue q
+                       WHERE q.customer_id = d.customer_id
+                         AND q.doc_id = d.doc_id
+                         AND q.doc_version = d.version
+                   )
+               ) AS would_insert
+        FROM documents d
+        WHERE {_ELIGIBLE_DOC_SQL}
+        """,
+        customer_id,
+        _EXCLUDED_SOURCE_VALUES,
+    )
+    return int(row["eligible"] or 0), int(row["would_insert"] or 0)
+
+
+async def count_resettable_rows(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    *,
+    include_dlq: bool = False,
+) -> int:
+    """How many rows `reset_terminal_rows` would touch, without writing.
+
+    Same status set and the same live-eligible-document join, so the
+    dry-run number is the real number.
+    """
+    statuses = list(WIKI_RESET_TERMINAL_STATUSES)
+    if include_dlq:
+        statuses.append("dlq")
+    count = await conn.fetchval(
+        f"""
+        SELECT count(*)
+        FROM wiki_synthesis_queue q
+        WHERE q.customer_id = $1
+          AND q.status = ANY($3::text[])
+          AND EXISTS (
+              SELECT 1 FROM documents d
+              WHERE {_ELIGIBLE_DOC_SQL}
+                AND d.doc_id = q.doc_id
+                AND d.version = q.doc_version
+          )
+        """,
+        customer_id,
+        _EXCLUDED_SOURCE_VALUES,
+        statuses,
+    )
+    return int(count or 0)
+
+
+async def open_onboarding_run(
+    conn: asyncpg.Connection, customer_id: str, *, events_total: int
+) -> int:
+    """Open the 'onboarding' run row a mass seed reports progress under.
+
+    The dashboard reads this to surface "Wiki being generated, X events
+    left." Distinct from `open_run` (worker drains): no stage, opens at
+    status='running' with the seeded total.
+    """
+    run_id = await conn.fetchval(
+        """
+        INSERT INTO wiki_synthesis_runs
+            (customer_id, kind, events_total, status)
+        VALUES ($1, 'onboarding', $2, 'running')
+        RETURNING run_id
+        """,
+        customer_id,
+        events_total,
+    )
+    return int(run_id)
+
+
+async def reset_terminal_rows(
+    conn: asyncpg.Connection,
+    customer_id: str,
+    *,
+    include_dlq: bool = False,
+) -> int:
+    """Reset terminal queue rows to 'pending' so triage re-evaluates them.
+
+    Only rows whose (doc_id, doc_version) still matches a live eligible
+    document are reset — terminal rows for superseded versions, deleted
+    docs, or excluded sources stay terminal (resurrecting them would
+    re-triage content the pipeline deliberately no longer wants).
+    Clears per-row triage/synthesis state but keeps identity columns
+    (doc_id, doc_version, enqueued_at) so source_ts ordering survives.
+    """
+    statuses = list(WIKI_RESET_TERMINAL_STATUSES)
+    if include_dlq:
+        statuses.append("dlq")
+    reset = await conn.fetchval(
+        f"""
+        WITH reset AS (
+            UPDATE wiki_synthesis_queue q
+            SET status = 'pending',
+                triage_score = NULL,
+                triage_error = NULL,
+                triage_completed_at = NULL,
+                synthesis_run_id = NULL,
+                synthesis_completed_at = NULL,
+                synthesis_error = NULL,
+                dlq_reason = NULL,
+                dlq_at = NULL,
+                attempts = 0,
+                heartbeat_at = NULL
+            WHERE q.customer_id = $1
+              AND q.status = ANY($3::text[])
+              AND EXISTS (
+                  SELECT 1 FROM documents d
+                  WHERE {_ELIGIBLE_DOC_SQL}
+                    AND d.doc_id = q.doc_id
+                    AND d.version = q.doc_version
+              )
+            RETURNING 1
+        )
+        SELECT count(*) FROM reset
+        """,
+        customer_id,
+        _EXCLUDED_SOURCE_VALUES,
+        statuses,
+    )
+    return int(reset or 0)
 
 
 # ---------------------------------------------------------------------------
