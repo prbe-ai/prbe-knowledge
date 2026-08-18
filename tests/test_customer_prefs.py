@@ -50,12 +50,27 @@ async def test_returns_false_when_key_explicitly_false(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_returns_false_for_truthy_non_bool_value(monkeypatch) -> None:
-    """Strings like '1', 'true' must NOT be coerced to True — only the
-    real bool counts. Otherwise a botched PATCH that stored the string
-    'true' silently flips a tenant on."""
+async def test_accepts_exactly_the_two_shapes_sql_accepts(monkeypatch) -> None:
+    """Boolean true AND string "true" are ON; every other truthy value
+    stays OFF.
+
+    This test used to pin the string to False ("a botched PATCH must not
+    flip a tenant on") — but the engine's own PUT /settings writes the
+    string, and every SQL consumer (`->> = 'true'`) already read it as
+    ON, so the Python-side refusal protected nothing: it made the two
+    gates disagree, and a PUT-enabled tenant drained in SQL while the
+    Normalizer silently stopped enqueueing. The contract now is exact
+    parity with wiki_enabled_sql — see tests/test_customer_prefs_parity.py
+    for the live-DB matrix.
+    """
     _patch_raw_conn(monkeypatch, {"wiki_generation_enabled": "true"})
-    assert await customer_prefs.is_wiki_generation_enabled("c1") is False
+    assert await customer_prefs.is_wiki_generation_enabled("c1") is True
+
+    for still_off in ("1", 1, "yes", "True", ["true"]):
+        _patch_raw_conn(monkeypatch, {"wiki_generation_enabled": still_off})
+        assert await customer_prefs.is_wiki_generation_enabled("c1") is False, (
+            still_off
+        )
 
 
 @pytest.mark.asyncio

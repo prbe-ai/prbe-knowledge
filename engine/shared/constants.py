@@ -1784,10 +1784,16 @@ WIKI_ENQUEUE_EXCLUDED_SOURCES: tuple[SourceSystem, ...] = (
 )
 
 # Per-statement ceiling for the nightly queue-seed reconcile. The seed is
-# one INSERT…SELECT anti-join per enabled tenant; on a healthy index it
-# runs in seconds, so a two-minute cap only exists to stop a pathological
-# plan from occupying the nightly window.
+# a batched INSERT…SELECT anti-join per enabled tenant; on a healthy index
+# a batch runs in seconds, so a two-minute cap only exists to stop a
+# pathological plan from occupying the nightly window.
 WIKI_RECONCILE_STATEMENT_TIMEOUT_MS = 120_000
+
+# Rows per reconcile seed batch. Each batch is its own statement + txn
+# under the timeout above, so a huge backlog makes durable progress
+# instead of failing all-or-nothing. 20k queue-row inserts is comfortably
+# a few seconds of work against the 4-index queue table.
+WIKI_RECONCILE_SEED_BATCH = 20_000
 
 
 # ---------------------------------------------------------------------------
@@ -1840,8 +1846,22 @@ WIKI_AGENT_BATCH_SIZE = 200
 # drain_skip_concurrent) — cross-tenant fan-out on the ONE machine is
 # the only knob that raises throughput. Within-tenant drains stay
 # serial by design (rows claimed in source_ts order).
-WIKI_AGENT_GLOBAL_CONCURRENCY = int(
-    os.getenv("WIKI_AGENT_GLOBAL_CONCURRENCY", "2")
+def _env_positive_int(name: str, default: int) -> int:
+    """Parse a positive-int env override; malformed or non-positive values
+    fall back to the default instead of crashing every importing service
+    at boot (this module is imported by all of them)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 1 else default
+
+
+WIKI_AGENT_GLOBAL_CONCURRENCY = _env_positive_int(
+    "WIKI_AGENT_GLOBAL_CONCURRENCY", 2
 )
 
 # Gemini model used by the wiki agent loop. Triage stays Flash Lite;

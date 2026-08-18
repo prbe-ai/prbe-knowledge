@@ -27,8 +27,8 @@ _TEST_ENV = {
     # PRBE_TEST_DATABASE_URL lets concurrent checkouts on one machine run
     # against their own database instead of racing each other's migrations
     # in the shared compose Postgres (the container name is fixed, so two
-    # worktrees otherwise share one schema). Still pinned local-only —
-    # never a way to point tests at a real deployment.
+    # worktrees otherwise share one schema). ENFORCED local-only below —
+    # never a way to point destructive test fixtures at a real deployment.
     "DATABASE_URL": os.environ.get(
         "PRBE_TEST_DATABASE_URL",
         "postgresql://prbe:prbe@localhost:5432/prbe_knowledge",
@@ -41,6 +41,16 @@ _TEST_ENV = {
     "ANTHROPIC_API_KEY": "",
     "TOKEN_ENCRYPTION_KEY": "VQzt8cN0Q8dUJYwQZUWaGKg_uvDyF-58DyHJ6m5f8ww=",
 }
+# The override's whole point is OTHER local databases, so the guard pins
+# the host, not the DSN: a CI misconfiguration or poisoned environment
+# must not aim the TRUNCATE-everything fixtures at a real deployment.
+_TEST_DB_HOST = (_TEST_ENV["DATABASE_URL"].split("@", 1)[-1]).split("/", 1)[0].split(":", 1)[0]
+if _TEST_DB_HOST not in ("localhost", "127.0.0.1", "::1"):
+    raise RuntimeError(
+        "PRBE_TEST_DATABASE_URL must point at localhost — refusing to run "
+        f"destructive test fixtures against host {_TEST_DB_HOST!r}"
+    )
+
 for _k, _v in _TEST_ENV.items():
     os.environ[_k] = _v
 

@@ -24,6 +24,7 @@ import pytest_asyncio
 from engine.shared.db import raw_conn, with_tenant
 from kb.synthesis import persistence
 from scripts.wiki_synthesis_catchup import seed as cli_seed
+from tests.wiki_fixtures import insert_customer, insert_document
 
 CUSTOMER = "wiki-seed-cust"
 _NOW = datetime(2026, 8, 1, tzinfo=UTC)
@@ -31,13 +32,7 @@ _NOW = datetime(2026, 8, 1, tzinfo=UTC)
 
 @pytest_asyncio.fixture
 async def seeded_customer(live_db: None) -> str:
-    async with raw_conn() as conn:
-        await conn.execute(
-            "INSERT INTO customers(customer_id, display_name, api_key_hash, preferences) "
-            "VALUES ($1, 'wiki-seed', 'h', $2::jsonb)",
-            CUSTOMER,
-            '{"wiki_generation_enabled": true}',
-        )
+    await insert_customer(CUSTOMER, preferences='{"wiki_generation_enabled": true}')
     return CUSTOMER
 
 
@@ -49,28 +44,15 @@ async def _insert_doc(
     valid_to: datetime | None = None,
     deleted_at: datetime | None = None,
 ) -> None:
-    async with with_tenant(CUSTOMER) as conn:
-        await conn.execute(
-            """
-            INSERT INTO documents
-                (doc_id, version, customer_id, source_system, source_id,
-                 source_url, doc_type, content_hash, created_at, updated_at,
-                 valid_from, valid_to, deleted_at, acl)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9, $9, $10, $11,
-                    '{}'::jsonb)
-            """,
-            doc_id,
-            version,
-            CUSTOMER,
-            source_system,
-            doc_id,
-            f"https://example.test/{doc_id}",
-            f"{source_system}.message",
-            f"hash-{doc_id}-{version}",
-            _NOW,
-            valid_to,
-            deleted_at,
-        )
+    await insert_document(
+        CUSTOMER,
+        doc_id,
+        source_system=source_system,
+        version=version,
+        valid_to=valid_to,
+        deleted_at=deleted_at,
+        created_at=_NOW,
+    )
 
 
 async def _queue_row(
@@ -264,3 +246,53 @@ async def test_cli_reset_terminal_path(seeded_customer: str) -> None:
     )
     assert stats["reset"] == 1
     assert (await _queue_statuses())["doc:redo"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_seed_limit_bounds_one_call(seeded_customer: str) -> None:
+    """The batching contract: `inserted == limit` means "call again"."""
+    await _insert_doc("doc:a")
+    await _insert_doc("doc:b")
+    await _insert_doc("doc:c")
+
+    async with with_tenant(CUSTOMER) as conn:
+        eligible, first = await persistence.seed_missing_docs(
+            conn, CUSTOMER, limit=2
+        )
+        # Batch mode skips the eligible count: computing it would force a
+        # full scan per batch, defeating the LIMIT's early termination.
+        assert (eligible, first) == (0, 2)
+        _eligible, second = await persistence.seed_missing_docs(
+            conn, CUSTOMER, limit=2
+        )
+        assert second == 1
+        _eligible, third = await persistence.seed_missing_docs(
+            conn, CUSTOMER, limit=2
+        )
+        assert third == 0
+    assert len(await _queue_statuses()) == 3
+
+
+def test_cli_rejects_invalid_flag_combinations() -> None:
+    from scripts.wiki_synthesis_catchup import main
+
+    with pytest.raises(SystemExit):
+        main(["cust", "--include-dlq"])  # requires --reset-terminal
+    with pytest.raises(SystemExit):
+        main([])  # customer_id required unless --all-enabled
+
+
+def test_concurrency_env_override_parses_defensively(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed env value must not crash every importing service at
+    boot; a non-positive one must not silently disable draining."""
+    from engine.shared.constants import _env_positive_int
+
+    monkeypatch.setenv("X_CONC", "3")
+    assert _env_positive_int("X_CONC", 2) == 3
+    for bad in ("", "two", "0", "-1"):
+        monkeypatch.setenv("X_CONC", bad)
+        assert _env_positive_int("X_CONC", 2) == 2
+    monkeypatch.delenv("X_CONC")
+    assert _env_positive_int("X_CONC", 2) == 2

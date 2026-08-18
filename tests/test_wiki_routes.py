@@ -25,6 +25,7 @@ from engine.shared.config import Settings, get_settings
 from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
 from kb.ingestion_app import app
 from kb.synthesis import persistence
+from tests.wiki_fixtures import insert_document
 
 CUSTOMER = "wiki-test-cust"
 
@@ -1155,7 +1156,6 @@ async def test_the_settings_route_takes_the_agents_page_lock(
     """
     import asyncio
 
-    from engine.shared.db import with_tenant
     from engine.shared.locks import advisory_lock_key
 
     await _put(client, "lock-me", "body", expected_version=0)
@@ -1268,7 +1268,6 @@ async def test_http_put_takes_the_page_lock(client: httpx.AsyncClient) -> None:
     """
     import asyncio
 
-    from engine.shared.db import with_tenant
     from engine.shared.locks import advisory_lock_key
 
     # THE KEY IS BUILT HERE, NOT IMPORTED FROM THE ROUTE. Calling the
@@ -1787,20 +1786,7 @@ async def test_reusing_a_key_with_different_text_is_a_409_not_a_silent_drop(
 
 
 async def _insert_live_doc(doc_id: str) -> None:
-    async with with_tenant(CUSTOMER) as conn:
-        await conn.execute(
-            """
-            INSERT INTO documents
-                (doc_id, version, customer_id, source_system, source_id,
-                 source_url, doc_type, content_hash, created_at, updated_at,
-                 valid_from, acl)
-            VALUES ($1, 1, $2, 'slack', $1, 'https://example.test',
-                    'slack.message', $3, NOW(), NOW(), NOW(), '{}'::jsonb)
-            """,
-            doc_id,
-            CUSTOMER,
-            f"hash-{doc_id}",
-        )
+    await insert_document(CUSTOMER, doc_id)
 
 
 async def _pending_docs() -> set[str]:
@@ -1873,7 +1859,9 @@ async def test_seed_failure_does_not_break_the_put(
     committed and the response already says 200, so a seeding crash must
     be logged and swallowed — the nightly reconcile is the retry."""
 
-    async def exploding_seed(conn, customer_id):
+    await _insert_live_doc("doc:would-seed")
+
+    async def exploding_seed(conn, customer_id, *, limit=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr(persistence, "seed_missing_docs", exploding_seed)
@@ -1892,3 +1880,49 @@ async def test_seed_failure_does_not_break_the_put(
         )
     assert stored == "true"
     assert await _pending_docs() == set()
+
+
+@pytest.mark.asyncio
+async def test_reenabling_wakes_the_worker_even_with_nothing_new_to_seed(
+    client: httpx.AsyncClient, settings: Settings
+) -> None:
+    """off→on with PENDING rows from before the flip-off must still fire
+    the wake: inserted == 0 there, and gating the notify on it left the
+    old rows waiting for the 30-minute periodic cycle."""
+    import asyncio
+
+    import asyncpg
+
+    from engine.shared.constants import WIKI_PENDING_CHANNEL
+
+    await _insert_live_doc("doc:old-pending")
+    async with raw_conn() as conn:
+        await conn.execute(
+            "INSERT INTO wiki_synthesis_queue "
+            "(customer_id, doc_id, doc_version, source_system, doc_type, status) "
+            "VALUES ($1, 'doc:old-pending', 1, 'slack', 'slack.message', 'pending')",
+            CUSTOMER,
+        )
+
+    received: list[str] = []
+    notify_event = asyncio.Event()
+    listener = await asyncpg.connect(settings.database_url)
+    try:
+
+        def _on_notify(_conn, _pid, channel, payload) -> None:
+            received.append(payload)
+            notify_event.set()
+
+        await listener.add_listener(WIKI_PENDING_CHANNEL, _on_notify)
+
+        resp = await client.put(
+            "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["catchup_started"] is True
+
+        await asyncio.wait_for(notify_event.wait(), timeout=5)
+    finally:
+        await listener.close()
+
+    assert CUSTOMER in received

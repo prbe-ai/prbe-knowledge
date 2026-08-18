@@ -63,6 +63,7 @@ __all__ = [
     "fetch_triaged_manifest",
     "fetch_wiki_index",
     "get_event_body_for_agent",
+    "list_enabled_active_customers",
     "list_pending_customers",
     "list_triaged_customers",
     "mark_batch_triage_error",
@@ -159,46 +160,135 @@ _ELIGIBLE_DOC_SQL = """
 
 _EXCLUDED_SOURCE_VALUES = [s.value for s in WIKI_ENQUEUE_EXCLUDED_SOURCES]
 
+# The queue-side anti-join every seed/count shares: "this live doc has no
+# queue row yet". A plain LEFT JOIN … IS NULL (not a correlated EXISTS
+# inside an aggregate FILTER) so the planner can hash-anti-join instead of
+# probing uq_wsq_customer_doc_version once per document row.
+_UNQUEUED_JOIN_SQL = """
+        LEFT JOIN wiki_synthesis_queue q
+          ON q.customer_id = d.customer_id
+         AND q.doc_id = d.doc_id
+         AND q.doc_version = d.version
+"""
+
+
+def _reset_statuses(include_dlq: bool) -> list[str]:
+    statuses = list(WIKI_RESET_TERMINAL_STATUSES)
+    if include_dlq:
+        statuses.append("dlq")
+    return statuses
+
+
+async def list_enabled_active_customers(conn: asyncpg.Connection) -> list[str]:
+    """Active customers whose wiki flag is on — THE enumeration.
+
+    The nightly reconcile and the catchup CLI's --all-enabled both walk
+    this exact list; one query here keeps 'enabled tenant' from meaning
+    two different things on two schedules.
+    """
+    rows = await conn.fetch(
+        f"""
+        SELECT customer_id
+        FROM customers
+        WHERE status = 'active'
+          AND {wiki_enabled_sql()}
+        ORDER BY customer_id
+        """
+    )
+    return [r["customer_id"] for r in rows]
+
 
 async def seed_missing_docs(
-    conn: asyncpg.Connection, customer_id: str
+    conn: asyncpg.Connection,
+    customer_id: str,
+    *,
+    limit: int | None = None,
 ) -> tuple[int, int]:
     """Insert queue rows for live eligible docs that aren't queued yet.
 
-    Idempotent: `ON CONFLICT (customer_id, doc_id, doc_version) DO
-    NOTHING` on the queue's unique key is the concurrency guarantee —
-    the Normalizer, the nightly reconcile, the settings toggle, the
-    rebuild trigger, and the catchup CLI can all seed simultaneously
-    without duplicating rows. Returns (eligible_total, inserted).
+    One scan: a CTE selects the eligible set once, the INSERT feeds from
+    its un-queued half (anti-join, so steady-state nightly runs don't
+    push every already-queued doc through the unique-index arbiter), and
+    both counts come off the same pass. `ON CONFLICT … DO NOTHING` on
+    the queue's unique key stays as the guarantee against CONCURRENT
+    seeders — the Normalizer, the nightly reconcile, the settings
+    toggle, the rebuild trigger, and the catchup CLI can all run at
+    once without duplicating rows.
+
+    `limit` bounds one call's inserts so a caller can batch (the nightly
+    reconcile and the toggle catchup do — one statement per batch, each
+    under its own statement_timeout, so a huge backlog makes durable
+    progress instead of failing all-or-nothing). Returns
+    (eligible_total, inserted). LIMITED CALLS RETURN eligible=0: the
+    count would force a full materialization of the eligible scan on
+    every batch, which is exactly the unbounded work the limit exists
+    to avoid — batch callers loop until `inserted == 0` (not `< limit`:
+    a concurrent seeder's ON CONFLICT wins count toward the LIMIT but
+    not toward inserted, so `< limit` would exit with backlog left).
+
+    source_ts semantics: seeded rows use `documents.created_at`, the
+    schema's documented FALLBACK. The Normalizer's live enqueue uses the
+    richer in-memory source-side timestamp (Slack ts, Notion
+    last_edited_time) that the documents table does not store — so a
+    seeded corpus drains in created_at order, which for bulk imports is
+    as good as the importer's timestamps. Persisting the extracted
+    source_ts on documents would close the gap (TODOS.md).
     """
-    eligible = await conn.fetchval(
-        f"""
-        SELECT count(*)
-        FROM documents d
-        WHERE {_ELIGIBLE_DOC_SQL}
-        """,
-        customer_id,
-        _EXCLUDED_SOURCE_VALUES,
-    )
+    if limit is None:
+        row = await conn.fetchrow(
+            f"""
+            WITH eligible AS (
+                SELECT d.customer_id, d.doc_id, d.version, d.source_system,
+                       d.doc_type, d.created_at,
+                       (q.doc_id IS NULL) AS unqueued
+                FROM documents d
+            {_UNQUEUED_JOIN_SQL}
+                WHERE {_ELIGIBLE_DOC_SQL}
+            ),
+            ins AS (
+                INSERT INTO wiki_synthesis_queue
+                    (customer_id, doc_id, doc_version, source_system,
+                     doc_type, source_ts, status, enqueued_at)
+                SELECT customer_id, doc_id, version, source_system,
+                       doc_type, created_at, 'pending', NOW()
+                FROM eligible
+                WHERE unqueued
+                ON CONFLICT (customer_id, doc_id, doc_version) DO NOTHING
+                RETURNING 1
+            )
+            SELECT (SELECT count(*) FROM eligible) AS eligible,
+                   (SELECT count(*) FROM ins) AS inserted
+            """,
+            customer_id,
+            _EXCLUDED_SOURCE_VALUES,
+        )
+        return int(row["eligible"] or 0), int(row["inserted"] or 0)
+
+    # Batch mode: no eligible count — the planner can stop the anti-join
+    # scan at LIMIT unqueued rows instead of materializing the full set.
     inserted = await conn.fetchval(
         f"""
-        WITH inserted AS (
+        WITH ins AS (
             INSERT INTO wiki_synthesis_queue
                 (customer_id, doc_id, doc_version, source_system,
                  doc_type, source_ts, status, enqueued_at)
             SELECT d.customer_id, d.doc_id, d.version, d.source_system,
                    d.doc_type, d.created_at, 'pending', NOW()
             FROM documents d
+        {_UNQUEUED_JOIN_SQL}
             WHERE {_ELIGIBLE_DOC_SQL}
+              AND q.doc_id IS NULL
+            LIMIT $3
             ON CONFLICT (customer_id, doc_id, doc_version) DO NOTHING
             RETURNING 1
         )
-        SELECT count(*) FROM inserted
+        SELECT count(*) FROM ins
         """,
         customer_id,
         _EXCLUDED_SOURCE_VALUES,
+        limit,
     )
-    return int(eligible or 0), int(inserted or 0)
+    return 0, int(inserted or 0)
 
 
 async def count_seedable_docs(
@@ -209,20 +299,15 @@ async def count_seedable_docs(
     Powers `--dry-run` and the rebuild preview. `would_insert` is a real
     anti-join count, not `eligible - 0` — the historical dry-run bug
     reported every doc as already queued and taught operators to skip
-    the preview.
+    the preview. Same LEFT JOIN shape as the seed, so the numbers a
+    preview shows are the numbers the seed produces.
     """
     row = await conn.fetchrow(
         f"""
         SELECT count(*) AS eligible,
-               count(*) FILTER (
-                   WHERE NOT EXISTS (
-                       SELECT 1 FROM wiki_synthesis_queue q
-                       WHERE q.customer_id = d.customer_id
-                         AND q.doc_id = d.doc_id
-                         AND q.doc_version = d.version
-                   )
-               ) AS would_insert
+               count(*) FILTER (WHERE q.doc_id IS NULL) AS would_insert
         FROM documents d
+        {_UNQUEUED_JOIN_SQL}
         WHERE {_ELIGIBLE_DOC_SQL}
         """,
         customer_id,
@@ -242,9 +327,7 @@ async def count_resettable_rows(
     Same status set and the same live-eligible-document join, so the
     dry-run number is the real number.
     """
-    statuses = list(WIKI_RESET_TERMINAL_STATUSES)
-    if include_dlq:
-        statuses.append("dlq")
+    statuses = _reset_statuses(include_dlq)
     count = await conn.fetchval(
         f"""
         SELECT count(*)
@@ -302,9 +385,7 @@ async def reset_terminal_rows(
     Clears per-row triage/synthesis state but keeps identity columns
     (doc_id, doc_version, enqueued_at) so source_ts ordering survives.
     """
-    statuses = list(WIKI_RESET_TERMINAL_STATUSES)
-    if include_dlq:
-        statuses.append("dlq")
+    statuses = _reset_statuses(include_dlq)
     reset = await conn.fetchval(
         f"""
         WITH reset AS (

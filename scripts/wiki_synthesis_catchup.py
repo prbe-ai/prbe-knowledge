@@ -57,7 +57,6 @@ import sys
 
 from engine.shared.config import get_settings
 from engine.shared.constants import WIKI_PENDING_CHANNEL
-from engine.shared.customer_prefs import wiki_enabled_sql
 from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
 from engine.shared.logging import configure_logging, get_logger
 from kb.synthesis import persistence
@@ -103,7 +102,10 @@ async def seed(
                 if reset_terminal
                 else 0
             )
-            would_reset = reset if reset_terminal else None
+            # Dry-run-only key: in a wet run `reset` IS the number, and
+            # printing it twice under two names taught readers the names
+            # meant different things.
+            would_reset = None
 
         run_id: int | None = None
         # Mark the onboarding-style mass enqueue. The dashboard reads
@@ -155,33 +157,22 @@ def _print_stats(s: dict[str, int | bool | str | None]) -> None:
     else:
         parts.append(f"inserted={s['inserted']}")
     if s["terminal_to_reset"] is not None:
-        parts.append(f"terminal={s['terminal_to_reset']}")
-        if not s["dry_run"]:
-            parts.append(f"reset={s['reset']}")
+        parts.append(f"would_reset={s['terminal_to_reset']}")
+    if s["reset"]:
+        parts.append(f"reset={s['reset']}")
     if s["run_id"] is not None:
         parts.append(f"run_id={s['run_id']}")
     if s["notified"]:
         parts.append(f"notified={WIKI_PENDING_CHANNEL}")
-    print(" ".join(str(p) for p in parts) + suffix)
+    print(" ".join(parts) + suffix)
 
 
 async def _list_enabled_customers() -> list[str]:
-    """Customers with preferences.wiki_generation_enabled = true.
-
-    Reads the global view (no with_tenant) — pairs with raw_conn rather
-    than with_tenant since we need cross-customer visibility.
-    """
+    """Customers with the wiki flag on — the same enumeration the nightly
+    reconcile walks, so --all-enabled and the cron can never disagree
+    about who is enabled."""
     async with raw_conn() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT customer_id
-            FROM customers
-            WHERE status = 'active'
-              AND {wiki_enabled_sql()}
-            ORDER BY customer_id
-            """
-        )
-    return [r["customer_id"] for r in rows]
+        return await persistence.list_enabled_active_customers(conn)
 
 
 async def run(args: argparse.Namespace) -> int:

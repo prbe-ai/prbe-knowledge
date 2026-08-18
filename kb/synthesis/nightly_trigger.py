@@ -49,10 +49,10 @@ import asyncpg
 from engine.shared.config import get_settings
 from engine.shared.constants import (
     WIKI_PENDING_CHANNEL,
+    WIKI_RECONCILE_SEED_BATCH,
     WIKI_RECONCILE_STATEMENT_TIMEOUT_MS,
     SourceSystem,
 )
-from engine.shared.customer_prefs import wiki_enabled_sql
 from engine.shared.db import (
     apply_connection_setup,
     close_pool,
@@ -63,7 +63,10 @@ from engine.shared.db import (
 from engine.shared.logging import configure_logging, get_logger
 from kb.code_graph.bridge import enqueue_initial_backfill
 from kb.synthesis.diagram_renderer import regenerate_wiki_diagram
-from kb.synthesis.persistence import seed_missing_docs
+from kb.synthesis.persistence import (
+    list_enabled_active_customers,
+    seed_missing_docs,
+)
 
 log = get_logger(__name__)
 
@@ -100,34 +103,40 @@ async def reconcile_missing_queue_rows() -> dict[str, int]:
     """
     summary = {"customers": 0, "seeded": 0, "failures": 0}
     async with raw_conn() as conn:
-        rows = await conn.fetch(
-            f"""
-            SELECT customer_id
-            FROM customers
-            WHERE status = 'active'
-              AND {wiki_enabled_sql()}
-            ORDER BY customer_id
-            """
-        )
-    for row in rows:
-        customer_id = row["customer_id"]
+        customers = await list_enabled_active_customers(conn)
+    for customer_id in customers:
         summary["customers"] += 1
         try:
-            async with with_tenant(customer_id) as conn, conn.transaction():
-                await conn.execute(
-                    f"SET LOCAL statement_timeout = "
-                    f"{WIKI_RECONCILE_STATEMENT_TIMEOUT_MS}"
-                )
-                eligible, inserted = await seed_missing_docs(
-                    conn, customer_id
-                )
-            summary["seeded"] += inserted
-            if inserted:
+            # Batched: each batch is its own transaction under its own
+            # statement_timeout, so a backlog too big for one statement
+            # makes durable progress tonight instead of failing
+            # all-or-nothing every night — the guarantee has to hold for
+            # exactly the tenants with the largest backfills.
+            seeded_here = 0
+            while True:
+                async with with_tenant(customer_id) as conn, conn.transaction():
+                    await conn.execute(
+                        f"SET LOCAL statement_timeout = "
+                        f"{WIKI_RECONCILE_STATEMENT_TIMEOUT_MS}"
+                    )
+                    _eligible, inserted = await seed_missing_docs(
+                        conn,
+                        customer_id,
+                        limit=WIKI_RECONCILE_SEED_BATCH,
+                    )
+                seeded_here += inserted
+                # Loop until a batch inserts NOTHING — `< batch` would
+                # exit early when a concurrent seeder's ON CONFLICT wins
+                # counted toward the LIMIT but not toward inserted,
+                # leaving backlog for a full extra day.
+                if inserted == 0:
+                    break
+            summary["seeded"] += seeded_here
+            if seeded_here:
                 log.info(
                     "nightly_reconcile.seeded",
                     customer=customer_id,
-                    eligible=eligible,
-                    inserted=inserted,
+                    inserted=seeded_here,
                 )
         except Exception as exc:
             summary["failures"] += 1
@@ -368,20 +377,23 @@ async def main() -> None:
 
     # Step B0: reconcile — seed queue rows for every enabled tenant's
     # un-queued docs BEFORE the notify pass, so tonight's notify already
-    # covers documents the event-driven paths missed. Failure here must
-    # not block the notify: tenants with existing pending rows still
-    # drain even if the reconcile enumeration itself falls over.
-    await init_pool(settings)
+    # covers documents the event-driven paths missed. NOTHING in this
+    # block may stop Step B: init_pool and close_pool sit inside the
+    # guard too, because a pool that cannot open (or close) is exactly
+    # the kind of transient failure that must not cost tenants with
+    # existing pending rows their nightly drain.
     try:
-        await reconcile_missing_queue_rows()
+        await init_pool(settings)
+        try:
+            await reconcile_missing_queue_rows()
+        finally:
+            await close_pool()
     except Exception as exc:
         log.warning(
             "nightly_trigger.reconcile_failed",
             error=str(exc),
             error_class=type(exc).__name__,
         )
-    finally:
-        await close_pool()
 
     # Step B: existing nightly synthesis trigger.
     notified = await trigger_nightly_synthesis(settings.database_url)

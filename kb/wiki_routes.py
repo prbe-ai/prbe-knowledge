@@ -81,6 +81,7 @@ from engine.shared.constants import (
     WIKI_DOC_TYPE_PREFIX,
     WIKI_INDEX_DOC_TYPE,
     WIKI_PENDING_CHANNEL,
+    WIKI_RECONCILE_SEED_BATCH,
     DocClass,
     SourceSystem,
 )
@@ -1663,13 +1664,27 @@ async def set_wiki_generation_settings(
     silently.
     """
     async with with_tenant(customer_id) as conn:
-        row = await conn.fetchrow(
+        # Two statements, one transaction, prev read FIRST under FOR
+        # UPDATE. Not a CTE: a locking scan inside the UPDATE statement
+        # runs after the row was self-updated and SKIPS the tuple
+        # (HeapTupleSelfUpdated), so `prev` read as NULL on every call
+        # and each on→on PUT re-scheduled the seed. Here the row lock
+        # serializes concurrent PUTs at the SELECT — the second waits,
+        # then reads the committed flip, so only one off→on transition
+        # observes prev != 'true'.
+        prev = await conn.fetchrow(
             """
-            WITH prior AS (
-                SELECT preferences->>'wiki_generation_enabled' AS prev
-                FROM customers
-                WHERE customer_id = $1
-            )
+            SELECT preferences->>'wiki_generation_enabled' AS prev
+            FROM customers
+            WHERE customer_id = $1
+            FOR UPDATE
+            """,
+            customer_id,
+        )
+        if prev is None:
+            raise HTTPException(status_code=404, detail="unknown customer")
+        updated = await conn.fetchval(
+            """
             UPDATE customers
                SET preferences = jsonb_set(
                        COALESCE(preferences, '{}'::jsonb),
@@ -1678,15 +1693,11 @@ async def set_wiki_generation_settings(
                        true
                    )
              WHERE customer_id = $1
-         RETURNING preferences->>'wiki_generation_enabled' AS now,
-                   (SELECT prev FROM prior) AS prev
+         RETURNING preferences->>'wiki_generation_enabled'
             """,
             customer_id,
             "true" if body.generation_enabled else "false",
         )
-    if row is None:
-        raise HTTPException(status_code=404, detail="unknown customer")
-    updated = row["now"]
     log.info(
         "wiki.generation_setting_changed",
         customer=customer_id,
@@ -1697,7 +1708,7 @@ async def set_wiki_generation_settings(
     # after the response (a huge tenant's seed must not time out this
     # request) on a connection of its own. Best-effort by design —
     # the nightly reconcile re-seeds anything a lost task leaves behind.
-    catchup_started = updated == "true" and row["prev"] != "true"
+    catchup_started = updated == "true" and prev["prev"] != "true"
     if catchup_started:
         background_tasks.add_task(_seed_after_enable, customer_id)
     return WikiGenerationSettingsResponse(
@@ -1715,21 +1726,36 @@ async def _seed_after_enable(customer_id: str) -> None:
     Failures log and stop; the nightly reconcile is the retry.
     """
     try:
-        async with with_tenant(customer_id) as conn:
-            eligible, inserted = await persistence.seed_missing_docs(
-                conn, customer_id
-            )
-            if inserted:
-                await conn.execute(
-                    "SELECT pg_notify($1, $2)",
-                    WIKI_PENDING_CHANNEL,
-                    customer_id,
+        # Batched like the nightly reconcile — a single-statement seed of
+        # the largest corpora would be client-cancelled by the pool's
+        # command_timeout and roll back whole. The wake fires after the
+        # FIRST batch so the drain starts while later batches fill in.
+        # Notify even when nothing was inserted: a tenant re-enabling the
+        # wiki may have PENDING rows from before the flip-off, and
+        # without a wake those wait for the 30-min periodic cycle. The
+        # worker re-checks flag + pending, so a spurious wake is a cheap
+        # no-op.
+        seeded = 0
+        first_batch = True
+        while True:
+            async with with_tenant(customer_id) as conn:
+                _eligible, inserted = await persistence.seed_missing_docs(
+                    conn, customer_id, limit=WIKI_RECONCILE_SEED_BATCH
                 )
+                if first_batch:
+                    await conn.execute(
+                        "SELECT pg_notify($1, $2)",
+                        WIKI_PENDING_CHANNEL,
+                        customer_id,
+                    )
+            seeded += inserted
+            first_batch = False
+            if inserted == 0:
+                break
         log.info(
             "wiki.settings_catchup_seeded",
             customer=customer_id,
-            eligible=eligible,
-            inserted=inserted,
+            inserted=seeded,
         )
     except Exception as exc:
         log.warning(
