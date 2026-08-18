@@ -8,6 +8,31 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
+- **`search_knowledge` grew a `detail` dial — and its default response got
+  leaner without losing a fact.** Measured on live production responses,
+  60% of a search payload was structure and metadata rather than evidence,
+  and because responses run into the ~20KB byte budget (9 of 10 measured
+  calls truncated), that overhead was being paid for with dropped search
+  results, not just tokens. Two changes:
+
+  - Compaction now collapses measured repeats unconditionally: chunk-level
+    `retriever_scores` (empty in 69/69 production chunks), `canonical_id`
+    when byte-identical to `doc_id` (69/83), a chunk's `matched_via` when it
+    duplicates its document's (19/69), empty `graph_evidence`/`why_relevant`,
+    and null-valued keys inside provenance entries. Populated values always
+    pass; absent keys mean "nothing here", never "unknown".
+  - `detail: "ids" | "evidence" | "full"` (default `"evidence"`) projects
+    each result row: `evidence` keeps identity + chunk content and drops
+    per-doc audit metadata (`author_id`, timestamps) and non-graph
+    provenance; `ids` is the no-content triage shape; `full` is the prior
+    compact response. The envelope (`degraded`, `truncated`,
+    `confidence_breakdown`, `total_candidates`, ...) is identical at every
+    detail — a leaner answer can never masquerade as a healthier one — and
+    profiles run before the byte budget, so leaner details keep more hits
+    under the cap. Replayed against the captured production corpus:
+    ~−26%/call at the default, −71% at `ids`; `verbose=True` still returns
+    the raw upstream payload untouched.
+
 - **The wiki now covers documents that arrived before a tenant turned it
   on.** The nightly trigger reconciles the synthesis queue for every
   enabled tenant (batched, idempotent, timestamp-agnostic — backdated

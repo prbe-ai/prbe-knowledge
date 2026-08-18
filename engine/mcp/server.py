@@ -13,6 +13,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent
 
+from engine.mcp.clients._responses import _DETAILS as _DETAIL_VALUES
 from engine.mcp.clients.knowledge import KnowledgeError, get_client
 from engine.mcp.consts import (
     ALLOWED_HOSTS,
@@ -88,6 +89,7 @@ async def search_knowledge(
     top_k_related: int = 10,
     discovery: bool = False,
     verbose: bool = False,
+    detail: str = "evidence",
 ) -> CallToolResult:
     """Search team operational history when a concrete history question could
     change the answer or approach.
@@ -111,14 +113,16 @@ async def search_knowledge(
 
     NOT source-code search. For code, read the repo directly.
 
-    Response shape: `results[]`, each Document result carrying doc-level metadata
-    (`doc_id`, `source_system`, `source_url`, `title`, `author_id`,
-    `created_at`, `updated_at`, `score`, `chunk_count`) and a nested
-    `chunks[]` array of the matching spans within that document. Each
-    chunk carries its own `score`, `content`, and `graph_evidence`
-    (a list of `{edge_type, confidence, via_entity, reason}` entries —
-    the trail of knowledge-graph edges that connected the chunk to your
-    query; empty list when the chunk matched on text alone). Top-level
+    Response shape: `results[]`, each Document result carrying its identity
+    (`doc_id`, `source_system`, `source_url`, `title`, `score`,
+    `chunk_count`) and a nested `chunks[]` array of the matching spans
+    within that document. Each chunk carries its own `score` and `content`,
+    plus `graph_evidence` when populated (a list of `{edge_type, confidence,
+    via_entity, reason}` entries — the trail of knowledge-graph edges that
+    connected the chunk to your query; ABSENT when the chunk matched on text
+    alone — absent keys throughout this response mean "nothing here", never
+    "unknown"). Audit metadata (`author_id`, `created_at`, `updated_at`) and
+    full provenance ride only on detail="full" — see `detail` below. Top-level
     `confidence_breakdown` is an aggregate count of evidence confidences
     (`EXTRACTED` / `INFERRED` / `AMBIGUOUS`) across all returned chunks —
     a low EXTRACTED ratio means most matches are inferred and you should
@@ -285,8 +289,41 @@ async def search_knowledge(
             `total_candidates`, `extracted_entities`, and
             `applied_temporal` stay so the caller can tell when to
             raise top_k or when the router misinterpreted the query.
-            Set True for the full upstream payload when debugging.
+            Set True for the full upstream payload when debugging;
+            verbose=True outranks `detail`.
+        detail: Your altitude dial — how much of each result to return.
+            The ENVELOPE (`degraded`, `truncated`, `confidence_breakdown`,
+            `total_candidates`, ...) is identical at every detail; only the
+            rows inside `results` change, so a partial or degraded answer can
+            never masquerade as a complete one by being asked for leaner.
+              "evidence" (default): doc identity (`doc_id`, `title`,
+                `source_url`, `score`) + full chunk content. Drops per-doc
+                audit metadata (`created_at`/`updated_at`/`author_id`) and
+                provenance boilerplate; provenance that arrived over a
+                knowledge-graph edge (`edge_type`/`why`) is always kept.
+                Everything dropped is one detail="full" call away, and
+                `doc_id` + `get_source` reach the entire document.
+              "ids": triage — doc identity and scores, no chunk content.
+                For "did the lab touch X at all?" sweeps before spending
+                tokens reading evidence.
+              "full": every field the compact response carries, including
+                audit metadata and complete provenance. The debugging and
+                audit shape.
+            Leaner details also survive the response byte budget better: the
+            budget trims tail chunks and then whole documents to fit, so at
+            "evidence" more of your actual hits make it under the cap.
     """
+    if detail not in _DETAIL_VALUES:
+        return _tool_result(
+            {
+                "error": (
+                    f"detail must be one of {', '.join(_DETAIL_VALUES)}; "
+                    f"got {detail!r}"
+                ),
+                "status": 422,
+            },
+            is_error=True,
+        )
     customer_id = get_current_customer()
     client = get_client()
     sources = [source] if source else None
@@ -300,6 +337,7 @@ async def search_knowledge(
             top_k_related=min(max(top_k_related, 0), 20),
             discovery=discovery,
             verbose=verbose,
+            detail=detail,
         )
     except KnowledgeError as exc:
         return _error_response(exc)
