@@ -2219,3 +2219,22 @@ async def test_undo_with_no_rebuild_is_a_no_op_not_an_error(
     assert undo.status_code == 200, undo.text
     assert undo.json()["restored_pages"] == 0
     assert await _live_pages() == {"wiki:runbook:alpha"}
+
+
+@pytest.mark.asyncio
+async def test_undo_reports_when_there_was_nothing_to_undo(
+    client: httpx.AsyncClient,
+) -> None:
+    """`undone` distinguishes "I stopped it" from "there was nothing to stop".
+
+    It returned True unconditionally at first, which made those two answers
+    identical -- and they are the one distinction a caller reaching for undo
+    actually wants. Caught by smoking the deployed endpoint, where a no-op
+    against a quiet tenant still answered `undone: true`.
+    """
+    undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
+    assert undo.status_code == 200, undo.text
+    body = undo.json()
+    assert body["undone"] is False
+    assert body["restored_pages"] == 0
+    assert body["cancelled_run_ids"] == []
