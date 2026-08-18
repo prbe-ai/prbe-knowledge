@@ -2411,9 +2411,12 @@ async def _restore_retired_pages(conn: asyncpg.Connection, customer_id: str) -> 
 class BackfillUndoResponse(BaseModel):
     """What an undo answers.
 
-    `restored_pages` counts pages put back. Zero is normal and does not mean
-    failure — a rebuild that finished re-deriving everything it touched has
-    nothing to put back.
+    `undone` is whether there was anything to undo. False means no rebuild was
+    in flight and no page needed putting back — a successful 200, not an error.
+
+    `restored_pages` counts pages put back. Zero alongside `undone` True is
+    normal: a rebuild that had already re-derived everything it touched leaves
+    nothing to restore, but stopping its runs was still real work.
     """
 
     undone: bool = True
@@ -2466,7 +2469,17 @@ async def _do_undo_wiki_backfill(customer_id: str) -> BackfillUndoResponse:
         restored_pages=restored,
         cancelled_run_ids=cancelled or None,
     )
-    return BackfillUndoResponse(undone=True, restored_pages=restored, cancelled_run_ids=cancelled)
+    # `undone` reports whether there was anything to undo, not whether the call
+    # succeeded -- the 200 is what reports success. Returning True
+    # unconditionally made "I stopped your rebuild" indistinguishable from
+    # "there was no rebuild", which is the one distinction a caller reaching for
+    # undo actually wants. Caught by smoking the live endpoint, where a no-op
+    # answered `undone: true`.
+    return BackfillUndoResponse(
+        undone=bool(cancelled or restored),
+        restored_pages=restored,
+        cancelled_run_ids=cancelled,
+    )
 
 
 async def _insert_pending_runs(
