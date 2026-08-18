@@ -1316,6 +1316,38 @@ CREATE POLICY tenant_isolation ON wiki_page_settings
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
+--
+-- REPLAY GUARD FOR `POST /api/wiki/pages/{type}/{slug}/append`.
+-- An agent that times out cannot know whether its paragraph landed, and
+-- retrying is what it does next. Without a record of what has already been
+-- applied that retry appends twice, and a duplicated decision log reads as
+-- two decisions -- silently, because nothing is watching an unattended write.
+--
+-- Keyed per PAGE, not per tenant: a key is minted per call, so the same key
+-- arriving for a different page is not a retry of anything and must not be
+-- swallowed. Rows are pruned opportunistically by the route itself, under the
+-- page lock it already holds, so there is no sweeper to fall behind.
+CREATE TABLE wiki_append_idempotency (
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    wiki_type       TEXT NOT NULL,
+    slug            TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    -- The version the append PRODUCED, returned verbatim on replay so a retry
+    -- gets the answer it was retrying for rather than the page's later state.
+    version         INTEGER NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (customer_id, wiki_type, slug, idempotency_key)
+);
+
+CREATE INDEX wiki_append_idempotency_prune_idx
+    ON wiki_append_idempotency (customer_id, wiki_type, slug, created_at);
+
+ALTER TABLE wiki_append_idempotency ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wiki_append_idempotency FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON wiki_append_idempotency
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
 CREATE TABLE wiki_timeline_entries (
     id              BIGSERIAL PRIMARY KEY,
     customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,

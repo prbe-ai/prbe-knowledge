@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 import httpx
@@ -1476,3 +1477,213 @@ async def test_the_settings_routes_require_the_internal_key(
         ),
     ):
         assert (await call).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# POST /pages/{wiki_type}/{slug}/append
+#
+# Deliberately lean. A test earns its place here only where the failure is
+# SILENT or unrecoverable -- a dropped paragraph, a duplicated decision, a
+# leaked write past a reservation. Everything that fails loudly the first time
+# anyone runs the route (empty text, a missing key, a bad slug) is covered by
+# the shared validators and is not re-tested per route.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_append_creates_the_page_when_it_does_not_exist(
+    client: httpx.AsyncClient,
+) -> None:
+    """An agent logging a decision should not have to check existence first.
+
+    That check is the two-step this route exists to remove, and an agent that
+    has to perform it will race anyway.
+    """
+    resp = await client.post(
+        "/api/wiki/pages/runbook/dockq-scoring/append",
+        json={"text": "Chose DockQ over TM-score for interface quality."},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["created"] is True
+    assert payload["replayed"] is False
+
+    page = await client.get("/api/wiki/pages/runbook/dockq-scoring", headers=_hdr())
+    assert "DockQ over TM-score" in page.json()["body"]
+
+
+@pytest.mark.asyncio
+async def test_two_concurrent_appends_both_survive(client: httpx.AsyncClient) -> None:
+    """THE feature. A plain read-modify-write is last-one-wins, so two agents
+    logging at the same moment silently lose one paragraph.
+
+    Both are fired without awaiting in between so they contend for the page
+    lock rather than running in sequence.
+    """
+    await client.post(
+        "/api/wiki/pages/runbook/concurrent/append",
+        json={"text": "seed"},
+        headers=_hdr(),
+    )
+
+    first, second = await asyncio.gather(
+        client.post(
+            "/api/wiki/pages/runbook/concurrent/append",
+            json={"text": "first agent"},
+            headers=_hdr(),
+        ),
+        client.post(
+            "/api/wiki/pages/runbook/concurrent/append",
+            json={"text": "second agent"},
+            headers=_hdr(),
+        ),
+    )
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+
+    body = (
+        await client.get("/api/wiki/pages/runbook/concurrent", headers=_hdr())
+    ).json()["body"]
+    assert "first agent" in body
+    assert "second agent" in body
+
+
+@pytest.mark.asyncio
+async def test_replaying_an_idempotency_key_appends_nothing(
+    client: httpx.AsyncClient,
+) -> None:
+    """A timeout is exactly the case where the caller cannot know whether the
+    write landed, and retrying is what an agent does next. Without this the
+    retry duplicates the paragraph and one decision reads as two.
+
+    The replay must also report the version the FIRST call produced, not the
+    page's current version -- a retry should get the answer it was retrying
+    for.
+    """
+    payload = {"text": "only once", "idempotency_key": "retry-me"}
+    first = await client.post(
+        "/api/wiki/pages/runbook/idem/append", json=payload, headers=_hdr()
+    )
+    assert first.status_code == 200, first.text
+
+    second = await client.post(
+        "/api/wiki/pages/runbook/idem/append", json=payload, headers=_hdr()
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["replayed"] is True
+    assert second.json()["version"] == first.json()["version"]
+
+    body = (await client.get("/api/wiki/pages/runbook/idem", headers=_hdr())).json()["body"]
+    assert body.count("only once") == 1
+
+
+@pytest.mark.asyncio
+async def test_append_rejects_index_wiki_type(client: httpx.AsyncClient) -> None:
+    """The third write onto the reserved type, alongside PUT and revert.
+
+    Worth its own test for the reason the revert one gives: the read validator
+    deliberately lifts this reservation, and the writes must not drift into it.
+    """
+    resp = await client.post(
+        "/api/wiki/pages/index/contents/append",
+        json={"text": "sneaking a line onto the generated index"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 400, resp.text
+    assert "reserved" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_append_past_the_page_cap_refuses_with_413(
+    client: httpx.AsyncClient,
+) -> None:
+    """A page that is appended to unattended eventually fills up.
+
+    The refusal has to be a 413 that names the cap, not `ck_wiki_live_page_size`
+    surfacing as a 500 -- the caller is an agent deciding what to do next, and
+    a constraint violation tells it nothing actionable.
+    """
+    filler = "x" * 4000
+    for _ in range(2):
+        await client.post(
+            "/api/wiki/pages/runbook/full/append",
+            json={"text": filler},
+            headers=_hdr(),
+        )
+
+    resp = await client.post(
+        "/api/wiki/pages/runbook/full/append",
+        json={"text": filler},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 413, resp.text
+    assert "cap" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_append_works_on_a_page_frozen_against_the_pipeline(
+    client: httpx.AsyncClient,
+) -> None:
+    """`pipeline_updates=false` freezes a page against the nightly AGENT, not
+    against people. A deliberate write is the thing that setting protects, so
+    blocking it here would invert the feature."""
+    await client.put(
+        "/api/wiki/pages/runbook/frozen",
+        json={"title": "Frozen", "body": "original"},
+        headers=_hdr(),
+    )
+    await client.put(
+        "/api/wiki/pages/runbook/frozen/settings",
+        json={"pipeline_updates": False},
+        headers=_hdr(),
+    )
+
+    resp = await client.post(
+        "/api/wiki/pages/runbook/frozen/append",
+        json={"text": "a human still gets to write here"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    body = (await client.get("/api/wiki/pages/runbook/frozen", headers=_hdr())).json()["body"]
+    assert "original" in body
+    assert "a human still gets to write here" in body
+
+
+@pytest.mark.asyncio
+async def test_append_after_a_delete_starts_a_new_page(client: httpx.AsyncClient) -> None:
+    """The serialization the handler documents, pinned.
+
+    An append is not version-checked, so its behaviour against the OTHER
+    writers has to be stated somewhere that fails when it changes. A delete
+    that committed first must be respected: the append starts a fresh page
+    rather than resurrecting the old body, and reports `created`. Silently
+    restoring deleted content would make delete unreliable, and appending into
+    a tombstone would lose the paragraph.
+    """
+    await client.put(
+        "/api/wiki/pages/runbook/deleted-then-appended",
+        json={"title": "Gone", "body": "secret that was deleted on purpose"},
+        headers=_hdr(),
+    )
+    assert (
+        await client.delete(
+            "/api/wiki/pages/runbook/deleted-then-appended", headers=_hdr()
+        )
+    ).status_code == 200
+
+    resp = await client.post(
+        "/api/wiki/pages/runbook/deleted-then-appended/append",
+        json={"text": "written after the delete"},
+        headers=_hdr(),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["created"] is True
+
+    body = (
+        await client.get(
+            "/api/wiki/pages/runbook/deleted-then-appended", headers=_hdr()
+        )
+    ).json()["body"]
+    assert "written after the delete" in body
+    assert "secret that was deleted on purpose" not in body

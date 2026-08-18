@@ -89,6 +89,7 @@ from kb.handlers.wiki import (
 )
 from kb.synthesis import persistence
 from kb.synthesis.crawlers import REGISTRY as BACKFILL_CRAWLER_REGISTRY
+from kb.synthesis.staged_graph import PAGE_CAP_BYTES
 from kb.wiki_links import parse_page_links
 
 log = get_logger(__name__)
@@ -177,6 +178,62 @@ class WikiUpsertBody(BaseModel):
                 "use 'manual_entry' for human uploads"
             )
         return value
+
+
+class WikiAppendBody(BaseModel):
+    """One paragraph onto the end of a page, in one call.
+
+    NO `expected_version`, and that is the whole point. The read-modify-write
+    this replaces makes an agent lose a race it had no way to win: two agents
+    logging a decision at the same moment produce a 409 for the second, whose
+    only recourse is to re-read and try again against a page that may have
+    moved once more. An append has no such conflict BETWEEN APPENDS -- the
+    lock serialises them and both paragraphs survive.
+
+    It is not conflict-free against every writer, and the route says so: a
+    concurrent full-page PUT still wins or loses by version the way it always
+    did, and an append that lands after a delete recreates the page. Those are
+    documented on the handler rather than papered over here.
+    """
+
+    text: str = Field(min_length=1, max_length=_MAX_BODY_BYTES)
+
+    idempotency_key: str | None = Field(default=None, max_length=128)
+    """Replay guard. Supplied, a repeat of the SAME key on the SAME page
+    returns the version the first call produced and appends nothing.
+
+    OPTIONAL so the route is usable by hand (`curl`, a one-off script) without
+    inventing a key, but the SDK always mints one: a timeout is exactly the
+    case where the caller cannot know whether the write landed, and retrying
+    is what an agent does next. Without a key that retry duplicates the
+    paragraph, and a duplicated decision log reads as two decisions.
+    """
+
+    title: str | None = Field(default=None, max_length=200)
+    """Used ONLY when the append CREATES the page. Ignored otherwise -- an
+    append is not a rename, and letting it retitle would make a routine log
+    line silently rewrite the page's heading.
+    """
+
+    author_id: str | None = Field(default=None, max_length=128)
+    commit_message: str | None = Field(default=None, max_length=240)
+
+
+class WikiAppendResponse(BaseModel):
+    doc_id: str
+    version: int
+    created: bool
+    """True when this call brought the page into existence."""
+    replayed: bool
+    """True when `idempotency_key` matched a previous call and nothing was
+    appended. The version is the one that call produced, not the page's
+    current version -- a retry gets the answer it was retrying for."""
+    body_size_bytes: int
+    remaining_bytes: int
+    """How much room is left under the live-page cap. Surfaced because a
+    decision log fills up: at 8 KiB a page holds a few dozen paragraphs, and
+    an agent appending unattended deserves to see the wall coming rather than
+    meet it as a refusal."""
 
 
 class WikiPageSettingsBody(BaseModel):
@@ -500,6 +557,31 @@ async def _read_live_page_for_cas(
     return row["version"], body
 
 
+async def _read_live_page_for_append(
+    conn: asyncpg.Connection, customer_id: str, doc_id: str
+) -> tuple[int, str, str] | None:
+    """`(version, body, title)` of the live page, or None when there is none.
+
+    Separate from `_read_live_page_for_cas` because an append needs the TITLE
+    and a CAS check does not. The title is not decoration here: `_build_event`
+    requires one, and an append that re-sent a placeholder would silently
+    rename the page every time an agent logged a line. Read under the caller's
+    held lock, same as the CAS read.
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT version, title, deleted_at FROM documents
+        WHERE customer_id = $1 AND doc_id = $2 AND valid_to IS NULL
+        """,
+        customer_id,
+        doc_id,
+    )
+    if row is None or row["deleted_at"] is not None:
+        return None
+    body = await fetch_live_body_from_chunks(conn, customer_id, doc_id)
+    return row["version"], body, row["title"] or ""
+
+
 def _wiki_precondition_failed(
     *, expected: int | None, current: int, current_body: str
 ) -> HTTPException:
@@ -653,6 +735,212 @@ async def upsert_wiki_page(
             WikiLinkOut(raw=link.raw, kind=link.kind, target=link.target) for link in parsed_links
         ],
         dangling_links=dangling,
+    )
+
+
+#: How long an idempotency record stays replayable. Long enough to cover any
+#: retry an HTTP client will still be attempting, short enough that the table
+#: stays a scratch space rather than an audit log -- the history chain already
+#: records what was written, and this table only records that it was.
+_APPEND_IDEMPOTENCY_TTL = "24 hours"
+
+
+@router.post(
+    "/pages/{wiki_type}/{slug}/append",
+    response_model=WikiAppendResponse,
+    dependencies=[Depends(verify_internal_knowledge_key)],
+)
+async def append_wiki_page(
+    wiki_type: str,
+    slug: str,
+    body: WikiAppendBody,
+    request: Request,
+    customer_id: str = Depends(_require_customer),
+) -> WikiAppendResponse:
+    """Add one paragraph to the end of a page, atomically.
+
+    WHY THIS IS NOT `PUT` WITH A LONGER BODY. An agent logging a decision as it
+    happens has to read the page, append locally, and write the whole thing
+    back. Two agents doing that concurrently means the second gets a 409 and
+    must redo the round trip against a page that may have moved again. This
+    route takes the SAME per-page lock the upsert takes, so two appends
+    serialise and both paragraphs survive with no retry and no merge.
+
+    WHAT IT DOES NOT SERIALISE AGAINST, stated because "an append cannot
+    conflict" is only true between appends:
+
+      * a concurrent full-page `PUT` still resolves by `expected_version`. A
+        PUT that committed first makes this append land on top of it, which is
+        correct; a PUT carrying a stale `expected_version` loses as it always
+        did.
+      * an append that arrives after the page was DELETED recreates it, with
+        `created=true`. It does not resurrect the old body -- the delete is
+        respected and the paragraph starts a new page. Use `revert` to bring
+        content back.
+      * `pipeline_updates=false` does NOT block this. That setting freezes a
+        page against the nightly agent, not against people; a human or agent
+        writing deliberately is the thing it was built to protect.
+
+    IDEMPOTENCY IS CHECKED INSIDE THE LOCK, so two concurrent retries of the
+    same key cannot both pass the lookup and both append. The record stores the
+    version the first call produced and the replay returns exactly that, rather
+    than the page's current version -- a retry should get the answer it was
+    retrying for, not a later one that reflects somebody else's writes.
+
+    THE PAGE CAN FILL UP. `ck_wiki_live_page_size` caps a live wiki page at
+    `PAGE_CAP_BYTES`, so a page that is appended to unattended eventually
+    refuses. That refusal is a 413 naming the cap, not a constraint violation
+    surfaced as a 500, and every success reports `remaining_bytes` so a caller
+    can see the wall before it arrives.
+    """
+    wiki_type = _validate_wiki_type(wiki_type)  # also refuses the reserved 'index'
+    slug = _validate_slug(slug)
+    doc_id = f"wiki:{wiki_type}:{slug}"
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail="text must contain something other than whitespace",
+        )
+
+    async with with_tenant(customer_id) as lock_conn:
+        await lock_conn.execute(
+            "SELECT pg_advisory_xact_lock($1)", page_lock_key(customer_id, wiki_type, slug)
+        )
+
+        if body.idempotency_key is not None:
+            prior = await lock_conn.fetchrow(
+                """
+                SELECT version FROM wiki_append_idempotency
+                WHERE customer_id = $1 AND wiki_type = $2 AND slug = $3
+                  AND idempotency_key = $4
+                """,
+                customer_id,
+                wiki_type,
+                slug,
+                body.idempotency_key,
+            )
+            if prior is not None:
+                live = await _read_live_page_for_append(lock_conn, customer_id, doc_id)
+                size = len(live[1].encode("utf-8")) if live else 0
+                log.info(
+                    "wiki.append.replayed",
+                    customer=customer_id,
+                    doc_id=doc_id,
+                    version=prior["version"],
+                )
+                return WikiAppendResponse(
+                    doc_id=doc_id,
+                    version=prior["version"],
+                    created=False,
+                    replayed=True,
+                    body_size_bytes=size,
+                    remaining_bytes=max(PAGE_CAP_BYTES - size, 0),
+                )
+
+        live = await _read_live_page_for_append(lock_conn, customer_id, doc_id)
+        created = live is None
+        if live is None:
+            new_body = text
+            # The slug is a better fallback than a constant: it is what the
+            # caller named the page, and `_build_event` requires a title.
+            title = body.title or slug.replace("-", " ").replace("_", " ").strip() or slug
+        else:
+            existing = live[1].rstrip()
+            # Fixed server-side separator, matching `notes_append`. A
+            # caller-supplied one would be a formatting API nobody asked for,
+            # and two callers choosing differently makes one page read as two.
+            new_body = f"{existing}\n\n{text}" if existing else text
+            title = live[2] or slug
+
+        size = len(new_body.encode("utf-8"))
+        if size > PAGE_CAP_BYTES:
+            # Pre-checked rather than left to `ck_wiki_live_page_size`, which
+            # would surface as an unhandled constraint violation. The caller
+            # gets the numbers it needs to decide what to do next.
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"appending would make {wiki_type}/{slug} {size} bytes, over the "
+                    f"{PAGE_CAP_BYTES}-byte live page cap. Start a new page, or "
+                    f"summarise this one first."
+                ),
+            )
+
+        event = _build_event(
+            customer_id=customer_id,
+            wiki_type=wiki_type,
+            slug=slug,
+            title=title,
+            body=new_body,
+            frontmatter={},
+            doc_class=DocClass.MANUAL_ENTRY.value,
+            author_id=body.author_id,
+            compiled_from_doc_ids=None,
+            compile_trigger=None,
+            received_at=datetime.now(UTC),
+            is_delete=False,
+            commit_message=body.commit_message
+            or (f"Appended by {body.author_id}" if body.author_id else "Appended"),
+            commit_author=body.author_id,
+            summary=None,
+        )
+        try:
+            result = build_normalization_result(event)
+        except InvalidWebhookPayload as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        normalizer = Normalizer(ctx=request.app.state.ctx, store=request.app.state.store)
+        outcome = await normalizer._persist(customer_id, SourceSystem.WIKI, result)
+        if not outcome.doc_ids:
+            raise HTTPException(status_code=500, detail="wiki normalize produced no documents")
+
+        version = await _read_doc_version(customer_id, doc_id) or result.documents[0].version
+
+        if body.idempotency_key is not None:
+            await lock_conn.execute(
+                """
+                INSERT INTO wiki_append_idempotency
+                    (customer_id, wiki_type, slug, idempotency_key, version)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (customer_id, wiki_type, slug, idempotency_key)
+                DO NOTHING
+                """,
+                customer_id,
+                wiki_type,
+                slug,
+                body.idempotency_key,
+                version,
+            )
+            # Opportunistic prune, this page only, under the lock we already
+            # hold. Bounded work and no worker to fall behind.
+            await lock_conn.execute(
+                f"""
+                DELETE FROM wiki_append_idempotency
+                WHERE customer_id = $1 AND wiki_type = $2 AND slug = $3
+                  AND created_at < NOW() - INTERVAL '{_APPEND_IDEMPOTENCY_TTL}'
+                """,
+                customer_id,
+                wiki_type,
+                slug,
+            )
+
+    log.info(
+        "wiki.appended",
+        customer=customer_id,
+        doc_id=doc_id,
+        version=version,
+        created=created,
+        appended_bytes=len(text.encode("utf-8")),
+        body_size_bytes=size,
+    )
+    return WikiAppendResponse(
+        doc_id=doc_id,
+        version=version,
+        created=created,
+        replayed=False,
+        body_size_bytes=size,
+        remaining_bytes=max(PAGE_CAP_BYTES - size, 0),
     )
 
 
