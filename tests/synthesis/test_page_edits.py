@@ -154,3 +154,82 @@ def test_a_replacement_may_contain_its_own_anchor() -> None:
 
     assert out.count("## Auth and identity") == 1
     assert "## Auth and identity and identity" not in out
+
+
+# ---------------------------------------------------------------------------
+# Near-miss hints on a failed anchor (production incident 2026-08-17)
+#
+# "Copy the anchor VERBATIM" without showing what is actually there leaves the
+# model guessing from the same context that produced the wrong anchor, so it
+# guesses wrong again. Each wrong guess costs a turn and is never consequential;
+# fifteen in a row halt the drain. Quoting the nearest real lines turns the
+# retry into a copy.
+# ---------------------------------------------------------------------------
+
+_BODY = """# Overview
+
+The research OS ships telemetry to the engine.
+
+## Deployment notes
+
+Rollout is gated on the chart's appVersion.
+"""
+
+
+def test_a_missed_anchor_quotes_the_line_the_model_meant() -> None:
+    """The common miss: right sentence, wrong capitalisation."""
+    with pytest.raises(EditError) as caught:
+        apply_edits(
+            _BODY,
+            [
+                PageEdit(
+                    op="replace",
+                    find="The research OS ships telemetry to the Engine.",
+                    text="x",
+                )
+            ],
+        )
+
+    msg = str(caught.value)
+    assert "does not appear in the page" in msg
+    # The real line, verbatim and copyable.
+    assert "The research OS ships telemetry to the engine." in msg
+
+
+def test_an_anchor_close_to_nothing_gets_no_suggestions() -> None:
+    """Quoting the 'closest' line when nothing is close is noise the model has
+    to reason past, and reasoning past noise is what costs turns."""
+    with pytest.raises(EditError) as caught:
+        apply_edits(_BODY, [PageEdit(op="replace", find="zzzzz qqqqq", text="x")])
+
+    msg = str(caught.value)
+    assert "does not appear in the page" in msg
+    assert "Closest lines" not in msg
+
+
+def test_suggestions_are_bounded() -> None:
+    """A pathological page must not put its whole body in an error message."""
+    from kb.synthesis.page_edits import _NEAR_MISS_COUNT, _NEAR_MISS_MAX_CHARS
+
+    body = "\n".join(f"the quick brown fox jumps over the lazy dog number {i}" for i in range(200))
+    with pytest.raises(EditError) as caught:
+        apply_edits(
+            body,
+            [PageEdit(op="replace", find="the quick brown fox jumps over the lazy dog", text="x")],
+        )
+
+    quoted = [ln for ln in str(caught.value).splitlines() if ln.startswith("  ")]
+    assert len(quoted) <= _NEAR_MISS_COUNT
+    assert all(len(ln.strip()) <= _NEAR_MISS_MAX_CHARS for ln in quoted)
+
+
+def test_an_ambiguous_anchor_still_says_so_rather_than_suggesting() -> None:
+    """Two matches is a different problem: the text IS there, twice. Suggesting
+    the line it already matched would read as 'it is missing'."""
+    body = "same line\nsame line\n"
+    with pytest.raises(EditError) as caught:
+        apply_edits(body, [PageEdit(op="replace", find="same line", text="x")])
+
+    msg = str(caught.value)
+    assert "appears 2 times" in msg
+    assert "Closest lines" not in msg

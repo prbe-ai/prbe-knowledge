@@ -745,10 +745,15 @@ async def test_commit_update_preserves_frontmatter_links(reset_db: None) -> None
 
 
 @pytest.mark.asyncio
-async def test_discard_dlqs_triaged_rows_with_reason(reset_db: None) -> None:
+async def test_discard_requeues_the_slice_on_a_first_halt(reset_db: None) -> None:
     """The runtime's discard() drops in-memory state; the worker calls
-    dlq_agent_synthesizing_rows separately to flip rows to DLQ. This
-    test exercises both halves end-to-end."""
+    release_agent_synthesizing_rows separately to move the rows. This test
+    exercises both halves end-to-end.
+
+    A FIRST halt requeues rather than dead-letters. The old policy DLQ'd the
+    whole in-flight slice on any halt, so rows the agent never even attempted
+    were lost to a stall on one page -- 338 of them for one tenant across three
+    nights, recoverable only by an admin reset nobody knew to run."""
     from kb.synthesis import persistence
 
     qid = await _seed_synthesizing("github:commit:dlq", "body")
@@ -767,8 +772,54 @@ async def test_discard_dlqs_triaged_rows_with_reason(reset_db: None) -> None:
         },
     )
     await rt.discard()
-    n = await persistence.dlq_agent_synthesizing_rows(CUSTOMER, reason="agent.test_halt")
-    assert n >= 1
+    requeued, dlqd = await persistence.release_agent_synthesizing_rows(
+        CUSTOMER, reason="agent.test_halt"
+    )
+    assert (requeued, dlqd) == (1, 0)
+    async with raw_conn() as conn:
+        row = await conn.fetchrow(
+            "SELECT status, dlq_reason, attempts FROM wiki_synthesis_queue "
+            "WHERE customer_id = $1 AND queue_id = $2",
+            CUSTOMER,
+            qid,
+        )
+    # Back in the lane for the next drain, with no dead-letter reason left
+    # behind to be misread later.
+    assert row["status"] == "triaged"
+    assert row["dlq_reason"] is None
+    # Untouched: this fixture seeds 'synthesizing' directly, so no claim ever
+    # counted an attempt -- which is exactly what pins that release does not
+    # count one either. `claim_triaged_rows` owns that increment.
+    assert row["attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_slice_dlqs_once_it_runs_out_of_attempts(reset_db: None) -> None:
+    """Retrying is bounded: a row that keeps halting the agent still stops.
+
+    Without this the new policy would hand a reliably-halting slice back to the
+    next drain forever, which is a worse failure than the one it replaces --
+    the agent would halt on it every night and nothing would say why."""
+    from engine.shared.constants import WIKI_SYNTHESIS_MAX_ATTEMPTS
+    from kb.synthesis import persistence
+
+    qid = await _seed_synthesizing("github:commit:exhausted", "body")
+    async with raw_conn() as conn:
+        await conn.execute(
+            "UPDATE wiki_synthesis_queue SET attempts = $3 "
+            "WHERE customer_id = $1 AND queue_id = $2",
+            CUSTOMER,
+            qid,
+            # The claim that produced this 'synthesizing' row already counted
+            # its attempt, so "out of attempts" is AT the cap, not one below.
+            WIKI_SYNTHESIS_MAX_ATTEMPTS,
+        )
+
+    requeued, dlqd = await persistence.release_agent_synthesizing_rows(
+        CUSTOMER, reason="agent.stall"
+    )
+
+    assert (requeued, dlqd) == (0, 1)
     async with raw_conn() as conn:
         row = await conn.fetchrow(
             "SELECT status, dlq_reason FROM wiki_synthesis_queue "
@@ -777,4 +828,4 @@ async def test_discard_dlqs_triaged_rows_with_reason(reset_db: None) -> None:
             qid,
         )
     assert row["status"] == "dlq"
-    assert row["dlq_reason"] == "agent.test_halt"
+    assert row["dlq_reason"] == "agent.stall"

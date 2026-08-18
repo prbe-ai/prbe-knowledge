@@ -735,7 +735,7 @@ class WikiAgentRuntime:
         )
         self._pending_updates.clear()
         self._pending_creates.clear()
-        # The worker calls dlq_agent_synthesizing_rows separately so
+        # The worker calls release_agent_synthesizing_rows separately so
         # the dlq_reason carries the categorized halt reason; this
         # method is purely the in-memory cleanup half.
 

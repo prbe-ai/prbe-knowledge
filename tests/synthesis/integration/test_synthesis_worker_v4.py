@@ -229,10 +229,16 @@ async def test_advisory_lock_contended_no_op_exit(reset_db: None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_halt_dlqs_all_synthesizing_rows(
+async def test_agent_halt_requeues_the_slice_rather_than_dlqing_it(
     reset_db: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Agent stalls -> all 'synthesizing' rows go to DLQ with reason."""
+    """Agent stalls -> the in-flight slice goes back to 'triaged', not DLQ.
+
+    A halt is a DRAIN-level failure. It used to park every 'synthesizing' row
+    in DLQ, so rows the agent never attempted were lost because it stalled on
+    one page -- and dead-lettered rows never retry. Now the row's own `attempts`
+    counter decides, the same way `mark_for_retry` and `reclaim_stuck_rows`
+    already decide it."""
     await _seed_triaged("github:commit:halt-1", "body 1")
     await _seed_triaged("github:commit:halt-2", "body 2")
 
@@ -247,15 +253,18 @@ async def test_agent_halt_dlqs_all_synthesizing_rows(
 
     async with raw_conn() as conn:
         rows = await conn.fetch(
-            "SELECT status, dlq_reason FROM wiki_synthesis_queue "
+            "SELECT status, dlq_reason, attempts FROM wiki_synthesis_queue "
             "WHERE customer_id = $1",
             CUSTOMER,
         )
     assert len(rows) == 2
     for row in rows:
-        assert row["status"] == "dlq"
-        assert row["dlq_reason"] is not None
-        assert row["dlq_reason"].startswith("agent."), row["dlq_reason"]
+        assert row["status"] == "triaged", "a first halt must not dead-letter"
+        # No reason left behind: a later genuine dead-letter must not be read
+        # as this one.
+        assert row["dlq_reason"] is None
+        # Counted once, by the claim -- not twice.
+        assert row["attempts"] == 1
 
 
 @pytest.mark.asyncio

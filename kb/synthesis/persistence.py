@@ -56,7 +56,6 @@ __all__ = [
     "close_run",
     "count_resettable_rows",
     "count_seedable_docs",
-    "dlq_agent_synthesizing_rows",
     "dlq_customer_for_triage_failure",
     "fetch_bodies",
     "fetch_existing_page",
@@ -79,6 +78,7 @@ __all__ = [
     "open_onboarding_run",
     "open_run",
     "reclaim_stuck_rows",
+    "release_agent_synthesizing_rows",
     "reset_terminal_rows",
     "seed_missing_docs",
 ]
@@ -1423,41 +1423,70 @@ async def get_event_body_for_agent(
     }
 
 
-async def dlq_agent_synthesizing_rows(
+async def release_agent_synthesizing_rows(
     customer_id: str,
     *,
     reason: str,
-) -> int:
-    """DLQ all 'synthesizing' rows after a wiki agent halt.
+) -> tuple[int, int]:
+    """Retry or DLQ the 'synthesizing' slice after a wiki agent halt.
 
-    v4 halt policy: an agent halt (turn cap, stall, update cap, Gemini
-    outage, compactor crash) parks the customer's whole in-flight slice
-    in DLQ. The pending_updates / pending_creates the agent had staged
-    are dropped (they were never persisted). Admin reset flips them
-    back to triaged for the next drain.
+    Returns `(requeued, dlqd)`.
 
-    Returns the number of rows DLQ'd. Does NOT use with_tenant because
-    wiki_synthesis_queue has RLS disabled (migration 0034); the
-    explicit WHERE customer_id enforces the scoping.
+    A HALT IS A DRAIN-LEVEL FAILURE, NOT A ROW-LEVEL ONE, and that is the whole
+    change here. The old policy parked the customer's entire in-flight slice in
+    DLQ on any halt -- turn cap, stall, update cap, Gemini outage, compactor
+    crash. But a stall means the agent could not get a write accepted, usually
+    against ONE page; every other row in the slice was dead-lettered without
+    ever being attempted, and dead-lettered rows never retry. On 2026-08-17 that
+    cost one tenant 338 rows across three nights, and the only route back was an
+    admin reset nobody knew to run.
+
+    So the row's own `attempts` counter decides, exactly as `mark_for_retry` and
+    `reclaim_stuck_rows` already decide it: under the cap goes back to `triaged`
+    for the next drain, at the cap goes to DLQ. A halt now costs a retry rather
+    than the batch, and a row that genuinely keeps halting the agent still stops
+    after WIKI_SYNTHESIS_MAX_ATTEMPTS instead of halting it forever.
+
+    `attempts` is NOT incremented here: `claim_triaged_rows` already bumped it
+    when it moved the row into `synthesizing`, so this attempt is counted
+    before the agent even starts. Incrementing again would count one attempt
+    twice and halve the retry budget. Same reason `mark_for_retry` and
+    `reclaim_stuck_rows` read the counter without touching it.
+
+    Rows going back to `triaged` keep their `dlq_reason` cleared so a later
+    genuine dead-letter is not read as this one. The pending_updates /
+    pending_creates the agent had staged are dropped either way: they were never
+    persisted.
+
+    Does NOT use with_tenant because wiki_synthesis_queue has RLS disabled
+    (migration 0034); the explicit WHERE customer_id enforces the scoping.
     """
     async with raw_conn() as conn:
-        result = await conn.execute(
+        rows = await conn.fetch(
             """
             UPDATE wiki_synthesis_queue
-            SET status = 'dlq',
-                dlq_reason = $2,
-                dlq_at = NOW(),
-                attempts = attempts + 1
+            SET status = CASE
+                  WHEN attempts >= $3 THEN 'dlq'
+                  ELSE 'triaged'
+                END,
+                dlq_reason = CASE
+                  WHEN attempts >= $3 THEN $2
+                  ELSE NULL
+                END,
+                dlq_at = CASE
+                  WHEN attempts >= $3 THEN NOW()
+                  ELSE NULL
+                END
             WHERE customer_id = $1
               AND status = 'synthesizing'
+            RETURNING status
             """,
             customer_id,
             reason,
+            WIKI_SYNTHESIS_MAX_ATTEMPTS,
         )
-    try:
-        return int(result.split()[-1])
-    except (ValueError, IndexError):
-        return 0
+    dlqd = sum(1 for r in rows if r["status"] == "dlq")
+    return len(rows) - dlqd, dlqd
 
 
 # ---------------------------------------------------------------------------

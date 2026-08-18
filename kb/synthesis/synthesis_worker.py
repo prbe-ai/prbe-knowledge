@@ -201,7 +201,7 @@ class SynthesisWorker:
                 )
             except AgentHaltError as exc:
                 halt_reason = exc.reason
-                dlq_count = await persistence.dlq_agent_synthesizing_rows(
+                requeued, dlq_count = await persistence.release_agent_synthesizing_rows(
                     customer_id, reason=exc.reason
                 )
                 log.warning(
@@ -209,17 +209,19 @@ class SynthesisWorker:
                     customer=customer_id,
                     agent_run_id=agent_run_id,
                     reason=exc.reason,
+                    requeued=requeued,
                     dlq_count=dlq_count,
                 )
             except Exception as exc:
                 halt_reason = f"agent.exception: {type(exc).__name__}"
-                dlq_count = await persistence.dlq_agent_synthesizing_rows(
+                requeued, dlq_count = await persistence.release_agent_synthesizing_rows(
                     customer_id, reason=halt_reason
                 )
                 log.exception(
                     "synthesis_worker.agent_unhandled",
                     customer=customer_id,
                     agent_run_id=agent_run_id,
+                    requeued=requeued,
                     dlq_count=dlq_count,
                 )
 
