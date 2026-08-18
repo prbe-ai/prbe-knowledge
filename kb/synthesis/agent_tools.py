@@ -155,6 +155,27 @@ LIST_WIKI_PAGES_TOOL: dict[str, Any] = {
     "parameters": {"type": "object", "properties": {}},
 }
 
+def _capped(description: str, limit: int) -> dict[str, Any]:
+    """A string property whose length limit the MODEL can actually read.
+
+    The limit goes in the DESCRIPTION, not only in `maxLength`, because
+    `gemini_agent_client._sanitize_parameters` strips `maxLength` (it is in
+    `_GEMINI_REJECTED_SCHEMA_KEYS`) before the FunctionDeclaration is built. So
+    a cap expressed only as a keyword reaches the validator and never the
+    model: the agent learns the rule by having its write refused, and a refused
+    write costs a turn and is never consequential. Fifteen of those in a row
+    halt the drain and DLQ every row then in `synthesizing`.
+
+    `maxLength` is kept anyway -- it is the correct schema, it survives on any
+    provider that does not strip it, and it keeps the number in one place.
+    """
+    return {
+        "type": "string",
+        "maxLength": limit,
+        "description": f"{description} At most {limit} characters.",
+    }
+
+
 READ_PAGE_TOOL: dict[str, Any] = {
     "name": "read_page",
     "description": (
@@ -166,7 +187,10 @@ READ_PAGE_TOOL: dict[str, Any] = {
         "type": "object",
         "properties": {
             "wiki_type": _WIKI_TYPE_SCHEMA,
-            "slug": {"type": "string"},
+            "slug": _capped(
+                "URL-safe identifier for the page, unique within its type.",
+                64,
+            ),
         },
         "required": ["wiki_type", "slug"],
     },
@@ -212,7 +236,10 @@ UPDATE_PAGE_TOOL: dict[str, Any] = {
         "type": "object",
         "properties": {
             "wiki_type": _WIKI_TYPE_SCHEMA,
-            "slug": {"type": "string"},
+            "slug": _capped(
+                "URL-safe identifier for the page, unique within its type.",
+                64,
+            ),
             "edits": {
                 "type": "array",
                 "minItems": 1,
@@ -247,6 +274,7 @@ UPDATE_PAGE_TOOL: dict[str, Any] = {
             },
             "summary": {
                 "type": "string",
+                "maxLength": 240,
                 "description": (
                     "One-sentence stable overview of what this page IS "
                     "(the repo's / runbook's / person's enduring "
@@ -254,10 +282,12 @@ UPDATE_PAGE_TOOL: dict[str, Any] = {
                     "existing summary verbatim unless the page's "
                     "fundamental purpose has changed. Never rewrite it "
                     "to describe the latest change — the index would "
-                    "read like a changelog."
+                    "read like a changelog. At most 240 characters."
                 ),
             },
-            "commit_message": {"type": "string"},
+            "commit_message": _capped(
+                "One line saying what this change does and why.", 240
+            ),
             "applied_queue_ids": {
                 "type": "array",
                 "items": {"type": "integer"},
@@ -285,21 +315,27 @@ CREATE_PAGE_TOOL: dict[str, Any] = {
         "type": "object",
         "properties": {
             "wiki_type": _WIKI_TYPE_SCHEMA,
-            "slug": {"type": "string"},
-            "title": {"type": "string"},
+            "slug": _capped(
+                "URL-safe identifier for the page, unique within its type.",
+                64,
+            ),
+            "title": _capped("Human-readable page title.", 200),
             "body_markdown": {"type": "string"},
             "summary": {
                 "type": "string",
+                "maxLength": 240,
                 "description": (
                     "One-sentence stable overview of what this page IS "
                     "(the repo's / runbook's / person's enduring "
                     "purpose). Shown as the wiki-index blurb; should "
                     "read the same in 6 months as today. Not what "
-                    "triggered creating it."
+                    "triggered creating it. At most 240 characters."
                 ),
             },
             "frontmatter": {"type": "object"},
-            "commit_message": {"type": "string"},
+            "commit_message": _capped(
+                "One line saying what this change does and why.", 240
+            ),
             "applied_queue_ids": {
                 "type": "array",
                 "items": {"type": "integer"},

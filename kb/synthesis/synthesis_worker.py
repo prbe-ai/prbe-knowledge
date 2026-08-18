@@ -224,33 +224,36 @@ class SynthesisWorker:
                 )
 
             # A drain that finished but REFUSED writes is `partial`, not
-            # `complete`. The refusals are almost always a `wiki_type` outside
-            # the closed set: the model is told, may move on, and the page it
-            # meant to write simply never exists. Reporting that as `complete`
-            # is the failure mode this whole lane keeps producing -- a green
-            # signal over work that did not happen -- and the only trace was an
-            # INFO log line. `partial` is already in the status CHECK and is
-            # already what the status endpoint surfaces.
+            # `complete`. The model is told about each refusal, may move on,
+            # and the page it meant to write simply never exists. Reporting
+            # that as `complete` is the failure mode this whole lane keeps
+            # producing -- a green signal over work that did not happen -- and
+            # the only trace was an INFO log line. `partial` is already in the
+            # status CHECK and is already what the status endpoint surfaces.
             #
             # halt_reason still wins: a halted drain is failed, not partial.
             rejected = getattr(metrics, "rejected_tool_calls", 0) if metrics else 0
             if halt_reason:
                 status, error = "failed", halt_reason
             elif rejected:
-                bad = sorted(getattr(metrics, "rejected_wiki_types", set()))
+                why = sorted(getattr(metrics, "rejected_reasons", set()))
                 status = "partial"
-                # Names WHAT was refused, not just how often: a wiki_type that
-                # keeps recurring here is the enum missing a member, and that
-                # is a product decision someone has to make from this string.
+                # Names WHY the writes were refused, not just how often. This
+                # string is the whole diagnostic: `anchor_not_found` says the
+                # model could not reproduce a verbatim anchor, `too_long` says
+                # a field blew a cap the tool schema never advertised. It used
+                # to name the call's `wiki_type` instead, which was recorded
+                # whatever field had actually failed -- so it blamed valid page
+                # types for failures three fields away.
                 error = f"{rejected} tool call(s) refused" + (
-                    f"; rejected wiki_type(s): {', '.join(bad)}" if bad else ""
+                    f"; reason(s): {', '.join(why)}" if why else ""
                 )
                 log.warning(
                     "synthesis_worker.run_partial_rejected_writes",
                     customer=customer_id,
                     run_id=run_id,
                     rejected=rejected,
-                    wiki_types=bad,
+                    reasons=why,
                 )
             else:
                 status, error = "complete", None

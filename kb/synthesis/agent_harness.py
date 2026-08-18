@@ -133,6 +133,47 @@ class _LLMClient(Protocol):
     ) -> dict[str, Any]: ...
 
 
+#: Refusal message -> a short stable name for WHY the call was refused.
+#:
+#: Ordered, first match wins. The names are contract-ish: they land in the run
+#: row's `error`, so someone reading a week of runs can see whether one cause
+#: dominates. Keep them short and mechanical -- they are a key, not prose.
+#:
+#: Every pattern here was taken from a refusal seen in production, not guessed:
+#: the anchor misses come from `page_edits.apply_edits`, the length caps from
+#: the `Field(max_length=...)` constraints on the tool-arg models, and the
+#: depth cap from the graph preflight.
+_REFUSAL_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("anchor_not_found", "does not appear in the page"),
+    ("anchor_ambiguous", "so it does not say which one you mean"),
+    ("levels_deep", "levels deep, past"),
+    ("too_long", "should have at most"),
+    ("too_short", "should have at least"),
+    ("bad_wiki_type", "is not a valid wikitype"),
+    ("missing_field", "field required"),
+)
+
+#: What an unrecognised refusal is called. Deliberately not "other": if this
+#: starts dominating a run's `error`, the list above is out of date, and a name
+#: that says so is more useful than a bucket that hides it.
+_UNCLASSIFIED_REFUSAL = "unclassified"
+
+
+def _classify_refusal(detail: str) -> str:
+    """A short stable name for why a tool call was refused.
+
+    Matching on the message rather than the exception type because every one of
+    these arrives as the same `ToolValidationError`: `apply_edits` re-raises its
+    `EditError` as one, and Pydantic's constraint failures are one already. The
+    type says "the model got it wrong"; only the text says how.
+    """
+    lowered = detail.lower()
+    for name, needle in _REFUSAL_PATTERNS:
+        if needle in lowered:
+            return name
+    return _UNCLASSIFIED_REFUSAL
+
+
 @dataclass(slots=True)
 class AgentMetrics:
     """Per-drain audit metrics.
@@ -150,18 +191,31 @@ class AgentMetrics:
     last_consequential_turn: int = 0
     halt_reason: str | None = None
     #: Tool calls the runtime refused because their arguments did not
-    #: validate -- overwhelmingly a `wiki_type` outside the closed set.
+    #: validate.
     #:
     #: COUNTED, not just logged, because the model is told about each one and
     #: may simply move on: the drain then finishes, reports `complete`, and
     #: the page the agent meant to write does not exist. That is a silent
     #: partial success, and the only trace of it was an INFO line nobody
     #: reads. The worker turns a non-zero count into run status `partial`.
+    #:
+    #: They also cost a TURN and are never consequential, so a model that
+    #: cannot get a write accepted burns the stall window and halts the drain
+    #: -- which DLQs every row then in `synthesizing`. That is the expensive
+    #: version of this counter, and why naming the cause below matters.
     rejected_tool_calls: int = 0
-    #: The distinct wiki_types the model tried to use and could not, so the
-    #: run's `error` names WHAT was refused rather than only how often. A
-    #: recurring value here is the signal that the enum is missing a member.
-    rejected_wiki_types: set[str] = field(default_factory=set)
+    #: WHY the calls were refused: the distinct failure kinds, e.g.
+    #: `anchor_not_found`, `summary_too_long`. Used in the run's `error` so a
+    #: reader learns what to fix.
+    #:
+    #: This used to hold the distinct `wiki_type`s instead, taken from the
+    #: refused call's args -- but the args were recorded WHATEVER field had
+    #: actually failed, so a perfectly valid `feature` or `repo` was named as
+    #: the culprit for an anchor mismatch three fields away. The docstring then
+    #: told the reader a recurring value meant "the enum is missing a member",
+    #: sending them to add a member that was already there. Both types blamed
+    #: in production were valid members the whole time.
+    rejected_reasons: set[str] = field(default_factory=set)
 
     @property
     def cache_hit_rate(self) -> float | None:
@@ -371,9 +425,7 @@ class AgentLoop:
                 # model so it can re-decide on the next turn.
                 result = {"error": "tool_validation_error", "detail": str(exc)}
                 self.metrics.rejected_tool_calls += 1
-                bad_type = args.get("wiki_type") if isinstance(args, dict) else None
-                if isinstance(bad_type, str) and bad_type:
-                    self.metrics.rejected_wiki_types.add(bad_type[:64])
+                self.metrics.rejected_reasons.add(_classify_refusal(str(exc)))
                 log.info(
                     "agent.tool_validation_error",
                     customer=self.runtime.customer_id,
