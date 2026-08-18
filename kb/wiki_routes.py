@@ -51,6 +51,7 @@ loosen this validator.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -807,6 +808,25 @@ async def append_wiki_page(
     than the page's current version -- a retry should get the answer it was
     retrying for, not a later one that reflects somebody else's writes.
 
+    THE GUARANTEE HAS ONE WINDOW, and pretending otherwise would be worse than
+    the window. `Normalizer._persist` commits in its OWN transaction; the
+    idempotency row is written afterwards on this connection. A crash between
+    the two leaves the paragraph appended with no record of the key, so a retry
+    appends it twice.
+
+    The ordering is chosen, not accidental. Writing the record FIRST closes that
+    window and opens a strictly worse one: a crash after the record and before
+    the persist makes the retry report a successful replay for a paragraph that
+    was never written, and a silently DROPPED decision cannot be recovered by
+    anyone, while a duplicated one is visible and deletable. Same reasoning as
+    the setting-then-body ordering in `upsert_wiki_page`.
+
+    A REPLAY'S FIELDS ARE NOT ALL FROM THE ORIGINAL CALL. `version` is the one
+    that call produced; `body_size_bytes` and `remaining_bytes` describe the
+    page as it stands NOW, because they are what a caller deciding whether to
+    keep appending needs. `created` is always false on a replay -- it answers
+    "did THIS call create the page", and this call did nothing.
+
     THE PAGE CAN FILL UP. `ck_wiki_live_page_size` caps a live wiki page at
     `PAGE_CAP_BYTES`, so a page that is appended to unattended eventually
     refuses. That refusal is a 413 naming the cap, not a constraint violation
@@ -828,18 +848,39 @@ async def append_wiki_page(
             "SELECT pg_advisory_xact_lock($1)", page_lock_key(customer_id, wiki_type, slug)
         )
 
+        text_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
         if body.idempotency_key is not None:
             prior = await lock_conn.fetchrow(
-                """
-                SELECT version FROM wiki_append_idempotency
+                f"""
+                SELECT version, text_sha256 FROM wiki_append_idempotency
                 WHERE customer_id = $1 AND wiki_type = $2 AND slug = $3
                   AND idempotency_key = $4
+                  AND created_at >= NOW() - INTERVAL '{_APPEND_IDEMPOTENCY_TTL}'
                 """,
                 customer_id,
                 wiki_type,
                 slug,
                 body.idempotency_key,
             )
+            # The TTL is enforced HERE, not only by the prune. The prune runs
+            # opportunistically on the next keyed append to this page, so a page
+            # nobody writes to again keeps its records forever -- and a replay
+            # that honoured a record older than the window it advertises is a
+            # different contract from the one documented.
+            if prior is not None and prior["text_sha256"] != text_sha:
+                # NOT a retry. Same key, different paragraph, which means the
+                # caller reused a key rather than repeating a call. Replaying
+                # the old answer here would report success and silently drop
+                # the new text -- the exact failure this route exists to end.
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"idempotency_key {body.idempotency_key!r} was already used on "
+                        f"{wiki_type}/{slug} with different text. Use a fresh key for a "
+                        f"new paragraph, or resend the original text to replay."
+                    ),
+                )
             if prior is not None:
                 live = await _read_live_page_for_append(lock_conn, customer_id, doc_id)
                 size = len(live[1].encode("utf-8")) if live else 0
@@ -921,8 +962,9 @@ async def append_wiki_page(
             await lock_conn.execute(
                 """
                 INSERT INTO wiki_append_idempotency
-                    (customer_id, wiki_type, slug, idempotency_key, version)
-                VALUES ($1, $2, $3, $4, $5)
+                    (customer_id, wiki_type, slug, idempotency_key, text_sha256,
+                     version)
+                VALUES ($1, $2, $3, $4, $5, $6)
                 ON CONFLICT (customer_id, wiki_type, slug, idempotency_key)
                 DO NOTHING
                 """,
@@ -930,6 +972,7 @@ async def append_wiki_page(
                 wiki_type,
                 slug,
                 body.idempotency_key,
+                text_sha,
                 version,
             )
             # Opportunistic prune, this page only, under the lock we already
@@ -990,10 +1033,14 @@ async def list_wiki_references(
     So the engine publishes what it parsed, the consumer keeps its own durable
     copy, and there is still one parser.
 
-    CURSORED ON THE EDGE ID rather than a timestamp. Edges are inserted, never
-    updated in place, so the id is monotonic per tenant and a reconciler can
-    resume from the last one it stored without risking the window where two
-    edges share a `valid_from`.
+    THE CURSOR PAGES ONE SNAPSHOT; IT IS NOT A CHANGE FEED. `after_id` exists so
+    a caller can walk a large answer in bounded pages, and edge ids are
+    monotonic per tenant so that walk is stable. It must NOT be persisted and
+    resumed as an incremental sync: a page that DROPS a reference has its edge
+    closed, and a closed edge simply stops appearing here rather than arriving
+    as a tombstone. A consumer advancing a stored cursor forever would keep
+    every reference it ever saw. Consumers reconcile by replacing their set
+    from a full walk -- see research-os `app/wiki/references.py`.
 
     LIVE EDGES ONLY (`valid_to IS NULL`). A page that dropped a reference has
     the edge closed rather than deleted, and a consumer replaying history would

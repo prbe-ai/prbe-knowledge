@@ -1744,3 +1744,33 @@ async def test_references_can_be_filtered_to_one_kind(
     assert resp.status_code == 200, resp.text
     kinds = {i["kind"] for i in resp.json()["items"]}
     assert kinds == {"experiment"}
+
+
+@pytest.mark.asyncio
+async def test_reusing_a_key_with_different_text_is_a_409_not_a_silent_drop(
+    client: httpx.AsyncClient,
+) -> None:
+    """Same key, different paragraph, is not a retry.
+
+    Replaying the first answer here would report success and discard the new
+    text -- a silently dropped decision, which is the exact failure the whole
+    route exists to end. It has to be loud.
+    """
+    first = await client.post(
+        "/api/wiki/pages/runbook/keyreuse/append",
+        json={"text": "the original decision", "idempotency_key": "same-key"},
+        headers=_hdr(),
+    )
+    assert first.status_code == 200, first.text
+
+    second = await client.post(
+        "/api/wiki/pages/runbook/keyreuse/append",
+        json={"text": "a DIFFERENT decision", "idempotency_key": "same-key"},
+        headers=_hdr(),
+    )
+    assert second.status_code == 409, second.text
+    assert "different text" in second.json()["detail"]
+
+    body = (await client.get("/api/wiki/pages/runbook/keyreuse", headers=_hdr())).json()["body"]
+    assert "the original decision" in body
+    assert "a DIFFERENT decision" not in body

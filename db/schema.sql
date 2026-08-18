@@ -1332,6 +1332,10 @@ CREATE TABLE wiki_append_idempotency (
     wiki_type       TEXT NOT NULL,
     slug            TEXT NOT NULL,
     idempotency_key TEXT NOT NULL,
+    -- The text this key was FIRST used for. Reusing a key with different text
+    -- is not a retry; replaying the old answer would silently discard the new
+    -- paragraph, so that case is a 409 rather than a false success.
+    text_sha256     TEXT NOT NULL,
     -- The version the append PRODUCED, returned verbatim on replay so a retry
     -- gets the answer it was retrying for rather than the page's later state.
     version         INTEGER NOT NULL,

@@ -71,6 +71,11 @@ def upgrade() -> None:
         sa.Column("wiki_type", sa.Text(), nullable=False),
         sa.Column("slug", sa.Text(), nullable=False),
         sa.Column("idempotency_key", sa.Text(), nullable=False),
+        # The text this key was FIRST used for. A caller that reuses a key with
+        # DIFFERENT text is not retrying, it is making a new request with a
+        # stale key -- and replaying the old answer would silently discard the
+        # new paragraph. Compared on lookup so that case is a loud 409 instead.
+        sa.Column("text_sha256", sa.Text(), nullable=False),
         # The version the append PRODUCED. Returned verbatim on replay, so a
         # retry gets the same answer as the call it is retrying rather than
         # whatever the page has drifted to since.
