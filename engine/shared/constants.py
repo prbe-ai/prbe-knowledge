@@ -1795,6 +1795,16 @@ WIKI_RECONCILE_STATEMENT_TIMEOUT_MS = 120_000
 # a few seconds of work against the 4-index queue table.
 WIKI_RECONCILE_SEED_BATCH = 20_000
 
+# Per-statement ceiling inside the rebuild trigger's transaction and the
+# preview's counts. Deliberately UNDER the prbe-backend BFF's 20s total
+# client timeout on these proxied calls (_WIKI_TIMEOUT in
+# apps/data_plane/routers/dashboard/knowledge.py): a reseed that cannot
+# finish inside it fails fast with the whole txn (wipe included) rolled
+# back and an honest error, instead of the BFF 502ing while the engine
+# commits behind its back and the retry hits a mystery 409. Tenants too
+# large for this window rebuild via the catchup CLI.
+WIKI_REBUILD_STATEMENT_TIMEOUT_MS = 15_000
+
 
 # ---------------------------------------------------------------------------
 # Wiki agent loop (v4: Gemini 3.1 Pro driving the synthesis stage)
