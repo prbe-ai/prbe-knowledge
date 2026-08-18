@@ -65,8 +65,8 @@ PAGE_CAP_BYTES = 8 * 1024
 #: worse to read than one long one AND cost the index more, since each page
 #: contributes a full entry regardless of size.
 #:
-#: Applied ONLY to split products, never to pages generally: `person/shi_dong`
-#: is 143 bytes and entirely legitimate. See `_split_children`.
+#: Applied ONLY to split products, never to pages generally: a one-paragraph
+#: `decision` page is 143 bytes and entirely legitimate. See `_split_children`.
 SPLIT_FLOOR_BYTES = 2 * 1024
 
 #: Cap and floor together bound ONE split, not accumulation across passes: a
@@ -407,9 +407,9 @@ def _split_floor_violations(
 
     A split product is a page created in this batch whose parent is also in it:
     that is what "the agent broke a page apart" looks like from here. The floor
-    deliberately does NOT apply to pages generally -- `person/shi_dong` is 143
-    bytes and correct -- nor to a new page created on its own, which is a new
-    subject rather than a fragment of an old one.
+    deliberately does NOT apply to pages generally -- a one-paragraph `decision`
+    page is 143 bytes and correct -- nor to a new page created on its own, which
+    is a new subject rather than a fragment of an old one.
 
     BOTH SIDES, not just the child. The prompt tells the agent both sides must
     clear the floor and only the child was checked, so a parent that split

@@ -6,8 +6,7 @@ the route synthesizes a `WebhookEvent` whose `raw_payload[WIKI_PAYLOAD_KEY]`
 carries everything `normalize` needs:
 
     {"wiki_page": {
-        "wiki_type": "repo" | "runbook" | "person" | "company"
-                     | "customer" | "project" | "event",
+        "wiki_type": <a member of kb.synthesis.models.WikiType>,
         "slug": "<a-z0-9->",
         "title": "...",
         "body": "<markdown>",                  # required, persisted via chunks
