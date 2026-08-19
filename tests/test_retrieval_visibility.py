@@ -16,10 +16,6 @@ Coverage:
 - ``services/retrieval/retrievers/inferred_edges.py`` — inferred_edge_search
 - ``services/retrieval/main.py``                      — _load_source_doc_and_chunks
 - ``services/retrieval/agent/tools.py``               — execute_fetch_doc
-- Wiki-listing queries (Plan B):
-    - ``services/ingestion/wiki_routes.py``      (wiki TOC)
-    - ``services/synthesis/wiki_agent.py``       (drain-time index regen)
-    - ``services/synthesis/persistence.py``      (fetch_wiki_index)
 
 Live Postgres required (the shared ``live_db`` fixture truncates between
 tests).
@@ -46,7 +42,6 @@ from engine.retrieval.retrievers.vector import vector_search
 from engine.shared.constants import NodeLabel
 from engine.shared.db import raw_conn
 from engine.shared.embeddings import get_embedder_v2, reset_embedder
-from kb.synthesis.persistence import fetch_wiki_index
 
 pytestmark = pytest.mark.asyncio
 
@@ -78,8 +73,8 @@ async def _seed_doc(
     title: str,
     content: str,
     visibility: str,
-    source_system: str = "wiki",
-    doc_type: str = "wiki.runbook",
+    source_system: str = "manual_upload",
+    doc_type: str = "manual_upload.markdown",
     source_id: str | None = None,
     source_url: str | None = None,
     chunk_kind: str = "content",
@@ -108,7 +103,7 @@ async def _seed_doc(
             ) VALUES (
                 $1, 1, $2,
                 $3, $4, $5,
-                'compiled_wiki', $6, 'text/markdown',
+                'manual_entry', $6, 'text/markdown',
                 $7, $8, $9, 0,
                 $10, $10, $10, $10,
                 '{}'::jsonb,
@@ -779,16 +774,16 @@ async def test_sql_group_by_excludes_drafts_by_default(live_db) -> None:
         ("d1", "draft"),
     ]:
         await _seed_doc(
-            cid, f"wiki:gb:{slug}",
+            cid, f"upload:gb:{slug}",
             title=f"page {slug}",
             content=f"body {slug}",
             visibility=vis,
-            doc_type="wiki.knowledge_page",
+            doc_type="manual_upload.text",
         )
 
     groups = await sql_group_by(cid, key="doc_type", top_k=10)
     by_key = {g["key"]: g["n"] for g in groups}
-    assert by_key.get("wiki.knowledge_page") == 2  # draft hidden
+    assert by_key.get("manual_upload.text") == 2  # draft hidden
 
 
 async def test_sql_group_by_include_drafts_returns_full_count(
@@ -803,148 +798,15 @@ async def test_sql_group_by_include_drafts_returns_full_count(
         ("d1", "draft"),
     ]:
         await _seed_doc(
-            cid, f"wiki:gb:{slug}",
+            cid, f"upload:gb:{slug}",
             title=f"page {slug}",
             content=f"body {slug}",
             visibility=vis,
-            doc_type="wiki.knowledge_page",
+            doc_type="manual_upload.text",
         )
 
     groups = await sql_group_by(
         cid, key="doc_type", top_k=10, include_drafts=True,
     )
     by_key = {g["key"]: g["n"] for g in groups}
-    assert by_key.get("wiki.knowledge_page") == 3
-
-
-# ---------------------------------------------------------------------------
-# Plan B — Wiki-listing queries
-# ---------------------------------------------------------------------------
-
-
-async def _seed_wiki_doc(
-    customer_id: str,
-    doc_id: str,
-    *,
-    visibility: str,
-    doc_type: str = "wiki.postmortem",
-    title: str = "Page",
-) -> None:
-    """Wiki doc + chunk pair shaped like Component 5's writeback output."""
-    await _seed_doc(
-        customer_id,
-        doc_id,
-        title=title,
-        content=f"body for {doc_id}",
-        visibility=visibility,
-        source_system="wiki",
-        doc_type=doc_type,
-        source_id=doc_id,
-    )
-
-
-async def test_fetch_wiki_index_excludes_drafts(live_db) -> None:
-    """services/synthesis/persistence.py fetch_wiki_index hides drafts.
-
-    The wiki agent reads this once at drain start and uses it to pick
-    (wiki_type, slug) targets. A draft artifact written by Component 5
-    must not appear here until the reviewer approves it.
-    """
-    cid = _new_customer_id()
-    await _seed_customer(cid)
-    await _seed_wiki_doc(cid, "wiki:postmortem:approved-pm", visibility="approved")
-    await _seed_wiki_doc(cid, "wiki:postmortem:draft-pm", visibility="draft")
-
-    rows = await fetch_wiki_index(cid)
-    # slug derivation: source_id.split(":", 1)[1]. For source_id =
-    # "wiki:postmortem:approved-pm" the split is "postmortem:approved-pm".
-    slugs = {r["slug"] for r in rows}
-    assert "postmortem:approved-pm" in slugs
-    assert "postmortem:draft-pm" not in slugs
-
-
-async def test_wiki_route_index_excludes_drafts(live_db) -> None:
-    """services/ingestion/wiki_routes.py GET /index hides drafts.
-
-    Direct SQL re-execution of the same query (the route itself wraps an
-    HTTP layer + key auth we don't need here); the predicate is what we
-    care about.
-    """
-    cid = _new_customer_id()
-    await _seed_customer(cid)
-    await _seed_wiki_doc(cid, "wiki:postmortem:approved-pm", visibility="approved")
-    await _seed_wiki_doc(cid, "wiki:postmortem:draft-pm", visibility="draft")
-
-    from engine.shared.constants import (
-        WIKI_DOC_TYPE_PREFIX,
-        WIKI_INDEX_DOC_TYPE,
-        SourceSystem,
-    )
-    from engine.shared.db import with_tenant
-
-    async with with_tenant(cid) as conn:
-        rows = await conn.fetch(
-            """
-            SELECT title, source_id, version, updated_at, metadata
-            FROM documents
-            WHERE customer_id = $1
-              AND source_system = $2
-              AND doc_type LIKE $3
-              AND doc_type <> $4
-              AND valid_to IS NULL
-              AND deleted_at IS NULL
-              AND visibility = 'approved'
-            ORDER BY updated_at DESC
-            """,
-            cid,
-            SourceSystem.WIKI.value,
-            f"{WIKI_DOC_TYPE_PREFIX}%",
-            WIKI_INDEX_DOC_TYPE,
-        )
-    source_ids = {r["source_id"] for r in rows}
-    assert "wiki:postmortem:approved-pm" in source_ids
-    assert "wiki:postmortem:draft-pm" not in source_ids
-
-
-async def test_wiki_agent_drain_index_excludes_drafts(live_db) -> None:
-    """services/synthesis/wiki_agent.py drain-time index regen hides drafts.
-
-    Mirrors the synth-time query the agent runs to assemble the
-    auto-generated wiki index. A draft artifact must not contribute to
-    the rendered TOC body until approval.
-    """
-    cid = _new_customer_id()
-    await _seed_customer(cid)
-    await _seed_wiki_doc(cid, "wiki:postmortem:approved-pm", visibility="approved")
-    await _seed_wiki_doc(cid, "wiki:postmortem:draft-pm", visibility="draft")
-
-    from engine.shared.constants import (
-        WIKI_DOC_TYPE_PREFIX,
-        WIKI_INDEX_DOC_TYPE,
-        SourceSystem,
-    )
-    from engine.shared.db import with_tenant
-
-    async with with_tenant(cid) as conn:
-        rows = await conn.fetch(
-            """
-            SELECT title, body_preview, source_id, version, updated_at,
-                   metadata
-            FROM documents
-            WHERE customer_id = $1
-              AND source_system = $2
-              AND doc_type LIKE $3
-              AND doc_type <> $4
-              AND valid_to IS NULL
-              AND deleted_at IS NULL
-              AND visibility = 'approved'
-            ORDER BY updated_at DESC
-            """,
-            cid,
-            SourceSystem.WIKI.value,
-            f"{WIKI_DOC_TYPE_PREFIX}%",
-            WIKI_INDEX_DOC_TYPE,
-        )
-    source_ids = {r["source_id"] for r in rows}
-    assert "wiki:postmortem:approved-pm" in source_ids
-    assert "wiki:postmortem:draft-pm" not in source_ids
+    assert by_key.get("manual_upload.text") == 3

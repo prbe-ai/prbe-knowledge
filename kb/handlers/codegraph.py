@@ -112,8 +112,7 @@ class CodeGraphConnector(Connector):
         # No public webhook surface — events are enqueued in-process by
         # code_graph/bridge.py from already-verified source connectors.
         # Returning False keeps standalone /webhooks/code_graph a hard 401
-        # (hosted gateway mode never calls verify_signature). Mirrors
-        # handlers/wiki.py.
+        # (hosted gateway mode never calls verify_signature).
         return False
 
     # ---- 2. event parsing -----------------------------------------------
@@ -219,7 +218,7 @@ class CodeGraphConnector(Connector):
         # reliability work (PRs #184, #186, #189, #190). The classifier-based
         # extraction had unfixable directionality + verbosity issues. Existing
         # edges in graph_edges (DEPENDS_ON, label=Repo) stay frozen at the
-        # PR #190 state; the wiki architecture diagram renders that snapshot.
+        # PR #190 state.
         #
         # To revive: uncomment the block below. The cross_repo_deps module,
         # tests, and persistence helpers are all intact. Consider replacing
