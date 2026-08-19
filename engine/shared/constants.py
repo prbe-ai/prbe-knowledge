@@ -1751,6 +1751,18 @@ WIKI_TRIAGE_MODEL = "gemini-3.5-flash"
 # "gemini-3.1-flash-lite" via this constant + redeploy.
 DIRECTED_PHRASES_MODEL = "gemini-3-flash-preview"
 
+# Workflow-memory situation classifier, tie-break leg only. The classifier is
+# embedding-first and reaches a model ONLY when the top two situations score
+# within MARGIN of each other, so this is a rare call on a sub-second serving
+# path -- which is the argument for a flash-class model rather than the
+# synthesis default. Same model the wiki triage settled on, in LiteLLM's
+# provider-prefixed form. The task is a shortlist pick from 2-3 supplied
+# options with a permitted "none": if this is ever swapped, the thing to
+# re-check is whether the replacement still answers "none" honestly rather
+# than always choosing from the menu, because a model that never abstains
+# turns off the `unknown` escape hatch without changing a line of our code.
+WFMEM_CLASSIFIER_TIEBREAK_MODEL = "gemini/gemini-3.5-flash"
+
 # Concurrency caps. The wiki-worker fans out customers, then triage
 # batches per customer. (The v4 wiki agent uses
 # WIKI_AGENT_GLOBAL_CONCURRENCY for synthesis-side fan-out plus a
