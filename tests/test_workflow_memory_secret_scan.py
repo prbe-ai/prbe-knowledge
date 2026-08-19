@@ -48,6 +48,8 @@ from shared.wfmem.secret_scan import (
             "jwt",
         ),
         ("DATABASE_URL=postgresql://prbe:hunter2pass@localhost:5432/db", "dsn_with_password"),
+        ("redis://default:s3cretpass@cache:6379/0", "dsn_with_password"),
+        ("mongodb+srv://admin:pw12345@cluster0.mongodb.net", "dsn_with_password"),
         (
             "https://hooks.slack.com" "/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
             "slack_webhook",
@@ -214,3 +216,35 @@ def test_aws_access_key_id_boundary():
 def test_assigned_secret_boundary():
     assert scan_for_secrets("TOKEN=" + "a" * 15) == []
     assert "assigned_secret" in scan_for_secrets("TOKEN=" + "a" * 16)
+
+
+# --- follow-up hardening: NBSP deletion + dsn_with_password ReDoS ----------
+
+
+def test_nbsp_before_at_does_not_hide_a_dsn_password():
+    """NBSP must be DELETED, not translated to a space, before scanning.
+
+    A translated space still satisfies `\\s`, exactly as NBSP did, so the
+    password class (`[^\\s/@]`) would still stop short of the literal `@` and
+    the match would still fail -- this is the case that proved translation
+    doesn't work and only deletion does.
+    """
+    assert "dsn_with_password" in scan_for_secrets(
+        "DATABASE_URL=postgresql://prbe:hunter2pass\xa0@localhost:5432/db"
+    )
+
+
+def test_dsn_detector_does_not_backtrack_quadratically():
+    """A near-miss DSN-shaped blob must not hang ingest.
+
+    Before bounding every quantifier this was O(n^2): 0.17s at 20K chars,
+    2.91s at 80K, 11.76s at 160K on a blob of repeated `"a."` with a trailing
+    `"://"` and no real match. Making only the scheme prefix atomic was tried
+    and did not fix it (still 8.9s at 160K) -- the engine still retries at
+    O(n) starting positions. Bounding every quantifier does.
+    """
+    text = ("a." * 100_000) + "://"
+    start = time.perf_counter()
+    scan_for_secrets(text)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"scan_for_secrets took {elapsed:.3f}s, expected < 1.0s"

@@ -56,7 +56,20 @@ _DETECTORS: tuple[tuple[str, re.Pattern[str]], ...] = (
     # @-delimited userinfo at all, so it stays clean even at `{1,}`. What `{3,}`
     # actually guards against is a placeholder DSN like
     # `postgresql://user:x@host:5432/db`, which is a template, not a leak.
-    ("dsn_with_password", re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s/:@]+:[^\s/@]{3,}@")),
+    #
+    # Every quantifier is bounded. Real schemes are a handful of characters and
+    # userinfo/passwords are bounded in practice, so capping them turns each match
+    # attempt into constant work -- without the caps this is quadratic (11.8s on a
+    # 160KB near-miss), because the engine retries at every starting position.
+    # Making just the scheme-prefix atomic was tried and does NOT fix it (still
+    # 8.9s at 160KB): atomic grouping stops backtracking within one match attempt,
+    # but the engine still retries at O(n) starting positions, so it stays
+    # quadratic. Bounding every quantifier is what turns each attempt into O(1)
+    # work regardless of input length.
+    (
+        "dsn_with_password",
+        re.compile(r"\b[a-z][a-z0-9+.\-]{0,30}://[^\s/:@]{1,256}:[^\s/@]{3,256}@"),
+    ),
     (
         "assigned_secret",
         re.compile(
@@ -75,12 +88,16 @@ MAX_SCAN_CHARS = 20_000
 #: than trust it is finite.
 MAX_JSON_DEPTH = 50
 
-#: Zero-width and bidi-control code points stripped before scanning. Rich-text
-#: paste from Notion/Slack/Docs injects these routinely -- a ZWJ dropped
-#: mid-token (`ghp_...`) breaks the literal-adjacency match every detector
-#: relies on, which would otherwise let the credential behind it through.
+#: Zero-width, bidi-control, and NBSP code points deleted before scanning.
+#: Rich-text paste from Notion/Slack/Docs injects these routinely -- a ZWJ
+#: dropped mid-token (`ghp_...`) breaks the literal-adjacency match every
+#: detector relies on, which would otherwise let the credential behind it
+#: through. NBSP (U+00A0) is deleted, not translated to a regular space:
+#: normalization is scan-only (the stored text is untouched), so deletion
+#: costs nothing, and a translated space still satisfies `\s` exactly as NBSP
+#: did -- see `_normalize`'s docstring for why that matters.
 _ZERO_WIDTH_AND_BIDI = dict.fromkeys(
-    [0x200B, 0x200C, 0x200D, 0xFEFF, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E],
+    [0x200B, 0x200C, 0x200D, 0xFEFF, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x00A0],
     None,
 )
 
@@ -97,15 +114,19 @@ class SecretDetected(ValueError):
 
 
 def _normalize(text: str) -> str:
-    """Undo zero-width/bidi noise before scanning, fold NBSP to a plain space.
+    """Undo zero-width/bidi/NBSP noise before scanning -- scan-only, never stored.
 
-    Deletes the code points in `_ZERO_WIDTH_AND_BIDI` outright (they carry no
-    visible content, so removing them restores the adjacency a detector's
-    character class expects) and translates U+00A0 (NBSP) to an ordinary
-    space (it is visible whitespace, so it is folded rather than deleted).
+    Deletes every code point in `_ZERO_WIDTH_AND_BIDI` outright, NBSP included.
+    Translating NBSP to a regular space instead of deleting it was tried and
+    does NOT work: `[^\\s/@]`-style classes reject a regular space exactly as
+    they reject NBSP (both satisfy `\\s`), so a translated space still breaks
+    the literal adjacency `dsn_with_password` needs between a password and the
+    `@` that follows it -- the evasion stays open while looking fixed. Deletion
+    is safe here specifically because this function's output is never stored,
+    only matched against: collapsing `hello\\xa0world` into `helloworld` for the
+    purpose of shape-matching costs nothing.
     """
-    text = text.translate(_ZERO_WIDTH_AND_BIDI)
-    return text.replace("\xa0", " ")
+    return text.translate(_ZERO_WIDTH_AND_BIDI)
 
 
 def scan_for_secrets(text: str) -> list[str]:
