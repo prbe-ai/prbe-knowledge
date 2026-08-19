@@ -5,9 +5,9 @@ customer's org. Edges flow into ``graph_edges`` as ``DEPENDS_ON`` between
 ``Repo`` graph nodes.
 
 NOTE: extraction is disabled (see the paused block in
-kb/handlers/codegraph.py) and the wiki index renderer that consumed
-these edges has been removed. Existing edges remain queryable through
-the graph retriever; nothing writes new ones.
+kb/handlers/codegraph.py) and the index renderer that consumed these
+edges has been removed. Existing edges remain queryable through the
+graph retriever; nothing writes new ones.
 
 Pipeline:
 
