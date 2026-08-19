@@ -609,6 +609,24 @@ CREATE TABLE IF NOT EXISTS neon_auth."user" (
 #: All five tables FK to customers; nothing else about it matters here.
 _CUSTOMERS_STUB = "CREATE TABLE customers (customer_id TEXT PRIMARY KEY)"
 
+#: Which relations count as workflow-memory objects, as a regex rather than as
+#: WFMEM_TABLES. The list is what nearly made this guard useless: it only ever
+#: covered the objects somebody remembered to name, so a sixth table added by a
+#: later migration would be invisible to the very test whose job is to notice.
+#: A prefix rule fails safe as the schema grows. WFMEM_TABLES stays where an
+#: explicit set is genuinely wanted -- the per-table structural tests above,
+#: which must fail loudly if a table goes missing entirely.
+_WFMEM_RELATION_RE = "^(situation|clause|serve_ledger|wfmem_)"
+
+#: Functions and off-table triggers are matched on the `wfmem_` prefix ALONE.
+#: That is not a stylistic choice: the schema.sql database also contains this
+#: repo's other functions (customers_fill_r2_bucket,
+#: verify_and_touch_custom_ingest_token) and their triggers, which the
+#: migration-replay database has no reason to contain, so an unfiltered
+#: comparison would fail on every run. The cost is real and worth stating: a
+#: future wfmem function that does NOT carry the prefix is invisible here.
+_WFMEM_FUNCTION_RE = "^wfmem_"
+
 
 def _migration_upgrade_statements() -> list[str]:
     """The SQL migration 0076 would run, without an alembic context.
@@ -639,18 +657,48 @@ def _dsn_for(dbname: str) -> str:
     return urlunparse(parsed._replace(path=f"/{dbname}"))
 
 
+def _normalized_lines(text: str) -> tuple[str, ...]:
+    """A function body reduced to its non-blank lines, each stripped.
+
+    Necessary, and the reason is worth stating so nobody "tightens" this back:
+    the migration embeds its SQL inside an INDENTED Python string literal while
+    schema.sql sits at column zero, so every line of the two files differs by
+    leading whitespace. Everywhere else that is invisible, because Postgres
+    reprints the catalog in a normal form -- constraints, indexes, policies and
+    triggers all compare byte-identical. ``prosrc`` is the exception: it is
+    stored as the raw text it was created with. Comparing it verbatim makes
+    this section permanently red on two files that genuinely match. Whitespace
+    is not semantics in plpgsql; a body that differs by anything else still
+    fails here.
+    """
+    return tuple(line.strip() for line in text.splitlines() if line.strip())
+
+
 async def _wfmem_fingerprint(conn: asyncpg.Connection) -> dict[str, list[tuple[Any, ...]]]:
-    """Everything about the five tables that could drift between the two files."""
-    tables = list(WFMEM_TABLES)
+    """Every workflow-memory object that could drift between the two files.
+
+    Scoped by name PREFIX, not by the WFMEM_TABLES list, so a table, function
+    or trigger added by a later migration is covered without anyone having to
+    remember this file exists. Two sections exist specifically because the
+    per-table view was blind to them:
+
+    * ``functions`` -- the trigger DEFINITIONS were compared all along, but
+      pg_get_triggerdef only names the function it calls. The function BODY
+      was never read, so schema.sql and the migration could have defined
+      wfmem_touch_updated_at differently and this guard would have passed.
+    * ``triggers_by_function`` -- a trigger that a wfmem migration puts on a
+      table it does not own (``customers`` is the live example we nearly
+      shipped) sits outside every per-table query in here.
+    """
     return {
         "columns": [
             tuple(r)
             for r in await conn.fetch(
                 "SELECT table_name, ordinal_position, column_name, data_type, udt_name, "
                 "is_nullable, column_default FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = ANY($1::text[]) "
+                "WHERE table_schema = 'public' AND table_name ~ $1 "
                 "ORDER BY table_name, ordinal_position",
-                tables,
+                _WFMEM_RELATION_RE,
             )
         ],
         "constraints": [
@@ -658,45 +706,75 @@ async def _wfmem_fingerprint(conn: asyncpg.Connection) -> dict[str, list[tuple[A
             for r in await conn.fetch(
                 "SELECT c.relname, con.conname, pg_get_constraintdef(con.oid) "
                 "FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid "
-                "WHERE c.relnamespace = 'public'::regnamespace AND c.relname = ANY($1::text[]) "
+                "WHERE c.relnamespace = 'public'::regnamespace AND c.relname ~ $1 "
                 "ORDER BY 1, 2",
-                tables,
+                _WFMEM_RELATION_RE,
             )
         ],
         "indexes": [
             tuple(r)
             for r in await conn.fetch(
                 "SELECT tablename, indexname, indexdef FROM pg_indexes "
-                "WHERE schemaname = 'public' AND tablename = ANY($1::text[]) ORDER BY 1, 2",
-                tables,
+                "WHERE schemaname = 'public' AND tablename ~ $1 ORDER BY 1, 2",
+                _WFMEM_RELATION_RE,
             )
         ],
         "policies": [
             tuple(r)
             for r in await conn.fetch(
                 "SELECT tablename, policyname, permissive, cmd, qual, with_check "
-                "FROM pg_policies WHERE schemaname = 'public' AND tablename = ANY($1::text[]) "
+                "FROM pg_policies WHERE schemaname = 'public' AND tablename ~ $1 "
                 "ORDER BY 1, 2",
-                tables,
+                _WFMEM_RELATION_RE,
             )
         ],
         "rls_flags": [
             tuple(r)
             for r in await conn.fetch(
                 "SELECT relname, relrowsecurity, relforcerowsecurity FROM pg_class "
-                "WHERE relnamespace = 'public'::regnamespace AND relname = ANY($1::text[]) "
-                "ORDER BY 1",
-                tables,
+                "WHERE relnamespace = 'public'::regnamespace AND relkind = 'r' "
+                "AND relname ~ $1 ORDER BY 1",
+                _WFMEM_RELATION_RE,
             )
         ],
+        # Per-table: every non-internal trigger sitting ON a wfmem table,
+        # whatever function it calls.
         "triggers": [
             tuple(r)
             for r in await conn.fetch(
                 "SELECT c.relname, t.tgname, pg_get_triggerdef(t.oid) FROM pg_trigger t "
                 "JOIN pg_class c ON c.oid = t.tgrelid "
                 "WHERE NOT t.tgisinternal AND c.relnamespace = 'public'::regnamespace "
-                "AND c.relname = ANY($1::text[]) ORDER BY 1, 2",
-                tables,
+                "AND c.relname ~ $1 ORDER BY 1, 2",
+                _WFMEM_RELATION_RE,
+            )
+        ],
+        # By-function: every non-internal trigger CALLING a wfmem function,
+        # whatever table it sits on. Deliberately unrestricted by table and by
+        # schema -- that is the whole point of this section.
+        "triggers_by_function": [
+            tuple(r)
+            for r in await conn.fetch(
+                "SELECT c.relnamespace::regnamespace::text, c.relname, t.tgname, p.proname, "
+                "pg_get_triggerdef(t.oid) FROM pg_trigger t "
+                "JOIN pg_class c ON c.oid = t.tgrelid "
+                "JOIN pg_proc p ON p.oid = t.tgfoid "
+                "WHERE NOT t.tgisinternal AND p.proname ~ $1 ORDER BY 1, 2, 3",
+                _WFMEM_FUNCTION_RE,
+            )
+        ],
+        # The function bodies themselves. pg_get_functiondef carries the
+        # language, return type and volatility alongside the source, so a
+        # trigger function that quietly starts writing a different value shows
+        # up here as a diff.
+        "functions": [
+            (r["proname"], r["identity_arguments"], _normalized_lines(r["definition"]))
+            for r in await conn.fetch(
+                "SELECT p.proname, pg_get_function_identity_arguments(p.oid) "
+                "AS identity_arguments, pg_get_functiondef(p.oid) AS definition "
+                "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+                "WHERE n.nspname = 'public' AND p.proname ~ $1 ORDER BY 1, 2",
+                _WFMEM_FUNCTION_RE,
             )
         ],
     }
@@ -708,6 +786,11 @@ async def test_schema_sql_has_not_drifted_from_the_migration(live_db):
     migration chain. The two files are identical today only by care, and
     nothing else in the repo keeps them that way, so: build one scratch DB by
     replaying the migration, another from schema.sql, and diff the result.
+
+    The diff covers tables, columns, constraints, indexes, policies, RLS flags,
+    triggers ON wfmem tables, triggers CALLING wfmem functions wherever they
+    sit, and the function bodies -- matched by name prefix so that objects
+    added later are covered by default rather than on remembering to.
     """
     suffix = f"{os.getpid()}_{uuid4().hex[:8]}"
     mig_db = f"wfmem_drift_mig_{suffix}"
@@ -746,6 +829,18 @@ async def test_schema_sql_has_not_drifted_from_the_migration(live_db):
         finally:
             await admin.close()
 
+    # Non-vacuity first. Every section is prefix-matched, so a typo in one of
+    # the regexes would return nothing on BOTH sides and compare equal -- a
+    # green guard that inspects nothing, which is the failure this whole test
+    # was written to stop happening elsewhere.
+    for section, rows in migration_fingerprint.items():
+        assert rows, f"the {section} fingerprint is empty -- the guard is inspecting nothing"
+    assert any(row[0] == "wfmem_touch_updated_at" for row in migration_fingerprint["functions"]), (
+        "wfmem_touch_updated_at is missing from the functions fingerprint; "
+        f"got {[row[0] for row in migration_fingerprint['functions']]}"
+    )
+
+    assert sorted(migration_fingerprint) == sorted(schema_fingerprint)
     for section in sorted(migration_fingerprint):
         assert migration_fingerprint[section] == schema_fingerprint[section], (
             f"db/schema.sql and migration 0076 disagree on {section}. CI applies "
