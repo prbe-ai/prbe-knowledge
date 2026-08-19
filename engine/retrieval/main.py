@@ -11,6 +11,7 @@ Endpoints exposed:
     GET  /sources/...      raw document fetch
     GET  /health           liveness + DB ping
     /usage/...             read endpoints for usage_events (mounted via router)
+    /procedures/...        workflow memory: preview, declare, query (via router)
 
 The pipeline itself lives in:
     pipeline.py         dispatcher (mode=list vs mode=search)
@@ -55,6 +56,7 @@ from engine.retrieval.pipeline import (
     run_router_phase,
     run_search_phase,
 )
+from engine.retrieval.procedures import procedures_router
 from engine.retrieval.synthesis import (
     StreamDelta,
     StreamFinal,
@@ -1462,6 +1464,12 @@ async def get_source(
 # and is excluded from UsageLoggingMiddleware so reads don't recursively
 # log themselves.
 app.include_router(usage_router)
+
+# Workflow memory: /procedures/preview, /procedures/declare, /procedures/query.
+# Same auth dependency as everything else here, and every response carries the
+# three-state capability envelope -- a tenant without the cell gets an empty
+# result, not a 403, so a client can tell "off" from "not entitled".
+app.include_router(procedures_router)
 
 
 __all__ = [
