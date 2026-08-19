@@ -1799,11 +1799,13 @@ CREATE POLICY tenant_isolation ON purge_runs
 -- `procedure_clauses` are deliberately NOT created — nothing writes them in
 -- v0 and their shape is unknown.
 --
--- DELIBERATELY ABSENT: clause_evidence has NO quote/text column. Evidence is
--- stored by reference and resolved at view time through the viewer's ACL;
--- the column's absence enforces that structurally instead of by review
--- (tests/test_workflow_memory_isolation.py asserts it). situation_occurrences
--- and conformance are not created either — they need Phase 1's detectors.
+-- DELIBERATELY ABSENT: clause_evidence stores evidence BY REFERENCE, enforced
+-- on TWO axes — (a) no quote/text column, and (b) a CHECK refusing quote-shaped
+-- keys inside source_ref, which is the unconstrained JSONB where a quote would
+-- actually land. Evidence resolves at view time through the viewer's ACL and a
+-- baked-in quote escapes that check; both axes have tests in
+-- tests/test_workflow_memory_isolation.py. situation_occurrences and
+-- conformance are not created either — they need Phase 1's detectors.
 --
 -- This block MUST stay identical to
 -- db/migrations/versions/20260817_0076_workflow_memory_store.py: CI applies
@@ -1859,6 +1861,10 @@ CREATE INDEX clauses_customer_status_idx ON clauses (customer_id, status);
 -- exists in any tenant, which is a cross-tenant existence oracle, and it
 -- corrupts any later join that runs outside a tenant GUC. Keying the FK
 -- on (customer_id, id) makes the mismatch unrepresentable.
+-- Caveat: "unrepresentable" is slightly too strong. The FK route is closed,
+-- but an explicit-id insert of another tenant's uuid still errors DIFFERENTLY
+-- from a random uuid via the single-column PK, so a narrow existence oracle
+-- survives at the primary key.
 CREATE TABLE clause_situation_edges (
     clause_id       UUID NOT NULL,
     situation_id    UUID NOT NULL,
@@ -1878,7 +1884,8 @@ CREATE TABLE clause_situation_edges (
 
 CREATE INDEX cse_situation_idx ON clause_situation_edges (customer_id, situation_id);
 
--- NO quote/text column here. See the section header.
+-- NO quote/text column here, AND no quote-shaped key inside source_ref.
+-- See the section header: the column-absence claim alone was wrong.
 CREATE TABLE clause_evidence (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     customer_id      TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
@@ -1889,14 +1896,26 @@ CREATE TABLE clause_evidence (
                      CHECK (source_class IN ('declared','human_doc','human_message',
                                              'pr_review','human_wiki_edit',
                                              'agent_transcript','run_outcome')),
-    source_ref       JSONB NOT NULL,
+    -- A POINTER, not a payload: {"session": "...", "span": [0, 1]}.
+    -- Unconstrained JSONB is exactly where a quote would land, so the
+    -- quote-shaped keys are refused here rather than left to review.
+    source_ref       JSONB NOT NULL
+                     CHECK (NOT (source_ref ?| ARRAY['quote','text','body','content',
+                                                     'excerpt','snippet','raw','full_text',
+                                                     'verbatim','passage'])),
     author_ref       TEXT,
-    exposure_tainted BOOLEAN NOT NULL DEFAULT FALSE,
+    -- NO DEFAULT, deliberately. A default of FALSE fails OPEN: a writer that
+    -- forgets the taint computation records the evidence as clean, and
+    -- taint-excluded support is a stated non-negotiable. With NOT NULL and no
+    -- default, an omission is a constraint violation and every write has to
+    -- state its taint.
+    exposure_tainted BOOLEAN NOT NULL,
     ts               TIMESTAMPTZ NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX clause_evidence_clause_idx ON clause_evidence (clause_id);
+-- Leads with the tenant column, matching the composite FK.
+CREATE INDEX clause_evidence_clause_idx ON clause_evidence (customer_id, clause_id);
 
 CREATE TABLE serve_ledger (
     id           BIGSERIAL PRIMARY KEY,
@@ -1953,6 +1972,12 @@ CREATE TRIGGER clauses_touch_updated_at_trg
 -- RLS on all five. FORCE so the policy applies to the table owner too, and
 -- BOTH halves: USING alone hides another tenant's rows on read but still
 -- lets a buggy writer file a row under the wrong customer.
+--
+-- serve_ledger is the exception: FOR SELECT + FOR INSERT policies only. It is
+-- an append-only exposure log, and under FORCE RLS the ABSENCE of an
+-- UPDATE/DELETE policy is the deny — a tenant cannot backdate or erase its own
+-- history. Backdating is worse than deletion: it silently inverts the taint
+-- join the table exists for.
 ALTER TABLE situations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE situations FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON situations
@@ -1979,6 +2004,12 @@ CREATE POLICY tenant_isolation ON clause_evidence
 
 ALTER TABLE serve_ledger ENABLE ROW LEVEL SECURITY;
 ALTER TABLE serve_ledger FORCE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON serve_ledger
-    USING (customer_id = current_setting('app.current_customer_id', true))
+CREATE POLICY tenant_isolation_select ON serve_ledger
+    FOR SELECT
+    USING (customer_id = current_setting('app.current_customer_id', true));
+CREATE POLICY tenant_isolation_insert ON serve_ledger
+    FOR INSERT
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+-- Belt-and-braces for any role that would otherwise inherit the privilege
+-- through PUBLIC; the deny above is the policy absence, not this REVOKE.
+REVOKE UPDATE, DELETE ON serve_ledger FROM PUBLIC;

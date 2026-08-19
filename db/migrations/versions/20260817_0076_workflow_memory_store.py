@@ -12,17 +12,27 @@ and a near-certain second migration anyway.
 
 DELIBERATELY ABSENT
 -------------------
-* ``clause_evidence`` has NO quote/text column. Evidence is stored by
-  reference and resolved at view time through the viewer's ACL; making the
-  column absent enforces that structurally instead of by review. A test
-  asserts the absence so a future contributor cannot quietly add one.
+* ``clause_evidence`` stores evidence BY REFERENCE, and that is enforced on
+  TWO axes, not one. (a) No quote/text column exists. (b) ``source_ref`` --
+  unconstrained JSONB, which is where a quote would actually land -- carries
+  a CHECK refusing quote-shaped keys. An earlier revision of this migration
+  claimed the absent column was sufficient; it was not. A full quote, or an
+  entire private DM, fit inside ``source_ref`` with no DDL change at all.
+  Both axes have tests; evidence resolves at view time through the viewer's
+  ACL, and a baked-in quote escapes that check.
 * ``situation_occurrences`` and ``conformance`` are NOT created. They need
   Phase 1's detectors and nightly join; empty tables invite premature writes.
 
-Every table gets ENABLE + FORCE ROW LEVEL SECURITY and a tenant_isolation
-policy with BOTH USING and WITH CHECK, per the audit intent of migration
-0067 -- USING alone hides another tenant's rows on read but still lets a
-buggy writer file a row under the wrong customer.
+Four of the five tables get ENABLE + FORCE ROW LEVEL SECURITY and a
+tenant_isolation policy with BOTH USING and WITH CHECK, per the audit intent
+of migration 0067 -- USING alone hides another tenant's rows on read but
+still lets a buggy writer file a row under the wrong customer.
+
+``serve_ledger`` is the exception and gets FOR SELECT + FOR INSERT policies
+only. It is an append-only exposure log; under FORCE RLS the ABSENCE of an
+UPDATE/DELETE policy is a deny, so a tenant cannot rewrite its own history.
+Backdating (``SET served_at = '2001-01-01'``) is worse than deletion -- it
+silently inverts the taint join the table exists for.
 """
 
 from alembic import op
@@ -40,6 +50,10 @@ _TABLES = (
     "clause_evidence",
     "serve_ledger",
 )
+
+#: The tables a tenant may UPDATE and DELETE within, i.e. everything except the
+#: append-only serve_ledger, which gets FOR SELECT + FOR INSERT policies only.
+_MUTABLE_TABLES = tuple(t for t in _TABLES if t != "serve_ledger")
 
 
 def upgrade() -> None:
@@ -102,6 +116,10 @@ def upgrade() -> None:
         -- exists in any tenant, which is a cross-tenant existence oracle, and it
         -- corrupts any later join that runs outside a tenant GUC. Keying the FK
         -- on (customer_id, id) makes the mismatch unrepresentable.
+        -- Caveat: "unrepresentable" is slightly too strong. The FK route is
+        -- closed, but an explicit-id insert of another tenant's uuid still
+        -- errors DIFFERENTLY from a random uuid via the single-column PK, so a
+        -- narrow existence oracle survives at the primary key.
         CREATE TABLE clause_situation_edges (
             clause_id       UUID NOT NULL,
             situation_id    UUID NOT NULL,
@@ -124,7 +142,8 @@ def upgrade() -> None:
         "CREATE INDEX cse_situation_idx ON clause_situation_edges (customer_id, situation_id)"
     )
 
-    # NO quote/text column here. See module docstring.
+    # NO quote/text column here, AND no quote-shaped key inside source_ref.
+    # See module docstring: the column-absence claim alone was wrong.
     op.execute(
         """
         CREATE TABLE clause_evidence (
@@ -137,15 +156,29 @@ def upgrade() -> None:
                              CHECK (source_class IN ('declared','human_doc','human_message',
                                                      'pr_review','human_wiki_edit',
                                                      'agent_transcript','run_outcome')),
-            source_ref       JSONB NOT NULL,
+            -- A POINTER, not a payload: {"session": "...", "span": [0, 1]}.
+            -- Unconstrained JSONB is exactly where a quote would land, so the
+            -- quote-shaped keys are refused here rather than left to review.
+            source_ref       JSONB NOT NULL
+                             CHECK (NOT (source_ref ?| ARRAY['quote','text','body','content',
+                                                             'excerpt','snippet','raw','full_text',
+                                                             'verbatim','passage'])),
             author_ref       TEXT,
-            exposure_tainted BOOLEAN NOT NULL DEFAULT FALSE,
+            -- NO DEFAULT, deliberately. A default of FALSE fails OPEN: a writer
+            -- that forgets the taint computation records the evidence as clean,
+            -- and taint-excluded support is a stated non-negotiable. With NOT
+            -- NULL and no default, an omission is a constraint violation and
+            -- every write has to state its taint.
+            exposure_tainted BOOLEAN NOT NULL,
             ts               TIMESTAMPTZ NOT NULL,
             created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """
     )
-    op.execute("CREATE INDEX clause_evidence_clause_idx ON clause_evidence (clause_id)")
+    # Leads with the tenant column, matching the composite FK.
+    op.execute(
+        "CREATE INDEX clause_evidence_clause_idx ON clause_evidence (customer_id, clause_id)"
+    )
 
     op.execute(
         """
@@ -212,6 +245,9 @@ def upgrade() -> None:
     for table in _TABLES:
         op.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
         op.execute(f"ALTER TABLE {table} FORCE ROW LEVEL SECURITY")
+
+    # Everything but serve_ledger: one FOR ALL policy, both halves.
+    for table in _MUTABLE_TABLES:
         op.execute(f"DROP POLICY IF EXISTS tenant_isolation ON {table}")
         op.execute(
             f"""
@@ -220,6 +256,28 @@ def upgrade() -> None:
                 WITH CHECK (customer_id = current_setting('app.current_customer_id', true))
             """
         )
+
+    # serve_ledger is append-only: SELECT and INSERT policies only. Under FORCE
+    # RLS a command with no applicable policy matches no rows, so the ABSENCE of
+    # an UPDATE/DELETE policy is the deny -- a tenant cannot backdate or erase
+    # its own exposure history. The REVOKE is belt-and-braces for any role that
+    # would otherwise inherit the privilege through PUBLIC.
+    op.execute("DROP POLICY IF EXISTS tenant_isolation ON serve_ledger")
+    op.execute(
+        """
+        CREATE POLICY tenant_isolation_select ON serve_ledger
+            FOR SELECT
+            USING (customer_id = current_setting('app.current_customer_id', true))
+        """
+    )
+    op.execute(
+        """
+        CREATE POLICY tenant_isolation_insert ON serve_ledger
+            FOR INSERT
+            WITH CHECK (customer_id = current_setting('app.current_customer_id', true))
+        """
+    )
+    op.execute("REVOKE UPDATE, DELETE ON serve_ledger FROM PUBLIC")
 
 
 def downgrade() -> None:
