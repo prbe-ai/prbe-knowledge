@@ -20,7 +20,7 @@ which spins its own event loop and clashes with the pool initialised by
 the ``live_db`` fixture (asyncpg connections are loop-bound). We use the
 ``httpx.AsyncClient`` + ``ASGITransport`` + ``app.router.lifespan_context``
 pattern already used in ``tests/test_internal_devices.py`` and
-``tests/test_wiki_routes.py``.
+``tests/test_purge_routes.py``.
 """
 
 from __future__ import annotations

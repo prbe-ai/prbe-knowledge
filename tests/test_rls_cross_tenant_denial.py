@@ -223,7 +223,7 @@ async def test_inferred_edges_queue_no_longer_force_rls(two_tenants) -> None:
     The side-worker drains this queue cross-tenant (one shared FOR UPDATE
     SKIP LOCKED claim across all customers), which is impossible under
     FORCE RLS without setting the GUC pre-claim. 0068 disables RLS on
-    this queue table specifically, matching the wiki_synthesis_queue
+    this queue table specifically, matching the inferred_edges_queue
     pattern (migration 0034).
 
     This regression test pins that fact so a well-meaning future
