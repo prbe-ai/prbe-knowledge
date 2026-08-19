@@ -7,7 +7,7 @@
 # prbe-knowledge snapshot, dockerfile_path = ./sandbox/Dockerfile.product.
 #
 # This is NOT a production image and not the per-role data-plane image. Ingestion /
-# worker / cron / wiki / MCP never run here — only the retrieval serving slice. That
+# worker / cron / MCP never run here — only the retrieval serving slice. That
 # slice is self-contained: services/retrieval/main.py's lifespan opens a PG pool and
 # nothing else (no scheduler, no poller, no queue consumer).
 #

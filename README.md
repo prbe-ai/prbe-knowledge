@@ -162,8 +162,7 @@ prbe-knowledge/
 │   ├── handlers/       one connector per source (Slack, GitHub, ...)
 │   ├── polling/        outbound pollers (self-host mode)
 │   ├── ingestion_app.py  webhook + ingest HTTP app (:8080)
-│   ├── worker.py       composed worker process (drain + backfills + pollers)
-│   └── synthesis/      knowledge-page (wiki) generation
+│   └── worker.py       composed worker process (drain + backfills + pollers)
 ├── services/           thin deploy wrappers — compose/Helm entrypoints
 │                       (services.ingestion.main:app etc.) stay stable
 ├── db/

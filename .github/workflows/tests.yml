@@ -109,30 +109,18 @@ jobs:
           psql -h localhost -p 5432 -U prbe -d prbe_knowledge -v ON_ERROR_STOP=1 -f db/schema.sql
           .venv/bin/alembic stamp head
 
-      # Scoped to the STORAGE suite (Postgres + MinIO) PLUS the wiki routes, not
-      # `tests/` wholesale. The
-      # full suite has ~42 pre-existing failures unrelated to storage: tests that need
-      # the ParadeDB/BM25 extension or a live Gemini key, plus stale expectations left
-      # by a code-graph label refactor (Function/Class/Module -> CodeSymbol, Repo ->
+      # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale.
+      # The full suite has ~42 pre-existing failures unrelated to storage: tests that
+      # need the ParadeDB/BM25 extension or a live Gemini key, plus stale expectations
+      # left by a code-graph label refactor (Function/Class/Module -> CodeSymbol, Repo ->
       # Document). De-drifting that is its own effort; gating on it now would just paint
       # every PR red. This gate covers the object-store backend + blob/upload paths -- the
       # area #460 touched -- and can widen as the rest of the suite is repaired.
       #
-      # `test_wiki_routes.py` was added because the wiki page API is the engine's
-      # only externally-reachable write surface AND it was shipping bugs this
-      # gate could not see: `GET /pages/index/contents/history` answered 400 for
-      # every tenant (breaking research-os's `/v1/wiki/versions` and the MCP's
-      # `wiki_versions()`) and nothing in CI ran the file that would have caught
-      # it. It is green as of this commit; keep it that way.
-      # `test_wiki.py` and `test_index_renderer.py` were added for the same
-      # reason `test_wiki_routes.py` was: work shipped with tests that this gate
-      # never executed. PR #476 changed how much of the wiki the front page
-      # reads and its `pytest` check went green without running a single one of
-      # the tests it added. `test_wiki.py` also had a permanently-red test
-      # (contradictory `in` / `not in` assertions left over from migration
-      # 0091's label rename) that sat undetected precisely because nothing ran
-      # it. Both files are green as of this commit; keep them that way.
-      - name: Tests (storage + wiki-routes suites)
+      # The wiki-routes files this gate also ran (test_wiki_routes.py, handlers/test_wiki.py,
+      # synthesis/test_index_renderer.py, test_staged_graph.py, test_wiki_agent.py,
+      # test_triage.py, test_triage_worker.py) were deleted with the wiki feature.
+      - name: Tests (storage suite)
         run: >-
           .venv/bin/pytest -q
           tests/test_object_store_s3.py
@@ -140,11 +128,4 @@ jobs:
           tests/test_persist_trace_blob_r2.py
           tests/test_query_traces_trace_blob_migration.py
           tests/handlers/test_manual_upload.py
-          tests/test_wiki_routes.py
-          tests/handlers/test_wiki.py
-          tests/synthesis/test_index_renderer.py
-          tests/synthesis/test_staged_graph.py
-          tests/synthesis/test_wiki_agent.py
-          tests/synthesis/test_triage.py
-          tests/synthesis/test_triage_worker.py
           tests/handlers/test_slack.py
