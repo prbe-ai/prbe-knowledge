@@ -1,10 +1,11 @@
 """Per-tenant capability flags for workflow memory.
 
-Six booleans in `customers.preferences` -- the same JSONB column and the same
-fail-closed coercion `shared.customer_prefs` uses, because these flags gate the
-same kind of thing: work a tenant has to explicitly ask for. A missing key, a
-missing customer, a blob that is not an object, a string `"true"` instead of a
-bool, an unreadable database: every one of those is **off**.
+Six booleans in `customers.preferences` -- the same JSONB column
+`engine.shared.customer_prefs` reads, and a fail-closed coercion of the same
+spirit but a STRICTER letter (see `_coerce_capability_bool`, which explains the
+divergence and why it is not an oversight). A missing key, a missing customer, a
+blob that is not an object, a string `"true"` instead of a bool, an unreadable
+database: every one of those is **off**.
 
 TWO AXES, NOT ONE SWITCH
 ------------------------
@@ -31,9 +32,9 @@ key is not an error, it is a permanent `False`, and it is indistinguishable
 from a tenant who chose not to opt in. Nobody notices until someone asks why
 the feature "never turned on" for one customer.
 
-This module is READ-ONLY, like `shared.customer_prefs`. The writers --
+This module is READ-ONLY, like `engine.shared.customer_prefs`. The writers --
 `enable_capability` (which also seeds) and `disable_capability` (the kill
-switch) -- live in `shared.wfmem.situations`, because enabling touches the
+switch) -- live in `engine.shared.wfmem.situations`, because enabling touches the
 situations table and the import can only point one way.
 
 Here the key set is DERIVED from the two axes (so it cannot be half-updated by
@@ -45,18 +46,70 @@ key.
 
 from __future__ import annotations
 
+import json
 from enum import StrEnum
 
-# The coercion, imported rather than copied. These six cells live in the same
-# JSONB column, are written by the same dashboard PATCH, and must answer to the
-# same rules; a second local copy is a second place for the contract to drift.
-# Private-by-underscore and imported anyway: the alternative is a duplicate
-# whose divergence would be silent.
-from shared.customer_prefs import _coerce_bool
-from shared.db import raw_conn
-from shared.logging import get_logger
+from engine.shared.db import raw_conn
+from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
+
+
+def _coerce_capability_bool(raw: object, key: str) -> bool:
+    """Pull `key` out of a JSONB blob. ON means a REAL JSON boolean `true`.
+
+    STRICTER THAN `customer_prefs._coerce_bool` ON PURPOSE, and this used to
+    import that function precisely so the two could not drift. They drifted
+    anyway -- upstream, for a good reason that does not extend to these keys --
+    and the divergence is now deliberate and written down rather than silent.
+
+    `customer_prefs._coerce_bool` accepts the jsonb STRING "true" as well,
+    because the engine's own `PUT /settings` writes `to_jsonb(<text>)` while
+    dashboard PATCHes write a real boolean, so both shapes exist in the wild for
+    the wiki cells. Refusing the string there caused a real outage: a tenant
+    enabled through the engine PUT read as ON for every SQL consumer
+    (`->> = 'true'`) and OFF for the Python gate, and the Normalizer quietly
+    stopped enqueueing their documents.
+
+    None of that applies here. These six cells have exactly two writers --
+    `enable_capability` and `disable_capability` -- and both go through
+    `to_jsonb($3::boolean)` specifically so the value cannot drift into a string
+    the way a formatted literal can. Migration 0111 backfills real booleans. So a
+    string `"true"` sitting in a wfmem cell did not come from a supported path;
+    it came from a hand-edited blob, a buggy PATCH, or a bad restore. Honouring
+    it would mean turning a capability ON because something wrote it wrong.
+
+    There is a second, sharper reason. `enabled_tenants_missing_situations`
+    matches with jsonb containment (`@> {key: true}`), which does NOT match the
+    string shape. Accept the string here and the reader says ON while the audit
+    query that exists to find broken tenants cannot see them -- reintroducing the
+    exact reader/SQL split that forced the upstream change, pointed the other way.
+
+    A present-but-wrong-typed value is therefore False AND LOUD. Absent is False
+    and silent, because absent is a real answer: the tenant never opted in.
+    """
+    if raw is None:
+        return False
+    if isinstance(raw, (str, bytes, bytearray)):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return False
+    if not isinstance(raw, dict):
+        return False
+    if key not in raw:
+        return False
+    value = raw[key]
+    if value is True:
+        return True
+    if value is not False:
+        log.warning(
+            "wfmem_capabilities.non_boolean_cell",
+            key=key,
+            value_type=type(value).__name__,
+            value=repr(value)[:64],
+        )
+    return False
 
 
 class InputPath(StrEnum):
@@ -95,7 +148,7 @@ def output_capability_key(surface: OutputSurface | str) -> str:
     return f"{_OUTPUT_PREFIX}{OutputSurface(surface).value}"
 
 
-#: The whole registry, derived from the axes. Migration 0077 backfills exactly
+#: The whole registry, derived from the axes. Migration 0111 backfills exactly
 #: this set (hardcoded there, because a migration must not import app code that
 #: can change under it); a test compares the two lists.
 WFMEM_CAPABILITY_KEYS: frozenset[str] = frozenset(
@@ -148,7 +201,7 @@ async def is_capability_enabled(customer_id: str, key: str) -> bool:
             error_class=type(exc).__name__,
         )
         return False
-    return _coerce_bool(raw, key)
+    return _coerce_capability_bool(raw, key)
 
 
 async def capability_envelope(customer_id: str, key: str) -> dict[str, object]:

@@ -13,7 +13,7 @@ import time
 
 import pytest
 
-from shared.wfmem.secret_scan import (
+from engine.shared.wfmem.secret_scan import (
     MAX_JSON_DEPTH,
     MAX_SCAN_CHARS,
     SecretDetected,

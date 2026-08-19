@@ -1792,7 +1792,7 @@ CREATE POLICY tenant_isolation ON purge_runs
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
--- Workflow memory Phase 0: the procedure store (migration 0076).
+-- Workflow memory Phase 0: the procedure store (migration 0110).
 --
 -- situations / clauses / clause_situation_edges / clause_evidence /
 -- serve_ledger. All five carry data in v0. `procedures` /
@@ -1808,7 +1808,7 @@ CREATE POLICY tenant_isolation ON purge_runs
 -- conformance are not created either — they need Phase 1's detectors.
 --
 -- This block MUST stay identical to
--- db/migrations/versions/20260817_0076_workflow_memory_store.py: CI applies
+-- db/migrations/versions/20260819_0110_workflow_memory_store.py: CI applies
 -- this file and stamps alembic head, it never runs the migration chain.
 -- ---------------------------------------------------------------------------
 CREATE TABLE situations (

@@ -8,8 +8,8 @@ from uuid import UUID
 import pytest
 import pytest_asyncio
 
-from shared.db import raw_conn, with_tenant
-from shared.wfmem.visibility import fetch_visible_clauses
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.wfmem.visibility import fetch_visible_clauses
 
 TENANT = "cust-wfmem-vis"
 ALICE = "user:alice"

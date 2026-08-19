@@ -43,7 +43,7 @@ import asyncpg
 import pytest
 import pytest_asyncio
 
-from shared.db import raw_conn, with_tenant
+from engine.shared.db import raw_conn, with_tenant
 
 TENANT_A = "cust-wfmem-a"
 TENANT_B = "cust-wfmem-b"
@@ -383,7 +383,7 @@ async def test_every_table_has_forced_rls_and_exact_tenant_policies(live_db, tab
 
 
 # ---------------------------------------------------------------------------
-# Composite foreign keys: the headline security property of migration 0076.
+# Composite foreign keys: the headline security property of migration 0110.
 # ---------------------------------------------------------------------------
 
 
@@ -589,7 +589,7 @@ async def test_serve_ledger_is_append_only_for_its_own_tenant(two_tenants):
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _MIGRATION_PATH = (
-    _REPO_ROOT / "db" / "migrations" / "versions" / "20260817_0076_workflow_memory_store.py"
+    _REPO_ROOT / "db" / "migrations" / "versions" / "20260819_0110_workflow_memory_store.py"
 )
 _SCHEMA_PATH = _REPO_ROOT / "db" / "schema.sql"
 
@@ -629,13 +629,13 @@ _WFMEM_FUNCTION_RE = "^wfmem_"
 
 
 def _migration_upgrade_statements() -> list[str]:
-    """The SQL migration 0076 would run, without an alembic context.
+    """The SQL migration 0110 would run, without an alembic context.
 
     Imports the migration and swaps its `op` for a recorder, so this stays
     honest if someone edits the migration -- it replays what is in the file,
     not a copy of it.
     """
-    spec = importlib.util.spec_from_file_location("wfmem_migration_0076", _MIGRATION_PATH)
+    spec = importlib.util.spec_from_file_location("wfmem_migration_0110", _MIGRATION_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -843,7 +843,7 @@ async def test_schema_sql_has_not_drifted_from_the_migration(live_db):
     assert sorted(migration_fingerprint) == sorted(schema_fingerprint)
     for section in sorted(migration_fingerprint):
         assert migration_fingerprint[section] == schema_fingerprint[section], (
-            f"db/schema.sql and migration 0076 disagree on {section}. CI applies "
+            f"db/schema.sql and migration 0110 disagree on {section}. CI applies "
             "schema.sql and stamps alembic head, so schema.sql is what the tests "
             "actually run against -- the two must be updated together."
         )

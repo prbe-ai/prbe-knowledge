@@ -37,8 +37,8 @@ silently inverts the taint join the table exists for.
 
 from alembic import op
 
-revision = "0076_workflow_memory_store"
-down_revision = "0075_r2_bucket_not_null"
+revision = "0110_workflow_memory_store"
+down_revision = "0109_documents_title_preview_tsv"
 branch_labels = None
 depends_on = None
 

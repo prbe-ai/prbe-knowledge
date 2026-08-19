@@ -29,7 +29,7 @@ invisible; one extra branch at the serving edge is what converts it into
 something a reader can see. Not implemented in this stage.
 
 This module also holds BOTH WRITERS of the capability cells --
-`enable_capability` and `disable_capability` -- while `shared.wfmem.capabilities`
+`enable_capability` and `disable_capability` -- while `engine.shared.wfmem.capabilities`
 stays read-only. The split is the seeding: enabling touches `situations`, so the
 writers live where the situations are, and a reader importing `capabilities`
 does not drag the write path in behind it.
@@ -48,8 +48,8 @@ from typing import NamedTuple
 
 import asyncpg
 
-from shared.db import raw_conn, with_tenant
-from shared.wfmem.capabilities import WFMEM_INPUT_DECLARED, require_capability_key
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.wfmem.capabilities import WFMEM_INPUT_DECLARED, require_capability_key
 
 
 class SeedSituation(NamedTuple):
@@ -252,7 +252,7 @@ async def enable_capability(customer_id: str, key: str) -> None:
 async def disable_capability(customer_id: str, key: str) -> None:
     """Turn one capability off. The kill switch.
 
-    WRITES `false`, it does not delete the key. Migration 0077 exists to make
+    WRITES `false`, it does not delete the key. Migration 0111 exists to make
     every cell explicit -- so the dashboard shows off because it IS off, not
     because of a reader's fallback -- and a disable that removed the key would
     walk that back one tenant at a time, leaving the same ambiguity the
@@ -290,7 +290,7 @@ async def _write_capability_cell(
     The CASE repairs a non-object `preferences` instead of failing on it.
     `jsonb_set` raises `cannot set path in scalar` for a scalar or array blob,
     which would take the kill switch out exactly when someone needs it, and a
-    non-object blob has no keys to lose -- unlike migration 0077, which skips
+    non-object blob has no keys to lose -- unlike migration 0111, which skips
     those rows because a bulk backfill has no business rewriting them.
     """
     status = await conn.execute(

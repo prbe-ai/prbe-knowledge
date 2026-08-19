@@ -1,7 +1,9 @@
 """Per-tenant workflow-memory capability flags, and seed-on-enable.
 
-The flags are six booleans in `customers.preferences`, read with the same
-fail-closed coercion `shared.customer_prefs` uses. That posture is the thing
+The flags are six booleans in `customers.preferences`, read with a fail-closed
+coercion of wfmem's own -- STRICTER than `engine.shared.customer_prefs`, which
+was changed upstream to honour the jsonb string `"true"` for reasons that do not
+apply to these cells (see `_coerce_capability_bool`). That posture is the thing
 under test here: a tenant who has not explicitly opted in gets nothing, and no
 error path may flip that to "on".
 
@@ -40,16 +42,18 @@ WHAT THIS FILE HAS TO DEFEND, and why each claim needs its own test:
   whose rows were deleted -- plus a case that fails for the LEFT JOIN written
   without a tenant predicate.
 * THE REGISTRY AND THE MIGRATION CANNOT DRIFT, and the migration is never run
-  by CI (which stamps the head). 0077 hardcodes its key list on purpose --
+  by CI (which stamps the head). 0111 hardcodes its key list on purpose --
   migrations are frozen in time and must not import app code -- so the tests
   compare the two lists, replay the rendered SQL to check the key-absence and
   non-object guards are still there, and execute a real upgrade/downgrade
   round trip to prove those guards bite.
 
-Run with the isolated wfmem database:
+Run with the isolated wfmem database. `PRBE_TEST_DATABASE_URL` is conftest's own
+hook for concurrent checkouts on one machine, and it enforces a localhost host --
+these fixtures TRUNCATE, so they must never reach a real deployment:
 
-    PYTHONPATH=<scratchpad> .venv/bin/pytest tests/test_workflow_memory_capabilities.py \
-        -q -p wfmem_isolated_db
+    PRBE_TEST_DATABASE_URL=postgresql://prbe:prbe@localhost:5432/prbe_knowledge_wfmem \
+        .venv/bin/pytest tests/test_workflow_memory_capabilities.py -q
 """
 
 from __future__ import annotations
@@ -65,9 +69,10 @@ from typing import Any
 import asyncpg
 import pytest
 import pytest_asyncio
+import structlog.testing
 
-from shared.db import raw_conn, with_tenant
-from shared.wfmem.capabilities import (
+from engine.shared.db import raw_conn, with_tenant
+from engine.shared.wfmem.capabilities import (
     WFMEM_CAPABILITY_KEYS,
     WFMEM_INPUT_DECLARED,
     InputPath,
@@ -77,7 +82,7 @@ from shared.wfmem.capabilities import (
     is_capability_enabled,
     output_capability_key,
 )
-from shared.wfmem.situations import (
+from engine.shared.wfmem.situations import (
     SEED_SITUATIONS,
     disable_capability,
     enable_capability,
@@ -107,7 +112,7 @@ EXPECTED_KEYS = frozenset(
 async def two_tenants(live_db: None) -> AsyncIterator[tuple[str, str]]:
     """Two customers with an empty `preferences` blob -- the never-configured state.
 
-    Deliberately does NOT run migration 0077's backfill: CI stamps the alembic
+    Deliberately does NOT run migration 0111's backfill: CI stamps the alembic
     head instead of running migrations, so anything that depended on the
     backfill having executed would pass here and lie there.
     """
@@ -224,10 +229,49 @@ async def test_key_reads_true_only_after_explicit_boolean_true(
 
 @pytest.mark.parametrize("value", ["true", "True", "1", "yes"])
 async def test_string_true_does_not_enable(two_tenants: tuple[str, str], value: str) -> None:
-    """`_coerce_bool`'s contract: the value must be a real JSON bool."""
+    """`_coerce_capability_bool`'s contract: the value must be a real JSON bool.
+
+    `"true"` is the case that matters and the reason wfmem no longer shares
+    `customer_prefs._coerce_bool`: that function was CHANGED upstream to honour
+    the jsonb string, to fix a real wiki outage where the engine's PUT wrote a
+    string and the Python gate read it as off. These cells have no writer that
+    produces the string shape, so honouring it here would mean enabling a
+    capability because something wrote it wrong -- and it would hide the tenant
+    from `enabled_tenants_missing_situations`, whose jsonb containment match
+    does not accept the string either.
+    """
     tenant, _ = two_tenants
     await _set_pref(tenant, WFMEM_INPUT_DECLARED, value)
     assert await is_capability_enabled(tenant, WFMEM_INPUT_DECLARED) is False
+
+
+async def test_wrong_typed_cell_is_off_and_loud(two_tenants: tuple[str, str]) -> None:
+    """A present-but-wrong-typed cell is False AND warns. Absent is False, silently.
+
+    The warning is the whole difference between "this tenant opted out" and
+    "something wrote this cell by a route that does not exist" -- two states that
+    are otherwise identical on the wire and in the dashboard. Same reasoning as
+    `enabled_tenants_missing_situations`: where we cannot prevent the bad state,
+    we make it visible rather than waiting for a customer to report that a
+    feature they turned on does nothing.
+    """
+    tenant, _ = two_tenants
+
+    await _set_pref(tenant, WFMEM_INPUT_DECLARED, "true")
+    with structlog.testing.capture_logs() as logs:
+        assert await is_capability_enabled(tenant, WFMEM_INPUT_DECLARED) is False
+    assert [entry for entry in logs if entry["event"] == "wfmem_capabilities.non_boolean_cell"], (
+        f"a string-valued cell must warn; captured: {logs}"
+    )
+
+    # Explicit false is a supported value and must stay quiet -- migration 0111
+    # writes it to every cell, so warning here would fire for every tenant.
+    await _set_pref(tenant, WFMEM_INPUT_DECLARED, False)
+    with structlog.testing.capture_logs() as logs:
+        assert await is_capability_enabled(tenant, WFMEM_INPUT_DECLARED) is False
+    assert not [
+        entry for entry in logs if entry["event"] == "wfmem_capabilities.non_boolean_cell"
+    ], f"explicit false is not a misconfiguration; captured: {logs}"
 
 
 @pytest.mark.parametrize("value", [1, 0, None, {"enabled": True}, ["true"]])
@@ -263,7 +307,9 @@ async def test_undecodable_json_reads_false(
     that would start delivering junk to the coercion.
     """
     tenant, _ = two_tenants
-    monkeypatch.setattr("shared.wfmem.capabilities.raw_conn", _fake_raw_conn(returns="{not json"))
+    monkeypatch.setattr(
+        "engine.shared.wfmem.capabilities.raw_conn", _fake_raw_conn(returns="{not json")
+    )
     assert await is_capability_enabled(tenant, WFMEM_INPUT_DECLARED) is False
 
 
@@ -282,7 +328,7 @@ async def test_null_preferences_reads_false(
     a future nullable column would land in the same place.
     """
     tenant, _ = two_tenants
-    monkeypatch.setattr("shared.wfmem.capabilities.raw_conn", _fake_raw_conn(returns=None))
+    monkeypatch.setattr("engine.shared.wfmem.capabilities.raw_conn", _fake_raw_conn(returns=None))
     assert await is_capability_enabled(tenant, WFMEM_INPUT_DECLARED) is False
 
 
@@ -292,7 +338,8 @@ async def test_db_error_reads_false(
     """An unreachable database is not an accidental grant."""
     tenant, _ = two_tenants
     monkeypatch.setattr(
-        "shared.wfmem.capabilities.raw_conn", _fake_raw_conn(raises=RuntimeError("pool is gone"))
+        "engine.shared.wfmem.capabilities.raw_conn",
+        _fake_raw_conn(raises=RuntimeError("pool is gone")),
     )
     assert await is_capability_enabled(tenant, WFMEM_INPUT_DECLARED) is False
 
@@ -627,7 +674,7 @@ async def test_disable_turns_an_enabled_cell_off(two_tenants: tuple[str, str], k
 async def test_disable_writes_false_rather_than_deleting_the_key(
     two_tenants: tuple[str, str],
 ) -> None:
-    """The explicit-false invariant migration 0077 establishes must survive a disable.
+    """The explicit-false invariant migration 0111 establishes must survive a disable.
 
     Deleting the key reads False too, so no behavioural test can tell the two
     apart -- but an operator reading the row during an incident can, and that is
@@ -801,11 +848,11 @@ async def test_audit_is_not_confused_by_another_tenants_vocabulary(
 # --------------------------------------------------------------------------
 
 
-def _load_migration_0077() -> ModuleType:
+def _load_migration_0111() -> ModuleType:
     versions = Path(__file__).resolve().parents[1] / "db" / "migrations" / "versions"
-    matches = sorted(versions.glob("*_0077_*.py"))
-    assert len(matches) == 1, f"expected exactly one 0077 migration, found {matches}"
-    spec = importlib.util.spec_from_file_location("wfmem_migration_0077", matches[0])
+    matches = sorted(versions.glob("*_0111_*.py"))
+    assert len(matches) == 1, f"expected exactly one 0111 migration, found {matches}"
+    spec = importlib.util.spec_from_file_location("wfmem_migration_0111", matches[0])
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -813,14 +860,14 @@ def _load_migration_0077() -> ModuleType:
 
 
 def _rendered_sql(direction: str) -> list[str]:
-    """The SQL migration 0077 would run, without an alembic context.
+    """The SQL migration 0111 would run, without an alembic context.
 
     Same trick as tests/test_workflow_memory_isolation.py: swap the module's
     `op` for a recorder so this replays what is IN THE FILE, with the keys
     actually interpolated, rather than substring-matching an f-string template
     that may or may not render the way it reads.
     """
-    module = _load_migration_0077()
+    module = _load_migration_0111()
     collected: list[str] = []
 
     class _Recorder:
@@ -834,14 +881,14 @@ def _rendered_sql(direction: str) -> list[str]:
 
 
 def test_migration_backfills_exactly_the_registry_keys() -> None:
-    module = _load_migration_0077()
+    module = _load_migration_0111()
     assert frozenset(module.WFMEM_CAPABILITY_KEYS_BACKFILLED) == WFMEM_CAPABILITY_KEYS
     assert len(module.WFMEM_CAPABILITY_KEYS_BACKFILLED) == 6
 
 
 def test_migration_follows_the_head() -> None:
-    module = _load_migration_0077()
-    assert module.down_revision == "0076_workflow_memory_store"
+    module = _load_migration_0111()
+    assert module.down_revision == "0110_workflow_memory_store"
     assert len(module.revision) <= 32, "alembic_version.version_num is varchar(32)"
 
 
@@ -896,7 +943,7 @@ async def test_migration_round_trip_against_a_live_database(live_db: None) -> No
     from alembic.operations import Operations
     from sqlalchemy import create_engine, text
 
-    module = _load_migration_0077()
+    module = _load_migration_0111()
     url = os.environ["DATABASE_URL"]
     if url.startswith("postgresql://"):
         url = "postgresql+psycopg://" + url.removeprefix("postgresql://")
