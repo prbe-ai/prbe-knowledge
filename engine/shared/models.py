@@ -105,8 +105,7 @@ class Document(BaseModel):
 
     doc_class: DocClass = DocClass.RAW_SOURCE
     # doc_type is a free-form string at the model level so connectors that
-    # mint dynamic types (e.g. wiki pages, where the LLM picks `wiki.repo`,
-    # `wiki.runbook`, etc.) can pass them through. Closed-set sources still
+    # mint dynamic types can pass them through. Closed-set sources still
     # pass `DocType.<MEMBER>` enum values — StrEnum members are str
     # subclasses so the existing call sites keep working unchanged.
     doc_type: str
@@ -161,10 +160,10 @@ class Document(BaseModel):
     # Retrieval-visibility gate. APPROVED (default) preserves the
     # pre-existing contract for every connector — their docs land
     # immediately readable, identical to behavior before migration
-    # 0082 added the column. Post-approval wiki artifacts (postmortem,
-    # knowledge_page, correction) override this to DRAFT at writeback
-    # time and rely on the review approve path to flip it to APPROVED
-    # in a single transaction. See shared/constants.py::Visibility.
+    # 0082 added the column. Post-approval writeback paths override
+    # this to DRAFT and rely on the review approve path to flip it to
+    # APPROVED in a single transaction. See
+    # shared/constants.py::Visibility.
     visibility: Visibility = Visibility.APPROVED
 
 
@@ -1081,8 +1080,9 @@ def make_person(
     canonical_id: str,
     properties: dict[str, Any] | None = None,
 ) -> "GraphNodeSpec":
-    """Build a PERSON GraphNodeSpec. No kind enum — the wiki/canonical
-    distinction that motivated WikiPerson is now properties.source_system.
+    """Build a PERSON GraphNodeSpec. No kind enum — the provenance
+    distinction that motivated separate person kinds is now
+    properties.source_system.
     """
     return GraphNodeSpec(
         label=NodeLabel.PERSON,

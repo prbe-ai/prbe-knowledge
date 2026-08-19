@@ -19,11 +19,6 @@ class SourceSystem(StrEnum):
     CODEX = "codex"
     MANUAL_UPLOAD = "manual_upload"
     CUSTOM_INGEST = "custom_ingest"
-    # Curated team-knowledge layer (runbooks, decisions, service cards, feature
-    # notes). Pages are authored programmatically via /api/wiki/pages/* — no
-    # external webhook. doc_class distinguishes human authorship (MANUAL_ENTRY)
-    # from agent-compiled summaries (COMPILED_WIKI).
-    WIKI = "wiki"
     CODE_GRAPH = "code_graph"
     PAGERDUTY = "pagerduty"
     INCIDENT_IO = "incident_io"
@@ -46,7 +41,6 @@ SOURCE_DISPLAY_NAMES: dict[SourceSystem, str] = {
     SourceSystem.CODEX: "Codex",
     SourceSystem.MANUAL_UPLOAD: "Manual upload",
     SourceSystem.CUSTOM_INGEST: "Custom Ingest",
-    SourceSystem.WIKI: "Wiki",
     SourceSystem.CODE_GRAPH: "Code",
     SourceSystem.PAGERDUTY: "PagerDuty",
     SourceSystem.INCIDENT_IO: "incident.io",
@@ -55,7 +49,6 @@ SOURCE_DISPLAY_NAMES: dict[SourceSystem, str] = {
 
 class DocClass(StrEnum):
     RAW_SOURCE = "raw_source"
-    COMPILED_WIKI = "compiled_wiki"
     MANUAL_ENTRY = "manual_entry"
     AGENT_ARTIFACT = "agent_artifact"
 
@@ -95,13 +88,6 @@ class DocType(StrEnum):
     MANUAL_UPLOAD_DOCX = "manual_upload.docx"
     MANUAL_UPLOAD_FILE = "manual_upload.file"
     CUSTOM_DOCUMENT = "custom.document"
-    # Wiki pages use a free-form `wiki.<type>` doc_type stamped at write
-    # time from the LLM-emitted `wiki_type` slug — no enum, no validation
-    # gate. The synthesis agent decides what page kinds are useful for a
-    # given customer's corpus (typically `repo`, `runbook`, `person`, but
-    # nothing prevents new ones). The auto-generated overview page is
-    # written under `wiki.index`. Anywhere we need to filter for wiki
-    # pages in SQL: `WHERE doc_type LIKE 'wiki.%'`.
     # LEGACY (PR-A pre-Path-2): one Document per symbol. Migration 0050
     # hard-deletes existing rows of this type when the file-as-Document
     # rewrite (CODE_FILE below) ships. Keep the constant defined so the
@@ -122,45 +108,18 @@ class DocType(StrEnum):
     # rationale text lands in BM25 + vector indexes. Prefix is `github.`
     # so doc_type_resolver's SourceSystem.GITHUB narrowing includes it.
     FEATURE_RATIONALE = "github.feature_rationale"
-    # Post-approval wiki artifacts authored by the postmortem / wiki-edit
-    # agents after an incident investigation is approved AND resolved.
-    # These doc_types share the `wiki.` prefix so existing wiki listings
-    # (`doc_type LIKE 'wiki.%'`) include them, while remaining
-    # distinguishable from human-authored wiki pages.
-    #
-    # Visibility (DRAFT vs APPROVED) gates retrieval -- DRAFT artifacts are
-    # excluded from search until a reviewer approves them via the
-    # wiki_review_queue lifecycle.
-    WIKI_POSTMORTEM = "wiki.postmortem"
-    WIKI_KNOWLEDGE_PAGE = "wiki.knowledge_page"
-    WIKI_CORRECTION = "wiki.correction"
-    # TODO(post-approval): wiki-listing queries in services/ingestion/wiki_routes.py,
-    #   services/synthesis/wiki_agent.py, and services/synthesis/persistence.py fan
-    #   over `doc_type LIKE 'wiki.%'` without filtering by visibility. Once the
-    #   writeback route (Component 5) starts persisting these doc types as drafts,
-    #   those queries need a `visibility = 'approved'` predicate.
 
 
 class Visibility(StrEnum):
     """Retrieval-visibility gate on a Document / Chunk.
 
     DRAFT rows are excluded from search and synthesis until promoted to
-    APPROVED via the post-approval review pipeline. Used by the
-    post-approval wiki artifacts (postmortems, knowledge pages,
-    corrections); existing wiki/source documents default to APPROVED at
-    write time, matching pre-existing behavior.
+    APPROVED via the post-approval review pipeline. Source documents
+    default to APPROVED at write time, matching pre-existing behavior.
     """
 
     DRAFT = "draft"
     APPROVED = "approved"
-
-
-# SQL pattern matching every wiki page doc_type (excludes the singleton
-# index page so listings don't show themselves). The schema stamps
-# wiki pages as `wiki.<wiki_type>` with no validation; this prefix +
-# the explicit `<> 'wiki.index'` exclusion is the canonical filter.
-WIKI_DOC_TYPE_PREFIX = "wiki."
-WIKI_INDEX_DOC_TYPE = "wiki.index"
 
 
 class NodeLabel(StrEnum):
@@ -886,7 +845,6 @@ DEFAULT_INGESTION_PRIORITY = 100
 TOP_K_VECTOR = 50
 TOP_K_BM25 = 50
 TOP_K_GRAPH = 20
-TOP_K_DIRECTED = 20
 RRF_K = 60
 DEDUP_COSINE_THRESHOLD = 0.95
 
@@ -916,33 +874,6 @@ GRAPH_EXPLORE_HOP2_CAP = 1500
 GRAPH_EXPLORE_WHY_MAX_CHARS = 200
 GRAPH_SEARCH_DEFAULT_LIMIT = 10
 GRAPH_SEARCH_MAX_LIMIT = 25
-
-# Directed-vectors feature: doc-level retrieval signal contributed by
-# per-document trigger phrases stored in the directed_vectors table.
-# Eval-tuned; commits in the same change that bumps it. Set to 0.0 to
-# disable contribution without removing the retriever from the fan-out.
-DIRECTED_RETRIEVAL_WEIGHT: float = 1.0
-
-# Cap on LLM-generated directed phrases per wiki document. Engineer-pinned
-# phrases get their own cap (MAX_HUMAN_DIRECTED_PER_DOC) so a runaway LLM
-# can't bury legitimate pins.
-MAX_DIRECTED_VECTORS_PER_DOC: int = 16
-
-# Cap on engineer-pinned directed phrases per wiki document. Higher than
-# the LLM cap because explicit pins are intentional, but bounded so a
-# malicious / typo'd frontmatter can't balloon the table.
-MAX_HUMAN_DIRECTED_PER_DOC: int = 32
-
-# Per-phrase character cap. Trigger phrases are short by design (5-12
-# tokens per the prompt); 256 chars is generous slack against natural
-# English while still rejecting megabyte-long pathological inputs that
-# would bloat embedding cost / storage / log noise.
-MAX_DIRECTED_PHRASE_CHARS: int = 256
-
-# Cosine distance threshold below which two candidate trigger phrases are
-# considered near-duplicates and one is dropped (humans always win on
-# collision; LLM duplicates of human pins are suppressed).
-DIRECTED_DEDUPE_COSINE_THRESHOLD: float = 0.05
 
 # Doc-grouped fusion: weight applied to the sum of NON-best content-chunk RRF
 # scores when collapsing per-doc. doc_score = max(rrfs) + alpha * sum(others) +
@@ -1586,331 +1517,6 @@ GRANOLA_REQUEST_INTERVAL_SECONDS = 0.25
 # into a single enqueue + notify; the second hit returns 429 with Retry-After.
 GRANOLA_REFRESH_DEBOUNCE_SECONDS = 30
 
-
-# pg_notify channels for the wiki synthesis pipeline.
-#
-# Pre-redesign: a single `wiki_synthesize` channel — Normalizer._persist
-# fired NOTIFY on every webhook, the in-process cron drained immediately,
-# resulting in continuous daytime synthesis. That model didn't match the
-# wiki's actual scope (slow-moving company knowledge). The redesign:
-#
-# - Normalizer._persist NO LONGER fires NOTIFY. Queue rows accumulate
-#   silently during the day at status='pending'.
-# - The wiki-cron fly app fires NOTIFY on `wiki_synthesize_pending`
-#   nightly at 02:00 UTC (per opted-in customer with pending rows). The
-#   /api/wiki/synthesize/trigger endpoint also fires it for manual wakes
-#   from the dashboard "Generate Wiki Now" button.
-# - The wiki-worker (triage) app LISTENs on `wiki_synthesize_pending` →
-#   drains pending rows through triage → marks them triaged/rejected/
-#   verifier_rejected → fires NOTIFY on `wiki_synthesize_triaged` from
-#   the same transaction that committed the UPDATE (Postgres delivers
-#   NOTIFY only after COMMIT, so listeners never wake on un-visible rows).
-# - The wiki-synthesis app LISTENs on `wiki_synthesize_triaged` → drains
-#   triaged rows through verifier + synthesize → writes wiki pages →
-#   regenerates the index.
-WIKI_PENDING_CHANNEL = "wiki_synthesize_pending"
-WIKI_TRIAGED_CHANNEL = "wiki_synthesize_triaged"
-
-# Backfill pipeline wake channel — fired by the
-# /api/wiki/backfill/trigger route after it inserts pending rows. Empty
-# payload; the BackfillWorker treats this as a "drain pending rows now"
-# wake hint and claims rows via FOR UPDATE SKIP LOCKED. Distinct from
-# WIKI_PENDING_CHANNEL because the daily-replay path operates on the v4
-# queue, while backfill reads from source APIs.
-WIKI_BACKFILL_CHANNEL = "wiki_backfill_pending"
-
-# Backfill cancel channel — fired by the trigger route's force-cancel
-# path. Payload is a JSON object ``{customer_id, run_ids: [int]}``;
-# every BackfillWorker LISTENing on this channel cancels in-flight
-# tasks whose run_id matches. Coarse 10s drain window — see
-# BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS.
-WIKI_BACKFILL_CANCEL_CHANNEL = "wiki_backfill_cancel"
-
-# Cooperative drain window the trigger route waits after firing the
-# cancel NOTIFY before proceeding to wipe + insert new pending rows.
-# Sized larger than the worker's per-tick cadence but small enough that
-# admin-initiated force-restart still feels interactive in the dashboard.
-BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS = 10.0
-
-# Per-machine cap on concurrent backfill crawler agents. Read at boot
-# from the BACKFILL_PARALLELISM env var by ``BackfillWorker``; the
-# constant here is the default. Sized at 6 against the 4 GB / 2 vCPU
-# fly machine envelope (idle ~150 MB, ~150-250 MB per active crawler ->
-# ~1.5 GB peak crawler load + headroom). Tune via env, not code.
-BACKFILL_PARALLELISM = 6
-
-# How many wiki_synthesis_queue rows the cron claims per drain tick. Triage is
-# token-budget batched on top of this; this is just the upper bound on rows
-# pulled into memory at once.
-WIKI_SYNTHESIS_CLAIM_BATCH = 200
-
-# Token budget per Haiku triage call, expressed in *estimated Anthropic
-# tokens* (post-multiplier — see `kb.synthesis.triage`). Rows are
-# packed greedily until this ceiling is hit, then the batch fires. The
-# packer adds prompt + tool-schema + per-event framing overhead on top
-# of body tokens before comparing to this budget, so it represents the
-# user-content slice of the wire request, not the full request size.
-#
-# Headroom: Anthropic Haiku's hard context limit is 200K tokens. We
-# budget 150K for content; the remaining 50K is left as margin for
-# (1) prompt + tool-schema + envelope (~2K), (2) tokenizer drift between
-# our cl100k estimate and Anthropic's true tokenizer, and (3) the model's
-# own response. Production drains were DLQ'ing entire batches at the
-# previous 120K budget because the packer counted only raw body text in
-# cl100k and Anthropic's tokenizer + request envelope pushed the wire
-# count past 200K (e.g. batch_size=66 produced 208K Anthropic tokens).
-WIKI_TRIAGE_TOKEN_BUDGET = 150_000
-
-# Output-side budget for the triage Anthropic call.
-#
-# Haiku 4.5's `max_tokens` ceiling is 8192. We set 8000 to leave a 192-
-# token cushion against SDK-version drift / per-conversation token
-# bookkeeping. The original 4096 was way too low: a batch of ~28+ events
-# would produce more verdicts than fit in 4096 output tokens, so Haiku
-# would stop at max_tokens with NO tool_use block — causing a Pydantic
-# crash on the missing `verdicts` field and DLQ-ing the whole batch.
-WIKI_TRIAGE_MAX_OUTPUT_TOKENS = 8000
-
-# Per-verdict size estimate, in Anthropic tokens. TriageVerdict is
-# {important: bool, score: float, reason: str ≤ ~100 tokens}; with the
-# JSON envelope `"queue_id": {...}` and pretty-printing, a verdict lands
-# around 80-120 Anthropic tokens. 150 is the conservative cap.
-WIKI_TRIAGE_VERDICT_TOKENS = 150
-
-# Output-side cap on events per batch:
-#   floor(WIKI_TRIAGE_MAX_OUTPUT_TOKENS / WIKI_TRIAGE_VERDICT_TOKENS)
-#   = 8000 / 150 = 53 → round down to 50 for envelope + drift margin.
-# The packer enforces MIN(input-token-budget, this-event-cap) so the
-# limiting factor is whichever binds first for a given batch.
-WIKI_TRIAGE_MAX_EVENTS_PER_BATCH = 50
-
-# Importance threshold for triage to keep an event. Below this score the row
-# is marked 'rejected' and never reaches synthesis. Raised from 5.0 → 7.0
-# to align triage with the wiki's actual scope (slow-moving company
-# knowledge, not a per-event log). Step down stepwise (7.0 → 6.0 → 5.0)
-# if the wiki is under-populated; step up if it gets spammy.
-WIKI_TRIAGE_SCORE_THRESHOLD = 7.0
-
-# Per-row attempt cap before a queue row is parked in 'failed'.
-WIKI_SYNTHESIS_MAX_ATTEMPTS = 3
-
-# NO PERIODIC WAKE. The wiki drains on NOTIFY only.
-#
-# This was 1800 (30 min), described as "a safety net if a notify is missed
-# during a connection drop". It was not a safety net -- it was the scheduler,
-# and it silently replaced the design. Only TWO things ever notify the wiki
-# channels: the nightly cron (kb/synthesis/nightly_trigger) and the manual
-# "generate now" route. Ingestion does not. So the timer was never catching a
-# missed notify from a busy pipeline; it was finding rows ingestion had left
-# pending and draining them on its own schedule.
-#
-# The cost of that, measured on 2026-08-12 before this changed: 32 synthesis
-# runs and 25 timer-driven triage runs in 24 hours, against ZERO nightly ones,
-# rewriting 16 pages 72 times. Every drain is a multi-turn Gemini Pro agent
-# loop, and the wiki is explicitly slow-moving knowledge -- see
-# WIKI_TRIAGE_SCORE_THRESHOLD above, raised to 7.0 for exactly that reason. It
-# also made `updated_at` meaningless as "when did this knowledge change" and
-# left the page histories full of rewrites of unchanged material.
-#
-# WHAT THE RISK ACTUALLY IS, stated so it can be re-decided: if a NOTIFY is
-# genuinely lost -- a connection drop at the moment the 02:00 cron fires --
-# that tenant waits until the next night. Two senders, one of them a cron at a
-# fixed time whose failure is visible in its own run history, is a small enough
-# surface that a 30-minute poll is the wrong shape of insurance. Set this to a
-# number of seconds if that judgement turns out to be wrong; the workers still
-# read it.
-WIKI_SYNTHESIS_PERIODIC_WAKE_SECONDS: float | None = None
-
-# Provider knob for the triage stage. v4 uses the wiki agent (Gemini
-# Pro) for synthesis, so the synthesis + verifier provider knobs are
-# gone. Triage is provider-pluggable: flip the value and redeploy.
-# Recognized values:
-#   "haiku" | "claude-haiku"            -> Anthropic Haiku 4.5
-#   "gemini-flash-lite" | "gemini-3.1-flash-lite" -> Gemini 3.1 Flash Lite
-#   "gemini-3.5-flash"                  -> Gemini 3.5 Flash (default; 2026-05-19)
-# No env-var override path — the prior `getattr(settings, ...)` plumbing
-# referenced fields that didn't exist on Settings, so the env var was
-# silently inert. Constants-only is honest.
-#
-# Default flipped 2026-05-19 from "haiku" to "gemini-3.5-flash" after the
-# A/B sweep in scripts/eval_3_5_flash_sweep.py (report:
-# ~/.gstack/projects/prbe-knowledge/eval-3-5-flash-sweep-20260520T025718Z.md).
-# 20 fixtures x 2 trials per model. Label accuracy: both 100%. Opus-judged
-# quality: 9.3 (haiku) vs 9.4 (3.5-flash) — statistical tie. p50 latency:
-# 1913ms → 1614ms (~16% faster). Cost per call: $0.00225 → $0.00060
-# (~3.75x cheaper). Net: equal quality at <30% of the wire cost on a
-# high-volume hot path.
-WIKI_TRIAGE_MODEL = "gemini-3.5-flash"
-
-# Directed-phrase generation runs once per wiki page during synthesis to
-# emit 5-10 trigger phrases that boost retrieval ranking when an engineer's
-# symptom-style query semantically matches them. The 2026-05-09 model
-# shootout (scripts/eval_directed_phrases.py, judged by Opus 4.7) picked
-# Gemini 3 Flash: specificity 8.6/retrieval-fit 8.2 vs Haiku 7.8/7.8, at
-# ~1/4 the cost ($0.0005 vs $0.0022 per call). Flip to "haiku" or
-# "gemini-3.1-flash-lite" via this constant + redeploy.
-DIRECTED_PHRASES_MODEL = "gemini-3-flash-preview"
-
-# Concurrency caps. The wiki-worker fans out customers, then triage
-# batches per customer. (The v4 wiki agent uses
-# WIKI_AGENT_GLOBAL_CONCURRENCY for synthesis-side fan-out plus a
-# per-customer advisory lock; it doesn't cluster events anymore.)
-WIKI_SYNTHESIS_CUSTOMER_CONCURRENCY = 4
-WIKI_TRIAGE_BATCH_CONCURRENCY = 8
-
-# Manual trigger rate limit (advisory-lock + lookback in the BFF). The
-# /api/wiki/synthesize/trigger endpoint here surfaces the same value so
-# the dashboard can render an accurate "try again in Xs" toast.
-WIKI_TRIGGER_RATE_LIMIT_SECONDS = 300
-
-# Hour-of-day (UTC) the wiki-cron fly machine fires its nightly NOTIFY.
-# 02:00 UTC = 18:00 PT / 21:00 ET — picked so the drain finishes before
-# the team's morning standup but doesn't compete with the rest of the
-# nightly pipeline (Granola steady-poll cycles, etc.).
-WIKI_NIGHTLY_HOUR_UTC = 2
-
-# Source systems that never feed wiki synthesis. WIKI because the cron's
-# own COMPILED_WIKI writes must not feed back into its own queue;
-# CODE_GRAPH because code.symbol docs are deterministic AST extractions
-# whose body is a function signature + docstring — triage would burn LLM
-# tokens extracting Decisions/Runbooks from them and produce nothing.
-# The Normalizer enqueue gate and every queue-seeding path
-# (kb.synthesis.persistence.seed_missing_docs) consume THIS tuple; the
-# two lists drifted once (the catchup script excluded only WIKI and
-# enqueued thousands of code_graph rows) — do not re-list sources inline.
-WIKI_ENQUEUE_EXCLUDED_SOURCES: tuple[SourceSystem, ...] = (
-    SourceSystem.WIKI,
-    SourceSystem.CODE_GRAPH,
-)
-
-# Per-statement ceiling for the nightly queue-seed reconcile. The seed is
-# a batched INSERT…SELECT anti-join per enabled tenant; on a healthy index
-# a batch runs in seconds, so a two-minute cap only exists to stop a
-# pathological plan from occupying the nightly window.
-WIKI_RECONCILE_STATEMENT_TIMEOUT_MS = 120_000
-
-# Rows per reconcile seed batch. Each batch is its own statement + txn
-# under the timeout above, so a huge backlog makes durable progress
-# instead of failing all-or-nothing. 20k queue-row inserts is comfortably
-# a few seconds of work against the 4-index queue table.
-WIKI_RECONCILE_SEED_BATCH = 20_000
-
-# Per-statement ceiling inside the rebuild trigger's transaction and the
-# preview's counts. Deliberately UNDER the prbe-backend BFF's 20s total
-# client timeout on these proxied calls (_WIKI_TIMEOUT in
-# apps/data_plane/routers/dashboard/knowledge.py): a reseed that cannot
-# finish inside it fails fast with the whole txn (wipe included) rolled
-# back and an honest error, instead of the BFF 502ing while the engine
-# commits behind its back and the retry hits a mystery 409. Tenants too
-# large for this window rebuild via the catchup CLI.
-WIKI_REBUILD_STATEMENT_TIMEOUT_MS = 15_000
-
-
-# ---------------------------------------------------------------------------
-# Wiki agent loop (v4: Gemini 3.1 Pro driving the synthesis stage)
-# ---------------------------------------------------------------------------
-
-# Hard cap on agent turns per drain. Picked at 200 to leave headroom for
-# pebble's ~3000-event drains; smaller customers typically finish in
-# 10-50 turns. Exceeding this cap halts the drain and DLQs the in-flight
-# rows; admin reset is the recovery path.
-WIKI_AGENT_TURN_CAP = 200
-
-# Hard cap on staged page updates per drain. The wiki is supposed to
-# move slowly — 30 page edits per night is generous. Exceeding this cap
-# means the agent is hallucinating page mass and we'd rather DLQ than
-# write 100 brand-new pages.
-WIKI_AGENT_UPDATE_CAP = 30
-
-# Stall threshold. If the agent makes no consequential tool call (no
-# page update / create / skip) for this many consecutive turns, halt.
-#
-# Bumped from 3 to 15 after acme' run 105 stalled with 200
-# events DLQ'd despite the agent making real progress on reads. The
-# old "one read-page, one read-event, one think" math was wrong — a
-# realistic decision flow on a chunk of 200 events looks like:
-#   next_events -> list_wiki_pages -> read_page x3 -> get_event_body x2
-#   -> update_page (CONSEQUENTIAL)
-# That's 7 read-style turns before the first consequential one.
-# Three would have halted in the middle of normal exploration. 15
-# leaves margin for the agent to read 5 pages and 3 event bodies
-# before deciding, with extra room for a re-read or thought-only
-# turn. Stuck loops still trip eventually.
-WIKI_AGENT_STALL_TURNS = 15
-
-# Auto-compaction trigger. When estimated input tokens cross this
-# fraction of Gemini 3.1 Pro's 2M context window, summarize the
-# conversation history (preserving structured runtime state) before
-# the next turn.
-WIKI_AGENT_COMPACT_THRESHOLD = 0.60
-
-# Number of triaged events per next_events() page. Gemini reads the
-# day in batches; the agent re-calls next_events() until drain_complete.
-WIKI_AGENT_BATCH_SIZE = 200
-
-# Maximum number of customer drains running simultaneously per
-# wiki-synthesis machine. Higher than per-customer concurrency (1
-# under advisory lock) so two small customers can drain in parallel
-# while pebble holds its own machine. Env-overridable because adding
-# replicas is a no-op (per-customer advisory locks make extra pods log
-# drain_skip_concurrent) — cross-tenant fan-out on the ONE machine is
-# the only knob that raises throughput. Within-tenant drains stay
-# serial by design (rows claimed in source_ts order).
-def _env_positive_int(name: str, default: int) -> int:
-    """Parse a positive-int env override; malformed or non-positive values
-    fall back to the default instead of crashing every importing service
-    at boot (this module is imported by all of them)."""
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value >= 1 else default
-
-
-WIKI_AGENT_GLOBAL_CONCURRENCY = _env_positive_int(
-    "WIKI_AGENT_GLOBAL_CONCURRENCY", 2
-)
-
-# Gemini model used by the wiki agent loop. Triage stays Flash Lite;
-# only the agent uses Pro because per-cluster reasoning + cross-event
-# pattern recognition need the bigger model.
-WIKI_AGENT_MODEL = "gemini-3.1-pro-preview"
-
-# Compactor model. Cheaper Flash variant since it only summarizes the
-# conversation; preserves the structured runtime state untouched.
-WIKI_AGENT_COMPACTOR_MODEL = "gemini-3.1-flash-lite"
-
-# Per-source backfill crawler models. Default to the same Pro model the
-# daily-replay agent uses; per-source knobs let us swap a cheaper /
-# bigger model for one source without redeploying the rest. Mentioned
-# under "Per-source models" in docs/wiki-backfill-plan.md.
-WIKI_BACKFILL_MODEL_GITHUB = "gemini-3.1-pro-preview"
-
-# Stop-walking heuristic for backfill crawlers. After this many
-# consecutive source items that don't cause the agent to call
-# update_page / create_page, the crawler treats the repo as drained and
-# moves on. Picked at 50 to match the system prompt's stopping rule.
-WIKI_BACKFILL_QUIET_STREAK = 50
-
-# Time horizon (days) for GitHub PR + issue ingestion. Commits walk
-# all-time per the locked plan so old structural commits ("first added
-# auth middleware") still surface even when ticket history is bounded.
-WIKI_BACKFILL_GITHUB_PRS_DAYS = 365
-
-
-# Cap on Phase 2 fan-out per (customer, source). After Phase 1 completes,
-# the orchestrator queries the source's discoverer for targets (e.g.,
-# repos for GitHub) and inserts one Phase 2 row per target up to this
-# cap. Above the cap, take the top-N by recent activity. At ~$0.30-0.60
-# per Phase 2 agent run (Gemini Pro), 30 caps worst-case spend at
-# ~$15/backfill on the largest customers we have today.
-BACKFILL_MAX_TARGETS_PER_SOURCE = int(os.environ.get("BACKFILL_MAX_TARGETS_PER_SOURCE", "30"))
-
-# Agent's CachedContent TTL. Re-create on miss; alert if hit_rate < 80%.
-WIKI_AGENT_CACHE_TTL = "3600s"
 
 
 # --- DB pool init backoff ---------------------------------------------------

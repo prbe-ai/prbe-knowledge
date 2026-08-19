@@ -7,13 +7,10 @@ recipe; this module is the single home for that helper.
 
 Salts in production:
 
-    backfill-trigger  : per-customer wipe + insert critical section in
-                        the trigger route.
-    backfill-run      : per-(customer, source) defense-in-depth lock the
-                        BackfillWorker takes around the per-source crawl.
-    page              : per-(customer, page_slug) lock the wiki agent
-                        takes around the read-then-write in
-                        update_page / create_page.
+    custom-ingest-doc : per-(customer, doc_id) lock the Normalizer takes
+                        around the custom-ingest door's read-then-write.
+    leiden-community  : per-customer lock the Leiden cron takes around a
+                        community-detection pass.
 
 Stable across processes — same input bytes always hash to the same
 bigint, so locks work cluster-wide without coordination beyond the DB.
