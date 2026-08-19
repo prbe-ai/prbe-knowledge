@@ -24,7 +24,7 @@ The real job-to-be-done is not to automate the chain — it's already automated.
 
 That is the orchestration product. PRBE sits at two insertion points in the existing automated chain — context-injection at agent-launch, verification at PR-draft — and makes the automation actually worth trusting.
 
-**Phase 0** ships the foundational knowledge layer that everything above depends on. Not the orchestration (Phase 1+). Not the verification (Phase 2+). Not the compiled wiki of stable entities (Phase 0.5). **ACL is captured and maintained but not enforced at query time in Phase 0** — `documents.acl` + `acl_snapshots` populate from every handler's `extract_acl()`, but the retrieval service's `acl.py` is a pass-through stub. Phase 1 flips enforcement on without a backfill, because the data is already there. Just: ingest customer data from five sources, store normalized + versioned + ACL-captured (unenforced), return ranked chunks via HTTP on query. This is infra with no standalone customer value, built against the thesis that the context-injection and verification products that consume it are what customers will pay for.
+**Phase 0** ships the foundational knowledge layer that everything above depends on. Not the orchestration (Phase 1+). Not the verification (Phase 2+). Not the compiled pages of stable entities (Phase 0.5). **ACL is captured and maintained but not enforced at query time in Phase 0** — `documents.acl` + `acl_snapshots` populate from every handler's `extract_acl()`, but the retrieval service's `acl.py` is a pass-through stub. Phase 1 flips enforcement on without a backfill, because the data is already there. Just: ingest customer data from five sources, store normalized + versioned + ACL-captured (unenforced), return ranked chunks via HTTP on query. This is infra with no standalone customer value, built against the thesis that the context-injection and verification products that consume it are what customers will pay for.
 
 ---
 
@@ -142,7 +142,7 @@ We considered building PRBE as a thin orchestration layer on top of Glean's MCP 
 
 - **Vendor dependency on a larger competitor during a pivot.** Glean could absorb our orchestration features (add a "conflict detection" agent) on a quarterly timeline. Building on them gives them perfect visibility into what we're building.
 - **Pricing tier mismatch.** Glean is enterprise-sold, and their per-seat pricing would stack on top of ours — making our offering non-competitive for the mid-market AI-native customers who are our actual ICP.
-- **We do not own our data model.** Glean's document model is optimized for search; ours is optimized for orchestration (`FIRES_IN`, `CONFLICTS_WITH`, `REGRESSES` edges, wiki doc_classes). Those shapes can't be retrofitted onto a rented substrate.
+- **We do not own our data model.** Glean's document model is optimized for search; ours is optimized for orchestration (`FIRES_IN`, `CONFLICTS_WITH`, `REGRESSES` edges, compilation doc_classes). Those shapes can't be retrofitted onto a rented substrate.
 - **Valuation / acquisition story.** "Thin orchestration layer on Glean" is a feature. "End-to-end autonomous-debug trust platform with proprietary knowledge graph" is a company.
 
 ### What changes if Glean ships a verification layer tomorrow
@@ -208,7 +208,7 @@ Week 1 lock the canonical schema against all 5 source API specs + fixtures. Week
 
 ## Recommended Approach
 
-**Approach C, with selective-compilation wiki support baked into the schema for Phase 0.5 extension.**
+**Approach C, with selective-compilation support baked into the schema for Phase 0.5 extension.**
 
 ### Architecture at a glance
 
@@ -271,7 +271,7 @@ prbe-knowledge/
 │       └── Dockerfile
 ├── shared/
 │   ├── models.py          # Pydantic canonical schemas
-│   ├── constants.py       # graph labels, edge types, wiki doc_types
+│   ├── constants.py       # graph labels, edge types, doc_types
 │   ├── s3.py
 │   ├── db.py              # Postgres connection pooling
 │   └── config.py
@@ -349,8 +349,8 @@ class Document(BaseModel):
     source_url: str
 
     # Classification
-    doc_class: str = "raw_source"  # raw_source|compiled_wiki|manual_entry|agent_artifact
-    doc_type: str                  # "slack.message"|"wiki.service_card"|...
+    doc_class: str = "raw_source"  # raw_source|compiled_page|manual_entry|agent_artifact
+    doc_type: str                  # "slack.message"|"compiled.service_card"|...
     content_type: str = "text/plain"
     language: Optional[str]
 
@@ -386,7 +386,7 @@ class Document(BaseModel):
     ingestion_event_id: Optional[int]
     normalizer_version: str = "v1"
 
-    # Wiki-support (Phase 0 reserves, Phase 0.5+ populates)
+    # Compilation support (Phase 0 reserves, Phase 0.5+ populates)
     compiled_from_doc_ids: Optional[list[str]] = None
     compilation_model: Optional[str] = None
     compiled_at: Optional[datetime] = None
@@ -434,7 +434,7 @@ CREATE TABLE documents (
     body_size_bytes      INT  NOT NULL,
     body_token_count     INT  NOT NULL,
     -- Full body content lives in chunks.content (inline). NO documents.body column.
-    -- Wiki compilation reconstructs full body from chunks via shared/document_utils.reconstruct_body().
+    -- Page compilation reconstructs full body from chunks via shared/document_utils.reconstruct_body().
     author_id            TEXT,
 
     created_at           TIMESTAMPTZ NOT NULL,
@@ -645,7 +645,7 @@ CREATE INDEX ON audit_log (customer_id, occurred_at DESC);
 Apache AGE was the initial design choice but is not available on Neon Scale tier (verified via `CREATE EXTENSION age;` failure). The graph is modeled as two standard Postgres tables with Row Level Security for tenant isolation. Operationally this is actually stronger than AGE's per-customer graph pattern — RLS is DB-enforced, not app-enforced.
 
 ```sql
--- graph_nodes: entities extracted from documents, plus reserved wiki/orchestration entities
+-- graph_nodes: entities extracted from documents, plus reserved compilation/orchestration entities
 CREATE TABLE graph_nodes (
     node_id       BIGSERIAL PRIMARY KEY,
     customer_id   TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
@@ -693,11 +693,11 @@ CREATE POLICY tenant_isolation ON graph_edges
 ```
 
 **Phase 0 node labels (the `label` column values):** `Service`, `Repo`, `Person`, `Channel`, `Ticket`, `PR`, `Issue`, `Document`, `ErrorGroup`
-**Reserved for Phase 0.5+:** `ServiceCard`, `Decision`, `Feature`, `Runbook`, `WikiPerson`
+**Reserved for Phase 0.5+:** `ServiceCard`, `Decision`, `Feature`, `Runbook`
 **Reserved for Phase 1+:** `Agent`, `Workflow`, `FixArtifact`, `VerificationResult`
 
 **Phase 0 edge types (the `edge_type` column values):** `OWNS`, `MENTIONS`, `AUTHORED`, `BLOCKS`, `SUPERSEDES`, `DUPLICATES`, `TOUCHES`, `FIRES_IN`, `MEMBER_OF`, `LINKED_FROM`
-**Reserved for Phase 1+:** `CONFLICTS_WITH`, `VERIFIED_BY`, `DERIVED_FROM`, `FIXES`, `REGRESSES`, `ASSIGNED_TO`, `COMPILED_FROM` (wiki provenance)
+**Reserved for Phase 1+:** `CONFLICTS_WITH`, `VERIFIED_BY`, `DERIVED_FROM`, `FIXES`, `REGRESSES`, `ASSIGNED_TO`, `COMPILED_FROM` (compilation provenance)
 
 All labels and edge types are documented as Python constants in `shared/constants.py` (`NODE_LABELS`, `EDGE_TYPES`) to prevent drift across handlers. The string-valued columns let us add new labels/types without schema migrations.
 
@@ -859,7 +859,7 @@ Every handler implements a direct-SDK interface against its source's native API.
 
 **Base class choice: `abc.ABC` with `@abstractmethod`, not `Protocol`.** Rationale: 5 subagents implementing 5 handlers in parallel. `abc.ABC` fails at import time if a method is missing; `Protocol` only fails at usage site. ABC gives Week 2 subagents immediate feedback without waiting for integration review.
 
-**Constants: `shared/constants.py` exports `Enum` subclasses, not bare strings.** `NODE_LABELS`, `EDGE_TYPES`, `SOURCE_SYSTEMS`, `DOC_CLASSES`, `WIKI_DOC_TYPES` are all `enum.StrEnum`. Typos get caught at dev time instead of producing silent graph drift.
+**Constants: `shared/constants.py` exports `Enum` subclasses, not bare strings.** `NODE_LABELS`, `EDGE_TYPES`, `SOURCE_SYSTEMS`, `DOC_CLASSES`, `DOC_TYPES` are all `enum.StrEnum`. Typos get caught at dev time instead of producing silent graph drift.
 
 ```python
 # services/ingestion/handlers/base.py
@@ -1032,78 +1032,6 @@ Week 6 — Pilot onboarding buffer + hardening
              Reserved for fixes from real dogfood data + onboarding first pilot customer.
 ```
 
-### Phase 0.5 preview (the week after Phase 0 ships)
-
-Not Phase 0 scope, but the schema supports it and this is the next step.
-
-Separate Fly.io app: `prbe-knowledge-compile`. Cron trigger at 00:00 UTC. Also callable via an admin endpoint for manual recompile.
-
-### Topology
-
-Sequential within a customer, parallelizable across customers. Different customer = separate Fly task if we ever need to scale horizontally. Within one customer, the Sonnet regeneration + write-back path is strictly sequential with a Postgres advisory lock per wiki page `doc_id` — defense in depth against manual-trigger / retry / reprocess overlap.
-
-Haiku triage stays parallel (`asyncio.gather`): it's read-only, no write race possible, and it's ~600ms per candidate — parallelizing saves real wall time with zero risk.
-
-### Five-stage pipeline
-
-```
-STAGE 1 — Collect candidates (for one customer)
-  SELECT events FROM ingestion_events
-    WHERE customer_id = $1
-      AND received_at >= yesterday_midnight
-      AND status = 'processed';
-  Expand each event to doc_ids it produced/updated.
-  For each doc, query graph: which wiki pages are linked to this doc's entities?
-  COALESCE candidates by wiki page:
-    output = { wiki_page_doc_id: [triggering_event_ids, ...] }
-  This is the ONLY dedup step — after this, at most one compile per page per batch.
-
-STAGE 2 — Haiku triage (parallel, ~$0.0001 per page, ~600ms each)
-  asyncio.gather over all candidates:
-    prompt_haiku(current_page_content, aggregated_changes_summary)
-      → {"needs_update": bool, "reason": str}
-  Filter to pages where needs_update=true. Drop the rest silently.
-
-STAGE 3+4 — Sonnet regeneration (SEQUENTIAL per customer, ~$0.10-0.20 per page)
-  For each surviving page, one at a time:
-    SELECT pg_try_advisory_xact_lock(hashtext('wiki:' || doc_id));
-    If lock not acquired: skip this page, log, continue (picked up next batch).
-    Otherwise:
-      - Read ALL current source docs feeding this page (graph traversal)
-      - Read current wiki page content (for style continuity, NOT as ground truth)
-      - Prompt Sonnet to FULLY REGENERATE the page from sources — not incremental edit.
-        Rationale: incremental drift accumulates hallucinations over N cycles;
-        full regen is drift-free, cost delta is minor at Phase 0.5 scale.
-      - Validate: page must cite every claim, format matches wiki.service_card template
-      - Compute ACL = intersection of source doc ACLs (if any source is private,
-        compiled page inherits the restriction)
-      - INSERT into documents as new version (same doc_id, version+1):
-          doc_class = 'compiled_wiki'
-          doc_type  = 'wiki.service_card'
-          supersedes_doc_id = prior version's doc_id (same doc_id, bumped version)
-          compiled_from_doc_ids = [list of source doc_ids]
-          compilation_model = 'claude-sonnet-4-6'
-          compiled_at = NOW()
-          compile_trigger = 'scheduled' | 'manual' | 'normalizer_reprocess'
-      - Re-chunk + re-embed the new page (same pipeline as ingestion handlers)
-      - Upsert graph nodes/edges:
-          graph_nodes: upsert ServiceCard node (label='ServiceCard', canonical_id from service)
-          graph_edges: upsert DESCRIBES edge (ServiceCard → Service)
-          graph_edges: upsert COMPILED_FROM edges (ServiceCard → each raw_source Document)
-    Advisory lock releases at transaction commit.
-
-STAGE 5 — Observability
-  emit per-customer metrics:
-    compile_duration_s, pages_updated, pages_skipped_triage, pages_skipped_lock,
-    sonnet_tokens_input, sonnet_tokens_output, compilation_cost_usd
-```
-
-### Phase 0.5 scope limits
-
-- **One wiki type only: `wiki.service_card`.** Expand to `wiki.decision`, `wiki.feature`, `wiki.runbook` in Phase 1+ once real data shapes the templates.
-- **Cost ceiling: <$100/month per customer** in Sonnet + Haiku combined. Alerted on breach.
-- **Freshness SLO: <24h lag** between source updates and corresponding wiki page update. Good enough for the verification use case; tightening is a Phase 2 conversation.
-
 ---
 
 ## Open Questions
@@ -1230,8 +1158,8 @@ You already know enough technically to build Phase 0 — the gap is customer spe
 
 - When I pushed you to reduce scope from 5 sources to 3 to ship faster, you defended 5 with specific reasoning: "roadmap and design docs live in Notion/Slack, without that the context is incomplete and the product is as good as nothing." You didn't just dismiss the push — you articulated why. That's founder-grade premise defense.
 - When I over-indexed on "don't sunset your existing stack," you corrected me with precise data: "we have the functionality saved... existing stack only really has one customer that isnt really using the product anyways." You knew your situation better than my generic advice. You didn't ask permission to override me — you stated the facts and moved.
-- On the Karpathy wiki question, you didn't accept my enthusiastic endorsement. You pressure-tested it: "at scale, the architecture breaks down since you can't fit the entire context about a company... cost to maintaining it on event updates is not insignificant." That's exactly the right question. You cited gBrain as a specific counter-example — which forced me to disaggregate "the wiki" into stable vs. volatile entities, which is the correct framing. You were doing the thinking, not consuming my answer.
-- Throughout this session you repeatedly framed decisions in terms of: "what does this cost us later if wrong?" Every major decision — 5 sources, new repos, schema flexibility fields, wiki scope — you evaluated on forward-looking retrofitting cost. That's how engineering leaders think, not how first-time builders think.
+- On the Karpathy compiled-knowledge question, you didn't accept my enthusiastic endorsement. You pressure-tested it: "at scale, the architecture breaks down since you can't fit the entire context about a company... cost to maintaining it on event updates is not insignificant." That's exactly the right question. You cited gBrain as a specific counter-example — which forced me to disaggregate the compiled layer into stable vs. volatile entities, which is the correct framing. You were doing the thinking, not consuming my answer.
+- Throughout this session you repeatedly framed decisions in terms of: "what does this cost us later if wrong?" Every major decision — 5 sources, new repos, schema flexibility fields, compilation scope — you evaluated on forward-looking retrofitting cost. That's how engineering leaders think, not how first-time builders think.
 - You asked "why a monorepo, what does that entail exactly" without apology for the question. That's the right instinct — don't let jargon go unchallenged. Builders who ship don't pretend to know things they don't.
 
 ---

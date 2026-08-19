@@ -167,15 +167,7 @@ Copy of the design doc's criteria. Phase 0 shippable when all hold:
 
 ---
 
-## Phase 0.5 — Selective Wiki Compilation — CUT (2026-08)
-
-Shipped, then removed. Compiled knowledge pages were generated nightly by an
-agent loop over triaged ingestion events. Generation was turned off fleet-wide
-on 2026-08-18 and the code deleted; the retrieval stack answers from source
-documents directly. Do not revive without re-deciding the cost/freshness
-question that killed it.
-
-### Source expansion (parallel workstream)
+## Source expansion (parallel workstream)
 
 - [ ] **Langfuse** handler — LLM observability (first priority: Reevo's GTM co-pilot produces its real bug signal in LLM traces, not stack traces)
 
@@ -190,7 +182,7 @@ The smallest thing a customer actually pays for. Wire the Sentry→Linear→agen
 - [ ] Webhook handler on Linear issue-create
 - [ ] For each auto-created ticket: pull related context
   - Services involved (from `FIRES_IN` edges on the error group)
-  - Owners + team conventions (from `OWNS` + Notion wiki pages)
+  - Owners + team conventions (from `OWNS` + Notion pages)
   - Related recent PRs (from graph traversal)
   - Linked design docs (Notion)
   - Recent decisions relevant to the symptom (Slack + Notion)
