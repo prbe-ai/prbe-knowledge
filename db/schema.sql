@@ -158,6 +158,19 @@ CREATE TABLE documents (
                                  'A'
                              )
                          ) STORED,
+    -- The title+body_preview vector, MATERIALIZED rather than left as an
+    -- expression index. Under FORCE RLS the planner will not use an expression
+    -- index (matching one means evaluating the expression before the security
+    -- qual), so grounding's fts arm rebuilt this tsvector for every live
+    -- document in the tenant -- 1052 ms/probe. A stored column is an ordinary
+    -- column reference and indexes normally. See migration 0109.
+    title_preview_tsv    tsvector GENERATED ALWAYS AS (
+                             to_tsvector(
+                                 'english'::regconfig,
+                                 coalesce(title, '') || ' ' ||
+                                 coalesce(body_preview, '')
+                             )
+                         ) STORED,
     body_size_bytes      INT  NOT NULL DEFAULT 0,
     body_token_count     INT  NOT NULL DEFAULT 0,
     author_id            TEXT,
@@ -234,8 +247,7 @@ CREATE INDEX idx_documents_live ON documents (customer_id, doc_id) WHERE valid_t
 -- after customer_id is doc_id), so without this the retire scans every live
 -- document for the tenant. See migration 0105.
 CREATE INDEX idx_documents_parent_live ON documents (customer_id, parent_doc_id) WHERE valid_to IS NULL;
-CREATE INDEX idx_documents_fts_title_preview ON documents
-    USING GIN (to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body_preview,'')));
+CREATE INDEX idx_documents_title_preview_tsv ON documents USING GIN (title_preview_tsv);
 CREATE INDEX idx_documents_entities ON documents USING GIN (entities jsonb_path_ops);
 CREATE INDEX idx_documents_metadata ON documents USING GIN (metadata jsonb_path_ops);
 -- Trigram GIN for the id_lookup retriever's leading-wildcard LIKE arms
