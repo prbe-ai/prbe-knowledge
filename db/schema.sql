@@ -32,7 +32,7 @@ CREATE TABLE customers (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     metadata             JSONB NOT NULL DEFAULT '{}',
     -- Per-tenant feature toggles (added by migration 0023). Read by
-    -- shared.customer_prefs for the wiki-generation gate. Schema-on-read
+    -- shared.customer_prefs for per-feature gating. Schema-on-read
     -- bool keys; missing keys resolve to False on every reader.
     preferences          JSONB NOT NULL DEFAULT '{}',
     -- Per-tenant R2 bucket name. Added by migration 0073, locked NOT NULL
@@ -199,9 +199,9 @@ CREATE TABLE documents (
     compiled_at          TIMESTAMPTZ DEFAULT NULL,
     compile_trigger      TEXT DEFAULT NULL,
 
-    -- migration 0082 (post-approval wiki-artifact draft gating). New
-    -- wiki-artifact writes set 'draft'; the review approve path flips
-    -- to 'approved' atomically. Existing rows backfill to 'approved'.
+    -- migration 0082 (post-approval draft gating for generated artifacts).
+    -- New generated-artifact writes set 'draft'; the review approve path
+    -- flips to 'approved' atomically. Existing rows backfill to 'approved'.
     visibility           TEXT NOT NULL DEFAULT 'approved',
 
     -- PK includes customer_id so tenants ingesting the same source identity
@@ -250,7 +250,7 @@ CREATE INDEX idx_documents_title_trgm ON documents USING GIN (title gin_trgm_ops
 -- GIN over the weighted title tsvector (migration 0099).
 CREATE INDEX idx_documents_title_tsv ON documents USING GIN (title_tsv);
 -- Partial index keeps the doc-type listing path from scanning draft rows
--- once visibility='draft' wiki artifacts start appearing. See migration 0082.
+-- once visibility='draft' artifacts start appearing. See migration 0082.
 CREATE INDEX IF NOT EXISTS documents_visibility_approved_idx
     ON documents (customer_id, doc_type) WHERE visibility = 'approved';
 
@@ -325,8 +325,8 @@ CREATE TABLE chunks (
     -- Kept in sync by two triggers below, not by application code.
     title                TEXT NOT NULL DEFAULT '',
 
-    -- migration 0082 (post-approval wiki-artifact draft gating). Tracks
-    -- the visibility of the chunk's owning document version so retrieval
+    -- migration 0082 (post-approval draft gating for generated artifacts).
+    -- Tracks the visibility of the chunk's owning document version so retrieval
     -- can default-filter draft chunks without joining documents.
     visibility           TEXT NOT NULL DEFAULT 'approved',
 
@@ -449,8 +449,8 @@ CREATE TRIGGER trg_chunks_fill_title
     FOR EACH ROW
     EXECUTE FUNCTION chunks_fill_title_on_insert();
 -- Partial index keeps retrieval's per-doc chunk fetch index-only once
--- visibility='draft' rows start appearing (post-approval wiki artifacts).
--- See migration 0082.
+-- visibility='draft' rows start appearing (post-approval generated
+-- artifacts). See migration 0082.
 CREATE INDEX IF NOT EXISTS chunks_visibility_approved_idx
     ON chunks (customer_id, doc_id) WHERE visibility = 'approved';
 
@@ -1180,8 +1180,8 @@ CREATE UNIQUE INDEX idx_inferred_edges_queue_outstanding
 -- worker.py:_claim_one). Under FORCE RLS that drain SELECT silently
 -- zero-matches when running as a non-superuser role (e.g. probe_app),
 -- because there's no GUC to set before the row is claimed. Follows the
--- same no-RLS pattern as ingestion_queue / backfill_state /
--- wiki_synthesis_queue. See migration 0068.
+-- same no-RLS pattern as ingestion_queue / backfill_state. See
+-- migration 0068.
 --
 -- Tenant scoping is enforced by the side-worker wrapping the per-row
 -- processing in `with_tenant(customer_id)` AND the SQL filtering on
