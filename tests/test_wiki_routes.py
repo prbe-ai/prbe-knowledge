@@ -1072,6 +1072,12 @@ async def test_a_page_kind_outside_the_closed_set_is_refused(
 
 # ---------------------------------------------------------------------------
 # Tenant-level generation setting
+#
+# The READ stays covered below. The write's own tests are gone with the write:
+# `PUT /api/wiki/settings` answers 410, so a test that PUT and then asserted on
+# the column passed for the wrong reason -- nothing was written, and the
+# property it documented ("the write must not clobber the rest of the shared
+# JSONB column") is not something the route can get wrong any more.
 # ---------------------------------------------------------------------------
 
 
@@ -1097,34 +1103,6 @@ async def test_generation_is_off_until_someone_turns_it_on(
         # that transitions off→on.
         "catchup_started": False,
     }
-
-
-@pytest.mark.asyncio
-async def test_turning_generation_on_preserves_other_preferences(
-    client: httpx.AsyncClient,
-) -> None:
-    """The write must not clobber the rest of the JSONB column.
-
-    `preferences` is shared. A naive `SET preferences = '{"wiki...": "true"}'`
-    reads back perfectly through this route while silently discarding every
-    other setting the tenant had -- which is the kind of loss nobody attributes
-    to the wiki weeks later.
-    """
-    async with raw_conn() as conn:
-        await conn.execute(
-            'UPDATE customers SET preferences = \'{"keep_me": "yes"}\'::jsonb '
-            "WHERE customer_id = $1",
-            CUSTOMER,
-        )
-
-    await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
-
-    async with raw_conn() as conn:
-        kept = await conn.fetchval(
-            "SELECT preferences->>'keep_me' FROM customers WHERE customer_id = $1",
-            CUSTOMER,
-        )
-    assert kept == "yes"
 
 
 @pytest.mark.asyncio
