@@ -78,7 +78,6 @@ from kb.internal_devices import router as devices_router
 from kb.purge_routes import router as purge_router
 from kb.slack_lifecycle import handle_slack_lifecycle_event
 from kb.stats_routes import router as stats_router
-from kb.wiki_routes import router as wiki_router
 
 log = get_logger(__name__)
 
@@ -118,7 +117,6 @@ app.include_router(entity_clusters_router)
 app.include_router(entity_merge_suggestions_router)
 app.include_router(feature_nodes_router)
 app.include_router(devices_router)
-app.include_router(wiki_router)
 app.include_router(custom_ingest_router)
 
 
