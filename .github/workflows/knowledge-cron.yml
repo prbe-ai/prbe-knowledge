@@ -14,62 +14,21 @@ name: knowledge-cron
 
 on:
   schedule:
-    # 02:00 UTC: wiki nightly trigger
-    - cron: "0 2 * * *"
     # 03:00 UTC: leiden community-detection cron
     - cron: "0 3 * * *"
   # Manual trigger for ops + testing.
   workflow_dispatch:
     inputs:
       job:
-        description: 'Which scheduled job to fire (wiki | leiden | all)'
+        description: 'Which scheduled job to fire (leiden | all)'
         required: false
         default: 'all'
         type: choice
         options:
           - all
-          - wiki
           - leiden
 
 jobs:
-  # -----------------------------------------------------------------------
-  # 02:00 UTC - wiki nightly trigger
-  #
-  # Connects, fires pg_notify per opted-in customer with pending rows,
-  # exits. The wiki-worker app's NotifyListener picks up the wake; the
-  # wiki-synthesis app picks up the triaged rows the worker produces.
-  # Decoupled so a long pebble drain doesn't hold the cron machine alive.
-  # -----------------------------------------------------------------------
-  wiki-nightly:
-    if: |
-      (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *') ||
-      (github.event_name == 'workflow_dispatch' && (inputs.job == 'wiki' || inputs.job == 'all'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - uses: superfly/flyctl-actions/setup-flyctl@master
-      - name: Run wiki nightly trigger
-        # `--rm` so the ephemeral machine cleans up after exit.
-        # Image is positional in modern flyctl (machine run <image> [command]);
-        # `--image` and `:latest` are both gone. Fly tags deploys with
-        # `deployment-<hash>`; resolve the current tag from the app
-        # status before firing. The command after `--` overrides the
-        # Dockerfile CMD / fly.cron.toml [processes].cron with the
-        # explicit module path -- keeps the entry-point coupling local
-        # to this workflow.
-        run: |
-          IMAGE=$(flyctl image show -a prbe-knowledge-cron --json \
-            | jq -r '.[0] | "\(.Registry)/\(.Repository):\(.Tag)"')
-          echo "Using image: $IMAGE"
-          flyctl machine run \
-            "$IMAGE" \
-            --app prbe-knowledge-cron \
-            --rm \
-            -- python -m services.synthesis.nightly_trigger
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-
   # -----------------------------------------------------------------------
   # 03:00 UTC - leiden community-detection cron
   #
@@ -92,7 +51,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Run leiden community-detection
-        # Same image-resolution + invocation pattern as wiki-nightly.
+        # Resolve the current deploy tag from the app status before firing:
+        # the image is positional in modern flyctl (machine run <image>
+        # [command]) and `:latest` does not exist, so `--rm` plus an explicit
+        # module path keeps the entry-point coupling local to this workflow.
         run: |
           IMAGE=$(flyctl image show -a prbe-knowledge-cron --json \
             | jq -r '.[0] | "\(.Registry)/\(.Repository):\(.Tag)"')

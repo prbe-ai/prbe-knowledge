@@ -24,7 +24,6 @@ from httpx import ASGITransport
 from engine.shared.config import Settings, get_settings
 from engine.shared.db import close_pool, init_pool, raw_conn, with_tenant
 from kb.ingestion_app import app
-from kb.synthesis import persistence
 from tests.wiki_fixtures import insert_document
 
 CUSTOMER = "wiki-test-cust"
@@ -482,269 +481,6 @@ def _stub_bootstrap_registry(monkeypatch) -> None:
         {"github": object, "slack": object},
         raising=False,
     )
-
-
-@pytest.mark.asyncio
-async def test_bootstrap_trigger_fires_pg_notify(
-    client: httpx.AsyncClient, _stub_bootstrap_registry: None
-) -> None:
-    """POSTing the trigger fires payload-less pg_notify on
-    WIKI_BACKFILL_CHANNEL and inserts pending rows the worker will
-    claim. Body is now empty payload (workers claim via FOR UPDATE
-    SKIP LOCKED), so the listener no longer routes per-payload."""
-    import asyncio
-
-    import asyncpg
-
-    from engine.shared.config import get_settings as _get_settings
-    from engine.shared.constants import WIKI_BACKFILL_CHANNEL
-
-    notifications: list[str] = []
-    listen_dsn = _get_settings().database_url
-    listener_conn = await asyncpg.connect(listen_dsn)
-
-    def _on_notify(_c, _pid, _channel, payload) -> None:
-        notifications.append(payload)
-
-    try:
-        await listener_conn.add_listener(WIKI_BACKFILL_CHANNEL, _on_notify)
-
-        resp = await client.post(
-            "/api/wiki/bootstrap/trigger",
-            json={
-                "sources": ["github", "slack"],
-                "wipe_first": True,
-                "reason": "first run",
-            },
-            headers=_hdr(),
-        )
-        assert resp.status_code == 202, resp.text
-        body = resp.json()
-        assert body["triggered"] is True
-        assert isinstance(body["run_ids"], list)
-        assert len(body["run_ids"]) == 2
-        assert all(isinstance(rid, int) for rid in body["run_ids"])
-
-        # Give the NOTIFY a moment to deliver — Postgres queues NOTIFY
-        # at NOTIFY-time and delivers on commit; ASGITransport runs the
-        # endpoint synchronously inside the same loop.
-        for _ in range(20):
-            if notifications:
-                break
-            await asyncio.sleep(0.05)
-        assert notifications, "expected pg_notify on the bootstrap channel"
-        # Wake hint is empty payload — workers claim rows directly,
-        # no per-NOTIFY routing needed.
-        assert notifications[0] == ""
-
-        # The route inserts pending wiki_synthesis_runs rows; workers
-        # claim via FOR UPDATE SKIP LOCKED and flip them to running.
-        async with raw_conn() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT source, kind, stage, status FROM wiki_synthesis_runs
-                WHERE customer_id = $1 AND kind = 'bootstrap'
-                ORDER BY source
-                """,
-                CUSTOMER,
-            )
-        assert {r["source"] for r in rows} == {"github", "slack"}
-        assert all(r["kind"] == "bootstrap" for r in rows)
-        assert all(r["stage"] == "synthesis" for r in rows)
-        # New invariant: trigger inserts at 'pending', not 'running'.
-        assert all(r["status"] == "pending" for r in rows)
-    finally:
-        await listener_conn.close()
-
-
-@pytest.mark.asyncio
-async def test_bootstrap_trigger_defaults(
-    client: httpx.AsyncClient, _stub_bootstrap_registry: None
-) -> None:
-    """Empty body defaults to all registered crawlers; wipe_first=True."""
-    resp = await client.post(
-        "/api/wiki/bootstrap/trigger",
-        json={},
-        headers=_hdr(),
-    )
-    assert resp.status_code == 202, resp.text
-    body = resp.json()
-    assert body["triggered"] is True
-    assert isinstance(body["run_ids"], list)
-    # Stub registry has two entries (github + slack), so all-default
-    # should pre-open one run per source.
-    assert len(body["run_ids"]) == 2
-
-
-@pytest.mark.asyncio
-async def test_bootstrap_trigger_rejects_unknown_sources(
-    client: httpx.AsyncClient, _stub_bootstrap_registry: None
-) -> None:
-    """An unknown source name returns 400, not a silent drop."""
-    resp = await client.post(
-        "/api/wiki/bootstrap/trigger",
-        json={"sources": ["github", "definitely-not-real"]},
-        headers=_hdr(),
-    )
-    assert resp.status_code == 400, resp.text
-    assert "definitely-not-real" in resp.json()["detail"]
-
-
-@pytest.mark.asyncio
-async def test_bootstrap_trigger_returns_409_on_in_flight(
-    client: httpx.AsyncClient, _stub_bootstrap_registry: None
-) -> None:
-    """An in-flight (pending or running) row blocks a fresh trigger
-    unless ``force=true``. The 409 body carries the in-flight run_ids
-    + per-source status so the dashboard can render a structured
-    cancel-and-restart prompt."""
-    # Pre-insert a 'running' row for github.
-    async with raw_conn() as conn:
-        existing_id = int(
-            await conn.fetchval(
-                """
-                INSERT INTO wiki_synthesis_runs
-                    (customer_id, kind, stage, source, status)
-                VALUES ($1, 'bootstrap', 'synthesis', 'github', 'running')
-                RETURNING run_id
-                """,
-                CUSTOMER,
-            )
-        )
-
-    resp = await client.post(
-        "/api/wiki/bootstrap/trigger",
-        json={"sources": ["slack"]},
-        headers=_hdr(),
-    )
-    assert resp.status_code == 409, resp.text
-    detail = resp.json()["detail"]
-    assert detail["status"] == "in_flight"
-    assert existing_id in detail["run_ids"]
-    assert detail["sources_running"] == ["github"]
-    assert detail["sources_pending"] == []
-    # No new pending rows were inserted (atomicity check).
-    async with raw_conn() as conn:
-        rows = await conn.fetch(
-            "SELECT source, status FROM wiki_synthesis_runs "
-            "WHERE customer_id = $1 AND kind = 'bootstrap'",
-            CUSTOMER,
-        )
-    assert {(r["source"], r["status"]) for r in rows} == {("github", "running")}
-
-
-@pytest.mark.asyncio
-async def test_bootstrap_trigger_force_proceeds_after_drain_timeout(
-    client: httpx.AsyncClient,
-    _stub_bootstrap_registry: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``?force=true`` with an in-flight row + no worker registered:
-    trigger marks the old row 'cancelled', sleeps the drain window,
-    proceeds with wipe + new pending insert.
-
-    Drain timeout patched down so the test runs fast."""
-    from kb import wiki_routes as _wr
-
-    monkeypatch.setattr(_wr, "BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
-
-    async with raw_conn() as conn:
-        old_id = int(
-            await conn.fetchval(
-                """
-                INSERT INTO wiki_synthesis_runs
-                    (customer_id, kind, stage, source, status)
-                VALUES ($1, 'bootstrap', 'synthesis', 'github', 'running')
-                RETURNING run_id
-                """,
-                CUSTOMER,
-            )
-        )
-
-    resp = await client.post(
-        "/api/wiki/bootstrap/trigger?force=true",
-        json={"sources": ["github"], "wipe_first": False},
-        headers=_hdr(),
-    )
-    assert resp.status_code == 202, resp.text
-    new_run_ids = resp.json()["run_ids"]
-    assert len(new_run_ids) == 1
-    assert old_id not in new_run_ids
-
-    async with raw_conn() as conn:
-        rows = await conn.fetch(
-            "SELECT run_id, status, error FROM wiki_synthesis_runs "
-            "WHERE customer_id = $1 AND kind = 'bootstrap' ORDER BY run_id",
-            CUSTOMER,
-        )
-    by_id = {int(r["run_id"]): r for r in rows}
-    assert by_id[old_id]["status"] == "cancelled"
-    assert "force-trigger" in (by_id[old_id]["error"] or "")
-    new_id = next(rid for rid in by_id if rid != old_id)
-    assert by_id[new_id]["status"] == "pending"
-
-
-@pytest.mark.asyncio
-async def test_bootstrap_trigger_force_fires_cancel_notify(
-    client: httpx.AsyncClient,
-    _stub_bootstrap_registry: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """``?force=true`` fires pg_notify on WIKI_BACKFILL_CANCEL_CHANNEL
-    with a JSON payload carrying customer_id + cancelled run_ids so
-    workers can cancel matching tasks."""
-    import asyncio
-
-    import asyncpg
-
-    from engine.shared.config import get_settings as _get_settings
-    from engine.shared.constants import WIKI_BACKFILL_CANCEL_CHANNEL
-    from kb import wiki_routes as _wr
-
-    monkeypatch.setattr(_wr, "BACKFILL_CANCEL_DRAIN_TIMEOUT_SECONDS", 0.05)
-
-    listen_dsn = _get_settings().database_url
-    listener_conn = await asyncpg.connect(listen_dsn)
-    cancel_payloads: list[str] = []
-
-    def _on_cancel(_c, _pid, _channel, payload) -> None:
-        cancel_payloads.append(payload)
-
-    try:
-        await listener_conn.add_listener(WIKI_BACKFILL_CANCEL_CHANNEL, _on_cancel)
-
-        async with raw_conn() as conn:
-            old_id = int(
-                await conn.fetchval(
-                    """
-                    INSERT INTO wiki_synthesis_runs
-                        (customer_id, kind, stage, source, status)
-                    VALUES ($1, 'bootstrap', 'synthesis', 'slack', 'pending')
-                    RETURNING run_id
-                    """,
-                    CUSTOMER,
-                )
-            )
-
-        resp = await client.post(
-            "/api/wiki/bootstrap/trigger?force=true",
-            json={"sources": ["slack"], "wipe_first": False},
-            headers=_hdr(),
-        )
-        assert resp.status_code == 202, resp.text
-
-        for _ in range(20):
-            if cancel_payloads:
-                break
-            await asyncio.sleep(0.05)
-        assert cancel_payloads, "expected pg_notify on the cancel channel"
-        import orjson as _orjson
-
-        decoded = _orjson.loads(cancel_payloads[0])
-        assert decoded["customer_id"] == CUSTOMER
-        assert old_id in decoded["run_ids"]
-    finally:
-        await listener_conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1336,6 +1072,12 @@ async def test_a_page_kind_outside_the_closed_set_is_refused(
 
 # ---------------------------------------------------------------------------
 # Tenant-level generation setting
+#
+# The READ stays covered below. The write's own tests are gone with the write:
+# `PUT /api/wiki/settings` answers 410, so a test that PUT and then asserted on
+# the column passed for the wrong reason -- nothing was written, and the
+# property it documented ("the write must not clobber the rest of the shared
+# JSONB column") is not something the route can get wrong any more.
 # ---------------------------------------------------------------------------
 
 
@@ -1361,94 +1103,6 @@ async def test_generation_is_off_until_someone_turns_it_on(
         # that transitions off→on.
         "catchup_started": False,
     }
-
-
-@pytest.mark.asyncio
-async def test_generation_can_be_turned_on_and_back_off(
-    client: httpx.AsyncClient,
-) -> None:
-    """Both directions, and the stored value is what the PIPELINE reads.
-
-    Asserted against the raw `preferences->>` text, not just the response: the
-    route could return `true` while writing a JSON boolean, a nested object, or
-    the wrong key, and every one of those reads back correctly through its own
-    response while the nightly trigger sees nothing.
-    """
-    on = await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
-    assert on.status_code == 200, on.text
-    assert on.json()["generation_enabled"] is True
-
-    async with raw_conn() as conn:
-        stored = await conn.fetchval(
-            "SELECT preferences->>'wiki_generation_enabled' FROM customers WHERE customer_id = $1",
-            CUSTOMER,
-        )
-    assert stored == "true", "the pipeline compares this to the STRING 'true'"
-
-    off = await client.put("/api/wiki/settings", json={"generation_enabled": False}, headers=_hdr())
-    assert off.status_code == 200, off.text
-    assert off.json()["generation_enabled"] is False
-    assert (await client.get("/api/wiki/settings", headers=_hdr())).json()[
-        "generation_enabled"
-    ] is False
-
-
-@pytest.mark.asyncio
-async def test_turning_generation_on_preserves_other_preferences(
-    client: httpx.AsyncClient,
-) -> None:
-    """The write must not clobber the rest of the JSONB column.
-
-    `preferences` is shared. A naive `SET preferences = '{"wiki...": "true"}'`
-    reads back perfectly through this route while silently discarding every
-    other setting the tenant had -- which is the kind of loss nobody attributes
-    to the wiki weeks later.
-    """
-    async with raw_conn() as conn:
-        await conn.execute(
-            'UPDATE customers SET preferences = \'{"keep_me": "yes"}\'::jsonb '
-            "WHERE customer_id = $1",
-            CUSTOMER,
-        )
-
-    await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
-
-    async with raw_conn() as conn:
-        kept = await conn.fetchval(
-            "SELECT preferences->>'keep_me' FROM customers WHERE customer_id = $1",
-            CUSTOMER,
-        )
-    assert kept == "yes"
-
-
-@pytest.mark.asyncio
-async def test_turning_generation_on_works_from_the_default_preferences(
-    client: httpx.AsyncClient,
-) -> None:
-    """The actual common case: `preferences` at its `'{}'` default.
-
-    A tenant that has never set anything has an EMPTY OBJECT, not NULL --
-    `customers.preferences` is NOT NULL DEFAULT '{}'. That is why the write
-    passes `create_missing`: `jsonb_set` without it leaves an absent key
-    absent, reports success, and the operator then waits for a nightly run that
-    will never include them.
-    """
-    async with raw_conn() as conn:
-        await conn.execute(
-            "UPDATE customers SET preferences = '{}'::jsonb WHERE customer_id = $1",
-            CUSTOMER,
-        )
-
-    resp = await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
-
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["generation_enabled"] is True
-    async with raw_conn() as conn:
-        stored = await conn.fetchval(
-            "SELECT preferences->>'wiki_generation_enabled' FROM customers WHERE customer_id = $1",
-            CUSTOMER,
-        )
-    assert stored == "true"
 
 
 @pytest.mark.asyncio
@@ -1772,130 +1426,6 @@ async def _pending_docs() -> set[str]:
     return {r["doc_id"] for r in rows}
 
 
-@pytest.mark.asyncio
-async def test_turning_generation_on_seeds_the_existing_corpus(
-    client: httpx.AsyncClient,
-) -> None:
-    """The off→on PUT schedules a seed of docs ingested BEFORE the flip.
-
-    This is the product half of the retroactive-seed fix: without it a
-    tenant who enables the wiki starts from "documents ingested after
-    today" and their backfilled history never becomes wiki input.
-    ASGITransport awaits Starlette's background tasks before returning,
-    so the seed has run by the time the client call resolves.
-    """
-    await _insert_live_doc("doc:before-flip")
-
-    resp = await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["catchup_started"] is True
-    assert await _pending_docs() == {"doc:before-flip"}
-
-
-@pytest.mark.asyncio
-async def test_on_to_on_put_does_not_reschedule_the_seed(
-    client: httpx.AsyncClient,
-) -> None:
-    """Only the TRANSITION seeds — a repeated on-PUT is a plain flag write."""
-    first = await client.put(
-        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
-    )
-    assert first.json()["catchup_started"] is True
-
-    again = await client.put(
-        "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
-    )
-    assert again.status_code == 200
-    assert again.json()["catchup_started"] is False
-
-
-@pytest.mark.asyncio
-async def test_turning_generation_off_never_seeds(
-    client: httpx.AsyncClient,
-) -> None:
-    await _insert_live_doc("doc:whatever")
-    resp = await client.put(
-        "/api/wiki/settings", json={"generation_enabled": False}, headers=_hdr()
-    )
-    assert resp.status_code == 200
-    assert resp.json()["catchup_started"] is False
-    assert await _pending_docs() == set()
-
-
-@pytest.mark.asyncio
-async def test_seed_failure_does_not_break_the_put(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The background seed is best-effort: the flag write already
-    committed and the response already says 200, so a seeding crash must
-    be logged and swallowed — the nightly reconcile is the retry."""
-
-    await _insert_live_doc("doc:would-seed")
-
-    async def exploding_seed(conn, customer_id, *, limit=None):
-        raise RuntimeError("boom")
-
-    monkeypatch.setattr(persistence, "seed_missing_docs", exploding_seed)
-
-    resp = await client.put("/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr())
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["catchup_started"] is True
-
-    async with raw_conn() as conn:
-        stored = await conn.fetchval(
-            "SELECT preferences->>'wiki_generation_enabled' FROM customers WHERE customer_id = $1",
-            CUSTOMER,
-        )
-    assert stored == "true"
-    assert await _pending_docs() == set()
-
-
-@pytest.mark.asyncio
-async def test_reenabling_wakes_the_worker_even_with_nothing_new_to_seed(
-    client: httpx.AsyncClient, settings: Settings
-) -> None:
-    """off→on with PENDING rows from before the flip-off must still fire
-    the wake: inserted == 0 there, and gating the notify on it left the
-    old rows waiting for the 30-minute periodic cycle."""
-    import asyncio
-
-    import asyncpg
-
-    from engine.shared.constants import WIKI_PENDING_CHANNEL
-
-    await _insert_live_doc("doc:old-pending")
-    async with raw_conn() as conn:
-        await conn.execute(
-            "INSERT INTO wiki_synthesis_queue "
-            "(customer_id, doc_id, doc_version, source_system, doc_type, status) "
-            "VALUES ($1, 'doc:old-pending', 1, 'slack', 'slack.message', 'pending')",
-            CUSTOMER,
-        )
-
-    received: list[str] = []
-    notify_event = asyncio.Event()
-    listener = await asyncpg.connect(settings.database_url)
-    try:
-
-        def _on_notify(_conn, _pid, channel, payload) -> None:
-            received.append(payload)
-            notify_event.set()
-
-        await listener.add_listener(WIKI_PENDING_CHANNEL, _on_notify)
-
-        resp = await client.put(
-            "/api/wiki/settings", json={"generation_enabled": True}, headers=_hdr()
-        )
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["catchup_started"] is True
-
-        await asyncio.wait_for(notify_event.wait(), timeout=5)
-    finally:
-        await listener.close()
-
-    assert CUSTOMER in received
-
-
 # ---------------------------------------------------------------------------
 # Backfill trigger → queue reseed + preview (PR: rebuild recovers all sources)
 # ---------------------------------------------------------------------------
@@ -1952,112 +1482,6 @@ async def _queue_state() -> dict[str, str]:
 
 
 @pytest.mark.asyncio
-async def test_backfill_trigger_reseeds_the_daily_pipeline(
-    client: httpx.AsyncClient,
-) -> None:
-    """The wipe's recovery path: crawlers only cover registered sources,
-    so the trigger must seed missing docs and reset terminal rows in the
-    same transaction — otherwise transcript-derived pages never return."""
-    await _insert_live_doc("doc:unqueued")
-    await _insert_live_doc("doc:done")
-    await _terminal_queue_row("doc:done", status="done")
-    await _compiled_page("wiki:runbook:old")
-
-    resp = await client.post("/api/wiki/backfill/trigger", json={}, headers=_hdr())
-    assert resp.status_code == 202, resp.text
-    data = resp.json()
-    assert data["eligible_documents"] == 2
-    assert data["seeded"] == 1
-    assert data["reset"] == 1
-    assert data["run_ids"]
-
-    assert await _queue_state() == {
-        "doc:unqueued": "pending",
-        "doc:done": "pending",
-    }
-    # And the wipe still happened -- as a RETIRE, not a delete.
-    #
-    # The distinction is the point. To every reader the wiki is just as empty:
-    # each page read path filters `valid_to IS NULL`, so a retired page is as
-    # gone as a deleted one. What survives is the version history that
-    # `GET /v1/wiki/pages/{type}/{slug}/versions` and `POST .../revert` are
-    # built on, and that `_restore_retired_pages` needs to undo a rebuild.
-    async with raw_conn() as conn:
-        live = await conn.fetchval(
-            "SELECT count(*) FROM documents "
-            "WHERE customer_id = $1 AND doc_class = 'compiled_wiki' "
-            "AND valid_to IS NULL",
-            CUSTOMER,
-        )
-        history = await conn.fetchval(
-            "SELECT count(*) FROM documents WHERE customer_id = $1 AND doc_class = 'compiled_wiki'",
-            CUSTOMER,
-        )
-    assert live == 0, "the wiki must read as empty after a wipe"
-    assert history > 0, (
-        "retired versions must survive -- deleting them is what made a failed "
-        "rebuild unrecoverable and broke page history"
-    )
-
-
-@pytest.mark.asyncio
-async def test_backfill_trigger_without_wipe_seeds_but_never_resets(
-    client: httpx.AsyncClient,
-) -> None:
-    """wipe_first=false keeps existing pages, so terminal rows stay
-    terminal — re-deriving them would only rewrite pages that still
-    exist. Seeding gaps is still correct and harmless."""
-    await _insert_live_doc("doc:unqueued")
-    await _insert_live_doc("doc:done")
-    await _terminal_queue_row("doc:done", status="done")
-
-    resp = await client.post(
-        "/api/wiki/backfill/trigger",
-        json={"wipe_first": False},
-        headers=_hdr(),
-    )
-    assert resp.status_code == 202, resp.text
-    assert resp.json()["seeded"] == 1
-    assert resp.json()["reset"] == 0
-    assert (await _queue_state())["doc:done"] == "done"
-
-
-@pytest.mark.asyncio
-async def test_backfill_trigger_failure_after_wipe_rolls_everything_back(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Wipe + reseed + run-insert live in ONE transaction: a failure
-    after the deletes must leave the wiki exactly as it was, never a
-    wiped tenant with no recovery rows."""
-    import kb.wiki_routes as wiki_routes_module
-
-    await _insert_live_doc("doc:a")
-    await _compiled_page("wiki:runbook:keep")
-
-    async def exploding_insert(conn, *, customer_id, sources):
-        raise RuntimeError("boom after wipe")
-
-    monkeypatch.setattr(wiki_routes_module, "_insert_pending_runs", exploding_insert)
-
-    with pytest.raises(RuntimeError, match="boom after wipe"):
-        await client.post("/api/wiki/backfill/trigger", json={}, headers=_hdr())
-
-    # Nothing committed: page survives, queue still empty, no run rows.
-    async with raw_conn() as conn:
-        pages = await conn.fetchval(
-            "SELECT count(*) FROM documents WHERE customer_id = $1 AND doc_class = 'compiled_wiki'",
-            CUSTOMER,
-        )
-        runs = await conn.fetchval(
-            "SELECT count(*) FROM wiki_synthesis_runs WHERE customer_id = $1",
-            CUSTOMER,
-        )
-    assert pages == 1
-    assert runs == 0
-    assert await _queue_state() == {}
-
-
-@pytest.mark.asyncio
 async def test_backfill_preview_reports_counts_and_writes_nothing(
     client: httpx.AsyncClient,
 ) -> None:
@@ -2101,6 +1525,22 @@ async def test_backfill_preview_requires_internal_key(
 # ---------------------------------------------------------------------------
 
 
+async def _simulate_rebuild_wipe(sources: list[str] | None = None):
+    """Put the tenant into the state a rebuild leaves behind, without the route.
+
+    `POST /api/wiki/bootstrap/trigger` refuses now: it wipes compiled pages and
+    the workers that would re-derive them are no longer deployed. That wipe is
+    exactly the state undo exists to reverse, so these tests reach the shared
+    handler the route used to delegate to rather than the refused door. The
+    subject here has always been undo, never the trigger.
+    """
+    from kb.wiki_routes import BackfillTriggerBody, _do_trigger_wiki_backfill
+
+    return await _do_trigger_wiki_backfill(
+        BackfillTriggerBody(sources=sources or ["github"]), CUSTOMER, False
+    )
+
+
 async def _live_pages() -> set[str]:
     async with raw_conn() as conn:
         rows = await conn.fetch(
@@ -2129,10 +1569,7 @@ async def test_undo_restores_pages_the_rebuild_never_rederived(
     await _compiled_page("wiki:runbook:beta")
     assert await _live_pages() == {"wiki:runbook:alpha", "wiki:runbook:beta"}
 
-    resp = await client.post(
-        "/api/wiki/bootstrap/trigger", json={"sources": ["github"]}, headers=_hdr()
-    )
-    assert resp.status_code == 202, resp.text
+    await _simulate_rebuild_wipe()
     assert await _live_pages() == set(), "the wipe must leave the wiki reading empty"
 
     undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
@@ -2164,10 +1601,7 @@ async def test_undo_never_restores_a_page_whose_kind_was_retired(
     await _compiled_page("wiki:person:maison")
     assert await _live_pages() == {"wiki:runbook:alpha", "wiki:person:maison"}
 
-    resp = await client.post(
-        "/api/wiki/bootstrap/trigger", json={"sources": ["github"]}, headers=_hdr()
-    )
-    assert resp.status_code == 202, resp.text
+    await _simulate_rebuild_wipe()
     assert await _live_pages() == set()
 
     undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
@@ -2187,10 +1621,7 @@ async def test_undo_leaves_pages_the_rebuild_already_rebuilt(
     whichever row the planner happened to return first.
     """
     await _compiled_page("wiki:runbook:alpha")
-    resp = await client.post(
-        "/api/wiki/bootstrap/trigger", json={"sources": ["github"]}, headers=_hdr()
-    )
-    assert resp.status_code == 202, resp.text
+    await _simulate_rebuild_wipe()
 
     # Stand in for the rebuild re-deriving the page: a fresh live version.
     async with with_tenant(CUSTOMER) as conn:
@@ -2230,11 +1661,7 @@ async def test_undo_cancels_the_runs_still_in_flight(
     A crawler that committed a page between the restore and the response would
     leave the operator looking at a wiki they just asked to put back.
     """
-    resp = await client.post(
-        "/api/wiki/bootstrap/trigger", json={"sources": ["github"]}, headers=_hdr()
-    )
-    assert resp.status_code == 202, resp.text
-    opened = resp.json()["run_ids"]
+    opened = (await _simulate_rebuild_wipe()).run_ids
 
     undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
     assert undo.status_code == 200, undo.text
@@ -2280,3 +1707,76 @@ async def test_undo_reports_when_there_was_nothing_to_undo(
     assert body["undone"] is False
     assert body["restored_pages"] == 0
     assert body["cancelled_run_ids"] == []
+
+
+# ---------------------------------------------------------------------------
+# Decommissioned rebuild-class routes
+#
+# This replaced sixteen tests covering the bootstrap/backfill triggers and the
+# per-tenant generation switch: the wipe-then-reseed ordering, the in-flight
+# 409, the force drain, the seed-on-enable. Every one of them described a
+# pipeline that is no longer deployed, so they asserted about work that cannot
+# happen.
+#
+# The property worth keeping is narrower and more important: these routes are
+# the ones that DESTROY. A rebuild retires a tenant's compiled pages and the
+# workers that would re-derive them are gone, so the wipe half runs and the
+# rebuild half never arrives. research-os refuses its own /v1/wiki/rebuild,
+# but the dashboard reaches this API through the prbe-backend BFF without
+# passing through research-os at all -- so this refusal, not that one, is what
+# closes the hole.
+# ---------------------------------------------------------------------------
+
+
+_DECOMMISSIONED_ROUTES = [
+    ("POST", "/api/wiki/backfill/trigger", {"sources": ["github"]}),
+    ("POST", "/api/wiki/bootstrap/trigger", {"sources": ["github"]}),
+    ("POST", "/api/wiki/synthesize/trigger", {}),
+    ("PUT", "/api/wiki/settings", {"generation_enabled": True}),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "method,path,body",
+    _DECOMMISSIONED_ROUTES,
+    ids=[f"{m} {p}" for m, p, _ in _DECOMMISSIONED_ROUTES],
+)
+async def test_a_rebuild_class_route_refuses_and_destroys_nothing(
+    client: httpx.AsyncClient, method: str, path: str, body: dict
+) -> None:
+    """410, and the pages that were live before are still live after.
+
+    The second assertion is the one with teeth. A refusal that happened to run
+    after the wipe would pass a status-code check and still leave the tenant
+    with an empty wiki and no worker to fill it -- which is precisely the
+    failure this cutover exists to prevent.
+    """
+    await _compiled_page("wiki:runbook:survivor")
+    before = await _live_pages()
+    assert before == {"wiki:runbook:survivor"}
+
+    resp = await client.request(method, path, json=body, headers=_hdr())
+
+    assert resp.status_code == 410, resp.text
+    assert "decommissioned" in resp.json()["detail"]
+    assert await _live_pages() == before, f"{method} {path} refused but pages went missing anyway"
+
+
+@pytest.mark.asyncio
+async def test_the_recovery_path_is_deliberately_still_open(
+    client: httpx.AsyncClient, _stub_bootstrap_registry: None
+) -> None:
+    """Undo keeps working while the routes around it refuse.
+
+    Pinned because "refuse every wiki mutation" is the obvious next edit, and
+    it would close the door on exactly the tenants a rebuild already stranded.
+    """
+    await _compiled_page("wiki:runbook:alpha")
+    await _simulate_rebuild_wipe()
+    assert await _live_pages() == set()
+
+    undo = await client.post("/api/wiki/backfill/undo", headers=_hdr())
+
+    assert undo.status_code == 200, undo.text
+    assert await _live_pages() == {"wiki:runbook:alpha"}
