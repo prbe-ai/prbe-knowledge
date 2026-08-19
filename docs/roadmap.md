@@ -167,23 +167,13 @@ Copy of the design doc's criteria. Phase 0 shippable when all hold:
 
 ---
 
-## Phase 0.5 — Selective Wiki Compilation
+## Phase 0.5 — Selective Wiki Compilation — CUT (2026-08)
 
-Build on Phase 0 schema with a separate `prbe-knowledge-compile` Fly app. One wiki type only: `wiki.service_card`.
-
-Karpathy-style LLM wiki pattern applied to **stable entities only** (services, repos, features) — not to high-volume streaming content (Slack messages, Sentry events) where the compilation cost doesn't pay back.
-
-### Scope
-
-- [ ] Daily compile worker (cron at 00:00 UTC, also manual-admin trigger)
-- [ ] Stage 1 — collect candidates from `ingestion_events` → group by wiki page doc_id
-- [ ] Stage 2 — Haiku triage (parallel, ~$0.0001/page) → filter to pages needing update
-- [ ] Stage 3+4 — Sonnet full regeneration (sequential per customer with Postgres advisory lock), full-regen not incremental (avoids drift)
-- [ ] ACL propagation: compiled page = intersection of source ACLs
-- [ ] `COMPILED_FROM` edges in graph
-- [ ] `compile_trigger` field populated (scheduled | manual | normalizer_reprocess | source_update)
-- [ ] Cost ceiling: < $100/month per customer (Sonnet + Haiku combined), alert on breach
-- [ ] Freshness SLO: <24h lag between source update and wiki update
+Shipped, then removed. Compiled knowledge pages were generated nightly by an
+agent loop over triaged ingestion events. Generation was turned off fleet-wide
+on 2026-08-18 and the code deleted; the retrieval stack answers from source
+documents directly. Do not revive without re-deciding the cost/freshness
+question that killed it.
 
 ### Source expansion (parallel workstream)
 
@@ -227,7 +217,7 @@ The defensible product. Glean/Resolve commoditize retrieval. "This fix doesn't c
 - [ ] Conflict detection: diff intersects with any `status=open` PR touching same paths
 - [ ] Regression detection: diff touches code paths with recent `FIXES` edges (the bug you're about to re-introduce)
 - [ ] Roadmap-break detection: diff touches planned feature areas flagged in Notion
-- [ ] Convention violation: diff violates team style/architecture notes in wiki
+- [ ] Convention violation: diff violates team style/architecture notes in Notion
 - [ ] Structured verdict output: `{merge_safe: bool, reasons: [{category, evidence_doc_ids, explanation}]}`
 - [ ] GitHub PR check integration — verdict as PR status check
 - [ ] **Pylon** handler — customer-support context for user-facing regressions

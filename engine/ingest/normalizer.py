@@ -48,10 +48,8 @@ from engine.shared.constants import (
     EMBEDDING_V2_DIM,
     EMBEDDING_V2_MODEL,
     NORMALIZER_VERSION,
-    WIKI_ENQUEUE_EXCLUDED_SOURCES,
     SourceSystem,
 )
-from engine.shared.customer_prefs import is_wiki_generation_enabled
 from engine.shared.db import get_pool, with_tenant
 from engine.shared.embeddings import (
     DocItem,
@@ -567,50 +565,6 @@ class Normalizer:
                 conn, customer_id, graph_edges, node_ids, source_system.value
             )
 
-        # ---- Wiki-synthesis enqueue (no NOTIFY) -------------------------
-        # After Phase B's commit, append one row per persisted doc into
-        # wiki_synthesis_queue. Queue rows accumulate at status='pending'
-        # silently during the day — synthesis is nightly-only, driven by
-        # the wiki-cron fly app firing pg_notify('wiki_synthesize_pending')
-        # at 02:00 UTC, plus a manual trigger endpoint for the dashboard.
-        #
-        # Pre-redesign this path also fired pg_notify for each persisted
-        # doc, causing continuous daytime synthesis. Removed so the wiki
-        # behaves like the slow-moving knowledge base it's supposed to be.
-        #
-        # Skip the sources that never feed synthesis (see the
-        # WIKI_ENQUEUE_EXCLUDED_SOURCES rationale: WIKI would feed the
-        # cron's own writes back into its queue; CODE_GRAPH docs are
-        # deterministic AST extractions synthesis can't use). Also skip
-        # when the tenant has not opted into wiki generation.
-        if (
-            source_system not in WIKI_ENQUEUE_EXCLUDED_SOURCES
-            and doc_ids
-            and await is_wiki_generation_enabled(customer_id)
-        ):
-            try:
-                # Use the in-memory documents that were just persisted —
-                # they carry the source-side metadata extract_source_ts
-                # needs (Slack ts, GitHub created_at, etc.). The DB only
-                # stores body_preview/title/etc., not the raw source-side
-                # event timestamp surface.
-                persisted_docs = [
-                    doc for doc in result.documents if doc.doc_id in set(doc_ids)
-                ]
-                await self._enqueue_wiki_synthesis(customer_id, persisted_docs)
-            except Exception as exc:
-                # Boundary swallow: ingestion already committed, queue
-                # enqueue is best-effort. The nightly trigger's
-                # reconcile step (reconcile_missing_queue_rows) seeds
-                # any doc this drop leaves un-queued.
-                log.warning(
-                    "wiki.synthesis.enqueue_failed",
-                    customer=customer_id,
-                    doc_count=len(doc_ids),
-                    error=str(exc),
-                    error_class=type(exc).__name__,
-                )
-
         # ---- Inferred-edges enqueue (best-effort) ---------------------------
         # After Phase B commits, append one row per persisted doc into
         # inferred_edges_queue. The side-queue worker drains this table
@@ -618,8 +572,7 @@ class Normalizer:
         # INFERRED/AMBIGUOUS edges. Insert failure MUST NOT block main
         # ingestion -- wrap in try/except, log on failure, continue.
         #
-        # Skip wiki source (no cross-source inference on compiled pages) and
-        # skip if no docs were persisted this cycle. Agent-session transcripts
+        # Skip if no docs were persisted this cycle. Agent-session transcripts
         # are gated to their finalization pass (see _inferred_edge_doc_ids).
         if result.consume_payload_keys and queue_id is not None:
             await self._consume_payload_keys(queue_id, result.consume_payload_keys)
@@ -636,7 +589,7 @@ class Normalizer:
                 | {pre.document.doc_id for pre in result.documents_with_chunks},
             )
 
-        if source_system != SourceSystem.WIKI and doc_ids:
+        if doc_ids:
             edge_doc_ids = _inferred_edge_doc_ids(
                 source_system, doc_ids, result.documents
             )
@@ -694,7 +647,7 @@ class Normalizer:
         Every item keeps its OWN document set, per-doc savepoint isolation
         (a NON-TRANSIENT poison doc in one item is quarantined via savepoint and
         does not roll back another -- group-split-on-failure), ordering check,
-        per-item outcome, and post-commit wiki / inferred-edge enqueues. Writes
+        per-item outcome, and post-commit inferred-edge enqueues. Writes
         are idempotent (upsert by doc_id + content_hash), so if a caller's
         per-row commit bookkeeping later re-claims an item, re-processing is a
         no-op -- same safety as the single-row path.
@@ -864,23 +817,7 @@ class Normalizer:
         outcomes: list[NormalizeOutcome] = []
         for item_idx, (result, _queue_id) in enumerate(items):
             doc_ids = per_item_doc_ids[item_idx]
-            if (
-                source_system not in WIKI_ENQUEUE_EXCLUDED_SOURCES
-                and doc_ids
-                and await is_wiki_generation_enabled(customer_id)
-            ):
-                try:
-                    persisted_docs = [
-                        doc for doc in result.documents if doc.doc_id in set(doc_ids)
-                    ]
-                    await self._enqueue_wiki_synthesis(customer_id, persisted_docs)
-                except Exception as exc:
-                    log.warning(
-                        "wiki.synthesis.enqueue_failed",
-                        customer=customer_id, doc_count=len(doc_ids),
-                        error=str(exc), error_class=type(exc).__name__,
-                    )
-            if source_system != SourceSystem.WIKI and doc_ids:
+            if doc_ids:
                 edge_doc_ids = _inferred_edge_doc_ids(
                     source_system, doc_ids, result.documents
                 )
@@ -937,65 +874,6 @@ class Normalizer:
         """
         result = NormalizationResult(documents=[doc])
         return await self._persist(customer_id, doc.source_system, result)
-
-    async def _enqueue_wiki_synthesis(
-        self,
-        customer_id: str,
-        docs: list[Document],
-    ) -> None:
-        """Append a wiki_synthesis_queue row per persisted doc.
-
-        Idempotent on `(customer_id, doc_id, doc_version)` — a redelivered
-        webhook that re-persists the same content (same version) won't
-        double-enqueue. The doc_version comes from the DB rather than the
-        in-memory Document because `_upsert_document` mutates `doc.version`
-        in place; we re-read to be defensive against future callers that
-        skip that mutation.
-
-        Populates `source_ts` from per-source metadata via
-        `extract_source_ts(doc)` so the wiki agent can read the day in
-        time order. Falls back to documents.created_at when the connector
-        didn't surface a parseable source-side timestamp.
-
-        Does NOT fire pg_notify — synthesis is nightly-batch via the
-        wiki-cron fly app, not realtime. See the comment block in
-        `_persist` for the why.
-        """
-        from engine.ingest.source_ts import extract_source_ts
-
-        if not docs:
-            return
-        doc_ids = [doc.doc_id for doc in docs]
-        # Map doc_id -> source_ts for the parameterized join below.
-        source_ts_by_doc_id: dict[str, datetime] = {
-            doc.doc_id: extract_source_ts(doc) for doc in docs
-        }
-        # asyncpg doesn't accept Python dicts as parameters; pass two
-        # parallel arrays and join by index.
-        ts_doc_ids = list(source_ts_by_doc_id.keys())
-        ts_values = [source_ts_by_doc_id[d] for d in ts_doc_ids]
-        async with with_tenant(customer_id) as conn:
-            await conn.execute(
-                """
-                INSERT INTO wiki_synthesis_queue
-                    (customer_id, doc_id, doc_version, source_system,
-                     doc_type, status, enqueued_at, source_ts)
-                SELECT d.customer_id, d.doc_id, d.version, d.source_system,
-                       d.doc_type, 'pending', NOW(), ts.source_ts
-                FROM documents d
-                JOIN unnest($2::text[], $3::timestamptz[])
-                     AS ts(doc_id, source_ts)
-                  ON ts.doc_id = d.doc_id
-                WHERE d.customer_id = $1
-                  AND d.doc_id = ANY($2::text[])
-                  AND d.valid_to IS NULL
-                ON CONFLICT (customer_id, doc_id, doc_version) DO NOTHING
-                """,
-                customer_id,
-                ts_doc_ids,
-                ts_values,
-            )
-        _ = doc_ids  # retained for potential future logging
 
     async def _enqueue_inferred_edges(
         self,
@@ -2089,7 +1967,7 @@ def _stringify_body(doc: Document) -> str:
     duplicated ~440 MB of storage. That key is no longer written by any
     handler. The fallback to metadata["body"] below remains only for stray
     test fixtures or mid-deploy queue rows that predate the migration; it
-    can be removed after the wiki/runbook/storage-cleanup migration drains.
+    can be removed after the storage-cleanup migration drains.
     """
     if doc.body is not None and doc.body != "":
         return doc.body
@@ -2137,46 +2015,6 @@ async def fetch_live_body_from_chunks(
         """,
         customer_id,
         doc_id,
-    )
-    return reconstruct_chunk_text(
-        (row["content"] for row in rows),
-        non_overlap_separator="",
-    )
-
-
-async def fetch_body_from_chunks_for_version(
-    conn: asyncpg.Connection,
-    customer_id: str,
-    doc_id: str,
-    version: int,
-) -> str:
-    """Reconstruct a specific document version's body from chunks.
-
-    Chunks span versions via [first_seen_version, last_seen_version]; a row
-    is part of version V if first_seen_version <= V <= last_seen_version.
-    Used by wiki history/revert flows where any prior version may need to
-    be read back.
-
-    Adjacent chunks share an overlap region (chunker writes 512-token windows
-    with 64-token overlap); folds chunks with ``_skip_chunk_overlap_tokens``
-    to remove the chunker's 64-token overlap region between adjacent chunks;
-    reassembled body matches the original pre-chunking source (modulo
-    tiktoken round-trip).
-    """
-    rows = await conn.fetch(
-        """
-        SELECT content
-        FROM chunks
-        WHERE customer_id = $1
-          AND doc_id = $2
-          AND kind = 'content'
-          AND first_seen_version <= $3
-          AND last_seen_version >= $3
-        ORDER BY chunk_index
-        """,
-        customer_id,
-        doc_id,
-        version,
     )
     return reconstruct_chunk_text(
         (row["content"] for row in rows),

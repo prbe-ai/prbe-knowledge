@@ -9,7 +9,7 @@ Bug guarded against
 Under the shared-managed cluster, prbe-knowledge will connect as the
 non-privileged ``probe_app`` role instead of the ``probe`` superuser
 that bypasses RLS today. RLS policies on graph_nodes / graph_edges /
-directed_vectors / usage_events / query_traces / code_repo_state /
+usage_events / query_traces / code_repo_state /
 inferred_edges_queue ENFORCE under probe_app — but only if the
 ``app.current_customer_id`` GUC is set via ``with_tenant(customer_id)``.
 
@@ -223,8 +223,10 @@ async def test_inferred_edges_queue_no_longer_force_rls(two_tenants) -> None:
     The side-worker drains this queue cross-tenant (one shared FOR UPDATE
     SKIP LOCKED claim across all customers), which is impossible under
     FORCE RLS without setting the GUC pre-claim. 0068 disables RLS on
-    this queue table specifically, matching the wiki_synthesis_queue
-    pattern (migration 0034).
+    this queue table specifically, following the precedent set by the
+    wiki synthesis queue in migration 0034 -- that queue and its table
+    are gone, but the reason it established stands: a cross-tenant
+    claim loop cannot run under a per-tenant predicate.
 
     This regression test pins that fact so a well-meaning future
     migration doesn't re-enable RLS on this queue table and break the

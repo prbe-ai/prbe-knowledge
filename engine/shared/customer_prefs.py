@@ -1,84 +1,26 @@
 """Per-tenant feature toggles read from `customers.preferences` (JSONB).
 
-The column is added by alembic 0023; this module is the read-side. Each
-key is a single boolean. Missing keys, missing customer rows, malformed
-JSON, and any DB error all resolve to **False** — the policy is
-fail-closed / opt-in. The dashboard PATCHes the column; this module
-never writes.
-
-Mirrors the per-(agent_kind, source) opt-in posture in
-prbe-orchestrator's `is_enrichment_enabled`: a tenant who has not
-explicitly opted in does not get the feature, even if the upstream
-deploy temporarily can't read the row.
+The column is added by alembic 0023; this module is the read-side.
+Missing keys, missing customer rows, malformed JSON, and any DB error
+all resolve to the reader's declared fallback — the policy is fail-soft
+toward the safe default, never toward an error. The dashboard PATCHes
+the column; this module never writes.
 """
 
 from __future__ import annotations
 
 import json
-import re
 
 from engine.shared.db import raw_conn
 from engine.shared.logging import get_logger
 
 log = get_logger(__name__)
 
-WIKI_GENERATION_ENABLED_KEY = "wiki_generation_enabled"
-
-
-def wiki_enabled_sql(prefs_col: str = "preferences") -> str:
-    """SQL predicate matching `is_wiki_generation_enabled` exactly.
-
-    Every SQL enumeration of "enabled tenants" (queue drain guards, the
-    nightly reconcile, the catchup CLI) must interpolate THIS fragment
-    rather than re-typing the JSONB comparison, so the SQL side can
-    never drift from the Python side. Text comparison against 'true'
-    keeps absent keys, nulls, and malformed values reading as OFF —
-    the same fail-closed posture as `_coerce_bool`, which accepts the
-    same two ON shapes this comparison does (jsonb boolean true and
-    jsonb string "true" both render as text 'true' under `->>`).
-    tests/test_customer_prefs_parity.py pins the two sides together.
-
-    `prefs_col` is a trusted identifier supplied by the caller (e.g.
-    "c.preferences"), never user input — and the assertion makes sure
-    a future caller cannot quietly change that.
-    """
-    if not re.fullmatch(r"[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?", prefs_col):
-        raise ValueError(f"prefs_col must be a plain identifier, got {prefs_col!r}")
-    return f"{prefs_col}->>'{WIKI_GENERATION_ENABLED_KEY}' = 'true'"
-
-
 # JSONB sub-key for per-repo code-graph branch overrides. Shape:
 #     {"acme/api": "develop", "acme/worker": "release"}
 # Missing repo → fall back to the push payload's `repository.default_branch`.
 # Future: dashboard UI writes this; for now operators PATCH it via SQL.
 CODE_GRAPH_BRANCH_OVERRIDES_KEY = "code_graph_branch_overrides"
-
-
-async def is_wiki_generation_enabled(customer_id: str) -> bool:
-    """Return True iff the tenant has explicitly opted into wiki synthesis.
-
-    Fail-closed on every error path: missing customer, missing key,
-    JSON decode failure, unexpected value type, DB error. The wiki
-    cron and the queue writer both call this; a False return must
-    short-circuit before any LLM-driven work.
-    """
-    if not customer_id:
-        return False
-    try:
-        async with raw_conn() as conn:
-            raw = await conn.fetchval(
-                "SELECT preferences FROM customers WHERE customer_id = $1",
-                customer_id,
-            )
-    except Exception as exc:
-        log.warning(
-            "customer_prefs.read_failed",
-            customer=customer_id,
-            error=str(exc),
-            error_class=type(exc).__name__,
-        )
-        return False
-    return _coerce_bool(raw, WIKI_GENERATION_ENABLED_KEY)
 
 
 async def code_graph_indexed_branch(
@@ -138,30 +80,3 @@ def _coerce_branch_override(raw: object, repo: str, fallback: str) -> str:
         return fallback
     branch = overrides.get(repo)
     return branch if isinstance(branch, str) and branch else fallback
-
-
-def _coerce_bool(raw: object, key: str) -> bool:
-    """Pull `key` out of a JSONB blob; return False unless the value is
-    ON. asyncpg may return JSONB as dict or str depending on driver
-    setup — handle both.
-
-    ON means jsonb boolean true OR jsonb string "true" — the SAME two
-    shapes `wiki_enabled_sql`'s `->> = 'true'` comparison matches. The
-    engine's own PUT /settings writes the STRING shape (to_jsonb of a
-    text parameter), while dashboard PATCHes and hand-written SQL write
-    the boolean, so both exist in the wild. Before this accepted the
-    string, a tenant enabled through the engine PUT was ON for every
-    SQL consumer (drains, nightly, catchup) and OFF for this gate — the
-    Normalizer silently stopped enqueueing their new documents.
-    """
-    if raw is None:
-        return False
-    if isinstance(raw, (str, bytes, bytearray)):
-        try:
-            raw = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
-            return False
-    if not isinstance(raw, dict):
-        return False
-    value = raw.get(key)
-    return value is True or value == "true"

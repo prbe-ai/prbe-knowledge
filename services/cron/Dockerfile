@@ -17,10 +17,9 @@ RUN apt-get update \
 WORKDIR /app
 
 # Generic cron image — must include every module any scheduled command
-# might import. Today: services.synthesis (wiki nightly trigger) and
-# services.community + scripts.leiden_one_shot (leiden cron). Future
-# cron commands land here too. Trade a slightly bigger image for one
-# fly app instead of N.
+# might import. Today: services.community + scripts.leiden_one_shot
+# (leiden cron). Future cron commands land here too. Trade a slightly
+# bigger image for one fly app instead of N.
 COPY pyproject.toml ./
 COPY engine/ ./engine/
 COPY kb/ ./kb/
@@ -31,7 +30,7 @@ COPY alembic.ini ./
 
 RUN pip install -e "."
 
-# Default command: wiki nightly trigger. Each scheduled job in
+# Default command: leiden community detection. Each scheduled job in
 # .github/workflows/knowledge-cron.yml overrides this via
 # `flyctl machine run --command "..."`.
-CMD ["python", "-m", "services.synthesis.nightly_trigger"]
+CMD ["python", "-m", "scripts.leiden_one_shot", "--all-customers", "--yes"]

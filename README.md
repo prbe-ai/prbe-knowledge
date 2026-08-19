@@ -71,10 +71,6 @@ community mode everything is scoped to `DEFAULT_CUSTOMER_ID` (defaults to
                     │   │  /query     │  → RRF fusion → synthesis   │
                     │   │  /retrieve  │                             │
                     │   └─────────────┘                             │
-                    │   ┌─────────────┐                             │
-                    │   │ synthesis   │  nightly: cluster activity   │
-                    │   │ (cron)      │  into knowledge pages        │
-                    │   └─────────────┘                             │
                     └──────────────────────────────────────────────┘
 ```
 
@@ -87,8 +83,6 @@ community mode everything is scoped to `DEFAULT_CUSTOMER_ID` (defaults to
 - **Retrieval** (`:8081`) serves `POST /retrieve` (raw chunks: vector + BM25 +
   graph fused via RRF) and `POST /query` (retrieval + LLM-synthesized cited
   answer). `GET /health` for liveness.
-- **Synthesis** (optional `cron` profile) periodically clusters recent activity
-  into knowledge pages.
 
 Full design: [docs/phase0-design.md](docs/phase0-design.md) ·
 storage/data flow: [docs/storage-architecture.md](docs/storage-architecture.md) ·
@@ -162,8 +156,7 @@ prbe-knowledge/
 │   ├── handlers/       one connector per source (Slack, GitHub, ...)
 │   ├── polling/        outbound pollers (self-host mode)
 │   ├── ingestion_app.py  webhook + ingest HTTP app (:8080)
-│   ├── worker.py       composed worker process (drain + backfills + pollers)
-│   └── synthesis/      knowledge-page (wiki) generation
+│   └── worker.py       composed worker process (drain + backfills + pollers)
 ├── services/           thin deploy wrappers — compose/Helm entrypoints
 │                       (services.ingestion.main:app etc.) stay stable
 ├── db/

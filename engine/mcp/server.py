@@ -253,14 +253,14 @@ async def search_knowledge(
             between two hub nodes, so widening the budget surfaces
             entity-anchored canonical docs (the actual PR, ticket,
             design rationale, runbook) rather than the hub-to-hub
-            wiki/index docs that connect to everything. Vector and BM25
+            index docs that connect to everything. Vector and BM25
             are unaffected.
 
             Default to True for most queries against this corpus.
             Empirically (post-anti-bonus, 6 paired acme
             queries): 5/6 cases see canonical PRs/commits/Notion docs
             move into top-3 that focus mode buried at rank 6+ behind
-            transcripts or wiki anchors. The 1 neutral case was already
+            transcripts or hub anchors. The 1 neutral case was already
             surfacing the right canonical doc at top-1, so discovery
             had nothing to fix.
 
@@ -423,12 +423,12 @@ async def query_knowledge(
             surprise-ranked tail reaches the LLM — surfacing
             entity-anchored canonical docs (the actual PR, commit,
             design doc, ticket, runbook) rather than the hub-to-hub
-            wiki/index docs that connect to everything. Vector and BM25
+            index docs that connect to everything. Vector and BM25
             budgets are unchanged. Default to True
             for most questions against this corpus. Use for conceptual
             questions ("how should we approach X", "what's blocking
             Y") and any case where focus mode is returning transcript-
-            or wiki-shaped evidence when you expected the canonical
+            or hub-shaped evidence when you expected the canonical
             artifact. Skip when the canonical answer is already at
             top-1 in focus mode and you're token-sensitive. Same
             toggle and caveats as `search_knowledge`'s discovery flag.

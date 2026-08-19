@@ -49,7 +49,6 @@ The Compose stack starts:
 | `ingestion`    | webhook + custom-ingest API on `:8080`                            |
 | `retrieval`    | `/retrieve` + `/query` on `:8081`                                 |
 | `worker`       | drains the ingestion queue (normalize · chunk · embed)            |
-| `cron`         | optional, behind the `cron` profile: nightly knowledge-page synth |
 
 The `migrate` job runs `scripts/migrate.py`, which:
 
@@ -59,10 +58,6 @@ The `migrate` job runs `scripts/migrate.py`, which:
 3. On an **existing** database, runs `alembic upgrade head` (incremental).
 
 Re-run it any time with `make migrate` (idempotent).
-
-The nightly synthesis trigger is **not** part of the default `up`. Fire it once
-with `docker compose --profile cron up cron`, or schedule it externally (cron /
-Kubernetes CronJob) against `python -m services.synthesis.nightly_trigger`.
 
 ## Path 2: Helm (production)
 

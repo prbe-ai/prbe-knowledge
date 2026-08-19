@@ -64,8 +64,8 @@ async def vector_search(
 
     `include_drafts` defaults to False so retrieval returns only rows with
     ``visibility = 'approved'`` (the partial indexes from migration 0082
-    keep this cheap). Reviewer-scoped BFF surfaces flip this to True after
-    role-checking ``wiki_reviewer``; API-key callers never bypass.
+    keep this cheap). Reviewer-scoped BFF surfaces flip this to True;
+    API-key callers never bypass.
 
     `author_ids`, when set, hard-filters by `documents.author_id = ANY(...)`.
     Mirrors `sql_list`'s author filter (services/retrieval/retrievers/sql.py:246).

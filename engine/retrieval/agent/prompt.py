@@ -169,7 +169,7 @@ only when clearly off-topic; every drop needs a one-line `reason` in
 Good drops:
   - "anchor entity (PRB-17) appears but query is about PR #71 fix"
   - "vector matched on conversational shape, not the specific entity"
-  - "wiki landing page surfaced; query is specific to one subsystem"
+  - "repo landing page surfaced; query is specific to one subsystem"
 Bad drops: "low score", "duplicate" — the consumer filters and dedupes.
 
 RECALL IS THE PRIORITY. When a turn or chunk PLAUSIBLY bears on the
