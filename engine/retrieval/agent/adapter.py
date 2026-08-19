@@ -160,7 +160,7 @@ def _build_doc_to_graph_evidence(
 # Per-anchor cap on injected neighbors. Surfacing graph_evidence for
 # INFERRED edges where the result-set doc is one endpoint regardless of
 # whether the OTHER endpoint is curated; cap so a high-degree doc
-# (claude_code session with 126 neighbors, wiki:repo:prbe_knowledge with
+# (claude_code session with 126 neighbors, a hub repo doc with
 # 83 neighbors) doesn't dump 100+ edges into the response and bloat
 # graph_evidence beyond what the chain panel can render. Top 8 keeps
 # the densest chains readable while letting low-degree docs surface

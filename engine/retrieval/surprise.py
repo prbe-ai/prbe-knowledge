@@ -27,16 +27,16 @@ Hub-to-hub anti-bonus
 ---------------------
 Mirror of Component 4 on the penalty side. When BOTH endpoints have
 degree >= 3, the edge connects two hubs -- a structural connector,
-not an informative bridge. Common case: a wiki:index page (degree
-100+) connecting to a busy repo (degree 50+); the edge exists because
-both ends are popular, not because the link carries signal.
+not an informative bridge. Common case: an index-like summary page
+(degree 100+) connecting to a busy repo (degree 50+); the edge exists
+because both ends are popular, not because the link carries signal.
 
 Empirical motivation: with discovery=true on a query like
 "prbe-knowledge-mcp lane A scoped JWT", graph hits anchored on the
-prbe-knowledge-mcp Repo entity surfaced wiki summary pages above the
-canonical lane-A commit. Both wiki page and commit are graph-anchored
-to the repo, but the wiki page's edge is hub-to-hub while the
-commit's edge is peripheral-to-hub.
+prbe-knowledge-mcp Repo entity surfaced broad summary pages above the
+canonical lane-A commit. Both summary page and commit are
+graph-anchored to the repo, but the summary page's edge is hub-to-hub
+while the commit's edge is peripheral-to-hub.
 
 Penalty grows logarithmically with min(degrees) so a degree-100 hub
 edge is penalised more than a degree-5 mild-hub edge. Floored at 0.5
@@ -176,8 +176,8 @@ def surprise_score(
     # --- Component 5: hub-to-hub anti-bonus ---
     # Mirror of Component 4 on the penalty side. When BOTH endpoints have
     # degree >= 3, the edge is a structural connector between two hubs
-    # rather than an informative bridge. Common case: wiki:index pages
-    # (degree 100+) connecting to busy repos (degree 50+) -- the edge
+    # rather than an informative bridge. Common case: index-like summary
+    # pages (degree 100+) connecting to busy repos (degree 50+) -- the edge
     # exists because both ends are popular, not because the link carries
     # signal. Penalty scales with log2(min_deg) so a degree-100 hub edge
     # is demoted more than a degree-5 mild-hub edge.

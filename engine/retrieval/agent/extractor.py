@@ -149,7 +149,6 @@ shape genuinely calls for it.
                                           → ["sentry.issue", "sentry.event"]
     * "meetings" / "granola"             → ["granola.meeting"]
     * "claude code sessions"             → ["claude_code.session"]
-    * "wiki pages"                       → null (use sources, not doc_types)
 
   HARD RULE — when you set `doc_types`, the query is asking about the
   CLASS, so DO NOT also emit a specific instance of that class in

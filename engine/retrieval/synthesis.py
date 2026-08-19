@@ -160,7 +160,7 @@ rather than refusing for lack of a date."""
 _SOURCE_PREFERENCE_RULE = """Source-preference rule:
 - The chunk header `source:` field tells you which kind it is.
   AUTHORITATIVE sources (the team's source of truth): linear, notion,
-  slack, github, wiki, sentry, pagerduty, granola — facts here are
+  slack, github, sentry, pagerduty, granola — facts here are
   what you cite. AGENT SESSION transcripts (often contain meta-
   commentary, hypotheses, debugging notes, and references to the
   canonical docs): claude_code, codex. Judge each chunk by its

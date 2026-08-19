@@ -319,7 +319,7 @@ async def _lookup_bare_id_matches(
 
 # source_system → grounding entity_type for doc-title matches. The downstream
 # extractor / fanout already understands ticket / pr / channel / commit_sha
-# from the ENTITY_TYPE_REGISTRY surface; notion/wiki/other get a
+# from the ENTITY_TYPE_REGISTRY surface; notion/other get a
 # generic `page` / `document` so the field carries provenance without
 # requiring downstream code changes. `entity_type` is informational on
 # GroundingCandidate (the strong signal is canonical_id) — this map only
@@ -329,7 +329,6 @@ _SOURCE_SYSTEM_TO_ENTITY_TYPE: Final[dict[str, str]] = {
     "slack": "channel",
     "github": "document",  # disambiguated below via doc_id prefix
     "notion": "page",
-    "wiki": "document",
     "claude_code": "session",
     "codex": "session",
     "granola": "document",
@@ -361,7 +360,7 @@ def _doc_id_to_entity_type(doc_id: str, source_system: str) -> str:
 
 
 # Title fuzzy-match caps. Concept queries often touch 1-3 canonical docs
-# (a Linear ticket + a Notion design + a wiki page); 10 is a generous upper
+# (a Linear ticket + a Notion design + a GitHub PR); 10 is a generous upper
 # bound that covers multi-aspect queries without flooding the prompt.
 _DOC_TITLE_TOTAL_CAP: Final[int] = 10
 
@@ -419,12 +418,9 @@ async def _fuzzy_match_document_titles(
     explicit `customer_id = $1` filter — defense in depth, matches the
     pattern of every other channel in this file.
 
-    `valid_to IS NULL` filters out soft-deleted versions. Wiki source
-    is included (unlike inferred-edges enqueue, which skips it):
-    wiki-synthesized pages like 'Probe Bench Test' or
-    `wiki:event:shared_managed_pivot` ARE the canonical concept docs
-    for many architectural queries, and excluding them would re-create
-    the same gap this channel exists to close.
+    `valid_to IS NULL` filters out soft-deleted versions. No source
+    system is excluded — this channel exists to close the gap where a
+    concept query's canonical doc is missed by the entity channels.
     """
     if not tokens:
         return []
