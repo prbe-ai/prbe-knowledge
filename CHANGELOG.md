@@ -6,6 +6,27 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Changed
+
+- **The rebuild button can no longer empty a wiki that nothing can
+  rebuild.** `POST /api/wiki/backfill/trigger`, its `/bootstrap/trigger`
+  alias, `POST /api/wiki/synthesize/trigger` and `PUT /api/wiki/settings`
+  answer 410. Wiki generation was switched off across the fleet on
+  2026-08-18, which removed the triage, synthesis and backfill workers —
+  but a rebuild retires every compiled page *before* re-crawling, so the
+  wipe still ran and the rebuild never arrived. research-os refuses its own
+  `POST /v1/wiki/rebuild`, and the dashboard reaches this API through the
+  prbe-backend BFF without passing through research-os, so this refusal is
+  the one that closes that door.
+- **The nightly wiki trigger is gone** from `knowledge-cron.yml`. It was
+  the 02:00 UTC `pg_notify` that woke the worker app; with it and the
+  manual synthesize trigger both closed, nothing can wake synthesis.
+- Still working, deliberately: every read, page writes (unreachable from
+  outside now that research-os refuses them), the DLQ reset (an operator
+  lever that only moves rows between statuses), and
+  `POST /api/wiki/backfill/undo` — the recovery path, and the only way home
+  for a tenant a rebuild already stranded.
+
 ### Added
 
 - **The wiki now covers documents that arrived before a tenant turned it
