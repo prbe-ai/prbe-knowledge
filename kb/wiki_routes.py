@@ -102,6 +102,7 @@ from kb.synthesis import persistence
 from kb.synthesis.crawlers import REGISTRY as BACKFILL_CRAWLER_REGISTRY
 from kb.synthesis.models import WikiType
 from kb.synthesis.staged_graph import PAGE_CAP_BYTES
+from kb.wiki_decommission import decommissioned_wiki_write
 from kb.wiki_links import parse_page_links
 
 log = get_logger(__name__)
@@ -1634,6 +1635,7 @@ async def get_wiki_generation_settings(
     response_model=WikiGenerationSettingsResponse,
     dependencies=[Depends(verify_internal_knowledge_key)],
 )
+@decommissioned_wiki_write
 async def set_wiki_generation_settings(
     body: WikiGenerationSettingsBody,
     background_tasks: BackgroundTasks,
@@ -1907,6 +1909,7 @@ class DlqResetResponse(BaseModel):
     response_model=SynthesisTriggerResponse,
     dependencies=[Depends(verify_internal_knowledge_key)],
 )
+@decommissioned_wiki_write
 async def trigger_wiki_synthesis(
     body: SynthesisTriggerBody,
     customer_id: str = Depends(_require_customer),
@@ -2825,6 +2828,7 @@ async def preview_wiki_backfill(
     status_code=202,
     dependencies=[Depends(verify_internal_knowledge_key)],
 )
+@decommissioned_wiki_write
 async def trigger_wiki_backfill(
     body: BackfillTriggerBody,
     customer_id: str = Depends(_require_customer),
@@ -2840,6 +2844,7 @@ async def trigger_wiki_backfill(
     status_code=202,
     dependencies=[Depends(verify_internal_knowledge_key)],
 )
+@decommissioned_wiki_write
 async def trigger_wiki_bootstrap(
     body: BackfillTriggerBody,
     customer_id: str = Depends(_require_customer),

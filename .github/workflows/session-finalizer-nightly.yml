@@ -32,8 +32,10 @@ name: session-finalizer-nightly
 
 on:
   schedule:
-    # 04:00 UTC — after wiki (02:00) and leiden (03:00) so the three nightlies
-    # never contend for the same DB.
+    # 04:00 UTC — after leiden (03:00) so the nightlies never contend for the
+    # same DB. The 02:00 wiki trigger that used to lead this sequence was
+    # removed with the wiki; the slot is deliberately left empty rather than
+    # pulling everything an hour earlier, since nothing here is short of time.
     - cron: "0 4 * * *"
   workflow_dispatch:
     inputs:
