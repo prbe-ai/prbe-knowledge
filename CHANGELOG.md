@@ -8,6 +8,28 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Changed
 
+- **The /knowledge stats header no longer takes seconds to answer.**
+  `GET /api/stats/ingestion` ran four uncached aggregates, and neither of the
+  two that matter had an index behind it. Measured on the research plane for a
+  19.5k-document tenant: the document count took 5,187 ms cold and bitmap-scanned
+  10,494 heap pages to answer for 19,573 rows; the chunk count took 2,936 ms and
+  touched 148,808 buffers, 77% of them a Memoize'd nested loop into `documents`
+  resolving `source_system` one chunk at a time. Migration 0111 adds a partial
+  covering index to each side, so both aggregates are now Index Only Scans and
+  the same tenant costs 28 ms and 92 ms. The join to `documents` in the chunk
+  count is deliberately kept: ~3% of live chunks belong to a superseded or
+  soft-deleted document and must not be counted.
+- **The same endpoint is cached 30s per tenant and runs its four queries
+  concurrently.** `?refresh=true` bypasses the cache; the dashboard's Refresh
+  button sets it. The four queries now use a connection each, so the four
+  results are no longer one consistent snapshot — safe for display counters,
+  documented at the call site, and not a pattern to copy elsewhere. The cache
+  lock is per tenant, so one slow tenant cannot stall another's header.
+  The `refresh` bypass only reaches here once research-os relays it
+  (research-os v0.211.0.0); until that ships, Refresh returns the cached
+  payload for up to 30s. Order of deploy does not matter — FastAPI ignores the
+  unknown parameter in one direction and defaults it to false in the other.
+
 - **The rebuild button can no longer empty a wiki that nothing can
   rebuild.** `POST /api/wiki/backfill/trigger`, its `/bootstrap/trigger`
   alias, `POST /api/wiki/synthesize/trigger` and `PUT /api/wiki/settings`
