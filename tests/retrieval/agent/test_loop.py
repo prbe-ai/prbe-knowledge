@@ -664,7 +664,7 @@ def test_derive_source_system_from_doc_id_known_prefixes() -> None:
         ("notion:doc:abc", "notion"),
         ("sentry:issue:E-1", "sentry"),
         ("code_graph:owner/repo:path/to.py", "code_graph"),
-        ("custom:page:foo", "custom_ingest"),
+        ("granola:meeting:m1", "granola"),
     ]
     for doc_id, expected in cases:
         assert _derive_source_system_from_doc_id(doc_id) == expected
