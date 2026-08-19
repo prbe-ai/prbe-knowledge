@@ -9,7 +9,7 @@ Bug guarded against
 Under the shared-managed cluster, prbe-knowledge will connect as the
 non-privileged ``probe_app`` role instead of the ``probe`` superuser
 that bypasses RLS today. RLS policies on graph_nodes / graph_edges /
-directed_vectors / usage_events / query_traces / code_repo_state /
+usage_events / query_traces / code_repo_state /
 inferred_edges_queue ENFORCE under probe_app — but only if the
 ``app.current_customer_id`` GUC is set via ``with_tenant(customer_id)``.
 

@@ -28,10 +28,10 @@ adds a source-tagged table can extend `_CASCADE_STEPS` in the same commit.
     │          document during phase 2.                            │
     └──────────────────────────────────────────────────────────────┘
 
-Order inside phase 2 is not arbitrary. `chunks`, `directed_vectors` and
-`failed_chunks` carry NO foreign key to `documents` (deliberate — see
-schema.sql), so they must be deleted through a doc_id sub-select BEFORE the
-documents they point at disappear, or they are orphaned permanently.
+Order inside phase 2 is not arbitrary. `chunks` and `failed_chunks` carry NO
+foreign key to `documents` (deliberate — see schema.sql), so they must be
+deleted through a doc_id sub-select BEFORE the documents they point at
+disappear, or they are orphaned permanently.
 
 What `verified=True` does and does not mean
 -------------------------------------------
@@ -158,7 +158,6 @@ _CASCADE_STEPS: tuple[_Step, ...] = (
     _doc_joined("inferred_edges_queue", column="anchor_doc_id"),
     # -- document-joined rows (no FK to documents) ---------------------
     _doc_joined("chunks"),
-    _doc_joined("directed_vectors"),
     _doc_joined("failed_chunks"),
     # -- the documents themselves --------------------------------------
     _by_source("documents"),

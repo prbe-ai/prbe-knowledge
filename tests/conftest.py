@@ -89,7 +89,6 @@ TRUNCATE_SQL = """
         ingestion_queue,
         acl_snapshots,
         chunks,
-        directed_vectors,
         documents,
         customer_source_mapping,
         code_repo_state,
