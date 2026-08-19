@@ -18,7 +18,7 @@ adds a source-tagged table can extend `_CASCADE_STEPS` in the same commit.
     ├──────────────────────────────────────────────────────────────┤
     │ phase 2  cascade         ONE TRANSACTION                     │
     │          queues → doc-joined rows → documents → per-source   │
-    │          state → wiki → graph provenance → orphan nodes      │
+    │          state → graph provenance → orphan nodes             │
     ├──────────────────────────────────────────────────────────────┤
     │ phase 3  R2 sweep        raw/<source>/<customer>/            │
     ├──────────────────────────────────────────────────────────────┤
@@ -55,9 +55,6 @@ that way. Known limits, all inherent to the schema rather than to this code:
   them. Deleting by tag is the best signal the schema offers; it can drop an
   edge a surviving source also asserted, or keep one this source contributed
   to under another source's tag.
-* **Wiki artifacts synthesized from this source survive.** They are written as
-  `source_system='wiki'`, so they are outside the cascade by construction and
-  outside the verification count too.
 """
 
 from __future__ import annotations
@@ -157,7 +154,6 @@ _CASCADE_STEPS: tuple[_Step, ...] = (
     _by_source("backfill_state"),
     _by_source("ingestion_cursors", column="source"),
     _by_source("pending_edges"),
-    _by_source("wiki_synthesis_queue"),
     # inferred_edges_queue reaches documents through `anchor_doc_id`.
     _doc_joined("inferred_edges_queue", column="anchor_doc_id"),
     # -- document-joined rows (no FK to documents) ---------------------
@@ -169,14 +165,6 @@ _CASCADE_STEPS: tuple[_Step, ...] = (
     # -- per-source state ----------------------------------------------
     _by_source("acl_snapshots"),
     _by_source("ingestion_events"),
-    # wiki_raw_data.source / wiki_timeline_entries.source hold the source
-    # system ('github' — kb/synthesis/crawlers/github.py:82), so these are
-    # genuinely source-scoped. wiki_links is NOT: its `link_source` column is
-    # the link KIND ('markdown'/'frontmatter'/'manual', enforced by
-    # ck_wiki_links_source), so matching it against a source system would
-    # delete nothing while still reporting clean.
-    _by_source("wiki_timeline_entries", column="source"),
-    _by_source("wiki_raw_data", column="source"),
     _by_customer("code_repo_state", only_for=(SourceSystem.GITHUB,)),
 )
 
