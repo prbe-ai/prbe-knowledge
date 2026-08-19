@@ -439,30 +439,33 @@ async def _fuzzy_match_document_titles(
             coalesce(d.title, '') AS title,
             d.updated_at,
             similarity(coalesce(d.title, ''), $2) AS trgm_sim,
-            -- NOT switched to the stored `d.title_tsv`, though that is
-            -- tempting: it would skip re-tokenizing body_preview per row and
-            -- measured 138 ms -> 71 ms.
+            -- `d.title_preview_tsv` (migration 0109) is the SAME expression
+            -- this used to inline, materialized as a STORED generated column.
+            -- Not a semantic change: character for character the vector the
+            -- old `idx_documents_fts_title_preview` was built on, so
+            -- qualification is identical and body_preview still qualifies.
             --
-            -- It is wrong, and the test suite says so. `fts_hit` is not just a
-            -- ranking signal: the outer query filters on
-            -- `WHERE trgm_sim >= $4 OR fts_hit = 1`, so a document that
-            -- matched ONLY through body_preview would lose its qualification
-            -- and drop out of the results entirely. That is a recall
-            -- regression wearing a performance fix's clothes --
+            -- Still NOT `d.title_tsv`, and the reason is unchanged: that
+            -- column is title-only and setweight'd, `fts_hit` QUALIFIES rows
+            -- rather than merely ranking them (the outer query filters on
+            -- `trgm_sim >= $4 OR fts_hit = 1`), so a document matching only
+            -- through body_preview would silently stop qualifying --
             -- test_fuzzy_match_document_titles_fts_only_path_hits_body_preview
-            -- is what caught it.
+            -- is what caught that. title_tsv also carries 0099's
+            -- punctuation-flattened tokens, which LOOSENS qualification in the
+            -- other direction.
             --
-            -- A short-circuit (`title_tsv @@ q OR <full expr> @@ q`) recovers
-            -- most of the speed, but title_tsv carries 0099's
-            -- punctuation-flattened tokens, so it can match where the plain
-            -- concatenation does not -- which LOOSENS qualification rather
-            -- than preserving it. Also a behaviour change, just in the other
-            -- direction. Left alone deliberately; the channel is already fast
-            -- enough after the threshold and index fixes.
+            -- Why materialize at all: under FORCE RLS the planner will not use
+            -- an EXPRESSION index -- matching one means evaluating the indexed
+            -- expression before the security qual -- so the inline form
+            -- rebuilt this tsvector for every live document in the tenant.
+            -- Measured on the managed plane as role probe_app: 1052 ms/probe
+            -- inline, 238 ms against the stored column. LEAKPROOF does not
+            -- help an expression index (874 ms with to_tsvector marked); only
+            -- materializing it does.
             CASE
-                WHEN to_tsvector('english', coalesce(d.title, '') || ' '
-                                 || coalesce(d.body_preview, ''))
-                     @@ plainto_tsquery('english', $3) THEN 1
+                WHEN d.title_preview_tsv @@ plainto_tsquery('english', $3)
+                    THEN 1
                 ELSE 0
             END AS fts_hit
         FROM documents d
@@ -487,9 +490,7 @@ async def _fuzzy_match_document_titles(
               -- above already exclude NULL and empty titles, and `valid_to IS
               -- NULL` above matches the index's own partial predicate.
               d.title % $2
-              OR to_tsvector('english', coalesce(d.title, '') || ' '
-                             || coalesce(d.body_preview, ''))
-                 @@ plainto_tsquery('english', $3)
+              OR d.title_preview_tsv @@ plainto_tsquery('english', $3)
           )
     )
     SELECT doc_id, source_system, title, updated_at, trgm_sim, fts_hit
