@@ -1,7 +1,7 @@
 """drop the team wiki: its compiled pages, their chunks, and its seven tables
 
-Revision ID: 0109_drop_wiki
-Revises: 0108_retire_pp_under_rls
+Revision ID: 0110_drop_wiki
+Revises: 0109_documents_title_preview_tsv
 Create Date: 2026-08-19
 
 The wiki is removed. Generation stopped fleet-wide on 2026-08-18, the HTTP
@@ -69,8 +69,8 @@ import os
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0109_drop_wiki"
-down_revision = "0108_retire_pp_under_rls"
+revision = "0110_drop_wiki"
+down_revision = "0109_documents_title_preview_tsv"
 branch_labels = None
 depends_on = None
 
