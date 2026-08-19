@@ -13,7 +13,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, TextContent
 
-from engine.mcp.clients._responses import _DETAILS as _DETAIL_VALUES
+from engine.mcp.clients._responses import DETAIL_EVIDENCE, VALID_DETAILS, detail_error
 from engine.mcp.clients.knowledge import KnowledgeError, get_client
 from engine.mcp.consts import (
     ALLOWED_HOSTS,
@@ -28,6 +28,12 @@ from engine.mcp.services.response_budget import (
     fit_response_to_budget,
     serialize_tool_response,
 )
+
+#: Typed so FastMCP advertises the vocabulary in the tool schema and rejects
+#: unknown values pre-handler. Must mirror VALID_DETAILS — the compaction
+#: test pins the two together (test_detail_literal_matches_the_vocabulary),
+#: so a fourth profile that touches one and not the other fails loudly.
+DetailMode = Literal["ids", "evidence", "full"]
 
 mcp = FastMCP(
     MCP_SERVER_NAME,
@@ -89,7 +95,7 @@ async def search_knowledge(
     top_k_related: int = 10,
     discovery: bool = False,
     verbose: bool = False,
-    detail: str = "evidence",
+    detail: DetailMode = DETAIL_EVIDENCE,
 ) -> CallToolResult:
     """Search team operational history when a concrete history question could
     change the answer or approach.
@@ -121,8 +127,12 @@ async def search_knowledge(
     via_entity, reason}` entries — the trail of knowledge-graph edges that
     connected the chunk to your query; ABSENT when the chunk matched on text
     alone — absent keys throughout this response mean "nothing here", never
-    "unknown"). Audit metadata (`author_id`, `created_at`, `updated_at`) and
-    full provenance ride only on detail="full" — see `detail` below. Top-level
+    "unknown". One scoped exception: a CHUNK's `matched_via` is omitted when
+    identical to its document's, so read the document's provenance as
+    covering its chunks). Audit metadata (`author_id`, `created_at`,
+    `updated_at`) and full provenance ride only on detail="full" — see
+    `detail` below; for time-ordering questions ("which came first?"), ask
+    for detail="full" or read timestamps off `get_source`. Top-level
     `confidence_breakdown` is an aggregate count of evidence confidences
     (`EXTRACTED` / `INFERRED` / `AMBIGUOUS`) across all returned chunks —
     a low EXTRACTED ratio means most matches are inferred and you should
@@ -192,9 +202,10 @@ async def search_knowledge(
     `get_source` on specific `doc_id`s. `cursor` is reserved for future
     stateful continuation; today it's always null.
 
-    Each document carries `author_id` — the raw author identifier from
-    the source system (GitHub login, commit-author email, Slack user
-    id, Linear user id). It is NOT canonicalized: the same person can
+    At detail="full", each document carries `author_id` — the raw author
+    identifier from the source system (GitHub login, commit-author email,
+    Slack user id, Linear user id); the default detail="evidence" omits it.
+    It is NOT canonicalized: the same person can
     appear under multiple values across sources, and even within one
     source (e.g. a GitHub commit may surface as `mahit` when the email
     resolved to a login or as `mahit@example.com` when it didn't). Use
@@ -313,15 +324,9 @@ async def search_knowledge(
             budget trims tail chunks and then whole documents to fit, so at
             "evidence" more of your actual hits make it under the cap.
     """
-    if detail not in _DETAIL_VALUES:
+    if detail not in VALID_DETAILS:
         return _tool_result(
-            {
-                "error": (
-                    f"detail must be one of {', '.join(_DETAIL_VALUES)}; "
-                    f"got {detail!r}"
-                ),
-                "status": 422,
-            },
+            {"error": detail_error(detail), "status": 422},
             is_error=True,
         )
     customer_id = get_current_customer()
@@ -368,10 +373,13 @@ async def query_knowledge(
     underlying documents), `insufficient_context` (bool — true when the
     LLM couldn't find enough grounded evidence and refused to guess),
     `model` (which LLM produced the answer), and the full retrieval
-    payload as `search_knowledge` (doc-grouped `results[]` with nested
-    `chunks[]`, each chunk carrying `score`, `content`, `graph_evidence`,
-    `why_relevant` (the gatherer's per-chunk rationale), and
-    chunk-level `matched_via`). When `top_k_related >= 1`, also carries
+    payload as doc-grouped `results[]` with nested `chunks[]`, each chunk
+    carrying `score` and `content`, plus `graph_evidence`, `why_relevant`
+    (the gatherer's per-chunk rationale) and chunk-level `matched_via` when
+    populated and distinct from the document's — absent keys mean "nothing
+    here", never "unknown". These rows match `search_knowledge` at
+    detail="full" (this tool has no detail parameter and keeps the audit
+    metadata the search default omits). When `top_k_related >= 1`, also carries
     top-level `related_entities` + `query_root_doc_id` + `gatherer_notes`.
     When `insufficient_context=true`, surface that refusal to the user
     instead of paraphrasing it.
@@ -494,8 +502,8 @@ async def get_source(
     "linear:org-acme:issue:uuid-9821" or
     "slack:T_ACME:C_GENERAL:1714000000.123".
 
-    Includes `author_id` at the top level (same raw form as on
-    `search_knowledge` Document results). The response includes navigation
+    Includes `author_id` at the top level (the same raw form
+    `search_knowledge` returns at detail="full"). The response includes navigation
     metadata such as `sections`, `line_start`, `line_end`,
     `total_lines`, `next_cursor`, `truncated`, `chunk_count`, and
     `body_size_bytes`.

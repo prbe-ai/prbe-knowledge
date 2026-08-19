@@ -19,8 +19,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
     `retriever_scores` (empty in 69/69 production chunks), `canonical_id`
     when byte-identical to `doc_id` (69/83), a chunk's `matched_via` when it
     duplicates its document's (19/69), empty `graph_evidence`/`why_relevant`,
-    and null-valued keys inside provenance entries. Populated values always
-    pass; absent keys mean "nothing here", never "unknown".
+    and null-valued keys inside provenance entries. The empty-value collapses
+    pass populated values through untouched; chunk `retriever_scores` is
+    deny-listed outright like its document-level twin (`verbose=True` keeps
+    it). Absent keys mean "nothing here", never "unknown" — with one scoped
+    exception: a chunk's `matched_via` omitted as identical to its
+    document's is covered by the document's copy.
   - `detail: "ids" | "evidence" | "full"` (default `"evidence"`) projects
     each result row: `evidence` keeps identity + chunk content and drops
     per-doc audit metadata (`author_id`, timestamps) and non-graph
@@ -31,7 +35,12 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
     profiles run before the byte budget, so leaner details keep more hits
     under the cap. Replayed against the captured production corpus:
     ~−26%/call at the default, −71% at `ids`; `verbose=True` still returns
-    the raw upstream payload untouched.
+    the raw upstream payload untouched. `query_knowledge`'s evidence rows get
+    the same redundancy collapse (it has no `detail` parameter; its rows match
+    search's detail="full"), and the byte budget's trim stage now POPS
+    `graph_evidence` from tail chunks instead of writing `[]` — an empty list
+    is a shape the new contract says cannot exist, and emitting it would have
+    read as "no graph grounding" on a chunk that had some.
 
 - **The wiki now covers documents that arrived before a tenant turned it
   on.** The nightly trigger reconciles the synthesis queue for every

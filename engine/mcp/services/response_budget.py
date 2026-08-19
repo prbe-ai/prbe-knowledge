@@ -198,9 +198,20 @@ def fit_response_to_budget(
     docs: list[dict[str, Any]] = []
     for result in out.get("results") or []:
         copied = dict(result)
-        if "chunks" in result or result.get("node_type") != "Entity":
+        # Materialize a mutable chunks list ONLY where the row carries one.
+        # detail="ids" removes the key by contract, and under the
+        # absent-means-nothing convention re-adding `chunks: []` here would
+        # claim "this document has no matching spans" — false; they were
+        # projected away by request. A non-list value is upstream garbage:
+        # dict(chunk) on it would raise and destroy the whole response on
+        # the over-budget path (the majority path in production), so it is
+        # dropped rather than copied — compaction already filters non-dict
+        # chunks the same way.
+        if isinstance(result.get("chunks"), list):
             copied["chunks"] = [
-                dict(chunk) for chunk in result.get("chunks") or []
+                dict(chunk)
+                for chunk in result["chunks"]
+                if isinstance(chunk, dict)
             ]
         docs.append(copied)
     out["results"] = docs
@@ -215,9 +226,14 @@ def fit_response_to_budget(
     current_size = _measure(out)
 
     # Stage 1: drop graph_evidence on tail chunks (rare savings, but
-    # free when present). Replacing one JSON value with [] has an exact,
-    # locally computable saving, so avoid serializing the whole payload once
-    # per chunk.
+    # free when present). The key is POPPED, not set to [] — compaction
+    # strips empty graph_evidence and the tool contract says the key is
+    # absent when a chunk matched on text alone, so an emitted [] would
+    # uniquely mean "evidence trimmed for budget" while reading as "no
+    # graph grounding". `stripped_graph_evidence_count` says it happened.
+    # Removing "key": [] from the encoding saves len('"graph_evidence":[]')
+    # plus a separator; measured conservatively as the value size alone so
+    # the loop never undercounts what remains.
     evidence_dropped = 0
     if current_size > target_bytes:
         for d in reversed(docs):
@@ -225,7 +241,7 @@ def fit_response_to_budget(
                 evidence = c.get("graph_evidence")
                 if evidence:
                     current_size -= _encoded_size(evidence) - _encoded_size([])
-                    c["graph_evidence"] = []
+                    c.pop("graph_evidence", None)
                     evidence_dropped += 1
                     if current_size <= target_bytes:
                         break
@@ -284,6 +300,13 @@ def fit_response_to_budget(
     # meaningful and can drill in via `get_source` for the full body.
     out["dropped_chunk_count"] = int(out["dropped_chunk_count"]) + dropped
     out["dropped_result_count"] = int(out["dropped_result_count"]) + dropped_results
+    # Stage 1 POPS graph_evidence from tail chunks (an emitted [] would read
+    # as "matched on text alone" — see the stage-1 comment). Popping without
+    # accounting would be silent though, so the count rides along whenever it
+    # happened; absent means "nothing was stripped", matching the
+    # absent-means-nothing convention on the rest of the response.
+    if evidence_dropped:
+        out["stripped_graph_evidence_count"] = evidence_dropped
     out["truncated"] = bool(
         out["truncated"]
         or dropped > 0

@@ -10,7 +10,7 @@ so failed and successful calls can be correlated with upstream logs.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Final
 
 # Top-level fields stripped by default. These are pure server
 # instrumentation. We deliberately KEEP `total_candidates` (recall
@@ -145,11 +145,19 @@ def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
     doc_via = result.get("matched_via")
     if "matched_via" in compacted:
         compacted["matched_via"] = _lean_matched_via(compacted["matched_via"])
-    chunks = result.get("chunks") or []
+    chunks = result.get("chunks")
+    if not isinstance(chunks, list):
+        # A string here would iterate as characters and hand the caller a
+        # fabricated chunk list; upstream garbage earns an empty list, not
+        # an invented one.
+        chunks = []
     lean_chunks: list[Any] = []
     for chunk in chunks:
         if not isinstance(chunk, dict):
-            lean_chunks.append(chunk)
+            # Dropped, not passed through: downstream (the byte budget's
+            # dict(chunk) copy) would raise on it and destroy the whole
+            # response; a chunk that is not an object carries no evidence
+            # worth preserving.
             continue
         lean = _strip(chunk, _CHUNK_DROP)
         if lean.get("matched_via") == doc_via:
@@ -175,7 +183,9 @@ def compact_search(payload: dict[str, Any]) -> dict[str, Any]:
     """
     out = _strip(payload, _TOP_LEVEL_DROP)
     results = payload.get("results") or []
-    out["results"] = [_compact_result(r) for r in results]
+    out["results"] = [
+        _compact_result(r) if isinstance(r, dict) else r for r in results
+    ]
     return out
 
 
@@ -185,9 +195,9 @@ def compact_query(payload: dict[str, Any]) -> dict[str, Any]:
 
     The synthesized `answer`, `citations`, `insufficient_context`, and
     `model` fields pass through unchanged. Underlying polymorphic results
-    (`results[*]`) are compacted the same way as `compact_search` so the
-    two endpoints expose the same shape to callers; only debug/telemetry
-    fields are removed.
+    (`results[*]`) are compacted the same way as `compact_search`, so the
+    shared shape is search_knowledge's detail="full"; the search TOOL
+    projects further via `apply_detail`, query_knowledge does not.
     """
     out = _strip(payload, _TOP_LEVEL_DROP)
     results = payload.get("results")
@@ -243,10 +253,24 @@ def compact_source_view(payload: dict[str, Any]) -> dict[str, Any]:
 # prevent. Profiles therefore only ever rewrite rows inside `results` —
 # envelope safety holds by construction, not by a second deny-list.
 
-DETAIL_IDS = "ids"
-DETAIL_EVIDENCE = "evidence"
-DETAIL_FULL = "full"
-_DETAILS = (DETAIL_IDS, DETAIL_EVIDENCE, DETAIL_FULL)
+DETAIL_IDS: Final = "ids"
+DETAIL_EVIDENCE: Final = "evidence"
+DETAIL_FULL: Final = "full"
+#: Public on purpose: the tool layer validates against this same tuple, so a
+#: fourth profile lands in exactly one place.
+VALID_DETAILS = (DETAIL_IDS, DETAIL_EVIDENCE, DETAIL_FULL)
+
+
+def detail_error(detail: object) -> str:
+    """The one wording for an unknown detail, shared by the tool layer's 422
+    and apply_detail's ValueError so the two can never drift.
+
+    The echoed value is clipped: this error goes straight to the caller
+    WITHOUT passing the response byte budget, so reflecting an arbitrarily
+    long value verbatim would let the one unvalidated string in the call
+    defeat the cap the budget exists to enforce (same discipline as
+    KnowledgeError's body[:200])."""
+    return f"detail must be one of {', '.join(VALID_DETAILS)}; got {str(detail)[:80]!r}"
 
 # Per-document metadata `evidence` does without: audit fields an agent reads
 # past on the way to the content. All of it remains one detail="full" (or
@@ -254,10 +278,22 @@ _DETAILS = (DETAIL_IDS, DETAIL_EVIDENCE, DETAIL_FULL)
 # the handle that keeps that escape hatch reachable.
 _EVIDENCE_DOC_DROP = frozenset({"created_at", "updated_at", "author_id"})
 
-# What a document row keeps at detail="ids": enough to rank, cite, and fetch —
-# nothing to read. The triage shape for "did the lab touch X at all?".
+# What a document row keeps at detail="ids": enough to rank and fetch
+# (doc_id -> get_source) — nothing to read. The triage shape for "did the
+# team touch X at all?". source_url is deliberately not here: linking a
+# human to a source is an evidence-level act.
 _IDS_DOC_KEEP = frozenset(
-    {"doc_id", "canonical_id", "title", "score", "source_system", "node_type"}
+    {
+        "doc_id",
+        "canonical_id",
+        "title",
+        "score",
+        "source_system",
+        "node_type",
+        # The weight signal: one matching span and twelve are different
+        # triage answers, and the count costs single-digit tokens.
+        "chunk_count",
+    }
 )
 
 
@@ -276,21 +312,23 @@ def _has_inferred_edge(entries: Any) -> bool:
     )
 
 
+def _without_boiler_via(node: dict[str, Any]) -> dict[str, Any]:
+    """Drop `matched_via` unless it carries an inferred-edge entry — the ONE
+    rule of `evidence`-level provenance, applied identically at doc and chunk
+    level so the two can never diverge."""
+    if _has_inferred_edge(node.get("matched_via")):
+        return node
+    return {k: v for k, v in node.items() if k != "matched_via"}
+
+
 def _evidence_result(result: dict[str, Any]) -> dict[str, Any]:
     if result.get("node_type") == "Entity":
         return result
-    lean = _strip(result, _EVIDENCE_DOC_DROP)
-    if not _has_inferred_edge(lean.get("matched_via")):
-        lean.pop("matched_via", None)
+    lean = _without_boiler_via(_strip(result, _EVIDENCE_DOC_DROP))
     chunks = lean.get("chunks")
     if isinstance(chunks, list):
         lean["chunks"] = [
-            (
-                {k: v for k, v in c.items() if not (k == "matched_via" and not _has_inferred_edge(v))}
-                if isinstance(c, dict)
-                else c
-            )
-            for c in chunks
+            _without_boiler_via(c) if isinstance(c, dict) else c for c in chunks
         ]
     return lean
 
@@ -309,10 +347,8 @@ def apply_detail(payload: dict[str, Any], detail: str) -> dict[str, Any]:
     Entities pass through every profile untouched — they are small,
     self-describing, and have no chunk payload to spend.
     """
-    if detail not in _DETAILS:
-        raise ValueError(
-            f"detail must be one of {', '.join(_DETAILS)}; got {detail!r}"
-        )
+    if detail not in VALID_DETAILS:
+        raise ValueError(detail_error(detail))
     if detail == DETAIL_FULL:
         return payload
     project = _evidence_result if detail == DETAIL_EVIDENCE else _ids_result

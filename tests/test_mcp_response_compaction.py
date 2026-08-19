@@ -218,6 +218,8 @@ def test_detail_ids_returns_identity_without_content() -> None:
         "title": "fix the thing",
         "source_system": "github",
         "score": 0.9,
+        # The weight signal: 1 span vs 12 is a different triage answer.
+        "chunk_count": 2,
     }
 
 
@@ -230,20 +232,70 @@ def test_detail_never_touches_the_envelope_and_entities_pass_through() -> None:
     """Profiles rewrite `results` rows only. A leaner detail must never make a
     degraded or truncated answer look healthier — the same failure mode the
     _TOP_LEVEL_DROP tripwire above guards, one layer down."""
+    import copy
+
     compacted = compact_search(_doc_payload())
     compacted["degraded"] = True
     compacted["degraded_reason"] = "provider_error_prefanout_fallback"
     compacted["truncated"] = True
+    # Deep snapshot: apply_detail shares sub-objects with its input, so
+    # comparing out[key] == compacted[key] would compare an object with
+    # itself and pass even if a profile mutated it in place.
+    expected = copy.deepcopy(compacted)
     for detail in ("ids", "evidence", "full"):
         out = apply_detail(compacted, detail)
-        for key, value in compacted.items():
+        for key, value in expected.items():
             if key == "results":
                 continue
             assert out[key] == value, (detail, key)
         # Entities are small and self-describing: identical at every detail.
-        assert out["results"][1] == compacted["results"][1], detail
+        assert out["results"][1] == expected["results"][1], detail
+    # And the input itself was never mutated by any profile.
+    assert compacted == expected
 
 
 def test_detail_rejects_unknown_values_loudly() -> None:
     with pytest.raises(ValueError, match="ids, evidence, full"):
         apply_detail({"results": []}, "eviednce")
+
+
+def test_detail_literal_matches_the_vocabulary() -> None:
+    """The tool schema's Literal and the runtime tuple must be the same set:
+    the Literal is what clients see and what FastMCP validates pre-handler,
+    VALID_DETAILS is what apply_detail enforces — a fourth profile added to
+    one and not the other would validate in one layer and 422 in the next."""
+    from typing import get_args
+
+    from engine.mcp.clients._responses import VALID_DETAILS
+    from engine.mcp.server import DetailMode
+
+    assert tuple(get_args(DetailMode)) == tuple(VALID_DETAILS)
+
+
+def test_compact_query_applies_the_same_collapse_and_keeps_synthesis_fields() -> None:
+    """query_knowledge shares _compact_result, so its evidence rows changed
+    with this diff too — pin the collapse on that path, and that the
+    synthesized fields ride through untouched."""
+    from engine.mcp.clients._responses import compact_query
+
+    payload = {
+        **_doc_payload(),
+        "answer": "the answer",
+        "citations": [{"doc_id": "github:acme:pr:1"}],
+        "insufficient_context": False,
+        "model": "m",
+    }
+    out = compact_query(payload)
+    assert out["answer"] == "the answer"
+    assert out["citations"] == [{"doc_id": "github:acme:pr:1"}]
+    assert out["insufficient_context"] is False
+    doc = out["results"][0]
+    # Same collapse rules as search: canonical_id repeat gone, inherited
+    # chunk provenance gone, empty diagnostics gone — and the doc keeps the
+    # audit metadata the search DEFAULT drops (query has no detail param;
+    # its rows match search at detail="full").
+    assert "canonical_id" not in doc
+    assert doc["author_id"] == "someone"
+    first = doc["chunks"][0]
+    assert "matched_via" not in first
+    assert "retriever_scores" not in first
