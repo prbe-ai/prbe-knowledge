@@ -1,0 +1,40 @@
+{
+  "bundle": {
+    "customer_id": "cust-eval",
+    "anchor_doc_id": "notion:page:session-finalizer-architecture",
+    "docs": [
+      {
+        "doc_id": "notion:page:session-finalizer-architecture",
+        "customer_id": "cust-eval",
+        "source_system": "notion",
+        "title": "Session Finalizer Architecture",
+        "content": "Session Finalizer Architecture\n\nThe session finalizer pipeline converts idle coding-agent sessions into consolidated session documents.\n\n## Triage stage\nSessions arrive in session_finalize_queue. The triage stage (SessionTriageAgent) batches sessions in token-budget packs of up to 150K tokens and scores them 0-10. Sessions scoring >= 7.0 advance to extraction.\n\n## Extraction stage\nThe finalizer agent (SessionFinalizerAgent in services/finalizer/agent.py) processes triaged sessions and writes or updates consolidated session documents. It uses Gemini 3.1 Pro.\n\n## Nightly schedule\nThe finalizer cron fires at 04:00 UTC, waking the worker via pg_notify on session_finalize_pending.",
+        "token_count": 120
+      },
+      {
+        "doc_id": "code_graph:file:prbe-knowledge:services/finalizer/agent.py",
+        "customer_id": "cust-eval",
+        "source_system": "code_graph",
+        "title": "services/finalizer/agent.py",
+        "content": "# services/finalizer/agent.py\n\nclass SessionFinalizerAgent:\n    \"\"\"Gemini 3.1 Pro agent for session document extraction.\"\"\"\n    model = FINALIZER_AGENT_MODEL  # gemini-3.1-pro-preview\n\n    async def drain(self, customer_id: str) -> DrainResult:\n        \"\"\"Drain triaged sessions for this customer.\"\"\"\n        ...",
+        "token_count": 60
+      }
+    ]
+  },
+  "nodes": [
+    {"label": "Document", "canonical_id": "notion:page:session-finalizer-architecture"},
+    {"label": "Document", "canonical_id": "code_graph:file:prbe-knowledge:services/finalizer/agent.py"},
+    {"label": "Class", "canonical_id": "SessionFinalizerAgent"},
+    {"label": "Service", "canonical_id": "session-finalizer"},
+    {"label": "Feature", "canonical_id": "finalizer-cron"}
+  ],
+  "expected_edges": [
+    {
+      "from_label": "Document",
+      "from_canonical_id": "notion:page:session-finalizer-architecture",
+      "to_canonical_id": "code_graph:file:prbe-knowledge:services/finalizer/agent.py",
+      "edge_type": "DOCUMENTS",
+      "note": "Notion architecture doc explicitly documents SessionFinalizerAgent in agent.py, describing its triage and extraction stages"
+    }
+  ]
+}

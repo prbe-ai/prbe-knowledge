@@ -44,7 +44,7 @@ node in the bundle, omit the edge entirely.
 
 "edge_type" -- CLOSED ENUM. Use ONLY one of:
   DISCUSSES        -- a thread/PR/doc discusses an entity (code symbol, service, concept)
-  DOCUMENTS        -- a doc/page/wiki provides documentation for an entity
+  DOCUMENTS        -- a doc or page provides documentation for an entity
   RESOLVES         -- a ticket/PR/session resolves a bug, incident, or issue
   MENTIONS_ENTITY  -- a passing reference (weaker than DISCUSSES; use when \
 the mention is brief or in passing)

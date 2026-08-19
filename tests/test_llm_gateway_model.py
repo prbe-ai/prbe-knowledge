@@ -1,6 +1,6 @@
 """A bare model id routed through the gateway must use the OpenAI transport.
 
-Regression test for the 2026-08-11 wiki triage outage: every triage call failed
+Regression test for the 2026-08-11 triage outage: every triage call failed
 with `GeminiException - {"detail":"Method Not Allowed"}` and one batch failure
 dead-lettered 13,147 queue rows. Root cause was not the model id and not the
 gateway -- it was the pair. LiteLLM infers its transport from the id's prefix,

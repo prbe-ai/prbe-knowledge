@@ -237,12 +237,12 @@ async def test_caller_custom_llm_provider_wins_over_gateway_default(
 async def test_gateway_completion_strips_gemini_prefix_and_routes_via_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The 405 that kept the team wiki empty.
+    """The 405 that dead-lettered every nightly triage batch.
 
     `gemini/<m>` makes the LiteLLM SDK build the Gemini-NATIVE URL
     `/v1beta/models/<m>:generateContent` and POST it at our proxy, which
     serves no such path and answers FastAPI 405
-    `{"detail":"Method Not Allowed"}`. Every wiki triage batch died on
+    `{"detail":"Method Not Allowed"}`. Every triage batch died on
     exactly that, 13,147 rows deep into the DLQ.
 
     Two assertions, and BOTH are load-bearing:

@@ -8,7 +8,7 @@
         "customer_id": "cust-eval",
         "source_system": "notion",
         "title": "Q2 2026 Engineering Roadmap",
-        "content": "Q2 2026 Engineering Roadmap\n\n## Shipped\n- Hybrid search (pgvector + BM25)\n- Tenant RLS hardening\n\n## In Progress\n- Feature flags: gradual rollout infrastructure (see FEAT-44). Currently in canary.\n- Per-tenant rate limiting (RATE-55)\n\n## Planned\n- Code graph ingestion via tree-sitter\n- Wiki synthesis v2 with Gemini Pro",
+        "content": "Q2 2026 Engineering Roadmap\n\n## Shipped\n- Hybrid search (pgvector + BM25)\n- Tenant RLS hardening\n\n## In Progress\n- Feature flags: gradual rollout infrastructure (see FEAT-44). Currently in canary.\n- Per-tenant rate limiting (RATE-55)\n\n## Planned\n- Code graph ingestion via tree-sitter\n- Session digest synthesis v2 with Gemini Pro",
         "token_count": 80
       },
       {

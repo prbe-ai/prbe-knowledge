@@ -44,7 +44,7 @@ def test_path_canonical_accepts_freeform_labels() -> None:
     assert not _is_path_canonical("Person", "richardwei6")
     assert not _is_path_canonical("Person", "Richard Wei")
     assert not _is_path_canonical("Topic", "litellm-proxy")
-    assert not _is_path_canonical("WikiPerson", "ashwaryeyadav")
+    assert not _is_path_canonical("Author", "ashwaryeyadav")
     assert not _is_path_canonical("Feature", "auto-merge")
 
 

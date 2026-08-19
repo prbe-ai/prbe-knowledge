@@ -116,10 +116,6 @@ jobs:
       # Document). De-drifting that is its own effort; gating on it now would just paint
       # every PR red. This gate covers the object-store backend + blob/upload paths -- the
       # area #460 touched -- and can widen as the rest of the suite is repaired.
-      #
-      # The wiki-routes files this gate also ran (test_wiki_routes.py, handlers/test_wiki.py,
-      # synthesis/test_index_renderer.py, test_staged_graph.py, test_wiki_agent.py,
-      # test_triage.py, test_triage_worker.py) were deleted with the wiki feature.
       - name: Tests (storage suite)
         run: >-
           .venv/bin/pytest -q
