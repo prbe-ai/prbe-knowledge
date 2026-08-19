@@ -254,6 +254,15 @@ CREATE INDEX idx_documents_title_tsv ON documents USING GIN (title_tsv);
 CREATE INDEX IF NOT EXISTS documents_visibility_approved_idx
     ON documents (customer_id, doc_type) WHERE visibility = 'approved';
 
+-- Covers both aggregates behind the /knowledge stats header (migration 0111):
+-- the per-source document count/MAX(ingested_at) by full partial-index scan,
+-- and the live-document side of the chunk count by (customer_id, doc_id)
+-- prefix. Every column those two read is here, so both go index-only and the
+-- 10,494-page heap scan the count used to do disappears.
+CREATE INDEX IF NOT EXISTS idx_documents_stats_live
+    ON documents (customer_id, doc_id, source_system, ingested_at)
+    WHERE valid_to IS NULL AND deleted_at IS NULL;
+
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON documents
@@ -364,6 +373,12 @@ CREATE INDEX idx_chunks_fts_content    ON chunks USING GIN (to_tsvector('english
 CREATE INDEX idx_chunks_content_tsv    ON chunks USING GIN (content_tsv);
 -- One metadata chunk per doc; partial index serves backfill idempotency check.
 CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kind = 'metadata';
+-- Live chunks for one tenant (migration 0111). idx_chunks_doc_live is partial
+-- on valid_to but carries no customer_id, and idx_chunks_customer carries
+-- customer_id but every version -- so the stats count used to BitmapAnd the two
+-- and read 148,808 buffers. This one is correct on both axes.
+CREATE INDEX IF NOT EXISTS idx_chunks_stats_live
+    ON chunks (customer_id, doc_id) WHERE valid_to IS NULL;
 
 -- Single-column uniqueness on chunk_id (migration 0101). chunk_id is already
 -- unique in practice (`{doc_id}:{prefix}{content_hash[:16]}`); this enforces
