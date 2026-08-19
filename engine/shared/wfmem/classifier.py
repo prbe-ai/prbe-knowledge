@@ -81,7 +81,6 @@ column would be an optimization of something that was never the problem.
 
 from __future__ import annotations
 
-import json
 import math
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -94,6 +93,7 @@ from engine.shared.constants import WFMEM_CLASSIFIER_TIEBREAK_MODEL
 from engine.shared.db import with_tenant
 from engine.shared.embeddings import get_embedder_v2
 from engine.shared.logging import get_logger
+from engine.shared.wfmem.llm_json import loads_forgiving, response_text
 
 log = get_logger(__name__)
 
@@ -659,7 +659,7 @@ async def _break_tie(
         )
         return _unknown(method=METHOD_NONE, model=None, runner_up=_runner_up(scored, None))
 
-    parsed = _parse_tiebreak_response(_response_text(response), allowed=set(by_slug))
+    parsed = _parse_tiebreak_response(response_text(response), allowed=set(by_slug))
     if parsed is None:
         # Unusable: unparseable, wrong shape, or a slug that was not on the
         # menu. An off-menu slug is refused rather than honoured -- the
@@ -701,14 +701,6 @@ def _default_completion() -> Any:
     return acompletion
 
 
-def _response_text(response: Any) -> str | None:
-    """`.choices[0].message.content` off a LiteLLM response, defensively."""
-    try:
-        return response.choices[0].message.content
-    except (AttributeError, IndexError, TypeError):
-        return None
-
-
 def _parse_tiebreak_response(
     raw: str | None, *, allowed: set[str]
 ) -> tuple[str | None, float] | None:
@@ -726,7 +718,7 @@ def _parse_tiebreak_response(
     if not raw or not raw.strip():
         return None
 
-    payload = _loads_forgiving(raw)
+    payload = loads_forgiving(raw)
     if not isinstance(payload, dict) or "slug" not in payload:
         return None
 
@@ -737,26 +729,6 @@ def _parse_tiebreak_response(
         return None
 
     return slug.strip(), _coerce_confidence(payload.get("confidence"))
-
-
-def _loads_forgiving(raw: str) -> Any:
-    """`json.loads`, retried on the outermost `{...}` if the whole string fails."""
-    text = raw.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[-1] if "\n" in text else text
-        text = text.rsplit("```", 1)[0]
-    try:
-        return json.loads(text)
-    except (json.JSONDecodeError, ValueError):
-        pass
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        return json.loads(text[start : end + 1])
-    except (json.JSONDecodeError, ValueError):
-        return None
 
 
 def _coerce_confidence(value: Any) -> float:
