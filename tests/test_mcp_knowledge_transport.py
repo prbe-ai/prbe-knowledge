@@ -560,7 +560,12 @@ def test_response_budget_truncates_oversized_document_without_mutating_input() -
     chunk = fitted["results"][0]["chunks"][0]
     assert chunk["content"] == "x" * 500
     assert chunk["content_truncated"] is True
-    assert chunk["graph_evidence"] == []
+    # POPPED, not []: compaction guarantees empty graph_evidence never ships,
+    # so an [] emitted here would uniquely mean "trimmed for budget" while
+    # reading as "matched on text alone" — a lie about a graph-grounded
+    # chunk. Absence + stripped_graph_evidence_count is the honest shape.
+    assert "graph_evidence" not in chunk
+    assert fitted["stripped_graph_evidence_count"] == 1
 
 
 def test_large_response_trimming_uses_bounded_full_payload_measurements(
@@ -590,3 +595,141 @@ def test_large_response_trimming_uses_bounded_full_payload_measurements(
 
     assert measure_calls <= 5
     assert len(serialize_tool_response(fitted).encode("utf-8")) <= MAX_RESPONSE_BYTES_HARD
+
+
+def _detail_upstream_payload() -> dict:
+    """One Document with audit metadata, chunks, and diagnostic fields —
+    enough surface that each detail profile produces a visibly different
+    wire shape, so the tests below prove the parameter REACHES the
+    projection rather than merely not erroring."""
+    return {
+        "query": "q",
+        "trace_id": "t-detail",
+        "results": [
+            {
+                "node_type": "Document",
+                "doc_id": "github:acme:pr:9",
+                "canonical_id": "github:acme:pr:9",
+                "title": "t",
+                "source_system": "github",
+                "source_url": "https://github.com/acme/pr/9",
+                "score": 0.9,
+                "author_id": "someone",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "chunk_count": 1,
+                "chunks": [
+                    {
+                        "content": "evidence",
+                        "score": 0.9,
+                        "retriever_scores": {},
+                        "why_relevant": "",
+                        "graph_evidence": [],
+                    }
+                ],
+            }
+        ],
+        "timing_ms": {"total": 1.0},
+    }
+
+
+async def test_search_tool_wires_detail_through_to_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting `detail=detail` at the server call site must fail a test:
+    without this, the new parameter could silently become a no-op that
+    always answers with the default profile."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_detail_upstream_payload())
+
+    async with _client(httpx.MockTransport(handler)) as http:
+        client = KnowledgeClient(http=http, internal_key="test-key")
+        monkeypatch.setattr(server, "get_current_customer", lambda: "customer-1")
+        monkeypatch.setattr(server, "get_client", lambda: client)
+
+        async with create_connected_server_and_client_session(server.mcp) as session:
+            result = await session.call_tool(
+                "search_knowledge",
+                {"query": "q", "top_k_related": 0, "detail": "ids"},
+            )
+
+    assert result.isError is False
+    payload = json.loads(result.content[0].text)
+    [doc] = payload["results"]
+    # ids: identity + weight, no content — and the byte budget must not
+    # re-materialize a `chunks: []` the projection removed by contract.
+    assert "chunks" not in doc
+    assert doc["doc_id"] == "github:acme:pr:9"
+    assert doc["chunk_count"] == 1
+    assert "author_id" not in doc
+
+
+async def test_search_tool_default_detail_is_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_detail_upstream_payload())
+
+    async with _client(httpx.MockTransport(handler)) as http:
+        client = KnowledgeClient(http=http, internal_key="test-key")
+        monkeypatch.setattr(server, "get_current_customer", lambda: "customer-1")
+        monkeypatch.setattr(server, "get_client", lambda: client)
+
+        async with create_connected_server_and_client_session(server.mcp) as session:
+            result = await session.call_tool(
+                "search_knowledge", {"query": "q", "top_k_related": 0}
+            )
+
+    payload = json.loads(result.content[0].text)
+    [doc] = payload["results"]
+    # evidence: content stays, audit metadata goes.
+    assert doc["chunks"][0]["content"] == "evidence"
+    for gone in ("author_id", "created_at", "updated_at"):
+        assert gone not in doc
+
+
+async def test_search_tool_rejects_unknown_detail_before_calling_upstream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(200, json=_detail_upstream_payload())
+
+    async with _client(httpx.MockTransport(handler)) as http:
+        client = KnowledgeClient(http=http, internal_key="test-key")
+        monkeypatch.setattr(server, "get_current_customer", lambda: "customer-1")
+        monkeypatch.setattr(server, "get_client", lambda: client)
+
+        async with create_connected_server_and_client_session(server.mcp) as session:
+            result = await session.call_tool(
+                "search_knowledge",
+                {"query": "q", "top_k_related": 0, "detail": "eviednce"},
+            )
+
+    # The Literal on the tool schema rejects it at the protocol layer —
+    # before the handler, before any upstream call.
+    assert result.isError is True
+    assert calls == []
+
+
+async def test_verbose_outranks_detail_and_skips_all_compaction() -> None:
+    """The raw-payload escape hatch: verbose=True must return the upstream
+    body untouched even when a detail profile was requested — a projection
+    of a debug payload is a contradiction."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_detail_upstream_payload())
+
+    async with _client(httpx.MockTransport(handler)) as http:
+        client = KnowledgeClient(http=http, internal_key="test-key")
+        out = await client.retrieve(
+            query="q", customer_id="c", verbose=True, detail="ids"
+        )
+
+    assert out["timing_ms"] == {"total": 1.0}
+    [doc] = out["results"]
+    assert doc["canonical_id"] == "github:acme:pr:9"
+    assert doc["chunks"][0]["retriever_scores"] == {}

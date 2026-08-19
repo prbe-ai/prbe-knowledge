@@ -13,6 +13,8 @@ from uuid import uuid4
 import httpx
 
 from engine.mcp.clients._responses import (
+    DETAIL_EVIDENCE,
+    apply_detail,
     compact_query,
     compact_search,
     compact_source_view,
@@ -137,6 +139,7 @@ class KnowledgeClient:
         top_k_related: int = 10,
         discovery: bool = False,
         verbose: bool = False,
+        detail: str = DETAIL_EVIDENCE,
     ) -> dict[str, Any]:
         trace_id = f"q-mcp-{uuid4().hex}"
         body: dict[str, Any] = {
@@ -162,7 +165,12 @@ class KnowledgeClient:
         )
         payload = self._decode_payload(resp, path="/retrieve", trace_id=trace_id)
         _default_degraded(payload)
-        return payload if verbose else compact_search(payload)
+        if verbose:
+            # The raw-payload escape hatch outranks any profile: verbose exists
+            # for debugging the upstream shape, and a projection of a debug
+            # payload is a contradiction.
+            return payload
+        return apply_detail(compact_search(payload), detail)
 
     async def query(
         self,

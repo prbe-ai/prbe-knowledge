@@ -273,7 +273,7 @@ forms. The same human appears under multiple values:
 - Linear → user id (`user_a3f9`)
 - Notion / Granola / Sentry → varies
 
-Today, `search_knowledge` chunks expose `author_id` as the raw form. The
+Today, `search_knowledge` exposes `author_id` (doc-level, raw form, detail="full" only since the detail parameter landed). The
 `Co-authored-by:` work landed alongside this comment surfaces co-authors
 under their email — usually a *different* string from the same person's
 primary `author_id` on PRs. Agents filtering by `author_ids=["mahit"]`
