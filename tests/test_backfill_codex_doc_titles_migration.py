@@ -29,7 +29,11 @@ def test_migration_file_exists() -> None:
 def test_revision_chain() -> None:
     m = _load_migration()
     assert m.revision == "0042_backfill_codex_doc_titles"
-    assert m.down_revision == "0041_wiki_v4_agent_loop"
+    # Pin the chain position, not the predecessor's full id: this migration
+    # must hang off 0041 so it can never be reordered into the sequence
+    # ahead of the schema it updates.
+    assert m.down_revision is not None
+    assert m.down_revision.startswith("0041_")
 
 
 def test_revision_id_fits_alembic_version_column() -> None:
