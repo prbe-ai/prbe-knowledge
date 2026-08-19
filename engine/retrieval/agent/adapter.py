@@ -44,7 +44,6 @@ log = get_logger(__name__)
 # overlapping but distinct set; the two share {vector, bm25, graph,
 # inferred_edge, id_lookup} while agent-only channels like graph_walk /
 # inferred_neighbor / entity_cluster / reissue coerce to "vector" and
-# `directed` is a consumer-only channel that the agent never emits)
 # down into the consumer-visible MatchProvenance set. Derived from the
 # MatchProvenance model so adding a channel to the Literal in
 # shared.models automatically updates this set — no silent drift.

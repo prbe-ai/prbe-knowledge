@@ -1,4 +1,4 @@
-"""drop the team wiki: its compiled pages, their chunks, and its seven tables
+"""drop the team wiki: its compiled pages, their chunks, and its eight tables
 
 Revision ID: 0110_drop_wiki
 Revises: 0109_documents_title_preview_tsv
@@ -25,7 +25,7 @@ is agent-written notes with provenance at the moment of work. Nothing here is
 archived first. That is a decision about THIS content, not a precedent.
 
 WHAT THE COUNTS LOOKED LIKE when this was written, on the research plane's `kb`
-database: 0 wiki documents, 0 directed_vectors, 0 rows in four of the seven
+database: 0 wiki documents, 0 directed_vectors, 0 rows in four of the eight
 tables -- and 139,635 rows in `wiki_synthesis_queue` with 270 runs and 30 links.
 That queue is the whole argument for dropping rather than leaving it: ingest
 kept filling it on every webhook for tenants whose preference was still true,
@@ -55,16 +55,13 @@ owner of table", which is loud rather than silent, but would still fail a
 deploy. `app` owns them today; a deployment whose migrator does not will stop
 here instead of half-finishing.
 
-DOWNGRADE RECREATES THE TABLES, EMPTY, AND SAYS SO. The DDL is reversible; the
-rows are not. A downgrade that silently produced an empty wiki would look like
-a restore, so it raises unless the operator sets `PRBE_ALLOW_EMPTY_WIKI_RESTORE`
--- the schema comes back for a rollback that needs the shape, and nobody
-mistakes it for the data.
+DOWNGRADE REFUSES, and the function says why at length. The rows were deleted
+rather than archived, so no migration can restore them; and an earlier draft
+that recreated the tables "shape only" got the shapes wrong in four places,
+which would have failed a rollback later and less legibly than refusing does.
 """
 
 from __future__ import annotations
-
-import os
 
 import sqlalchemy as sa
 from alembic import op
@@ -144,83 +141,50 @@ def upgrade() -> None:
     for table in _WIKI_TABLES:
         op.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
 
+    # The last wiki-shaped object in the live schema. It capped a live wiki
+    # page's `body_size_bytes` and is vacuously true the moment no row can
+    # carry `source_system='wiki'` -- so it breaks nothing either way, and that
+    # is exactly why it has to go now rather than later: left in place it reads
+    # as live policy to the next person who opens `documents`.
+    op.execute("ALTER TABLE documents DROP CONSTRAINT IF EXISTS ck_wiki_live_page_size")
+
 
 def downgrade() -> None:
-    if not os.environ.get("PRBE_ALLOW_EMPTY_WIKI_RESTORE"):
-        raise RuntimeError(
-            "0109 cannot restore the wiki: its pages, chunks and queue rows were "
-            "deleted, not archived, and this downgrade would recreate seven empty "
-            "tables that look like a restore and are not. Set "
-            "PRBE_ALLOW_EMPTY_WIKI_RESTORE=1 if the empty SCHEMA is what you need "
-            "(a rollback to code that expects the tables to exist)."
-        )
-    # Shape only, and only enough of it for older code to start against. The
-    # indexes, RLS policies and constraints are NOT restored: they exist to make
-    # a working pipeline correct, and there is no pipeline to be correct for.
-    op.execute(
-        """
-        CREATE TABLE IF NOT EXISTS wiki_synthesis_queue (
-            id BIGSERIAL PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            doc_id TEXT NOT NULL,
-            doc_version INT,
-            source_system TEXT,
-            doc_type TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        CREATE TABLE IF NOT EXISTS wiki_synthesis_runs (
-            id BIGSERIAL PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            kind TEXT,
-            status TEXT,
-            started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            error TEXT
-        );
-        CREATE TABLE IF NOT EXISTS wiki_raw_data (
-            id BIGSERIAL PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            payload JSONB
-        );
-        CREATE TABLE IF NOT EXISTS wiki_links (
-            id BIGSERIAL PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            src_doc_id TEXT,
-            dst TEXT
-        );
-        CREATE TABLE IF NOT EXISTS wiki_timeline_entries (
-            id BIGSERIAL PRIMARY KEY,
-            customer_id TEXT NOT NULL,
-            doc_id TEXT,
-            occurred_at TIMESTAMPTZ
-        );
-        CREATE TABLE IF NOT EXISTS wiki_page_settings (
-            customer_id TEXT NOT NULL,
-            wiki_type TEXT NOT NULL,
-            slug TEXT NOT NULL,
-            pipeline_updates BOOLEAN NOT NULL DEFAULT TRUE,
-            PRIMARY KEY (customer_id, wiki_type, slug)
-        );
-        CREATE TABLE IF NOT EXISTS wiki_append_idempotency (
-            customer_id TEXT NOT NULL,
-            wiki_type TEXT NOT NULL,
-            slug TEXT NOT NULL,
-            idempotency_key TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (customer_id, wiki_type, slug, idempotency_key)
-        );
-        -- `halfvec` needs the vector extension, which every deployment that ran
-        -- this migration already has.
-        CREATE TABLE IF NOT EXISTS directed_vectors (
-            vector_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            customer_id TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-            doc_id TEXT NOT NULL,
-            embedding halfvec(3072) NOT NULL,
-            source_text TEXT NOT NULL,
-            source TEXT NOT NULL,
-            synthesis_run_id BIGINT NULL,
-            content_hash BYTEA NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """
+    """Refuses. The wiki cannot be restored from here, and a half-restore is worse.
+
+    This function used to recreate the eight tables behind an environment flag,
+    "shape only, for a rollback to code that expects them to exist". Review
+    found that the shapes were WRONG -- `queue_id` written as `id`,
+    `src_wiki_type`/`src_slug` collapsed to `src_doc_id`, NOT-NULL columns
+    (`text_sha256`, `version`, `entry_date`) missing, and the
+    `uq_wsq_customer_doc_version` constraint absent, which is the exact target
+    of pre-0110 `_enqueue_wiki_synthesis`'s `ON CONFLICT`. So the rollback the
+    flag existed to enable would have failed on its first query anyway, with
+    `UndefinedColumnError` instead of `UndefinedTable`.
+
+    It also dropped FORCE RLS and the `tenant_isolation` policies that
+    `directed_vectors`, `wiki_page_settings` and `wiki_append_idempotency`
+    carried. Recreating those tables WITHOUT tenant isolation, for the
+    NOBYPASSRLS `app` role that reads them, is a cross-tenant hole opened by a
+    rollback -- the one moment nobody is looking for new holes.
+
+    A schema that is close but wrong is worse than no schema: the first fails
+    at the first query with a message about the real problem, the second fails
+    later, further away, and looks like a code bug.
+
+    TO ACTUALLY ROLL BACK: take the DDL from git, where it is exact and
+    complete --
+
+        git show <this-revision>^:db/schema.sql
+
+    -- and restore the rows from a database backup. The rows were deleted, not
+    archived, so no migration can bring them back.
+    """
+    raise RuntimeError(
+        "0110_drop_wiki is not reversible. The wiki's pages, chunks and queue "
+        "rows were deleted, not archived, and the eight tables cannot be "
+        "recreated correctly from here -- their exact DDL, including FORCE RLS "
+        "and the tenant_isolation policies, is in git: "
+        "`git show <this-revision>^:db/schema.sql`. Restore rows from a "
+        "database backup."
     )

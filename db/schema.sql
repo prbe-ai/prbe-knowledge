@@ -208,27 +208,7 @@ CREATE TABLE documents (
     -- (e.g. the same Slack workspace replayed under a different customer)
     -- don't collide on doc_id and silently drop writes via ON CONFLICT.
     PRIMARY KEY (customer_id, doc_id, version),
-    CONSTRAINT documents_visibility_chk CHECK (visibility IN ('draft','approved')),
-    -- Backstop under the staged-commit preflight (kb/synthesis/staged_graph.py),
-    -- and weaker than it on purpose: the preflight sees the whole batch and can
-    -- tell the agent why in words, this only catches writers that never go
-    -- through it. It constrains a COUNTER, not content -- there is no page
-    -- `body` column, bodies live across `chunks`, and `body_size_bytes` is
-    -- whatever the handler reported.
-    --
-    -- `source_system <> 'wiki'`: `documents` holds every connector, and Slack
-    -- threads and GitHub PRs are routinely far larger with no business being
-    -- split. `doc_type = 'wiki.index'`: the front page is generated whole from
-    -- the others. `valid_to IS NOT NULL`: `documents` is temporal, and 97
-    -- historical wiki versions were over this cap when it was added (0 live
-    -- ones) -- rewriting published history to satisfy a new rule would corrupt
-    -- the audit chain the version list exists to provide.
-    CONSTRAINT ck_wiki_live_page_size CHECK (
-        source_system <> 'wiki'
-        OR doc_type = 'wiki.index'
-        OR valid_to IS NOT NULL
-        OR body_size_bytes <= 8192
-    )
+    CONSTRAINT documents_visibility_chk CHECK (visibility IN ('draft','approved'))
 );
 
 CREATE INDEX idx_documents_customer_source ON documents (customer_id, source_system, source_id);

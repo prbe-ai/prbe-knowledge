@@ -497,7 +497,7 @@ class MatchProvenance(BaseModel):
     """
 
     channel: Literal[
-        "vector", "bm25", "graph", "inferred_edge", "id_lookup", "directed"
+        "vector", "bm25", "graph", "inferred_edge", "id_lookup"
     ]
     rank: int
     score: float
