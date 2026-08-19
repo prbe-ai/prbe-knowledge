@@ -31,6 +31,11 @@ key is not an error, it is a permanent `False`, and it is indistinguishable
 from a tenant who chose not to opt in. Nobody notices until someone asks why
 the feature "never turned on" for one customer.
 
+This module is READ-ONLY, like `shared.customer_prefs`. The writers --
+`enable_capability` (which also seeds) and `disable_capability` (the kill
+switch) -- live in `shared.wfmem.situations`, because enabling touches the
+situations table and the import can only point one way.
+
 Here the key set is DERIVED from the two axes (so it cannot be half-updated by
 hand), the accessors go through the enums (so an off-axis value raises at
 construction), and `is_capability_enabled` REFUSES a key that is not in the

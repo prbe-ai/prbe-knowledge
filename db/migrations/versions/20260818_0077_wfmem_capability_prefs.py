@@ -21,6 +21,16 @@ who explicitly opted out (`false`), is left exactly as they are -- the WHERE
 clause filters on key absence, not on value. Same idiom as 0038, which did this
 for the per-source enrichment toggles.
 
+TWO GUARDS, not one, and the second is easy to miss. `preferences` is typed
+JSONB, not "JSONB object": a scalar or array is representable and the column has
+no CHECK forbidding it. `jsonb_set` on a scalar does not skip the row, it raises
+`cannot set path in scalar` and ABORTS THE WHOLE MIGRATION -- so one tenant with
+a junk blob blocks the backfill for every other tenant. Hence
+`jsonb_typeof(...) = 'object'` on both the upgrade and the downgrade (`- key` on
+a scalar fails the same way). Those rows are left alone deliberately: the reader
+already resolves a non-object blob to false, and quietly rewriting somebody's
+malformed preferences from inside a backfill is not this migration's business.
+
 NO DDL. `customers.preferences` already exists (schema.sql:37, `JSONB NOT NULL
 DEFAULT '{}'`), so `db/schema.sql` is unchanged by this revision.
 
@@ -64,6 +74,7 @@ def upgrade() -> None:
                        true
                    )
              WHERE NOT (COALESCE(preferences, '{{}}'::jsonb) ? '{key}')
+               AND jsonb_typeof(COALESCE(preferences, '{{}}'::jsonb)) = 'object'
             """
         )
 
@@ -81,4 +92,10 @@ def downgrade() -> None:
     # and re-upgrading does not bring the opt-in back -- the upgrade writes
     # `false` into the now-absent key.
     for key in WFMEM_CAPABILITY_KEYS_BACKFILLED:
-        op.execute(f"UPDATE customers SET preferences = preferences - '{key}'")
+        op.execute(
+            f"""
+            UPDATE customers
+               SET preferences = preferences - '{key}'
+             WHERE jsonb_typeof(preferences) = 'object'
+            """
+        )
