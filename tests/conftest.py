@@ -76,6 +76,11 @@ def settings() -> Settings:
 
 TRUNCATE_SQL = """
     TRUNCATE TABLE
+        serve_ledger,
+        clause_evidence,
+        clause_situation_edges,
+        clauses,
+        situations,
         graph_edges,
         graph_nodes,
         audit_log,

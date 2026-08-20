@@ -1518,6 +1518,33 @@ GRANOLA_REQUEST_INTERVAL_SECONDS = 0.25
 GRANOLA_REFRESH_DEBOUNCE_SECONDS = 30
 
 
+# Workflow-memory situation classifier, tie-break leg only. The classifier is
+# embedding-first and reaches a model ONLY when the top two situations score
+# within MARGIN of each other, so this is a rare call on a sub-second serving
+# path -- which is the argument for a flash-class model. The task is a
+# shortlist pick from 2-3 supplied options with a permitted "none": if this is
+# ever swapped, the thing to re-check is whether the replacement still answers
+# "none" honestly rather than always choosing from the menu, because a model
+# that never abstains turns off the `unknown` escape hatch without changing a
+# line of our code.
+WFMEM_CLASSIFIER_TIEBREAK_MODEL = "gemini/gemini-3.5-flash"
+
+# Workflow-memory structuring pass: declared prose -> a clause draft. NOT
+# flash-class, unlike the tie-break above, and the difference is deliberate.
+# The tie-break picks one item off a supplied shortlist on a sub-second serving
+# path; this rewrites free prose into a typed record ONCE per `/set-rule`, with
+# a human sitting there waiting for the echo, so cost and latency are not the
+# binding constraints -- volume is orders of magnitude lower and the flow is
+# gated on a confirmation anyway. What IS binding is restraint: the draft's
+# `body` becomes authoritative only because the author recognises their own rule
+# in it, so the model has to rewrite conservatively and leave `binding` empty
+# rather than inventing a plausible script path. Following a "do not add
+# anything the person did not say" instruction under pressure to be helpful is
+# exactly where a frontier-class model beats a flash one, and a polished
+# invention here is not caught downstream -- people approve what looks right.
+# If this is ever swapped, re-check that the replacement still refuses to
+# embellish, because that failure is invisible in the response shape.
+WFMEM_STRUCTURING_MODEL = "anthropic/claude-sonnet-4-6"
 
 # --- DB pool init backoff ---------------------------------------------------
 # Connect-with-backoff knobs for shared.db.init_pool, kept here per the

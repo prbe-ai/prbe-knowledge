@@ -921,7 +921,7 @@ CREATE TABLE entity_merge_edge_snapshot (
     --                             (graph_edges_unique_lane). Keeps its two
     --                             distinct endpoints, so unmerge restores it by
     --                             resolving pre_from/pre_to canonical ids.
-    --                             Added by migration 0113 — the writer at
+    --                             Added by migration 0117 — the writer at
     --                             entity_clusters_routes.py:363 predates it and
     --                             had never executed, so nothing ever violated
     --                             the narrower form.
@@ -1470,3 +1470,286 @@ ALTER TABLE purge_runs FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON purge_runs
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
+-- Workflow memory Phase 0: the procedure store (migration 0114).
+--
+-- situations / clauses / clause_situation_edges / clause_evidence /
+-- serve_ledger. All five carry data in v0. `procedures` /
+-- `procedure_clauses` are deliberately NOT created — nothing writes them in
+-- v0 and their shape is unknown.
+--
+-- DELIBERATELY ABSENT: clause_evidence stores evidence BY REFERENCE, enforced
+-- on TWO axes — (a) no quote/text column, and (b) a CHECK refusing quote-shaped
+-- keys inside source_ref, which is the unconstrained JSONB where a quote would
+-- actually land. Evidence resolves at view time through the viewer's ACL and a
+-- baked-in quote escapes that check; both axes have tests in
+-- tests/test_workflow_memory_isolation.py. situation_occurrences and
+-- conformance are not created either — they need Phase 1's detectors.
+--
+-- This block MUST stay identical to
+-- db/migrations/versions/20260820_0114_workflow_memory_store.py: CI applies
+-- this file and stamps alembic head, it never runs the migration chain.
+-- ---------------------------------------------------------------------------
+CREATE TABLE situations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    slug            TEXT NOT NULL,
+    label           TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    example_signals JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (customer_id, slug),
+    -- Redundant for uniqueness (id is already the PK), but REQUIRED as
+    -- the target of the composite FKs below: Postgres will only
+    -- reference columns that carry a unique constraint.
+    UNIQUE (customer_id, id)
+);
+
+CREATE TABLE clauses (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id         TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    kind                TEXT NOT NULL
+                        CHECK (kind IN ('step','check','exception','anti_pattern','asset')),
+    semantic_action     TEXT,
+    body                TEXT NOT NULL,
+    binding             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    scope               JSONB NOT NULL DEFAULT '{}'::jsonb,
+    status              TEXT NOT NULL
+                        CHECK (status IN ('declared','documented','observed_convention',
+                                          'success_associated','expert_confirmed',
+                                          'intervention_validated','exception','anti_pattern',
+                                          'contested','stale','agent_proposed')),
+    owner_ref           TEXT,
+    author_ref          TEXT NOT NULL,
+    version             INTEGER NOT NULL DEFAULT 1,
+    lineage             JSONB NOT NULL DEFAULT '{}'::jsonb,
+    salience            REAL NOT NULL DEFAULT 0.5,
+    binding_health      JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Publication, which is a SEPARATE AXIS from corroboration (migration
+    -- 0112). NULL means the clause is visible under the ordinary two-human
+    -- rule; non-NULL means a named person published it on their own
+    -- authority, without waiting for a second human to agree. Two columns
+    -- rather than a boolean because unilateral publication is an act of
+    -- authority over what a team is told to do, and an unattributable one is
+    -- worse than none. NOT a `status` value: status describes how strong the
+    -- evidence is, this describes whether the clause has been published, and
+    -- a force-published rule is still `declared` with one human behind it.
+    --
+    -- LAST, AFTER created_at/updated_at, and that is not cosmetic. 0112 adds
+    -- them with ALTER TABLE ADD COLUMN, which appends -- so declaring them
+    -- mid-table here gives schema.sql different ordinal positions than the
+    -- migration chain produces. The drift guard compares ordinals and caught
+    -- exactly that. Any future column added by an ALTER goes at the bottom.
+    shared_by           TEXT,
+    shared_at           TIMESTAMPTZ,
+    CONSTRAINT ck_clauses_publication_is_attributed
+        CHECK ((shared_by IS NULL) = (shared_at IS NULL)),
+    -- The body's embedding, stored so neighbour search embeds ONE text per
+    -- declaration instead of the whole corpus (migration 0117). The model id
+    -- is not optional: a cosine between vectors from two different embedders
+    -- is a plausible-looking number rather than an error, so a row embedded by
+    -- an older model must be EXCLUDED from a search, not silently compared.
+    -- Same reasoning that puts model_id in the classifier's cache key.
+    body_embedding       halfvec(3072),
+    body_embedding_model TEXT,
+    CONSTRAINT ck_clauses_embedding_names_its_model
+        CHECK ((body_embedding IS NULL) = (body_embedding_model IS NULL)),
+    UNIQUE (customer_id, id)          -- composite-FK target; see situations
+);
+
+CREATE INDEX clauses_customer_status_idx ON clauses (customer_id, status);
+-- Partial: published clauses are the minority and the only rows this serves.
+-- The visibility predicate tests `shared_by IS NOT NULL`, which a full index
+-- over a mostly-NULL column would answer no faster.
+CREATE INDEX clauses_published_idx ON clauses (customer_id, shared_at)
+    WHERE shared_by IS NOT NULL;
+-- Neighbour search at declaration time. House pattern: chunks,
+-- directed_vectors and graph_nodes all index halfvec with HNSW cosine.
+CREATE INDEX clauses_body_embedding_hnsw
+    ON clauses USING hnsw (body_embedding halfvec_cosine_ops);
+
+-- COMPOSITE FKs, not simple ones. Postgres referential-integrity checks
+-- bypass row security by design, and the tenant policy only inspects THIS
+-- row's customer_id -- so a simple `REFERENCES clauses(id)` lets tenant A
+-- attach an edge to tenant B's clause id. That succeeds iff the uuid
+-- exists in any tenant, which is a cross-tenant existence oracle, and it
+-- corrupts any later join that runs outside a tenant GUC. Keying the FK
+-- on (customer_id, id) makes the mismatch unrepresentable.
+-- Caveat: "unrepresentable" is slightly too strong. The FK route is closed,
+-- but an explicit-id insert of another tenant's uuid still errors DIFFERENTLY
+-- from a random uuid via the single-column PK, so a narrow existence oracle
+-- survives at the primary key.
+CREATE TABLE clause_situation_edges (
+    clause_id       UUID NOT NULL,
+    situation_id    UUID NOT NULL,
+    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    FOREIGN KEY (customer_id, clause_id)
+        REFERENCES clauses (customer_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (customer_id, situation_id)
+        REFERENCES situations (customer_id, id) ON DELETE CASCADE,
+    when_conditions JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- {method,confidence,model,prompt_version,classified_at}. The only
+    -- reclassification input not derivable from the clause itself: once
+    -- an edge is written, "situation X" is all you know.
+    classification  JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (clause_id, situation_id)
+);
+
+CREATE INDEX cse_situation_idx ON clause_situation_edges (customer_id, situation_id);
+
+-- NO quote/text column here, AND no quote-shaped key inside source_ref.
+-- See the section header: the column-absence claim alone was wrong.
+CREATE TABLE clause_evidence (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id      TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    clause_id        UUID NOT NULL,
+    FOREIGN KEY (customer_id, clause_id)
+        REFERENCES clauses (customer_id, id) ON DELETE CASCADE,
+    source_class     TEXT NOT NULL
+                     CHECK (source_class IN ('declared','human_doc','human_message',
+                                             'pr_review','human_wiki_edit',
+                                             'agent_transcript','run_outcome')),
+    -- A POINTER, not a payload: {"session": "...", "span": [0, 1]}.
+    -- Unconstrained JSONB is exactly where a quote would land, so the
+    -- quote-shaped keys are refused here rather than left to review.
+    source_ref       JSONB NOT NULL
+                     CHECK (NOT (source_ref ?| ARRAY['quote','text','body','content',
+                                                     'excerpt','snippet','raw','full_text',
+                                                     'verbatim','passage'])),
+    author_ref       TEXT,
+    -- NO DEFAULT, deliberately. A default of FALSE fails OPEN: a writer that
+    -- forgets the taint computation records the evidence as clean, and
+    -- taint-excluded support is a stated non-negotiable. With NOT NULL and no
+    -- default, an omission is a constraint violation and every write has to
+    -- state its taint.
+    exposure_tainted BOOLEAN NOT NULL,
+    ts               TIMESTAMPTZ NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Leads with the tenant column, matching the composite FK.
+CREATE INDEX clause_evidence_clause_idx ON clause_evidence (customer_id, clause_id);
+
+CREATE TABLE serve_ledger (
+    id           BIGSERIAL PRIMARY KEY,
+    customer_id  TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    -- Bare ids, deliberately no FK: this is an append-only audit log and
+    -- an ON DELETE rule would silently rewrite exposure history. The only
+    -- FK is customer_id, whose CASCADE is intended.
+    clause_ids   UUID[] NOT NULL,
+    situation_id UUID,
+    session_id   TEXT,
+    -- WHO the delivery went to. Without this the ledger cannot answer
+    -- "was this person's agent shown this clause before they produced
+    -- that evidence", which IS the taint join -- and taint-excluded
+    -- support is the §7 non-negotiable the whole ledger exists for.
+    -- Note for Stage 4: no user identity crosses into prbe-knowledge
+    -- today (engine_headers sends only the internal key + customer), so
+    -- the /v1/procedures contract must start carrying the actor.
+    actor_ref    TEXT,
+    channel      TEXT NOT NULL
+                 CHECK (channel IN ('retrieved','strip','compiled','injected')),
+    route        TEXT NOT NULL DEFAULT 'n/a' CHECK (route IN ('dumb','smart','n/a')),
+    mode         TEXT NOT NULL DEFAULT 'live' CHECK (mode IN ('live','shadow')),
+    trigger      TEXT,
+    served_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX serve_ledger_session_idx ON serve_ledger (customer_id, session_id);
+CREATE INDEX serve_ledger_actor_idx ON serve_ledger (customer_id, actor_ref, served_at);
+-- Phase 1's taint join asks "which clauses were served into this session",
+-- which is a containment query over the array. Without GIN that is a seq
+-- scan over a table that grows with every request.
+CREATE INDEX serve_ledger_clause_ids_idx ON serve_ledger USING GIN (clause_ids);
+
+-- Postgres has no ON UPDATE for column defaults, so an `updated_at DEFAULT
+-- now()` never advances past insert time. Shape copied from
+-- customers_fill_r2_bucket above, the house convention.
+CREATE OR REPLACE FUNCTION wfmem_touch_updated_at() RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER situations_touch_updated_at_trg
+    BEFORE UPDATE ON situations
+    FOR EACH ROW
+    EXECUTE FUNCTION wfmem_touch_updated_at();
+
+CREATE TRIGGER clauses_touch_updated_at_trg
+    BEFORE UPDATE ON clauses
+    FOR EACH ROW
+    EXECUTE FUNCTION wfmem_touch_updated_at();
+
+-- A stored embedding goes stale the moment the text it describes changes, and
+-- staleness here is INVISIBLE: the search still returns results, just wrong
+-- ones. Clearing both columns on a body edit means a stale vector can never be
+-- compared against -- the clause drops out of neighbour search until something
+-- re-embeds it, which is the safe direction to fail. Nothing in v0 updates a
+-- body; this exists so that when an edit path is added, it cannot introduce
+-- the bug by omission.
+CREATE OR REPLACE FUNCTION wfmem_clear_stale_clause_embedding() RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.body IS DISTINCT FROM OLD.body THEN
+        NEW.body_embedding := NULL;
+        NEW.body_embedding_model := NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER clauses_clear_stale_embedding_trg
+    BEFORE UPDATE ON clauses
+    FOR EACH ROW
+    EXECUTE FUNCTION wfmem_clear_stale_clause_embedding();
+
+-- RLS on all five. FORCE so the policy applies to the table owner too, and
+-- BOTH halves: USING alone hides another tenant's rows on read but still
+-- lets a buggy writer file a row under the wrong customer.
+--
+-- serve_ledger is the exception: FOR SELECT + FOR INSERT policies only. It is
+-- an append-only exposure log, and under FORCE RLS the ABSENCE of an
+-- UPDATE/DELETE policy is the deny — a tenant cannot backdate or erase its own
+-- history. Backdating is worse than deletion: it silently inverts the taint
+-- join the table exists for.
+ALTER TABLE situations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE situations FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON situations
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+ALTER TABLE clauses ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clauses FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON clauses
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+ALTER TABLE clause_situation_edges ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clause_situation_edges FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON clause_situation_edges
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+ALTER TABLE clause_evidence ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clause_evidence FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON clause_evidence
+    USING (customer_id = current_setting('app.current_customer_id', true))
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+ALTER TABLE serve_ledger ENABLE ROW LEVEL SECURITY;
+ALTER TABLE serve_ledger FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation_select ON serve_ledger
+    FOR SELECT
+    USING (customer_id = current_setting('app.current_customer_id', true));
+CREATE POLICY tenant_isolation_insert ON serve_ledger
+    FOR INSERT
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+-- Belt-and-braces for any role that would otherwise inherit the privilege
+-- through PUBLIC; the deny above is the policy absence, not this REVOKE.
+REVOKE UPDATE, DELETE ON serve_ledger FROM PUBLIC;
