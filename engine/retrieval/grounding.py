@@ -485,6 +485,15 @@ async def _fuzzy_match_document_titles(
               -- The coalesce was never doing anything: the two guards directly
               -- above already exclude NULL and empty titles, and `valid_to IS
               -- NULL` above matches the index's own partial predicate.
+              --
+              -- This disjunct is the residual RLS cost in grounding: `%` runs
+              -- through `similarity_op`, which is not LEAKPROOF, so the planner
+              -- will not push it below the tenant security qual. Marking that
+              -- operator LEAKPROOF is a real option and is deliberately NOT
+              -- taken -- the flag is database-global, weakens cross-tenant
+              -- inference resistance, and two cheaper alternatives are
+              -- unmeasured. Do not apply it as a tuning step; read
+              -- docs/storage-architecture.md "RLS and index usage" first.
               d.title % $2
               OR d.title_preview_tsv @@ plainto_tsquery('english', $3)
           )
