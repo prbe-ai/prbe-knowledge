@@ -588,8 +588,24 @@ async def test_serve_ledger_is_append_only_for_its_own_tenant(two_tenants):
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_MIGRATION_PATH = (
-    _REPO_ROOT / "db" / "migrations" / "versions" / "20260819_0110_workflow_memory_store.py"
+_VERSIONS_DIR = _REPO_ROOT / "db" / "migrations" / "versions"
+
+#: EVERY migration that touches workflow-memory DDL, in apply order.
+#:
+#: This was a single path until 0112, and the singular was a latent bug rather
+#: than a simplification: schema.sql accumulates the effect of the WHOLE chain,
+#: so comparing it against one migration means every later one is unchecked. It
+#: failed the moment 0112 added two columns -- correctly, and for the wrong
+#: reason, reporting drift when the real problem was that the guard could only
+#: see half the migrations.
+#:
+#: ADD EVERY NEW WFMEM MIGRATION HERE. A migration left off this list is not
+#: caught by anything: CI applies schema.sql and stamps the head, so the chain
+#: never runs there, and this comparison is the only thing keeping the two
+#: files honest. The completeness test below fails if one is missed.
+_MIGRATION_PATHS = (
+    _VERSIONS_DIR / "20260819_0110_workflow_memory_store.py",
+    _VERSIONS_DIR / "20260819_0112_wfmem_clause_publication.py",
 )
 _SCHEMA_PATH = _REPO_ROOT / "db" / "schema.sql"
 
@@ -629,17 +645,19 @@ _WFMEM_FUNCTION_RE = "^wfmem_"
 
 
 def _migration_upgrade_statements() -> list[str]:
-    """The SQL migration 0110 would run, without an alembic context.
+    """The SQL every wfmem migration would run, in order, without alembic.
 
-    Imports the migration and swaps its `op` for a recorder, so this stays
-    honest if someone edits the migration -- it replays what is in the file,
-    not a copy of it.
+    Imports each migration and swaps its `op` for a recorder, so this stays
+    honest if someone edits one -- it replays what is in the files, not a copy
+    of them.
+
+    THE RECORDER ONLY UNDERSTANDS `op.execute`. That is why those migrations are
+    written in raw SQL rather than with `add_column` / `create_index`: an op
+    helper would record nothing here, and the guard would compare schema.sql
+    against a migration it had only half read AND PASS. A silent pass is the
+    worst outcome available to this test, so the recorder REFUSES anything else
+    rather than ignoring it.
     """
-    spec = importlib.util.spec_from_file_location("wfmem_migration_0110", _MIGRATION_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
     collected: list[str] = []
 
     class _Recorder:
@@ -647,9 +665,51 @@ def _migration_upgrade_statements() -> list[str]:
         def execute(sql: object) -> None:
             collected.append(str(sql))
 
-    module.op = _Recorder  # type: ignore[attr-defined]
-    module.upgrade()
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(
+                f"migration used op.{name}(), which this guard cannot replay. "
+                "Write wfmem DDL as op.execute(...) with raw SQL, or teach the "
+                "recorder to render it -- silently skipping it would make this "
+                "test pass while schema.sql drifts."
+            )
+
+    for path in _MIGRATION_PATHS:
+        assert path.exists(), f"{path.name} is missing from db/migrations/versions"
+        spec = importlib.util.spec_from_file_location(f"wfmem_migration_{path.stem}", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.op = _Recorder()  # type: ignore[attr-defined]
+        module.upgrade()
+
     return collected
+
+
+def test_every_wfmem_migration_is_replayed_by_the_drift_guard() -> None:
+    """A wfmem migration left out of `_MIGRATION_PATHS` is checked by nothing.
+
+    CI applies db/schema.sql and stamps the alembic head, so the chain never
+    runs there; this comparison is the only thing keeping the two files honest.
+    A migration the guard does not replay is a column that can exist in one file
+    and not the other, forever, with every test green.
+
+    Scans the versions directory rather than trusting the tuple -- the failure
+    mode is somebody adding a migration and not this line.
+    """
+    named = {path.name for path in _MIGRATION_PATHS}
+    on_disk = {
+        path.name
+        for path in _VERSIONS_DIR.glob("*.py")
+        if "wfmem" in path.name or "workflow_memory" in path.name
+    }
+    # 0111 is a data backfill of customers.preferences with no DDL, so it has
+    # nothing for this guard to compare and is excluded by name rather than by
+    # a rule that would also excuse a real one.
+    on_disk.discard("20260819_0111_wfmem_capability_prefs.py")
+    assert on_disk == named, (
+        f"these wfmem migrations are not replayed by the drift guard: "
+        f"{sorted(on_disk - named)}. Add them to _MIGRATION_PATHS."
+    )
 
 
 def _dsn_for(dbname: str) -> str:

@@ -405,6 +405,130 @@ async def test_a_refusal_is_reported_rather_than_raised(
 
 
 # --------------------------------------------------------------------------
+# Publication
+# --------------------------------------------------------------------------
+
+
+async def test_declaring_with_publish_reaches_a_stranger(
+    enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One person, one call, live for the team.
+
+    Without this the onboarding case is impossible: a lead declaring twenty
+    existing team rules produces twenty clauses nobody can see.
+    """
+    _patch_models(monkeypatch)
+    declared = (
+        await _post(
+            "/procedures/declare",
+            {"draft": DRAFT, "actor_ref": ACTOR, "publish": True},
+        )
+    ).json()
+
+    assert declared["shared_by"] == ACTOR
+    served = (await _post("/procedures/query", {"actor_ref": "user:stranger"})).json()
+    assert [c["id"] for c in served["clauses"]] == [declared["clause_id"]]
+
+
+async def test_publish_defaults_off_over_the_wire(
+    enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request that never mentions publishing must not publish. The two-human
+    rule is what stops a private habit becoming false policy."""
+    _patch_models(monkeypatch)
+    declared = (
+        await _post("/procedures/declare", {"draft": DRAFT, "actor_ref": ACTOR})
+    ).json()
+    assert declared["shared_by"] is None
+    served = (await _post("/procedures/query", {"actor_ref": "user:stranger"})).json()
+    assert served["clauses"] == []
+
+
+async def test_a_served_published_rule_is_labelled_not_laundered(
+    enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wire must carry enough to tell "one person says so" from "the team
+    does this". A client that cannot see the difference has had the two-human
+    guard defeated for it, by the feature meant to route around it."""
+    _patch_models(monkeypatch)
+    await _post("/procedures/declare", {"draft": DRAFT, "actor_ref": ACTOR, "publish": True})
+
+    served = (await _post("/procedures/query", {"actor_ref": "user:stranger"})).json()
+    clause = served["clauses"][0]
+    assert clause["shared_by"] == ACTOR
+    assert clause["human_backers"] == 1
+
+
+async def test_publishing_an_existing_rule_over_http(
+    enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_models(monkeypatch)
+    declared = (
+        await _post("/procedures/declare", {"draft": DRAFT, "actor_ref": ACTOR})
+    ).json()
+
+    published = (
+        await _post(
+            "/procedures/publish",
+            {"clause_id": declared["clause_id"], "actor_ref": ACTOR},
+        )
+    ).json()
+
+    assert published["changed"] is True
+    assert published["shared_by"] == ACTOR
+    served = (await _post("/procedures/query", {"actor_ref": "user:stranger"})).json()
+    assert len(served["clauses"]) == 1
+
+
+async def test_withdrawing_a_publication_over_http(
+    enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_models(monkeypatch)
+    declared = (
+        await _post(
+            "/procedures/declare",
+            {"draft": DRAFT, "actor_ref": ACTOR, "publish": True},
+        )
+    ).json()
+
+    withdrawn = (
+        await _post(
+            "/procedures/publish",
+            {"clause_id": declared["clause_id"], "actor_ref": ACTOR, "published": False},
+        )
+    ).json()
+
+    assert withdrawn["changed"] is True
+    served = (await _post("/procedures/query", {"actor_ref": "user:stranger"})).json()
+    assert served["clauses"] == []
+
+
+async def test_publishing_a_missing_rule_is_refused_not_500(
+    enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_models(monkeypatch)
+    response = await _post(
+        "/procedures/publish",
+        {"clause_id": "11111111-1111-1111-1111-111111111111", "actor_ref": ACTOR},
+    )
+    assert response.status_code == 200
+    assert "does not exist" in response.json()["refused"]
+
+
+async def test_publishing_is_gated_by_the_declared_input_capability(tenant: str) -> None:
+    """Publishing changes what is WRITTEN about a rule, so it gates on the input
+    cell rather than the retrieval one."""
+    payload = (
+        await _post(
+            "/procedures/publish",
+            {"clause_id": "11111111-1111-1111-1111-111111111111", "actor_ref": ACTOR},
+        )
+    ).json()
+    assert payload["capability"]["enabled"] is False
+    assert payload["changed"] is False
+
+
+# --------------------------------------------------------------------------
 # Query
 # --------------------------------------------------------------------------
 

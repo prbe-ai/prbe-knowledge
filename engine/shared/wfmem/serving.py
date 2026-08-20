@@ -115,6 +115,18 @@ class ServedClause:
     scope: dict[str, Any]
     created_at: datetime
     updated_at: datetime
+    #: Who published this on their own authority, or None if it is visible
+    #: because two humans back it. CARRIED ALL THE WAY TO THE SURFACE on
+    #: purpose: the house rule is label, never gate, and a rule one person
+    #: declared and published themselves is a different claim from one the team
+    #: demonstrably follows. Drop this field and both render identically, which
+    #: is the failure the whole two-human guard exists to prevent -- arrived at
+    #: by the feature meant to work around it.
+    shared_by: str | None = None
+    #: How many DISTINCT untainted humans back it. 1 on a published-but-
+    #: uncorroborated rule, which is the number a reader needs to see next to
+    #: `shared_by` for that label to mean anything.
+    human_backers: int = 0
 
 
 @dataclass(frozen=True)
@@ -151,9 +163,28 @@ _STATUS_ORDER = """
     COALESCE(array_position($3::text[], c.status), array_length($3::text[], 1) + 1)
 """
 
-_SELECT_COLUMNS = """
+# The same COUNT the visibility predicate runs, selected rather than only
+# tested. It is the number that makes `shared_by` legible: "published by
+# @mahit, 1 human behind it" and "published by @mahit, 4 humans behind it" are
+# very different instructions, and without it a surface can only say the first
+# half. Postgres evaluates the subquery once per returned row, and the row
+# count here is capped at MAX_LIMIT.
+_HUMAN_BACKERS = """
+    (
+        SELECT COUNT(DISTINCT e.author_ref)
+          FROM clause_evidence e
+         WHERE e.clause_id = c.id
+           AND e.author_ref IS NOT NULL
+           AND e.source_class = ANY($2::text[])
+           AND NOT e.exposure_tainted
+    )
+"""
+
+_SELECT_COLUMNS = f"""
     c.id, c.kind, c.body, c.status, c.author_ref, c.version,
-    c.binding, c.scope, c.created_at, c.updated_at
+    c.binding, c.scope, c.created_at, c.updated_at,
+    c.shared_by,
+    {_HUMAN_BACKERS} AS human_backers
 """
 
 
@@ -300,6 +331,8 @@ def _to_served(row: Any) -> ServedClause:
         scope=_as_dict(row["scope"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        shared_by=row["shared_by"],
+        human_backers=row["human_backers"] or 0,
     )
 
 

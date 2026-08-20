@@ -29,6 +29,25 @@ HUMAN_SOURCE_CLASSES = (
 )
 
 #: Applied to an aliased `clauses c`. $1 = viewer's actor ref, $2 = human classes.
+#:
+#: THREE WAYS A CLAUSE IS VISIBLE, and they are different claims:
+#:
+#: 1. Two distinct untainted humans back it -- the team really does do this.
+#: 2. You wrote it -- your own working note is yours to see.
+#: 3. Somebody PUBLISHED it (`shared_by IS NOT NULL`) -- one named person put
+#:    it in front of the team on their own authority.
+#:
+#: The third arm exists because without it the most important case is
+#: impossible: a lead declaring twenty existing team rules produces twenty
+#: clauses nobody can see, silently, because a lead is one person. Requiring a
+#: colleague to independently retype each rule is not corroboration, it is a
+#: captcha -- and the pair would be going through the motions, which is worse
+#: than one person signing their name to it.
+#:
+#: A published clause is LABELLED, NEVER HIDDEN, and serving surfaces are
+#: expected to show `shared_by` alongside it. The whole point of keeping
+#: publication off the `status` ladder is that a reader can still tell "one
+#: person says so" from "the team demonstrably does this".
 VISIBILITY_PREDICATE = """
     (
         (
@@ -40,6 +59,7 @@ VISIBILITY_PREDICATE = """
                AND NOT e.exposure_tainted
         ) >= 2
         OR c.author_ref = $1
+        OR c.shared_by IS NOT NULL
     )
 """
 

@@ -1849,10 +1849,34 @@ CREATE TABLE clauses (
     binding_health      JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Publication, which is a SEPARATE AXIS from corroboration (migration
+    -- 0112). NULL means the clause is visible under the ordinary two-human
+    -- rule; non-NULL means a named person published it on their own
+    -- authority, without waiting for a second human to agree. Two columns
+    -- rather than a boolean because unilateral publication is an act of
+    -- authority over what a team is told to do, and an unattributable one is
+    -- worse than none. NOT a `status` value: status describes how strong the
+    -- evidence is, this describes whether the clause has been published, and
+    -- a force-published rule is still `declared` with one human behind it.
+    --
+    -- LAST, AFTER created_at/updated_at, and that is not cosmetic. 0112 adds
+    -- them with ALTER TABLE ADD COLUMN, which appends -- so declaring them
+    -- mid-table here gives schema.sql different ordinal positions than the
+    -- migration chain produces. The drift guard compares ordinals and caught
+    -- exactly that. Any future column added by an ALTER goes at the bottom.
+    shared_by           TEXT,
+    shared_at           TIMESTAMPTZ,
+    CONSTRAINT ck_clauses_publication_is_attributed
+        CHECK ((shared_by IS NULL) = (shared_at IS NULL)),
     UNIQUE (customer_id, id)          -- composite-FK target; see situations
 );
 
 CREATE INDEX clauses_customer_status_idx ON clauses (customer_id, status);
+-- Partial: published clauses are the minority and the only rows this serves.
+-- The visibility predicate tests `shared_by IS NOT NULL`, which a full index
+-- over a mostly-NULL column would answer no faster.
+CREATE INDEX clauses_published_idx ON clauses (customer_id, shared_at)
+    WHERE shared_by IS NOT NULL;
 
 -- COMPOSITE FKs, not simple ones. Postgres referential-integrity checks
 -- bypass row security by design, and the tenant policy only inspects THIS

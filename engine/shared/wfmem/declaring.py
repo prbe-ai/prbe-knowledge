@@ -118,6 +118,12 @@ class Declaration:
     created: bool
     evidence_id: UUID
     situation_id: UUID | None
+    #: Who published it on their own authority, or None if it is visible only
+    #: under the ordinary two-human rule. Returned so a surface can tell the
+    #: author which of the two just happened -- "your rule is live for the team"
+    #: and "your rule is saved and private until somebody agrees" are different
+    #: sentences, and guessing wrong in either direction is a bad outcome.
+    shared_by: str | None = None
 
 
 class DeclarationRefused(ValueError):
@@ -200,12 +206,27 @@ async def declare(
     classification: dict[str, Any] | None = None,
     relation: Relation = Relation.NEW,
     related_clause_id: UUID | None = None,
+    publish: bool = False,
 ) -> Declaration:
     """Write the rule. One transaction: clause, situation edge, evidence.
 
     `relation` is the author's decision, not a guess. `MERGE` needs
     `related_clause_id` and writes no new clause; `VARIANT` and `CONFLICT` need
     one and record lineage in both directions where the relation is symmetric.
+
+    `publish=True` makes the clause visible to the team IMMEDIATELY, on this
+    author's own authority, instead of waiting for a second human's independent
+    agreement. It is the difference between "saved, and private until somebody
+    else says the same thing" and "this is now team policy". Without it the
+    important case is impossible: a lead declaring twenty existing team rules
+    produces twenty invisible clauses, silently, because a lead is one person.
+
+    It is NOT the default, and should not become one. The two-human rule is what
+    stops a private habit from becoming false policy, and most declarations
+    genuinely are one person's note. Publishing is a deliberate act, it is
+    attributed to `actor_ref` in `shared_by`, and serving surfaces label it --
+    a reader can always tell "one person says so" from "the team demonstrably
+    does this".
 
     Raises `SecretDetected` before opening the transaction, and
     `DeclarationRefused` for a relation whose arguments do not make sense.
@@ -225,6 +246,7 @@ async def declare(
             source_ref=source_ref,
             situation_id=situation_id,
             classification=classification,
+            publish=publish,
         )
 
     if relation in (Relation.VARIANT, Relation.CONFLICT) and related_clause_id is None:
@@ -239,7 +261,68 @@ async def declare(
         classification=classification,
         relation=relation,
         related_clause_id=related_clause_id,
+        publish=publish,
     )
+
+
+async def publish_clause(customer_id: str, clause_id: UUID, *, actor_ref: str) -> str | None:
+    """Publish an EXISTING clause on `actor_ref`'s authority. Returns the publisher.
+
+    The separate verb matters. Declaring and publishing are different decisions
+    made at different times: somebody writes a note for themselves, and weeks
+    later decides the team should follow it. Forcing that through `declare`
+    would mean re-typing the rule, which produces a second clause instead of
+    publishing the first.
+
+    IDEMPOTENT, AND FIRST PUBLISHER WINS. A second call leaves `shared_by` and
+    `shared_at` alone rather than overwriting them. The column answers "who put
+    this in front of the team", and that is the FIRST person to do so -- letting
+    a later caller overwrite it would quietly reassign responsibility for a
+    decision they did not make.
+
+    Returns the publisher's ref (which may be somebody else, on a repeat call),
+    or None if no such clause exists in this tenant.
+    """
+    if not actor_ref:
+        raise DeclarationRefused("publishing a rule must record who did it")
+
+    async with with_tenant(customer_id) as conn:
+        return await conn.fetchval(
+            """
+            UPDATE clauses
+               SET shared_by = COALESCE(shared_by, $3),
+                   shared_at = COALESCE(shared_at, now())
+             WHERE customer_id = $1 AND id = $2
+            RETURNING shared_by
+            """,
+            customer_id,
+            clause_id,
+            actor_ref,
+        )
+
+
+async def unpublish_clause(customer_id: str, clause_id: UUID) -> bool:
+    """Withdraw a publication. Returns True if a row changed.
+
+    The undo half, and it exists because publication is unilateral. Somebody
+    publishes a rule the team turns out not to agree with, and the only
+    alternatives without this are deleting the clause -- destroying its evidence
+    and history -- or leaving false policy in front of everybody. Withdrawing
+    returns the clause to the ordinary two-human rule; it stays visible if it
+    genuinely earned corroboration in the meantime, which is the correct
+    outcome and not something a caller has to work out.
+    """
+    async with with_tenant(customer_id) as conn:
+        status = await conn.execute(
+            """
+            UPDATE clauses
+               SET shared_by = NULL, shared_at = NULL
+             WHERE customer_id = $1 AND id = $2 AND shared_by IS NOT NULL
+            """,
+            customer_id,
+            clause_id,
+        )
+    return status.rsplit(" ", 1)[-1] != "0"
 
 
 def _scan(draft: ClauseDraft, source_ref: dict[str, Any]) -> None:
@@ -267,8 +350,10 @@ async def _insert(
     classification: dict[str, Any] | None,
     relation: Relation,
     related_clause_id: UUID | None,
+    publish: bool,
 ) -> Declaration:
     lineage = _lineage_for(relation, related_clause_id)
+    shared_by = actor_ref if publish else None
 
     async with with_tenant(customer_id) as conn:
         if related_clause_id is not None and not await _clause_exists(
@@ -284,8 +369,13 @@ async def _insert(
             """
             INSERT INTO clauses
                 (customer_id, kind, body, semantic_action, binding, scope,
-                 status, author_ref, lineage)
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9::jsonb)
+                 status, author_ref, lineage, shared_by, shared_at)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9::jsonb,
+                    $10,
+                    -- Timestamp derived from the publisher rather than passed
+                    -- separately, so the CHECK that keeps the pair together
+                    -- cannot be violated by a caller that sets one of them.
+                    CASE WHEN $10::text IS NULL THEN NULL ELSE now() END)
             RETURNING id
             """,
             customer_id,
@@ -297,6 +387,7 @@ async def _insert(
             DECLARED_STATUS,
             actor_ref,
             json.dumps(lineage),
+            shared_by,
         )
 
         if relation is Relation.CONFLICT and related_clause_id is not None:
@@ -310,7 +401,11 @@ async def _insert(
         )
 
     return Declaration(
-        clause_id=clause_id, created=True, evidence_id=evidence_id, situation_id=situation_id
+        clause_id=clause_id,
+        created=True,
+        evidence_id=evidence_id,
+        situation_id=situation_id,
+        shared_by=shared_by,
     )
 
 
@@ -322,6 +417,7 @@ async def _merge(
     source_ref: dict[str, Any],
     situation_id: UUID | None,
     classification: dict[str, Any] | None,
+    publish: bool = False,
 ) -> Declaration:
     """Add the declarer as evidence on an existing clause. No new clause.
 
@@ -345,8 +441,36 @@ async def _merge(
             conn, customer_id, into, actor_ref=actor_ref, source_ref=source_ref
         )
 
+        shared_by: str | None = None
+        if publish:
+            # COALESCE, so merging-with-publish onto an already-published clause
+            # does not reassign authorship of that decision to whoever merged
+            # second. Same first-publisher-wins rule as `publish_clause`.
+            shared_by = await conn.fetchval(
+                """
+                UPDATE clauses
+                   SET shared_by = COALESCE(shared_by, $3),
+                       shared_at = COALESCE(shared_at, now())
+                 WHERE customer_id = $1 AND id = $2
+                RETURNING shared_by
+                """,
+                customer_id,
+                into,
+                actor_ref,
+            )
+        else:
+            shared_by = await conn.fetchval(
+                "SELECT shared_by FROM clauses WHERE customer_id = $1 AND id = $2",
+                customer_id,
+                into,
+            )
+
     return Declaration(
-        clause_id=into, created=False, evidence_id=evidence_id, situation_id=situation_id
+        clause_id=into,
+        created=False,
+        evidence_id=evidence_id,
+        situation_id=situation_id,
+        shared_by=shared_by,
     )
 
 

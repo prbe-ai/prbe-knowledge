@@ -54,6 +54,8 @@ from engine.shared.wfmem.declaring import (
     Relation,
     declare,
     find_neighbours,
+    publish_clause,
+    unpublish_clause,
 )
 from engine.shared.wfmem.secret_scan import SecretDetected
 from engine.shared.wfmem.serving import DEFAULT_LIMIT, ServedClause, serve_clauses
@@ -138,6 +140,11 @@ class DeclareRequest(BaseModel):
     classification: dict[str, Any] | None = None
     relation: Relation = Relation.NEW
     related_clause_id: UUID | None = None
+    #: Make it visible to the team now, on this author's authority, instead of
+    #: waiting for a second human to independently agree. Defaults False and
+    #: must keep doing so: the two-human rule is what stops a private habit
+    #: becoming false policy, and most declarations really are one person's note.
+    publish: bool = False
 
     @model_validator(mode="after")
     def _relation_needs_a_counterpart(self) -> DeclareRequest:
@@ -157,6 +164,29 @@ class DeclareResponse(BaseModel):
     created: bool = False
     evidence_id: UUID | None = None
     situation_id: UUID | None = None
+    #: Who published it, or None if it is waiting on a second human. The client
+    #: needs this to tell the author which of two very different things just
+    #: happened -- "your rule is live for the team" versus "saved, and private
+    #: until somebody agrees" -- and guessing wrong in either direction is bad.
+    shared_by: str | None = None
+    refused: str | None = None
+
+
+class PublishRequest(BaseModel):
+    clause_id: UUID
+    actor_ref: str = Field(min_length=1, max_length=200)
+    #: False withdraws a publication. The undo exists because publishing is
+    #: unilateral: without it, the only ways to walk back a rule the team turns
+    #: out to disagree with are deleting the clause -- destroying its evidence
+    #: and history -- or leaving false policy in front of everybody.
+    published: bool = True
+
+
+class PublishResponse(BaseModel):
+    capability: CapabilityOut
+    clause_id: UUID | None = None
+    shared_by: str | None = None
+    changed: bool = False
     refused: str | None = None
 
 
@@ -177,6 +207,13 @@ class ClauseOut(BaseModel):
     version: int
     binding: dict[str, Any] = Field(default_factory=dict)
     scope: dict[str, Any] = Field(default_factory=dict)
+    #: Label, never gate. A rule one person declared and published themselves is
+    #: a different claim from one the team demonstrably follows, and a surface
+    #: that drops these two fields renders both identically -- reaching, via the
+    #: feature meant to work around the two-human guard, exactly the failure
+    #: that guard exists to prevent.
+    shared_by: str | None = None
+    human_backers: int = 0
 
 
 class QueryResponse(BaseModel):
@@ -256,6 +293,7 @@ async def declare_rule(
             classification=req.classification,
             relation=req.relation,
             related_clause_id=req.related_clause_id,
+            publish=req.publish,
         )
     except SecretDetected as exc:
         # 422 with the DETECTOR NAMES, never the matched text. The author needs
@@ -277,7 +315,51 @@ async def declare_rule(
         created=result.created,
         evidence_id=result.evidence_id,
         situation_id=result.situation_id,
+        shared_by=result.shared_by,
     )
+
+
+@procedures_router.post("/procedures/publish", response_model=PublishResponse)
+async def publish_rule(
+    req: PublishRequest,
+    customer_id: str = Depends(authenticate_query),
+) -> PublishResponse:
+    """Publish an existing clause to the team, or withdraw a publication.
+
+    Separate from `/declare` because these are different decisions made at
+    different times: somebody writes a note for themselves, and weeks later
+    decides the team should follow it. Routing that through `/declare` would
+    mean retyping the rule, which produces a SECOND clause rather than
+    publishing the first.
+
+    Gated on the declared-input capability rather than the retrieval one --
+    publishing changes what is written about a rule, not how it is served.
+    """
+    capability = await _envelope(customer_id, _DECLARED_KEY)
+    if not capability.enabled:
+        return PublishResponse(capability=capability)
+
+    try:
+        if req.published:
+            shared_by = await publish_clause(customer_id, req.clause_id, actor_ref=req.actor_ref)
+            if shared_by is None:
+                return PublishResponse(
+                    capability=capability,
+                    refused="that rule does not exist in this workspace",
+                )
+            return PublishResponse(
+                capability=capability,
+                clause_id=req.clause_id,
+                shared_by=shared_by,
+                changed=True,
+            )
+
+        changed = await unpublish_clause(customer_id, req.clause_id)
+        return PublishResponse(
+            capability=capability, clause_id=req.clause_id, changed=changed
+        )
+    except DeclarationRefused as exc:
+        return PublishResponse(capability=capability, refused=str(exc))
 
 
 @procedures_router.post("/procedures/query", response_model=QueryResponse)
@@ -397,6 +479,8 @@ def _clause_out(clause: ServedClause) -> ClauseOut:
         version=clause.version,
         binding=clause.binding,
         scope=clause.scope,
+        shared_by=clause.shared_by,
+        human_backers=clause.human_backers,
     )
 
 
