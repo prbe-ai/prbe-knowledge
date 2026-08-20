@@ -153,6 +153,113 @@ sequenceDiagram
 
 ---
 
+## RLS and index usage
+
+Every customer-scoped table is behind `ENABLE` + `FORCE ROW LEVEL SECURITY`,
+and the retrieval service is deliberately not `BYPASSRLS`. That is the isolation
+guarantee — a forgotten `WHERE customer_id = ...` is a bug, not a breach — and
+it constrains query planning in a way that is invisible until something is
+mysteriously slow.
+
+**The rule.** RLS makes the tenant qual a *security barrier*. The planner may
+evaluate another qual *below* that barrier only if it is provably `LEAKPROOF`,
+because evaluating a function against rows the caller may not see can reveal
+that those rows exist — through an error raised only on certain inputs, or
+through timing. A qual that cannot go below the barrier runs *after* filtering,
+and a predicate that runs after filtering cannot be used to *locate* rows. So it
+cannot drive an index scan.
+
+**What this does and does not affect.** It is not "RLS breaks indexes." Measured
+on this schema:
+
+| Access path | Indexed under RLS? |
+|---|---|
+| Plain column predicates (btree equality, `customer_id`) | yes |
+| pg_search / ParadeDB `@@@` | yes |
+| pgvector HNSW (`halfvec_cosine_ops`) | yes |
+| **Expression indexes** (index on `to_tsvector(...)`) | **no — see below** |
+| **Non-leakproof operators** (`%` via `similarity_op`, `@@` via `ts_match_vq`) | **no** |
+
+This is why the vector and BM25 channels of the pre-fan-out were never slow,
+and why the grounding channel was.
+
+**Expression indexes are unusable under RLS regardless of LEAKPROOF.** Matching
+one means evaluating the *indexed expression* below the barrier, which the
+planner declines under RLS even when every function involved is marked
+leakproof. Measured on the managed plane (tenant `probe-founders`, role
+`probe_app`, `row_security = on`), single probe:
+
+    expression index                             1052 ms
+    same, with to_tsvector/ts_match_vq marked
+      LEAKPROOF                                   874 ms   <- still not indexed
+    STORED generated column + index on it           23 ms
+
+The fix is to remove the expression: materialize it as a `STORED GENERATED`
+column so the query references a **plain column**, which needs no below-barrier
+evaluation at all. Migration `0109` did this for `documents.title_preview_tsv`
+and cut the full grounding predicate 1052 ms -> 238 ms with no semantic change
+and no security decision. Note the win came from *precomputation*, not from the
+new index — which still shows zero scans.
+
+If you add a GIN/GiST index on an expression over an RLS table, assume it will
+never be used and materialize instead.
+
+### LEAKPROOF: an available lever, deliberately not taken
+
+The residual cost in grounding is the trigram arm — `documents.title % $2` —
+where the blocker is the *operator* rather than an expression wrapping it.
+`ALTER FUNCTION similarity_op(text, text) LEAKPROOF` would let it use
+`idx_documents_title_trgm`. Recorded in `0109` as worth roughly the remaining
+9x on that predicate.
+
+**Status: open, deliberately deferred (2026-08-19). Not a bug, not an
+oversight, and not to be applied as a routine tuning step.**
+
+What you would be trading:
+
+- *Access control is unchanged.* RLS still filters the result set; no tenant can
+  retrieve another tenant's row, leakproof or not.
+- *Inference resistance is weakened.* The operator would be evaluated against
+  index entries spanning all tenants, so query cost comes to depend weakly on
+  how much of the whole corpus matches the search term — a low-bandwidth
+  cross-tenant cardinality oracle via timing.
+- The classic error-channel attack needs a caller who can submit arbitrary SQL
+  predicates. Ours cannot: the operator is fixed by our code and only the bound
+  parameter is tenant-supplied. The timing channel survives that, and is the
+  honest residual.
+- `ALTER FUNCTION ... LEAKPROOF` requires superuser and is **database-global**.
+  It cannot be scoped to one column or one table. It would apply to `%` on every
+  RLS table we have and every one added later — including `graph_nodes`, which
+  still carries an unfixed version of this same problem.
+
+That last asymmetry is the argument against it today: a permanent, global,
+questionnaire-disclosable property spent on one arm of one code path, while p90
+is pinned by an unrelated stage cap.
+
+**Measure these before acting.** Both are unverified, and the first could make
+the second moot:
+
+1. *Where the residual time actually goes.* Btree equality is itself leakproof,
+   so the tenant qual may already be index-driven and `%` may be running over
+   just this tenant's rows. A comment in `grounding.py` records `title % $2`
+   planning as `BitmapOr` across both indexes at 77 ms — which does not obviously
+   square with the ~9x claim, and the two were measured at different times under
+   different RLS settings. Reconcile them first.
+2. *Whether `LIST` partitioning on `customer_id` prunes under RLS.*
+   `current_setting()` is stable, so runtime pruning should apply at the executor
+   and confine the scan without touching the barrier — full RLS preserved, no
+   waiver, no table-per-tenant sprawl.
+
+Both are cheap to check inside a rolled-back transaction on the managed plane,
+which is how `0109` was validated before it shipped.
+
+**Note for the schema guards.** `index_contracts.py` compares predicate text
+against index expression text. It cannot detect an RLS-blocked index and
+reported 4/4 green throughout the `0109` incident while the query was
+seq-scanning. Treat it as silent on this failure mode.
+
+---
+
 ## Storage-layer cheat sheet
 
 | Table | Role | Key indexes |
