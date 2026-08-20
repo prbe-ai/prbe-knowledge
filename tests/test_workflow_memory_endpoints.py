@@ -28,7 +28,6 @@ Run with the isolated wfmem database (these fixtures TRUNCATE):
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -63,31 +62,6 @@ DRAFT = {
     "binding": {},
     "scope": {},
 }
-
-
-@dataclass
-class _Chunk:
-    chunk_index: int
-    embedding: list[float]
-
-
-@dataclass
-class _EmbedResult:
-    embedded: list[_Chunk]
-    failed: list[Any]
-
-
-class _StubEmbedder:
-    """Deterministic orthogonal-ish vectors so nothing here depends on a model."""
-
-    model_id = "stub-embedder"
-
-    async def embed_many(self, texts: list[str]) -> Any:
-        chunks = [_Chunk(i, [float(len(t) % 7), 1.0]) for i, t in enumerate(texts)]
-        return _EmbedResult(embedded=chunks, failed=[])
-
-    async def embed_query(self, text: str) -> list[float]:
-        return [float(len(text) % 7), 1.0]
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -148,11 +122,11 @@ async def _post(path: str, body: dict[str, Any], *, headers: dict[str, str] | No
 
 
 def _patch_models(monkeypatch: pytest.MonkeyPatch, *, draft: ClauseDraft | None = None) -> None:
-    """Replace the two model calls and the embedder.
+    """Replace the structuring model call.
 
-    conftest blanks the provider keys, so an unpatched test would either hit a
-    real provider or fall through to the hash-vector stub -- one is a bill, the
-    other is noise dressed as a result.
+    Only the LLM: with no provider key an unpatched structuring pass would fail
+    the request outright, and these tests are about the HTTP surface rather than
+    about what a model returns.
     """
     import engine.retrieval.procedures as mod
 
@@ -166,12 +140,12 @@ def _patch_models(monkeypatch: pytest.MonkeyPatch, *, draft: ClauseDraft | None 
         )
 
     monkeypatch.setattr(mod, "structure", fake_structure)
-    monkeypatch.setattr(
-        "engine.shared.wfmem.declaring.get_embedder_v2", lambda: _StubEmbedder()
-    )
-    monkeypatch.setattr(
-        "engine.shared.wfmem.classifier.get_embedder_v2", lambda: _StubEmbedder()
-    )
+    # The EMBEDDER is deliberately NOT stubbed here. conftest blanks the
+    # provider keys, so the real one is already `_hash_vector` -- deterministic,
+    # and crucially the right dimension for the halfvec(3072) column. An
+    # ad-hoc fake returning a convenient 2-element vector fails the INSERT and
+    # surfaces as a 500 with an empty body, which is a confusing way to learn
+    # you were testing the wrong thing.
 
 
 # --------------------------------------------------------------------------

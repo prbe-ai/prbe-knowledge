@@ -606,6 +606,7 @@ _VERSIONS_DIR = _REPO_ROOT / "db" / "migrations" / "versions"
 _MIGRATION_PATHS = (
     _VERSIONS_DIR / "20260819_0110_workflow_memory_store.py",
     _VERSIONS_DIR / "20260819_0112_wfmem_clause_publication.py",
+    _VERSIONS_DIR / "20260819_0113_wfmem_clause_embedding.py",
 )
 _SCHEMA_PATH = _REPO_ROOT / "db" / "schema.sql"
 
@@ -624,6 +625,13 @@ CREATE TABLE IF NOT EXISTS neon_auth."user" (
 
 #: All five tables FK to customers; nothing else about it matters here.
 _CUSTOMERS_STUB = "CREATE TABLE customers (customer_id TEXT PRIMARY KEY)"
+
+#: Both scratch databases need pgvector: `clauses.body_embedding` is a
+#: `halfvec(3072)` (migration 0113). The real database gets this from the image;
+#: a freshly-CREATEd one does not, and without it the replay dies on
+#: `type "halfvec" does not exist` -- which reads like a schema bug rather than
+#: a missing extension in a throwaway database.
+_VECTOR_EXTENSION = "CREATE EXTENSION IF NOT EXISTS vector"
 
 #: Which relations count as workflow-memory objects, as a regex rather than as
 #: WFMEM_TABLES. The list is what nearly made this guard useless: it only ever
@@ -867,6 +875,7 @@ async def test_schema_sql_has_not_drifted_from_the_migration(live_db):
     try:
         migration_conn = await asyncpg.connect(_dsn_for(mig_db))
         try:
+            await migration_conn.execute(_VECTOR_EXTENSION)
             await migration_conn.execute(_CUSTOMERS_STUB)
             for statement in _migration_upgrade_statements():
                 await migration_conn.execute(statement)
@@ -876,6 +885,7 @@ async def test_schema_sql_has_not_drifted_from_the_migration(live_db):
 
         schema_conn = await asyncpg.connect(_dsn_for(sch_db))
         try:
+            await schema_conn.execute(_VECTOR_EXTENSION)
             await schema_conn.execute(_NEON_AUTH_SHIM)
             await schema_conn.execute(_SCHEMA_PATH.read_text())
             schema_fingerprint = await _wfmem_fingerprint(schema_conn)

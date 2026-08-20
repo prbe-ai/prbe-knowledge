@@ -139,35 +139,37 @@ async def find_neighbours(
 ) -> list[Neighbour]:
     """Existing clauses that resemble `draft`, most similar first.
 
-    Reads EVERY clause in the tenant, not just those in the draft's situation. A
-    duplicate filed under a different situation is still a duplicate, and it is
-    the one a situation-scoped search would never show -- which is precisely how
-    the same rule ends up in the store three times with three different labels.
+    ONE embedding call and one indexed query. This used to fetch up to 500
+    clause rows, embed all of them plus the draft on EVERY preview, score them
+    in Python and throw the vectors away -- ~500x the necessary work with a
+    human waiting, and worse, a silent correctness ceiling: the 500 were ordered
+    `updated_at DESC`, so past that many clauses the oldest could never surface
+    as neighbours. A feature whose whole job is preventing duplicates would
+    quietly stop seeing the rules most likely to have been forgotten. The stored
+    vector removes the ceiling rather than raising it.
+
+    Searches EVERY clause in the tenant, not just those in the draft's
+    situation. A duplicate filed under a different situation is still a
+    duplicate, and it is the one a situation-scoped search would never show --
+    precisely how the same rule ends up in the store three times under three
+    labels.
 
     Deliberately ignores the visibility guard. A neighbour list is not a serving
-    surface: it exists so the author does not unknowingly duplicate a colleague's
-    single-author rule, and hiding it would guarantee the duplicate. Only the
-    body, status and author are exposed, which the author would see the moment
-    the guard unlocked anyway -- and the alternative is a system that lets you
-    create a conflict it can see and you cannot.
+    surface: it exists so the author does not unknowingly duplicate a
+    colleague's single-author rule, and hiding it would guarantee the duplicate.
+    The alternative is a system that lets you create a conflict it can see and
+    you cannot.
+
+    Rows whose embedding is absent, or was produced by a DIFFERENT model, are
+    excluded. A cosine across two embedders is a plausible-looking number rather
+    than an error, so comparing them would degrade the result invisibly; being
+    missing from the list is at least a gap somebody can notice.
     """
-    async with with_tenant(customer_id) as conn:
-        rows = await conn.fetch(
-            """
-            SELECT id, body, status, author_ref, binding
-              FROM clauses
-             WHERE customer_id = $1
-             ORDER BY updated_at DESC
-             LIMIT 500
-            """,
-            customer_id,
-        )
-    if not rows:
+    if limit <= 0:
         return []
 
     embedder = embedder or get_embedder_v2()
-    bodies = [row["body"] for row in rows]
-    vectors = await _embed_all(embedder, [draft.body, *bodies])
+    vectors = await _embed_all(embedder, [draft.body])
     if vectors is None:
         # Degrade to "no neighbours" rather than raising. A declaration that
         # cannot be enriched with neighbours is still a declaration worth
@@ -176,24 +178,68 @@ async def find_neighbours(
         log.warning("wfmem_declaring.neighbour_embedding_failed", customer=customer_id)
         return []
 
-    query_vector, body_vectors = vectors[0], vectors[1:]
-    scored: list[Neighbour] = []
-    for row, vector in zip(rows, body_vectors, strict=True):
-        similarity = _cosine(query_vector, vector)
-        if similarity < NEIGHBOUR_FLOOR:
-            continue
-        scored.append(
-            Neighbour(
-                clause_id=row["id"],
-                body=row["body"],
-                status=row["status"],
-                author_ref=row["author_ref"],
-                similarity=similarity,
-                same_binding=_as_dict(row["binding"]) == draft.binding,
-            )
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            # `<=>` is cosine DISTANCE under halfvec_cosine_ops, so the floor
+            # inverts: similarity >= NEIGHBOUR_FLOOR is distance <= 1 - floor.
+            # The ORDER BY is what lets the HNSW index serve this; filtering on
+            # the computed distance in a WHERE would not.
+            """
+            SELECT id, body, status, author_ref, binding,
+                   1 - (body_embedding <=> $2::halfvec) AS similarity
+              FROM clauses
+             WHERE customer_id = $1
+               AND body_embedding IS NOT NULL
+               AND body_embedding_model = $3
+             ORDER BY body_embedding <=> $2::halfvec
+             LIMIT $4
+            """,
+            customer_id,
+            _vector_literal(vectors[0]),
+            embedder.model_id,
+            limit,
         )
-    scored.sort(key=lambda n: (-n.similarity, str(n.clause_id)))
-    return scored[: max(0, limit)]
+
+    return [
+        Neighbour(
+            clause_id=row["id"],
+            body=row["body"],
+            status=row["status"],
+            author_ref=row["author_ref"],
+            similarity=float(row["similarity"]),
+            same_binding=_as_dict(row["binding"]) == draft.binding,
+        )
+        for row in rows
+        if float(row["similarity"]) >= NEIGHBOUR_FLOOR
+    ]
+
+
+def _vector_literal(vector: list[float]) -> str:
+    """pgvector's text input form.
+
+    Passed as a string and cast in SQL rather than registering a codec: asyncpg
+    has no native halfvec type, and a float[] would arrive as `{...}` which
+    pgvector does not parse.
+    """
+    return "[" + ",".join(repr(float(component)) for component in vector) + "]"
+
+
+async def embed_clause_body(body: str, embedder: Any | None = None) -> tuple[str, str] | None:
+    """(vector literal, model id) for a clause body, or None if embedding failed.
+
+    Returns None rather than raising, and the write path stores NULL on None. A
+    declaration must not fail because the embedder is down -- the rule is what
+    the person came to record, and the embedding only powers duplicate
+    detection. The cost of the miss is that this clause is absent from neighbour
+    searches until something re-embeds it, which is a visible gap rather than a
+    wrong answer.
+    """
+    embedder = embedder or get_embedder_v2()
+    vectors = await _embed_all(embedder, [body])
+    if vectors is None:
+        log.warning("wfmem_declaring.clause_embedding_failed")
+        return None
+    return _vector_literal(vectors[0]), embedder.model_id
 
 
 async def declare(
@@ -207,6 +253,7 @@ async def declare(
     relation: Relation = Relation.NEW,
     related_clause_id: UUID | None = None,
     publish: bool = False,
+    embedder: Any | None = None,
 ) -> Declaration:
     """Write the rule. One transaction: clause, situation edge, evidence.
 
@@ -262,6 +309,7 @@ async def declare(
         relation=relation,
         related_clause_id=related_clause_id,
         publish=publish,
+        embedder=embedder,
     )
 
 
@@ -351,9 +399,17 @@ async def _insert(
     relation: Relation,
     related_clause_id: UUID | None,
     publish: bool,
+    embedder: Any | None = None,
 ) -> Declaration:
     lineage = _lineage_for(relation, related_clause_id)
     shared_by = actor_ref if publish else None
+
+    # Embedded BEFORE the transaction opens, deliberately. It is a network call
+    # to a third party, and holding a Postgres transaction open across one is
+    # how a slow provider turns into lock contention on a table other requests
+    # are reading. A None here costs this clause its place in neighbour search
+    # and nothing else.
+    embedded = await embed_clause_body(draft.body, embedder)
 
     async with with_tenant(customer_id) as conn:
         if related_clause_id is not None and not await _clause_exists(
@@ -369,13 +425,15 @@ async def _insert(
             """
             INSERT INTO clauses
                 (customer_id, kind, body, semantic_action, binding, scope,
-                 status, author_ref, lineage, shared_by, shared_at)
+                 status, author_ref, lineage, shared_by, shared_at,
+                 body_embedding, body_embedding_model)
             VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9::jsonb,
                     $10,
                     -- Timestamp derived from the publisher rather than passed
                     -- separately, so the CHECK that keeps the pair together
                     -- cannot be violated by a caller that sets one of them.
-                    CASE WHEN $10::text IS NULL THEN NULL ELSE now() END)
+                    CASE WHEN $10::text IS NULL THEN NULL ELSE now() END,
+                    $11::halfvec, $12)
             RETURNING id
             """,
             customer_id,
@@ -388,6 +446,8 @@ async def _insert(
             actor_ref,
             json.dumps(lineage),
             shared_by,
+            embedded[0] if embedded else None,
+            embedded[1] if embedded else None,
         )
 
         if relation is Relation.CONFLICT and related_clause_id is not None:
@@ -598,18 +658,6 @@ async def _embed_all(embedder: Any, texts: list[str]) -> list[list[float]] | Non
     if len(by_index) != len(texts) or any(i not in by_index for i in range(len(texts))):
         return None
     return [by_index[i] for i in range(len(texts))]
-
-
-def _cosine(a: list[float], b: list[float]) -> float:
-    if len(a) != len(b):
-        return 0.0
-    dot = norm_a = norm_b = 0.0
-    for x, y in zip(a, b, strict=True):
-        dot += x * y
-        norm_a += x * x
-        norm_b += y * y
-    denom = (norm_a**0.5) * (norm_b**0.5)
-    return dot / denom if denom else 0.0
 
 
 def _as_dict(raw: Any) -> dict[str, Any]:

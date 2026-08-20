@@ -1868,6 +1868,16 @@ CREATE TABLE clauses (
     shared_at           TIMESTAMPTZ,
     CONSTRAINT ck_clauses_publication_is_attributed
         CHECK ((shared_by IS NULL) = (shared_at IS NULL)),
+    -- The body's embedding, stored so neighbour search embeds ONE text per
+    -- declaration instead of the whole corpus (migration 0113). The model id
+    -- is not optional: a cosine between vectors from two different embedders
+    -- is a plausible-looking number rather than an error, so a row embedded by
+    -- an older model must be EXCLUDED from a search, not silently compared.
+    -- Same reasoning that puts model_id in the classifier's cache key.
+    body_embedding       halfvec(3072),
+    body_embedding_model TEXT,
+    CONSTRAINT ck_clauses_embedding_names_its_model
+        CHECK ((body_embedding IS NULL) = (body_embedding_model IS NULL)),
     UNIQUE (customer_id, id)          -- composite-FK target; see situations
 );
 
@@ -1877,6 +1887,10 @@ CREATE INDEX clauses_customer_status_idx ON clauses (customer_id, status);
 -- over a mostly-NULL column would answer no faster.
 CREATE INDEX clauses_published_idx ON clauses (customer_id, shared_at)
     WHERE shared_by IS NOT NULL;
+-- Neighbour search at declaration time. House pattern: chunks,
+-- directed_vectors and graph_nodes all index halfvec with HNSW cosine.
+CREATE INDEX clauses_body_embedding_hnsw
+    ON clauses USING hnsw (body_embedding halfvec_cosine_ops);
 
 -- COMPOSITE FKs, not simple ones. Postgres referential-integrity checks
 -- bypass row security by design, and the tenant policy only inspects THIS
@@ -1992,6 +2006,28 @@ CREATE TRIGGER clauses_touch_updated_at_trg
     BEFORE UPDATE ON clauses
     FOR EACH ROW
     EXECUTE FUNCTION wfmem_touch_updated_at();
+
+-- A stored embedding goes stale the moment the text it describes changes, and
+-- staleness here is INVISIBLE: the search still returns results, just wrong
+-- ones. Clearing both columns on a body edit means a stale vector can never be
+-- compared against -- the clause drops out of neighbour search until something
+-- re-embeds it, which is the safe direction to fail. Nothing in v0 updates a
+-- body; this exists so that when an edit path is added, it cannot introduce
+-- the bug by omission.
+CREATE OR REPLACE FUNCTION wfmem_clear_stale_clause_embedding() RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.body IS DISTINCT FROM OLD.body THEN
+        NEW.body_embedding := NULL;
+        NEW.body_embedding_model := NULL;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER clauses_clear_stale_embedding_trg
+    BEFORE UPDATE ON clauses
+    FOR EACH ROW
+    EXECUTE FUNCTION wfmem_clear_stale_clause_embedding();
 
 -- RLS on all five. FORCE so the policy applies to the table owner too, and
 -- BOTH halves: USING alone hides another tenant's rows on read but still
