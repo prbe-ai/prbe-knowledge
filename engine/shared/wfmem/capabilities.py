@@ -74,7 +74,7 @@ def _coerce_capability_bool(raw: object, key: str) -> bool:
     None of that applies here. These six cells have exactly two writers --
     `enable_capability` and `disable_capability` -- and both go through
     `to_jsonb($3::boolean)` specifically so the value cannot drift into a string
-    the way a formatted literal can. Migration 0111 backfills real booleans. So a
+    the way a formatted literal can. Migration 0115 backfills real booleans. So a
     string `"true"` sitting in a wfmem cell did not come from a supported path;
     it came from a hand-edited blob, a buggy PATCH, or a bad restore. Honouring
     it would mean turning a capability ON because something wrote it wrong.
@@ -148,7 +148,7 @@ def output_capability_key(surface: OutputSurface | str) -> str:
     return f"{_OUTPUT_PREFIX}{OutputSurface(surface).value}"
 
 
-#: The whole registry, derived from the axes. Migration 0111 backfills exactly
+#: The whole registry, derived from the axes. Migration 0115 backfills exactly
 #: this set (hardcoded there, because a migration must not import app code that
 #: can change under it); a test compares the two lists.
 WFMEM_CAPABILITY_KEYS: frozenset[str] = frozenset(

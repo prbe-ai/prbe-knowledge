@@ -102,7 +102,7 @@ STRUCTURING_MODEL = WFMEM_STRUCTURING_MODEL
 #: shown is a kind it can never return, and a kind we describe but reject is a
 #: guaranteed refusal. Both are silent.
 #:
-#: Read out of the CHECK constraint in migration 0110, not from memory. A sixth
+#: Read out of the CHECK constraint in migration 0114, not from memory. A sixth
 #: kind added there and not here is dead on arrival; one removed there and left
 #: here is a constraint violation at somebody else's INSERT.
 _KIND_GUIDE: tuple[tuple[str, str], ...] = (

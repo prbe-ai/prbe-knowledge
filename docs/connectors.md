@@ -13,7 +13,6 @@ Probe ingests from these sources:
 | `claude_code`    | API             | Claude Code session ingest                    |
 | `granola`        | API             | Granola meeting-notes ingest                  |
 | `manual_upload`  | API             | upload a file/document directly               |
-| `wiki`           | internal        | generated knowledge pages                     |
 
 ## How webhook intake works (self-host)
 

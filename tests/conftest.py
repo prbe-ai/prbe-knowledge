@@ -94,12 +94,6 @@ TRUNCATE_SQL = """
         ingestion_queue,
         acl_snapshots,
         chunks,
-        directed_vectors,
-        wiki_links,
-        wiki_timeline_entries,
-        wiki_raw_data,
-        wiki_synthesis_queue,
-        wiki_synthesis_runs,
         documents,
         customer_source_mapping,
         code_repo_state,
@@ -107,11 +101,10 @@ TRUNCATE_SQL = """
     RESTART IDENTITY CASCADE;
 """
 # `incident_investigations` was listed here until migration 0092
-# (`drop_incident_pivot_tables`) dropped it along with
-# `customer_incident_mcp_servers`, `wiki_review_queue` and
-# `customer_postmortem_templates` -- the only one of the four this list
-# ever named. TRUNCATE takes the whole list or none, so a correctly
-# migrated database failed EVERY live-DB test at fixture setup with
+# (`drop_incident_pivot_tables`) dropped it along with three sibling
+# tables -- and it was the only one of the four this list ever named.
+# TRUNCATE takes the whole list or none, so a correctly migrated
+# database failed EVERY live-DB test at fixture setup with
 # `UndefinedTableError`, before a single assertion ran.
 
 

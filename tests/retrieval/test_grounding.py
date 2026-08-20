@@ -312,8 +312,8 @@ def test_doc_id_to_entity_type_notion():
     assert _doc_id_to_entity_type("notion:page:abc", "notion") == "page"
 
 
-def test_doc_id_to_entity_type_wiki_falls_to_document():
-    assert _doc_id_to_entity_type("wiki:project:mg", "wiki") == "document"
+def test_doc_id_to_entity_type_unmapped_source_falls_to_document():
+    assert _doc_id_to_entity_type("custom:project:mg", "custom_ingest") == "document"
 
 
 def test_doc_id_to_entity_type_unknown_source_falls_to_document():
@@ -332,7 +332,7 @@ async def test_fuzzy_match_document_titles_returns_match_on_tsvector_hit(
     seeded_customer_with_docs,
 ):
     """The classic failing case: query 'multi-granola' must surface the
-    Linear PRB-18 + Notion design rationale + wiki page as grounded
+    Linear PRB-18 + Notion design rationale + custom-ingest page as grounded
     candidates. Pre-channel-4, all three were Document nodes that
     grounding silently missed, leading to the phantom-entity / curation-
     lottery non-determinism this channel exists to fix."""
@@ -343,7 +343,7 @@ async def test_fuzzy_match_document_titles_returns_match_on_tsvector_hit(
     canonical_ids = {c.canonical_id for c in candidates}
     assert "linear:org:issue:prb-18" in canonical_ids
     assert "notion:page:design-mg" in canonical_ids
-    assert "wiki:project:multi_granola" in canonical_ids
+    assert "custom:project:multi_granola" in canonical_ids
     # All hits carry match_source for telemetry
     assert all(c.match_source == "doc_title" for c in candidates)
     # entity_type is derived from doc_id structure, not generic 'document'

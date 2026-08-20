@@ -32,7 +32,7 @@ CREATE TABLE customers (
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     metadata             JSONB NOT NULL DEFAULT '{}',
     -- Per-tenant feature toggles (added by migration 0023). Read by
-    -- shared.customer_prefs for the wiki-generation gate. Schema-on-read
+    -- shared.customer_prefs for per-feature gating. Schema-on-read
     -- bool keys; missing keys resolve to False on every reader.
     preferences          JSONB NOT NULL DEFAULT '{}',
     -- Per-tenant R2 bucket name. Added by migration 0073, locked NOT NULL
@@ -199,36 +199,16 @@ CREATE TABLE documents (
     compiled_at          TIMESTAMPTZ DEFAULT NULL,
     compile_trigger      TEXT DEFAULT NULL,
 
-    -- migration 0082 (post-approval wiki-artifact draft gating). New
-    -- wiki-artifact writes set 'draft'; the review approve path flips
-    -- to 'approved' atomically. Existing rows backfill to 'approved'.
+    -- migration 0082 (post-approval draft gating for generated artifacts).
+    -- New generated-artifact writes set 'draft'; the review approve path
+    -- flips to 'approved' atomically. Existing rows backfill to 'approved'.
     visibility           TEXT NOT NULL DEFAULT 'approved',
 
     -- PK includes customer_id so tenants ingesting the same source identity
     -- (e.g. the same Slack workspace replayed under a different customer)
     -- don't collide on doc_id and silently drop writes via ON CONFLICT.
     PRIMARY KEY (customer_id, doc_id, version),
-    CONSTRAINT documents_visibility_chk CHECK (visibility IN ('draft','approved')),
-    -- Backstop under the staged-commit preflight (kb/synthesis/staged_graph.py),
-    -- and weaker than it on purpose: the preflight sees the whole batch and can
-    -- tell the agent why in words, this only catches writers that never go
-    -- through it. It constrains a COUNTER, not content -- there is no page
-    -- `body` column, bodies live across `chunks`, and `body_size_bytes` is
-    -- whatever the handler reported.
-    --
-    -- `source_system <> 'wiki'`: `documents` holds every connector, and Slack
-    -- threads and GitHub PRs are routinely far larger with no business being
-    -- split. `doc_type = 'wiki.index'`: the front page is generated whole from
-    -- the others. `valid_to IS NOT NULL`: `documents` is temporal, and 97
-    -- historical wiki versions were over this cap when it was added (0 live
-    -- ones) -- rewriting published history to satisfy a new rule would corrupt
-    -- the audit chain the version list exists to provide.
-    CONSTRAINT ck_wiki_live_page_size CHECK (
-        source_system <> 'wiki'
-        OR doc_type = 'wiki.index'
-        OR valid_to IS NOT NULL
-        OR body_size_bytes <= 8192
-    )
+    CONSTRAINT documents_visibility_chk CHECK (visibility IN ('draft','approved'))
 );
 
 CREATE INDEX idx_documents_customer_source ON documents (customer_id, source_system, source_id);
@@ -270,9 +250,18 @@ CREATE INDEX idx_documents_title_trgm ON documents USING GIN (title gin_trgm_ops
 -- GIN over the weighted title tsvector (migration 0099).
 CREATE INDEX idx_documents_title_tsv ON documents USING GIN (title_tsv);
 -- Partial index keeps the doc-type listing path from scanning draft rows
--- once visibility='draft' wiki artifacts start appearing. See migration 0082.
+-- once visibility='draft' artifacts start appearing. See migration 0082.
 CREATE INDEX IF NOT EXISTS documents_visibility_approved_idx
     ON documents (customer_id, doc_type) WHERE visibility = 'approved';
+
+-- Covers both aggregates behind the /knowledge stats header (migration 0111):
+-- the per-source document count/MAX(ingested_at) by full partial-index scan,
+-- and the live-document side of the chunk count by (customer_id, doc_id)
+-- prefix. Every column those two read is here, so both go index-only and the
+-- 10,494-page heap scan the count used to do disappears.
+CREATE INDEX IF NOT EXISTS idx_documents_stats_live
+    ON documents (customer_id, doc_id, source_system, ingested_at)
+    WHERE valid_to IS NULL AND deleted_at IS NULL;
 
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents FORCE ROW LEVEL SECURITY;
@@ -345,8 +334,8 @@ CREATE TABLE chunks (
     -- Kept in sync by two triggers below, not by application code.
     title                TEXT NOT NULL DEFAULT '',
 
-    -- migration 0082 (post-approval wiki-artifact draft gating). Tracks
-    -- the visibility of the chunk's owning document version so retrieval
+    -- migration 0082 (post-approval draft gating for generated artifacts).
+    -- Tracks the visibility of the chunk's owning document version so retrieval
     -- can default-filter draft chunks without joining documents.
     visibility           TEXT NOT NULL DEFAULT 'approved',
 
@@ -384,6 +373,12 @@ CREATE INDEX idx_chunks_fts_content    ON chunks USING GIN (to_tsvector('english
 CREATE INDEX idx_chunks_content_tsv    ON chunks USING GIN (content_tsv);
 -- One metadata chunk per doc; partial index serves backfill idempotency check.
 CREATE INDEX idx_chunks_metadata_kind  ON chunks (customer_id, doc_id) WHERE kind = 'metadata';
+-- Live chunks for one tenant (migration 0111). idx_chunks_doc_live is partial
+-- on valid_to but carries no customer_id, and idx_chunks_customer carries
+-- customer_id but every version -- so the stats count used to BitmapAnd the two
+-- and read 148,808 buffers. This one is correct on both axes.
+CREATE INDEX IF NOT EXISTS idx_chunks_stats_live
+    ON chunks (customer_id, doc_id) WHERE valid_to IS NULL;
 
 -- Single-column uniqueness on chunk_id (migration 0101). chunk_id is already
 -- unique in practice (`{doc_id}:{prefix}{content_hash[:16]}`); this enforces
@@ -469,8 +464,8 @@ CREATE TRIGGER trg_chunks_fill_title
     FOR EACH ROW
     EXECUTE FUNCTION chunks_fill_title_on_insert();
 -- Partial index keeps retrieval's per-doc chunk fetch index-only once
--- visibility='draft' rows start appearing (post-approval wiki artifacts).
--- See migration 0082.
+-- visibility='draft' rows start appearing (post-approval generated
+-- artifacts). See migration 0082.
 CREATE INDEX IF NOT EXISTS chunks_visibility_approved_idx
     ON chunks (customer_id, doc_id) WHERE visibility = 'approved';
 
@@ -480,50 +475,6 @@ CREATE POLICY tenant_isolation ON chunks
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
--- ---------------------------------------------------------------------------
--- directed_vectors: per-document trigger phrases used as a doc-level
--- retrieval booster. Engineer-pinned (source='human') phrases are authored
--- via wiki frontmatter `directed:` blocks; LLM-generated (source='llm')
--- phrases come from synthesis. The retriever (services/retrieval/retrievers/
--- directed.py) HNSW-searches `embedding` and reports one hit per matched
--- doc; fusion folds the cosine-distance signal into the doc score
--- (services/retrieval/fusion.py). Phrase text NEVER reaches the agent —
--- only the owning doc's content chunks are returned.
---
--- No FK to documents — same rationale chunks uses (PK includes version,
--- but a directed_vector is doc-level not version-level). Tenant cascade
--- flows through customer_id REFERENCES customers ON DELETE CASCADE.
--- ---------------------------------------------------------------------------
-CREATE TABLE directed_vectors (
-    vector_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    customer_id      TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    doc_id           TEXT NOT NULL,
-    embedding        halfvec(3072) NOT NULL,
-    source_text      TEXT NOT NULL,
-    source           TEXT NOT NULL,
-    -- LLM-generated rows carry the run that produced them; older runs'
-    -- rows are deleted on regen. Human pins set this to NULL.
-    synthesis_run_id BIGINT NULL,
-    content_hash     BYTEA NOT NULL,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT ck_dv_source CHECK (source IN ('human','llm')),
-    CONSTRAINT ck_dv_run_for_llm CHECK (
-        (source = 'llm'   AND synthesis_run_id IS NOT NULL) OR
-        (source = 'human' AND synthesis_run_id IS NULL)
-    ),
-    CONSTRAINT uq_dv_doc_hash UNIQUE (customer_id, doc_id, content_hash)
-);
-
-CREATE INDEX idx_directed_vectors_embedding_hnsw
-    ON directed_vectors USING hnsw (embedding halfvec_cosine_ops);
-CREATE INDEX idx_directed_vectors_customer_doc
-    ON directed_vectors (customer_id, doc_id);
-
-ALTER TABLE directed_vectors ENABLE ROW LEVEL SECURITY;
-ALTER TABLE directed_vectors FORCE ROW LEVEL SECURITY;
-CREATE POLICY directed_vectors_tenant_isolation ON directed_vectors
-    USING (customer_id = current_setting('app.current_customer_id', true))
-    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
 -- acl_snapshots: temporal ACL truth.
@@ -963,8 +914,20 @@ CREATE TABLE entity_merge_edge_snapshot (
     merge_id                       UUID NOT NULL REFERENCES entity_merge_audit(merge_id),
     snapshot_seq                   INT  NOT NULL,
     customer_id                    TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    -- 'deleted_self_loop'      — both endpoints collapsed onto the primary;
+    --                             unmerge restores it as ($node, $node).
+    -- 'deleted_duplicate_lane'  — the rewritten edge collided with an edge the
+    --                             primary already held in this alias's lane
+    --                             (graph_edges_unique_lane). Keeps its two
+    --                             distinct endpoints, so unmerge restores it by
+    --                             resolving pre_from/pre_to canonical ids.
+    --                             Added by migration 0117 — the writer at
+    --                             entity_clusters_routes.py:363 predates it and
+    --                             had never executed, so nothing ever violated
+    --                             the narrower form.
     operation                      TEXT NOT NULL
-                                   CHECK (operation IN ('deleted_self_loop')),
+                                   CHECK (operation IN ('deleted_self_loop',
+                                                        'deleted_duplicate_lane')),
     pre_edge_type                  TEXT NOT NULL,
     pre_from_canonical_id          TEXT NOT NULL,
     pre_from_label                 TEXT NOT NULL,
@@ -1137,289 +1100,6 @@ CREATE POLICY query_traces_tenant_isolation ON query_traces
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
--- wiki_synthesis_queue / wiki_synthesis_runs
---
--- Internal queue tables for the LLM-Wiki synthesis cron (services/synthesis/).
--- `Normalizer._persist` enqueues one row per persisted document; the cron
--- drains them, runs Haiku triage + Sonnet synthesis, and writes wiki pages
--- via build_normalization_result.
---
--- Convention for internal queue tables (matches ingestion_queue,
--- backfill_state): NO row-level security. Tenant scoping for per-customer
--- operations is enforced by application code (`with_tenant(customer_id)`
--- + explicit WHERE customer_id = $1). The cron's cross-customer
--- `SELECT DISTINCT customer_id` in `_tick` would silently return zero
--- rows under FORCE RLS without a tenant GUC; see migration
--- 20260503_0034_wiki_synthesis_no_rls.py for the rationale.
--- ---------------------------------------------------------------------------
-CREATE TABLE wiki_synthesis_queue (
-    queue_id                BIGSERIAL PRIMARY KEY,
-    customer_id             TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    doc_id                  TEXT NOT NULL,
-    doc_version             INT  NOT NULL,
-    source_system           TEXT NOT NULL,
-    doc_type                TEXT NOT NULL,
-    enqueued_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- Source-side timestamp (Slack ts, GitHub created_at, Linear updatedAt,
-    -- Granola startedAt, Notion last_edited_time, fallback documents.created_at).
-    -- Populated by Normalizer at insert. The wiki agent reads triaged events
-    -- ordered by source_ts ASC to walk the day in time order.
-    source_ts               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    status                  TEXT NOT NULL DEFAULT 'pending',
-    triage_score            REAL,
-    triage_error            TEXT,
-    triage_completed_at     TIMESTAMPTZ,
-    attempts                INT NOT NULL DEFAULT 0,
-    synthesis_run_id        BIGINT,
-    synthesis_completed_at  TIMESTAMPTZ,
-    synthesis_error         TEXT,
-    -- Stamped at claim time. ReclaimLoop sweeps stale rows back to the
-    -- prior state if attempts < cap, else to terminal 'failed' so ops
-    -- can investigate via the dashboard. See migration 0038.
-    heartbeat_at            TIMESTAMPTZ,
-    -- DLQ surface for unrecoverable failures: triage batch crash, agent
-    -- halt (turn cap, stall, compactor failure, Gemini outage). Admin
-    -- reset (POST .../dlq/reset) flips rows back to pending or triaged.
-    dlq_reason              TEXT,
-    dlq_at                  TIMESTAMPTZ,
-    CONSTRAINT uq_wsq_customer_doc_version UNIQUE (customer_id, doc_id, doc_version),
-    CONSTRAINT ck_wsq_status CHECK (status IN (
-        'pending','triaging','triaged','rejected',
-        'synthesizing','done','failed',
-        'synthesis_skipped','dlq'
-    ))
-);
-
-CREATE INDEX idx_wsq_drain
-    ON wiki_synthesis_queue (customer_id, status, enqueued_at);
-
--- Cursor index for the wiki agent's next_events() pagination. The
--- agent reads triaged events ordered by source_ts ASC, queue_id ASC,
--- skipping rows already applied or skipped in the current run.
-CREATE INDEX ix_wsq_drain_cursor
-    ON wiki_synthesis_queue (customer_id, status, source_ts, queue_id);
-
--- Reclaim only ever scans rows in 'triaging'/'synthesizing' — partial
--- index keeps the sweep cheap as the queue's done/rejected tail grows.
-CREATE INDEX idx_wsq_heartbeat_reclaim
-    ON wiki_synthesis_queue (heartbeat_at)
-    WHERE status IN ('triaging', 'synthesizing');
-
-CREATE TABLE wiki_synthesis_runs (
-    run_id          BIGSERIAL PRIMARY KEY,
-    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    kind            TEXT NOT NULL,
-    -- Discriminator: which worker wrote this run row. Triage and
-    -- synthesis each open their own run per drain; the status endpoint
-    -- filters stage='synthesis' for `last_run_pages_*`.
-    stage           TEXT NOT NULL DEFAULT 'synthesis',
-    -- Per-source discriminator for bootstrap runs ('slack', 'github',
-    -- 'linear', etc.). NULL for daily-replay (kind='wake'/'scheduled').
-    source          TEXT,
-    -- Phase 2 fan-out target. NULL for Phase 1 rows (one per source per
-    -- trigger). Phase 2 rows carry a target like 'owner/repo' (GitHub),
-    -- 'channel_id' (Slack), etc. The orchestrator's post-Phase-1 hook
-    -- inserts these by querying the source's BackfillFanout discoverer.
-    target          TEXT,
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    finished_at     TIMESTAMPTZ,
-    events_total    INT NOT NULL DEFAULT 0,
-    events_triaged  INT NOT NULL DEFAULT 0,
-    events_kept     INT NOT NULL DEFAULT 0,
-    pages_updated   INT NOT NULL DEFAULT 0,
-    pages_created   INT NOT NULL DEFAULT 0,
-    status          TEXT NOT NULL DEFAULT 'running',
-    error           TEXT,
-    CONSTRAINT ck_wsr_kind CHECK (kind IN ('onboarding','wake','scheduled','bootstrap')),
-    CONSTRAINT ck_wsr_stage CHECK (stage IN ('triage','synthesis')),
-    CONSTRAINT ck_wsr_status CHECK (status IN ('pending','running','complete','failed','partial','cancelled'))
-);
-
-CREATE INDEX idx_wsr_customer
-    ON wiki_synthesis_runs (customer_id, started_at DESC);
-
-CREATE INDEX idx_wsr_stage_started
-    ON wiki_synthesis_runs (customer_id, stage, started_at DESC);
-
-CREATE INDEX idx_wsr_kind_source
-    ON wiki_synthesis_runs (customer_id, kind, source, started_at DESC);
-
-CREATE INDEX idx_wsr_kind_source_target
-    ON wiki_synthesis_runs (customer_id, kind, source, target, started_at DESC);
-
--- ---------------------------------------------------------------------------
--- wiki_links / wiki_timeline_entries / wiki_raw_data
---
--- Bootstrap-era extensions for the wiki page graph. All three tables share
--- the wiki_synthesis_queue precedent (migration 0034): NO row-level security.
--- Tenant scoping is application-enforced (explicit WHERE customer_id = $1).
--- See migration 20260506_0043_wiki_bootstrap_schema.py for rationale.
--- ---------------------------------------------------------------------------
-CREATE TABLE wiki_links (
-    id              BIGSERIAL PRIMARY KEY,
-    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    src_wiki_type   TEXT NOT NULL,
-    src_slug        TEXT NOT NULL,
-    dst_wiki_type   TEXT NOT NULL,
-    dst_slug        TEXT NOT NULL,
-    -- Optional relation verb extracted from `[[type:slug|verb]]` markdown
-    -- syntax or a frontmatter field name. Empty string when the link is a
-    -- bare `[[type:slug]]` mention.
-    link_type       TEXT NOT NULL DEFAULT '',
-    -- ~80 chars surrounding the link site in the source markdown. Useful
-    -- for backlink rendering ("mentioned in: '... [[person:X|works_at]]
-    -- the auth migration ...'").
-    context         TEXT NOT NULL DEFAULT '',
-    -- Where the link came from. 'markdown' = body inline; 'frontmatter' =
-    -- YAML field; 'manual' = admin / migration-set.
-    link_source     TEXT NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT ck_wiki_links_source CHECK (link_source IN ('markdown','frontmatter','manual')),
-    -- The parser slices a ~80-char window for `context`. Cap of 200 leaves
-    -- 2.5x headroom for multibyte characters and future window adjustments
-    -- without a re-migration. Pure "don't misuse this field" guard rail —
-    -- context is not in the unique key, so this isn't btree protection.
-    CONSTRAINT ck_wiki_links_context_len CHECK (length(context) <= 200),
-    CONSTRAINT uq_wiki_links UNIQUE NULLS NOT DISTINCT
-        (customer_id, src_wiki_type, src_slug,
-         dst_wiki_type, dst_slug, link_type, link_source)
-);
-
-CREATE INDEX ix_wiki_links_from
-    ON wiki_links (customer_id, src_wiki_type, src_slug);
-
-CREATE INDEX ix_wiki_links_to
-    ON wiki_links (customer_id, dst_wiki_type, dst_slug);
-
--- Per-PAGE settings, deliberately NOT on `documents` (migration 0103).
---
--- `documents` is a version chain: PK (customer_id, doc_id, version), one new
--- row per write, and `Normalizer._persist` builds that row wholly from the
--- incoming payload. A flag stored there is a fact about ONE VERSION, so every
--- writer (dashboard BFF, `probe wiki write`, research-os PUT, the synthesis
--- agent) would have to remember to copy it forward or silently reset it -- and
--- `revert` rebuilds its event from the metadata of the version being reverted
--- TO, which would time-travel the setting along with the prose.
---
--- A setting is also not a revision: toggling it changes no content, so it must
--- not mint a version. Hence its own row, keyed on page identity rather than on
--- (doc_id, version), carrying its own audit columns.
---
--- ABSENT ROW MEANS PIPELINE UPDATES ARE ON. The default lives in the reader
--- (`fetch_page_pipeline_updates`), not in a backfill, so a page nobody has
--- ever configured is one nobody has to migrate.
-CREATE TABLE wiki_page_settings (
-    customer_id      TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    wiki_type        TEXT NOT NULL,
-    slug             TEXT NOT NULL,
-    -- False freezes the page: the nightly synthesis agent reads it as context
-    -- but will not rewrite it. True is the default and needs no row.
-    pipeline_updates BOOLEAN NOT NULL DEFAULT TRUE,
-    -- Who last flipped it and when. The page's own version history cannot
-    -- answer this, because flipping it writes no version.
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_by       TEXT,
-    PRIMARY KEY (customer_id, wiki_type, slug)
-);
-
-ALTER TABLE wiki_page_settings ENABLE ROW LEVEL SECURITY;
-ALTER TABLE wiki_page_settings FORCE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON wiki_page_settings
-    USING (customer_id = current_setting('app.current_customer_id', true))
-    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
-
---
--- REPLAY GUARD FOR `POST /api/wiki/pages/{type}/{slug}/append`.
--- An agent that times out cannot know whether its paragraph landed, and
--- retrying is what it does next. Without a record of what has already been
--- applied that retry appends twice, and a duplicated decision log reads as
--- two decisions -- silently, because nothing is watching an unattended write.
---
--- Keyed per PAGE, not per tenant: a key is minted per call, so the same key
--- arriving for a different page is not a retry of anything and must not be
--- swallowed. Rows are pruned opportunistically by the route itself, under the
--- page lock it already holds, so there is no sweeper to fall behind.
-CREATE TABLE wiki_append_idempotency (
-    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    wiki_type       TEXT NOT NULL,
-    slug            TEXT NOT NULL,
-    idempotency_key TEXT NOT NULL,
-    -- The text this key was FIRST used for. Reusing a key with different text
-    -- is not a retry; replaying the old answer would silently discard the new
-    -- paragraph, so that case is a 409 rather than a false success.
-    text_sha256     TEXT NOT NULL,
-    -- The version the append PRODUCED, returned verbatim on replay so a retry
-    -- gets the answer it was retrying for rather than the page's later state.
-    version         INTEGER NOT NULL,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (customer_id, wiki_type, slug, idempotency_key)
-);
-
-CREATE INDEX wiki_append_idempotency_prune_idx
-    ON wiki_append_idempotency (customer_id, wiki_type, slug, created_at);
-
-ALTER TABLE wiki_append_idempotency ENABLE ROW LEVEL SECURITY;
-ALTER TABLE wiki_append_idempotency FORCE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation ON wiki_append_idempotency
-    USING (customer_id = current_setting('app.current_customer_id', true))
-    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
-
-CREATE TABLE wiki_timeline_entries (
-    id              BIGSERIAL PRIMARY KEY,
-    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    wiki_type       TEXT NOT NULL,
-    slug            TEXT NOT NULL,
-    -- Day-bucket the source event falls under (typically the source
-    -- system's own timestamp). The dashboard renders the timeline
-    -- grouped by entry_date DESC.
-    entry_date      DATE NOT NULL,
-    source          TEXT NOT NULL,
-    -- One-line headline for the timeline UI. Capped at 1000 chars because
-    -- this column participates in `uq_wiki_timeline_dedup`, and Postgres
-    -- btree keys are limited to ~2704 bytes per row. The other columns
-    -- in the unique total ~150 bytes; 1000 leaves comfortable headroom
-    -- and is well above any sensible "one-line audit entry" length.
-    -- Long-form expansion goes in `detail` (uncapped, not in the unique).
-    summary         TEXT NOT NULL,
-    detail          TEXT NOT NULL DEFAULT '',
-    -- Optional source-side ref (Slack thread_ts, GitHub PR number, ...).
-    -- Lets the dashboard deep-link from a timeline entry to its source.
-    source_ref      TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT ck_wiki_timeline_summary_len CHECK (length(summary) <= 1000),
-    CONSTRAINT uq_wiki_timeline_dedup UNIQUE
-        (customer_id, wiki_type, slug, entry_date, summary)
-);
-
-CREATE INDEX ix_wiki_timeline_page
-    ON wiki_timeline_entries (customer_id, wiki_type, slug, entry_date DESC);
-
-CREATE INDEX ix_wiki_timeline_date
-    ON wiki_timeline_entries (customer_id, entry_date DESC);
-
-CREATE TABLE wiki_raw_data (
-    id              BIGSERIAL PRIMARY KEY,
-    customer_id     TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
-    wiki_type       TEXT NOT NULL,
-    slug            TEXT NOT NULL,
-    source          TEXT NOT NULL,
-    -- Source-system identifier (Slack thread_ts, GitHub PR id, Linear
-    -- issue id, ...). Together with (customer_id, wiki_type, slug,
-    -- source) this is the dedup key — re-bootstrap of the same source
-    -- doesn't duplicate raw rows.
-    source_ref      TEXT NOT NULL,
-    data            JSONB NOT NULL,
-    fetched_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT uq_wiki_raw_data UNIQUE (customer_id, wiki_type, slug, source, source_ref)
-);
-
-CREATE INDEX ix_wiki_raw_data_page
-    ON wiki_raw_data (customer_id, wiki_type, slug, fetched_at DESC);
-
-CREATE INDEX ix_wiki_raw_data_source
-    ON wiki_raw_data (customer_id, source, source_ref);
-
--- ---------------------------------------------------------------------------
 -- Custom Ingest Tokens (migration 0046)
 -- Self-serve bearer tokens for the Custom Ingest API. Customers mint a
 -- token from the dashboard; that token authenticates writes to the
@@ -1527,8 +1207,8 @@ CREATE UNIQUE INDEX idx_inferred_edges_queue_outstanding
 -- worker.py:_claim_one). Under FORCE RLS that drain SELECT silently
 -- zero-matches when running as a non-superuser role (e.g. probe_app),
 -- because there's no GUC to set before the row is claimed. Follows the
--- same no-RLS pattern as ingestion_queue / backfill_state /
--- wiki_synthesis_queue. See migration 0068.
+-- same no-RLS pattern as ingestion_queue / backfill_state. See
+-- migration 0068.
 --
 -- Tenant scoping is enforced by the side-worker wrapping the per-row
 -- processing in `with_tenant(customer_id)` AND the SQL filtering on
@@ -1792,7 +1472,7 @@ CREATE POLICY tenant_isolation ON purge_runs
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
--- Workflow memory Phase 0: the procedure store (migration 0110).
+-- Workflow memory Phase 0: the procedure store (migration 0114).
 --
 -- situations / clauses / clause_situation_edges / clause_evidence /
 -- serve_ledger. All five carry data in v0. `procedures` /
@@ -1808,7 +1488,7 @@ CREATE POLICY tenant_isolation ON purge_runs
 -- conformance are not created either — they need Phase 1's detectors.
 --
 -- This block MUST stay identical to
--- db/migrations/versions/20260819_0110_workflow_memory_store.py: CI applies
+-- db/migrations/versions/20260820_0114_workflow_memory_store.py: CI applies
 -- this file and stamps alembic head, it never runs the migration chain.
 -- ---------------------------------------------------------------------------
 CREATE TABLE situations (
@@ -1869,7 +1549,7 @@ CREATE TABLE clauses (
     CONSTRAINT ck_clauses_publication_is_attributed
         CHECK ((shared_by IS NULL) = (shared_at IS NULL)),
     -- The body's embedding, stored so neighbour search embeds ONE text per
-    -- declaration instead of the whole corpus (migration 0113). The model id
+    -- declaration instead of the whole corpus (migration 0117). The model id
     -- is not optional: a cosine between vectors from two different embedders
     -- is a plausible-looking number rather than an error, so a row embedded by
     -- an older model must be EXCLUDED from a search, not silently compared.

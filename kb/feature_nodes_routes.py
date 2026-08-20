@@ -77,7 +77,7 @@ Sequencing (three transactions, in order):
      become permanent.
   2. ``persist_single_document`` commits the Document + chunks +
      embedding in its OWN transaction, then enqueues
-     wiki_synthesis_queue + inferred_edges_queue.
+     inferred_edges_queue.
   3. Main with_tenant block: upserts FEATURE + PR/Repo/Person stubs +
      (idempotent re-upsert of the rationale's stub from step 1) +
      all edges including DESCRIBES.
@@ -89,8 +89,7 @@ canonical_ids + content_hash idempotency mean a redelivered webhook
 re-runs the full flow cleanly (the graph_nodes stub re-upserts
 idempotently, the Document no-ops on matching content_hash, the
 FEATURE + edges retry succeeds). Same eventual-consistency story as
-wiki_synthesis_queue + inferred_edges_queue, which by design fire
-AFTER doc commit.
+inferred_edges_queue, which by design fires AFTER doc commit.
 """
 
 from __future__ import annotations

@@ -5,7 +5,7 @@ These files let the auto-research optimization platform run the prbe-knowledge
 coding agent can optimize retrieval quality against a held-out KPI it never sees.
 
 They are agent-visible build/run assets only. They are **not** part of any production
-deploy and **not** the per-role data-plane image. Ingestion / worker / cron / wiki /
+deploy and **not** the per-role data-plane image. Ingestion / worker / cron /
 MCP never run here.
 
 | file | role |

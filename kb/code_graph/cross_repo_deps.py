@@ -2,8 +2,12 @@
 
 For each repo's clone, find verified references to OTHER repos in the same
 customer's org. Edges flow into ``graph_edges`` as ``DEPENDS_ON`` between
-``Repo`` graph nodes. The wiki index renderer reads these edges instead
-of letting the LLM hallucinate connections from page summaries.
+``Repo`` graph nodes.
+
+NOTE: extraction is disabled (see the paused block in
+kb/handlers/codegraph.py) and the index renderer that consumed these
+edges has been removed. Existing edges remain queryable through the
+graph retriever; nothing writes new ones.
 
 Pipeline:
 
@@ -17,9 +21,9 @@ Pipeline:
      emit one ``DEPENDS_ON`` edge per pair, with provenance in
      ``properties``.
 
-Bidirectionality is computed at READ time (in the wiki index renderer)
-by checking whether the reverse edge also exists. That decoupling avoids
-needing a "wait for all repos to finish" hook in the event pipeline.
+Bidirectionality is computed at READ time by checking whether the reverse
+edge also exists. That decoupling avoids needing a "wait for all repos to
+finish" hook in the event pipeline.
 
 Idempotency: callers should DELETE existing ``DEPENDS_ON`` edges from
 the source repo's node before persisting new ones, so a dropped
@@ -899,8 +903,8 @@ async def persist_cross_repo_edges(
 
     Runs in its own transaction (separate from the main code-graph
     extract / persist) so a failure here does not roll back symbol
-    extraction. Cross-repo edges are advisory data for the wiki
-    architecture diagram; partial state is acceptable.
+    extraction. Cross-repo edges are advisory; partial state is
+    acceptable.
     """
     async with with_tenant(customer_id) as conn, conn.transaction():
         source_node_id = await _get_or_create_repo_node(

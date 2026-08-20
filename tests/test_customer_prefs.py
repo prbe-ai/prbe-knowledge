@@ -1,10 +1,8 @@
-"""Fail-closed semantics for shared.customer_prefs.is_wiki_generation_enabled.
+"""Fail-soft semantics for shared.customer_prefs readers.
 
 These tests bypass the DB and patch `raw_conn` directly — the reader's
-contract is "any non-True input → False" and that contract is what
-keeps wiki synthesis off for tenants who haven't opted in. The DB-level
-behavior (real customers row, real JSONB column) is exercised by
-tests/test_normalizer_wiki_enqueue.py and tests/synthesis/test_wiki_cron.py.
+contract is "any unreadable or unexpected input → the declared
+fallback", never a raise into the caller's hot path.
 """
 
 from __future__ import annotations
@@ -29,89 +27,6 @@ def _patch_raw_conn(monkeypatch, fetchval_return) -> MagicMock:
 
     monkeypatch.setattr(customer_prefs, "raw_conn", fake_raw_conn)
     return fetchval
-
-
-@pytest.mark.asyncio
-async def test_returns_true_when_key_explicitly_true(monkeypatch) -> None:
-    _patch_raw_conn(monkeypatch, {"wiki_generation_enabled": True})
-    assert await customer_prefs.is_wiki_generation_enabled("c1") is True
-
-
-@pytest.mark.asyncio
-async def test_returns_false_when_key_missing(monkeypatch) -> None:
-    _patch_raw_conn(monkeypatch, {})
-    assert await customer_prefs.is_wiki_generation_enabled("c1") is False
-
-
-@pytest.mark.asyncio
-async def test_returns_false_when_key_explicitly_false(monkeypatch) -> None:
-    _patch_raw_conn(monkeypatch, {"wiki_generation_enabled": False})
-    assert await customer_prefs.is_wiki_generation_enabled("c1") is False
-
-
-@pytest.mark.asyncio
-async def test_accepts_exactly_the_two_shapes_sql_accepts(monkeypatch) -> None:
-    """Boolean true AND string "true" are ON; every other truthy value
-    stays OFF.
-
-    This test used to pin the string to False ("a botched PATCH must not
-    flip a tenant on") — but the engine's own PUT /settings writes the
-    string, and every SQL consumer (`->> = 'true'`) already read it as
-    ON, so the Python-side refusal protected nothing: it made the two
-    gates disagree, and a PUT-enabled tenant drained in SQL while the
-    Normalizer silently stopped enqueueing. The contract now is exact
-    parity with wiki_enabled_sql — see tests/test_customer_prefs_parity.py
-    for the live-DB matrix.
-    """
-    _patch_raw_conn(monkeypatch, {"wiki_generation_enabled": "true"})
-    assert await customer_prefs.is_wiki_generation_enabled("c1") is True
-
-    for still_off in ("1", 1, "yes", "True", ["true"]):
-        _patch_raw_conn(monkeypatch, {"wiki_generation_enabled": still_off})
-        assert await customer_prefs.is_wiki_generation_enabled("c1") is False, (
-            still_off
-        )
-
-
-@pytest.mark.asyncio
-async def test_returns_false_when_customer_missing(monkeypatch) -> None:
-    _patch_raw_conn(monkeypatch, None)
-    assert await customer_prefs.is_wiki_generation_enabled("nope") is False
-
-
-@pytest.mark.asyncio
-async def test_returns_false_for_blank_customer_id(monkeypatch) -> None:
-    """Reader must short-circuit before opening a connection — guards
-    against a caller that confused an empty tenant id with 'no filter'.
-    """
-    fetchval = _patch_raw_conn(monkeypatch, {"wiki_generation_enabled": True})
-    assert await customer_prefs.is_wiki_generation_enabled("") is False
-    fetchval.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_returns_false_on_db_error(monkeypatch) -> None:
-    @asynccontextmanager
-    async def fake_raw_conn():
-        raise RuntimeError("pool dead")
-        yield  # pragma: no cover
-
-    monkeypatch.setattr(customer_prefs, "raw_conn", fake_raw_conn)
-    assert await customer_prefs.is_wiki_generation_enabled("c1") is False
-
-
-@pytest.mark.asyncio
-async def test_parses_string_jsonb(monkeypatch) -> None:
-    """asyncpg returns JSONB as a str unless a codec is registered;
-    the reader must handle both."""
-    _patch_raw_conn(monkeypatch, '{"wiki_generation_enabled": true}')
-    assert await customer_prefs.is_wiki_generation_enabled("c1") is True
-
-
-@pytest.mark.asyncio
-async def test_returns_false_on_malformed_json_string(monkeypatch) -> None:
-    _patch_raw_conn(monkeypatch, "{not json")
-    assert await customer_prefs.is_wiki_generation_enabled("c1") is False
 
 
 # ---- code_graph_indexed_branch ------------------------------------------

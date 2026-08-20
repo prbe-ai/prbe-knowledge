@@ -266,11 +266,6 @@ async def run_worker_forever() -> None:
     # IntegrationPoller replaces the retired prbe-knowledge-poller Fly app.
     # Discovers participating connectors via their poll_config ClassVar.
     integration_poller = IntegrationPoller()
-    # Wiki triage + synthesis run in their own dedicated fly apps
-    # (prbe-knowledge-wiki-worker / prbe-knowledge-wiki-synthesis), driven
-    # by pg_notify channels and a nightly cron. Removed from this app's
-    # gather as part of the wiki triage redesign — see services/synthesis/
-    # triage_app.py and synthesis_app.py for the new entry points.
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
     health_config = uvicorn.Config(

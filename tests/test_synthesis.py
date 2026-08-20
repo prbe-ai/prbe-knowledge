@@ -177,7 +177,7 @@ def test_system_prompt_carries_source_preference_rule() -> None:
     session chunk (`claude_code:*`) landed as the primary doc and the
     chunk content was meta-commentary about Probe rather than factual
     content. The system prompt now instructs the LLM to treat
-    authoritative source docs (linear/notion/slack/github/wiki) as
+    authoritative source docs (linear/notion/slack/github) as
     primary truth and use session transcripts as supporting context
     only. Verified 2026-05-20 against the multi-granola chronology
     query — when curation lands on the live debugging session, the

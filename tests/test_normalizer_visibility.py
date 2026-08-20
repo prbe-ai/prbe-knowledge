@@ -135,7 +135,7 @@ def _build_doc(
         source_id=doc_id,
         source_url="",
         doc_class=DocClass.AGENT_ARTIFACT,
-        doc_type=DocType.WIKI_POSTMORTEM,
+        doc_type=DocType.INCIDENT_INVESTIGATION,
         content_type="text/markdown",
         content_hash=f"hash-{doc_id}",
         title=f"Test artifact {doc_id}",
@@ -164,7 +164,7 @@ async def test_persist_single_document_defaults_visibility_to_approved(
         normalizer = Normalizer(ctx, embedder=_StubEmbedder())
         doc = _build_doc(
             customer_id,
-            doc_id="pd:wiki.postmortem:default-test:v1",
+            doc_id="pd:incident.investigation:default-test:v1",
             visibility=Visibility.APPROVED,
         )
         await normalizer.persist_single_document(customer_id, doc)
@@ -206,7 +206,7 @@ async def test_persist_single_document_threads_draft_visibility(
         normalizer = Normalizer(ctx, embedder=_StubEmbedder())
         doc = _build_doc(
             customer_id,
-            doc_id="pd:wiki.postmortem:draft-test:v1",
+            doc_id="pd:incident.investigation:draft-test:v1",
             visibility=Visibility.DRAFT,
         )
         await normalizer.persist_single_document(customer_id, doc)

@@ -252,7 +252,7 @@ async def enable_capability(customer_id: str, key: str) -> None:
 async def disable_capability(customer_id: str, key: str) -> None:
     """Turn one capability off. The kill switch.
 
-    WRITES `false`, it does not delete the key. Migration 0111 exists to make
+    WRITES `false`, it does not delete the key. Migration 0115 exists to make
     every cell explicit -- so the dashboard shows off because it IS off, not
     because of a reader's fallback -- and a disable that removed the key would
     walk that back one tenant at a time, leaving the same ambiguity the
@@ -290,7 +290,7 @@ async def _write_capability_cell(
     The CASE repairs a non-object `preferences` instead of failing on it.
     `jsonb_set` raises `cannot set path in scalar` for a scalar or array blob,
     which would take the kill switch out exactly when someone needs it, and a
-    non-object blob has no keys to lose -- unlike migration 0111, which skips
+    non-object blob has no keys to lose -- unlike migration 0115, which skips
     those rows because a bulk backfill has no business rewriting them.
     """
     status = await conn.execute(

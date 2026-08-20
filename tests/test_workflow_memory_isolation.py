@@ -383,7 +383,7 @@ async def test_every_table_has_forced_rls_and_exact_tenant_policies(live_db, tab
 
 
 # ---------------------------------------------------------------------------
-# Composite foreign keys: the headline security property of migration 0110.
+# Composite foreign keys: the headline security property of migration 0114.
 # ---------------------------------------------------------------------------
 
 
@@ -604,9 +604,9 @@ _VERSIONS_DIR = _REPO_ROOT / "db" / "migrations" / "versions"
 #: never runs there, and this comparison is the only thing keeping the two
 #: files honest. The completeness test below fails if one is missed.
 _MIGRATION_PATHS = (
-    _VERSIONS_DIR / "20260819_0110_workflow_memory_store.py",
-    _VERSIONS_DIR / "20260819_0112_wfmem_clause_publication.py",
-    _VERSIONS_DIR / "20260819_0113_wfmem_clause_embedding.py",
+    _VERSIONS_DIR / "20260820_0114_workflow_memory_store.py",
+    _VERSIONS_DIR / "20260820_0116_wfmem_clause_publication.py",
+    _VERSIONS_DIR / "20260820_0117_wfmem_clause_embedding.py",
 )
 _SCHEMA_PATH = _REPO_ROOT / "db" / "schema.sql"
 
@@ -627,7 +627,7 @@ CREATE TABLE IF NOT EXISTS neon_auth."user" (
 _CUSTOMERS_STUB = "CREATE TABLE customers (customer_id TEXT PRIMARY KEY)"
 
 #: Both scratch databases need pgvector: `clauses.body_embedding` is a
-#: `halfvec(3072)` (migration 0113). The real database gets this from the image;
+#: `halfvec(3072)` (migration 0117). The real database gets this from the image;
 #: a freshly-CREATEd one does not, and without it the replay dies on
 #: `type "halfvec" does not exist` -- which reads like a schema bug rather than
 #: a missing extension in a throwaway database.
@@ -713,7 +713,7 @@ def test_every_wfmem_migration_is_replayed_by_the_drift_guard() -> None:
     # 0111 is a data backfill of customers.preferences with no DDL, so it has
     # nothing for this guard to compare and is excluded by name rather than by
     # a rule that would also excuse a real one.
-    on_disk.discard("20260819_0111_wfmem_capability_prefs.py")
+    on_disk.discard("20260820_0115_wfmem_capability_prefs.py")
     assert on_disk == named, (
         f"these wfmem migrations are not replayed by the drift guard: "
         f"{sorted(on_disk - named)}. Add them to _MIGRATION_PATHS."
@@ -913,7 +913,7 @@ async def test_schema_sql_has_not_drifted_from_the_migration(live_db):
     assert sorted(migration_fingerprint) == sorted(schema_fingerprint)
     for section in sorted(migration_fingerprint):
         assert migration_fingerprint[section] == schema_fingerprint[section], (
-            f"db/schema.sql and migration 0110 disagree on {section}. CI applies "
+            f"db/schema.sql and migration 0114 disagree on {section}. CI applies "
             "schema.sql and stamps alembic head, so schema.sql is what the tests "
             "actually run against -- the two must be updated together."
         )

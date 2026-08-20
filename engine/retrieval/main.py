@@ -897,8 +897,8 @@ async def _load_source_doc_and_chunks(
     """Direct doc-by-id fetch + its chunks.
 
     `include_drafts` defaults to False — drafts are invisible to API-key
-    callers (Plan A Component 6). Reviewer-scoped BFF flips this to True
-    after role-checking ``wiki_reviewer``.
+    callers (Plan A Component 6). Reviewer-scoped BFF surfaces flip this
+    to True.
     """
     # Default branch hides ``visibility='draft'`` rows. Sibling of the
     # existing ``valid_to IS NULL`` filter — matches the style used in

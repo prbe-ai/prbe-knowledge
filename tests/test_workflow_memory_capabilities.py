@@ -42,7 +42,7 @@ WHAT THIS FILE HAS TO DEFEND, and why each claim needs its own test:
   whose rows were deleted -- plus a case that fails for the LEFT JOIN written
   without a tenant predicate.
 * THE REGISTRY AND THE MIGRATION CANNOT DRIFT, and the migration is never run
-  by CI (which stamps the head). 0111 hardcodes its key list on purpose --
+  by CI (which stamps the head). 0115 hardcodes its key list on purpose --
   migrations are frozen in time and must not import app code -- so the tests
   compare the two lists, replay the rendered SQL to check the key-absence and
   non-object guards are still there, and execute a real upgrade/downgrade
@@ -112,7 +112,7 @@ EXPECTED_KEYS = frozenset(
 async def two_tenants(live_db: None) -> AsyncIterator[tuple[str, str]]:
     """Two customers with an empty `preferences` blob -- the never-configured state.
 
-    Deliberately does NOT run migration 0111's backfill: CI stamps the alembic
+    Deliberately does NOT run migration 0115's backfill: CI stamps the alembic
     head instead of running migrations, so anything that depended on the
     backfill having executed would pass here and lie there.
     """
@@ -264,7 +264,7 @@ async def test_wrong_typed_cell_is_off_and_loud(two_tenants: tuple[str, str]) ->
         f"a string-valued cell must warn; captured: {logs}"
     )
 
-    # Explicit false is a supported value and must stay quiet -- migration 0111
+    # Explicit false is a supported value and must stay quiet -- migration 0115
     # writes it to every cell, so warning here would fire for every tenant.
     await _set_pref(tenant, WFMEM_INPUT_DECLARED, False)
     with structlog.testing.capture_logs() as logs:
@@ -674,7 +674,7 @@ async def test_disable_turns_an_enabled_cell_off(two_tenants: tuple[str, str], k
 async def test_disable_writes_false_rather_than_deleting_the_key(
     two_tenants: tuple[str, str],
 ) -> None:
-    """The explicit-false invariant migration 0111 establishes must survive a disable.
+    """The explicit-false invariant migration 0115 establishes must survive a disable.
 
     Deleting the key reads False too, so no behavioural test can tell the two
     apart -- but an operator reading the row during an incident can, and that is
@@ -848,11 +848,11 @@ async def test_audit_is_not_confused_by_another_tenants_vocabulary(
 # --------------------------------------------------------------------------
 
 
-def _load_migration_0111() -> ModuleType:
+def _load_migration_0115() -> ModuleType:
     versions = Path(__file__).resolve().parents[1] / "db" / "migrations" / "versions"
-    matches = sorted(versions.glob("*_0111_*.py"))
-    assert len(matches) == 1, f"expected exactly one 0111 migration, found {matches}"
-    spec = importlib.util.spec_from_file_location("wfmem_migration_0111", matches[0])
+    matches = sorted(versions.glob("*_0115_*.py"))
+    assert len(matches) == 1, f"expected exactly one 0115 migration, found {matches}"
+    spec = importlib.util.spec_from_file_location("wfmem_migration_0115", matches[0])
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -860,14 +860,14 @@ def _load_migration_0111() -> ModuleType:
 
 
 def _rendered_sql(direction: str) -> list[str]:
-    """The SQL migration 0111 would run, without an alembic context.
+    """The SQL migration 0115 would run, without an alembic context.
 
     Same trick as tests/test_workflow_memory_isolation.py: swap the module's
     `op` for a recorder so this replays what is IN THE FILE, with the keys
     actually interpolated, rather than substring-matching an f-string template
     that may or may not render the way it reads.
     """
-    module = _load_migration_0111()
+    module = _load_migration_0115()
     collected: list[str] = []
 
     class _Recorder:
@@ -881,14 +881,14 @@ def _rendered_sql(direction: str) -> list[str]:
 
 
 def test_migration_backfills_exactly_the_registry_keys() -> None:
-    module = _load_migration_0111()
+    module = _load_migration_0115()
     assert frozenset(module.WFMEM_CAPABILITY_KEYS_BACKFILLED) == WFMEM_CAPABILITY_KEYS
     assert len(module.WFMEM_CAPABILITY_KEYS_BACKFILLED) == 6
 
 
 def test_migration_follows_the_head() -> None:
-    module = _load_migration_0111()
-    assert module.down_revision == "0110_workflow_memory_store"
+    module = _load_migration_0115()
+    assert module.down_revision == "0114_workflow_memory_store"
     assert len(module.revision) <= 32, "alembic_version.version_num is varchar(32)"
 
 
@@ -943,7 +943,7 @@ async def test_migration_round_trip_against_a_live_database(live_db: None) -> No
     from alembic.operations import Operations
     from sqlalchemy import create_engine, text
 
-    module = _load_migration_0111()
+    module = _load_migration_0115()
     url = os.environ["DATABASE_URL"]
     if url.startswith("postgresql://"):
         url = "postgresql+psycopg://" + url.removeprefix("postgresql://")

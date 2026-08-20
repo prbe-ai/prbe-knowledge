@@ -6,7 +6,61 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- **Entity merges that hit a duplicate edge lane no longer roll back silently.**
+  `merge_cluster`'s collision handler runs inside `with_tenant`'s explicit
+  transaction, so the `UniqueViolation` it catches had already aborted that
+  transaction — the recovery `INSERT` died with `InFailedSQLTransactionError`
+  and the whole merge was thrown away. Signature on the managed plane: 88
+  duplicate-key errors in 24h paired 1:1 with 88 "current transaction is
+  aborted", and not one completed merge. The UPDATE is now wrapped in a
+  SAVEPOINT, and the handler matches `graph_edges_unique_lane` by name rather
+  than catching any unique violation. Letting the path run for the first time
+  exposed a second layer: it writes `operation = 'deleted_duplicate_lane'`,
+  which the column's CHECK never permitted (migration 0113 widens it).
+- **`system_settings` exists on every plane again, so the global ingestion
+  killswitch works.** A database bootstrapped from `schema.sql` + `alembic stamp
+  head` never replays the chain, so the table migration 0025 created was absent
+  from managed-shared — 4,271 errors/24h — and its reader fails open, meaning
+  the master switch for halting all plugin ingestion silently did nothing there.
+  Migration 0112 repairs it; `scripts/check_schema_drift.py` makes the next
+  instance loud.
+- **Cross-source vector similarity actually runs.** `inferred_edges/bundle.py`
+  named a CTE `similar`, a reserved word, so the statement was a syntax error and
+  the query had never executed once in production — 752 failures/24h, swallowed
+  by a bare `except Exception` that logged at DEBUG and blamed a missing
+  embedding. Renamed, and the handler now catches `asyncpg.PostgresError` and
+  logs at WARNING with the real error type.
+- **`neon_auth` lookups stop erroring on managed** (1,514/24h). Migration 0112
+  grants the app role USAGE + SELECT, guarded so it no-ops where the schema is
+  absent. This silences the error; it does not make the feature work — the table
+  is an empty shim and every active managed customer has a NULL
+  `organization_id`. See TODOS.md.
+
 ### Changed
+
+- **The /knowledge stats header no longer takes seconds to answer.**
+  `GET /api/stats/ingestion` ran four uncached aggregates, and neither of the
+  two that matter had an index behind it. Measured on the research plane for a
+  19.5k-document tenant: the document count took 5,187 ms cold and bitmap-scanned
+  10,494 heap pages to answer for 19,573 rows; the chunk count took 2,936 ms and
+  touched 148,808 buffers, 77% of them a Memoize'd nested loop into `documents`
+  resolving `source_system` one chunk at a time. Migration 0111 adds a partial
+  covering index to each side, so both aggregates are now Index Only Scans and
+  the same tenant costs 28 ms and 92 ms. The join to `documents` in the chunk
+  count is deliberately kept: ~3% of live chunks belong to a superseded or
+  soft-deleted document and must not be counted.
+- **The same endpoint is cached 30s per tenant and runs its four queries
+  concurrently.** `?refresh=true` bypasses the cache; the dashboard's Refresh
+  button sets it. The four queries now use a connection each, so the four
+  results are no longer one consistent snapshot — safe for display counters,
+  documented at the call site, and not a pattern to copy elsewhere. The cache
+  lock is per tenant, so one slow tenant cannot stall another's header.
+  The `refresh` bypass only reaches here once research-os relays it
+  (research-os v0.211.0.0); until that ships, Refresh returns the cached
+  payload for up to 30s. Order of deploy does not matter — FastAPI ignores the
+  unknown parameter in one direction and defaults it to false in the other.
 
 - **The rebuild button can no longer empty a wiki that nothing can
   rebuild.** `POST /api/wiki/backfill/trigger`, its `/bootstrap/trigger`

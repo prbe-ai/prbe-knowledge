@@ -146,7 +146,7 @@ def test_the_valid_kinds_do_not_drift_from_the_migration() -> None:
     """
     migration = (
         Path(__file__).resolve().parents[1]
-        / "db/migrations/versions/20260819_0110_workflow_memory_store.py"
+        / "db/migrations/versions/20260820_0114_workflow_memory_store.py"
     ).read_text()
     check = re.search(r"CHECK \(kind IN \(([^)]*)\)\)", migration)
     assert check is not None, "the kind CHECK constraint moved; this guard needs updating"

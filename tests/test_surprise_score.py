@@ -275,15 +275,15 @@ def test_hub_anti_bonus_stacks_with_confidence() -> None:
 
 def test_hub_anti_bonus_stacks_with_cross_source() -> None:
     """Cross-source bonus * hub-hub penalty applies to INFERRED edges
-    bridging two hub docs across sources -- the wiki-page-vs-canonical-
+    bridging two hub docs across sources -- the index-page-vs-canonical-
     commit failure mode this component was added for."""
     import math
 
     s = _score(
         confidence="INFERRED",
-        anchor_source="wiki",
+        anchor_source="notion",
         target_source="github",
-        anchor_degree=50,    # wiki-page-shaped hub
+        anchor_degree=50,    # index-page-shaped hub
         target_degree=20,    # repo-shaped hub
     )
     decay = max(1.0 - 0.15 * math.log2(20.0 / 2.0), 0.5)

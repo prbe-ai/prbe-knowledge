@@ -411,12 +411,10 @@ def _gateway_model(model: str, kwargs: dict[str, Any]) -> str:
         serves no such path, which answers 405 `{"detail":"Method Not
         Allowed"}`.
 
-    The second shape is the one the wiki synthesis stack actually sends:
-    `kb/synthesis/providers.py::_gemini_call_json` calls
-    `acompletion(model=_gemini_litellm_model(model))`, and that helper prepends
-    `gemini/`. Every triage batch died on it, and one batch failure
-    dead-lettered 13,147 queue rows for the tenant. Verified against the live
-    gateway:
+    The second shape is the one an SDK-prefixing caller sends: a helper
+    that prepends `gemini/` before calling `acompletion(model=...)`. This
+    dead-lettered 13,147 queue rows for one tenant in a single batch
+    failure. Verified against the live gateway:
 
         gemini-3.5-flash                -> DefaultCredentialsError
         gemini/gemini-3.5-flash         -> 405 Method Not Allowed

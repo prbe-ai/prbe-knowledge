@@ -20,7 +20,6 @@ from engine.shared.db import raw_conn
 # not gated here:
 #   - CLAUDE_CODE / CODEX: agent sessions, no OAuth token
 #   - MANUAL_UPLOAD / CUSTOM_INGEST: BYO upload paths, separate token tables
-#   - WIKI: authored programmatically, no upstream
 #   - CODE_GRAPH: derived from github content; its own enqueue path
 #                 short-circuits when the upstream github source disappears
 _OAUTH_SOURCES: frozenset[SourceSystem] = frozenset(
@@ -43,7 +42,6 @@ _UNGATED_SOURCES: frozenset[SourceSystem] = frozenset(
         SourceSystem.CODEX,
         SourceSystem.MANUAL_UPLOAD,
         SourceSystem.CUSTOM_INGEST,
-        SourceSystem.WIKI,
         SourceSystem.CODE_GRAPH,
         # Incident sources use per-tenant webhook secrets keyed in
         # webhook_secrets (prbe-backend), not integration_tokens. The

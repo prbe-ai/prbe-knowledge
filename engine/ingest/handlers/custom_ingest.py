@@ -56,7 +56,7 @@ class CustomIngestConnector(Connector):
         # /api/custom-ingest/documents route (X-Internal-Knowledge-Key in
         # hosted mode, KNOWLEDGE_API_TOKEN bearer in standalone; see
         # custom_ingest_routes.py). Returning False keeps standalone
-        # /webhooks/custom_ingest a hard 401. Mirrors handlers/wiki.py.
+        # /webhooks/custom_ingest a hard 401.
         return False
 
     def parse_webhook_event(

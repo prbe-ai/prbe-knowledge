@@ -55,7 +55,8 @@ async def seeded_customer_with_docs(live_db) -> SeededCustomer:
     Two live docs (PRB-18 Linear + Notion design rationale) anchor on the
     'multi-granola' concept. One soft-deleted doc (valid_to != NULL)
     verifies the live filter. One cross-tenant doc (different customer_id)
-    verifies customer scoping. One wiki doc verifies wiki is included.
+    verifies customer scoping. One custom-ingest doc verifies a source
+    system with no entity-type mapping is still included.
     """
     from datetime import UTC, datetime
     customer_id = "test-cust-doc-titles-1"
@@ -73,7 +74,7 @@ async def seeded_customer_with_docs(live_db) -> SeededCustomer:
             )
         # Doc 1: Linear PRB-18 (live) - canonical multi-granola plan
         # Doc 2: Notion design rationale (live)
-        # Doc 3: Wiki page (live, NOT excluded)
+        # Doc 3: Custom-ingest page (live, NOT excluded)
         # Doc 4: Soft-deleted older version (valid_to set)
         # Doc 5: Cross-tenant doc with same title (different customer_id)
         await conn.executemany(
@@ -102,10 +103,11 @@ async def seeded_customer_with_docs(live_db) -> SeededCustomer:
                  "Multi-Granola — Design Rationale & Open Questions",
                  "Alternatives considered: shared team key, server-side rotation.",
                  now, None),
-                ("wiki:project:multi_granola", customer_id, "wiki", "multi_granola",
-                 "/wiki/project/multi_granola", "wiki.project",
+                ("custom:project:multi_granola", customer_id, "custom_ingest",
+                 "multi_granola",
+                 "/custom/project/multi_granola", "custom.document",
                  "Multi-Granola feature index",
-                 "Synthesized navigational hub for multi-granola work.",
+                 "Navigational hub for multi-granola work.",
                  now, None),
                 ("linear:org:issue:prb-old", customer_id, "linear", "prb-old",
                  "https://linear.app/x/PRB-OLD", "linear.issue",
