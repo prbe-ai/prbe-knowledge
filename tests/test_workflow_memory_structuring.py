@@ -43,6 +43,7 @@ Run it (no database needed, but conftest pins one anyway):
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -400,6 +401,61 @@ async def test_the_llm_raising_becomes_a_typed_failure() -> None:
     assert [e for e in logs if e["event"] == "wfmem_structuring.llm_failed"], (
         f"a failed structuring call must be visible; captured: {logs}"
     )
+
+
+async def test_the_failure_log_says_WHICH_failure_it_was() -> None:
+    """Visible is not the same as diagnosable, and production taught us the gap.
+
+    Every `/procedures/preview` failed from the day the feature shipped, and the
+    log line said `LLMError` and nothing else -- so a 404 (the cluster's gateway
+    serves no Anthropic deployment, a config bug fixable in a minute) looked
+    exactly like a provider outage, which is nobody's to fix and waits. Finding
+    out took a shell in the pod and a dump of the gateway's model list.
+
+    `status_code` and `provider` are structural -- they come off the HTTP layer
+    and cannot contain the prompt -- so they buy the diagnosis without reopening
+    the leak the test below guards.
+    """
+    completion = FakeCompletion(
+        raises=LLMError("not found", status_code=404, provider="anthropic")
+    )
+
+    with structlog.testing.capture_logs() as logs, pytest.raises(StructuringFailed):
+        await structure(PROSE, CONTEXT, completion=completion)
+
+    entry = next(e for e in logs if e["event"] == "wfmem_structuring.llm_failed")
+    assert entry["status_code"] == 404
+    assert entry["provider"] == "anthropic"
+    # The model is what a 404 is ABOUT, so it has to be in the same line.
+    assert entry["model"] == STRUCTURING_MODEL
+
+
+async def test_the_structuring_model_can_be_corrected_without_a_release() -> None:
+    """The property that actually rescued this.
+
+    A model constant can be wrong in a way no test can see -- whether a gateway
+    serves that deployment is deployment state, not code. So the escape hatch is
+    the guard: a default that turns out to be unreachable is a values change,
+    not a release, on the same env-override convention
+    `SEARCH_AGENT_INFERENCE_MODEL` already follows. Remove the override and the
+    next bad default is stuck in whatever image is deployed.
+    """
+    import importlib
+
+    import engine.shared.constants as constants
+
+    original = os.environ.get("WFMEM_STRUCTURING_MODEL")
+    os.environ["WFMEM_STRUCTURING_MODEL"] = "gemini/some-other-model"
+    try:
+        assert (
+            importlib.reload(constants).WFMEM_STRUCTURING_MODEL == "gemini/some-other-model"
+        )
+    finally:
+        if original is None:
+            del os.environ["WFMEM_STRUCTURING_MODEL"]
+        else:
+            os.environ["WFMEM_STRUCTURING_MODEL"] = original
+        importlib.reload(constants)
 
 
 async def test_a_non_llm_exception_is_also_wrapped() -> None:

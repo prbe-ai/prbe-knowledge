@@ -335,12 +335,26 @@ async def structure(prose: str, context: Any, *, completion: Any | None = None) 
         # `str(exc)` is NOT logged, deliberately, breaking with the classifier.
         # A provider's error message is not guaranteed to be free of the request
         # that produced it, and the request here is unscanned prose a human
-        # pasted. The class and the model are what actually distinguish the
-        # failures worth distinguishing.
+        # pasted.
+        #
+        # But the class and the model alone were NOT enough, and production
+        # proved it: every `/procedures/preview` failed for days as an
+        # indistinguishable `LLMError`, and finding out why took a shell in the
+        # pod and a dump of the gateway's model list. It was a 404 -- the
+        # cluster's LiteLLM serves no Anthropic deployment at all -- which is a
+        # config bug somebody could have fixed in a minute if the line had said
+        # so. A 404 from the gateway, a 401 with a bad key and a 500 from the
+        # provider are three different jobs for three different people.
+        #
+        # `status_code` and `provider` come off LLMError, which lifts them from
+        # the HTTP layer. They are structural: neither can contain the prompt,
+        # so this buys the diagnosis without reopening the leak.
         log.warning(
             "wfmem_structuring.llm_failed",
             model=STRUCTURING_MODEL,
             error_class=type(exc).__name__,
+            status_code=getattr(exc, "status_code", None),
+            provider=getattr(exc, "provider", None),
         )
         raise StructuringFailed(
             REASON_LLM_UNAVAILABLE,

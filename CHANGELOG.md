@@ -6,6 +6,35 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- **Workflow memory's write path never worked in production, and the log line
+  could not say why.** Every `/procedures/preview` and `/procedures/declare`
+  502'd from the day the feature shipped. `WFMEM_STRUCTURING_MODEL` named
+  `anthropic/claude-sonnet-4-6`, and the research-os cluster's LiteLLM gateway
+  serves Fireworks, Cerebras and `gemini-*` — no Anthropic deployment at all —
+  while the engine has no `ANTHROPIC_API_KEY` to go direct with. Both spellings
+  fail and they fail differently: the prefixed id 404s (an Anthropic-native
+  request against an OpenAI-shaped proxy) and the bare id gets "no healthy
+  deployments for this model". The comment claiming a `claude-*` modelList entry
+  was true of the *prbe-backend* proxy, a different deployment.
+
+  Default is now `gemini/gemini-3.6-flash`, verified reachable against the live
+  gateway rather than inferred, and env-overridable per the
+  `SEARCH_AGENT_INFERENCE_MODEL` convention. **This is a deliberate downgrade**
+  from the frontier-class model the original note argued for — the structuring
+  pass has to refuse to embellish, and a polished invention is not caught
+  downstream because people approve what looks right. Restoring one is a values
+  change once that gateway serves it, not a release.
+
+  The structuring failure log now carries `status_code` and `provider` (the
+  classifier's tie-break too). It carried only the exception class, so a 404
+  from the gateway — a config bug fixable in a minute — was indistinguishable
+  from a provider outage, and diagnosing it took a shell in the pod and a dump
+  of the gateway's model list. `str(exc)` stays out: the request here is
+  unscanned prose a human pasted, and a provider's message can quote it back.
+  `status_code` and `provider` come off the HTTP layer and cannot.
+
 ### Added
 
 - **Workflow memory: a store for the team's procedure rules, off by default.**
