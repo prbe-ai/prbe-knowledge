@@ -421,7 +421,11 @@ async def _fetch_vector_similar_cross_source(
                 ORDER BY c.chunk_index ASC
                 LIMIT 1
             ),
-            similar AS (
+            -- NOT `similar`: SIMILAR is a reserved word in Postgres (SIMILAR
+            -- TO), so an unquoted CTE of that name is a syntax error and this
+            -- whole query never ran -- 752 failures/day, silently, from the day
+            -- it shipped until 2026-08-20.
+            similar_docs AS (
                 SELECT DISTINCT c.doc_id,
                        1 - (c.embedding_v2 <=> ae.embedding) AS similarity
                 FROM chunks c
@@ -434,7 +438,7 @@ async def _fetch_vector_similar_cross_source(
                 LIMIT 200
             )
             SELECT s.doc_id
-            FROM similar s
+            FROM similar_docs s
             JOIN documents d ON d.doc_id = s.doc_id
                              AND d.customer_id = $1
                              AND d.valid_to IS NULL
@@ -448,13 +452,19 @@ async def _fetch_vector_similar_cross_source(
         )
         await conn.execute("RELEASE SAVEPOINT vector_similar")
         return [r["doc_id"] for r in rows if r["doc_id"] not in exclude]
-    except Exception as exc:  # pgvector unavailable, zero-vec, or no embedding
+    except asyncpg.PostgresError as exc:
+        # WARNING, not debug. This handler swallowed a permanent SQL syntax
+        # error for months while its comment asserted the cause was a missing
+        # embedding, and the empty list it returns is indistinguishable from
+        # "this document genuinely has no neighbours". A degraded bundle is
+        # worth continuing on; it is not worth hiding.
         await conn.execute("ROLLBACK TO SAVEPOINT vector_similar")
         await conn.execute("RELEASE SAVEPOINT vector_similar")
-        log.debug(
+        log.warning(
             "inferred_edges.bundle.vector_similar_failed",
             customer=customer_id,
             anchor=anchor_doc_id,
+            error_type=type(exc).__name__,
             error=str(exc),
         )
         return []

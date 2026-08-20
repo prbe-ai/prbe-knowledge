@@ -257,3 +257,111 @@ async def test_bundle_customer_id_on_bundle_object(live_db) -> None:
         bundle = await build_bundle("cust-id-check", "id-check-doc", conn)
 
     assert bundle.customer_id == "cust-id-check"
+
+
+# ---------------------------------------------------------------------------
+# _fetch_vector_similar_cross_source (REGRESSION, 2026-08-20)
+#
+# This function had ZERO tests, and that is exactly why it shipped broken: its
+# CTE was named `similar`, a reserved word in Postgres (SIMILAR TO), so the
+# statement was a syntax error and the query NEVER ran once in production --
+# 752 failures a day, from the day it shipped.
+#
+# Nothing caught it because the failure is swallowed and the function returns
+# [], which is indistinguishable from "this document has no similar neighbours".
+# Every end-to-end bundle test above still passed; they just silently received
+# fewer candidate docs, and nothing asserted on the count.
+#
+# The assertion that matters is `!= []` on a corpus that HAS a cross-source
+# neighbour. Both tests below fail against the pre-rename code.
+#
+# Note these seed `embedding_v2`, not `embedding`. _insert_chunk above fills the
+# legacy v1 column with a zero vector and says outright that values don't matter
+# because it never exercises similarity -- the production query reads v2, and a
+# zero vector has no defined cosine direction anyway.
+# ---------------------------------------------------------------------------
+
+VEC_TENANT = "cust-vector-similar-tenant"
+
+
+async def _insert_chunk_with_v2(
+    conn, customer_id: str, doc_id: str, content: str, fill: float
+) -> None:
+    """Seed a chunk whose embedding_v2 is a non-zero constant vector.
+
+    `fill` differentiates documents: cosine distance between two identical
+    constant vectors is 0, and between different constants it is small but
+    non-zero, which is enough to make ORDER BY deterministic without pretending
+    these are meaningful embeddings.
+    """
+    await conn.execute(
+        """
+        INSERT INTO chunks (
+            chunk_id, doc_id, customer_id, chunk_index, content, content_hash,
+            token_count, embedding_v2, embedding_v2_model, embedding_v2_dim,
+            chunker_version, first_seen_version, last_seen_version, valid_from
+        ) VALUES (
+            $1, $2, $3, 0, $4, md5($4),
+            length($4) / 4,
+            (SELECT array_agg(v)::halfvec
+               FROM (SELECT $5::real AS v FROM generate_series(1, 3072)) s),
+            'gemini-embedding-2', 3072,
+            'naive-v1', 1, 1, NOW()
+        )
+        ON CONFLICT (customer_id, chunk_id) DO NOTHING
+        """,
+        f"{doc_id}:chunk:0", doc_id, customer_id, content, fill,
+    )
+
+
+@pytest.mark.asyncio
+async def test_vector_similar_cross_source_actually_returns_neighbours(
+    live_db,
+) -> None:
+    """The query executes and finds a cross-source neighbour.
+
+    Pre-fix this returned [] because the SQL did not parse.
+    """
+    from engine.ingest.inferred_edges.bundle import _fetch_vector_similar_cross_source
+    from engine.shared.db import raw_conn
+
+    async with raw_conn() as conn:
+        await _insert_customer(conn, VEC_TENANT)
+        await _insert_doc(conn, VEC_TENANT, "vec-anchor", "slack")
+        await _insert_chunk_with_v2(conn, VEC_TENANT, "vec-anchor", "auth service", 0.5)
+        await _insert_doc(conn, VEC_TENANT, "vec-neighbour", "github")
+        await _insert_chunk_with_v2(conn, VEC_TENANT, "vec-neighbour", "auth fix", 0.5)
+
+    async with with_tenant(VEC_TENANT) as conn:
+        found = await _fetch_vector_similar_cross_source(
+            conn, VEC_TENANT, "vec-anchor", "slack", set()
+        )
+
+    assert found != [], "query did not execute — the reserved-word bug is back"
+    assert "vec-neighbour" in found
+    assert "vec-anchor" not in found, "anchor must exclude itself"
+
+
+@pytest.mark.asyncio
+async def test_vector_similar_cross_source_excludes_same_source(live_db) -> None:
+    """A same-source neighbour is filtered out — the whole point is CROSS source.
+
+    Guards the `d.source_system <> $3` predicate, which a careless rewrite of
+    the CTE could drop while still parsing.
+    """
+    from engine.ingest.inferred_edges.bundle import _fetch_vector_similar_cross_source
+    from engine.shared.db import raw_conn
+
+    async with raw_conn() as conn:
+        await _insert_customer(conn, VEC_TENANT)
+        await _insert_doc(conn, VEC_TENANT, "same-anchor", "slack")
+        await _insert_chunk_with_v2(conn, VEC_TENANT, "same-anchor", "auth", 0.5)
+        await _insert_doc(conn, VEC_TENANT, "same-sibling", "slack")
+        await _insert_chunk_with_v2(conn, VEC_TENANT, "same-sibling", "auth too", 0.5)
+
+    async with with_tenant(VEC_TENANT) as conn:
+        found = await _fetch_vector_similar_cross_source(
+            conn, VEC_TENANT, "same-anchor", "slack", set()
+        )
+
+    assert "same-sibling" not in found
