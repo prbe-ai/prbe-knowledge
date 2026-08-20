@@ -6,6 +6,45 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- **Workflow memory: a store for the team's procedure rules, off by default.**
+  A person declares a rule once and their teammates' coding agents can be handed
+  it when they are in the situation it applies to. Five tables (`situations`,
+  `clauses`, `clause_situation_edges`, `clause_evidence`, `serve_ledger`), each
+  with `FORCE ROW LEVEL SECURITY` and composite `(customer_id, id)` foreign keys
+  — simple ones would let a tenant probe for another tenant's clause ids, since
+  Postgres RI checks bypass row security by design.
+
+  Three endpoints on the retrieval service: `/procedures/preview` structures the
+  prose, classifies it and looks for near-duplicates without writing anything;
+  `/procedures/declare` writes what a human confirmed; `/procedures/query`
+  serves. A fourth, `/procedures/publish`, puts an existing rule in front of the
+  team or withdraws it.
+
+  Every cell is gated per-tenant and fails closed, and each response carries the
+  three-state `enabled` / `entitled` / `upgrade_url` envelope rather than a
+  status code — "nobody turned it on" and "the plan does not include it" are
+  different answers, and a client that cannot tell them apart reports the switch
+  as broken. Nothing is reachable until a tenant is explicitly enabled, which is
+  also what seeds their twelve situations.
+
+  Three properties are load-bearing and fail silently if broken, so each has
+  direct tests: evidence is stored BY REFERENCE (there is no quote column, and a
+  CHECK refuses quote-shaped keys in `source_ref`), a credential-shaped rule is
+  refused at ingest across every author-supplied field, and a clause backed by
+  only one human stays private to that human until a second, untainted human
+  appears. That last rule has an escape hatch — a named person can publish on
+  their own authority — because without one a lead declaring twenty existing
+  team rules produces twenty clauses nobody can see. Published rules are
+  labelled with who published them and how many humans back them, never
+  laundered into looking corroborated.
+
+  Every delivery that returns rules writes one `serve_ledger` row in the same
+  transaction as the read. Exposure is unbackfillable, so a delivery that wrote
+  no row is not a gap that can be repaired later.
+
+
 ### Fixed
 
 - **Entity merges that hit a duplicate edge lane no longer roll back silently.**
