@@ -651,11 +651,18 @@ async def _break_tie(
         # in a serving path the correct handling for a transport error and for
         # a library-internal one is identical anyway -- degrade, log, do not
         # raise into somebody's search request.
+        # `status_code` and `provider` ride along for the same reason they were
+        # added to the structuring pass: a 404 from the gateway (no such model
+        # deployment) and a 500 from the provider degrade identically here and
+        # are completely different jobs to fix. Cheap, structural, and the thing
+        # that turns "the classifier is flaky" into an actionable line.
         log.warning(
             "wfmem_classifier.tiebreak_failed",
             model=TIEBREAK_MODEL,
             error=str(exc),
             error_class=type(exc).__name__,
+            status_code=getattr(exc, "status_code", None),
+            provider=getattr(exc, "provider", None),
         )
         return _unknown(method=METHOD_NONE, model=None, runner_up=_runner_up(scored, None))
 
