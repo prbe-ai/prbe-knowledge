@@ -723,3 +723,222 @@ async def test_list_401_without_internal_key(
         headers={"X-Prbe-Customer": CUSTOMER_ID},
     )
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-lane collision during merge (REGRESSION, 2026-08-20)
+#
+# The collision handler in merge_cluster has always LOOKED right: catch the
+# UniqueViolation, snapshot the redundant edge, delete it. It had never once run.
+#
+# merge_cluster's body is inside with_tenant()'s explicit transaction, so the
+# failing UPDATE aborted that transaction before the handler's INSERT could
+# execute; the INSERT then died with InFailedSQLTransactionError and the WHOLE
+# MERGE rolled back. Production signature on the managed plane: 88 duplicate-key
+# errors in 24h, paired 1:1 with 88 "current transaction is aborted".
+#
+# These tests fail against the pre-savepoint code (the merge 500s) and pass
+# after. Assert the OUTCOME -- merge committed, snapshot written, one edge left
+# -- not merely that a row exists somewhere.
+# ---------------------------------------------------------------------------
+
+
+async def _seed_edge_in_alias_lane(
+    conn: asyncpg.Connection,
+    *,
+    edge_type: str,
+    from_node_id: int,
+    to_node_id: int,
+    aliased_from_canonical_id: str,
+) -> None:
+    """Seed an edge on the PRIMARY already stamped into a given alias's lane.
+
+    This is the state a real collision needs. graph_edges_unique_lane keys on
+    (customer_id, edge_type, from_node_id, to_node_id, COALESCE(aliased_from,''),
+    COALESCE(aliased_to,'')), and merge stamps `aliased_from_canonical_id` with
+    the alias's canonical id (routes:265). So an alias edge only collides when
+    the primary ALREADY carries an edge in that same alias's lane -- which is
+    what a re-merge after an unmerge, or a duplicate extraction, produces.
+    """
+    await conn.execute(
+        """
+        INSERT INTO graph_edges
+          (customer_id, edge_type, from_node_id, to_node_id, properties,
+           source_system, confidence, aliased_from_canonical_id)
+        VALUES ($1, $2, $3, $4, '{}'::jsonb, 'github', 'EXTRACTED', $5)
+        """,
+        CUSTOMER_ID, edge_type, from_node_id, to_node_id,
+        aliased_from_canonical_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_survives_duplicate_lane_and_records_the_deletion(
+    client: httpx.AsyncClient,
+) -> None:
+    """The primary already carries an edge in this alias's lane.
+
+    Rewriting the alias's own edge produces an identical lane key, so the
+    UPDATE hits graph_edges_unique_lane. The merge must still commit, the
+    redundant edge must be gone, and the deletion must be auditable.
+    """
+    async with raw_conn() as conn:
+        await _seed_customer(conn)
+        primary_id = await _seed_person(conn, "dupe-primary")
+        alias_id = await _seed_person(conn, "dupe-alias")
+        doc_id = await _seed_doc(conn, "dupe-doc")
+        # Primary already sits in dupe-alias's lane for this edge.
+        await _seed_edge_in_alias_lane(
+            conn, edge_type="AUTHORED", from_node_id=primary_id,
+            to_node_id=doc_id, aliased_from_canonical_id="dupe-alias",
+        )
+        # The alias's own edge. On merge it rewrites to exactly the row above.
+        await _seed_edge(
+            conn, edge_type="AUTHORED", from_node_id=alias_id,
+            to_node_id=doc_id, properties={"side": "alias"},
+        )
+
+    merge_id = await _merge(client, primary="dupe-primary", aliases=["dupe-alias"])
+
+    async with raw_conn() as conn:
+        # 1. The merge COMMITTED. Pre-savepoint this was the failure mode: the
+        #    recovery INSERT died on the poisoned transaction and everything
+        #    rolled back, so the endpoint 500'd and no cluster existed.
+        surviving = await conn.fetch(
+            """
+            SELECT edge_id, from_node_id, aliased_from_canonical_id
+              FROM graph_edges
+             WHERE customer_id = $1 AND edge_type = 'AUTHORED' AND to_node_id = $2
+            """,
+            CUSTOMER_ID, doc_id,
+        )
+        # 2. One edge per lane. The redundant alias-side row is gone.
+        assert len(surviving) == 1, f"expected the lane deduped, got {len(surviving)}"
+        assert surviving[0]["from_node_id"] == primary_id
+        assert surviving[0]["aliased_from_canonical_id"] == "dupe-alias"
+
+        # 3. The deletion is auditable, so unmerge can restore it. Without the
+        #    savepoint this INSERT was the statement that died -- its presence
+        #    is the proof the recovery path RAN, not merely that it was written.
+        snapshots = await conn.fetch(
+            """
+            SELECT operation FROM entity_merge_edge_snapshot
+             WHERE merge_id = $1 AND operation = 'deleted_duplicate_lane'
+            """,
+            uuid.UUID(merge_id),
+        )
+        assert len(snapshots) == 1, "collision path did not record its deletion"
+
+
+@pytest.mark.asyncio
+async def test_merge_without_collision_still_rewrites_the_edge(
+    client: httpx.AsyncClient,
+) -> None:
+    """The savepoint must not disturb the ordinary path.
+
+    RELEASE SAVEPOINT on success is easy to get wrong (leak a savepoint per
+    edge, or roll back a clean rewrite). Distinct edge_types mean no collision,
+    so this edge takes the RELEASE branch and must end up on the primary node.
+    """
+    async with raw_conn() as conn:
+        await _seed_customer(conn)
+        primary_id = await _seed_person(conn, "clean-primary")
+        alias_id = await _seed_person(conn, "clean-alias")
+        doc_id = await _seed_doc(conn, "clean-doc")
+        await _seed_edge(
+            conn, edge_type="AUTHORED", from_node_id=primary_id,
+            to_node_id=doc_id, properties={"side": "primary"},
+        )
+        await _seed_edge(
+            conn, edge_type="REVIEWED", from_node_id=alias_id,
+            to_node_id=doc_id, properties={"side": "alias"},
+        )
+
+    merge_id = await _merge(client, primary="clean-primary", aliases=["clean-alias"])
+
+    async with raw_conn() as conn:
+        reviewed_from = await conn.fetchval(
+            """
+            SELECT from_node_id FROM graph_edges
+             WHERE customer_id = $1 AND edge_type = 'REVIEWED' AND to_node_id = $2
+            """,
+            CUSTOMER_ID, doc_id,
+        )
+        assert reviewed_from == primary_id, "clean rewrite did not move the edge"
+        # Nothing was deleted, so the collision path must not have fired.
+        deleted = await conn.fetchval(
+            """
+            SELECT count(*) FROM entity_merge_edge_snapshot
+             WHERE merge_id = $1 AND operation = 'deleted_duplicate_lane'
+            """,
+            uuid.UUID(merge_id),
+        )
+        assert deleted == 0
+
+
+@pytest.mark.asyncio
+async def test_unmerge_restores_the_alias_edge_after_a_lane_dedupe(
+    client: httpx.AsyncClient,
+) -> None:
+    """Unmerging a merge that deduped a lane loses nothing.
+
+    Worth an explicit test because the obvious reading is that it SHOULD lose
+    something: the merge deleted an edge, and unmerge's snapshot-replay (step 5)
+    only handles self-loops. It does not lose it, for a reason that is easy to
+    talk yourself out of -- a lane collision means the primary already held an
+    edge with the identical key INCLUDING this alias's lane stamp, so step 4
+    rewrites that edge back onto the alias and reproduces exactly what was
+    deleted. Replaying the snapshot too would just collide with it.
+
+    If someone later "fixes" unmerge by replaying duplicate-lane snapshots, this
+    test still passes at one edge -- and that is the point: the assertion is the
+    edge COUNT, so a redundant replay that silently duplicated the edge fails.
+    """
+    async with raw_conn() as conn:
+        await _seed_customer(conn)
+        primary_id = await _seed_person(conn, "restore-primary")
+        alias_id = await _seed_person(conn, "restore-alias")
+        doc_id = await _seed_doc(conn, "restore-doc")
+        await _seed_edge_in_alias_lane(
+            conn, edge_type="AUTHORED", from_node_id=primary_id,
+            to_node_id=doc_id, aliased_from_canonical_id="restore-alias",
+        )
+        await _seed_edge(
+            conn, edge_type="AUTHORED", from_node_id=alias_id,
+            to_node_id=doc_id, properties={"side": "alias"},
+        )
+
+    await _merge(client, primary="restore-primary", aliases=["restore-alias"])
+
+    async with raw_conn() as conn:
+        after_merge = await conn.fetchval(
+            """
+            SELECT count(*) FROM graph_edges
+             WHERE customer_id = $1 AND edge_type = 'AUTHORED' AND to_node_id = $2
+            """,
+            CUSTOMER_ID, doc_id,
+        )
+    assert after_merge == 1, "collision path did not dedupe the lane"
+
+    resp = await client.delete(
+        "/api/entity-clusters/Person/restore-primary/aliases/restore-alias",
+        headers=_headers(),
+    )
+    assert resp.status_code == 204, resp.text
+
+    async with raw_conn() as conn:
+        restored = await conn.fetch(
+            """
+            SELECT n.canonical_id
+              FROM graph_edges e
+              JOIN graph_nodes n ON n.node_id = e.from_node_id
+             WHERE e.customer_id = $1 AND e.edge_type = 'AUTHORED'
+               AND e.to_node_id = $2
+            """,
+            CUSTOMER_ID, doc_id,
+        )
+        canonicals = sorted(r["canonical_id"] for r in restored)
+
+    # Exactly one, back on the alias where it started. Not zero (the edge was
+    # not lost) and not two (the snapshot was not replayed on top of it).
+    assert canonicals == ["restore-alias"], f"expected one alias edge, got {canonicals}"

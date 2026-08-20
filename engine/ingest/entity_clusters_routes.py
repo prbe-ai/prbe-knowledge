@@ -312,6 +312,19 @@ async def merge_cluster(body: MergeRequest) -> MergeResponse:
             # the connection — so we DELETE it instead. The merge audit
             # snapshotted the row at step 7 (provenance was merged), so
             # unmerge can still restore it from entity_merge_edge_snapshot.
+            # SAVEPOINT is load-bearing, not defensive. merge_cluster runs
+            # inside with_tenant()'s explicit transaction (engine/shared/db.py),
+            # so the UniqueViolation below ABORTS that transaction the instant it
+            # is raised. Without a savepoint to roll back to, the recovery path
+            # here -- the snapshot INSERT and the DELETE -- dies with
+            # InFailedSQLTransactionError and the ENTIRE MERGE rolls back.
+            #
+            # That is what was happening in production: 88 duplicate-key errors
+            # in 24h on the managed plane, paired 1:1 with 88 "current
+            # transaction is aborted", and not one of those merges completed.
+            # The handler read as correct for months and had never once run.
+            # Same pattern as inferred_edges/bundle.py's SAVEPOINT vector_similar.
+            await conn.execute("SAVEPOINT merge_edge_lane")
             try:
                 await conn.execute(
                     """
@@ -325,7 +338,16 @@ async def merge_cluster(body: MergeRequest) -> MergeResponse:
                     new_from, new_to, new_aliased_from, new_aliased_to,
                     e["edge_id"],
                 )
-            except asyncpg.exceptions.UniqueViolationError:
+                await conn.execute("RELEASE SAVEPOINT merge_edge_lane")
+            # Match the lane constraint by NAME. A bare UniqueViolationError
+            # would also catch a violation of graph_edges' PK or any future
+            # unique index, and silently "recover" by deleting an edge for a
+            # reason that has nothing to do with a duplicate lane.
+            except asyncpg.exceptions.UniqueViolationError as exc:
+                await conn.execute("ROLLBACK TO SAVEPOINT merge_edge_lane")
+                await conn.execute("RELEASE SAVEPOINT merge_edge_lane")
+                if exc.constraint_name != "graph_edges_unique_lane":
+                    raise
                 snapshot_seq += 1
                 await conn.execute(
                     """
@@ -529,6 +551,20 @@ async def unmerge_alias(
             """,
             new_alias_node_id, merge_id, alias_canonical_id,
         )
+
+        # NO step 5b for duplicate-lane deletions, and that is a conclusion,
+        # not an omission. A collision means the primary ALREADY held an edge
+        # with the identical lane key -- including aliased_from = this alias.
+        # Step 4 above rewrites that edge back onto the restored alias node and
+        # clears the lane stamp, which reproduces exactly the edge the merge
+        # deleted. Re-inserting the snapshot would collide with the row step 4
+        # just restored. The snapshot row is kept for the audit trail, not
+        # because unmerge needs to replay it.
+        #
+        #   merge:    E1(primary, lane=alias)  +  E2(alias) -> same key -> E2 deleted
+        #   unmerge:  E1 -> (alias, lane cleared)  ==  E2's pre-merge identity
+        #
+        # Verified by test_unmerge_restores_the_alias_edge_after_a_lane_dedupe.
 
         # 6. Recompute degree on primary + restored alias.
         primary_row = await conn.fetchrow(

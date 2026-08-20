@@ -914,8 +914,20 @@ CREATE TABLE entity_merge_edge_snapshot (
     merge_id                       UUID NOT NULL REFERENCES entity_merge_audit(merge_id),
     snapshot_seq                   INT  NOT NULL,
     customer_id                    TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    -- 'deleted_self_loop'      — both endpoints collapsed onto the primary;
+    --                             unmerge restores it as ($node, $node).
+    -- 'deleted_duplicate_lane'  — the rewritten edge collided with an edge the
+    --                             primary already held in this alias's lane
+    --                             (graph_edges_unique_lane). Keeps its two
+    --                             distinct endpoints, so unmerge restores it by
+    --                             resolving pre_from/pre_to canonical ids.
+    --                             Added by migration 0113 — the writer at
+    --                             entity_clusters_routes.py:363 predates it and
+    --                             had never executed, so nothing ever violated
+    --                             the narrower form.
     operation                      TEXT NOT NULL
-                                   CHECK (operation IN ('deleted_self_loop')),
+                                   CHECK (operation IN ('deleted_self_loop',
+                                                        'deleted_duplicate_lane')),
     pre_edge_type                  TEXT NOT NULL,
     pre_from_canonical_id          TEXT NOT NULL,
     pre_from_label                 TEXT NOT NULL,

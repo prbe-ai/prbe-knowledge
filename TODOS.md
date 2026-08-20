@@ -38,6 +38,26 @@ or retry loop that increments version on conflict. ~10 lines.
 
 ## P2 — operational hygiene
 
+### neon_auth person enrichment is unwired on managed, not just unpermitted
+**Where:** `neon_auth."user"` on managed-shared; the query lives in prbe-backend
+(see `kb/handlers/claude_code.py:717` — "Gateway injects this from
+neon_auth.user.name").
+
+Migration 0112 grants the app role SELECT, which stops 1,514 errors/day. It does
+not make the lookup return anything. Measured 2026-08-20 on managed:
+
+  * `neon_auth."user"` is the 4-column shim `scripts/migrate.py` creates so
+    `customers.organization_id`'s FK has a target. `relpages = 0` — it has never
+    held a row. It is not Neon Auth's real data.
+  * All 5 active customers have `organization_id IS NULL`, so nothing links a
+    tenant to an organisation either.
+
+So person name/email enrichment cannot work on managed regardless of grants.
+**Decide:** wire the Neon Auth sync (populate the tables and the org links), or
+delete the lookup in prbe-backend. Doing neither leaves a query that is
+permitted, silent, and permanently empty.
+
+
 ### Wire `tenant_virtual_key_context` at LLM entrypoints (Phase 0c)
 **Where:** `services/retrieval/router.py` (`_call_haiku`),
 `services/retrieval/synthesis.py` (`synthesize_stream` + `_call_*` non-

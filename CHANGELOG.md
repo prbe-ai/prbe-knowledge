@@ -6,6 +6,38 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- **Entity merges that hit a duplicate edge lane no longer roll back silently.**
+  `merge_cluster`'s collision handler runs inside `with_tenant`'s explicit
+  transaction, so the `UniqueViolation` it catches had already aborted that
+  transaction — the recovery `INSERT` died with `InFailedSQLTransactionError`
+  and the whole merge was thrown away. Signature on the managed plane: 88
+  duplicate-key errors in 24h paired 1:1 with 88 "current transaction is
+  aborted", and not one completed merge. The UPDATE is now wrapped in a
+  SAVEPOINT, and the handler matches `graph_edges_unique_lane` by name rather
+  than catching any unique violation. Letting the path run for the first time
+  exposed a second layer: it writes `operation = 'deleted_duplicate_lane'`,
+  which the column's CHECK never permitted (migration 0113 widens it).
+- **`system_settings` exists on every plane again, so the global ingestion
+  killswitch works.** A database bootstrapped from `schema.sql` + `alembic stamp
+  head` never replays the chain, so the table migration 0025 created was absent
+  from managed-shared — 4,271 errors/24h — and its reader fails open, meaning
+  the master switch for halting all plugin ingestion silently did nothing there.
+  Migration 0112 repairs it; `scripts/check_schema_drift.py` makes the next
+  instance loud.
+- **Cross-source vector similarity actually runs.** `inferred_edges/bundle.py`
+  named a CTE `similar`, a reserved word, so the statement was a syntax error and
+  the query had never executed once in production — 752 failures/24h, swallowed
+  by a bare `except Exception` that logged at DEBUG and blamed a missing
+  embedding. Renamed, and the handler now catches `asyncpg.PostgresError` and
+  logs at WARNING with the real error type.
+- **`neon_auth` lookups stop erroring on managed** (1,514/24h). Migration 0112
+  grants the app role USAGE + SELECT, guarded so it no-ops where the schema is
+  absent. This silences the error; it does not make the feature work — the table
+  is an empty shim and every active managed customer has a NULL
+  `organization_id`. See TODOS.md.
+
 ### Changed
 
 - **The /knowledge stats header no longer takes seconds to answer.**
