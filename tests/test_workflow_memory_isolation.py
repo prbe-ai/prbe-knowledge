@@ -715,6 +715,11 @@ def test_every_wfmem_migration_is_replayed_by_the_drift_guard() -> None:
     # nothing for this guard to compare and is excluded by name rather than by
     # a rule that would also excuse a real one.
     on_disk.discard("20260820_0115_wfmem_capability_prefs.py")
+    # 0119 is likewise data-only: it repairs 0118's silently-empty backfill and
+    # touches no DDL. Its correctness is asserted by
+    # `test_the_misc_backfill_works_under_the_role_that_actually_runs_it`, which
+    # a schema comparison could never have caught.
+    on_disk.discard("20260821_0119_wfmem_misc_backfill_rls.py")
     assert on_disk == named, (
         f"these wfmem migrations are not replayed by the drift guard: "
         f"{sorted(on_disk - named)}. Add them to _MIGRATION_PATHS."
@@ -917,4 +922,144 @@ async def test_schema_sql_has_not_drifted_from_the_migration(live_db):
             f"db/schema.sql and migration 0114 disagree on {section}. CI applies "
             "schema.sql and stamps alembic head, so schema.sql is what the tests "
             "actually run against -- the two must be updated together."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Data migrations vs. FORCE ROW LEVEL SECURITY
+# ---------------------------------------------------------------------------
+#
+# 0118 SHIPPED, REPORTED SUCCESS, AND INSERTED NOTHING. Its DDL landed and both
+# of its data statements were filtered to zero rows, so production sat at head
+# 0118 with `situations.classifiable` present and not one `misc` row anywhere.
+#
+# Migrations run as `app`: the table OWNER, not a superuser, no BYPASSRLS -- and
+# FORCE is exactly the flag that subjects an owner to the policy. With no tenant
+# GUC bound, `customer_id = current_setting('app.current_customer_id', true)`
+# compares against NULL, so `SELECT DISTINCT customer_id FROM situations` returns
+# nothing and the INSERT that consumes it writes nothing.
+#
+# Every test in this file already knew the shape of that trap and said so three
+# times over -- and still could not catch it, because they assert on ISOLATION
+# while a data migration fails on VISIBILITY, and because the drift guard
+# compares schema rather than rows. So the guard has to be the migration's own
+# logic, executed under a role that cannot bypass the policy.
+
+
+_MISC_SLUG = "misc"
+
+
+async def _seed_one_situation(conn: Any, customer_id: str, slug: str) -> None:
+    await conn.execute(
+        """
+        INSERT INTO situations (customer_id, slug, label, description)
+        VALUES ($1, $2, 'L', 'a description long enough to be plausible')
+        ON CONFLICT (customer_id, slug) DO NOTHING
+        """,
+        customer_id,
+        slug,
+    )
+
+
+async def test_reading_the_tenant_list_from_situations_sees_nothing_under_rls(
+    two_tenants: tuple[str, str],
+) -> None:
+    """0118's actual bug, pinned so nobody writes it again.
+
+    This is the statement the broken migration was built on. Under the role that
+    really runs migrations it returns ZERO rows -- which is why an INSERT reading
+    from it wrote nothing and raised nothing.
+    """
+    tenant_a, _ = two_tenants
+    async with with_tenant(tenant_a) as conn:
+        await _seed_one_situation(conn, tenant_a, "launch-run")
+
+    async with raw_conn() as conn, conn.transaction():
+        await conn.execute(f"SET LOCAL ROLE {RLS_ROLE}")
+        # No tenant GUC bound -- exactly a migration's connection.
+        visible = await conn.fetch("SELECT DISTINCT customer_id FROM situations")
+        from_customers = await conn.fetch(
+            "SELECT customer_id FROM customers WHERE customer_id = $1", tenant_a
+        )
+
+    assert visible == [], (
+        "a migration reading `situations` with no tenant GUC must see nothing -- "
+        "if this ever returns rows the policy has been weakened"
+    )
+    assert len(from_customers) == 1, (
+        "`customers` must stay readable without a GUC; it is the only way a data "
+        "migration can discover which tenants to bind to"
+    )
+
+
+async def test_the_misc_backfill_works_under_the_role_that_actually_runs_it(
+    two_tenants: tuple[str, str],
+) -> None:
+    """0119's logic, executed as a non-superuser. Fails against 0118's version.
+
+    The whole repair is "bind the tenant GUC per tenant", and this is the only
+    assertion in the repo that would notice if somebody removed it.
+    """
+    tenant_a, tenant_b = two_tenants
+    async with with_tenant(tenant_a) as conn:
+        await _seed_one_situation(conn, tenant_a, "launch-run")
+    # tenant_b deliberately gets NO vocabulary: a tenant that never enabled the
+    # capability must not be given a lone bucket row.
+
+    async with raw_conn() as conn, conn.transaction():
+        await conn.execute(f"SET LOCAL ROLE {RLS_ROLE}")
+        # `customers` is not row-secured, so the tenant list is readable
+        # with nothing bound. Everything after this needs the GUC.
+        candidates = [
+            r["customer_id"]
+            for r in await conn.fetch(
+                "SELECT customer_id FROM customers WHERE customer_id = ANY($1::text[]) ORDER BY 1",
+                [tenant_a, tenant_b],
+            )
+        ]
+        tenants = []
+        for customer_id in candidates:
+            await conn.execute(
+                "SELECT set_config('app.current_customer_id', $1, true)", customer_id
+            )
+            # ONLY NOW is `situations` visible. Asking before this -- via an
+            # EXISTS in the tenant query, which is the obvious way to write
+            # it -- is false for everyone and skips the whole loop. That is
+            # 0118's bug, and the first draft of 0119's repair had it too.
+            if not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM situations WHERE customer_id = $1 AND slug <> $2)",
+                customer_id,
+                _MISC_SLUG,
+            ):
+                continue
+            tenants.append(customer_id)
+            await conn.execute(
+                """
+                    INSERT INTO situations
+                        (customer_id, slug, label, description, classifiable)
+                    VALUES ($1, $2, 'Anything else', 'holding bucket', false)
+                    ON CONFLICT (customer_id, slug) DO UPDATE SET classifiable = false
+                    """,
+                customer_id,
+                _MISC_SLUG,
+            )
+
+    assert tenants == [tenant_a], "only a tenant with a vocabulary gets a bucket"
+
+    async with with_tenant(tenant_a) as conn:
+        row = await conn.fetchrow(
+            "SELECT classifiable FROM situations WHERE customer_id = $1 AND slug = $2",
+            tenant_a,
+            _MISC_SLUG,
+        )
+    assert row is not None, (
+        "the bucket was not written -- this is 0118's failure exactly: the "
+        "statements ran, nothing errored, and no row exists"
+    )
+    assert row["classifiable"] is False
+
+    async with with_tenant(tenant_b) as conn:
+        assert (
+            await conn.fetchval("SELECT count(*) FROM situations WHERE customer_id = $1", tenant_b)
+            == 0
         )

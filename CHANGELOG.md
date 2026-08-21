@@ -8,6 +8,32 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **0118's backfill inserted nothing, and reported success.** Its `ALTER TABLE
+  ADD COLUMN` landed (DDL is not row-filtered) and both data statements were
+  silently filtered to zero rows. Production sat at head `0118` with
+  `situations.classifiable` present and not one `misc` row in the database.
+
+  `situations`, `clauses` and `clause_situation_edges` all carry FORCE ROW LEVEL
+  SECURITY, and migrations run as `app` — the table OWNER, but not a superuser
+  and without BYPASSRLS. FORCE is exactly the flag that subjects an owner to the
+  policy. With no `app.current_customer_id` bound, the policy compares against
+  NULL, so `SELECT DISTINCT customer_id FROM situations` returns nothing and the
+  INSERT consuming it writes nothing. No error, no warning.
+
+  The tests could not catch it: the local and CI role is a SUPERUSER and bypasses
+  RLS, so the backfill worked perfectly under test, and the drift guard compares
+  schema rather than rows. 0119 repairs it by binding the tenant GUC per tenant,
+  driving the loop from `customers` (deliberately not row-secured).
+
+  **The rule this establishes: a data migration touching an RLS-FORCED table must
+  bind the tenant GUC per tenant.** There is no ambient admin here. The first
+  draft of this very repair asked `WHERE EXISTS (SELECT 1 FROM situations ...)`
+  in its tenant query and was therefore empty for everyone — the same bug wearing
+  a different hat — and the new test under the non-superuser `prbe_rls_test` role
+  is what caught it.
+
+### Fixed
+
 - **The classifier's LLM tie-break never once worked in production.**
   `_TIEBREAK_MAX_TOKENS` was 256 -- generous for a reply that is ~15 tokens of
   JSON, and nowhere near enough for a THINKING model, whose reasoning is billed
