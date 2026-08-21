@@ -69,7 +69,6 @@ from engine.shared.embeddings import EmbeddedChunk, EmbedResult, FailedChunk
 from engine.shared.llm import LLMError
 from engine.shared.wfmem.classifier import (
     _TIEBREAK_MAX_TOKENS,
-    _parse_tiebreak_response,
     CLASSIFIER_PROMPT_VERSION,
     FLOOR,
     MARGIN,
@@ -80,6 +79,7 @@ from engine.shared.wfmem.classifier import (
     TIEBREAK_MODEL,
     Classification,
     Outcome,
+    _parse_tiebreak_response,
     _vocabulary_cache_key,
     _vocabulary_cache_put,
     classify,
