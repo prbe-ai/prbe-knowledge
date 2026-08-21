@@ -6,6 +6,30 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Fixed
+
+- **The classifier's LLM tie-break never once worked in production.**
+  `_TIEBREAK_MAX_TOKENS` was 256 -- generous for a reply that is ~15 tokens of
+  JSON, and nowhere near enough for a THINKING model, whose reasoning is billed
+  against the same budget before it emits a single visible character. Measured
+  against the live model:
+
+      max_tokens=256   completion_tokens=252   '```json\n{\n  "slug": null'
+      max_tokens=2048  completion_tokens=533   '{"slug": null, "confidence": 0.0}'
+
+  So every ambiguous classification truncated, failed to parse, degraded to
+  `unknown`, declined to attach a situation, and left the clause unreachable --
+  the upstream cause of the orphaned-rule bug the `misc` bucket below exists to
+  catch. Nothing errored; the log line said `tiebreak_unusable_response`, which
+  reads like a flaky model rather than a budget we set.
+
+  Now 2048, sized for the reasoning rather than the answer. Turning thinking off
+  would be cheaper and is MODEL-SPECIFIC -- it would stop applying the day
+  somebody swaps the model in `constants.py`, which is the kind of coupling that
+  produced this. Code fences were investigated and exonerated: the parser strips
+  them, and there is now a test pinning that so the next person does not go
+  looking there.
+
 ### Added
 
 - **A `misc` situation, so a rule nobody could classify is not unreachable.**
