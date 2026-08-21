@@ -8,6 +8,68 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **The classifier's LLM tie-break never once worked in production.**
+  `_TIEBREAK_MAX_TOKENS` was 256 -- generous for a reply that is ~15 tokens of
+  JSON, and nowhere near enough for a THINKING model, whose reasoning is billed
+  against the same budget before it emits a single visible character. Measured
+  against the live model:
+
+      max_tokens=256   completion_tokens=252   '```json\n{\n  "slug": null'
+      max_tokens=2048  completion_tokens=533   '{"slug": null, "confidence": 0.0}'
+
+  So every ambiguous classification truncated, failed to parse, degraded to
+  `unknown`, declined to attach a situation, and left the clause unreachable --
+  the upstream cause of the orphaned-rule bug the `misc` bucket below exists to
+  catch. Nothing errored; the log line said `tiebreak_unusable_response`, which
+  reads like a flaky model rather than a budget we set.
+
+  Now 2048, sized for the reasoning rather than the answer. Turning thinking off
+  would be cheaper and is MODEL-SPECIFIC -- it would stop applying the day
+  somebody swaps the model in `constants.py`, which is the kind of coupling that
+  produced this. Code fences were investigated and exonerated: the parser strips
+  them, and there is now a test pinning that so the next person does not go
+  looking there.
+
+### Added
+
+- **A `misc` situation, so a rule nobody could classify is not unreachable.**
+  `declare` attached a situation only when it HAD one, and the classifier
+  honestly answers `unknown` for prose it cannot place. Those two correct
+  behaviours composed into a silent loss: the clause was written, got a real id,
+  returned 200, appeared in an unfiltered `probe rule list` -- and was invisible
+  to every situation-scoped read, which is the only read this store exists to
+  serve. Production hit it on the very first rule anyone declared: it was plainly
+  about opening a pull request, and asking for `open-pr` rules returned nothing.
+
+  A declaration with no situation now lands in `misc`, and says so
+  (`situation_fallback`) rather than reporting a filing that did not happen. The
+  bucket is EXCLUSIVE: giving a clause a real situation later evicts its `misc`
+  edge, so the bucket keeps meaning "still has no home" instead of filling with
+  rules that already found one.
+
+  `misc` is NOT a thirteenth classifier label, and the new `situations.
+  classifiable` column is what keeps it out of the label space. The reason is
+  mechanical: the classifier embeds each description, and "anything that does not
+  fit the others" has no situation in it to embed -- so as a label it either
+  matches nothing (bucket unreachable) or weakly matches everything and starts
+  winning near-floor ties against real situations, filing rules under misc BY
+  classification rather than for want of a home. A column rather than a reserved
+  slug because `situations` is per-tenant and editable, so a rule keyed on the
+  literal string breaks the moment somebody renames it.
+
+  Serving offers the bucket in exactly one case: a situation-scoped read that
+  matched NOTHING. Topping up a partial result was the tempting version and is
+  wrong -- at limit=3 it would spend a third of the agent's attention on rules we
+  know do not apply, diluting an answer that was already correct. Bucket cards
+  carry `from_fallback` so a reader can tell "your team decided this" from
+  "nothing fit, here is an unfiled rule"; render them alike and the safety net
+  becomes a source of confident irrelevant advice.
+
+  Migration 0118 backfills the bucket for every tenant that already has a
+  vocabulary and adopts the clauses that were already stranded.
+
+### Fixed
+
 - **Workflow memory's write path never worked in production, and the log line
   could not say why.** Every `/procedures/preview` and `/procedures/declare`
   502'd from the day the feature shipped. `WFMEM_STRUCTURING_MODEL` named

@@ -68,6 +68,7 @@ from engine.shared.db import raw_conn, with_tenant
 from engine.shared.embeddings import EmbeddedChunk, EmbedResult, FailedChunk
 from engine.shared.llm import LLMError
 from engine.shared.wfmem.classifier import (
+    _TIEBREAK_MAX_TOKENS,
     CLASSIFIER_PROMPT_VERSION,
     FLOOR,
     MARGIN,
@@ -78,6 +79,7 @@ from engine.shared.wfmem.classifier import (
     TIEBREAK_MODEL,
     Classification,
     Outcome,
+    _parse_tiebreak_response,
     _vocabulary_cache_key,
     _vocabulary_cache_put,
     classify,
@@ -155,11 +157,17 @@ async def _read_situations(customer_id: str) -> list[dict[str, Any]]:
     Explicit tenant predicate rather than leaning on the GUC: the dev role is a
     SUPERUSER and bypasses RLS, so a bare SELECT under `with_tenant` would
     return every tenant's rows and quietly corrupt the vector mapping.
+
+    `classifiable` (0118) mirrors the classifier's own filter. Without it this
+    helper returns the `misc` bucket too, and every test that maps a vector per
+    row would be building a mapping one longer than the one under test -- which
+    misaligns every vector after `misc` in slug order and would show up as
+    inexplicable accuracy failures rather than as an off-by-one.
     """
     async with raw_conn() as conn:
         rows = await conn.fetch(
             "SELECT id, slug, label, description FROM situations "
-            "WHERE customer_id = $1 ORDER BY slug",
+            "WHERE customer_id = $1 AND classifiable ORDER BY slug",
             customer_id,
         )
     return [dict(r) for r in rows]
@@ -970,3 +978,64 @@ async def test_real_embeddings_reject_something_off_topic(seeded: str) -> None:
     worse than one that labels nothing: it serves the wrong team rules."""
     result = await classify(seeded, "booking a table for four on Friday evening")
     assert result.outcome is Outcome.UNKNOWN
+
+
+# --------------------------------------------------------------------------
+# The tie-break token budget
+# --------------------------------------------------------------------------
+
+
+def test_the_tiebreak_budget_leaves_room_for_a_thinking_model() -> None:
+    """THE TIE-BREAK NEVER ONCE WORKED IN PRODUCTION, and this is why.
+
+    `_TIEBREAK_MAX_TOKENS` was 256 -- generous for a reply that is ~15 tokens of
+    JSON, and nowhere near enough for a THINKING model, whose reasoning is billed
+    against the same budget before it emits a single visible character. Measured
+    against the live model:
+
+        max_tokens=256   completion_tokens=252   '```json\\n{\\n  "slug": null'
+        max_tokens=2048  completion_tokens=533   '{"slug": null, "confidence": 0.0}'
+
+    Every ambiguous classification therefore truncated, failed to parse, degraded
+    to `unknown`, declined to attach a situation, and left the clause unreachable
+    -- which is the bug the `misc` bucket exists to catch, arriving here from
+    upstream.
+
+    A pin rather than a proof: no unit test can measure another model's
+    reasoning. What it CAN do is stop somebody trimming this back toward the
+    cliff as an "obvious" saving, which is exactly how it was set in the first
+    place.
+    """
+    assert _TIEBREAK_MAX_TOKENS >= 1024, (
+        "a thinking model spends this budget on reasoning before answering; "
+        "256 truncated every reply and the failure was silent"
+    )
+
+
+def test_a_truncated_reply_degrades_to_unknown_and_says_which_stage_failed() -> None:
+    """The observed production failure, replayed byte for byte.
+
+    `method` is the load-bearing half: `none` means no stage decided this and we
+    defaulted, which is how a broken tie-break is told apart from a model that
+    looked and honestly answered "none of these" (`llm`). Collapse the two and a
+    permanently dead call reads as a model exercising judgement.
+    """
+    truncated = '```json\n{\n  "slug": null'
+
+    assert _parse_tiebreak_response(truncated, allowed={"open-pr", "review-code"}) is None
+
+
+def test_a_complete_reply_parses_whether_or_not_the_model_fences_it() -> None:
+    """The model fences its JSON sometimes and not others -- both were observed
+    in the same session. Fencing was never the bug, and this pins that so the
+    next person debugging a tie-break does not go looking there."""
+    allowed = {"open-pr", "review-code"}
+    bare = '{"slug": "open-pr", "confidence": 0.8}'
+    fenced = '```json\n{"slug": "open-pr", "confidence": 0.8}\n```'
+
+    assert _parse_tiebreak_response(bare, allowed=allowed) == ("open-pr", 0.8)
+    assert _parse_tiebreak_response(fenced, allowed=allowed) == ("open-pr", 0.8)
+    # An honest abstention is a PARSE SUCCESS carrying no slug, not a failure.
+    assert _parse_tiebreak_response(
+        '{"slug": null, "confidence": 0.0}', allowed=allowed
+    ) == (None, 0.0)

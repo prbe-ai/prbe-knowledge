@@ -115,6 +115,27 @@ async def _counts(customer_id: str) -> tuple[int, int, int]:
     return clauses, evidence, edges
 
 
+async def _situation_slugs(customer_id: str, clause_id: UUID) -> list[str]:
+    """Which situations a clause is actually attached to, by slug.
+
+    Edge COUNTS cannot tell `misc` from a real filing, and since 0118 that is
+    the whole question -- a clause is never unattached now, so "how many" stopped
+    carrying the information the older assertions were reading out of it.
+    """
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT s.slug FROM clause_situation_edges e
+              JOIN situations s ON s.id = e.situation_id
+             WHERE e.clause_id = $1 AND e.customer_id = $2
+             ORDER BY s.slug
+            """,
+            clause_id,
+            customer_id,
+        )
+    return [r["slug"] for r in rows]
+
+
 def _lineage(row: Any) -> dict[str, Any]:
     raw = row["lineage"]
     return json.loads(raw) if isinstance(raw, str) else (raw or {})
@@ -176,9 +197,21 @@ async def test_the_evidence_row_is_explicitly_untainted(tenant: str) -> None:
 
 async def test_a_declaration_without_a_situation_still_writes(tenant: str) -> None:
     """An unclassified rule is still a rule. The classifier answering `unknown`
-    must not cost the author their declaration."""
+    must not cost the author their declaration.
+
+    NOTE WHY THIS TENANT STILL GETS `None` after 0118: the fixture never seeds a
+    vocabulary, so there is no `misc` row to fall back to. That is the
+    pre-0118-tenant path and it is deliberate -- inventing a fallback row here
+    would write a situation outside the seeding path that
+    `enabled_tenants_missing_situations` audits, and would make a tenant who
+    never enabled the capability look half-configured. The write still succeeds,
+    which is the property this test is actually about;
+    `test_a_declaration_with_no_situation_is_reachable_rather_than_orphaned`
+    covers the seeded case.
+    """
     result = await declare(tenant, _draft(), actor_ref=ALICE, source_ref=SOURCE_REF)
     assert result.situation_id is None
+    assert result.situation_fallback is False, "nothing was filed, so nothing may claim it was"
     assert await _counts(tenant) == (1, 1, 0)
 
 
@@ -309,9 +342,19 @@ async def test_a_merge_must_name_its_target(tenant: str) -> None:
 
 
 async def test_a_merge_may_add_a_situation_the_original_lacked(tenant: str) -> None:
+    """...and the clause LEAVES the fallback bucket when it does.
+
+    Since 0118 the original does not sit unattached: a declaration with no
+    situation lands in `misc` so it is reachable at all. That makes the edge
+    count go 1 -> 1 rather than 0 -> 1, and the interesting assertion moves to
+    WHICH edge it is. `misc` means "still has no home", and a clause left in
+    both would be served by the fallback tier as "nothing fit here" under one
+    situation while being correctly filed under another.
+    """
     situation_id = await _situation(tenant)
     first = await declare(tenant, _draft(), actor_ref=ALICE, source_ref=SOURCE_REF)
-    assert (await _counts(tenant))[2] == 0
+    assert first.situation_fallback is True
+    assert await _situation_slugs(tenant, first.clause_id) == ["misc"]
 
     await declare(
         tenant,
@@ -323,6 +366,45 @@ async def test_a_merge_may_add_a_situation_the_original_lacked(tenant: str) -> N
         related_clause_id=first.clause_id,
     )
     assert (await _counts(tenant))[2] == 1
+    assert await _situation_slugs(tenant, first.clause_id) == ["launch-run"]
+
+
+async def test_a_declaration_with_no_situation_is_reachable_rather_than_orphaned(
+    tenant: str,
+) -> None:
+    """THE BUG THIS EXISTS FOR HAS NO ERROR IN IT.
+
+    Before 0118 a clause with no situation was written, returned a real id and a
+    200, showed up in an unfiltered listing, and was invisible to every
+    situation-scoped read -- which is the only read the store exists to serve.
+    Production hit it on the very first rule anyone declared.
+    """
+    await _situation(tenant)  # seeds the vocabulary, `misc` included
+    result = await declare(tenant, _draft(), actor_ref=ALICE, source_ref=SOURCE_REF)
+
+    assert result.situation_id is not None, "a clause must never be written unattached"
+    assert result.situation_fallback is True, (
+        "the caller has to be able to tell 'filed in the bucket because nothing "
+        "fit' from 'filed where somebody chose'"
+    )
+    assert await _situation_slugs(tenant, result.clause_id) == ["misc"]
+
+
+async def test_an_explicitly_situated_declaration_never_touches_the_bucket(
+    tenant: str,
+) -> None:
+    """The fallback is for clauses with nowhere to go, and nothing else.
+
+    If it also fired for a chosen situation the bucket would fill with correctly
+    filed rules and stop meaning "still homeless".
+    """
+    situation_id = await _situation(tenant)
+    result = await declare(
+        tenant, _draft(), actor_ref=ALICE, source_ref=SOURCE_REF, situation_id=situation_id
+    )
+
+    assert result.situation_fallback is False
+    assert await _situation_slugs(tenant, result.clause_id) == ["launch-run"]
 
 
 async def test_merging_into_a_missing_clause_is_refused(tenant: str) -> None:

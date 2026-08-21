@@ -134,9 +134,30 @@ MARGIN = 0.06
 #: change in constants.py.
 TIEBREAK_MODEL = WFMEM_CLASSIFIER_TIEBREAK_MODEL
 
-#: A tiny JSON object is the entire expected response. The ceiling exists so a
-#: model that decides to explain itself gets cut off rather than billed.
-_TIEBREAK_MAX_TOKENS = 256
+#: A tiny JSON object is the entire expected response, and the ceiling exists so
+#: a model that decides to explain itself gets cut off rather than billed.
+#:
+#: 256 WAS THAT NUMBER AND IT MEANT THE TIE-BREAK NEVER ONCE WORKED. The
+#: tie-break model is a THINKING model, and reasoning tokens are billed against
+#: `max_tokens` before a single visible character is emitted -- so the budget was
+#: spent on thought and the reply was truncated mid-object, every time.
+#: Measured against the live model:
+#:
+#:     max_tokens=256   completion_tokens=252   '```json\n{\n  "slug": null'
+#:     max_tokens=2048  completion_tokens=533   '{"slug": null, "confidence": 0.0}'
+#:
+#: The failure was invisible in exactly the way that matters: an unparseable
+#: reply degrades to `unknown`, `unknown` declines to attach a situation, and the
+#: clause lands unreachable. Nothing errored, and the log line said
+#: "tiebreak_unusable_response" -- which reads like a flaky model rather than a
+#: budget we set.
+#:
+#: Sized for the reasoning, not the answer: the visible reply is ~15 tokens and
+#: everything else is thought. Turning thinking off would be cheaper and is
+#: MODEL-SPECIFIC -- it would silently stop applying the day somebody swaps the
+#: model in constants.py, which is exactly the kind of coupling that produced
+#: this bug. A budget that fits the reasoning works whatever is swapped in.
+_TIEBREAK_MAX_TOKENS = 2048
 
 #: Used when the tie-break model picks a candidate but reports no usable
 #: confidence of its own. NOT a measurement and deliberately not a
@@ -373,9 +394,22 @@ async def _load_situations(customer_id: str) -> list[_Situation]:
         async with with_tenant(customer_id) as conn:
             rows = await conn.fetch(
                 """
+                -- `classifiable` (0118) excludes the `misc` fallback. It is a
+                -- holding bucket for rules nothing fit, NOT a label: its
+                -- description has no situation in it to embed, so leaving it in
+                -- here would either waste a candidate slot or -- much worse --
+                -- let "none of the above" win a near-floor tie against a real
+                -- situation, filing rules under misc BY classification rather
+                -- than for want of a home.
+                --
+                -- This also keeps NO_VOCABULARY honest: a tenant holding only
+                -- the fallback returns zero rows here and is correctly reported
+                -- as having no vocabulary, rather than looking configured while
+                -- being unable to classify anything.
                 SELECT id, slug, label, description, updated_at
                   FROM situations
                  WHERE customer_id = $1
+                   AND classifiable
                  ORDER BY slug
                 """,
                 customer_id,

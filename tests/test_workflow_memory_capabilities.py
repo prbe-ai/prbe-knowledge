@@ -437,9 +437,26 @@ async def test_envelope_shape_when_on(two_tenants: tuple[str, str], key: str) ->
 # --------------------------------------------------------------------------
 
 
-def test_seed_vocabulary_is_twelve_distinct_situations() -> None:
-    assert len(SEED_SITUATIONS) == 12
-    slugs = [s.slug for s in SEED_SITUATIONS]
+def test_seed_vocabulary_is_twelve_labels_plus_one_bucket() -> None:
+    """Twelve CLASSIFIER LABELS, and `misc`, which is not one of them.
+
+    The count split matters more than the total. `misc` is where a rule goes
+    when nothing fit, and it is excluded from the classifier's candidate set on
+    purpose: "anything that does not fit the others" has no situation in it to
+    embed, so as a label it would either match nothing or weakly match
+    everything -- the second of which files rules under misc BY classification
+    rather than for want of a home, quietly making the bucket the vocabulary.
+    """
+    labels = [s for s in SEED_SITUATIONS if s.classifiable]
+    buckets = [s for s in SEED_SITUATIONS if not s.classifiable]
+
+    assert len(labels) == 12
+    assert [s.slug for s in buckets] == ["misc"], (
+        "exactly one non-classifiable bucket; a second would make 'nothing fit' "
+        "a choice between buckets, which is a classification again"
+    )
+
+    slugs = [s.slug for s in labels]
     assert len(set(slugs)) == 12
     assert set(slugs) == {
         "launch-run",
@@ -464,15 +481,15 @@ def test_seed_descriptions_are_classifier_input_not_label_synonyms() -> None:
         assert len(situation.description) >= 60, situation.slug
         assert situation.description.strip().lower() != situation.label.strip().lower()
     descriptions = [s.description for s in SEED_SITUATIONS]
-    assert len(set(descriptions)) == 12
+    assert len(set(descriptions)) == len(SEED_SITUATIONS)
 
 
-async def test_seed_situations_inserts_twelve(two_tenants: tuple[str, str]) -> None:
+async def test_seed_situations_inserts_the_whole_vocabulary(two_tenants: tuple[str, str]) -> None:
     tenant, _ = two_tenants
     async with with_tenant(tenant) as conn:
         inserted = await seed_situations(conn, tenant)
-    assert inserted == 12
-    assert await _count_situations(tenant) == 12
+    assert inserted == len(SEED_SITUATIONS)
+    assert await _count_situations(tenant) == len(SEED_SITUATIONS)
     async with raw_conn() as conn:
         rows = await conn.fetch(
             "SELECT slug, label, description FROM situations WHERE customer_id = $1 ORDER BY slug",
@@ -491,19 +508,19 @@ async def test_seed_situations_is_idempotent(two_tenants: tuple[str, str]) -> No
         first = await seed_situations(conn, tenant)
     async with with_tenant(tenant) as conn:
         second = await seed_situations(conn, tenant)
-    assert (first, second) == (12, 0)
-    assert await _count_situations(tenant) == 12
+    assert (first, second) == (len(SEED_SITUATIONS), 0)
+    assert await _count_situations(tenant) == len(SEED_SITUATIONS)
 
 
 async def test_seed_situations_is_per_tenant(two_tenants: tuple[str, str]) -> None:
     tenant_a, tenant_b = two_tenants
     async with with_tenant(tenant_a) as conn:
         await seed_situations(conn, tenant_a)
-    assert await _count_situations(tenant_a) == 12
+    assert await _count_situations(tenant_a) == len(SEED_SITUATIONS)
     assert await _count_situations(tenant_b) == 0
     # And B seeding later is a full seed, not a partial one deduped against A.
     async with with_tenant(tenant_b) as conn:
-        assert await seed_situations(conn, tenant_b) == 12
+        assert await seed_situations(conn, tenant_b) == len(SEED_SITUATIONS)
 
 
 async def test_seed_situations_uses_the_callers_transaction(
@@ -563,7 +580,7 @@ async def test_reseeding_does_not_revert_a_tenants_edits(two_tenants: tuple[str,
     assert row["label"] == edited_label, "a re-seed overwrote the tenant's label"
     assert row["description"] == edited_description, "a re-seed overwrote the tenant's description"
     assert reseeded == 0
-    assert await _count_situations(tenant) == 12
+    assert await _count_situations(tenant) == len(SEED_SITUATIONS)
 
 
 # --------------------------------------------------------------------------
@@ -576,7 +593,7 @@ async def test_enable_declared_input_flips_and_seeds(two_tenants: tuple[str, str
     await enable_capability(tenant, WFMEM_INPUT_DECLARED)
     assert await is_capability_enabled(tenant, WFMEM_INPUT_DECLARED) is True
     assert await _read_prefs(tenant) == {WFMEM_INPUT_DECLARED: True}
-    assert await _count_situations(tenant) == 12
+    assert await _count_situations(tenant) == len(SEED_SITUATIONS)
     assert await _count_situations(other) == 0
 
 
@@ -587,7 +604,7 @@ async def test_enable_declared_input_twice_does_not_duplicate(
     await enable_capability(tenant, WFMEM_INPUT_DECLARED)
     await enable_capability(tenant, WFMEM_INPUT_DECLARED)
     assert await is_capability_enabled(tenant, WFMEM_INPUT_DECLARED) is True
-    assert await _count_situations(tenant) == 12
+    assert await _count_situations(tenant) == len(SEED_SITUATIONS)
 
 
 @pytest.mark.parametrize("key", sorted(EXPECTED_KEYS - {"wfmem_input_declared"}))
@@ -693,7 +710,7 @@ async def test_disable_leaves_the_vocabulary_intact(two_tenants: tuple[str, str]
     tenant, _ = two_tenants
     await enable_capability(tenant, WFMEM_INPUT_DECLARED)
     await disable_capability(tenant, WFMEM_INPUT_DECLARED)
-    assert await _count_situations(tenant) == 12
+    assert await _count_situations(tenant) == len(SEED_SITUATIONS)
 
 
 async def test_disable_enable_round_trip_does_not_duplicate_or_revert(
@@ -716,7 +733,7 @@ async def test_disable_enable_round_trip_does_not_duplicate_or_revert(
     await enable_capability(tenant, WFMEM_INPUT_DECLARED)
 
     assert await is_capability_enabled(tenant, WFMEM_INPUT_DECLARED) is True
-    assert await _count_situations(tenant) == 12
+    assert await _count_situations(tenant) == len(SEED_SITUATIONS)
     async with raw_conn() as conn:
         label = await conn.fetchval(
             "SELECT label FROM situations WHERE customer_id = $1 AND slug = 'deploy'", tenant

@@ -1500,6 +1500,14 @@ CREATE TABLE situations (
     example_signals JSONB NOT NULL DEFAULT '[]'::jsonb,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- 0118. Whether this row is one of the CLASSIFIER'S LABELS. The `misc`
+    -- fallback is false: rules land there when nothing fit, and putting a
+    -- "none of the above" description into an embedding label space either
+    -- matches nothing or weakly matches everything -- the second of which
+    -- steals traffic from real situations. Declared LAST because
+    -- `ALTER TABLE ADD COLUMN` appends and this file must reproduce the
+    -- migration chain's column order exactly.
+    classifiable    BOOLEAN NOT NULL DEFAULT true,
     UNIQUE (customer_id, slug),
     -- Redundant for uniqueness (id is already the PK), but REQUIRED as
     -- the target of the composite FKs below: Postgres will only
