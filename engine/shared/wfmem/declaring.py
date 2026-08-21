@@ -53,6 +53,7 @@ from engine.shared.db import with_tenant
 from engine.shared.embeddings import get_embedder_v2
 from engine.shared.logging import get_logger
 from engine.shared.wfmem.secret_scan import assert_clean, assert_clean_json
+from engine.shared.wfmem.situations import FALLBACK_SITUATION_SLUG
 from engine.shared.wfmem.structuring import ClauseDraft
 
 log = get_logger(__name__)
@@ -118,6 +119,12 @@ class Declaration:
     created: bool
     evidence_id: UUID
     situation_id: UUID | None
+    #: True when `situation_id` is the `misc` fallback because nothing fit,
+    #: rather than a situation anybody chose. REPORTED, not swallowed: the
+    #: fallback stops a clause being unreachable, it does not make it correctly
+    #: filed, and a surface that cannot tell the two apart would go quiet on
+    #: exactly the rules most in need of a human moving them somewhere real.
+    situation_fallback: bool = False
     #: Who published it on their own authority, or None if it is visible only
     #: under the ordinary two-human rule. Returned so a surface can tell the
     #: author which of the two just happened -- "your rule is live for the team"
@@ -453,8 +460,22 @@ async def _insert(
         if relation is Relation.CONFLICT and related_clause_id is not None:
             await _add_reciprocal_conflict(conn, customer_id, related_clause_id, clause_id)
 
+        # NOTHING IS WRITTEN WITHOUT A SITUATION. A clause with no edge stores
+        # fine, returns 200, and is invisible to every situation-scoped read --
+        # the only read this store exists to serve. `misc` is where those go
+        # now; `fallback` records that nobody chose it, so the surface can say
+        # so instead of reporting a filing that did not happen.
+        fallback = situation_id is None
+        if fallback:
+            situation_id = await _fallback_situation_id(conn, customer_id)
         if situation_id is not None:
-            await _attach_situation(conn, customer_id, clause_id, situation_id, classification)
+            await _attach_situation(
+                conn,
+                customer_id,
+                clause_id,
+                situation_id,
+                _FALLBACK_CLASSIFICATION if fallback else classification,
+            )
 
         evidence_id = await _add_evidence(
             conn, customer_id, clause_id, actor_ref=actor_ref, source_ref=source_ref
@@ -466,6 +487,10 @@ async def _insert(
         evidence_id=evidence_id,
         situation_id=situation_id,
         shared_by=shared_by,
+        # `situation_id is not None` matters: a tenant seeded before 0118 has no
+        # fallback row, so the clause is still orphaned and the caller must not
+        # be told it was filed anywhere.
+        situation_fallback=fallback and situation_id is not None,
     )
 
 
@@ -578,6 +603,29 @@ async def _add_reciprocal_conflict(
     )
 
 
+#: Written onto the edge when a clause lands in `misc`. Deliberately NOT the
+#: caller's `classification`: that describes an attempt to place the rule, and
+#: this edge records that no placement happened. Storing the failed attempt
+#: under a successful-looking edge is how a later reclassification pass would
+#: conclude the rule was already handled.
+_FALLBACK_CLASSIFICATION: dict[str, Any] = {"method": "fallback", "reason": "no_situation"}
+
+
+async def _fallback_situation_id(conn: Any, customer_id: str) -> UUID | None:
+    """The tenant's `misc` row, or None if they have not been seeded with one.
+
+    None is a real answer, not an error: a tenant seeded before 0118 has no
+    fallback row, and inventing one here would write a situation outside the
+    seeding path that `enabled_tenants_missing_situations` audits. The caller
+    degrades to the old behaviour -- an orphaned clause -- and reports it.
+    """
+    return await conn.fetchval(
+        "SELECT id FROM situations WHERE customer_id = $1 AND slug = $2",
+        customer_id,
+        FALLBACK_SITUATION_SLUG,
+    )
+
+
 async def _attach_situation(
     conn: Any,
     customer_id: str,
@@ -596,6 +644,34 @@ async def _attach_situation(
         clause_id,
         situation_id,
         json.dumps(classification or {"method": "human"}),
+    )
+
+    # A clause that has just been given a REAL situation leaves the bucket.
+    #
+    # `misc` means "still has no home", and it is only worth anything if that
+    # stays true: the serving fallback offers the bucket when a situation has no
+    # rules of its own, so a clause left in both would be served as "nothing fit"
+    # under one situation while being correctly filed under another. The bucket
+    # would fill with rules that already found homes and slowly become a second,
+    # worse copy of the store.
+    #
+    # Scoped by slug rather than by "any other edge": a clause deliberately
+    # attached to two real situations keeps both, which is a thing somebody may
+    # legitimately want. Only the fallback is exclusive with everything else.
+    await conn.execute(
+        """
+        DELETE FROM clause_situation_edges e
+         USING situations s
+         WHERE e.clause_id = $1
+           AND e.customer_id = $2
+           AND e.situation_id = s.id
+           AND s.slug = $3
+           AND s.id <> $4
+        """,
+        clause_id,
+        customer_id,
+        FALLBACK_SITUATION_SLUG,
+        situation_id,
     )
 
 

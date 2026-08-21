@@ -373,9 +373,22 @@ async def _load_situations(customer_id: str) -> list[_Situation]:
         async with with_tenant(customer_id) as conn:
             rows = await conn.fetch(
                 """
+                -- `classifiable` (0118) excludes the `misc` fallback. It is a
+                -- holding bucket for rules nothing fit, NOT a label: its
+                -- description has no situation in it to embed, so leaving it in
+                -- here would either waste a candidate slot or -- much worse --
+                -- let "none of the above" win a near-floor tie against a real
+                -- situation, filing rules under misc BY classification rather
+                -- than for want of a home.
+                --
+                -- This also keeps NO_VOCABULARY honest: a tenant holding only
+                -- the fallback returns zero rows here and is correctly reported
+                -- as having no vocabulary, rather than looking configured while
+                -- being unable to classify anything.
                 SELECT id, slug, label, description, updated_at
                   FROM situations
                  WHERE customer_id = $1
+                   AND classifiable
                  ORDER BY slug
                 """,
                 customer_id,

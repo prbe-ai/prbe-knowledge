@@ -47,6 +47,7 @@ from uuid import UUID
 
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
+from engine.shared.wfmem.situations import FALLBACK_SITUATION_SLUG
 from engine.shared.wfmem.visibility import HUMAN_SOURCE_CLASSES, VISIBILITY_PREDICATE
 
 log = get_logger(__name__)
@@ -127,6 +128,14 @@ class ServedClause:
     #: uncorroborated rule, which is the number a reader needs to see next to
     #: `shared_by` for that label to mean anything.
     human_backers: int = 0
+    #: True when this came out of the `misc` bucket because the situation the
+    #: caller asked about had no rules of its own. MUST reach the surface: it is
+    #: the difference between "your team decided this about what you are doing"
+    #: and "nothing here fit, so here is a rule nobody could file". Render them
+    #: alike and the fallback stops being a safety net and becomes a source of
+    #: confident irrelevant advice -- which is how an agent learns to skip the
+    #: whole surface.
+    from_fallback: bool = False
 
 
 @dataclass(frozen=True)
@@ -229,12 +238,50 @@ async def serve_clauses(
             *_query_args(actor_ref, customer_id, situation_id, limit),
         )
         clauses = [_to_served(row) for row in rows]
+
+        # THE FALLBACK TIER, and note how narrow it is: only when the situation
+        # was named AND matched nothing at all.
+        #
+        # Topping up a PARTIAL result was the tempting version and it is wrong.
+        # `misc` holds the rules nothing fit, so mixing them beside real matches
+        # dilutes an answer that was already correct, and at limit=3 it would
+        # spend a third of the agent's attention on rules we know do not apply.
+        # Empty is different: there is nothing to dilute, and "we have no rules
+        # for this, but here is what never found a home" beats silence -- which
+        # is what the author of an unfiled rule gets today.
+        #
+        # Never fires for an unscoped listing: that already returns everything,
+        # `misc` included, so re-querying the bucket would duplicate every rule
+        # in it.
+        #
+        # The `!= situation_id` guard is an OPTIMISATION, not a correctness fix,
+        # and saying so matters because the obvious reading is wrong. Asking for
+        # `misc` directly cannot double-count: this branch only runs when the
+        # first query came back empty, so a bucket with rules never reaches it
+        # and a bucket without them has nothing to duplicate. The guard just
+        # skips a second query guaranteed to return what the first one did.
+        # (A mutation test that deleted it stayed green, which is how this
+        # comment got corrected rather than left as a plausible-sounding lie.)
+        if not clauses and situation_id is not None:
+            fallback_id = await _fallback_situation_id(conn, customer_id)
+            if fallback_id is not None and fallback_id != situation_id:
+                rows = await conn.fetch(
+                    _build_query(True),
+                    *_query_args(actor_ref, customer_id, fallback_id, limit),
+                )
+                clauses = [_to_served(row, from_fallback=True) for row in rows]
+
         serve_id = None
         if clauses:
             serve_id = await _record_serve(
                 conn,
                 customer_id=customer_id,
                 clause_ids=[c.id for c in clauses],
+                # The ledger records the situation the caller ASKED about, not
+                # the bucket the rows came from. Exposure is "this person was
+                # shown this while doing X", and X is the question they asked --
+                # rewriting it to `misc` would make every fallback serve look
+                # like somebody browsing the junk drawer.
                 situation_id=situation_id,
                 session_id=session_id,
                 actor_ref=actor_ref,
@@ -242,6 +289,15 @@ async def serve_clauses(
             )
 
     return Serving(clauses=clauses, serve_id=serve_id, situation_id=situation_id)
+
+
+async def _fallback_situation_id(conn: Any, customer_id: str) -> UUID | None:
+    """The tenant's `misc` row, or None when they predate 0118's seeding."""
+    return await conn.fetchval(
+        "SELECT id FROM situations WHERE customer_id = $1 AND slug = $2",
+        customer_id,
+        FALLBACK_SITUATION_SLUG,
+    )
 
 
 def _build_query(filter_by_situation: bool) -> str:
@@ -319,7 +375,7 @@ def _query_args(
     return (*base, limit)
 
 
-def _to_served(row: Any) -> ServedClause:
+def _to_served(row: Any, *, from_fallback: bool = False) -> ServedClause:
     return ServedClause(
         id=row["id"],
         kind=row["kind"],
@@ -333,6 +389,7 @@ def _to_served(row: Any) -> ServedClause:
         updated_at=row["updated_at"],
         shared_by=row["shared_by"],
         human_backers=row["human_backers"] or 0,
+        from_fallback=from_fallback,
     )
 
 

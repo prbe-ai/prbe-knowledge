@@ -533,3 +533,121 @@ async def test_the_ledger_row_lands_under_the_serving_tenant(tenant: str) -> Non
     await serve_clauses(tenant, actor_ref=CAROL)
     assert await _ledger_rows(OTHER_TENANT) == []
     assert len(await _ledger_rows(tenant)) == 1
+
+
+# --------------------------------------------------------------------------
+# The `misc` fallback tier (0118)
+#
+# A clause with no situation used to be written, returned 200, and be invisible
+# to every situation-scoped read -- the only read this store exists to serve.
+# `misc` is where those go now, and this section is about the one question that
+# decides whether the bucket is worth having: WHEN does it surface, and can a
+# reader tell a bucket rule from a real match.
+# --------------------------------------------------------------------------
+
+
+async def test_a_situation_with_no_rules_of_its_own_serves_the_bucket(tenant: str) -> None:
+    """Otherwise `misc` is an orphanage with better paperwork.
+
+    Moving a clause from "no edge" to "an edge nobody queries" is the same
+    invisibility with extra machinery, so the bucket has to actually surface.
+    """
+    misc = await _situation_id(tenant, "misc")
+    deploy = await _situation_id(tenant, "deploy")
+    homeless = await _make_clause(tenant, body="restart the engine after a knowledge merge")
+    await _attach(tenant, homeless, misc)
+
+    served = await serve_clauses(tenant, actor_ref=CAROL, situation_id=deploy)
+
+    assert [c.body for c in served.clauses] == ["restart the engine after a knowledge merge"]
+    assert served.clauses[0].from_fallback is True, (
+        "a bucket rule rendered as a match is confident irrelevant advice, which "
+        "is how an agent learns to ignore the whole surface"
+    )
+
+
+async def test_the_bucket_never_dilutes_a_situation_that_has_its_own_rules(tenant: str) -> None:
+    """Topping up a PARTIAL result was the tempting version and it is wrong.
+
+    `misc` holds what nothing fit, so mixing it beside real matches spends the
+    agent's attention -- a third of it, at limit=3 -- on rules we already know do
+    not apply, and dilutes an answer that was correct.
+    """
+    misc = await _situation_id(tenant, "misc")
+    deploy = await _situation_id(tenant, "deploy")
+    real = await _make_clause(tenant, body="roll the engine deployments")
+    await _attach(tenant, real, deploy)
+    homeless = await _make_clause(tenant, body="unfiled advice")
+    await _attach(tenant, homeless, misc)
+
+    served = await serve_clauses(tenant, actor_ref=CAROL, situation_id=deploy)
+
+    assert [c.body for c in served.clauses] == ["roll the engine deployments"]
+    assert served.clauses[0].from_fallback is False
+
+
+async def test_a_rule_asked_for_by_name_is_a_match_even_when_it_lives_in_the_bucket(
+    tenant: str,
+) -> None:
+    """`misc` is a real situation you can query, and a direct hit is not a
+    fallback -- nobody fell back to anything, they asked.
+
+    Note what this does NOT prove: it cannot catch a missing `!= situation_id`
+    guard, because the fallback branch only runs on an empty first result, so a
+    bucket with rules never reaches it. That guard is an optimisation and the
+    code says so; a mutation test deleting it is expected to stay green.
+    """
+    misc = await _situation_id(tenant, "misc")
+    homeless = await _make_clause(tenant, body="unfiled advice")
+    await _attach(tenant, homeless, misc)
+
+    served = await serve_clauses(tenant, actor_ref=CAROL, situation_id=misc)
+
+    assert [c.body for c in served.clauses] == ["unfiled advice"]
+    assert served.clauses[0].from_fallback is False, "asked for directly, so it is a match"
+
+
+async def test_an_unscoped_listing_is_untouched_by_the_fallback(tenant: str) -> None:
+    """It already returns everything, `misc` included. Running the tier here
+    would re-query the bucket and duplicate every rule in it."""
+    misc = await _situation_id(tenant, "misc")
+    homeless = await _make_clause(tenant, body="unfiled advice")
+    await _attach(tenant, homeless, misc)
+
+    served = await serve_clauses(tenant, actor_ref=CAROL)
+
+    assert [c.body for c in served.clauses] == ["unfiled advice"]
+    assert served.clauses[0].from_fallback is False
+
+
+async def test_the_ledger_records_the_situation_asked_about_not_the_bucket(
+    tenant: str,
+) -> None:
+    """Exposure is "this person was shown this while doing X", and X is the
+    question they asked. Rewriting it to `misc` would make every fallback serve
+    look like somebody browsing the junk drawer, and the ledger is
+    unbackfillable -- there is no second chance to record what was really asked.
+    """
+    misc = await _situation_id(tenant, "misc")
+    deploy = await _situation_id(tenant, "deploy")
+    homeless = await _make_clause(tenant, body="unfiled advice")
+    await _attach(tenant, homeless, misc)
+
+    served = await serve_clauses(tenant, actor_ref=CAROL, situation_id=deploy)
+
+    assert served.serve_id is not None, "cards were handed over, so exposure was real"
+    rows = await _ledger_rows(tenant)
+    assert len(rows) == 1
+    assert rows[0]["situation_id"] == deploy
+
+
+async def test_an_empty_bucket_leaves_an_empty_answer_empty(tenant: str) -> None:
+    """No cards means no ledger row, fallback or not -- an empty result shows
+    nobody anything and there is no clause id to join on."""
+    deploy = await _situation_id(tenant, "deploy")
+
+    served = await serve_clauses(tenant, actor_ref=CAROL, situation_id=deploy)
+
+    assert served.clauses == []
+    assert served.serve_id is None
+    assert await _ledger_rows(tenant) == []

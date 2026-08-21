@@ -6,6 +6,44 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- **A `misc` situation, so a rule nobody could classify is not unreachable.**
+  `declare` attached a situation only when it HAD one, and the classifier
+  honestly answers `unknown` for prose it cannot place. Those two correct
+  behaviours composed into a silent loss: the clause was written, got a real id,
+  returned 200, appeared in an unfiltered `probe rule list` -- and was invisible
+  to every situation-scoped read, which is the only read this store exists to
+  serve. Production hit it on the very first rule anyone declared: it was plainly
+  about opening a pull request, and asking for `open-pr` rules returned nothing.
+
+  A declaration with no situation now lands in `misc`, and says so
+  (`situation_fallback`) rather than reporting a filing that did not happen. The
+  bucket is EXCLUSIVE: giving a clause a real situation later evicts its `misc`
+  edge, so the bucket keeps meaning "still has no home" instead of filling with
+  rules that already found one.
+
+  `misc` is NOT a thirteenth classifier label, and the new `situations.
+  classifiable` column is what keeps it out of the label space. The reason is
+  mechanical: the classifier embeds each description, and "anything that does not
+  fit the others" has no situation in it to embed -- so as a label it either
+  matches nothing (bucket unreachable) or weakly matches everything and starts
+  winning near-floor ties against real situations, filing rules under misc BY
+  classification rather than for want of a home. A column rather than a reserved
+  slug because `situations` is per-tenant and editable, so a rule keyed on the
+  literal string breaks the moment somebody renames it.
+
+  Serving offers the bucket in exactly one case: a situation-scoped read that
+  matched NOTHING. Topping up a partial result was the tempting version and is
+  wrong -- at limit=3 it would spend a third of the agent's attention on rules we
+  know do not apply, diluting an answer that was already correct. Bucket cards
+  carry `from_fallback` so a reader can tell "your team decided this" from
+  "nothing fit, here is an unfiled rule"; render them alike and the safety net
+  becomes a source of confident irrelevant advice.
+
+  Migration 0118 backfills the bucket for every tenant that already has a
+  vocabulary and adopts the clauses that were already stranded.
+
 ### Fixed
 
 - **Workflow memory's write path never worked in production, and the log line

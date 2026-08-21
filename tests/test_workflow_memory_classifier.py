@@ -155,11 +155,17 @@ async def _read_situations(customer_id: str) -> list[dict[str, Any]]:
     Explicit tenant predicate rather than leaning on the GUC: the dev role is a
     SUPERUSER and bypasses RLS, so a bare SELECT under `with_tenant` would
     return every tenant's rows and quietly corrupt the vector mapping.
+
+    `classifiable` (0118) mirrors the classifier's own filter. Without it this
+    helper returns the `misc` bucket too, and every test that maps a vector per
+    row would be building a mapping one longer than the one under test -- which
+    misaligns every vector after `misc` in slug order and would show up as
+    inexplicable accuracy failures rather than as an off-by-one.
     """
     async with raw_conn() as conn:
         rows = await conn.fetch(
             "SELECT id, slug, label, description FROM situations "
-            "WHERE customer_id = $1 ORDER BY slug",
+            "WHERE customer_id = $1 AND classifiable ORDER BY slug",
             customer_id,
         )
     return [dict(r) for r in rows]

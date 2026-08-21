@@ -65,8 +65,45 @@ class SeedSituation(NamedTuple):
     #: description that restates the label gives it nothing to discriminate on.
     description: str
 
+    #: Is this row one of the CLASSIFIER'S LABELS? True for every situation that
+    #: names a real moment; false for the fallback bucket alone.
+    #:
+    #: The fallback cannot be a label, for a mechanical reason rather than a
+    #: tidy one. The classifier scores an embedding of the person's prose
+    #: against an embedding of each description, and "anything that does not fit
+    #: the others" has no situation in it to embed. So it either matches nothing
+    #: -- and the bucket is unreachable, which is the bug this whole change
+    #: exists to fix -- or it matches everything weakly and starts winning ties
+    #: against real situations near the floor. The second is far worse: rules
+    #: would be filed under `misc` BY the classifier rather than because nothing
+    #: fit, and the holding bucket would quietly become the vocabulary.
+    classifiable: bool = True
+
+
+#: Where a clause goes when nothing fit. NOT a thirteenth label -- see
+#: `SeedSituation.classifiable` for why it must never enter the label space.
+#:
+#: It exists because `declare` attaching a situation only when it HAS one, and
+#: the classifier honestly answering `unknown`, compose into a silent loss: the
+#: clause is written, returns 200, shows up in an unfiltered listing, and is
+#: invisible to every situation-scoped read. Production hit this on the very
+#: first declared rule. A clause with nowhere to go now has somewhere.
+FALLBACK_SITUATION = SeedSituation(
+    slug="misc",
+    label="Anything else",
+    description=(
+        "A rule that does not belong to any of the situations above. This is a "
+        "holding bucket, not a label: nothing is ever classified INTO it, and "
+        "rules land here only because no situation fit them."
+    ),
+    classifiable=False,
+)
+
+FALLBACK_SITUATION_SLUG = FALLBACK_SITUATION.slug
+
 
 SEED_SITUATIONS: tuple[SeedSituation, ...] = (
+    FALLBACK_SITUATION,
     SeedSituation(
         slug="launch-run",
         label="Launching a training run",
@@ -205,9 +242,10 @@ async def seed_situations(conn: asyncpg.Connection, customer_id: str) -> int:
     """
     rows = await conn.fetch(
         """
-        INSERT INTO situations (customer_id, slug, label, description)
-        SELECT $1, s.slug, s.label, s.description
-          FROM unnest($2::text[], $3::text[], $4::text[]) AS s(slug, label, description)
+        INSERT INTO situations (customer_id, slug, label, description, classifiable)
+        SELECT $1, s.slug, s.label, s.description, s.classifiable
+          FROM unnest($2::text[], $3::text[], $4::text[], $5::boolean[])
+               AS s(slug, label, description, classifiable)
         ON CONFLICT (customer_id, slug) DO NOTHING
         RETURNING id
         """,
@@ -215,6 +253,7 @@ async def seed_situations(conn: asyncpg.Connection, customer_id: str) -> int:
         [s.slug for s in SEED_SITUATIONS],
         [s.label for s in SEED_SITUATIONS],
         [s.description for s in SEED_SITUATIONS],
+        [s.classifiable for s in SEED_SITUATIONS],
     )
     return len(rows)
 

@@ -164,6 +164,11 @@ class DeclareResponse(BaseModel):
     created: bool = False
     evidence_id: UUID | None = None
     situation_id: UUID | None = None
+    #: `situation_id` is the `misc` bucket because nothing fit, not a situation
+    #: anybody chose. Reported rather than swallowed: the fallback stops a
+    #: clause being unreachable, it does not make it correctly filed, and only
+    #: the author can move it somewhere real.
+    situation_fallback: bool = False
     #: Who published it, or None if it is waiting on a second human. The client
     #: needs this to tell the author which of two very different things just
     #: happened -- "your rule is live for the team" versus "saved, and private
@@ -214,6 +219,11 @@ class ClauseOut(BaseModel):
     #: that guard exists to prevent.
     shared_by: str | None = None
     human_backers: int = 0
+    #: Served out of the `misc` bucket because the requested situation had no
+    #: rules. The surface must SAY so -- an unfiled rule rendered as a match is
+    #: confident irrelevant advice, which is how an agent learns to ignore this
+    #: whole surface.
+    from_fallback: bool = False
 
 
 class QueryResponse(BaseModel):
@@ -316,6 +326,7 @@ async def declare_rule(
         evidence_id=result.evidence_id,
         situation_id=result.situation_id,
         shared_by=result.shared_by,
+        situation_fallback=result.situation_fallback,
     )
 
 
@@ -481,6 +492,7 @@ def _clause_out(clause: ServedClause) -> ClauseOut:
         scope=clause.scope,
         shared_by=clause.shared_by,
         human_backers=clause.human_backers,
+        from_fallback=clause.from_fallback,
     )
 
 

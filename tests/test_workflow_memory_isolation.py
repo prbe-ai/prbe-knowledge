@@ -607,6 +607,7 @@ _MIGRATION_PATHS = (
     _VERSIONS_DIR / "20260820_0114_workflow_memory_store.py",
     _VERSIONS_DIR / "20260820_0116_wfmem_clause_publication.py",
     _VERSIONS_DIR / "20260820_0117_wfmem_clause_embedding.py",
+    _VERSIONS_DIR / "20260821_0118_wfmem_situation_fallback.py",
 )
 _SCHEMA_PATH = _REPO_ROOT / "db" / "schema.sql"
 

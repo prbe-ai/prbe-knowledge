@@ -711,3 +711,54 @@ def test_the_declare_response_never_carries_clause_bodies() -> None:
     from engine.retrieval.procedures import DeclareResponse
 
     assert "body" not in DeclareResponse.model_fields
+
+
+# --------------------------------------------------------------------------
+# The `misc` fallback, over the wire (0118)
+# --------------------------------------------------------------------------
+
+
+async def test_declaring_without_a_situation_reports_the_bucket_on_the_wire(
+    enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`situation_fallback` is the difference between "filed where somebody
+    chose" and "nothing fit, so it went in the bucket".
+
+    A client that cannot tell those apart goes quiet on exactly the rules most
+    in need of a human moving them somewhere real -- and before this the same
+    client was told `situation_id: null`, which read as "not filed at all".
+    """
+    _patch_models(monkeypatch)
+
+    payload = (await _post("/procedures/declare", {"draft": DRAFT, "actor_ref": ACTOR})).json()
+
+    assert payload["clause_id"] is not None
+    assert payload["situation_id"] is not None, "never write a clause nothing can reach"
+    assert payload["situation_fallback"] is True
+
+
+async def test_a_situation_with_no_rules_serves_the_bucket_over_the_wire(
+    enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the bucket, proven at the edge a client actually sees:
+    the card comes back AND it is labelled as a fallback rather than a match."""
+    _patch_models(monkeypatch)
+    first = (await _post("/procedures/declare", {"draft": DRAFT, "actor_ref": ACTOR})).json()
+    await _post(
+        "/procedures/declare",
+        {
+            "draft": DRAFT,
+            "actor_ref": OTHER_ACTOR,
+            "relation": "merge",
+            "related_clause_id": first["clause_id"],
+        },
+    )
+
+    payload = (
+        await _post(
+            "/procedures/query", {"actor_ref": "user:carol", "situation_slug": "deploy"}
+        )
+    ).json()
+
+    assert [c["body"] for c in payload["clauses"]] == [DRAFT["body"]]
+    assert payload["clauses"][0]["from_fallback"] is True
