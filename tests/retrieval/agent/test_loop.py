@@ -1073,7 +1073,12 @@ async def test_extracted_search_options_flow_into_execute_search(
     assert captured.await_count == 1
     kwargs = captured.await_args.kwargs
     assert kwargs.get("sort_by") == "recency"
-    assert kwargs.get("author_ids") == ["mahit@prbe.ai", "mahitoburrito"]
+    # A person in the query no longer narrows the content channels.
+    # `entity_must_match` defaults False and QueryRequest documents it as the
+    # switch for exactly this. Authorship is still searchable -- the metadata
+    # chunk carries an `author:` line as ordinary indexed text -- so the filter
+    # was only ever deleting matches the index already had.
+    assert kwargs.get("author_ids") is None
 
 
 @pytest.mark.asyncio
@@ -2352,3 +2357,169 @@ def test_fused_scores_empty_for_absent_prefanout() -> None:
 
     assert fused_prefanout_scores(None) == {}
     assert fused_prefanout_scores({}) == {}
+
+
+# ============================================================
+# Person-name queries — the "Michael" regression
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_person_name_does_not_narrow_by_default(
+    fake_request: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE REGRESSION. A person named in the query must not delete the
+    documents that merely MENTION them.
+
+    Shipped bug: `_resolve_person_author_ids` expanded "Michael" into
+    `documents.author_id` values and threaded them into all four content
+    channels as `AND d.author_id = ANY(...)`. Granola meetings are authored
+    by whoever RECORDED them (always richard@/ashwarye@), never by the
+    participants, so the predicate matched zero rows, every channel returned
+    nothing, and the query short-circuited to an EMPTY result with
+    degraded=false. The document it was looking for was titled
+    "Richard // Michael Debugging + Check-In" -- the queried name was in the
+    title of the document the search refused to return.
+    """
+    req = QueryRequest(query="Michael", customer_id="cust-1", top_k=5)
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
+        AsyncMock(return_value=GroundingBundle()),
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.extract_entities_with_llm",
+        AsyncMock(return_value=EntityExtraction(
+            entities=[
+                ExtractedEntity(
+                    entity_type="person",
+                    canonical_id="U09HWCR6B60",
+                    display_name="Michael Lin",
+                    confidence=1.0,
+                ),
+            ],
+            search_options=SearchOptions(),
+        )),
+    )
+    # Michael is a real person with real author ids who authors NOTHING in
+    # this source. That combination is what made the old filter fatal.
+    resolver = AsyncMock(return_value=["U09HWCR6B60", "michael@anthrogen.com"])
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._resolve_person_author_ids", resolver
+    )
+
+    seen: dict[str, object] = {}
+
+    async def _fake_search(**kwargs):
+        seen.update(kwargs)
+        return {"sub_queries": [{
+            "query": "Michael",
+            "grounded_entities": [],
+            "vector": [],
+            "bm25": [{
+                "doc_id": "granola:meeting:not_OslfXhcKZyOMBe",
+                "score": 0.9,
+                "source_system": "granola",
+                "title": "Richard // Michael Debugging + Check-In",
+                "content": "title: Richard // Michael Debugging + Check-In\nauthor: richard@prbe.ai",
+            }],
+            "graph": [], "inferred_edge": [],
+        }]}
+
+    monkeypatch.setattr("engine.retrieval.agent.loop.execute_search", _fake_search)
+
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args(chunks=1, confidence="high"))],
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert seen.get("author_ids") is None, (
+        "content channels still received a narrowing author predicate"
+    )
+    # The resolver must not even run when nothing will consume its output.
+    resolver.assert_not_awaited()
+    assert fake_request.state.gatherer_status != "zero_recall_short_circuit"
+    assert resp.total_candidates > 0
+
+
+@pytest.mark.asyncio
+async def test_person_narrows_when_entity_must_match_is_set(
+    fake_request: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`entity_must_match=True` still restores the hard author filter.
+
+    The broad-recall default must not delete the opt-in capability:
+    `strict_entity_filtering=True` over MCP maps to this flag and promises
+    narrowing. The predicate stays in the retrievers precisely so this keeps
+    working -- deleting it would make a documented parameter silently no-op.
+    """
+    req = QueryRequest(query="what did mahit write?", entity_must_match=True)
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
+        AsyncMock(return_value=GroundingBundle()),
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.extract_entities_with_llm",
+        AsyncMock(return_value=EntityExtraction(
+            entities=[
+                ExtractedEntity(
+                    entity_type="person",
+                    canonical_id="mahit@prbe.ai",
+                    display_name="Mahit",
+                    confidence=1.0,
+                ),
+            ],
+            search_options=SearchOptions(),
+        )),
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._resolve_person_author_ids",
+        AsyncMock(return_value=["mahit@prbe.ai", "mahitoburrito"]),
+    )
+    captured = AsyncMock(return_value={"sub_queries": [{
+        "query": "what did mahit write?",
+        "grounded_entities": [],
+        "vector": [{"doc_id": "stub:0", "score": 0.5, "source_system": "github",
+                    "title": "stub", "content": "stub"}],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]})
+    monkeypatch.setattr("engine.retrieval.agent.loop.execute_search", captured)
+
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args(chunks=1, confidence="high"))],
+        )),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert captured.await_args.kwargs.get("author_ids") == [
+        "mahit@prbe.ai", "mahitoburrito",
+    ]
+
+
+def test_bm25_pool_does_not_filter_chunk_kind() -> None:
+    """The flat surface this fix depends on.
+
+    Authorship is searchable because the synthetic `kind='metadata'` chunk
+    carries `title:` / `source:` / `id:` / `author:` / `url:` as ordinary
+    indexed text, and the BM25 pool query searches it like any other chunk.
+    Add a `kind = 'content'` predicate to that pool and every author-, id-
+    and url-keyed query silently stops matching -- the exact class of bug
+    this branch fixed, re-entering through the index instead of the filter.
+    """
+    from pathlib import Path
+
+    src = Path("engine/retrieval/retrievers/bm25.py").read_text()
+    pool_start = src.index("pool_sql = f\"\"\"")
+    pool_end = src.index("\"\"\"", pool_start + 20)
+    pool = src[pool_start:pool_end]
+
+    assert "@@@" in pool, "anchored on the wrong block; update this guard"
+    assert "kind = 'content'" not in pool, (
+        "the BM25 pool now filters chunk kind — metadata chunks (author:, id:, "
+        "url:) just stopped being searchable"
+    )
