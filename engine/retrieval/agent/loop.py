@@ -1975,7 +1975,42 @@ async def run_gatherer(
     # still match pre-merge raw author_id rows (raw historical text, never
     # rewritten on merge). When no person entity is present, returns [] —
     # the retrievers treat that as "no filter."
-    author_ids = await _resolve_person_author_ids(customer_id, entity_dicts)
+    # GATED on `entity_must_match`, which QueryRequest already documents as the
+    # switch for exactly this and defaults to False: "preferred for broad-recall
+    # callers (e.g. the MCP) where a router-extracted entity that has no matching
+    # graph_node would otherwise zero out the SQL result."
+    #
+    # Ungated, this violated that contract and produced confident empty answers.
+    # A person in the query was expanded to `documents.author_id` values and
+    # threaded into ALL FOUR content channels as `AND d.author_id = ANY(...)`.
+    # On any source where author is the RECORDER rather than a participant --
+    # granola meetings are always authored by whoever had the app running -- the
+    # predicate matched zero rows, every channel returned nothing, and the query
+    # short-circuited to `zero_recall_short_circuit` with degraded=false. For a
+    # document whose TITLE contained the queried name.
+    #
+    # WHY THIS IS THE WHOLE FIX. Search is already a flat surface: the synthetic
+    # `kind='metadata'` chunk carries `title:` / `source:` / `id:` / `author:` /
+    # `url:` as ordinary indexed text (see normalizer._metadata_text), and the
+    # BM25 pool query does NOT filter on chunk kind. So a person's name already
+    # matches every document they authored, through the same lexical channel as
+    # a title or body match, ranked by the same RRF. Nothing needs to be ADDED
+    # to make authorship searchable -- the hard filter was simply deleting the
+    # matches the index already had. An earlier revision of this fix built a
+    # fifth "author" retrieval channel to re-add them; it was redundant
+    # machinery, and every problem it introduced (scope escape past
+    # `source_keys`, N duplicate queries per reformulation, recency ordering
+    # feeding RRF as if it were relevance, a new index on documents.author_id)
+    # existed only because of the channel, never because of the bug.
+    #
+    # `strict_entity_filtering=True` over MCP still narrows, and the list
+    # pipeline is untouched -- the predicate stays in the retrievers, only the
+    # default caller stops supplying it.
+    author_ids = (
+        await _resolve_person_author_ids(customer_id, entity_dicts)
+        if req.entity_must_match
+        else []
+    )
 
     # Caller-provided hard scope from QueryRequest. `req.doc_types`
     # OVERRIDES the extractor's inferred doc_types (the documented

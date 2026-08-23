@@ -8,6 +8,38 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **Searching a person's name returned nothing, even when the name was in the
+  document's title.** Ask the knowledge base about a colleague and you got a
+  confident empty answer for documents that were sitting right there. Measured
+  against the live index: `Michael` returned 0 hits while `Debugging Check-In`
+  returned 19, including the very document titled *"Richard // Michael Debugging
+  + Check-In"*. `Connor` returned 0 while the document titled `Connor <> Richard`
+  was retrievable by searching a different person's name entirely.
+
+  Any person the router grounded was expanded into `documents.author_id` values
+  and threaded into all four content channels as a hard `AND d.author_id =
+  ANY(...)`. On sources where the author is the RECORDER rather than a
+  participant — granola meetings are always authored by whoever had the app
+  running — the predicate matched zero rows, every channel returned nothing, and
+  the query short-circuited with `degraded=false`. Not a slow path or a ranking
+  problem: an inferred filter silently deleting exact matches the index already
+  had, and reporting the result as a clean success.
+
+  It also ignored a switch that already existed. `entity_must_match` defaults to
+  False and documents itself as the guard for exactly this case — "preferred for
+  broad-recall callers where a router-extracted entity that has no matching
+  graph_node would otherwise zero out the SQL result". The search path now
+  honours it, so the narrowing is opt-in via `strict_entity_filtering=True`, and
+  the list pipeline that legitimately filters by author is untouched.
+
+  Nothing was added to make authorship searchable, because it already was. The
+  synthetic `kind='metadata'` chunk carries `title:` / `source:` / `id:` /
+  `author:` / `url:` as ordinary indexed text, and the BM25 pool query does not
+  filter on chunk kind — so a person's name already matches every document they
+  wrote, through the same lexical channel as a title or body match and ranked by
+  the same fusion. Search was already the flat surface it should be; the filter
+  was the only thing hiding it.
+
 - **0118's backfill inserted nothing, and reported success.** Its `ALTER TABLE
   ADD COLUMN` landed (DDL is not row-filtered) and both data statements were
   silently filtered to zero rows. Production sat at head `0118` with
