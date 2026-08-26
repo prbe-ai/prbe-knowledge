@@ -234,6 +234,14 @@ CREATE INDEX idx_documents_metadata ON documents USING GIN (metadata jsonb_path_
 -- (`source_id LIKE '%:<id>'`, `doc_id LIKE '%:<id>'`). Btree can't help
 -- here; without these the planner seq-scans documents filtered only by
 -- customer_id. See migration 0055.
+-- Expression index on the custom-ingest scope key (0122). The value is the
+-- expression STATISTICS it gives ANALYZE: without them a JSONB extraction has
+-- default selectivity, and the keyless source_key predicate unified search
+-- sends on every request made the planner reject the HNSW index for a
+-- Parallel Seq Scan (measured 37-52s vs ~300ms warm, research plane
+-- 2026-08-26). Equality service is a bonus.
+CREATE INDEX idx_documents_source_key_expr ON documents ((metadata->>'source_key'));
+
 CREATE INDEX idx_documents_source_id_trgm ON documents USING GIN (source_id gin_trgm_ops);
 CREATE INDEX idx_documents_doc_id_trgm ON documents USING GIN (doc_id gin_trgm_ops);
 
