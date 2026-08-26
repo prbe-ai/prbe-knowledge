@@ -73,9 +73,10 @@ class _Dispatcher:
         if "WITH RECURSIVE" in sql:
             return [{"source_system": s} for s in self.source_rows]
         if "AND d.source_system = $" in sql:
-            # top-up: the scalar source equality this path appends. Distinct
-            # from the caller's hard filter, which spells `= ANY($N::text[])`.
-            return self.topup_rows.get(params[-2], [])
+            # top-up: the scalar source equality this path appends (last
+            # parameter). Distinct from the caller's hard filter, which
+            # spells `= ANY($N::text[])`.
+            return self.topup_rows.get(params[-1], [])
         return self.pool_rows
 
 
@@ -186,7 +187,7 @@ async def test_topup_runs_only_for_the_short_source(db: _Dispatcher) -> None:
     hits = await _search(db)
 
     topup_params = [p for s, p in db.fetched if "AND d.source_system = $" in s]
-    assert [p[-2] for p in topup_params] == ["custom_ingest"]
+    assert [p[-1] for p in topup_params] == ["custom_ingest"]
     assert {h.source_system for h in hits} == {"github", "custom_ingest"}
 
 
@@ -199,7 +200,7 @@ async def test_caller_sources_list_is_the_quota_list(db: _Dispatcher) -> None:
 
     assert not any("WITH RECURSIVE" in s for s, _ in db.fetched)
     topup_params = [p for s, p in db.fetched if "AND d.source_system = $" in s]
-    assert sorted(p[-2] for p in topup_params) == ["github", "slack"]
+    assert sorted(p[-1] for p in topup_params) == ["github", "slack"]
 
 
 # ============================================================
