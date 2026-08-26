@@ -49,6 +49,17 @@ def test_issue_token_narrowed_by_linear_source() -> None:
     assert out == ["linear.issue"]
 
 
+def test_session_token_narrowed_by_pi_source() -> None:
+    """pi registers the `claude_code.` doc_type prefix (same as Codex),
+    because the connector emits CLAUDE_CODE_SESSION docs for all three
+    agent sources -- provenance differs at source_system, doc shape does
+    not. Requires kb.handlers to have been imported (root conftest does
+    this) so PiConnector's @register_connector call has populated
+    shared.source_registry before this resolves."""
+    out = resolve_doc_type_token("session", sources=[SourceSystem.PI])
+    assert out == ["claude_code.session"]
+
+
 def test_unknown_token_returns_none() -> None:
     assert resolve_doc_type_token("frobnication") is None
 
