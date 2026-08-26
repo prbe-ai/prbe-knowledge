@@ -246,3 +246,37 @@ async def test_pool_and_topup_overlap_dedupes(db: _Dispatcher) -> None:
 
     ci = [h.chunk_id for h in hits if h.source_system == "custom_ingest"]
     assert ci == ["ci1", "ci2"]
+
+
+async def test_ann_statements_respect_the_admission_bound(db: _Dispatcher, monkeypatch) -> None:
+    """No more than the semaphore's worth of ANN statements in flight.
+
+    Measured 2026-08-26: 4 concurrent sub-queries x (pool + top-ups) x 2
+    replicas put ~20+ simultaneous ANN scans on a 2-vCPU Postgres --
+    channel_total 214s vs channel_max 74s, pure thrash. Every statement was
+    individually index-shaped and fast; the storm was the problem. Admission
+    control is the fix, so this pins that the bound is actually applied to
+    both statement kinds (pool AND top-up), not just declared."""
+    import asyncio as aio
+
+    in_flight = 0
+    peak = 0
+    real_fetch = _Dispatcher.fetch
+
+    async def _counting_fetch(self: _Dispatcher, sql: str, *params: Any) -> list[Any]:
+        nonlocal in_flight, peak
+        if "FROM chunks c" in sql:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await aio.sleep(0.01)  # let the gather actually overlap
+            in_flight -= 1
+        return await real_fetch(self, sql, *params)
+
+    monkeypatch.setattr(_Dispatcher, "fetch", _counting_fetch)
+    monkeypatch.setattr(vector_mod, "_ANN_STATEMENT_SEMAPHORE", vector_mod.asyncio.Semaphore(2))
+
+    db.pool_rows = []
+    db.source_rows = ["a", "b", "c", "d", "e", "f"]  # every source short -> 6 top-ups
+    await _search(db)
+
+    assert peak <= 2, f"admission bound violated: {peak} ANN statements in flight"

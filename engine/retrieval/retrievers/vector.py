@@ -26,6 +26,28 @@ from engine.shared.models import TemporalSpec, normalize_author_id
 # top-up phase has little or nothing to do.
 PER_SOURCE_ANN_POOL = 400
 
+# Process-wide ceiling on concurrent ANN statements from the per-source path.
+#
+# Why it exists, measured on the research plane 2026-08-26: the pre-fan-out
+# runs up to 4 reformulated sub-queries concurrently, each sub-query's vector
+# channel now issues 1 pool + up to N top-up statements, and the engine's two
+# replicas double that again -- ~20+ simultaneous ANN scans against a Postgres
+# pod with 2 vCPUs and a 6.2GB HNSW index over 1GB of shared_buffers. The
+# per-channel timing shipped alongside this path made the effect legible:
+# channel_total (summed work) 214s vs channel_max (wall) 74s on one request --
+# every statement individually index-shaped and individually fast, all of them
+# thrashing the same cache and cores.
+#
+# Four keeps a single sub-query's pool + a few top-ups flowing while forcing
+# the cross-sub-query storm to queue. Queueing is the point: on an
+# oversubscribed database, admission control beats parallelism -- the same
+# statements complete sooner in fours than in twenty-fours.
+#
+# Module-level (per process, not per request) because the storm IS
+# cross-request: the four sub-queries arrive as concurrent tasks in one
+# process, and bounding each request separately would bound nothing.
+_ANN_STATEMENT_SEMAPHORE = asyncio.Semaphore(4)
+
 
 @dataclass(slots=True)
 class VectorHit:
@@ -435,7 +457,7 @@ async def _per_source_ann_search(
             f"{inner_sql}\n            ORDER BY {ann_order_sql}"
             f"\n            LIMIT $3"
         )
-        async with with_tenant(customer_id) as conn:
+        async with _ANN_STATEMENT_SEMAPHORE, with_tenant(customer_id) as conn:
             await _enable_iterative_scan(conn)
             return await conn.fetch(sql, *pool_params)
 
@@ -472,7 +494,7 @@ async def _per_source_ann_search(
             f"\n            ORDER BY {ann_order_sql}"
             f"\n            LIMIT $3"
         )
-        async with with_tenant(customer_id) as conn:
+        async with _ANN_STATEMENT_SEMAPHORE, with_tenant(customer_id) as conn:
             await _enable_iterative_scan(conn)
             return await conn.fetch(sql, *topup_params)
 
