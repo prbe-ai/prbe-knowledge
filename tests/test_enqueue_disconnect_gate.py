@@ -147,6 +147,7 @@ async def test_gate_skipped_for_non_oauth_sources(live_db) -> None:
 
     assert await is_source_connected(CUSTOMER_ID, SourceSystem.CLAUDE_CODE) is True
     assert await is_source_connected(CUSTOMER_ID, SourceSystem.CODEX) is True
+    assert await is_source_connected(CUSTOMER_ID, SourceSystem.PI) is True
     assert await is_source_connected(CUSTOMER_ID, SourceSystem.MANUAL_UPLOAD) is True
     assert await is_source_connected(CUSTOMER_ID, SourceSystem.CODE_GRAPH) is True
 
