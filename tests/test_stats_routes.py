@@ -217,7 +217,7 @@ async def test_device_stats_rejects_non_device_source(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("source", ["claude_code", "codex"])
+@pytest.mark.parametrize("source", ["claude_code", "codex", "pi"])
 async def test_device_stats_returns_grouped_live_counts(
     client: httpx.AsyncClient,
     fake_db: _FakeConnection,
