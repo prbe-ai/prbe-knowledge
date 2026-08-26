@@ -331,6 +331,7 @@ _SOURCE_SYSTEM_TO_ENTITY_TYPE: Final[dict[str, str]] = {
     "notion": "page",
     "claude_code": "session",
     "codex": "session",
+    "pi": "session",
     "granola": "document",
     "sentry": "error_group",
     "pagerduty": "incident",

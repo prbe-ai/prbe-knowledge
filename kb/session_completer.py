@@ -1,4 +1,4 @@
-"""Periodic finalizer for agent-session sources (Claude Code, Codex) that go idle.
+"""Periodic finalizer for agent-session sources (Claude Code, Codex, pi) that go idle.
 
 For each (customer, session) where the most recent ingestion_queue activity is
 older than `idle_minutes`, write a finalize.marker placeholder to R2 and
@@ -10,12 +10,12 @@ Post-migration 0026 the live session row is keyed on bare session_id (no
 `:batch_seq` suffix), and finalize is no longer a separate row — it
 coalesces into the same row as live batches via the same UPSERT path.
 
-Codex sessions need the same finalizer treatment as Claude Code — both
-ingest in coalescing mode where idle sessions otherwise stay `pending`
-forever. We loop over both sources and write the marker under the
-source-prefixed R2 path (raw/claude_code/... vs raw/codex/...) so each
-source's marker collides correctly with that source's live batches and
-nothing else.
+Codex and pi sessions need the same finalizer treatment as Claude Code —
+all three ingest in coalescing mode where idle sessions otherwise stay
+`pending` forever. We loop over every agent-session source and write the
+marker under the source-prefixed R2 path (raw/claude_code/... vs
+raw/codex/... vs raw/pi/...) so each source's marker collides correctly
+with that source's live batches and nothing else.
 """
 from __future__ import annotations
 
@@ -115,7 +115,7 @@ async def enqueue_idle_session_finalizers(
             enqueued_at = NOW()
     """
 
-    # Both agent-session sources ingest in coalescing mode and need
+    # All agent-session sources ingest in coalescing mode and need
     # finalize markers when idle. We finalize each source independently so
     # the R2 marker key lives under the source-prefixed namespace and
     # collides with the right live batches.
