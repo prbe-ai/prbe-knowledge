@@ -46,9 +46,12 @@ from engine.shared.pg_search_guardian import (
     analyze_tables,
     current_timeline_id,
     drop_broken_index,
+    find_absent_required_indexes,
     find_broken_pg_search_indexes,
     find_invalid_index_debris,
+    read_known_absent,
     read_last_timeline,
+    record_known_absent,
     record_timeline,
 )
 
@@ -74,6 +77,14 @@ async def run_once(*, dry_run: bool = False) -> int:
 
         broken = await find_broken_pg_search_indexes(conn)
         debris = await find_invalid_index_debris(conn)
+        # ABSENT is its own axis, because the guardian's own repair produces
+        # it: after a drop, the broken-index detector -- which can only see
+        # indexes that exist -- reads a false all-clear while BM25 quietly
+        # returns nothing. Observed 2026-08-26: the 04:14 tick correctly
+        # dropped the corrupted index and every later tick reported healthy
+        # while lexical search was dead.
+        absent = frozenset(await find_absent_required_indexes(conn))
+        known_absent = await read_known_absent(conn)
 
         log.info(
             "guardian.tick",
@@ -82,8 +93,33 @@ async def run_once(*, dry_run: bool = False) -> int:
             promoted=promoted,
             broken_count=len(broken),
             debris_count=len(debris),
+            absent_count=len(absent),
             dry_run=dry_run,
         )
+
+        # Transitions only. An absence lasts hours by design (rebuilds are
+        # attended), so alerting on the STATE would fire every minute for the
+        # whole window and train everyone to ignore it. The restored side
+        # closes the loop: the rebuild's completion is worth telling too.
+        newly_absent = absent - known_absent
+        newly_restored = known_absent - absent
+        if newly_absent:
+            capture(
+                "kb_pg_search_index_absent",
+                {
+                    "indexes": sorted(newly_absent),
+                    "timeline_id": timeline,
+                    "state": "lexical search returns nothing for these; "
+                    "an attended rebuild is required",
+                },
+            )
+        if newly_restored:
+            capture(
+                "kb_pg_search_index_restored",
+                {"indexes": sorted(newly_restored), "timeline_id": timeline},
+            )
+        if absent != known_absent and not dry_run:
+            await record_known_absent(conn, absent)
 
         if promoted:
             capture(
@@ -124,6 +160,11 @@ async def run_once(*, dry_run: bool = False) -> int:
 
         announced = True
         if dropped:
+            # The repair alert already says BM25 is down; pre-record the
+            # absence so the next tick's transition check does not re-alert
+            # for the same event.
+            if not dry_run:
+                await record_known_absent(conn, known_absent | frozenset(dropped))
             announced = capture(
                 "kb_pg_search_index_repaired",
                 {

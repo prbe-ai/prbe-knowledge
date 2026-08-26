@@ -1780,5 +1780,9 @@ REVOKE UPDATE, DELETE ON serve_ledger FROM PUBLIC;
 CREATE TABLE IF NOT EXISTS pg_search_guardian_state (
     id                SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
     last_timeline_id  BIGINT NOT NULL,
-    observed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    observed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Which required-index absences have already been alerted (0121), so the
+    -- guardian alerts on transitions rather than once a minute for the whole
+    -- attended-rebuild window.
+    known_absent      TEXT[] NOT NULL DEFAULT '{}'
 );

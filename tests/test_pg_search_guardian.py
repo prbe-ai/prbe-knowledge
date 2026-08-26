@@ -359,3 +359,95 @@ async def test_an_undelivered_promotion_alert_does_not_fail_the_job(monkeypatch)
     monkeypatch.setattr(cron, "get_pool", lambda: _FakePool())
 
     assert await cron.run_once() == 0
+
+
+# ============================================================
+# Absence: the false all-clear the guardian's own repair produces
+# ============================================================
+
+async def test_absent_required_index_is_reported() -> None:
+    """After the guardian drops a broken index, the index is simply GONE --
+    and the broken-index detector, which can only see indexes that exist,
+    reads `broken_count: 0`. Observed live 2026-08-26: every tick after the
+    04:14 repair reported healthy while BM25 returned nothing. Absence of a
+    required index must be its own signal."""
+    conn = _FakeConn()
+
+    async def _regclass(_sql: str, name: str) -> Any:
+        return None if name == "idx_chunks_bm25_v2" else "present"
+
+    conn.fetchval = _regclass  # type: ignore[method-assign]
+    assert await guardian.find_absent_required_indexes(conn) == ["idx_chunks_bm25_v2"]  # type: ignore[arg-type]
+
+
+async def test_absent_table_is_the_migrations_problem_not_ours() -> None:
+    """A required index over a table that does not exist is a fresh or
+    part-migrated database, not a search outage. Reporting it would page
+    for every `docker compose up`."""
+    conn = _FakeConn()
+
+    async def _regclass(_sql: str, _name: str) -> Any:
+        return None  # neither index nor table exists
+
+    conn.fetchval = _regclass  # type: ignore[method-assign]
+    assert await guardian.find_absent_required_indexes(conn) == []  # type: ignore[arg-type]
+
+
+async def test_known_absent_guards_against_a_scalar() -> None:
+    """A malformed scalar must not become a set of characters.
+
+    `frozenset("present")` is {'p','r','e','s','n','t'} -- the same
+    string-iteration trap the lost_channels forwarding shipped with. The
+    guard is on the CONTAINER type."""
+    conn = _FakeConn()
+    conn.fetchval_result = "present"  # a scalar, not a text[]
+    assert await guardian.read_known_absent(conn) == frozenset()  # type: ignore[arg-type]
+
+
+async def test_absence_alerts_fire_on_transitions_not_state(monkeypatch) -> None:
+    """An absence persists for HOURS by design -- rebuilds are attended --
+    so alerting on the state would fire every minute for the whole window.
+    Steady-state known absence: no capture. Newly restored: one capture."""
+    from scripts import cron_pg_search_guardian as cron
+
+    events: list[str] = []
+    monkeypatch.setattr(cron, "capture", lambda name, *_a, **_k: events.append(name) or True)
+    monkeypatch.setattr(cron, "find_broken_pg_search_indexes", _async_return([]))
+    monkeypatch.setattr(cron, "find_invalid_index_debris", _async_return([]))
+    monkeypatch.setattr(cron, "current_timeline_id", _async_return(4))
+    monkeypatch.setattr(cron, "read_last_timeline", _async_return(4))
+    monkeypatch.setattr(cron, "record_timeline", _async_return(None))
+    monkeypatch.setattr(cron, "record_known_absent", _async_return(None))
+    monkeypatch.setattr(cron, "get_pool", lambda: _FakePool())
+
+    # Steady state: absent, and already known absent -> silence.
+    monkeypatch.setattr(cron, "find_absent_required_indexes", _async_return(["idx_chunks_bm25_v2"]))
+    monkeypatch.setattr(cron, "read_known_absent", _async_return(frozenset({"idx_chunks_bm25_v2"})))
+    assert await cron.run_once() == 0
+    assert events == []
+
+    # Rebuilt: newly restored -> exactly one closing alert.
+    monkeypatch.setattr(cron, "find_absent_required_indexes", _async_return([]))
+    assert await cron.run_once() == 0
+    assert events == ["kb_pg_search_index_restored"]
+
+
+async def test_new_absence_alerts_once(monkeypatch) -> None:
+    """The transition INTO absence alerts; exit stays 0 -- nothing was
+    changed by the guardian, so red would dilute what red means."""
+    from scripts import cron_pg_search_guardian as cron
+
+    events: list[str] = []
+    monkeypatch.setattr(cron, "capture", lambda name, *_a, **_k: events.append(name) or True)
+    monkeypatch.setattr(cron, "find_broken_pg_search_indexes", _async_return([]))
+    monkeypatch.setattr(cron, "find_invalid_index_debris", _async_return([]))
+    monkeypatch.setattr(cron, "current_timeline_id", _async_return(4))
+    monkeypatch.setattr(cron, "read_last_timeline", _async_return(4))
+    monkeypatch.setattr(cron, "record_timeline", _async_return(None))
+    monkeypatch.setattr(cron, "record_known_absent", _async_return(None))
+    monkeypatch.setattr(cron, "get_pool", lambda: _FakePool())
+    monkeypatch.setattr(cron, "find_absent_required_indexes", _async_return(["idx_chunks_bm25_v2"]))
+    monkeypatch.setattr(cron, "read_known_absent", _async_return(frozenset()))
+
+    assert await cron.run_once() == 0
+    assert events == ["kb_pg_search_index_absent"]
