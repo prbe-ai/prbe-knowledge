@@ -416,11 +416,24 @@ async def _per_source_ann_search(
     """
     pool_limit = max(top_k, PER_SOURCE_ANN_POOL)
 
+    # Parameter slot 3 is each query's own LIMIT. `_build_inner_query` binds
+    # $3 to top_k for the single-query paths; here every ANN query has a
+    # DIFFERENT limit (pool size, per-source quota), so each swaps its own
+    # value into the slot instead of appending a new parameter and leaving $3
+    # dangling. Postgres infers a statement's parameter list from the highest
+    # $n it references, and a $3 that appears in no expression has no
+    # inferable type: the bind fails with `could not determine data type of
+    # parameter $3`. That is not hypothetical -- the first deploy of this
+    # path did exactly that on every request, and the fake-connection unit
+    # tests could not see it because bind-time errors only exist on a real
+    # protocol. The live-binding test exists because of this.
+
     async def _fetch_pool() -> list[Any]:
-        pool_params = [*params, pool_limit]
+        pool_params = list(params)
+        pool_params[2] = pool_limit
         sql = (
             f"{inner_sql}\n            ORDER BY {ann_order_sql}"
-            f"\n            LIMIT ${len(pool_params)}"
+            f"\n            LIMIT $3"
         )
         async with with_tenant(customer_id) as conn:
             await _enable_iterative_scan(conn)
@@ -452,11 +465,12 @@ async def _per_source_ann_search(
         return [r["source_system"] for r in rows]
 
     async def _fetch_topup(source: str) -> list[Any]:
-        topup_params = [*params, source, per_source_top_k]
+        topup_params = [*params, source]
+        topup_params[2] = per_source_top_k
         sql = (
-            f"{inner_sql}\n              AND d.source_system = ${len(topup_params) - 1}"
+            f"{inner_sql}\n              AND d.source_system = ${len(topup_params)}"
             f"\n            ORDER BY {ann_order_sql}"
-            f"\n            LIMIT ${len(topup_params)}"
+            f"\n            LIMIT $3"
         )
         async with with_tenant(customer_id) as conn:
             await _enable_iterative_scan(conn)
