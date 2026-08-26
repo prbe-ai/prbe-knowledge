@@ -282,3 +282,78 @@ async def record_timeline(conn: asyncpg.Connection, timeline_id: int) -> None:
         """,
         timeline_id,
     )
+
+
+# Indexes that MUST exist for the product to be whole, mapped to their table.
+# This is deliberately its own list rather than the drop-allowlist above: the
+# allowlist bounds what an unattended job may DESTROY (and includes non-
+# pg_search indexes like the HNSW one, which replicate fine); this names what
+# the guardian should MISS when it is gone. Today that is exactly the BM25
+# index -- the one whose absence makes lexical search silently return nothing
+# while every tick reads `broken_count: 0`.
+REQUIRED_PG_SEARCH_INDEXES: dict[str, str] = {"idx_chunks_bm25_v2": "chunks"}
+
+
+async def find_absent_required_indexes(conn: asyncpg.Connection) -> list[str]:
+    """Required pg_search indexes that do not exist at all.
+
+    The guardian's own repair produces this state: it DROPS a broken index,
+    after which the table plans fine, BM25 quietly returns zero hits, and the
+    broken-index detector -- which can only see indexes that exist -- reports
+    a false all-clear. Observed live on 2026-08-26: the 04:14 tick correctly
+    dropped the corrupted index, and every subsequent tick read
+    `broken_count: 0` while lexical search was dead. Nothing prompted the
+    rebuild for half an hour until a human went looking.
+
+    A required index over a table that does not exist is NOT reported: on a
+    fresh or partially-migrated database the missing piece is the table, and
+    that is the migration chain's problem, not a search outage.
+    """
+    absent: list[str] = []
+    for index_name, table_name in REQUIRED_PG_SEARCH_INDEXES.items():
+        if await conn.fetchval("SELECT to_regclass($1)", index_name) is not None:
+            continue
+        if await conn.fetchval("SELECT to_regclass($1)", table_name) is None:
+            continue
+        absent.append(index_name)
+    return absent
+
+
+async def read_known_absent(conn: asyncpg.Connection) -> frozenset[str]:
+    """The absences already reported, so alerts fire on transitions only.
+
+    An absence persists for hours BY DESIGN -- rebuilds are attended -- so
+    alerting on the state rather than the change would fire every minute for
+    the whole window: the exact alert-storm shape the timeline marker's
+    record-LAST discipline exists to avoid on the promotion path.
+    """
+    value = await conn.fetchval(
+        "SELECT known_absent FROM pg_search_guardian_state WHERE id = 1"
+    )
+    # List-guarded, not just truthiness-guarded: a string is iterable and
+    # every character passes an element check, so a malformed scalar here
+    # would silently become a set of letters (the exact bug class the
+    # lost_channels forwarding shipped with).
+    if not isinstance(value, (list, tuple)):
+        return frozenset()
+    return frozenset(v for v in value if isinstance(v, str))
+
+
+async def record_known_absent(conn: asyncpg.Connection, absent: frozenset[str]) -> None:
+    """Persist the currently-known absences (singleton UPSERT, timeline kept).
+
+    The INSERT arm needs a timeline value for a first-ever tick; 0 is the
+    "never seen" sentinel `read_last_timeline` already treats as None-like
+    (a first real timeline is always >= 1, so the first comparison records
+    rather than alerts).
+    """
+    await conn.execute(
+        """
+        INSERT INTO pg_search_guardian_state (id, last_timeline_id, observed_at, known_absent)
+        VALUES (1, 0, NOW(), $1)
+        ON CONFLICT (id) DO UPDATE
+            SET known_absent = EXCLUDED.known_absent,
+                observed_at  = EXCLUDED.observed_at
+        """,
+        sorted(absent),
+    )
