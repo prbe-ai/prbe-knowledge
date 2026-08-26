@@ -97,7 +97,7 @@ async def enqueue_idle_session_finalizers(
     # with an empty event list (no unit docs, no harm).
     #
     # Intentionally NOT gated by engine.ingest.connectedness:
-    # finalize markers only fire for CLAUDE_CODE / CODEX, which don't
+    # finalize markers only fire for CLAUDE_CODE / CODEX / PI, which don't
     # have integration_tokens rows (agent sessions, no OAuth lifecycle).
     upsert_sql = """
     INSERT INTO ingestion_queue
@@ -119,7 +119,7 @@ async def enqueue_idle_session_finalizers(
     # finalize markers when idle. We finalize each source independently so
     # the R2 marker key lives under the source-prefixed namespace and
     # collides with the right live batches.
-    AGENT_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX)
+    AGENT_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI)
     store = get_store()
     enqueued = 0
     total_candidates = 0
