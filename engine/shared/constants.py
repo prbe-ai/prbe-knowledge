@@ -17,6 +17,12 @@ class SourceSystem(StrEnum):
     # sanitizer. Doc shape and unit extraction are identical to claude_code;
     # this label exists so dashboard queries can distinguish provenance.
     CODEX = "codex"
+    # pi (earendil-works/pi) sessions arrive shimmed into Claude-Code shape by
+    # the tap's sanitizer, exactly like Codex above. ONE source id covers pi
+    # forks and SDK embeds too -- the harness variant rides on the session
+    # document rather than minting a second source, because this enum is
+    # read in roughly 40 places across three repos and cannot grow per fork.
+    PI = "pi"
     MANUAL_UPLOAD = "manual_upload"
     CUSTOM_INGEST = "custom_ingest"
     CODE_GRAPH = "code_graph"
@@ -39,6 +45,7 @@ SOURCE_DISPLAY_NAMES: dict[SourceSystem, str] = {
     SourceSystem.GRANOLA: "Granola",
     SourceSystem.CLAUDE_CODE: "Claude Code",
     SourceSystem.CODEX: "Codex",
+    SourceSystem.PI: "pi",
     SourceSystem.MANUAL_UPLOAD: "Manual upload",
     SourceSystem.CUSTOM_INGEST: "Custom Ingest",
     SourceSystem.CODE_GRAPH: "Code",
