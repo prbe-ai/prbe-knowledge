@@ -1761,3 +1761,24 @@ CREATE POLICY tenant_isolation_insert ON serve_ledger
 -- Belt-and-braces for any role that would otherwise inherit the privilege
 -- through PUBLIC; the deny above is the policy absence, not this REVOKE.
 REVOKE UPDATE, DELETE ON serve_ledger FROM PUBLIC;
+
+-- ---------------------------------------------------------------------------
+-- pg_search_guardian_state: one row remembering the Postgres timeline ID the
+-- guardian cron last saw (migration 0120).
+--
+-- The timeline increments on every promotion, and a promotion is the only
+-- reliable signal that this instance's pg_search indexes are suspect. A
+-- promoted standby carries either a 0-byte index (pg_search Community does not
+-- replicate index storage -- the 2026-08-25 kb outage) or, worse, a NONZERO
+-- index frozen at clone time that plans fine and silently returns incomplete
+-- results. Size-based detection sees only the first. See
+-- scripts/cron_pg_search_guardian.py.
+--
+-- NO RLS: there is no customer_id here -- one row about one Postgres instance,
+-- not tenant data. Same shape of exemption as node_post_write_queue.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pg_search_guardian_state (
+    id                SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    last_timeline_id  BIGINT NOT NULL,
+    observed_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

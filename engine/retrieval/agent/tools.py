@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
 
@@ -530,8 +531,38 @@ async def execute_search(
                 record_channel_loss("inferred_edge")
                 return []
 
+        # Per-channel wall clock, measured around each channel coroutine.
+        #
+        # The pre-fan-out logs ONE `elapsed_ms` covering four channels across
+        # up to five sub-queries. When that number sat at 18-34s p50 against a
+        # 60s budget (kb, Aug 2026) it could not say which channel was slow,
+        # so the investigation had to sample pg_stat_activity by hand and
+        # still could not separate a slow channel from a slow reformulation.
+        # These timings are the missing decomposition.
+        #
+        # Measured INSIDE the gather, so each figure is that channel's own
+        # wall clock rather than a share of the total. The four run
+        # concurrently, so they sum to MORE than the fan-out's elapsed time —
+        # the max is the critical path, the sum is total work. Reading the sum
+        # as latency is the one wrong way to use this.
+        #
+        # A channel that raised is still timed: the handlers above catch and
+        # return [], so a fast failure reads as a fast channel, and only these
+        # numbers next to `lost_channels` tell a 30s timeout from a 5ms miss.
+        timings: dict[str, float] = {}
+
+        async def _timed(channel: str, coro: Awaitable[list[dict[str, Any]]]):
+            started = time.perf_counter()
+            try:
+                return await coro
+            finally:
+                timings[channel] = round((time.perf_counter() - started) * 1000, 1)
+
         v, b, g, i = await asyncio.gather(
-            _vec_call(), _bm25_call(), _graph_call(), _inferred_call(),
+            _timed("vector", _vec_call()),
+            _timed("bm25", _bm25_call()),
+            _timed("graph", _graph_call()),
+            _timed("inferred_edge", _inferred_call()),
         )
         return {
             "query": q,
@@ -541,6 +572,7 @@ async def execute_search(
             "bm25": b,
             "graph": g,
             "inferred_edge": i,
+            "channel_ms": timings,
         }
 
     sub_queries = await asyncio.gather(*(_per_query(q) for q in queries))

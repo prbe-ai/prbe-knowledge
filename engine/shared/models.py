@@ -790,6 +790,25 @@ class RetrieveResponse(BaseModel):
     # None whenever `degraded` is False.
     degraded: bool = False
     degraded_reason: str | None = None
+    # WHICH channels died, by name ("vector", "bm25", "graph",
+    # "inferred_edge"). `degraded_reason` collapses every channel failure
+    # into the single token "channel_degraded", so a caller holding a
+    # degraded response could not tell a dead BM25 index from a dead graph
+    # channel — and during the 2026-08-25 kb incident that is exactly the
+    # question the MCP surface could not answer while BM25 was down for
+    # forty minutes.
+    #
+    # Empty (not None) when nothing was lost, so a consumer can iterate
+    # unconditionally. Ordered for a stable wire payload: `lost_channels()`
+    # returns a frozenset, whose iteration order is not reproducible across
+    # processes, and an unstable list defeats response diffing in tests and
+    # caches alike.
+    #
+    # Independent of `degraded`: a channel loss folded onto an
+    # already-degraded status (`loop_timeout` wins by design, see
+    # `merge_channel_loss`) still populates this, so the names survive even
+    # when the reason names something else.
+    lost_channels: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _clear_reason_when_healthy(self) -> "RetrieveResponse":

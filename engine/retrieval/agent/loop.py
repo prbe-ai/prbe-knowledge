@@ -2086,12 +2086,30 @@ async def run_gatherer(
     for sub in prefanout_result.get("sub_queries") or []:
         for _ch in prefanout_hit_counts:
             prefanout_hit_counts[_ch] += len(sub.get(_ch) or [])
+    # Decompose the one `elapsed_ms` number into per-channel wall clock.
+    #
+    # `max` is the critical path -- the channel the fan-out actually waited
+    # on -- and is the figure to compare against the stage budget. `total` is
+    # summed work across concurrent channels and sub-queries, so it exceeds
+    # elapsed by design; it is the multiplication factor (channels x
+    # reformulations) that a rising sub-query count shows up in first. Logging
+    # both is what separates "one slow channel" from "too many sub-queries",
+    # which the single elapsed figure could never distinguish.
+    prefanout_channel_max: dict[str, float] = {}
+    prefanout_channel_total: dict[str, float] = {}
+    for sub in prefanout_result.get("sub_queries") or []:
+        for _ch, _ms in (sub.get("channel_ms") or {}).items():
+            prefanout_channel_max[_ch] = max(prefanout_channel_max.get(_ch, 0.0), _ms)
+            prefanout_channel_total[_ch] = prefanout_channel_total.get(_ch, 0.0) + _ms
     log.info(
         "agent.prefanout_complete",
         customer_id=customer_id,
         trace_id=trace_id,
         elapsed_ms=round(timing["prefanout_ms"], 1),
         hits=prefanout_hit_counts,
+        sub_query_count=len(prefanout_result.get("sub_queries") or []),
+        channel_max_ms=prefanout_channel_max,
+        channel_total_ms=prefanout_channel_total,
     )
 
     # Step 3 — Build the user message and short-circuit if no LLM.

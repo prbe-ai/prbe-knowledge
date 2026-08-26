@@ -712,7 +712,8 @@ async def to_query_response(
     # A channel can die without the loop noticing (its handler returns []).
     # Fold that in here, at the one place the caller-visible flag is built, so
     # `degraded` and `degraded_reason` cannot disagree about the same request.
-    effective_status = merge_channel_loss(status, lost_channels())
+    lost = lost_channels()
+    effective_status = merge_channel_loss(status, lost)
 
     return RetrieveResponse(
         query=query,
@@ -748,6 +749,10 @@ async def to_query_response(
         # Only carry the reason when it IS a degradation — a reason string on
         # a healthy response invites callers to branch on it.
         degraded_reason=effective_status if is_degraded(effective_status) else None,
+        # Sorted, not set-ordered — see the field's note on wire stability.
+        # Carried independently of `degraded` so a loss folded onto a
+        # more-specific status still names the channels that died.
+        lost_channels=sorted(lost),
     )
 
 
