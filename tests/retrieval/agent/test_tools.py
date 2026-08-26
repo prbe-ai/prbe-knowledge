@@ -353,3 +353,68 @@ async def test_fetch_doc_minimal_call_returns_chunks_only() -> None:
         assert out["chunks"] == []
         assert out["outbound_inferred_edges"] == []
         assert out["evidence_by_edge_id"] == {}
+
+
+# ============================================================
+# channel_ms — per-channel timing decomposition (kb prefanout, Aug 2026)
+# ============================================================
+
+@pytest.mark.asyncio
+async def test_search_reports_per_channel_timing() -> None:
+    """Every sub-query carries a `channel_ms` for all four channels.
+
+    The pre-fan-out logged ONE elapsed figure covering four channels across up
+    to five sub-queries. At 18-34s p50 against a 60s budget that number could
+    not name the slow channel, which is why the Aug 2026 latency investigation
+    had to sample pg_stat_activity by hand. Keys must be present even for
+    channels that returned nothing, or "fast" and "never ran" look identical."""
+    with patch(
+        "engine.retrieval.agent.tools._vector", new=AsyncMock(return_value=[])
+    ), patch(
+        "engine.retrieval.agent.tools._bm25", new=AsyncMock(return_value=[])
+    ), patch(
+        "engine.retrieval.agent.tools.build_bundle",
+        new=AsyncMock(
+            return_value=type("B", (), {
+                "candidates": [], "bare_id_matches": [],
+                "connected_sources": [], "timing_ms": 0.0,
+            })()
+        ),
+    ):
+        out = await execute_search("cust-1", queries=["q0", "q1"])
+
+    assert len(out["sub_queries"]) == 2
+    for sub in out["sub_queries"]:
+        timings = sub["channel_ms"]
+        assert set(timings) == {"vector", "bm25", "graph", "inferred_edge"}
+        assert all(isinstance(v, float) and v >= 0.0 for v in timings.values())
+
+
+@pytest.mark.asyncio
+async def test_search_times_a_failing_channel_rather_than_dropping_it() -> None:
+    """A channel that raised is still timed.
+
+    The four handlers catch and return [], so a channel that died is
+    indistinguishable from one that found nothing — that is exactly what
+    `record_channel_loss` exists to fix on the results side. The timing side
+    has the same hazard: dropping the key on failure would erase the evidence
+    that a channel burned 30s before timing out."""
+    with patch(
+        "engine.retrieval.agent.tools._vector",
+        new=AsyncMock(side_effect=RuntimeError("bm25 index is gone")),
+    ), patch(
+        "engine.retrieval.agent.tools._bm25", new=AsyncMock(return_value=[])
+    ), patch(
+        "engine.retrieval.agent.tools.build_bundle",
+        new=AsyncMock(
+            return_value=type("B", (), {
+                "candidates": [], "bare_id_matches": [],
+                "connected_sources": [], "timing_ms": 0.0,
+            })()
+        ),
+    ):
+        out = await execute_search("cust-1", queries=["q0"])
+
+    sub = out["sub_queries"][0]
+    assert sub["vector"] == []
+    assert "vector" in sub["channel_ms"]

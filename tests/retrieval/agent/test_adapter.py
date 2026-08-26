@@ -18,6 +18,7 @@ from engine.retrieval.agent.models import (
     GathererNotes,
     GathererOutput,
 )
+from engine.retrieval.channel_health import begin_request, record_channel_loss
 
 
 def _ge(doc_id: str, content: str = "...", matched_via: list[str] | None = None) -> GatheredChunk:
@@ -873,3 +874,64 @@ async def test_no_fused_scores_leaves_retriever_scores_empty() -> None:
         status=None, query="q", gathered=gathered, trace_id="t", timing_ms={}
     )
     assert resp.results[0].retriever_scores == {}
+
+
+# ============================================================
+# lost_channels — WHICH channel died, by name (kb incident 2026-08-25)
+# ============================================================
+
+async def test_lost_channels_names_the_dead_channel() -> None:
+    """`degraded_reason` says "channel_degraded"; this says WHICH.
+
+    During the 2026-08-25 kb incident BM25 was down for forty minutes and
+    the MCP surface could not say so — every channel failure collapses into
+    one token, so a caller holding a degraded response could not distinguish
+    a dead BM25 index from a dead graph channel. The names are the whole
+    point of the field."""
+    begin_request()
+    record_channel_loss("bm25")
+    gathered = GathererOutput(
+        entities=[], chunks=[_ge("github:pr:1")], gatherer_notes=GathererNotes()
+    )
+    resp = await to_query_response(
+        status="ok", query="q", gathered=gathered, trace_id="t", timing_ms={}
+    )
+    assert resp.lost_channels == ["bm25"]
+    assert resp.degraded is True
+    assert resp.degraded_reason == "channel_degraded"
+
+
+async def test_lost_channels_empty_on_a_healthy_response() -> None:
+    """Empty list, never None, so consumers iterate unconditionally."""
+    begin_request()
+    gathered = GathererOutput(
+        entities=[], chunks=[_ge("github:pr:1")], gatherer_notes=GathererNotes()
+    )
+    resp = await to_query_response(
+        status="ok", query="q", gathered=gathered, trace_id="t", timing_ms={}
+    )
+    assert resp.lost_channels == []
+    assert resp.degraded is False
+
+
+async def test_lost_channels_survive_a_more_specific_status() -> None:
+    """A loss folded onto an already-degraded status still names the channels.
+
+    `merge_channel_loss` deliberately lets `loop_timeout` win over
+    `channel_degraded` — the timeout tells the caller more. That precedence
+    used to be the only record of the loss, so the channel names vanished
+    exactly when two things went wrong at once (a 30s BM25 timeout is a good
+    way to also run the loop out of budget). This field is independent of the
+    reason, so both survive."""
+    begin_request()
+    record_channel_loss("bm25")
+    record_channel_loss("graph")
+    gathered = GathererOutput(
+        entities=[], chunks=[_ge("github:pr:1")], gatherer_notes=GathererNotes()
+    )
+    resp = await to_query_response(
+        status="loop_timeout", query="q", gathered=gathered, trace_id="t", timing_ms={}
+    )
+    # Sorted, so the wire payload is reproducible across processes.
+    assert resp.lost_channels == ["bm25", "graph"]
+    assert resp.degraded_reason == "loop_timeout"
