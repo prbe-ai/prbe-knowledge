@@ -64,6 +64,52 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   a different hat — and the new test under the non-superuser `prbe_rls_test` role
   is what caught it.
 
+- **Ingestion froze for 26 hours across every tenant while the worker reported
+  itself healthy.** A node replacement took the Postgres cluster away at
+  19:16 UTC on 2026-08-27. Postgres came back 53 minutes later; the worker never
+  did. 39,000 documents piled up unindexed for six tenants, the pod stayed
+  `Running` with zero restarts, and the logs went completely silent — no
+  traceback, no error, nothing to find.
+
+  Three separate defects turned a routine dependency blip into a day-long
+  outage, and each one is worth naming because they failed in sequence.
+
+  The claim was the one unguarded database call in the drain loop.
+  `Worker._claim_loop` and `BackfillWorker.run` both awaited a claim with no
+  `try`/`except`, so a single `ConnectionRefusedError` propagated through
+  `asyncio.gather(return_exceptions=False)` and out of `run_worker_forever`,
+  ending the process's main coroutine. A related path did the same from a
+  `finally`: cancelling an already-dead heartbeat task re-raises whatever it
+  stored, which escapes past every `except` clause in `_process` and skips the
+  error handling that would have recorded the row. A heartbeat is bookkeeping;
+  its failure must never decide the fate of the work it reports on.
+
+  Unwinding did not end the process. The exception reached `asyncio.run()`'s
+  teardown, where `_cancel_all_tasks()` blocked forever waiting on a task that
+  ignored cancellation. `py-spy` found the container still sitting in that
+  teardown 26 hours later with the `ConnectionRefusedError` trapped, unprinted,
+  in the `__exit__` frame — which is why there was nothing in the logs. A fatal
+  gather now logs and aborts the process outright, so the crash is loud, the
+  exit code reaches the orchestrator, and the pod restarts.
+
+  And `/health` only ever asked whether Postgres answered. uvicorn's listening
+  socket outlives a dead drain, so the liveness probe collected a 200 every
+  twenty seconds for 26 hours and Kubernetes never restarted anything. Liveness
+  now asserts that the WORK is running, via a beacon the claim loop and the
+  heartbeat both advance: a reachable dependency says nothing about whether a
+  worker is doing its job, and a health check that cannot tell a working process
+  from a corpse actively suppresses the restart that would have fixed this in
+  two minutes.
+
+  Also closed a latent hazard found on the way: neither ingest-path
+  `acompletion` call passed a `timeout` and the wrapper had no default, so an
+  outbound provider call could occupy a claim loop indefinitely. With
+  `worker_max_concurrent` loops (2 in production) and a row that keeps its
+  heartbeat fresh while it hangs, the reclaim loop — which only looks for a
+  STALE heartbeat — would never have rescued it. `shared.llm` now applies
+  `LLM_REQUEST_TIMEOUT_SECONDS` when the caller sets none; every interactive
+  caller already passes its own tighter deadline and is unaffected.
+
 ### Fixed
 
 - **The classifier's LLM tie-break never once worked in production.**

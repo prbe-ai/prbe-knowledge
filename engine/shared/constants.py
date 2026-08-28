@@ -830,6 +830,21 @@ MAX_WEBHOOK_ATTEMPTS = 5
 QUEUE_HEARTBEAT_INTERVAL_SECONDS = 30
 QUEUE_RECLAIM_THRESHOLD_SECONDS = 300
 
+# How long a claim loop waits after an unexpected error before claiming again.
+# Long enough that a dependency outage (a Postgres restart takes ~1min, a node
+# replacement rather longer) is not hammered; short enough that the drain
+# resumes promptly once it returns.
+QUEUE_ERROR_BACKOFF_SECONDS = 5.0
+
+# `/health` reports 503 once the drain has shown no sign of life for this long,
+# which fails the liveness probe and gets the worker restarted.
+#
+# Must comfortably exceed QUEUE_HEARTBEAT_INTERVAL_SECONDS: a row that takes
+# many minutes keeps the beacon fresh through its heartbeat, so only a drain
+# that has genuinely stopped goes stale. 6x the heartbeat leaves room for a
+# slow DB write without ever declaring a working worker dead.
+WORKER_DRAIN_STALL_THRESHOLD_SECONDS = 180.0
+
 # Default queue priority at enqueue time. Worker._claim_one orders by
 # priority DESC, so higher numbers claim first. Tiers:
 #
@@ -1488,6 +1503,22 @@ LLM_TPM_BUDGET = int(os.getenv("LLM_TPM_BUDGET", "0"))
 # constraint is research-os abandoning /v1/search at 30s, so this stays well
 # inside the tighter of the two.
 LLM_TPM_MAX_WAIT_SECONDS = float(os.getenv("LLM_TPM_MAX_WAIT_SECONDS", "5.0"))
+
+# Default wall-clock ceiling on ONE provider call, applied in shared.llm when
+# the caller passes no `timeout` of its own.
+#
+# LiteLLM's own default is not a guarantee we control, and an outbound call with
+# no ceiling is a queue-wide hazard rather than a slow request: the ingestion
+# drain runs `worker_max_concurrent` claim loops (2 in production), each of
+# which calls the inferred-edges extractor inline. Two calls that never return
+# occupy every claim loop and the queue stops for all tenants — with the row
+# still marked `processing` and its heartbeat advancing, so nothing reclaims it.
+#
+# 120s is deliberately generous: it is a backstop against a hung socket, not a
+# latency target. Every interactive caller has a tighter deadline of its own
+# (the gatherer's turn budget, research-os abandoning /v1/search at 30s), and
+# any caller needing a different ceiling passes `timeout=` explicitly.
+LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "120"))
 
 # Prefix used in `integration_tokens.scope` to signal the row represents a
 # GitHub App installation rather than an OAuth access_token. The installation
