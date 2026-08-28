@@ -110,6 +110,22 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   `LLM_REQUEST_TIMEOUT_SECONDS` when the caller sets none; every interactive
   caller already passes its own tighter deadline and is unaffected.
 
+  A cross-model adversarial pass over the fix caught four more, all of the same
+  shape — a failure that keeps the drain alive but leaves the work stranded. The
+  self-host Helm chart probed the worker with `pgrep -f services.ingestion.worker`
+  under a comment asserting "no HTTP server" and "the process exits on fatal
+  errors"; both halves were false, and pgrep would have passed for all 26 hours,
+  so that chart now probes `/health` like every other role. A row that fails in
+  `_process`'s prelude — before its own `try`, where the `SourceSystem` coercion
+  lives — is now recorded against `worker_max_attempts`, because reclaim resets
+  rows without consulting `attempts` and such a row would otherwise cycle
+  claim → raise → reclaim forever, never dead-lettering, holding a slot under its
+  tenant's in-flight cap. `_heartbeat` survives a failed write instead of dying on
+  the first one and letting its own still-being-processed row be reclaimed out
+  from under it. And an unexpected `CancelledError` at the supervisor is now
+  fatal rather than logged as a tidy shutdown, since unwinding leads back into
+  the teardown that hung.
+
 ### Fixed
 
 - **The classifier's LLM tie-break never once worked in production.**

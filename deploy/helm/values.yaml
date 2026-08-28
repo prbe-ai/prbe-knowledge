@@ -190,6 +190,10 @@ retrieval:
 
 worker:
   replicas: 1
+  # Port for the worker's health app. Must match WORKER_HEALTH_PORT, which the
+  # deployment sets from this value; the liveness probe targets it by name.
+  # Matches the app default in kb/worker.py.
+  healthPort: 8082
   resources:
     requests:
       cpu: 100m

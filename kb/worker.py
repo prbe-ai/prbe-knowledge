@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import signal
 import sys
 from datetime import UTC, datetime
+from typing import NoReturn
 
 import asyncpg
 
@@ -195,6 +197,31 @@ class GranolaNotifyListener:
 
 
 
+def _abort(reason: str) -> NoReturn:
+    """Flush the logs and END this process, skipping asyncio teardown.
+
+    Its own function so a test can patch this symbol rather than kill the
+    interpreter running the suite.
+
+    `os._exit` and not `sys.exit`: `sys.exit` raises `SystemExit`, which unwinds
+    into `asyncio.run()`'s teardown — the exact place that hung for 26 hours on
+    2026-08-27, blocked in `_cancel_all_tasks()` on a task that ignored
+    cancellation. The process never exited, so Kubernetes never restarted it and
+    the traceback stayed trapped, unprinted, in the `__exit__` frame.
+
+    The cost is real and accepted: the caller's `finally` does not run, so
+    backfill claims are not released and in-flight rows stay `processing`. Both
+    are reclaimed on the stale-heartbeat sweep, which is the same recovery path
+    an OOM kill or SIGKILL already relies on. A bounded delay beats a process
+    that will not die.
+    """
+    log.error("worker.abort", reason=reason)
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    os._exit(1)
+
+
 async def run_worker_forever() -> None:
     """Entry point for `python -m engine.ingest.worker`.
 
@@ -358,6 +385,15 @@ async def run_worker_forever() -> None:
         try:
             await gather_future
         except asyncio.CancelledError:
+            if not shutdown_started:
+                # Nobody asked for this. A child was cancelled by something
+                # other than our signal handler, so the drain is gone but the
+                # process would otherwise return into the same asyncio.run()
+                # teardown that hung for 26 hours. Treat it as fatal, not as a
+                # tidy shutdown -- an unexplained cancellation is exactly the
+                # case where "log shutdown_complete and unwind" is a lie.
+                log.error("worker.unexpected_cancellation")
+                _abort("worker.unexpected_cancellation")
             log.info("worker.shutdown_complete")
         except BaseException:
             # One of the long-lived coroutines died. `asyncio.gather` here is
@@ -373,10 +409,7 @@ async def run_worker_forever() -> None:
             # `os._exit` skips the same teardown that hung, so the crash is
             # loud, the exit code reaches Kubernetes, and the pod restarts.
             log.exception("worker.fatal")
-            for stream in (sys.stdout, sys.stderr):
-                with contextlib.suppress(Exception):
-                    stream.flush()
-            os._exit(1)
+            _abort("worker.fatal")
     finally:
         # Drain in-flight release tasks before asyncio.run's task-cancel sweep
         # interrupts their asyncpg UPDATE mid-roundtrip. See PR #210.

@@ -164,7 +164,29 @@ class Worker:
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._shutdown.wait(), timeout=poll_interval)
             return
-        await self._process(claimed)
+        try:
+            await self._process(claimed)
+        except Exception as exc:
+            # `_process` handles its own errors, so reaching here means the
+            # failure came from OUTSIDE its try: the field reads and the
+            # `SourceSystem(...)` coercion in its prelude, or an exception
+            # escaping its `finally`.
+            #
+            # The claim loop's own guard would keep the drain alive, but the
+            # row would never be marked -- reclaim flips it back to `pending`
+            # without consulting `attempts`, so a permanently malformed row
+            # (an unrecognised `source_system`, say) cycles claim -> raise ->
+            # reclaim forever, never dead-lettering, and its slots count
+            # against that tenant's in-flight cap the whole time. Record it
+            # here so `worker_max_attempts` is actually enforced.
+            await self._on_error(
+                claimed["queue_id"],
+                claimed["attempts"] + 1,
+                repr(exc),
+                transient=True,
+                captured_version=claimed["version"],
+            )
+            raise
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -569,11 +591,24 @@ class Worker:
     async def _heartbeat(self, queue_id: int) -> None:
         while True:
             await asyncio.sleep(QUEUE_HEARTBEAT_INTERVAL_SECONDS)
-            async with get_pool().acquire() as conn:
-                await conn.execute(
-                    "UPDATE ingestion_queue SET heartbeat_at = NOW() WHERE queue_id = $1",
-                    queue_id,
-                )
+            try:
+                async with get_pool().acquire() as conn:
+                    await conn.execute(
+                        "UPDATE ingestion_queue SET heartbeat_at = NOW() "
+                        "WHERE queue_id = $1",
+                        queue_id,
+                    )
+            except Exception:
+                # ONE transient write must not end the heartbeat. Without this
+                # the task dies on the first blip and never beats again, so a
+                # row that is still being worked looks stale after
+                # QUEUE_RECLAIM_THRESHOLD_SECONDS and gets reclaimed out from
+                # under the worker still processing it -- two workers on one
+                # row, from a single failed UPDATE. Keep beating; the next tick
+                # is QUEUE_HEARTBEAT_INTERVAL_SECONDS away and the reclaim
+                # threshold is an order of magnitude wider.
+                log.warning("worker.heartbeat_tick_failed", queue_id=queue_id)
+                continue
             # A row legitimately taking many minutes keeps the drain's liveness
             # beacon fresh, so a slow row is never mistaken for a dead worker.
             note_progress()

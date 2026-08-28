@@ -1520,6 +1520,23 @@ LLM_TPM_MAX_WAIT_SECONDS = float(os.getenv("LLM_TPM_MAX_WAIT_SECONDS", "5.0"))
 # any caller needing a different ceiling passes `timeout=` explicitly.
 LLM_REQUEST_TIMEOUT_SECONDS = float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "120"))
 
+# For the rare call whose OUTPUT budget makes 120s an unreasonable ceiling.
+#
+# The cross-repo dependency classifier asks for up to 32,768 output tokens; at
+# realistic decode rates that generation alone can run past ten minutes, so the
+# default ceiling would abort legitimate work and silently drop the
+# classification (the caller returns None on error). It is a background
+# code-graph job with no interactive deadline, so it gets a wider backstop
+# rather than the shared one.
+#
+# Still a backstop, not a latency target: it bounds a hung socket. A call this
+# long holds a claim loop for its duration, which is safe because the row's
+# heartbeat keeps both the reclaim threshold and the liveness beacon fresh
+# while it runs.
+LLM_LONG_GENERATION_TIMEOUT_SECONDS = float(
+    os.getenv("LLM_LONG_GENERATION_TIMEOUT_SECONDS", "600")
+)
+
 # Prefix used in `integration_tokens.scope` to signal the row represents a
 # GitHub App installation rather than an OAuth access_token. The installation
 # id follows the colon; tokens are minted on demand from the App private key.

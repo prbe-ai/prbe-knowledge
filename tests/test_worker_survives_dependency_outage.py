@@ -290,3 +290,90 @@ async def test_a_dead_heartbeat_does_not_escape_process(monkeypatch) -> None:
     assert marked == [34987], (
         "the row must still be committed; a failed heartbeat must not skip it"
     )
+
+
+# ---------------------------------------------------------------------------
+# 4. a row that fails OUTSIDE _process's try must still be dead-lettered
+# ---------------------------------------------------------------------------
+
+
+async def test_a_row_failing_before_process_try_is_recorded(monkeypatch) -> None:
+    """Keeping the drain alive must not create a row that cycles forever.
+
+    `_process` reads its row fields and coerces `SourceSystem(...)` BEFORE its
+    own `try`, so a malformed row raises past all of its error handling. The
+    claim loop's guard then keeps the drain running -- but reclaim flips the row
+    back to `pending` without consulting `attempts`, so without this the row
+    would cycle claim -> raise -> reclaim forever, never dead-lettering, while
+    occupying a slot under the tenant's in-flight cap.
+    """
+    w = _bare_worker()
+    recorded: list[tuple[int, int]] = []
+
+    async def fake_on_error(queue_id, attempts, error, *, transient, captured_version):
+        recorded.append((queue_id, attempts))
+        return False
+
+    async def boom(_row):
+        raise ValueError("'nonsense' is not a valid SourceSystem")
+
+    async def claim_once():
+        return {"queue_id": 99, "attempts": 7, "version": 2}
+
+    w._on_error = fake_on_error
+    w._process = boom
+    w._claim_one = claim_once
+
+    with pytest.raises(ValueError):
+        await w._claim_tick(poll_interval=0.01)
+
+    assert recorded == [(99, 8)], (
+        "the row must be recorded so worker_max_attempts can eventually DLQ it"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 5. one failed heartbeat write must not end the heartbeat
+# ---------------------------------------------------------------------------
+
+
+async def test_heartbeat_survives_a_failed_write(monkeypatch) -> None:
+    """A dead heartbeat gets its own row reclaimed out from under it.
+
+    Nothing retried the UPDATE, so a single transient failure ended the task
+    permanently. The row then looks stale after QUEUE_RECLAIM_THRESHOLD_SECONDS
+    and is reclaimed while the original worker is still processing it -- two
+    workers on one row, from one failed write.
+    """
+    w = _bare_worker()
+    monkeypatch.setattr(worker_mod, "QUEUE_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    attempts: list[int] = []
+
+    class _Conn:
+        async def execute(self, *args, **kwargs) -> None:
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise ConnectionRefusedError(111, "Connect call failed")
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *exc) -> bool:
+            return False
+
+    class _Pool:
+        def acquire(self):
+            return _Acquire()
+
+    monkeypatch.setattr(worker_mod, "get_pool", lambda: _Pool())
+
+    task = asyncio.create_task(w._heartbeat(queue_id=1))
+    await asyncio.sleep(0.08)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(attempts) >= 2, (
+        f"heartbeat must keep beating after a failed write, got {len(attempts)} attempts"
+    )
