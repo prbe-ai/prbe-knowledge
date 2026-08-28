@@ -104,7 +104,7 @@ class NormalizeOutcome:
 # with session_complete=True on the session doc and extracts the high-signal
 # unit docs (qa / decision / code_change / file_ref). We detect that pass at
 # the session level and enqueue then; every other source enqueues each doc.
-_AGENT_SESSION_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX)
+_AGENT_SESSION_SOURCES = (SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI)
 
 
 def _inferred_edge_doc_ids(

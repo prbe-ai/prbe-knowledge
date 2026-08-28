@@ -705,3 +705,34 @@ async def test_a_failed_supersede_pass_keeps_the_decisions(monkeypatch) -> None:
         session_id="s", events=[_user("go", 0)]
     )
     assert len(bundle.decision) == 2
+
+
+@pytest.mark.asyncio
+async def test_pi_agent_label_reaches_the_extraction_system_prompt(monkeypatch) -> None:
+    """`_AGENT_LABELS` feeds the unit-extraction system prompt via
+    `_SYSTEM_TEMPLATE.format(agent=...)`. Without a "pi" entry, every pi
+    session's extraction would be told it is looking at a generic "coding
+    agent" instead of pi -- no crash, just systematically vaguer prompts on
+    100% of pi sessions. This asserts the real system message text, not
+    just dict membership, so a regression in either the label or the
+    template wiring is caught here."""
+    empty_payload = {"qa": [], "code_change": [], "decision": [], "file_ref": []}
+    fake = AsyncMock(return_value=_litellm_tool_response("emit_units", empty_payload))
+    monkeypatch.setattr("engine.shared.llm_tools.acompletion", fake)
+
+    await extract_units_from_session(
+        session_id="s1",
+        events=[
+            {"line_no": 0, "raw": {
+                "type": "user",
+                "message": {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            }}
+        ],
+        cwd="/tmp/p",
+        agent="pi",
+    )
+
+    fake.assert_awaited_once()
+    system_message = fake.await_args.kwargs["messages"][0]["content"]
+    assert "one pi session" in system_message
+    assert "coding agent" not in system_message

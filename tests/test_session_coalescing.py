@@ -428,8 +428,8 @@ async def test_slack_still_uses_one_row_per_event(live_db) -> None:
 
 @pytest.mark.parametrize(
     "source",
-    [SourceSystem.CLAUDE_CODE, SourceSystem.CODEX],
-    ids=["claude_code", "codex"],
+    [SourceSystem.CLAUDE_CODE, SourceSystem.CODEX, SourceSystem.PI],
+    ids=["claude_code", "codex", "pi"],
 )
 def test_compose_storage_id_suffixes_batch_seq_per_agent_source(
     source: SourceSystem,

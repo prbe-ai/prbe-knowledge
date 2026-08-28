@@ -1166,3 +1166,28 @@ class CodexConnector(ClaudeCodeConnector):
     _doc_id_prefix: ClassVar[str] = "codex"
     _agent_label: ClassVar[str] = "codex"
     _session_title_prefix: ClassVar[str] = "Codex session"
+
+
+@register_connector(SourceSystem.PI)
+class PiConnector(ClaudeCodeConnector):
+    """pi (earendil-works/pi) sessions, shimmed into Claude-Code shape by
+    the tap's sanitizer. Inherits all parsing / fetch_supplementary /
+    normalize logic from ClaudeCodeConnector — only the source label and
+    doc-id prefix differ so dashboard queries can distinguish provenance.
+
+    pi-only structure (tree position -- entry id / parentId, branch
+    summaries, compaction token counts, user labels, model changes,
+    per-message provider and model, and any extension-authored custom entry
+    type the connector has never seen) rides along on each event under the
+    `_pi_extras` key. It survives into raw R2 storage but is not currently
+    parsed into units; a native pipeline can read it without re-ingest.
+    """
+    source_system: ClassVar[SourceSystem] = SourceSystem.PI
+    display_name: ClassVar[str] = "pi"
+    # Source profile (doc_type_prefix "claude_code.", priority 75, 0.5
+    # multiplier, 7d half-life) is inherited from ClaudeCodeConnector on
+    # purpose: same doc shape, same coalescing semantics, same staleness
+    # curve — only the provenance label differs.
+    _doc_id_prefix: ClassVar[str] = "pi"
+    _agent_label: ClassVar[str] = "pi"
+    _session_title_prefix: ClassVar[str] = "pi session"
