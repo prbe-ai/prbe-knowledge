@@ -155,3 +155,5 @@ jobs:
           tests/test_query_traces_trace_blob_migration.py
           tests/handlers/test_manual_upload.py
           tests/handlers/test_slack.py
+          tests/test_pg_search_guardian.py
+          tests/test_pg_search_rebuild.py
