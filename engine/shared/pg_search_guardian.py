@@ -357,3 +357,112 @@ async def record_known_absent(conn: asyncpg.Connection, absent: frozenset[str]) 
         """,
         sorted(absent),
     )
+
+
+# ---------------------------------------------------------------------------
+# Unattended rebuild
+# ---------------------------------------------------------------------------
+
+# The DDL for every index in REQUIRED_PG_SEARCH_INDEXES, so the rebuild does not
+# have to parse db/schema.sql at runtime.
+#
+# THIS IS A COPY, AND COPIES DRIFT. tests/test_pg_search_rebuild.py asserts that
+# every statement here still matches the one schema.sql declares, normalised for
+# whitespace and comments -- the same shape index_contracts.py uses, and for the
+# same reason: a rebuild that silently recreates last month's index definition
+# is worse than no rebuild, because the result LOOKS healthy.
+#
+# `IF NOT EXISTS` is deliberate. The rebuild only runs when the index is already
+# known absent, but two ticks racing is not worth a crash.
+REQUIRED_INDEX_DDL: dict[str, str] = {
+    "idx_chunks_bm25_v2": """
+        CREATE INDEX IF NOT EXISTS idx_chunks_bm25_v2
+        ON chunks USING bm25 (
+            chunk_id, content, title, customer_id, doc_id, kind,
+            chunk_index, first_seen_version, last_seen_version, visibility
+        )
+        WITH (
+            key_field=chunk_id,
+            text_fields='{"title": {"tokenizer": {"type": "source_code"}}}'
+        )
+    """,
+}
+
+# Advisory lock key. Two rebuilds of the same index at once would each hold a
+# SHARE lock and build a 500MB+ index; the second is pure waste at best. The
+# CronJob's concurrencyPolicy already prevents overlap WITHIN one cluster, but
+# nothing stops a human running the attended recipe while a tick is mid-build --
+# and that is the case worth defending against, because it is the case where
+# somebody is watching the wrong terminal.
+REBUILD_ADVISORY_LOCK_KEY = 0x7042_5F42_4D32_3501
+
+# Plain CREATE INDEX, never CONCURRENTLY. CIC on pg_search 0.23.4 dies at 99%
+# with an uninitialized tablespace OID, and `lock_timeout` kills its
+# wait-for-writers phase outright. Plain build takes an ACCESS SHARE-blocking
+# ShareLock: readers are unaffected, writers to the table queue.
+#
+# 256MB, not the instance default of 512MB, and no parallel workers. This runs
+# on an instance whose whole container limit is 4Gi with 2GB of that pinned in
+# shared_buffers -- the budget that produced two OOM group kills on 2026-08-28
+# and 2026-08-29. A rebuild that takes six minutes and finishes beats one that
+# takes three and kills the primary.
+REBUILD_MAINTENANCE_WORK_MEM = "256MB"
+REBUILD_PARALLEL_WORKERS = 0
+
+# Ceiling on the wait for the table lock. Same reasoning as DROP_LOCK_TIMEOUT
+# but far longer: the drop is a catalog flick that must never queue, while the
+# build is the thing we actually came to do, so it is worth waiting out a
+# transient ingestion batch. Still bounded -- a skip costs one tick, a pinned
+# lock request blocks every writer arriving behind it.
+REBUILD_LOCK_TIMEOUT = "60s"
+
+
+async def rebuild_absent_index(
+    conn: asyncpg.Connection,
+    index_name: str,
+    *,
+    dry_run: bool = False,
+) -> bool:
+    """Rebuild one absent required index. True if built, False if it skipped.
+
+    Returns False rather than raising for the two conditions that are a normal
+    part of a busy database -- the lock was unavailable, or the index already
+    exists -- because both are resolved by the next tick and neither is worth a
+    red CronJob.
+
+    The identifier and the DDL are interpolated because DDL takes no bind
+    parameters. Safe for the same reason `drop_broken_index` is: `index_name`
+    reaches here only from REQUIRED_PG_SEARCH_INDEXES, and the statement itself
+    comes from REQUIRED_INDEX_DDL. Neither carries a value derived from user
+    input or from the database.
+    """
+    if index_name not in REQUIRED_INDEX_DDL:
+        raise ValueError(f"no rebuild DDL declared for index: {index_name!r}")
+
+    ddl = REQUIRED_INDEX_DDL[index_name]
+    if dry_run:
+        log.info("rebuild.would_build", index=index_name)
+        return False
+
+    try:
+        # NOT in a transaction block, and not by accident: a 500MB index build
+        # inside an explicit transaction holds its locks and its WAL for the
+        # whole duration with nothing to gain. Each SET is session-scoped and
+        # this connection is used for nothing else.
+        await conn.execute(f"SET lock_timeout = '{REBUILD_LOCK_TIMEOUT}'")
+        await conn.execute(f"SET maintenance_work_mem = '{REBUILD_MAINTENANCE_WORK_MEM}'")
+        await conn.execute(
+            f"SET max_parallel_maintenance_workers = {REBUILD_PARALLEL_WORKERS}"
+        )
+        # The build outlives any sane statement_timeout. Unset for this session
+        # only -- the guardian's own connection, never a request-path one.
+        await conn.execute("SET statement_timeout = 0")
+        await conn.execute(ddl)
+        return True
+    except asyncpg.LockNotAvailableError:
+        log.warning(
+            "rebuild.skipped_lock_timeout",
+            index=index_name,
+            reason="table busy with writers; next tick retries",
+        )
+        return False
