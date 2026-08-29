@@ -27,8 +27,30 @@ WHAT HAS NOT CHANGED
 The rebuild does NOT fix the standby. pg_search Community does not replicate
 BM25 contents (streaming-replica reads are an Enterprise feature), so every
 rebuild re-arms the trap for the next failover. This job automates the
-treadmill; it does not stop it. Stopping it means pg_search >= 0.24.0, which
-ports WAL integration to Community (paradedb#4901).
+treadmill; it does not stop it.
+
+DO NOT "FIX" THAT BY UPGRADING pg_search. That was the obvious next move and it
+is actively harmful on Community with a physical standby. Measured 2026-08-29,
+primary + streaming standby in Docker, index built while the standby streamed:
+
+  0.23.4 (ours)  standby index 0 bytes, standby STAYS UP, BM25 broken after
+                 promotion -- the degradation this job repairs.
+  0.25.6         standby's startup process takes the pg_search/INIT_INDEX WAL
+                 record and FATALs:
+                   "replicas are not supported on community and require
+                    paradedb enterprise"
+                 then "shutting down due to startup process failure". The
+                 standby is GONE, and with it the cluster's HA.
+
+Combined with this job the newer version is worse still: every automatic
+rebuild would kill the standby. paradedb#4901 ports WAL integration for
+SINGLE-NODE crash recovery; halting a Community standby is its intended
+behaviour, not an edge case. The supported fix is ParadeDB Enterprise.
+
+Cheaper mitigation that does work on Community, same measurement run: a standby
+RE-CLONED (pg_basebackup) after the index exists receives a full-size, working
+copy and serves BM25 correctly once promoted. So recycling the replica after a
+rebuild converts the next failover from degraded to clean.
 
 DELIBERATELY SILENT ON SUCCESS
 ------------------------------
