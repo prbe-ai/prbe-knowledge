@@ -163,7 +163,7 @@ _SOURCE_PREFERENCE_RULE = """Source-preference rule:
   slack, github, sentry, pagerduty, granola — facts here are
   what you cite. AGENT SESSION transcripts (often contain meta-
   commentary, hypotheses, debugging notes, and references to the
-  canonical docs): claude_code, codex. Judge each chunk by its
+  canonical docs): claude_code, codex, pi. Judge each chunk by its
   `source:` field, not by guessing from the body text.
 - When BOTH kinds appear in the chunks, ground factual claims in the
   authoritative chunks and cite them. Session transcripts are
