@@ -102,6 +102,7 @@ from aiolimiter import AsyncLimiter
 from litellm.exceptions import OpenAIError as _LiteLLMBaseError
 
 from engine.shared.constants import (
+    LLM_REQUEST_TIMEOUT_SECONDS,
     LLM_TPM_BUDGET,
     LLM_TPM_MAX_WAIT_SECONDS,
 )
@@ -491,6 +492,12 @@ async def acompletion(
         ``stream``, ``response_format``, ``api_base`` (per-call gateway
         override), ``timeout``.
 
+        ``timeout`` defaults to ``LLM_REQUEST_TIMEOUT_SECONDS`` when the
+        caller passes none, so no provider call can block its caller
+        forever — see that constant for why an unbounded one is a
+        queue-wide hazard rather than merely a slow request. Pass an
+        explicit ``timeout`` to override it.
+
     Returns
     -------
     The provider-normalized response object that ``litellm.acompletion``
@@ -531,6 +538,7 @@ async def acompletion(
     """
     kwargs = _maybe_inject_gateway(kwargs)
     model = _gateway_model(model, kwargs)
+    kwargs.setdefault("timeout", LLM_REQUEST_TIMEOUT_SECONDS)
     await _acquire_token_budget(messages, kwargs)
     try:
         return await litellm.acompletion(model=model, messages=messages, **kwargs)
@@ -604,6 +612,7 @@ async def aembedding(
     gateway_injected = not caller_set_api_base and "api_base" in kwargs
     if gateway_injected and "custom_llm_provider" not in kwargs:
         kwargs["custom_llm_provider"] = "openai"
+    kwargs.setdefault("timeout", LLM_REQUEST_TIMEOUT_SECONDS)
     try:
         return await litellm.aembedding(model=model, input=input, **kwargs)
     except _LiteLLMBaseError as exc:

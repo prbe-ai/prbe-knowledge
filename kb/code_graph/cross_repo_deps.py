@@ -42,6 +42,7 @@ from typing import Any
 import asyncpg
 import orjson
 
+from engine.shared.constants import LLM_LONG_GENERATION_TIMEOUT_SECONDS
 from engine.shared.db import with_tenant
 from engine.shared.logging import get_logger
 
@@ -407,6 +408,11 @@ async def _call_classifier_llm(
                     {"role": "user", "content": user_prompt},
                 ],
                 max_tokens=32768,
+                # Explicit, because `shared.llm`'s 120s default is sized for
+                # ordinary calls and this one asks for 32k output tokens --
+                # that generation alone can outrun 120s, and the `except`
+                # below turns a timeout into a silently dropped classification.
+                timeout=LLM_LONG_GENERATION_TIMEOUT_SECONDS,
                 # LiteLLM forwards `response_format={"type": "json_object"}`
                 # to Gemini as the equivalent `response_mime_type:
                 # application/json` hint — same intent as the legacy

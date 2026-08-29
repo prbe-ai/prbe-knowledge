@@ -38,18 +38,30 @@ spec:
           securityContext:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          # Background ingestion worker — no HTTP server. The process exits on
-          # fatal errors, so a crash-loop is the failure signal; a simple
-          # process-presence exec probe guards against a hung interpreter.
+          # The worker DOES run an HTTP server: a small health app alongside the
+          # drain loop (kb/worker.py). `/health` reports 503 once the drain
+          # stops showing signs of life, so a hung worker fails liveness.
+          #
+          # This probe was `pgrep -f services.ingestion.worker`, on the stated
+          # assumption that "the process exits on fatal errors, so a crash-loop
+          # is the failure signal". Both halves were wrong. On 2026-08-27 the
+          # drain died on a transient Postgres outage and the process then hung
+          # inside asyncio.run()'s teardown for 26 hours — very much present,
+          # indexing nothing for every tenant. pgrep passed every check.
+          # Probe the WORK, not the process.
           command: ["python", "-m", "services.ingestion.worker"]
+          ports:
+            - name: health
+              containerPort: {{ .Values.worker.healthPort }}
+              protocol: TCP
           env:
+            - name: WORKER_HEALTH_PORT
+              value: {{ .Values.worker.healthPort | quote }}
             {{- include "probe-knowledge.env" . | nindent 12 }}
           livenessProbe:
-            exec:
-              command:
-                - /bin/sh
-                - -c
-                - pgrep -f "services.ingestion.worker" > /dev/null
+            httpGet:
+              path: /health
+              port: health
             initialDelaySeconds: 20
             periodSeconds: 30
             timeoutSeconds: 5

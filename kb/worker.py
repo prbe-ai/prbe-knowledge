@@ -11,14 +11,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import signal
+import sys
 from datetime import UTC, datetime
+from typing import NoReturn
 
 import asyncpg
 
 from engine.ingest.handlers.base import ConnectorContext, make_default_context
 from engine.ingest.worker import ReclaimLoop, Worker, _build_health_app
-from engine.shared.constants import GRANOLA_REFRESH_CHANNEL
+from engine.shared.constants import (
+    GRANOLA_REFRESH_CHANNEL,
+    WORKER_DRAIN_STALL_THRESHOLD_SECONDS,
+)
 from engine.shared.db import apply_connection_setup, init_pool
 from engine.shared.logging import bind_trace, get_logger
 from kb.poller import IntegrationPoller
@@ -66,7 +72,15 @@ class BackfillWorker:
 
         log.info("backfill_worker.start")
         while not self._shutdown.is_set():
-            claimed = await claim_pending_backfill()
+            try:
+                claimed = await claim_pending_backfill()
+            except Exception:
+                # Same reasoning as Worker._claim_loop: the claim was the one
+                # unguarded DB call in this loop, so a Postgres blip propagated
+                # out of run_worker_forever and took the whole process with it.
+                log.exception("backfill_worker.claim_failed")
+                await self._sleep_or_wake()
+                continue
             if claimed is None:
                 await self._sleep_or_wake()
                 continue
@@ -183,6 +197,31 @@ class GranolaNotifyListener:
 
 
 
+def _abort(reason: str) -> NoReturn:
+    """Flush the logs and END this process, skipping asyncio teardown.
+
+    Its own function so a test can patch this symbol rather than kill the
+    interpreter running the suite.
+
+    `os._exit` and not `sys.exit`: `sys.exit` raises `SystemExit`, which unwinds
+    into `asyncio.run()`'s teardown — the exact place that hung for 26 hours on
+    2026-08-27, blocked in `_cancel_all_tasks()` on a task that ignored
+    cancellation. The process never exited, so Kubernetes never restarted it and
+    the traceback stayed trapped, unprinted, in the `__exit__` frame.
+
+    The cost is real and accepted: the caller's `finally` does not run, so
+    backfill claims are not released and in-flight rows stay `processing`. Both
+    are reclaimed on the stale-heartbeat sweep, which is the same recovery path
+    an OOM kill or SIGKILL already relies on. A bounded delay beats a process
+    that will not die.
+    """
+    log.error("worker.abort", reason=reason)
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            stream.flush()
+    os._exit(1)
+
+
 async def run_worker_forever() -> None:
     """Entry point for `python -m engine.ingest.worker`.
 
@@ -269,7 +308,12 @@ async def run_worker_forever() -> None:
 
     health_port = int(os.environ.get("WORKER_HEALTH_PORT", "8082"))
     health_config = uvicorn.Config(
-        _build_health_app(),
+        # Liveness asserts the DRAIN is running, not just that Postgres
+        # answers. A worker whose loops have died keeps its uvicorn socket
+        # open and its DB reachable, so a DB-only probe reports 200 forever.
+        _build_health_app(
+            drain_stall_threshold_seconds=WORKER_DRAIN_STALL_THRESHOLD_SECONDS
+        ),
         host="0.0.0.0",
         port=health_port,
         log_config=None,
@@ -341,7 +385,31 @@ async def run_worker_forever() -> None:
         try:
             await gather_future
         except asyncio.CancelledError:
+            if not shutdown_started:
+                # Nobody asked for this. A child was cancelled by something
+                # other than our signal handler, so the drain is gone but the
+                # process would otherwise return into the same asyncio.run()
+                # teardown that hung for 26 hours. Treat it as fatal, not as a
+                # tidy shutdown -- an unexplained cancellation is exactly the
+                # case where "log shutdown_complete and unwind" is a lie.
+                log.error("worker.unexpected_cancellation")
+                _abort("worker.unexpected_cancellation")
             log.info("worker.shutdown_complete")
+        except BaseException:
+            # One of the long-lived coroutines died. `asyncio.gather` here is
+            # return_exceptions=False, so its siblings are already abandoned
+            # and this process can no longer do its job.
+            #
+            # Abort rather than return, because unwinding is NOT a reliable way
+            # to end this process: on 2026-08-27 the exception propagated into
+            # `asyncio.run()`'s teardown, `_cancel_all_tasks()` blocked forever
+            # on a task that ignored cancellation, and the container sat in
+            # that teardown for 26 hours — never exiting, never restarting, and
+            # never printing the traceback, which stayed trapped in the frame.
+            # `os._exit` skips the same teardown that hung, so the crash is
+            # loud, the exit code reaches Kubernetes, and the pod restarts.
+            log.exception("worker.fatal")
+            _abort("worker.fatal")
     finally:
         # Drain in-flight release tasks before asyncio.run's task-cancel sweep
         # interrupts their asyncpg UPDATE mid-roundtrip. See PR #210.

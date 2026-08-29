@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -18,6 +19,7 @@ import asyncpg
 from engine.ingest.handlers.base import ConnectorContext
 from engine.ingest.normalizer import Normalizer
 from engine.shared.constants import (
+    QUEUE_ERROR_BACKOFF_SECONDS,
     QUEUE_HEARTBEAT_INTERVAL_SECONDS,
     QUEUE_RECLAIM_THRESHOLD_SECONDS,
     BackfillStatus,
@@ -36,6 +38,34 @@ from engine.shared.logging import bind_trace, get_logger
 from engine.shared.storage import get_store
 
 log = get_logger(__name__)
+
+
+# ---- drain liveness beacon -------------------------------------------------
+# Monotonic mark of the last sign of life from the drain: a claim-loop
+# iteration, or a heartbeat write while a long row is in flight. `/health`
+# reports 503 once it goes stale (see `_build_health_app`), so a worker whose
+# loops have stopped fails its liveness probe and Kubernetes restarts it.
+#
+# Why a beacon rather than trusting the process to die: on 2026-08-27
+# `run_worker_forever()` ended on a transient `ConnectionRefusedError` and
+# `asyncio.run()`'s teardown then hung forever in `_cancel_all_tasks`, waiting
+# on a task that ignored cancellation. uvicorn's listening socket outlived the
+# drain, so `/health` — which only ever checked that Postgres answered —
+# returned 200 for 26 hours while the queue indexed nothing for six tenants.
+# A dead worker that still passes its liveness probe is the failure this
+# closes: reachable dependencies say nothing about whether the work is running.
+_last_progress_monotonic: float = time.monotonic()
+
+
+def note_progress() -> None:
+    """Record a sign of life from the drain. Cheap enough to call per tick."""
+    global _last_progress_monotonic
+    _last_progress_monotonic = time.monotonic()
+
+
+def seconds_since_progress() -> float:
+    """Seconds since the drain last showed a sign of life."""
+    return time.monotonic() - _last_progress_monotonic
 
 
 class Worker:
@@ -96,22 +126,67 @@ class Worker:
 
     async def _claim_loop(self, poll_interval: float) -> None:
         while not self._shutdown.is_set():
-            if self._claim_coalesce_max > 1:
-                rows = await self._claim_batch()
-                if not rows:
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(
-                            self._shutdown.wait(), timeout=poll_interval
-                        )
-                    continue
-                await self._process_batch(rows)
-                continue
-            claimed = await self._claim_one()
-            if claimed is None:
+            note_progress()
+            try:
+                await self._claim_tick(poll_interval)
+            except Exception:
+                # A transient dependency failure must not END the drain.
+                # `CancelledError` is a BaseException, so a real shutdown still
+                # propagates and only genuine errors are absorbed here.
+                #
+                # Before this guard the claim itself was unprotected: every DB
+                # call in `_claim_one` / `_process`'s commit path propagated out
+                # of this loop, through `Worker.run`'s gather and out of
+                # `run_worker_forever`. On 2026-08-27 a ~50min Postgres outage
+                # (node replacement) did exactly that — one
+                # `ConnectionRefusedError` ended the process's main coroutine
+                # and froze ingestion for EVERY tenant for 26 hours. Postgres
+                # came back 53 minutes later; the worker never did.
+                log.exception("worker.claim_loop_error")
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self._shutdown.wait(), timeout=QUEUE_ERROR_BACKOFF_SECONDS
+                    )
+
+    async def _claim_tick(self, poll_interval: float) -> None:
+        """One claim-and-process iteration. Raises on dependency failure;
+        `_claim_loop` owns the retry/backoff so the drain survives it."""
+        if self._claim_coalesce_max > 1:
+            rows = await self._claim_batch()
+            if not rows:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(self._shutdown.wait(), timeout=poll_interval)
-                continue
+                return
+            await self._process_batch(rows)
+            return
+        claimed = await self._claim_one()
+        if claimed is None:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._shutdown.wait(), timeout=poll_interval)
+            return
+        try:
             await self._process(claimed)
+        except Exception as exc:
+            # `_process` handles its own errors, so reaching here means the
+            # failure came from OUTSIDE its try: the field reads and the
+            # `SourceSystem(...)` coercion in its prelude, or an exception
+            # escaping its `finally`.
+            #
+            # The claim loop's own guard would keep the drain alive, but the
+            # row would never be marked -- reclaim flips it back to `pending`
+            # without consulting `attempts`, so a permanently malformed row
+            # (an unrecognised `source_system`, say) cycles claim -> raise ->
+            # reclaim forever, never dead-lettering, and its slots count
+            # against that tenant's in-flight cap the whole time. Record it
+            # here so `worker_max_attempts` is actually enforced.
+            await self._on_error(
+                claimed["queue_id"],
+                claimed["attempts"] + 1,
+                repr(exc),
+                transient=True,
+                captured_version=claimed["version"],
+            )
+            raise
 
     def shutdown(self) -> None:
         self._shutdown.set()
@@ -358,8 +433,7 @@ class Worker:
             for hb in heartbeats:
                 hb.cancel()
             for hb in heartbeats:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await hb
+                await self._stop_heartbeat(hb)
 
     async def _fail_batch_row(
         self,
@@ -485,18 +559,59 @@ class Worker:
                 with contextlib.suppress(Exception):
                     await self._mark_manual_upload_failed_ingest(customer_id, event_id, error)
         finally:
-            heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await heartbeat_task
+            await self._stop_heartbeat(heartbeat_task)
+
+    @staticmethod
+    async def _stop_heartbeat(task: asyncio.Task) -> None:
+        """Cancel a heartbeat task and absorb however it ended.
+
+        `cancel()` on a task that has ALREADY died is a no-op, so the `await`
+        re-raises the exception it stored. Because these calls live in a
+        `finally`, that exception escapes past every `except` clause in the
+        caller — skipping the error handling that would have marked the row.
+
+        That is the precise path that ended the worker on 2026-08-27: the
+        heartbeat's `UPDATE` hit the Postgres outage, its
+        `ConnectionRefusedError` re-raised out of `_process`'s `finally`, and
+        the drain died with the row still `processing` and never dead-lettered.
+
+        A heartbeat is bookkeeping. Its failure must never decide the fate of
+        the work it was reporting on, so it is logged and dropped here.
+        """
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            # Expected: this is our own cancel landing. Matches the behaviour
+            # this replaced.
+            pass
+        except Exception:
+            log.exception("worker.heartbeat_failed")
 
     async def _heartbeat(self, queue_id: int) -> None:
         while True:
             await asyncio.sleep(QUEUE_HEARTBEAT_INTERVAL_SECONDS)
-            async with get_pool().acquire() as conn:
-                await conn.execute(
-                    "UPDATE ingestion_queue SET heartbeat_at = NOW() WHERE queue_id = $1",
-                    queue_id,
-                )
+            try:
+                async with get_pool().acquire() as conn:
+                    await conn.execute(
+                        "UPDATE ingestion_queue SET heartbeat_at = NOW() "
+                        "WHERE queue_id = $1",
+                        queue_id,
+                    )
+            except Exception:
+                # ONE transient write must not end the heartbeat. Without this
+                # the task dies on the first blip and never beats again, so a
+                # row that is still being worked looks stale after
+                # QUEUE_RECLAIM_THRESHOLD_SECONDS and gets reclaimed out from
+                # under the worker still processing it -- two workers on one
+                # row, from a single failed UPDATE. Keep beating; the next tick
+                # is QUEUE_HEARTBEAT_INTERVAL_SECONDS away and the reclaim
+                # threshold is an order of magnitude wider.
+                log.warning("worker.heartbeat_tick_failed", queue_id=queue_id)
+                continue
+            # A row legitimately taking many minutes keeps the drain's liveness
+            # beacon fresh, so a slow row is never mistaken for a dead worker.
+            note_progress()
 
     async def _mark_done(
         self,
@@ -862,12 +977,24 @@ class ReclaimLoop:
         self._shutdown.set()
 
 
-def _build_health_app():
-    """FastAPI app exposing `/health` so Fly can probe liveness.
+def _build_health_app(drain_stall_threshold_seconds: float | None = None):
+    """FastAPI app exposing `/health` so the orchestrator can probe liveness.
 
     Deliberately separate from the full ingestion app — this one runs
-    alongside the drain loop in the worker process so Fly's health
+    alongside the drain loop in the worker process so the health
     check has something to hit.
+
+    `drain_stall_threshold_seconds` opts the caller into the DRAIN check on top
+    of the DB check: `/health` reports 503 once the drain has shown no sign of
+    life (`seconds_since_progress`) for that long. Callers that run no drain
+    (any service reusing this app for a plain DB probe) leave it None and keep
+    the DB-only behaviour.
+
+    Checking the database was never enough. A worker whose loops have died
+    still holds an open uvicorn socket and still reaches Postgres, so it
+    answers 200 forever — which is precisely how the 2026-08-27 stall stayed
+    invisible for 26 hours. Liveness has to assert that the WORK is running,
+    not merely that its dependencies are reachable.
     """
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
@@ -879,12 +1006,20 @@ def _build_health_app():
     @app.get("/health")
     async def health() -> JSONResponse:
         db_ok = await health_check()
-        body = {
-            "status": "ok" if db_ok else "degraded",
+        body: dict[str, Any] = {
             "db": db_ok,
             "time": datetime.now(UTC).isoformat(),
         }
-        return JSONResponse(body, status_code=200 if db_ok else 503)
+        drain_ok = True
+        if drain_stall_threshold_seconds is not None:
+            stalled_for = seconds_since_progress()
+            drain_ok = stalled_for < drain_stall_threshold_seconds
+            body["drain_idle_seconds"] = round(stalled_for, 1)
+            body["drain_stall_threshold_seconds"] = drain_stall_threshold_seconds
+        ok = db_ok and drain_ok
+        body["status"] = "ok" if ok else "degraded"
+        body["drain"] = drain_ok
+        return JSONResponse(body, status_code=200 if ok else 503)
 
     return app
 
