@@ -227,6 +227,26 @@ def test_streaming_system_prompt_matches_nonstreaming_rule() -> None:
         assert marker in sp_stream, f"streaming prompt missing: {marker}"
 
 
+def test_source_preference_rule_includes_pi_as_agent_session() -> None:
+    """pi (PiConnector, kb/handlers/claude_code.py) emits chunks with
+    `source_system=pi` through the same synthesis pipeline as
+    claude_code/codex session chunks. The rule's AGENT SESSION
+    enumeration must name it explicitly — an unlisted source_system
+    gets no preference guidance at all — matching how
+    test_pi_source_constants.py pins pi's registered profile against
+    codex's rather than leaving it implicit."""
+    from datetime import UTC, datetime
+
+    now = datetime(2026, 5, 20, tzinfo=UTC)
+    sp_nonstream = _build_system_prompt(now)
+    sp_stream = _build_streaming_system_prompt(now)
+    for sp in (sp_nonstream, sp_stream):
+        # pi named alongside claude_code/codex in the AGENT SESSION
+        # bucket itself, not merely present anywhere in the prompt
+        # (e.g. accidentally only in the untrusted-data rule).
+        assert "claude_code, codex, pi" in sp
+
+
 def test_format_user_prompt_renders_neighbor_metadata_for_chronology() -> None:
     """The synthesis LLM previously refused chronology queries
     (answer="" on "reconstruct the multi-granola timeline") because

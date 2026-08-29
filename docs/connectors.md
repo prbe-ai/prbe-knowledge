@@ -11,6 +11,8 @@ Probe ingests from these sources:
 | `sentry`         | signed webhook  | Sentry webhook secret                         |
 | `custom_ingest`  | API             | push arbitrary documents (see below)          |
 | `claude_code`    | API             | Claude Code session ingest                    |
+| `codex`          | API             | Codex session ingest                          |
+| `pi`             | API             | pi session ingest                             |
 | `granola`        | API             | Granola meeting-notes ingest                  |
 | `manual_upload`  | API             | upload a file/document directly               |
 
