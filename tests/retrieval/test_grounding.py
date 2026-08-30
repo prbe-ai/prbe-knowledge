@@ -435,3 +435,44 @@ async def test_build_bundle_merges_doc_title_into_candidates(
     for c in bundle.candidates:
         assert c.canonical_id not in seen, f"duplicate candidate: {c.canonical_id}"
         seen.add(c.canonical_id)
+
+
+@pytest.mark.integration
+async def test_build_bundle_skips_doc_titles_above_token_ceiling(
+    seeded_customer, monkeypatch
+):
+    """Above _DOC_TITLE_MAX_TOKENS the doc-title channel must not run at all.
+
+    The gate exists because long keyword-bag probes are provably yield-free
+    there while costing the whole grounding stage its latency (the RLS-blocked
+    per-row scan — see the constant's comment). Asserting the function is
+    never CALLED, not just that it returns nothing: an implementation that
+    still ran the scan and discarded the rows would pass a result-shaped
+    assertion while keeping every millisecond of the cost.
+    """
+    called = False
+
+    async def spy(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return []
+
+    monkeypatch.setattr(
+        "engine.retrieval.grounding._fuzzy_match_document_titles", spy
+    )
+
+    # 7 tokens: one past the ceiling.
+    bundle = await build_bundle(
+        seeded_customer.customer_id,
+        "auto session tracking domain specific personalization classifier",
+    )
+    assert called is False
+    # The other channels are untouched by the gate.
+    assert "github" in bundle.connected_sources
+
+    # At the ceiling (6 tokens) the channel still runs.
+    await build_bundle(
+        seeded_customer.customer_id,
+        "auto session tracking domain specific personalization",
+    )
+    assert called is True
