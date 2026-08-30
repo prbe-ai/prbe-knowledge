@@ -25,6 +25,7 @@ from engine.shared.litellm_key import (
     current_tenant_virtual_key,
     get_tenant_virtual_key,
     invalidate_tenant_virtual_key,
+    optional_tenant_virtual_key_context,
     tenant_virtual_key_context,
 )
 
@@ -33,6 +34,7 @@ from engine.shared.litellm_key import (
 def _clear_cache_and_env(monkeypatch: pytest.MonkeyPatch):
     """Reset the in-memory key cache and env between tests."""
     litellm_key_mod._KEY_CACHE.clear()
+    litellm_key_mod._FAILURE_CACHE.clear()
     monkeypatch.setenv("BACKEND_BASE_URL", "http://prbe-backend.internal:8080")
     monkeypatch.setenv("INTERNAL_BACKEND_API_KEY", "test-internal-key")
     monkeypatch.delenv("LLM_GATEWAY_URL", raising=False)
@@ -286,3 +288,113 @@ async def test_caller_api_key_still_wins(monkeypatch: pytest.MonkeyPatch) -> Non
                 )
 
     assert fake.await_args.kwargs["api_key"] == "sk-explicit-override"
+
+
+# ---------------------------------------------------------------------------
+# Fail-open binding (optional_tenant_virtual_key_context)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_optional_context_binds_the_tenant_key_when_available() -> None:
+    """The happy path is identical to the strict context manager."""
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"litellm_key": "sk-tenant"})
+    )
+    async with (
+        httpx.AsyncClient(transport=transport) as http,
+        optional_tenant_virtual_key_context("cust-1", http=http) as key,
+    ):
+        assert key == "sk-tenant"
+        assert current_tenant_virtual_key() == "sk-tenant"
+    assert current_tenant_virtual_key() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "handler",
+    [
+        pytest.param(lambda request: httpx.Response(404), id="no-key-for-tenant"),
+        pytest.param(lambda request: httpx.Response(500), id="control-plane-5xx"),
+        pytest.param(
+            lambda request: httpx.Response(200, json={"nope": 1}), id="malformed-body"
+        ),
+    ],
+)
+async def test_optional_context_never_breaks_the_request(handler) -> None:
+    """Attribution must not cost availability.
+
+    `tenant_virtual_key_context` RAISES on all three of these. Wrapping a
+    retrieval entrypoint in it would take search down for a tenant whenever
+    the control plane blipped or a tenant had no key minted yet. The
+    fail-open sibling yields None and lets the call fall through to the
+    process-wide LLM_GATEWAY_KEY -- today's behaviour.
+    """
+    transport = httpx.MockTransport(handler)
+    async with (
+        httpx.AsyncClient(transport=transport) as http,
+        optional_tenant_virtual_key_context("cust-1", http=http) as key,
+    ):
+        assert key is None
+        assert current_tenant_virtual_key() is None
+
+
+@pytest.mark.asyncio
+async def test_optional_context_survives_transport_failure() -> None:
+    """A dead control plane degrades, it does not raise."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("control plane unreachable")
+
+    transport = httpx.MockTransport(handler)
+    async with (
+        httpx.AsyncClient(transport=transport) as http,
+        optional_tenant_virtual_key_context("cust-1", http=http) as key,
+    ):
+        assert key is None
+
+
+@pytest.mark.asyncio
+async def test_optional_context_negative_caches_so_an_outage_is_not_per_request() -> None:
+    """The latency guarantee, not just the availability one.
+
+    `_KEY_CACHE` only remembers success, so without a negative cache a
+    control-plane outage would put a 5s fetch timeout in front of EVERY
+    retrieval request -- a sixth of the gatherer's budget, re-learning the
+    same failure each time. The second call must not touch the network.
+    """
+    call_count = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_count["n"] += 1
+        return httpx.Response(503)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        async with optional_tenant_virtual_key_context("cust-1", http=http) as first:
+            assert first is None
+        async with optional_tenant_virtual_key_context("cust-1", http=http) as second:
+            assert second is None
+
+    assert call_count["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_invalidate_clears_the_negative_cache_too() -> None:
+    """A recovered control plane must be reachable before the failure TTL.
+
+    Otherwise rotating or minting a key leaves the tenant unattributed for
+    the remainder of the window with no way to force a retry.
+    """
+    responses = iter([httpx.Response(503), httpx.Response(200, json={"litellm_key": "sk-new"})])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return next(responses)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        async with optional_tenant_virtual_key_context("cust-1", http=http) as first:
+            assert first is None
+        invalidate_tenant_virtual_key("cust-1")
+        async with optional_tenant_virtual_key_context("cust-1", http=http) as second:
+            assert second == "sk-new"

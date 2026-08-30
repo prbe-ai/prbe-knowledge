@@ -157,3 +157,5 @@ jobs:
           tests/handlers/test_slack.py
           tests/test_pg_search_guardian.py
           tests/test_pg_search_rebuild.py
+          tests/test_litellm_key.py
+          tests/retrieval/test_tenant_key_binding.py

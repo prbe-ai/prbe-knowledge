@@ -42,6 +42,7 @@ from engine.retrieval.router import (
     _fallback_intent,
 )
 from engine.shared.constants import SEARCH_AGENT_INFERENCE_MODEL
+from engine.shared.litellm_key import optional_tenant_virtual_key_context
 from engine.shared.logging import get_logger
 from engine.shared.models import (
     QueryRequest,
@@ -132,7 +133,8 @@ async def run_router_phase(
 
     t_grounding = time.perf_counter()
     try:
-        bundle = await _build_bundle_with_token_fallback(customer_id, req.query)
+        async with optional_tenant_virtual_key_context(customer_id):
+            bundle = await _build_bundle_with_token_fallback(customer_id, req.query)
     except Exception as exc:
         log.warning(
             "pipeline.grounding_failed",
@@ -211,7 +213,8 @@ async def run_search_phase(
     re-runs grounding internally — they're cheap and keep the agent
     self-contained for testability).
     """
-    return await run_gatherer(req, customer_id, request=request)
+    async with optional_tenant_virtual_key_context(customer_id):
+        return await run_gatherer(req, customer_id, request=request)
 
 
 async def run_retrieval(
@@ -226,4 +229,5 @@ async def run_retrieval(
     `run_router_phase` + `run_search_phase` separately to emit SSE
     progress events between grounding and the agent loop.
     """
-    return await run_gatherer(req, customer_id, request=request)
+    async with optional_tenant_virtual_key_context(customer_id):
+        return await run_gatherer(req, customer_id, request=request)
