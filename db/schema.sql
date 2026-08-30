@@ -4,6 +4,22 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS btree_gin;
+-- pg_prewarm (0123): the guardian's post-promotion cache warm. TOLERANT of
+-- both absence and privilege, unlike the three above: pg_prewarm is an
+-- UNTRUSTED extension (superuser or explicit grant required), and this file
+-- bootstraps installs whose migration role is not superuser. The guardian
+-- itself skips with a log line when the extension is missing, so failing the
+-- whole bootstrap over an optimization would invert the dependency.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_prewarm') THEN
+        BEGIN
+            CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE NOTICE 'pg_prewarm not created (insufficient privilege); guardian prewarm will skip';
+        END;
+    END IF;
+END $$;
 
 -- Apache AGE was evaluated and is not available on Neon Scale tier.
 -- Graph is modeled as relational tables (graph_nodes + graph_edges) below,
@@ -365,6 +381,12 @@ CREATE TABLE chunks (
 -- v1 HNSW index over `embedding` was dropped in migration 0071 (no
 -- production reader after the cutover).
 CREATE INDEX idx_chunks_embedding_v2_hnsw ON chunks USING hnsw (embedding_v2 halfvec_cosine_ops);
+-- Live-only twin (0124): serves TemporalMode.LATEST -- the default, whose
+-- chunk predicate (valid_to IS NULL) implies this index's. Only ~35% of
+-- chunks are live, so the full index walks 3x the graph the default path
+-- needs. The full index above STAYS: ALL/AS_OF modes and the inferred-edges
+-- bundle still order over every version.
+CREATE INDEX idx_chunks_embedding_v2_hnsw_live ON chunks USING hnsw (embedding_v2 halfvec_cosine_ops) WHERE valid_to IS NULL;
 CREATE INDEX idx_chunks_customer       ON chunks (customer_id);
 CREATE INDEX idx_chunks_doc            ON chunks (doc_id);
 CREATE INDEX idx_chunks_doc_live       ON chunks (doc_id) WHERE valid_to IS NULL;

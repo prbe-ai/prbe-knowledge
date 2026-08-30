@@ -46,7 +46,23 @@ PER_SOURCE_ANN_POOL = 400
 # Module-level (per process, not per request) because the storm IS
 # cross-request: the four sub-queries arrive as concurrent tasks in one
 # process, and bounding each request separately would bound nothing.
-_ANN_STATEMENT_SEMAPHORE = asyncio.Semaphore(4)
+#
+# SIX since 2026-08-30, re-priced for a database that no longer matches the
+# one the four was measured on. The 2026-08-26 sizing was against 2 vCPUs,
+# 1GB shared_buffers and a 6.2GB HNSW index mostly on disk -- admission
+# control was standing in for capacity. The database now runs 3.5 vCPUs
+# (research-os #1175) with the index resident on a 24Gi node (#1143), so
+# statements are CPU-shaped and short, and width 4 left cores idle while
+# top-ups queued: the vector channel measured ~5.5s under a 4-sub-query
+# burst with individual statements at ~1-2s. Six admits one more pool + a
+# top-up concurrently without re-creating the 24-way storm the four was
+# built against. Re-measure, not raise, if the index outgrows memory again
+# -- on a disk-bound database four was the better number. COUPLED KNOB:
+# SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES (constants.py) sets how many
+# sub-queries feed this gate; its documented rollback to 4 restores the old
+# fan-out volume through THIS wider gate, so on a disk-bound database the
+# two must be considered together, not flipped independently.
+_ANN_STATEMENT_SEMAPHORE = asyncio.Semaphore(6)
 
 
 @dataclass(slots=True)

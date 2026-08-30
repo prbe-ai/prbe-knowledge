@@ -265,6 +265,71 @@ async def analyze_tables(conn: asyncpg.Connection, tables: list[str]) -> None:
             log.warning("guardian.analyze_failed", table=table, error=str(exc))
 
 
+async def prewarm_indexes(
+    conn: asyncpg.Connection, indexes: list[str]
+) -> None:
+    """pg_prewarm the retrieval hot set after a promotion.
+
+    A promoted standby serves its first queries from a cold cache, and the
+    first storm-shaped search measured 66.8s against a 30s caller budget
+    until buffers warmed (~2 queries) -- every failover ships one guaranteed
+    engine_timeout to whoever searches first. Observed again 2026-08-30
+    after the CPU-limit rollout's switchover: first query 30s
+    engine_timeout, second 10.9s.
+
+    'read' mode, not 'buffer': it pulls blocks into the OS page cache
+    without evicting shared_buffers -- 'buffer' would trade chunks of the
+    working set for whichever index warms last. The OS cache is where the
+    24Gi node keeps the hot set anyway (~16GB of page cache in steady
+    state), and the list the cron passes is the DEFAULT path's indexes
+    (the live HNSW twin + bm25, ~3.3GB together), not the 7.7GB full HNSW
+    index the planner no longer picks for LATEST-mode queries.
+
+    Best-effort with the same posture and for the same reason as
+    `analyze_tables` directly above: this is an optimization on top of the
+    repair, and a raise here must not stop the tick from recording the
+    timeline. Additionally skipped in full when the extension is absent
+    (pg_prewarm ships in contrib but a self-host database may not have run
+    migration 0123), because alerting every minute about a missing
+    optimization would train operators to ignore the guardian.
+    """
+    # The availability probe is itself guarded: it is a network round-trip on
+    # a just-promoted, I/O-saturated instance -- the most likely moment for a
+    # transient failure in this whole function -- and an exception escaping
+    # here would reach the tick. (No identifier validation, deliberately:
+    # unlike analyze_tables, every name below travels as a $1 bind parameter,
+    # never interpolated, so there is nothing to inject into.)
+    try:
+        if await conn.fetchval("SELECT to_regproc('pg_prewarm')") is None:
+            log.info("guardian.prewarm_skipped", reason="pg_prewarm not installed")
+            return
+    except Exception as exc:
+        log.warning("guardian.prewarm_probe_failed", error=str(exc))
+        return
+    for index in indexes:
+        try:
+            if await conn.fetchval("SELECT to_regclass($1)", index) is None:
+                log.info(
+                    "guardian.prewarm_skipped", index=index,
+                    reason="index does not exist",
+                )
+                continue
+            # Per-call client-side timeout, sized UNDER the CronJob's own
+            # activeDeadlineSeconds with room for both indexes: the live
+            # HNSW read is ~2.7GB (~6-20s), bm25 ~0.6GB. 60s bounds a
+            # pathological disk without letting the warm eat the pod
+            # deadline; asyncpg cancels the statement on expiry, so nothing
+            # leaks into later ticks. A partial warm is a partial win, not
+            # a failure -- this runs after the repair and the timeline
+            # record (see the call site).
+            blocks = await conn.fetchval(
+                "SELECT pg_prewarm($1, 'read')", index, timeout=60.0
+            )
+            log.info("guardian.prewarmed", index=index, blocks=blocks)
+        except Exception as exc:
+            log.warning("guardian.prewarm_failed", index=index, error=str(exc))
+
+
 async def read_last_timeline(conn: asyncpg.Connection) -> int | None:
     """The timeline the guardian last recorded, or None on its first ever tick."""
     return await conn.fetchval("SELECT last_timeline_id FROM pg_search_guardian_state WHERE id = 1")
