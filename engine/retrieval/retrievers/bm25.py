@@ -345,6 +345,42 @@ async def bm25_search(
         # the old predicate was really providing.
         params.append(top_k * _BM25_POOL_MULTIPLIER)
         pool_idx = len(params)
+        # The tenant and visibility filters appear TWICE below, and both
+        # copies are load-bearing.
+        #
+        # As plain SQL predicates (`c.customer_id = $1`, `c.visibility =
+        # 'approved'`) pg_search cannot see them: the ParadeDB scan applies
+        # them as per-candidate HEAP filters, so TopK walks the heap for every
+        # chunk in the OR match set before the LIMIT ever binds. Measured on
+        # the research primary (2026-08-30, probe tenant, a real 17-token
+        # query): 403,559 buffer touches and 5,814 ms to return 300 rows --
+        # against 407 ms for the identical ranking with no filter at all. The
+        # entire gap is heap checks, and it scales with the match set and the
+        # cold cache, which is what produced the 13-21 s storm numbers.
+        #
+        # Restating them INSIDE the boolean as `must` clauses keeps the
+        # filtering index-side and TopK execution intact: same query, same
+        # tenant, 1,269 ms under FORCE RLS as the app role. The nested
+        # `should` boolean must ride inside `must`, not beside it -- Tantivy
+        # treats bare `should` legs as optional once any `must` exists, which
+        # would silently widen the match set to the whole tenant.
+        #
+        # `match(..., conjunction_mode => true)`, NOT `term()`, for
+        # customer_id: the field is indexed under the default tokenizer, which
+        # splits on hyphens, so term('customer_id', 'bucket-robotics') looks
+        # up a token that does not exist and returns ZERO rows for every
+        # hyphenated tenant (verified live). conjunction_mode requires every
+        # token of the id, which is correct and cheap.
+        #
+        # The SQL predicates STAY, because the index-side clause is a
+        # pre-filter, not the correctness filter: tokenized ids overlap
+        # ('probe' matches probe-demo's first token), and under FORCE RLS the
+        # policy qual re-applies the tenant check regardless. Belt and braces,
+        # in that order.
+        tenant_must = "paradedb.match('customer_id', $1, conjunction_mode => true)"
+        visibility_must = (
+            "" if include_drafts else "paradedb.term('visibility', 'approved'),"
+        )
         pool_sql = f"""
             SELECT c.chunk_id,
                    c.doc_id,
@@ -357,9 +393,13 @@ async def bm25_search(
                    (c.content_tsv @@ to_tsquery('english', $4)) AS content_hit
             FROM chunks c
             WHERE c.customer_id = $1
-              AND c.chunk_id @@@ paradedb.boolean(should => ARRAY[
-                    paradedb.boost({_BM25_TITLE_BOOST}, paradedb.match('title', $2)),
-                    paradedb.match('content', $2)
+              AND c.chunk_id @@@ paradedb.boolean(must => ARRAY[
+                    {tenant_must},
+                    {visibility_must}
+                    paradedb.boolean(should => ARRAY[
+                      paradedb.boost({_BM25_TITLE_BOOST}, paradedb.match('title', $2)),
+                      paradedb.match('content', $2)
+                    ])
                   ])
               {"" if include_drafts else "AND c.visibility = 'approved'"}
               {pred.chunk_sql}
