@@ -476,3 +476,74 @@ async def test_build_bundle_skips_doc_titles_above_token_ceiling(
         "auto session tracking domain specific personalization",
     )
     assert called is True
+
+
+@pytest.mark.integration
+async def test_multi_probe_matchers_equal_single_probe_loop(seeded_customer):
+    """The batched matchers' contract: index i is byte-identical to the
+    single-probe function called with probes[i].
+
+    This is what lets `_build_bundle_with_token_fallback` swap N
+    build_bundle calls for two batched statements without changing one
+    result. Probes deliberately mix a hit, a partial, and a miss so the
+    per-probe caps and orderings are exercised, not just emptiness.
+    """
+    from engine.retrieval.grounding import (
+        _fuzzy_match_document_titles_multi,
+        _fuzzy_match_entities_multi,
+    )
+
+    probes = ["auth", "refactor", "zzz-no-such-token"]
+
+    multi_ent = await _fuzzy_match_entities_multi(
+        seeded_customer.customer_id, probes, per_type_cap=5, total_cap=20
+    )
+    multi_title = await _fuzzy_match_document_titles_multi(
+        seeded_customer.customer_id, probes
+    )
+    assert len(multi_ent) == len(probes)
+    assert len(multi_title) == len(probes)
+
+    for i, probe in enumerate(probes):
+        single_ent = await _fuzzy_match_entities(
+            customer_id=seeded_customer.customer_id,
+            tokens=[probe],
+            per_type_cap=5,
+            total_cap=20,
+        )
+        single_title = await _fuzzy_match_document_titles(
+            seeded_customer.customer_id, [probe]
+        )
+        assert multi_ent[i] == single_ent, f"entity mismatch for probe {probe!r}"
+        assert multi_title[i] == single_title, (
+            f"doc-title mismatch for probe {probe!r}"
+        )
+
+
+@pytest.mark.integration
+async def test_token_fallback_uses_batched_matchers(seeded_customer, monkeypatch):
+    """The fallback must not run one bundle per token any more.
+
+    Counting calls, not results: a regression back to per-probe
+    build_bundle calls would return identical candidates while restoring
+    all N tenant-wide scans.
+    """
+    from engine.retrieval import router as router_mod
+
+    bundle_calls = 0
+    real_build_bundle = router_mod.build_bundle
+
+    async def counting_build_bundle(*args, **kwargs):
+        nonlocal bundle_calls
+        bundle_calls += 1
+        return await real_build_bundle(*args, **kwargs)
+
+    monkeypatch.setattr(router_mod, "build_bundle", counting_build_bundle)
+
+    bundle = await router_mod._build_bundle_with_token_fallback(
+        seeded_customer.customer_id, "auth refactor deploy pipeline"
+    )
+    # Exactly one bundle: the initial full-query one. The probes ride the
+    # two batched matchers instead.
+    assert bundle_calls == 1
+    assert "github" in bundle.connected_sources
