@@ -521,7 +521,18 @@ async def test_prewarm_failure_does_not_abort_the_batch() -> None:
     assert conn.prewarmed == ["idx_b"]
 
 
-async def test_prewarm_refuses_a_suspicious_identifier() -> None:
-    conn = _PrewarmConn()
-    with pytest.raises(ValueError, match="suspicious"):
-        await guardian.prewarm_indexes(conn, ['idx"; DROP TABLE chunks; --'])  # type: ignore[arg-type]
+async def test_prewarm_probe_failure_is_swallowed() -> None:
+    """The availability probe is the most likely call in this function to
+    fail transiently (a just-promoted, I/O-saturated instance), and it runs
+    OUTSIDE the per-index try -- so it needs its own guard, or the raise
+    reaches the tick before record_timeline and re-arms the promotion alert
+    every minute. Nothing may escape prewarm_indexes, full stop."""
+    class _ProbeBlows(_PrewarmConn):
+        async def fetchval(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+            if "to_regproc" in sql:
+                raise RuntimeError("connection reset")
+            return await super().fetchval(sql, *args, **kwargs)
+
+    conn = _ProbeBlows()
+    await guardian.prewarm_indexes(conn, ["idx_a"])  # type: ignore[arg-type]
+    assert conn.prewarmed == []

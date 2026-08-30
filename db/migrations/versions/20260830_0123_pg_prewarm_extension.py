@@ -4,14 +4,17 @@ Every failover ships one guaranteed engine_timeout today: the promoted
 instance serves its first searches from a cold cache, and the first
 storm-shaped query measured 66.8s against the caller's 30s budget (observed
 again 2026-08-30: first post-switchover query 30s engine_timeout). The
-guardian's post-promotion hook (`prewarm_indexes`) reads the HNSW and BM25
-indexes into the OS page cache; this migration is only the extension it
-calls.
+guardian's post-promotion hook (`prewarm_indexes`) reads the hot indexes
+into the OS page cache; this migration is only the extension it calls.
 
-`IF NOT EXISTS` keeps this idempotent against a database where an operator
-installed it by hand first. The guardian itself degrades gracefully when the
-extension is absent (a self-host that never runs this migration just logs
-`guardian.prewarm_skipped`), so nothing hard-depends on it.
+TOLERANT of absence and privilege, and that is the load-bearing part:
+pg_prewarm is an UNTRUSTED extension -- unlike vector/pg_trgm/btree_gin it
+needs superuser (or an explicit grant) to create -- and alembic runs every
+migration on every install, so a bare CREATE EXTENSION here would fail the
+whole upgrade on exactly the self-host whose operator was never told to
+preinstall it (docs list only the three trusted ones). The guardian degrades
+gracefully when the extension is absent (`guardian.prewarm_skipped`), so
+nothing hard-depends on it and this migration must not either.
 """
 
 from alembic import op
@@ -23,7 +26,20 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute("CREATE EXTENSION IF NOT EXISTS pg_prewarm")
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_prewarm') THEN
+                BEGIN
+                    CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'pg_prewarm not created (insufficient privilege); guardian prewarm will skip';
+                END;
+            END IF;
+        END $$
+        """
+    )
 
 
 def downgrade() -> None:

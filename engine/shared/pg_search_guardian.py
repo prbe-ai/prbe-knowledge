@@ -278,10 +278,12 @@ async def prewarm_indexes(
     engine_timeout, second 10.9s.
 
     'read' mode, not 'buffer': it pulls blocks into the OS page cache
-    without evicting shared_buffers, and the HNSW index (7.7GB) is larger
-    than shared_buffers (6GB) -- 'buffer' would trade the whole working set
-    for one index. The OS cache is where the 24Gi node keeps the hot set
-    anyway (~16GB of page cache in steady state).
+    without evicting shared_buffers -- 'buffer' would trade chunks of the
+    working set for whichever index warms last. The OS cache is where the
+    24Gi node keeps the hot set anyway (~16GB of page cache in steady
+    state), and the list the cron passes is the DEFAULT path's indexes
+    (the live HNSW twin + bm25, ~3.3GB together), not the 7.7GB full HNSW
+    index the planner no longer picks for LATEST-mode queries.
 
     Best-effort with the same posture and for the same reason as
     `analyze_tables` directly above: this is an optimization on top of the
@@ -291,12 +293,20 @@ async def prewarm_indexes(
     migration 0123), because alerting every minute about a missing
     optimization would train operators to ignore the guardian.
     """
-    if await conn.fetchval("SELECT to_regproc('pg_prewarm')") is None:
-        log.info("guardian.prewarm_skipped", reason="pg_prewarm not installed")
+    # The availability probe is itself guarded: it is a network round-trip on
+    # a just-promoted, I/O-saturated instance -- the most likely moment for a
+    # transient failure in this whole function -- and an exception escaping
+    # here would reach the tick. (No identifier validation, deliberately:
+    # unlike analyze_tables, every name below travels as a $1 bind parameter,
+    # never interpolated, so there is nothing to inject into.)
+    try:
+        if await conn.fetchval("SELECT to_regproc('pg_prewarm')") is None:
+            log.info("guardian.prewarm_skipped", reason="pg_prewarm not installed")
+            return
+    except Exception as exc:
+        log.warning("guardian.prewarm_probe_failed", error=str(exc))
         return
     for index in indexes:
-        if not index.replace("_", "").isalnum():
-            raise ValueError(f"refusing to prewarm suspicious identifier: {index!r}")
         try:
             if await conn.fetchval("SELECT to_regclass($1)", index) is None:
                 log.info(
@@ -304,12 +314,16 @@ async def prewarm_indexes(
                     reason="index does not exist",
                 )
                 continue
-            # Per-call client-side timeout: the HNSW read is ~16-60s of
-            # sequential I/O; 240s bounds a pathological disk without
-            # letting one index wedge the tick forever. asyncpg cancels
-            # the statement on expiry, so nothing leaks into later ticks.
+            # Per-call client-side timeout, sized UNDER the CronJob's own
+            # activeDeadlineSeconds with room for both indexes: the live
+            # HNSW read is ~2.7GB (~6-20s), bm25 ~0.6GB. 60s bounds a
+            # pathological disk without letting the warm eat the pod
+            # deadline; asyncpg cancels the statement on expiry, so nothing
+            # leaks into later ticks. A partial warm is a partial win, not
+            # a failure -- this runs after the repair and the timeline
+            # record (see the call site).
             blocks = await conn.fetchval(
-                "SELECT pg_prewarm($1, 'read')", index, timeout=240.0
+                "SELECT pg_prewarm($1, 'read')", index, timeout=60.0
             )
             log.info("guardian.prewarmed", index=index, blocks=blocks)
         except Exception as exc:

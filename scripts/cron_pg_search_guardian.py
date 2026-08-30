@@ -64,12 +64,15 @@ log = get_logger(__name__)
 # serving cold. These are the large ones on the retrieval hot path.
 ANALYZE_AFTER_PROMOTION = ["chunks", "documents"]
 
-# Indexes worth pg_prewarm'ing after a promotion -- the retrieval hot path's
-# two big ones, in the order a cold search hits them. Same explicit-list
-# discipline as ANALYZE_AFTER_PROMOTION: warming everything would be a
-# surprise I/O storm on an instance already serving cold.
+# Indexes worth pg_prewarm'ing after a promotion -- what the DEFAULT search
+# path actually walks, in the order a cold search hits them. The LIVE partial
+# HNSW index (0124), not the full one: TemporalMode.LATEST's planner choice
+# is the live index, and the full one goes cold in cache by design -- warming
+# 7.7GB of it would evict hot pages to speed up queries nobody runs. Same
+# explicit-list discipline as ANALYZE_AFTER_PROMOTION: warming everything
+# would be a surprise I/O storm on an instance already serving cold.
 PREWARM_AFTER_PROMOTION = [
-    "idx_chunks_embedding_v2_hnsw",
+    "idx_chunks_embedding_v2_hnsw_live",
     "idx_chunks_bm25_v2",
 ]
 
@@ -146,9 +149,6 @@ async def run_once(*, dry_run: bool = False) -> int:
             )
             if not dry_run:
                 await analyze_tables(conn, ANALYZE_AFTER_PROMOTION)
-                # After ANALYZE, so the first post-warm queries also plan
-                # well. Both are best-effort; neither can abort the tick.
-                await prewarm_indexes(conn, PREWARM_AFTER_PROMOTION)
 
         if debris:
             # Alert-only, never dropped: an in-progress CONCURRENTLY build is
@@ -200,6 +200,19 @@ async def run_once(*, dry_run: bool = False) -> int:
         # already handled one.
         if not dry_run:
             await record_timeline(conn, timeline)
+
+        # Prewarm AFTER the repair and AFTER the timeline is recorded, on
+        # purpose and against the reading order. The warm is minutes of
+        # sequential I/O on a freshly promoted instance, and the CronJob has
+        # an activeDeadlineSeconds it can hit mid-read -- if that happened
+        # BEFORE record_timeline, the killed tick would never advance the
+        # marker, the next tick would re-detect the same promotion, and the
+        # repair would livelock behind a cache warm forever (with
+        # concurrencyPolicy: Forbid skipping ticks in between). Here, a
+        # deadline kill costs only the tail of an optimization: the repair
+        # is done, the timeline is recorded, and search is already serving.
+        if promoted and not dry_run:
+            await prewarm_indexes(conn, PREWARM_AFTER_PROMOTION)
 
     # A repair nobody was told about is the one outcome worse than no repair:
     # BM25 silently stays off until somebody notices search got worse. Exiting

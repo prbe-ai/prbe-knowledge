@@ -4,9 +4,22 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS btree_gin;
--- pg_prewarm (0123): the guardian's post-promotion cache warm. Optional at
--- runtime -- prewarm_indexes skips with a log line when absent.
-CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+-- pg_prewarm (0123): the guardian's post-promotion cache warm. TOLERANT of
+-- both absence and privilege, unlike the three above: pg_prewarm is an
+-- UNTRUSTED extension (superuser or explicit grant required), and this file
+-- bootstraps installs whose migration role is not superuser. The guardian
+-- itself skips with a log line when the extension is missing, so failing the
+-- whole bootstrap over an optimization would invert the dependency.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = 'pg_prewarm') THEN
+        BEGIN
+            CREATE EXTENSION IF NOT EXISTS pg_prewarm;
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE NOTICE 'pg_prewarm not created (insufficient privilege); guardian prewarm will skip';
+        END;
+    END IF;
+END $$;
 
 -- Apache AGE was evaluated and is not available on Neon Scale tier.
 -- Graph is modeled as relational tables (graph_nodes + graph_edges) below,

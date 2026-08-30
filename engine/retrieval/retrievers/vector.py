@@ -57,7 +57,11 @@ PER_SOURCE_ANN_POOL = 400
 # burst with individual statements at ~1-2s. Six admits one more pool + a
 # top-up concurrently without re-creating the 24-way storm the four was
 # built against. Re-measure, not raise, if the index outgrows memory again
-# -- on a disk-bound database four was the better number.
+# -- on a disk-bound database four was the better number. COUPLED KNOB:
+# SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES (constants.py) sets how many
+# sub-queries feed this gate; its documented rollback to 4 restores the old
+# fan-out volume through THIS wider gate, so on a disk-bound database the
+# two must be considered together, not flipped independently.
 _ANN_STATEMENT_SEMAPHORE = asyncio.Semaphore(6)
 
 

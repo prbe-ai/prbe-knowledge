@@ -139,4 +139,21 @@ INDEX_CONTRACTS: Final[tuple[IndexContract, ...]] = (
             "Documented pgvector behaviour (pgvector#760)."
         ),
     ),
+    IndexContract(
+        index="idx_chunks_embedding_v2_hnsw_live",
+        table="chunks",
+        expression="halfvec_cosine_ops) WHERE valid_to IS NULL",
+        source_file="engine/retrieval/temporal.py",
+        predicate="chunk_sql=f\"AND {chunk_alias}.valid_to IS NULL\"",
+        why=(
+            "The live-only twin (0124) is chosen by the planner ONLY while "
+            "TemporalMode.LATEST's chunk predicate exactly implies the index's "
+            "WHERE clause. Only ~35% of chunks are live, so losing the "
+            "implication silently returns every default ANN query to walking "
+            "3x the graph on the full index -- with no error, no test failure "
+            "and no guardian signal, since hnsw is outside the pg_search "
+            "scans. If LATEST ever grows an OR-form (the AS_OF branch already "
+            "has one), this contract is what fires."
+        ),
+    ),
 )

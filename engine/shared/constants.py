@@ -1124,26 +1124,60 @@ SEARCH_AGENT_FETCH_CHUNKS_MAX = 10
 # funnel has room -- measured in production, ~280 candidates are rendered to
 # return 10-16 results.
 #
+def _env_int(name: str, default: int) -> int:
+    """Tolerant env-int parse for constants advertised as incident-time knobs.
+
+    A bare `int(os.getenv(...))` at module import turns a typo'd
+    `kubectl set env` -- an empty value, `four`, `2.0` -- into an
+    ImportError on every pod, i.e. the whole engine crashlooping during the
+    exact incident the knob exists to mitigate. Malformed values fall back
+    to the shipped default; logging is not available this early, so the
+    fallback is silent by necessity and the kubectl description of each
+    knob says to verify the value took effect.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 # Total prefanout sub-queries per search: the raw query plus at most
 # (N - 1) extractor reformulations. Everything downstream scales LINEARLY
 # with this number -- each sub-query runs all four channels, so it is the
 # multiplier on total database work (measured fan-out factor 3.3-3.9x at
 # the old effective value of 4).
 #
-# TWO since 2026-08-30, down from the extractor's full 1 + 3. The
-# reformulations' recall value has never been measured; their cost now has
-# been, and at 2 the raw query keeps one reformulation (the extractor's
-# first, which its prompt orders most-confident-first) while halving DB
-# work. This is a RECALL-AFFECTING change shipped ahead of its eval: run
-# the retrieval eval suite (research-os#1126) against 2 vs 4 before
-# treating this number as settled, and prefer flipping the env var to
-# hand-reverting.
+# TWO since 2026-08-30, down from the extractor's full 1 + 3, by explicit
+# owner decision, and the cost of the cut should be stated plainly rather
+# than smoothed over: the extractor's prompt DECOMPOSES multi-hop questions
+# into one sub-query per factual piece (extractor.py ~180-196), so at 2 a
+# "when did X happen and who fixed it" search keeps hop 1 and structurally
+# drops hops 2-3 -- the reformulations are complementary coverage, not
+# ranked alternatives. Their recall value has never been measured; their
+# cost now has been. Run the retrieval eval suite (research-os#1126,
+# which has a dedicated multi-hop suite -- currently 0.08 recall@10, so
+# there is signal to lose) against 2 vs 4 before treating this number as
+# settled. The extractor still generates its full 3 (its prompt and
+# _MAX_SUB_QUERIES are untouched); trimming happens at prefanout assembly,
+# so the LLM tokens for dropped reformulations are still spent -- capping
+# generation at the source is the follow-up if 2 survives the eval.
 #
 # Env-overridable for exactly that experiment and for the regression case:
 # `kubectl set env DEPLOY SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES=4` restores
-# the old behaviour without a release. Floor of 1 = raw query only.
+# the old fan-out volume without a release -- verify the value took effect
+# (a malformed value silently falls back to 2, see _env_int). NOTE the
+# rollback interacts with the ANN admission gate: 4 restores old VOLUME
+# through the post-2026-08-30 Semaphore(6) in
+# engine/retrieval/retrievers/vector.py, wider than the Semaphore(4) the
+# old volume was bounded by -- fine on the resident-index database both
+# were re-priced for, but on a disk-bound one (index outgrown memory,
+# prewarm failed) flip that semaphore's caveat first. Floor of 1 = raw
+# query only.
 SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES = max(
-    1, int(os.getenv("SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES", "2"))
+    1, _env_int("SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES", 2)
 )
 
 # Env-overridable because it is the first dial to reach for if recall

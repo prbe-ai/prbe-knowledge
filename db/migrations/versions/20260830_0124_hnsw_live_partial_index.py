@@ -31,6 +31,32 @@ depends_on = None
 
 
 def upgrade() -> None:
+    # Drop an INVALID leftover FIRST. `CREATE INDEX IF NOT EXISTS` matches on
+    # NAME alone, and an interrupted CONCURRENTLY build -- the exact
+    # production path this migration leans on -- leaves an INVALID index the
+    # planner ignores. Without this guard the migration would no-op against
+    # the corpse, record itself applied, and every LATEST-mode query would
+    # keep walking the full index with nothing anywhere to say so (the
+    # guardian's debris scan covers pg_search access methods only). Same
+    # convention as 0062/0099/0105.
+    op.execute(
+        """
+        DO $$
+        DECLARE
+            invalid_name text;
+        BEGIN
+            SELECT c.relname INTO invalid_name
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            WHERE c.relname = 'idx_chunks_embedding_v2_hnsw_live'
+              AND NOT i.indisvalid;
+            IF invalid_name IS NOT NULL THEN
+                RAISE NOTICE 'dropping INVALID %', invalid_name;
+                EXECUTE 'DROP INDEX ' || quote_ident(invalid_name);
+            END IF;
+        END $$
+        """
+    )
     op.execute(
         "CREATE INDEX IF NOT EXISTS idx_chunks_embedding_v2_hnsw_live "
         "ON chunks USING hnsw (embedding_v2 halfvec_cosine_ops) "

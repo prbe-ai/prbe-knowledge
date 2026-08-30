@@ -2538,8 +2538,16 @@ async def test_prefanout_subqueries_capped_at_constant(
     runs all four channels), so a regression here silently multiplies
     database work -- which is exactly why the assertion is on what
     execute_search RECEIVES, not on any timing.
+
+    The constant is MONKEYPATCHED to a literal, not imported: the constant
+    is env-overridable by design (the 2-vs-4 eval experiment its comment
+    prescribes runs by exporting it), and a test that asserts against the
+    ambient value fails in exactly that shell while pinning nothing at the
+    shipped default.
     """
-    from engine.shared.constants import SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES", 2
+    )
 
     req = QueryRequest(query="raw query", customer_id="cust-1", top_k=5)
 
@@ -2573,6 +2581,5 @@ async def test_prefanout_subqueries_capped_at_constant(
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
     queries = captured.await_args.kwargs["queries"]
-    assert queries[0] == "raw query"
-    assert len(queries) == SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES
-    assert "alt one" in queries  # most-confident reformulation kept
+    # Exact list: raw first, then the first non-echo reformulation, capped.
+    assert queries == ["raw query", "alt one"]
