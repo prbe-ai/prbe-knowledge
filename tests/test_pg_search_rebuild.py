@@ -89,3 +89,33 @@ def test_rebuild_uses_a_bounded_memory_budget() -> None:
     assert REBUILD_MAINTENANCE_WORK_MEM.endswith("MB")
     assert int(REBUILD_MAINTENANCE_WORK_MEM.removesuffix("MB")) <= 256
     assert REBUILD_PARALLEL_WORKERS == 0
+
+
+def test_the_rebuild_overrides_the_pools_command_timeout() -> None:
+    """The bug that let a real rebuild die at exactly 300 seconds.
+
+    `engine/shared/db.py` builds the pool with
+    `command_timeout=settings.db_statement_timeout_ms / 1000` -- 300s by
+    default. asyncpg applies that to EVERY call unless one is passed
+    explicitly, and `timeout=None` does not disable it, it selects exactly that
+    default. `SET statement_timeout = 0` only relaxes the server side.
+
+    So the rebuild must pass its own timeout, and it must be larger than any
+    plausible build and smaller than the CronJob's activeDeadlineSeconds (1800)
+    -- past the deadline the pod is SIGKILLed mid-CREATE INDEX, which leaves
+    the invalid-index debris this job deliberately refuses to touch.
+    """
+    import inspect
+
+    from engine.shared import pg_search_guardian as g
+
+    src = inspect.getsource(g.rebuild_absent_index)
+    assert "timeout=REBUILD_COMMAND_TIMEOUT_SECONDS" in src, (
+        "rebuild_absent_index must pass an explicit timeout to conn.execute; "
+        "without one asyncpg silently applies the pool's 300s command_timeout "
+        "and a slow rebuild dies with a bare TimeoutError."
+    )
+    assert 300 < g.REBUILD_COMMAND_TIMEOUT_SECONDS < 1800, (
+        f"{g.REBUILD_COMMAND_TIMEOUT_SECONDS}s must exceed the pool default "
+        "(300s) and stay under the CronJob deadline (1800s)"
+    )

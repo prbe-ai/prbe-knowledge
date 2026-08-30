@@ -416,6 +416,23 @@ REBUILD_PARALLEL_WORKERS = 0
 # lock request blocks every writer arriving behind it.
 REBUILD_LOCK_TIMEOUT = "60s"
 
+# asyncpg applies the POOL's `command_timeout` -- 300s, from
+# `db_statement_timeout_ms` -- to every call unless one is passed explicitly.
+# `timeout=None` does NOT disable it; it falls back to exactly that default. And
+# `SET statement_timeout = 0` below only relaxes the SERVER side, so the client
+# timer fires regardless.
+#
+# 2026-08-30: a rebuild on a contended primary was cut off at 300.000s with a
+# bare `TimeoutError`, after four earlier runs finished in ~226s and made the
+# ceiling look like headroom. The index stayed absent and keyword search stayed
+# off until the next tick.
+#
+# 1500s, not unbounded: the CronJob's activeDeadlineSeconds is 1800, and a
+# script that loses its own race is SIGKILLed mid-CREATE INDEX, leaving exactly
+# the invalid-index debris this job refuses to touch. Failing at 1500 leaves
+# five minutes to log it and exit cleanly.
+REBUILD_COMMAND_TIMEOUT_SECONDS = 1500
+
 
 async def rebuild_absent_index(
     conn: asyncpg.Connection,
@@ -457,8 +474,20 @@ async def rebuild_absent_index(
         # The build outlives any sane statement_timeout. Unset for this session
         # only -- the guardian's own connection, never a request-path one.
         await conn.execute("SET statement_timeout = 0")
-        await conn.execute(ddl)
+        await conn.execute(ddl, timeout=REBUILD_COMMAND_TIMEOUT_SECONDS)
         return True
+    except TimeoutError:
+        # asyncpg's TimeoutError stringifies EMPTY, so logging str(exc) here
+        # produces `"error": ""` and tells the reader nothing -- the same trap
+        # that made the index-relay stalls unreadable. Name the cause instead.
+        log.error(
+            "rebuild.timed_out",
+            index=index_name,
+            timeout_seconds=REBUILD_COMMAND_TIMEOUT_SECONDS,
+            reason="CREATE INDEX exceeded the client-side command timeout; the "
+            "index is still absent and keyword search is still off",
+        )
+        raise
     except asyncpg.LockNotAvailableError:
         log.warning(
             "rebuild.skipped_lock_timeout",
