@@ -60,6 +60,7 @@ __all__ = [
     "current_tenant_virtual_key",
     "get_tenant_virtual_key",
     "invalidate_tenant_virtual_key",
+    "optional_tenant_virtual_key_context",
     "tenant_virtual_key_context",
 ]
 
@@ -84,6 +85,21 @@ _CURRENT_KEY: ContextVar[str | None] = ContextVar(
 # cardinality is "active tenants per worker" (small), and a brief
 # inconsistency window after a key rotation is acceptable.
 _KEY_CACHE: dict[str, tuple[str, float]] = {}
+
+# How long a FAILED lookup is remembered. Short, because the failure is
+# usually transient (control-plane restart) and every second of it costs
+# attribution; long enough that an outage does not put a control-plane
+# round trip in front of every request.
+_FAILURE_TTL_SECONDS = 30.0
+
+# Negative cache: customer_id -> failed_at_monotonic.
+#
+# `_KEY_CACHE` only remembers SUCCESS, so without this a control-plane
+# outage would pay `_FETCH_TIMEOUT_SECONDS` (5s) on EVERY retrieval
+# request -- a sixth of the gatherer's 30s budget, spent to learn the
+# same thing each time. Attribution is the nice-to-have here and latency
+# is not, so a failure is sticky for a short while.
+_FAILURE_CACHE: dict[str, float] = {}
 
 
 class LiteLLMKeyUnavailable(Exception):
@@ -115,6 +131,7 @@ def invalidate_tenant_virtual_key(customer_id: str) -> None:
     from the control plane.
     """
     _KEY_CACHE.pop(customer_id, None)
+    _FAILURE_CACHE.pop(customer_id, None)
 
 
 async def get_tenant_virtual_key(
@@ -226,6 +243,58 @@ async def tenant_virtual_key_context(
     (e.g. for logging).
     """
     key = await get_tenant_virtual_key(customer_id, http=http)
+    token = _CURRENT_KEY.set(key)
+    try:
+        yield key
+    finally:
+        _CURRENT_KEY.reset(token)
+
+
+@asynccontextmanager
+async def optional_tenant_virtual_key_context(
+    customer_id: str,
+    *,
+    http: httpx.AsyncClient | None = None,
+) -> AsyncIterator[str | None]:
+    """Bind the tenant's virtual key if one can be had; otherwise carry on.
+
+    The fail-OPEN sibling of `tenant_virtual_key_context`. That one raises
+    when the control plane cannot produce a key, which is the right contract
+    for a caller that must have per-tenant billing. It is the wrong contract
+    for a request entrypoint: wrapping `/retrieve` in it would mean a control
+    plane blip, an unprovisioned tenant, or a 404 takes retrieval DOWN for
+    that customer. Attribution is an accounting improvement and must never
+    be paid for in availability, so this yields ``None`` and lets the call
+    fall through to the process-wide ``LLM_GATEWAY_KEY`` -- exactly the
+    behaviour that exists today.
+
+    Yields the bound key, or ``None`` when falling back, so callers can log
+    which happened.
+
+    The caught set is deliberate rather than a bare ``except Exception``:
+    transport failure, an explicit "no key" and a malformed body are the
+    real-world failures, and anything else is a bug in this module that
+    should surface loudly instead of degrading silently forever.
+    """
+    now = time.monotonic()
+    failed_at = _FAILURE_CACHE.get(customer_id)
+    if failed_at is not None and (now - failed_at) < _FAILURE_TTL_SECONDS:
+        yield None
+        return
+
+    try:
+        key = await get_tenant_virtual_key(customer_id, http=http)
+    except (LiteLLMKeyUnavailable, httpx.HTTPError, ValueError) as exc:
+        _FAILURE_CACHE[customer_id] = now
+        log.warning(
+            "litellm_key.unavailable_using_shared_key",
+            customer_id=customer_id,
+            error=str(exc),
+        )
+        yield None
+        return
+
+    _FAILURE_CACHE.pop(customer_id, None)
     token = _CURRENT_KEY.set(key)
     try:
         yield key
