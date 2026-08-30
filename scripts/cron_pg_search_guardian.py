@@ -49,6 +49,7 @@ from engine.shared.pg_search_guardian import (
     find_absent_required_indexes,
     find_broken_pg_search_indexes,
     find_invalid_index_debris,
+    prewarm_indexes,
     read_known_absent,
     read_last_timeline,
     record_known_absent,
@@ -62,6 +63,15 @@ log = get_logger(__name__)
 # surprise workload on an instance that has just been promoted and is already
 # serving cold. These are the large ones on the retrieval hot path.
 ANALYZE_AFTER_PROMOTION = ["chunks", "documents"]
+
+# Indexes worth pg_prewarm'ing after a promotion -- the retrieval hot path's
+# two big ones, in the order a cold search hits them. Same explicit-list
+# discipline as ANALYZE_AFTER_PROMOTION: warming everything would be a
+# surprise I/O storm on an instance already serving cold.
+PREWARM_AFTER_PROMOTION = [
+    "idx_chunks_embedding_v2_hnsw",
+    "idx_chunks_bm25_v2",
+]
 
 
 async def run_once(*, dry_run: bool = False) -> int:
@@ -136,6 +146,9 @@ async def run_once(*, dry_run: bool = False) -> int:
             )
             if not dry_run:
                 await analyze_tables(conn, ANALYZE_AFTER_PROMOTION)
+                # After ANALYZE, so the first post-warm queries also plan
+                # well. Both are best-effort; neither can abort the tick.
+                await prewarm_indexes(conn, PREWARM_AFTER_PROMOTION)
 
         if debris:
             # Alert-only, never dropped: an in-progress CONCURRENTLY build is

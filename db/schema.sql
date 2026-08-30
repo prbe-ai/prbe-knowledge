@@ -4,6 +4,9 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 CREATE EXTENSION IF NOT EXISTS btree_gin;
+-- pg_prewarm (0123): the guardian's post-promotion cache warm. Optional at
+-- runtime -- prewarm_indexes skips with a log line when absent.
+CREATE EXTENSION IF NOT EXISTS pg_prewarm;
 
 -- Apache AGE was evaluated and is not available on Neon Scale tier.
 -- Graph is modeled as relational tables (graph_nodes + graph_edges) below,
@@ -365,6 +368,12 @@ CREATE TABLE chunks (
 -- v1 HNSW index over `embedding` was dropped in migration 0071 (no
 -- production reader after the cutover).
 CREATE INDEX idx_chunks_embedding_v2_hnsw ON chunks USING hnsw (embedding_v2 halfvec_cosine_ops);
+-- Live-only twin (0124): serves TemporalMode.LATEST -- the default, whose
+-- chunk predicate (valid_to IS NULL) implies this index's. Only ~35% of
+-- chunks are live, so the full index walks 3x the graph the default path
+-- needs. The full index above STAYS: ALL/AS_OF modes and the inferred-edges
+-- bundle still order over every version.
+CREATE INDEX idx_chunks_embedding_v2_hnsw_live ON chunks USING hnsw (embedding_v2 halfvec_cosine_ops) WHERE valid_to IS NULL;
 CREATE INDEX idx_chunks_customer       ON chunks (customer_id);
 CREATE INDEX idx_chunks_doc            ON chunks (doc_id);
 CREATE INDEX idx_chunks_doc_live       ON chunks (doc_id) WHERE valid_to IS NULL;

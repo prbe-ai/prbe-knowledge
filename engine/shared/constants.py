@@ -1124,6 +1124,28 @@ SEARCH_AGENT_FETCH_CHUNKS_MAX = 10
 # funnel has room -- measured in production, ~280 candidates are rendered to
 # return 10-16 results.
 #
+# Total prefanout sub-queries per search: the raw query plus at most
+# (N - 1) extractor reformulations. Everything downstream scales LINEARLY
+# with this number -- each sub-query runs all four channels, so it is the
+# multiplier on total database work (measured fan-out factor 3.3-3.9x at
+# the old effective value of 4).
+#
+# TWO since 2026-08-30, down from the extractor's full 1 + 3. The
+# reformulations' recall value has never been measured; their cost now has
+# been, and at 2 the raw query keeps one reformulation (the extractor's
+# first, which its prompt orders most-confident-first) while halving DB
+# work. This is a RECALL-AFFECTING change shipped ahead of its eval: run
+# the retrieval eval suite (research-os#1126) against 2 vs 4 before
+# treating this number as settled, and prefer flipping the env var to
+# hand-reverting.
+#
+# Env-overridable for exactly that experiment and for the regression case:
+# `kubectl set env DEPLOY SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES=4` restores
+# the old behaviour without a release. Floor of 1 = raw query only.
+SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES = max(
+    1, int(os.getenv("SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES", "2"))
+)
+
 # Env-overridable because it is the first dial to reach for if recall
 # regresses: `kubectl set env DEPLOY SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET=40000`
 # restores the old behaviour without a release.

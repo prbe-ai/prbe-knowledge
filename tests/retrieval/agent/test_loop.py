@@ -2523,3 +2523,56 @@ def test_bm25_pool_does_not_filter_chunk_kind() -> None:
         "the BM25 pool now filters chunk kind — metadata chunks (author:, id:, "
         "url:) just stopped being searchable"
     )
+
+
+@pytest.mark.asyncio
+async def test_prefanout_subqueries_capped_at_constant(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_request: SimpleNamespace,
+) -> None:
+    """The extractor may emit 3 reformulations; execute_search must see at
+    most SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES queries, raw first, capped
+    AFTER dedup so an echo of the raw query cannot consume a slot.
+
+    Every downstream cost scales linearly with this list (each sub-query
+    runs all four channels), so a regression here silently multiplies
+    database work -- which is exactly why the assertion is on what
+    execute_search RECEIVES, not on any timing.
+    """
+    from engine.shared.constants import SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES
+
+    req = QueryRequest(query="raw query", customer_id="cust-1", top_k=5)
+
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
+        AsyncMock(return_value=GroundingBundle()),
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.extract_entities_with_llm",
+        AsyncMock(return_value=EntityExtraction(
+            # First one echoes the raw query and must not eat a slot.
+            sub_queries=["RAW QUERY", "alt one", "alt two", "alt three"],
+        )),
+    )
+    captured = AsyncMock(return_value={"sub_queries": [{
+        "query": "raw query",
+        "grounded_entities": [],
+        "vector": [{"doc_id": "stub:0", "score": 0.5,
+                    "source_system": "github", "title": "stub",
+                    "content": "stub"}],
+        "bm25": [], "graph": [], "inferred_edge": [],
+    }]})
+    monkeypatch.setattr("engine.retrieval.agent.loop.execute_search", captured)
+
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args(chunks=1, confidence="high"))],
+        )),
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    queries = captured.await_args.kwargs["queries"]
+    assert queries[0] == "raw query"
+    assert len(queries) == SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES
+    assert "alt one" in queries  # most-confident reformulation kept

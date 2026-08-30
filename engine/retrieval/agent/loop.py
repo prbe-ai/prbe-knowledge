@@ -83,6 +83,7 @@ from engine.shared.constants import (
     SEARCH_AGENT_MAX_CONTEXT_TOKENS,
     SEARCH_AGENT_MAX_EXTENSIONS,
     SEARCH_AGENT_MAX_OUTPUT_TOKENS,
+    SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES,
     SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET,
     SEARCH_AGENT_SOFT_TURN_CAP,
     SEARCH_AGENT_TOOL_BUDGET,
@@ -2057,6 +2058,11 @@ async def run_gatherer(
     prefanout_queries = [req.query]
     seen_q = {req.query.strip().lower()}
     for sq in extracted.sub_queries:
+        # Capped AFTER dedup so a reformulation that echoes the raw query
+        # cannot consume a slot. See the constant for why 2 and how to
+        # restore 4 without a release.
+        if len(prefanout_queries) >= SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES:
+            break
         key = sq.strip().lower()
         if key and key not in seen_q:
             seen_q.add(key)

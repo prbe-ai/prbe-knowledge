@@ -265,6 +265,57 @@ async def analyze_tables(conn: asyncpg.Connection, tables: list[str]) -> None:
             log.warning("guardian.analyze_failed", table=table, error=str(exc))
 
 
+async def prewarm_indexes(
+    conn: asyncpg.Connection, indexes: list[str]
+) -> None:
+    """pg_prewarm the retrieval hot set after a promotion.
+
+    A promoted standby serves its first queries from a cold cache, and the
+    first storm-shaped search measured 66.8s against a 30s caller budget
+    until buffers warmed (~2 queries) -- every failover ships one guaranteed
+    engine_timeout to whoever searches first. Observed again 2026-08-30
+    after the CPU-limit rollout's switchover: first query 30s
+    engine_timeout, second 10.9s.
+
+    'read' mode, not 'buffer': it pulls blocks into the OS page cache
+    without evicting shared_buffers, and the HNSW index (7.7GB) is larger
+    than shared_buffers (6GB) -- 'buffer' would trade the whole working set
+    for one index. The OS cache is where the 24Gi node keeps the hot set
+    anyway (~16GB of page cache in steady state).
+
+    Best-effort with the same posture and for the same reason as
+    `analyze_tables` directly above: this is an optimization on top of the
+    repair, and a raise here must not stop the tick from recording the
+    timeline. Additionally skipped in full when the extension is absent
+    (pg_prewarm ships in contrib but a self-host database may not have run
+    migration 0123), because alerting every minute about a missing
+    optimization would train operators to ignore the guardian.
+    """
+    if await conn.fetchval("SELECT to_regproc('pg_prewarm')") is None:
+        log.info("guardian.prewarm_skipped", reason="pg_prewarm not installed")
+        return
+    for index in indexes:
+        if not index.replace("_", "").isalnum():
+            raise ValueError(f"refusing to prewarm suspicious identifier: {index!r}")
+        try:
+            if await conn.fetchval("SELECT to_regclass($1)", index) is None:
+                log.info(
+                    "guardian.prewarm_skipped", index=index,
+                    reason="index does not exist",
+                )
+                continue
+            # Per-call client-side timeout: the HNSW read is ~16-60s of
+            # sequential I/O; 240s bounds a pathological disk without
+            # letting one index wedge the tick forever. asyncpg cancels
+            # the statement on expiry, so nothing leaks into later ticks.
+            blocks = await conn.fetchval(
+                "SELECT pg_prewarm($1, 'read')", index, timeout=240.0
+            )
+            log.info("guardian.prewarmed", index=index, blocks=blocks)
+        except Exception as exc:
+            log.warning("guardian.prewarm_failed", index=index, error=str(exc))
+
+
 async def read_last_timeline(conn: asyncpg.Connection) -> int | None:
     """The timeline the guardian last recorded, or None on its first ever tick."""
     return await conn.fetchval("SELECT last_timeline_id FROM pg_search_guardian_state WHERE id = 1")

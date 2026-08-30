@@ -451,3 +451,77 @@ async def test_new_absence_alerts_once(monkeypatch) -> None:
 
     assert await cron.run_once() == 0
     assert events == ["kb_pg_search_index_absent"]
+
+
+# ============================================================
+# Post-promotion prewarm
+# ============================================================
+
+
+class _PrewarmConn(_FakeConn):
+    """FakeConn whose fetchval dispatches on the statement, because prewarm
+    makes three DIFFERENT fetchval calls (to_regproc, to_regclass,
+    pg_prewarm) and a single canned result would let a broken dispatch pass."""
+
+    def __init__(self, *, extension_present: bool = True,
+                 index_present: bool = True) -> None:
+        super().__init__()
+        self.extension_present = extension_present
+        self.index_present = index_present
+        self.prewarmed: list[str] = []
+
+    async def fetchval(self, sql: str, *args: Any, **_kwargs: Any) -> Any:
+        if "to_regproc" in sql:
+            return "pg_prewarm" if self.extension_present else None
+        if "to_regclass" in sql:
+            return args[0] if self.index_present else None
+        if "pg_prewarm" in sql:
+            self.prewarmed.append(args[0])
+            return 12345
+        raise AssertionError(f"unexpected fetchval: {sql}")
+
+
+async def test_prewarm_reads_each_index() -> None:
+    conn = _PrewarmConn()
+    await guardian.prewarm_indexes(conn, ["idx_a", "idx_b"])  # type: ignore[arg-type]
+    assert conn.prewarmed == ["idx_a", "idx_b"]
+
+
+async def test_prewarm_skips_entirely_without_the_extension() -> None:
+    """A self-host that never ran migration 0123 must get one log line, not
+    an error and not a per-index probe storm."""
+    conn = _PrewarmConn(extension_present=False)
+    await guardian.prewarm_indexes(conn, ["idx_a"])  # type: ignore[arg-type]
+    assert conn.prewarmed == []
+
+
+async def test_prewarm_skips_a_missing_index_and_continues() -> None:
+    class _FirstMissing(_PrewarmConn):
+        async def fetchval(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+            if "to_regclass" in sql and args and args[0] == "idx_missing":
+                return None
+            return await super().fetchval(sql, *args, **kwargs)
+
+    conn = _FirstMissing()
+    await guardian.prewarm_indexes(conn, ["idx_missing", "idx_b"])  # type: ignore[arg-type]
+    assert conn.prewarmed == ["idx_b"]
+
+
+async def test_prewarm_failure_does_not_abort_the_batch() -> None:
+    """Same posture as analyze_tables: best-effort, because a raise here
+    would stop the tick before it records the timeline."""
+    class _FirstBlows(_PrewarmConn):
+        async def fetchval(self, sql: str, *args: Any, **kwargs: Any) -> Any:
+            if "pg_prewarm" in sql and args and args[0] == "idx_a":
+                raise RuntimeError("disk went away")
+            return await super().fetchval(sql, *args, **kwargs)
+
+    conn = _FirstBlows()
+    await guardian.prewarm_indexes(conn, ["idx_a", "idx_b"])  # type: ignore[arg-type]
+    assert conn.prewarmed == ["idx_b"]
+
+
+async def test_prewarm_refuses_a_suspicious_identifier() -> None:
+    conn = _PrewarmConn()
+    with pytest.raises(ValueError, match="suspicious"):
+        await guardian.prewarm_indexes(conn, ['idx"; DROP TABLE chunks; --'])  # type: ignore[arg-type]
