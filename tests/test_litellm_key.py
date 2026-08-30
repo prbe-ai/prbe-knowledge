@@ -483,3 +483,56 @@ async def test_a_resolvable_id_skips_the_slug_hop() -> None:
 
     assert key == "sk-direct"
     assert len(seen) == 1 and "by-slug" not in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_routing_calls_go_to_the_control_plane_not_the_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`/routing/*` lives on the control plane, which is a different service.
+
+    The managed data plane's backend serves ZERO routing paths -- confirmed
+    against its own /openapi.json -- so pointing the fetcher at
+    BACKEND_BASE_URL is a 404 on every call. That was the third of three
+    reasons per-tenant billing never worked.
+    """
+    monkeypatch.setenv("CONTROL_PLANE_BASE_URL", "http://control-plane.internal:8080")
+    from engine.shared.config import get_settings
+
+    get_settings.cache_clear()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"llm_virtual_key": "sk-cp"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        key = await get_tenant_virtual_key("cust-1", http=http)
+
+    assert key == "sk-cp"
+    assert seen[0].startswith("http://control-plane.internal:8080/routing/")
+    assert "prbe-backend" not in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_the_backend_url_for_self_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Self-host may serve both surfaces from one service; don't break it."""
+    monkeypatch.delenv("CONTROL_PLANE_BASE_URL", raising=False)
+    from engine.shared.config import get_settings
+
+    get_settings.cache_clear()
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"llm_virtual_key": "sk-selfhost"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        key = await get_tenant_virtual_key("cust-1", http=http)
+
+    assert key == "sk-selfhost"
+    assert seen[0].startswith("http://prbe-backend.internal:8080/routing/")

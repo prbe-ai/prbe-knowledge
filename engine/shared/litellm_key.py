@@ -175,7 +175,12 @@ async def get_tenant_virtual_key(
         return cached[0]
 
     settings = get_settings()
-    base = (settings.backend_base_url or "").rstrip("/")
+    # The `/routing/*` endpoints live on the CONTROL PLANE, not the backend.
+    # `backend_base_url` is the fallback only for self-host, where one service
+    # may serve both.
+    base = (
+        settings.control_plane_base_url or settings.backend_base_url or ""
+    ).rstrip("/")
     api_key = (
         settings.internal_backend_api_key.get_secret_value()
         if settings.internal_backend_api_key
@@ -183,7 +188,8 @@ async def get_tenant_virtual_key(
     )
     if not base or not api_key:
         raise LiteLLMKeyUnavailable(
-            "BACKEND_BASE_URL or INTERNAL_BACKEND_API_KEY is not configured"
+            "CONTROL_PLANE_BASE_URL/BACKEND_BASE_URL or "
+            "INTERNAL_BACKEND_API_KEY is not configured"
         )
 
     headers = {"X-Internal-Backend-Key": api_key}

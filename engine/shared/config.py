@@ -187,6 +187,21 @@ class Settings(BaseSettings):
     backend_base_url: str = ""
     internal_backend_api_key: SecretStr = SecretStr("")
 
+    # --- control plane (tenant routing + per-tenant LiteLLM keys) ------------
+    # A DIFFERENT service from `backend_base_url`. The `/routing/*` endpoints
+    # (by-slug resolution and the per-tenant LiteLLM virtual key) live on the
+    # control plane; the managed data plane's backend serves none of them --
+    # verified against its own /openapi.json, which lists zero routing paths.
+    # Pointing the key fetcher at the backend is a 404 on every call, which is
+    # part of why per-tenant billing never worked (2026-08-30).
+    #
+    # In managed mode the chart sets this to the in-cluster Service
+    # (`http://control-plane.control-plane.svc.cluster.local:8080`); the
+    # public hostname is NOT reachable from a pod, because DOKS LoadBalancers
+    # do not hairpin. Empty falls back to `backend_base_url`, which is the
+    # self-host shape where one service may serve both.
+    control_plane_base_url: str = ""
+
     # --- Single-tenant community mode (self-host) ---------------------------
     # When the control plane is absent, the engine runs as a single tenant.
     # `default_customer_id` (e.g. "default") becomes the tenant for every
