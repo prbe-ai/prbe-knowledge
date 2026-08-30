@@ -30,6 +30,8 @@ from typing import Any
 from engine.retrieval.grounding import (
     GroundingBundle,
     _extract_tokens,
+    _fuzzy_match_document_titles_multi,
+    _fuzzy_match_entities_multi,
     build_bundle,
 )
 from engine.shared.logging import get_logger
@@ -221,19 +223,53 @@ async def _build_bundle_with_token_fallback(
     )
     probes = [t for _, t in sorted_tokens[:_MAX_TOKEN_FALLBACK_PROBES]]
 
-    sub_bundles = await asyncio.gather(
-        *(build_bundle(customer_id, t) for t in probes),
+    # BATCHED, not one build_bundle per probe. The per-probe bundles ran
+    # every channel and kept only `.candidates` -- the bare-id and
+    # connected-sources work was computed and discarded, and the two fuzzy
+    # matchers were each a full tenant-wide scan per probe (the RLS-blocked
+    # shape; see the multi variants' comment in grounding.py). One
+    # statement per matcher now covers all probes; the reassembly below
+    # mirrors build_bundle's own merge (entity candidates first, doc-title
+    # appended, deduped by canonical_id within the probe), so each probe's
+    # candidate list is what its bundle would have carried.
+    matcher_results = await asyncio.gather(
+        _fuzzy_match_entities_multi(
+            customer_id, probes, per_type_cap=5, total_cap=20
+        ),
+        _fuzzy_match_document_titles_multi(customer_id, probes),
         return_exceptions=True,
     )
+    empty: list[list] = [[] for _ in probes]
+    entity_lists = (
+        matcher_results[0]
+        if not isinstance(matcher_results[0], BaseException)
+        else empty
+    )
+    title_lists = (
+        matcher_results[1]
+        if not isinstance(matcher_results[1], BaseException)
+        else empty
+    )
+    for label, r in zip(("entities_multi", "doc_titles_multi"), matcher_results, strict=True):
+        if isinstance(r, BaseException):
+            log.warning(
+                "grounding.token_fallback_partial_failure",
+                extra={"customer_id": customer_id, "subtask": label, "error": str(r)},
+            )
 
     seen: set[tuple[str, str]] = {
         (c.entity_type, c.canonical_id) for c in initial.candidates
     }
     merged: list = list(initial.candidates)
-    for sb in sub_bundles:
-        if isinstance(sb, BaseException):
-            continue
-        for c in sb.candidates:
+    for ent, titles in zip(entity_lists, title_lists, strict=True):
+        probe_seen = {c.canonical_id for c in ent}
+        probe_candidates = list(ent)
+        for c in titles:
+            if c.canonical_id in probe_seen:
+                continue
+            probe_seen.add(c.canonical_id)
+            probe_candidates.append(c)
+        for c in probe_candidates:
             key = (c.entity_type, c.canonical_id)
             if key in seen:
                 continue

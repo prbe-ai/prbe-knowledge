@@ -561,6 +561,220 @@ async def _fuzzy_match_document_titles(
     return out
 
 
+# ---------------------------------------------------------------------------
+# Multi-probe (batched) variants of the two fuzzy matchers.
+#
+# `_build_bundle_with_token_fallback` (router.py) used to call
+# `build_bundle` once PER TOKEN -- up to five extra bundles, each running
+# every channel. Under FORCE RLS neither fuzzy matcher can use its index
+# (`similarity_op` is not LEAKPROOF), so each probe was its own full scan:
+# graph_nodes label-filtered rows for entities, all ~41k live titled docs
+# for titles. Six concurrent tenant-wide scans per search on a 2-vCPU pod
+# was most of the grounding stage's 2.6-3.4s (measured 2026-08-30, after
+# the doc-title token gate landed and did NOT move this -- single-token
+# probes pass any token gate legitimately).
+#
+# These variants take every probe in ONE statement: CROSS JOIN
+# unnest(probes) WITH ORDINALITY, per-probe caps as window functions, one
+# heap pass instead of N. Per-row similarity() work is unchanged (it is
+# per (row, probe) either way); what goes away is N-1 heap walks, N-1
+# statements, and N-1 backends contending for the same two cores.
+#
+# CONTRACT: index i of the result is byte-identical to what the
+# single-probe function returns for probes[i] -- same ranking keys, same
+# caps, same candidate mapping. tests/retrieval/test_grounding.py asserts
+# this equivalence against a live database; change either side only with
+# that test.
+#
+# Fault isolation is deliberately coarser than the per-probe gather it
+# replaces: one bad probe now fails the whole batch (caller degrades to
+# the initial bundle alone). Probes are content tokens from
+# `_extract_tokens`, all bound as parameters, so a probe that can error
+# the statement has no known shape; trading that corner for 5x less scan
+# work is the point of the batch.
+# ---------------------------------------------------------------------------
+
+
+async def _fuzzy_match_entities_multi(
+    customer_id: str,
+    probes: list[str],
+    per_type_cap: int = 5,
+    total_cap: int = 20,
+) -> list[list[GroundingCandidate]]:
+    """`_fuzzy_match_entities` for N probes in one scan.
+
+    Returns one candidate list per probe, index-aligned with `probes`.
+    """
+    if not probes:
+        return []
+
+    labels = list(GROUNDING_ENTITY_LABELS)
+
+    sql = """
+    WITH probe AS (
+        SELECT p, ord FROM unnest($2::text[]) WITH ORDINALITY AS t(p, ord)
+    ),
+    ranked AS (
+        SELECT
+            probe.ord,
+            label, canonical_id,
+            properties->>'kind' AS kind,
+            coalesce(properties->>'name', canonical_id) AS display_name,
+            properties->>'last_seen_at' AS last_seen_at_raw,
+            GREATEST(
+                similarity(coalesce(properties->>'name',''), probe.p),
+                CASE
+                    WHEN to_tsvector('english', coalesce(properties->>'name', ''))
+                         @@ plainto_tsquery('english', probe.p) THEN 0.5
+                    ELSE 0.0
+                END
+            ) AS rel,
+            ROW_NUMBER() OVER (
+                PARTITION BY probe.ord, label
+                ORDER BY GREATEST(
+                    similarity(coalesce(properties->>'name',''), probe.p),
+                    CASE
+                        WHEN to_tsvector('english', coalesce(properties->>'name', ''))
+                             @@ plainto_tsquery('english', probe.p) THEN 0.5
+                        ELSE 0.0
+                    END
+                ) DESC,
+                (properties->>'last_seen_at')::timestamptz DESC NULLS LAST
+            ) AS rn
+        FROM graph_nodes
+        CROSS JOIN probe
+        WHERE customer_id = $1
+          AND label = ANY($3::text[])
+          AND (
+              lower(properties->>'name') % probe.p
+              OR to_tsvector('english', coalesce(properties->>'name', ''))
+                 @@ plainto_tsquery('english', probe.p)
+          )
+    ),
+    capped AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY ord
+                   ORDER BY rel DESC, last_seen_at_raw DESC NULLS LAST
+               ) AS rn2
+        FROM ranked
+        WHERE rn <= $4
+    )
+    SELECT ord, label, canonical_id, kind, display_name, last_seen_at_raw, rel
+    FROM capped
+    WHERE rn2 <= $5
+    ORDER BY ord, rn2
+    """
+
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            sql, customer_id, probes, labels, per_type_cap, total_cap
+        )
+
+    out: list[list[GroundingCandidate]] = [[] for _ in probes]
+    for r in rows:
+        entity_type = entity_type_for_node(r["label"], r["kind"])
+        if not entity_type:
+            continue
+        last_seen = None
+        if r["last_seen_at_raw"]:
+            try:
+                last_seen = datetime.fromisoformat(r["last_seen_at_raw"])
+            except ValueError:
+                last_seen = None
+        out[r["ord"] - 1].append(GroundingCandidate(
+            entity_type=entity_type,
+            canonical_id=r["canonical_id"],
+            display_name=r["display_name"],
+            last_seen_at=last_seen,
+            match_source="trgm" if r["rel"] != 0.5 else "fts",
+        ))
+    return out
+
+
+async def _fuzzy_match_document_titles_multi(
+    customer_id: str,
+    probes: list[str],
+    cap: int = _DOC_TITLE_TOTAL_CAP,
+) -> list[list[GroundingCandidate]]:
+    """`_fuzzy_match_document_titles` for N probes in one scan.
+
+    Returns one candidate list per probe, index-aligned with `probes`.
+    The `_DOC_TITLE_MAX_TOKENS` gate does not apply here by design:
+    probes are single tokens, which CAN clear the similarity floor
+    (measured on production tokens: 19/60 via trgm, 39/60 via FTS).
+    """
+    if not probes:
+        return []
+
+    sql = """
+    WITH probe AS (
+        SELECT p, ord FROM unnest($2::text[]) WITH ORDINALITY AS t(p, ord)
+    ),
+    ranked AS (
+        SELECT
+            probe.ord,
+            d.doc_id,
+            d.source_system,
+            coalesce(d.title, '') AS title,
+            d.updated_at,
+            similarity(coalesce(d.title, ''), probe.p) AS trgm_sim,
+            CASE
+                WHEN d.title_preview_tsv @@ plainto_tsquery('english', probe.p)
+                    THEN 1
+                ELSE 0
+            END AS fts_hit
+        FROM documents d
+        CROSS JOIN probe
+        WHERE d.customer_id = $1
+          AND d.valid_to IS NULL
+          AND d.title IS NOT NULL
+          AND d.title <> ''
+          AND (
+              d.title % probe.p
+              OR d.title_preview_tsv @@ plainto_tsquery('english', probe.p)
+          )
+    ),
+    capped AS (
+        SELECT *,
+               ROW_NUMBER() OVER (
+                   PARTITION BY ord
+                   ORDER BY fts_hit DESC, trgm_sim DESC,
+                            updated_at DESC NULLS LAST
+               ) AS rn
+        FROM ranked
+        WHERE trgm_sim >= $3 OR fts_hit = 1
+    )
+    SELECT ord, doc_id, source_system, title, updated_at, trgm_sim, fts_hit
+    FROM capped
+    WHERE rn <= $4
+    ORDER BY ord, rn
+    """
+
+    async with with_tenant(customer_id) as conn:
+        # Same threshold discipline as the single-probe form: drive `%`
+        # from the constant the post-filter uses. SET LOCAL only -- see
+        # the comment there.
+        await conn.execute(
+            "SET LOCAL pg_trgm.similarity_threshold = "
+            f"{_DOC_TITLE_TRGM_FLOOR}"
+        )
+        rows = await conn.fetch(
+            sql, customer_id, probes, _DOC_TITLE_TRGM_FLOOR, cap
+        )
+
+    out: list[list[GroundingCandidate]] = [[] for _ in probes]
+    for r in rows:
+        out[r["ord"] - 1].append(GroundingCandidate(
+            entity_type=_doc_id_to_entity_type(r["doc_id"], r["source_system"]),
+            canonical_id=r["doc_id"],
+            display_name=r["title"],
+            last_seen_at=r["updated_at"],
+            match_source="doc_title",
+        ))
+    return out
+
+
 async def _connected_sources(customer_id: str) -> list[str]:
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(
