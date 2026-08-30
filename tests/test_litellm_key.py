@@ -154,7 +154,7 @@ async def test_fetch_response_missing_key_raises() -> None:
 
     transport = httpx.MockTransport(handler)
     async with httpx.AsyncClient(transport=transport) as http:
-        with pytest.raises(LiteLLMKeyUnavailable, match="missing 'litellm_key'"):
+        with pytest.raises(LiteLLMKeyUnavailable, match="missing 'llm_virtual_key'"):
             await get_tenant_virtual_key("cust-1", http=http)
 
 
@@ -398,3 +398,88 @@ async def test_invalidate_clears_the_negative_cache_too() -> None:
         invalidate_tenant_virtual_key("cust-1")
         async with optional_tenant_virtual_key_context("cust-1", http=http) as second:
             assert second == "sk-new"
+
+
+# ---------------------------------------------------------------------------
+# Control-plane response contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reads_the_field_the_control_plane_actually_sends() -> None:
+    """The control plane sends `llm_virtual_key`, not `litellm_key`.
+
+    Until 2026-08-30 this module read only `litellm_key`/`key`, so EVERY
+    fetch raised "missing litellm_key" and per-tenant attribution could
+    never work. Nothing caught it because nothing called the module.
+    Pinned against the real field name in
+    apps/control_plane/routers/routing.py::LiteLLMKeyResponse.
+    """
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200, json={"customer_id": "u-1", "llm_virtual_key": "sk-real", "minted_at": None}
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as http:
+        key = await get_tenant_virtual_key(
+            "11111111-2222-3333-4444-555555555555", http=http
+        )
+    assert key == "sk-real"
+
+
+@pytest.mark.asyncio
+async def test_slug_is_resolved_to_the_customer_uuid_first() -> None:
+    """The planes disagree on what `customer_id` means.
+
+    Data-plane tenant tables carry a slug (`probe-founders`); the control
+    plane's litellm-key route is a primary-key lookup on the customers UUID.
+    Passing the slug straight through is a 404 -- the other half of why
+    attribution never worked.
+    """
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        seen.append(path)
+        if "by-slug" in path:
+            return httpx.Response(
+                200,
+                json={"customer_id": "uuid-abc", "slug": "probe-founders", "ready": True},
+            )
+        if path.endswith("/routing/customer/probe-founders/litellm-key"):
+            return httpx.Response(404)  # the control plane keys on UUID
+        return httpx.Response(200, json={"llm_virtual_key": "sk-by-slug"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        key = await get_tenant_virtual_key("probe-founders", http=http)
+
+    assert key == "sk-by-slug"
+    assert seen == [
+        "/routing/customer/probe-founders/litellm-key",
+        "/routing/by-slug/probe-founders",
+        "/routing/customer/uuid-abc/litellm-key",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_resolvable_id_skips_the_slug_hop() -> None:
+    """Callers whose id the control plane already knows pay no extra round trip.
+
+    The slug hop is 404-gated precisely so the common self-host / already-a-UUID
+    path stays one request.
+    """
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json={"llm_virtual_key": "sk-direct"})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as http:
+        key = await get_tenant_virtual_key(
+            "11111111-2222-3333-4444-555555555555", http=http
+        )
+
+    assert key == "sk-direct"
+    assert len(seen) == 1 and "by-slug" not in seen[0]

@@ -186,11 +186,37 @@ async def get_tenant_virtual_key(
             "BACKEND_BASE_URL or INTERNAL_BACKEND_API_KEY is not configured"
         )
 
-    url = f"{base}/routing/customer/{customer_id}/litellm-key"
     headers = {"X-Internal-Backend-Key": api_key}
 
+    async def _get_key(client: httpx.AsyncClient, cid: str) -> httpx.Response:
+        return await client.get(
+            f"{base}/routing/customer/{cid}/litellm-key",
+            headers=headers,
+            timeout=_FETCH_TIMEOUT_SECONDS,
+        )
+
     async def _do_fetch(client: httpx.AsyncClient) -> str:
-        resp = await client.get(url, headers=headers, timeout=_FETCH_TIMEOUT_SECONDS)
+        resp = await _get_key(client, customer_id)
+
+        # The two planes disagree about what "customer_id" means. Data-plane
+        # tenant tables carry a SLUG (`probe-founders`); this control-plane
+        # route is a primary-key lookup on the customers UUID, so a slug is a
+        # 404. Resolve and retry rather than requiring every caller to know
+        # which kind of id it holds. Only on 404, so a caller that already
+        # has the UUID -- self-host, and anything the control plane calls --
+        # pays no extra round trip, and the 5-minute cache amortises the
+        # slug hop to once per tenant per TTL.
+        if resp.status_code == 404:
+            resolved = await client.get(
+                f"{base}/routing/by-slug/{customer_id}",
+                headers=headers,
+                timeout=_FETCH_TIMEOUT_SECONDS,
+            )
+            if resolved.status_code < 400:
+                found = resolved.json().get("customer_id")
+                if found and isinstance(found, str) and found != customer_id:
+                    resp = await _get_key(client, found)
+
         if resp.status_code == 404:
             raise LiteLLMKeyUnavailable(
                 f"control plane has no LiteLLM key for customer {customer_id}"
@@ -200,10 +226,19 @@ async def get_tenant_virtual_key(
                 f"control plane returned {resp.status_code}: {resp.text[:200]}"
             )
         body = resp.json()
-        key = body.get("litellm_key") or body.get("key")
+        # `llm_virtual_key` is what the control plane actually sends
+        # (routing.py::LiteLLMKeyResponse, no serialization alias). The other
+        # two were the ONLY names read until 2026-08-30, so every fetch raised
+        # "missing litellm_key" and per-tenant billing was dead on arrival.
+        # Nothing caught it because nothing called this module.
+        key = (
+            body.get("llm_virtual_key")
+            or body.get("litellm_key")
+            or body.get("key")
+        )
         if not key or not isinstance(key, str):
             raise LiteLLMKeyUnavailable(
-                f"control plane response missing 'litellm_key' for {customer_id}"
+                f"control plane response missing 'llm_virtual_key' for {customer_id}"
             )
         return key
 
