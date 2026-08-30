@@ -394,6 +394,43 @@ _DOC_TITLE_TOTAL_CAP: Final[int] = 10
 # a recall change and belongs behind a search-quality decision, not a perf PR.
 _DOC_TITLE_TRGM_FLOOR: Final[float] = 0.3
 
+# Token ceiling above which this channel is skipped outright.
+#
+# Above ~6 tokens the channel is provably yield-free, so running it buys
+# nothing and costs the whole grounding stage its latency: under FORCE RLS
+# the planner cannot use `idx_documents_title_trgm` (`similarity_op` is not
+# LEAKPROOF, so the trgm operator may not run ahead of the security qual),
+# and the query degrades to a per-row `similarity()` over every live titled
+# doc in the tenant -- 1,149 ms quiet / 3-5 s under load on 41k docs,
+# measured 2026-08-30 as role `app`. Since the four grounding lookups are
+# gathered and the other three answer in <30 ms, this channel IS the
+# grounding stage's floor.
+#
+# Why yield-free, measured on the probe tenant (max trgm similarity across
+# ALL 41,209 live titles, and title_preview_tsv AND-match count, by probe
+# length):
+#
+#     4 tokens   max sim 0.41   1 FTS hit    <- can yield, kept
+#     5 tokens   max sim 0.30   0 FTS hits   <- floor exactly, kept
+#     6 tokens   max sim 0.29   1 FTS hit    <- body_preview can hit, kept
+#     8 tokens   max sim 0.25   0 FTS hits   <- cannot clear the floor
+#    18 tokens   max sim 0.26   0 FTS hits   <- cannot clear the floor
+#
+# trgm similarity is |shared trigrams| / |union|, so a probe much longer
+# than any title cannot reach 0.3 against short titles -- the ceiling is
+# arithmetic, not tuning. The FTS branch is plainto_tsquery, i.e. AND of
+# every token, which body_preview can satisfy at 6 tokens and in practice
+# never does at 8+. Long queries here are the MCP's keyword bags (the tool
+# docstring asks for "an entity dump of KEYWORDS AND IDENTIFIERS"), and
+# those ground through the entity and bare-id channels, which this gate
+# does not touch.
+#
+# NOT a substitute for the structural fix: short concept probes still pay
+# the RLS-blocked scan (~1.1 s). That fix is a security decision (LEAKPROOF
+# flip vs a SECURITY DEFINER lookup) and is deliberately not smuggled into
+# a perf change -- same discipline as the floor above.
+_DOC_TITLE_MAX_TOKENS: Final[int] = 6
+
 
 async def _fuzzy_match_document_titles(
     customer_id: str,
@@ -560,11 +597,20 @@ async def build_bundle(customer_id: str, query: str) -> GroundingBundle:
     tokens = _extract_tokens(query)
     bare_ids = _detect_bare_ids(query)
 
+    async def _doc_titles_gated() -> list[GroundingCandidate]:
+        # Skipped, not truncated: probing with a subset of a long query's
+        # tokens would CHANGE which titles match, silently. Above the
+        # ceiling the full probe is provably yield-free (see the constant),
+        # so [] is the honest answer at none of the cost.
+        if len(tokens) > _DOC_TITLE_MAX_TOKENS:
+            return []
+        return await _fuzzy_match_document_titles(customer_id, tokens)
+
     results = await asyncio.gather(
         _fuzzy_match_entities(customer_id, tokens, per_type_cap=5, total_cap=20),
         _lookup_bare_id_matches(customer_id, bare_ids),
         _connected_sources(customer_id),
-        _fuzzy_match_document_titles(customer_id, tokens),
+        _doc_titles_gated(),
         return_exceptions=True,
     )
 
