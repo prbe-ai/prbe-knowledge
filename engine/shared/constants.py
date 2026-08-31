@@ -1180,6 +1180,22 @@ SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES = max(
     1, _env_int("SEARCH_AGENT_PREFANOUT_MAX_SUBQUERIES", 2)
 )
 
+# ---- Chunk retention (scripts/cron_chunk_retention.py) ----------------------
+# How long a SUPERSEDED chunk (valid_to set) is kept before deletion. What
+# the window buys is chunk-level AS_OF time travel that far back; what it
+# costs is every retrieval expense scaling with dead rows (65% of the
+# research-plane table when this shipped). Measured AS_OF/ALL usage when the
+# 30 was chosen: zero in 1,059 requests over 14 days -- the window prices an
+# ability nobody has exercised, so it is deliberately modest. Owner-approved
+# 2026-08-31. Raise it BEFORE a use case needs deeper history, not after --
+# deleted history does not come back.
+CHUNK_RETENTION_DAYS = max(1, _env_int("CHUNK_RETENTION_DAYS", 30))
+
+# Rows per DELETE batch. Bounds lock hold and per-transaction WAL (the
+# standby replays every byte); 5k rows of ~1KB chunks is a ~5MB WAL burst,
+# which replication absorbs without falling behind.
+CHUNK_RETENTION_BATCH_SIZE = max(100, _env_int("CHUNK_RETENTION_BATCH_SIZE", 5000))
+
 # Env-overridable because it is the first dial to reach for if recall
 # regresses: `kubectl set env DEPLOY SEARCH_AGENT_PREFANOUT_TOKEN_BUDGET=40000`
 # restores the old behaviour without a release.
