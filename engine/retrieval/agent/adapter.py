@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any, get_args
 
 from engine.retrieval.agent.models import (
+    GatheredChunk,
     GathererOutput,
     GathererStatus,
     is_degraded,
@@ -441,6 +442,8 @@ async def to_query_response(
     doc_types: list[str] | None = None,
     source_keys_include_keyless: bool = False,
     sources: list[str] | None = None,
+    id_pins: list[Any] | None = None,
+    top_k: int | None = None,
 ) -> RetrieveResponse:
     """Wrap a GathererOutput in the existing RetrieveResponse shape.
 
@@ -500,6 +503,38 @@ async def to_query_response(
     caller genuinely has no gatherer outcome (non-gatherer paths, unit tests);
     that reports not-degraded, which is correct for those callers.
     """
+    if id_pins:
+        # Identifier pins: exact matches for ids the USER TYPED, resolved by
+        # a scope-threaded lookup (retrievers/id_lookup.py). Prepended here
+        # -- BEFORE the scope gate below, so pins pass through the same
+        # final verification as every other chunk -- and deduped against
+        # whatever the model kept: the pin's copy wins the front position,
+        # the model's copy is dropped. This is the survival half of the
+        # lane (D2/D5): the 21% nondeterministic selector can no longer
+        # make an exact match vanish. Marked matched_via id_lookup, the
+        # channel label this vocabulary always reserved for exactly this.
+        pinned_doc_ids = {h.doc_id for h in id_pins}
+        retained = [c for c in gathered.chunks if c.doc_id not in pinned_doc_ids]
+        pin_chunks = [
+            GatheredChunk(
+                doc_id=h.doc_id,
+                chunk_id=h.chunk_id,
+                content=h.content,
+                matched_via=["id_lookup"],
+                why_relevant=(
+                    f"Exact identifier match: {h.matched_canonical_id}"
+                ),
+                source_system=h.source_system,
+                title=h.title or "",
+                source_url=h.source_url or "",
+                created_at=h.created_at.isoformat() if h.created_at else None,
+                updated_at=h.updated_at.isoformat() if h.updated_at else None,
+                author_id=h.author_id,
+            )
+            for h in id_pins
+        ]
+        gathered.chunks = pin_chunks + retained
+
     if (source_keys or doc_types or sources) and customer_id:
         await _enforce_scope_on_chunks(
             customer_id,
@@ -643,6 +678,21 @@ async def to_query_response(
         if customer_id and gathered.entities
         else {}
     )
+
+    if top_k is not None and top_k > 0:
+        # Explicit final response budget (outside-voice F5: nothing sliced
+        # to req.top_k before this existed — the agent path backfilled ten
+        # docs regardless). Documents only, pins-first order preserved
+        # (pins were prepended to gathered.chunks, and grouping walks
+        # chunks in order); entity rows ride separately below.
+        doc_results = [r for r in results if isinstance(r, QueryDocumentResult)]
+        if len(doc_results) > top_k:
+            keep = set(id(r) for r in doc_results[:top_k])
+            results = [
+                r
+                for r in results
+                if not isinstance(r, QueryDocumentResult) or id(r) in keep
+            ]
 
     for entity in gathered.entities:
         rank_counter += 1

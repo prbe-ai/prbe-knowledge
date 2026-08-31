@@ -2583,3 +2583,106 @@ async def test_prefanout_subqueries_capped_at_constant(
     queries = captured.await_args.kwargs["queries"]
     # Exact list: raw first, then the first non-echo reformulation, capped.
     assert queries == ["raw query", "alt one"]
+
+
+@pytest.mark.asyncio
+async def test_pure_lookup_skips_both_llm_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_request: SimpleNamespace,
+) -> None:
+    """Every typed id resolved + empty residual => neither the extractor
+    nor the gatherer LLM runs, and the pinned doc leads a full response.
+
+    Asserted on CALLS, not timing: the fast path's whole contract is which
+    expensive things did not happen.
+    """
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from engine.retrieval.retrievers.id_lookup import IdLookupHit
+
+    req = QueryRequest(query="PRB-17", customer_id="cust-1", top_k=5)
+
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
+        AsyncMock(return_value=GroundingBundle()),
+    )
+    hit = IdLookupHit(
+        chunk_id="ck-1", doc_id="linear:t:issue:u1", doc_version=1,
+        source_system="linear", source_url="https://l/PRB-17", title="PRB-17",
+        content="ticket body", created_at=_dt(2026, 8, 31, tzinfo=_UTC),
+        updated_at=_dt(2026, 8, 31, tzinfo=_UTC), score=1.0,
+        matched_canonical_id="PRB-17",
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.id_lookup_search",
+        AsyncMock(return_value=[hit]),
+    )
+    extractor = AsyncMock(return_value=EntityExtraction())
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.extract_entities_with_llm", extractor
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.execute_search",
+        AsyncMock(return_value={"sub_queries": [{
+            "query": "PRB-17", "grounded_entities": [],
+            "vector": [{"doc_id": "ctx:1", "score": 0.5,
+                        "source_system": "github", "title": "ctx",
+                        "content": "context"}],
+            "bm25": [], "graph": [], "inferred_edge": [],
+        }]}),
+    )
+    gatherer_llm = AsyncMock()
+    with patch("engine.retrieval.agent.loop.acompletion", new=gatherer_llm):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    extractor.assert_not_awaited()
+    gatherer_llm.assert_not_awaited()
+    assert fake_request.state.gatherer_status == "id_lookup_short_circuit"
+    doc_ids = [r.doc_id for r in resp.results if hasattr(r, "doc_id")]
+    assert doc_ids and doc_ids[0] == "linear:t:issue:u1"
+    assert resp.degraded is False
+
+
+@pytest.mark.asyncio
+async def test_unresolved_id_keeps_the_full_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_request: SimpleNamespace,
+) -> None:
+    """One detected id that resolves to nothing => no short-circuit. A thin
+    fast-path answer there would dress a miss up as certainty."""
+    req = QueryRequest(query="PRB-404", customer_id="cust-1", top_k=5)
+
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
+        AsyncMock(return_value=GroundingBundle()),
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.id_lookup_search",
+        AsyncMock(return_value=[]),
+    )
+    extractor = AsyncMock(return_value=EntityExtraction())
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.extract_entities_with_llm", extractor
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.execute_search",
+        AsyncMock(return_value={"sub_queries": [{
+            "query": "PRB-404", "grounded_entities": [],
+            "vector": [{"doc_id": "ctx:1", "score": 0.5,
+                        "source_system": "github", "title": "ctx",
+                        "content": "context"}],
+            "bm25": [], "graph": [], "inferred_edge": [],
+        }]}),
+    )
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args(chunks=1, confidence="high"))],
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    extractor.assert_awaited()  # the full loop ran
+    assert fake_request.state.gatherer_status != "id_lookup_short_circuit"
+    assert resp is not None
