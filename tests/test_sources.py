@@ -652,3 +652,39 @@ async def test_source_view_carries_stage_timings(live_db, settings) -> None:
     assert timing["total_ms"] >= max(
         timing["db_ms"], timing["reconstruct_ms"], timing["view_ms"]
     )
+
+
+@pytest.mark.asyncio
+async def test_source_view_repeat_read_hits_reassembly_cache(live_db, settings) -> None:
+    """Second read of an unchanged document serves the cached stitch.
+
+    Asserted through the cache's own counters AND identical bodies -- not
+    through timing, which flakes on a busy box. The paging pattern this
+    exists for (an agent cursoring through one transcript) is literally
+    this test: same doc, different view, same chunk set.
+    """
+    from engine.retrieval.reassembly_cache import reassembly_cache
+
+    api_key = await _seed_customer("cust-cachehit")
+    await _seed_doc_with_chunks(
+        "cust-cachehit",
+        "slack:T1:C1:cachehit",
+        chunks=["line one\nline two\nline three\n" * 30],
+    )
+
+    first = await _get_source_view(
+        "slack:T1:C1:cachehit",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    hits_before = reassembly_cache.hits
+    second = await _get_source_view(
+        "slack:T1:C1:cachehit",
+        headers={"Authorization": f"Bearer {api_key}"},
+        query="?mode=tail&limit_lines=5",
+    )
+    await init_pool(settings)
+    assert first.status_code == 200 and second.status_code == 200
+    assert reassembly_cache.hits == hits_before + 1
+    # The tail must be the tail of the SAME stitched text the preview saw.
+    assert second.json()["content"].splitlines()[-1] == \
+        first.json()["content"].splitlines()[0].replace("one", "three")
