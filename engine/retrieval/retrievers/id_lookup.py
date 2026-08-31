@@ -26,8 +26,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from engine.retrieval.helpers import source_key_predicate
 from engine.retrieval.temporal import build_predicate
 from engine.shared.db import with_tenant
+from engine.shared.identifiers import DetectedIdentifier
 from engine.shared.models import TemporalSpec, normalize_author_id
 
 # A canonical_id qualifies for exact-id lookup when it looks like a stable
@@ -72,6 +74,10 @@ class IdLookupHit:
     score: float
     author_id: str | None = None
     kind: str = "content"
+    # Which detected identifier this doc matched -- the id-pins lane needs
+    # the mapping (one pin slot per identifier, best doc each), and a flat
+    # hit list cannot carry it (outside-voice F4).
+    matched_canonical_id: str = ""
 
 
 async def id_lookup_search(
@@ -79,65 +85,81 @@ async def id_lookup_search(
     canonical_ids: list[str],
     temporal: TemporalSpec | None = None,
     include_drafts: bool = False,
+    sources: list[str] | None = None,
+    doc_types: list[str] | None = None,
+    author_ids: list[str] | None = None,
+    source_keys: list[str] | None = None,
+    source_keys_include_keyless: bool = False,
 ) -> list[IdLookupHit]:
     """Return one content chunk per doc whose source_id/doc_id/source_url
-    matches any of `canonical_ids`.
+    matches any of `canonical_ids`, carrying WHICH id matched.
 
-    Match shape:
-      - `documents.source_id = ANY($canonical_ids)` — direct hit on the
-        ingested identifier (handler-supplied; e.g. session UUID for
-        claude_code, `issue:<uuid>` for Linear when the router already
-        knows the prefix).
-      - `documents.source_id LIKE '%:<canonical_id>'` — handlers that
-        encode a kind prefix in source_id (per memory
-        `feedback_documents_source_id_format.md`) still match when the
-        router only emits the bare UUID.
-      - `documents.doc_id LIKE '%:<canonical_id>'` — fallback for docs
-        whose doc_id terminator equals the canonical_id (covers GitHub
-        PR refs, Linear ticket codes after coalescing, etc.).
-      - `documents.source_url LIKE '%/<canonical_id>...'` — Linear stores
-        tickets keyed by an internal UUID (source_id = `issue:<uuid>`,
-        doc_id ends in `:<uuid>`) but the URL carries the human handle
-        (`/issue/PRB-17/...`). Patterns anchor on a path separator so
-        `/PRB-17/` matches but `/PRB-170/` does not. Until we backfill an
-        identifier alias for tickets, URL match is the only signal that
-        connects extractor-emitted `PRB-17` to the issue's doc row.
+    Match shape (per id, via a lateral unnest so the mapping survives):
+      - `documents.source_id = <id>` -- direct hit on the ingested
+        identifier (indexed equality).
+      - `documents.source_id LIKE '%:<id>'` / `doc_id LIKE '%:<id>'` --
+        handlers that prefix a kind into the stored id still match a bare
+        one.
+      - `documents.source_url LIKE` path-segment forms -- Linear stores
+        tickets keyed by an internal UUID; the human handle (`PRB-17`)
+        appears only in the URL. Anchored on `/<id>` with a segment
+        terminator so `/PRB-170/` cannot match `/PRB-17`. This arm is a
+        tenant-scoped scan (no usable index under FORCE RLS -- the same
+        leakproof wall every trgm consumer here hits), which is WHY the
+        id-pins lane calls this exactly ONCE per request, never per
+        sub-query. Measured cost class: one bounded documents scan.
 
-    Temporal applies the same predicate as the other retrievers so a
-    historical-version lookup goes against the right SCD2 row. Returns one
-    chunk per doc (chunk_index ASC) — fusion only needs anchor signal.
+    Scope filters (sources / doc_types / author_ids / source_keys /
+    temporal / visibility) are enforced IN THIS QUERY, not downstream:
+    a pinned doc bypassing the workspace lens would be a scope leak with
+    a certainty label on it (outside-voice F3).
+
+    One row per (matched id, doc) pair — DISTINCT ON (m.cid, c.doc_id),
+    NOT plain doc_id: a doc matching two typed ids must count as resolving
+    BOTH, or the loser is falsely reported unresolved and the mapping goes
+    nondeterministic (review F4). Rows come back ordered so the caller's
+    per-id best-doc pick is deterministic: matched id, then updated_at
+    DESC, then doc_id.
     """
     ids = [c for c in canonical_ids if is_lookup_candidate(c)]
     if not ids:
         return []
 
+    # URL arms only make sense for ticket-shaped ids: Linear keys the doc by
+    # an internal UUID and puts the human handle (PRB-17) in the URL path.
+    # UUIDs and shas resolve via the indexed source_id/doc_id arms; running
+    # the leading-wildcard URL LIKEs for them turns an indexable lookup into
+    # a tenant-wide documents scan (review F10). Derived here, not threaded:
+    # detect_identifiers canonicalizes tickets to uppercase, so the anchored
+    # ticket regex is an exact kind test on the canonical form.
+    url_flags = [bool(_TICKET_RE.match(c)) for c in ids]
+
     spec = temporal or TemporalSpec()
-    suffixes = [f"%:{c}" for c in ids]
-    # URL path-segment patterns. The four variants cover the boundary the
-    # ticket code can sit against in a real URL:
-    #   /PRB-17/  in the middle of the path
-    #   /PRB-17   at the very end (no trailing slash)
-    #   /PRB-17?  immediately before a query string
-    #   /PRB-17#  immediately before a fragment
-    # `%PRB-17%` would over-match (`/PRB-170/`, `?prb-17-attached`); the
-    # leading `/` plus a terminator on the trailing side keeps matches
-    # to whole path segments.
-    url_patterns: list[str] = []
-    for c in ids:
-        url_patterns.append(f"%/{c}/%")
-        url_patterns.append(f"%/{c}")
-        url_patterns.append(f"%/{c}?%")
-        url_patterns.append(f"%/{c}#%")
 
     async with with_tenant(customer_id) as conn:
-        params: list[Any] = [customer_id, ids, suffixes, url_patterns]
+        params: list[Any] = [customer_id, ids, url_flags]
+
+        source_filter = ""
+        if sources:
+            params.append(sources)
+            source_filter = f"AND d.source_system = ANY(${len(params)}::text[])"
+        doc_type_filter = ""
+        if doc_types:
+            params.append(doc_types)
+            doc_type_filter = f"AND d.doc_type = ANY(${len(params)}::text[])"
+        author_filter = ""
+        if author_ids:
+            params.append(author_ids)
+            author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
+        source_key_filter = source_key_predicate(
+            params, source_keys, alias="d",
+            include_keyless=source_keys_include_keyless,
+        )
         pred = build_predicate(
             spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
         )
         params.extend(pred.params)
 
-        # Default branch hides drafts (Plan A Component 6); reviewer
-        # surfaces pass include_drafts=True to bypass.
         visibility_filter = (
             ""
             if include_drafts
@@ -146,7 +168,8 @@ async def id_lookup_search(
 
         rows = await conn.fetch(
             f"""
-            SELECT DISTINCT ON (c.doc_id)
+            SELECT DISTINCT ON (m.cid, c.doc_id)
+                   m.cid AS matched_canonical_id,
                    c.chunk_id,
                    c.doc_id,
                    d.version AS doc_version,
@@ -157,28 +180,38 @@ async def id_lookup_search(
                    c.content,
                    d.created_at,
                    d.updated_at
-            FROM chunks c
-            JOIN documents d
-              ON c.doc_id = d.doc_id
-             AND d.customer_id = c.customer_id
-             AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
-            WHERE c.customer_id = $1
-              AND COALESCE(c.kind, 'content') = 'content'
-              AND (
-                d.source_id = ANY($2::text[])
-                OR d.source_id LIKE ANY($3::text[])
-                OR d.doc_id LIKE ANY($3::text[])
-                OR d.source_url LIKE ANY($4::text[])
+            FROM documents d
+            JOIN unnest($2::text[], $3::bool[]) AS m(cid, url_ok)
+              ON (
+                d.source_id = m.cid
+                OR d.source_id LIKE '%:' || m.cid
+                OR d.doc_id LIKE '%:' || m.cid
+                OR (m.url_ok AND (
+                    d.source_url LIKE '%/' || m.cid || '/%'
+                    OR d.source_url LIKE '%/' || m.cid
+                    OR d.source_url LIKE '%/' || m.cid || '?%'
+                    OR d.source_url LIKE '%/' || m.cid || '#%'
+                ))
               )
+            JOIN chunks c
+              ON c.doc_id = d.doc_id
+             AND c.customer_id = d.customer_id
+             AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
+            WHERE d.customer_id = $1
+              AND COALESCE(c.kind, 'content') = 'content'
+              {source_filter}
+              {doc_type_filter}
+              {author_filter}
+              {source_key_filter}
               {pred.chunk_sql}
               {pred.doc_sql}
               {visibility_filter}
-            ORDER BY c.doc_id, c.chunk_index ASC
+            ORDER BY m.cid, c.doc_id, c.chunk_index ASC
             """,
             *params,
         )
 
-    return [
+    hits = [
         IdLookupHit(
             chunk_id=r["chunk_id"],
             doc_id=r["doc_id"],
@@ -191,6 +224,59 @@ async def id_lookup_search(
             updated_at=r["updated_at"],
             score=1.0,
             author_id=normalize_author_id(r["author_id"]),
+            matched_canonical_id=r["matched_canonical_id"],
         )
         for r in rows
     ]
+    # Deterministic order for per-id best-doc selection downstream.
+    hits.sort(key=lambda h: (h.matched_canonical_id, _neg_ts(h.updated_at), h.doc_id))
+    return hits
+
+
+def _neg_ts(ts: datetime) -> float:
+    """Sort key helper: newest first without reverse-sorting the whole tuple."""
+    return -ts.timestamp()
+
+
+def resolve_pins(
+    detected: list[DetectedIdentifier],
+    hits: list[IdLookupHit],
+    top_k: int,
+) -> tuple[list[IdLookupHit], set[str], set[str]]:
+    """Best doc per detected identifier, capped so ranking keeps room.
+
+    Returns (pins, unresolved_canonical_ids, overflow_canonical_ids).
+    One pin slot per identifier -- the BEST matching doc by the
+    deterministic order id_lookup_search established -- deduped by doc_id
+    (two ids resolving to the same doc pin it once), capped at
+    max(1, top_k // 2) so a query quoting ten ids cannot return a phone
+    book, and safe at top_k=1 (outside-voice F4).
+
+    `overflow` is the third category the cap creates: ids that RESOLVED
+    but lost their pin slot to the cap. They are not unresolved (the doc
+    exists) and not pinned (no slot), so the caller must treat them as
+    blocking the pure-lookup short-circuit -- otherwise a response could
+    silently omit documents the user typed the exact id of (review F5).
+    """
+    by_cid: dict[str, IdLookupHit] = {}
+    for h in hits:
+        by_cid.setdefault(h.matched_canonical_id, h)
+    pins: list[IdLookupHit] = []
+    seen_docs: set[str] = set()
+    unresolved: set[str] = set()
+    overflow: set[str] = set()
+    cap = max(1, top_k // 2)
+    for d in detected:
+        h = by_cid.get(d.canonical_id)
+        if h is None:
+            unresolved.add(d.canonical_id)
+            continue
+        if h.doc_id in seen_docs:
+            # Resolved AND represented: another id already pinned this doc.
+            continue
+        if len(pins) >= cap:
+            overflow.add(d.canonical_id)
+            continue
+        seen_docs.add(h.doc_id)
+        pins.append(h)
+    return pins, unresolved, overflow

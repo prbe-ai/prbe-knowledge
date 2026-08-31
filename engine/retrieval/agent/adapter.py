@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any, get_args
 
 from engine.retrieval.agent.models import (
+    GatheredChunk,
     GathererOutput,
     GathererStatus,
     is_degraded,
@@ -441,6 +442,8 @@ async def to_query_response(
     doc_types: list[str] | None = None,
     source_keys_include_keyless: bool = False,
     sources: list[str] | None = None,
+    id_pins: list[Any] | None = None,
+    top_k: int | None = None,
 ) -> RetrieveResponse:
     """Wrap a GathererOutput in the existing RetrieveResponse shape.
 
@@ -500,6 +503,69 @@ async def to_query_response(
     caller genuinely has no gatherer outcome (non-gatherer paths, unit tests);
     that reports not-degraded, which is correct for those callers.
     """
+    if id_pins:
+        # Identifier pins: exact matches for ids the USER TYPED, resolved by
+        # a scope-threaded lookup (retrievers/id_lookup.py). Prepended here
+        # -- BEFORE the scope gate below, so pins pass through the same
+        # final verification as every other chunk. This is the survival
+        # half of the lane (D2/D5): the 21% nondeterministic selector can
+        # no longer make an exact match vanish.
+        #
+        # When the model ALREADY kept chunks for a pinned doc, those chunks
+        # win: they are the passages the gatherer judged to answer the
+        # query, and replacing them with the pin's chunk (the doc's first
+        # chunk — usually a header) would make pinning strictly worse than
+        # not pinning (review F3). The doc still moves to the front and its
+        # lead chunk gains id_lookup provenance. Only a doc the model
+        # dropped gets the synthesized pin chunk.
+        #
+        # The merge lands on a COPY of the GathererOutput: the loop stashed
+        # the original by reference for the post-flush trace persist, and
+        # mutating it here would record id_lookup pins as gatherer output —
+        # corrupting the selector-drop measurements this lane exists to fix
+        # (review F7).
+        pinned_doc_ids = {h.doc_id for h in id_pins}
+        model_kept: dict[str, list[Any]] = {}
+        rest = []
+        for c in gathered.chunks:
+            if c.doc_id in pinned_doc_ids:
+                model_kept.setdefault(c.doc_id, []).append(c)
+            else:
+                rest.append(c)
+        merged: list[Any] = []
+        for h in id_pins:
+            kept = model_kept.get(h.doc_id)
+            if kept:
+                lead = kept[0]
+                if "id_lookup" not in lead.matched_via:
+                    lead = lead.model_copy(
+                        update={
+                            "matched_via": [*lead.matched_via, "id_lookup"]
+                        }
+                    )
+                merged.append(lead)
+                merged.extend(kept[1:])
+            else:
+                merged.append(
+                    GatheredChunk(
+                        doc_id=h.doc_id,
+                        chunk_id=h.chunk_id,
+                        content=h.content,
+                        matched_via=["id_lookup"],
+                        why_relevant=(
+                            f"Exact identifier match: {h.matched_canonical_id}"
+                        ),
+                        source_system=h.source_system,
+                        title=h.title or "",
+                        source_url=h.source_url or "",
+                        created_at=h.created_at.isoformat(),
+                        updated_at=h.updated_at.isoformat(),
+                        author_id=h.author_id,
+                    )
+                )
+        merged.extend(rest)
+        gathered = gathered.model_copy(update={"chunks": merged})
+
     if (source_keys or doc_types or sources) and customer_id:
         await _enforce_scope_on_chunks(
             customer_id,
@@ -547,6 +613,17 @@ async def to_query_response(
             doc_groups[chunk.doc_id] = []
             doc_order.append(chunk.doc_id)
         doc_groups[chunk.doc_id].append(chunk)
+
+    # Explicit final response budget (outside-voice F5: nothing sliced to
+    # req.top_k before this existed — the agent path backfilled ten docs
+    # regardless). Applied HERE, before rank/score assignment and the
+    # confidence tally, so surviving docs get contiguous ranks, entity rows
+    # continue the sequence without a hole, and confidence_breakdown counts
+    # only evidence the caller actually receives (review F8). Pins-first
+    # order is preserved: they were prepended to the chunk list above and
+    # grouping walks chunks in order.
+    if top_k is not None and top_k > 0 and len(doc_order) > top_k:
+        doc_order = doc_order[:top_k]
 
     results: list[QueryResult] = []
     rank_counter = 0

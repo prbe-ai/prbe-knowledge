@@ -65,6 +65,12 @@ GathererStatus = Literal[
     # nothing; the harness returns an empty GathererOutput without
     # entering the loop, saving 3-5s on truly hopeless queries.
     "zero_recall_short_circuit",
+    # Every identifier the user typed resolved to a doc AND nothing topical
+    # remained after stripping the ids and their frame words — a pure
+    # lookup. The pins ARE the answer; the prefanout gathered context; LLM
+    # turns would add latency, not information. The id-pins lane's fast
+    # path (D5, 2026-08-31).
+    "id_lookup_short_circuit",
     # The gatherer's message history exceeded the model's context window
     # (ContextWindowExceededError from the provider). Unlike
     # fatal_provider_error this is a DETERMINISTIC input-too-large 400, not
@@ -118,6 +124,9 @@ _NON_DEGRADED_STATUSES: frozenset[str] = frozenset(
     {
         "ok",
         "zero_recall_short_circuit",
+        # A pure identifier lookup that resolved everything it was asked:
+        # the strongest answer this system can give, not a weaker one.
+        "id_lookup_short_circuit",
     }
 )
 

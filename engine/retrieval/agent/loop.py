@@ -44,6 +44,7 @@ from engine.retrieval.agent.extractor import extract_entities_with_llm
 from engine.retrieval.agent.models import (
     ConfidenceLabel,
     DroppedCandidate,
+    EntityExtraction,
     GatheredChunk,
     GathererNotes,
     GathererOutput,
@@ -64,6 +65,12 @@ from engine.retrieval.agent.tools import (
 from engine.retrieval.channel_health import begin_request, lost_channels
 from engine.retrieval.grounding import GroundingBundle
 from engine.retrieval.helpers import expand_to_author_id_set
+from engine.retrieval.retrievers.bm25 import residualize_for_bm25
+from engine.retrieval.retrievers.id_lookup import (
+    IdLookupHit,
+    id_lookup_search,
+    resolve_pins,
+)
 from engine.retrieval.router import (
     Intent,
     RouterEntity,
@@ -91,6 +98,7 @@ from engine.shared.constants import (
     SourceSystem,
 )
 from engine.shared.db import with_tenant
+from engine.shared.identifiers import detect_identifiers
 from engine.shared.llm import LLMError, acompletion, gateway_url
 from engine.shared.llm_tools import (
     is_context_overflow,
@@ -620,6 +628,7 @@ def _build_user_message(
     author_ids: list[str] | None = None,
     source_keys: list[str] | None = None,
     doc_types: list[str] | None = None,
+    id_pins: list[IdLookupHit] | None = None,
 ) -> str:
     """Render the per-query user message.
 
@@ -647,6 +656,35 @@ def _build_user_message(
             f"  - {m.entity_type}:{m.canonical_id} ({m.display_name}) [bare_id]"
         )
     grounding_block = "\n".join(grounding_lines) if grounding_lines else "  (no entities matched)"
+
+    # <id_pins>: exact-identifier matches for ids the USER TYPED, resolved
+    # by scope-threaded SQL — certainty the ranked channels cannot express.
+    # Rendered ONLY when pins exist so identifier-free queries keep a
+    # byte-identical prompt prefix (same cache-stability rule as
+    # <search_options> below). These docs are ALREADY guaranteed in the
+    # final response by the adapter; telling the model makes its
+    # reasoning use them (the multi-hop half of the lane) rather than
+    # re-discovering or contradicting them.
+    id_pins_block = ""
+    if id_pins:
+        # doc_id and title are third-party ingested text (Slack/Linear/
+        # GitHub); escape them like the query itself (router.py's MUST rule
+        # for user-controlled text entering a downstream LLM call) so a
+        # crafted title cannot close the tag mid-prompt (review F6). The
+        # canonical id is regex-shaped by construction and safe.
+        pin_lines = "\n".join(
+            f"  - {h.matched_canonical_id} -> {_escape_query_for_xml(h.doc_id)}"
+            f" ({_escape_query_for_xml(h.title or h.source_system)})"
+            for h in id_pins
+        )
+        id_pins_block = (
+            "<id_pins>\n"
+            "Exact matches for identifiers the user typed. These documents\n"
+            "are certain and will appear in the results; build the answer\n"
+            "AROUND them.\n"
+            f"{pin_lines}\n"
+            "</id_pins>\n"
+        )
 
     sources_block = (
         ", ".join(bundle.connected_sources) if bundle.connected_sources else "(none)"
@@ -739,6 +777,7 @@ def _build_user_message(
     safe_query = _escape_query_for_xml(query)
     return (
         f"<grounding>\n{grounding_block}\n</grounding>\n\n"
+        f"{id_pins_block}"
         f"<connected_sources>{sources_block}</connected_sources>"
         f"{options_block}"
         f"{channel_results_block}"
@@ -832,8 +871,18 @@ def _extract_cache_hit_rate(resp: Any) -> float | None:
 def _empty_passthrough(
     reason: GathererStatus,
     state: LoopState | None = None,
+    *,
+    confidence: str = "low",
+    record_drop: bool = True,
 ) -> GathererOutput:
-    """Synthesize an empty, low-confidence output for degraded paths.
+    """Synthesize an empty output for harness-terminated paths.
+
+    Defaults describe the DEGRADED paths (low confidence + a dropped-
+    candidate marker naming the reason). The id-lookup short-circuit
+    reuses the same skeleton but is the opposite of degraded -- an exact
+    match is the strongest answer this system can give -- so it overrides
+    both (review F9: shipping confidence='low' there made every consumer
+    read the lane's best outcome as its weakest).
 
     Recall-floor backfill may subsequently populate its chunks from citable
     pre-fan-out evidence. When the loop already ran, preserve its
@@ -845,13 +894,17 @@ def _empty_passthrough(
         gatherer_notes=GathererNotes(
             turns_used=state.turn_count if state is not None else 0,
             tools_called=list(state.tools_fired) if state is not None else [],
-            confidence="low",
-            dropped=[
-                DroppedCandidate(
-                    canonical_id="<harness>",
-                    reason=f"harness_passthrough: {reason}",
-                )
-            ],
+            confidence=confidence,
+            dropped=(
+                [
+                    DroppedCandidate(
+                        canonical_id="<harness>",
+                        reason=f"harness_passthrough: {reason}",
+                    )
+                ]
+                if record_drop
+                else []
+            ),
         ),
     )
 
@@ -1907,28 +1960,106 @@ async def run_gatherer(
     # a ceiling a caller can actually rely on.
     t_stage_start = time.perf_counter()
 
-    # Step 1 — SEQUENTIAL grounding → LLM extraction (bundle as context).
+    # Step 1 — grounding, with the id-pins lookup riding alongside.
+    #
+    # detect_identifiers reads the RAW QUERY ONLY, so everything here is
+    # something the user actually typed — LLM-extracted entities can never
+    # reach the exact-lookup, which is what makes a pin's certainty honest
+    # (a hallucinated id pinned at the top would be worse than any miss).
+    # The lookup runs ONCE per request, concurrent with grounding, with the
+    # request's scope filters enforced IN its SQL — a pinned doc that
+    # bypassed the workspace lens would be a scope leak wearing a
+    # certainty label.
+    detected_ids = detect_identifiers(req.query)
     t_grounding = time.perf_counter()
-    try:
-        bundle = await _build_bundle_with_token_fallback(customer_id, req.query)
-    except Exception as exc:
-        log.warning(
-            "agent.grounding_failed",
-            customer_id=customer_id,
-            trace_id=trace_id,
-            error=str(exc),
-        )
-        bundle = GroundingBundle()
+
+    async def _grounding_task() -> GroundingBundle:
+        try:
+            return await _build_bundle_with_token_fallback(customer_id, req.query)
+        except Exception as exc:
+            log.warning(
+                "agent.grounding_failed",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                error=str(exc),
+            )
+            return GroundingBundle()
+
+    async def _id_lookup_task() -> list[IdLookupHit]:
+        if not detected_ids:
+            return []
+        try:
+            return await id_lookup_search(
+                customer_id,
+                [d.canonical_id for d in detected_ids],
+                sources=[s.value for s in req.sources] if req.sources else None,
+                doc_types=req.doc_types or None,
+                source_keys=req.source_keys or None,
+                source_keys_include_keyless=bool(req.source_keys_include_keyless),
+            )
+        except Exception as exc:
+            # A failed lookup degrades to "no pins", never to a failed
+            # request — the ranked channels still answer.
+            log.warning(
+                "agent.id_lookup_failed",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                error=str(exc),
+            )
+            return []
+
+    bundle, id_hits = await asyncio.gather(_grounding_task(), _id_lookup_task())
     timing["grounding_ms"] = (time.perf_counter() - t_grounding) * 1000
 
-    t_extraction = time.perf_counter()
-    # Seed the extractor too — without it, entity extraction variance
-    # changes the prefanout anchors and the variance attribution in the
-    # trace gets misassigned to the (now-seeded) gatherer loop.
-    extraction_seed = _seed_for_query(customer_id, req.query)
-    extracted = await extract_entities_with_llm(
-        customer_id, req.query, bundle, seed=extraction_seed
+    id_pins, unresolved_ids, overflow_ids = resolve_pins(
+        detected_ids, id_hits, req.top_k
     )
+    if detected_ids:
+        log.info(
+            "agent.id_pins_resolved",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            detected=len(detected_ids),
+            pinned=len(id_pins),
+            unresolved=sorted(unresolved_ids),
+            overflow=sorted(overflow_ids),
+        )
+
+    # Pure-lookup fast path: EVERY detected id resolved AND pinned AND
+    # nothing topical remains once identifier tokens and their frame words
+    # are stripped (the same residual test that gates BM25). One unresolved
+    # id keeps the full loop — the user asked about something we could not
+    # pin, and a thin short-circuit there would dress a miss up as an
+    # answer. Overflow ids (resolved but capped out of a pin slot) block it
+    # too: short-circuiting there would silently omit documents the user
+    # typed the exact id of (review F5); the full loop can still rank them.
+    pure_lookup = bool(
+        detected_ids
+        and not unresolved_ids
+        and not overflow_ids
+        and residualize_for_bm25(
+            req.query, [d.canonical_id for d in detected_ids]
+        )
+        is None
+    )
+
+    t_extraction = time.perf_counter()
+    if pure_lookup:
+        # Skip the extractor LLM call outright: there is no topical residual
+        # to extract entities or reformulations FROM. The prefanout below
+        # still runs (raw query, grounded anchors); the short-circuit block
+        # projects its top fused docs into the response via the recall-floor
+        # backfill, so the answer carries context around the pinned docs,
+        # not just their cards.
+        extracted = EntityExtraction()
+    else:
+        # Seed the extractor too — without it, entity extraction variance
+        # changes the prefanout anchors and the variance attribution in the
+        # trace gets misassigned to the (now-seeded) gatherer loop.
+        extraction_seed = _seed_for_query(customer_id, req.query)
+        extracted = await extract_entities_with_llm(
+            customer_id, req.query, bundle, seed=extraction_seed
+        )
     timing["extraction_ms"] = (time.perf_counter() - t_extraction) * 1000
     extracted_entities = extracted.entities
     search_options = extracted.search_options
@@ -2012,6 +2143,34 @@ async def run_gatherer(
         if req.entity_must_match
         else []
     )
+
+    # Pins honor the same author hard-filter every ranked channel enforces
+    # (review F2). The id lookup ran concurrently with grounding — before
+    # person entities could resolve — so the filter lands here, on the hits
+    # it already fetched (IdLookupHit carries author_id; no re-query). A
+    # dropped pin's id counts as unresolved and clears the fast path: a
+    # doc that exists but is out of the author scope must neither pin nor
+    # short-circuit — the certainty label is exactly what must not leak.
+    if author_ids and id_pins:
+        _allowed_authors = set(author_ids)
+        _author_dropped = [
+            h for h in id_pins if h.author_id not in _allowed_authors
+        ]
+        if _author_dropped:
+            id_pins = [h for h in id_pins if h.author_id in _allowed_authors]
+            unresolved_ids |= {
+                h.matched_canonical_id for h in _author_dropped
+            }
+            pure_lookup = False
+            log.info(
+                "agent.id_pins_author_filtered",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                dropped=sorted(
+                    h.matched_canonical_id for h in _author_dropped
+                ),
+                remaining=len(id_pins),
+            )
 
     # Caller-provided hard scope from QueryRequest. `req.doc_types`
     # OVERRIDES the extractor's inferred doc_types (the documented
@@ -2127,6 +2286,7 @@ async def run_gatherer(
         author_ids=author_ids,
         source_keys=request_source_keys,
         doc_types=request_doc_types,
+        id_pins=id_pins,
     )
     system_prompt = build_system_prompt(datetime.now(UTC))
 
@@ -2187,6 +2347,80 @@ async def run_gatherer(
     # not a query-shape issue, and the previous behavior was a 90s
     # death loop for the much more common "query has no answer" case.
     prefanout_total = sum(prefanout_hit_counts.values())
+    if pure_lookup:
+        # Identifier-only query, every id resolved: the pins ARE the answer.
+        # Skipping the gatherer here is not a degradation — is_degraded
+        # excludes this status — it is the lane working as designed
+        # (~seconds instead of LLM turns), so the passthrough overrides the
+        # degraded-path defaults: confidence high, no dropped marker
+        # (review F9). The recall-floor backfill below projects the top
+        # fused prefanout docs into the response so it carries context
+        # around the pinned docs, not just their cards — without the
+        # explicit call the early return would skip the shared backfill at
+        # the end of this function and discard the prefanout (review F1).
+        log.info(
+            "agent.id_lookup_short_circuit",
+            customer_id=customer_id,
+            trace_id=trace_id,
+            pinned=len(id_pins),
+        )
+        status = "id_lookup_short_circuit"
+        gathered = _empty_passthrough(
+            "id_lookup_short_circuit",
+            state,
+            confidence="high",
+            record_drop=False,
+        )
+        backfilled = _backfill_recall_floor(gathered, state.prefanout)
+        if backfilled:
+            log.info(
+                "agent.recall_floor_backfill",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                status=status,
+                appended=backfilled,
+                total_chunks=len(gathered.chunks),
+            )
+        timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
+        if request is not None:
+            status = merge_channel_loss(status, lost_channels())
+            request.state.gatherer_status = status
+            request.state.tool_calls_count = 0
+            request.state.need_deeper_extensions = 0
+            request.state.confidence = gathered.gatherer_notes.confidence
+            request.state.dropped_count = len(gathered.gatherer_notes.dropped)
+            request.state.cache_hit_rate = None
+            request.state.intents_count = 1
+            request.state.router_model = SEARCH_AGENT_INFERENCE_MODEL
+            request.state.failure_recovered = is_degraded(status)
+        _stash_for_trace_persist(
+            request,
+            customer_id=customer_id,
+            trace_id=trace_id,
+            query=req.query,
+            state=state,
+            gathered=gathered,
+            status=status,
+            timing=timing,
+        )
+        return await to_query_response(
+            query=req.query,
+            gathered=gathered,
+            trace_id=trace_id,
+            timing_ms=timing,
+            prefanout=state.prefanout,
+            fused_scores=fused_prefanout_scores(state.prefanout),
+            customer_id=customer_id,
+            top_k_related=req.top_k_related,
+            source_keys=request_source_keys,
+            doc_types=request_doc_types,
+            source_keys_include_keyless=request_source_keys_include_keyless,
+            sources=request_sources,
+            status=status,
+            id_pins=id_pins,
+            top_k=req.top_k,
+        )
+
     if prefanout_total == 0:
         log.info(
             "agent.zero_recall_short_circuit",
@@ -2240,6 +2474,8 @@ async def run_gatherer(
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
             status=status,
+            id_pins=id_pins,
+            top_k=req.top_k,
         )
 
     if _no_llm_configured():
@@ -2293,6 +2529,8 @@ async def run_gatherer(
             source_keys_include_keyless=request_source_keys_include_keyless,
             sources=request_sources,
             status=status,
+            id_pins=id_pins,
+            top_k=req.top_k,
         )
 
     gathered: GathererOutput | None = None
@@ -2510,6 +2748,8 @@ async def run_gatherer(
         source_keys_include_keyless=request_source_keys_include_keyless,
         sources=request_sources,
         status=status,
+        id_pins=id_pins,
+        top_k=req.top_k,
     )
 
 
