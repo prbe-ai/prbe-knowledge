@@ -380,12 +380,12 @@ CREATE TABLE chunks (
 -- Production retrieval index over gemini-embedding-2 vectors. The legacy
 -- v1 HNSW index over `embedding` was dropped in migration 0071 (no
 -- production reader after the cutover).
-CREATE INDEX idx_chunks_embedding_v2_hnsw ON chunks USING hnsw (embedding_v2 halfvec_cosine_ops);
--- Live-only twin (0124): serves TemporalMode.LATEST -- the default, whose
--- chunk predicate (valid_to IS NULL) implies this index's. Only ~35% of
--- chunks are live, so the full index walks 3x the graph the default path
--- needs. The full index above STAYS: ALL/AS_OF modes and the inferred-edges
--- bundle still order over every version.
+-- Live-only ANN index (0124; the FULL twin was dropped in 0126). Serves
+-- TemporalMode.LATEST -- the default, whose chunk predicate
+-- (valid_to IS NULL) implies this WHERE clause. Non-LATEST temporal modes
+-- (AS_OF/ALL) have no ANN index by decision: measured usage was zero, and
+-- their vector channel degrades to a bounded seq-scan sort. See 0126's
+-- docstring for the audit.
 CREATE INDEX idx_chunks_embedding_v2_hnsw_live ON chunks USING hnsw (embedding_v2 halfvec_cosine_ops) WHERE valid_to IS NULL;
 CREATE INDEX idx_chunks_customer       ON chunks (customer_id);
 CREATE INDEX idx_chunks_doc            ON chunks (doc_id);

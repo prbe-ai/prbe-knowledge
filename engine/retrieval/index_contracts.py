@@ -125,7 +125,11 @@ INDEX_CONTRACTS: Final[tuple[IndexContract, ...]] = (
         ),
     ),
     IndexContract(
-        index="idx_chunks_embedding_v2_hnsw",
+        # The ANN ORDER BY shape contract, carried by the LIVE index since
+        # 0126 dropped the full one (audited consumer-free; see that
+        # migration). The guard is unchanged in substance: the sort key the
+        # query emits must stay a bare distance an HNSW index can serve.
+        index="idx_chunks_embedding_v2_hnsw_live",
         table="chunks",
         expression="embedding_v2 halfvec_cosine_ops",
         source_file="engine/retrieval/retrievers/vector.py",
