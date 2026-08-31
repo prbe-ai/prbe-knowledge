@@ -620,3 +620,35 @@ async def test_source_view_preview_max_bytes_unchanged_by_full_constant(live_db,
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["max_bytes"] == 12_000  # _SOURCE_VIEW_DEFAULT_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_source_view_carries_stage_timings(live_db, settings) -> None:
+    """Every source-view response reports where its milliseconds went.
+
+    This endpoint runs at ~13x /retrieve's call volume and had zero
+    instrumentation -- the trace row said WHAT was served, never what it
+    cost. The keys are the contract the first analysis will grep for
+    (source_view.served log lines carry the same dict), so their presence
+    and basic sanity are pinned here rather than trusted.
+    """
+    api_key = await _seed_customer("cust-timing")
+    await _seed_doc_with_chunks(
+        "cust-timing",
+        "slack:T1:C1:timing",
+        chunks=["alpha beta gamma\n" * 40],
+    )
+
+    resp = await _get_source_view(
+        "slack:T1:C1:timing",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    await init_pool(settings)
+    assert resp.status_code == 200, resp.text
+    timing = resp.json()["timing_ms"]
+    assert set(timing) == {"db_ms", "reconstruct_ms", "view_ms", "total_ms"}
+    assert all(v >= 0 for v in timing.values())
+    # total covers the three stages (rounding gives it a little slack).
+    assert timing["total_ms"] >= max(
+        timing["db_ms"], timing["reconstruct_ms"], timing["view_ms"]
+    )

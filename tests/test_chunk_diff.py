@@ -234,3 +234,86 @@ async def test_chunk_diff_no_op_on_identical_body(live_db) -> None:
             customer_id,
         )
         assert dup_chunks == 0
+
+
+@pytest.mark.asyncio
+async def test_removed_chunk_version_range_agrees_with_valid_to(live_db) -> None:
+    """Removal caps last_seen_version so the version join and valid_to agree.
+
+    The in-place resync path (incomplete docs, same version) used to mark a
+    removed chunk dead while its version range still admitted it -- so
+    `d.version BETWEEN first_seen AND last_seen` served content the producer
+    had deleted wherever a query lacked the valid_to predicate. Two cases pin
+    the LEAST():
+
+      * same-version removal (doc.version == chunk's last_seen): capped to
+        version - 1 -- the chunk was last part of a completed state one
+        version earlier;
+      * version-bump removal (doc.version == last_seen + 1): a no-op -- the
+        range already ends at the version the chunk was genuinely part of.
+    """
+    from types import SimpleNamespace
+
+    from engine.ingest.normalizer import _apply_chunk_plan, _ChunkPlan
+
+    customer_id = "cust-caprange-1"
+    await _seed_customer(customer_id)
+
+    async with db_module.raw_conn() as conn:
+        for doc_id, version, _chunk_id, _chash in (
+            ("doc-samever", 3, "ck-samever", "hash-samever"),
+            ("doc-bumped", 4, "ck-bumped", "hash-bumped"),
+        ):
+            await conn.execute(
+                """
+                INSERT INTO documents (customer_id, doc_id, version, source_system,
+                                       source_id, source_url, doc_type, content_hash,
+                                       created_at, updated_at, valid_from, acl,
+                                       title, body_preview)
+                VALUES ($1, $2, $3, 'slack', $2, 'https://x', 'message', $4,
+                        NOW(), NOW(), NOW(), '{}'::jsonb, 't', 'p')
+                """,
+                customer_id, doc_id, version, f"dh-{doc_id}",
+            )
+        # Chunk last seen at version 3 in both docs.
+        for doc_id, chunk_id, chash in (
+            ("doc-samever", "ck-samever", "hash-samever"),
+            ("doc-bumped", "ck-bumped", "hash-bumped"),
+        ):
+            await conn.execute(
+                """
+                INSERT INTO chunks (customer_id, chunk_id, doc_id, chunk_index,
+                                    content, content_hash, token_count,
+                                    first_seen_version, last_seen_version)
+                VALUES ($1, $2, $3, 0, 'body', $4, 1, 1, 3)
+                """,
+                customer_id, chunk_id, doc_id, chash,
+            )
+
+        # Same-version removal: doc at 3, chunk last_seen 3 -> capped to 2.
+        await _apply_chunk_plan(
+            conn,
+            SimpleNamespace(customer_id=customer_id, doc_id="doc-samever", version=3),  # type: ignore[arg-type]
+            _ChunkPlan(removed_hashes={"hash-samever"}),
+        )
+        # Version-bump removal: doc now at 4, chunk last_seen 3 -> stays 3.
+        await _apply_chunk_plan(
+            conn,
+            SimpleNamespace(customer_id=customer_id, doc_id="doc-bumped", version=4),  # type: ignore[arg-type]
+            _ChunkPlan(removed_hashes={"hash-bumped"}),
+        )
+
+        rows = {
+            r["chunk_id"]: r
+            for r in await conn.fetch(
+                """
+                SELECT chunk_id, valid_to, last_seen_version FROM chunks
+                WHERE customer_id = $1
+                """,
+                customer_id,
+            )
+        }
+    assert rows["ck-samever"]["valid_to"] is not None
+    assert rows["ck-samever"]["last_seen_version"] == 2
+    assert rows["ck-bumped"]["valid_to"] is not None
+    assert rows["ck-bumped"]["last_seen_version"] == 3
