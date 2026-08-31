@@ -317,6 +317,92 @@ async def test_id_lookup_maps_each_id_and_gates_url_arms(live_db) -> None:
     assert await id_lookup_search(cid, [url_only_uuid]) == []
 
 
+async def test_prefix_lookup_unique_vs_ambiguous(live_db) -> None:
+    """Inferred hex prefixes pin only on a UNIQUE match (git short-hash
+    rule); two matches -> ambiguous, no hit, prefix reported."""
+    from engine.retrieval.retrievers.id_lookup import _prefix_lookup
+    from engine.shared.models import TemporalSpec
+
+    cid = _new_customer_id()
+    await _seed_customer(cid)
+    await _seed_doc(
+        cid, f"{cid}:github:owner/repo:commit:ce09c4370ea9487302dbce1e8c51b5a0",
+        title="fix: the thing", content="commit body", visibility="approved",
+        source_system="github", source_id="owner/repo@ce09c4370ea9487302dbce1e8c51b5a041ac3424",
+    )
+    await _seed_doc(
+        cid, f"{cid}:claude_code:t:5e0f3220-dad2-479a-a8b8-853a3c7132a6",
+        title="session", content="session body", visibility="approved",
+        source_system="claude_code", source_id="5e0f3220-dad2-479a-a8b8-853a3c7132a6",
+    )
+    # A second doc sharing the ambiguous prefix 'ce09c43'.
+    await _seed_doc(
+        cid, f"{cid}:github:owner/repo:commit:ce09c43ffffffffffffffffffffffff",
+        title="other commit", content="other body", visibility="approved",
+        source_system="github", source_id="owner/repo@ce09c43fffffffffffffffffffffffffffffffff",
+    )
+
+    scope = dict(
+        spec=TemporalSpec(), include_drafts=False, sources=None,
+        doc_types=None, author_ids=None, source_keys=None,
+        source_keys_include_keyless=False,
+    )
+    hits, ambiguous = await _prefix_lookup(cid, ["5e0f3220", "ce09c43"], **scope)
+    assert [h.matched_canonical_id for h in hits] == ["5e0f3220"]
+    assert hits[0].doc_id.endswith("5e0f3220-dad2-479a-a8b8-853a3c7132a6")
+    assert ambiguous == {"ce09c43"}
+
+
+async def test_number_ref_lookup_repo_rules(live_db) -> None:
+    """Number refs resolve per repo: unique repo pins (preferring the PR
+    doc over the '(#N)' commit), a junk qualifier falls back to the bare
+    rule, and a number in two repos is ambiguous unless qualified."""
+    from engine.retrieval.retrievers.id_lookup import _number_ref_lookup
+    from engine.shared.models import TemporalSpec
+
+    cid = _new_customer_id()
+    await _seed_customer(cid)
+    # Repo A: PR doc AND its squash commit for #539.
+    await _seed_doc(
+        cid, "github:acme/research-os:pr:539",
+        title="v1 feat: thing", content="pr body", visibility="approved",
+        source_system="github", source_id="acme/research-os#539",
+    )
+    await _seed_doc(
+        cid, "github:acme/research-os:commit:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        title="feat: thing (#539)", content="commit body", visibility="approved",
+        source_system="github", source_id="acme/research-os@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    # #77 exists in TWO repos -> bare ref ambiguous, qualified resolves.
+    await _seed_doc(
+        cid, "github:acme/alpha:commit:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        title="fix (#77)", content="a", visibility="approved",
+        source_system="github", source_id="acme/alpha@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    )
+    await _seed_doc(
+        cid, "github:acme/beta:commit:cccccccccccccccccccccccccccccccccccccccc",
+        title="fix (#77)", content="b", visibility="approved",
+        source_system="github", source_id="acme/beta@cccccccccccccccccccccccccccccccccccccccc",
+    )
+
+    scope = dict(
+        spec=TemporalSpec(), include_drafts=False, sources=None,
+        doc_types=None, author_ids=None, source_keys=None,
+        source_keys_include_keyless=False,
+    )
+    hits, ambiguous = await _number_ref_lookup(
+        cid, ["#539", "the#539", "#77", "alpha#77"], **scope
+    )
+    got = {h.matched_canonical_id: h.doc_id for h in hits}
+    # Unique repo: resolves, PR doc preferred over the commit doc.
+    assert got["#539"] == "github:acme/research-os:pr:539"
+    # Junk qualifier falls back to the bare rule.
+    assert got["the#539"] == "github:acme/research-os:pr:539"
+    # Two repos share #77: bare is ambiguous, qualified resolves.
+    assert "#77" in ambiguous
+    assert got["alpha#77"] == "github:acme/alpha:commit:" + "b" * 40
+
+
 async def test_sql_list_excludes_drafts_by_default(live_db) -> None:
     cid = _new_customer_id()
     await _seed_customer(cid)

@@ -54,6 +54,29 @@ _ISSUE_REF_RE = re.compile(r"\b([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)?#\d{1,6})\b"
 # Bare commit shas: 12-40 hex. Runs AFTER UUID masking. The 12 floor keeps
 # ordinary words and short hex fragments out.
 _SHA_RE = re.compile(r"\b[0-9a-fA-F]{12,40}\b")
+# Number refs: '#383', 'PR #232', 'pull request #536', and repo-qualified
+# 'research-os PR #539'. Runs AFTER issue_ref masking so 'repo#123' (no
+# space, exact kind) is never re-captured. The optional qualifier is
+# whatever word precedes the frame word — it can be junk ('the PR #232');
+# resolution treats it as a SOFT filter and falls back to the bare-number
+# rule when it matches no repo, so a junk qualifier costs nothing.
+_NUMBER_REF_RE = re.compile(
+    r"(?:\b(?P<repo>[A-Za-z0-9_.-]+)\s+)?"
+    r"(?:(?:PR|pull\s+request|issue)\s*)?"
+    r"#(?P<num>\d{1,6})\b",
+    re.IGNORECASE,
+)
+# PagerDuty incident ids: 'Q' + 13 uppercase alphanumerics. Uppercase-only
+# on purpose — lowercase words can never collide, and PD never emits
+# lowercase ids.
+_PD_RE = re.compile(r"\bQ[A-Z0-9]{12,15}\b")
+# Bare hex prefixes: 7-11 hex chars — a short commit sha ('ce09c43') or the
+# first segment of a UUID ('5e0f3220'). Runs LAST, on a query with uuids,
+# number refs and full shas already masked, so it only sees residue. The 7
+# floor keeps short hex-looking words out; 12+ is the sha kind. Detection
+# is loose BY DESIGN: resolution pins a prefix only when it matches exactly
+# one document, so a false positive here costs one bounded lookup.
+_HEX_PREFIX_RE = re.compile(r"\b[0-9a-fA-F]{7,11}\b")
 
 # Common English words that satisfy the ticket shape (WORD-DIGITS). The
 # ticket regex is intentionally loose; this list catches the handful of
@@ -64,7 +87,14 @@ _TICKET_STOPWORDS = frozenset({"TOP", "UTF", "SHA", "MD", "BASE", "GPT", "V"})
 
 @dataclass(frozen=True, slots=True)
 class DetectedIdentifier:
-    kind: str  # "uuid" | "ticket" | "issue_ref" | "commit_sha"
+    # "uuid" | "ticket" | "issue_ref" | "commit_sha" | "pd_incident"
+    #   -> EXACT kinds: the user typed the whole identifier; equality/suffix
+    #      arms resolve it, and whatever matches is right.
+    # "number_ref" | "hex_prefix"
+    #   -> INFERRED kinds: the lookup must EXPAND them (a number to a repo's
+    #      PR, a prefix to a full sha/uuid) and may pin only when the
+    #      expansion is unique — see id_lookup.lookup_identifiers.
+    kind: str
     canonical_id: str
 
 
@@ -83,11 +113,15 @@ def detect_identifiers(query: str) -> list[DetectedIdentifier]:
             seen.add(canonical)
             out.append(DetectedIdentifier(kind=kind, canonical_id=canonical))
 
+    def _mask(text: str, span: tuple[int, int]) -> str:
+        # Same-length padding so later spans stay aligned and later
+        # patterns cannot see fragments of an already-claimed identifier.
+        a, b = span
+        return text[:a] + "\x00" * (b - a) + text[b:]
+
     masked = query
     for m in _UUID_RE.finditer(query):
         _add("uuid", m.group(0).lower())
-        # Replace with same-length padding so later spans stay aligned
-        # and the sha pattern cannot see the uuid's hex segments.
         masked = masked.replace(m.group(0), "\x00" * len(m.group(0)))
 
     for m in _TICKET_RE.finditer(masked):
@@ -96,10 +130,27 @@ def detect_identifiers(query: str) -> list[DetectedIdentifier]:
             continue
         _add("ticket", m.group(1).upper())
 
-    for m in _ISSUE_REF_RE.finditer(masked):
+    for m in list(_ISSUE_REF_RE.finditer(masked)):
         _add("issue_ref", m.group(1))
+        masked = _mask(masked, m.span())
 
-    for m in _SHA_RE.finditer(masked):
+    for m in list(_NUMBER_REF_RE.finditer(masked)):
+        repo = m.group("repo") or ""
+        # A frame word captured as the qualifier ('PR #232' -> repo='PR')
+        # is the regex doing its job on the optional branch; strip it.
+        if repo.lower() in ("pr", "pull", "issue", "request"):
+            repo = ""
+        _add("number_ref", f"{repo}#{m.group('num')}" if repo else f"#{m.group('num')}")
+        masked = _mask(masked, m.span())
+
+    for m in list(_SHA_RE.finditer(masked)):
         _add("commit_sha", m.group(0).lower())
+        masked = _mask(masked, m.span())
+
+    for m in _PD_RE.finditer(masked):
+        _add("pd_incident", m.group(0))
+
+    for m in _HEX_PREFIX_RE.finditer(masked):
+        _add("hex_prefix", m.group(0).lower())
 
     return out

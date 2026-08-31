@@ -58,3 +58,50 @@ def test_duplicates_collapse_and_punctuation_boundaries_hold() -> None:
 
 def test_ticket_stopwords_do_not_detect() -> None:
     assert detect_identifiers("top-10 utf-8 gpt-5 results") == []
+
+
+# ---- inferred kinds: number refs, hex prefixes, PagerDuty ids ---------------
+
+
+def _kinds(query: str) -> list[tuple[str, str]]:
+    return [(d.kind, d.canonical_id) for d in detect_identifiers(query)]
+
+
+def test_number_refs_bare_framed_and_qualified() -> None:
+    assert _kinds("#383") == [("number_ref", "#383")]
+    assert _kinds("PR #232") == [("number_ref", "#232")]
+    assert _kinds("pull request #536") == [("number_ref", "#536")]
+    assert _kinds("issue #42") == [("number_ref", "#42")]
+    assert _kinds("research-os PR #539") == [("number_ref", "research-os#539")]
+    # A junk qualifier is captured — resolution treats it as soft.
+    assert _kinds("the PR #232") == [("number_ref", "the#232")]
+
+
+def test_full_issue_ref_is_not_double_reported() -> None:
+    out = _kinds("prbe-ai/prbe-knowledge#29")
+    assert out == [("issue_ref", "prbe-ai/prbe-knowledge#29")]
+
+
+def test_hex_prefixes_short_sha_and_uuid_segment() -> None:
+    assert _kinds("ce09c43") == [("hex_prefix", "ce09c43")]
+    assert _kinds("commit 0dd764a") == [("hex_prefix", "0dd764a")]
+    assert _kinds("session 5e0f3220") == [("hex_prefix", "5e0f3220")]
+    assert _kinds("CE09C43") == [("hex_prefix", "ce09c43")]
+
+
+def test_hex_prefix_floors_and_masking() -> None:
+    # 6 chars: below the floor; 12+: the sha kind, not a prefix.
+    assert _kinds("abc123") == []
+    assert _kinds("9027120fe3ab") == [("commit_sha", "9027120fe3ab")]
+    # A full uuid is masked — its segments never re-report as prefixes.
+    out = _kinds("3c325e11-2008-46a9-83f7-fc40d11eaf82")
+    assert [k for k, _ in out] == ["uuid"]
+    # Digits after a number ref are masked — '#1785992' is not a prefix.
+    assert _kinds("#178599") == [("number_ref", "#178599")]
+
+
+def test_pagerduty_incident_ids() -> None:
+    assert _kinds("incident Q00CUSHZAE4OXF") == [("pd_incident", "Q00CUSHZAE4OXF")]
+    assert _kinds("Q0RPQN0Z3INCYO") == [("pd_incident", "Q0RPQN0Z3INCYO")]
+    # Lowercase can never be a PD id.
+    assert _kinds("q00cushzae4oxf") == []

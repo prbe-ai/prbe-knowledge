@@ -68,7 +68,7 @@ from engine.retrieval.helpers import expand_to_author_id_set
 from engine.retrieval.retrievers.bm25 import residualize_for_bm25
 from engine.retrieval.retrievers.id_lookup import (
     IdLookupHit,
-    id_lookup_search,
+    lookup_identifiers,
     resolve_pins,
 )
 from engine.retrieval.router import (
@@ -1985,13 +1985,13 @@ async def run_gatherer(
             )
             return GroundingBundle()
 
-    async def _id_lookup_task() -> list[IdLookupHit]:
+    async def _id_lookup_task() -> tuple[list[IdLookupHit], set[str]]:
         if not detected_ids:
-            return []
+            return [], set()
         try:
-            return await id_lookup_search(
+            return await lookup_identifiers(
                 customer_id,
-                [d.canonical_id for d in detected_ids],
+                detected_ids,
                 sources=[s.value for s in req.sources] if req.sources else None,
                 doc_types=req.doc_types or None,
                 source_keys=req.source_keys or None,
@@ -2006,9 +2006,11 @@ async def run_gatherer(
                 trace_id=trace_id,
                 error=str(exc),
             )
-            return []
+            return [], set()
 
-    bundle, id_hits = await asyncio.gather(_grounding_task(), _id_lookup_task())
+    bundle, (id_hits, ambiguous_ids) = await asyncio.gather(
+        _grounding_task(), _id_lookup_task()
+    )
     timing["grounding_ms"] = (time.perf_counter() - t_grounding) * 1000
 
     id_pins, unresolved_ids, overflow_ids = resolve_pins(
@@ -2022,6 +2024,10 @@ async def run_gatherer(
             detected=len(detected_ids),
             pinned=len(id_pins),
             unresolved=sorted(unresolved_ids),
+            # Subset of unresolved: inferred refs (prefix / number) that
+            # matched MORE than one thing — refusing to guess is the
+            # designed outcome, not a lookup failure.
+            ambiguous=sorted(ambiguous_ids),
             overflow=sorted(overflow_ids),
         )
 
