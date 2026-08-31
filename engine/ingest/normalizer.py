@@ -1702,18 +1702,40 @@ async def _apply_chunk_plan(
     for piece, fail in plan.failed_pieces:
         await _insert_failed_chunk(conn, doc, fail, piece)
 
-    # 3) Removed: mark stale at NOW().
+    # 3) Removed: mark stale at NOW() -- and cap the VERSION range to match,
+    #    because the two liveness markers used to disagree and the version
+    #    join believed the wrong one. On the in-place resync path (incomplete
+    #    docs update at the SAME version; see the `return True` branch in
+    #    upsert_document) a removed chunk kept last_seen_version == the
+    #    still-live doc version, so `d.version BETWEEN first_seen AND
+    #    last_seen` served content the producer had just deleted whenever a
+    #    query lacked the valid_to predicate (TemporalMode.ALL, ad-hoc SQL).
+    #    Measured 2026-08-30: 10,611 such rows, all transcript sources, ages
+    #    down to minutes -- an ongoing property of live-session re-chunking,
+    #    not debris. Backfilled by migration 0125.
+    #
+    #    LEAST(), not an unconditional set: on the version-BUMP path the doc
+    #    is already at N+1 when removal runs and last_seen correctly reads N
+    #    == doc.version - 1, so LEAST is a no-op there; on the same-version
+    #    path it caps N -> N-1. A chunk born and removed inside one version
+    #    ends with first_seen > last_seen: an empty range that joins nothing,
+    #    which is the truthful description of content no completed version
+    #    state ever carried. Resurrection stays symmetric -- the add path's
+    #    ON CONFLICT already restores BOTH markers (last_seen_version and
+    #    valid_to = NULL) together.
     if plan.removed_hashes:
         await conn.execute(
             """
             UPDATE chunks
-            SET valid_to = NOW()
+            SET valid_to = NOW(),
+                last_seen_version = LEAST(last_seen_version, $4 - 1)
             WHERE customer_id = $1 AND doc_id = $2
               AND content_hash = ANY($3::text[]) AND valid_to IS NULL
             """,
             doc.customer_id,
             doc.doc_id,
             list(plan.removed_hashes),
+            doc.version,
         )
 
     return _ChunkSyncOutcome(

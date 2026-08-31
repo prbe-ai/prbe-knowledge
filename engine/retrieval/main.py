@@ -1182,6 +1182,12 @@ async def get_source_view(
         mode == "full"
         and request.headers.get("X-Caller-Kind", "").casefold() == "mcp"
     )
+    # Stage clocks -- the first instrumentation this endpoint has carried.
+    # See SourceViewResponse.timing_ms for why: 13x /retrieve's volume and
+    # not one millisecond of it attributable until now. Three boundaries:
+    # the DB fetch, the size-proportional text work (overlap-aware
+    # reassembly + line split), and the mode-specific view build.
+    t_start = time.perf_counter()
     doc, chunk_rows = await _load_source_doc_and_chunks(
         customer_id=customer_id,
         doc_id=doc_id,
@@ -1190,6 +1196,7 @@ async def get_source_view(
             _SOURCE_VIEW_MCP_FULL_MAX_BYTES if is_mcp_full else None
         ),
     )
+    t_db = time.perf_counter()
     chunk_contents = [
         str(chunk["content"]) for chunk in chunk_rows  # type: ignore[index]
     ]
@@ -1201,6 +1208,7 @@ async def get_source_view(
     chunk_offsets = _chunk_line_offsets(chunk_rows, chunk_spans)
     full_lines = full_content.splitlines()
     total_lines = len(full_lines)
+    t_reconstruct = time.perf_counter()
     sections: list[SourceViewSection] = []
 
     if mode == "search":
@@ -1336,6 +1344,27 @@ async def get_source_view(
             limit_lines=limit_lines,
         )
 
+    t_end = time.perf_counter()
+    source_response.timing_ms = {
+        "db_ms": round((t_db - t_start) * 1000, 1),
+        "reconstruct_ms": round((t_reconstruct - t_db) * 1000, 1),
+        "view_ms": round((t_end - t_reconstruct) * 1000, 1),
+        "total_ms": round((t_end - t_start) * 1000, 1),
+    }
+    # The greppable line, mirroring agent.prefanout_complete's role for
+    # /retrieve: one place where a log sweep yields the distribution
+    # without a database query. body/chunk sizes ride along because the
+    # reconstruct stage's cost hypothesis is size-proportionality --
+    # correlating the two is the whole first analysis.
+    log.info(
+        "source_view.served",
+        customer_id=customer_id,
+        mode=mode,
+        chunk_count=len(chunk_rows),
+        total_lines=total_lines,
+        response_bytes=len(source_response.content),
+        **source_response.timing_ms,
+    )
     request.state.result_count = len(source_response.sections)
     request.state.usage_response_payload = source_response
     return source_response

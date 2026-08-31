@@ -968,6 +968,18 @@ class SourceViewResponse(BaseModel):
     body_size_bytes: int
     max_bytes: int
     limit_lines: int
+    # Per-stage wall clock, the first instrumentation this endpoint has ever
+    # carried. get_source runs at 13x /retrieve's call volume (4,570 vs 353
+    # rows in one 7-day query_traces window) with an 89KB average response,
+    # and until this field the trace row recorded WHAT was served but not
+    # where a single millisecond went. Keys: db_ms (doc + chunk fetch),
+    # reconstruct_ms (the threaded overlap-aware text reassembly -- the
+    # suspected cost center for multi-MB session transcripts), view_ms (the
+    # mode-specific section build), total_ms. Riding ON the response, not in
+    # request.state, so it lands in query_traces.response with zero
+    # middleware changes and callers can see it too. Empty dict on paths
+    # that predate the instrumentation.
+    timing_ms: dict[str, float] = Field(default_factory=dict)
 
 
 class BootstrapConfig(BaseModel):
