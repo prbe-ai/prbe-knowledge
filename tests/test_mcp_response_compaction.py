@@ -177,10 +177,13 @@ def test_compaction_collapses_measured_repeats() -> None:
     for gone in ("retriever_scores", "why_relevant", "graph_evidence", "chunk_id"):
         assert gone not in first
     # A chunk that matched its own way keeps its own (leaned) trail, and
-    # populated diagnostics always pass.
+    # populated rationale always passes.
     assert second["matched_via"][0]["edge_type"] == "resolves"
     assert second["why_relevant"] == "names the exact symbol"
-    assert second["graph_evidence"] == [{"edge_type": "resolves"}]
+    # graph_evidence is VERBOSE-ONLY (2026-08-31): measured at ~42% of a
+    # live response after the graph channel lit up. confidence_breakdown
+    # still says it exists; verbose=True returns the trails.
+    assert "graph_evidence" not in second
     # Null-valued provenance keys are stripped; populated ones are untouched.
     assert doc["matched_via"] == [
         {"channel": "vector", "rank": 1, "score": 1.0, "intent_idx": 0}
@@ -299,3 +302,59 @@ def test_compact_query_applies_the_same_collapse_and_keeps_synthesis_fields() ->
     first = doc["chunks"][0]
     assert "matched_via" not in first
     assert "retriever_scores" not in first
+
+
+def test_boilerplate_trims_2026_08_31() -> None:
+    """Constant/empty fields agents never act on are shed; populated
+    values pass. Envelope honesty fields are untouched."""
+    payload = _doc_payload()
+    payload["aggregations"] = []
+    payload["related_entities_error"] = None
+    payload["related_entities"] = [
+        {
+            "canonical_id": "person:alice",
+            "label": "Person",
+            "display_name": "Alice",
+            "edge_types": [],
+            "max_confidence": "EXTRACTED",
+            "doc_count": 1,
+            "score": 1.0,
+            "associated_doc_ids": [],
+            "member_count": 1,
+            "member_sources": [],
+        }
+    ]
+    payload["degraded"] = False
+    payload["results"][0]["chunks"][0]["score"] = 1.0
+    payload["results"][1].update(
+        {"matched_via": [], "properties": {}, "attached_doc_ids": [],
+         "edge_types": [], "doc_count": 0}
+    )
+    out = compact_search(payload)
+    assert "aggregations" not in out
+    assert "related_entities_error" not in out
+    assert out["related_entities"] == [
+        {"canonical_id": "person:alice", "label": "Person", "display_name": "Alice"}
+    ]
+    assert out["degraded"] is False  # honesty fields pass untouched
+    chunk = out["results"][0]["chunks"][0]
+    assert "score" not in chunk  # the gatherer-path constant 1.0
+    entity = out["results"][1]
+    for gone in ("matched_via", "properties", "attached_doc_ids",
+                 "edge_types", "doc_count"):
+        assert gone not in entity
+    assert entity["canonical_id"] == "code_graph:acme:svc"
+
+
+def test_populated_values_survive_the_boilerplate_trims() -> None:
+    payload = _doc_payload()
+    payload["aggregations"] = [{"count": 3}]
+    payload["related_entities_error"] = "walk timed out"
+    payload["results"][0]["chunks"][0]["score"] = 0.83
+    payload["results"][1].update({"doc_count": 4, "edge_types": ["AUTHORED"]})
+    out = compact_search(payload)
+    assert out["aggregations"] == [{"count": 3}]
+    assert out["related_entities_error"] == "walk timed out"
+    assert out["results"][0]["chunks"][0]["score"] == 0.83
+    assert out["results"][1]["doc_count"] == 4
+    assert out["results"][1]["edge_types"] == ["AUTHORED"]
