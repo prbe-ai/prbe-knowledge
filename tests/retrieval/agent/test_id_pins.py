@@ -58,34 +58,44 @@ def test_one_pin_per_identifier_best_doc_first() -> None:
         [_hit("PRB-17", "doc-old", older), _hit("PRB-17", "doc-new", newer)],
         key=lambda h: (h.matched_canonical_id, -h.updated_at.timestamp(), h.doc_id),
     )
-    pins, unresolved = resolve_pins(_det("PRB-17"), hits, top_k=8)
+    pins, unresolved, overflow = resolve_pins(_det("PRB-17"), hits, top_k=8)
     assert [p.doc_id for p in pins] == ["doc-new"]
     assert unresolved == set()
+    assert overflow == set()
 
 
 def test_unresolved_ids_reported_and_multi_entity_pins() -> None:
     hits = [_hit("PRB-17", "doc-a"), _hit("PRB-99", "doc-b")]
-    pins, unresolved = resolve_pins(
+    pins, unresolved, overflow = resolve_pins(
         _det("PRB-17", "PRB-99", "GONE-1"), hits, top_k=8
     )
     assert [p.matched_canonical_id for p in pins] == ["PRB-17", "PRB-99"]
     assert unresolved == {"GONE-1"}
+    assert overflow == set()
 
 
 def test_cap_is_half_top_k_but_never_zero() -> None:
     hits = [_hit(f"T-{i}", f"doc-{i}") for i in range(10)]
     det = _det(*[f"T-{i}" for i in range(10)])
-    pins, _ = resolve_pins(det, hits, top_k=8)
+    pins, _, overflow = resolve_pins(det, hits, top_k=8)
     assert len(pins) == 4  # max(1, 8 // 2)
-    pins1, _ = resolve_pins(det, hits, top_k=1)
+    # Review F5: ids that resolved but lost their slot to the cap are a
+    # third category — reported, so the caller can block the fast path.
+    assert overflow == {f"T-{i}" for i in range(4, 10)}
+    pins1, _, overflow1 = resolve_pins(det, hits, top_k=1)
     assert len(pins1) == 1  # the outside-voice F4 integer-division case
+    assert overflow1 == {f"T-{i}" for i in range(1, 10)}
 
 
 def test_two_ids_same_doc_pin_once() -> None:
     hits = [_hit("PRB-17", "doc-x"), _hit("uuid-1", "doc-x")]
-    pins, unresolved = resolve_pins(_det("PRB-17", "uuid-1"), hits, top_k=8)
+    pins, unresolved, overflow = resolve_pins(
+        _det("PRB-17", "uuid-1"), hits, top_k=8
+    )
     assert [p.doc_id for p in pins] == ["doc-x"]
     assert unresolved == set()
+    # Represented-by-the-same-doc is NOT overflow: both ids are in the answer.
+    assert overflow == set()
 
 
 # ---- adapter guarantee ------------------------------------------------------
@@ -149,6 +159,49 @@ async def test_kept_pin_dedupes_to_front_with_id_lookup_provenance() -> None:
         if isinstance(r, QueryDocumentResult) and r.doc_id == "doc-pinned"
     )
     assert "id_lookup" in [m.channel for m in pinned.matched_via]
+    # Review F3: the model's curated chunk answers the query; the pin must
+    # move the doc to the front WITHOUT replacing that chunk with the
+    # lookup's header chunk.
+    assert pinned.chunks[0].content == "body doc-pinned"
+
+
+async def test_pin_merge_does_not_mutate_the_stashed_gathered() -> None:
+    """Review F7: the loop stashes the GathererOutput by reference for the
+    post-flush trace persist; the pin merge must land on a copy so traces
+    keep the gatherer's true output."""
+    gathered = _gathered("doc-model-kept")
+    before = [(c.doc_id, tuple(c.matched_via)) for c in gathered.chunks]
+    await to_query_response(
+        query="q",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        status="ok",
+        id_pins=[_hit("PRB-17", "doc-pinned")],
+        top_k=8,
+    )
+    after = [(c.doc_id, tuple(c.matched_via)) for c in gathered.chunks]
+    assert after == before
+
+
+async def test_top_k_slice_keeps_ranks_contiguous() -> None:
+    """Review F8: the budget applies before rank assignment, so surviving
+    docs are ranked 1..top_k and entity rows continue the sequence with no
+    hole."""
+    from engine.retrieval.agent.models import GatheredEntity
+
+    gathered = _gathered("a", "b", "c", "d", "e")
+    gathered.entities = [GatheredEntity(canonical_id="ent-1", label="Person")]
+    resp = await to_query_response(
+        query="q",
+        gathered=gathered,
+        trace_id="t",
+        timing_ms={},
+        status="ok",
+        top_k=2,
+    )
+    ranks = [r.rank for r in resp.results]
+    assert ranks == [1, 2, 3]  # 2 docs + 1 entity, contiguous
 
 
 async def test_top_k_budget_holds_with_pins_first() -> None:

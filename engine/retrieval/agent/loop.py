@@ -667,9 +667,14 @@ def _build_user_message(
     # re-discovering or contradicting them.
     id_pins_block = ""
     if id_pins:
+        # doc_id and title are third-party ingested text (Slack/Linear/
+        # GitHub); escape them like the query itself (router.py's MUST rule
+        # for user-controlled text entering a downstream LLM call) so a
+        # crafted title cannot close the tag mid-prompt (review F6). The
+        # canonical id is regex-shaped by construction and safe.
         pin_lines = "\n".join(
-            f"  - {h.matched_canonical_id} -> {h.doc_id}"
-            f" ({h.title or h.source_system})"
+            f"  - {h.matched_canonical_id} -> {_escape_query_for_xml(h.doc_id)}"
+            f" ({_escape_query_for_xml(h.title or h.source_system)})"
             for h in id_pins
         )
         id_pins_block = (
@@ -866,8 +871,18 @@ def _extract_cache_hit_rate(resp: Any) -> float | None:
 def _empty_passthrough(
     reason: GathererStatus,
     state: LoopState | None = None,
+    *,
+    confidence: str = "low",
+    record_drop: bool = True,
 ) -> GathererOutput:
-    """Synthesize an empty, low-confidence output for degraded paths.
+    """Synthesize an empty output for harness-terminated paths.
+
+    Defaults describe the DEGRADED paths (low confidence + a dropped-
+    candidate marker naming the reason). The id-lookup short-circuit
+    reuses the same skeleton but is the opposite of degraded -- an exact
+    match is the strongest answer this system can give -- so it overrides
+    both (review F9: shipping confidence='low' there made every consumer
+    read the lane's best outcome as its weakest).
 
     Recall-floor backfill may subsequently populate its chunks from citable
     pre-fan-out evidence. When the loop already ran, preserve its
@@ -879,13 +894,17 @@ def _empty_passthrough(
         gatherer_notes=GathererNotes(
             turns_used=state.turn_count if state is not None else 0,
             tools_called=list(state.tools_fired) if state is not None else [],
-            confidence="low",
-            dropped=[
-                DroppedCandidate(
-                    canonical_id="<harness>",
-                    reason=f"harness_passthrough: {reason}",
-                )
-            ],
+            confidence=confidence,
+            dropped=(
+                [
+                    DroppedCandidate(
+                        canonical_id="<harness>",
+                        reason=f"harness_passthrough: {reason}",
+                    )
+                ]
+                if record_drop
+                else []
+            ),
         ),
     )
 
@@ -1992,7 +2011,9 @@ async def run_gatherer(
     bundle, id_hits = await asyncio.gather(_grounding_task(), _id_lookup_task())
     timing["grounding_ms"] = (time.perf_counter() - t_grounding) * 1000
 
-    id_pins, unresolved_ids = resolve_pins(detected_ids, id_hits, req.top_k)
+    id_pins, unresolved_ids, overflow_ids = resolve_pins(
+        detected_ids, id_hits, req.top_k
+    )
     if detected_ids:
         log.info(
             "agent.id_pins_resolved",
@@ -2001,16 +2022,21 @@ async def run_gatherer(
             detected=len(detected_ids),
             pinned=len(id_pins),
             unresolved=sorted(unresolved_ids),
+            overflow=sorted(overflow_ids),
         )
 
-    # Pure-lookup fast path: EVERY detected id resolved AND nothing topical
-    # remains once identifier tokens and their frame words are stripped
-    # (the same residual test that gates BM25). One unresolved id keeps the
-    # full loop — the user asked about something we could not pin, and a
-    # thin short-circuit there would dress a miss up as an answer.
+    # Pure-lookup fast path: EVERY detected id resolved AND pinned AND
+    # nothing topical remains once identifier tokens and their frame words
+    # are stripped (the same residual test that gates BM25). One unresolved
+    # id keeps the full loop — the user asked about something we could not
+    # pin, and a thin short-circuit there would dress a miss up as an
+    # answer. Overflow ids (resolved but capped out of a pin slot) block it
+    # too: short-circuiting there would silently omit documents the user
+    # typed the exact id of (review F5); the full loop can still rank them.
     pure_lookup = bool(
         detected_ids
         and not unresolved_ids
+        and not overflow_ids
         and residualize_for_bm25(
             req.query, [d.canonical_id for d in detected_ids]
         )
@@ -2021,8 +2047,10 @@ async def run_gatherer(
     if pure_lookup:
         # Skip the extractor LLM call outright: there is no topical residual
         # to extract entities or reformulations FROM. The prefanout below
-        # still runs (raw query, grounded anchors) so the response carries
-        # context around the pinned docs, not just their cards.
+        # still runs (raw query, grounded anchors); the short-circuit block
+        # projects its top fused docs into the response via the recall-floor
+        # backfill, so the answer carries context around the pinned docs,
+        # not just their cards.
         extracted = EntityExtraction()
     else:
         # Seed the extractor too — without it, entity extraction variance
@@ -2115,6 +2143,34 @@ async def run_gatherer(
         if req.entity_must_match
         else []
     )
+
+    # Pins honor the same author hard-filter every ranked channel enforces
+    # (review F2). The id lookup ran concurrently with grounding — before
+    # person entities could resolve — so the filter lands here, on the hits
+    # it already fetched (IdLookupHit carries author_id; no re-query). A
+    # dropped pin's id counts as unresolved and clears the fast path: a
+    # doc that exists but is out of the author scope must neither pin nor
+    # short-circuit — the certainty label is exactly what must not leak.
+    if author_ids and id_pins:
+        _allowed_authors = set(author_ids)
+        _author_dropped = [
+            h for h in id_pins if h.author_id not in _allowed_authors
+        ]
+        if _author_dropped:
+            id_pins = [h for h in id_pins if h.author_id in _allowed_authors]
+            unresolved_ids |= {
+                h.matched_canonical_id for h in _author_dropped
+            }
+            pure_lookup = False
+            log.info(
+                "agent.id_pins_author_filtered",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                dropped=sorted(
+                    h.matched_canonical_id for h in _author_dropped
+                ),
+                remaining=len(id_pins),
+            )
 
     # Caller-provided hard scope from QueryRequest. `req.doc_types`
     # OVERRIDES the extractor's inferred doc_types (the documented
@@ -2292,13 +2348,16 @@ async def run_gatherer(
     # death loop for the much more common "query has no answer" case.
     prefanout_total = sum(prefanout_hit_counts.values())
     if pure_lookup:
-        # Identifier-only query, every id resolved: the pins ARE the answer
-        # and the prefanout above already gathered context around them.
+        # Identifier-only query, every id resolved: the pins ARE the answer.
         # Skipping the gatherer here is not a degradation — is_degraded
         # excludes this status — it is the lane working as designed
-        # (~seconds instead of LLM turns). Recall-floor backfill fills the
-        # non-pin slots from citable prefanout evidence exactly as the
-        # zero-recall path does.
+        # (~seconds instead of LLM turns), so the passthrough overrides the
+        # degraded-path defaults: confidence high, no dropped marker
+        # (review F9). The recall-floor backfill below projects the top
+        # fused prefanout docs into the response so it carries context
+        # around the pinned docs, not just their cards — without the
+        # explicit call the early return would skip the shared backfill at
+        # the end of this function and discard the prefanout (review F1).
         log.info(
             "agent.id_lookup_short_circuit",
             customer_id=customer_id,
@@ -2306,7 +2365,22 @@ async def run_gatherer(
             pinned=len(id_pins),
         )
         status = "id_lookup_short_circuit"
-        gathered = _empty_passthrough("id_lookup_short_circuit", state)
+        gathered = _empty_passthrough(
+            "id_lookup_short_circuit",
+            state,
+            confidence="high",
+            record_drop=False,
+        )
+        backfilled = _backfill_recall_floor(gathered, state.prefanout)
+        if backfilled:
+            log.info(
+                "agent.recall_floor_backfill",
+                customer_id=customer_id,
+                trace_id=trace_id,
+                status=status,
+                appended=backfilled,
+                total_chunks=len(gathered.chunks),
+            )
         timing["agent_ms"] = (time.perf_counter() - t_agent) * 1000
         if request is not None:
             status = merge_channel_loss(status, lost_channels())

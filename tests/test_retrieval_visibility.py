@@ -281,6 +281,42 @@ async def test_id_lookup_excludes_drafts_by_default(live_db) -> None:
     assert any(h.doc_id == f"{cid}:draft:{draft_ticket}" for h in hits_drafts_on)
 
 
+async def test_id_lookup_maps_each_id_and_gates_url_arms(live_db) -> None:
+    """Review F4 + F10, at the SQL level.
+
+    F4: a doc matching TWO typed ids must come back as two rows (one per
+    matched_canonical_id) — DISTINCT ON (m.cid, c.doc_id) — so neither id
+    is falsely reported unresolved by resolve_pins.
+
+    F10: the leading-wildcard source_url arms only run for ticket-shaped
+    ids; a UUID that appears solely in a URL path must NOT match (it
+    resolves via the indexed source_id/doc_id arms or not at all).
+    """
+    cid = _new_customer_id()
+    await _seed_customer(cid)
+    internal_uuid = "3c325e11-2008-46a9-83f7-fc40d11eaf82"
+    url_only_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    await _seed_doc(
+        cid, f"{cid}:linear:{internal_uuid}",
+        title="PRB-17 rate limits",
+        content="ticket body",
+        visibility="approved",
+        source_system="linear",
+        source_id=internal_uuid,
+        source_url=f"https://linear.app/t/issue/PRB-17/{url_only_uuid}",
+    )
+
+    hits = await id_lookup_search(cid, ["PRB-17", internal_uuid])
+    assert sorted(h.matched_canonical_id for h in hits) == sorted(
+        ["PRB-17", internal_uuid]
+    )
+    assert {h.doc_id for h in hits} == {f"{cid}:linear:{internal_uuid}"}
+
+    # The url-only uuid sits in the URL path, but UUID kinds never take the
+    # URL arms — no match is the correct answer.
+    assert await id_lookup_search(cid, [url_only_uuid]) == []
+
+
 async def test_sql_list_excludes_drafts_by_default(live_db) -> None:
     cid = _new_customer_id()
     await _seed_customer(cid)

@@ -2641,7 +2641,83 @@ async def test_pure_lookup_skips_both_llm_calls(
     assert fake_request.state.gatherer_status == "id_lookup_short_circuit"
     doc_ids = [r.doc_id for r in resp.results if hasattr(r, "doc_id")]
     assert doc_ids and doc_ids[0] == "linear:t:issue:u1"
+    # Review F1: the prefanout the fast path still runs must reach the
+    # response via the recall-floor backfill — pins plus context, never
+    # pins alone.
+    assert "ctx:1" in doc_ids
     assert resp.degraded is False
+    # Review F9: an exact match is the strongest answer this system can
+    # give — the passthrough must not wear the degraded-path defaults.
+    assert resp.gatherer_notes["confidence"] == "high"
+    assert resp.gatherer_notes["dropped"] == []
+    assert fake_request.state.confidence == "high"
+    assert fake_request.state.dropped_count == 0
+
+
+@pytest.mark.asyncio
+async def test_author_scope_drops_pin_and_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_request: SimpleNamespace,
+) -> None:
+    """Review F2: with entity_must_match, a pin authored outside the
+    resolved author scope must neither pin nor short-circuit — the
+    certainty label is exactly what must not leak past the author
+    hard-filter every ranked channel enforces."""
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from engine.retrieval.retrievers.id_lookup import IdLookupHit
+
+    req = QueryRequest(
+        query="PRB-17", customer_id="cust-1", top_k=5, entity_must_match=True
+    )
+
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
+        AsyncMock(return_value=GroundingBundle()),
+    )
+    hit = IdLookupHit(
+        chunk_id="ck-1", doc_id="linear:t:issue:u1", doc_version=1,
+        source_system="linear", source_url="https://l/PRB-17", title="PRB-17",
+        content="ticket body", created_at=_dt(2026, 8, 31, tzinfo=_UTC),
+        updated_at=_dt(2026, 8, 31, tzinfo=_UTC), score=1.0,
+        author_id="bob", matched_canonical_id="PRB-17",
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.id_lookup_search",
+        AsyncMock(return_value=[hit]),
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._resolve_person_author_ids",
+        AsyncMock(return_value=["alice"]),
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.extract_entities_with_llm",
+        AsyncMock(return_value=EntityExtraction()),
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.execute_search",
+        AsyncMock(return_value={"sub_queries": [{
+            "query": "PRB-17", "grounded_entities": [],
+            "vector": [{"doc_id": "ctx:1", "score": 0.5,
+                        "source_system": "github", "title": "ctx",
+                        "content": "context"}],
+            "bm25": [], "graph": [], "inferred_edge": [],
+        }]}),
+    )
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args(chunks=1, confidence="high"))],
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    # No short-circuit, and the out-of-scope doc is not pinned rank-1.
+    assert fake_request.state.gatherer_status != "id_lookup_short_circuit"
+    for r in resp.results:
+        for m in getattr(r, "matched_via", []) or []:
+            assert m.channel != "id_lookup"
 
 
 @pytest.mark.asyncio

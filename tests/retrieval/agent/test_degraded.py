@@ -34,7 +34,14 @@ from engine.shared.models import RetrieveResponse
 # Every status the loop can terminate with, split by whether the caller is
 # holding degraded output. Kept as explicit literals (not derived from the
 # implementation) so this is a real assertion, not a tautology.
-_HEALTHY = {"ok", "zero_recall_short_circuit"}
+_HEALTHY = {
+    "ok",
+    "zero_recall_short_circuit",
+    # Healthy, deliberately: every typed identifier resolved and pinned,
+    # nothing topical remained -- the exact-id lane answering as designed,
+    # faster than the loop could. The strongest answer this system gives.
+    "id_lookup_short_circuit",
+}
 _DEGRADED = {
     "passthrough_harness_fallback",
     "loop_timeout",

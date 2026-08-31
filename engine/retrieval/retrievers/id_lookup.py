@@ -114,17 +114,30 @@ async def id_lookup_search(
     a pinned doc bypassing the workspace lens would be a scope leak with
     a certainty label on it (outside-voice F3).
 
-    Returns rows ordered so the caller's per-id best-doc pick is
-    deterministic: matched id, then updated_at DESC, then doc_id.
+    One row per (matched id, doc) pair — DISTINCT ON (m.cid, c.doc_id),
+    NOT plain doc_id: a doc matching two typed ids must count as resolving
+    BOTH, or the loser is falsely reported unresolved and the mapping goes
+    nondeterministic (review F4). Rows come back ordered so the caller's
+    per-id best-doc pick is deterministic: matched id, then updated_at
+    DESC, then doc_id.
     """
     ids = [c for c in canonical_ids if is_lookup_candidate(c)]
     if not ids:
         return []
 
+    # URL arms only make sense for ticket-shaped ids: Linear keys the doc by
+    # an internal UUID and puts the human handle (PRB-17) in the URL path.
+    # UUIDs and shas resolve via the indexed source_id/doc_id arms; running
+    # the leading-wildcard URL LIKEs for them turns an indexable lookup into
+    # a tenant-wide documents scan (review F10). Derived here, not threaded:
+    # detect_identifiers canonicalizes tickets to uppercase, so the anchored
+    # ticket regex is an exact kind test on the canonical form.
+    url_flags = [bool(_TICKET_RE.match(c)) for c in ids]
+
     spec = temporal or TemporalSpec()
 
     async with with_tenant(customer_id) as conn:
-        params: list[Any] = [customer_id, ids]
+        params: list[Any] = [customer_id, ids, url_flags]
 
         source_filter = ""
         if sources:
@@ -155,7 +168,7 @@ async def id_lookup_search(
 
         rows = await conn.fetch(
             f"""
-            SELECT DISTINCT ON (c.doc_id)
+            SELECT DISTINCT ON (m.cid, c.doc_id)
                    m.cid AS matched_canonical_id,
                    c.chunk_id,
                    c.doc_id,
@@ -168,15 +181,17 @@ async def id_lookup_search(
                    d.created_at,
                    d.updated_at
             FROM documents d
-            JOIN unnest($2::text[]) AS m(cid)
+            JOIN unnest($2::text[], $3::bool[]) AS m(cid, url_ok)
               ON (
                 d.source_id = m.cid
                 OR d.source_id LIKE '%:' || m.cid
                 OR d.doc_id LIKE '%:' || m.cid
-                OR d.source_url LIKE '%/' || m.cid || '/%'
-                OR d.source_url LIKE '%/' || m.cid
-                OR d.source_url LIKE '%/' || m.cid || '?%'
-                OR d.source_url LIKE '%/' || m.cid || '#%'
+                OR (m.url_ok AND (
+                    d.source_url LIKE '%/' || m.cid || '/%'
+                    OR d.source_url LIKE '%/' || m.cid
+                    OR d.source_url LIKE '%/' || m.cid || '?%'
+                    OR d.source_url LIKE '%/' || m.cid || '#%'
+                ))
               )
             JOIN chunks c
               ON c.doc_id = d.doc_id
@@ -191,7 +206,7 @@ async def id_lookup_search(
               {pred.chunk_sql}
               {pred.doc_sql}
               {visibility_filter}
-            ORDER BY c.doc_id, c.chunk_index ASC
+            ORDER BY m.cid, c.doc_id, c.chunk_index ASC
             """,
             *params,
         )
@@ -227,14 +242,21 @@ def resolve_pins(
     detected: list[DetectedIdentifier],
     hits: list[IdLookupHit],
     top_k: int,
-) -> tuple[list[IdLookupHit], set[str]]:
+) -> tuple[list[IdLookupHit], set[str], set[str]]:
     """Best doc per detected identifier, capped so ranking keeps room.
 
-    Returns (pins, unresolved_canonical_ids). One pin slot per identifier
-    -- the BEST matching doc by the deterministic order id_lookup_search
-    established -- deduped by doc_id (two ids resolving to the same doc
-    pin it once), capped at max(1, top_k // 2) so a query quoting ten ids
-    cannot return a phone book, and safe at top_k=1 (outside-voice F4).
+    Returns (pins, unresolved_canonical_ids, overflow_canonical_ids).
+    One pin slot per identifier -- the BEST matching doc by the
+    deterministic order id_lookup_search established -- deduped by doc_id
+    (two ids resolving to the same doc pin it once), capped at
+    max(1, top_k // 2) so a query quoting ten ids cannot return a phone
+    book, and safe at top_k=1 (outside-voice F4).
+
+    `overflow` is the third category the cap creates: ids that RESOLVED
+    but lost their pin slot to the cap. They are not unresolved (the doc
+    exists) and not pinned (no slot), so the caller must treat them as
+    blocking the pure-lookup short-circuit -- otherwise a response could
+    silently omit documents the user typed the exact id of (review F5).
     """
     by_cid: dict[str, IdLookupHit] = {}
     for h in hits:
@@ -242,6 +264,7 @@ def resolve_pins(
     pins: list[IdLookupHit] = []
     seen_docs: set[str] = set()
     unresolved: set[str] = set()
+    overflow: set[str] = set()
     cap = max(1, top_k // 2)
     for d in detected:
         h = by_cid.get(d.canonical_id)
@@ -249,8 +272,11 @@ def resolve_pins(
             unresolved.add(d.canonical_id)
             continue
         if h.doc_id in seen_docs:
+            # Resolved AND represented: another id already pinned this doc.
             continue
-        if len(pins) < cap:
-            seen_docs.add(h.doc_id)
-            pins.append(h)
-    return pins, unresolved
+        if len(pins) >= cap:
+            overflow.add(d.canonical_id)
+            continue
+        seen_docs.add(h.doc_id)
+        pins.append(h)
+    return pins, unresolved, overflow
