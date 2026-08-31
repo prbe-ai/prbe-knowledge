@@ -89,15 +89,45 @@ def test_hex_prefixes_short_sha_and_uuid_segment() -> None:
     assert _kinds("CE09C43") == [("hex_prefix", "ce09c43")]
 
 
-def test_hex_prefix_floors_and_masking() -> None:
+def test_hex_prefix_floors_and_guards() -> None:
     # 6 chars: below the floor; 12+: the sha kind, not a prefix.
     assert _kinds("abc123") == []
     assert _kinds("9027120fe3ab") == [("commit_sha", "9027120fe3ab")]
     # A full uuid is masked — its segments never re-report as prefixes.
     out = _kinds("3c325e11-2008-46a9-83f7-fc40d11eaf82")
     assert [k for k, _ in out] == ["uuid"]
-    # Digits after a number ref are masked — '#1785992' is not a prefix.
     assert _kinds("#178599") == [("number_ref", "#178599")]
+
+
+def test_hex_prefix_excludes_decimals_and_hyphen_chains() -> None:
+    """Review regressions: pure-decimal tokens are quantities (dates,
+    epochs, order numbers), never prefixes; segments of hyphenated tokens
+    (tickets, run slugs) never re-report."""
+    assert _kinds("what changed on 20260831") == []
+    assert _kinds("revenue was 1000000 last quarter") == []
+    assert _kinds("thread 1714000000.123") == []
+    assert _kinds("DEADBEEF-12") == [("ticket", "DEADBEEF-12")]
+
+
+def test_adjacent_identifiers_all_survive_a_number_ref() -> None:
+    """Review regression: the number ref's greedy qualifier must not
+    swallow (or mask) a neighboring identifier, and an identifier-shaped
+    qualifier is dropped from the canonical."""
+    out = _kinds("commit 9027120fe3ab #383")
+    assert ("commit_sha", "9027120fe3ab") in out
+    assert ("number_ref", "#383") in out
+    out = _kinds("deadbeefcafe#42")
+    assert ("issue_ref", "deadbeefcafe#42") in out
+    assert ("commit_sha", "deadbeefcafe") in out
+    out = _kinds("incident Q00CUSHZAE4OXF #12")
+    assert ("pd_incident", "Q00CUSHZAE4OXF") in out
+
+
+def test_number_ref_carries_structured_halves() -> None:
+    d = detect_identifiers("research-os PR #539")[0]
+    assert (d.qualifier, d.number) == ("research-os", "539")
+    d = detect_identifiers("deadlock #383")[0]
+    assert (d.qualifier, d.number) == ("deadlock", "383")
 
 
 def test_pagerduty_incident_ids() -> None:
@@ -105,3 +135,5 @@ def test_pagerduty_incident_ids() -> None:
     assert _kinds("Q0RPQN0Z3INCYO") == [("pd_incident", "Q0RPQN0Z3INCYO")]
     # Lowercase can never be a PD id.
     assert _kinds("q00cushzae4oxf") == []
+    # Digit-free ALL-CAPS words are English, not PD ids (review).
+    assert _kinds("QUALIFICATIONS matrix") == []

@@ -679,9 +679,10 @@ def _build_user_message(
         )
         id_pins_block = (
             "<id_pins>\n"
-            "Exact matches for identifiers the user typed. These documents\n"
-            "are certain and will appear in the results; build the answer\n"
-            "AROUND them.\n"
+            "Documents resolved from identifiers in the query — exact\n"
+            "matches, or partial references (short sha, '#N') that resolved\n"
+            "to exactly one document. They will appear in the results;\n"
+            "build the answer AROUND them.\n"
             f"{pin_lines}\n"
             "</id_pins>\n"
         )
@@ -2044,7 +2045,17 @@ async def run_gatherer(
         and not unresolved_ids
         and not overflow_ids
         and residualize_for_bm25(
-            req.query, [d.canonical_id for d in detected_ids]
+            req.query,
+            [
+                # A number ref's qualifier may be a TOPICAL word the greedy
+                # capture swallowed ('deadlock #383'); only the '#N' half
+                # belongs to the lane. Feeding the full canonical into the
+                # residual test stripped that word and let the short-circuit
+                # answer a topical query with a PR card (review:
+                # removed-behavior/cross-file).
+                f"#{d.number}" if d.kind == "number_ref" else d.canonical_id
+                for d in detected_ids
+            ],
         )
         is None
     )
