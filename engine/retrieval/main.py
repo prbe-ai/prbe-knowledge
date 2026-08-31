@@ -57,6 +57,10 @@ from engine.retrieval.pipeline import (
     run_search_phase,
 )
 from engine.retrieval.procedures import procedures_router
+from engine.retrieval.reassembly_cache import (
+    chunk_set_fingerprint,
+    reassembly_cache,
+)
 from engine.retrieval.synthesis import (
     StreamDelta,
     StreamFinal,
@@ -972,7 +976,7 @@ async def _load_source_doc_and_chunks(
 
         chunk_rows = await conn.fetch(
             f"""
-            SELECT content, chunk_index
+            SELECT content, chunk_index, content_hash
             {chunk_scope_sql}
             ORDER BY chunk_index
             """,
@@ -1197,14 +1201,29 @@ async def get_source_view(
         ),
     )
     t_db = time.perf_counter()
-    chunk_contents = [
-        str(chunk["content"]) for chunk in chunk_rows  # type: ignore[index]
-    ]
-    full_content, chunk_spans = await asyncio.to_thread(
-        reconstruct_chunk_text_with_spans,
-        chunk_contents,
-        expected_overlap_tokens=_expected_source_overlap_tokens(doc),
-    )
+    # Reassembly cache: keyed on the loaded chunk SET, not (doc, version) --
+    # live sessions mutate a version's membership in place, and the
+    # fingerprint is what makes staleness structurally impossible (see
+    # reassembly_cache.py). A hit skips what the first-ever timing_ms
+    # measurement showed to be 94% of a big-transcript request: 422.5ms of
+    # overlap-aware restitching to serve a 15-line tail.
+    fingerprint = chunk_set_fingerprint(chunk_rows)
+    cached = reassembly_cache.get(customer_id, doc_id, fingerprint)
+    cache_hit = cached is not None
+    if cached is not None:
+        full_content, chunk_spans = cached
+    else:
+        chunk_contents = [
+            str(chunk["content"]) for chunk in chunk_rows  # type: ignore[index]
+        ]
+        full_content, chunk_spans = await asyncio.to_thread(
+            reconstruct_chunk_text_with_spans,
+            chunk_contents,
+            expected_overlap_tokens=_expected_source_overlap_tokens(doc),
+        )
+        reassembly_cache.put(
+            customer_id, doc_id, fingerprint, full_content, chunk_spans
+        )
     chunk_offsets = _chunk_line_offsets(chunk_rows, chunk_spans)
     full_lines = full_content.splitlines()
     total_lines = len(full_lines)
@@ -1363,6 +1382,7 @@ async def get_source_view(
         chunk_count=len(chunk_rows),
         total_lines=total_lines,
         response_bytes=len(source_response.content),
+        reassembly_cache_hit=cache_hit,
         **source_response.timing_ms,
     )
     request.state.result_count = len(source_response.sections)
