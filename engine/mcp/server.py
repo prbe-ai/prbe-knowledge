@@ -122,14 +122,16 @@ async def search_knowledge(
     Response shape: `results[]`, each Document result carrying its identity
     (`doc_id`, `source_system`, `source_url`, `title`, `score`,
     `chunk_count`) and a nested `chunks[]` array of the matching spans
-    within that document. Each chunk carries its own `score` and `content`,
-    plus `graph_evidence` when populated (a list of `{edge_type, confidence,
-    via_entity, reason}` entries — the trail of knowledge-graph edges that
-    connected the chunk to your query; ABSENT when the chunk matched on text
-    alone — absent keys throughout this response mean "nothing here", never
-    "unknown". One scoped exception: a CHUNK's `matched_via` is omitted when
-    identical to its document's, so read the document's provenance as
-    covering its chunks). Audit metadata (`author_id`, `created_at`,
+    within that document. Each chunk carries `content` and, when the
+    gatherer wrote one, `why_relevant` — absent keys throughout this
+    response mean "nothing here", never "unknown". (One scoped exception:
+    a CHUNK's `matched_via` is omitted when identical to its document's,
+    so read the document's provenance as covering its chunks.) The
+    knowledge-graph evidence trails (`graph_evidence` entries per chunk)
+    ride ONLY on `verbose=True`: the top-level `confidence_breakdown`
+    already says whether graph evidence exists and at what confidence, so
+    re-call with `verbose=True` only when you need the actual edge trails.
+    Audit metadata (`author_id`, `created_at`,
     `updated_at`) and full provenance ride only on detail="full" — see
     `detail` below; for time-ordering questions ("which came first?"), ask
     for detail="full" or read timestamps off `get_source`. Top-level
@@ -139,11 +141,13 @@ async def search_knowledge(
     treat the result set as weaker.
 
     The response also includes `related_entities` — non-Document graph
-    nodes attached to the returned docs. Follow one with another search only
-    when the adjacent context is relevant to the current decision. Set
-    `top_k_related=0` to skip this enrichment for token-sensitive flows.
-    `related_entities=null` with `related_entities_error` set means the
-    walk failed — documents are still trustworthy.
+    nodes attached to the returned docs, each just its identity
+    (`canonical_id`, `label`, `display_name`): a crawl-candidate handle to
+    drop into a follow-up search. Follow one only when the adjacent context
+    is relevant to the current decision. Set `top_k_related=0` to skip this
+    enrichment for token-sensitive flows. `related_entities=null` with
+    `related_entities_error` present means the walk failed — documents are
+    still trustworthy (the error field appears only when it fired).
 
     CHECK `degraded` FIRST. Top-level boolean. `true` means the search
     agent could not complete normally and this response is the raw
@@ -374,12 +378,14 @@ async def query_knowledge(
     LLM couldn't find enough grounded evidence and refused to guess),
     `model` (which LLM produced the answer), and the full retrieval
     payload as doc-grouped `results[]` with nested `chunks[]`, each chunk
-    carrying `score` and `content`, plus `graph_evidence`, `why_relevant`
-    (the gatherer's per-chunk rationale) and chunk-level `matched_via` when
-    populated and distinct from the document's — absent keys mean "nothing
-    here", never "unknown". These rows match `search_knowledge` at
-    detail="full" (this tool has no detail parameter and keeps the audit
-    metadata the search default omits). When `top_k_related >= 1`, also carries
+    carrying `content`, plus `why_relevant` (the gatherer's per-chunk
+    rationale) and chunk-level `matched_via` when populated and distinct
+    from the document's — absent keys mean "nothing here", never
+    "unknown". Graph-evidence trails are not included (the synthesis
+    already consumed them; `confidence_breakdown` summarizes them). These
+    rows match `search_knowledge` at detail="full" (this tool has no
+    detail parameter and keeps the audit metadata the search default
+    omits). When `top_k_related >= 1`, also carries
     top-level `related_entities` + `query_root_doc_id` + `gatherer_notes`.
     When `insufficient_context=true`, surface that refusal to the user
     instead of paraphrasing it.

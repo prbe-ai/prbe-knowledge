@@ -55,20 +55,39 @@ _ENTITY_RESULT_DROP = frozenset(
     }
 )
 
-# Per-chunk fields stripped by default. We keep `score`, `content`, and
-# populated `graph_evidence` (a list of {edge_type, confidence, via_entity,
-# reason} entries — the agent's only evidence the chunk actually grounds the
-# query against the knowledge graph). `chunk_id` and `rank_in_doc` are pure
-# server bookkeeping; `retriever_scores` was already judged noise at document
-# level and the chunk-level copy measured empty in 69/69 production chunks —
-# a dict of nothing, shipped on every chunk of every response.
+# Per-chunk fields stripped by default. We keep `content` and
+# `why_relevant`. `chunk_id` and `rank_in_doc` are pure server bookkeeping;
+# `retriever_scores` was already judged noise at document level and the
+# chunk-level copy measured empty in 69/69 production chunks.
+#
+# `graph_evidence` is VERBOSE-ONLY as of 2026-08-31. When the budget's
+# truncation order was written it measured 42 bytes on a 196KB response;
+# after the KB graph channel went live it measured ~42% OF THE RESPONSE
+# (33 entries x ~100 tokens on a live top_k=5 call), dominated by per-edge
+# `via_entity_*` decoration re-shipped for the same entity. The envelope's
+# `confidence_breakdown` still says evidence EXISTS (and how confident);
+# an agent that wants the trails re-calls with `verbose=True`, which
+# bypasses compaction entirely.
 _CHUNK_DROP = frozenset(
     {
         "chunk_id",
         "rank_in_doc",
         "retriever_scores",
+        "graph_evidence",
     }
 )
+
+# Chunk `score` is dropped when it carries the gatherer path's constant 1.0
+# ("surfaced == max confidence within the curated set") — a real magnitude
+# from any other path survives.
+_CHUNK_CONSTANT_SCORE = 1.0
+
+# `related_entities` rows keep only their identity (the crawl-candidate
+# handle). The other seven fields are adapter constants on this path
+# (edge_types:[], associated_doc_ids:[], member_sources:[], member_count:1,
+# doc_count:1, score:1.0, max_confidence:"EXTRACTED") — measured boilerplate
+# on every row of every response.
+_RELATED_ENTITY_KEEP = frozenset({"canonical_id", "label", "display_name"})
 
 # Fields stripped from a single-doc get_source response.
 # `metadata` is dropped because source-system internals (Notion block
@@ -138,7 +157,16 @@ def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
     so collapsing them converts directly into evidence that survives the cap.
     """
     if result.get("node_type") == "Entity":
-        return _strip(result, _ENTITY_RESULT_DROP)
+        lean_entity = _strip(result, _ENTITY_RESULT_DROP)
+        # Shed the near-always-empty navigation fields (matched_via: [],
+        # properties: {}, attached_doc_ids: [], edge_types: [], doc_count: 0)
+        # — absent already means "nothing here". Populated values pass.
+        return {
+            k: v
+            for k, v in lean_entity.items()
+            if v or k not in ("matched_via", "properties", "attached_doc_ids",
+                              "edge_types", "doc_count")
+        }
     compacted = _strip(result, _DOC_RESULT_DROP)
     if compacted.get("canonical_id") == compacted.get("doc_id"):
         compacted.pop("canonical_id", None)
@@ -164,13 +192,37 @@ def _compact_result(result: dict[str, Any]) -> dict[str, Any]:
             lean.pop("matched_via", None)
         elif "matched_via" in lean:
             lean["matched_via"] = _lean_matched_via(lean["matched_via"])
-        if not lean.get("graph_evidence"):
-            lean.pop("graph_evidence", None)
+        if lean.get("score") == _CHUNK_CONSTANT_SCORE:
+            lean.pop("score", None)
         if not lean.get("why_relevant"):
             lean.pop("why_relevant", None)
         lean_chunks.append(lean)
     compacted["chunks"] = lean_chunks
     return compacted
+
+
+def _lean_envelope(out: dict[str, Any]) -> dict[str, Any]:
+    """Shed envelope fields that are dead weight when empty.
+
+    `aggregations: []` (the populated case passes), `related_entities_error:
+    null` (shown only when the walk actually failed), and the seven constant
+    fields on each `related_entities` row. Every honesty field (`degraded`,
+    `truncated`, `confidence_breakdown`, counts) passes untouched — the
+    tripwire test on _TOP_LEVEL_DROP guards that contract.
+    """
+    if not out.get("aggregations"):
+        out.pop("aggregations", None)
+    if out.get("related_entities_error") is None:
+        out.pop("related_entities_error", None)
+    related = out.get("related_entities")
+    if isinstance(related, list):
+        out["related_entities"] = [
+            {k: v for k, v in r.items() if k in _RELATED_ENTITY_KEEP}
+            if isinstance(r, dict)
+            else r
+            for r in related
+        ]
+    return out
 
 
 def compact_search(payload: dict[str, Any]) -> dict[str, Any]:
@@ -186,7 +238,7 @@ def compact_search(payload: dict[str, Any]) -> dict[str, Any]:
     out["results"] = [
         _compact_result(r) if isinstance(r, dict) else r for r in results
     ]
-    return out
+    return _lean_envelope(out)
 
 
 def compact_query(payload: dict[str, Any]) -> dict[str, Any]:
@@ -203,7 +255,7 @@ def compact_query(payload: dict[str, Any]) -> dict[str, Any]:
     results = payload.get("results")
     if results is not None:
         out["results"] = [_compact_result(r) for r in results]
-    return out
+    return _lean_envelope(out)
 
 
 def compact_source(payload: dict[str, Any]) -> dict[str, Any]:
