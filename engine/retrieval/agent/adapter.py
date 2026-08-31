@@ -552,8 +552,13 @@ async def to_query_response(
                         chunk_id=h.chunk_id,
                         content=h.content,
                         matched_via=["id_lookup"],
+                        # Inferred resolutions (prefix / number ref) say how
+                        # they resolved; claiming "Exact" for an expansion
+                        # the user never typed would launder an inference
+                        # into a certainty (review: cross-file).
                         why_relevant=(
-                            f"Exact identifier match: {h.matched_canonical_id}"
+                            h.resolution_note
+                            or f"Exact identifier match: {h.matched_canonical_id}"
                         ),
                         source_system=h.source_system,
                         title=h.title or "",

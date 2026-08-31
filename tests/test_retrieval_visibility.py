@@ -317,6 +317,160 @@ async def test_id_lookup_maps_each_id_and_gates_url_arms(live_db) -> None:
     assert await id_lookup_search(cid, [url_only_uuid]) == []
 
 
+async def test_prefix_lookup_unique_vs_ambiguous(live_db) -> None:
+    """Inferred hex prefixes pin only when they expand to ONE identifier
+    (git short-hash rule): several docs carrying the SAME identifier still
+    resolve; two DISTINCT identifiers sharing the prefix are ambiguous."""
+    from engine.retrieval.retrievers.id_lookup import _prefix_lookup
+
+    cid = _new_customer_id()
+    await _seed_customer(cid)
+    await _seed_doc(
+        cid, "github:owner/repo:commit:5e0f32aaffffffffffffffffffffffffffffffff",
+        title="fix: the thing", content="commit body", visibility="approved",
+        source_system="github",
+        source_id="owner/repo@5e0f32aaffffffffffffffffffffffffffffffff",
+    )
+    await _seed_doc(
+        cid, f"claude_code:{cid}:5e0f3220-dad2-479a-a8b8-853a3c7132a6",
+        title="session", content="session body", visibility="approved",
+        source_system="claude_code",
+        source_id="5e0f3220-dad2-479a-a8b8-853a3c7132a6",
+    )
+    # Two docs, SAME commit identifier -> still unique.
+    await _seed_doc(
+        cid, "github:owner/repo:commit:ce09c4370ea9487302dbce1e8c51b5a041ac3424",
+        title="fix", content="commit body", visibility="approved",
+        source_system="github",
+        source_id="owner/repo@ce09c4370ea9487302dbce1e8c51b5a041ac3424",
+    )
+    await _seed_doc(
+        cid, "github:owner/repo:commit-mirror:ce09c4370ea9487302dbce1e8c51b5a041ac3424",
+        title="mirror", content="mirror body", visibility="approved",
+        source_system="github",
+        source_id="mirror:ce09c4370ea9487302dbce1e8c51b5a041ac3424",
+    )
+
+    # '5e0f32' -> 6 chars is below the floor at detection; here we pass
+    # 7-char prefixes directly. '5e0f322' matches BOTH the commit sha
+    # (5e0f32aa...) -- no wait, '5e0f322' is not a prefix of '5e0f32aa'.
+    hits, ambiguous = await _prefix_lookup(cid, ["5e0f3220", "ce09c43"])
+    got = {h.matched_canonical_id: h.doc_id for h in hits}
+    assert got["5e0f3220"].endswith("5e0f3220-dad2-479a-a8b8-853a3c7132a6")
+    # Same identifier in two docs: resolves (not ambiguous), one pin.
+    assert got["ce09c43"].startswith("github:owner/repo:commit")
+    assert ambiguous == set()
+    assert all(h.resolution_note for h in hits)
+
+    # Now a SECOND distinct sha sharing the ce09c43 prefix -> ambiguous.
+    await _seed_doc(
+        cid, "github:owner/repo:commit:ce09c43fffffffffffffffffffffffffffffffff",
+        title="other", content="other body", visibility="approved",
+        source_system="github",
+        source_id="owner/repo@ce09c43fffffffffffffffffffffffffffffffff",
+    )
+    hits2, ambiguous2 = await _prefix_lookup(cid, ["ce09c43"])
+    assert hits2 == []
+    assert ambiguous2 == {"ce09c43"}
+
+    # Anchoring: a prefix that only occurs MID-identifier never matches.
+    hits3, _ = await _prefix_lookup(cid, ["f32aaff"])
+    assert hits3 == []
+
+
+async def test_number_ref_lookup_repo_rules(live_db) -> None:
+    """Number refs resolve per repo: unique repo pins (preferring the PR
+    doc over the '(#N)' commit), a junk qualifier falls back to the bare
+    rule, and a number in two repos is ambiguous unless qualified."""
+    from engine.retrieval.retrievers.id_lookup import _number_ref_lookup
+    from engine.shared.identifiers import DetectedIdentifier
+
+    cid = _new_customer_id()
+    await _seed_customer(cid)
+    await _seed_doc(
+        cid, "github:acme/research-os:pr:539",
+        title="v1 feat: thing", content="pr body", visibility="approved",
+        source_system="github", source_id="acme/research-os#539",
+    )
+    await _seed_doc(
+        cid, "github:acme/research-os:commit:" + "a" * 40,
+        title="feat: thing (#539)", content="commit body", visibility="approved",
+        source_system="github", source_id="acme/research-os@" + "a" * 40,
+    )
+    await _seed_doc(
+        cid, "github:acme/alpha:commit:" + "b" * 40,
+        title="fix (#77)", content="a", visibility="approved",
+        source_system="github", source_id="acme/alpha@" + "b" * 40,
+    )
+    await _seed_doc(
+        cid, "github:acme/beta:commit:" + "c" * 40,
+        title="fix (#77)", content="b", visibility="approved",
+        source_system="github", source_id="acme/beta@" + "c" * 40,
+    )
+    # A non-github doc quoting '(#539)' must not create a phantom group.
+    await _seed_doc(
+        cid, f"{cid}:slack-quote",
+        title="deployed the thing (#539)", content="chat", visibility="approved",
+        source_system="slack",
+    )
+
+    def ref(canonical: str, qualifier: str, number: str) -> DetectedIdentifier:
+        return DetectedIdentifier(
+            kind="number_ref", canonical_id=canonical,
+            qualifier=qualifier, number=number,
+        )
+
+    hits, ambiguous = await _number_ref_lookup(
+        cid,
+        [
+            ref("#539", "", "539"),
+            ref("the#539", "the", "539"),
+            ref("#77", "", "77"),
+            ref("alpha#77", "alpha", "77"),
+        ],
+    )
+    got = {h.matched_canonical_id: h.doc_id for h in hits}
+    # Unique repo: resolves, PR doc preferred over the commit doc.
+    assert got["#539"] == "github:acme/research-os:pr:539"
+    # A qualifier matching no repo DISQUALIFIES the ref (review: prose like
+    # 'causes of #500 errors' must never widen into the bare rule and pin).
+    assert "the#539" not in got
+    # Two repos share #77: bare is ambiguous, qualified resolves.
+    assert "#77" in ambiguous
+    assert got["alpha#77"] == "github:acme/alpha:commit:" + "b" * 40
+    assert all(h.resolution_note for h in hits)
+
+
+async def test_lookup_identifiers_routes_issue_ref_to_number_lane(live_db) -> None:
+    """'research-os#539' detects as issue_ref (exact), but its stored
+    source_id is 'acme/research-os#539' — equality can't match a repo
+    typed without its owner. The router must ALSO ride it through the
+    number lane, whose repo-tail rules can (review: altitude)."""
+    from engine.retrieval.retrievers.id_lookup import lookup_identifiers
+    from engine.shared.identifiers import detect_identifiers
+
+    cid = _new_customer_id()
+    await _seed_customer(cid)
+    await _seed_doc(
+        cid, "github:acme/research-os:pr:539",
+        title="v1 feat: thing", content="pr body", visibility="approved",
+        source_system="github", source_id="acme/research-os#539",
+    )
+
+    detected = detect_identifiers("research-os#539")
+    assert [d.kind for d in detected] == ["issue_ref"]
+    hits, ambiguous = await lookup_identifiers(cid, detected)
+    assert [h.doc_id for h in hits] == ["github:acme/research-os:pr:539"]
+    assert ambiguous == set()
+
+    # The full owner/repo form still resolves via the EXACT lane (its
+    # hit carries no resolution_note).
+    detected_full = detect_identifiers("acme/research-os#539")
+    hits2, _ = await lookup_identifiers(cid, detected_full)
+    assert hits2 and hits2[0].doc_id == "github:acme/research-os:pr:539"
+    assert hits2[0].resolution_note == ""
+
+
 async def test_sql_list_excludes_drafts_by_default(live_db) -> None:
     cid = _new_customer_id()
     await _seed_customer(cid)

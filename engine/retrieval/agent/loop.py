@@ -68,7 +68,7 @@ from engine.retrieval.helpers import expand_to_author_id_set
 from engine.retrieval.retrievers.bm25 import residualize_for_bm25
 from engine.retrieval.retrievers.id_lookup import (
     IdLookupHit,
-    id_lookup_search,
+    lookup_identifiers,
     resolve_pins,
 )
 from engine.retrieval.router import (
@@ -679,9 +679,10 @@ def _build_user_message(
         )
         id_pins_block = (
             "<id_pins>\n"
-            "Exact matches for identifiers the user typed. These documents\n"
-            "are certain and will appear in the results; build the answer\n"
-            "AROUND them.\n"
+            "Documents resolved from identifiers in the query — exact\n"
+            "matches, or partial references (short sha, '#N') that resolved\n"
+            "to exactly one document. They will appear in the results;\n"
+            "build the answer AROUND them.\n"
             f"{pin_lines}\n"
             "</id_pins>\n"
         )
@@ -1985,13 +1986,13 @@ async def run_gatherer(
             )
             return GroundingBundle()
 
-    async def _id_lookup_task() -> list[IdLookupHit]:
+    async def _id_lookup_task() -> tuple[list[IdLookupHit], set[str]]:
         if not detected_ids:
-            return []
+            return [], set()
         try:
-            return await id_lookup_search(
+            return await lookup_identifiers(
                 customer_id,
-                [d.canonical_id for d in detected_ids],
+                detected_ids,
                 sources=[s.value for s in req.sources] if req.sources else None,
                 doc_types=req.doc_types or None,
                 source_keys=req.source_keys or None,
@@ -2006,9 +2007,11 @@ async def run_gatherer(
                 trace_id=trace_id,
                 error=str(exc),
             )
-            return []
+            return [], set()
 
-    bundle, id_hits = await asyncio.gather(_grounding_task(), _id_lookup_task())
+    bundle, (id_hits, ambiguous_ids) = await asyncio.gather(
+        _grounding_task(), _id_lookup_task()
+    )
     timing["grounding_ms"] = (time.perf_counter() - t_grounding) * 1000
 
     id_pins, unresolved_ids, overflow_ids = resolve_pins(
@@ -2022,6 +2025,10 @@ async def run_gatherer(
             detected=len(detected_ids),
             pinned=len(id_pins),
             unresolved=sorted(unresolved_ids),
+            # Subset of unresolved: inferred refs (prefix / number) that
+            # matched MORE than one thing — refusing to guess is the
+            # designed outcome, not a lookup failure.
+            ambiguous=sorted(ambiguous_ids),
             overflow=sorted(overflow_ids),
         )
 
@@ -2038,7 +2045,24 @@ async def run_gatherer(
         and not unresolved_ids
         and not overflow_ids
         and residualize_for_bm25(
-            req.query, [d.canonical_id for d in detected_ids]
+            req.query,
+            [
+                # A number ref's qualifier may be a TOPICAL word the greedy
+                # capture swallowed ('deadlock #383'); only the '#N' half
+                # belongs to the lane THEN, and the word must stay in the
+                # residual so the query never short-circuits into a PR card.
+                # But when the ref RESOLVED, the qualifier named a real repo
+                # ('research-os PR #539') — it was consumed by the lane, and
+                # leaving it in the residual would deny exactly the fast
+                # path this lane resolves best (review, both directions).
+                d.canonical_id
+                if d.kind != "number_ref"
+                or any(
+                    h.matched_canonical_id == d.canonical_id for h in id_hits
+                )
+                else f"#{d.number}"
+                for d in detected_ids
+            ],
         )
         is None
     )

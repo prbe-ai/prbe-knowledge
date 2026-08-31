@@ -2615,8 +2615,8 @@ async def test_pure_lookup_skips_both_llm_calls(
         matched_canonical_id="PRB-17",
     )
     monkeypatch.setattr(
-        "engine.retrieval.agent.loop.id_lookup_search",
-        AsyncMock(return_value=[hit]),
+        "engine.retrieval.agent.loop.lookup_identifiers",
+        AsyncMock(return_value=([hit], set())),
     )
     extractor = AsyncMock(return_value=EntityExtraction())
     monkeypatch.setattr(
@@ -2684,8 +2684,8 @@ async def test_author_scope_drops_pin_and_fast_path(
         author_id="bob", matched_canonical_id="PRB-17",
     )
     monkeypatch.setattr(
-        "engine.retrieval.agent.loop.id_lookup_search",
-        AsyncMock(return_value=[hit]),
+        "engine.retrieval.agent.loop.lookup_identifiers",
+        AsyncMock(return_value=([hit], set())),
     )
     monkeypatch.setattr(
         "engine.retrieval.agent.loop._resolve_person_author_ids",
@@ -2721,6 +2721,102 @@ async def test_author_scope_drops_pin_and_fast_path(
 
 
 @pytest.mark.asyncio
+async def test_prefix_pin_short_circuits_like_full_ids(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_request: SimpleNamespace,
+) -> None:
+    """A uniquely-resolved hex prefix behaves exactly like a full id:
+    pin first, both LLM calls skipped."""
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from engine.retrieval.retrievers.id_lookup import IdLookupHit
+
+    req = QueryRequest(query="ce09c43", customer_id="cust-1", top_k=5)
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
+        AsyncMock(return_value=GroundingBundle()),
+    )
+    hit = IdLookupHit(
+        chunk_id="ck-1", doc_id="github:acme/r:commit:ce09c4370ea9deadbeef",
+        doc_version=1, source_system="github", source_url="https://g/x",
+        title="fix: thing", content="commit body",
+        created_at=_dt(2026, 8, 31, tzinfo=_UTC),
+        updated_at=_dt(2026, 8, 31, tzinfo=_UTC), score=1.0,
+        matched_canonical_id="ce09c43",
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.lookup_identifiers",
+        AsyncMock(return_value=([hit], set())),
+    )
+    extractor = AsyncMock(return_value=EntityExtraction())
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.extract_entities_with_llm", extractor
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.execute_search",
+        AsyncMock(return_value={"sub_queries": [{
+            "query": "ce09c43", "grounded_entities": [],
+            "vector": [], "bm25": [], "graph": [], "inferred_edge": [],
+        }]}),
+    )
+    gatherer_llm = AsyncMock()
+    with patch("engine.retrieval.agent.loop.acompletion", new=gatherer_llm):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    extractor.assert_not_awaited()
+    gatherer_llm.assert_not_awaited()
+    assert fake_request.state.gatherer_status == "id_lookup_short_circuit"
+    doc_ids = [r.doc_id for r in resp.results if hasattr(r, "doc_id")]
+    assert doc_ids[0] == "github:acme/r:commit:ce09c4370ea9deadbeef"
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_prefix_keeps_the_full_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_request: SimpleNamespace,
+) -> None:
+    """An ambiguous prefix (two matches) must not pin OR short-circuit —
+    refusing to guess means the ranked loop answers."""
+    req = QueryRequest(query="ce09c43", customer_id="cust-1", top_k=5)
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop._build_bundle_with_token_fallback",
+        AsyncMock(return_value=GroundingBundle()),
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.lookup_identifiers",
+        AsyncMock(return_value=([], {"ce09c43"})),
+    )
+    extractor = AsyncMock(return_value=EntityExtraction())
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.extract_entities_with_llm", extractor
+    )
+    monkeypatch.setattr(
+        "engine.retrieval.agent.loop.execute_search",
+        AsyncMock(return_value={"sub_queries": [{
+            "query": "ce09c43", "grounded_entities": [],
+            "vector": [{"doc_id": "ctx:1", "score": 0.5,
+                        "source_system": "github", "title": "ctx",
+                        "content": "context"}],
+            "bm25": [], "graph": [], "inferred_edge": [],
+        }]}),
+    )
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args(chunks=1, confidence="high"))],
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    extractor.assert_awaited()
+    assert fake_request.state.gatherer_status != "id_lookup_short_circuit"
+    for r in resp.results:
+        for m in getattr(r, "matched_via", []) or []:
+            assert m.channel != "id_lookup"
+
+
+@pytest.mark.asyncio
 async def test_unresolved_id_keeps_the_full_loop(
     monkeypatch: pytest.MonkeyPatch,
     fake_request: SimpleNamespace,
@@ -2734,8 +2830,8 @@ async def test_unresolved_id_keeps_the_full_loop(
         AsyncMock(return_value=GroundingBundle()),
     )
     monkeypatch.setattr(
-        "engine.retrieval.agent.loop.id_lookup_search",
-        AsyncMock(return_value=[]),
+        "engine.retrieval.agent.loop.lookup_identifiers",
+        AsyncMock(return_value=([], set())),
     )
     extractor = AsyncMock(return_value=EntityExtraction())
     monkeypatch.setattr(

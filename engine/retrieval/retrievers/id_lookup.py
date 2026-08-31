@@ -1,5 +1,12 @@
-"""Exact-id retriever — pins docs whose `source_id`/`doc_id` matches a
-router-extracted canonical_id.
+"""Identifier retriever — resolves typed identifiers to documents, for
+the id-pins lane.
+
+Two lanes, split by what the user typed (identifiers.EXACT_KINDS vs
+INFERRED_KINDS): EXACT lookups (`id_lookup_search`) match a whole typed
+identifier by equality/suffix — whatever matches is right. INFERRED
+lookups (`_prefix_lookup`, `_number_ref_lookup`) EXPAND a partial
+reference (a short sha, a bare '#N') and may pin only when the expansion
+is unique; anything else is reported ambiguous, never guessed.
 
 Vector and BM25 both fail on UUID-precise queries: embeddings of random
 hex are noise (every session metadata chunk lands at ~0.50 cosine), and
@@ -21,6 +28,7 @@ ordering of unrelated candidates.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -28,8 +36,13 @@ from typing import Any
 
 from engine.retrieval.helpers import source_key_predicate
 from engine.retrieval.temporal import build_predicate
+from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
-from engine.shared.identifiers import DetectedIdentifier
+from engine.shared.identifiers import (
+    EXACT_KINDS,
+    INFERRED_KINDS,
+    DetectedIdentifier,
+)
 from engine.shared.models import TemporalSpec, normalize_author_id
 
 # A canonical_id qualifies for exact-id lookup when it looks like a stable
@@ -40,6 +53,7 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 _TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-\d{1,6}$")
 _HASH_PREFIX_RE = re.compile(r"^[0-9a-f]{12,40}$")
 _ISSUE_REF_RE = re.compile(r"^[a-zA-Z0-9_./-]+#\d{1,6}$")
+_PD_ID_RE = re.compile(r"^Q(?=[A-Z0-9]*\d)[A-Z0-9]{13,15}$")
 
 
 def is_lookup_candidate(canonical_id: str) -> bool:
@@ -56,6 +70,8 @@ def is_lookup_candidate(canonical_id: str) -> bool:
     if _TICKET_RE.match(canonical_id):
         return True
     if _ISSUE_REF_RE.match(canonical_id):
+        return True
+    if _PD_ID_RE.match(canonical_id):
         return True
     return bool(_HASH_PREFIX_RE.match(canonical_id))
 
@@ -78,6 +94,65 @@ class IdLookupHit:
     # the mapping (one pin slot per identifier, best doc each), and a flat
     # hit list cannot carry it (outside-voice F4).
     matched_canonical_id: str = ""
+    # INFERRED resolutions (prefix / number ref) say HOW they resolved, so
+    # consumers never present an expansion as an exact match the user typed
+    # (review: cross-file). Empty for exact hits.
+    resolution_note: str = ""
+
+
+def _append_scope_filters(
+    params: list[Any],
+    *,
+    spec: TemporalSpec,
+    include_drafts: bool,
+    sources: list[str] | None,
+    doc_types: list[str] | None,
+    author_ids: list[str] | None,
+    source_keys: list[str] | None,
+    source_keys_include_keyless: bool,
+    doc_only: bool = False,
+) -> str:
+    """The one scope gate every lookup in this module shares.
+
+    Appends parameters to `params` and returns the `AND ...` SQL tail
+    (source/doc_type/author/source_key/temporal/visibility). ONE builder on
+    purpose: several lookup queries each re-implementing the workspace lens
+    is several chances for a pinned doc to leak past it.
+
+    `doc_only=True` omits the chunk-alias fragments (chunk temporal +
+    chunk visibility) for the inferred lookups' documents-only phase 1;
+    their phase 2 chunk fetch applies the full gate, so a doc whose chunks
+    are all filtered still never pins.
+    """
+    out: list[str] = []
+    if sources:
+        params.append(sources)
+        out.append(f"AND d.source_system = ANY(${len(params)}::text[])")
+    if doc_types:
+        params.append(doc_types)
+        out.append(f"AND d.doc_type = ANY(${len(params)}::text[])")
+    if author_ids:
+        params.append(author_ids)
+        out.append(f"AND d.author_id = ANY(${len(params)}::text[])")
+    out.append(
+        source_key_predicate(
+            params, source_keys, alias="d",
+            include_keyless=source_keys_include_keyless,
+        )
+    )
+    pred = build_predicate(
+        spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
+    )
+    params.extend(pred.params)
+    if not doc_only:
+        out.append(pred.chunk_sql)
+    out.append(pred.doc_sql)
+    if not include_drafts:
+        if doc_only:
+            out.append("AND d.visibility = 'approved'")
+        else:
+            out.append("AND c.visibility = 'approved' AND d.visibility = 'approved'")
+    return "\n              ".join(x for x in out if x)
 
 
 async def id_lookup_search(
@@ -138,48 +213,22 @@ async def id_lookup_search(
 
     async with with_tenant(customer_id) as conn:
         params: list[Any] = [customer_id, ids, url_flags]
-
-        source_filter = ""
-        if sources:
-            params.append(sources)
-            source_filter = f"AND d.source_system = ANY(${len(params)}::text[])"
-        doc_type_filter = ""
-        if doc_types:
-            params.append(doc_types)
-            doc_type_filter = f"AND d.doc_type = ANY(${len(params)}::text[])"
-        author_filter = ""
-        if author_ids:
-            params.append(author_ids)
-            author_filter = f"AND d.author_id = ANY(${len(params)}::text[])"
-        source_key_filter = source_key_predicate(
-            params, source_keys, alias="d",
-            include_keyless=source_keys_include_keyless,
-        )
-        pred = build_predicate(
-            spec, doc_alias="d", chunk_alias="c", next_param_index=len(params) + 1
-        )
-        params.extend(pred.params)
-
-        visibility_filter = (
-            ""
-            if include_drafts
-            else "AND c.visibility = 'approved' AND d.visibility = 'approved'"
+        scope_sql = _append_scope_filters(
+            params,
+            spec=spec,
+            include_drafts=include_drafts,
+            sources=sources,
+            doc_types=doc_types,
+            author_ids=author_ids,
+            source_keys=source_keys,
+            source_keys_include_keyless=source_keys_include_keyless,
         )
 
         rows = await conn.fetch(
             f"""
             SELECT DISTINCT ON (m.cid, c.doc_id)
                    m.cid AS matched_canonical_id,
-                   c.chunk_id,
-                   c.doc_id,
-                   d.version AS doc_version,
-                   d.source_system,
-                   d.source_url,
-                   d.title,
-                   d.author_id,
-                   c.content,
-                   d.created_at,
-                   d.updated_at
+                   {_HIT_COLUMNS}
             FROM documents d
             JOIN unnest($2::text[], $3::bool[]) AS m(cid, url_ok)
               ON (
@@ -193,45 +242,541 @@ async def id_lookup_search(
                     OR d.source_url LIKE '%/' || m.cid || '#%'
                 ))
               )
-            JOIN chunks c
-              ON c.doc_id = d.doc_id
-             AND c.customer_id = d.customer_id
-             AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
+            {_CHUNK_JOIN}
             WHERE d.customer_id = $1
               AND COALESCE(c.kind, 'content') = 'content'
-              {source_filter}
-              {doc_type_filter}
-              {author_filter}
-              {source_key_filter}
-              {pred.chunk_sql}
-              {pred.doc_sql}
-              {visibility_filter}
+              {scope_sql}
             ORDER BY m.cid, c.doc_id, c.chunk_index ASC
             """,
             *params,
         )
 
-    hits = [
-        IdLookupHit(
-            chunk_id=r["chunk_id"],
-            doc_id=r["doc_id"],
-            doc_version=r["doc_version"],
-            source_system=r["source_system"],
-            source_url=r["source_url"],
-            title=r["title"],
-            content=r["content"],
-            created_at=r["created_at"],
-            updated_at=r["updated_at"],
-            score=1.0,
-            author_id=normalize_author_id(r["author_id"]),
-            matched_canonical_id=r["matched_canonical_id"],
-        )
-        for r in rows
-    ]
+    hits = [_row_to_hit(r, r["matched_canonical_id"]) for r in rows]
     # Deterministic order for per-id best-doc selection downstream.
     hits.sort(key=lambda h: (h.matched_canonical_id, _neg_ts(h.updated_at), h.doc_id))
     return hits
 
+
+
+_HIT_COLUMNS = """
+                   c.chunk_id,
+                   c.doc_id,
+                   d.version AS doc_version,
+                   d.source_system,
+                   d.source_url,
+                   d.title,
+                   d.author_id,
+                   c.content,
+                   d.created_at,
+                   d.updated_at
+"""
+
+_CHUNK_JOIN = """
+            JOIN chunks c
+              ON c.doc_id = d.doc_id
+             AND c.customer_id = d.customer_id
+             AND d.version BETWEEN c.first_seen_version AND c.last_seen_version
+"""
+
+
+def _row_to_hit(r: Any, canonical_id: str, note: str = "") -> IdLookupHit:
+    return IdLookupHit(
+        chunk_id=r["chunk_id"],
+        doc_id=r["doc_id"],
+        doc_version=r["doc_version"],
+        source_system=r["source_system"],
+        source_url=r["source_url"],
+        title=r["title"],
+        content=r["content"],
+        created_at=r["created_at"],
+        updated_at=r["updated_at"],
+        score=1.0,
+        author_id=normalize_author_id(r["author_id"]),
+        matched_canonical_id=canonical_id,
+        resolution_note=note,
+    )
+
+
+# SQL-safety gate, NOT a kind re-derivation: prefixes are concatenated into
+# LIKE patterns, so they must be provably free of LIKE metacharacters. The
+# kind routing already guarantees hex; this makes the guarantee local.
+_HEX_ONLY_RE = re.compile(r"^[0-9a-f]{7,11}$")
+
+# Phase-1 row cap for the inferred lookups. Hitting it means the match set
+# was pathological; everything in that fetch is then treated as AMBIGUOUS
+# (fail-CLOSED) — a truncated competitor set must never turn "ambiguous"
+# into "unique" (review: efficiency).
+_INFERRED_MATCH_CAP = 500
+
+
+async def _fetch_first_chunks(
+    customer_id: str,
+    doc_ids: list[str],
+    *,
+    temporal: TemporalSpec | None,
+    include_drafts: bool,
+    sources: list[str] | None,
+    doc_types: list[str] | None,
+    author_ids: list[str] | None,
+    source_keys: list[str] | None,
+    source_keys_include_keyless: bool,
+) -> dict[str, Any]:
+    """First content chunk per doc, full scope enforced — phase 2 of the
+    inferred lookups. Docs whose chunks are all filtered out simply drop
+    (no pin), which the caller reports as unresolved."""
+    if not doc_ids:
+        return {}
+    async with with_tenant(customer_id) as conn:
+        params: list[Any] = [customer_id, doc_ids]
+        scope_sql = _append_scope_filters(
+            params,
+            spec=temporal or TemporalSpec(),
+            include_drafts=include_drafts,
+            sources=sources,
+            doc_types=doc_types,
+            author_ids=author_ids,
+            source_keys=source_keys,
+            source_keys_include_keyless=source_keys_include_keyless,
+        )
+        rows = await conn.fetch(
+            f"""
+            SELECT DISTINCT ON (c.doc_id)
+                   {_HIT_COLUMNS}
+            FROM documents d
+            {_CHUNK_JOIN}
+            WHERE d.customer_id = $1
+              AND d.doc_id = ANY($2::text[])
+              AND COALESCE(c.kind, 'content') = 'content'
+              {scope_sql}
+            ORDER BY c.doc_id, c.chunk_index ASC
+            """,
+            *params,
+        )
+    return {r["doc_id"]: r for r in rows}
+
+
+async def _prefix_lookup(
+    customer_id: str,
+    prefixes: list[str],
+    *,
+    temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
+    sources: list[str] | None = None,
+    doc_types: list[str] | None = None,
+    author_ids: list[str] | None = None,
+    source_keys: list[str] | None = None,
+    source_keys_include_keyless: bool = False,
+) -> tuple[list[IdLookupHit], set[str]]:
+    """Resolve bare hex prefixes (short sha / uuid first-segment) to full
+    stored identifiers. Returns (hits, ambiguous_prefixes).
+
+    Git's short-hash rule, enforced on the IDENTIFIER, not the doc count:
+    the match arms are ANCHORED at the start of a stored identifier
+    (start-of-string, after '@' in `owner/repo@<sha>`, after ':' in
+    `issue:<uuid>`) — never a bare substring, which would match mid-sha —
+    and matches group by the FULL identifier the prefix expanded to
+    (extracted in SQL). One distinct identifier resolves, even when several
+    docs carry it; two distinct identifiers -> ambiguous, no pin, reported.
+    A guessed expansion pinned with a certainty label is the one outcome
+    this module exists to prevent.
+
+    Uniqueness is judged within the request's scope (sources/doc_types/
+    source_keys/visibility): "unique among the documents this caller may
+    see" is the deliberate contract — the workspace lens defines the
+    caller's world, exactly as git resolves within one repository.
+
+    Two phases so the cost matches the answer: phase 1 scans DOCUMENTS
+    only (no chunk join, no content) to find and group matches; phase 2
+    fetches one content chunk for the few unique winners. Leading-wildcard
+    arms are the same bounded tenant-scan cost class as the ticket URL
+    arms, and run once per request.
+    """
+    clean = [c for c in prefixes if _HEX_ONLY_RE.match(c)]
+    if not clean:
+        return [], set()
+
+    async with with_tenant(customer_id) as conn:
+        params: list[Any] = [customer_id, clean]
+        scope_sql = _append_scope_filters(
+            params,
+            spec=temporal or TemporalSpec(),
+            include_drafts=include_drafts,
+            sources=sources,
+            doc_types=doc_types,
+            author_ids=author_ids,
+            source_keys=source_keys,
+            source_keys_include_keyless=source_keys_include_keyless,
+            doc_only=True,
+        )
+        # LATERAL so the row cap applies PER IDENTIFIER: a pathological
+        # prefix stops scanning at its own cap and cannot contaminate the
+        # verdict on its neighbors, and the LIMIT terminates the inner scan
+        # early instead of sitting above a blocking DISTINCT (review).
+        rows = await conn.fetch(
+            f"""
+            SELECT m.cid AS matched_cid, x.doc_id, x.source_id, x.updated_at
+            FROM unnest($2::text[]) AS m(cid)
+            JOIN LATERAL (
+                SELECT d.doc_id, d.source_id, d.updated_at
+                FROM documents d
+                WHERE d.customer_id = $1
+                  AND (
+                    d.source_id LIKE m.cid || '%'
+                    OR d.source_id LIKE '%@' || m.cid || '%'
+                    OR d.source_id LIKE '%:' || m.cid || '%'
+                  )
+                  {scope_sql}
+                LIMIT {_INFERRED_MATCH_CAP + 1}
+            ) x ON true
+            """,
+            *params,
+        )
+
+    by_cid: dict[str, list[Any]] = {}
+    for r in rows:
+        by_cid.setdefault(r["matched_cid"], []).append(r)
+
+    ambiguous: set[str] = set()
+    winners: dict[str, str] = {}  # cid -> doc_id
+    for cid, group in by_cid.items():
+        if len(group) > _INFERRED_MATCH_CAP:
+            # This identifier's own fetch was truncated: fail CLOSED — a
+            # truncated competitor set must never read as "unique".
+            ambiguous.add(cid)
+            continue
+        # The full identifier each row's match expanded to, extracted here
+        # (≤ cap rows) rather than per-row in SQL.
+        ident_re = re.compile(
+            r"(?:^|[@:])(" + cid + r"[0-9a-fA-F-]*)", re.IGNORECASE
+        )
+        resolved: dict[str, list[Any]] = {}
+        for r in group:
+            m = ident_re.search(r["source_id"] or "")
+            resolved.setdefault(
+                m.group(1).lower() if m else r["doc_id"], []
+            ).append(r)
+        if len(resolved) > 1:
+            ambiguous.add(cid)
+            continue
+        full_id, docs = next(iter(resolved.items()))
+        # One identifier, possibly several docs carrying it (a parent doc
+        # plus derived children): the primary doc is the one whose
+        # source_id IS the identifier (or the shortest doc_id), newest
+        # first as the tiebreak.
+        best = min(
+            docs,
+            key=lambda r: (
+                0 if full_id == (r["source_id"] or "").lower() else 1,
+                len(r["doc_id"]),
+                _neg_ts(r["updated_at"]),
+                r["doc_id"],
+            ),
+        )
+        winners[cid] = best["doc_id"]
+
+    chunk_rows = await _fetch_first_chunks(
+        customer_id,
+        sorted(set(winners.values())),
+        temporal=temporal,
+        include_drafts=include_drafts,
+        sources=sources,
+        doc_types=doc_types,
+        author_ids=author_ids,
+        source_keys=source_keys,
+        source_keys_include_keyless=source_keys_include_keyless,
+    )
+    hits = [
+        _row_to_hit(
+            chunk_rows[doc_id],
+            cid,
+            note=f"Uniquely resolved partial identifier: {cid}",
+        )
+        for cid, doc_id in winners.items()
+        if doc_id in chunk_rows
+    ]
+    return hits, ambiguous
+
+
+async def _number_ref_lookup(
+    customer_id: str,
+    refs: list[DetectedIdentifier],
+    *,
+    temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
+    sources: list[str] | None = None,
+    doc_types: list[str] | None = None,
+    author_ids: list[str] | None = None,
+    source_keys: list[str] | None = None,
+    source_keys_include_keyless: bool = False,
+) -> tuple[list[IdLookupHit], set[str]]:
+    """Resolve PR/issue number refs ('#383', 'research-os#539') to a repo's
+    PR, issue, or squash-merge commit doc. Returns (hits, ambiguous_refs).
+
+    The number is matched in SQL; the repo is resolved in PYTHON, because
+    the qualifier is a SOFT filter: 'the PR #232' carries qualifier 'the',
+    and demanding a repo literally named 'the' would lose a resolvable
+    number. Rules, in order, per ref:
+
+      1. Group matching docs by repo (`split_part(doc_id, ':', 2)`, guarded
+         to github-shaped doc_ids so a non-github doc can never mint a
+         phantom repo group).
+      2. A qualifier must match exactly one group (full name or tail) to
+         resolve. Matching zero or several DISQUALIFIES the ref — the
+         user scoped the number, and a scope this lane cannot honor must
+         not be silently widened into the bare rule (that minted wrong
+         pins from prose like 'causes of #500 errors').
+      3. No qualifier: exactly one group total resolves; two or more ->
+         ambiguous (picking a repo would be a guess).
+
+    Within the resolved repo, prefer the PR/issue doc over the commit doc
+    whose title carries '(#N)', newest first. Numbers are digits-only by
+    regex, so LIKE injection is impossible; qualifiers never reach SQL.
+    Uniqueness is scope-relative, same contract as _prefix_lookup. Two
+    phases, same cost shape as _prefix_lookup.
+    """
+    parsed = [r for r in refs if r.number.isdigit()]
+    if not parsed:
+        return [], set()
+    nums = sorted({r.number for r in parsed})
+
+    async with with_tenant(customer_id) as conn:
+        params: list[Any] = [customer_id, nums, SourceSystem.GITHUB.value]
+        scope_sql = _append_scope_filters(
+            params,
+            spec=temporal or TemporalSpec(),
+            include_drafts=include_drafts,
+            sources=sources,
+            doc_types=doc_types,
+            author_ids=author_ids,
+            source_keys=source_keys,
+            source_keys_include_keyless=source_keys_include_keyless,
+            doc_only=True,
+        )
+        # Same LATERAL shape as _prefix_lookup: per-number cap, early
+        # termination, no blocking DISTINCT. Preference and repo grouping
+        # happen in Python over ≤ cap rows.
+        rows = await conn.fetch(
+            f"""
+            SELECT m.num AS matched_num, x.doc_id, x.source_id, x.updated_at
+            FROM unnest($2::text[]) AS m(num)
+            JOIN LATERAL (
+                SELECT d.doc_id, d.source_id, d.updated_at
+                FROM documents d
+                WHERE d.customer_id = $1
+                  AND d.source_system = $3
+                  AND d.doc_id LIKE $3 || ':%'
+                  AND (
+                    d.source_id LIKE '%#' || m.num
+                    OR d.doc_id LIKE '%:pr:' || m.num
+                    OR d.doc_id LIKE '%:issue:' || m.num
+                    OR d.title LIKE '%(#' || m.num || ')%'
+                  )
+                  {scope_sql}
+                LIMIT {_INFERRED_MATCH_CAP + 1}
+            ) x ON true
+            """,
+            *params,
+        )
+
+    by_num: dict[str, list[Any]] = {}
+    for r in rows:
+        by_num.setdefault(r["matched_num"], []).append(r)
+
+    def _pref(r: Any, num: str) -> int:
+        if r["doc_id"].endswith(f":pr:{num}") or (r["source_id"] or "").endswith(f"#{num}"):
+            return 0
+        if r["doc_id"].endswith(f":issue:{num}"):
+            return 1
+        return 2
+
+    ambiguous: set[str] = set()
+    winners: dict[str, tuple[str, str]] = {}  # canonical -> (doc_id, note)
+    for ref in parsed:
+        group_rows = by_num.get(ref.number)
+        if not group_rows:
+            continue  # plain unresolved — no signal either way
+        if len(group_rows) > _INFERRED_MATCH_CAP:
+            ambiguous.add(ref.canonical_id)
+            continue
+        groups: dict[str, list[Any]] = {}
+        for r in group_rows:
+            # doc_id LIKE 'github:%' is enforced in SQL, so segment 2 is
+            # always owner/repo.
+            groups.setdefault(r["doc_id"].split(":")[1], []).append(r)
+        chosen_repo: str | None = None
+        if ref.qualifier:
+            q = ref.qualifier.lower()
+            matched = [
+                g for g in groups
+                if g.lower() == q or g.lower().endswith("/" + q)
+            ]
+            if len(matched) == 1:
+                chosen_repo = matched[0]
+            else:
+                # A qualifier that matches no repo — or several — DISQUALIFIES
+                # the ref. Falling through to the bare rule minted wrong pins
+                # from prose: 'causes of #500 errors' carries qualifier 'of'
+                # and would pin PR #500 in a single-repo tenant with the
+                # prompt told to build the answer around it (review). When
+                # the user scoped the number and we cannot honor the scope,
+                # refusing is the honest answer; the ranked loop still runs.
+                continue
+        if chosen_repo is None:
+            if len(groups) == 1:
+                chosen_repo = next(iter(groups))
+            else:
+                ambiguous.add(ref.canonical_id)
+                continue
+        best = min(
+            groups[chosen_repo],
+            key=lambda r: (_pref(r, ref.number), _neg_ts(r["updated_at"]), r["doc_id"]),
+        )
+        winners[ref.canonical_id] = (
+            best["doc_id"],
+            f"Resolved reference #{ref.number} to {chosen_repo}#{ref.number}",
+        )
+
+    chunk_rows = await _fetch_first_chunks(
+        customer_id,
+        sorted({doc_id for doc_id, _ in winners.values()}),
+        temporal=temporal,
+        include_drafts=include_drafts,
+        sources=sources,
+        doc_types=doc_types,
+        author_ids=author_ids,
+        source_keys=source_keys,
+        source_keys_include_keyless=source_keys_include_keyless,
+    )
+    hits = [
+        _row_to_hit(chunk_rows[doc_id], canonical, note=note)
+        for canonical, (doc_id, note) in winners.items()
+        if doc_id in chunk_rows
+    ]
+    return hits, ambiguous
+
+
+# Tripwire: the router below dispatches inferred kinds by name. A kind added
+# to identifiers.INFERRED_KINDS without a lane here would otherwise be
+# detected, routed nowhere, and reported unresolved with no error (review).
+assert frozenset({"hex_prefix", "number_ref"}) == INFERRED_KINDS, (
+    "new inferred kind detected but not routed — add its lane to "
+    "lookup_identifiers"
+)
+
+
+async def lookup_identifiers(
+    customer_id: str,
+    detected: list[DetectedIdentifier],
+    temporal: TemporalSpec | None = None,
+    include_drafts: bool = False,
+    sources: list[str] | None = None,
+    doc_types: list[str] | None = None,
+    author_ids: list[str] | None = None,
+    source_keys: list[str] | None = None,
+    source_keys_include_keyless: bool = False,
+) -> tuple[list[IdLookupHit], set[str]]:
+    """Route detected identifiers to the lookup their kind requires.
+
+    EXACT kinds (identifiers.EXACT_KINDS) go through `id_lookup_search`
+    unchanged — the user typed the whole id, so whatever the equality/
+    suffix arms match is right. INFERRED kinds (hex_prefix / number_ref)
+    go through the expansion lookups above, which pin only on a unique
+    resolution and report the ambiguous rest. An issue_ref additionally
+    rides the number lane: 'research-os#539' stores as
+    'acme/research-os#539', so equality alone cannot resolve a repo typed
+    without its owner — the repo-tail rules there can.
+
+    The three lookups are independent (own pooled connections) and run
+    concurrently. Returns (hits, ambiguous_canonical_ids), hits in the
+    deterministic order resolve_pins documents; exact hits come first, so
+    a canonical resolved by both lanes keeps its exact resolution.
+    Ambiguous ids carry no hits, so resolve_pins naturally reports them
+    unresolved and the pure-lookup short-circuit stays off — the full
+    ranked loop is the honest answer for a reference this lane cannot
+    uniquely resolve.
+    """
+    exact = [d.canonical_id for d in detected if d.kind in EXACT_KINDS]
+    prefixes = [d.canonical_id for d in detected if d.kind == "hex_prefix"]
+    numbers = [d for d in detected if d.kind == "number_ref"]
+    for d in detected:
+        if d.kind == "issue_ref":
+            qualifier, _, num = d.canonical_id.rpartition("#")
+            if num.isdigit():
+                numbers.append(
+                    DetectedIdentifier(
+                        kind="number_ref",
+                        canonical_id=d.canonical_id,
+                        qualifier=qualifier,
+                        number=num,
+                    )
+                )
+
+    async def _exact() -> tuple[list[IdLookupHit], set[str]]:
+        if not exact:
+            return [], set()
+        found = await id_lookup_search(
+            customer_id,
+            exact,
+            temporal=temporal,
+            include_drafts=include_drafts,
+            sources=sources,
+            doc_types=doc_types,
+            author_ids=author_ids,
+            source_keys=source_keys,
+            source_keys_include_keyless=source_keys_include_keyless,
+        )
+        return found, set()
+
+    async def _prefixes() -> tuple[list[IdLookupHit], set[str]]:
+        if not prefixes:
+            return [], set()
+        return await _prefix_lookup(
+            customer_id,
+            prefixes,
+            temporal=temporal,
+            include_drafts=include_drafts,
+            sources=sources,
+            doc_types=doc_types,
+            author_ids=author_ids,
+            source_keys=source_keys,
+            source_keys_include_keyless=source_keys_include_keyless,
+        )
+
+    async def _numbers() -> tuple[list[IdLookupHit], set[str]]:
+        if not numbers:
+            return [], set()
+        return await _number_ref_lookup(
+            customer_id,
+            numbers,
+            temporal=temporal,
+            include_drafts=include_drafts,
+            sources=sources,
+            doc_types=doc_types,
+            author_ids=author_ids,
+            source_keys=source_keys,
+            source_keys_include_keyless=source_keys_include_keyless,
+        )
+
+    results = await asyncio.gather(_exact(), _prefixes(), _numbers())
+    hits: list[IdLookupHit] = []
+    ambiguous: set[str] = set()
+    for h, a in results:
+        hits.extend(h)
+        ambiguous |= a
+    # ONE deterministic order for the merged list — resolve_pins' per-id
+    # best-doc pick depends on it. The lane rank is IN the key: an exact
+    # hit (no resolution_note) must beat an inferred expansion for the
+    # same canonical even when the inferred doc is newer — stability alone
+    # only protects identical keys, not different docs (review).
+    hits.sort(
+        key=lambda h: (
+            h.matched_canonical_id,
+            1 if h.resolution_note else 0,
+            _neg_ts(h.updated_at),
+            h.doc_id,
+        )
+    )
+    return hits, ambiguous
 
 def _neg_ts(ts: datetime) -> float:
     """Sort key helper: newest first without reverse-sorting the whole tuple."""
@@ -267,16 +812,16 @@ def resolve_pins(
     overflow: set[str] = set()
     cap = max(1, top_k // 2)
     for d in detected:
-        h = by_cid.get(d.canonical_id)
-        if h is None:
+        hit = by_cid.get(d.canonical_id)
+        if hit is None:
             unresolved.add(d.canonical_id)
             continue
-        if h.doc_id in seen_docs:
+        if hit.doc_id in seen_docs:
             # Resolved AND represented: another id already pinned this doc.
             continue
         if len(pins) >= cap:
             overflow.add(d.canonical_id)
             continue
-        seen_docs.add(h.doc_id)
-        pins.append(h)
+        seen_docs.add(hit.doc_id)
+        pins.append(hit)
     return pins, unresolved, overflow

@@ -236,3 +236,27 @@ async def test_no_pins_no_top_k_is_byte_identical_behavior() -> None:
 def test_id_lookup_short_circuit_is_not_degraded() -> None:
     assert not is_degraded("id_lookup_short_circuit")
     assert is_degraded("loop_timeout")
+
+
+async def test_inferred_pin_carries_resolution_note_not_exact_claim() -> None:
+    """Review: an expansion the user never typed must not be presented as
+    an exact match."""
+    hit = _hit("ce09c43", "doc-commit")
+    hit.resolution_note = "Uniquely resolved partial identifier: ce09c43"
+    resp = await to_query_response(
+        query="q",
+        gathered=_gathered(),
+        trace_id="t",
+        timing_ms={},
+        status="ok",
+        id_pins=[hit],
+        top_k=8,
+    )
+    pinned = next(
+        r
+        for r in resp.results
+        if isinstance(r, QueryDocumentResult) and r.doc_id == "doc-commit"
+    )
+    why = pinned.chunks[0].why_relevant
+    assert "Exact identifier match" not in why
+    assert "Uniquely resolved" in why
