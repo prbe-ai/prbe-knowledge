@@ -432,8 +432,9 @@ async def test_number_ref_lookup_repo_rules(live_db) -> None:
     got = {h.matched_canonical_id: h.doc_id for h in hits}
     # Unique repo: resolves, PR doc preferred over the commit doc.
     assert got["#539"] == "github:acme/research-os:pr:539"
-    # Junk qualifier falls back to the bare rule.
-    assert got["the#539"] == "github:acme/research-os:pr:539"
+    # A qualifier matching no repo DISQUALIFIES the ref (review: prose like
+    # 'causes of #500 errors' must never widen into the bare rule and pin).
+    assert "the#539" not in got
     # Two repos share #77: bare is ambiguous, qualified resolves.
     assert "#77" in ambiguous
     assert got["alpha#77"] == "github:acme/alpha:commit:" + "b" * 40

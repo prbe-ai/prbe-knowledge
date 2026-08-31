@@ -2049,11 +2049,18 @@ async def run_gatherer(
             [
                 # A number ref's qualifier may be a TOPICAL word the greedy
                 # capture swallowed ('deadlock #383'); only the '#N' half
-                # belongs to the lane. Feeding the full canonical into the
-                # residual test stripped that word and let the short-circuit
-                # answer a topical query with a PR card (review:
-                # removed-behavior/cross-file).
-                f"#{d.number}" if d.kind == "number_ref" else d.canonical_id
+                # belongs to the lane THEN, and the word must stay in the
+                # residual so the query never short-circuits into a PR card.
+                # But when the ref RESOLVED, the qualifier named a real repo
+                # ('research-os PR #539') — it was consumed by the lane, and
+                # leaving it in the residual would deny exactly the fast
+                # path this lane resolves best (review, both directions).
+                d.canonical_id
+                if d.kind != "number_ref"
+                or any(
+                    h.matched_canonical_id == d.canonical_id for h in id_hits
+                )
+                else f"#{d.number}"
                 for d in detected_ids
             ],
         )

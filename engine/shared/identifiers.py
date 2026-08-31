@@ -76,7 +76,7 @@ _NUMBER_FRAME_STRIP = frozenset(
 # digit. Uppercase-only AND digit-required on purpose: real PD ids are
 # random base-alnum and always carry digits, while ALL-CAPS English words
 # (QUALIFICATIONS) never do (review: line-by-line).
-_PD_RE = re.compile(r"\bQ(?=[A-Z0-9]*\d)[A-Z0-9]{12,15}\b")
+_PD_RE = re.compile(r"\bQ(?=[A-Z0-9]*\d)[A-Z0-9]{13,15}\b")
 # Bare hex prefixes: 7-11 hex chars with AT LEAST ONE letter — a short
 # commit sha ('ce09c43') or a UUID first segment ('5e0f3220'). The letter
 # requirement excludes every pure-decimal token (dates '20260831', epoch
@@ -88,6 +88,10 @@ _PD_RE = re.compile(r"\bQ(?=[A-Z0-9]*\d)[A-Z0-9]{12,15}\b")
 _HEX_PREFIX_RE = re.compile(
     r"(?<![\w-])(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,11}(?![\w-])"
 )
+# English words spelled entirely in hex letters that clear the 7-char floor
+# (same mechanism as _TICKET_STOPWORDS). 'deadbeef' is deliberately absent —
+# nobody types it as prose.
+_HEX_PREFIX_STOPWORDS = frozenset({"defaced", "effaced", "acceded"})
 
 # Common English words that satisfy the ticket shape (WORD-DIGITS). The
 # ticket regex is intentionally loose; this list catches the handful of
@@ -192,6 +196,9 @@ def detect_identifiers(query: str) -> list[DetectedIdentifier]:
         _add("pd_incident", m.group(0))
 
     for m in _HEX_PREFIX_RE.finditer(masked):
-        _add("hex_prefix", m.group(0).lower())
+        token = m.group(0).lower()
+        if token in _HEX_PREFIX_STOPWORDS:
+            continue
+        _add("hex_prefix", token)
 
     return out

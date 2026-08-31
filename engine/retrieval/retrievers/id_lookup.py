@@ -38,7 +38,11 @@ from engine.retrieval.helpers import source_key_predicate
 from engine.retrieval.temporal import build_predicate
 from engine.shared.constants import SourceSystem
 from engine.shared.db import with_tenant
-from engine.shared.identifiers import EXACT_KINDS, DetectedIdentifier
+from engine.shared.identifiers import (
+    EXACT_KINDS,
+    INFERRED_KINDS,
+    DetectedIdentifier,
+)
 from engine.shared.models import TemporalSpec, normalize_author_id
 
 # A canonical_id qualifies for exact-id lookup when it looks like a stable
@@ -49,7 +53,7 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 _TICKET_RE = re.compile(r"^[A-Z][A-Z0-9]{1,9}-\d{1,6}$")
 _HASH_PREFIX_RE = re.compile(r"^[0-9a-f]{12,40}$")
 _ISSUE_REF_RE = re.compile(r"^[a-zA-Z0-9_./-]+#\d{1,6}$")
-_PD_ID_RE = re.compile(r"^Q[A-Z0-9]{12,15}$")
+_PD_ID_RE = re.compile(r"^Q(?=[A-Z0-9]*\d)[A-Z0-9]{13,15}$")
 
 
 def is_lookup_candidate(canonical_id: str) -> bool:
@@ -404,32 +408,30 @@ async def _prefix_lookup(
             source_keys_include_keyless=source_keys_include_keyless,
             doc_only=True,
         )
-        params.append(_INFERRED_MATCH_CAP + 1)
+        # LATERAL so the row cap applies PER IDENTIFIER: a pathological
+        # prefix stops scanning at its own cap and cannot contaminate the
+        # verdict on its neighbors, and the LIMIT terminates the inner scan
+        # early instead of sitting above a blocking DISTINCT (review).
         rows = await conn.fetch(
             f"""
-            SELECT DISTINCT
-                   m.cid AS matched_cid,
-                   d.doc_id,
-                   d.source_id,
-                   d.updated_at,
-                   lower(substring(
-                       d.source_id from '(?:^|[@:])(' || m.cid || '[0-9a-fA-F-]*)'
-                   )) AS resolved_id
-            FROM documents d
-            JOIN unnest($2::text[]) AS m(cid)
-              ON (
-                d.source_id LIKE m.cid || '%'
-                OR d.source_id LIKE '%@' || m.cid || '%'
-                OR d.source_id LIKE '%:' || m.cid || '%'
-              )
-            WHERE d.customer_id = $1
-              {scope_sql}
-            LIMIT ${{}}
-            """.replace("${}", f"${len(params)}"),
+            SELECT m.cid AS matched_cid, x.doc_id, x.source_id, x.updated_at
+            FROM unnest($2::text[]) AS m(cid)
+            JOIN LATERAL (
+                SELECT d.doc_id, d.source_id, d.updated_at
+                FROM documents d
+                WHERE d.customer_id = $1
+                  AND (
+                    d.source_id LIKE m.cid || '%'
+                    OR d.source_id LIKE '%@' || m.cid || '%'
+                    OR d.source_id LIKE '%:' || m.cid || '%'
+                  )
+                  {scope_sql}
+                LIMIT {_INFERRED_MATCH_CAP + 1}
+            ) x ON true
+            """,
             *params,
         )
 
-    capped = len(rows) > _INFERRED_MATCH_CAP
     by_cid: dict[str, list[Any]] = {}
     for r in rows:
         by_cid.setdefault(r["matched_cid"], []).append(r)
@@ -437,21 +439,34 @@ async def _prefix_lookup(
     ambiguous: set[str] = set()
     winners: dict[str, str] = {}  # cid -> doc_id
     for cid, group in by_cid.items():
-        if capped:
+        if len(group) > _INFERRED_MATCH_CAP:
+            # This identifier's own fetch was truncated: fail CLOSED — a
+            # truncated competitor set must never read as "unique".
             ambiguous.add(cid)
             continue
-        resolved = {r["resolved_id"] or r["doc_id"] for r in group}
+        # The full identifier each row's match expanded to, extracted here
+        # (≤ cap rows) rather than per-row in SQL.
+        ident_re = re.compile(
+            r"(?:^|[@:])(" + cid + r"[0-9a-fA-F-]*)", re.IGNORECASE
+        )
+        resolved: dict[str, list[Any]] = {}
+        for r in group:
+            m = ident_re.search(r["source_id"] or "")
+            resolved.setdefault(
+                m.group(1).lower() if m else r["doc_id"], []
+            ).append(r)
         if len(resolved) > 1:
             ambiguous.add(cid)
             continue
+        full_id, docs = next(iter(resolved.items()))
         # One identifier, possibly several docs carrying it (a parent doc
         # plus derived children): the primary doc is the one whose
         # source_id IS the identifier (or the shortest doc_id), newest
         # first as the tiebreak.
         best = min(
-            group,
+            docs,
             key=lambda r: (
-                0 if (r["resolved_id"] or "") == r["source_id"].lower() else 1,
+                0 if full_id == (r["source_id"] or "").lower() else 1,
                 len(r["doc_id"]),
                 _neg_ts(r["updated_at"]),
                 r["doc_id"],
@@ -505,9 +520,12 @@ async def _number_ref_lookup(
       1. Group matching docs by repo (`split_part(doc_id, ':', 2)`, guarded
          to github-shaped doc_ids so a non-github doc can never mint a
          phantom repo group).
-      2. Qualifier matching exactly one group (full name or tail) resolves
-         there; matching two -> ambiguous.
-      3. Otherwise: exactly one group total resolves; two or more ->
+      2. A qualifier must match exactly one group (full name or tail) to
+         resolve. Matching zero or several DISQUALIFIES the ref — the
+         user scoped the number, and a scope this lane cannot honor must
+         not be silently widened into the bare rule (that minted wrong
+         pins from prose like 'causes of #500 errors').
+      3. No qualifier: exactly one group total resolves; two or more ->
          ambiguous (picking a repo would be a guess).
 
     Within the resolved repo, prefer the PR/issue doc over the commit doc
@@ -534,41 +552,42 @@ async def _number_ref_lookup(
             source_keys_include_keyless=source_keys_include_keyless,
             doc_only=True,
         )
-        params.append(_INFERRED_MATCH_CAP + 1)
+        # Same LATERAL shape as _prefix_lookup: per-number cap, early
+        # termination, no blocking DISTINCT. Preference and repo grouping
+        # happen in Python over ≤ cap rows.
         rows = await conn.fetch(
             f"""
-            SELECT DISTINCT
-                   m.num AS matched_num,
-                   d.doc_id,
-                   d.updated_at,
-                   split_part(d.doc_id, ':', 2) AS repo_group,
-                   CASE
-                     WHEN d.doc_id LIKE '%:pr:' || m.num THEN 0
-                     WHEN d.source_id LIKE '%#' || m.num THEN 0
-                     WHEN d.doc_id LIKE '%:issue:' || m.num THEN 1
-                     ELSE 2
-                   END AS pref
-            FROM documents d
-            JOIN unnest($2::text[]) AS m(num)
-              ON (
-                d.source_id LIKE '%#' || m.num
-                OR d.doc_id LIKE '%:pr:' || m.num
-                OR d.doc_id LIKE '%:issue:' || m.num
-                OR d.title LIKE '%(#' || m.num || ')%'
-              )
-            WHERE d.customer_id = $1
-              AND d.source_system = $3
-              AND d.doc_id LIKE $3 || ':%'
-              {scope_sql}
-            LIMIT ${{}}
-            """.replace("${}", f"${len(params)}"),
+            SELECT m.num AS matched_num, x.doc_id, x.source_id, x.updated_at
+            FROM unnest($2::text[]) AS m(num)
+            JOIN LATERAL (
+                SELECT d.doc_id, d.source_id, d.updated_at
+                FROM documents d
+                WHERE d.customer_id = $1
+                  AND d.source_system = $3
+                  AND d.doc_id LIKE $3 || ':%'
+                  AND (
+                    d.source_id LIKE '%#' || m.num
+                    OR d.doc_id LIKE '%:pr:' || m.num
+                    OR d.doc_id LIKE '%:issue:' || m.num
+                    OR d.title LIKE '%(#' || m.num || ')%'
+                  )
+                  {scope_sql}
+                LIMIT {_INFERRED_MATCH_CAP + 1}
+            ) x ON true
+            """,
             *params,
         )
 
-    capped = len(rows) > _INFERRED_MATCH_CAP
     by_num: dict[str, list[Any]] = {}
     for r in rows:
         by_num.setdefault(r["matched_num"], []).append(r)
+
+    def _pref(r: Any, num: str) -> int:
+        if r["doc_id"].endswith(f":pr:{num}") or (r["source_id"] or "").endswith(f"#{num}"):
+            return 0
+        if r["doc_id"].endswith(f":issue:{num}"):
+            return 1
+        return 2
 
     ambiguous: set[str] = set()
     winners: dict[str, tuple[str, str]] = {}  # canonical -> (doc_id, note)
@@ -576,12 +595,14 @@ async def _number_ref_lookup(
         group_rows = by_num.get(ref.number)
         if not group_rows:
             continue  # plain unresolved — no signal either way
-        if capped:
+        if len(group_rows) > _INFERRED_MATCH_CAP:
             ambiguous.add(ref.canonical_id)
             continue
         groups: dict[str, list[Any]] = {}
         for r in group_rows:
-            groups.setdefault(r["repo_group"], []).append(r)
+            # doc_id LIKE 'github:%' is enforced in SQL, so segment 2 is
+            # always owner/repo.
+            groups.setdefault(r["doc_id"].split(":")[1], []).append(r)
         chosen_repo: str | None = None
         if ref.qualifier:
             q = ref.qualifier.lower()
@@ -591,10 +612,15 @@ async def _number_ref_lookup(
             ]
             if len(matched) == 1:
                 chosen_repo = matched[0]
-            elif len(matched) > 1:
-                ambiguous.add(ref.canonical_id)
+            else:
+                # A qualifier that matches no repo — or several — DISQUALIFIES
+                # the ref. Falling through to the bare rule minted wrong pins
+                # from prose: 'causes of #500 errors' carries qualifier 'of'
+                # and would pin PR #500 in a single-repo tenant with the
+                # prompt told to build the answer around it (review). When
+                # the user scoped the number and we cannot honor the scope,
+                # refusing is the honest answer; the ranked loop still runs.
                 continue
-            # 0 matched: junk qualifier — fall through to the bare rule.
         if chosen_repo is None:
             if len(groups) == 1:
                 chosen_repo = next(iter(groups))
@@ -603,7 +629,7 @@ async def _number_ref_lookup(
                 continue
         best = min(
             groups[chosen_repo],
-            key=lambda r: (r["pref"], _neg_ts(r["updated_at"]), r["doc_id"]),
+            key=lambda r: (_pref(r, ref.number), _neg_ts(r["updated_at"]), r["doc_id"]),
         )
         winners[ref.canonical_id] = (
             best["doc_id"],
@@ -627,6 +653,15 @@ async def _number_ref_lookup(
         if doc_id in chunk_rows
     ]
     return hits, ambiguous
+
+
+# Tripwire: the router below dispatches inferred kinds by name. A kind added
+# to identifiers.INFERRED_KINDS without a lane here would otherwise be
+# detected, routed nowhere, and reported unresolved with no error (review).
+assert frozenset({"hex_prefix", "number_ref"}) == INFERRED_KINDS, (
+    "new inferred kind detected but not routed — add its lane to "
+    "lookup_identifiers"
+)
 
 
 async def lookup_identifiers(
@@ -729,9 +764,18 @@ async def lookup_identifiers(
         hits.extend(h)
         ambiguous |= a
     # ONE deterministic order for the merged list — resolve_pins' per-id
-    # best-doc pick depends on it. Stable sort: exact-lane hits were
-    # extended first, so equal keys keep exact ahead of inferred.
-    hits.sort(key=lambda h: (h.matched_canonical_id, _neg_ts(h.updated_at), h.doc_id))
+    # best-doc pick depends on it. The lane rank is IN the key: an exact
+    # hit (no resolution_note) must beat an inferred expansion for the
+    # same canonical even when the inferred doc is newer — stability alone
+    # only protects identical keys, not different docs (review).
+    hits.sort(
+        key=lambda h: (
+            h.matched_canonical_id,
+            1 if h.resolution_note else 0,
+            _neg_ts(h.updated_at),
+            h.doc_id,
+        )
+    )
     return hits, ambiguous
 
 def _neg_ts(ts: datetime) -> float:
