@@ -82,7 +82,10 @@ GathererStatus = Literal[
     # SEARCH_AGENT_MAX_OUTPUT_TOKENS instead of finishing its own emit. The
     # answer that comes back is whatever the model had written when the cap
     # cut it off, so it is structurally partial even when the JSON repair in
-    # `_coerce_lenient` salvages a parseable object.
+    # `_coerce_lenient` salvages a parseable object. Since the length-retry
+    # (SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY) landed, reaching this
+    # status means the frequency-penalty retry ALSO truncated, errored, or
+    # was disabled -- a run whose retry emitted cleanly reports `ok`.
     #
     # This status exists BECAUSE we now send a max_tokens cap. Capping the
     # completion is what keeps `input + reservation` inside the context window,

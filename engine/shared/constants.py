@@ -1240,11 +1240,43 @@ SEARCH_AGENT_MODEL_CONTEXT_WINDOW = int(
 #
 # Env-overridable: the right value is a property of the MODEL, and
 # SEARCH_AGENT_INFERENCE_MODEL is itself env-overridable. The sample above is
-# small (n=10, light traffic), so retune with
-# `kubectl set env DEPLOY SEARCH_AGENT_MAX_OUTPUT_TOKENS=24000` if
-# `finish_reason="length"` starts appearing in agent.turn_complete.
+# small (n=10, light traffic).
+#
+# Do NOT raise this when `finish_reason="length"` appears. Every capped turn
+# examined live (10/399 retrievals, 2026-09-01..03) was a RUNAWAY, not a big
+# answer: coherent reasoning that plans a ~2.5k-token emit, then a single
+# unterminated JSON value generated until the cap — `terminal_args_json_repaired`
+# showed 38-77KB of raw args with no closed element past the first 0.1-2.8KB.
+# A runaway consumes whatever cap exists, so raising it only spends more
+# Cerebras quota per incident. The recovery path is the length-retry below.
 SEARCH_AGENT_MAX_OUTPUT_TOKENS = int(
     os.getenv("SEARCH_AGENT_MAX_OUTPUT_TOKENS", "16000")
+)
+
+# Frequency penalty for the ONE retry of a turn that died at the cap above
+# (`finish_reason="length"`). Normal turns keep frequency_penalty unset — the
+# gatherer's emit is verbatim-copying of long near-identical ids, the worst
+# case for a cumulative repetition penalty (the shared `custom_ingest:...`
+# prefix racks up penalty with every chunk, and a flipped digit in a late
+# chunk's uuid is a SILENT bad citation, worse than the truncation it
+# prevents). So the penalty applies only where today's outcome is already a
+# degraded response.
+#
+# Why a penalty retry works when a plain retry cannot: the runaway is
+# deterministic (temperature=0 + query-derived seed reproduces it exactly —
+# the same 10 queries truncated identically every time), and at temperature=0
+# a repetition loop is marginal — the repeated continuation barely wins the
+# argmax. frequency_penalty accumulates per occurrence, so a small value tips
+# an established loop off its repeat while leaving high-margin copying alone.
+# Cerebras documents the knob as honored for gpt-oss
+# (inference-docs.cerebras.ai/models/openai-oss); Fireworks (the failover
+# route) accepts it too, so one parameter covers both providers.
+#
+# 0 disables the retry entirely (kill switch). Cost when it fires: one extra
+# turn, up to SEARCH_AGENT_MAX_OUTPUT_TOKENS more completion tokens, on the
+# ~2.5% of retrievals that already burned a full cap.
+SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY = float(
+    os.getenv("SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY", "0.2")
 )
 
 # Slack between our token estimate and the provider's real count. We measure

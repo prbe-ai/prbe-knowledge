@@ -86,6 +86,7 @@ from engine.shared.constants import (
     SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
     SEARCH_AGENT_HARD_CAP,
     SEARCH_AGENT_INFERENCE_MODEL,
+    SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY,
     SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
     SEARCH_AGENT_MAX_CONTEXT_TOKENS,
     SEARCH_AGENT_MAX_EXTENSIONS,
@@ -214,6 +215,12 @@ class LoopState:
     # of retrievals degrading. Reset per run, never shared between requests.
     llm_model: str = field(default_factory=lambda: SEARCH_AGENT_INFERENCE_MODEL)
     llm_failed_over: bool = False
+    # Whether this run has already spent its ONE frequency-penalty retry of a
+    # turn that died at the output cap (`finish_reason="length"`). Per-run,
+    # like llm_failed_over, and for the same reason: the retry re-spends up to
+    # a full SEARCH_AGENT_MAX_OUTPUT_TOKENS, and a model still running away
+    # WITH the penalty applied is not going to stop on a third attempt.
+    length_retry_used: bool = False
     # Resolved search_options from the LLM extractor — sort directive +
     # downstream filter args the harness applied to the pre-fan-out. Kept
     # on state so the trace blob captures intent without re-running the
@@ -1018,6 +1025,12 @@ def _enforce_context_budget(state: LoopState) -> None:
         )
 
 
+def _finish_reason_of(resp: Any) -> str | None:
+    """First choice's finish_reason, None when the shape is missing."""
+    choices = getattr(resp, "choices", None) or []
+    return getattr(choices[0], "finish_reason", None) if choices else None
+
+
 async def _run_turn(state: LoopState) -> Any:
     """Run one LLM turn with tool_choice='required'. Records latency +
     cache hit rate on state. Returns the raw response."""
@@ -1155,6 +1168,67 @@ async def _run_turn(state: LoopState) -> Any:
                 error=str(fallback_exc),
             )
             raise
+
+    # ONE retry, with a frequency penalty, when the turn died at the output
+    # cap. Every capped turn examined live (10/399 retrievals, 2026-09-01..03)
+    # was a runaway single JSON value, deterministic under temperature=0 + the
+    # query-derived seed — so a plain retry reproduces it byte-for-byte, while
+    # a cumulative repetition penalty tips the loop off its repeat. Normal
+    # turns never carry the penalty: the emit verbatim-copies near-identical
+    # ids, the worst case for one (see
+    # SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY for the full rationale and
+    # the kill switch).
+    if (
+        _finish_reason_of(resp) == "length"
+        and not state.length_retry_used
+        and SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY > 0
+    ):
+        state.length_retry_used = True
+        first_elapsed_ms = (time.perf_counter() - t_turn) * 1000
+        log.warning(
+            "agent.length_retry",
+            customer_id=state.customer_id,
+            trace_id=state.trace_id,
+            turn=state.turn_count,
+            discarded_completion_tokens=(
+                usage_tokens(resp)["completion_tokens"]
+                if getattr(resp, "usage", None) is not None
+                else None
+            ),
+            frequency_penalty=SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY,
+        )
+        retry_kwargs = {
+            **call_kwargs,
+            "frequency_penalty": SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY,
+        }
+        t_retry = time.perf_counter()
+        try:
+            retry_resp = await acompletion(**retry_kwargs)
+        except LLMError as retry_exc:
+            # Keep the truncated first response: salvage + backfill on a
+            # partial emit beats surfacing an error, and today's
+            # output_truncated path already handles exactly that. No failover
+            # flip here — this turn HAS a usable (if truncated) answer.
+            state.failed_turn_latencies_ms.append(
+                (time.perf_counter() - t_retry) * 1000
+            )
+            log.warning(
+                "agent.length_retry_failed",
+                customer_id=state.customer_id,
+                trace_id=state.trace_id,
+                turn=state.turn_count,
+                error=str(retry_exc),
+            )
+        else:
+            # The retry becomes the recorded turn (even if it ALSO hit the
+            # cap — same truncated outcome either way, and its
+            # finish_reason="length" keeps the output_truncated status
+            # honest). The discarded attempt's wall time rides
+            # failed_turn_latencies_ms like any other spent-and-unusable
+            # call; its token burn is in the agent.length_retry log line.
+            state.failed_turn_latencies_ms.append(first_elapsed_ms)
+            resp = retry_resp
+            t_turn = t_retry
 
     elapsed_ms = (time.perf_counter() - t_turn) * 1000
     state.turn_count += 1
