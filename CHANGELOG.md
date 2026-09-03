@@ -8,6 +8,22 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **~2.5% of searches came back `degraded: output_truncated` — the gatherer
+  recovered them by retrying once with a frequency penalty.** Every truncated
+  run in a 2.4-day window (10 of 399, four tenants) had the same shape: the
+  model reasons normally, plans a ~2.5k-token emit, then a single unterminated
+  JSON value runs away until the 16k output cap kills the turn —
+  `terminal_args_json_repaired` showed 38–77KB of raw args with no closed
+  element past the first 0.1–2.8KB. The runaway is deterministic
+  (temperature=0 + query-derived seed), so a plain retry reproduces it
+  byte-for-byte; a retry carrying
+  `SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY` (default 0.2, 0 disables)
+  tips the marginal argmax loop off its repeat. Normal turns never carry the
+  penalty — the emit verbatim-copies near-identical ids, the worst case for a
+  cumulative penalty — so healthy decoding is byte-identical to before. A
+  clean retry now reports `ok`; `output_truncated` means the retry also
+  truncated, errored, or was disabled.
+
 - **Searching a person's name returned nothing, even when the name was in the
   document's title.** Ask the knowledge base about a colleague and you got a
   confident empty answer for documents that were sitting right there. Measured

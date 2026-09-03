@@ -2239,6 +2239,135 @@ def test_output_truncated_is_a_degraded_status() -> None:
     assert "output_truncated" not in _NON_DEGRADED_STATUSES
 
 
+@pytest.mark.asyncio
+async def test_length_turn_retries_once_with_frequency_penalty(
+    fake_request: SimpleNamespace,
+) -> None:
+    """A turn that dies at the output cap is retried ONCE with
+    frequency_penalty; a clean retry means the run reports `ok`, not
+    `output_truncated`.
+
+    The live failure this encodes (10/399 retrievals, 2026-09-01..03): a
+    deterministic runaway JSON value that eats the whole cap, which a plain
+    retry reproduces byte-for-byte. The penalty rides ONLY the retry — the
+    first call must not carry it (verbatim id-copying is the worst case for
+    a cumulative penalty)."""
+    req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
+    truncated = _mk_resp(
+        tool_calls=[_terminal_call()], finish_reason="length",
+        completion_tokens=16000,
+    )
+    clean = _mk_resp(
+        tool_calls=[_terminal_call()], finish_reason="tool_calls",
+        completion_tokens=800,
+    )
+    mock_acomp = AsyncMock(side_effect=[truncated, clean])
+
+    with patch(
+        "engine.retrieval.agent.loop.acompletion", new=mock_acomp,
+    ), patch(
+        "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY",
+        0.3,
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert mock_acomp.await_count == 2
+    assert "frequency_penalty" not in mock_acomp.await_args_list[0].kwargs
+    assert mock_acomp.await_args_list[1].kwargs["frequency_penalty"] == 0.3
+    assert fake_request.state.gatherer_status == "ok"
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state.length_retry_used is True
+    # The retry is the recorded turn: no "length" in the per-turn ledger, so
+    # the status logic sees a healthy run. The discarded attempt's wall time
+    # lands with the other spent-and-unusable calls.
+    assert loop_state.turn_count == 1
+    assert loop_state.finish_reasons_per_turn == ["tool_calls"]
+    assert loop_state.completion_tokens_per_turn == [800]
+    assert len(loop_state.failed_turn_latencies_ms) == 1
+
+
+@pytest.mark.asyncio
+async def test_length_retry_that_also_truncates_stays_output_truncated(
+    fake_request: SimpleNamespace,
+) -> None:
+    """When the penalty retry ALSO dies at the cap, the run degrades to
+    `output_truncated` exactly as before, and no third attempt is made."""
+    req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
+    truncated = _mk_resp(
+        tool_calls=[_terminal_call()], finish_reason="length",
+        completion_tokens=16000,
+    )
+    mock_acomp = AsyncMock(side_effect=[truncated, truncated])
+
+    with patch(
+        "engine.retrieval.agent.loop.acompletion", new=mock_acomp,
+    ), patch(
+        "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY",
+        0.3,
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert mock_acomp.await_count == 2
+    assert fake_request.state.gatherer_status == "output_truncated"
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state.finish_reasons_per_turn == ["length"]
+
+
+@pytest.mark.asyncio
+async def test_length_retry_disabled_by_zero_penalty(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Penalty 0 is the kill switch: no retry call, and the truncated turn
+    degrades to `output_truncated` exactly as pre-retry behavior."""
+    req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
+    truncated = _mk_resp(
+        tool_calls=[_terminal_call()], finish_reason="length",
+        completion_tokens=16000,
+    )
+    mock_acomp = AsyncMock(side_effect=[truncated])
+
+    with patch(
+        "engine.retrieval.agent.loop.acompletion", new=mock_acomp,
+    ), patch(
+        "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY",
+        0.0,
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert mock_acomp.await_count == 1
+    assert fake_request.state.gatherer_status == "output_truncated"
+
+
+@pytest.mark.asyncio
+async def test_length_retry_llm_error_keeps_truncated_first_emit(
+    fake_request: SimpleNamespace,
+) -> None:
+    """A retry that errors keeps the truncated FIRST response: salvage +
+    backfill on a partial emit beats surfacing an error, and it must not
+    trigger the provider-failover path (this turn has a usable answer)."""
+    from engine.shared.llm import LLMError
+    req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
+    truncated = _mk_resp(
+        tool_calls=[_terminal_call()], finish_reason="length",
+        completion_tokens=16000,
+    )
+    mock_acomp = AsyncMock(side_effect=[truncated, LLMError("cerebras 500")])
+
+    with patch(
+        "engine.retrieval.agent.loop.acompletion", new=mock_acomp,
+    ), patch(
+        "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY",
+        0.3,
+    ):
+        await run_gatherer(req, customer_id="cust-1", request=fake_request)
+
+    assert mock_acomp.await_count == 2
+    assert fake_request.state.gatherer_status == "output_truncated"
+    loop_state = fake_request.state.search_agent_loop_state
+    assert loop_state.llm_failed_over is False
+    assert loop_state.finish_reasons_per_turn == ["length"]
+
+
 def test_is_context_overflow_classifies_overflow_vs_outage() -> None:
     """The gatherer degrades to 200 when the shared `is_context_overflow`
     predicate (shared/llm_tools) is True, and 503s otherwise. Lock the two
