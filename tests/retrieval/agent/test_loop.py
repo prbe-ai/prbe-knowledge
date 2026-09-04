@@ -14,6 +14,7 @@ no live DB. Covers:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from types import SimpleNamespace
@@ -54,6 +55,7 @@ from engine.retrieval.grounding import GroundingBundle
 from engine.shared.constants import (
     SEARCH_AGENT_CONTEXT_SAFETY_MARGIN,
     SEARCH_AGENT_GATHERER_TIMEOUT_SECONDS,
+    SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
     SEARCH_AGENT_MAX_CONTEXT_TOKENS,
     SEARCH_AGENT_MAX_OUTPUT_TOKENS,
     SEARCH_AGENT_MODEL_CONTEXT_WINDOW,
@@ -1274,6 +1276,81 @@ async def test_bad_confidence_literal_clamps_to_medium(
     assert resp.gatherer_notes["confidence"] == "medium"
     # No retry: single LLM round-trip per the new design.
     assert mock_acomp.await_count == 1
+
+
+async def _hang(*a: Any, **k: Any) -> Any:
+    """An LLM call that never returns inside any budget under test."""
+    await asyncio.sleep(30)
+
+
+@pytest.mark.asyncio
+async def test_blown_setup_reports_budget_starved_not_loop_timeout(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Setup spent the whole stage cap, so `_remaining_loop_budget` hit its
+    floor and the loop ran on borrowed time. That is NOT the same failure as
+    a loop given its full budget and timing out, and it is fixed somewhere
+    else entirely -- in the retrieval stages, not the loop or the provider.
+
+    While both reported `loop_timeout`, the aggregate pointed at the wrong
+    half for weeks: daily loop_timeout ran 18-59% on tenant `probe` through
+    2026-08-30 with pre-fan-out p90 at 38.3s against a 25s cap, and the
+    2026-08-30 latency sweep took it to ~0 without touching the loop.
+
+    Stage cap 0 forces the floor unconditionally, so this does not race."""
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+    with (
+        patch("engine.retrieval.agent.loop.SEARCH_AGENT_LOOP_TIMEOUT_SECONDS", 0.0),
+        patch("engine.retrieval.agent.loop._MIN_LOOP_BUDGET_SECONDS", 0.05),
+        patch("engine.retrieval.agent.loop.acompletion", new=_hang),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "loop_budget_starved"
+    assert resp.degraded is True
+    assert resp.degraded_reason == "loop_budget_starved"
+
+
+@pytest.mark.asyncio
+async def test_full_budget_timeout_still_reports_loop_timeout(
+    fake_request: SimpleNamespace,
+) -> None:
+    """The other half of the split. Setup was cheap, the loop got
+    effectively the whole cap and burned it, so the loop really is the slow
+    part -- keep the name that says so.
+
+    Floor of 0 means the starvation branch cannot fire: any positive
+    remainder is a real budget."""
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+    with (
+        patch("engine.retrieval.agent.loop.SEARCH_AGENT_LOOP_TIMEOUT_SECONDS", 0.3),
+        patch("engine.retrieval.agent.loop._MIN_LOOP_BUDGET_SECONDS", 0.0),
+        patch("engine.retrieval.agent.loop.acompletion", new=_hang),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "loop_timeout"
+    assert resp.degraded_reason == "loop_timeout"
+
+
+@pytest.mark.asyncio
+async def test_loop_budget_rides_the_timing_dict_on_healthy_runs(
+    fake_request: SimpleNamespace,
+) -> None:
+    """`timing_ms` is persisted whole to `query_traces.response`, so
+    recording the budget there makes PARTIAL starvation -- the loop got 8s
+    of 25s and timed out -- answerable in one query instead of an
+    archaeology project. It has to be present on healthy runs too, or the
+    denominator is missing."""
+    req = QueryRequest(query="x", customer_id="cust-1", top_k=5)
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(
+            tool_calls=[_terminal_call(_final_emission_args())],
+        )),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "ok"
+    budget_ms = resp.timing_ms["loop_budget_ms"]
+    assert 0 < budget_ms <= SEARCH_AGENT_LOOP_TIMEOUT_SECONDS * 1000
 
 
 @pytest.mark.asyncio

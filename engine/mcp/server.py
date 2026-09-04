@@ -163,6 +163,12 @@ async def search_knowledge(
         Re-run ONCE. If it degrades again, report the degradation rather
         than retrying further; repeated retries during a provider outage
         add load to the thing that is already failing.
+      * `loop_budget_starved` — retrieval (grounding + pre-fan-out) spent
+        the entire stage budget before the agent got to reason, so the
+        answer is the raw candidate pool with no curation. Load-shaped,
+        not query-shaped: a re-run under the same load starves the same
+        way. Re-run ONCE, and if it repeats say the search was uncurated
+        rather than treating the pool as a curated answer.
       * `context_overflow`, `tool_budget_exceeded`, `output_truncated` —
         deterministic. The identical request will fail identically, so
         re-running is pure waste. NARROW instead: lower `top_k`, tighten

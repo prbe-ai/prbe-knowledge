@@ -42,6 +42,22 @@ GathererStatus = Literal[
     "ok",
     "passthrough_harness_fallback",
     "loop_timeout",
+    # The loop ran out of time, but it never HAD any: grounding + extraction
+    # + pre-fan-out alone spent the whole SEARCH_AGENT_LOOP_TIMEOUT_SECONDS
+    # stage cap, so `_remaining_loop_budget` hit its floor and handed the
+    # loop `_MIN_LOOP_BUDGET_SECONDS` of borrowed time. Split off
+    # `loop_timeout` because the two need OPPOSITE fixes -- this one is
+    # solved in the retrieval stages, that one in the loop or the provider --
+    # and while they shared a name the aggregate pointed at the wrong half.
+    #
+    # It pointed wrong for weeks. On tenant `probe`, daily loop_timeout ran
+    # 18-59% from 2026-08-14 through 08-30 with pre-fan-out p50 11.0s and p90
+    # 38.3s against a 25s cap: the loop was being starved, not stalling. The
+    # 2026-08-30 latency sweep (#524-#531) took pre-fan-out to p50 2.4s / p90
+    # 3.5s and the rate went to ~0 without a single line changing in the loop.
+    # `timing_ms.loop_budget_ms` now rides every trace so the next occurrence
+    # is one query away instead of an archaeology project.
+    "loop_budget_starved",
     "schema_violation",
     "tool_budget_exceeded",
     # No LLM credentials configured (test env / bootstrap / self-host without

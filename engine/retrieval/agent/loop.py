@@ -2703,9 +2703,24 @@ async def run_gatherer(
     # What is LEFT of the stage budget after setup. Floored at a small positive
     # value rather than 0: a non-positive wait_for would cancel the loop before
     # it ran a single turn, and an already-blown budget should still degrade
-    # through the normal loop_timeout path (which backfills from the
-    # pre-fan-out) rather than take a different branch.
+    # through the normal timeout path (which backfills from the pre-fan-out)
+    # rather than take a different branch.
     loop_budget = _remaining_loop_budget(t_stage_start)
+    # Did the floor above do ALL the work? Setup (grounding + extraction +
+    # pre-fan-out) having spent the entire stage cap is a different failure
+    # from a loop that had its full budget and used it, and it is fixed
+    # somewhere else entirely -- so record which one this is rather than
+    # filing both under `loop_timeout`. The comparison is the floor itself,
+    # not a threshold anybody picked: below it, `_remaining_loop_budget`
+    # provably returned borrowed time.
+    setup_spent = time.perf_counter() - t_stage_start
+    loop_budget_starved = (
+        SEARCH_AGENT_LOOP_TIMEOUT_SECONDS - setup_spent < _MIN_LOOP_BUDGET_SECONDS
+    )
+    # Rides `response.timing_ms` -> `query_traces.response->'timing_ms'`, so
+    # PARTIAL starvation (the loop got 8s of 25s and timed out) is visible in
+    # a query too. No migration: this dict is already persisted whole.
+    timing["loop_budget_ms"] = loop_budget * 1000
     try:
         gathered = await asyncio.wait_for(
             _drive_loop(state),
@@ -2731,15 +2746,22 @@ async def run_gatherer(
                     finish_reasons_per_turn=state.finish_reasons_per_turn,
                 )
     except TimeoutError:
+        status = "loop_budget_starved" if loop_budget_starved else "loop_timeout"
+        # `loop_budget` and `setup_spent` are the whole point of this line:
+        # without them a reader cannot tell a loop that was given 25 seconds
+        # from one that was given 5, and the two have nothing in common.
         log.warning(
             "agent.loop_timeout",
             customer_id=customer_id,
             trace_id=trace_id,
             turn=state.turn_count,
             tool_calls=state.tool_calls_count,
+            status=status,
+            loop_budget_s=round(loop_budget, 2),
+            setup_spent_s=round(setup_spent, 2),
+            stage_cap_s=SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
         )
-        status = "loop_timeout"
-        gathered = _empty_passthrough("loop_timeout", state)
+        gathered = _empty_passthrough(status, state)
     except LLMError as exc:
         if is_context_overflow(exc):
             # Deterministic input-too-large (provider 400), NOT an outage —

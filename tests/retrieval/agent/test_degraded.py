@@ -45,6 +45,10 @@ _HEALTHY = {
 _DEGRADED = {
     "passthrough_harness_fallback",
     "loop_timeout",
+    # Degraded, deliberately: the answer is the raw pre-fan-out pool with no
+    # curation at all -- strictly less than `loop_timeout`, where the loop at
+    # least got its full budget and did some work before running out.
+    "loop_budget_starved",
     "schema_violation",
     "tool_budget_exceeded",
     "no_llm_configured",

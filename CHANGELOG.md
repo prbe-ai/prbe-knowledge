@@ -8,6 +8,31 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **`loop_timeout` blamed the agent loop for a problem in retrieval, and the
+  aggregate pointed at the wrong half for two weeks.**
+  `SEARCH_AGENT_LOOP_TIMEOUT_SECONDS` (25s) caps the *entire* gatherer stage.
+  `_remaining_loop_budget` subtracts grounding + extraction + pre-fan-out and
+  floors the remainder at `_MIN_LOOP_BUDGET_SECONDS`, so when setup blew the
+  cap the loop was handed 5s of borrowed time, died immediately, and reported
+  it under the loop's own name. On tenant `probe`, daily `loop_timeout` ran
+  18–59% from 2026-08-14 through 08-30 with pre-fan-out p50 11.0s and **p90
+  38.3s against a 25s cap**. The 2026-08-30 latency sweep (#524–#531) took
+  pre-fan-out to p50 2.4s / p90 3.5s and the rate fell to ~0 — without one
+  line changing in the loop.
+
+  A starved loop and a slow loop are now separate statuses. New
+  `loop_budget_starved` fires when `_remaining_loop_budget` provably returned
+  borrowed time — the floor itself is the discriminator, not a threshold
+  anybody picked — and it is classified degraded. `agent.loop_timeout` now
+  logs `loop_budget_s`, `setup_spent_s` and `stage_cap_s`, so a single line
+  distinguishes a loop given 25 seconds from one given 5. `timing_ms` gains
+  `loop_budget_ms` on every run that reaches the loop, which rides the
+  existing `query_traces.response` JSONB (no migration), so *partial*
+  starvation — the loop got 8s of 25s and timed out — is one query away
+  instead of an archaeology project. MCP callers get separate guidance:
+  `loop_budget_starved` is load-shaped, not query-shaped, so narrowing the
+  query does not help and the pool it returns is uncurated.
+
 - **2% of searches threw away a good answer over a footnote nobody reads.**
   The gatherer curates its results, then fills in `gatherer_notes.dropped` —
   a list of candidates it looked at and skipped, used only for a count.
