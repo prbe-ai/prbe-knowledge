@@ -258,11 +258,26 @@ class GatheredChunk(BaseModel):
 
 
 class DroppedCandidate(BaseModel):
-    """A candidate the agent saw but chose not to surface."""
+    """A candidate the agent saw but chose not to surface.
+
+    EVERY field is optional, deliberately. This struct is pure telemetry:
+    `to_query_response` projects `degraded` / `degraded_reason` rather than
+    reading `reason` (see adapter.py, "which nothing reads"), and the only
+    other consumer is `len()` for `query_traces.dropped_count`.
+
+    While `canonical_id` was REQUIRED this was the strictest list in the
+    whole payload, and GathererOutput validates as one object -- so a model
+    that labelled a drop with `chunk_id` cost the user every curated entity
+    and chunk in the same emission. Observed live 2026-09-04 (trace
+    q-1788502834260-6fdc93a2): 3 malformed drop notes, 7 entities and all
+    chunks discarded, user served the recall floor instead.
+
+    Nothing in here is worth an answer. Keep it total.
+    """
 
     model_config = ConfigDict(extra="ignore")
 
-    canonical_id: str
+    canonical_id: str = ""
     reason: str = ""
 
 

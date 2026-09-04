@@ -1277,6 +1277,111 @@ async def test_bad_confidence_literal_clamps_to_medium(
 
 
 @pytest.mark.asyncio
+async def test_dropped_with_chunk_id_survives(
+    fake_request: SimpleNamespace,
+) -> None:
+    """The model labels its drop notes with `chunk_id` -- the key every
+    candidate in <channel_results> carries -- where the schema wanted
+    `canonical_id`. Before this was tolerated, the three malformed notes
+    took the WHOLE emission with them: every curated entity and chunk
+    discarded, user served the raw recall floor.
+
+    Replayed verbatim from trace q-1788502834260-6fdc93a2 (2026-09-04
+    06:20:39Z, tenant probe-demo), the trace behind the Slack
+    `engine degraded: schema_violation` report."""
+    req = QueryRequest(query="robotics companies", customer_id="cust-1", top_k=5)
+    args = _final_emission_args(chunks=3)
+    args["entities"] = [
+        {
+            "canonical_id": "robotics-companies",
+            "label": "robotics-companies",
+            "properties": {},
+            "why_relevant": "Feature matches query term 'robotics companies'.",
+        },
+    ]
+    args["gatherer_notes"]["dropped"] = [
+        {"chunk_id": "custom_ingest:doc-a:chunk:0", "reason": "not about foundation models."},
+        {"chunk_id": "codex:probe:sess-b:chunk:2", "reason": "session, unrelated to query."},
+        {"chunk_id": "custom_ingest:doc-c:chunk:1", "reason": "not model deployment."},
+    ]
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(tool_calls=[_terminal_call(args)])),
+    ) as mock_acomp:
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "ok"
+    # The curated work survives -- this is the whole point. 3 emitted
+    # chunks + 1 recall-floor backfill doc + the 1 emitted entity row.
+    assert resp.total_candidates == 5
+    dropped = resp.gatherer_notes["dropped"]
+    assert len(dropped) == 3
+    # The id is recovered from the alias, not discarded.
+    assert dropped[0]["canonical_id"] == "custom_ingest:doc-a:chunk:0"
+    assert dropped[0]["reason"] == "not about foundation models."
+    assert mock_acomp.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_dropped_as_bare_string_survives(
+    fake_request: SimpleNamespace,
+) -> None:
+    """The model writes the drop note as prose instead of an object.
+    Pydantic rejects a `str` where DroppedCandidate belongs, which used
+    to fail the whole emission over a field nothing reads.
+
+    Replayed from trace q-1788496917219-5d30aa35 (2026-09-04 04:42:01Z)."""
+    req = QueryRequest(query="asdasda", customer_id="cust-1", top_k=5)
+    args = _final_emission_args(chunks=2)
+    args["gatherer_notes"]["dropped"] = [
+        "query appears nonsensical or unrelated to available data; no "
+        "relevant entities or chunks could be identified",
+    ]
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(tool_calls=[_terminal_call(args)])),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "ok"
+    dropped = resp.gatherer_notes["dropped"]
+    assert len(dropped) == 1
+    assert dropped[0]["reason"].startswith("query appears nonsensical")
+    assert dropped[0]["canonical_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_empty_entity_dicts_are_dropped_not_fatal(
+    fake_request: SimpleNamespace,
+) -> None:
+    """Cerebras pads `entities[]` with empty `{}` objects. They pass the
+    existing non-dict filter, then fail `canonical_id` required. Live
+    2026-09-03 19:06Z: one real entity followed by 229 of them, 230
+    validation errors, the entire answer lost.
+
+    An id-less entity could never have validated, so drop it and keep
+    its neighbours."""
+    req = QueryRequest(query="rosetta gene vocabulary", customer_id="cust-1", top_k=5)
+    args = _final_emission_args(chunks=2)
+    args["entities"] = [
+        {
+            "canonical_id": "experiment:0630278f",
+            "label": "Shared Gene Vocabulary Selection",
+            "properties": {},
+            "why_relevant": "Defines the shared gene vocabulary.",
+        },
+        *({} for _ in range(229)),
+    ]
+    with patch(
+        "engine.retrieval.agent.loop.acompletion",
+        new=AsyncMock(return_value=_mk_resp(tool_calls=[_terminal_call(args)])),
+    ):
+        resp = await run_gatherer(req, customer_id="cust-1", request=fake_request)
+    assert fake_request.state.gatherer_status == "ok"
+    entity_rows = [r for r in resp.results if r.node_type == "Entity"]
+    assert len(entity_rows) == 1
+    assert entity_rows[0].canonical_id == "experiment:0630278f"
+
+
+@pytest.mark.asyncio
 async def test_explicit_null_confidence_clamps_to_medium(
     fake_request: SimpleNamespace,
 ) -> None:

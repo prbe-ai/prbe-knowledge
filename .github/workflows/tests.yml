@@ -132,6 +132,14 @@ jobs:
       # predicate publishes somebody's private note. None of them raise. The
       # tests are the only thing that notices, so they have to actually run.
       #
+      # `tests/retrieval/agent/` is on the list for the same reason and costs
+      # nothing: 273 tests, ~1.2s, no Postgres and no MinIO -- the LLM is
+      # mocked throughout. It guards the gatherer's terminal-args coercer,
+      # which is the ONLY thing standing between a non-strict provider's
+      # schema drift and a user losing their whole answer (the enforcement it
+      # replaced went away with the Cerebras swap, PR #320). A silent
+      # regression there degrades every search and raises no error.
+      #
       # They need Postgres (already provisioned above) and nothing else -- the
       # embedder and both model calls are stubs, because conftest blanks the
       # provider keys. The classifier's real-accuracy block skips itself without
@@ -159,3 +167,4 @@ jobs:
           tests/test_pg_search_rebuild.py
           tests/test_litellm_key.py
           tests/retrieval/test_tenant_key_binding.py
+          tests/retrieval/agent/
