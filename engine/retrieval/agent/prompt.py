@@ -163,8 +163,9 @@ one-line `why_relevant`. Chunk-only output is the common failure mode
 this rule prevents.
 
 Default to KEEPING candidates the consumer can filter further. Drop
-only when clearly off-topic; every drop needs a one-line `reason` in
-`gatherer_notes.dropped` (the schema enforces this).
+only when clearly off-topic. Each `gatherer_notes.dropped` entry is an
+OBJECT with two string fields: `canonical_id` -- the id you saw the
+candidate under, its `chunk_id` is fine -- and a one-line `reason`.
 
 Good drops:
   - "anchor entity (PRB-17) appears but query is about PR #71 fix"

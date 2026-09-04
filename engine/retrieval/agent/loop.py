@@ -1426,6 +1426,14 @@ def _derive_doc_id_from_chunk_id(chunk_id: str) -> str | None:
 # the first non-empty match wins.
 _CHUNK_CONTENT_ALIASES = ("description", "summary", "snippet", "text", "body", "title")
 
+# Id fields non-strict providers put on a dropped candidate instead of
+# `canonical_id`. `chunk_id` dominates: the model is usually dropping
+# CHUNKS, and every candidate it was shown in <channel_results> is keyed
+# that way -- so it reaches for the vocabulary of its input. Same root
+# cause as the `title`/`source`/`url` drift the chunk coercion above
+# handles. Order matters; first non-empty match wins.
+_DROPPED_ID_ALIASES = ("chunk_id", "doc_id", "id", "entity_id")
+
 
 def _derive_source_system_from_doc_id(doc_id: str | None) -> str:
     """Doc IDs are namespaced `<source>:<...>` (e.g. `slack:thread:T123`,
@@ -1713,13 +1721,33 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
     # — Cerebras emits this for github/notion-shaped docs).
     entities_in = out.get("entities") or []
     entities_out: list[dict[str, Any]] = []
+    entities_idless = 0
     for e in entities_in:
         if not isinstance(e, dict):
             continue
         e_out = dict(e)
         if not e_out.get("canonical_id") and e_out.get("id"):
             e_out["canonical_id"] = e_out["id"]
+        if not e_out.get("canonical_id"):
+            # No recoverable identity -- the same rule the chunk loop below
+            # applies to an unresolvable citation. The bare-string filter
+            # above does not catch this shape: Cerebras also pads the array
+            # with EMPTY DICTS, which are `isinstance(dict)` and then fail
+            # `canonical_id` required. Live 2026-09-03T19:06Z: one real
+            # entity followed by 229 `{}`, 230 validation errors, the whole
+            # emission lost. An id-less entity could never have validated,
+            # so dropping it costs nothing and saves its neighbours.
+            entities_idless += 1
+            continue
         entities_out.append(e_out)
+    if entities_idless:
+        log.info(
+            "agent.literal_clamped",
+            customer_id=state.customer_id if state is not None else None,
+            trace_id=state.trace_id if state is not None else None,
+            field="entities.canonical_id",
+            dropped=entities_idless,
+        )
     out["entities"] = entities_out
     # Chunks: derive missing required fields where possible
     chunks_in = out.get("chunks") or []
@@ -1820,6 +1848,46 @@ def _coerce_lenient(raw: dict[str, Any], state: LoopState | None = None) -> dict
             original=str(notes["confidence"])[:50],
         )
         notes["confidence"] = "medium"
+    # `gatherer_notes` must never be the reason an answer is lost -- nothing
+    # reads it (see DroppedCandidate). With `canonical_id` now defaulted,
+    # the only remaining way `dropped` can fail validation is a member that
+    # is not a dict at all: the model writing the whole note as prose.
+    # Observed live 2026-09-04T04:42Z, `dropped: ["query appears
+    # nonsensical..."]` -- one string, entire emission rejected.
+    #
+    # Normalize every member to a dict, and recover an id from whatever
+    # alias the model reached for so the telemetry stays worth having.
+    if "dropped" in notes:
+        raw_dropped = notes["dropped"]
+        dropped_out: list[dict[str, Any]] = []
+        coerced = 0
+        for d in raw_dropped if isinstance(raw_dropped, list) else []:
+            if isinstance(d, dict):
+                d_out = dict(d)
+                if not d_out.get("canonical_id"):
+                    coerced += 1
+                    for alias in _DROPPED_ID_ALIASES:
+                        v = d_out.get(alias)
+                        if isinstance(v, str) and v:
+                            d_out["canonical_id"] = v
+                            break
+                dropped_out.append(d_out)
+            elif isinstance(d, str):
+                # The note written as prose. It IS the reason; keep it.
+                dropped_out.append({"reason": d})
+                coerced += 1
+            else:
+                # Nothing recoverable (int / list / null). Telemetry only.
+                coerced += 1
+        if coerced:
+            log.info(
+                "agent.literal_clamped",
+                customer_id=state.customer_id if state is not None else None,
+                trace_id=state.trace_id if state is not None else None,
+                field="gatherer_notes.dropped",
+                coerced=coerced,
+            )
+        notes["dropped"] = dropped_out
     out["gatherer_notes"] = notes
     return out
 

@@ -8,6 +8,33 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **2% of searches threw away a good answer over a footnote nobody reads.**
+  The gatherer curates its results, then fills in `gatherer_notes.dropped` —
+  a list of candidates it looked at and skipped, used only for a count.
+  `DroppedCandidate.canonical_id` was required, so when the model labelled a
+  drop with `chunk_id` instead (the key every candidate in
+  `<channel_results>` carries, so the model reached for the vocabulary of its
+  input), Pydantic rejected the emission — which validates as ONE object —
+  and every curated entity and chunk went with it. The user got the raw
+  recall floor: 8 uncurated documents, no `why_relevant`, no entities, at
+  `confidence: low`. Measured on the research tenants, 7 days: 13 of 664
+  gatherer runs (2.0%). All four terminal-parse failures in a 24h sample
+  were this one shape — one bad list member sinking the payload, worst case
+  a single real entity followed by 229 empty `{}` objects.
+
+  `gatherer_notes` can no longer fail validation: `canonical_id` defaults to
+  `""`, the coercer normalizes non-dict members and recovers an id from
+  `chunk_id` / `doc_id` / `id` / `entity_id`, and `entities[]` items with no
+  recoverable id are dropped rather than sinking their neighbours — the rule
+  the chunk loop already applied to unresolvable citations. Nothing enforces
+  this schema at the provider any more (tool-argument strictness went away
+  with the Cerebras swap, #320), so the harness owns it. The prompt also
+  claimed "the schema enforces this" about `reason`, which has been optional
+  since #320, while never naming the field that actually was required; it now
+  describes the real shape. `tests/retrieval/agent/` joins the CI file list —
+  273 tests, ~1.2s, no infrastructure — so the coercer stops being the one
+  unguarded thing between provider drift and a lost answer.
+
 - **~2.5% of searches came back `degraded: output_truncated` — the gatherer
   recovered them by retrying once with a frequency penalty.** Every truncated
   run in a 2.4-day window (10 of 399, four tenants) had the same shape: the
