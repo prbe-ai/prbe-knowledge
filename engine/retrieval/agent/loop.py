@@ -87,6 +87,7 @@ from engine.shared.constants import (
     SEARCH_AGENT_HARD_CAP,
     SEARCH_AGENT_INFERENCE_MODEL,
     SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY,
+    SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE,
     SEARCH_AGENT_LOOP_TIMEOUT_SECONDS,
     SEARCH_AGENT_MAX_CONTEXT_TOKENS,
     SEARCH_AGENT_MAX_EXTENSIONS,
@@ -1169,19 +1170,29 @@ async def _run_turn(state: LoopState) -> Any:
             )
             raise
 
-    # ONE retry, with a frequency penalty, when the turn died at the output
+    # ONE retry, at a RAISED TEMPERATURE, when the turn died at the output
     # cap. Every capped turn examined live (10/399 retrievals, 2026-09-01..03)
     # was a runaway single JSON value, deterministic under temperature=0 + the
-    # query-derived seed — so a plain retry reproduces it byte-for-byte, while
-    # a cumulative repetition penalty tips the loop off its repeat. Normal
-    # turns never carry the penalty: the emit verbatim-copies near-identical
-    # ids, the worst case for one (see
-    # SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY for the full rationale and
-    # the kill switch).
+    # query-derived seed — so a retry that changes nothing the provider honors
+    # is the same request and reproduces it.
+    #
+    # This shipped as a frequency-penalty retry and did not work: the gateway
+    # drops frequency_penalty on the cerebras route, silently, so the retry
+    # WAS a plain retry. Both live failures on 2026-09-04 retried and
+    # truncated identically at 16000 tokens. Temperature is the one sampling
+    # control that survives the trip — see the two constants for the
+    # measurements. The penalty rides along because the retry can land on
+    # Fireworks after a failover, where it is honored; it is no longer what
+    # makes this work.
+    #
+    # Normal turns keep temperature 0 and no penalty: determinism feeds the
+    # prompt cache, and the emit verbatim-copies near-identical ids, the worst
+    # case for a repetition penalty. Both apply ONLY where today's outcome is
+    # already a degraded response.
     if (
         _finish_reason_of(resp) == "length"
         and not state.length_retry_used
-        and SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY > 0
+        and SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE > 0
     ):
         state.length_retry_used = True
         first_elapsed_ms = (time.perf_counter() - t_turn) * 1000
@@ -1195,10 +1206,14 @@ async def _run_turn(state: LoopState) -> Any:
                 if getattr(resp, "usage", None) is not None
                 else None
             ),
+            temperature=SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE,
             frequency_penalty=SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY,
         )
         retry_kwargs = {
             **call_kwargs,
+            # Order matters only for readability: `call_kwargs` carries
+            # temperature 0, and this overrides it.
+            "temperature": SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE,
             "frequency_penalty": SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY,
         }
         t_retry = time.perf_counter()

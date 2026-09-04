@@ -1268,15 +1268,55 @@ SEARCH_AGENT_MAX_OUTPUT_TOKENS = int(
 # a repetition loop is marginal — the repeated continuation barely wins the
 # argmax. frequency_penalty accumulates per occurrence, so a small value tips
 # an established loop off its repeat while leaving high-margin copying alone.
-# Cerebras documents the knob as honored for gpt-oss
-# (inference-docs.cerebras.ai/models/openai-oss); Fireworks (the failover
-# route) accepts it too, so one parameter covers both providers.
+# THE PENALTY REACHES FIREWORKS AND ONLY FIREWORKS. Cerebras documents the
+# knob as honored for gpt-oss (inference-docs.cerebras.ai/models/openai-oss)
+# and that is what this comment used to rest on, but the call goes through the
+# LiteLLM gateway, whose capability map for the `cerebras` provider does not
+# list frequency_penalty (or presence_penalty) -- and the proxy config sets
+# `drop_params: true`, so it is stripped SILENTLY. Measured 2026-09-04 from
+# inside research-os-engine-retrieval, temperature 0 + fixed seed, penalty
+# 2.0 (10x this value) against none:
 #
-# 0 disables the retry entirely (kill switch). Cost when it fires: one extra
-# turn, up to SEARCH_AGENT_MAX_OUTPUT_TOKENS more completion tokens, on the
-# ~2.5% of retrievals that already burned a full cap.
+#   cerebras/gpt-oss-120b    1196 chars  sha 8e0807966363  <- byte-IDENTICAL
+#   fireworks gpt-oss-120b   1208 -> 1810 chars, hash differs  <- honored
+#
+# Keep it anyway: it costs nothing and the retry CAN land on Fireworks after
+# a failover, where it does work. It is no longer load-bearing, and it is no
+# longer the kill switch -- see SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE.
 SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY = float(
     os.getenv("SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY", "0.2")
+)
+
+# Temperature for that same retry, and the lever that actually does the work
+# on the deployed route. `temperature` IS in the gateway's supported set for
+# cerebras (see test_provider_params.py, which fails if that stops being
+# true), so unlike the penalty it survives the trip.
+#
+# Why a bump is REQUIRED and not merely helpful: the gatherer runs at
+# temperature 0 with a query-derived seed, so a retry that changes nothing
+# the provider honors is the same request and walks into the same runaway.
+# Both live failures were replayed from their trace blobs at six values:
+#
+#   temp   confornets (anthrogen)      LiveKit (probe-demo)
+#   0.0    RUNAWAY 16000 tok           RUNAWAY 16000 tok
+#   0.2    RUNAWAY 16000 tok           ok,  877 tok
+#   0.4    ok,  721 tok                ok, 1657 tok
+#   0.7    ok, 1781 tok, 3 chunks      ok, 2726 tok
+#   1.0    ok, 1227 tok                ok,  832 tok
+#
+# 0.7 rather than 0.4 because the runaway threshold MOVES between queries
+# (below 0.2 for one, between 0.2 and 0.4 for the other) and 0.4 clears the
+# worse of the two by a hair. 0.7 clears both and still lands near 2k tokens,
+# an eighth of the cap. Each value was byte-stable across 3 repeat runs --
+# `seed` is still honored above temperature 0, so the retry is a DIFFERENT
+# deterministic sample, not a coin flip.
+#
+# 0 disables the retry entirely (kill switch -- a retry at the original
+# temperature provably cannot help). This replaces the penalty as the switch;
+# an operator who had zeroed the penalty to stop the wasted tokens will find
+# the retry live again, and now actually working.
+SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE = float(
+    os.getenv("SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE", "0.7")
 )
 
 # Slack between our token estimate and the provider's real count. We measure
