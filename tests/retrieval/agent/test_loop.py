@@ -2422,18 +2422,23 @@ def test_output_truncated_is_a_degraded_status() -> None:
 
 
 @pytest.mark.asyncio
-async def test_length_turn_retries_once_with_frequency_penalty(
+async def test_length_turn_retries_once_at_a_raised_temperature(
     fake_request: SimpleNamespace,
 ) -> None:
-    """A turn that dies at the output cap is retried ONCE with
-    frequency_penalty; a clean retry means the run reports `ok`, not
+    """A turn that dies at the output cap is retried ONCE at a raised
+    temperature; a clean retry means the run reports `ok`, not
     `output_truncated`.
 
-    The live failure this encodes (10/399 retrievals, 2026-09-01..03): a
-    deterministic runaway JSON value that eats the whole cap, which a plain
-    retry reproduces byte-for-byte. The penalty rides ONLY the retry — the
-    first call must not carry it (verbatim id-copying is the worst case for
-    a cumulative penalty)."""
+    TEMPERATURE is what makes the retry a different request. The runaway is
+    deterministic (temperature 0 + query-derived seed), so a retry that
+    changes nothing the provider honors reproduces it exactly — which is
+    precisely what shipped, because the gateway drops `frequency_penalty` on
+    the cerebras route (see test_provider_params.py). Both live failures on
+    2026-09-04 retried and truncated identically at 16000 tokens.
+
+    Both parameters ride ONLY the retry: normal turns keep temperature 0 for
+    the prompt cache, and the emit verbatim-copies near-identical ids, the
+    worst case for a cumulative penalty."""
     req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
     truncated = _mk_resp(
         tool_calls=[_terminal_call()], finish_reason="length",
@@ -2448,14 +2453,25 @@ async def test_length_turn_retries_once_with_frequency_penalty(
     with patch(
         "engine.retrieval.agent.loop.acompletion", new=mock_acomp,
     ), patch(
+        "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE", 0.7,
+    ), patch(
         "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY",
         0.3,
     ):
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
+    first, retry = mock_acomp.await_args_list
     assert mock_acomp.await_count == 2
-    assert "frequency_penalty" not in mock_acomp.await_args_list[0].kwargs
-    assert mock_acomp.await_args_list[1].kwargs["frequency_penalty"] == 0.3
+    # The first call is the ordinary deterministic turn.
+    assert first.kwargs["temperature"] == 0
+    assert "frequency_penalty" not in first.kwargs
+    # The retry differs in the one way the provider actually honors.
+    assert retry.kwargs["temperature"] == 0.7
+    assert retry.kwargs["frequency_penalty"] == 0.3
+    # Everything else is unchanged -- same messages, same seed. A retry that
+    # also reshuffled the input would not be testing the runaway.
+    assert retry.kwargs["seed"] == first.kwargs["seed"]
+    assert retry.kwargs["messages"] == first.kwargs["messages"]
     assert fake_request.state.gatherer_status == "ok"
     loop_state = fake_request.state.search_agent_loop_state
     assert loop_state.length_retry_used is True
@@ -2484,8 +2500,7 @@ async def test_length_retry_that_also_truncates_stays_output_truncated(
     with patch(
         "engine.retrieval.agent.loop.acompletion", new=mock_acomp,
     ), patch(
-        "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY",
-        0.3,
+        "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE", 0.7,
     ):
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
 
@@ -2496,11 +2511,13 @@ async def test_length_retry_that_also_truncates_stays_output_truncated(
 
 
 @pytest.mark.asyncio
-async def test_length_retry_disabled_by_zero_penalty(
+async def test_length_retry_disabled_by_zero_temperature(
     fake_request: SimpleNamespace,
 ) -> None:
-    """Penalty 0 is the kill switch: no retry call, and the truncated turn
-    degrades to `output_truncated` exactly as pre-retry behavior."""
+    """Temperature 0 is the kill switch, and it is the honest one: a retry AT
+    THE ORIGINAL TEMPERATURE provably cannot help, so "no bump" and "no retry"
+    are the same statement. The switch used to be the penalty, which no longer
+    changes anything on the primary route."""
     req = QueryRequest(query="q", customer_id="cust-1", top_k=5)
     truncated = _mk_resp(
         tool_calls=[_terminal_call()], finish_reason="length",
@@ -2511,8 +2528,7 @@ async def test_length_retry_disabled_by_zero_penalty(
     with patch(
         "engine.retrieval.agent.loop.acompletion", new=mock_acomp,
     ), patch(
-        "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_FREQUENCY_PENALTY",
-        0.0,
+        "engine.retrieval.agent.loop.SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE", 0.0,
     ):
         await run_gatherer(req, customer_id="cust-1", request=fake_request)
 

@@ -8,6 +8,52 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Fixed
 
+- **The retry meant to rescue a truncated search was a no-op, because the
+  gateway silently deleted the one parameter it depended on.** When the
+  gatherer's emit runs away and dies at the 16k output cap, it retries once.
+  That retry carried `frequency_penalty` — which the LiteLLM proxy strips on
+  the `cerebras` route, since its capability map for that provider does not
+  list it and the config sets `drop_params: true`. Measured from inside the
+  live pod, temperature 0 + fixed seed, penalty **2.0** (10x the configured
+  value) against none: `cerebras/gpt-oss-120b` returned **byte-identical**
+  output, sha `8e0807966363` both times; Fireworks returned 1208 → 1810 chars
+  with a different hash. Cerebras's own docs say the knob is honored, and that
+  claim is what the code cited — it is true of their API, not of the route we
+  take.
+
+  So the retry re-sent a byte-identical request. The runaway is deterministic
+  (temperature 0 + a query-derived seed), so it reproduced exactly, burning a
+  second full 16,000-token generation — 7–10s — every time it fired. Both
+  failures on 2026-09-04 retried and truncated identically.
+
+  The retry now raises **temperature** (`SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE`,
+  default 0.7), the one sampling control that survives the trip. Both live
+  failures were replayed from their trace blobs at six values: 0.0 ran away on
+  both, 0.2 ran away on one, 0.4 and above cleared both. 0.7 rather than 0.4
+  because the runaway threshold *moves* between queries and 0.4 clears the
+  worse one by a hair; 0.7 still lands near 2k tokens, an eighth of the cap.
+  Each value was byte-stable across 3 repeat runs — `seed` is still honored
+  above temperature 0, so the retry is a different *deterministic* sample. The
+  penalty stays on the retry because a failover can land it on Fireworks,
+  where it works; it is no longer load-bearing, and no longer the kill switch.
+  **`SEARCH_AGENT_LENGTH_RETRY_TEMPERATURE=0` is now the kill switch** — an
+  operator who had zeroed the penalty to stop the waste will find the retry
+  live again, and working.
+
+  Retrieval quality moves less than the bug suggests: the recall floor already
+  backfills the answer to 10 documents from the same fused pool, so truncation
+  was costing *curation*, not documents. Replayed, curated chunks carrying a
+  real `why_relevant` went 1 → 3 on one query and 1 → 1 on the other, and the
+  number of picks the backfill would not have added anyway was identical (1
+  and 0) at both temperatures.
+
+  New `tests/retrieval/agent/test_provider_params.py` pins the measured
+  reality in both directions — that the route honors `temperature`, `seed`,
+  `tool_choice` and the rest of what every turn sends, and that it still drops
+  `frequency_penalty`. Offline, no network. `drop_params: true` makes a dead
+  parameter indistinguishable from a working one everywhere except an A/B on
+  output bytes, which is how a whole fix shipped as a no-op.
+
 - **`loop_timeout` blamed the agent loop for a problem in retrieval, and the
   aggregate pointed at the wrong half for two weeks.**
   `SEARCH_AGENT_LOOP_TIMEOUT_SECONDS` (25s) caps the *entire* gatherer stage.
