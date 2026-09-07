@@ -129,6 +129,12 @@ An already-running legacy producer must acknowledge the gate before final
 verification, and each post-R2 flush proves its exact backfill claim still owns
 the running row before queue admission. A timeout leaves the gate closed for a
 safe retry; a stale runner cannot publish into a later replacement connection.
+Legacy GitHub backfill object keys retain the existing tenant/source purge
+prefix but add a one-way digest of the exact database claim token. A retry by
+the same claim reuses its key; a later claim cannot overwrite or delete that
+receipt. After queue admission, only claim-qualified uploads that are absent
+from both queue key columns are removed, preserving pre-0127 deterministic-key
+rows while cleaning rejected or deduplicated uploads.
 
 New API and composed-worker processes wait for the complete 0127 schema floor
 before publishing readiness or starting any ingestion loop. The check resolves

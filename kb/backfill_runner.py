@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -130,6 +131,22 @@ def _slack_channel_cursor(channels: dict[str, str | None]) -> str:
     )
 
 
+def _github_claim_payload_key(key: str, claim_token: datetime) -> str:
+    """Make a legacy GitHub payload key private to one durable DB claim.
+
+    ``started_at`` is the backfill runner's compare-and-swap ownership token.
+    Hashing its canonical UTC representation keeps that token out of the key
+    while making retries by the same owner stable and later owners distinct.
+    The source/tenant prefix remains unchanged so source-wide purge still
+    sweeps every claim's objects.
+    """
+    canonical_token = claim_token.astimezone(UTC).isoformat(timespec="microseconds")
+    claim_digest = hashlib.sha256(canonical_token.encode()).hexdigest()[:24]
+    if key.endswith(".json"):
+        return f"{key[:-5]}.claim-{claim_digest}.json"
+    return f"{key}.claim-{claim_digest}"
+
+
 async def _flush_batch(
     store: ObjectStore,
     bucket: str,
@@ -148,12 +165,12 @@ async def _flush_batch(
     pipelined executemany. ON CONFLICT DO NOTHING preserves the per-row dedup
     semantics of the old single-row path.
 
-    Crash recovery invariant: the R2 key is deterministic from
-    source_event_id (see caller). If executemany raises after R2 puts
-    succeeded, the orphaned objects are overwritten idempotently on retry,
-    and ON CONFLICT DO NOTHING admits duplicate queue rows safely. Callers
-    MUST NOT change the key scheme away from source_event_id without
-    revisiting this property.
+    Non-GitHub R2 keys remain deterministic from ``source_event_id``. Legacy
+    GitHub keys additionally carry a one-way digest of the exact DB claim:
+    retries by one owner overwrite idempotently, while a stale owner can
+    delete its rejected upload without touching the object referenced by a
+    later owner's queue receipt. An ON CONFLICT loser is deleted only after a
+    same-transaction lookup proves neither queue key column references it.
 
     Raises on first failure. Caller is responsible for routing the exception
     to _mark_failed so the run flips to status='failed' rather than silently
@@ -161,19 +178,30 @@ async def _flush_batch(
     """
     if not batch:
         return True
+    # Every production GitHub caller supplies the durable started_at claim.
+    # A claim-less caller owns no object namespace and therefore must not put.
+    if source == SourceSystem.GITHUB and claim_token is None:
+        return False
+
+    upload_batch = batch
+    if source == SourceSystem.GITHUB:
+        assert claim_token is not None  # narrowed by the guard above
+        upload_batch = [
+            (_github_claim_payload_key(key, claim_token), envelope, source_event_id)
+            for key, envelope, source_event_id in batch
+        ]
 
     async def _bounded_put(key: str, envelope: bytes) -> None:
         async with sem:
             await store.put(bucket, key, envelope)
 
-    await asyncio.gather(
-        *(_bounded_put(key, envelope) for key, envelope, _ in batch)
-    )
+    await asyncio.gather(*(_bounded_put(key, envelope) for key, envelope, _ in upload_batch))
 
     rows = [
         (customer_id, source.value, source_event_id, key, QueueStatus.PENDING.value)
-        for key, _, source_event_id in batch
+        for key, _, source_event_id in upload_batch
     ]
+
     async def _insert(conn) -> None:
         # Backfill rows always land at priority 50 (never block live).
         # Both columns are populated for the migration window:
@@ -191,6 +219,7 @@ async def _flush_batch(
         )
 
     admitted = True
+    cleanup_keys: set[str] = set()
     if source == SourceSystem.GITHUB:
         from kb.github_control import adoption_lock, source_purge_active
 
@@ -200,9 +229,10 @@ async def _flush_batch(
         # row just as an old runner claims it, then clear the gate after a new
         # connection is created. Without this ownership check that stale runner
         # could publish one old batch against the new token before its next
-        # progress update noticed the lost claim. If admission loses, remove
-        # the deterministic objects before acknowledging the producer stop;
-        # purge waits for that acknowledgement before final verification.
+        # progress update noticed the lost claim. Claim-qualified keys ensure
+        # a rejected stale owner cannot erase a later owner's receipt. After
+        # the attempted INSERT, inspect both queue key columns under this same
+        # fence; only this call's unreferenced objects are cleanup candidates.
         async with with_tenant(customer_id) as conn:
             await adoption_lock(conn, customer_id)
             connected = await conn.fetchval(
@@ -220,21 +250,39 @@ async def _flush_batch(
                     claim_token,
                 )
             )
-            if (
-                await source_purge_active(conn, customer_id)
-                or not connected
-                or not owns_claim
-            ):
+            purge_active = await source_purge_active(conn, customer_id)
+            if purge_active or not connected or not owns_claim:
                 admitted = False
             else:
                 await _insert(conn)
+            uploaded_keys = {key for key, _, _ in upload_batch}
+            uploaded_event_ids = {source_event_id for _, _, source_event_id in upload_batch}
+            referenced_rows = await conn.fetch(
+                """
+                SELECT DISTINCT ref.key
+                FROM ingestion_queue AS q
+                CROSS JOIN LATERAL unnest(
+                    coalesce(q.payload_s3_keys, '{}'::text[])
+                    || ARRAY[q.payload_s3_key]
+                ) AS ref(key)
+                WHERE q.customer_id=$1 AND q.source_system=$2
+                  AND ref.key = ANY($3::text[])
+                  AND q.source_event_id = ANY($4::text[])
+                """,
+                customer_id,
+                source.value,
+                list(uploaded_keys),
+                list(uploaded_event_ids),
+            )
+            referenced_keys = {str(row["key"]) for row in referenced_rows}
+            cleanup_keys = uploaded_keys - referenced_keys
     else:
         async with get_pool().acquire() as conn:
             await _insert(conn)
 
-    if not admitted:
+    if cleanup_keys:
         deleted = await asyncio.gather(
-            *(store.delete(bucket, key) for key, _, _ in batch),
+            *(store.delete(bucket, key) for key in cleanup_keys),
             return_exceptions=True,
         )
         for outcome in deleted:

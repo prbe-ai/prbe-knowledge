@@ -289,3 +289,139 @@ async def test_delayed_old_flush_cannot_resurrect_after_verified_purge_and_resee
         assert await producer_claim() == new_claim
     finally:
         await settle_tasks(store, producer)
+
+
+async def test_claim_loss_does_not_delete_payload_owned_by_valid_queue_receipt(
+    legacy_source,
+):
+    store = BarrierStore()
+    legacy_source(store)
+    original_claim = await backfill_runner._mark_running(TENANT, SOURCE)
+    key = f"raw/github/{TENANT}/backfill/shared-event.json"
+    store.objects[key] = b'{"valid":"receipt"}'
+    async with with_tenant(TENANT) as conn:
+        await conn.execute(
+            """INSERT INTO ingestion_queue(customer_id,source_system,source_event_id,
+            payload_s3_key,payload_s3_keys,status) VALUES
+            ($1,'github','shared-event',$2,ARRAY[$2],'pending')""",
+            TENANT,
+            key,
+        )
+        fresh_claim = await conn.fetchval(
+            """UPDATE backfill_state SET status='running',
+            started_at=started_at+interval '1 second',heartbeat_at=now()
+            WHERE customer_id=$1 AND source_system='github' RETURNING started_at""",
+            TENANT,
+        )
+    assert fresh_claim != original_claim
+
+    accepted = await backfill_runner._flush_batch(
+        store,
+        f"fixture-{TENANT}",
+        TENANT,
+        SOURCE,
+        [(key, b'{"new":"claim-safe"}', "shared-event")],
+        asyncio.Semaphore(1),
+        claim_token=original_claim,
+    )
+    assert accepted is False
+    assert store.objects == {key: b'{"valid":"receipt"}'}
+    async with with_tenant(TENANT) as conn:
+        assert (
+            await conn.fetchval(
+                """SELECT payload_s3_key FROM ingestion_queue WHERE customer_id=$1
+            AND source_event_id='shared-event'""",
+                TENANT,
+            )
+            == key
+        )
+        assert (
+            await conn.fetchval(
+                """SELECT started_at FROM backfill_state WHERE customer_id=$1
+            AND source_system='github'""",
+                TENANT,
+            )
+            == fresh_claim
+        )
+
+
+async def test_same_claim_retry_reuses_its_key_and_keeps_queue_payload(legacy_source):
+    store = BarrierStore()
+    legacy_source(store)
+    claim = await backfill_runner._mark_running(TENANT, SOURCE)
+    logical_key = f"raw/github/{TENANT}/backfill/idempotent-event.json"
+    batch = [(logical_key, b'{"retry":"same"}', "idempotent-event")]
+
+    assert await backfill_runner._flush_batch(
+        store,
+        f"fixture-{TENANT}",
+        TENANT,
+        SOURCE,
+        batch,
+        asyncio.Semaphore(1),
+        claim_token=claim,
+    )
+    async with with_tenant(TENANT) as conn:
+        stored_key = await conn.fetchval(
+            """SELECT payload_s3_key FROM ingestion_queue WHERE customer_id=$1
+            AND source_event_id='idempotent-event'""",
+            TENANT,
+        )
+    assert stored_key != logical_key
+    assert stored_key.startswith(logical_key[:-5] + ".claim-")
+    assert store.objects == {stored_key: b'{"retry":"same"}'}
+
+    assert await backfill_runner._flush_batch(
+        store,
+        f"fixture-{TENANT}",
+        TENANT,
+        SOURCE,
+        batch,
+        asyncio.Semaphore(1),
+        claim_token=claim,
+    )
+    assert store.objects == {stored_key: b'{"retry":"same"}'}
+    async with with_tenant(TENANT) as conn:
+        assert (
+            await conn.fetchval(
+                """SELECT count(*) FROM ingestion_queue WHERE customer_id=$1
+            AND source_event_id='idempotent-event'""",
+                TENANT,
+            )
+            == 1
+        )
+
+
+async def test_duplicate_deterministic_receipt_cleans_only_new_claim_key(legacy_source):
+    store = BarrierStore()
+    legacy_source(store)
+    claim = await backfill_runner._mark_running(TENANT, SOURCE)
+    legacy_key = f"raw/github/{TENANT}/backfill/legacy-event.json"
+    store.objects[legacy_key] = b'{"legacy":"valid"}'
+    async with with_tenant(TENANT) as conn:
+        await conn.execute(
+            """INSERT INTO ingestion_queue(customer_id,source_system,source_event_id,
+            payload_s3_key,payload_s3_keys,status) VALUES
+            ($1,'github','legacy-event',$2,ARRAY[$2],'pending')""",
+            TENANT,
+            legacy_key,
+        )
+
+    assert await backfill_runner._flush_batch(
+        store,
+        f"fixture-{TENANT}",
+        TENANT,
+        SOURCE,
+        [(legacy_key, b'{"new":"loser"}', "legacy-event")],
+        asyncio.Semaphore(1),
+        claim_token=claim,
+    )
+    assert store.objects == {legacy_key: b'{"legacy":"valid"}'}
+    async with with_tenant(TENANT) as conn:
+        row = await conn.fetchrow(
+            """SELECT payload_s3_key,payload_s3_keys FROM ingestion_queue
+            WHERE customer_id=$1 AND source_event_id='legacy-event'""",
+            TENANT,
+        )
+    assert row["payload_s3_key"] == legacy_key
+    assert list(row["payload_s3_keys"]) == [legacy_key]
