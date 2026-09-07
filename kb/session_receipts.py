@@ -99,7 +99,7 @@ def validate_payload(payload: dict) -> None:
             range(payload["event_start"], payload["event_end"])
         ):
             raise ValueError("retained-event ordinals are not contiguous")
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise HTTPException(422, f"invalid transcript protocol: {exc}") from exc
 
 
