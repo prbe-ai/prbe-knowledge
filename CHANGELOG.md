@@ -6,6 +6,24 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ## [Unreleased]
 
+### Added
+
+- **Companion injection transport: the engine half.** Migration 0127 adds
+  `companion_mailbox` (append-only cards), `companion_deliveries` (append-only
+  emission-attempt outcomes keyed by a client-minted `attempt_id`) and
+  `companion_claims` (short leases for the actor-keyed lane), all under FORCE
+  RLS in the `serve_ledger` shape. `engine/shared/companion/` owns the mailbox
+  logic -- idempotent enqueue on a caller's dedupe key (identical retry returns
+  the original, a different payload is a conflict, a lapsed key is expired),
+  derived pending, atomic single-winner claims, idempotent acks -- and the
+  `companion_infra` capability cell with its own fail-closed accessor.
+  `/companion/enqueue`, `/poll` (a bounded wait of short reads, never a held
+  connection), `/claim`, `/ack` and `/deliveries` sit beside `/procedures/*`
+  under the same trusted-internal auth and three-state envelope. Deliberately
+  outside `wfmem/`: `clause_ids` and `serve_ledger_id` are reserved columns
+  for the intelligent layer. Spec: `companion-implementation-spec-2026-09-06`
+  v3 on the `mid-session-companion` Probe subproject.
+
 ### Fixed
 
 - **The retry meant to rescue a truncated search was a no-op, because the
