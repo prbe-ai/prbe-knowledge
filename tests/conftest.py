@@ -76,6 +76,9 @@ def settings() -> Settings:
 
 TRUNCATE_SQL = """
     TRUNCATE TABLE
+        companion_claims,
+        companion_deliveries,
+        companion_mailbox,
         serve_ledger,
         clause_evidence,
         clause_situation_edges,
