@@ -41,6 +41,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from engine.retrieval.auth import authenticate_query
+from engine.retrieval.companion import companion_router
 from engine.retrieval.graph_explore import (
     EXPLORE_CONFIDENCES,
     EXPLORE_EDGE_TYPES,
@@ -1519,6 +1520,11 @@ app.include_router(usage_router)
 # three-state capability envelope -- a tenant without the cell gets an empty
 # result, not a 403, so a client can tell "off" from "not entitled".
 app.include_router(procedures_router)
+
+# Companion transport: /companion/enqueue, /poll, /claim, /ack, /deliveries.
+# Same auth dependency and the same three-state envelope as procedures; a
+# tenant without `companion_infra` gets empty results and no writes.
+app.include_router(companion_router)
 
 
 __all__ = [

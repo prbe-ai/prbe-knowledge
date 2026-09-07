@@ -101,6 +101,10 @@ class AckRefused(ValueError):
     """The ack names a seam, outcome or card this tenant does not have."""
 
 
+class UnknownCard(AckRefused):
+    """The ack names a card this tenant does not have (a 404, not a 422)."""
+
+
 _CARD_COLUMNS = (
     "id, recipient, session_id, class, intended_seam, body, trial_id, created_at, expires_at"
 )
@@ -419,7 +423,7 @@ async def ack(
                 json.dumps(evidence or {}),
             )
         except asyncpg.ForeignKeyViolationError as exc:
-            raise AckRefused("mailbox_id is not a card of this tenant") from exc
+            raise UnknownCard("mailbox_id is not a card of this tenant") from exc
         if new_id is not None:
             await conn.execute(
                 "DELETE FROM companion_claims WHERE customer_id = $1 AND mailbox_id = $2",
