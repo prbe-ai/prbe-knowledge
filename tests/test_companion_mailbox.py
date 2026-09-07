@@ -260,15 +260,41 @@ async def test_claimed_card_is_not_pending_for_the_actor_lane(tenant) -> None:
 
 
 @pytest.mark.asyncio
-async def test_expired_lease_can_be_reclaimed(tenant) -> None:
-    card, _ = await _enqueue(session_id=None)
-    assert (
-        await claim_for_actor(TENANT, recipient=ALICE, claimed_by="ingest:one", lease_seconds=1)
-    ) is not None
+async def test_lapsed_lease_retires_unknown_instead_of_reclaim(tenant) -> None:
+    """Spec v3 §3: a lease that lapses without an ack is an AMBIGUOUS emission.
+
+    The card may already be in front of a model. Handing it to the next caller
+    would risk a second exposure, so the engine retires it as a terminal
+    `unknown` delivery (attributed to the lapsed claimant) and the next claim
+    moves on to the next candidate -- or gets None.
+    """
+    first, _ = await _enqueue(session_id=None, dedupe_key="a")
+    second, _ = await _enqueue(session_id=None, dedupe_key="b")
+    won = await claim_for_actor(TENANT, recipient=ALICE, claimed_by="ingest:one", lease_seconds=1)
+    assert won is not None and won.mailbox_id == first.mailbox_id
     async with with_tenant(TENANT) as conn:
         await conn.execute("UPDATE companion_claims SET lease_until = now() - interval '1 second'")
-    won = await claim_for_actor(TENANT, recipient=ALICE, claimed_by="ingest:two")
-    assert won is not None and won.mailbox_id == card.mailbox_id
+
+    nxt = await claim_for_actor(TENANT, recipient=ALICE, claimed_by="ingest:two")
+    assert nxt is not None and nxt.mailbox_id == second.mailbox_id, (
+        "the lapsed card must not be re-issued"
+    )
+
+    rows = await deliveries(TENANT, recipient=ALICE)
+    retired = [r for r in rows if r["mailbox_id"] == first.mailbox_id]
+    assert len(retired) == 1
+    assert retired[0]["outcome"] == "unknown" and retired[0]["seam"] == "mcp-rider"
+    assert retired[0]["delivering_credential"] == "ingest:one"
+    assert retired[0]["receiving_instance"] == "engine:lease-lapsed"
+    # And it is gone for good: no lease row, never pending again.
+    async with with_tenant(TENANT) as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM companion_claims WHERE mailbox_id = $1", first.mailbox_id
+            )
+            == 0
+        )
+    assert await claim_for_actor(TENANT, recipient=ALICE, claimed_by="ingest:three") is None
 
 
 # --------------------------------------------------------------------------

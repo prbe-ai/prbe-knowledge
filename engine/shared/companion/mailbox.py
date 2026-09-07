@@ -274,7 +274,7 @@ _PENDING_PREDICATE = """
     )
     AND NOT EXISTS (
         SELECT 1 FROM companion_claims c
-        WHERE c.customer_id = m.customer_id AND c.mailbox_id = m.id AND c.lease_until > now()
+        WHERE c.customer_id = m.customer_id AND c.mailbox_id = m.id
     )
 """
 
@@ -310,6 +310,55 @@ async def pending(
     return [_card(r) for r in rows]
 
 
+#: Marks a delivery row the ENGINE wrote, not an actuator: the lease lapsed
+#: without an ack, so the outcome is unknown and the card is retired.
+LEASE_LAPSED_INSTANCE = "engine:lease-lapsed"
+
+
+async def _retire_lapsed_leases(conn: asyncpg.Connection, customer_id: str, recipient: str) -> int:
+    """Turn every lapsed, un-acked lease on this recipient's cards into a
+    terminal `unknown` delivery. Returns how many were retired."""
+    lapsed = await conn.fetch(
+        """
+        DELETE FROM companion_claims c
+        USING companion_mailbox m
+        WHERE c.customer_id = $1
+          AND m.customer_id = c.customer_id AND m.id = c.mailbox_id
+          AND m.recipient = $2
+          AND c.lease_until <= now()
+          AND NOT EXISTS (
+              SELECT 1 FROM companion_deliveries d
+              WHERE d.customer_id = c.customer_id AND d.mailbox_id = c.mailbox_id
+          )
+        RETURNING c.mailbox_id, c.claimed_by, c.lease_until
+        """,
+        customer_id,
+        recipient,
+    )
+    for row in lapsed:
+        await conn.execute(
+            """
+            INSERT INTO companion_deliveries
+                (customer_id, mailbox_id, attempt_id, seam, outcome,
+                 delivering_credential, receiving_instance, evidence)
+            VALUES ($1, $2, $3, 'mcp-rider', 'unknown', $4, $5, $6::jsonb)
+            ON CONFLICT (customer_id, attempt_id) DO NOTHING
+            """,
+            customer_id,
+            row["mailbox_id"],
+            uuid4(),
+            row["claimed_by"],
+            LEASE_LAPSED_INSTANCE,
+            json.dumps(
+                {
+                    "reason": "lease lapsed without an ack",
+                    "lease_until": row["lease_until"].isoformat(),
+                }
+            ),
+        )
+    return len(lapsed)
+
+
 async def claim_for_actor(
     customer_id: str,
     *,
@@ -320,12 +369,20 @@ async def claim_for_actor(
     """Take a short lease on the oldest pending actor-keyed card, or None.
 
     Atomic across concurrent callers: the lease row's primary key is the card,
-    and the upsert only overwrites a lease that has already lapsed. A caller
-    that loses the race gets no row back and tries the next candidate.
+    so two concurrent inserts resolve to exactly one winner; the loser gets no
+    row back and tries the next candidate.
+
+    A LAPSED LEASE IS NOT RECLAIMED (spec v3 §3). A lease that ran out without
+    an ack is an AMBIGUOUS emission -- the card may already be in front of a
+    model -- so re-issuing it would risk a second exposure. Instead the card is
+    retired here as a terminal `unknown` delivery attributed to the lapsed
+    claimant, and the claim moves on. The retirement is a DELETE ... RETURNING
+    on the lease row, so concurrent callers cannot both retire the same card.
     """
     if not 1 <= lease_seconds <= 3_600:
         raise ValueError("lease_seconds must be in [1, 3600]")
     async with with_tenant(customer_id) as conn:
+        await _retire_lapsed_leases(conn, customer_id, recipient)
         candidates = await conn.fetch(
             f"""
             SELECT {", ".join("m." + c.strip() for c in _CARD_COLUMNS.split(","))}
@@ -345,10 +402,7 @@ async def claim_for_actor(
                 """
                 INSERT INTO companion_claims (customer_id, mailbox_id, claimed_by, lease_until)
                 VALUES ($1, $2, $3, now() + make_interval(secs => $4))
-                ON CONFLICT (customer_id, mailbox_id) DO UPDATE
-                    SET claimed_by = EXCLUDED.claimed_by,
-                        lease_until = EXCLUDED.lease_until
-                    WHERE companion_claims.lease_until <= now()
+                ON CONFLICT (customer_id, mailbox_id) DO NOTHING
                 RETURNING mailbox_id
                 """,
                 customer_id,
