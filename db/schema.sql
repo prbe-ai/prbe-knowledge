@@ -1849,6 +1849,7 @@ CREATE TABLE IF NOT EXISTS github_backfill_jobs (
     cursor TEXT,
     enumeration_complete BOOLEAN NOT NULL DEFAULT FALSE,
     attempts INT NOT NULL DEFAULT 0,
+    retry_count INT NOT NULL DEFAULT 0,
     lease_id UUID,
     heartbeat_at TIMESTAMPTZ,
     processed_count BIGINT NOT NULL DEFAULT 0,

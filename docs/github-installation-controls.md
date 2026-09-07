@@ -25,9 +25,17 @@ membership and owner/admin management permissions before proxying.
   Enumeration failures never replace the existing selection with an empty list.
 - `POST .../backfills`: `{scope,idempotency_key}` creates a durable job. The same
   key/selection returns the same job; key reuse for a different selection is 409.
+- `POST .../backfills/lookup`: the same request body recovers an accepted job
+  without provider calls or worker readiness. Returns 404 when absent and 409
+  on a different selection; repository name case and ordering are immaterial.
+  The gateway checks this receipt before gating new work on capabilities.
 - `GET .../backfills?limit=30&cursor={job_uuid}`: `{jobs,next_cursor}`.
 - `GET .../backfills/{job_uuid}`, `POST .../{job_uuid}/cancel`,
   `POST .../{job_uuid}/retry`: operate on exactly the selected installation/job.
+- `POST .../backfills/{job_uuid}/retry/lookup`: recovers a previously accepted
+  retry in queued/running/completed state, or 404. A durable `retry_count`
+  increments only when a user retry is accepted, independently of worker
+  attempts. A subsequent failed/canceled attempt can be retried again.
 - `GET .../purge-preview` and `POST .../purge`: counts for documents, chunks and
   active_jobs; warnings describe retained shared graph entities/unbound legacy
   data. Purge only deletes documents owned by connector-issued bindings, and a
@@ -35,7 +43,7 @@ membership and owner/admin management permissions before proxying.
 
 Jobs return id, connection_id (installation string), source=github, state, scope,
 workspace_id=null, created_at, started_at, finished_at, processed_count, counts,
-warnings, last_error, attempts. States are queued, running, cancel_requested,
+warnings, last_error, attempts, retry_count. States are queued, running, cancel_requested,
 canceled, completed, failed. Cancellation takes the installation/job write fence
 and can immediately acknowledge canceled once accepted writes have committed.
 
@@ -59,8 +67,13 @@ at success, terminal failure, cancellation or purge. Enumeration applies a
 serial per history cursor, have a bounded buffer, and are canceled when a slice
 closes. Only remote provider requests/embeddings are stubbed in the new DB tests.
 
-Write lock order is installation → history job → queue → sorted document IDs.
+Write lock order is adoption (when needed) → installation → history job → queue
+→ sorted document IDs. Purge locks shared document candidates before deciding
+ownership, through binding removal; a projection whose reused chunks disappeared
+during planning retries against the new base.
 Provider and embedding calls happen before the short projection transaction.
+Incomplete v2 embedding batches commit no projection, so a healthy retry can
+restore every chunk before the queue or job receives a successful receipt.
 Live generations do not invalidate explicit history jobs. Source updated_at and
 live-versus-history precedence prevent late older history overwriting live data.
 Per-queue leases fence reclaimed writers. Jobs remain running after enumeration

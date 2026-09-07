@@ -1307,6 +1307,16 @@ class GitHubConnector(Connector):
         if event_type is None:
             return NormalizationResult(skipped_reason="missing X-GitHub-Event header")
 
+        if _header(headers, "x-probe-github-protocol") and event_type in (
+            _EVENT_REPOSITORY,
+            _EVENT_INSTALLATION,
+            _EVENT_INSTALLATION_REPOSITORIES,
+        ):
+            # These handlers only dispatch to the legacy code-graph bridge.
+            # It has no installation fence, including when normalization races
+            # a v2 pause or disconnect after the queue row was claimed.
+            return NormalizationResult(skipped_reason="GitHub v2 code-graph lifecycle is disabled")
+
         if event_type == _EVENT_PULL_REQUEST:
             return self._normalize_pr(event)
         if event_type == _EVENT_ISSUES:

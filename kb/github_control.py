@@ -152,23 +152,47 @@ def public_job(row: Any) -> dict:
         "warnings": decoded(row["warnings"]),
         "last_error": row["last_error"],
         "attempts": row["attempts"],
+        "retry_count": row["retry_count"],
     }
+
+
+def job_fingerprint(scope: list[dict], kind: str) -> str:
+    # GitHub names are case-insensitive, and labels do not change the selection.
+    names = sorted(scope_names(scope))
+    return hashlib.sha256(json.dumps([kind, names]).encode()).hexdigest()
+
+
+async def existing_job(
+    conn: Any,
+    customer_id: str,
+    installation_id: str,
+    scope: list[dict],
+    key: str,
+    *,
+    kind="backfill",
+):
+    existing = await conn.fetchrow(
+        "SELECT * FROM github_backfill_jobs WHERE customer_id=$1 AND installation_id=$2 AND idempotency_key=$3",
+        customer_id,
+        installation_id,
+        key,
+    )
+    if existing:
+        if existing["request_fingerprint"] != job_fingerprint(scope, kind):
+            raise HTTPException(409, "Idempotency key was used for a different selection")
+        return existing
+    return None
 
 
 async def create_job(conn: Any, row: Any, scope: list[dict], key: str, *, kind="backfill"):
     if not scope:
         raise HTTPException(422, "Select at least one repository")
-    fingerprint = hashlib.sha256(json.dumps([kind, scope], sort_keys=True).encode()).hexdigest()
-    existing = await conn.fetchrow(
-        "SELECT * FROM github_backfill_jobs WHERE customer_id=$1 AND installation_id=$2 AND idempotency_key=$3",
-        row["customer_id"],
-        row["installation_id"],
-        key,
+    existing = await existing_job(
+        conn, row["customer_id"], row["installation_id"], scope, key, kind=kind
     )
     if existing:
-        if existing["request_fingerprint"] != fingerprint:
-            raise HTTPException(409, "Idempotency key was used for a different selection")
         return existing
+    fingerprint = job_fingerprint(scope, kind)
     return await conn.fetchrow(
         """INSERT INTO github_backfill_jobs(customer_id,installation_id,scope,generation,
               idempotency_key,request_fingerprint,kind)

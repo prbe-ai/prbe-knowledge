@@ -128,7 +128,7 @@ async def seed_github_installation(
             customer_id,
             installation_id,
         )
-        if protocol_version == 2 and existing and not existing["managed"]:
+        if protocol_version == 2 and (existing is None or not existing["managed"]):
             pending = await conn.fetchval(
                 """SELECT EXISTS(SELECT 1 FROM ingestion_queue
                 WHERE customer_id=$1 AND source_system='github' AND github_installation_id IS NULL

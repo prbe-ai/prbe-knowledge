@@ -9,7 +9,8 @@ from __future__ import annotations
 from fastapi import HTTPException
 
 from engine.shared.db import with_tenant
-from kb.github_control import get_installation
+from engine.shared.locks import advisory_lock_key
+from kb.github_control import adoption_lock, get_installation
 
 
 async def _owned_doc_ids(conn, customer_id, installation_id):
@@ -49,6 +50,9 @@ async def preview(customer_id: str, installation_id: str) -> dict:
 
 async def purge(customer_id: str, installation_id: str, *, allow_legacy: bool = False) -> dict:
     async with with_tenant(customer_id) as conn:
+        # Legacy history enqueue holds this same tenant lock. Take it before
+        # the installation lock so no unscoped work can cross the drain check.
+        await adoption_lock(conn, customer_id)
         # Retain the revoked binding row: late webhook deliveries and in-flight
         # hydration cannot accidentally fall through to the legacy singleton lane.
         row = await conn.fetchrow(
@@ -92,6 +96,20 @@ async def purge(customer_id: str, installation_id: str, *, allow_legacy: bool = 
             customer_id,
             installation_id,
         )
+        candidates = await conn.fetch(
+            """SELECT doc_id FROM github_document_bindings
+            WHERE customer_id=$1 AND installation_id=$2 ORDER BY doc_id""",
+            customer_id,
+            installation_id,
+        )
+        # Lock shared candidates too: another installation can bind or purge
+        # the same document. Ownership is decided only after these locks, and
+        # bindings are removed while still holding them.
+        for candidate in candidates:
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock($1)",
+                advisory_lock_key("github-doc", customer_id, candidate["doc_id"]),
+            )
         ids = await _owned_doc_ids(conn, customer_id, installation_id)
         chunks = await conn.fetchval(
             "SELECT count(*) FROM chunks WHERE customer_id=$1 AND doc_id=ANY($2::text[])",

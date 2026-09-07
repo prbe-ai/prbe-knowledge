@@ -21,7 +21,7 @@ from engine.ingest.handlers.base import ConnectorContext
 from engine.shared.config import get_settings
 from engine.shared.constants import EMBEDDING_V2_DIM
 from engine.shared.db import raw_conn, with_tenant
-from engine.shared.embeddings import EmbeddedChunk, EmbedResult
+from engine.shared.embeddings import EmbeddedChunk, EmbedResult, FailedChunk
 from kb.github_control import (
     admit_projection,
     cancel_job,
@@ -605,3 +605,357 @@ async def test_additive_migration_preserves_legacy_mapping(connected):
             assert await conn.fetchval("SELECT count(*) FROM customer_source_mapping") == 1
         finally:
             await tx.rollback()
+
+
+async def wait_for_advisory_wait():
+    """Wait for an actual database lock conflict, not a scheduler sleep."""
+    async with asyncio.timeout(5), raw_conn() as conn:
+        while not await conn.fetchval(
+            """SELECT EXISTS(SELECT 1 FROM pg_stat_activity
+            WHERE datname=current_database() AND wait_event='advisory'
+            AND pid<>pg_backend_pid())"""
+        ):
+            await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("action", ["created", "deleted"])
+async def test_v2_repository_event_cannot_dispatch_bridge_after_purge(worker, monkeypatch, action):
+    calls = []
+
+    async def bridge(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr("kb.handlers.github.code_graph_bridge.enqueue_initial_backfill", bridge)
+    monkeypatch.setattr("kb.handlers.github.code_graph_bridge.enqueue_disconnect", bridge)
+    normalize = worker.connector.normalize
+
+    async def disconnect_before_normalize(event, hydrated):
+        await purge(TENANT, "101")
+        return await normalize(event, hydrated)
+
+    monkeypatch.setattr(worker.connector, "normalize", disconnect_before_normalize)
+    event = envelope()
+    event["_headers"] = {"X-GitHub-Event": "repository"}
+    event["payload"]["action"] = action
+    assert await enqueue_live(TENANT, "101", event, "repository-lifecycle")
+    await worker.queue_step(TENANT, live=True)
+    assert calls == []
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval("SELECT status FROM ingestion_queue") == "v2_canceled"
+
+
+async def test_binding_committed_during_purge_is_preserved(worker, monkeypatch):
+    from engine.ingest import normalizer
+
+    await enqueue_live(TENANT, "101", envelope(), "owner-a")
+    await worker.queue_step(TENANT, live=True)
+    await enqueue_live(TENANT, "202", envelope(installation="202"), "owner-b")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    admit = normalizer._admit_ordered_write
+
+    async def pause_with_document_lock(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await admit(*args, **kwargs)
+
+    monkeypatch.setattr(normalizer, "_admit_ordered_write", pause_with_document_lock)
+    writer = asyncio.create_task(worker.queue_step(TENANT, live=True))
+    await asyncio.wait_for(entered.wait(), 5)
+    purger = asyncio.create_task(purge(TENANT, "101"))
+    try:
+        await wait_for_advisory_wait()
+        assert not purger.done()
+    finally:
+        release.set()
+        await writer
+    result = await purger
+    assert result["documents"] == 0
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval("SELECT count(*) FROM documents") == 1
+        assert await conn.fetchval("SELECT count(*) FROM chunks") > 0
+        assert await conn.fetchval("SELECT installation_id FROM github_document_bindings") == "202"
+
+
+async def test_purge_before_binding_retries_missing_reused_chunks(worker, monkeypatch):
+    from kb import github_control_purge
+
+    await enqueue_live(TENANT, "101", envelope(), "owner-a")
+    await worker.queue_step(TENANT, live=True)
+    await enqueue_live(TENANT, "202", envelope(installation="202"), "owner-b")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    owned = github_control_purge._owned_doc_ids
+
+    async def pause_with_ownership_locks(*args):
+        ids = await owned(*args)
+        entered.set()
+        await release.wait()
+        return ids
+
+    monkeypatch.setattr(github_control_purge, "_owned_doc_ids", pause_with_ownership_locks)
+    purger = asyncio.create_task(purge(TENANT, "101"))
+    await asyncio.wait_for(entered.wait(), 5)
+    writer = asyncio.create_task(worker.queue_step(TENANT, live=True))
+    try:
+        await wait_for_advisory_wait()
+        assert not writer.done()
+    finally:
+        release.set()
+        await purger
+    await writer
+    async with with_tenant(TENANT) as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT status FROM ingestion_queue WHERE github_installation_id='202'"
+            )
+            == "v2_pending"
+        )
+        assert await conn.fetchval("SELECT count(*) FROM documents") == 0
+    # The healthy retry plans against the now-empty base instead of claiming
+    # to reuse chunks that the completed purge deleted.
+    await worker.queue_step(TENANT, live=True)
+    async with with_tenant(TENANT) as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT status FROM ingestion_queue WHERE github_installation_id='202'"
+            )
+            == "v2_completed"
+        )
+        assert await conn.fetchval("SELECT count(*) FROM documents") == 1
+        assert await conn.fetchval("SELECT count(*) FROM chunks") > 0
+        assert await conn.fetchval("SELECT installation_id FROM github_document_bindings") == "202"
+
+
+async def test_concurrent_shared_purges_leave_no_unowned_document(worker, monkeypatch):
+    from kb import github_control_purge
+
+    for installation in ("101", "202"):
+        await enqueue_live(TENANT, installation, envelope(installation=installation), installation)
+        await worker.queue_step(TENANT, live=True)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    owned = github_control_purge._owned_doc_ids
+
+    async def pause_first_purge(conn, customer_id, installation_id):
+        ids = await owned(conn, customer_id, installation_id)
+        if installation_id == "101":
+            assert ids == []
+            entered.set()
+            await release.wait()
+        return ids
+
+    monkeypatch.setattr(github_control_purge, "_owned_doc_ids", pause_first_purge)
+    first = asyncio.create_task(purge(TENANT, "101"))
+    await asyncio.wait_for(entered.wait(), 5)
+    second = asyncio.create_task(purge(TENANT, "202"))
+    try:
+        await wait_for_advisory_wait()
+        assert not second.done()
+    finally:
+        release.set()
+        results = await asyncio.gather(first, second)
+    assert sum(result["documents"] for result in results) == 1
+    async with with_tenant(TENANT) as conn:
+        for table in ("documents", "chunks", "github_document_bindings"):
+            assert await conn.fetchval(f"SELECT count(*) FROM {table}") == 0
+
+
+async def test_legacy_enqueue_wins_before_purge_drain_check(connected, monkeypatch):
+    from engine.shared.constants import SourceSystem
+    from kb import github_control
+    from kb.backfill_runner import enqueue_backfill
+
+    async with with_tenant(TENANT) as conn:
+        await conn.execute("UPDATE github_installations SET managed=FALSE")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    lock = github_control.adoption_lock
+
+    async def pause_legacy_enqueue(conn, customer_id):
+        await lock(conn, customer_id)
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(github_control, "adoption_lock", pause_legacy_enqueue)
+    enqueuer = asyncio.create_task(enqueue_backfill(TENANT, SourceSystem.GITHUB))
+    await asyncio.wait_for(entered.wait(), 5)
+    purger = asyncio.create_task(purge(TENANT, "101"))
+    try:
+        await wait_for_advisory_wait()
+    finally:
+        release.set()
+        await enqueuer
+    with pytest.raises(HTTPException) as error:
+        await purger
+    assert error.value.status_code == 409
+    async with with_tenant(TENANT) as conn:
+        assert (await get_installation(conn, TENANT, "101"))["managed"] is False
+        assert await conn.fetchval("SELECT status FROM backfill_state") == "pending"
+
+
+async def test_purge_wins_before_legacy_enqueue(connected, monkeypatch):
+    from engine.shared.constants import SourceSystem
+    from kb import github_control_purge
+    from kb.backfill_runner import enqueue_backfill
+
+    async with with_tenant(TENANT) as conn:
+        await conn.execute("UPDATE github_installations SET managed=FALSE")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    owned = github_control_purge._owned_doc_ids
+
+    async def pause_purge(*args):
+        ids = await owned(*args)
+        entered.set()
+        await release.wait()
+        return ids
+
+    monkeypatch.setattr(github_control_purge, "_owned_doc_ids", pause_purge)
+    purger = asyncio.create_task(purge(TENANT, "101"))
+    await asyncio.wait_for(entered.wait(), 5)
+    enqueuer = asyncio.create_task(enqueue_backfill(TENANT, SourceSystem.GITHUB))
+    try:
+        await wait_for_advisory_wait()
+    finally:
+        release.set()
+        await purger
+    with pytest.raises(ValueError, match="installation-scoped"):
+        await enqueuer
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval("SELECT count(*) FROM backfill_state") == 0
+
+
+@pytest.mark.parametrize("legacy_work", ["queue", "backfill"])
+async def test_new_installation_must_drain_legacy_work(connected, monkeypatch, legacy_work):
+    from kb import github_seed
+
+    monkeypatch.setattr(github_seed, "github_mint_path", lambda settings: "hosted")
+
+    async def unexpected_mint(*args, **kwargs):
+        raise AssertionError("Token mint must not run before the legacy drain gate")
+
+    monkeypatch.setattr(github_seed, "fetch_github_installation_token", unexpected_mint)
+    async with with_tenant(TENANT) as conn:
+        if legacy_work == "queue":
+            await conn.execute(
+                """INSERT INTO ingestion_queue(customer_id,source_system,source_event_id)
+                VALUES ($1,'github','legacy')""",
+                TENANT,
+            )
+        else:
+            await conn.execute(
+                """INSERT INTO backfill_state(customer_id,source_system,status)
+                VALUES ($1,'github','running')""",
+                TENANT,
+            )
+    with pytest.raises(github_seed.GitHubLegacyWorkPending):
+        await github_seed.seed_github_installation(TENANT, "303", protocol_version=2)
+    async with with_tenant(TENANT) as conn:
+        assert not await conn.fetchval(
+            "SELECT 1 FROM github_installations WHERE installation_id='303'"
+        )
+
+
+async def test_partial_embedding_retry_restores_chunks_before_job_completion(worker):
+    from kb.github_control import enqueue_event
+
+    expected_chunks = []
+
+    class PartialEmbedder(FakeEmbedder):
+        async def embed_documents(self, items):
+            expected_chunks.append(len(items))
+            result = await super().embed_documents(items)
+            assert len(result.embedded) > 1
+            return EmbedResult(
+                embedded=result.embedded[1:],
+                failed=[FailedChunk(0, "synthetic content", "temporary test failure")],
+            )
+
+    job = await new_job()
+    async with with_tenant(TENANT) as conn:
+        installation = await get_installation(conn, TENANT, "101", lock=True)
+        await enqueue_event(
+            conn, installation=installation, envelope=envelope(), source_event_id="partial", job=job
+        )
+        await conn.execute(
+            "UPDATE github_backfill_jobs SET state='running',enumeration_complete=TRUE WHERE id=$1",
+            job["id"],
+        )
+    worker.normalizer._embedder = PartialEmbedder()
+    await worker.queue_step(TENANT, live=False)
+    await worker.reconcile(TENANT)
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval("SELECT status FROM ingestion_queue") == "v2_pending"
+        assert await conn.fetchval("SELECT state FROM github_backfill_jobs") == "running"
+        assert await conn.fetchval("SELECT count(*) FROM documents") == 0
+        assert await conn.fetchval("SELECT count(*) FROM chunks") == 0
+    worker.normalizer._embedder = FakeEmbedder()
+    await worker.queue_step(TENANT, live=False)
+    await worker.reconcile(TENANT)
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval("SELECT status FROM ingestion_queue") == "v2_completed"
+        assert await conn.fetchval("SELECT state FROM github_backfill_jobs") == "completed"
+        assert (
+            await conn.fetchval("SELECT count(*) FROM chunks WHERE valid_to IS NULL")
+            == expected_chunks[0]
+        )
+        assert await conn.fetchval("SELECT count(*) FROM failed_chunks") == 0
+        counts = json.loads(await conn.fetchval("SELECT counts FROM github_backfill_jobs"))
+        assert counts["indexed_events"] == 1
+        assert counts["failed_events"] == 0
+
+
+async def test_exact_start_receipt_survives_provider_outage_and_scope_reordering(api, monkeypatch):
+    body = {"scope": [*SCOPE, {"external_id": "other/project"}], "idempotency_key": "lost-response"}
+    accepted = await api.post(PREFIX + "/backfills", json=body)
+    assert accepted.status_code == 200
+
+    async def unavailable(*args):
+        raise HTTPException(502, "Provider unavailable")
+
+    monkeypatch.setattr("kb.github_control_routes.list_repositories", unavailable)
+    equivalent = {
+        **body,
+        "scope": [
+            {"external_id": "OTHER/PROJECT", "label": "Different display label"},
+            {"external_id": "PRBE/PAYMENTS"},
+        ],
+    }
+    for suffix in ("/backfills/lookup", "/backfills"):
+        recovered = await api.post(PREFIX + suffix, json=equivalent)
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["id"] == accepted.json()["id"]
+        mismatch = await api.post(PREFIX + suffix, json={**body, "scope": SCOPE})
+        assert mismatch.status_code == 409
+    missing = await api.post(PREFIX + "/backfills/lookup", json={**body, "idempotency_key": "new"})
+    assert missing.status_code == 404
+    foreign = await api.post(
+        PREFIX + "/backfills/lookup",
+        json=body,
+        headers={**HEADERS, "X-Prbe-Customer": "github-other-tenant"},
+    )
+    assert foreign.status_code == 404
+
+
+async def test_retry_receipt_is_distinct_from_worker_attempts(api):
+    job = await new_job()
+    path = PREFIX + f"/backfills/{job['id']}/retry"
+    async with with_tenant(TENANT) as conn:
+        await conn.execute("UPDATE github_backfill_jobs SET attempts=3 WHERE id=$1", job["id"])
+    assert (await api.post(path + "/lookup")).status_code == 404
+    await cancel_job(TENANT, "101", job["id"])
+    first = await api.post(path)
+    assert first.json()["retry_count"] == 1
+    repeated = await api.post(path)
+    assert repeated.json()["retry_count"] == 1
+    assert (await api.post(path + "/lookup")).json()["retry_count"] == 1
+    async with with_tenant(TENANT) as conn:
+        await conn.execute(
+            "UPDATE github_backfill_jobs SET state='completed',counts='{}' WHERE id=$1", job["id"]
+        )
+    assert (await api.post(path + "/lookup")).json()["state"] == "completed"
+    async with with_tenant(TENANT) as conn:
+        await conn.execute("UPDATE github_backfill_jobs SET state='failed' WHERE id=$1", job["id"])
+    assert (await api.post(path + "/lookup")).status_code == 404
+    assert (await api.post(path)).json()["retry_count"] == 2

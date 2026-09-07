@@ -18,6 +18,7 @@ from kb.github_control import (
     cancel_job,
     create_job,
     decoded,
+    existing_job,
     get_installation,
     normalize_scope,
     public_job,
@@ -232,6 +233,11 @@ async def start_backfill(
 ) -> dict:
     scope = normalize_scope([x.model_dump() for x in body.scope])
     async with with_tenant(customer_id) as conn:
+        existing = await existing_job(
+            conn, customer_id, installation_id, scope, body.idempotency_key
+        )
+        if existing:
+            return public_job(existing)
         await get_installation(conn, customer_id, installation_id)
     await validate_scope(request, customer_id, installation_id, scope)
     async with with_tenant(customer_id) as conn:
@@ -280,6 +286,19 @@ async def list_backfills(
     }
 
 
+@router.post("/installations/{installation_id}/backfills/lookup")
+async def lookup_backfill(
+    installation_id: str, body: BackfillStart, customer_id: str = Depends(_require_customer)
+) -> dict:
+    """Recover an exact accepted request without contacting the provider."""
+    scope = normalize_scope([x.model_dump() for x in body.scope])
+    async with with_tenant(customer_id) as conn:
+        row = await existing_job(conn, customer_id, installation_id, scope, body.idempotency_key)
+        if row is None:
+            raise HTTPException(404, "Backfill request not found")
+        return public_job(row)
+
+
 @router.get("/installations/{installation_id}/backfills/{job_id}")
 async def get_backfill(
     installation_id: str, job_id: UUID, customer_id: str = Depends(_require_customer)
@@ -320,6 +339,7 @@ async def retry_backfill(
         if row["state"] in ("failed", "canceled"):
             row = await conn.fetchrow(
                 """UPDATE github_backfill_jobs SET state='queued',finished_at=NULL,attempts=attempts+1,
+                retry_count=retry_count+1,
                 last_error=NULL,lease_id=NULL,enumeration_complete=FALSE,cursor=NULL
                 WHERE customer_id=$1 AND id=$2 RETURNING *""",
                 customer_id,
@@ -333,6 +353,23 @@ async def retry_backfill(
                 customer_id,
                 job_id,
             )
+        return public_job(row)
+
+
+@router.post("/installations/{installation_id}/backfills/{job_id}/retry/lookup")
+async def lookup_retry(
+    installation_id: str, job_id: UUID, customer_id: str = Depends(_require_customer)
+) -> dict:
+    async with with_tenant(customer_id) as conn:
+        row = await conn.fetchrow(
+            """SELECT * FROM github_backfill_jobs WHERE customer_id=$1 AND installation_id=$2
+            AND id=$3 AND retry_count>0 AND state IN ('queued','running','completed')""",
+            customer_id,
+            installation_id,
+            job_id,
+        )
+        if row is None:
+            raise HTTPException(404, "Accepted retry not found")
         return public_job(row)
 
 

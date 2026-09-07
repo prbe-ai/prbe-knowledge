@@ -424,6 +424,12 @@ class Normalizer:
                 )
             )
 
+        if github_lease_id is not None and any(plan.failed_pieces for plan in plans):
+            # A v2 queue receipt must represent a complete projection. Committing
+            # a partial version stamps its queue sequence, making a healthy
+            # retry look stale while the missing chunks never get repaired.
+            raise NormalizationError("GitHub chunk embedding was incomplete; retry the event")
+
         # ---- Phase B: ONE short write transaction. No external I/O between
         # BEGIN and COMMIT, so every lock held here is millisecond-scale.
         # Doc_ids this batch is trying to write. Used below to tell a node
@@ -443,6 +449,22 @@ class Normalizer:
                 for doc_id in sorted(all_doc_ids):
                     await conn.execute("SELECT pg_advisory_xact_lock($1)",
                                        advisory_lock_key("github-doc", customer_id, doc_id))
+                if github_lease_id is not None:
+                    for (doc, _, _), plan in zip(all_docs, plans, strict=True):
+                        reused = set(plan.reused_content_hashes)
+                        if plan.reused_metadata_hash is not None:
+                            reused.add(plan.reused_metadata_hash)
+                        if not reused:
+                            continue
+                        present = await conn.fetch(
+                            """SELECT content_hash FROM chunks WHERE customer_id=$1 AND doc_id=$2
+                            AND valid_to IS NULL AND content_hash=ANY($3::text[])""",
+                            customer_id, doc.doc_id, list(reused),
+                        )
+                        if reused - {row["content_hash"] for row in present}:
+                            # Another installation may have purged between the
+                            # read/embedding phase and this document write lock.
+                            raise NormalizationError("GitHub chunk base changed; retry the event")
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
             await _upsert_code_repo_state(conn, customer_id, result.code_repo_state_updates)
 
