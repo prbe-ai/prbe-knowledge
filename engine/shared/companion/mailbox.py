@@ -536,3 +536,58 @@ async def deliveries(
             d["evidence"] = json.loads(d["evidence"])
         out.append(d)
     return out
+
+
+#: Evidence keys the actuators may set; the report counts rows where each is
+#: a JSON `true`. Keeping the two facts separate is the point (spec §8):
+#: `harness_accepted` = the harness applied the output; `observed_in_context`
+#: = the trial nonce was seen where the model reads. Neither is implied by an
+#: emitted ack.
+EVIDENCE_HARNESS_ACCEPTED = "harness_accepted"
+EVIDENCE_OBSERVED_IN_CONTEXT = "observed_in_context"
+
+
+async def report(
+    customer_id: str,
+    *,
+    session_id: str | None = None,
+    recipient: str | None = None,
+) -> list[dict[str, Any]]:
+    """Per (seam, outcome) aggregates for the fault catalog.
+
+    Counts attempts and the two evidence facts, and summarises the monotonic
+    receipt-to-emission latency (the only exact local latency; cross-clock
+    deltas are estimates and are deliberately not aggregated here).
+    """
+    if session_id is None and recipient is None:
+        raise ValueError("filter by session_id or recipient")
+    async with with_tenant(customer_id) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT d.seam, d.outcome,
+                   count(*)::int AS attempts,
+                   count(*) FILTER (WHERE d.evidence -> $4 = 'true'::jsonb)::int AS harness_accepted,
+                   count(*) FILTER (WHERE d.evidence -> $5 = 'true'::jsonb)::int AS observed_in_context,
+                   count(d.receipt_to_emission_ms)::int AS latency_n,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY d.receipt_to_emission_ms) AS latency_p50,
+                   percentile_cont(0.95) WITHIN GROUP (ORDER BY d.receipt_to_emission_ms) AS latency_p95,
+                   min(d.receipt_to_emission_ms) AS latency_min,
+                   max(d.receipt_to_emission_ms) AS latency_max,
+                   min(d.ack_received_at) AS first_at,
+                   max(d.ack_received_at) AS last_at
+            FROM companion_deliveries d
+            JOIN companion_mailbox m
+              ON m.customer_id = d.customer_id AND m.id = d.mailbox_id
+            WHERE d.customer_id = $1
+              AND ($2::text IS NULL OR m.session_id = $2)
+              AND ($3::text IS NULL OR m.recipient = $3)
+            GROUP BY d.seam, d.outcome
+            ORDER BY d.seam, d.outcome
+            """,
+            customer_id,
+            session_id,
+            recipient,
+            EVIDENCE_HARNESS_ACCEPTED,
+            EVIDENCE_OBSERVED_IN_CONTEXT,
+        )
+    return [dict(r) for r in rows]

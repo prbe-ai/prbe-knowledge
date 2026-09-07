@@ -48,6 +48,7 @@ from engine.shared.companion.mailbox import (
     deliveries,
     enqueue,
     pending,
+    report,
 )
 from engine.shared.logging import get_logger
 
@@ -231,6 +232,30 @@ class DeliveriesResponse(BaseModel):
     truncated: bool = False
 
 
+class LatencyOut(BaseModel):
+    n: int
+    p50: float | None
+    p95: float | None
+    min: int | None
+    max: int | None
+
+
+class SeamReportOut(BaseModel):
+    seam: str
+    outcome: str
+    attempts: int
+    harness_accepted: int
+    observed_in_context: int
+    latency_ms: LatencyOut
+    first_at: datetime
+    last_at: datetime
+
+
+class ReportResponse(BaseModel):
+    capability: CapabilityOut
+    seams: list[SeamReportOut] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
@@ -376,4 +401,48 @@ async def list_deliveries(
         capability=capability,
         deliveries=[DeliveryOut.model_validate(r) for r in rows[:limit]],
         truncated=truncated,
+    )
+
+
+@companion_router.get("/companion/report", response_model=ReportResponse)
+async def seam_report(
+    session_id: str | None = Query(default=None, min_length=1, max_length=SESSION_ID_MAX),
+    recipient: str | None = Query(default=None, min_length=6, max_length=200),
+    customer_id: str = Depends(authenticate_query),
+) -> ReportResponse:
+    """Per (seam, outcome) numbers for the fault catalog (spec §8).
+
+    Attempts, the two evidence counts (`harness_accepted`, `observed_in_context`
+    -- JSON `true` in the ack's evidence), and the monotonic latency
+    distribution. Cross-clock enqueue-to-emission deltas are left to the
+    catalog author: they carry clock-offset uncertainty and should not be
+    aggregated as if exact.
+    """
+    if session_id is None and recipient is None:
+        raise HTTPException(status_code=422, detail="filter by session_id or recipient")
+    capability = await _envelope(customer_id)
+    if not capability.enabled:
+        return ReportResponse(capability=capability)
+    rows = await report(customer_id, session_id=session_id, recipient=recipient)
+    return ReportResponse(
+        capability=capability,
+        seams=[
+            SeamReportOut(
+                seam=r["seam"],
+                outcome=r["outcome"],
+                attempts=r["attempts"],
+                harness_accepted=r["harness_accepted"],
+                observed_in_context=r["observed_in_context"],
+                latency_ms=LatencyOut(
+                    n=r["latency_n"],
+                    p50=r["latency_p50"],
+                    p95=r["latency_p95"],
+                    min=r["latency_min"],
+                    max=r["latency_max"],
+                ),
+                first_at=r["first_at"],
+                last_at=r["last_at"],
+            )
+            for r in rows
+        ],
     )
