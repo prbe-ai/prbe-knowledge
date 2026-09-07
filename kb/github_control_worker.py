@@ -24,6 +24,7 @@ from engine.shared.exceptions import (
 )
 from engine.shared.logging import get_logger
 from engine.shared.models import WebhookEvent
+from engine.shared.schema_readiness import github_control_schema_ready
 from kb.github_control import (
     MAX_HISTORY_QUEUE,
     GitHubQueueCapacityReached,
@@ -58,21 +59,7 @@ class GitHubControlWorker:
 
     async def _schema_ready(self) -> bool:
         """Stay dormant across rolling deploys until the complete v2 schema commits."""
-        async with raw_conn() as conn:
-            return bool(
-                await conn.fetchval(
-                    """SELECT to_regclass('github_installations') IS NOT NULL
-                    AND to_regclass('github_backfill_jobs') IS NOT NULL
-                    AND to_regclass('github_backfill_retry_receipts') IS NOT NULL
-                    AND to_regclass('github_document_bindings') IS NOT NULL
-                    AND EXISTS (SELECT 1 FROM information_schema.columns
-                      WHERE table_schema=current_schema() AND table_name='github_installations'
-                        AND column_name='history_lease_id')
-                    AND EXISTS (SELECT 1 FROM information_schema.columns
-                      WHERE table_schema=current_schema() AND table_name='github_document_bindings'
-                        AND column_name='repository')"""
-                )
-            )
+        return await github_control_schema_ready()
 
     async def _heartbeat(self):
         while not self.shutdown_event.is_set():
