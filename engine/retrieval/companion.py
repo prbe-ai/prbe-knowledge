@@ -28,7 +28,7 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from engine.retrieval.auth import authenticate_query
 from engine.shared.companion.capability import companion_envelope
@@ -66,6 +66,18 @@ CONFIG_VERSION = 1
 # --------------------------------------------------------------------------
 # Wire shapes
 # --------------------------------------------------------------------------
+
+
+class _Strict(BaseModel):
+    """Refuse unknown fields (spec §2.3 strict parse).
+
+    Pydantic ignores extras by default, which would make a client sending
+    `actor_ref`, `source` or `mode` look like it worked -- silently dropped while
+    the server pins its own value. A 422 turns a misunderstanding into a
+    visible error rather than a quiet mis-attribution.
+    """
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class CapabilityOut(BaseModel):
@@ -106,8 +118,8 @@ def _card_out(card: Card) -> CardOut:
     )
 
 
-class EnqueueRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
+class EnqueueRequest(_Strict):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     recipient: str = Field(min_length=6, max_length=200)
     session_id: str | None = Field(default=None, max_length=SESSION_ID_MAX)
@@ -124,13 +136,13 @@ class EnqueueResponse(BaseModel):
     created: bool = False
 
 
-class KnownCard(BaseModel):
+class KnownCard(_Strict):
     mailbox_id: UUID
     #: Informational: any state the client reports means "do not re-offer".
     state: str = Field(min_length=1, max_length=32)
 
 
-class PollRequest(BaseModel):
+class PollRequest(_Strict):
     recipient: str = Field(min_length=6, max_length=200)
     session_id: str = Field(min_length=1, max_length=SESSION_ID_MAX)
     known: list[KnownCard] = Field(default_factory=list, max_length=500)
@@ -143,7 +155,7 @@ class ConfigOut(BaseModel):
     hot_flush_patterns: list[str] = Field(default_factory=list)
     max_cards_per_emission: int = 3
     max_emission_chars: int = 8_000
-    max_config_age_s: int = 600
+    max_config_age_s: int = 60
     poll_wait_max_s: int = POLL_WAIT_MAX_S
 
 
@@ -153,7 +165,7 @@ class PollResponse(BaseModel):
     config: ConfigOut
 
 
-class ClaimRequest(BaseModel):
+class ClaimRequest(_Strict):
     recipient: str = Field(min_length=6, max_length=200)
     claimed_by: str = Field(min_length=1, max_length=200)
     lease_seconds: int = Field(default=60, ge=1, le=3_600)
@@ -164,7 +176,7 @@ class ClaimResponse(BaseModel):
     card: CardOut | None = None
 
 
-class AckRequest(BaseModel):
+class AckRequest(_Strict):
     mailbox_id: UUID
     attempt_id: UUID
     seam: str = Field(min_length=1, max_length=32)
@@ -173,8 +185,9 @@ class AckRequest(BaseModel):
     delivering_credential: str | None = Field(default=None, max_length=200)
     harness_version: str | None = Field(default=None, max_length=64)
     session_state: str | None = Field(default=None, max_length=16)
-    client_received_at: datetime | None = None
-    client_emitted_at: datetime | None = None
+    # tz-aware only: asyncpg would store a naive value as server-local time.
+    client_received_at: AwareDatetime | None = None
+    client_emitted_at: AwareDatetime | None = None
     receipt_to_emission_ms: int | None = Field(default=None, ge=0)
     evidence: dict[str, Any] = Field(default_factory=dict)
 
@@ -213,6 +226,9 @@ class DeliveryOut(BaseModel):
 class DeliveriesResponse(BaseModel):
     capability: CapabilityOut
     deliveries: list[DeliveryOut] = Field(default_factory=list)
+    #: True when more rows exist beyond `limit` -- an actor-wide readback can
+    #: otherwise hide earlier attempts behind the bound.
+    truncated: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -280,6 +296,11 @@ async def poll_cards(
             log.info("companion.poll.client_gone", customer=customer_id, session=req.session_id)
             break
         await asyncio.sleep(min(POLL_INTERVAL_S, remaining))
+    # The gate can be withdrawn while a poll waits (consent revoked, tenant cell
+    # flipped). Nothing goes out on a snapshot taken up to 25 seconds ago.
+    capability = await _envelope(customer_id)
+    if not capability.enabled:
+        return PollResponse(capability=capability, config=_config(False))
     return PollResponse(
         capability=capability,
         cards=[_card_out(c) for c in cards],
@@ -347,8 +368,12 @@ async def list_deliveries(
     capability = await _envelope(customer_id)
     if not capability.enabled:
         return DeliveriesResponse(capability=capability)
-    rows = await deliveries(customer_id, session_id=session_id, recipient=recipient, limit=limit)
+    rows = await deliveries(
+        customer_id, session_id=session_id, recipient=recipient, limit=limit + 1
+    )
+    truncated = len(rows) > limit
     return DeliveriesResponse(
         capability=capability,
-        deliveries=[DeliveryOut.model_validate(r) for r in rows],
+        deliveries=[DeliveryOut.model_validate(r) for r in rows[:limit]],
+        truncated=truncated,
     )

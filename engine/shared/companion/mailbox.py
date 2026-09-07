@@ -503,8 +503,9 @@ async def deliveries(
     """Readback for the fault catalog: one dict per emission attempt."""
     if session_id is None and recipient is None:
         raise ValueError("filter by session_id or recipient")
-    if not 1 <= limit <= 1_000:
-        raise ValueError("limit must be in [1, 1000]")
+    # 1001 so a caller may fetch one row past its own 1,000 bound to detect truncation.
+    if not 1 <= limit <= 1_001:
+        raise ValueError("limit must be in [1, 1001]")
     async with with_tenant(customer_id) as conn:
         rows = await conn.fetch(
             """

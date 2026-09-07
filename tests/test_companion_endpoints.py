@@ -284,3 +284,107 @@ async def test_claim_lane_over_http(enabled: str) -> None:
         "POST", "/companion/claim", {"recipient": ALICE, "claimed_by": "user:mcp-2"}
     )
     assert again.json()["card"] is None
+
+
+# --------------------------------------------------------------------------
+# Review follow-ups (stage-0 halves review, 2026-09-06)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unknown_fields_are_422_on_every_route(enabled: str) -> None:
+    """Spec §2.3 strict parse. A client sending `actor_ref` (or `source`, or
+    `mode`) must learn it was ignored -- loudly, as a 422 -- not have the field
+    silently dropped while the server pins its own value."""
+    cases = [
+        ("/companion/enqueue", _enqueue_body(actor_ref="user:mallory")),
+        ("/companion/enqueue", _enqueue_body(source="brain")),
+        ("/companion/poll", {"recipient": ALICE, "session_id": "sess-http", "cursor": "x"}),
+        ("/companion/claim", {"recipient": ALICE, "claimed_by": "user:m", "mode": "shadow"}),
+        (
+            "/companion/ack",
+            {
+                "mailbox_id": str(uuid4()),
+                "attempt_id": str(uuid4()),
+                "seam": "stop",
+                "outcome": "emitted",
+                "receiving_instance": "x",
+                "delivered": True,
+            },
+        ),
+    ]
+    for path, body in cases:
+        resp = await _request("POST", path, body)
+        assert resp.status_code == 422, (path, body, resp.text)
+
+
+@pytest.mark.asyncio
+async def test_poll_rechecks_capability_after_the_wait(
+    enabled: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Consent or the tenant cell can be withdrawn while a poll is waiting.
+
+    The card must not go out on a capability snapshot taken 25 seconds ago:
+    the gate is re-evaluated after the wait, and a withdrawn gate returns
+    nothing with `enabled: false` even though a card is pending.
+    """
+    import engine.retrieval.companion as mod
+
+    calls = {"n": 0}
+    real = mod.companion_envelope
+
+    async def flip(customer_id: str) -> dict[str, object]:
+        calls["n"] += 1
+        env = await real(customer_id)
+        # call 1: enqueue gate; call 2: poll pre-wait gate; call 3: the post-wait
+        # recheck this test exists for. Without the recheck the card goes out.
+        if calls["n"] >= 3:
+            env = {**env, "enabled": False}
+        return env
+
+    monkeypatch.setattr(mod, "companion_envelope", flip)
+    await _request("POST", "/companion/enqueue", _enqueue_body())  # call 1: enabled
+    poll = await _request(
+        "POST",
+        "/companion/poll",
+        {"recipient": ALICE, "session_id": "sess-http", "wait_seconds": 0},
+    )
+    assert poll.status_code == 200, poll.text
+    assert poll.json()["cards"] == [] and poll.json()["capability"]["enabled"] is False
+    assert poll.json()["config"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_naive_timestamps_are_422(enabled: str) -> None:
+    """asyncpg would store a naive datetime as server-local time, silently
+    shifting the client's clock by the server's offset. Require tz-aware."""
+    card = (await _request("POST", "/companion/enqueue", _enqueue_body())).json()["card"]
+    base = {
+        "mailbox_id": card["mailbox_id"],
+        "attempt_id": str(uuid4()),
+        "seam": "stop",
+        "outcome": "emitted",
+        "receiving_instance": "x",
+    }
+    naive = await _request(
+        "POST", "/companion/ack", {**base, "client_emitted_at": "2026-09-06T12:00:00"}
+    )
+    assert naive.status_code == 422, naive.text
+    aware = await _request(
+        "POST",
+        "/companion/ack",
+        {
+            **base,
+            "client_emitted_at": "2026-09-06T12:00:00Z",
+            "client_received_at": "2026-09-06T11:59:59+00:00",
+        },
+    )
+    assert aware.status_code == 200, aware.text
+
+
+@pytest.mark.asyncio
+async def test_config_age_fits_the_client(enabled: str) -> None:
+    poll = await _request(
+        "POST", "/companion/poll", {"recipient": ALICE, "session_id": "sess-http"}
+    )
+    assert poll.json()["config"]["max_config_age_s"] <= 300
