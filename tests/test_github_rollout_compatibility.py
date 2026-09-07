@@ -293,7 +293,7 @@ async def test_hosted_token_requires_matching_installation_identity(monkeypatch,
 
     def handler(request):
         seen.append(json.loads(request.content))
-        body = {"token": "fixture-bearer", "expires_at": "2026-12-31T00:00:00Z"}
+        body = {"token": "fixture-bearer", "expires_at": "2099-12-31T00:00:00Z"}
         if returned_id is not None:
             body["installation_id"] = returned_id
         return httpx.Response(200, json=body)
@@ -323,7 +323,7 @@ async def test_legacy_token_request_keeps_the_old_optional_identity_contract(mon
     def handler(request):
         assert json.loads(request.content) == {"customer_id": "fixture-tenant"}
         return httpx.Response(
-            200, json={"token": "fixture-bearer", "expires_at": "2026-12-31T00:00:00Z"}
+            200, json={"token": "fixture-bearer", "expires_at": "2099-12-31T00:00:00Z"}
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
@@ -331,3 +331,49 @@ async def test_legacy_token_request_keeps_the_old_optional_identity_contract(mon
             http, customer_id="fixture-tenant"
         )
     assert token == "fixture-bearer"
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (
+            {
+                "installation_id": "202",
+                "token": "",
+                "expires_at": "2099-12-31T00:00:00Z",
+            },
+            "invalid GitHub token response",
+        ),
+        (
+            {
+                "installation_id": "202",
+                "token": "fixture-bearer",
+                "expires_at": "not-a-timestamp",
+            },
+            "invalid GitHub token expiry",
+        ),
+        (
+            {
+                "installation_id": "202",
+                "token": "fixture-bearer",
+                "expires_at": "2000-01-01T00:00:00Z",
+            },
+            "expired GitHub installation token",
+        ),
+    ],
+)
+async def test_hosted_token_rejects_unusable_credentials(monkeypatch, body, message):
+    settings = Settings(
+        backend_base_url="http://backend.invalid",
+        internal_backend_api_key=SecretStr("fixture-key"),
+    )
+    monkeypatch.setattr(backend_client, "get_settings", lambda: settings)
+
+    def handler(_request):
+        return httpx.Response(200, json=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(GitHubAuthError, match=message):
+            await backend_client.fetch_github_installation_token(
+                http, customer_id="fixture-tenant", installation_id="202"
+            )
