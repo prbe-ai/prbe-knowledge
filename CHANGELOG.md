@@ -23,6 +23,14 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   outside `wfmem/`: `clause_ids` and `serve_ledger_id` are reserved columns
   for the intelligent layer. Spec: `companion-implementation-spec-2026-09-06`
   v3 on the `mid-session-companion` Probe subproject.
+- **Companion transport, post-review:** a lapsed actor lease now retires the
+  card as a terminal `unknown` delivery instead of re-issuing it (spec §3);
+  every request model refuses unknown fields; the poll re-checks the gate
+  after its wait; ack timestamps must be tz-aware; `/companion/deliveries`
+  carries a `truncated` flag; and `GET /companion/report` aggregates per
+  (seam, outcome) for the fault catalog -- attempts, `harness_accepted` /
+  `observed_in_context` evidence counts, and the monotonic latency
+  distribution.
 
 ### Fixed
 
