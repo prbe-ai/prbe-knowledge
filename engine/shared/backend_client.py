@@ -104,6 +104,14 @@ async def fetch_github_installation_token(
         )
 
     body = resp.json()
+    if installation_id is not None and (
+        not isinstance(body, dict)
+        or str(body.get("installation_id", "")) != str(installation_id)
+    ):
+        # Older hosted backends ignore the selector and mint their latest
+        # tenant installation. Never use that token for a different passport.
+        # A response without its exact binding is equally unverifiable.
+        raise GitHubAuthError("backend did not confirm the requested GitHub installation")
     token = body["token"]
     expires_at = datetime.fromisoformat(body["expires_at"].replace("Z", "+00:00"))
     return token, expires_at

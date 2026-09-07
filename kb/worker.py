@@ -27,6 +27,7 @@ from engine.shared.constants import (
 )
 from engine.shared.db import apply_connection_setup, init_pool
 from engine.shared.logging import bind_trace, get_logger
+from engine.shared.schema_readiness import wait_for_github_control_schema
 from kb.poller import IntegrationPoller
 from kb.polling.scheduler import PollScheduler
 from kb.polling.sink import PollDocumentSink
@@ -238,6 +239,7 @@ async def run_worker_forever() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     await init_pool(settings)
+    await wait_for_github_control_schema()
     # Import handlers package so @register_connector decorators run.
     # Side-effect import — handlers' @register_connector decorators run on
     # import. The module name is used by the registry, so ruff doesn't flag

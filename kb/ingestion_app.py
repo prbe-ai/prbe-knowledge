@@ -68,6 +68,7 @@ from engine.shared.exceptions import (
     PrbeError,
 )
 from engine.shared.logging import bind_trace, configure_logging, get_logger
+from engine.shared.schema_readiness import wait_for_github_control_schema
 from engine.shared.source_registry import ingestion_priority_for
 from engine.shared.storage import get_store
 from engine.system_settings import get_ingestion_killswitch
@@ -88,6 +89,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
     await init_pool(settings)
+    await wait_for_github_control_schema()
     await ensure_default_customer()  # no-op unless DEFAULT_CUSTOMER_ID set
 
     # Trigger @register_connector decorators.
