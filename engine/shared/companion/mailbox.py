@@ -292,6 +292,7 @@ async def pending(
     outcome, no live lease, and not one of the ids the client already holds.
     """
     async with with_tenant(customer_id) as conn:
+        await _retire_lapsed_leases(conn, customer_id, recipient)
         rows = await conn.fetch(
             f"""
             SELECT {", ".join("m." + c.strip() for c in _CARD_COLUMNS.split(","))}
@@ -315,16 +316,22 @@ async def pending(
 LEASE_LAPSED_INSTANCE = "engine:lease-lapsed"
 
 
-async def _retire_lapsed_leases(conn: asyncpg.Connection, customer_id: str, recipient: str) -> int:
-    """Turn every lapsed, un-acked lease on this recipient's cards into a
-    terminal `unknown` delivery. Returns how many were retired."""
+async def _retire_lapsed_leases(
+    conn: asyncpg.Connection, customer_id: str, recipient: str | None = None
+) -> int:
+    """Turn every lapsed, un-acked lease into a terminal `unknown` delivery.
+
+    `recipient=None` sweeps the whole tenant. Called on every claim AND on
+    every readback (poll, deliveries, report) so a lapse is visible as soon
+    as anyone looks, not only when the next actor claim happens to run.
+    Returns how many were retired."""
     lapsed = await conn.fetch(
         """
         DELETE FROM companion_claims c
         USING companion_mailbox m
         WHERE c.customer_id = $1
           AND m.customer_id = c.customer_id AND m.id = c.mailbox_id
-          AND m.recipient = $2
+          AND ($2::text IS NULL OR m.recipient = $2)
           AND c.lease_until <= now()
           AND NOT EXISTS (
               SELECT 1 FROM companion_deliveries d
@@ -507,6 +514,7 @@ async def deliveries(
     if not 1 <= limit <= 1_001:
         raise ValueError("limit must be in [1, 1001]")
     async with with_tenant(customer_id) as conn:
+        await _retire_lapsed_leases(conn, customer_id, recipient)
         rows = await conn.fetch(
             """
             SELECT d.id, d.mailbox_id, d.attempt_id, d.seam, d.outcome,
@@ -562,6 +570,7 @@ async def report(
     if session_id is None and recipient is None:
         raise ValueError("filter by session_id or recipient")
     async with with_tenant(customer_id) as conn:
+        await _retire_lapsed_leases(conn, customer_id, recipient)
         rows = await conn.fetch(
             """
             SELECT d.seam, d.outcome,

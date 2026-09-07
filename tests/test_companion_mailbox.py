@@ -38,6 +38,7 @@ from engine.shared.companion.mailbox import (
     deliveries,
     enqueue,
     pending,
+    report,
 )
 from engine.shared.db import raw_conn, with_tenant
 
@@ -295,6 +296,38 @@ async def test_lapsed_lease_retires_unknown_instead_of_reclaim(tenant) -> None:
             == 0
         )
     assert await claim_for_actor(TENANT, recipient=ALICE, claimed_by="ingest:three") is None
+
+
+@pytest.mark.asyncio
+async def test_lapsed_lease_is_retired_on_readback_without_a_new_claim(tenant) -> None:
+    """A lapse must be VISIBLE as soon as anyone looks.
+
+    Retiring only on the next claim would let deliveries/report under-report
+    `unknown` until some later actor happened to claim again. Every readback
+    (pending, deliveries, report) sweeps the tenant's lapsed leases first.
+    """
+    card, _ = await _enqueue(session_id=None, dedupe_key="lapse-readback")
+    won = await claim_for_actor(TENANT, recipient=ALICE, claimed_by="ingest:one", lease_seconds=1)
+    assert won is not None and won.mailbox_id == card.mailbox_id
+    async with with_tenant(TENANT) as conn:
+        await conn.execute("UPDATE companion_claims SET lease_until = now() - interval '1 second'")
+
+    rows = await deliveries(TENANT, recipient=ALICE)
+    retired = [r for r in rows if r["mailbox_id"] == card.mailbox_id]
+    assert len(retired) == 1 and retired[0]["outcome"] == "unknown"
+    assert retired[0]["receiving_instance"] == "engine:lease-lapsed"
+    # The report path sweeps too, and the aggregate shows the unknown at once.
+    report_rows = await report(TENANT, recipient=ALICE)
+    assert any(r["seam"] == "mcp-rider" and r["outcome"] == "unknown" for r in report_rows)
+    # A session readback (no recipient filter) sweeps tenant-wide as well.
+    other, _ = await _enqueue(session_id=None, dedupe_key="lapse-readback-2")
+    won2 = await claim_for_actor(TENANT, recipient=ALICE, claimed_by="ingest:two", lease_seconds=1)
+    assert won2 is not None and won2.mailbox_id == other.mailbox_id
+    async with with_tenant(TENANT) as conn:
+        await conn.execute("UPDATE companion_claims SET lease_until = now() - interval '1 second'")
+    await deliveries(TENANT, session_id="some-session")  # recipient=None -> tenant-wide sweep
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval("SELECT count(*) FROM companion_claims") == 0
 
 
 # --------------------------------------------------------------------------
