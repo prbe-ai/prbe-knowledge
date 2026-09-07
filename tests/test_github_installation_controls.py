@@ -19,16 +19,22 @@ from pydantic import SecretStr
 
 from engine.ingest.handlers.base import ConnectorContext
 from engine.shared.config import get_settings
-from engine.shared.constants import EMBEDDING_V2_DIM
+from engine.shared.constants import EMBEDDING_V2_DIM, SourceSystem
 from engine.shared.db import raw_conn, with_tenant
 from engine.shared.embeddings import EmbeddedChunk, EmbedResult, FailedChunk
+from engine.shared.models import WebhookEvent
 from kb.github_control import (
+    MAX_HISTORY_QUEUE,
+    MAX_INSTALLATION_QUEUE,
+    GitHubQueueCapacityReached,
     admit_projection,
     cancel_job,
     create_job,
+    enqueue_event,
     enqueue_live,
     get_installation,
     normalize_scope,
+    revoke_repository_access,
 )
 from kb.github_control_purge import purge
 from kb.github_control_routes import router
@@ -116,6 +122,44 @@ async def new_job(installation="101", key="test-launch"):
     async with with_tenant(TENANT) as conn:
         row = await get_installation(conn, TENANT, installation, lock=True)
         return await create_job(conn, row, SCOPE, key)
+
+
+async def persist_native_event(worker, item):
+    payload = item["payload"]
+    headers = item["_headers"]
+    parsed = worker.connector.parse_webhook_event(TENANT, headers, payload)
+    assert parsed is not None
+    event = WebhookEvent(
+        customer_id=TENANT,
+        source_system=SourceSystem.GITHUB,
+        source_event_id=parsed.source_event_id,
+        received_at=parsed.received_at,
+        payload_s3_key="",
+        raw_payload=payload,
+        headers=headers,
+    )
+    result = await worker.connector.normalize(event, {})
+    return await worker.normalizer._persist(TENANT, SourceSystem.GITHUB, result)
+
+
+async def enqueue_history(item, *, job):
+    async with with_tenant(TENANT) as conn:
+        installation = await get_installation(conn, TENANT, "101", lock=True)
+        locked_job = await conn.fetchrow(
+            "SELECT * FROM github_backfill_jobs WHERE id=$1 FOR UPDATE", job["id"]
+        )
+        assert await enqueue_event(
+            conn,
+            installation=installation,
+            envelope=item,
+            source_event_id=f"history-{job['id']}",
+            job=locked_job,
+        )
+        await conn.execute(
+            """UPDATE github_backfill_jobs SET state='running',enumeration_complete=TRUE
+            WHERE id=$1""",
+            job["id"],
+        )
 
 
 async def test_scope_canonical_and_no_traversal():
@@ -219,6 +263,105 @@ async def test_native_worker_persists_body_chunks_and_source_version(worker):
             )
             == 0
         )
+
+
+async def test_v2_refuses_to_adopt_unbound_native_document(worker):
+    original = envelope(title="Native record")
+    outcome = await persist_native_event(worker, original)
+    assert outcome.doc_ids
+    doc_id = outcome.doc_ids[0]
+    async with with_tenant(TENANT) as conn:
+        original_chunks = await conn.fetchval(
+            "SELECT count(*) FROM chunks WHERE customer_id=$1 AND doc_id=$2",
+            TENANT,
+            doc_id,
+        )
+        assert not await conn.fetchval(
+            "SELECT 1 FROM github_document_bindings WHERE customer_id=$1 AND doc_id=$2",
+            TENANT,
+            doc_id,
+        )
+
+    for index, title in enumerate(("First v2 update", "Later v2 update"), start=1):
+        assert await enqueue_live(
+            TENANT,
+            "101",
+            envelope(title=title, updated=f"2026-09-0{index + 2}T12:00:00Z"),
+            f"identity-conflict-{index}",
+        )
+        await worker.queue_step(TENANT, live=True)
+
+    async with with_tenant(TENANT) as conn:
+        rows = await conn.fetch(
+            """SELECT status,error FROM ingestion_queue WHERE customer_id=$1
+            ORDER BY queue_id""",
+            TENANT,
+        )
+        assert [row["status"] for row in rows] == ["v2_failed", "v2_failed"]
+        assert all("Existing native GitHub data conflicts" in row["error"] for row in rows)
+        assert await conn.fetchval(
+            "SELECT title FROM documents WHERE customer_id=$1 AND doc_id=$2 AND valid_to IS NULL",
+            TENANT,
+            doc_id,
+        ) == "Native record"
+        assert await conn.fetchval(
+            "SELECT count(*) FROM chunks WHERE customer_id=$1 AND doc_id=$2",
+            TENANT,
+            doc_id,
+        ) == original_chunks
+        assert not await conn.fetchval(
+            "SELECT 1 FROM github_document_bindings WHERE customer_id=$1 AND doc_id=$2",
+            TENANT,
+            doc_id,
+        )
+
+    disconnected = await purge(TENANT, "101")
+    assert disconnected["documents"] == 0
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval(
+            "SELECT title FROM documents WHERE customer_id=$1 AND doc_id=$2 AND valid_to IS NULL",
+            TENANT,
+            doc_id,
+        ) == "Native record"
+
+
+async def test_equal_version_live_beats_later_enqueued_history(worker):
+    updated = "2026-09-04T12:00:00Z"
+    live = envelope(title="Identical content", updated=updated)
+    live["payload"]["issue"]["state"] = "closed"
+    live["payload"]["issue"]["labels"] = [{"name": "live-authoritative"}]
+    assert await enqueue_live(
+        TENANT,
+        "101",
+        live,
+        "live-enqueued-first",
+    )
+    job = await new_job(key="precedence-history")
+    history = envelope(title="Identical content", updated=updated)
+    history["payload"]["issue"]["state"] = "open"
+    history["payload"]["issue"]["labels"] = [{"name": "history-stale"}]
+    await enqueue_history(history, job=job)
+
+    await worker.queue_step(TENANT, live=False)
+    await worker.queue_step(TENANT, live=True)
+    async with with_tenant(TENANT) as conn:
+        row = await conn.fetchrow(
+            """SELECT title,metadata FROM documents WHERE customer_id=$1
+            AND valid_to IS NULL""",
+            TENANT,
+        )
+        metadata = json.loads(row["metadata"])
+        live_queue, history_queue = await conn.fetch(
+            """SELECT queue_id,github_job_id FROM ingestion_queue WHERE customer_id=$1
+            ORDER BY queue_id""",
+            TENANT,
+        )
+        assert live_queue["queue_id"] < history_queue["queue_id"]
+        assert row["title"] == "Identical content"
+        assert metadata["state"] == "closed"
+        assert metadata["labels"] == ["live-authoritative"]
+        assert metadata["_github_operation"] == "live"
+        assert metadata["_github_queue_seq"] == live_queue["queue_id"]
 
 
 async def test_cancel_waits_for_write_fence_then_acknowledges(connected):
@@ -374,10 +517,11 @@ async def test_retry_does_not_change_live_cursor_or_another_job(api):
     first = await new_job(key="first")
     second = await new_job(key="second")
     await cancel_job(TENANT, "101", first["id"])
-    response = await api.post(PREFIX + f"/backfills/{first['id']}/retry")
+    retry = {"idempotency_key": "retry-first"}
+    response = await api.post(PREFIX + f"/backfills/{first['id']}/retry", json=retry)
     assert response.status_code == 200
     assert response.json()["state"] == "queued"
-    repeated = await api.post(PREFIX + f"/backfills/{first['id']}/retry")
+    repeated = await api.post(PREFIX + f"/backfills/{first['id']}/retry", json=retry)
     assert repeated.json()["attempts"] == response.json()["attempts"]
     assert (await api.get(PREFIX + f"/backfills/{second['id']}")).json()["state"] == "queued"
     assert (await api.get(PREFIX + "/sync")).json()["generation"] == 1
@@ -403,6 +547,99 @@ async def test_pause_cancels_catchup_not_explicit_history(api):
         )
 
 
+async def test_history_provider_lease_is_per_installation_across_replicas(
+    worker, monkeypatch
+):
+    first = await new_job(key="lease-first")
+    await new_job(key="lease-second")
+    await new_job(installation="202", key="other-installation")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    repo = envelope()["payload"]["repository"]
+
+    async def repos(_http, _customer, installation_id):
+        if installation_id == "101":
+            entered.set()
+            await release.wait()
+        return [repo]
+
+    def empty_backfill(*_args):
+        async def stream():
+            if False:  # pragma: no cover - keep this an async generator
+                yield None
+
+        return stream()
+
+    peer = GitHubControlWorker(worker.ctx)
+    worker.connector.backfill = empty_backfill
+    peer.connector.backfill = empty_backfill
+    monkeypatch.setattr("kb.github_control_worker.list_repositories", repos)
+
+    active = asyncio.create_task(worker.history_step(TENANT))
+    await asyncio.wait_for(entered.wait(), 5)
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval(
+            """SELECT history_lease_id IS NOT NULL FROM github_installations
+            WHERE customer_id=$1 AND installation_id='101'""",
+            TENANT,
+        )
+        assert await conn.fetchval(
+            "SELECT state FROM github_backfill_jobs WHERE id=$1", first["id"]
+        ) == "running"
+
+    # A second replica skips the leased installation but still advances a
+    # different installation for the same tenant.
+    assert await peer.history_step(TENANT) is True
+    assert await peer.history_step(TENANT) is False
+    release.set()
+    assert await active is True
+
+
+async def test_atomic_per_installation_queue_capacity_reserves_live_slots(connected):
+    job = await new_job(key="capacity")
+    payload = json.dumps(envelope())
+    async with with_tenant(TENANT) as conn:
+        await conn.execute(
+            """INSERT INTO ingestion_queue(customer_id,source_system,source_event_id,status,
+            github_installation_id,github_generation,github_job_id,github_payload,priority)
+            SELECT $1,'github','capacity-seed-'||n,'v2_pending','101',1,$2,$3::jsonb,50
+            FROM generate_series(1,$4) n""",
+            TENANT,
+            job["id"],
+            payload,
+            MAX_HISTORY_QUEUE - 1,
+        )
+
+    async def history_admit(suffix):
+        async with with_tenant(TENANT) as conn:
+            installation = await get_installation(conn, TENANT, "101", lock=True)
+            locked_job = await conn.fetchrow(
+                "SELECT * FROM github_backfill_jobs WHERE id=$1 FOR UPDATE", job["id"]
+            )
+            return await enqueue_event(
+                conn,
+                installation=installation,
+                envelope=envelope(),
+                source_event_id=f"capacity-race-{suffix}",
+                job=locked_job,
+            )
+
+    outcomes = await asyncio.gather(history_admit("a"), history_admit("b"), return_exceptions=True)
+    assert sum(outcome is True for outcome in outcomes) == 1
+    assert sum(isinstance(outcome, GitHubQueueCapacityReached) for outcome in outcomes) == 1
+
+    for index in range(MAX_INSTALLATION_QUEUE - MAX_HISTORY_QUEUE):
+        assert await enqueue_live(TENANT, "101", envelope(), f"live-reserve-{index}")
+    with pytest.raises(GitHubQueueCapacityReached) as full:
+        await enqueue_live(TENANT, "101", envelope(), "live-overflow")
+    assert full.value.status_code == 503
+    assert full.value.headers == {"Retry-After": "5"}
+    # Capacity is installation-local, never a tenant-wide/universal queue.
+    assert await enqueue_live(
+        TENANT, "202", envelope(installation="202"), "other-installation-still-live"
+    )
+
+
 async def test_selected_token_binding_is_sent_to_backend(monkeypatch):
     from engine.shared.backend_client import fetch_github_installation_token
     from engine.shared.config import Settings
@@ -416,7 +653,12 @@ async def test_selected_token_binding_is_sent_to_backend(monkeypatch):
     def handler(request):
         seen.append(json.loads(request.content))
         return httpx.Response(
-            200, json={"token": "test-bearer", "expires_at": "2026-09-07T12:00:00Z"}
+            200,
+            json={
+                "token": "test-bearer",
+                "expires_at": "2099-09-07T12:00:00Z",
+                "installation_id": "202",
+            },
         )
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
@@ -433,7 +675,9 @@ async def test_force_rls_blocks_unscoped_and_foreign_tenant_reads(connected):
         )
         await conn.execute("GRANT USAGE ON SCHEMA public TO github_control_reader")
         await conn.execute(
-            "GRANT SELECT ON github_installations,github_backfill_jobs,github_document_bindings TO github_control_reader"
+            """GRANT SELECT ON github_installations,github_backfill_jobs,
+            github_document_bindings,github_source_gates,
+            github_backfill_retry_receipts TO github_control_reader"""
         )
         async with conn.transaction():
             await conn.execute("SET LOCAL ROLE github_control_reader")
@@ -441,6 +685,8 @@ async def test_force_rls_blocks_unscoped_and_foreign_tenant_reads(connected):
                 "SELECT set_config('app.current_customer_id','github-other-tenant',true)"
             )
             assert await conn.fetchval("SELECT count(*) FROM github_installations") == 0
+            assert await conn.fetchval("SELECT count(*) FROM github_source_gates") == 0
+            assert await conn.fetchval("SELECT count(*) FROM github_backfill_retry_receipts") == 0
             await conn.execute("SELECT set_config('app.current_customer_id',$1,true)", TENANT)
             assert await conn.fetchval("SELECT count(*) FROM github_installations") == 2
 
@@ -552,6 +798,201 @@ async def test_real_webhook_never_writes_r2_when_managed_or_paused(connected, mo
             )
             assert response.status_code == 200
             assert response.json()["status"] == "ignored"
+
+
+async def test_live_deselect_preserves_history_until_provider_revokes(
+    worker, api, monkeypatch
+):
+    assert await enqueue_live(TENANT, "101", envelope(title="Shared representation"), "live")
+    await worker.queue_step(TENANT, live=True)
+    completed = await new_job(key="completed-history")
+    await enqueue_history(envelope(title="Shared representation"), job=completed)
+    await worker.queue_step(TENANT, live=False)
+    await worker.reconcile(TENANT)
+
+    response = await api.patch(
+        PREFIX + "/sync", json={"scope": [], "sync_enabled": False, "expected_revision": 1}
+    )
+    assert response.status_code == 200, response.text
+    async with with_tenant(TENANT) as conn:
+        binding = await conn.fetchrow(
+            """SELECT live_present,history_present FROM github_document_bindings
+            WHERE customer_id=$1 AND installation_id='101'""",
+            TENANT,
+        )
+        assert binding["live_present"] is False
+        assert binding["history_present"] is True
+        assert await conn.fetchval(
+            "SELECT count(*) FROM documents WHERE customer_id=$1 AND valid_to IS NULL", TENANT
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM chunks WHERE customer_id=$1 AND valid_to IS NULL", TENANT
+        ) > 0
+
+    affected = await new_job(key="revoked-history")
+    from types import SimpleNamespace
+
+    from kb.ingestion_app import app
+
+    class NoObjectStore:
+        def __getattr__(self, name):
+            raise AssertionError("Managed repository revocation must not touch R2")
+
+    async def killswitch():
+        return SimpleNamespace(enabled=True)
+
+    monkeypatch.setattr("kb.ingestion_app.get_ingestion_killswitch", killswitch)
+    app.state.store = NoObjectStore()
+    app.state.ctx = worker.ctx
+    payload = {
+        "action": "removed",
+        "installation": {"id": 101},
+        "repositories_added": [],
+        "repositories_removed": [{"full_name": "prbe/payments"}],
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test", headers=HEADERS
+    ) as client:
+        revoked = await client.post(
+            "/webhooks/github", json=payload, headers={"X-GitHub-Event": "installation_repositories"}
+        )
+    assert revoked.status_code == 200, revoked.text
+    assert revoked.json()["status"] == "accepted"
+
+    async with with_tenant(TENANT) as conn:
+        binding = await conn.fetchrow(
+            """SELECT repository,live_present,history_present
+            FROM github_document_bindings WHERE customer_id=$1 AND installation_id='101'""",
+            TENANT,
+        )
+        assert dict(binding) == {
+            "repository": "prbe/payments",
+            "live_present": False,
+            "history_present": False,
+        }
+        assert await conn.fetchval(
+            "SELECT count(*) FROM documents WHERE customer_id=$1 AND valid_to IS NULL", TENANT
+        ) == 0
+        assert await conn.fetchval(
+            "SELECT count(*) FROM chunks WHERE customer_id=$1 AND valid_to IS NULL", TENANT
+        ) == 0
+        failed = await conn.fetchrow(
+            "SELECT state,last_error FROM github_backfill_jobs WHERE id=$1", affected["id"]
+        )
+        assert failed["state"] == "failed"
+        assert "access was removed" in failed["last_error"]
+
+
+async def test_provider_revocation_preserves_another_installation_membership(worker):
+    for installation in ("101", "202"):
+        assert await enqueue_live(
+            TENANT,
+            installation,
+            envelope(title=f"Seen through {installation}", installation=installation),
+            f"shared-{installation}",
+        )
+        await worker.queue_step(TENANT, live=True)
+
+    assert await revoke_repository_access(TENANT, "101", ["PRBE/PAYMENTS"]) == [
+        "prbe/payments"
+    ]
+    async with with_tenant(TENANT) as conn:
+        bindings = await conn.fetch(
+            """SELECT installation_id,live_present,history_present
+            FROM github_document_bindings WHERE customer_id=$1 ORDER BY installation_id""",
+            TENANT,
+        )
+        assert [dict(row) for row in bindings] == [
+            {"installation_id": "101", "live_present": False, "history_present": False},
+            {"installation_id": "202", "live_present": True, "history_present": False},
+        ]
+        assert await conn.fetchval(
+            "SELECT count(*) FROM documents WHERE customer_id=$1 AND valid_to IS NULL", TENANT
+        ) == 1
+        assert await conn.fetchval(
+            "SELECT count(*) FROM chunks WHERE customer_id=$1 AND valid_to IS NULL", TENANT
+        ) > 0
+
+
+async def test_provider_revocation_keeps_authorized_live_work_and_catches_up(worker):
+    two_repos = [*SCOPE, {"external_id": "other/project", "label": "other/project"}]
+    async with with_tenant(TENANT) as conn:
+        await conn.execute(
+            """UPDATE github_installations SET scope=$3::jsonb WHERE customer_id=$1
+            AND installation_id=$2""",
+            TENANT,
+            "101",
+            json.dumps(two_repos),
+        )
+    kept = envelope(title="Authorized repository survives")
+    kept["payload"]["repository"]["full_name"] = "other/project"
+    assert await enqueue_live(TENANT, "101", kept, "kept-live-update")
+
+    await revoke_repository_access(TENANT, "101", ["prbe/payments"])
+    async with with_tenant(TENANT) as conn:
+        queued = await conn.fetchrow(
+            """SELECT status,github_generation FROM ingestion_queue WHERE customer_id=$1
+            AND source_event_id LIKE '%kept-live-update'""",
+            TENANT,
+        )
+        assert dict(queued) == {"status": "v2_pending", "github_generation": 2}
+        catchup = await conn.fetchrow(
+            """SELECT state,scope,generation FROM github_backfill_jobs WHERE customer_id=$1
+            AND installation_id='101' AND kind='catchup'""",
+            TENANT,
+        )
+        assert catchup["state"] == "queued"
+        assert json.loads(catchup["scope"]) == [
+            {"external_id": "other/project", "label": "other/project"}
+        ]
+        assert catchup["generation"] == 2
+
+    await worker.queue_step(TENANT, live=True)
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval(
+            """SELECT title FROM documents WHERE customer_id=$1
+            AND source_id LIKE 'other/project%' AND valid_to IS NULL""",
+            TENANT,
+        ) == "Authorized repository survives"
+
+
+async def test_quarantined_projection_does_not_grant_purge_ownership(
+    worker, monkeypatch
+):
+    from engine.ingest import normalizer
+    from engine.shared.exceptions import NormalizationError
+
+    assert await enqueue_live(TENANT, "101", envelope(title="Owned by 101"), "owner-101")
+    await worker.queue_step(TENANT, live=True)
+    assert await enqueue_live(
+        TENANT,
+        "202",
+        envelope(title="Rejected 202", installation="202"),
+        "quarantine-202",
+    )
+
+    async def reject_projection(_conn, _doc):
+        raise NormalizationError("synthetic permanent projection failure")
+
+    monkeypatch.setattr(normalizer, "_upsert_document", reject_projection)
+    await worker.queue_step(TENANT, live=True)
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval(
+            """SELECT count(*) FROM github_document_bindings WHERE customer_id=$1
+            AND installation_id='202'""",
+            TENANT,
+        ) == 0
+        assert await conn.fetchval(
+            """SELECT count(*) FROM github_document_bindings WHERE customer_id=$1
+            AND installation_id='101'""",
+            TENANT,
+        ) == 1
+
+    assert (await purge(TENANT, "202"))["documents"] == 0
+    async with with_tenant(TENANT) as conn:
+        assert await conn.fetchval(
+            "SELECT title FROM documents WHERE customer_id=$1 AND valid_to IS NULL", TENANT
+        ) == "Owned by 101"
 
 
 async def test_purge_during_embedding_cannot_resurrect_documents(worker):
@@ -826,6 +1267,29 @@ async def test_purge_wins_before_legacy_enqueue(connected, monkeypatch):
         assert await conn.fetchval("SELECT count(*) FROM backfill_state") == 0
 
 
+async def test_source_gate_prevents_pending_legacy_claim(connected):
+    from kb.backfill_runner import claim_pending_backfill
+    from kb.github_control import set_source_purge_gate
+
+    async with with_tenant(TENANT) as conn:
+        await set_source_purge_gate(conn, TENANT, True)
+        await conn.execute(
+            """INSERT INTO backfill_state(customer_id,source_system,status)
+            VALUES ($1,'github','pending')""",
+            TENANT,
+        )
+
+    assert await claim_pending_backfill() is None
+    async with with_tenant(TENANT) as conn:
+        row = await conn.fetchrow(
+            """SELECT status,last_error FROM backfill_state WHERE customer_id=$1
+            AND source_system='github'""",
+            TENANT,
+        )
+        assert row["status"] == "failed"
+        assert "source removal" in row["last_error"]
+
+
 @pytest.mark.parametrize("legacy_work", ["queue", "backfill"])
 async def test_new_installation_must_drain_legacy_work(connected, monkeypatch, legacy_work):
     from kb import github_seed
@@ -943,19 +1407,29 @@ async def test_retry_receipt_is_distinct_from_worker_attempts(api):
     path = PREFIX + f"/backfills/{job['id']}/retry"
     async with with_tenant(TENANT) as conn:
         await conn.execute("UPDATE github_backfill_jobs SET attempts=3 WHERE id=$1", job["id"])
-    assert (await api.post(path + "/lookup")).status_code == 404
+    first_key = {"idempotency_key": "retry-action-one"}
+    second_key = {"idempotency_key": "retry-action-two"}
+    assert (await api.post(path + "/lookup", json=first_key)).status_code == 404
     await cancel_job(TENANT, "101", job["id"])
-    first = await api.post(path)
+    first = await api.post(path, json=first_key)
     assert first.json()["retry_count"] == 1
-    repeated = await api.post(path)
+    repeated = await api.post(path, json=first_key)
     assert repeated.json()["retry_count"] == 1
-    assert (await api.post(path + "/lookup")).json()["retry_count"] == 1
+    assert (await api.post(path + "/lookup", json=first_key)).json()["retry_count"] == 1
     async with with_tenant(TENANT) as conn:
         await conn.execute(
             "UPDATE github_backfill_jobs SET state='completed',counts='{}' WHERE id=$1", job["id"]
         )
-    assert (await api.post(path + "/lookup")).json()["state"] == "completed"
+    assert (await api.post(path + "/lookup", json=first_key)).json()["state"] == "completed"
     async with with_tenant(TENANT) as conn:
         await conn.execute("UPDATE github_backfill_jobs SET state='failed' WHERE id=$1", job["id"])
-    assert (await api.post(path + "/lookup")).status_code == 404
-    assert (await api.post(path)).json()["retry_count"] == 2
+    recovered = await api.post(path + "/lookup", json=first_key)
+    assert recovered.status_code == 200
+    assert recovered.json()["state"] == "failed"
+    assert (await api.post(path, json=first_key)).json()["retry_count"] == 1
+    assert (await api.post(path, json=second_key)).json()["retry_count"] == 2
+    # A later retry mutates the job's aggregate counter, but the first action's
+    # durable receipt must continue returning the response originally accepted
+    # for that idempotency key.
+    assert (await api.post(path + "/lookup", json=first_key)).json()["retry_count"] == 1
+    assert (await api.post(path, json=first_key)).json()["retry_count"] == 1

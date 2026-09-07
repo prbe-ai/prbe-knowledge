@@ -107,6 +107,10 @@ class UnsupportedEventType(IngestionError):
 class NormalizationError(IngestionError): ...
 
 
+class GitHubIdentityConflict(NormalizationError):
+    """A protocol-v2 projection collided with unowned legacy GitHub data."""
+
+
 class SourceAPIError(IngestionError):
     transient = True
 

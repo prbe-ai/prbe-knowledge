@@ -28,7 +28,7 @@ from engine.ingest.handlers.base import ConnectorContext
 from engine.ingest.handlers.registry import build_connector
 from engine.shared.config import get_settings
 from engine.shared.constants import BackfillStatus, QueueStatus, SourceSystem
-from engine.shared.db import get_pool, raw_conn
+from engine.shared.db import get_pool, raw_conn, with_tenant
 from engine.shared.encryption import decrypt_token
 from engine.shared.exceptions import NotSupportedByConnector, PermanentSourceError
 from engine.shared.logging import get_logger
@@ -58,6 +58,10 @@ class BackfillReclaimedError(Exception):
     worker now owns this (customer, source). The run loop bails without calling
     _mark_failed since the row is no longer ours to mutate.
     """
+
+
+class _GitHubSourcePurgeActive(Exception):
+    """The durable source gate stopped an already-running legacy producer."""
 
 
 @dataclass(frozen=True)
@@ -133,7 +137,9 @@ async def _flush_batch(
     source: SourceSystem,
     batch: list[tuple[str, bytes, str]],
     sem: asyncio.Semaphore,
-) -> None:
+    *,
+    claim_token: datetime | None = None,
+) -> bool:
     """Coalesced flush: parallel R2 puts + one executemany for queue rows.
 
     `batch` is a list of (key, envelope_bytes, source_event_id). All puts run
@@ -154,7 +160,7 @@ async def _flush_batch(
     swallowing a partial batch.
     """
     if not batch:
-        return
+        return True
 
     async def _bounded_put(key: str, envelope: bytes) -> None:
         async with sem:
@@ -168,7 +174,7 @@ async def _flush_batch(
         (customer_id, source.value, source_event_id, key, QueueStatus.PENDING.value)
         for key, _, source_event_id in batch
     ]
-    async with get_pool().acquire() as conn:
+    async def _insert(conn) -> None:
         # Backfill rows always land at priority 50 (never block live).
         # Both columns are populated for the migration window:
         # `payload_s3_key` for back-compat readers, `payload_s3_keys`
@@ -183,6 +189,58 @@ async def _flush_batch(
             """,
             rows,
         )
+
+    admitted = True
+    if source == SourceSystem.GITHUB:
+        from kb.github_control import adoption_lock, source_purge_active
+
+        # R2 stays outside the transaction. The short adoption fence makes
+        # source-gate close and queue admission mutually exclusive. A matching
+        # claim token is also required: source-wide purge can delete a pending
+        # row just as an old runner claims it, then clear the gate after a new
+        # connection is created. Without this ownership check that stale runner
+        # could publish one old batch against the new token before its next
+        # progress update noticed the lost claim. If admission loses, remove
+        # the deterministic objects before acknowledging the producer stop;
+        # purge waits for that acknowledgement before final verification.
+        async with with_tenant(customer_id) as conn:
+            await adoption_lock(conn, customer_id)
+            connected = await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM integration_tokens
+                WHERE customer_id=$1 AND source_system='github' AND status='active')""",
+                customer_id,
+            )
+            owns_claim = bool(
+                claim_token
+                and await conn.fetchval(
+                    """SELECT 1 FROM backfill_state WHERE customer_id=$1
+                    AND source_system='github' AND status='running'
+                    AND started_at=$2""",
+                    customer_id,
+                    claim_token,
+                )
+            )
+            if (
+                await source_purge_active(conn, customer_id)
+                or not connected
+                or not owns_claim
+            ):
+                admitted = False
+            else:
+                await _insert(conn)
+    else:
+        async with get_pool().acquire() as conn:
+            await _insert(conn)
+
+    if not admitted:
+        deleted = await asyncio.gather(
+            *(store.delete(bucket, key) for key, _, _ in batch),
+            return_exceptions=True,
+        )
+        for outcome in deleted:
+            if isinstance(outcome, BaseException):
+                raise outcome
+    return admitted
 
 
 async def run_backfill(
@@ -296,14 +354,18 @@ async def run_backfill(
                 (c for _, _, _, c in reversed(batch) if c is not None),
                 None,
             )
-            await _flush_batch(
+            admitted = await _flush_batch(
                 store,
                 bucket,
                 customer_id,
                 source,
                 [(k, e, sid) for k, e, sid, _ in batch],
                 r2_sem,
+                claim_token=claim_token,
             )
+            if not admitted:
+                batch = []
+                raise _GitHubSourcePurgeActive
             enqueued += len(batch)
             batch = []
             if pending_cursor is not None:
@@ -337,6 +399,12 @@ async def run_backfill(
             # already streamed into our buffer.
             if not await is_source_connected(customer_id, source):
                 batch = []
+                if source == SourceSystem.GITHUB:
+                    from kb.github_control import source_purge_active
+
+                    async with with_tenant(customer_id) as conn:
+                        if await source_purge_active(conn, customer_id):
+                            raise _GitHubSourcePurgeActive
                 log.info(
                     "backfill.aborted_disconnect",
                     customer=customer_id,
@@ -412,6 +480,19 @@ async def run_backfill(
         )
         log.info(
             "backfill.done", customer=customer_id, source=source.value, events=enqueued
+        )
+    except _GitHubSourcePurgeActive:
+        await _mark_failed(
+            customer_id,
+            source,
+            "GitHub source removal stopped legacy history",
+            claim_token=claim_token,
+        )
+        log.info(
+            "backfill.aborted_source_purge",
+            customer=customer_id,
+            source=source.value,
+            enqueued=enqueued,
         )
     except BackfillReclaimedError:
         # Reaper or a competing claim took the row. The new owner is responsible
@@ -524,9 +605,11 @@ async def enqueue_backfill(customer_id: str, source: SourceSystem) -> None:
 
     async with with_tenant(customer_id) as conn:
         if source == SourceSystem.GITHUB:
-            from kb.github_control import adoption_lock
+            from kb.github_control import adoption_lock, source_purge_active
 
             await adoption_lock(conn, customer_id)
+            if await source_purge_active(conn, customer_id):
+                raise ValueError("GitHub source removal is still in progress")
             managed = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM github_installations WHERE customer_id=$1 AND managed)", customer_id)
             if managed:
                 raise ValueError("Use installation-scoped GitHub history controls for this customer")
@@ -1045,6 +1128,28 @@ async def claim_pending_backfill() -> tuple[str, SourceSystem] | None:
         )
         if row is None:
             return None
+        if row["source_system"] == SourceSystem.GITHUB.value:
+            from kb.github_control import adoption_lock, source_purge_active
+
+            # Serialize legacy claim admission with the durable source-wide
+            # purge gate. If claim wins, purge observes `running` and waits for
+            # its acknowledgement; if gate close wins, this row is terminalized
+            # without ever starting provider I/O. This closes the pending->claim
+            # gap between purge's running-row poll and its cascade delete.
+            await conn.execute(
+                "SELECT set_config('app.current_customer_id',$1,true)",
+                row["customer_id"],
+            )
+            await adoption_lock(conn, row["customer_id"])
+            if await source_purge_active(conn, row["customer_id"]):
+                await conn.execute(
+                    """UPDATE backfill_state SET status='failed',
+                    last_error='GitHub source removal stopped legacy history',
+                    heartbeat_at=now() WHERE customer_id=$1
+                    AND source_system='github' AND status='pending'""",
+                    row["customer_id"],
+                )
+                return None
         # Claim it by setting status=running immediately (inside the same tx).
         await conn.execute(
             """

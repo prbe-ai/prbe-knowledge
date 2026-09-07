@@ -12,6 +12,9 @@ CREATE TABLE IF NOT EXISTS github_installations (
     last_attempt_at TIMESTAMPTZ,
     last_success_at TIMESTAMPTZ,
     last_error TEXT,
+    history_lease_id UUID,
+    history_heartbeat_at TIMESTAMPTZ,
+    history_last_claimed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (customer_id, installation_id)
@@ -52,17 +55,46 @@ CREATE TABLE IF NOT EXISTS github_worker_capabilities (
     protocol_version INT NOT NULL,
     heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS github_source_gates (
+    customer_id TEXT PRIMARY KEY REFERENCES customers(customer_id) ON DELETE CASCADE,
+    purge_in_progress BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS github_document_bindings (
     customer_id TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
     installation_id TEXT NOT NULL,
     doc_id TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    live_present BOOLEAN NOT NULL DEFAULT FALSE,
+    history_present BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY(customer_id,installation_id,doc_id),
+    FOREIGN KEY(customer_id,installation_id)
+        REFERENCES github_installations(customer_id,installation_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS github_bindings_repository ON github_document_bindings
+    (customer_id,installation_id,repository);
+CREATE TABLE IF NOT EXISTS github_backfill_retry_receipts (
+    customer_id TEXT NOT NULL,
+    installation_id TEXT NOT NULL,
+    job_id UUID NOT NULL REFERENCES github_backfill_jobs(id) ON DELETE CASCADE,
+    idempotency_key TEXT NOT NULL,
+    retry_count INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY(customer_id,installation_id,job_id,idempotency_key),
     FOREIGN KEY(customer_id,installation_id)
         REFERENCES github_installations(customer_id,installation_id) ON DELETE CASCADE
 );
 ALTER TABLE github_document_bindings ENABLE ROW LEVEL SECURITY;
 ALTER TABLE github_document_bindings FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON github_document_bindings USING
+    (customer_id = current_setting('app.current_customer_id',true));
+ALTER TABLE github_source_gates ENABLE ROW LEVEL SECURITY;
+ALTER TABLE github_source_gates FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON github_source_gates USING
+    (customer_id = current_setting('app.current_customer_id',true));
+ALTER TABLE github_backfill_retry_receipts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE github_backfill_retry_receipts FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation ON github_backfill_retry_receipts USING
     (customer_id = current_setting('app.current_customer_id',true));
 ALTER TABLE ingestion_queue ADD COLUMN IF NOT EXISTS github_installation_id TEXT;
 ALTER TABLE ingestion_queue ADD COLUMN IF NOT EXISTS github_generation BIGINT;

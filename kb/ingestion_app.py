@@ -553,11 +553,30 @@ async def webhook(
 
         installation_id = str((payload.get("installation") or {}).get("id") or "")
         if installation_id and await managed_installation(customer_id, installation_id):
-            if request.headers.get("x-github-event") == "installation" and payload.get("action") == "deleted":
+            github_event = request.headers.get("x-github-event")
+            if github_event == "installation" and payload.get("action") == "deleted":
                 from kb.github_control_purge import purge
 
                 await purge(customer_id, installation_id)
                 return JSONResponse({"status": "disconnected", "trace_id": trace_id})
+            if github_event == "installation_repositories":
+                from kb.github_control import revoke_repository_access
+
+                removed = [
+                    repo["full_name"]
+                    for repo in payload.get("repositories_removed") or []
+                    if isinstance(repo, dict) and isinstance(repo.get("full_name"), str)
+                ]
+                revoked = await revoke_repository_access(
+                    customer_id, installation_id, removed
+                )
+                return JSONResponse(
+                    {
+                        "status": "accepted" if revoked else "ignored",
+                        "trace_id": trace_id,
+                        "source_event_id": parsed.source_event_id,
+                    }
+                )
             inserted = await enqueue_live(customer_id, installation_id,
                                           orjson.loads(envelope), parsed.source_event_id)
             return JSONResponse({"status": "accepted" if inserted else "ignored",

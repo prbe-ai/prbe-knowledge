@@ -450,6 +450,29 @@ class Normalizer:
                     await conn.execute("SELECT pg_advisory_xact_lock($1)",
                                        advisory_lock_key("github-doc", customer_id, doc_id))
                 if github_lease_id is not None:
+                    # A document-level binding is the authority used by scoped
+                    # purge. Never silently turn an existing legacy/native row
+                    # into v2-owned data: doing so would let a later installation
+                    # disconnect erase every pre-v2 version and chunk. The
+                    # document locks above make this check atomic with both the
+                    # first v2 write and scoped purge.
+                    conflict = await conn.fetchval(
+                        """SELECT d.doc_id FROM documents d
+                        WHERE d.customer_id=$1 AND d.doc_id=ANY($2::text[])
+                        AND NOT EXISTS (SELECT 1 FROM github_document_bindings b
+                          WHERE b.customer_id=$1 AND b.doc_id=d.doc_id)
+                        ORDER BY d.doc_id LIMIT 1""",
+                        customer_id,
+                        sorted(all_doc_ids),
+                    )
+                    if conflict:
+                        from engine.shared.exceptions import GitHubIdentityConflict
+
+                        raise GitHubIdentityConflict(
+                            "Existing native GitHub data conflicts with installation control; "
+                            "preserve or explicitly remove the legacy connection before retrying",
+                            doc_id=conflict,
+                        )
                     for (doc, _, _), plan in zip(all_docs, plans, strict=True):
                         reused = set(plan.reused_content_hashes)
                         if plan.reused_metadata_hash is not None:
@@ -599,9 +622,22 @@ class Normalizer:
             )
             if github_lease_id is not None:
                 for doc, _, _ in all_docs:
-                    await conn.execute("""INSERT INTO github_document_bindings(customer_id,installation_id,doc_id)
-                        VALUES ($1,$2,$3) ON CONFLICT DO NOTHING""",
-                        customer_id, doc.metadata["_github_installation_id"], doc.doc_id)
+                    # A savepoint-isolated permanent failure created no v2
+                    # projection, so it cannot grant this installation purge
+                    # ownership. Same-content and stale-known documents are
+                    # intentionally still bound: their existing projection is
+                    # valid and the source membership was observed.
+                    if doc.doc_id in quarantined:
+                        continue
+                    lane = doc.metadata["_github_binding_lane"]
+                    await conn.execute("""INSERT INTO github_document_bindings(
+                        customer_id,installation_id,doc_id,repository,live_present,history_present)
+                        VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT(customer_id,installation_id,doc_id)
+                        DO UPDATE SET repository=EXCLUDED.repository,
+                          live_present=github_document_bindings.live_present OR EXCLUDED.live_present,
+                          history_present=github_document_bindings.history_present OR EXCLUDED.history_present""",
+                        customer_id, doc.metadata["_github_installation_id"], doc.doc_id,
+                        doc.metadata["_github_repository"], lane == "live", lane == "history")
 
         # ---- Inferred-edges enqueue (best-effort) ---------------------------
         # After Phase B commits, append one row per persisted doc into
@@ -1231,6 +1267,7 @@ class _ChunkPlan:
 # prefix marks it engine-internal: the enumeration endpoint strips
 # underscore-prefixed keys before returning caller metadata.
 _CI_QUEUE_SEQ_KEY = "_ci_queue_seq"
+_GITHUB_FORCE_LIVE_VERSION_KEY = "_github_force_live_version"
 
 
 async def _admit_ordered_write(
@@ -1274,18 +1311,37 @@ async def _admit_ordered_write(
         if existing and existing["updated_at"] == doc.updated_at:
             import json
 
+            # Equal-version deletion remains authoritative regardless of lane.
+            # Decide that before mutating a history marker in place.
+            if existing["deleted_at"] is not None and doc.deleted_at is None:
+                return False
             previous = existing["metadata"]
             if isinstance(previous, str):
                 previous = json.loads(previous)
-            if doc.metadata.get("_github_operation") == "history" and previous.get("_github_operation", "live") == "live":
+            incoming_operation = doc.metadata.get("_github_operation", "live")
+            previous_operation = previous.get("_github_operation", "live")
+            if incoming_operation == "history" and previous_operation == "live":
                 return False
-            if queue_id is not None and previous.get("_github_queue_seq", 0) >= queue_id:
+            live_supersedes_history = (
+                incoming_operation == "live" and previous_operation == "history"
+            )
+            if (
+                not live_supersedes_history
+                and queue_id is not None
+                and previous.get("_github_queue_seq", 0) >= queue_id
+            ):
                 return False
+            if live_supersedes_history and queue_id is not None:
+                # Equal provider versions use live as the authoritative
+                # representation even when a later-enqueued history row happened
+                # to finish first on another replica. Force a complete SCD
+                # version even when title/body are byte-identical so state,
+                # labels, references and the metadata chunk all become live's
+                # representation. _upsert_document removes this transient key.
+                doc.metadata[_GITHUB_FORCE_LIVE_VERSION_KEY] = True
         if queue_id is not None:
             doc.metadata["_github_queue_seq"] = queue_id
-        return not (existing and (existing["updated_at"] > doc.updated_at or
-                         (existing["updated_at"] == doc.updated_at and existing["deleted_at"] is not None
-                          and doc.deleted_at is None)))
+        return not (existing and existing["updated_at"] > doc.updated_at)
     if source_system != SourceSystem.CUSTOM_INGEST or queue_id is None:
         return True
     await conn.execute(
@@ -1355,6 +1411,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
     txn and retry with the freshly-bumped version. Read-committed isolation
     guarantees the conflicting writer's commit is visible to the next read.
     """
+    force_live_version = bool(doc.metadata.pop(_GITHUB_FORCE_LIVE_VERSION_KEY, False))
     for attempt in range(_UPSERT_DOC_MAX_RETRIES):
         existing = await conn.fetchrow(
             """
@@ -1367,7 +1424,12 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
             doc.customer_id,
         )
 
-        if existing and existing["content_hash"] == doc.content_hash and doc.deleted_at is None:
+        if (
+            existing
+            and existing["content_hash"] == doc.content_hash
+            and doc.deleted_at is None
+            and not force_live_version
+        ):
             # Same content, not a delete → idempotent no-op. A retry can land
             # here too: a concurrent writer wrote OUR exact content first.
             # Preserve the live version on the in-memory doc so chunk writes

@@ -23,6 +23,7 @@ from kb.github_control import (
     normalize_scope,
     public_job,
     public_sync,
+    remove_repository_membership,
     scope_names,
 )
 
@@ -46,6 +47,10 @@ class SyncPatch(BaseModel):
 
 class BackfillStart(BaseModel):
     scope: list[ScopeItem] = Field(min_length=1, max_length=500)
+    idempotency_key: str = Field(min_length=1, max_length=200)
+
+
+class RetryRequest(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=200)
 
 
@@ -92,9 +97,17 @@ async def validate_scope(
 @router.get("/capabilities")
 async def capabilities() -> dict:
     async with raw_conn() as conn:
+        schema_ready = bool(
+            await conn.fetchval(
+                "SELECT to_regclass('github_worker_capabilities') IS NOT NULL"
+            )
+        )
         ready = bool(
-            await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM github_worker_capabilities
-            WHERE protocol_version=2 AND heartbeat_at > now()-interval '90 seconds')""")
+            schema_ready
+            and await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM github_worker_capabilities
+                WHERE protocol_version=2 AND heartbeat_at > now()-interval '90 seconds')"""
+            )
         )
     return {
         "protocol_version": 2,
@@ -192,6 +205,7 @@ async def patch_sync(
         )
         if current["revision"] != expected:
             raise HTTPException(409, "Settings changed; refresh and try again")
+        removed_scope = scope_names(current["scope"]) - scope_names(scope)
         row = await conn.fetchrow(
             """UPDATE github_installations SET managed=TRUE,
             sync_enabled=$3,scope=$4::jsonb,revision=revision+1,generation=generation+1,
@@ -203,6 +217,14 @@ async def patch_sync(
         )
         # Only live work is invalidated. Explicit history jobs retain their
         # immutable scope, cursor and write permission while live is paused.
+        catchup_leases = await conn.fetch(
+            """SELECT lease_id FROM github_backfill_jobs WHERE customer_id=$1
+            AND installation_id=$2 AND kind='catchup'
+            AND state IN ('queued','running','cancel_requested') AND lease_id IS NOT NULL
+            ORDER BY id FOR UPDATE""",
+            customer_id,
+            installation_id,
+        )
         await conn.execute(
             """UPDATE github_backfill_jobs SET state='canceled',finished_at=now(),lease_id=NULL
             WHERE customer_id=$1 AND installation_id=$2 AND kind='catchup'
@@ -210,6 +232,15 @@ async def patch_sync(
             customer_id,
             installation_id,
         )
+        for leased in catchup_leases:
+            await conn.execute(
+                """UPDATE github_installations SET history_lease_id=NULL,
+                history_heartbeat_at=NULL WHERE customer_id=$1 AND installation_id=$2
+                AND history_lease_id=$3""",
+                customer_id,
+                installation_id,
+                leased["lease_id"],
+            )
         await conn.execute(
             """UPDATE ingestion_queue SET status='v2_canceled',github_payload=NULL,
             github_lease_id=NULL,completed_at=now() WHERE customer_id=$1 AND github_installation_id=$2
@@ -218,6 +249,14 @@ async def patch_sync(
             AND status IN ('v2_pending','v2_processing')""",
             customer_id,
             installation_id,
+        )
+        await remove_repository_membership(
+            conn,
+            customer_id,
+            installation_id,
+            removed_scope,
+            remove_live=True,
+            remove_history=False,
         )
         if enabled:
             await create_job(conn, row, scope, f"catchup:{row['generation']}", kind="catchup")
@@ -324,7 +363,10 @@ async def cancel_backfill(
 
 @router.post("/installations/{installation_id}/backfills/{job_id}/retry")
 async def retry_backfill(
-    installation_id: str, job_id: UUID, customer_id: str = Depends(_require_customer)
+    installation_id: str,
+    job_id: UUID,
+    body: RetryRequest,
+    customer_id: str = Depends(_require_customer),
 ) -> dict:
     async with with_tenant(customer_id) as conn:
         await get_installation(conn, customer_id, installation_id, lock=True)
@@ -336,41 +378,73 @@ async def retry_backfill(
         )
         if row is None:
             raise HTTPException(404, "Backfill not found")
-        if row["state"] in ("failed", "canceled"):
-            row = await conn.fetchrow(
-                """UPDATE github_backfill_jobs SET state='queued',finished_at=NULL,attempts=attempts+1,
-                retry_count=retry_count+1,
-                last_error=NULL,lease_id=NULL,enumeration_complete=FALSE,cursor=NULL
-                WHERE customer_id=$1 AND id=$2 RETURNING *""",
-                customer_id,
-                job_id,
-            )
-            # Keep successful receipts. A failed/canceled envelope was erased,
-            # so replay traversal from the scope root: its last fetch checkpoint
-            # may be newer than those unindexed items. Completed receipts dedupe.
-            await conn.execute(
-                "DELETE FROM ingestion_queue WHERE customer_id=$1 AND github_job_id=$2 AND status IN ('v2_failed','v2_canceled')",
-                customer_id,
-                job_id,
-            )
+        receipt = await conn.fetchrow(
+            """SELECT retry_count FROM github_backfill_retry_receipts
+            WHERE customer_id=$1 AND installation_id=$2 AND job_id=$3 AND idempotency_key=$4""",
+            customer_id,
+            installation_id,
+            job_id,
+            body.idempotency_key,
+        )
+        if receipt is not None:
+            result = public_job(row)
+            result["retry_count"] = receipt["retry_count"]
+            return result
+        if row["state"] not in ("failed", "canceled"):
+            raise HTTPException(409, "Backfill is not in a retryable state")
+        row = await conn.fetchrow(
+            """UPDATE github_backfill_jobs SET state='queued',finished_at=NULL,attempts=attempts+1,
+            retry_count=retry_count+1,
+            last_error=NULL,lease_id=NULL,enumeration_complete=FALSE,cursor=NULL
+            WHERE customer_id=$1 AND id=$2 RETURNING *""",
+            customer_id,
+            job_id,
+        )
+        await conn.execute(
+            """INSERT INTO github_backfill_retry_receipts(
+            customer_id,installation_id,job_id,idempotency_key,retry_count)
+            VALUES ($1,$2,$3,$4,$5)""",
+            customer_id,
+            installation_id,
+            job_id,
+            body.idempotency_key,
+            row["retry_count"],
+        )
+        # Keep successful receipts. A failed/canceled envelope was erased,
+        # so replay traversal from the scope root: its last fetch checkpoint
+        # may be newer than those unindexed items. Completed receipts dedupe.
+        await conn.execute(
+            "DELETE FROM ingestion_queue WHERE customer_id=$1 AND github_job_id=$2 AND status IN ('v2_failed','v2_canceled')",
+            customer_id,
+            job_id,
+        )
         return public_job(row)
 
 
 @router.post("/installations/{installation_id}/backfills/{job_id}/retry/lookup")
 async def lookup_retry(
-    installation_id: str, job_id: UUID, customer_id: str = Depends(_require_customer)
+    installation_id: str,
+    job_id: UUID,
+    body: RetryRequest,
+    customer_id: str = Depends(_require_customer),
 ) -> dict:
     async with with_tenant(customer_id) as conn:
         row = await conn.fetchrow(
-            """SELECT * FROM github_backfill_jobs WHERE customer_id=$1 AND installation_id=$2
-            AND id=$3 AND retry_count>0 AND state IN ('queued','running','completed')""",
+            """SELECT j.*,r.retry_count AS accepted_retry_count FROM github_backfill_jobs j
+            JOIN github_backfill_retry_receipts r ON r.customer_id=j.customer_id
+              AND r.installation_id=j.installation_id AND r.job_id=j.id
+            WHERE j.customer_id=$1 AND j.installation_id=$2 AND j.id=$3
+              AND r.idempotency_key=$4""",
             customer_id,
             installation_id,
             job_id,
+            body.idempotency_key,
         )
         if row is None:
             raise HTTPException(404, "Accepted retry not found")
-        return public_job(row)
+        result = public_job(row)
+        result["retry_count"] = row["accepted_retry_count"]
+        return result
 
 
 @router.get("/installations/{installation_id}/purge-preview")

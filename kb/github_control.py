@@ -32,6 +32,20 @@ class JobState(StrEnum):
 
 ACTIVE_STATES = (JobState.QUEUED, JobState.RUNNING, JobState.CANCEL_REQUESTED)
 MAX_ENVELOPE_BYTES = 1024 * 1024
+MAX_INSTALLATION_QUEUE = 200
+MAX_HISTORY_QUEUE = 180
+
+
+class GitHubQueueCapacityReached(HTTPException):
+    """The installation queue is full; live delivery must be retried."""
+
+    def __init__(self, *, history: bool) -> None:
+        detail = (
+            "GitHub history is waiting for indexing capacity"
+            if history
+            else "GitHub live indexing is at capacity; retry this delivery"
+        )
+        super().__init__(status_code=503, detail=detail, headers={"Retry-After": "5"})
 
 
 async def adoption_lock(conn: Any, customer_id: str) -> None:
@@ -42,9 +56,116 @@ async def adoption_lock(conn: Any, customer_id: str) -> None:
     )
 
 
+async def source_purge_active(conn: Any, customer_id: str) -> bool:
+    return bool(
+        await conn.fetchval(
+            "SELECT purge_in_progress FROM github_source_gates WHERE customer_id=$1",
+            customer_id,
+        )
+    )
+
+
+async def set_source_purge_gate(conn: Any, customer_id: str, active: bool) -> None:
+    """Set the durable source-wide gate while holding ``adoption_lock``."""
+    await conn.execute(
+        """INSERT INTO github_source_gates(customer_id,purge_in_progress,updated_at)
+        VALUES ($1,$2,now()) ON CONFLICT(customer_id) DO UPDATE
+        SET purge_in_progress=EXCLUDED.purge_in_progress,updated_at=now()""",
+        customer_id,
+        active,
+    )
+
+
+async def retire_unrepresented_documents(
+    conn: Any, customer_id: str, doc_ids: list[str]
+) -> list[str]:
+    """Retire, but do not delete, docs with no live/history installation membership.
+
+    Callers hold every corresponding ``github-doc`` advisory lock. Inactive
+    binding rows deliberately remain as deletion provenance for a later scoped
+    disconnect; only the membership flags decide current visibility.
+    """
+    if not doc_ids:
+        return []
+    rows = await conn.fetch(
+        """SELECT candidate.doc_id FROM unnest($2::text[]) candidate(doc_id)
+        WHERE NOT EXISTS (
+          SELECT 1 FROM github_document_bindings b
+          WHERE b.customer_id=$1 AND b.doc_id=candidate.doc_id
+            AND (b.live_present OR b.history_present))
+        ORDER BY candidate.doc_id""",
+        customer_id,
+        doc_ids,
+    )
+    retired = [row["doc_id"] for row in rows]
+    if not retired:
+        return []
+    await conn.execute(
+        """UPDATE chunks SET valid_to=coalesce(valid_to,now())
+        WHERE customer_id=$1 AND doc_id=ANY($2::text[]) AND valid_to IS NULL""",
+        customer_id,
+        retired,
+    )
+    await conn.execute(
+        """UPDATE documents SET valid_to=coalesce(valid_to,now())
+        WHERE customer_id=$1 AND doc_id=ANY($2::text[]) AND valid_to IS NULL""",
+        customer_id,
+        retired,
+    )
+    return retired
+
+
+async def remove_repository_membership(
+    conn: Any,
+    customer_id: str,
+    installation_id: str,
+    repositories: set[str],
+    *,
+    remove_live: bool,
+    remove_history: bool,
+) -> list[str]:
+    """Fence membership removal and retire docs no accepted lane still represents."""
+    names = sorted(name.lower() for name in repositories if name)
+    if not names:
+        return []
+    candidates = await conn.fetch(
+        """SELECT DISTINCT doc_id FROM github_document_bindings
+        WHERE customer_id=$1 AND installation_id=$2 AND repository=ANY($3::text[])
+        ORDER BY doc_id""",
+        customer_id,
+        installation_id,
+        names,
+    )
+    doc_ids = [row["doc_id"] for row in candidates]
+    for doc_id in doc_ids:
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            advisory_lock_key("github-doc", customer_id, doc_id),
+        )
+    if remove_live:
+        await conn.execute(
+            """UPDATE github_document_bindings SET live_present=FALSE
+            WHERE customer_id=$1 AND installation_id=$2 AND repository=ANY($3::text[])""",
+            customer_id,
+            installation_id,
+            names,
+        )
+    if remove_history:
+        await conn.execute(
+            """UPDATE github_document_bindings SET history_present=FALSE
+            WHERE customer_id=$1 AND installation_id=$2 AND repository=ANY($3::text[])""",
+            customer_id,
+            installation_id,
+            names,
+        )
+    return await retire_unrepresented_documents(conn, customer_id, doc_ids)
+
+
 async def enqueue_legacy_webhook(customer_id, installation_id, envelope, event_id, payload_key):
     async with with_tenant(customer_id) as conn:
         await adoption_lock(conn, customer_id)
+        if await source_purge_active(conn, customer_id):
+            return False, True
         row = await conn.fetchrow(
             "SELECT * FROM github_installations WHERE customer_id=$1 AND installation_id=$2 FOR UPDATE",
             customer_id,
@@ -249,6 +370,27 @@ async def enqueue_event(
     # A retry of one history job deduplicates, but history and live keep separate
     # queue receipts and converge at stable document identities/source versions.
     event_id = f"v2:{installation['installation_id']}:{job_id or 'live'}:{source_event_id}"
+    if await conn.fetchval(
+        """SELECT 1 FROM ingestion_queue WHERE customer_id=$1
+        AND source_system='github' AND source_event_id=$2""",
+        installation["customer_id"],
+        event_id,
+    ):
+        return False
+    # The caller holds the installation row lock, so count+insert is atomic
+    # across replicas. History leaves twenty slots reserved for live webhooks;
+    # a full live queue returns 503 so GitHub redelivers instead of losing data.
+    outstanding = int(
+        await conn.fetchval(
+            """SELECT count(*) FROM ingestion_queue WHERE customer_id=$1
+            AND github_installation_id=$2 AND status IN ('v2_pending','v2_processing')""",
+            installation["customer_id"],
+            installation["installation_id"],
+        )
+    )
+    limit = MAX_HISTORY_QUEUE if job else MAX_INSTALLATION_QUEUE
+    if outstanding >= limit:
+        raise GitHubQueueCapacityReached(history=job is not None)
     return bool(
         await conn.fetchval(
             """INSERT INTO ingestion_queue(customer_id,source_system,source_event_id,status,
@@ -270,6 +412,9 @@ async def enqueue_live(
     customer_id: str, installation_id: str, envelope: dict, event_id: str
 ) -> bool:
     async with with_tenant(customer_id) as conn:
+        await adoption_lock(conn, customer_id)
+        if await source_purge_active(conn, customer_id):
+            return False
         row = await conn.fetchrow(
             "SELECT * FROM github_installations WHERE customer_id=$1 AND installation_id=$2 FOR UPDATE",
             customer_id,
@@ -280,6 +425,123 @@ async def enqueue_live(
         return await enqueue_event(
             conn, installation=row, envelope=envelope, source_event_id=event_id
         )
+
+
+async def revoke_repository_access(
+    customer_id: str,
+    installation_id: str,
+    repositories: list[str],
+) -> list[str]:
+    """Apply a provider-authoritative repository removal under the write fence.
+
+    Unlike a user's live-scope deselection, provider revocation removes both
+    live and explicit-history membership. Jobs that include a revoked root fail
+    visibly; jobs for unrelated roots and their immutable history remain valid.
+    """
+    removed = {name.strip().lower() for name in repositories if name and name.strip()}
+    if not removed:
+        return []
+    async with with_tenant(customer_id) as conn:
+        installation = await conn.fetchrow(
+            """SELECT * FROM github_installations WHERE customer_id=$1
+            AND installation_id=$2 FOR UPDATE""",
+            customer_id,
+            installation_id,
+        )
+        if installation is None or not installation["active"]:
+            return []
+        old_scope = decoded(installation["scope"])
+        new_scope = [
+            item for item in old_scope if item["external_id"].lower() not in removed
+        ]
+        scope_changed = len(new_scope) != len(old_scope)
+        if scope_changed:
+            installation = await conn.fetchrow(
+                """UPDATE github_installations SET scope=$3::jsonb,revision=revision+1,
+                generation=generation+1,updated_at=now(),last_error=$4
+                WHERE customer_id=$1 AND installation_id=$2 RETURNING *""",
+                customer_id,
+                installation_id,
+                json.dumps(new_scope),
+                "GitHub repository access changed; review the selected live scope",
+            )
+            # Cancel only live envelopes whose repository was revoked (or whose
+            # payload is too malformed to prove it remains authorized). Retag
+            # unaffected work with the fenced generation so it can still apply.
+            await conn.execute(
+                """UPDATE ingestion_queue SET status='v2_canceled',github_payload=NULL,
+                github_lease_id=NULL,completed_at=now() WHERE customer_id=$1
+                AND github_installation_id=$2 AND github_job_id IS NULL
+                AND (coalesce(lower(github_payload#>>'{payload,repository,full_name}'),'')=''
+                  OR lower(github_payload#>>'{payload,repository,full_name}')=ANY($3::text[]))
+                AND status IN ('v2_pending','v2_processing')""",
+                customer_id,
+                installation_id,
+                sorted(removed),
+            )
+            await conn.execute(
+                """UPDATE ingestion_queue SET github_generation=$3 WHERE customer_id=$1
+                AND github_installation_id=$2 AND github_job_id IS NULL
+                AND status IN ('v2_pending','v2_processing')""",
+                customer_id,
+                installation_id,
+                installation["generation"],
+            )
+
+        jobs = await conn.fetch(
+            """SELECT * FROM github_backfill_jobs WHERE customer_id=$1
+            AND installation_id=$2 AND state IN ('queued','running','cancel_requested')
+            ORDER BY id FOR UPDATE""",
+            customer_id,
+            installation_id,
+        )
+        display = ", ".join(sorted(removed)[:3])
+        if len(removed) > 3:
+            display += f" and {len(removed) - 3} more"
+        for job in jobs:
+            if not (scope_names(job["scope"]) & removed):
+                continue
+            error = f"GitHub access was removed for {display}; revise scope and start again"
+            await conn.execute(
+                """UPDATE ingestion_queue SET status='v2_canceled',github_payload=NULL,
+                github_lease_id=NULL,completed_at=now() WHERE customer_id=$1
+                AND github_job_id=$2 AND status IN ('v2_pending','v2_processing')""",
+                customer_id,
+                job["id"],
+            )
+            await conn.execute(
+                """UPDATE github_backfill_jobs SET state='failed',finished_at=now(),
+                lease_id=NULL,last_error=$3 WHERE customer_id=$1 AND id=$2""",
+                customer_id,
+                job["id"],
+                error,
+            )
+            if job["lease_id"] is not None:
+                await conn.execute(
+                    """UPDATE github_installations SET history_lease_id=NULL,
+                    history_heartbeat_at=NULL WHERE customer_id=$1 AND installation_id=$2
+                    AND history_lease_id=$3""",
+                    customer_id,
+                    installation_id,
+                    job["lease_id"],
+                )
+        await remove_repository_membership(
+            conn,
+            customer_id,
+            installation_id,
+            removed,
+            remove_live=True,
+            remove_history=True,
+        )
+        if scope_changed and installation["sync_enabled"] and new_scope:
+            await create_job(
+                conn,
+                installation,
+                new_scope,
+                f"catchup:{installation['generation']}",
+                kind="catchup",
+            )
+    return sorted(removed)
 
 
 async def admit_projection(
@@ -352,10 +614,20 @@ async def cancel_job(customer_id: str, installation_id: str, job_id: UUID) -> di
                 customer_id,
                 job_id,
             )
+            job_lease = row["lease_id"]
             row = await conn.fetchrow(
                 """UPDATE github_backfill_jobs SET state='canceled',finished_at=now(),lease_id=NULL
                    WHERE customer_id=$1 AND id=$2 RETURNING *""",
                 customer_id,
                 job_id,
             )
+            if job_lease is not None:
+                await conn.execute(
+                    """UPDATE github_installations SET history_lease_id=NULL,
+                    history_heartbeat_at=NULL WHERE customer_id=$1 AND installation_id=$2
+                    AND history_lease_id=$3""",
+                    customer_id,
+                    installation_id,
+                    job_lease,
+                )
         return public_job(row)

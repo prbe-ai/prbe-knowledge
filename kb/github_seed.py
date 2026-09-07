@@ -109,20 +109,25 @@ async def seed_github_installation(
     # so store an opaque placeholder that reads clearly in a DB dump.
     placeholder = encrypt_token("installation-minted-on-demand")
 
-    # Record the mapping FIRST so the mint path can resolve
-    # customer -> installation during the dry-run fetch below (standalone reads
-    # integration_tokens.scope; hosted resolves via prbe-backend).
-    await record_mapping(
-        customer_id=customer_id,
-        source_system=SourceSystem.GITHUB,
-        external_id=installation_id,
-        external_name=None,
-        metadata={"installation_id": installation_id},
-    )
     async with with_tenant(customer_id) as conn:
-        from kb.github_control import adoption_lock
+        from kb.github_control import adoption_lock, source_purge_active
 
         await adoption_lock(conn, customer_id)
+        if await source_purge_active(conn, customer_id):
+            raise GitHubLegacyWorkPending(
+                "GitHub source removal is still in progress; retry connection after it completes"
+            )
+        # Keep mapping creation inside the adoption boundary. record_mapping uses
+        # its own connection for global external-id uniqueness, but the advisory
+        # lock prevents source-wide purge from snapshotting between this mapping
+        # and the installation control row below.
+        await record_mapping(
+            customer_id=customer_id,
+            source_system=SourceSystem.GITHUB,
+            external_id=installation_id,
+            external_name=None,
+            metadata={"installation_id": installation_id},
+        )
         existing = await conn.fetchrow(
             "SELECT managed FROM github_installations WHERE customer_id=$1 AND installation_id=$2 FOR UPDATE",
             customer_id,

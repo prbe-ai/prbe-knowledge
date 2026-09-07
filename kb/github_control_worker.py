@@ -17,10 +17,20 @@ from uuid import uuid4
 from engine.ingest.normalizer import Normalizer
 from engine.shared.constants import SourceSystem
 from engine.shared.db import raw_conn, with_tenant
-from engine.shared.exceptions import DuplicateEventIgnored, UnsupportedEventType
+from engine.shared.exceptions import (
+    DuplicateEventIgnored,
+    GitHubIdentityConflict,
+    UnsupportedEventType,
+)
 from engine.shared.logging import get_logger
 from engine.shared.models import WebhookEvent
-from kb.github_control import decoded, enqueue_event, installation_token
+from kb.github_control import (
+    MAX_HISTORY_QUEUE,
+    GitHubQueueCapacityReached,
+    decoded,
+    enqueue_event,
+    installation_token,
+)
 from kb.github_control_routes import list_repositories
 from kb.handlers.github import GitHubConnector
 
@@ -46,6 +56,24 @@ class GitHubControlWorker:
     def shutdown(self):
         self.shutdown_event.set()
 
+    async def _schema_ready(self) -> bool:
+        """Stay dormant across rolling deploys until the complete v2 schema commits."""
+        async with raw_conn() as conn:
+            return bool(
+                await conn.fetchval(
+                    """SELECT to_regclass('github_installations') IS NOT NULL
+                    AND to_regclass('github_backfill_jobs') IS NOT NULL
+                    AND to_regclass('github_backfill_retry_receipts') IS NOT NULL
+                    AND to_regclass('github_document_bindings') IS NOT NULL
+                    AND EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_schema=current_schema() AND table_name='github_installations'
+                        AND column_name='history_lease_id')
+                    AND EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_schema=current_schema() AND table_name='github_document_bindings'
+                        AND column_name='repository')"""
+                )
+            )
+
     async def _heartbeat(self):
         while not self.shutdown_event.is_set():
             async with raw_conn() as conn:
@@ -61,6 +89,14 @@ class GitHubControlWorker:
                 await asyncio.wait_for(self.shutdown_event.wait(), 15)
 
     async def run(self):
+        while not self.shutdown_event.is_set():
+            if await self._schema_ready():
+                break
+            log.info("github_v2.schema_not_ready")
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.shutdown_event.wait(), 5)
+        if self.shutdown_event.is_set():
+            return
         heartbeat = asyncio.create_task(self._heartbeat())
         try:
             while not self.shutdown_event.is_set():
@@ -115,6 +151,12 @@ class GitHubControlWorker:
                 customer_id,
             )
             await conn.execute(
+                """UPDATE github_installations SET history_lease_id=NULL,
+                history_heartbeat_at=NULL WHERE customer_id=$1 AND history_lease_id IS NOT NULL
+                AND history_heartbeat_at < now()-interval '120 seconds'""",
+                customer_id,
+            )
+            await conn.execute(
                 """UPDATE ingestion_queue q SET status='v2_canceled',github_payload=NULL,github_lease_id=NULL,
                 completed_at=now() FROM github_backfill_jobs j WHERE q.customer_id=$1 AND j.customer_id=$1
                 AND q.github_job_id=j.id AND j.state IN ('failed','canceled')
@@ -157,16 +199,60 @@ class GitHubControlWorker:
     async def history_step(self, customer_id: str) -> bool:
         lease = uuid4()
         async with with_tenant(customer_id) as conn:
-            job = await conn.fetchrow(
-                """SELECT j.* FROM github_backfill_jobs j JOIN github_installations i
-                USING(customer_id,installation_id) WHERE j.customer_id=$1 AND i.active AND j.state='queued'
-                AND NOT j.enumeration_complete AND (SELECT count(*) FROM ingestion_queue q
-                  WHERE q.customer_id=j.customer_id AND q.github_installation_id=j.installation_id
-                  AND q.status IN ('v2_pending','v2_processing')) < 200
-                ORDER BY j.heartbeat_at NULLS FIRST,j.created_at FOR UPDATE OF j SKIP LOCKED LIMIT 1""",
+            installation = await conn.fetchrow(
+                """SELECT i.* FROM github_installations i WHERE i.customer_id=$1 AND i.active
+                AND (i.history_lease_id IS NULL OR
+                  i.history_heartbeat_at < now()-interval '120 seconds')
+                AND EXISTS (SELECT 1 FROM github_backfill_jobs j
+                  WHERE j.customer_id=i.customer_id AND j.installation_id=i.installation_id
+                    AND j.state='queued' AND NOT j.enumeration_complete)
+                AND (SELECT count(*) FROM ingestion_queue q
+                  WHERE q.customer_id=i.customer_id AND q.github_installation_id=i.installation_id
+                    AND q.status IN ('v2_pending','v2_processing')) < $2
+                ORDER BY i.history_last_claimed_at NULLS FIRST,i.installation_id
+                FOR UPDATE OF i SKIP LOCKED LIMIT 1""",
                 customer_id,
+                MAX_HISTORY_QUEUE,
+            )
+            if not installation:
+                return False
+            outstanding = int(
+                await conn.fetchval(
+                    """SELECT count(*) FROM ingestion_queue WHERE customer_id=$1
+                    AND github_installation_id=$2
+                    AND status IN ('v2_pending','v2_processing')""",
+                    customer_id,
+                    installation["installation_id"],
+                )
+            )
+            capacity = max(0, MAX_HISTORY_QUEUE - outstanding)
+            if capacity == 0:
+                return False
+            await conn.execute(
+                """UPDATE github_installations SET history_lease_id=$3,
+                history_heartbeat_at=now(),history_last_claimed_at=now()
+                WHERE customer_id=$1 AND installation_id=$2""",
+                customer_id,
+                installation["installation_id"],
+                lease,
+            )
+            job = await conn.fetchrow(
+                """SELECT * FROM github_backfill_jobs WHERE customer_id=$1
+                AND installation_id=$2 AND state='queued' AND NOT enumeration_complete
+                ORDER BY heartbeat_at NULLS FIRST,created_at,id
+                FOR UPDATE SKIP LOCKED LIMIT 1""",
+                customer_id,
+                installation["installation_id"],
             )
             if not job:
+                await conn.execute(
+                    """UPDATE github_installations SET history_lease_id=NULL,
+                    history_heartbeat_at=NULL WHERE customer_id=$1 AND installation_id=$2
+                    AND history_lease_id=$3""",
+                    customer_id,
+                    installation["installation_id"],
+                    lease,
+                )
                 return False
             job = await conn.fetchrow(
                 """UPDATE github_backfill_jobs SET state='running',lease_id=$3,
@@ -227,13 +313,19 @@ class GitHubControlWorker:
                                 or current["lease_id"] != lease
                             ):
                                 return True
-                            inserted = await enqueue_event(
-                                conn,
-                                installation=installation,
-                                envelope=envelope,
-                                source_event_id=event.source_event_id,
-                                job=current,
-                            )
+                            try:
+                                inserted = await enqueue_event(
+                                    conn,
+                                    installation=installation,
+                                    envelope=envelope,
+                                    source_event_id=event.source_event_id,
+                                    job=current,
+                                )
+                            except GitHubQueueCapacityReached:
+                                # Do not advance the provider cursor past an
+                                # event that was not durably admitted.
+                                complete = False
+                                break
                             new_events += int(inserted)
                             await conn.execute(
                                 """UPDATE github_backfill_jobs SET cursor=$3,heartbeat_at=now(),
@@ -243,7 +335,15 @@ class GitHubControlWorker:
                                 event.raw_payload.get("_cursor", cursor),
                                 int(inserted),
                             )
-                        if new_events >= 100:
+                            await conn.execute(
+                                """UPDATE github_installations SET history_heartbeat_at=now()
+                                WHERE customer_id=$1 AND installation_id=$2
+                                AND history_lease_id=$3""",
+                                customer_id,
+                                job["installation_id"],
+                                lease,
+                            )
+                        if new_events >= min(100, capacity):
                             complete = False
                             break
                 finally:
@@ -279,6 +379,16 @@ class GitHubControlWorker:
                     job["id"],
                     lease,
                     f"GitHub history failed ({type(exc).__name__}); check access and retry",
+                )
+        finally:
+            async with with_tenant(customer_id) as conn:
+                await conn.execute(
+                    """UPDATE github_installations SET history_lease_id=NULL,
+                    history_heartbeat_at=NULL WHERE customer_id=$1 AND installation_id=$2
+                    AND history_lease_id=$3""",
+                    customer_id,
+                    job["installation_id"],
+                    lease,
                 )
         return True
 
@@ -322,11 +432,25 @@ class GitHubControlWorker:
                 token = installation_token(customer_id, row["github_installation_id"])
                 hydrated = await self.connector.fetch_supplementary(event, token)
                 result = await self.connector.normalize(event, hydrated)
-                for doc in result.documents:
+                binding_lane = "live"
+                if row["github_job_id"] is not None:
+                    async with with_tenant(customer_id) as conn:
+                        job_kind = await conn.fetchval(
+                            "SELECT kind FROM github_backfill_jobs WHERE customer_id=$1 AND id=$2",
+                            customer_id,
+                            row["github_job_id"],
+                        )
+                    binding_lane = "history" if job_kind == "backfill" else "live"
+                repository = ((payload.get("repository") or {}).get("full_name") or "").lower()
+                documents = [
+                    *result.documents,
+                    *(item.document for item in result.documents_with_chunks),
+                ]
+                for doc in documents:
                     doc.metadata["_github_installation_id"] = row["github_installation_id"]
-                    doc.metadata["_github_operation"] = (
-                        "history" if row["github_job_id"] else "live"
-                    )
+                    doc.metadata["_github_operation"] = binding_lane
+                    doc.metadata["_github_binding_lane"] = binding_lane
+                    doc.metadata["_github_repository"] = repository
                 if result.is_empty:
                     raise UnsupportedEventType(
                         result.skipped_reason or "No supported GitHub content"
@@ -341,6 +465,8 @@ class GitHubControlWorker:
                 if outcome.failed_chunk_count or outcome.quarantined_doc_ids:
                     raise ValueError("Some GitHub content could not be indexed")
                 await self._finish(row, lease, "v2_completed")
+        except GitHubIdentityConflict as exc:
+            await self._fail_identity_conflict(row, lease, str(exc))
         except (DuplicateEventIgnored, UnsupportedEventType):
             await self._finish(row, lease, "v2_skipped")
         except Exception as exc:
@@ -371,6 +497,71 @@ class GitHubControlWorker:
                         else "GitHub indexing failed repeatedly; pause and resume to catch up",
                     )
         return True
+
+    async def _fail_identity_conflict(self, row, lease, error: str) -> None:
+        """Terminalize a native/v2 identity collision under normal lock order."""
+        customer_id = row["customer_id"]
+        async with with_tenant(customer_id) as conn:
+            installation = await conn.fetchrow(
+                """SELECT * FROM github_installations WHERE customer_id=$1
+                AND installation_id=$2 FOR UPDATE""",
+                customer_id,
+                row["github_installation_id"],
+            )
+            job = None
+            if row["github_job_id"] is not None:
+                job = await conn.fetchrow(
+                    """SELECT * FROM github_backfill_jobs WHERE customer_id=$1
+                    AND id=$2 FOR UPDATE""",
+                    customer_id,
+                    row["github_job_id"],
+                )
+            changed = await conn.fetchval(
+                """UPDATE ingestion_queue SET status='v2_failed',error=$4,
+                github_payload=NULL,github_lease_id=NULL,completed_at=now()
+                WHERE customer_id=$1 AND queue_id=$2 AND github_lease_id=$3
+                AND status='v2_processing' RETURNING queue_id""",
+                customer_id,
+                row["queue_id"],
+                lease,
+                error,
+            )
+            if not changed:
+                return
+            if job is not None:
+                await conn.execute(
+                    """UPDATE ingestion_queue SET status='v2_canceled',github_payload=NULL,
+                    github_lease_id=NULL,completed_at=now() WHERE customer_id=$1
+                    AND github_job_id=$2 AND status IN ('v2_pending','v2_processing')""",
+                    customer_id,
+                    job["id"],
+                )
+                await conn.execute(
+                    """UPDATE github_backfill_jobs SET state='failed',lease_id=NULL,
+                    finished_at=now(),last_error=$3 WHERE customer_id=$1 AND id=$2""",
+                    customer_id,
+                    job["id"],
+                    error,
+                )
+                if installation and job["lease_id"] is not None:
+                    await conn.execute(
+                        """UPDATE github_installations SET history_lease_id=NULL,
+                        history_heartbeat_at=NULL WHERE customer_id=$1
+                        AND installation_id=$2 AND history_lease_id=$3""",
+                        customer_id,
+                        row["github_installation_id"],
+                        job["lease_id"],
+                    )
+            elif installation:
+                await conn.execute(
+                    """UPDATE github_installations SET last_attempt_at=now(),last_error=$4
+                    WHERE customer_id=$1 AND installation_id=$2 AND active
+                    AND generation=$3""",
+                    customer_id,
+                    row["github_installation_id"],
+                    row["github_generation"],
+                    error,
+                )
 
     async def _finish(self, row, lease, state):
         async with with_tenant(row["customer_id"]) as conn:

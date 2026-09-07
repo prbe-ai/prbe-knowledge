@@ -10,7 +10,11 @@ from fastapi import HTTPException
 
 from engine.shared.db import with_tenant
 from engine.shared.locks import advisory_lock_key
-from kb.github_control import adoption_lock, get_installation
+from kb.github_control import (
+    adoption_lock,
+    get_installation,
+    retire_unrepresented_documents,
+)
 
 
 async def _owned_doc_ids(conn, customer_id, installation_id):
@@ -79,7 +83,9 @@ async def purge(customer_id: str, installation_id: str, *, allow_legacy: bool = 
             )
         await conn.execute(
             """UPDATE github_installations SET active=FALSE,sync_enabled=FALSE,managed=TRUE,
-            generation=generation+1,revision=revision+1,updated_at=now() WHERE customer_id=$1 AND installation_id=$2""",
+            generation=generation+1,revision=revision+1,updated_at=now(),
+            history_lease_id=NULL,history_heartbeat_at=NULL
+            WHERE customer_id=$1 AND installation_id=$2""",
             customer_id,
             installation_id,
         )
@@ -111,6 +117,9 @@ async def purge(customer_id: str, installation_id: str, *, allow_legacy: bool = 
                 advisory_lock_key("github-doc", customer_id, candidate["doc_id"]),
             )
         ids = await _owned_doc_ids(conn, customer_id, installation_id)
+        shared_ids = [
+            candidate["doc_id"] for candidate in candidates if candidate["doc_id"] not in set(ids)
+        ]
         chunks = await conn.fetchval(
             "SELECT count(*) FROM chunks WHERE customer_id=$1 AND doc_id=ANY($2::text[])",
             customer_id,
@@ -141,6 +150,10 @@ async def purge(customer_id: str, installation_id: str, *, allow_legacy: bool = 
             customer_id,
             installation_id,
         )
+        # A remaining inactive binding preserves another installation's retired
+        # history, but must not keep this installation's formerly-live document
+        # searchable after its last active membership disappears.
+        await retire_unrepresented_documents(conn, customer_id, shared_ids)
         await conn.execute(
             """DELETE FROM integration_tokens WHERE customer_id=$1 AND source_system='github'
             AND scope=$2 AND device_id IS NULL""",
