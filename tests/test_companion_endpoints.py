@@ -388,3 +388,45 @@ async def test_config_age_fits_the_client(enabled: str) -> None:
         "POST", "/companion/poll", {"recipient": ALICE, "session_id": "sess-http"}
     )
     assert poll.json()["config"]["max_config_age_s"] <= 300
+
+
+@pytest.mark.asyncio
+async def test_observe_route_qualifies_an_attempt_and_refuses_unknowns(enabled: str) -> None:
+    card = (await _request("POST", "/companion/enqueue", _enqueue_body())).json()["card"]
+    attempt = str(uuid4())
+    ack_body = {
+        "mailbox_id": card["mailbox_id"],
+        "attempt_id": attempt,
+        "seam": "stop",
+        "outcome": "emitted",
+        "receiving_instance": "dev:claude-code",
+    }
+    assert (await _request("POST", "/companion/ack", ack_body)).status_code == 200
+    body = {
+        "mailbox_id": card["mailbox_id"],
+        "attempt_id": attempt,
+        "observed": True,
+        "observer": "tap:dev",
+        "client_observed_at": "2026-09-07T12:00:00+00:00",
+        "evidence": {"where": "transcript:user"},
+    }
+    one = await _request("POST", "/companion/observe", body)
+    two = await _request("POST", "/companion/observe", {**body, "observed": False})
+    assert one.status_code == 200, one.text
+    assert one.json()["created"] is True and two.json()["created"] is False
+    assert one.json()["observation_id"] == two.json()["observation_id"]
+    rows = (await _request("GET", "/companion/deliveries?session_id=sess-http")).json()
+    assert rows["deliveries"][0]["observed_in_context"] is True
+    assert rows["deliveries"][0]["observation_evidence"] == {"where": "transcript:user"}
+    rep = (await _request("GET", "/companion/report?session_id=sess-http")).json()
+    assert rep["seams"][0]["observed_in_context"] == 1 and rep["seams"][0]["not_observed"] == 0
+    # unknown attempt -> 404; unknown field / naive timestamp -> 422
+    assert (
+        await _request("POST", "/companion/observe", {**body, "attempt_id": str(uuid4())})
+    ).status_code == 404
+    assert (await _request("POST", "/companion/observe", {**body, "extra": 1})).status_code == 422
+    assert (
+        await _request(
+            "POST", "/companion/observe", {**body, "client_observed_at": "2026-09-07T12:00:00"}
+        )
+    ).status_code == 422

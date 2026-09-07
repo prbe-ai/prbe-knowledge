@@ -33,7 +33,7 @@ from engine.shared.db import raw_conn, with_tenant
 TENANT_A = "cust-companion-a"
 TENANT_B = "cust-companion-b"
 RLS_ROLE = "prbe_rls_test"
-TABLES = ("companion_mailbox", "companion_deliveries", "companion_claims")
+TABLES = ("companion_mailbox", "companion_deliveries", "companion_claims", "companion_observations")
 
 
 @pytest_asyncio.fixture
@@ -174,3 +174,70 @@ async def test_claims_are_mutable_within_tenant_only(two_tenants) -> None:
     async with with_tenant(b) as conn:
         await conn.execute(f"SET LOCAL ROLE {RLS_ROLE}")
         assert await conn.fetchval("SELECT count(*) FROM companion_claims") == 0
+
+
+@pytest.mark.asyncio
+async def test_observations_are_append_only_and_tenant_scoped(two_tenants) -> None:
+    a, b = two_tenants
+    async with with_tenant(a) as conn:
+        mid = await _seed_card(conn, a, "sess-a")
+        attempt = uuid4()
+        await conn.execute(
+            """
+            INSERT INTO companion_deliveries
+                (customer_id, mailbox_id, attempt_id, seam, outcome, receiving_instance)
+            VALUES ($1, $2, $3, 'stop', 'emitted', 'dev')
+            """,
+            a,
+            mid,
+            attempt,
+        )
+    async with with_tenant(a) as conn:
+        await conn.execute(f"SET LOCAL ROLE {RLS_ROLE}")
+        await conn.execute(
+            """
+            INSERT INTO companion_observations
+                (customer_id, mailbox_id, attempt_id, observed, observer)
+            VALUES ($1, $2, $3, true, 'tap:t')
+            """,
+            a,
+            mid,
+            attempt,
+        )
+        assert (
+            await conn.execute(
+                "UPDATE companion_observations SET observed = false WHERE attempt_id = $1", attempt
+            )
+            == "UPDATE 0"
+        )
+        assert (
+            await conn.execute("DELETE FROM companion_observations WHERE attempt_id = $1", attempt)
+            == "DELETE 0"
+        )
+        # A second verdict for the same attempt is refused by the unique key.
+        with pytest.raises(asyncpg.UniqueViolationError):
+            await conn.execute(
+                """
+                INSERT INTO companion_observations
+                    (customer_id, mailbox_id, attempt_id, observed, observer)
+                VALUES ($1, $2, $3, false, 'tap:t')
+                """,
+                a,
+                mid,
+                attempt,
+            )
+    async with with_tenant(b) as conn:
+        await conn.execute(f"SET LOCAL ROLE {RLS_ROLE}")
+        assert await conn.fetch("SELECT * FROM companion_observations") == []
+        # A cross-tenant observation cannot be filed under a's delivery.
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await conn.execute(
+                """
+                INSERT INTO companion_observations
+                    (customer_id, mailbox_id, attempt_id, observed, observer)
+                VALUES ($1, $2, $3, true, 'tap:t')
+                """,
+                a,
+                mid,
+                uuid4(),
+            )

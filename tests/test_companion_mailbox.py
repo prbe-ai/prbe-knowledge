@@ -33,10 +33,12 @@ from engine.shared.companion.mailbox import (
     Card,
     EnqueueConflict,
     EnqueueRefused,
+    UnknownAttempt,
     ack,
     claim_for_actor,
     deliveries,
     enqueue,
+    observe,
     pending,
     report,
 )
@@ -419,3 +421,74 @@ async def test_deliveries_readback_by_recipient_covers_actor_lane(tenant) -> Non
     assert len(by_recipient) == 1 and by_recipient[0]["evidence"] == {"nonce_seen": True}
     assert by_recipient[0]["session_id"] is None
     assert await deliveries(TENANT, session_id="sess-1") == []
+
+
+# --------------------------------------------------------------------------
+# observe (spec §8: observed-in-context is a LATER fact than the ack)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_observe_qualifies_one_attempt_first_write_wins(tenant) -> None:
+    card, _ = await _enqueue()
+    attempt = uuid4()
+    await ack(
+        TENANT,
+        mailbox_id=card.mailbox_id,
+        attempt_id=attempt,
+        seam="stop",
+        outcome="emitted",
+        receiving_instance="dev",
+    )
+    before = await deliveries(TENANT, session_id=card.session_id)
+    assert before[0]["observed_in_context"] is None, "nobody looked yet"
+
+    oid, created = await observe(
+        TENANT, mailbox_id=card.mailbox_id, attempt_id=attempt, observed=True, observer="tap:t"
+    )
+    assert created is True
+    again = await observe(
+        TENANT, mailbox_id=card.mailbox_id, attempt_id=attempt, observed=False, observer="tap:t"
+    )
+    assert again == (oid, False), "a contradicting second verdict does not overwrite"
+
+    rows = await deliveries(TENANT, session_id=card.session_id)
+    assert rows[0]["observed_in_context"] is True and rows[0]["observer"] == "tap:t"
+    agg = await report(TENANT, session_id=card.session_id)
+    assert agg[0]["observed_in_context"] == 1 and agg[0]["not_observed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_observe_negative_counts_separately_and_unknown_attempt_refused(tenant) -> None:
+    card, _ = await _enqueue()
+    attempt = uuid4()
+    await ack(
+        TENANT,
+        mailbox_id=card.mailbox_id,
+        attempt_id=attempt,
+        seam="stop",
+        outcome="emitted",
+        receiving_instance="dev",
+    )
+    await observe(
+        TENANT, mailbox_id=card.mailbox_id, attempt_id=attempt, observed=False, observer="tap:t"
+    )
+    agg = await report(TENANT, session_id=card.session_id)
+    assert agg[0]["observed_in_context"] == 0 and agg[0]["not_observed"] == 1
+    with pytest.raises(UnknownAttempt):
+        await observe(
+            TENANT, mailbox_id=card.mailbox_id, attempt_id=uuid4(), observed=True, observer="x"
+        )
+    # An actuator that already knew at ack time still counts as observed.
+    other, _ = await _enqueue(dedupe_key="obs-2")
+    await ack(
+        TENANT,
+        mailbox_id=other.mailbox_id,
+        attempt_id=uuid4(),
+        seam="stop",
+        outcome="emitted",
+        receiving_instance="dev",
+        evidence={"observed_in_context": True},
+    )
+    agg = await report(TENANT, session_id=card.session_id)
+    assert agg[0]["observed_in_context"] == 1

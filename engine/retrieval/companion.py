@@ -42,11 +42,13 @@ from engine.shared.companion.mailbox import (
     Card,
     EnqueueConflict,
     EnqueueRefused,
+    UnknownAttempt,
     UnknownCard,
     ack,
     claim_for_actor,
     deliveries,
     enqueue,
+    observe,
     pending,
     report,
 )
@@ -199,6 +201,21 @@ class AckResponse(BaseModel):
     created: bool = False
 
 
+class ObserveRequest(_Strict):
+    mailbox_id: UUID
+    attempt_id: UUID
+    observed: bool
+    observer: str = Field(min_length=1, max_length=200)
+    client_observed_at: AwareDatetime | None = None
+    evidence: dict[str, Any] = Field(default_factory=dict)
+
+
+class ObserveResponse(BaseModel):
+    capability: CapabilityOut
+    observation_id: int | None = None
+    created: bool = False
+
+
 class DeliveryOut(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -222,6 +239,12 @@ class DeliveryOut(BaseModel):
     intended_seam: str | None
     class_: str = Field(alias="class")
     enqueued_at: datetime
+    #: None = nobody looked; True/False = an observer's bounded verdict.
+    observed_in_context: bool | None = None
+    observer: str | None = None
+    observed_at: datetime | None = None
+    client_observed_at: datetime | None = None
+    observation_evidence: dict[str, Any] | None = None
 
 
 class DeliveriesResponse(BaseModel):
@@ -246,6 +269,8 @@ class SeamReportOut(BaseModel):
     attempts: int
     harness_accepted: int
     observed_in_context: int
+    #: An observer looked and did NOT find it: emitted-but-never-seen.
+    not_observed: int = 0
     latency_ms: LatencyOut
     first_at: datetime
     last_at: datetime
@@ -381,6 +406,39 @@ async def ack_delivery(
     return AckResponse(capability=capability, delivery_id=delivery_id, created=created)
 
 
+@companion_router.post("/companion/observe", response_model=ObserveResponse)
+async def observe_delivery(
+    req: ObserveRequest,
+    customer_id: str = Depends(authenticate_query),
+) -> ObserveResponse:
+    """Qualify one delivery attempt with the model-context fact (spec §8).
+
+    `observed=true`: the card body / trial nonce was seen where the model
+    reads (the tap finds it in the transcript it tails; a lab driver may say
+    so by hand). `observed=false`: a bounded search finished without finding
+    it. First write per attempt wins; 404 when the attempt is not a delivery
+    of this tenant's card.
+    """
+    capability = await _envelope(customer_id)
+    if not capability.enabled:
+        return ObserveResponse(capability=capability)
+    try:
+        observation_id, created = await observe(
+            customer_id,
+            mailbox_id=req.mailbox_id,
+            attempt_id=req.attempt_id,
+            observed=req.observed,
+            observer=req.observer,
+            client_observed_at=req.client_observed_at,
+            evidence=req.evidence,
+        )
+    except UnknownAttempt as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AckRefused as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ObserveResponse(capability=capability, observation_id=observation_id, created=created)
+
+
 @companion_router.get("/companion/deliveries", response_model=DeliveriesResponse)
 async def list_deliveries(
     session_id: str | None = Query(default=None, min_length=1, max_length=SESSION_ID_MAX),
@@ -433,6 +491,7 @@ async def seam_report(
                 attempts=r["attempts"],
                 harness_accepted=r["harness_accepted"],
                 observed_in_context=r["observed_in_context"],
+                not_observed=r.get("not_observed", 0),
                 latency_ms=LatencyOut(
                     n=r["latency_n"],
                     p50=r["latency_p50"],

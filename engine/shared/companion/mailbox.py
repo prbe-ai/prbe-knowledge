@@ -500,6 +500,61 @@ async def ack(
     return int(existing_id), False
 
 
+class UnknownAttempt(AckRefused):
+    """No delivery row carries this attempt_id for this tenant."""
+
+
+async def observe(
+    customer_id: str,
+    *,
+    mailbox_id: UUID,
+    attempt_id: UUID,
+    observed: bool,
+    observer: str,
+    client_observed_at: datetime | None = None,
+    evidence: dict[str, Any] | None = None,
+) -> tuple[int, bool]:
+    """Qualify one delivery attempt with the model-context fact (spec §8).
+
+    First write wins: an observation is a bounded search's verdict, and a
+    later contradicting row would make the catalog say two things. Returns
+    `(observation_id, created)`. Raises `UnknownAttempt` when no delivery row
+    of this tenant carries `attempt_id` (the composite FK is the guard), and
+    `AckRefused` for a malformed observer.
+    """
+    if not isinstance(observer, str) or not observer.strip() or len(observer) > 200:
+        raise AckRefused("observer is required (1..200 chars)")
+    async with with_tenant(customer_id) as conn:
+        try:
+            new_id = await conn.fetchval(
+                """
+                INSERT INTO companion_observations
+                    (customer_id, mailbox_id, attempt_id, observed, observer,
+                     client_observed_at, evidence)
+                VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                ON CONFLICT (customer_id, attempt_id) DO NOTHING
+                RETURNING id
+                """,
+                customer_id,
+                mailbox_id,
+                attempt_id,
+                observed,
+                observer,
+                client_observed_at,
+                json.dumps(evidence or {}),
+            )
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise UnknownAttempt("attempt_id is not a delivery of this tenant's card") from exc
+        if new_id is not None:
+            return int(new_id), True
+        existing = await conn.fetchval(
+            "SELECT id FROM companion_observations WHERE customer_id = $1 AND attempt_id = $2",
+            customer_id,
+            attempt_id,
+        )
+    return int(existing), False
+
+
 async def deliveries(
     customer_id: str,
     *,
@@ -522,10 +577,14 @@ async def deliveries(
                    d.session_state, d.client_received_at, d.client_emitted_at,
                    d.receipt_to_emission_ms, d.ack_received_at, d.evidence,
                    m.session_id, m.recipient, m.trial_id, m.intended_seam, m.class,
-                   m.created_at AS enqueued_at
+                   m.created_at AS enqueued_at,
+                   o.observed AS observed_in_context, o.observer, o.observed_at,
+                   o.client_observed_at, o.evidence AS observation_evidence
             FROM companion_deliveries d
             JOIN companion_mailbox m
               ON m.customer_id = d.customer_id AND m.id = d.mailbox_id
+            LEFT JOIN companion_observations o
+              ON o.customer_id = d.customer_id AND o.attempt_id = d.attempt_id
             WHERE d.customer_id = $1
               AND ($2::text IS NULL OR m.session_id = $2)
               AND ($3::text IS NULL OR m.recipient = $3)
@@ -542,6 +601,8 @@ async def deliveries(
         d = dict(r)
         if isinstance(d.get("evidence"), str):
             d["evidence"] = json.loads(d["evidence"])
+        if isinstance(d.get("observation_evidence"), str):
+            d["observation_evidence"] = json.loads(d["observation_evidence"])
         out.append(d)
     return out
 
@@ -576,7 +637,12 @@ async def report(
             SELECT d.seam, d.outcome,
                    count(*)::int AS attempts,
                    count(*) FILTER (WHERE d.evidence -> $4 = 'true'::jsonb)::int AS harness_accepted,
-                   count(*) FILTER (WHERE d.evidence -> $5 = 'true'::jsonb)::int AS observed_in_context,
+                   count(*) FILTER (
+                       WHERE d.evidence -> $5 = 'true'::jsonb OR o.observed IS TRUE
+                   )::int AS observed_in_context,
+                   count(*) FILTER (
+                       WHERE o.observed IS FALSE AND (d.evidence -> $5) IS DISTINCT FROM 'true'::jsonb
+                   )::int AS not_observed,
                    count(d.receipt_to_emission_ms)::int AS latency_n,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY d.receipt_to_emission_ms) AS latency_p50,
                    percentile_cont(0.95) WITHIN GROUP (ORDER BY d.receipt_to_emission_ms) AS latency_p95,
@@ -587,6 +653,8 @@ async def report(
             FROM companion_deliveries d
             JOIN companion_mailbox m
               ON m.customer_id = d.customer_id AND m.id = d.mailbox_id
+            LEFT JOIN companion_observations o
+              ON o.customer_id = d.customer_id AND o.attempt_id = d.attempt_id
             WHERE d.customer_id = $1
               AND ($2::text IS NULL OR m.session_id = $2)
               AND ($3::text IS NULL OR m.recipient = $3)

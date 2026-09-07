@@ -2056,3 +2056,38 @@ ALTER TABLE companion_claims FORCE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON companion_claims
     USING (customer_id = current_setting('app.current_customer_id', true))
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+
+-- ---------------------------------------------------------------------------
+-- 0128_companion_observations: append-only sidecar qualifying one delivery
+-- attempt with whether the model-readable context carried the card (spec §8).
+-- ---------------------------------------------------------------------------
+CREATE TABLE companion_observations (
+    id                 BIGSERIAL PRIMARY KEY,
+    customer_id        TEXT NOT NULL REFERENCES customers(customer_id) ON DELETE CASCADE,
+    mailbox_id         UUID NOT NULL,
+    attempt_id         UUID NOT NULL,
+    -- true: the card body / trial nonce was seen where the model reads.
+    -- false: a bounded search ended without finding it.
+    observed           BOOLEAN NOT NULL,
+    -- Who looked: 'tap:<device>:<harness>:<version>', 'driver:<user>', ...
+    observer           TEXT NOT NULL CHECK (length(observer) BETWEEN 1 AND 200),
+    observed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The observer's own wall clock, kept apart from the server's.
+    client_observed_at TIMESTAMPTZ,
+    evidence           JSONB NOT NULL DEFAULT '{}',
+    UNIQUE (customer_id, attempt_id),
+    FOREIGN KEY (customer_id, attempt_id) REFERENCES companion_deliveries (customer_id, attempt_id),
+    FOREIGN KEY (customer_id, mailbox_id) REFERENCES companion_mailbox (customer_id, id)
+);
+CREATE INDEX companion_observations_mailbox_idx
+    ON companion_observations (customer_id, mailbox_id);
+
+ALTER TABLE companion_observations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE companion_observations FORCE ROW LEVEL SECURITY;
+CREATE POLICY tenant_isolation_select ON companion_observations
+    FOR SELECT
+    USING (customer_id = current_setting('app.current_customer_id', true));
+CREATE POLICY tenant_isolation_insert ON companion_observations
+    FOR INSERT
+    WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
+REVOKE UPDATE, DELETE ON companion_observations FROM PUBLIC;
