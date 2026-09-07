@@ -276,6 +276,8 @@ class ClaudeCodeConnector(Connector):
 
         finalize_marker_seen = False
         client_finalize_seen = False
+        last_v2_batch = -1
+        last_v2_finalized = False
         # The keys that carry the completion signal, so the normalizer can drop
         # them once we have acted on it. See `consume_payload_keys`.
         finalize_keys: list[str] = []
@@ -291,6 +293,9 @@ class ClaudeCodeConnector(Connector):
             payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else {}
             if not isinstance(payload, dict):
                 continue
+            if payload.get("protocol_version") == 2 and payload.get("batch_seq", -1) > last_v2_batch:
+                last_v2_batch = payload["batch_seq"]
+                last_v2_finalized = payload.get("finalize") is True
             # An explicit client finalize (the tap's SessionEnd hook, via the
             # gateway's SessionFinalizeRequest route) lands here as an ordinary
             # coalesced payload carrying `finalize: true` and NO events. It is
@@ -328,12 +333,18 @@ class ClaudeCodeConnector(Connector):
             (e.get("raw") or {}).get("type") == "session_end"
             for e in merged_events
         )
+        if last_v2_batch >= 0:
+            client_finalize_seen = last_v2_finalized
         if client_finalize_seen:
             complete = True
         if finalize_marker_seen:
             complete = True
         if event.source_event_id.endswith(":finalize"):
             complete = True
+        if last_v2_batch >= 0:
+            # A historical session_end or a cron marker cannot certify a newer
+            # protocol stream. Only its last accepted, pinned finalize can.
+            complete = last_v2_finalized
 
         return {
             "session_id": session_id,
