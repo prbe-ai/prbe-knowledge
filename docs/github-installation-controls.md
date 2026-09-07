@@ -90,7 +90,10 @@ restore every chunk before the queue or job receives a successful receipt.
 Live generations do not invalidate explicit history jobs. Source updated_at and
 live-versus-history precedence prevent late older history overwriting live data;
 at an equal provider version, live persists its complete metadata representation
-even when a later-enqueued history row committed first.
+even when a later-enqueued history row committed first. Newer provider versions
+persist metadata-only changes despite a stable title/body hash. For same-second
+live events, queue order breaks ties when substantive metadata differs, while an
+exact retry or identical representation remains a no-op.
 Per-queue leases fence reclaimed writers. Jobs remain running after enumeration
 until every queued item has a terminal indexing receipt. Unsupported/failed
 provider pages cannot be reported as completed.

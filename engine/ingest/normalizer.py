@@ -1267,7 +1267,16 @@ class _ChunkPlan:
 # prefix marks it engine-internal: the enumeration endpoint strips
 # underscore-prefixed keys before returning caller metadata.
 _CI_QUEUE_SEQ_KEY = "_ci_queue_seq"
-_GITHUB_FORCE_LIVE_VERSION_KEY = "_github_force_live_version"
+_GITHUB_FORCE_VERSION_KEY = "_github_force_version"
+
+
+def _github_substantive_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Provider representation, excluding control-plane ordering/binding keys."""
+    return {
+        key: value
+        for key, value in metadata.items()
+        if not key.startswith("_github_")
+    }
 
 
 async def _admit_ordered_write(
@@ -1306,18 +1315,14 @@ async def _admit_ordered_write(
     if source_system == SourceSystem.GITHUB:
         # Provider time, not arrival order: an older history event can arrive
         # after a newer webhook. Equal-version deletion wins over a stale body.
-        existing = await conn.fetchrow("""SELECT updated_at,deleted_at,metadata FROM documents
+        existing = await conn.fetchrow("""SELECT updated_at,deleted_at,metadata,content_hash FROM documents
             WHERE customer_id=$1 AND doc_id=$2 AND valid_to IS NULL""", customer_id, doc.doc_id)
         if existing and existing["updated_at"] == doc.updated_at:
-            import json
-
             # Equal-version deletion remains authoritative regardless of lane.
             # Decide that before mutating a history marker in place.
             if existing["deleted_at"] is not None and doc.deleted_at is None:
                 return False
-            previous = existing["metadata"]
-            if isinstance(previous, str):
-                previous = json.loads(previous)
+            previous = _coerce_jsonb(existing["metadata"])
             incoming_operation = doc.metadata.get("_github_operation", "live")
             previous_operation = previous.get("_github_operation", "live")
             if incoming_operation == "history" and previous_operation == "live":
@@ -1338,7 +1343,31 @@ async def _admit_ordered_write(
                 # version even when title/body are byte-identical so state,
                 # labels, references and the metadata chunk all become live's
                 # representation. _upsert_document removes this transient key.
-                doc.metadata[_GITHUB_FORCE_LIVE_VERSION_KEY] = True
+                doc.metadata[_GITHUB_FORCE_VERSION_KEY] = True
+            elif (
+                queue_id is not None
+                and existing["content_hash"] == doc.content_hash
+                and _github_substantive_metadata(previous)
+                != _github_substantive_metadata(doc.metadata)
+            ):
+                # GitHub timestamps are second-granularity. A distinct, later
+                # accepted event can change state/labels/stats at the same
+                # source version. Queue order breaks that tie, while an exact
+                # retry was already rejected by the sequence guard above.
+                doc.metadata[_GITHUB_FORCE_VERSION_KEY] = True
+        if (
+            existing
+            and queue_id is not None
+            and doc.deleted_at is None
+            and existing["updated_at"] < doc.updated_at
+            and existing["content_hash"] == doc.content_hash
+        ):
+            # GitHub's stable content hash intentionally excludes mutable
+            # provider metadata such as state, labels, merge status and stats.
+            # A newer provider version with unchanged title/body must still
+            # open a complete SCD version; otherwise the queue receipt says
+            # completed while search keeps the old metadata forever.
+            doc.metadata[_GITHUB_FORCE_VERSION_KEY] = True
         if queue_id is not None:
             doc.metadata["_github_queue_seq"] = queue_id
         return not (existing and existing["updated_at"] > doc.updated_at)
@@ -1411,7 +1440,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
     txn and retry with the freshly-bumped version. Read-committed isolation
     guarantees the conflicting writer's commit is visible to the next read.
     """
-    force_live_version = bool(doc.metadata.pop(_GITHUB_FORCE_LIVE_VERSION_KEY, False))
+    force_github_version = bool(doc.metadata.pop(_GITHUB_FORCE_VERSION_KEY, False))
     for attempt in range(_UPSERT_DOC_MAX_RETRIES):
         existing = await conn.fetchrow(
             """
@@ -1428,7 +1457,7 @@ async def _upsert_document(conn: asyncpg.Connection, doc: Document) -> bool:
             existing
             and existing["content_hash"] == doc.content_hash
             and doc.deleted_at is None
-            and not force_live_version
+            and not force_github_version
         ):
             # Same content, not a delete → idempotent no-op. A retry can land
             # here too: a concurrent writer wrote OUR exact content first.

@@ -364,6 +364,68 @@ async def test_equal_version_live_beats_later_enqueued_history(worker):
         assert metadata["_github_queue_seq"] == live_queue["queue_id"]
 
 
+async def test_newer_live_metadata_only_update_persists_complete_version(worker):
+    opened = envelope(title="Stable title and body", updated="2026-09-04T12:00:00Z")
+    opened["payload"]["issue"]["state"] = "open"
+    opened["payload"]["issue"]["labels"] = []
+    assert await enqueue_live(TENANT, "101", opened, "metadata-open")
+    await worker.queue_step(TENANT, live=True)
+
+    closed = envelope(title="Stable title and body", updated="2026-09-04T12:05:00Z")
+    closed["payload"]["issue"]["state"] = "closed"
+    closed["payload"]["issue"]["labels"] = [{"name": "resolved"}]
+    assert await enqueue_live(TENANT, "101", closed, "metadata-close")
+    await worker.queue_step(TENANT, live=True)
+
+    async with with_tenant(TENANT) as conn:
+        rows = await conn.fetch(
+            """SELECT version,valid_to,metadata FROM documents WHERE customer_id=$1
+            ORDER BY version""",
+            TENANT,
+        )
+        assert len(rows) == 2
+        assert rows[0]["valid_to"] is not None
+        assert rows[1]["valid_to"] is None
+        metadata = json.loads(rows[1]["metadata"])
+        assert metadata["state"] == "closed"
+        assert metadata["labels"] == ["resolved"]
+        assert metadata["_github_operation"] == "live"
+
+
+async def test_equal_timestamp_live_metadata_uses_queue_tie_break_and_dedupes_duplicates(
+    worker,
+):
+    updated = "2026-09-04T12:00:00Z"
+    opened = envelope(title="Second-granularity update", updated=updated)
+    opened["payload"]["issue"]["state"] = "open"
+    opened["payload"]["issue"]["labels"] = []
+    assert await enqueue_live(TENANT, "101", opened, "same-second-open")
+    await worker.queue_step(TENANT, live=True)
+
+    closed = envelope(title="Second-granularity update", updated=updated)
+    closed["payload"]["issue"]["state"] = "closed"
+    closed["payload"]["issue"]["labels"] = [{"name": "same-second"}]
+    assert await enqueue_live(TENANT, "101", closed, "same-second-close")
+    await worker.queue_step(TENANT, live=True)
+    # A distinct delivery with the exact same substantive representation is a
+    # no-op even though its queue sequence is newer.
+    assert await enqueue_live(TENANT, "101", closed, "same-second-duplicate")
+    await worker.queue_step(TENANT, live=True)
+
+    async with with_tenant(TENANT) as conn:
+        rows = await conn.fetch(
+            """SELECT version,valid_to,metadata FROM documents WHERE customer_id=$1
+            ORDER BY version""",
+            TENANT,
+        )
+        assert len(rows) == 2
+        assert rows[0]["valid_to"] is not None
+        assert rows[1]["valid_to"] is None
+        metadata = json.loads(rows[1]["metadata"])
+        assert metadata["state"] == "closed"
+        assert metadata["labels"] == ["same-second"]
+
+
 async def test_cancel_waits_for_write_fence_then_acknowledges(connected):
     job = await new_job()
     entered = asyncio.Event()
