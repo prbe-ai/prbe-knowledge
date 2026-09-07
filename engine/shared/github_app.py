@@ -63,7 +63,7 @@ async def _resolve_installation_id(customer_id: str) -> str:
 
 
 async def mint_installation_token(
-    http: httpx.AsyncClient, *, customer_id: str
+    http: httpx.AsyncClient, *, customer_id: str, installation_id: str | None = None
 ) -> tuple[str, datetime]:
     """Mint a GitHub App installation token locally (standalone community mode).
 
@@ -78,7 +78,17 @@ async def mint_installation_token(
             "GITHUB_APP_ID / GITHUB_APP_PRIVATE_KEY not configured for local minting"
         )
 
-    installation_id = await _resolve_installation_id(customer_id)
+    if installation_id is None:
+        installation_id = await _resolve_installation_id(customer_id)
+    else:
+        from engine.shared.db import with_tenant
+
+        async with with_tenant(customer_id) as conn:
+            allowed = await conn.fetchval(
+                "SELECT 1 FROM customer_source_mapping WHERE customer_id=$1 AND source_system='github' AND external_id=$2",
+                customer_id, installation_id)
+        if not allowed:
+            raise GitHubAuthError("GitHub installation is not bound to this customer")
     cache_key = (customer_id, installation_id)
 
     cached = _token_cache.get(cache_key)

@@ -68,12 +68,14 @@ from engine.shared.exceptions import (
     PrbeError,
 )
 from engine.shared.logging import bind_trace, configure_logging, get_logger
+from engine.shared.schema_readiness import wait_for_github_control_schema
 from engine.shared.source_registry import ingestion_priority_for
 from engine.shared.storage import get_store
 from engine.system_settings import get_ingestion_killswitch
 from kb.admin_routes import router as admin_router
 from kb.backfill_routes import router as backfill_router
 from kb.feature_nodes_routes import router as feature_nodes_router
+from kb.github_control_routes import router as github_control_router
 from kb.internal_devices import router as devices_router
 from kb.purge_routes import router as purge_router
 from kb.slack_lifecycle import handle_slack_lifecycle_event
@@ -87,6 +89,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
     await init_pool(settings)
+    await wait_for_github_control_schema()
     await ensure_default_customer()  # no-op unless DEFAULT_CUSTOMER_ID set
 
     # Trigger @register_connector decorators.
@@ -113,6 +116,7 @@ app.include_router(backfill_router)
 app.include_router(purge_router)
 app.include_router(stats_router)
 app.include_router(admin_router)
+app.include_router(github_control_router)
 app.include_router(entity_clusters_router)
 app.include_router(entity_merge_suggestions_router)
 app.include_router(feature_nodes_router)
@@ -546,6 +550,39 @@ async def webhook(
             "trace_id": trace_id,
         }
     )
+    if source_enum == SourceSystem.GITHUB:
+        from kb.github_control import enqueue_live, managed_installation
+
+        installation_id = str((payload.get("installation") or {}).get("id") or "")
+        if installation_id and await managed_installation(customer_id, installation_id):
+            github_event = request.headers.get("x-github-event")
+            if github_event == "installation" and payload.get("action") == "deleted":
+                from kb.github_control_purge import purge
+
+                await purge(customer_id, installation_id)
+                return JSONResponse({"status": "disconnected", "trace_id": trace_id})
+            if github_event == "installation_repositories":
+                from kb.github_control import revoke_repository_access
+
+                removed = [
+                    repo["full_name"]
+                    for repo in payload.get("repositories_removed") or []
+                    if isinstance(repo, dict) and isinstance(repo.get("full_name"), str)
+                ]
+                revoked = await revoke_repository_access(
+                    customer_id, installation_id, removed
+                )
+                return JSONResponse(
+                    {
+                        "status": "accepted" if revoked else "ignored",
+                        "trace_id": trace_id,
+                        "source_event_id": parsed.source_event_id,
+                    }
+                )
+            inserted = await enqueue_live(customer_id, installation_id,
+                                          orjson.loads(envelope), parsed.source_event_id)
+            return JSONResponse({"status": "accepted" if inserted else "ignored",
+                                 "trace_id": trace_id, "source_event_id": parsed.source_event_id})
     store = request.app.state.store
     bucket = await store.bucket_for(customer_id)
     storage_id = _compose_storage_id(
@@ -560,12 +597,20 @@ async def webhook(
         log.error("ingestion.storage_put_failed", error=str(exc))
         raise HTTPException(status_code=503, detail="storage unavailable") from exc
 
-    inserted = await _enqueue(
-        customer_id=customer_id,
-        source=source_enum,
-        source_event_id=parsed.source_event_id,
-        payload_s3_key=key,
-    )
+    if source_enum == SourceSystem.GITHUB:
+        from kb.github_control import enqueue_legacy_webhook
+
+        inserted, discard_raw = await enqueue_legacy_webhook(customer_id, installation_id,
+            orjson.loads(envelope), parsed.source_event_id, key)
+        if discard_raw:
+            await store.delete(bucket, key)
+    else:
+        inserted = await _enqueue(
+            customer_id=customer_id,
+            source=source_enum,
+            source_event_id=parsed.source_event_id,
+            payload_s3_key=key,
+        )
     log.info(
         "ingestion.accepted",
         customer=customer_id,

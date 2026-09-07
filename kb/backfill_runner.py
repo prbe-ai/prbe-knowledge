@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -28,7 +29,7 @@ from engine.ingest.handlers.base import ConnectorContext
 from engine.ingest.handlers.registry import build_connector
 from engine.shared.config import get_settings
 from engine.shared.constants import BackfillStatus, QueueStatus, SourceSystem
-from engine.shared.db import get_pool, raw_conn
+from engine.shared.db import get_pool, raw_conn, with_tenant
 from engine.shared.encryption import decrypt_token
 from engine.shared.exceptions import NotSupportedByConnector, PermanentSourceError
 from engine.shared.logging import get_logger
@@ -58,6 +59,10 @@ class BackfillReclaimedError(Exception):
     worker now owns this (customer, source). The run loop bails without calling
     _mark_failed since the row is no longer ours to mutate.
     """
+
+
+class _GitHubSourcePurgeActive(Exception):
+    """The durable source gate stopped an already-running legacy producer."""
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,22 @@ def _slack_channel_cursor(channels: dict[str, str | None]) -> str:
     )
 
 
+def _github_claim_payload_key(key: str, claim_token: datetime) -> str:
+    """Make a legacy GitHub payload key private to one durable DB claim.
+
+    ``started_at`` is the backfill runner's compare-and-swap ownership token.
+    Hashing its canonical UTC representation keeps that token out of the key
+    while making retries by the same owner stable and later owners distinct.
+    The source/tenant prefix remains unchanged so source-wide purge still
+    sweeps every claim's objects.
+    """
+    canonical_token = claim_token.astimezone(UTC).isoformat(timespec="microseconds")
+    claim_digest = hashlib.sha256(canonical_token.encode()).hexdigest()[:24]
+    if key.endswith(".json"):
+        return f"{key[:-5]}.claim-{claim_digest}.json"
+    return f"{key}.claim-{claim_digest}"
+
+
 async def _flush_batch(
     store: ObjectStore,
     bucket: str,
@@ -133,7 +154,9 @@ async def _flush_batch(
     source: SourceSystem,
     batch: list[tuple[str, bytes, str]],
     sem: asyncio.Semaphore,
-) -> None:
+    *,
+    claim_token: datetime | None = None,
+) -> bool:
     """Coalesced flush: parallel R2 puts + one executemany for queue rows.
 
     `batch` is a list of (key, envelope_bytes, source_event_id). All puts run
@@ -142,33 +165,44 @@ async def _flush_batch(
     pipelined executemany. ON CONFLICT DO NOTHING preserves the per-row dedup
     semantics of the old single-row path.
 
-    Crash recovery invariant: the R2 key is deterministic from
-    source_event_id (see caller). If executemany raises after R2 puts
-    succeeded, the orphaned objects are overwritten idempotently on retry,
-    and ON CONFLICT DO NOTHING admits duplicate queue rows safely. Callers
-    MUST NOT change the key scheme away from source_event_id without
-    revisiting this property.
+    Non-GitHub R2 keys remain deterministic from ``source_event_id``. Legacy
+    GitHub keys additionally carry a one-way digest of the exact DB claim:
+    retries by one owner overwrite idempotently, while a stale owner can
+    delete its rejected upload without touching the object referenced by a
+    later owner's queue receipt. An ON CONFLICT loser is deleted only after a
+    same-transaction lookup proves neither queue key column references it.
 
     Raises on first failure. Caller is responsible for routing the exception
     to _mark_failed so the run flips to status='failed' rather than silently
     swallowing a partial batch.
     """
     if not batch:
-        return
+        return True
+    # Every production GitHub caller supplies the durable started_at claim.
+    # A claim-less caller owns no object namespace and therefore must not put.
+    if source == SourceSystem.GITHUB and claim_token is None:
+        return False
+
+    upload_batch = batch
+    if source == SourceSystem.GITHUB:
+        assert claim_token is not None  # narrowed by the guard above
+        upload_batch = [
+            (_github_claim_payload_key(key, claim_token), envelope, source_event_id)
+            for key, envelope, source_event_id in batch
+        ]
 
     async def _bounded_put(key: str, envelope: bytes) -> None:
         async with sem:
             await store.put(bucket, key, envelope)
 
-    await asyncio.gather(
-        *(_bounded_put(key, envelope) for key, envelope, _ in batch)
-    )
+    await asyncio.gather(*(_bounded_put(key, envelope) for key, envelope, _ in upload_batch))
 
     rows = [
         (customer_id, source.value, source_event_id, key, QueueStatus.PENDING.value)
-        for key, _, source_event_id in batch
+        for key, _, source_event_id in upload_batch
     ]
-    async with get_pool().acquire() as conn:
+
+    async def _insert(conn) -> None:
         # Backfill rows always land at priority 50 (never block live).
         # Both columns are populated for the migration window:
         # `payload_s3_key` for back-compat readers, `payload_s3_keys`
@@ -183,6 +217,78 @@ async def _flush_batch(
             """,
             rows,
         )
+
+    admitted = True
+    cleanup_keys: set[str] = set()
+    if source == SourceSystem.GITHUB:
+        from kb.github_control import adoption_lock, source_purge_active
+
+        # R2 stays outside the transaction. The short adoption fence makes
+        # source-gate close and queue admission mutually exclusive. A matching
+        # claim token is also required: source-wide purge can delete a pending
+        # row just as an old runner claims it, then clear the gate after a new
+        # connection is created. Without this ownership check that stale runner
+        # could publish one old batch against the new token before its next
+        # progress update noticed the lost claim. Claim-qualified keys ensure
+        # a rejected stale owner cannot erase a later owner's receipt. After
+        # the attempted INSERT, inspect both queue key columns under this same
+        # fence; only this call's unreferenced objects are cleanup candidates.
+        async with with_tenant(customer_id) as conn:
+            await adoption_lock(conn, customer_id)
+            connected = await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM integration_tokens
+                WHERE customer_id=$1 AND source_system='github' AND status='active')""",
+                customer_id,
+            )
+            owns_claim = bool(
+                claim_token
+                and await conn.fetchval(
+                    """SELECT 1 FROM backfill_state WHERE customer_id=$1
+                    AND source_system='github' AND status='running'
+                    AND started_at=$2""",
+                    customer_id,
+                    claim_token,
+                )
+            )
+            purge_active = await source_purge_active(conn, customer_id)
+            if purge_active or not connected or not owns_claim:
+                admitted = False
+            else:
+                await _insert(conn)
+            uploaded_keys = {key for key, _, _ in upload_batch}
+            uploaded_event_ids = {source_event_id for _, _, source_event_id in upload_batch}
+            referenced_rows = await conn.fetch(
+                """
+                SELECT DISTINCT ref.key
+                FROM ingestion_queue AS q
+                CROSS JOIN LATERAL unnest(
+                    coalesce(q.payload_s3_keys, '{}'::text[])
+                    || ARRAY[q.payload_s3_key]
+                ) AS ref(key)
+                WHERE q.customer_id=$1 AND q.source_system=$2
+                  AND ref.key = ANY($3::text[])
+                  AND q.source_event_id = ANY($4::text[])
+                """,
+                customer_id,
+                source.value,
+                list(uploaded_keys),
+                list(uploaded_event_ids),
+            )
+            referenced_keys = {str(row["key"]) for row in referenced_rows}
+            cleanup_keys = uploaded_keys - referenced_keys
+    else:
+        async with get_pool().acquire() as conn:
+            await _insert(conn)
+
+    if cleanup_keys:
+        deleted = await asyncio.gather(
+            *(store.delete(bucket, key) for key in cleanup_keys),
+            return_exceptions=True,
+        )
+        for outcome in deleted:
+            if isinstance(outcome, BaseException):
+                raise outcome
+    return admitted
 
 
 async def run_backfill(
@@ -296,14 +402,18 @@ async def run_backfill(
                 (c for _, _, _, c in reversed(batch) if c is not None),
                 None,
             )
-            await _flush_batch(
+            admitted = await _flush_batch(
                 store,
                 bucket,
                 customer_id,
                 source,
                 [(k, e, sid) for k, e, sid, _ in batch],
                 r2_sem,
+                claim_token=claim_token,
             )
+            if not admitted:
+                batch = []
+                raise _GitHubSourcePurgeActive
             enqueued += len(batch)
             batch = []
             if pending_cursor is not None:
@@ -337,6 +447,12 @@ async def run_backfill(
             # already streamed into our buffer.
             if not await is_source_connected(customer_id, source):
                 batch = []
+                if source == SourceSystem.GITHUB:
+                    from kb.github_control import source_purge_active
+
+                    async with with_tenant(customer_id) as conn:
+                        if await source_purge_active(conn, customer_id):
+                            raise _GitHubSourcePurgeActive
                 log.info(
                     "backfill.aborted_disconnect",
                     customer=customer_id,
@@ -412,6 +528,19 @@ async def run_backfill(
         )
         log.info(
             "backfill.done", customer=customer_id, source=source.value, events=enqueued
+        )
+    except _GitHubSourcePurgeActive:
+        await _mark_failed(
+            customer_id,
+            source,
+            "GitHub source removal stopped legacy history",
+            claim_token=claim_token,
+        )
+        log.info(
+            "backfill.aborted_source_purge",
+            customer=customer_id,
+            source=source.value,
+            enqueued=enqueued,
         )
     except BackfillReclaimedError:
         # Reaper or a competing claim took the row. The new owner is responsible
@@ -520,7 +649,18 @@ async def enqueue_backfill(customer_id: str, source: SourceSystem) -> None:
     re-polls of already-synced integrations (Granola steady-state), use
     `re_enqueue_for_polling` to preserve the cursor watermark.
     """
-    async with raw_conn() as conn:
+    from engine.shared.db import with_tenant
+
+    async with with_tenant(customer_id) as conn:
+        if source == SourceSystem.GITHUB:
+            from kb.github_control import adoption_lock, source_purge_active
+
+            await adoption_lock(conn, customer_id)
+            if await source_purge_active(conn, customer_id):
+                raise ValueError("GitHub source removal is still in progress")
+            managed = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM github_installations WHERE customer_id=$1 AND managed)", customer_id)
+            if managed:
+                raise ValueError("Use installation-scoped GitHub history controls for this customer")
         await conn.execute(
             """
             INSERT INTO backfill_state
@@ -1036,6 +1176,28 @@ async def claim_pending_backfill() -> tuple[str, SourceSystem] | None:
         )
         if row is None:
             return None
+        if row["source_system"] == SourceSystem.GITHUB.value:
+            from kb.github_control import adoption_lock, source_purge_active
+
+            # Serialize legacy claim admission with the durable source-wide
+            # purge gate. If claim wins, purge observes `running` and waits for
+            # its acknowledgement; if gate close wins, this row is terminalized
+            # without ever starting provider I/O. This closes the pending->claim
+            # gap between purge's running-row poll and its cascade delete.
+            await conn.execute(
+                "SELECT set_config('app.current_customer_id',$1,true)",
+                row["customer_id"],
+            )
+            await adoption_lock(conn, row["customer_id"])
+            if await source_purge_active(conn, row["customer_id"]):
+                await conn.execute(
+                    """UPDATE backfill_state SET status='failed',
+                    last_error='GitHub source removal stopped legacy history',
+                    heartbeat_at=now() WHERE customer_id=$1
+                    AND source_system='github' AND status='pending'""",
+                    row["customer_id"],
+                )
+                return None
         # Claim it by setting status=running immediately (inside the same tx).
         await conn.execute(
             """

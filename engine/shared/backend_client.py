@@ -6,7 +6,7 @@ only lives in one service. This client wraps the HTTP call.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
 import httpx
 
@@ -43,6 +43,7 @@ async def fetch_github_installation_token(
     http: httpx.AsyncClient,
     *,
     customer_id: str,
+    installation_id: str | None = None,
 ) -> tuple[str, datetime]:
     """Fetch a fresh GitHub App installation token from prbe-backend.
 
@@ -64,9 +65,9 @@ async def fetch_github_installation_token(
         if path == "standalone":
             from engine.shared.github_app import mint_installation_token
 
-            return await mint_installation_token(http, customer_id=customer_id)
+            return await mint_installation_token(http, customer_id=customer_id, installation_id=installation_id)
         raise GitHubAuthError(
-            "GitHub tokens unavailable: set BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY "
+            "GitHub token minting is not configured: set BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY "
             "(hosted) or GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY (standalone)"
         )
 
@@ -76,7 +77,7 @@ async def fetch_github_installation_token(
     try:
         resp = await http.post(
             url,
-            json={"customer_id": customer_id},
+            json={"customer_id": customer_id, **({"installation_id": installation_id} if installation_id else {})},
             headers={
                 # Canonical header — prbe-backend retired the X-Internal-Key
                 # alias when the Fly sunset closed (see
@@ -102,9 +103,28 @@ async def fetch_github_installation_token(
             f"backend token endpoint {resp.status_code}: {resp.text[:200]}"
         )
 
-    body = resp.json()
-    token = body["token"]
-    expires_at = datetime.fromisoformat(body["expires_at"].replace("Z", "+00:00"))
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise GitHubAuthError("backend returned an invalid GitHub token response") from exc
+    if installation_id is not None and (
+        not isinstance(body, dict)
+        or str(body.get("installation_id", "")) != str(installation_id)
+    ):
+        # Older hosted backends ignore the selector and mint their latest
+        # tenant installation. Never use that token for a different passport.
+        # A response without its exact binding is equally unverifiable.
+        raise GitHubAuthError("backend did not confirm the requested GitHub installation")
+    token = body.get("token") if isinstance(body, dict) else None
+    raw_expiry = body.get("expires_at") if isinstance(body, dict) else None
+    if not isinstance(token, str) or not token.strip() or not isinstance(raw_expiry, str):
+        raise GitHubAuthError("backend returned an invalid GitHub token response")
+    try:
+        expires_at = datetime.fromisoformat(raw_expiry.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise GitHubAuthError("backend returned an invalid GitHub token expiry") from exc
+    if expires_at.tzinfo is None or expires_at <= datetime.now(UTC):
+        raise GitHubAuthError("backend returned an expired GitHub installation token")
     return token, expires_at
 
 

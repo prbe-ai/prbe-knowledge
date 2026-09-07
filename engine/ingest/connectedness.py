@@ -10,7 +10,7 @@ disconnected — exactly the acme/github incident on 2026-05-15.
 from __future__ import annotations
 
 from engine.shared.constants import IntegrationStatus, SourceSystem
-from engine.shared.db import raw_conn
+from engine.shared.db import raw_conn, with_tenant
 
 # Sources whose lifecycle is keyed on an `integration_tokens` row. For these,
 # disconnect = token row gone (or status flipped from 'active'), and enqueue
@@ -74,6 +74,25 @@ async def is_source_connected(customer_id: str, source: SourceSystem) -> bool:
     """
     if source not in _OAUTH_SOURCES:
         return True
+    if source == SourceSystem.GITHUB:
+        # Source-wide purge closes a durable gate before it waits for an
+        # already-running legacy producer. Treat that as disconnected even
+        # while the legacy singleton token still exists, so the producer
+        # stops at its next per-event boundary.
+        async with with_tenant(customer_id) as conn:
+            gated = await conn.fetchval(
+                "SELECT purge_in_progress FROM github_source_gates WHERE customer_id=$1",
+                customer_id,
+            )
+            if gated:
+                return False
+            status = await conn.fetchval(
+                """SELECT status FROM integration_tokens
+                WHERE customer_id=$1 AND source_system=$2""",
+                customer_id,
+                source.value,
+            )
+        return status == IntegrationStatus.ACTIVE.value
     async with raw_conn() as conn:
         status = await conn.fetchval(
             "SELECT status FROM integration_tokens "

@@ -27,6 +27,7 @@ from engine.shared.constants import (
 )
 from engine.shared.db import apply_connection_setup, init_pool
 from engine.shared.logging import bind_trace, get_logger
+from engine.shared.schema_readiness import wait_for_github_control_schema
 from kb.poller import IntegrationPoller
 from kb.polling.scheduler import PollScheduler
 from kb.polling.sink import PollDocumentSink
@@ -238,6 +239,7 @@ async def run_worker_forever() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
     await init_pool(settings)
+    await wait_for_github_control_schema()
     # Import handlers package so @register_connector decorators run.
     # Side-effect import — handlers' @register_connector decorators run on
     # import. The module name is used by the registry, so ruff doesn't flag
@@ -298,6 +300,9 @@ async def run_worker_forever() -> None:
         wake_event=wake_event,
         heartbeat_interval_seconds=settings.backfill_heartbeat_interval_seconds,
     )
+    from kb.github_control_worker import GitHubControlWorker
+
+    github_control_worker = GitHubControlWorker(ctx)
     granola_listener = GranolaNotifyListener(settings.database_url, wake_event)
     reclaim_loop = ReclaimLoop(
         backfill_threshold_seconds=settings.backfill_stale_heartbeat_seconds,
@@ -350,6 +355,7 @@ async def run_worker_forever() -> None:
         log.info("worker.shutdown_signal", signal=signame)
         ingestion_worker.shutdown()
         backfill_worker.shutdown()
+        github_control_worker.shutdown()
         granola_listener.shutdown()
         reclaim_loop.shutdown()
         integration_poller.shutdown()
@@ -369,6 +375,7 @@ async def run_worker_forever() -> None:
     coroutines = [
         ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
         backfill_worker.run(),
+        github_control_worker.run(),
         granola_listener.run(),
         reclaim_loop.run(),
         integration_poller.run(),

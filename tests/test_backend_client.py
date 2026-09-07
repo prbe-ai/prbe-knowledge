@@ -48,7 +48,7 @@ async def test_happy_path_returns_token_and_expires_at() -> None:
                 200,
                 json={
                     "token": "ghs_abc",
-                    "expires_at": "2026-12-31T00:00:00Z",
+                    "expires_at": "2099-12-31T00:00:00Z",
                     "installation_id": "12345",
                 },
             )
@@ -59,7 +59,7 @@ async def test_happy_path_returns_token_and_expires_at() -> None:
             )
 
     assert token == "ghs_abc"
-    assert expires_at == datetime(2026, 12, 31, tzinfo=UTC)
+    assert expires_at == datetime(2099, 12, 31, tzinfo=UTC)
 
     # Verify the request shape: customer_id in body, X-Internal-Backend-Key header.
     request = route.calls[0].request

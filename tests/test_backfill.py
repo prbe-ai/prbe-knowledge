@@ -1774,11 +1774,11 @@ async def test_github_backfill_with_installation_scope_fetches_token_from_backen
 
     transport = httpx.MockTransport(handler)
 
-    fetched_for: list[str] = []
+    fetched_for: list[tuple[str, str | None]] = []
 
-    async def fake_fetch(http, *, customer_id):
-        fetched_for.append(customer_id)
-        return "ghs_fresh_bearer", datetime(2026, 12, 31, tzinfo=UTC)
+    async def fake_fetch(http, *, customer_id, installation_id=None):
+        fetched_for.append((customer_id, installation_id))
+        return "ghs_fresh_bearer", datetime(2099, 12, 31, tzinfo=UTC)
 
     monkeypatch.setattr(
         "kb.handlers.github.fetch_github_installation_token",
@@ -1804,7 +1804,7 @@ async def test_github_backfill_with_installation_scope_fetches_token_from_backen
 
     events = [e async for e in gh.backfill("cust", token)]
     assert len(events) == 1
-    assert fetched_for == ["cust"]
+    assert fetched_for == [("cust", "99")]
     assert observed_auth, "mock transport should have captured requests"
     for auth in observed_auth:
         assert auth == "Bearer ghs_fresh_bearer"

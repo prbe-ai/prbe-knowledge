@@ -59,6 +59,7 @@ that way. Known limits, all inherent to the schema rather than to this code:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from dataclasses import dataclass, field
@@ -250,6 +251,7 @@ _GATE_MAPPING_SQL = (
 # only runs if the previous one found residue, so a clean purge does exactly
 # one verification pass.
 _MAX_VERIFY_ROUNDS = 5
+_GITHUB_LEGACY_STOP_TIMEOUT_SECONDS = 10.0
 
 
 async def _close_gate(customer_id: str, source: SourceSystem) -> None:
@@ -260,6 +262,37 @@ async def _close_gate(customer_id: str, source: SourceSystem) -> None:
     transaction is invisible to every worker and the gate would stay open for
     the whole cascade.
     """
+    if source == SourceSystem.GITHUB:
+        from kb.github_control import adoption_lock, set_source_purge_gate
+        from kb.github_control_purge import purge
+
+        async with with_tenant(customer_id) as conn:
+            await adoption_lock(conn, customer_id)
+            await set_source_purge_gate(conn, customer_id, True)
+            installations = await conn.fetch("SELECT installation_id FROM github_installations WHERE customer_id=$1 ORDER BY installation_id", customer_id)
+        # A legacy producer can already be between its per-event connection
+        # check and an R2/queue flush. It acknowledges the durable gate by
+        # leaving `running`; do not begin the final sweep (and especially do
+        # not report verified) until that admitted work has settled. A stalled
+        # provider makes this purge attempt fail retryably while the gate stays
+        # closed, rather than producing a false verified receipt.
+        deadline = asyncio.get_running_loop().time() + _GITHUB_LEGACY_STOP_TIMEOUT_SECONDS
+        while True:
+            async with with_tenant(customer_id) as conn:
+                running = await conn.fetchval(
+                    """SELECT EXISTS(SELECT 1 FROM backfill_state WHERE customer_id=$1
+                    AND source_system='github' AND status='running')""",
+                    customer_id,
+                )
+            if not running:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError(
+                    "Legacy GitHub history is still stopping; retry source removal"
+                )
+            await asyncio.sleep(0.1)
+        for installation in installations:
+            await purge(customer_id, installation["installation_id"], allow_legacy=True)
     cascade = [s.value for s in cascade_for(source)]
     async with with_tenant(customer_id) as conn:
         await conn.execute(_GATE_TOKENS_SQL, customer_id, source.value)
@@ -444,6 +477,12 @@ async def purge_source(
         r2_errors += e
 
     verified = not residue and not r2_residue and r2_errors == 0
+    if verified and source == SourceSystem.GITHUB:
+        from kb.github_control import adoption_lock, set_source_purge_gate
+
+        async with with_tenant(customer_id) as conn:
+            await adoption_lock(conn, customer_id)
+            await set_source_purge_gate(conn, customer_id, False)
     result: dict[str, Any] = {
         "purge_id": purge_id,
         "customer_id": customer_id,
