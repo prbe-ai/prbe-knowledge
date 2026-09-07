@@ -112,6 +112,13 @@ def _coerce_capability_bool(raw: object, key: str) -> bool:
     return False
 
 
+#: Public name for the coercer, so a sibling capability family (the companion
+#: transport's `companion_infra` cell) can share EXACTLY these on/off rules
+#: without importing a private name or growing this registry with a key that
+#: belongs to neither axis.
+coerce_capability_bool = _coerce_capability_bool
+
+
 class InputPath(StrEnum):
     """How a clause gets INTO the store."""
 
