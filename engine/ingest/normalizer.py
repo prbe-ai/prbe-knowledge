@@ -357,6 +357,7 @@ class Normalizer:
         source_system: SourceSystem,
         result: NormalizationResult,
         queue_id: int | None = None,
+        github_lease_id: object | None = None,
     ) -> NormalizeOutcome:
         doc_ids: list[str] = []
         quarantined: list[str] = []
@@ -432,6 +433,16 @@ class Normalizer:
         all_doc_ids = {doc.doc_id for (doc, _, _) in all_docs}
 
         async with with_tenant(customer_id) as conn:
+            if source_system == SourceSystem.GITHUB and queue_id is not None:
+                from kb.github_control import admit_projection
+
+                if not await admit_projection(conn, customer_id, queue_id, github_lease_id):
+                    raise DuplicateEventIgnored("GitHub operation was canceled or superseded")
+                # GitHub batches may contain several docs. Acquire source-version
+                # locks in a stable order before ACL/doc/graph writes.
+                for doc_id in sorted(all_doc_ids):
+                    await conn.execute("SELECT pg_advisory_xact_lock($1)",
+                                       advisory_lock_key("github-doc", customer_id, doc_id))
             await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
             await _upsert_code_repo_state(conn, customer_id, result.code_repo_state_updates)
 
@@ -564,6 +575,11 @@ class Normalizer:
             await upsert_edges(
                 conn, customer_id, graph_edges, node_ids, source_system.value
             )
+            if github_lease_id is not None:
+                for doc, _, _ in all_docs:
+                    await conn.execute("""INSERT INTO github_document_bindings(customer_id,installation_id,doc_id)
+                        VALUES ($1,$2,$3) ON CONFLICT DO NOTHING""",
+                        customer_id, doc.metadata["_github_installation_id"], doc.doc_id)
 
         # ---- Inferred-edges enqueue (best-effort) ---------------------------
         # After Phase B commits, append one row per persisted doc into
@@ -589,7 +605,7 @@ class Normalizer:
                 | {pre.document.doc_id for pre in result.documents_with_chunks},
             )
 
-        if doc_ids:
+        if doc_ids and github_lease_id is None:
             edge_doc_ids = _inferred_edge_doc_ids(
                 source_system, doc_ids, result.documents
             )
@@ -725,8 +741,17 @@ class Normalizer:
 
         # ---- Phase B: ONE transaction for the whole batch ------------------
         async with with_tenant(customer_id) as conn:
+            if source_system == SourceSystem.GITHUB:
+                for doc_id in sorted(all_doc_ids):
+                    await conn.execute("SELECT pg_advisory_xact_lock($1)",
+                                       advisory_lock_key("github-doc", customer_id, doc_id))
             sp_counter = 0
             for item_idx, (result, queue_id) in enumerate(items):
+                if source_system == SourceSystem.GITHUB and queue_id is not None:
+                    from kb.github_control import admit_projection
+
+                    if not await admit_projection(conn, customer_id, queue_id):
+                        continue
                 await _insert_acl_snapshots(conn, customer_id, result.acl_snapshots)
                 await _upsert_code_repo_state(
                     conn, customer_id, result.code_repo_state_updates
@@ -1219,6 +1244,26 @@ async def _admit_ordered_write(
     impossible. Multi-doc connectors would need ordered lock acquisition
     and have their own upstream event-ordering semantics.
     """
+    if source_system == SourceSystem.GITHUB:
+        # Provider time, not arrival order: an older history event can arrive
+        # after a newer webhook. Equal-version deletion wins over a stale body.
+        existing = await conn.fetchrow("""SELECT updated_at,deleted_at,metadata FROM documents
+            WHERE customer_id=$1 AND doc_id=$2 AND valid_to IS NULL""", customer_id, doc.doc_id)
+        if existing and existing["updated_at"] == doc.updated_at:
+            import json
+
+            previous = existing["metadata"]
+            if isinstance(previous, str):
+                previous = json.loads(previous)
+            if doc.metadata.get("_github_operation") == "history" and previous.get("_github_operation", "live") == "live":
+                return False
+            if queue_id is not None and previous.get("_github_queue_seq", 0) >= queue_id:
+                return False
+        if queue_id is not None:
+            doc.metadata["_github_queue_seq"] = queue_id
+        return not (existing and (existing["updated_at"] > doc.updated_at or
+                         (existing["updated_at"] == doc.updated_at and existing["deleted_at"] is not None
+                          and doc.deleted_at is None)))
     if source_system != SourceSystem.CUSTOM_INGEST or queue_id is None:
         return True
     await conn.execute(

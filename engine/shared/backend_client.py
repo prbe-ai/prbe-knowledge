@@ -43,6 +43,7 @@ async def fetch_github_installation_token(
     http: httpx.AsyncClient,
     *,
     customer_id: str,
+    installation_id: str | None = None,
 ) -> tuple[str, datetime]:
     """Fetch a fresh GitHub App installation token from prbe-backend.
 
@@ -64,9 +65,9 @@ async def fetch_github_installation_token(
         if path == "standalone":
             from engine.shared.github_app import mint_installation_token
 
-            return await mint_installation_token(http, customer_id=customer_id)
+            return await mint_installation_token(http, customer_id=customer_id, installation_id=installation_id)
         raise GitHubAuthError(
-            "GitHub tokens unavailable: set BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY "
+            "GitHub token minting is not configured: set BACKEND_BASE_URL + INTERNAL_BACKEND_API_KEY "
             "(hosted) or GITHUB_APP_ID + GITHUB_APP_PRIVATE_KEY (standalone)"
         )
 
@@ -76,7 +77,7 @@ async def fetch_github_installation_token(
     try:
         resp = await http.post(
             url,
-            json={"customer_id": customer_id},
+            json={"customer_id": customer_id, **({"installation_id": installation_id} if installation_id else {})},
             headers={
                 # Canonical header — prbe-backend retired the X-Internal-Key
                 # alias when the Fly sunset closed (see

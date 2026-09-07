@@ -260,6 +260,13 @@ async def _close_gate(customer_id: str, source: SourceSystem) -> None:
     transaction is invisible to every worker and the gate would stay open for
     the whole cascade.
     """
+    if source == SourceSystem.GITHUB:
+        from kb.github_control_purge import purge
+
+        async with with_tenant(customer_id) as conn:
+            installations = await conn.fetch("SELECT installation_id FROM github_installations WHERE customer_id=$1 ORDER BY installation_id", customer_id)
+        for installation in installations:
+            await purge(customer_id, installation["installation_id"], allow_legacy=True)
     cascade = [s.value for s in cascade_for(source)]
     async with with_tenant(customer_id) as conn:
         await conn.execute(_GATE_TOKENS_SQL, customer_id, source.value)

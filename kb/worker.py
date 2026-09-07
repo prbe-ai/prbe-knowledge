@@ -298,6 +298,9 @@ async def run_worker_forever() -> None:
         wake_event=wake_event,
         heartbeat_interval_seconds=settings.backfill_heartbeat_interval_seconds,
     )
+    from kb.github_control_worker import GitHubControlWorker
+
+    github_control_worker = GitHubControlWorker(ctx)
     granola_listener = GranolaNotifyListener(settings.database_url, wake_event)
     reclaim_loop = ReclaimLoop(
         backfill_threshold_seconds=settings.backfill_stale_heartbeat_seconds,
@@ -350,6 +353,7 @@ async def run_worker_forever() -> None:
         log.info("worker.shutdown_signal", signal=signame)
         ingestion_worker.shutdown()
         backfill_worker.shutdown()
+        github_control_worker.shutdown()
         granola_listener.shutdown()
         reclaim_loop.shutdown()
         integration_poller.shutdown()
@@ -369,6 +373,7 @@ async def run_worker_forever() -> None:
     coroutines = [
         ingestion_worker.run(poll_interval=settings.worker_poll_interval_seconds),
         backfill_worker.run(),
+        github_control_worker.run(),
         granola_listener.run(),
         reclaim_loop.run(),
         integration_poller.run(),

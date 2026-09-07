@@ -46,6 +46,7 @@ from kb.code_graph.reindex import (
 )
 from kb.github_seed import (
     CustomerNotFoundError,
+    GitHubLegacyWorkPending,
     GitHubMintNotConfigured,
     seed_github_installation,
 )
@@ -276,6 +277,7 @@ async def oauth_exchange(
 class GitHubConnectRequest(BaseModel):
     customer_id: str
     installation_id: str
+    protocol_version: int = Field(default=1, ge=1, le=2)
 
 
 class GitHubConnectResponse(BaseModel):
@@ -291,7 +293,12 @@ class GitHubConnectResponse(BaseModel):
 )
 async def github_connect(body: GitHubConnectRequest) -> GitHubConnectResponse:
     try:
-        await seed_github_installation(body.customer_id, body.installation_id)
+        if body.protocol_version == 1:
+            await seed_github_installation(body.customer_id, body.installation_id)
+        else:
+            await seed_github_installation(body.customer_id, body.installation_id, protocol_version=2)
+    except GitHubLegacyWorkPending as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except CustomerNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except GitHubMintNotConfigured as exc:
@@ -313,6 +320,10 @@ async def github_connect(body: GitHubConnectRequest) -> GitHubConnectResponse:
     # don't fail the connect on a backfill-enqueue error (a later re-connect,
     # or the reconciler, recovers it). Mirrors oauth_exchange.
     backfill_queued = False
+    if body.protocol_version == 2:
+        return GitHubConnectResponse(customer_id=body.customer_id,
+                                     installation_id=body.installation_id,
+                                     backfill_queued=False)
     try:
         await enqueue_backfill(
             customer_id=body.customer_id, source=SourceSystem.GITHUB

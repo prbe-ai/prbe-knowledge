@@ -34,7 +34,7 @@ from engine.shared.constants import (
     SourceSystem,
 )
 from engine.shared.customer_mapping import record_mapping
-from engine.shared.db import raw_conn
+from engine.shared.db import raw_conn, with_tenant
 from engine.shared.encryption import encrypt_token
 from engine.shared.logging import get_logger
 
@@ -64,6 +64,10 @@ class GitHubMintNotConfigured(GitHubSeedError):
         )
 
 
+class GitHubLegacyWorkPending(GitHubSeedError):
+    """Existing unscoped jobs must drain before this installation adopts v2."""
+
+
 async def _customer_exists(customer_id: str) -> bool:
     async with raw_conn() as conn:
         row = await conn.fetchrow(
@@ -74,7 +78,7 @@ async def _customer_exists(customer_id: str) -> bool:
 
 
 async def seed_github_installation(
-    customer_id: str, installation_id: str
+    customer_id: str, installation_id: str, *, protocol_version: int = 1
 ) -> datetime:
     """Upsert the mapping + installation-scoped token row for a GitHub App
     installation and validate the mint path by fetching one installation token.
@@ -115,9 +119,39 @@ async def seed_github_installation(
         external_name=None,
         metadata={"installation_id": installation_id},
     )
-    async with raw_conn() as conn:
+    async with with_tenant(customer_id) as conn:
+        from kb.github_control import adoption_lock
+
+        await adoption_lock(conn, customer_id)
+        existing = await conn.fetchrow(
+            "SELECT managed FROM github_installations WHERE customer_id=$1 AND installation_id=$2 FOR UPDATE",
+            customer_id,
+            installation_id,
+        )
+        if protocol_version == 2 and existing and not existing["managed"]:
+            pending = await conn.fetchval(
+                """SELECT EXISTS(SELECT 1 FROM ingestion_queue
+                WHERE customer_id=$1 AND source_system='github' AND github_installation_id IS NULL
+                  AND status IN ('pending','processing')) OR EXISTS(SELECT 1 FROM backfill_state
+                WHERE customer_id=$1 AND source_system='github' AND status IN ('pending','running'))""",
+                customer_id,
+            )
+            if pending:
+                raise GitHubLegacyWorkPending(
+                    "Existing GitHub work is still finishing; retry setup after it drains"
+                )
         await conn.execute(
-            """
+            """INSERT INTO github_installations(customer_id,installation_id,managed,sync_enabled)
+               VALUES ($1,$2,$3,NOT $3) ON CONFLICT (customer_id,installation_id)
+               DO UPDATE SET active=TRUE, managed=github_installations.managed OR EXCLUDED.managed,
+                  updated_at=now()""",
+            customer_id,
+            installation_id,
+            protocol_version == 2,
+        )
+        if protocol_version == 1:
+            await conn.execute(
+                """
             INSERT INTO integration_tokens
                 (customer_id, source_system, access_token_encrypted,
                  refresh_token_encrypted, expires_at, scope, status)
@@ -127,16 +161,17 @@ async def seed_github_installation(
                 status     = 'active',
                 updated_at = NOW()
             """,
-            customer_id,
-            placeholder,
-            scope,
-            IntegrationStatus.ACTIVE.value,
-        )
+                customer_id,
+                placeholder,
+                scope,
+                IntegrationStatus.ACTIVE.value,
+            )
 
     async with httpx.AsyncClient(timeout=settings.http_timeout_seconds) as http:
         _token, expires_at = await fetch_github_installation_token(
             http,
             customer_id=customer_id,
+            installation_id=installation_id,
         )
 
     log.info(

@@ -164,6 +164,8 @@ async def run_graphql(
     auth_headers: dict[str, str],
     query: str,
     variables: dict[str, Any],
+    *,
+    strict: bool = False,
 ) -> dict[str, Any] | None:
     """POST a GraphQL query to api.github.com/graphql.
 
@@ -241,6 +243,8 @@ async def run_graphql(
         data = body.get("data")
 
         if errors:
+            if strict:
+                raise ValueError("GitHub returned a partial or failed history page")
             error_types = {
                 (e.get("type") or "").upper()
                 for e in errors

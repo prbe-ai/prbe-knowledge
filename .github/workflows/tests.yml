@@ -147,6 +147,10 @@ jobs:
       - name: Tests (storage + workflow-memory suites)
         run: >-
           .venv/bin/pytest -q
+          tests/test_github_installation_controls.py
+          tests/handlers/test_github.py
+          tests/test_backend_client.py
+          tests/test_codegraph_github_branch_filter.py
           tests/test_workflow_memory_capabilities.py
           tests/test_workflow_memory_classifier.py
           tests/test_workflow_memory_declaring.py

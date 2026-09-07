@@ -679,6 +679,7 @@ class GitHubConnector(Connector):
         bearer, _expires = await fetch_github_installation_token(
             self.http,
             customer_id=customer_id,
+            installation_id=scope[len(GITHUB_INSTALLATION_SCOPE_PREFIX):],
         )
         return bearer
 
@@ -859,6 +860,13 @@ class GitHubConnector(Connector):
             run_graphql,
         )
 
+        async def query_page(*args):
+            strict = getattr(self, "strict_backfill", False)
+            result = await run_graphql(*args, **({"strict": True} if strict else {}))
+            if strict and (result is None or result.get("repository") is None):
+                raise ValueError("GitHub history page unavailable; completion cannot be established")
+            return result
+
         state = _decode_github_cursor(cursor)
         bearer = await self._resolve_installation_bearer(token, customer_id=customer_id)
         auth_headers = {
@@ -919,7 +927,7 @@ class GitHubConnector(Connector):
 
         completed: set[str] = set()
         snapshot_lock = _asyncio.Lock()
-        queue: _asyncio.Queue = _asyncio.Queue()
+        queue: _asyncio.Queue = _asyncio.Queue(maxsize=100)
         concurrency = max(int(self.settings.github_backfill_repo_concurrency or 1), 1)
         sem = _asyncio.Semaphore(concurrency)
 
@@ -962,7 +970,7 @@ class GitHubConnector(Connector):
                 # Pulls phase.
                 if rs["phase"] == "pulls":
                     while True:
-                        data = await run_graphql(
+                        data = await query_page(
                             self.http,
                             auth_headers,
                             BACKFILL_PULLS_QUERY,
@@ -1073,7 +1081,7 @@ class GitHubConnector(Connector):
                 # Issues phase.
                 if rs["phase"] == "issues":
                     while True:
-                        data = await run_graphql(
+                        data = await query_page(
                             self.http,
                             auth_headers,
                             BACKFILL_ISSUES_QUERY,
@@ -1129,7 +1137,7 @@ class GitHubConnector(Connector):
                 # repos with non-main defaults.
                 if rs["phase"] == "commits":
                     while True:
-                        data = await run_graphql(
+                        data = await query_page(
                             self.http,
                             auth_headers,
                             BACKFILL_COMMITS_QUERY,
@@ -1200,7 +1208,7 @@ class GitHubConnector(Connector):
                 # are deliberately never synthesized from backfill.
                 if rs["phase"] == "releases":
                     while True:
-                        data = await run_graphql(
+                        data = await query_page(
                             self.http,
                             auth_headers,
                             BACKFILL_RELEASES_QUERY,
@@ -1264,30 +1272,26 @@ class GitHubConnector(Connector):
         # Launch one task per repo; the semaphore caps concurrency.
         tasks = [_asyncio.create_task(_walk_repo(r)) for r in repos_to_walk]
 
-        # Drain the queue until all repo-walkers have finished AND we've handed
-        # every queued event to the caller.
-        while True:
-            all_done = all(t.done() for t in tasks)
-            if all_done and queue.empty():
-                break
-            try:
-                event = await _asyncio.wait_for(queue.get(), timeout=0.05)
-            except TimeoutError:
-                continue
-            yield event
-
-        # Re-raise the first walker exception so backfill_runner.run_backfill
-        # marks this row failed instead of writing a "success" cursor over a
-        # partial walk. Previously the loop just logged and exited normally;
-        # any walker that raised silently dropped its repo from the backfill.
-        for task in tasks:
-            if not task.done():
-                continue
-            exc = task.exception()
-            if exc is None or isinstance(exc, _asyncio.CancelledError):
-                continue
-            log.warning("github.backfill_walker_error", error=str(exc))
-            raise exc
+        try:
+            while True:
+                if all(t.done() for t in tasks) and queue.empty():
+                    break
+                try:
+                    event = await _asyncio.wait_for(queue.get(), timeout=0.05)
+                except TimeoutError:
+                    continue
+                yield event
+            for task in tasks:
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+        finally:
+            # Sliced v2 jobs and cancellations must not leave provider walkers
+            # running after their generator closes (or filling an orphan queue).
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await _asyncio.gather(*tasks, return_exceptions=True)
 
     # ------------------------------------------------------------------
     # 4. normalization
@@ -1313,7 +1317,8 @@ class GitHubConnector(Connector):
             # extraction stays in sync. Fire-and-await: a bridge failure
             # shouldn't block the github.commit ingestion path, so
             # exceptions are logged and swallowed.
-            await self._fire_codegraph_incremental(event)
+            if not _header(headers, "x-probe-github-protocol"):
+                await self._fire_codegraph_incremental(event)
             return result
         if event_type == _EVENT_PR_REVIEW:
             return self._normalize_review(event)

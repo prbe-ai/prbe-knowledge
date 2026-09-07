@@ -520,7 +520,16 @@ async def enqueue_backfill(customer_id: str, source: SourceSystem) -> None:
     re-polls of already-synced integrations (Granola steady-state), use
     `re_enqueue_for_polling` to preserve the cursor watermark.
     """
-    async with raw_conn() as conn:
+    from engine.shared.db import with_tenant
+
+    async with with_tenant(customer_id) as conn:
+        if source == SourceSystem.GITHUB:
+            from kb.github_control import adoption_lock
+
+            await adoption_lock(conn, customer_id)
+            managed = await conn.fetchval("SELECT EXISTS(SELECT 1 FROM github_installations WHERE customer_id=$1 AND managed)", customer_id)
+            if managed:
+                raise ValueError("Use installation-scoped GitHub history controls for this customer")
         await conn.execute(
             """
             INSERT INTO backfill_state
