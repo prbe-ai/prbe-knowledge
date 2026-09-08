@@ -16,6 +16,7 @@ Pairing/heartbeat/revoke are public lifecycle endpoints on prbe-backend
 (api.prbe.ai/agent-tap/*); prbe-knowledge exposes only the internal
 /api/devices/* endpoints that the gateway calls.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -126,6 +127,17 @@ class ClaudeCodeConnector(Connector):
         headers: Mapping[str, str],
         raw_payload: Mapping[str, Any],
     ) -> WebhookParseResult | None:
+        if raw_payload.get("protocol_version") == 2:
+            # Cursor-only batches still identify the session. The normalizer
+            # parses the oldest accepted key before hydrating its later events.
+            from fastapi import HTTPException
+
+            from kb.session_receipts import validate_payload
+
+            try:
+                validate_payload(dict(raw_payload))
+            except HTTPException as exc:
+                raise InvalidWebhookPayload(f"invalid transcript protocol: {exc.detail}") from exc
         # source_event_id is the bare session_id for both live batches AND
         # finalize events. _enqueue (services/ingestion/main.py) UPSERTs on
         # this key for claude_code, so every batch + the cron finalize all
@@ -156,7 +168,7 @@ class ClaudeCodeConnector(Connector):
             raise InvalidWebhookPayload("claude_code: batch_seq must be int")
 
         events = raw_payload.get("events") or []
-        if not events:
+        if not events and raw_payload.get("protocol_version") != 2:
             return None  # empty post, nothing to enqueue
 
         return WebhookParseResult(
@@ -175,9 +187,7 @@ class ClaudeCodeConnector(Connector):
             return None
         return device_id
 
-    async def identify_workspaces(
-        self, token: IntegrationToken
-    ) -> list[ExternalWorkspaceRef]:
+    async def identify_workspaces(self, token: IntegrationToken) -> list[ExternalWorkspaceRef]:
         if token.device_id is None:
             raise ValueError("identify_workspaces called without device_id")
         meta = token.device_metadata or {}
@@ -223,9 +233,28 @@ class ClaudeCodeConnector(Connector):
 
         merged_events: list[dict[str, Any]] = []
         seen_line_nos: set[int] = set()
-        session_identity: dict[str, str] = {}
+        session_identity: dict[str, Any] = {}
+        latest_uploader_seq = -1
 
         def _remember_payload_identity(payload: Mapping[str, Any]) -> None:
+            nonlocal latest_uploader_seq
+            if payload.get("protocol_version") == 2:
+                session_identity["protocol_version"] = 2
+                if isinstance(payload.get("provenance"), dict):
+                    session_identity["provenance"] = dict(payload["provenance"])
+                if payload.get("batch_seq", -1) > latest_uploader_seq:
+                    latest_uploader_seq = payload["batch_seq"]
+                    session_identity["uploader"] = {
+                        key: value
+                        for key in (
+                            "employee_id",
+                            "employee_name",
+                            "employee_email",
+                            "employee_hostname",
+                            "device_id",
+                        )
+                        if (value := _nonempty_str(payload.get(key))) is not None
+                    }
             # In coalesced sessions, Normalizer.event.raw_payload is the
             # oldest payload. A session that started before a gateway identity
             # deploy can therefore have name/email/hostname only on later
@@ -278,8 +307,9 @@ class ClaudeCodeConnector(Connector):
         client_finalize_seen = False
         last_v2_batch = -1
         last_v2_finalized = False
-        # The keys that carry the completion signal, so the normalizer can drop
-        # them once we have acted on it. See `consume_payload_keys`.
+        # Legacy completion keys are consumed after extraction. Protocol 2
+        # finalize keys are immutable evidence of the accepted prefix; retain
+        # them, and let the highest sequence determine completion on every pass.
         finalize_keys: list[str] = []
         for key, body in fetched:
             if key.endswith("/finalize.marker"):
@@ -293,7 +323,10 @@ class ClaudeCodeConnector(Connector):
             payload = envelope.get("payload", envelope) if isinstance(envelope, dict) else {}
             if not isinstance(payload, dict):
                 continue
-            if payload.get("protocol_version") == 2 and payload.get("batch_seq", -1) > last_v2_batch:
+            if (
+                payload.get("protocol_version") == 2
+                and payload.get("batch_seq", -1) > last_v2_batch
+            ):
                 last_v2_batch = payload["batch_seq"]
                 last_v2_finalized = payload.get("finalize") is True
             # An explicit client finalize (the tap's SessionEnd hook, via the
@@ -310,7 +343,8 @@ class ClaudeCodeConnector(Connector):
             # runs on completion never fired for a cleanly-ended session.
             if payload.get("finalize") is True:
                 client_finalize_seen = True
-                finalize_keys.append(key)
+                if payload.get("protocol_version") != 2:
+                    finalize_keys.append(key)
             _remember_payload_identity(payload)
             for obj in payload.get("events") or []:
                 if isinstance(obj, dict):
@@ -329,10 +363,7 @@ class ClaudeCodeConnector(Connector):
         # says "this session ended cleanly", the sweep says "nobody ever said
         # anything and it has been quiet for hours" — and collapsing them would
         # make it impossible to tell a working finish hook from a silent one.
-        complete = any(
-            (e.get("raw") or {}).get("type") == "session_end"
-            for e in merged_events
-        )
+        complete = any((e.get("raw") or {}).get("type") == "session_end" for e in merged_events)
         if last_v2_batch >= 0:
             client_finalize_seen = last_v2_finalized
         if client_finalize_seen:
@@ -364,22 +395,26 @@ class ClaudeCodeConnector(Connector):
         events = hydrated.get("events") or []
         cwd = hydrated.get("cwd")
         complete = bool(hydrated.get("session_complete"))
-        employee_id = (
-            _nonempty_str(hydrated.get("employee_id"))
-            or self._employee_id_from_event(event, events)
+        # Authentication proves who uploaded supplied bytes, not who authored
+        # the historical conversation. There is no verified-author v2 claim.
+        unverified_author = hydrated.get("protocol_version") == 2
+        employee_id = _nonempty_str(hydrated.get("employee_id")) or self._employee_id_from_event(
+            event, events
         )
-        employee_name = (
-            _nonempty_str(hydrated.get("employee_name"))
-            or self._employee_name_from_event(event, events)
-        )
-        employee_email = (
-            _nonempty_str(hydrated.get("employee_email"))
-            or self._employee_email_from_event(event, events)
-        )
-        employee_hostname = (
-            _nonempty_str(hydrated.get("employee_hostname"))
-            or self._employee_hostname_from_event(event, events)
-        )
+        employee_name = _nonempty_str(
+            hydrated.get("employee_name")
+        ) or self._employee_name_from_event(event, events)
+        employee_email = _nonempty_str(
+            hydrated.get("employee_email")
+        ) or self._employee_email_from_event(event, events)
+        employee_hostname = _nonempty_str(
+            hydrated.get("employee_hostname")
+        ) or self._employee_hostname_from_event(event, events)
+        uploader = dict(hydrated.get("uploader") or {})
+        if unverified_author:
+            employee_id = uploader.get("employee_id") or employee_id
+            uploader.setdefault("employee_id", employee_id)
+            employee_name = employee_email = employee_hostname = None
 
         now = datetime.now(UTC)
         session_doc = self._build_session_doc(
@@ -396,6 +431,8 @@ class ClaudeCodeConnector(Connector):
         )
 
         documents: list[Document] = [session_doc]
+        if unverified_author:
+            self._capture_provenance(session_doc, hydrated, uploader)
         # Stamp employee_name + employee_email + hostname on the Person
         # node when the gateway provided them. name/email power
         # name-keyed graph filters via idx_graph_nodes_lower_props_name;
@@ -428,9 +465,7 @@ class ClaudeCodeConnector(Connector):
         # truncates the id to 8 characters so a query naming the real session
         # id could not match. agent_session_display_name is short and carries
         # the FULL id; see its docstring.
-        agent_session_node_id = agent_session_canonical_id(
-            self._agent_label, session_id
-        )
+        agent_session_node_id = agent_session_canonical_id(self._agent_label, session_id)
         graph_nodes: list[GraphNodeSpec] = [
             GraphNodeSpec(
                 label=NodeLabel.PERSON,
@@ -445,9 +480,7 @@ class ClaudeCodeConnector(Connector):
             make_named_entity(
                 NodeLabel.AGENT_SESSION,
                 agent_session_node_id,
-                agent_session_display_name(
-                    self._agent_label, session_id, employee_name
-                ),
+                agent_session_display_name(self._agent_label, session_id, employee_name),
                 properties={"agent": self._agent_label, "session_id": session_id},
             ),
         ]
@@ -473,6 +506,8 @@ class ClaudeCodeConnector(Connector):
                 properties={"session_id": session_id},
             ),
         ]
+        if unverified_author:
+            graph_edges = [edge for edge in graph_edges if edge.edge_type != EdgeType.AUTHORED]
         acl = self._acl(employee_id)
         acl_rows: list[ACLSnapshotRow] = [
             ACLSnapshotRow(
@@ -589,10 +624,12 @@ class ClaudeCodeConnector(Connector):
                         "decided_by": dec.decided_by,
                         "status": dec.status,
                         "trigger": dec.trigger,
-                        **({"supersedes": dec.supersedes}
-                           if dec.supersedes is not None else {}),
-                        **({"superseded_by": dec.superseded_by}
-                           if dec.superseded_by is not None else {}),
+                        **({"supersedes": dec.supersedes} if dec.supersedes is not None else {}),
+                        **(
+                            {"superseded_by": dec.superseded_by}
+                            if dec.superseded_by is not None
+                            else {}
+                        ),
                         **self._segment_metadata(dec),
                     },
                     body=_decision_body(dec),
@@ -655,6 +692,8 @@ class ClaudeCodeConnector(Connector):
 
         # Mirror ACL onto every unit doc
         for d in documents[1:]:  # skip session doc, already snapshotted
+            if unverified_author:
+                self._capture_provenance(d, hydrated, uploader)
             for p in acl.principals:
                 acl_rows.append(
                     ACLSnapshotRow(
@@ -683,25 +722,38 @@ class ClaudeCodeConnector(Connector):
             # work. Leaving the old units live is the safe failure: at worst
             # they are stale, and the next successful pass retires them.
             retire_children_of=(
-                [session_doc.doc_id]
-                if bundle.authoritative and len(documents) > 1
-                else []
+                [session_doc.doc_id] if bundle.authoritative and len(documents) > 1 else []
             ),
-            # Completion is an EVENT, not a property. Having acted on it, drop
-            # the keys that carried it: payload_s3_keys is append-only, so
+            # Legacy completion is an event. Having acted on it, drop
+            # its keys: payload_s3_keys is append-only, so
             # leaving them makes every later batch of a resumed session look
             # complete again and buy another full re-extraction of the whole
             # transcript. Only consumed when the extraction was authoritative —
             # a degraded pass has not really acted on the signal, and dropping
-            # it would strand the session unmined until the next sweep.
+            # it would strand the session unmined until the next sweep. V2
+            # completion evidence is retained and superseded by sequence.
             consume_payload_keys=(
-                list(hydrated.get("finalize_keys") or [])
-                if bundle.authoritative
-                else []
+                list(hydrated.get("finalize_keys") or []) if bundle.authoritative else []
             ),
         )
 
     # ---- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _capture_provenance(doc: Document, hydrated: Mapping[str, Any], uploader: dict) -> None:
+        doc.author_id = None
+        doc.metadata["protocol_version"] = 2
+        doc.metadata["author_verification"] = "unverified"
+        provenance = dict(hydrated.get("provenance") or {})
+        doc.metadata["provenance"] = provenance
+        for key in ("native_session_id", "identity_method", "observed_lineage"):
+            if key in provenance:
+                doc.metadata[key] = provenance[key]
+        for key in ("employee_id", "employee_name", "employee_email", "employee_hostname"):
+            doc.metadata.pop(key, None)
+        for key, value in uploader.items():
+            suffix = key.removeprefix("employee_") if key != "device_id" else "device_id"
+            doc.metadata[f"uploader_{suffix}"] = value
 
     def _employee_id_from_event(
         self,
@@ -712,7 +764,7 @@ class ClaudeCodeConnector(Connector):
         if not isinstance(emp, str) or not emp:
             # Finalize events have no employee_id in raw_payload — fall back to
             # the first merged batch event that carries one.
-            for e in (merged_events or []):
+            for e in merged_events or []:
                 candidate = e.get("employee_id")
                 if isinstance(candidate, str) and candidate:
                     return candidate
@@ -732,7 +784,7 @@ class ClaudeCodeConnector(Connector):
         val = event.raw_payload.get("employee_name")
         if isinstance(val, str) and val:
             return val
-        for e in (merged_events or []):
+        for e in merged_events or []:
             candidate = e.get("employee_name")
             if isinstance(candidate, str) and candidate:
                 return candidate
@@ -747,7 +799,7 @@ class ClaudeCodeConnector(Connector):
         val = event.raw_payload.get("employee_email")
         if isinstance(val, str) and val:
             return val
-        for e in (merged_events or []):
+        for e in merged_events or []:
             candidate = e.get("employee_email")
             if isinstance(candidate, str) and candidate:
                 return candidate
@@ -765,7 +817,7 @@ class ClaudeCodeConnector(Connector):
         val = event.raw_payload.get("employee_hostname")
         if isinstance(val, str) and val:
             return val
-        for e in (merged_events or []):
+        for e in merged_events or []:
             candidate = e.get("employee_hostname")
             if isinstance(candidate, str) and candidate:
                 return candidate
@@ -1122,8 +1174,11 @@ def _count_compactions(events: list[dict[str, Any]]) -> int:
     for event in events:
         raw = event.get("raw") if isinstance(event, dict) else None
         raw = raw if isinstance(raw, dict) else event
-        if isinstance(raw, dict) and raw.get("type") == "system" and \
-                raw.get("subtype") == "compact_boundary":
+        if (
+            isinstance(raw, dict)
+            and raw.get("type") == "system"
+            and raw.get("subtype") == "compact_boundary"
+        ):
             total += 1
     return total
 
@@ -1168,6 +1223,7 @@ class CodexConnector(ClaudeCodeConnector):
     storage but are not currently parsed into units; a v0.2 native pipeline
     can read them without re-ingest.
     """
+
     source_system: ClassVar[SourceSystem] = SourceSystem.CODEX
     display_name: ClassVar[str] = "Codex"
     # Source profile (doc_type_prefix "claude_code.", priority 75, 0.5
@@ -1193,6 +1249,7 @@ class PiConnector(ClaudeCodeConnector):
     `_pi_extras` key. It survives into raw R2 storage but is not currently
     parsed into units; a native pipeline can read it without re-ingest.
     """
+
     source_system: ClassVar[SourceSystem] = SourceSystem.PI
     display_name: ClassVar[str] = "pi"
     # Source profile (doc_type_prefix "claude_code.", priority 75, 0.5

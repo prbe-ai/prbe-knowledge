@@ -17,6 +17,7 @@ marker under the source-prefixed R2 path (raw/claude_code/... vs
 raw/codex/... vs raw/pi/...) so each source's marker collides correctly
 with that source's live batches and nothing else.
 """
+
 from __future__ import annotations
 
 import orjson
@@ -26,6 +27,7 @@ from engine.shared.db import get_pool
 from engine.shared.logging import get_logger
 from engine.shared.source_registry import ingestion_priority_for
 from engine.shared.storage import get_store
+from kb.session_receipts import _lock
 
 log = get_logger(__name__)
 
@@ -70,7 +72,7 @@ async def enqueue_idle_session_finalizers(
         ON q.customer_id = i.customer_id
        AND q.source_system = $1
        AND q.source_event_id = i.session_id
-     WHERE q.queue_id IS NULL
+     WHERE (q.queue_id IS NULL
         OR NOT EXISTS (
             SELECT 1 FROM unnest(q.payload_s3_keys) AS k
             -- Already finalized, by EITHER route. Matching only the cron's own
@@ -83,7 +85,11 @@ async def enqueue_idle_session_finalizers(
             -- corpus at once.
             WHERE k LIKE '%/finalize.marker'
                OR k LIKE '%/' || i.session_id || '.json'
-        )
+        ))
+       AND NOT EXISTS (
+           SELECT 1 FROM unnest(q.payload_s3_keys) AS k
+           WHERE k LIKE '%/sessions-v2/%'
+       )
      LIMIT $3
     """
 
@@ -132,34 +138,48 @@ async def enqueue_idle_session_finalizers(
             for r in rows:
                 customer_id = r["customer_id"]
                 session_id = r["session_id"]
-                if dry_run:
+                async with conn.transaction():
+                    await conn.execute(
+                        "SELECT set_config('app.current_customer_id', $1, true)", customer_id
+                    )
+                    await _lock(conn, customer_id, source.value, session_id)
+                    if await conn.fetchval(
+                        "SELECT 1 FROM session_streams WHERE customer_id=$1 AND source_system=$2 AND session_id=$3",
+                        customer_id,
+                        source.value,
+                        session_id,
+                    ):
+                        continue
+                    if dry_run:
+                        enqueued += 1
+                        continue
+                    bucket = await store.bucket_for(customer_id)
+                    if bucket not in seen_buckets:
+                        await store.ensure_bucket(bucket)
+                        seen_buckets.add(bucket)
+                    placeholder_key = (
+                        f"raw/{source.value}/{customer_id}/{session_id}/finalize.marker"
+                    )
+                    placeholder_body = orjson.dumps(
+                        {
+                            "device_id": "cron-finalize",
+                            "session_id": session_id,
+                            "batch_seq": -1,
+                            "cwd": None,
+                            "events": [],
+                            "finalize": True,
+                        }
+                    )
+                    await store.put(bucket, placeholder_key, placeholder_body)
+                    await conn.execute(
+                        upsert_sql,
+                        customer_id,
+                        source.value,
+                        session_id,  # bare session_id — coalescing key
+                        placeholder_key,
+                        priority,
+                    )
                     enqueued += 1
-                    continue
-                bucket = await store.bucket_for(customer_id)
-                if bucket not in seen_buckets:
-                    await store.ensure_bucket(bucket)
-                    seen_buckets.add(bucket)
-                placeholder_key = (
-                    f"raw/{source.value}/{customer_id}/{session_id}/finalize.marker"
-                )
-                placeholder_body = orjson.dumps({
-                    "device_id": "cron-finalize",
-                    "session_id": session_id,
-                    "batch_seq": -1,
-                    "cwd": None,
-                    "events": [],
-                    "finalize": True,
-                })
-                await store.put(bucket, placeholder_key, placeholder_body)
-                await conn.execute(
-                    upsert_sql,
-                    customer_id,
-                    source.value,
-                    session_id,  # bare session_id — coalescing key
-                    placeholder_key,
-                    priority,
-                )
-                enqueued += 1
     log.info(
         "session_completer.run",
         extra={

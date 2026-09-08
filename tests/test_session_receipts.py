@@ -63,7 +63,7 @@ async def database(monkeypatch):
         CREATE TABLE customers(customer_id TEXT PRIMARY KEY);
         INSERT INTO customers VALUES('tenant-a'),('tenant-b');
         CREATE TABLE documents(customer_id TEXT,doc_id TEXT);
-        CREATE TABLE ingestion_queue(customer_id TEXT,source_system TEXT,source_event_id TEXT,
+        CREATE TABLE ingestion_queue(queue_id BIGSERIAL PRIMARY KEY,customer_id TEXT,source_system TEXT,source_event_id TEXT,
             payload_s3_key TEXT,payload_s3_keys TEXT[],status TEXT,priority INTEGER,version INTEGER,
             enqueued_at TIMESTAMPTZ,completed_at TIMESTAMPTZ,error TEXT,
             UNIQUE(customer_id,source_system,source_event_id));
@@ -73,6 +73,7 @@ async def database(monkeypatch):
     await admin.execute(
         "GRANT USAGE ON SCHEMA public TO receipt_app; GRANT ALL ON ALL TABLES IN SCHEMA public TO receipt_app"
     )
+    await admin.execute("GRANT USAGE ON ALL SEQUENCES IN SCHEMA public TO receipt_app")
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=4)
 
     @asynccontextmanager
@@ -87,6 +88,8 @@ async def database(monkeypatch):
 
     monkeypatch.setattr(sr, "with_tenant", tenant)
     monkeypatch.setattr(sr, "is_source_connected", connected)
+    monkeypatch.setattr("engine.ingest.normalizer.get_pool", lambda: pool)
+    monkeypatch.setattr("kb.session_completer.get_pool", lambda: pool)
     yield tenant, admin
     await pool.close()
     await admin.close()
@@ -322,3 +325,203 @@ async def test_declared_historical_snapshot_cannot_finalize_an_accepted_prefix(d
         await sr.accept(final, "tenant-a", SourceSystem.CLAUDE_CODE, store)
     assert error.value.status_code == 409 and "changed before completion" in error.value.detail
     assert store.writes == 1
+
+
+def consumer(store, monkeypatch):
+    from engine.ingest.normalizer import Normalizer
+    from engine.shared import claude_code_extraction as ext
+    from kb.handlers import claude_code
+
+    normalizer = Normalizer(make_default_context(), store=store, embedder=object())
+
+    async def token(*args):
+        return None
+
+    async def extract(**kwargs):
+        return ext.UnitBundle(qa=[ext.QA(prompt="why?", outcome="synthetic")])
+
+    monkeypatch.setattr(normalizer, "_load_token", token)
+    monkeypatch.setattr(claude_code, "get_store", lambda: store)
+    monkeypatch.setattr("kb.session_completer.get_store", lambda: store)
+    monkeypatch.setattr(claude_code._ext, "extract_units_from_session", extract)
+    return normalizer
+
+
+def finalize(body):
+    result = {key: value for key, value in body.items() if key not in ("events", "cwd")}
+    result.update(finalize=True, batch_seq=body["batch_seq"] + 1)
+    for coordinate in ("source_byte", "source_line", "event"):
+        result[f"{coordinate}_start"] = result[f"{coordinate}_end"]
+    return result
+
+
+@pytest.mark.asyncio
+async def test_v2_completion_survives_extraction_idle_sweep_and_reprocessing(database, monkeypatch):
+    from kb.session_completer import enqueue_idle_session_finalizers
+
+    _tenant, admin = database
+    store = Store()
+    normalizer = consumer(store, monkeypatch)
+    body = batch(employee_id="uploader", device_id="device")
+    await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    await sr.accept(finalize(body), "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    row = await admin.fetchrow("SELECT queue_id,payload_s3_keys FROM ingestion_queue")
+    first = await normalizer._normalize_only(
+        "tenant-a", SourceSystem.CLAUDE_CODE, row["payload_s3_keys"]
+    )
+    assert first.documents[0].metadata["session_complete"] and len(first.documents) > 1
+    assert first.consume_payload_keys == []
+    # Execute the real key-consumption method, then the real idle selector.
+    await normalizer._consume_payload_keys(row["queue_id"], first.consume_payload_keys)
+    await admin.execute("UPDATE ingestion_queue SET enqueued_at=NOW()-INTERVAL '1 hour'")
+    assert await enqueue_idle_session_finalizers(idle_minutes=5) == 0
+    keys = await admin.fetchval("SELECT payload_s3_keys FROM ingestion_queue")
+    assert keys == row["payload_s3_keys"]
+    repeated = await normalizer._normalize_only("tenant-a", SourceSystem.CLAUDE_CODE, keys)
+    assert repeated.documents[0].metadata["session_complete"]
+    # Completion is durable evidence but a later accepted sequence reopens it.
+    tail = dict(
+        body,
+        batch_seq=2,
+        source_byte_start=30,
+        source_byte_end=40,
+        source_line_start=3,
+        source_line_end=4,
+        event_start=2,
+        event_end=3,
+        prefix_sha256="a" * 64,
+        events=[
+            {
+                "line_no": 2,
+                "raw": {"type": "user", "message": {"role": "user", "content": "resume"}},
+            }
+        ],
+    )
+    await sr.accept(tail, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    keys = await admin.fetchval("SELECT payload_s3_keys FROM ingestion_queue")
+    reopened = await normalizer._normalize_only("tenant-a", SourceSystem.CLAUDE_CODE, keys)
+    assert not reopened.documents[0].metadata["session_complete"]
+    assert len(reopened.documents) == 1 and reopened.documents[0].metadata["event_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_idle_finalizer_checks_the_tenant_scoped_stream_even_without_key_hint(
+    database, monkeypatch
+):
+    from kb.session_completer import enqueue_idle_session_finalizers
+
+    _tenant, admin = database
+    store = Store()
+    consumer(store, monkeypatch)
+    body = batch(employee_id="uploader")
+    await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    # Simulate legacy-shaped queue references: the URI prefilter is only an
+    # optimization, not the authoritative source ownership check.
+    await admin.execute(
+        "UPDATE ingestion_queue SET payload_s3_keys=ARRAY['legacy-shaped-key'], enqueued_at=NOW()-INTERVAL '1 hour'"
+    )
+    # The same UUID in another tenant stays eligible under its own scope.
+    await admin.execute(
+        "INSERT INTO ingestion_queue(customer_id,source_system,source_event_id,payload_s3_key,payload_s3_keys,enqueued_at) VALUES('tenant-b','claude_code',$1,'legacy',ARRAY['legacy'],NOW()-INTERVAL '1 hour')",
+        body["session_id"],
+    )
+    assert await enqueue_idle_session_finalizers(idle_minutes=5) == 1
+    assert (
+        await admin.fetchval(
+            "SELECT cardinality(payload_s3_keys) FROM ingestion_queue WHERE customer_id='tenant-a'"
+        )
+        == 1
+    )
+    assert (
+        await admin.fetchval(
+            "SELECT cardinality(payload_s3_keys) FROM ingestion_queue WHERE customer_id='tenant-b'"
+        )
+        == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_normalizer_reads_later_events_after_a_cursor_only_first_batch(database, monkeypatch):
+    _tenant, admin = database
+    store = Store()
+    normalizer = consumer(store, monkeypatch)
+    first = batch(
+        employee_id="uploader",
+        source_byte_end=4 * 1024 * 1024,
+        source_line_end=4000,
+        event_end=0,
+        events=[],
+    )
+    await sr.accept(first, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    next_body = dict(
+        first,
+        batch_seq=1,
+        source_byte_start=first["source_byte_end"],
+        source_byte_end=first["source_byte_end"] + 30,
+        source_line_start=4000,
+        source_line_end=4001,
+        event_end=1,
+        prefix_sha256="b" * 64,
+        events=[
+            {
+                "line_no": 0,
+                "raw": {
+                    "type": "user",
+                    "message": {"role": "user", "content": "after dropped history"},
+                },
+            }
+        ],
+    )
+    await sr.accept(next_body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    keys = await admin.fetchval("SELECT payload_s3_keys FROM ingestion_queue")
+    result = await normalizer._normalize_only("tenant-a", SourceSystem.CLAUDE_CODE, keys)
+    assert result.documents[0].metadata["event_count"] == 1
+    assert "after dropped history" in result.documents[0].body
+    broken = dict(first, event_end=1)
+    from engine.shared.exceptions import InvalidWebhookPayload
+
+    with pytest.raises(InvalidWebhookPayload):
+        ClaudeCodeConnector(make_default_context()).parse_webhook_event("tenant-a", {}, broken)
+
+
+@pytest.mark.asyncio
+async def test_copied_history_projects_native_provenance_and_uploader_without_authorship(
+    database, monkeypatch
+):
+    from engine.shared.constants import EdgeType
+
+    _tenant, admin = database
+    store = Store()
+    normalizer = consumer(store, monkeypatch)
+    body = batch(
+        employee_id="copy-uploader",
+        employee_name="Copy Uploader",
+        employee_email="uploader@example.test",
+        employee_hostname="upload-machine",
+        device_id="paired-upload-device",
+    )
+    body["provenance"] = dict(
+        original_author="unverified",
+        native_session_id=body["session_id"],
+        identity_method="producer-record-v1",
+        observed_lineage=["ancestor-session"],
+    )
+    await sr.accept(body, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    # Finalize carries no source provenance; hydration must retain the first batch's proof.
+    end = finalize(body)
+    end.pop("provenance")
+    await sr.accept(end, "tenant-a", SourceSystem.CLAUDE_CODE, store)
+    keys = await admin.fetchval("SELECT payload_s3_keys FROM ingestion_queue")
+    result = await normalizer._normalize_only("tenant-a", SourceSystem.CLAUDE_CODE, keys)
+    assert len(result.documents) > 1
+    assert not any(edge.edge_type == EdgeType.AUTHORED for edge in result.graph_edges)
+    for doc in result.documents:
+        assert doc.author_id is None and "Copy Uploader" not in doc.title
+        assert doc.metadata["provenance"] == body["provenance"]
+        assert doc.metadata["native_session_id"] == body["session_id"]
+        assert doc.metadata["observed_lineage"] == ["ancestor-session"]
+        assert doc.metadata["uploader_id"] == "copy-uploader"
+        assert doc.metadata["uploader_name"] == "Copy Uploader"
+        assert doc.metadata["uploader_device_id"] == "paired-upload-device"
+        assert not any(key.startswith("employee_") for key in doc.metadata)
+        assert doc.acl.principals[0].principal_id == "copy-uploader"
