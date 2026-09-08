@@ -78,6 +78,7 @@ from kb.feature_nodes_routes import router as feature_nodes_router
 from kb.github_control_routes import router as github_control_router
 from kb.internal_devices import router as devices_router
 from kb.purge_routes import router as purge_router
+from kb.session_receipts import router as session_receipts_router
 from kb.slack_lifecycle import handle_slack_lifecycle_event
 from kb.stats_routes import router as stats_router
 
@@ -122,6 +123,7 @@ app.include_router(entity_merge_suggestions_router)
 app.include_router(feature_nodes_router)
 app.include_router(devices_router)
 app.include_router(custom_ingest_router)
+app.include_router(session_receipts_router)
 
 
 @app.get("/health")
@@ -511,6 +513,11 @@ async def webhook(
             lifecycle["trace_id"] = trace_id
             return JSONResponse(lifecycle)
 
+    if source_enum in _COALESCING_AGENT_SOURCES and isinstance(payload, dict) and payload.get("protocol_version") == 2:
+        from kb.session_receipts import accept
+
+        return JSONResponse(await accept(payload, customer_id, source_enum, request.app.state.store))
+
     try:
         parsed = connector.parse_webhook_event(
             customer_id, dict(request.headers), payload
@@ -589,6 +596,13 @@ async def webhook(
         source_enum, parsed.source_event_id, parsed.parse_hint
     )
     key = _payload_key(source_enum, customer_id, storage_id)
+
+    if source_enum in _COALESCING_AGENT_SOURCES:
+        from kb.session_receipts import accept_legacy
+        inserted = await accept_legacy(payload, envelope, customer_id, source_enum,
+                                       store, key, _enqueue)
+        return JSONResponse({"status": "accepted" if inserted else "duplicate",
+                             "trace_id": trace_id, "source_event_id": parsed.source_event_id})
 
     try:
         await store.ensure_bucket(bucket)

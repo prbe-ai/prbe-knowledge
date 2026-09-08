@@ -109,6 +109,30 @@ jobs:
           psql -h localhost -p 5432 -U prbe -d prbe_knowledge -v ON_ERROR_STOP=1 -f db/schema.sql
           .venv/bin/alembic stamp head
 
+      # These tests deliberately reset their schemas. Separate databases keep
+      # receipt races and fresh-install checks away from the shared live_db
+      # fixtures, and explicit URLs prevent a green run that skips the contract.
+      - name: Provision isolated session contract databases
+        run: |
+          createdb -h localhost -p 5432 -U prbe session_receipts_test
+          createdb -h localhost -p 5432 -U prbe backfill_schema_test
+
+      - name: Tests (session protocol and bootstrap)
+        env:
+          PRBE_RECEIPT_TEST_DATABASE_URL: postgresql://prbe:prbe@localhost:5432/session_receipts_test
+          PRBE_SCHEMA_TEST_DATABASE_URL: postgresql://prbe:prbe@localhost:5432/backfill_schema_test
+        run: >-
+          .venv/bin/pytest -q
+          tests/test_session_receipts.py
+          tests/test_session_receipts_bootstrap.py
+          tests/test_session_completer.py
+          tests/handlers/test_claude_code_parse_webhook_event.py
+          tests/handlers/test_claude_code_fetch_supplementary.py
+          tests/handlers/test_claude_code_normalize.py
+          tests/handlers/test_claude_code_extract_external_id.py
+          tests/handlers/test_codex_registration.py
+          tests/handlers/test_pi_registration.py
+
       # Scoped to the STORAGE suite (Postgres + MinIO), not `tests/` wholesale.
       # The full suite has ~42 pre-existing failures unrelated to storage: tests that
       # need the ParadeDB/BM25 extension or a live Gemini key, plus stale expectations

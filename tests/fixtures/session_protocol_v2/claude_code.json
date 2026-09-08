@@ -1,0 +1,185 @@
+{
+  "generator": "research-os agent/tests/test_backfill_transcripts_upload.py producer + Journal.stage; 12 source turns",
+  "source": "claude_code",
+  "expected_events": 12,
+  "batches": [
+    {
+      "batch_seq": 0,
+      "cwd": "/synthetic",
+      "event_end": 10,
+      "event_start": 0,
+      "events": [
+        {
+          "line_no": 0,
+          "raw": {
+            "message": {
+              "content": "turn 0",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 1,
+          "raw": {
+            "message": {
+              "content": "turn 1",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 2,
+          "raw": {
+            "message": {
+              "content": "turn 2",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 3,
+          "raw": {
+            "message": {
+              "content": "turn 3",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 4,
+          "raw": {
+            "message": {
+              "content": "turn 4",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 5,
+          "raw": {
+            "message": {
+              "content": "turn 5",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 6,
+          "raw": {
+            "message": {
+              "content": "turn 6",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 7,
+          "raw": {
+            "message": {
+              "content": "turn 7",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 8,
+          "raw": {
+            "message": {
+              "content": "turn 8",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 9,
+          "raw": {
+            "message": {
+              "content": "turn 9",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "39513ba89f2ed50b1d573e5643ac91e664d4dea3739d67fbfed931ad0b07b032",
+      "protocol_version": 2,
+      "provenance": {
+        "identity_method": "producer-record-v1",
+        "native_session_id": "34538899-325d-47bb-9194-7995327dc0ee",
+        "observed_lineage": [],
+        "original_author": "unverified"
+      },
+      "session_id": "34538899-325d-47bb-9194-7995327dc0ee",
+      "snapshot_byte_end": 2281,
+      "snapshot_sha256": "3a7ed9a392364e16fcf48685d1b079abfcde2939f6666b5fe73df098e9909843",
+      "source_byte_end": 1901,
+      "source_byte_start": 0,
+      "source_line_end": 12,
+      "source_line_start": 0,
+      "stream_id": "f94fa5ec-ff37-46c9-8e41-1dc39872d14e"
+    },
+    {
+      "batch_seq": 1,
+      "cwd": "/synthetic",
+      "event_end": 12,
+      "event_start": 10,
+      "events": [
+        {
+          "line_no": 10,
+          "raw": {
+            "message": {
+              "content": "turn 10",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 11,
+          "raw": {
+            "message": {
+              "content": "turn 11",
+              "role": "user"
+            },
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "3a7ed9a392364e16fcf48685d1b079abfcde2939f6666b5fe73df098e9909843",
+      "protocol_version": 2,
+      "session_id": "34538899-325d-47bb-9194-7995327dc0ee",
+      "snapshot_byte_end": 2281,
+      "snapshot_sha256": "3a7ed9a392364e16fcf48685d1b079abfcde2939f6666b5fe73df098e9909843",
+      "source_byte_end": 2281,
+      "source_byte_start": 1901,
+      "source_line_end": 14,
+      "source_line_start": 12,
+      "stream_id": "f94fa5ec-ff37-46c9-8e41-1dc39872d14e"
+    },
+    {
+      "batch_seq": 2,
+      "event_end": 12,
+      "event_start": 12,
+      "finalize": true,
+      "prefix_sha256": "3a7ed9a392364e16fcf48685d1b079abfcde2939f6666b5fe73df098e9909843",
+      "protocol_version": 2,
+      "session_id": "34538899-325d-47bb-9194-7995327dc0ee",
+      "snapshot_byte_end": 2281,
+      "snapshot_sha256": "3a7ed9a392364e16fcf48685d1b079abfcde2939f6666b5fe73df098e9909843",
+      "source_byte_end": 2281,
+      "source_byte_start": 2281,
+      "source_line_end": 14,
+      "source_line_start": 14,
+      "stream_id": "f94fa5ec-ff37-46c9-8e41-1dc39872d14e"
+    }
+  ]
+}

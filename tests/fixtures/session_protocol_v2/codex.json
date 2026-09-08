@@ -1,0 +1,265 @@
+{
+  "generator": "research-os agent/tests/test_backfill_transcripts_upload.py producer + Journal.stage; 12 source turns",
+  "source": "codex",
+  "expected_events": 13,
+  "batches": [
+    {
+      "batch_seq": 0,
+      "cwd": "/synthetic",
+      "event_end": 7,
+      "event_start": 0,
+      "events": [
+        {
+          "line_no": 0,
+          "raw": {
+            "subtype": "session_start",
+            "timestamp": null,
+            "type": "system"
+          }
+        },
+        {
+          "line_no": 1,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 0",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 2,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 1",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 3,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 2",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 4,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 3",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 5,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 4",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 6,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 5",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "968bcf3672db47fe59ffb0b115e155d4b1140d5b3a4f649b2a416986e6488ba2",
+      "protocol_version": 2,
+      "provenance": {
+        "identity_method": "producer-record-v1",
+        "native_session_id": "fa157d45-08ff-43e7-8b46-07ad2ccb911f",
+        "observed_lineage": [],
+        "original_author": "unverified"
+      },
+      "session_id": "fa157d45-08ff-43e7-8b46-07ad2ccb911f",
+      "snapshot_byte_end": 1679,
+      "snapshot_sha256": "2986a45d72e1a3653f1ee2100f9f4b2702cada6c56d1a316aba49fd082186696",
+      "source_byte_end": 897,
+      "source_byte_start": 0,
+      "source_line_end": 9,
+      "source_line_start": 0,
+      "stream_id": "d4041e9a-acd2-4613-8407-ce6e9733ea87"
+    },
+    {
+      "batch_seq": 1,
+      "cwd": "/synthetic",
+      "event_end": 13,
+      "event_start": 7,
+      "events": [
+        {
+          "line_no": 7,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 6",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 8,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 7",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 9,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 8",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 10,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 9",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 11,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 10",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        },
+        {
+          "line_no": 12,
+          "raw": {
+            "message": {
+              "content": [
+                {
+                  "text": "turn 11",
+                  "type": "text"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "2986a45d72e1a3653f1ee2100f9f4b2702cada6c56d1a316aba49fd082186696",
+      "protocol_version": 2,
+      "session_id": "fa157d45-08ff-43e7-8b46-07ad2ccb911f",
+      "snapshot_byte_end": 1679,
+      "snapshot_sha256": "2986a45d72e1a3653f1ee2100f9f4b2702cada6c56d1a316aba49fd082186696",
+      "source_byte_end": 1679,
+      "source_byte_start": 897,
+      "source_line_end": 15,
+      "source_line_start": 9,
+      "stream_id": "d4041e9a-acd2-4613-8407-ce6e9733ea87"
+    },
+    {
+      "batch_seq": 2,
+      "event_end": 13,
+      "event_start": 13,
+      "finalize": true,
+      "prefix_sha256": "2986a45d72e1a3653f1ee2100f9f4b2702cada6c56d1a316aba49fd082186696",
+      "protocol_version": 2,
+      "session_id": "fa157d45-08ff-43e7-8b46-07ad2ccb911f",
+      "snapshot_byte_end": 1679,
+      "snapshot_sha256": "2986a45d72e1a3653f1ee2100f9f4b2702cada6c56d1a316aba49fd082186696",
+      "source_byte_end": 1679,
+      "source_byte_start": 1679,
+      "source_line_end": 15,
+      "source_line_start": 15,
+      "stream_id": "d4041e9a-acd2-4613-8407-ce6e9733ea87"
+    }
+  ]
+}

@@ -1,0 +1,798 @@
+{
+  "generator": "research-os agent/tests/test_backfill_transcripts_upload.py producer + Journal.stage; 12 source turns",
+  "source": "pi",
+  "expected_events": 25,
+  "batches": [
+    {
+      "batch_seq": 0,
+      "cwd": "/synthetic",
+      "event_end": 3,
+      "event_start": 0,
+      "events": [
+        {
+          "line_no": 0,
+          "raw": {
+            "_pi_extras": {
+              "cwd": "/synthetic",
+              "session_uuid": "14952845-4635-4c84-9a3f-48d66cfab040",
+              "version": 3
+            },
+            "subtype": "session_meta",
+            "timestamp": null,
+            "type": "system"
+          }
+        },
+        {
+          "line_no": 1,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "0",
+              "parentId": "-1"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-0",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 2,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "0",
+              "parentId": "-1"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-0",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "4a7e5a8a131b3184d63fd6b510ed2ba41c7f1742eff3a36fbea98998f3dd4d51",
+      "protocol_version": 2,
+      "provenance": {
+        "identity_method": "producer-record-v1",
+        "native_session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+        "observed_lineage": [],
+        "original_author": "unverified"
+      },
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 273,
+      "source_byte_start": 0,
+      "source_line_end": 4,
+      "source_line_start": 0,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 1,
+      "cwd": "/synthetic",
+      "event_end": 5,
+      "event_start": 3,
+      "events": [
+        {
+          "line_no": 3,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "1",
+              "parentId": "0"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-1",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 4,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "1",
+              "parentId": "0"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-1",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "47efc9db57e911e28d7b6006804bf22893b088e10724b5490c8e8afb2e57d38a",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 432,
+      "source_byte_start": 273,
+      "source_line_end": 5,
+      "source_line_start": 4,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 2,
+      "cwd": "/synthetic",
+      "event_end": 7,
+      "event_start": 5,
+      "events": [
+        {
+          "line_no": 5,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "2",
+              "parentId": "1"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-2",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 6,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "2",
+              "parentId": "1"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-2",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "43d57ca07c2895beb1d81671080c137f7e418421cae758a21fd500630ecf0a68",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 591,
+      "source_byte_start": 432,
+      "source_line_end": 6,
+      "source_line_start": 5,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 3,
+      "cwd": "/synthetic",
+      "event_end": 9,
+      "event_start": 7,
+      "events": [
+        {
+          "line_no": 7,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "3",
+              "parentId": "2"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-3",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 8,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "3",
+              "parentId": "2"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-3",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "44ecf6854599f6a2a6caaa3a97b5c6b5278dea381cc1ef1dafae192e94ee4dc4",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 750,
+      "source_byte_start": 591,
+      "source_line_end": 7,
+      "source_line_start": 6,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 4,
+      "cwd": "/synthetic",
+      "event_end": 11,
+      "event_start": 9,
+      "events": [
+        {
+          "line_no": 9,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "4",
+              "parentId": "3"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-4",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 10,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "4",
+              "parentId": "3"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-4",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "53382e6034f802b4cb6e6e53df8e4005546ebe84e0982d99975f7872929cb90c",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 909,
+      "source_byte_start": 750,
+      "source_line_end": 8,
+      "source_line_start": 7,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 5,
+      "cwd": "/synthetic",
+      "event_end": 13,
+      "event_start": 11,
+      "events": [
+        {
+          "line_no": 11,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "5",
+              "parentId": "4"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-5",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 12,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "5",
+              "parentId": "4"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-5",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "548af5dabb1363c0fe54fea6ceb01e2156e65d3a0cacf0bdbdcfae1901d6209e",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 1068,
+      "source_byte_start": 909,
+      "source_line_end": 9,
+      "source_line_start": 8,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 6,
+      "cwd": "/synthetic",
+      "event_end": 15,
+      "event_start": 13,
+      "events": [
+        {
+          "line_no": 13,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "6",
+              "parentId": "5"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-6",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 14,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "6",
+              "parentId": "5"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-6",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "f91ada705920104cc02e4bee5596b8eb477421063c7615bdd3c402a3d94eb56b",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 1227,
+      "source_byte_start": 1068,
+      "source_line_end": 10,
+      "source_line_start": 9,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 7,
+      "cwd": "/synthetic",
+      "event_end": 17,
+      "event_start": 15,
+      "events": [
+        {
+          "line_no": 15,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "7",
+              "parentId": "6"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-7",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 16,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "7",
+              "parentId": "6"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-7",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "a76b7bbd59adbdd1649bff7591ac2a60accdf81b728ceee0fcc75177648e2ee6",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 1386,
+      "source_byte_start": 1227,
+      "source_line_end": 11,
+      "source_line_start": 10,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 8,
+      "cwd": "/synthetic",
+      "event_end": 19,
+      "event_start": 17,
+      "events": [
+        {
+          "line_no": 17,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "8",
+              "parentId": "7"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-8",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 18,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "8",
+              "parentId": "7"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-8",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "b91852642794901b79e3f0eb1eba54db2424fb775ac03d570e5ef0bd6ee4ef61",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 1545,
+      "source_byte_start": 1386,
+      "source_line_end": 12,
+      "source_line_start": 11,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 9,
+      "cwd": "/synthetic",
+      "event_end": 21,
+      "event_start": 19,
+      "events": [
+        {
+          "line_no": 19,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "9",
+              "parentId": "8"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-9",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 20,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "9",
+              "parentId": "8"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-9",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "3ea7a3fbc59e3522f910a466700d05617fee9159bd97a55eb01ff06e1c21f2bb",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 1704,
+      "source_byte_start": 1545,
+      "source_line_end": 13,
+      "source_line_start": 12,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 10,
+      "cwd": "/synthetic",
+      "event_end": 23,
+      "event_start": 21,
+      "events": [
+        {
+          "line_no": 21,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "10",
+              "parentId": "9"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-10",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 22,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "10",
+              "parentId": "9"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-10",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "a92e56791cc123e94d1562244395e9f0425e9745330088f07b0291182acc5605",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 1864,
+      "source_byte_start": 1704,
+      "source_line_end": 14,
+      "source_line_start": 13,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 11,
+      "cwd": "/synthetic",
+      "event_end": 25,
+      "event_start": 23,
+      "events": [
+        {
+          "line_no": 23,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "11",
+              "parentId": "10"
+            },
+            "message": {
+              "content": [
+                {
+                  "id": "bash-11",
+                  "name": "bash",
+                  "summary": "echo synthetic",
+                  "type": "tool_use"
+                }
+              ],
+              "role": "assistant"
+            },
+            "timestamp": null,
+            "type": "assistant"
+          }
+        },
+        {
+          "line_no": 24,
+          "raw": {
+            "_pi_extras": {
+              "exit_code": 0,
+              "id": "11",
+              "parentId": "10"
+            },
+            "message": {
+              "content": [
+                {
+                  "result_bytes": 14,
+                  "tool_use_id": "bash-11",
+                  "type": "tool_result"
+                }
+              ],
+              "role": "user"
+            },
+            "timestamp": null,
+            "type": "user"
+          }
+        }
+      ],
+      "prefix_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 2025,
+      "source_byte_start": 1864,
+      "source_line_end": 15,
+      "source_line_start": 14,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    },
+    {
+      "batch_seq": 12,
+      "event_end": 25,
+      "event_start": 25,
+      "finalize": true,
+      "prefix_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "protocol_version": 2,
+      "session_id": "14952845-4635-4c84-9a3f-48d66cfab040",
+      "snapshot_byte_end": 2025,
+      "snapshot_sha256": "859a2312b1cee3731cbf60363bb0f6a94f0bd1ac3ed0a251605fc42eebe88a8d",
+      "source_byte_end": 2025,
+      "source_byte_start": 2025,
+      "source_line_end": 15,
+      "source_line_start": 15,
+      "stream_id": "48dffdc6-0e2c-40b2-848c-5b2e7e43e549"
+    }
+  ]
+}
