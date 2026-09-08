@@ -8,7 +8,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 
 ### Added
 
-- **Companion observations (spec §8).** Migration 0128 adds
+- **Companion observations (spec §8).** Migration 0130 adds
   `companion_observations`, an append-only sidecar with at most one verdict
   per delivery attempt (first write wins), FK-bound to the delivery it
   qualifies, FORCE RLS with SELECT/INSERT policies only. `POST
@@ -18,7 +18,7 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
   report counts ack evidence OR an observation row, plus `not_observed` for
   the emitted-but-never-seen rows. Proven on Claude Code, Codex and pi
   transcripts on 2026-09-07.
-- **Companion injection transport: the engine half.** Migration 0127 adds
+- **Companion injection transport: the engine half.** Migration 0129 adds
   `companion_mailbox` (append-only cards), `companion_deliveries` (append-only
   emission-attempt outcomes keyed by a client-minted `attempt_id`) and
   `companion_claims` (short leases for the actor-keyed lane), all under FORCE

@@ -23,8 +23,8 @@ observation row says so.
 
 from alembic import op
 
-revision = "0128_companion_observations"
-down_revision = "0127_companion_mailbox"
+revision = "0130_companion_observations"
+down_revision = "0129_companion_mailbox"
 branch_labels = None
 depends_on = None
 

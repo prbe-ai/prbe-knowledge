@@ -30,8 +30,8 @@ reserved for the intelligent layer and stay NULL until it exists.
 
 from alembic import op
 
-revision = "0127_companion_mailbox"
-down_revision = "0126_drop_full_hnsw_index"
+revision = "0129_companion_mailbox"
+down_revision = "0127_github_installation_control"
 branch_labels = None
 depends_on = None
 

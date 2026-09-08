@@ -1945,7 +1945,7 @@ DO $$ DECLARE item RECORD; BEGIN
     END LOOP;
 END $$;
 -- ---------------------------------------------------------------------------
--- Companion injection infrastructure (migration 0127): companion_mailbox,
+-- Companion injection infrastructure (migration 0129): companion_mailbox,
 -- companion_deliveries, companion_claims. The transport half of the
 -- mid-session companion. Append-only mailbox + deliveries mirror
 -- serve_ledger's SELECT/INSERT-only RLS shape (the missing UPDATE/DELETE
@@ -2058,7 +2058,7 @@ CREATE POLICY tenant_isolation ON companion_claims
     WITH CHECK (customer_id = current_setting('app.current_customer_id', true));
 
 -- ---------------------------------------------------------------------------
--- 0128_companion_observations: append-only sidecar qualifying one delivery
+-- 0130_companion_observations: append-only sidecar qualifying one delivery
 -- attempt with whether the model-readable context carried the card (spec §8).
 -- ---------------------------------------------------------------------------
 CREATE TABLE companion_observations (
